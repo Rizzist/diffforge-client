@@ -14,7 +14,7 @@ const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT: &str = "forge-snip-source-updated";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
-const SNIPPING_AREA_OVERLAY_WINDOW_LABEL: &str = "snipping-overlay";
+const SNIPPING_AREA_OVERLAY_WINDOW_PREFIX: &str = "snipping-overlay";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
 const SNIPPING_DISMISSED_TOASTS_FILE: &str = "snipping-dismissed-toasts.json";
@@ -84,9 +84,25 @@ fn snipping_left_mouse_button_pressed() -> bool {
     unsafe { CGEventSourceButtonState(0, 0) }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// VK_LBUTTON via GetAsyncKeyState: high bit set while the button is held.
+#[cfg(windows)]
+fn snipping_left_mouse_button_pressed() -> bool {
+    let state =
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) };
+    (state as u16 & 0x8000) != 0
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn snipping_left_mouse_button_pressed() -> bool {
     false
+}
+
+/// Whether this platform can actually answer "is the left button down?".
+/// Where it can, preview drops resolve the instant the button releases;
+/// where it cannot (Linux), the Moved-event deadline is the only signal and
+/// must never be short-circuited by the always-false button probe.
+fn snipping_mouse_button_state_supported() -> bool {
+    cfg!(any(target_os = "macos", windows))
 }
 
 #[cfg(target_os = "macos")]
@@ -107,15 +123,28 @@ extern "C" {
     fn CFRunLoopRun();
 }
 
+/// One per-monitor overlay window's frozen state during an active area snip:
+/// the monitor geometry (plus backdrop JPEG path) and the in-memory frozen
+/// frame the final crop is cut from. Keyed by overlay window label.
+#[derive(Clone)]
+struct SnippingAreaSession {
+    monitor: SnippingAreaMonitor,
+    snapshot: Option<Arc<xcap::image::RgbaImage>>,
+}
+
 #[derive(Clone)]
 struct SnippingState {
     shortcut_manager: SnippingShortcutManager,
-    active_area_monitor: Arc<StdMutex<Option<SnippingAreaMonitor>>>,
-    active_area_snapshot: Arc<StdMutex<Option<Arc<xcap::image::RgbaImage>>>>,
+    active_area_sessions: Arc<StdMutex<HashMap<String, SnippingAreaSession>>>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
     asset_target: Arc<StdMutex<SnippingAssetTarget>>,
     dispatch_targets: Arc<StdMutex<Value>>,
-    preview_restack_generation: Arc<AtomicU64>,
+    /// Settle deadline (epoch ms) pushed forward by every preview Moved
+    /// event; one watcher thread (gated by the flag below) polls it together
+    /// with the live mouse-button state, so a release resolves the drop
+    /// immediately instead of waiting out a debounce.
+    preview_restack_deadline_ms: Arc<AtomicU64>,
+    preview_restack_watcher_active: Arc<AtomicBool>,
     /// Preview window label -> asset path currently shown in that window
     /// (retargeted when an annotated copy takes over the preview).
     preview_paths: Arc<StdMutex<HashMap<String, String>>>,
@@ -134,12 +163,12 @@ impl SnippingState {
     fn new() -> Self {
         Self {
             shortcut_manager: SnippingShortcutManager::new(),
-            active_area_monitor: Arc::new(StdMutex::new(None)),
-            active_area_snapshot: Arc::new(StdMutex::new(None)),
+            active_area_sessions: Arc::new(StdMutex::new(HashMap::new())),
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
             asset_target: Arc::new(StdMutex::new(SnippingAssetTarget::default())),
             dispatch_targets: Arc::new(StdMutex::new(Value::Array(Vec::new()))),
-            preview_restack_generation: Arc::new(AtomicU64::new(0)),
+            preview_restack_deadline_ms: Arc::new(AtomicU64::new(0)),
+            preview_restack_watcher_active: Arc::new(AtomicBool::new(false)),
             preview_paths: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
@@ -997,8 +1026,8 @@ fn set_snipping_enabled_for(
         );
         prewarm_snipping_overlay_window(app);
     } else {
-        snipping_set_active_area_snapshot(app, None)?;
-        snipping_set_active_area_monitor(app, None)?;
+        snipping_clear_area_sessions(app)?;
+        snipping_hide_area_overlay(app);
         snipping_close_area_overlay(app);
     }
 
@@ -1092,47 +1121,38 @@ fn reset_snipping_shortcuts_for(app: &AppHandle) -> Result<SnippingSettingsStatu
     snipping_status_for(app)
 }
 
-fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor, String> {
-    if let Some(window) = app.get_webview_window("main") {
-        if let Ok(Some(monitor)) = window.current_monitor() {
-            let position = monitor.position();
-            let size = monitor.size();
-            let scale_factor = monitor.scale_factor().max(0.1);
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            let (capture_x, capture_y, capture_width, capture_height) = (
-                (f64::from(position.x) / scale_factor).round() as i32,
-                (f64::from(position.y) / scale_factor).round() as i32,
-                (f64::from(size.width) / scale_factor).round().max(1.0) as u32,
-                (f64::from(size.height) / scale_factor).round().max(1.0) as u32,
-            );
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let (capture_x, capture_y, capture_width, capture_height) =
-                (position.x, position.y, size.width, size.height);
+fn snipping_area_monitor_from_tauri_monitor(monitor: &tauri::Monitor) -> SnippingAreaMonitor {
+    let position = monitor.position();
+    let size = monitor.size();
+    let scale_factor = monitor.scale_factor().max(0.1);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let (capture_x, capture_y, capture_width, capture_height) = (
+        (f64::from(position.x) / scale_factor).round() as i32,
+        (f64::from(position.y) / scale_factor).round() as i32,
+        (f64::from(size.width) / scale_factor).round().max(1.0) as u32,
+        (f64::from(size.height) / scale_factor).round().max(1.0) as u32,
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (capture_x, capture_y, capture_width, capture_height) =
+        (position.x, position.y, size.width, size.height);
 
-            return Ok(SnippingAreaMonitor {
-                x: position.x,
-                y: position.y,
-                width: size.width,
-                height: size.height,
-                scale_factor,
-                capture_x,
-                capture_y,
-                capture_width,
-                capture_height,
-                snapshot_path: None,
-                snapshot_width: 0,
-                snapshot_height: 0,
-            });
-        }
+    SnippingAreaMonitor {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        scale_factor,
+        capture_x,
+        capture_y,
+        capture_width,
+        capture_height,
+        snapshot_path: None,
+        snapshot_width: 0,
+        snapshot_height: 0,
     }
+}
 
-    let monitor = XcapMonitor::all()
-        .map_err(|error| format!("Unable to list monitors: {error}"))?
-        .into_iter()
-        .find(|monitor| monitor.is_primary().unwrap_or(false))
-        .or_else(|| XcapMonitor::all().ok().and_then(|mut monitors| monitors.drain(..).next()))
-        .ok_or_else(|| "No monitor is available for snipping.".to_string())?;
-
+fn snipping_area_monitor_from_xcap_monitor(monitor: &XcapMonitor) -> SnippingAreaMonitor {
     let capture_x = monitor.x().unwrap_or(0);
     let capture_y = monitor.y().unwrap_or(0);
     let capture_width = monitor.width().unwrap_or(1);
@@ -1148,7 +1168,7 @@ fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor,
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let (x, y, width, height) = (capture_x, capture_y, capture_width, capture_height);
 
-    Ok(SnippingAreaMonitor {
+    SnippingAreaMonitor {
         x,
         y,
         width,
@@ -1161,7 +1181,64 @@ fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor,
         snapshot_path: None,
         snapshot_width: 0,
         snapshot_height: 0,
-    })
+    }
+}
+
+fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor, String> {
+    if let Some(window) = app.get_webview_window("main") {
+        if let Ok(Some(monitor)) = window.current_monitor() {
+            return Ok(snipping_area_monitor_from_tauri_monitor(&monitor));
+        }
+    }
+
+    let monitor = XcapMonitor::all()
+        .map_err(|error| format!("Unable to list monitors: {error}"))?
+        .into_iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .or_else(|| XcapMonitor::all().ok().and_then(|mut monitors| monitors.drain(..).next()))
+        .ok_or_else(|| "No monitor is available for snipping.".to_string())?;
+
+    Ok(snipping_area_monitor_from_xcap_monitor(&monitor))
+}
+
+/// Every connected display, one entry per future overlay window — area snips
+/// cover all screens at once the way the native screenshot UI does.
+fn snipping_area_monitors(app: &AppHandle) -> Result<Vec<SnippingAreaMonitor>, String> {
+    if let Ok(monitors) = app.available_monitors() {
+        let mapped: Vec<SnippingAreaMonitor> = monitors
+            .iter()
+            .map(snipping_area_monitor_from_tauri_monitor)
+            .collect();
+        if !mapped.is_empty() {
+            return Ok(mapped);
+        }
+    }
+
+    let monitors = XcapMonitor::all()
+        .map_err(|error| format!("Unable to list monitors: {error}"))?;
+    let mapped: Vec<SnippingAreaMonitor> = monitors
+        .iter()
+        .map(snipping_area_monitor_from_xcap_monitor)
+        .collect();
+    if mapped.is_empty() {
+        return Err("No monitor is available for snipping.".to_string());
+    }
+    Ok(mapped)
+}
+
+fn snipping_overlay_label(index: usize) -> String {
+    format!("{SNIPPING_AREA_OVERLAY_WINDOW_PREFIX}-{index}")
+}
+
+fn snipping_is_overlay_label(label: &str) -> bool {
+    label.starts_with(SNIPPING_AREA_OVERLAY_WINDOW_PREFIX)
+}
+
+fn snipping_overlay_windows(app: &AppHandle) -> Vec<(String, tauri::WebviewWindow)> {
+    app.webview_windows()
+        .into_iter()
+        .filter(|(label, _)| snipping_is_overlay_label(label))
+        .collect()
 }
 
 fn xcap_monitor_for_area(area: &SnippingAreaMonitor) -> Result<XcapMonitor, String> {
@@ -1269,8 +1346,7 @@ fn snipping_crop_area_preview_snapshot(
 }
 
 #[cfg(target_os = "macos")]
-fn snipping_macos_area_overlay_window_number(app: &AppHandle) -> Option<u32> {
-    let window = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL)?;
+fn snipping_macos_window_number(window: &tauri::WebviewWindow) -> Option<u32> {
     let ns_window = window.ns_window().ok()?;
     if ns_window.is_null() {
         return None;
@@ -1280,6 +1356,16 @@ fn snipping_macos_area_overlay_window_number(app: &AppHandle) -> Option<u32> {
     u32::try_from(ns_window.windowNumber())
         .ok()
         .filter(|window_number| *window_number > 0)
+}
+
+/// Window numbers of every snip overlay window, for excluding them from
+/// mid-session captures.
+#[cfg(target_os = "macos")]
+fn snipping_macos_overlay_window_numbers(app: &AppHandle) -> Vec<u32> {
+    snipping_overlay_windows(app)
+        .iter()
+        .filter_map(|(_, window)| snipping_macos_window_number(window))
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -1365,8 +1451,144 @@ fn snipping_macos_capture_region_below_window(
     snipping_macos_cg_image_to_rgba_image(cg_image.as_deref())
 }
 
+/// ScreenCaptureKit screenshot of one display, excluding the given window
+/// numbers (the snip overlays). This is the supported capture path on
+/// macOS 15+, where CGWindowListCreateImage's below-window variant returns
+/// nil — it re-freezes a Space without ever hiding the overlay, so there is
+/// no flicker. Synchronous wrapper around SCK's completion handlers; call it
+/// from a background thread only.
+#[cfg(target_os = "macos")]
+fn snipping_macos_sck_capture_display(
+    display_id: u32,
+    exclude_window_numbers: &[u32],
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    use objc2::AllocAnyThread as _;
+    use objc2_screen_capture_kit::{
+        SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+    };
+
+    let (sender, receiver) =
+        std::sync::mpsc::channel::<Result<xcap::image::RgbaImage, String>>();
+    let exclude_window_numbers = exclude_window_numbers.to_vec();
+    let width = width.max(1);
+    let height = height.max(1);
+
+    // Everything ObjC stays inside the completion blocks: Retained ObjC
+    // objects are not Send, so only the finished RgbaImage crosses the
+    // channel back to the calling thread.
+    let content_sender = sender.clone();
+    let content_block = block2::RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut objc2_foundation::NSError| {
+            let outcome = (|| -> Result<(), String> {
+                let content = unsafe { content.as_ref() }.ok_or_else(|| {
+                    unsafe { error.as_ref() }
+                        .map(|error| error.localizedDescription().to_string())
+                        .unwrap_or_else(|| {
+                            "ScreenCaptureKit returned no shareable content.".to_string()
+                        })
+                })?;
+                let displays = unsafe { content.displays() };
+                let display = displays
+                    .iter()
+                    .find(|display| unsafe { display.displayID() } == display_id)
+                    .ok_or_else(|| "Snip display is no longer available.".to_string())?;
+                let windows = unsafe { content.windows() };
+                let excluded: Vec<_> = windows
+                    .iter()
+                    .filter(|window| {
+                        exclude_window_numbers.contains(&(unsafe { window.windowID() }))
+                    })
+                    .collect();
+                let excluded_array = objc2_foundation::NSArray::from_retained_slice(&excluded);
+                let filter = unsafe {
+                    SCContentFilter::initWithDisplay_excludingWindows(
+                        SCContentFilter::alloc(),
+                        &display,
+                        &excluded_array,
+                    )
+                };
+                let config = unsafe { SCStreamConfiguration::new() };
+                unsafe {
+                    config.setWidth(width as usize);
+                    config.setHeight(height as usize);
+                    config.setShowsCursor(false);
+                }
+                let image_sender = content_sender.clone();
+                let image_block = block2::RcBlock::new(
+                    move |cg_image: *mut CGImage, error: *mut objc2_foundation::NSError| {
+                        let result = if cg_image.is_null() {
+                            Err(unsafe { error.as_ref() }
+                                .map(|error| error.localizedDescription().to_string())
+                                .unwrap_or_else(|| {
+                                    "ScreenCaptureKit returned no snip image.".to_string()
+                                }))
+                        } else {
+                            snipping_macos_cg_image_to_rgba_image(unsafe { cg_image.as_ref() })
+                        };
+                        let _ = image_sender.send(result);
+                    },
+                );
+                unsafe {
+                    SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                        &filter,
+                        &config,
+                        Some(&image_block),
+                    )
+                };
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                let _ = content_sender.send(Err(error));
+            }
+        },
+    );
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&content_block) };
+
+    receiver
+        .recv_timeout(Duration::from_millis(6000))
+        .map_err(|_| "Timed out capturing the screen with ScreenCaptureKit.".to_string())?
+}
+
+/// SCK capture sized to an xcap monitor (physical pixels), excluding the
+/// given overlay windows.
+#[cfg(target_os = "macos")]
+fn snipping_macos_sck_capture_monitor(
+    monitor: &XcapMonitor,
+    exclude_window_numbers: &[u32],
+) -> Result<xcap::image::RgbaImage, String> {
+    let display_id = monitor
+        .id()
+        .map_err(|error| format!("Unable to read display id for snip capture: {error}"))?;
+    let scale = f64::from(monitor.scale_factor().unwrap_or(1.0)).max(0.1);
+    let width = (f64::from(monitor.width().unwrap_or(1)) * scale).round().max(1.0) as u32;
+    let height = (f64::from(monitor.height().unwrap_or(1)) * scale).round().max(1.0) as u32;
+    snipping_macos_sck_capture_display(display_id, exclude_window_numbers, width, height)
+}
+
+/// Full-monitor capture for snips: xcap (CGWindowListCreateImage) first, and
+/// when macOS removes that legacy path, ScreenCaptureKit as the fallback.
+fn snipping_capture_monitor_full_image(
+    monitor: &XcapMonitor,
+) -> Result<xcap::image::RgbaImage, String> {
+    match monitor.capture_image() {
+        Ok(image) => Ok(image),
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(image) = snipping_macos_sck_capture_monitor(monitor, &[]) {
+                    return Ok(image);
+                }
+            }
+            Err(format!("Unable to capture screen: {error}"))
+        }
+    }
+}
+
 fn snipping_capture_area_image(
     app: &AppHandle,
+    overlay_label: &str,
     monitor: &XcapMonitor,
     x: u32,
     y: u32,
@@ -1375,7 +1597,11 @@ fn snipping_capture_area_image(
 ) -> Result<xcap::image::RgbaImage, String> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(window_number) = snipping_macos_area_overlay_window_number(app) {
+        if let Some(window_number) = app
+            .get_webview_window(overlay_label)
+            .as_ref()
+            .and_then(snipping_macos_window_number)
+        {
             if let Ok(image) =
                 snipping_macos_capture_region_below_window(monitor, x, y, width, height, window_number)
             {
@@ -1383,6 +1609,8 @@ fn snipping_capture_area_image(
             }
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = overlay_label;
 
     snipping_hide_area_overlay(app);
     thread::sleep(Duration::from_millis(SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS));
@@ -1392,22 +1620,28 @@ fn snipping_capture_area_image(
 }
 
 /// Mid-session capture that must NOT end the snip: tries the
-/// capture-below-overlay path first (works through macOS 14), and where
-/// CGWindowListCreateImage is gone (macOS 15+ returns nil) it hides the
-/// overlay only for the duration of the capture and puts it straight back —
-/// keeping the session, the Escape grab, and the overlay window alive. This
-/// is what Space-change re-freezes use; routing them through the final-capture
+/// capture-below-overlay path first (works through macOS 14), then
+/// ScreenCaptureKit with every overlay window excluded (macOS 15+, no
+/// flicker), and only as a last resort hides this one overlay for the
+/// duration of an xcap capture before putting it straight back — keeping the
+/// session, the Escape grab, and the overlay windows alive. This is what
+/// Space-change re-freezes use; routing them through the final-capture
 /// fallback used to tear the whole session down the moment the user swiped
 /// to a full-screen app.
 fn snipping_capture_monitor_image_keeping_session(
     app: &AppHandle,
+    overlay_label: &str,
     monitor: &XcapMonitor,
     width: u32,
     height: u32,
 ) -> Result<xcap::image::RgbaImage, String> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(window_number) = snipping_macos_area_overlay_window_number(app) {
+        if let Some(window_number) = app
+            .get_webview_window(overlay_label)
+            .as_ref()
+            .and_then(snipping_macos_window_number)
+        {
             if let Ok(image) = snipping_macos_capture_region_below_window(
                 monitor,
                 0,
@@ -1419,9 +1653,14 @@ fn snipping_capture_monitor_image_keeping_session(
                 return Ok(image);
             }
         }
+
+        let overlay_window_numbers = snipping_macos_overlay_window_numbers(app);
+        if let Ok(image) = snipping_macos_sck_capture_monitor(monitor, &overlay_window_numbers) {
+            return Ok(image);
+        }
     }
 
-    let overlay = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL);
+    let overlay = app.get_webview_window(overlay_label);
     if let Some(overlay) = overlay.as_ref() {
         let _ = overlay.hide();
     }
@@ -1898,9 +2137,11 @@ fn snipping_open_annotation_editor_for_paths(
         .unwrap_or((760.0, 480.0));
     // CSS chrome around the canvas: tool rail + stage padding horizontally;
     // title bar + composer + stage padding vertically (plus the thumbnail
-    // strip when editing several images).
-    let chrome_width = 76.0;
-    let chrome_height = if files.len() > 1 { 164.0 } else { 120.0 };
+    // strip when editing several images). Matches the compact editor CSS.
+    let chrome_width = 62.0;
+    let chrome_height = if files.len() > 1 { 138.0 } else { 102.0 };
+    // Lean editor: cap well below the work area so the window reads as a
+    // focused tool, not a second app taking over the screen.
     let (max_width, max_height) = monitor
         .as_ref()
         .map(|monitor| {
@@ -1908,11 +2149,11 @@ fn snipping_open_annotation_editor_for_paths(
                 .work_area()
                 .size
                 .to_logical::<f64>(monitor.scale_factor());
-            (area.width * 0.92, area.height * 0.92)
+            (area.width * 0.78, area.height * 0.78)
         })
-        .unwrap_or((1280.0, 860.0));
-    let inner_width = (image_width + chrome_width).clamp(480.0, max_width.max(480.0));
-    let inner_height = (image_height + chrome_height).clamp(360.0, max_height.max(360.0));
+        .unwrap_or((1100.0, 740.0));
+    let inner_width = (image_width + chrome_width).clamp(420.0, max_width.max(420.0));
+    let inner_height = (image_height + chrome_height).clamp(320.0, max_height.max(320.0));
     let window = WebviewWindowBuilder::new(
         app,
         label.clone(),
@@ -1920,7 +2161,7 @@ fn snipping_open_annotation_editor_for_paths(
     )
     .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
     .inner_size(inner_width, inner_height)
-    .min_inner_size(480.0, 360.0)
+    .min_inner_size(420.0, 320.0)
     .resizable(true)
     .decorations(false)
     // Normal z-order: clicking the main Diff Forge window brings it in front
@@ -2154,8 +2395,7 @@ fn snipping_capture_full_for(
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
     let monitor = xcap_monitor_for_full(app)?;
-    let image = monitor
-        .capture_image()
+    let image = snipping_capture_monitor_full_image(&monitor)
         .map_err(|error| format!("Unable to capture screenshot: {error}"))?;
     snipping_save_image(app, image, "full", reason, shortcut)
 }
@@ -2164,15 +2404,34 @@ fn size_snipping_overlay_window(
     window: &tauri::WebviewWindow,
     monitor: &SnippingAreaMonitor,
 ) {
-    let _ = window.set_position(tauri::PhysicalPosition::new(monitor.x, monitor.y));
-    let _ = window.set_size(tauri::PhysicalSize::new(monitor.width, monitor.height));
+    // macOS/Linux: position in logical points — physical coordinates are not
+    // a uniform space across mixed-DPI displays, so a physical set_position
+    // lands a secondary-display overlay in the wrong place. capture_* already
+    // holds the logical rect there. Windows keeps the physical path.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let _ = window.set_position(tauri::LogicalPosition::new(
+            f64::from(monitor.capture_x),
+            f64::from(monitor.capture_y),
+        ));
+        let _ = window.set_size(tauri::LogicalSize::new(
+            monitor.capture_width.max(1) as f64,
+            monitor.capture_height.max(1) as f64,
+        ));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = window.set_position(tauri::PhysicalPosition::new(monitor.x, monitor.y));
+        let _ = window.set_size(tauri::PhysicalSize::new(monitor.width, monitor.height));
+    }
 }
 
 fn ensure_snipping_overlay_window(
     app: &AppHandle,
+    label: &str,
     monitor: &SnippingAreaMonitor,
 ) -> Result<tauri::WebviewWindow, String> {
-    if let Some(window) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) {
+    if let Some(window) = app.get_webview_window(label) {
         size_snipping_overlay_window(&window, monitor);
         return Ok(window);
     }
@@ -2181,7 +2440,7 @@ fn ensure_snipping_overlay_window(
     let logical_height = f64::from(monitor.height) / monitor.scale_factor.max(1.0);
     let window = WebviewWindowBuilder::new(
         app,
-        SNIPPING_AREA_OVERLAY_WINDOW_LABEL,
+        label,
         WebviewUrl::App("index.html#/snipping-overlay".into()),
     )
     .title("Snipping")
@@ -2202,7 +2461,10 @@ fn ensure_snipping_overlay_window(
 
     size_snipping_overlay_window(&window, monitor);
     #[cfg(target_os = "macos")]
-    snipping_apply_overlay_fullscreen_window_style(&window);
+    {
+        snipping_convert_overlay_window_to_panel(&window);
+        snipping_apply_overlay_fullscreen_window_style(&window);
+    }
     Ok(window)
 }
 
@@ -2256,57 +2518,292 @@ fn snipping_order_overlay_front_regardless(window: &tauri::WebviewWindow) {
     });
 }
 
-fn prewarm_snipping_overlay_window(app: &AppHandle) {
-    let app_for_task = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        let Ok(monitor) = snipping_current_area_monitor(&app_for_task) else {
+#[cfg(target_os = "macos")]
+extern "C" fn snipping_panel_can_become_key(
+    _this: &objc2::runtime::AnyObject,
+    _sel: objc2::runtime::Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn snipping_panel_can_become_main(
+    _this: &objc2::runtime::AnyObject,
+    _sel: objc2::runtime::Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::NO
+}
+
+/// NSPanel subclass the overlay window is re-classed into. Layout parity
+/// with tao's `TaoWindow` (NSWindow + one `focusable` Bool ivar) is required:
+/// `object_setClass` keeps the instance bytes, so the replacement class must
+/// have the identical instance size. `canBecomeKeyWindow` is forced YES (the
+/// panel must take key while Diff Forge is inactive) and main is refused —
+/// a capture overlay should never be the app's main window.
+#[cfg(target_os = "macos")]
+fn snipping_overlay_panel_class() -> Option<&'static objc2::runtime::AnyClass> {
+    static PANEL_CLASS: OnceLock<Option<&'static objc2::runtime::AnyClass>> = OnceLock::new();
+    *PANEL_CLASS.get_or_init(|| {
+        let superclass = objc2::class!(NSPanel);
+        let mut builder =
+            objc2::runtime::ClassBuilder::new(c"DiffForgeSnipPanel", superclass)?;
+        builder.add_ivar::<objc2::runtime::Bool>(c"focusable");
+        unsafe {
+            builder.add_method(
+                objc2::sel!(canBecomeKeyWindow),
+                snipping_panel_can_become_key as extern "C" fn(_, _) -> _,
+            );
+            builder.add_method(
+                objc2::sel!(canBecomeMainWindow),
+                snipping_panel_can_become_main as extern "C" fn(_, _) -> _,
+            );
+        }
+        Some(builder.register())
+    })
+}
+
+/// Re-classes the tao NSWindow into a non-activating NSPanel. A regular
+/// NSWindow of an inactive app can never become key, and activating the app
+/// (tao's set_focus) either gets denied by macOS 14+ cooperative activation
+/// or yanks the user out of the fullscreen Space they invoked the snip on.
+/// A panel with NSWindowStyleMaskNonactivatingPanel takes key input with the
+/// app left inactive — the same technique CleanShot/Raycast-style overlays
+/// and Electron's panel windows use.
+#[cfg(target_os = "macos")]
+fn snipping_convert_overlay_window_to_panel(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Some(panel_class) = snipping_overlay_panel_class() else {
             return;
         };
-        let Ok(window) = ensure_snipping_overlay_window(&app_for_task, &monitor) else {
+        let Ok(ns_window) = window_for_main.ns_window() else {
             return;
         };
-        let _ = window.hide();
+        if ns_window.is_null() {
+            return;
+        }
+        let object: &objc2::runtime::AnyObject =
+            unsafe { &*ns_window.cast::<objc2::runtime::AnyObject>() };
+        if !std::ptr::eq(object.class(), panel_class) {
+            unsafe {
+                objc2::runtime::AnyObject::set_class(object, panel_class);
+            }
+        }
+        let panel: &objc2_app_kit::NSPanel =
+            unsafe { &*ns_window.cast::<objc2_app_kit::NSPanel>() };
+        panel.setStyleMask(
+            panel.styleMask() | objc2_app_kit::NSWindowStyleMask::NonactivatingPanel,
+        );
+        panel.setBecomesKeyOnlyIfNeeded(false);
+        panel.setWorksWhenModal(true);
+        // NSPanel semantics would otherwise order the overlay out whenever
+        // the app deactivates — which is the normal state during a snip.
+        panel.setHidesOnDeactivate(false);
     });
 }
 
-fn snipping_set_active_area_monitor(
+/// Makes one overlay panel the key window WITHOUT activating the app — the
+/// non-activating panel accepts key status while another app (a fullscreen
+/// Chrome, say) stays active, so hover tracking and webview keyboard input
+/// work and macOS never switches Spaces.
+#[cfg(target_os = "macos")]
+fn snipping_make_overlay_key(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.makeKeyAndOrderFront(None);
+    });
+}
+
+#[cfg(target_os = "macos")]
+static SNIPPING_OVERLAY_MOUSE_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static SNIPPING_AREA_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// AppKit routes mouseMoved events to the key window only, so with one
+/// overlay panel per display, hover tracking would stay stuck on whichever
+/// panel is key. While a snip session is active, this watches global mouse
+/// movement and hands key status to the overlay panel under the cursor —
+/// cross-display hover works like the native screenshot UI. Runs on the main
+/// thread (NSEvent monitor handlers fire there) and is a cheap atomic check
+/// outside snip sessions.
+#[cfg(target_os = "macos")]
+fn snipping_overlay_handle_mouse_moved() {
+    if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(app) = snipping_macos_event_tap_app() else {
+        return;
+    };
+    let location = objc2_app_kit::NSEvent::mouseLocation();
+    for (_, window) in snipping_overlay_windows(&app) {
+        let Ok(ns_ptr) = window.ns_window() else {
+            continue;
+        };
+        if ns_ptr.is_null() {
+            continue;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+        if !ns_window.isVisible() {
+            continue;
+        }
+        let frame = ns_window.frame();
+        let inside = location.x >= frame.origin.x
+            && location.x < frame.origin.x + frame.size.width
+            && location.y >= frame.origin.y
+            && location.y < frame.origin.y + frame.size.height;
+        if !inside {
+            continue;
+        }
+        if !ns_window.isKeyWindow() {
+            ns_window.makeKeyAndOrderFront(None);
+        }
+        break;
+    }
+}
+
+/// Installs the app-lifetime mouse-move monitors that drive cross-display
+/// overlay key handoff. A global monitor covers movement while another app
+/// is active; the local monitor covers movement once one of our panels holds
+/// key. Both are gated by SNIPPING_AREA_SESSION_ACTIVE.
+#[cfg(target_os = "macos")]
+fn register_snipping_overlay_mouse_monitors(app: &AppHandle) {
+    snipping_set_macos_event_tap_app(app);
+    if SNIPPING_OVERLAY_MOUSE_MONITORS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.run_on_main_thread(move || {
+        use objc2_app_kit::{NSEvent, NSEventMask};
+
+        let mask = NSEventMask::MouseMoved;
+
+        let global_block = block2::RcBlock::new(
+            move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                snipping_overlay_handle_mouse_moved();
+            },
+        );
+        if let Some(token) =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
+        {
+            // The monitors live for the app's lifetime.
+            std::mem::forget(token);
+        }
+
+        let local_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
+                snipping_overlay_handle_mouse_moved();
+                event.as_ptr()
+            },
+        );
+        let local_token = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block)
+        };
+        if let Some(token) = local_token {
+            std::mem::forget(token);
+        }
+    });
+}
+
+fn prewarm_snipping_overlay_window(app: &AppHandle) {
+    let app_for_task = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Ok(monitors) = snipping_area_monitors(&app_for_task) else {
+            return;
+        };
+        for (index, monitor) in monitors.iter().enumerate() {
+            let label = snipping_overlay_label(index);
+            let Ok(window) = ensure_snipping_overlay_window(&app_for_task, &label, monitor)
+            else {
+                continue;
+            };
+            let _ = window.hide();
+        }
+    });
+}
+
+/// Replaces the whole per-overlay session map (start of a new snip), deleting
+/// any backdrop files the previous sessions left behind.
+fn snipping_replace_area_sessions(
     app: &AppHandle,
-    monitor: Option<SnippingAreaMonitor>,
+    sessions: HashMap<String, SnippingAreaSession>,
 ) -> Result<(), String> {
     let state = app.state::<SnippingState>();
     let mut guard = state
-        .active_area_monitor
+        .active_area_sessions
         .lock()
         .map_err(|_| "Unable to lock snipping overlay state.".to_string())?;
-    let next_snapshot_path = monitor
-        .as_ref()
-        .and_then(|next_monitor| next_monitor.snapshot_path.as_deref())
-        .map(str::to_string);
-    let previous = std::mem::replace(&mut *guard, monitor);
-    if let Some(previous_monitor) = previous {
-        let previous_snapshot_path = previous_monitor.snapshot_path.as_deref();
-        if previous_snapshot_path != next_snapshot_path.as_deref() {
-            snipping_remove_snapshot_file(previous_snapshot_path);
+    let previous = std::mem::replace(&mut *guard, sessions);
+    let next_paths: HashSet<String> = guard
+        .values()
+        .filter_map(|session| session.monitor.snapshot_path.clone())
+        .collect();
+    drop(guard);
+    for (_, session) in previous {
+        if let Some(path) = session.monitor.snapshot_path.as_deref() {
+            if !next_paths.contains(path) {
+                snipping_remove_snapshot_file(Some(path));
+            }
         }
     }
     Ok(())
 }
 
-fn snipping_set_active_area_snapshot(
-    app: &AppHandle,
-    snapshot: Option<Arc<xcap::image::RgbaImage>>,
-) -> Result<(), String> {
-    let state = app.state::<SnippingState>();
-    let mut guard = state
-        .active_area_snapshot
-        .lock()
-        .map_err(|_| "Unable to lock snipping snapshot state.".to_string())?;
-    *guard = snapshot;
-    Ok(())
+fn snipping_clear_area_sessions(app: &AppHandle) -> Result<(), String> {
+    snipping_replace_area_sessions(app, HashMap::new())
 }
 
-fn snipping_crop_active_area_snapshot(
+fn snipping_area_session_labels(app: &AppHandle) -> Vec<String> {
+    app.state::<SnippingState>()
+        .active_area_sessions
+        .lock()
+        .map(|guard| guard.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn snipping_area_session_monitor(
     app: &AppHandle,
+    label: &str,
+) -> Result<SnippingAreaMonitor, String> {
+    let state = app.state::<SnippingState>();
+    let guard = state
+        .active_area_sessions
+        .lock()
+        .map_err(|_| "Unable to lock snipping overlay state.".to_string())?;
+    guard
+        .get(label)
+        .map(|session| session.monitor.clone())
+        .ok_or_else(|| "No active snipping overlay monitor.".to_string())
+}
+
+/// Swaps the in-memory frozen frame for one overlay's session (Space-change
+/// re-freeze); returns false when the session is no longer active.
+fn snipping_set_area_session_snapshot(
+    app: &AppHandle,
+    label: &str,
+    snapshot: Arc<xcap::image::RgbaImage>,
+) -> bool {
+    let state = app.state::<SnippingState>();
+    let Ok(mut guard) = state.active_area_sessions.lock() else {
+        return false;
+    };
+    match guard.get_mut(label) {
+        Some(session) => {
+            session.snapshot = Some(snapshot);
+            true
+        }
+        None => false,
+    }
+}
+
+fn snipping_crop_area_session_snapshot(
+    app: &AppHandle,
+    label: &str,
     x: u32,
     y: u32,
     width: u32,
@@ -2314,24 +2811,15 @@ fn snipping_crop_active_area_snapshot(
 ) -> Result<xcap::image::RgbaImage, String> {
     let state = app.state::<SnippingState>();
     let guard = state
-        .active_area_snapshot
+        .active_area_sessions
         .lock()
         .map_err(|_| "Unable to lock snipping snapshot state.".to_string())?;
     let image = guard
-        .as_ref()
+        .get(label)
+        .and_then(|session| session.snapshot.clone())
         .ok_or_else(|| "No frozen snip snapshot is available.".to_string())?;
+    drop(guard);
     snipping_crop_snapshot_image(image.as_ref(), x, y, width, height)
-}
-
-fn snipping_active_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor, String> {
-    let state = app.state::<SnippingState>();
-    let guard = state
-        .active_area_monitor
-        .lock()
-        .map_err(|_| "Unable to lock snipping overlay state.".to_string())?;
-    guard
-        .clone()
-        .ok_or_else(|| "No active snipping overlay monitor.".to_string())
 }
 
 fn snipping_begin_area_snip_for(
@@ -2340,60 +2828,172 @@ fn snipping_begin_area_snip_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
-    let mut monitor = snipping_current_area_monitor(app)?;
-    let xcap_monitor = xcap_monitor_for_area(&monitor)?;
-    let image = Arc::new(
-        xcap_monitor
-            .capture_image()
-            .map_err(|error| format!("Unable to capture screen for area snip: {error}"))?,
-    );
-    monitor.snapshot_width = image.width();
-    monitor.snapshot_height = image.height();
-    monitor.snapshot_path = None;
-    snipping_set_active_area_snapshot(app, Some(Arc::clone(&image)))?;
-    snipping_set_active_area_monitor(app, Some(monitor.clone()))?;
-    let window = ensure_snipping_overlay_window(app, &monitor)?;
-    let _ = window.emit(SNIPPING_AREA_OVERLAY_STARTED_EVENT, json!({
-        "kind": "snipping_area_overlay_started",
-        "monitor": monitor.clone(),
-    }));
-    // The reused (prewarmed) window must re-assert the fullscreen-capable
-    // style before every presentation, not only at creation.
-    #[cfg(target_os = "macos")]
-    snipping_apply_overlay_fullscreen_window_style(&window);
-    window
-        .show()
-        .map_err(|error| format!("Unable to show snipping overlay: {error}"))?;
-    // Surface the overlay even when Diff Forge is inactive and the user is
-    // on another app's fullscreen Space; only then activate for keyboard and
-    // hover tracking — activating with the overlay already key on the
-    // current Space keeps macOS from switching Spaces.
-    #[cfg(target_os = "macos")]
-    snipping_order_overlay_front_regardless(&window);
-    let _ = window.set_focus();
-    snipping_register_escape_cancel(app);
+    let monitors = snipping_area_monitors(app)?;
 
-    // The frozen-frame JPEG is only a visual backdrop; write it off the hot
-    // path so the selection overlay appears instantly, then announce it.
-    let app_for_snapshot = app.clone();
-    thread::spawn(move || {
-        snipping_store_area_snapshot_backdrop(&app_for_snapshot, image);
-    });
+    // Freeze every display in parallel BEFORE any overlay shows, so no
+    // overlay (hint pill, dimming) contaminates a frozen frame. Total
+    // latency is the slowest single display, same as one display before.
+    let mut capture_handles = Vec::new();
+    for (index, monitor) in monitors.into_iter().enumerate() {
+        capture_handles.push(thread::spawn(
+            move || -> (usize, SnippingAreaMonitor, Result<xcap::image::RgbaImage, String>) {
+                let result = xcap_monitor_for_area(&monitor)
+                    .and_then(|xcap_monitor| snipping_capture_monitor_full_image(&xcap_monitor));
+                (index, monitor, result)
+            },
+        ));
+    }
+
+    let mut sessions = HashMap::new();
+    let mut ordered: Vec<(String, SnippingAreaMonitor, Arc<xcap::image::RgbaImage>)> =
+        Vec::new();
+    let mut first_error: Option<String> = None;
+    for handle in capture_handles {
+        let Ok((index, mut monitor, result)) = handle.join() else {
+            continue;
+        };
+        match result {
+            Ok(image) => {
+                let image = Arc::new(image);
+                monitor.snapshot_width = image.width();
+                monitor.snapshot_height = image.height();
+                monitor.snapshot_path = None;
+                let label = snipping_overlay_label(index);
+                sessions.insert(
+                    label.clone(),
+                    SnippingAreaSession {
+                        monitor: monitor.clone(),
+                        snapshot: Some(Arc::clone(&image)),
+                    },
+                );
+                ordered.push((label, monitor, image));
+            }
+            Err(error) => {
+                // A display that cannot be captured (mirroring quirks, ...)
+                // is skipped; the snip continues on the displays that can.
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if ordered.is_empty() {
+        return Err(first_error
+            .unwrap_or_else(|| "Unable to capture screen for area snip.".to_string()));
+    }
+
+    snipping_replace_area_sessions(app, sessions)?;
+    #[cfg(target_os = "macos")]
+    SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
+
+    // Overlay windows left over from a display that disappeared since the
+    // prewarm must not linger as stale full-screen surfaces.
+    let active_labels: HashSet<&str> =
+        ordered.iter().map(|(label, _, _)| label.as_str()).collect();
+    for (label, window) in snipping_overlay_windows(app) {
+        if !active_labels.contains(label.as_str()) {
+            let _ = window.hide();
+        }
+    }
+
+    // The overlay under the cursor takes key for hover/keyboard; the others
+    // still accept the click that starts a drag (and the mouse-move monitor
+    // hands key over as the cursor crosses displays).
+    let cursor = app.cursor_position().ok();
+    let mut key_window: Option<tauri::WebviewWindow> = None;
+    let mut monitors_payload = Vec::new();
+    for (label, monitor, _) in &ordered {
+        // A display whose overlay cannot be created or shown is skipped: the
+        // snip keeps going on the displays that work. Aborting here would
+        // strand already-shown overlays with no Escape grab.
+        let Ok(window) = ensure_snipping_overlay_window(app, label, monitor) else {
+            continue;
+        };
+        let _ = app.emit(
+            SNIPPING_AREA_OVERLAY_STARTED_EVENT,
+            json!({
+                "kind": "snipping_area_overlay_started",
+                "overlayLabel": label,
+                "overlay_label": label,
+                "monitor": monitor.clone(),
+            }),
+        );
+        // The reused (prewarmed) window must re-assert the panel class and
+        // fullscreen-capable style before every presentation, not only at
+        // creation.
+        #[cfg(target_os = "macos")]
+        {
+            snipping_convert_overlay_window_to_panel(&window);
+            snipping_apply_overlay_fullscreen_window_style(&window);
+        }
+        if window.show().is_err() {
+            continue;
+        }
+        // Surface the overlay even while Diff Forge is inactive and the user
+        // is on another app's fullscreen Space. The app itself is NEVER
+        // activated: the non-activating panel takes key on its own, which is
+        // what keeps macOS from switching Spaces.
+        #[cfg(target_os = "macos")]
+        snipping_order_overlay_front_regardless(&window);
+
+        let cursor_inside = cursor
+            .as_ref()
+            .map(|position| {
+                position.x >= f64::from(monitor.x)
+                    && position.x < f64::from(monitor.x) + f64::from(monitor.width)
+                    && position.y >= f64::from(monitor.y)
+                    && position.y < f64::from(monitor.y) + f64::from(monitor.height)
+            })
+            .unwrap_or(false);
+        if cursor_inside || key_window.is_none() {
+            key_window = Some(window);
+        }
+        monitors_payload.push(json!({
+            "overlayLabel": label,
+            "monitor": monitor.clone(),
+        }));
+    }
+    if monitors_payload.is_empty() {
+        snipping_clear_area_sessions(app)?;
+        snipping_hide_area_overlay(app);
+        return Err("Unable to show any snipping overlay.".to_string());
+    }
+    if let Some(window) = key_window.as_ref() {
+        #[cfg(target_os = "macos")]
+        snipping_make_overlay_key(window);
+        #[cfg(not(target_os = "macos"))]
+        let _ = window.set_focus();
+    }
+    snipping_register_escape_cancel(app);
+    #[cfg(target_os = "macos")]
+    register_snipping_overlay_mouse_monitors(app);
+
+    // The frozen-frame JPEGs are only visual backdrops; write them off the
+    // hot path so the selection overlays appear instantly, then announce
+    // each to its overlay webview.
+    for (label, _, image) in ordered {
+        let app_for_snapshot = app.clone();
+        thread::spawn(move || {
+            snipping_store_area_snapshot_backdrop(&app_for_snapshot, &label, image);
+        });
+    }
 
     Ok(json!({
         "kind": "snipping_area_started",
         "reason": reason,
         "shortcut": shortcut,
-        "monitor": monitor,
+        "monitors": monitors_payload,
     }))
 }
 
-/// Writes the frozen-frame JPEG backdrop for the active snip session, swaps
-/// it into the active monitor state (deleting any previous backdrop file),
+/// Writes the frozen-frame JPEG backdrop for one overlay's session, swaps it
+/// into that session's monitor state (deleting any previous backdrop file),
 /// and announces it to the overlay webview. Safe to call again mid-session,
 /// which is how Space switches refresh the freeze.
 fn snipping_store_area_snapshot_backdrop(
     app: &AppHandle,
+    overlay_label: &str,
     image: Arc<xcap::image::RgbaImage>,
 ) {
     let Ok(snapshot_path) = snipping_overlay_snapshot_path() else {
@@ -2411,11 +3011,11 @@ fn snipping_store_area_snapshot_backdrop(
     let state = app.state::<SnippingState>();
     let mut still_active = false;
     let mut previous_path = None;
-    if let Ok(mut guard) = state.active_area_monitor.lock() {
-        if let Some(active_monitor) = guard.as_mut() {
-            previous_path = active_monitor.snapshot_path.replace(path_text.clone());
-            active_monitor.snapshot_width = image.width();
-            active_monitor.snapshot_height = image.height();
+    if let Ok(mut guard) = state.active_area_sessions.lock() {
+        if let Some(session) = guard.get_mut(overlay_label) {
+            previous_path = session.monitor.snapshot_path.replace(path_text.clone());
+            session.monitor.snapshot_width = image.width();
+            session.monitor.snapshot_height = image.height();
             still_active = true;
         }
     }
@@ -2426,51 +3026,62 @@ fn snipping_store_area_snapshot_backdrop(
     if let Some(previous_path) = previous_path.filter(|previous| previous != &path_text) {
         snipping_remove_snapshot_file(Some(&previous_path));
     }
-    if let Some(overlay) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) {
-        let _ = overlay.emit(
-            SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT,
-            json!({
-                "kind": "snipping_area_overlay_snapshot",
-                "snapshotPath": path_text.clone(),
-                "snapshot_path": path_text,
-            }),
-        );
-    }
+    let _ = app.emit(
+        SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT,
+        json!({
+            "kind": "snipping_area_overlay_snapshot",
+            "overlayLabel": overlay_label,
+            "overlay_label": overlay_label,
+            "snapshotPath": path_text.clone(),
+            "snapshot_path": path_text,
+        }),
+    );
 }
 
-/// Re-freezes the active snip session after a macOS Space switch: captures
-/// the new Space below the overlay (so the stale backdrop is not in the
-/// shot), swaps the in-memory frozen frame, and refreshes the backdrop.
+/// Re-freezes every active overlay session after a macOS Space switch:
+/// captures each display below its overlay (so the stale backdrop is not in
+/// the shot), swaps the in-memory frozen frames, and refreshes the backdrops.
+/// NSWorkspace's notification does not say which display changed Space, so
+/// all visible overlays re-freeze.
 #[cfg(target_os = "macos")]
 fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) else {
-        return;
-    };
-    if !window.is_visible().unwrap_or(false) {
+    let labels = snipping_area_session_labels(app);
+    if labels.is_empty() {
         return;
     }
-    let Ok(area_monitor) = snipping_active_area_monitor(app) else {
-        return;
-    };
     let app = app.clone();
     thread::spawn(move || {
         // Let the Space transition animation settle before re-capturing.
         thread::sleep(Duration::from_millis(260));
-        let Ok(monitor) = xcap_monitor_for_area(&area_monitor) else {
-            return;
-        };
-        let width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
-        let height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
-        let Ok(image) =
-            snipping_capture_monitor_image_keeping_session(&app, &monitor, width, height)
-        else {
-            return;
-        };
-        let image = Arc::new(image);
-        if snipping_set_active_area_snapshot(&app, Some(Arc::clone(&image))).is_err() {
-            return;
+        for label in labels {
+            let Some(window) = app.get_webview_window(&label) else {
+                continue;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                continue;
+            }
+            let Ok(area_monitor) = snipping_area_session_monitor(&app, &label) else {
+                continue;
+            };
+            let Ok(monitor) = xcap_monitor_for_area(&area_monitor) else {
+                continue;
+            };
+            let width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
+            let height = monitor
+                .height()
+                .unwrap_or(area_monitor.capture_height)
+                .max(1);
+            let Ok(image) = snipping_capture_monitor_image_keeping_session(
+                &app, &label, &monitor, width, height,
+            ) else {
+                continue;
+            };
+            let image = Arc::new(image);
+            if !snipping_set_area_session_snapshot(&app, &label, Arc::clone(&image)) {
+                continue;
+            }
+            snipping_store_area_snapshot_backdrop(&app, &label, image);
         }
-        snipping_store_area_snapshot_backdrop(&app, image);
     });
 }
 
@@ -2543,8 +3154,7 @@ fn snipping_unregister_escape_cancel(app: &AppHandle) {
 }
 
 fn snipping_cancel_area_snip_for(app: &AppHandle) -> Result<Value, String> {
-    snipping_set_active_area_snapshot(app, None)?;
-    snipping_set_active_area_monitor(app, None)?;
+    snipping_clear_area_sessions(app)?;
     snipping_hide_area_overlay(app);
     Ok(json!({
         "kind": "snipping_area_cancelled",
@@ -2552,14 +3162,16 @@ fn snipping_cancel_area_snip_for(app: &AppHandle) -> Result<Value, String> {
 }
 
 fn snipping_hide_area_overlay(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
     snipping_unregister_escape_cancel(app);
-    if let Some(window) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) {
+    for (_, window) in snipping_overlay_windows(app) {
         let _ = window.hide();
     }
 }
 
 fn snipping_close_area_overlay(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) {
+    for (_, window) in snipping_overlay_windows(app) {
         let _ = window.close();
     }
 }
@@ -2584,9 +3196,10 @@ fn snipping_area_capture_scale(
 
 fn snipping_finish_area_snip_for(
     app: &AppHandle,
+    overlay_label: &str,
     request: SnippingAreaSelectionRequest,
 ) -> Result<Value, String> {
-    let area_monitor = snipping_active_area_monitor(app)?;
+    let area_monitor = snipping_area_session_monitor(app, overlay_label)?;
     let fallback_scale = snipping_area_capture_scale(&area_monitor, request.scale_factor);
     // Map CSS selection coordinates onto the frozen snapshot exactly. The
     // snapshot is in physical pixels while the overlay reports logical
@@ -2611,8 +3224,7 @@ fn snipping_finish_area_snip_for(
     let selection_height = (request.height.max(0.0) * scale_y).round() as u32;
 
     if selection_width < SNIPPING_MIN_AREA_PIXELS || selection_height < SNIPPING_MIN_AREA_PIXELS {
-        snipping_set_active_area_snapshot(app, None)?;
-        snipping_set_active_area_monitor(app, None)?;
+        snipping_clear_area_sessions(app)?;
         snipping_hide_area_overlay(app);
         return Err("Snip area is too small.".to_string());
     }
@@ -2620,8 +3232,9 @@ fn snipping_finish_area_snip_for(
     let image_result = (|| -> Result<xcap::image::RgbaImage, String> {
         // The in-memory frozen frame is what the user actually saw while
         // selecting; prefer it over re-capturing the live screen.
-        if let Ok(image) = snipping_crop_active_area_snapshot(
+        if let Ok(image) = snipping_crop_area_session_snapshot(
             app,
+            overlay_label,
             selection_x,
             selection_y,
             selection_width,
@@ -2651,7 +3264,7 @@ fn snipping_finish_area_snip_for(
             let y = request.y.max(0.0).round() as u32;
             let width = (request.width.max(0.0).round() as u32).max(1);
             let height = (request.height.max(0.0).round() as u32).max(1);
-            snipping_capture_area_image(app, &monitor, x, y, width, height)
+            snipping_capture_area_image(app, overlay_label, &monitor, x, y, width, height)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2661,11 +3274,10 @@ fn snipping_finish_area_snip_for(
             let y = selection_y.min(monitor_height.saturating_sub(1));
             let width = selection_width.min(monitor_width.saturating_sub(x)).max(1);
             let height = selection_height.min(monitor_height.saturating_sub(y)).max(1);
-            snipping_capture_area_image(app, &monitor, x, y, width, height)
+            snipping_capture_area_image(app, overlay_label, &monitor, x, y, width, height)
         }
     })();
-    snipping_set_active_area_snapshot(app, None)?;
-    snipping_set_active_area_monitor(app, None)?;
+    snipping_clear_area_sessions(app)?;
     snipping_hide_area_overlay(app);
     snipping_save_image(app, image_result?, "area", "overlay", String::new())
 }
@@ -2739,11 +3351,16 @@ fn snipping_begin_area_snip(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn snipping_area_overlay_status(app: AppHandle) -> Result<Value, String> {
-    let monitor = snipping_active_area_monitor(&app)
+fn snipping_area_overlay_status(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Value, String> {
+    let label = window.label().to_string();
+    let monitor = snipping_area_session_monitor(&app, &label)
         .or_else(|_| snipping_current_area_monitor(&app))?;
     Ok(json!({
         "kind": "snipping_area_overlay_status",
+        "overlayLabel": label,
         "monitor": monitor,
     }))
 }
@@ -2751,9 +3368,10 @@ fn snipping_area_overlay_status(app: AppHandle) -> Result<Value, String> {
 #[tauri::command]
 fn snipping_finish_area_snip(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     request: SnippingAreaSelectionRequest,
 ) -> Result<Value, String> {
-    snipping_finish_area_snip_for(&app, request)
+    snipping_finish_area_snip_for(&app, window.label(), request)
 }
 
 #[tauri::command]
@@ -2801,16 +3419,25 @@ const SNIPPING_FLOAT_GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
 const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
-// A native window drag streams Moved events; the stack only re-packs after
-// the window has sat still this long (also long enough to skip mid-drag
-// pauses being treated as drops in most cases).
-const SNIPPING_FLOAT_RESTACK_SETTLE_MS: u64 = 420;
+// Fallback settle deadline pushed forward by every Moved event. On platforms
+// with a live mouse-button probe the watcher resolves the drop the moment
+// the button releases and this deadline only covers programmatic restack
+// animations; on platforms without one (Linux) it is the release signal.
+const SNIPPING_FLOAT_RESTACK_SETTLE_MS: u64 = 160;
+// Without a button probe a mid-drag pause is indistinguishable from a
+// release; keep the old longer stillness window there.
+const SNIPPING_FLOAT_RESTACK_SETTLE_FALLBACK_MS: u64 = 420;
+// How often the settle watcher polls the button state / deadline while a
+// drag or pending reflow is in flight.
+const SNIPPING_FLOAT_SETTLE_POLL_MS: u64 = 15;
 // Webview events for dropping a preview window onto the main window: the
 // main webview hit-tests the point for a drop target (todo card, terminal
 // pane, ...) and consumes the preview when one accepts.
 const SNIPPING_PREVIEW_DROP_EVENT: &str = "forge-snip-preview-drop";
 const SNIPPING_PREVIEW_DRAG_OVER_EVENT: &str = "forge-snip-preview-drag-over";
-const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 50;
+// One drag-over point per display frame keeps target highlights glued to the
+// cursor; the old 50ms cadence visibly trailed it.
+const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 16;
 // Anything closer than this to the grab position is a click, not a drop.
 const SNIPPING_PREVIEW_DRAG_MIN_DISTANCE: i32 = 8;
 
@@ -2862,8 +3489,11 @@ fn snipping_preview_stack_position(
 }
 
 const SNIPPING_FLOAT_ANIMATE_MS: f64 = 240.0;
+// Mid-drag re-packs use a shorter tween so the parting stack tracks the hand
+// instead of perpetually trailing it by a quarter second.
+const SNIPPING_FLOAT_DRAG_ANIMATE_MS: f64 = 120.0;
 const SNIPPING_FLOAT_ANIMATE_FRAME_MS: u64 = 12;
-const SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS: u64 = 70;
+const SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS: u64 = 33;
 
 /// Tweens preview windows to their stack slots (ease-out cubic) instead of
 /// snapping them. A new animation (or a re-targeted reflow mid-drag) bumps
@@ -2877,10 +3507,12 @@ fn snipping_animate_previews(
         tauri::PhysicalPosition<i32>,
         tauri::PhysicalPosition<i32>,
     )>,
+    duration_ms: f64,
 ) {
     if moves.is_empty() {
         return;
     }
+    let duration_ms = duration_ms.max(1.0);
     let generation = app
         .state::<SnippingState>()
         .preview_animation_generation
@@ -2894,7 +3526,7 @@ fn snipping_animate_previews(
                 return;
             }
             let progress =
-                (started.elapsed().as_millis() as f64 / SNIPPING_FLOAT_ANIMATE_MS).min(1.0);
+                (started.elapsed().as_millis() as f64 / duration_ms).min(1.0);
             let eased = 1.0 - (1.0 - progress).powi(3);
             let frame: Vec<(tauri::WebviewWindow, i32, i32)> = moves
                 .iter()
@@ -2929,7 +3561,7 @@ fn snipping_animate_previews(
 /// it); a preview being dragged OVER the column keeps a slot at its on-screen
 /// ordinal so the others part around it live, and a preview dropped back over
 /// the column is adopted into the stack at the height it was dropped.
-fn snipping_reflow_preview_stack(app: &AppHandle) {
+fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64) {
     let Some(monitor) = app
         .get_webview_window("main")
         .and_then(|main_window| main_window.current_monitor().ok().flatten())
@@ -2993,7 +3625,7 @@ fn snipping_reflow_preview_stack(app: &AppHandle) {
         }
         bottom_edge = y - gap;
     }
-    snipping_animate_previews(app, moves);
+    snipping_animate_previews(app, moves, animate_ms);
 }
 
 /// Throttled live re-pack while the user drags a preview: the rest of the
@@ -3019,22 +3651,71 @@ fn snipping_live_reflow_on_drag(app: &AppHandle, label: &str) {
     state
         .preview_live_reflow_last_ms
         .store(now_ms, Ordering::SeqCst);
-    snipping_reflow_preview_stack(app);
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_DRAG_ANIMATE_MS);
 }
 
-/// Debounced settle trigger fed by preview Moved/Destroyed window events.
+fn snipping_now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Settle deadline for the current platform: short where the watcher has a
+/// live button probe (the deadline then only covers programmatic restack
+/// animations), longer where Moved-event silence is the only release signal
+/// so a mid-drag pause is not mistaken for a drop.
+fn snipping_restack_settle_ms() -> u64 {
+    if snipping_mouse_button_state_supported() {
+        SNIPPING_FLOAT_RESTACK_SETTLE_MS
+    } else {
+        SNIPPING_FLOAT_RESTACK_SETTLE_FALLBACK_MS
+    }
+}
+
+/// Settle trigger fed by preview Moved/Destroyed window events and drag
+/// starts. Pushes the shared deadline forward and ensures the single watcher
+/// thread is running: the watcher resolves a user drag the instant the mouse
+/// button releases (where the platform can report it) and otherwise settles
+/// once the deadline passes with no further Moved events. One thread total,
+/// instead of one spawned per Moved event.
 fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
-    let generation = app
-        .state::<SnippingState>()
-        .preview_restack_generation
-        .clone();
-    let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let state = app.state::<SnippingState>();
+    state
+        .preview_restack_deadline_ms
+        .store(snipping_now_epoch_ms() + snipping_restack_settle_ms(), Ordering::SeqCst);
+    if state
+        .preview_restack_watcher_active
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let deadline = state.preview_restack_deadline_ms.clone();
+    let watcher_active = state.preview_restack_watcher_active.clone();
+    let drag_sessions = state.preview_drag_sessions.clone();
     let app = app.clone();
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(SNIPPING_FLOAT_RESTACK_SETTLE_MS));
-        if generation.load(Ordering::SeqCst) != ticket {
-            return;
+        let button_probe = snipping_mouse_button_state_supported();
+        loop {
+            thread::sleep(Duration::from_millis(SNIPPING_FLOAT_SETTLE_POLL_MS));
+            let dragging = drag_sessions
+                .lock()
+                .map(|sessions| !sessions.is_empty())
+                .unwrap_or(false);
+            if dragging && button_probe {
+                if !snipping_left_mouse_button_pressed() {
+                    // Released: resolve the drop right now.
+                    break;
+                }
+                // Still holding: never settle mid-drag, however long the
+                // pause — keep watching for the release.
+                continue;
+            }
+            if snipping_now_epoch_ms() >= deadline.load(Ordering::SeqCst) {
+                break;
+            }
         }
+        watcher_active.store(false, Ordering::SeqCst);
         let app_for_settle = app.clone();
         let _ = app.run_on_main_thread(move || {
             snipping_settle_preview_windows(&app_for_settle);
@@ -3042,17 +3723,18 @@ fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
     });
 }
 
-/// Runs once a preview window has stopped moving AND the mouse button is up:
-/// first offers any user-dragged preview to the main webview as a drop, then
-/// re-packs the bottom-left stack.
+/// Runs once a drag released (or the move stream went quiet): first offers
+/// any user-dragged preview to the main webview as a drop, then re-packs the
+/// bottom-left stack.
 fn snipping_settle_preview_windows(app: &AppHandle) {
     if snipping_left_mouse_button_pressed() {
-        // Still mid-drag (the user paused without releasing): check again.
+        // Rare watcher race (a drag re-grabbed between release and settle):
+        // never resolve a drop while the button is held; watch again.
         schedule_snipping_preview_stack_reflow(app);
         return;
     }
     snipping_resolve_preview_drop_candidates(app);
-    snipping_reflow_preview_stack(app);
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS);
 }
 
 /// Maps a preview window's center to main-webview CSS coordinates, or None

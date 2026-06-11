@@ -622,6 +622,15 @@ export function SnippingOverlayWindow() {
   const [capturing, setCapturing] = useState(false);
   const [overlayMonitor, setOverlayMonitor] = useState(null);
   const dragRef = useRef(null);
+  // One overlay window exists per display; backend events carry the target
+  // overlay's label so each webview only applies its own monitor/backdrop.
+  const windowLabel = useMemo(() => {
+    try {
+      return getCurrentWindow().label;
+    } catch {
+      return "";
+    }
+  }, []);
 
   const snapshotUrl = useMemo(() => {
     const snapshotPath = text(overlayMonitor?.snapshotPath || overlayMonitor?.snapshot_path);
@@ -686,9 +695,10 @@ export function SnippingOverlayWindow() {
     let unlistenOverlaySnapshot = null;
 
     listen(SNIPPING_AREA_OVERLAY_STARTED_EVENT, (event) => {
-      if (!cancelled) {
-        applyOverlayMonitor(event.payload?.monitor || event.payload || null);
-      }
+      if (cancelled) return;
+      const targetLabel = text(event.payload?.overlayLabel || event.payload?.overlay_label);
+      if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
+      applyOverlayMonitor(event.payload?.monitor || event.payload || null);
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -701,6 +711,8 @@ export function SnippingOverlayWindow() {
     // without resetting an in-progress selection.
     listen(SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT, (event) => {
       if (cancelled) return;
+      const targetLabel = text(event.payload?.overlayLabel || event.payload?.overlay_label);
+      if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
       const snapshotPath = text(event.payload?.snapshotPath || event.payload?.snapshot_path);
       if (!snapshotPath) return;
       setOverlayMonitor((current) => (
@@ -719,7 +731,7 @@ export function SnippingOverlayWindow() {
       unlistenOverlayStarted?.();
       unlistenOverlaySnapshot?.();
     };
-  }, [applyOverlayMonitor]);
+  }, [applyOverlayMonitor, windowLabel]);
 
   useEffect(() => {
     const onKeyDown = (event) => {

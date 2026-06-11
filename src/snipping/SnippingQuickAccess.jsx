@@ -42,11 +42,11 @@ const COLOR_OPTIONS = ["#f8fafc", "#ef4444", "#f59e0b", "#22c55e", "#38bdf8", "#
 // react-select theme for the composer's workspace/terminal pickers: compact
 // dark pills with an upward menu (the composer sits on the bottom edge).
 const TARGET_SELECT_STYLES = {
-  container: (base) => ({ ...base, flex: "0 1 auto", minWidth: 118, maxWidth: 188 }),
+  container: (base) => ({ ...base, flex: "0 1 auto", minWidth: 110, maxWidth: 172 }),
   control: (base, state) => ({
     ...base,
-    minHeight: 36,
-    height: 36,
+    minHeight: 32,
+    height: 32,
     borderRadius: 999,
     backgroundColor: state.isFocused ? "rgba(230, 236, 245, 0.09)" : "rgba(230, 236, 245, 0.06)",
     borderColor: state.isFocused ? "rgba(147, 197, 253, 0.45)" : "rgba(230, 236, 245, 0.12)",
@@ -1123,6 +1123,20 @@ export function SnippingAnnotationEditorWindow() {
               onMouseUp={finishDraw}
               ref={canvasRef}
             />
+            {/* Creation tools stay on the left rail; the act-on-the-result
+                buttons live top-right (under the batch strip when several
+                images are selected) where they are quickest to reach. */}
+            <EditorActionCluster aria-label="Annotation actions">
+              <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
+                <Undo aria-hidden="true" />
+              </EditorToolButton>
+              <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
+                <Delete aria-hidden="true" />
+              </EditorToolButton>
+              <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
+                <ContentCopy aria-hidden="true" />
+              </EditorToolButton>
+            </EditorActionCluster>
             <EditorFloatingRail aria-label="Annotation tools">
               <EditorToolGroup>
                 {TOOL_OPTIONS.map(({ id, label, Icon }) => (
@@ -1151,18 +1165,6 @@ export function SnippingAnnotationEditorWindow() {
                     <i aria-hidden="true" style={{ width: size + 3, height: size + 3 }} />
                   </SizeDotButton>
                 ))}
-              </EditorToolGroup>
-              <EditorRailDivider aria-hidden="true" />
-              <EditorToolGroup>
-                <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
-                  <Undo aria-hidden="true" />
-                </EditorToolButton>
-                <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
-                  <Delete aria-hidden="true" />
-                </EditorToolButton>
-                <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
-                  <ContentCopy aria-hidden="true" />
-                </EditorToolButton>
               </EditorToolGroup>
             </EditorFloatingRail>
           </EditorStage>
@@ -1318,8 +1320,8 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
 
 const FloatingButton = styled.button`
   display: inline-grid;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 999px;
@@ -1382,9 +1384,9 @@ const EditorTitleBar = styled.header`
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 12px;
-  min-height: 40px;
-  padding: 7px 10px 7px 14px;
+  gap: 10px;
+  min-height: 34px;
+  padding: 4px 8px 4px 12px;
   cursor: grab;
 
   &:active {
@@ -1455,18 +1457,18 @@ const EditorBatchStrip = styled.div`
   display: flex;
   flex: none;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
   overflow-x: auto;
-  padding: 4px 12px 8px;
+  padding: 2px 10px 6px;
   scrollbar-width: thin;
 `;
 
 const EditorThumbButton = styled.button`
   position: relative;
   flex: 0 0 auto;
-  width: 54px;
-  height: 32px;
+  width: 48px;
+  height: 28px;
   overflow: hidden;
   padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -1538,7 +1540,7 @@ const EditorStage = styled.section`
   min-height: 0;
   place-items: center;
   overflow: hidden;
-  padding: 12px 12px 12px 64px;
+  padding: 10px 10px 10px 52px;
   background:
     radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
     #05070b;
@@ -1557,16 +1559,16 @@ const EditorStage = styled.section`
 
 const EditorFloatingRail = styled.nav`
   position: absolute;
-  left: 12px;
+  left: 8px;
   top: 50%;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  max-height: calc(100% - 24px);
+  gap: 6px;
+  max-height: calc(100% - 20px);
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 10px 7px;
+  padding: 8px 5px;
   border: 1px solid rgba(230, 236, 245, 0.12);
   border-radius: 999px;
   background: rgba(10, 13, 19, 0.86);
@@ -1578,6 +1580,24 @@ const EditorFloatingRail = styled.nav`
   &::-webkit-scrollbar {
     display: none;
   }
+`;
+
+// Act-on-the-result buttons (undo / clear / copy) hug the stage's top-right
+// corner as a horizontal glass pill — directly under the batch strip when
+// one is showing, and always one short reach from the canvas.
+const EditorActionCluster = styled.nav`
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 4px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  background: rgba(10, 13, 19, 0.86);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
 `;
 
 const EditorRailDivider = styled.span`
@@ -1601,8 +1621,8 @@ const EditorToolGroup = styled.div`
 
 const EditorToolButton = styled.button`
   display: inline-grid;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   place-items: center;
   border: 0;
   border-radius: 999px;
@@ -1612,8 +1632,8 @@ const EditorToolButton = styled.button`
   transition: background 120ms ease, color 120ms ease;
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 16px;
+    height: 16px;
   }
 
   &:hover:not(:disabled) {
@@ -1690,16 +1710,16 @@ const EditorComposer = styled.form`
   display: flex;
   flex: none;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px 12px;
+  gap: 7px;
+  padding: 8px 10px 10px;
   border-top: 1px solid rgba(230, 236, 245, 0.07);
   background: rgba(10, 13, 19, 0.6);
 
   input {
     flex: 1;
     min-width: 0;
-    height: 36px;
-    padding: 0 14px;
+    height: 32px;
+    padding: 0 12px;
     border: 1px solid rgba(230, 236, 245, 0.12);
     border-radius: 999px;
     color: #f8fafc;
@@ -1722,8 +1742,8 @@ const EditorComposer = styled.form`
 
 const EditorSendButton = styled.button`
   display: inline-grid;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   flex: none;
   place-items: center;
   border: 1px solid rgba(147, 197, 253, 0.34);
