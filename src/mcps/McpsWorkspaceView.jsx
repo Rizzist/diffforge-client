@@ -2079,6 +2079,11 @@ export default function McpsWorkspaceView({
 
     return (
       <McpEditorPanel>
+        <McpHubBackRow>
+          <McpHubGhostButton onClick={() => setScreen("list")} type="button">
+            ‹ MCPs
+          </McpHubGhostButton>
+        </McpHubBackRow>
         <McpEditorHeader>
           <div>
             <PanelKicker>
@@ -2447,9 +2452,11 @@ export default function McpsWorkspaceView({
   ];
 
   return (
-    <McpWorkspaceSurface aria-label="Workspace MCPs">
+    <McpWorkspaceSurface aria-label="Workspace MCPs" data-screen={screen}>
       {/* One compact bar holds every selection: scope, list view, search,
-          and the secondary actions — no second selector row. */}
+          and the secondary actions — no second selector row. The detail
+          screen hides it so the editor gets the whole area. */}
+      {screen !== "detail" && (
       <McpHubTopBar>
         {scopeOptions.length > 0 && typeof onScopeChange === "function" && (
           <Select
@@ -2508,6 +2515,7 @@ export default function McpsWorkspaceView({
           </McpActionStatus>
         )}
       </McpHubTopBar>
+      )}
 
       <McpHubScroll>
         {error && screen !== "detail" && <McpEmptyAccess role="alert">{error}</McpEmptyAccess>}
@@ -2518,14 +2526,7 @@ export default function McpsWorkspaceView({
         ) : screen === "sources" ? (
           renderSourcesScreen()
         ) : screen === "detail" ? (
-          <>
-            <McpHubBackRow>
-              <McpHubGhostButton onClick={() => setScreen("list")} type="button">
-                ‹ MCPs
-              </McpHubGhostButton>
-            </McpHubBackRow>
-            {renderDetails()}
-          </>
+          renderDetails()
         ) : (
           renderListScreen()
         )}

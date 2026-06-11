@@ -613,6 +613,10 @@ const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   message: "",
 });
 
+function jsonArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function workspaceGitPullPromptCheckKey(workspaceId, rootDirectory) {
   if (!workspaceId || !rootDirectory) {
     return "";

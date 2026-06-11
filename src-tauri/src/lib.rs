@@ -4215,6 +4215,7 @@ pub fn run() {
             // (The tray icon is created only when background mode is entered.)
             todo_dispatch_start_background_dispatcher(app.handle().clone());
             todo_store_orphan_sweep_start(app.handle().clone());
+            agent_accounts_capture_watch_start(app.handle().clone());
             {
                 // Crash recovery: anything still marked in-flight in the todo
                 // ledger is a leftover from a previous process and gets
@@ -4467,12 +4468,13 @@ pub fn run() {
             todo_dispatch_overview,
             todo_dispatch_queue_get,
             todo_store_snapshot,
+            todo_store_history,
             todo_store_delete,
             todo_store_cancel,
             todo_store_set_status,
             todo_read_image_data_url,
             agent_accounts_state,
-            agent_accounts_add,
+            agent_accounts_update_display,
             agent_accounts_set_active,
             agent_accounts_remove,
             agent_accounts_pane_profiles,

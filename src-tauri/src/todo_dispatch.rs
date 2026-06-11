@@ -698,7 +698,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         update,
         "activity_hook_settled",
     );
-    todo_dispatch_queue_mark_settled(&workspace_id, &command_id, settle_status);
+    todo_dispatch_queue_mark_settled(Some(app), &workspace_id, &command_id, settle_status);
     log_terminal_status_event(
         "backend.todo_dispatch.hook_settled",
         json!({
@@ -1418,7 +1418,48 @@ async fn todo_read_image_data_url(path: String) -> Result<String, String> {
 /// terminal actuation: flips the store row when the device tracks it, else
 /// pushes a correction built from the mirror row (or the bare id). This is
 /// what lets history-view Unqueue work on rows no webview owns.
+/// Optional terminal-target stamping for status flips driven from the history
+/// view (Queue / retarget). `clear_target` wins over the individual fields.
+fn todo_store_apply_target_fields(
+    item: &mut Value,
+    clear_target: bool,
+    target_terminal_index: Option<i64>,
+    target_terminal_id: Option<&str>,
+    target_thread_id: Option<&str>,
+    target_agent_id: Option<&str>,
+) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    if clear_target {
+        for key in [
+            "targetColorSlot",
+            "targetTerminalColor",
+            "targetTerminalId",
+            "targetTerminalIndex",
+            "targetTerminalName",
+            "targetThreadId",
+        ] {
+            object.remove(key);
+        }
+        return;
+    }
+    if let Some(index) = target_terminal_index {
+        object.insert("targetTerminalIndex".to_string(), json!(index));
+    }
+    for (key, value) in [
+        ("targetTerminalId", target_terminal_id),
+        ("targetThreadId", target_thread_id),
+        ("targetAgentId", target_agent_id),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            object.insert(key.to_string(), json!(value));
+        }
+    }
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn todo_store_set_status(
     app: AppHandle,
     workspace_id: String,
@@ -1427,6 +1468,11 @@ async fn todo_store_set_status(
     dispatch_id: Option<String>,
     status: String,
     reason: Option<String>,
+    target_terminal_index: Option<i64>,
+    target_terminal_id: Option<String>,
+    target_thread_id: Option<String>,
+    target_agent_id: Option<String>,
+    clear_target: Option<bool>,
 ) -> Result<Value, String> {
     let workspace_id = workspace_id.trim().to_string();
     if workspace_id.is_empty() {
@@ -1454,6 +1500,17 @@ async fn todo_store_set_status(
     }
 
     tauri::async_runtime::spawn_blocking(move || {
+        let clear_target = clear_target.unwrap_or(false);
+        let apply_targets = |item: &mut Value| {
+            todo_store_apply_target_fields(
+                item,
+                clear_target,
+                target_terminal_index,
+                target_terminal_id.as_deref(),
+                target_thread_id.as_deref(),
+                target_agent_id.as_deref(),
+            );
+        };
         let mut matched_item: Option<Value> = None;
         if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
             let mut items = todo_dispatch_queue_read(&path)
@@ -1464,6 +1521,7 @@ async fn todo_store_set_status(
             for item in items.iter_mut() {
                 if refs.iter().any(|reference| todo_store_item_matches_id(item, reference)) {
                     todo_store_set_item_status(item, &status, &reason);
+                    apply_targets(item);
                     matched_item = Some(item.clone());
                     break;
                 }
@@ -1490,6 +1548,7 @@ async fn todo_store_set_status(
                         })
                     });
                 todo_store_set_item_status(&mut item, &status, &reason);
+                apply_targets(&mut item);
                 item
             }
         };
@@ -1703,18 +1762,6 @@ const TODO_STORE_SWEPT_ACTIVE_STATUSES: [&str; 5] =
 /// queued/running for items the store already settled. An incoming active
 /// claim only wins over a sweep-settled row when its status timestamp is
 /// strictly newer than the flip (a real user re-queue stamps a fresh one).
-fn todo_store_keep_settled_sweep_flips(workspace_id: &str, items: Vec<Value>) -> Vec<Value> {
-    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
-        return items;
-    };
-    let stored_items = todo_dispatch_queue_read(&path)
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    todo_store_keep_settled_sweep_flips_core(stored_items, items)
-}
-
 fn todo_store_keep_settled_sweep_flips_core(
     stored_items: Vec<Value>,
     items: Vec<Value>,
@@ -1764,6 +1811,363 @@ fn todo_store_keep_settled_sweep_flips_core(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Todo history ledger.
+//
+// The queue store retains settled rows (completed/cancelled/failed/
+// interrupted/timed_out) so finished todos stay visible in Todos History
+// without any cloud round trip, and `todo_store_history` is the single read
+// door the history view uses: queue-store rows (device truth, leading) merged
+// with cloud-mirror rows (peer devices, titled rows), deduped by the todo's
+// whole id family so one logical todo is always one history entry.
+// ---------------------------------------------------------------------------
+
+const TODO_STORE_SETTLED_RETENTION_STATUSES: [&str; 5] =
+    ["completed", "cancelled", "failed", "interrupted", "timed_out"];
+const TODO_STORE_SETTLED_RETENTION_MAX: usize = 200;
+const TODO_STORE_HISTORY_MAX_ITEMS: usize = 300;
+
+/// Every id the item is known by: its own id, todo/command/dispatch aliases,
+/// and the remote-command id. Two items sharing any token are the same todo.
+fn todo_store_history_item_tokens(item: &Value) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for key in [
+        "id",
+        "todo_id",
+        "todoId",
+        "command_id",
+        "commandId",
+        "dispatch_id",
+        "dispatchId",
+        "todo_dispatch_id",
+        "todoDispatchId",
+        "last_dispatch_id",
+        "lastDispatchId",
+    ] {
+        if let Some(value) = item
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !tokens.iter().any(|token| token == value) {
+                tokens.push(value.to_string());
+            }
+        }
+    }
+    let command_id = todo_dispatch_queue_item_command_id(item);
+    if !command_id.is_empty() && !tokens.iter().any(|token| token == &command_id) {
+        tokens.push(command_id);
+    }
+    tokens
+}
+
+/// Best-effort updated-at in epoch ms, accepting both the numeric stamps the
+/// store writes and the ISO strings replicas exchange.
+fn todo_store_item_updated_ms(item: &Value) -> u64 {
+    if let Some(ms) = item.get("updatedAtMs").and_then(Value::as_u64) {
+        return ms;
+    }
+    for key in [
+        "todoStatusUpdatedAt",
+        "todo_status_updated_at",
+        "updatedAt",
+        "updated_at",
+        "completedAt",
+        "completed_at",
+        "createdAt",
+        "created_at",
+    ] {
+        if let Some(ms) = item
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(todo_dispatch_parse_iso_ms)
+        {
+            return ms;
+        }
+    }
+    0
+}
+
+/// Parses "YYYY-MM-DDTHH:MM:SS(.fff)Z" into epoch ms (the inverse of
+/// `chrono_like_now_iso`); returns None for anything else.
+fn todo_dispatch_parse_iso_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let year: i64 = value.get(0..4)?.parse().ok()?;
+    let month: i64 = value.get(5..7)?.parse().ok()?;
+    let day: i64 = value.get(8..10)?.parse().ok()?;
+    let hour: i64 = value.get(11..13)?.parse().ok()?;
+    let minute: i64 = value.get(14..16)?.parse().ok()?;
+    let second: i64 = value.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let millis: i64 = match bytes.get(19) {
+        Some(b'.') => {
+            let fraction = value.get(20..)?.trim_end_matches('Z');
+            let digits = fraction.chars().take_while(char::is_ascii_digit).count();
+            if digits == 0 {
+                0
+            } else {
+                let parsed: i64 = fraction.get(0..digits.min(3))?.parse().ok()?;
+                match digits.min(3) {
+                    1 => parsed * 100,
+                    2 => parsed * 10,
+                    _ => parsed,
+                }
+            }
+        }
+        _ => 0,
+    };
+    // Howard Hinnant's days_from_civil.
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let yoe = adjusted_year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    if secs < 0 {
+        return None;
+    }
+    Some((secs * 1_000 + millis) as u64)
+}
+
+/// Status decisions are last-writer-wins by their stamp: a store row whose
+/// `todoStatusUpdatedAt` is strictly newer than the incoming claim's carries
+/// a deliberate flip (history Queue/Unqueue/retarget issued while this
+/// webview held a stale replica) — graft that status and its target fields
+/// onto the incoming row instead of letting the stale claim overwrite it.
+fn todo_store_apply_newer_store_status_core(
+    stored_items: &[Value],
+    items: Vec<Value>,
+) -> Vec<Value> {
+    if stored_items.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .map(|mut item| {
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            if item_id.is_empty() {
+                return item;
+            }
+            let Some(stored) = stored_items
+                .iter()
+                .find(|candidate| todo_store_item_matches_id(candidate, &item_id))
+            else {
+                return item;
+            };
+            let stored_status = todo_store_item_status(stored);
+            if stored_status.is_empty() {
+                return item;
+            }
+            let stored_at = todo_dispatch_text(stored, &["todoStatusUpdatedAt"]);
+            let incoming_at = todo_dispatch_text(&item, &["todoStatusUpdatedAt"]);
+            // Both sides stamp identical 24-char ISO; lexicographic compare
+            // is chronological. The store only wins when strictly newer.
+            if stored_at.is_empty() || (!incoming_at.is_empty() && incoming_at >= stored_at) {
+                return item;
+            }
+            if let Some(object) = item.as_object_mut() {
+                for key in [
+                    "todoStatus",
+                    "status",
+                    "todoStatusReason",
+                    "statusReason",
+                    "todoStatusUpdatedAt",
+                ] {
+                    if let Some(value) = stored.get(key) {
+                        object.insert(key.to_string(), value.clone());
+                    }
+                }
+                // Targets travel with the flip (retarget / clear-target).
+                for key in [
+                    "targetAgentId",
+                    "targetColorSlot",
+                    "targetTerminalColor",
+                    "targetTerminalId",
+                    "targetTerminalIndex",
+                    "targetThreadId",
+                ] {
+                    match stored.get(key).filter(|value| !value.is_null()) {
+                        Some(value) => {
+                            object.insert(key.to_string(), value.clone());
+                        }
+                        None => {
+                            object.remove(key);
+                        }
+                    }
+                }
+            }
+            item
+        })
+        .collect()
+}
+
+/// Keeps settled rows alive across webview snapshot rewrites: the webview
+/// consumes completed items from its visible list, so its full-snapshot sync
+/// omits them — without this merge every finished todo would vanish from the
+/// store (and therefore from Todos History) on the next sync. Tombstoned ids
+/// stay dead, and retention is capped so the file stays bounded.
+fn todo_store_retain_settled_items_core(
+    stored_items: Vec<Value>,
+    items: Vec<Value>,
+    tombstoned: &HashSet<String>,
+) -> Vec<Value> {
+    let incoming_tokens = items
+        .iter()
+        .flat_map(|item| todo_store_history_item_tokens(item))
+        .collect::<HashSet<_>>();
+    let mut retained = stored_items
+        .into_iter()
+        .filter(|item| {
+            if !TODO_STORE_SETTLED_RETENTION_STATUSES
+                .contains(&todo_store_item_status(item).as_str())
+            {
+                return false;
+            }
+            !todo_store_history_item_tokens(item)
+                .iter()
+                .any(|token| incoming_tokens.contains(token) || tombstoned.contains(token))
+        })
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        return items;
+    }
+    retained.sort_by_key(|item| std::cmp::Reverse(todo_store_item_updated_ms(item)));
+    retained.truncate(TODO_STORE_SETTLED_RETENTION_MAX);
+    let mut items = items;
+    items.extend(retained);
+    items
+}
+
+/// One history list per workspace: queue-store rows lead (device truth),
+/// mirror rows add peer-device todos and display enrichment (LLM titles,
+/// device names). Anything tombstoned anywhere on this device is dropped no
+/// matter which replica still carries it.
+fn todo_store_history_merge(
+    queue_items: Vec<Value>,
+    mirror_items: Vec<Value>,
+    tombstoned: &HashSet<String>,
+) -> Vec<Value> {
+    const ENRICH_KEYS: [&str; 10] = [
+        "llmTitle",
+        "llm_title",
+        "deviceId",
+        "device_id",
+        "deviceName",
+        "device_name",
+        "workspaceName",
+        "workspace_name",
+        "completedAt",
+        "completed_at",
+    ];
+    let mut merged: Vec<Value> = Vec::new();
+    let mut index_by_token: HashMap<String, usize> = HashMap::new();
+    for (is_mirror, source) in [(false, queue_items), (true, mirror_items)] {
+        for item in source {
+            if !item.is_object() {
+                continue;
+            }
+            let tokens = todo_store_history_item_tokens(&item);
+            if tokens.is_empty()
+                || tokens.iter().any(|token| tombstoned.contains(token))
+            {
+                continue;
+            }
+            if let Some(existing_index) = tokens
+                .iter()
+                .find_map(|token| index_by_token.get(token).copied())
+            {
+                if is_mirror {
+                    if let Some(existing) =
+                        merged.get_mut(existing_index).and_then(Value::as_object_mut)
+                    {
+                        for key in ENRICH_KEYS {
+                            let missing = existing
+                                .get(key)
+                                .map(|value| {
+                                    value.is_null()
+                                        || value
+                                            .as_str()
+                                            .is_some_and(|text| text.trim().is_empty())
+                                })
+                                .unwrap_or(true);
+                            if missing {
+                                if let Some(value) =
+                                    item.get(key).filter(|value| !value.is_null())
+                                {
+                                    existing.insert(key.to_string(), value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                for token in tokens {
+                    index_by_token.entry(token).or_insert(existing_index);
+                }
+                continue;
+            }
+            let index = merged.len();
+            for token in tokens {
+                index_by_token.insert(token, index);
+            }
+            merged.push(item);
+        }
+    }
+    merged.sort_by_key(|item| std::cmp::Reverse(todo_store_item_updated_ms(item)));
+    merged.truncate(TODO_STORE_HISTORY_MAX_ITEMS);
+    merged
+}
+
+/// The single read door for the Todos History view: every todo this workspace
+/// knows about — listed, queued, running, AND finished — local-first, with
+/// peer-device rows from the cloud mirror, one entry per logical todo.
+#[tauri::command]
+async fn todo_store_history(workspace_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_id = workspace_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err("workspace_id is required.".to_string());
+        }
+        let tombstoned = todo_store_all_tombstone_ids();
+        let queue_items = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| {
+                todo_dispatch_queue_read(&path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let mirror_items =
+            cloud_mcp_todo_mirror_history_items(&workspace_id, TODO_STORE_HISTORY_MAX_ITEMS);
+        let items = todo_store_history_merge(queue_items, mirror_items, &tombstoned);
+        Ok(json!({
+            "workspaceId": workspace_id,
+            "items": items,
+            "updatedAtMs": todo_dispatch_now_ms(),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo store history worker failed: {error}"))?
+}
+
 fn todo_dispatch_queue_item_command_id(item: &Value) -> String {
     item.get("remoteCommand")
         .and_then(|remote| remote.get("commandId").or_else(|| remote.get("command_id")))
@@ -1780,10 +2184,17 @@ fn todo_dispatch_queue_item_command_id(item: &Value) -> String {
         .to_string()
 }
 
-/// Settlement bridge from receipts into the queue snapshot: completed items
-/// leave the queue (matching the webview's consume behavior); failures and
-/// interruptions keep the item with its final status.
-fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status: &str) {
+/// Settlement bridge from receipts into the queue snapshot. Every settled
+/// item KEEPS its row with the final status — the queue store doubles as the
+/// device's todo history ledger, so completed todos must not vanish from the
+/// Todos History view the moment the turn ends. The webview's visible queue
+/// list still drops completed items via the journal prune entry below.
+fn todo_dispatch_queue_mark_settled(
+    app: Option<&AppHandle>,
+    workspace_id: &str,
+    command_id: &str,
+    status: &str,
+) {
     let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
         return;
     };
@@ -1796,33 +2207,36 @@ fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status
     let now_iso = chrono_like_now_iso();
     let next_items = items
         .into_iter()
-        .filter_map(|mut item| {
+        .map(|mut item| {
             if todo_dispatch_queue_item_command_id(&item) != command_id {
-                return Some(item);
+                return item;
             }
             changed = true;
+            todo_store_set_item_status(&mut item, status, "todo_queue_backend_settled");
             if status == "completed" {
                 completed_item_id = item
                     .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or(command_id)
                     .to_string();
-                return None;
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("completedAt".to_string(), json!(now_iso.clone()));
+                }
             }
-            if let Some(object) = item.as_object_mut() {
-                object.insert("todoStatus".to_string(), json!(status));
-                object.insert("status".to_string(), json!(status));
-                object.insert("updatedAt".to_string(), json!(now_iso.clone()));
-                object.insert("reason".to_string(), json!("todo_queue_backend_settled"));
-            }
-            Some(item)
+            item
         })
         .collect::<Vec<_>>();
     if changed {
         todo_dispatch_queue_write(workspace_id, &next_items);
+        if let Some(app) = app {
+            todo_store_emit_changed(app, workspace_id, "todo_queue_backend_settled", "store");
+        }
     }
-    // Completed items leave the queue; journal the removal so a webview that
-    // mounts later does not resurrect them from an earlier creation entry.
+    // The webview's visible queue consumes completed items; journal the prune
+    // so a webview that mounts later drops its localStorage copy. The store
+    // row itself stays (history retention) — the prune entry only governs the
+    // webview list, and the next queue sync keeps settled rows via the
+    // retention merge.
     if !completed_item_id.is_empty() {
         todo_dispatch_journal_append(
             workspace_id,
@@ -2010,6 +2424,149 @@ mod todo_store_tests {
         assert_eq!(todo_store_item_status(&merged[0]), "queued");
         assert_eq!(todo_store_item_status(&merged[1]), "listed");
     }
+
+    #[test]
+    fn newer_store_status_outranks_stale_webview_claim() {
+        let stored = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "queued",
+            "todoStatusReason": "todo_history_queue",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+            "targetTerminalIndex": 2,
+        })];
+        let incoming = vec![json!({
+            "id": "todo-1",
+            "text": "edited text survives",
+            "todoStatus": "listed",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(todo_store_item_status(&merged[0]), "queued");
+        assert_eq!(merged[0]["targetTerminalIndex"], 2);
+        // Non-status fields stay from the incoming row (text edits survive).
+        assert_eq!(merged[0]["text"], "edited text survives");
+    }
+
+    #[test]
+    fn newer_webview_claim_beats_older_store_status() {
+        let stored = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "queued",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let incoming = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "listed",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(todo_store_item_status(&merged[0]), "listed");
+    }
+
+    #[test]
+    fn settled_retention_keeps_consumed_completed_rows() {
+        let stored = vec![
+            json!({
+                "id": "todo-done",
+                "todoStatus": "completed",
+                "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+            }),
+            json!({
+                "id": "todo-live",
+                "todoStatus": "queued",
+            }),
+        ];
+        // The webview's snapshot omits the completed item (it consumed it)
+        // and rewrites the live one.
+        let incoming = vec![json!({ "id": "todo-live", "todoStatus": "queued" })];
+        let merged =
+            todo_store_retain_settled_items_core(stored, incoming, &HashSet::new());
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|item| item["id"] == "todo-done"
+            && todo_store_item_status(item) == "completed"));
+    }
+
+    #[test]
+    fn settled_retention_respects_tombstones_and_incoming_claims() {
+        let stored = vec![
+            json!({ "id": "todo-deleted", "todoStatus": "completed" }),
+            json!({ "id": "todo-requeued", "todoStatus": "interrupted" }),
+        ];
+        let incoming = vec![json!({ "id": "todo-requeued", "todoStatus": "queued" })];
+        let tombstoned: HashSet<String> = ["todo-deleted".to_string()].into();
+        let merged = todo_store_retain_settled_items_core(stored, incoming, &tombstoned);
+        // The tombstoned row stays dead and the re-queued row is not doubled.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["id"], "todo-requeued");
+        assert_eq!(todo_store_item_status(&merged[0]), "queued");
+    }
+
+    #[test]
+    fn history_merge_dedupes_across_id_families_and_enriches() {
+        let queue_items = vec![json!({
+            "id": "todo-1",
+            "text": "ship it",
+            "todoStatus": "running",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let mirror_items = vec![
+            json!({
+                "todo_id": "todo-1",
+                "last_dispatch_id": "dispatch-9",
+                "llmTitle": "Ship the release",
+                "deviceName": "MacBook",
+                "status": "queued",
+                "updated_at": "2026-06-11T09:00:00.000Z",
+            }),
+            json!({
+                "todo_id": "todo-peer",
+                "status": "completed",
+                "text": "peer todo",
+                "updated_at": "2026-06-11T08:00:00.000Z",
+            }),
+        ];
+        let merged = todo_store_history_merge(queue_items, mirror_items, &HashSet::new());
+        assert_eq!(merged.len(), 2);
+        let lead = merged
+            .iter()
+            .find(|item| item["id"] == "todo-1")
+            .expect("queue item leads");
+        // Device truth wins on status; mirror enrichment grafts display fields.
+        assert_eq!(todo_store_item_status(lead), "running");
+        assert_eq!(lead["llmTitle"], "Ship the release");
+        assert_eq!(lead["deviceName"], "MacBook");
+        assert!(merged.iter().any(|item| item["todo_id"] == "todo-peer"));
+    }
+
+    #[test]
+    fn history_merge_drops_tombstoned_aliases() {
+        let mirror_items = vec![json!({
+            "todo_id": "todo-ghost",
+            "last_dispatch_id": "dispatch-ghost",
+            "status": "running",
+        })];
+        let tombstoned: HashSet<String> = ["dispatch-ghost".to_string()].into();
+        let merged = todo_store_history_merge(Vec::new(), mirror_items, &tombstoned);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn iso_parse_roundtrips_store_stamps() {
+        assert_eq!(
+            todo_dispatch_parse_iso_ms("2026-06-11T10:00:00.000Z"),
+            Some(1_781_172_000_000),
+        );
+        assert_eq!(
+            todo_dispatch_parse_iso_ms("1970-01-01T00:00:01.250Z"),
+            Some(1_250),
+        );
+        assert!(todo_dispatch_parse_iso_ms("not a date").is_none());
+        let now_iso = chrono_like_now_iso();
+        let parsed = todo_dispatch_parse_iso_ms(&now_iso).expect("own stamps parse");
+        let now_ms = todo_dispatch_now_ms();
+        assert!(now_ms.abs_diff(parsed) < 5_000, "{now_iso} -> {parsed} vs {now_ms}");
+    }
 }
 
 #[cfg(test)]
@@ -2183,6 +2740,9 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
             "item": item,
         }),
     );
+    // History views refresh on store changes; without this the direct todo
+    // only appears after the next poll tick.
+    todo_store_emit_changed(app, workspace_id, "terminal_direct_submit", "store");
     if !todo_dispatch_webview_dispatcher_active() {
         todo_dispatch_push_queue_snapshot(
             app,
@@ -2365,7 +2925,23 @@ async fn todo_dispatch_queue_sync(
             .filter(|item| item.is_object())
             .collect::<Vec<_>>();
         let (items, rejected_ids) = todo_store_filter_tombstoned(items, &tombstoned);
-        let items = todo_store_keep_settled_sweep_flips(&workspace_id, items);
+        let stored_items = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| {
+                todo_dispatch_queue_read(&path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let items = todo_store_keep_settled_sweep_flips_core(stored_items.clone(), items);
+        // Status LWW: deliberate flips made through the store (history
+        // Queue/Unqueue/retarget) outrank stale webview claims by stamp.
+        let items = todo_store_apply_newer_store_status_core(&stored_items, items);
+        // History retention: settled rows the webview consumed from its
+        // visible list (completed todos above all) survive the full-snapshot
+        // rewrite so Todos History keeps showing them.
+        let items = todo_store_retain_settled_items_core(stored_items, items, &tombstoned);
         todo_dispatch_queue_write(&workspace_id, &items);
         // Origin "webview": the webview's own changed-listener skips these to
         // avoid sync feedback loops; other windows still refresh.

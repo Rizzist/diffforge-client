@@ -69,6 +69,19 @@ fn clean_optional_path(value: Option<String>) -> Option<PathBuf> {
 
 fn coordination_input_root(repo_path: Option<String>) -> Result<PathBuf, String> {
     let repo_path = clean_optional_path(repo_path).unwrap_or_else(default_repo_path);
+    // The global MCP defaults store is a managed coordination root that lives
+    // inside app data by design. Workspace-root rejection rules (no settings/
+    // cache folders) target user workspaces, not this store — without the
+    // exemption the Global defaults scope can never load its registry.
+    if let Some(defaults_root) = super::kernel::global_mcp_defaults_root_dir() {
+        let canonical_input = repo_path.canonicalize().unwrap_or_else(|_| repo_path.clone());
+        let canonical_defaults = defaults_root
+            .canonicalize()
+            .unwrap_or_else(|_| defaults_root.clone());
+        if canonical_input == canonical_defaults {
+            return Ok(repo_path);
+        }
+    }
     if repo_path.exists() {
         return crate::resolve_workspace_root_directory(Some(&crate::workspace_path_display(
             &repo_path,

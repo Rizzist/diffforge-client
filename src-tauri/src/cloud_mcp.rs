@@ -22038,6 +22038,43 @@ fn cloud_mcp_todo_mirror_workspace_todos_from_store(
     cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, repo_id, workspace_id)
 }
 
+/// Mirror rows for the Todos History view: unlike the workspace-todos
+/// snapshot (which hides terminal statuses so finished todos can't leak back
+/// into live queues), history needs the FULL lifecycle — completed, failed,
+/// cancelled, timed-out, interrupted — and only true delete-ish rows stay
+/// hidden. Todo rows only; dispatch rows are status events, not todos.
+pub(crate) fn cloud_mcp_todo_mirror_history_items(workspace_id: &str, limit: usize) -> Vec<Value> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Vec::new();
+    }
+    let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
+        return Vec::new();
+    };
+    let _ = cloud_mcp_todo_mirror_reconcile_conn(&conn);
+    let Ok(mut statement) = conn.prepare(
+        "SELECT row_json FROM workspace_todo_mirror_rows
+         WHERE row_kind='todo'
+           AND (workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1)
+           AND status NOT IN ('deleted', 'removed', 'rejected', 'skipped',
+                              'duplicate_ignored', 'released')
+         ORDER BY last_seen_ms DESC, updated_at DESC
+         LIMIT ?2",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mapped) = statement.query_map(
+        rusqlite::params![workspace_id, limit.max(1) as i64],
+        |row| row.get::<_, String>(0),
+    ) else {
+        return Vec::new();
+    };
+    mapped
+        .flatten()
+        .filter_map(|row_json| serde_json::from_str::<Value>(&row_json).ok())
+        .collect()
+}
+
 /// DiffForge generates aliased ids for one logical todo: the todo id, its
 /// dispatch id, and its command id share a recognizable family. Status events
 /// sometimes arrive identified by an alias, which used to leave the original

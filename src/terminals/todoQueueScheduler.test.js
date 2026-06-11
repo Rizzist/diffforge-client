@@ -37,6 +37,24 @@ test("generic item dispatches when targeted lane is blocked", () => {
   assert.deepEqual(result.target, { terminal: "orange" });
 });
 
+test("targeted item is held for its terminal, never reassigned to a free one", () => {
+  const result = selectTodoQueueDispatchCandidate({
+    queuedItems: [{ id: "green-target", target: "green" }],
+    resolveItemTarget: () => ({
+      // A different terminal is free, but this item's target is busy: the
+      // resolver reports unavailable and the scheduler must hold the item
+      // instead of sending it somewhere else.
+      hasExplicitTerminalTarget: true,
+      reason: "busy_turn",
+      target: null,
+    }),
+  });
+
+  assert.equal(result.target, null);
+  assert.equal(result.item.id, "green-target");
+  assert.equal(result.reason, "busy_turn");
+});
+
 test("boundary item at the front does not block regular queued work", () => {
   const result = selectTodoQueueDispatchCandidate({
     queuedItems: [

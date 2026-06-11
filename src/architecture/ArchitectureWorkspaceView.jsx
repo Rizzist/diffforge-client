@@ -402,6 +402,10 @@ function architectureTodoText(item) {
   return text(
     item?.text
       || item?.body
+      || item?.todoText
+      || item?.todo_text
+      || item?.todoBodyPreview
+      || item?.todo_body_preview
       || item?.prompt
       || item?.todo
       || item?.task
@@ -421,8 +425,12 @@ function architectureTodoTitle(item, fallback = "Todo") {
   const note = jsonObject(item?.note) || {};
   const body = architectureTodoText(item);
   const bodyTitle = architectureTodoPreviewText(body);
+  // The cloud-generated LLM title is the human label for the todo; the body
+  // preview is the fallback so a row is never reduced to a raw id.
   return text(
-    bodyTitle
+    item?.llmTitle
+      || item?.llm_title
+      || bodyTitle
       || item?.title
       || item?.name
       || note.title,
@@ -5238,7 +5246,6 @@ export default function ArchitectureWorkspaceView({
   onArchitectureSelectionChange = null,
   workspace,
   workspaceTerminalOptions = [],
-  workspaceTodos = null,
 }) {
   const activeWorkspaceId = workspace?.id || "";
   const activeWorkspaceName = workspace?.name || "";
@@ -5257,9 +5264,11 @@ export default function ArchitectureWorkspaceView({
 	      return finishedPlanRefs.has(planRef) ? taskWithCompletedTerminalPlan(task) : task;
 	    });
 	  }, [finishedPlanRefs, tasks]);
-  // Local-first todo history: the Rust queue ledger always has the listed/
-  // queued/running todos for this workspace, even offline or before any
-  // cloud snapshot lands; the cloud snapshot only adds peer-device entries.
+  // Todos History reads ONE Rust door: todo_store_history merges the local
+  // queue ledger (listed/queued/running AND retained finished rows — works
+  // offline) with the cloud mirror's rows (peer devices, LLM titles, full
+  // lifecycle), deduped per logical todo and tombstone-gated. No more
+  // cross-replica merging in the webview.
   const [localTodoItems, setLocalTodoItems] = useState([]);
   useEffect(() => {
     const workspaceId = text(activeWorkspaceId);
@@ -5268,9 +5277,9 @@ export default function ArchitectureWorkspaceView({
       return undefined;
     }
     let cancelled = false;
-    let unlistenStoreChanged = null;
+    const unlisteners = [];
     const refreshLocalTodos = () => {
-      invoke("todo_dispatch_queue_get", { workspaceId })
+      invoke("todo_store_history", { workspaceId })
         .then((result) => {
           if (cancelled) return;
           setLocalTodoItems(jsonArray(result?.items));
@@ -5278,8 +5287,9 @@ export default function ArchitectureWorkspaceView({
         .catch(() => {});
     };
     refreshLocalTodos();
-    // Store mutations (deletes, cancels, sweeps) must show instantly; the
-    // interval is only a safety net for missed events.
+    // Store mutations (deletes, cancels, sweeps, direct captures) and mirror
+    // updates (cloud echoes, peer devices) must show instantly; the interval
+    // is only a safety net for missed events.
     listen("todo-store-changed", (event) => {
       if (cancelled) return;
       const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
@@ -5291,20 +5301,28 @@ export default function ArchitectureWorkspaceView({
         unlisten();
         return;
       }
-      unlistenStoreChanged = unlisten;
+      unlisteners.push(unlisten);
+    }).catch(() => {});
+    listen("cloud-mcp-workspace-todos-updated", () => {
+      if (cancelled) return;
+      refreshLocalTodos();
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlisteners.push(unlisten);
     }).catch(() => {});
     const intervalId = window.setInterval(refreshLocalTodos, 2500);
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
-      if (unlistenStoreChanged) {
-        unlistenStoreChanged();
-      }
+      unlisteners.forEach((unlisten) => unlisten());
     };
   }, [activeWorkspaceId]);
   const todoHistoryItems = useMemo(
-    () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId, visibleTasks, localTodoItems),
-    [activeWorkspaceId, localTodoItems, visibleTasks, workspaceTodos],
+    () => architectureTodoHistoryItemsFromWorkspaceTodos(null, activeWorkspaceId, visibleTasks, localTodoItems),
+    [activeWorkspaceId, localTodoItems, visibleTasks],
   );
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "scannedResult"
@@ -9220,13 +9238,17 @@ function TodosHistoryPanel({
   const dispatchTodoAction = useCallback((item, action, extra = {}) => {
     const requestId = `todo-history-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     actionRequestRef.current = requestId;
-    // Cancel, delete, and unqueue are client-authoritative: the Rust todo
-    // store applies them immediately (tombstone or status flip + local
-    // emits) and syncs the cloud in the background, so the UI settles
-    // instantly and the row can never come back from a later hydration. The
-    // bus event still fires in parallel so a mounted TerminalView can
-    // interrupt live panes and prune its in-memory queue state.
-    const storeOwnsAction = action === "cancel" || action === "delete" || action === "unqueue";
+    // Every history action is client-authoritative: the Rust todo store
+    // applies it immediately (tombstone or status flip + local emits) and
+    // syncs the cloud in the background, so the UI settles instantly and the
+    // row can never come back from a later hydration. The bus event still
+    // fires in parallel so a mounted TerminalView can interrupt live panes,
+    // actuate queue dispatch, and prune its in-memory queue state.
+    const storeOwnsAction = action === "cancel"
+      || action === "delete"
+      || action === "unqueue"
+      || action === "queue"
+      || action === "retarget";
     window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_EVENT, {
       detail: {
         action,
@@ -9262,6 +9284,7 @@ function TodosHistoryPanel({
       commandId: String(item.commandId || "").trim() || null,
       dispatchId: String(item.dispatchId || "").trim() || null,
     };
+    const queueTargetIndex = Number(extra.targetTerminalIndex);
     const request = action === "cancel"
       ? invoke("todo_store_cancel", {
         workspaceId,
@@ -9275,11 +9298,20 @@ function TodosHistoryPanel({
           status: "listed",
           reason: "todo_history_unqueue",
         })
-        : invoke("todo_store_delete", {
-          workspaceId,
-          todoIds,
-          reason: "todo_history_delete",
-        });
+        : action === "queue" || action === "retarget"
+          ? invoke("todo_store_set_status", {
+            workspaceId,
+            ...todoRefs,
+            status: "queued",
+            reason: action === "queue" ? "todo_history_queue" : "todo_history_retarget",
+            targetTerminalIndex: Number.isInteger(queueTargetIndex) ? queueTargetIndex : null,
+            clearTarget: extra.generic === true,
+          })
+          : invoke("todo_store_delete", {
+            workspaceId,
+            todoIds,
+            reason: "todo_history_delete",
+          });
     request
       .then(() => respond(true))
       .catch((error) => respond(false, String(error?.message || error || "The todo action could not be applied.")));
@@ -9573,7 +9605,7 @@ const TODO_PLAN_STATUS_LABELS = {
   unknown: "Unknown",
 };
 
-function TodoTaskAccordionItem({ task, taskId }) {
+function TodoTaskAccordionItem({ task }) {
   const [expanded, setExpanded] = useState(false);
   const startMs = taskStartMs(task);
   const endMs = taskEndMs(task);
@@ -9594,7 +9626,6 @@ function TodoTaskAccordionItem({ task, taskId }) {
         <TodoTaskAccordionChevron aria-hidden="true" data-expanded={expanded ? "true" : "false"} />
         <div>
           <strong>{taskDisplayTitle(task)}</strong>
-          <span>{taskId}</span>
         </div>
         <TodoTaskMeta>
           <StatusPill data-status={taskStatusKind(task)} title={`Actual status: ${taskStatusLabel(task)}`}>
@@ -9647,13 +9678,6 @@ function TodoDetailPanel({
   const sourceDevice = item.sourceDevice || {};
   const targetDevice = item.targetDevice || {};
   const inputBlocks = todoInputBlocks(item.raw || item, item.relatedTasks);
-  const todoIds = [
-    ["Todo", item.todoId],
-    ["Dispatch", item.dispatchId],
-    ["Command", item.commandId],
-    ["Batch", item.batchId],
-    ["Prompt", item.promptEventId],
-  ].filter(([, value]) => text(value));
 
   return (
     <TaskDetails aria-label="Selected todo details">
@@ -9703,17 +9727,6 @@ function TodoDetailPanel({
               <p>{block.content}</p>
             </TaskInputBlock>
           ))}
-        <TaskInputBlock>
-          <span>Identifiers</span>
-          <TodoIdList>
-            {todoIds.length ? todoIds.map(([label, value]) => (
-              <TodoIdChip key={`${label}-${value}`}>
-                <span>{label}</span>
-                <strong>{value}</strong>
-              </TodoIdChip>
-            )) : <TodoEmptyInline>No dispatch identifiers recorded.</TodoEmptyInline>}
-          </TodoIdList>
-        </TaskInputBlock>
       </TaskInputPanel>
       <TodoDetailSection>
         <TodoDetailSectionHeader>
@@ -9722,16 +9735,12 @@ function TodoDetailPanel({
         </TodoDetailSectionHeader>
         {item.relatedTasks.length ? (
           <TodoTaskList>
-            {item.relatedTasks.map((task, index) => {
-              const taskId = taskPlanTaskId(task, `task-${index}`);
-              return (
-                <TodoTaskAccordionItem
-                  key={`${item.id}-${taskId}`}
-                  task={task}
-                  taskId={taskId}
-                />
-              );
-            })}
+            {item.relatedTasks.map((task, index) => (
+              <TodoTaskAccordionItem
+                key={`${item.id}-${taskPlanTaskId(task, `task-${index}`)}`}
+                task={task}
+              />
+            ))}
           </TodoTaskList>
         ) : (
           <TodoEmptyInline>No matching task records yet.</TodoEmptyInline>
@@ -13169,41 +13178,6 @@ const TodoDeviceCard = styled.div`
     font-size: 10px;
     font-style: normal;
     font-weight: 720;
-  }
-`;
-
-const TodoIdList = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  min-width: 0;
-`;
-
-const TodoIdChip = styled.div`
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  min-width: 0;
-  max-width: 100%;
-  padding: 4px 6px;
-  border: 1px solid rgba(148, 163, 184, 0.11);
-  border-radius: 7px;
-  background: rgba(15, 23, 42, 0.36);
-
-  span {
-    color: rgba(148, 163, 184, 0.78);
-    font-size: 8px;
-    font-weight: 900;
-  }
-
-  strong {
-    min-width: 0;
-    overflow: hidden;
-    color: rgba(226, 232, 240, 0.88);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 9px;
-    font-weight: 760;
   }
 `;
 

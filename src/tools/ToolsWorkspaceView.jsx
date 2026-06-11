@@ -485,36 +485,42 @@ export default function ToolsWorkspaceView({
     return parts.join(" · ") || "Synced to your account";
   }, [skillsMeta, skillsRevision, skillsState]);
 
-  // Library skills filtered by search; catalog entries the user hasn't added
-  // yet, with skills for CLIs installed on this device surfaced first.
-  const librarySkillRows = useMemo(() => {
-    const query = text(skillsQuery).toLowerCase();
-    return skillsLibrary.skills.filter((skill) => (
-      !query
-        || skill.title.toLowerCase().includes(query)
-        || skill.description.toLowerCase().includes(query)
-    ));
-  }, [skillsLibrary.skills, skillsQuery]);
-
-  const catalogSkillRows = useMemo(() => {
+  // One merged list (like the CLIs section): personal skills lead, catalog
+  // entries the user hasn't added follow, with skills for installed CLIs
+  // surfaced first among them. The search also matches ownership labels, so
+  // "personal", "curated", "downloadable", or "cli" filter by kind.
+  const skillRows = useMemo(() => {
     const query = text(skillsQuery).toLowerCase();
     const ownedIds = new Set(skillsLibrary.skills.map((skill) => skill.id));
-    return SKILLS_CATALOG
+    const ownedRows = skillsLibrary.skills.map((skill) => ({
+      ...skill,
+      key: `library:${skill.id}`,
+      owned: true,
+      searchLabel: `personal yours ${skill.source === "cli" ? "cli" : skill.source === "catalog" ? "curated" : "custom"}`,
+    }));
+    const catalogRows = SKILLS_CATALOG
       .filter((entry) => !ownedIds.has(entry.id))
-      .filter((entry) => (
-        !query
-          || entry.title.toLowerCase().includes(query)
-          || entry.description.toLowerCase().includes(query)
-      ))
-      .map((entry) => ({
-        ...entry,
-        cliInstalled: Boolean(catalogChecks?.[skillCliBinary(entry)]?.installed),
-      }))
+      .map((entry) => {
+        const cliInstalled = Boolean(catalogChecks?.[skillCliBinary(entry)]?.installed);
+        return {
+          ...entry,
+          cliInstalled,
+          key: `catalog:${entry.id}`,
+          owned: false,
+          searchLabel: `downloadable catalog curated${cliInstalled ? " cli installed" : ""}`,
+        };
+      })
       .sort((a, b) => {
         if (a.cliInstalled !== b.cliInstalled) return a.cliInstalled ? -1 : 1;
         if (a.source !== b.source) return a.source === "catalog" ? -1 : 1;
         return a.title.localeCompare(b.title);
       });
+    return [...ownedRows, ...catalogRows].filter((row) => (
+      !query
+        || row.title.toLowerCase().includes(query)
+        || String(row.description || "").toLowerCase().includes(query)
+        || row.searchLabel.includes(query)
+    ));
   }, [catalogChecks, skillsLibrary.skills, skillsQuery]);
 
   const selectedSkill = useMemo(() => {
@@ -757,82 +763,60 @@ export default function ToolsWorkspaceView({
                       <ToolsEmpty>Loading skills…</ToolsEmpty>
                     ) : (
                       <>
-                        <SkillsGroupLabel>{`Your skills · ${librarySkillRows.length}`}</SkillsGroupLabel>
                         <SkillsList role="list">
-                          {librarySkillRows.map((skill) => (
+                          {skillRows.map((row) => (
                             <SkillRow
-                              key={skill.id}
-                              onClick={() => setSelectedSkillKey(`library:${skill.id}`)}
+                              key={row.key}
+                              onClick={() => setSelectedSkillKey(row.key)}
                               role="listitem"
                               type="button"
                             >
                               <SkillRowIcon
                                 aria-hidden="true"
-                                style={{ "--skill-color": skillToneColor(skill.tone, skill.title) }}
+                                style={{ "--skill-color": skillToneColor(row.tone, row.title) }}
                               >
-                                <SkillIconGlyph icon={skill.icon} title={skill.title} />
+                                <SkillIconGlyph icon={row.icon} title={row.title} />
                               </SkillRowIcon>
                               <SkillRowCopy>
-                                <strong>{skill.title}</strong>
-                                <span>{skill.description || "No description"}</span>
+                                <strong>{row.title}</strong>
+                                <span>{row.description || "No description"}</span>
                               </SkillRowCopy>
                               <SkillRowSide>
-                                <SkillSourceBadge data-source={skill.source}>
-                                  {skill.source === "cli" ? "CLI" : skill.source === "catalog" ? "Curated" : "Custom"}
-                                </SkillSourceBadge>
-                                <SkillRowChevron aria-hidden="true">›</SkillRowChevron>
-                              </SkillRowSide>
-                            </SkillRow>
-                          ))}
-                          {!librarySkillRows.length && (
-                            <ToolsEmpty>
-                              {text(skillsQuery)
-                                ? "No skills match your search."
-                                : "No skills yet — add one from the catalog below or create your own."}
-                            </ToolsEmpty>
-                          )}
-                        </SkillsList>
-                        {catalogSkillRows.length > 0 && (
-                          <>
-                            <SkillsGroupLabel>Downloadable skills</SkillsGroupLabel>
-                            <SkillsList role="list">
-                              {catalogSkillRows.map((entry) => (
-                                <SkillRow
-                                  key={entry.id}
-                                  onClick={() => setSelectedSkillKey(`catalog:${entry.id}`)}
-                                  role="listitem"
-                                  type="button"
-                                >
-                                  <SkillRowIcon
-                                    aria-hidden="true"
-                                    style={{ "--skill-color": skillToneColor(entry.tone, entry.title) }}
-                                  >
-                                    <SkillIconGlyph icon={entry.icon} title={entry.title} />
-                                  </SkillRowIcon>
-                                  <SkillRowCopy>
-                                    <strong>{entry.title}</strong>
-                                    <span>{entry.description}</span>
-                                  </SkillRowCopy>
-                                  <SkillRowSide>
-                                    {entry.cliInstalled && (
+                                {row.owned ? (
+                                  <>
+                                    <SkillSourceBadge data-source={row.source}>
+                                      Personal
+                                    </SkillSourceBadge>
+                                    <SkillRowChevron aria-hidden="true">›</SkillRowChevron>
+                                  </>
+                                ) : (
+                                  <>
+                                    {row.cliInstalled && (
                                       <SkillSourceBadge data-source="cli">CLI installed</SkillSourceBadge>
                                     )}
                                     <CliRowButton
                                       disabled={skillsState === "saving"}
                                       onClick={(event) => {
                                         event.stopPropagation();
-                                        addCatalogSkill(entry);
+                                        addCatalogSkill(row);
                                       }}
                                       type="button"
                                     >
                                       Add
                                     </CliRowButton>
-                                  </SkillRowSide>
-                                </SkillRow>
-                              ))}
-                            </SkillsList>
-                          </>
-                        )}
+                                  </>
+                                )}
+                              </SkillRowSide>
+                            </SkillRow>
+                          ))}
+                          {!skillRows.length && (
+                            <ToolsEmpty>
+                              {text(skillsQuery)
+                                ? "No skills match your search."
+                                : "No skills yet — create one or add a downloadable skill."}
+                            </ToolsEmpty>
+                          )}
+                        </SkillsList>
                       </>
                     )}
                   </>
@@ -992,12 +976,14 @@ const ToolsScroll = styled.div`
 const ToolsMcpPane = styled.div`
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
-  padding: 12px 16px 0;
+  /* McpWorkspaceSurface carries its own padding; doubling it up left a wide
+     dead band around the whole MCPs tab. */
+  padding: 0;
 `;
 
 const ToolsLayout = styled.section`
@@ -1397,14 +1383,6 @@ const CliRowButton = styled.button`
 
 // --- Skills library (list + detail) ----------------------------------------
 
-const SkillsGroupLabel = styled.span`
-  margin-top: 2px;
-  color: var(--forge-text-muted, #7a8493);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-`;
 
 const SkillsList = styled.div`
   display: grid;

@@ -14509,6 +14509,16 @@ function TerminalView({
   todoQueueRemoteCommandReceiptStorageKeyRef.current = todoQueueRemoteCommandReceiptStorageKey;
   const visibleTodoQueueItems = useMemo(() => (
     todoQueueItems.filter((item) => {
+      // In-flight and finished work never renders as a queue card: running
+      // items show on their terminal (and in Todos History), completed items
+      // live in Todos History only. Filtering by lifecycle status here makes
+      // that independent of pending-state attachment timing — direct-typed
+      // prompts used to flash as a card in the race between the Rust capture
+      // adoption and the prompt-submitted handler attaching pending state.
+      const lifecycleStatus = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status);
+      if (lifecycleStatus === "running" || lifecycleStatus === "sending" || lifecycleStatus === "completed") {
+        return false;
+      }
       const pendingItem = todoQueuePendingItems[item.id] || null;
       if (pendingItem && getTodoQueuePendingPhase(pendingItem) !== "queued") {
         return false;
@@ -22627,6 +22637,169 @@ function TerminalView({
     updateTodoQueueItems,
   ]);
 
+  // A specific todo loses its terminal when that terminal closes: it stays
+  // queued but becomes generic, so the next free agent terminal picks it up
+  // instead of the todo silently waiting on a pane that no longer exists.
+  const genericizeQueuedTodoItemsForTerminals = useCallback(({
+    itemIds = [],
+    paneIds = [],
+    reason = "target_terminal_closed",
+    terminalIndexes = [],
+  } = {}) => {
+    const closedPaneIds = new Set(
+      paneIds.map((value) => String(value || "").trim()).filter(Boolean),
+    );
+    const closedIndexes = new Set(terminalIndexes.filter((value) => Number.isInteger(value)));
+    const explicitItemIds = new Set(
+      itemIds.map((value) => String(value || "").trim()).filter(Boolean),
+    );
+    if (!closedPaneIds.size && !closedIndexes.size && !explicitItemIds.size) {
+      return [];
+    }
+    const matchesClosedTarget = (item) => {
+      const itemId = String(item?.id || "").trim();
+      if (explicitItemIds.has(itemId)) {
+        return true;
+      }
+      const status = normalizeTodoQueueLifecycleStatus(item?.todoStatus || item?.todo_status);
+      if (status !== "queued" && status !== "listed") {
+        return false;
+      }
+      const targetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
+      if (!targetInfo.hasExplicitTerminalTarget) {
+        return false;
+      }
+      if (targetInfo.requestedTargetTerminalId && closedPaneIds.has(targetInfo.requestedTargetTerminalId)) {
+        return true;
+      }
+      return Number.isInteger(targetInfo.requestedTargetTerminalIndex)
+        && closedIndexes.has(targetInfo.requestedTargetTerminalIndex)
+        && !targetInfo.requestedTargetTerminalId;
+    };
+    const matchedIds = todoQueueItemsRef.current
+      .filter(matchesClosedTarget)
+      .map((item) => String(item?.id || "").trim())
+      .filter(Boolean);
+    if (!matchedIds.length) {
+      return [];
+    }
+    const matchedIdSet = new Set(matchedIds);
+    updateTodoQueueItems((currentItems) => (
+      currentItems.map((item) => {
+        if (!matchedIdSet.has(String(item?.id || "").trim())) {
+          return item;
+        }
+        const wasQueued = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) === "queued";
+        const {
+          queueState: _droppedQueueState,
+          queue_state: _droppedQueueStateSnake,
+          ...bare
+        } = item;
+        const next = { ...bare };
+        [
+          "targetColorSlot",
+          "targetTerminalColor",
+          "targetTerminalId",
+          "targetTerminalIndex",
+          "targetTerminalName",
+          "targetThreadId",
+        ].forEach((key) => {
+          delete next[key];
+        });
+        const withState = wasQueued
+          ? getTodoQueueItemWithPersistedQueueState(next, "queued", {
+            reason,
+            source: next.source || "",
+          })
+          : next;
+        return getTodoQueueItemWithCloudStatus(withState, wasQueued ? "queued" : "listed", { reason });
+      })
+    ), {
+      force: true,
+      immediate: true,
+      reason,
+    });
+    const pendingItems = { ...todoQueuePendingItemsRef.current };
+    let pendingChanged = false;
+    matchedIds.forEach((itemId) => {
+      const pendingItem = pendingItems[itemId];
+      if (pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued") {
+        pendingItems[itemId] = {
+          ...pendingItem,
+          paneId: "",
+          reason,
+          targetColorSlot: "",
+          targetTerminalColor: "",
+          targetTerminalId: "",
+          targetTerminalIndex: "",
+          targetThreadId: "",
+        };
+        pendingChanged = true;
+      }
+    });
+    if (pendingChanged) {
+      replaceTodoQueuePendingItems(pendingItems);
+    }
+    logTerminalStatus("frontend.todo_queue.target_genericized", {
+      itemIds: matchedIds,
+      paneIds: [...closedPaneIds],
+      reason,
+      terminalIndexes: [...closedIndexes],
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    setTodoQueueDispatchRevision((revision) => revision + 1);
+    return matchedIds;
+  }, [
+    replaceTodoQueuePendingItems,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
+
+  // Eager close detection: when a terminal disappears from this workspace's
+  // pane set (or its pane identity is replaced), every queued/listed todo
+  // that targeted it specifically becomes generic right away.
+  const todoQueueKnownTerminalIdentitiesRef = useRef({ panes: new Map(), workspaceId: "" });
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const panes = new Map();
+    logicalTerminalIndexes.forEach((terminalIndex) => {
+      panes.set(terminalIndex, String(getTerminalPaneId(terminalIndex) || "").trim());
+    });
+    const previous = todoQueueKnownTerminalIdentitiesRef.current;
+    todoQueueKnownTerminalIdentitiesRef.current = { panes, workspaceId };
+    if (!workspaceId || previous.workspaceId !== workspaceId) {
+      // First baseline for this workspace (or a workspace switch): nothing
+      // actually closed.
+      return;
+    }
+    const closedPaneIds = [];
+    const closedIndexes = [];
+    previous.panes.forEach((paneId, terminalIndex) => {
+      const currentPaneId = panes.get(terminalIndex);
+      if (currentPaneId === undefined) {
+        closedIndexes.push(terminalIndex);
+        if (paneId) {
+          closedPaneIds.push(paneId);
+        }
+      } else if (paneId && currentPaneId && currentPaneId !== paneId) {
+        closedPaneIds.push(paneId);
+      }
+    });
+    if (!closedPaneIds.length && !closedIndexes.length) {
+      return;
+    }
+    genericizeQueuedTodoItemsForTerminals({
+      paneIds: closedPaneIds,
+      reason: "target_terminal_closed",
+      terminalIndexes: closedIndexes,
+    });
+  }, [
+    genericizeQueuedTodoItemsForTerminals,
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    terminalWorkspace?.id,
+  ]);
+
   // Control bus for the workspace Todo History view: queue/unqueue/retarget/
   // delete/cancel actions arrive as window events with cloud todo refs.
   useEffect(() => {
@@ -22827,6 +23000,11 @@ function TerminalView({
         return;
       }
       if (!item) {
+        if (detail.storeApplied === true && (action === "queue" || action === "retarget")) {
+          // The history view already flipped the Rust store row (status +
+          // target); there is just nothing to actuate in this session.
+          return;
+        }
         respond(detail, false, action === "queue" || action === "retarget"
           ? "This todo lives on another device or workspace; queue it from the device that owns it."
           : "This todo is not in this device's local todo list.");
@@ -22841,12 +23019,16 @@ function TerminalView({
           applyTodoHistoryTarget(itemId, targetTerminalIndex);
         }
         queueTodoQueueItem(itemId);
-        respond(detail, true);
+        if (detail.storeApplied !== true) {
+          respond(detail, true);
+        }
         return;
       }
       if (action === "retarget") {
         applyTodoHistoryTarget(itemId, normalizeTodoTerminalIndex(detail.targetTerminalIndex));
-        respond(detail, true);
+        if (detail.storeApplied !== true) {
+          respond(detail, true);
+        }
         return;
       }
       const findLiveInFlightPrompt = () => {
@@ -22978,9 +23160,40 @@ function TerminalView({
               // live lifecycle (queued/sending/running) stays webview-owned.
               if (settledStatuses.has(storeStatus) && storeStatus !== localStatus) {
                 changed = true;
+                if (storeStatus === "completed") {
+                  // Completed items are consumed from the visible queue (the
+                  // store keeps the row as history; Todos History renders it).
+                  return;
+                }
                 nextItems.push(getTodoQueueItemWithCloudStatus(item, storeStatus, {
                   reason: String(storeItem.todoStatusReason || storeItem.statusReason || "todo_store_reconcile"),
                 }));
+                return;
+              }
+              // Newer-stamped queued/listed flips (history Queue/Unqueue made
+              // while this session held a stale replica) win by LWW; live
+              // in-flight items stay webview-owned.
+              const storeStamp = String(storeItem.todoStatusUpdatedAt || storeItem.todo_status_updated_at || "").trim();
+              const localStamp = String(item.todoStatusUpdatedAt || item.todo_status_updated_at || "").trim();
+              const hasLivePending = Boolean(todoQueuePendingItemsRef.current[itemId]);
+              if (!hasLivePending
+                && (storeStatus === "queued" || storeStatus === "listed")
+                && storeStamp
+                && (!localStamp || storeStamp > localStamp)) {
+                changed = true;
+                const flipped = getTodoQueueItemWithCloudStatus(item, storeStatus, {
+                  reason: String(storeItem.todoStatusReason || storeItem.statusReason || "todo_store_reconcile"),
+                });
+                // Targets travel with the flip (retarget / clear-target).
+                ["targetAgentId", "targetColorSlot", "targetTerminalColor", "targetTerminalId", "targetTerminalIndex", "targetThreadId"]
+                  .forEach((key) => {
+                    if (storeItem[key] === undefined || storeItem[key] === null) {
+                      delete flipped[key];
+                    } else {
+                      flipped[key] = storeItem[key];
+                    }
+                  });
+                nextItems.push(flipped);
                 return;
               }
             }
@@ -22989,6 +23202,14 @@ function TerminalView({
           storeItems.forEach((storeItem) => {
             const itemId = String(storeItem.id || "").trim();
             if (!itemId || seenIds.has(itemId)) {
+              return;
+            }
+            // The store retains settled rows as todo history; those belong to
+            // the Todos History view, never to the live queue list.
+            const storeStatus = normalizeTodoQueueLifecycleStatus(
+              storeItem.todoStatus || storeItem.todo_status,
+            );
+            if (settledStatuses.has(storeStatus)) {
               return;
             }
             changed = true;
@@ -24380,12 +24601,33 @@ function TerminalView({
 
     if (!queuedItem || !target) {
       const dispatchWaitReason = dispatchSelection.reason || selectionTargetInfo.reason || "no_available_terminal";
+      const dispatchWaitReasonKey = String(dispatchWaitReason || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
       if (queuedItem && queuedItemHasExplicitTerminalTarget && [
         "target_terminal_not_found",
-        "terminal_unavailable",
         "terminal_closed",
+        "target_terminal_closed",
+      ].includes(dispatchWaitReasonKey)) {
+        // The target terminal no longer exists: the todo stays queued but
+        // becomes generic, so the next free agent terminal picks it up.
+        genericizeQueuedTodoItemsForTerminals({
+          itemIds: [queuedItem.id],
+          reason: "target_terminal_closed",
+        });
+        logTerminalStatus("frontend.todo_queue.target_closed_genericized", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          reason: dispatchWaitReason,
+          requestedTargetTerminalId,
+          requestedTargetTerminalIndex: Number.isInteger(requestedTargetTerminalIndex) ? requestedTargetTerminalIndex : "",
+          requestedTargetTerminalName,
+          requestedTargetThreadId,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return;
+      }
+      if (queuedItem && queuedItemHasExplicitTerminalTarget && [
+        "terminal_unavailable",
         "target_agent_mismatch",
-      ].includes(String(dispatchWaitReason || "").trim().toLowerCase().replace(/[-\s]+/g, "_"))) {
+      ].includes(dispatchWaitReasonKey)) {
         const releasedAt = new Date().toISOString();
         const pendingItems = { ...todoQueuePendingItemsRef.current };
         delete pendingItems[queuedItem.id];
@@ -24739,6 +24981,7 @@ function TerminalView({
       });
   }, [
     clearTodoQueueItemPending,
+    genericizeQueuedTodoItemsForTerminals,
     getTodoQueueTerminalSendTarget,
     isAppClosing,
     isWorkspaceRuntimeDeactivating,
@@ -25435,6 +25678,9 @@ function TerminalView({
         if (!target.available) {
           const message = target.message || "This terminal is not ready for that todo yet.";
           if (currentDrag.itemId && TODO_QUEUE_BUSY_REASONS.has(String(target.reason || ""))) {
+            // Dropping onto a busy/running terminal is a successful targeted
+            // queue, not an error: the todo waits specifically for THIS
+            // terminal and dispatches there the moment its agent frees up.
             setTodoQueueItemPending(currentDrag.itemId, {
               item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
               phase: "queued",
@@ -25458,7 +25704,20 @@ function TerminalView({
                 terminalIndex: targetTerminalIndex ?? null,
               });
             }
-          } else if (currentDrag.itemId) {
+            setTodoDropError("");
+            logBigViewSyncDiagnosticEvent("tui.todo.drop_queued_for_busy_terminal", {
+              hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
+              paneId,
+              reason: target.reason || "",
+              source,
+              surface: "tui_terminal_grid",
+              targetRole,
+              targetTerminalIndex: targetTerminalIndex ?? "",
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+            return;
+          }
+          if (currentDrag.itemId) {
             clearTodoQueueItemPending(currentDrag.itemId, "error", {
               message,
               source,

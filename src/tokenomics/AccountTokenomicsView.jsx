@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import {
   dailyUsageTitle,
@@ -172,9 +172,9 @@ const AgentAccountPill = styled.button`
   }
 `;
 
-const AgentAccountRemove = styled.button`
+const AgentAccountIconButton = styled.button`
   display: inline-flex;
-  width: 18px;
+  min-width: 18px;
   height: 18px;
   align-items: center;
   justify-content: center;
@@ -183,42 +183,43 @@ const AgentAccountRemove = styled.button`
   border-radius: 999px;
   color: rgba(148, 163, 184, 0.7);
   background: transparent;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 800;
   line-height: 1;
   cursor: pointer;
 
   &:hover {
+    color: rgba(226, 232, 240, 0.95);
+    background: rgba(125, 176, 255, 0.25);
+  }
+
+  &[data-danger="true"]:hover {
     color: #fff;
     background: rgba(214, 69, 69, 0.85);
   }
-`;
 
-const AgentAccountAddButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border: 1px dashed rgba(148, 163, 184, 0.4);
-  border-radius: 999px;
-  color: rgba(148, 163, 184, 0.9);
-  background: transparent;
-  font-size: 11.5px;
-  font-weight: 700;
-  cursor: pointer;
-
-  &:hover {
-    border-color: rgba(125, 176, 255, 0.6);
-    color: rgba(200, 222, 255, 0.95);
+  &[data-armed="true"] {
+    padding: 0 6px;
+    color: #fff;
+    background: rgba(214, 69, 69, 0.85);
+    font-size: 10px;
   }
 `;
 
-const AgentAccountAddForm = styled.form`
+const AgentAccountEditorForm = styled.form`
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid rgba(125, 176, 255, 0.3);
+  border-radius: 10px;
+  color: rgba(203, 213, 225, 0.9);
+  background: rgba(30, 41, 59, 0.45);
+  font-size: 11.5px;
 
-  input {
-    width: 150px;
+  input[type="text"] {
+    width: 140px;
     padding: 4px 9px;
     border: 1px solid rgba(148, 163, 184, 0.3);
     border-radius: 999px;
@@ -232,54 +233,52 @@ const AgentAccountAddForm = styled.form`
     }
   }
 
+  label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: rgba(148, 163, 184, 0.85);
+    font-weight: 650;
+    cursor: pointer;
+  }
+
   button {
     padding: 4px 10px;
-    border: 1px solid rgba(74, 222, 128, 0.45);
     border-radius: 999px;
-    color: rgba(187, 247, 208, 0.95);
-    background: rgba(34, 197, 94, 0.12);
     font-size: 11.5px;
     font-weight: 750;
     cursor: pointer;
   }
-`;
 
-const AgentAccountLoginHint = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 8px 10px;
-  border: 1px solid rgba(251, 146, 60, 0.35);
-  border-radius: 10px;
-  background: rgba(251, 146, 60, 0.08);
-  color: rgba(254, 215, 170, 0.95);
-  font-size: 11.5px;
+  button[type="submit"] {
+    border: 1px solid rgba(74, 222, 128, 0.45);
+    color: rgba(187, 247, 208, 0.95);
+    background: rgba(34, 197, 94, 0.12);
+  }
 
-  code {
-    overflow-wrap: anywhere;
-    padding: 4px 8px;
-    border-radius: 7px;
-    color: rgba(226, 232, 240, 0.95);
-    background: rgba(2, 6, 14, 0.6);
-    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
-    font-size: 11px;
-    cursor: pointer;
+  button[type="button"] {
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    color: rgba(148, 163, 184, 0.9);
+    background: transparent;
   }
 
   html[data-forge-theme="light"] & {
-    color: rgba(154, 52, 18, 0.95);
+    color: rgba(30, 41, 59, 0.85);
+    background: rgba(241, 245, 249, 0.8);
   }
 `;
 
 /* Agent account profiles: per-CLI account switching managed beside the usage
-   data that motivates the switch. Switching only affects NEW terminal spawns;
-   running panes show a restart chip instead (never forced). */
+   data that motivates the switch. There is no add flow — signing into another
+   account in any terminal is captured automatically by the Rust watcher.
+   Switching only affects NEW terminal spawns; running panes show a restart
+   chip instead (never forced). */
 function AgentAccountsManager() {
   const [accounts, setAccounts] = useState(null);
-  const [addingKind, setAddingKind] = useState("");
-  const [addLabel, setAddLabel] = useState("");
-  const [loginHint, setLoginHint] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [confirmDeleteKey, setConfirmDeleteKey] = useState("");
   const [actionError, setActionError] = useState("");
+  const confirmDeleteTimerRef = useRef(null);
 
   const refresh = useCallback(() => {
     invoke("agent_accounts_state").then((state) => {
@@ -291,6 +290,9 @@ function AgentAccountsManager() {
     let cancelled = false;
     let unlisten = null;
     refresh();
+    // Logins inside profile dirs change identity dots without any event, so
+    // a slow poll backs up the capture-watcher events.
+    const interval = window.setInterval(refresh, 6000);
     listen(AGENT_ACCOUNTS_CHANGED_EVENT, () => {
       if (!cancelled) {
         refresh();
@@ -304,6 +306,10 @@ function AgentAccountsManager() {
     }).catch(() => {});
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
+      if (confirmDeleteTimerRef.current) {
+        window.clearTimeout(confirmDeleteTimerRef.current);
+      }
       if (unlisten) {
         unlisten();
       }
@@ -317,38 +323,40 @@ function AgentAccountsManager() {
       .catch((error) => setActionError(String(error?.message || error || "Unable to switch account.")));
   }, [refresh]);
 
-  const removeProfile = useCallback((kind, profileId) => {
+  const requestDelete = useCallback((kind, profileId) => {
+    const key = `${kind}:${profileId}`;
+    if (confirmDeleteKey !== key) {
+      setConfirmDeleteKey(key);
+      if (confirmDeleteTimerRef.current) {
+        window.clearTimeout(confirmDeleteTimerRef.current);
+      }
+      confirmDeleteTimerRef.current = window.setTimeout(() => setConfirmDeleteKey(""), 2600);
+      return;
+    }
+    setConfirmDeleteKey("");
     setActionError("");
     invoke("agent_accounts_remove", { agentKind: kind, profileId })
       .then(refresh)
-      .catch((error) => setActionError(String(error?.message || error || "Unable to remove account.")));
-  }, [refresh]);
+      .catch((error) => setActionError(String(error?.message || error || "Unable to delete account.")));
+  }, [confirmDeleteKey, refresh]);
 
-  const submitAdd = useCallback((event) => {
+  const submitEdit = useCallback((event) => {
     event.preventDefault();
-    const kind = addingKind;
-    const label = addLabel.trim();
-    if (!kind || !label) {
+    if (!editing) {
       return;
     }
     setActionError("");
-    invoke("agent_accounts_add", { agentKind: kind, label }).then((result) => {
-      setAddingKind("");
-      setAddLabel("");
-      setLoginHint({
-        command: String(result?.loginCommand || ""),
-        kind,
-        label,
-      });
+    invoke("agent_accounts_update_display", {
+      agentKind: editing.kind,
+      profileId: editing.profileId,
+      alias: editing.alias,
+      showAlias: editing.showAlias,
+      showEmail: editing.showEmail,
+    }).then(() => {
+      setEditing(null);
       refresh();
-    }).catch((error) => setActionError(String(error?.message || error || "Unable to add account.")));
-  }, [addLabel, addingKind, refresh]);
-
-  const copyLoginCommand = useCallback(() => {
-    if (loginHint?.command && navigator?.clipboard?.writeText) {
-      void navigator.clipboard.writeText(loginHint.command);
-    }
-  }, [loginHint]);
+    }).catch((error) => setActionError(String(error?.message || error || "Unable to update account.")));
+  }, [editing, refresh]);
 
   if (!accounts) {
     return null;
@@ -358,7 +366,7 @@ function AgentAccountsManager() {
     <AgentAccountsSection aria-label="Agent account profiles">
       <AgentAccountsHeader>
         <strong>Agent accounts</strong>
-        <span>Switching applies to new terminals; running ones show a restart chip.</span>
+        <span>Sign into another account in any terminal — it’s captured here automatically.</span>
       </AgentAccountsHeader>
       {["claude", "codex"].map((kind) => {
         const entry = accounts[kind];
@@ -367,80 +375,121 @@ function AgentAccountsManager() {
         }
         const profiles = Array.isArray(entry.profiles) ? entry.profiles : [];
         return (
-          <AgentAccountsRow key={kind}>
-            <AgentAccountsKindLabel>
-              {kind === "claude" ? "Claude" : "Codex"}
-            </AgentAccountsKindLabel>
-            {profiles.map((profile) => (
-              <AgentAccountPill
-                data-active={profile.isActive ? "true" : "false"}
-                key={profile.id}
-                onClick={() => {
-                  if (!profile.isActive) {
-                    setActive(kind, profile.id);
-                  }
-                }}
-                title={profile.isActive
-                  ? `Active: new ${kind} terminals use this account`
-                  : `Use this account for new ${kind} terminals`}
-                type="button"
-              >
-                <i aria-hidden="true" data-auth={profile.identity?.authReady ? "true" : "false"} />
-                {profile.label}
-                {profile.identity?.email ? <em>{profile.identity.email}</em> : null}
-                {!profile.identity?.authReady && !profile.isDefault ? <em>needs login</em> : null}
-                {!profile.isDefault && (
-                  <AgentAccountRemove
-                    aria-label={`Remove ${profile.label}`}
-                    as="span"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      removeProfile(kind, profile.id);
+          <Fragment key={kind}>
+            <AgentAccountsRow>
+              <AgentAccountsKindLabel>
+                {kind === "claude" ? "Claude" : "Codex"}
+              </AgentAccountsKindLabel>
+              {profiles.map((profile) => {
+                const email = profile.identity?.email || "";
+                const alias = String(profile.alias || "").trim();
+                const showAlias = profile.showAlias !== false;
+                const showEmail = profile.showEmail !== false;
+                const name = profile.isDefault
+                  ? (profile.label || "Default")
+                  : ((showAlias && alias) || profile.label || "Account");
+                const canEdit = !profile.isDefault && Boolean(email);
+                const canDelete = !profile.isDefault && !profile.isActive;
+                const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
+                return (
+                  <AgentAccountPill
+                    data-active={profile.isActive ? "true" : "false"}
+                    key={profile.id}
+                    onClick={() => {
+                      if (!profile.isActive) {
+                        setActive(kind, profile.id);
+                      }
                     }}
-                    role="button"
-                    title="Remove this profile (its login stays on disk)"
+                    title={profile.isActive
+                      ? `Active: new ${kind} terminals use this account`
+                      : `Use this account for new ${kind} terminals`}
+                    type="button"
                   >
-                    ×
-                  </AgentAccountRemove>
-                )}
-              </AgentAccountPill>
-            ))}
-            {addingKind === kind ? (
-              <AgentAccountAddForm onSubmit={submitAdd}>
+                    <i aria-hidden="true" data-auth={profile.identity?.authReady ? "true" : "false"} />
+                    {name}
+                    {email && (profile.isDefault || showEmail) ? <em>{email}</em> : null}
+                    {!profile.identity?.authReady && !profile.isDefault ? <em>needs login</em> : null}
+                    {canEdit && (
+                      <AgentAccountIconButton
+                        aria-label={`Edit ${name}`}
+                        as="span"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setEditing({
+                            kind,
+                            profileId: profile.id,
+                            name,
+                            alias,
+                            showAlias,
+                            showEmail,
+                          });
+                        }}
+                        role="button"
+                        title="Edit alias & what the pill shows"
+                      >
+                        ✎
+                      </AgentAccountIconButton>
+                    )}
+                    {canDelete && (
+                      <AgentAccountIconButton
+                        aria-label={`Delete ${name}`}
+                        as="span"
+                        data-armed={deleteArmed ? "true" : "false"}
+                        data-danger="true"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          requestDelete(kind, profile.id);
+                        }}
+                        role="button"
+                        title="Delete this account profile and its saved login"
+                      >
+                        {deleteArmed ? "sure?" : "×"}
+                      </AgentAccountIconButton>
+                    )}
+                  </AgentAccountPill>
+                );
+              })}
+            </AgentAccountsRow>
+            {editing?.kind === kind ? (
+              <AgentAccountEditorForm onSubmit={submitEdit}>
                 <input
-                  aria-label="New account label"
+                  aria-label="Account alias"
                   autoFocus
                   maxLength={40}
-                  onChange={(event) => setAddLabel(event.target.value)}
-                  placeholder="Label (e.g. Work)"
-                  value={addLabel}
+                  onChange={(event) => setEditing((current) => (
+                    current ? { ...current, alias: event.target.value } : current
+                  ))}
+                  placeholder={`Alias for ${editing.name}`}
+                  type="text"
+                  value={editing.alias}
                 />
-                <button type="submit">Create</button>
-              </AgentAccountAddForm>
-            ) : (
-              <AgentAccountAddButton
-                onClick={() => {
-                  setAddingKind(kind);
-                  setAddLabel("");
-                }}
-                type="button"
-              >
-                + Add account
-              </AgentAccountAddButton>
-            )}
-          </AgentAccountsRow>
+                <label>
+                  <input
+                    checked={editing.showAlias}
+                    onChange={(event) => setEditing((current) => (
+                      current ? { ...current, showAlias: event.target.checked } : current
+                    ))}
+                    type="checkbox"
+                  />
+                  show alias
+                </label>
+                <label>
+                  <input
+                    checked={editing.showEmail}
+                    onChange={(event) => setEditing((current) => (
+                      current ? { ...current, showEmail: event.target.checked } : current
+                    ))}
+                    type="checkbox"
+                  />
+                  show email
+                </label>
+                <button type="submit">Save</button>
+                <button onClick={() => setEditing(null)} type="button">Cancel</button>
+              </AgentAccountEditorForm>
+            ) : null}
+          </Fragment>
         );
       })}
-      {loginHint ? (
-        <AgentAccountLoginHint role="status">
-          <span>
-            {`Sign in once to finish adding “${loginHint.label}”: run this in any terminal `}
-            {"(use a private browser window if you're already signed into another account), "}
-            {"then this card updates automatically."}
-          </span>
-          <code onClick={copyLoginCommand} title="Click to copy">{loginHint.command}</code>
-        </AgentAccountLoginHint>
-      ) : null}
       {actionError ? <TokenomicsError>{actionError}</TokenomicsError> : null}
     </AgentAccountsSection>
   );

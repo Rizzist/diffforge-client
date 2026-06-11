@@ -3509,18 +3509,36 @@ fn snipping_preview_stack_position(
     Some(tauri::PhysicalPosition::new(x, y))
 }
 
-// One tween duration everywhere — mid-drag re-packs and the final settle
-// share the same 240ms ease-out; re-targets pick up from current positions
-// so the parting still tracks the hand.
-const SNIPPING_FLOAT_ANIMATE_MS: f64 = 240.0;
+// Two tween profiles: mid-drag re-packs keep an ease-out so the parting
+// still tracks the hand (an ease-in ramp there reads as input lag under the
+// 33ms re-target stream), while reorder settles take a longer smootherstep —
+// soft start AND soft stop — so the queue glides instead of jumping.
+const SNIPPING_FLOAT_ANIMATE_MS: f64 = 360.0;
+const SNIPPING_FLOAT_SETTLE_ANIMATE_MS: f64 = 520.0;
 const SNIPPING_FLOAT_ANIMATE_FRAME_MS: u64 = 12;
 const SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS: u64 = 33;
 
-/// Tweens preview windows to their stack slots (ease-out cubic) instead of
-/// snapping them. A new animation (or a re-targeted reflow mid-drag) bumps
-/// the generation, which stops in-flight tween threads at their next frame —
-/// the new tween picks up from wherever each window currently is, so rapid
-/// re-targets stay fluid.
+#[derive(Clone, Copy, PartialEq)]
+enum SnippingTweenEasing {
+    /// Ease-out cubic: starts at full speed — for live drag tracking.
+    Track,
+    /// Smootherstep (6t⁵−15t⁴+10t³): eases both ends — for queue settles.
+    Gentle,
+}
+
+fn snipping_tween_eased(progress: f64, easing: SnippingTweenEasing) -> f64 {
+    let t = progress.clamp(0.0, 1.0);
+    match easing {
+        SnippingTweenEasing::Track => 1.0 - (1.0 - t).powi(3),
+        SnippingTweenEasing::Gentle => t * t * t * (t * (t * 6.0 - 15.0) + 10.0),
+    }
+}
+
+/// Tweens preview windows to their stack slots instead of snapping them. A
+/// new animation (or a re-targeted reflow mid-drag) bumps the generation,
+/// which stops in-flight tween threads at their next frame — the new tween
+/// picks up from wherever each window currently is, so rapid re-targets stay
+/// fluid.
 fn snipping_animate_previews(
     app: &AppHandle,
     moves: Vec<(
@@ -3529,6 +3547,7 @@ fn snipping_animate_previews(
         tauri::PhysicalPosition<i32>,
     )>,
     duration_ms: f64,
+    easing: SnippingTweenEasing,
 ) {
     if moves.is_empty() {
         return;
@@ -3548,7 +3567,7 @@ fn snipping_animate_previews(
             }
             let progress =
                 (started.elapsed().as_millis() as f64 / duration_ms).min(1.0);
-            let eased = 1.0 - (1.0 - progress).powi(3);
+            let eased = snipping_tween_eased(progress, easing);
             let frame: Vec<(tauri::WebviewWindow, i32, i32)> = moves
                 .iter()
                 .map(|(window, from, to)| {
@@ -3583,7 +3602,7 @@ fn snipping_animate_previews(
 /// covers so the others part around it live without ever overlapping it, and
 /// a preview dropped back over the column is adopted into the stack at the
 /// height it was dropped.
-fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64) {
+fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: SnippingTweenEasing) {
     let Some(monitor) = app
         .get_webview_window("main")
         .and_then(|main_window| main_window.current_monitor().ok().flatten())
@@ -3670,7 +3689,7 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64) {
         }
         bottom_edge = y - gap;
     }
-    snipping_animate_previews(app, moves, animate_ms);
+    snipping_animate_previews(app, moves, animate_ms, easing);
 }
 
 /// Throttled live re-pack while the user drags a preview: the rest of the
@@ -3696,7 +3715,7 @@ fn snipping_live_reflow_on_drag(app: &AppHandle, label: &str) {
     state
         .preview_live_reflow_last_ms
         .store(now_ms, Ordering::SeqCst);
-    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS);
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
 }
 
 fn snipping_now_epoch_ms() -> u64 {
@@ -3779,7 +3798,11 @@ fn snipping_settle_preview_windows(app: &AppHandle) {
         return;
     }
     snipping_resolve_preview_drop_candidates(app);
-    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS);
+    snipping_reflow_preview_stack(
+        app,
+        SNIPPING_FLOAT_SETTLE_ANIMATE_MS,
+        SnippingTweenEasing::Gentle,
+    );
 }
 
 /// Maps a preview window's center to main-webview CSS coordinates, or None

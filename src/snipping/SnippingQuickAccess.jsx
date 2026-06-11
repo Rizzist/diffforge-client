@@ -20,8 +20,11 @@ import styled, { createGlobalStyle } from "styled-components";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
 const SNIPPING_LIVE_PREVIEW_EVENT = "forge-snip-live-preview";
-const SNIPPING_LIVE_PREVIEW_THROTTLE_MS = 120;
-const SNIPPING_LIVE_PREVIEW_MAX_WIDTH = 512;
+// ~22fps: frames are tiny (max edge capped below), so the encode+emit cost
+// per frame stays in the low milliseconds and the preview tracks the pen in
+// realtime without pinning a core.
+const SNIPPING_LIVE_PREVIEW_THROTTLE_MS = 45;
+const SNIPPING_LIVE_PREVIEW_MAX_EDGE = 512;
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
@@ -538,7 +541,11 @@ const FloatWindowRoot = styled.main`
   img {
     width: 100%;
     height: 100%;
-    object-fit: contain;
+    /* The snip must fill the preview to its edges whatever its aspect ratio
+       — a tall narrow capture letterboxed with contain reads as an empty
+       window. Cover keeps it centered and crops the overflow instead. */
+    object-fit: cover;
+    object-position: center;
     pointer-events: none;
     user-select: none;
     -webkit-user-select: none;
@@ -925,6 +932,7 @@ export function SnippingAnnotationEditorWindow() {
   const autosaveTimerRef = useRef(0);
   const livePreviewTimerRef = useRef(0);
   const livePreviewLastSentRef = useRef(0);
+  const livePreviewFrameCanvasRef = useRef(null);
 
   // Streams the composited canvas to the snip preview window while drawing,
   // so edits are visible there live (downscaled JPEG frames, throttled).
@@ -934,12 +942,26 @@ export function SnippingAnnotationEditorWindow() {
 
     let dataUrl = "";
     try {
-      const scale = Math.min(1, SNIPPING_LIVE_PREVIEW_MAX_WIDTH / canvas.width);
+      // Cap BOTH edges: the old width-only cap let tall captures through at
+      // full resolution, which made every frame a multi-megapixel JPEG
+      // encode — the actual source of the preview lag. The frame canvas is
+      // reused across frames to avoid a per-frame allocation.
+      const scale = Math.min(
+        1,
+        SNIPPING_LIVE_PREVIEW_MAX_EDGE / canvas.width,
+        SNIPPING_LIVE_PREVIEW_MAX_EDGE / canvas.height,
+      );
       if (scale < 1) {
-        const frame = document.createElement("canvas");
-        frame.width = Math.max(1, Math.round(canvas.width * scale));
-        frame.height = Math.max(1, Math.round(canvas.height * scale));
-        frame.getContext("2d").drawImage(canvas, 0, 0, frame.width, frame.height);
+        let frame = livePreviewFrameCanvasRef.current;
+        if (!frame) {
+          frame = document.createElement("canvas");
+          livePreviewFrameCanvasRef.current = frame;
+        }
+        const frameWidth = Math.max(1, Math.round(canvas.width * scale));
+        const frameHeight = Math.max(1, Math.round(canvas.height * scale));
+        if (frame.width !== frameWidth) frame.width = frameWidth;
+        if (frame.height !== frameHeight) frame.height = frameHeight;
+        frame.getContext("2d").drawImage(canvas, 0, 0, frameWidth, frameHeight);
         dataUrl = frame.toDataURL("image/jpeg", 0.72);
       } else {
         dataUrl = canvas.toDataURL("image/jpeg", 0.72);
@@ -1170,37 +1192,39 @@ export function SnippingAnnotationEditorWindow() {
           </EditorStage>
 
           <EditorComposer onSubmit={queueTodo}>
-            <Select
-              aria-label="Target workspace"
-              isDisabled={!dispatchTargets.length}
-              isSearchable={false}
-              menuPlacement="top"
-              onChange={(option) => setTargetWorkspaceId(option?.value || "")}
-              options={workspaceOptions}
-              placeholder="Workspace"
-              styles={TARGET_SELECT_STYLES}
-              value={workspaceOptions.find((option) => option.value === targetWorkspaceId) || null}
-            />
-            <Select
-              aria-label="Target terminal"
-              isDisabled={!(targetWorkspace?.threads || []).length}
-              isSearchable={false}
-              menuPlacement="top"
-              onChange={(option) => setTargetThreadId(option?.value || "")}
-              options={threadOptions}
-              placeholder="Any terminal"
-              styles={TARGET_SELECT_STYLES}
-              value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
-            />
-            <input
-              aria-label="Todo for coding agent"
-              onChange={(event) => setTodoDraft(event.target.value)}
-              placeholder="Circle an area, describe the fix, send it to an agent…"
-              value={todoDraft}
-            />
-            <EditorSendButton aria-label="Queue todo with this image" disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
-              <Send aria-hidden="true" />
-            </EditorSendButton>
+            <EditorComposerInner>
+              <Select
+                aria-label="Target workspace"
+                isDisabled={!dispatchTargets.length}
+                isSearchable={false}
+                menuPlacement="top"
+                onChange={(option) => setTargetWorkspaceId(option?.value || "")}
+                options={workspaceOptions}
+                placeholder="Workspace"
+                styles={TARGET_SELECT_STYLES}
+                value={workspaceOptions.find((option) => option.value === targetWorkspaceId) || null}
+              />
+              <Select
+                aria-label="Target terminal"
+                isDisabled={!(targetWorkspace?.threads || []).length}
+                isSearchable={false}
+                menuPlacement="top"
+                onChange={(option) => setTargetThreadId(option?.value || "")}
+                options={threadOptions}
+                placeholder="Any terminal"
+                styles={TARGET_SELECT_STYLES}
+                value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
+              />
+              <input
+                aria-label="Todo for coding agent"
+                onChange={(event) => setTodoDraft(event.target.value)}
+                placeholder="Circle an area, describe the fix, send it to an agent…"
+                value={todoDraft}
+              />
+              <EditorSendButton aria-label="Queue todo with this image" disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
+                <Send aria-hidden="true" />
+              </EditorSendButton>
+            </EditorComposerInner>
           </EditorComposer>
         </EditorWindowRoot>
       </EditorViewport>
@@ -1534,13 +1558,20 @@ const EditorThumbButton = styled.button`
 // thing", not in app chrome.
 const EditorStage = styled.section`
   position: relative;
-  display: grid;
+  /* Flex centering, not grid: the canvas's max-width/max-height percentages
+     must resolve against the stage (definite flex height) — inside an
+     auto-sized grid row they resolve to none, the canvas lays out at
+     intrinsic size and the overflow clip eats it off-center. The stage ends
+     above the composer, so centering here already excludes the chat input;
+     the extra bottom padding keeps the artwork from hugging it. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex: 1;
   min-width: 0;
   min-height: 0;
-  place-items: center;
   overflow: hidden;
-  padding: 10px 10px 10px 52px;
+  padding: 12px 12px 20px 52px;
   background:
     radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
     #05070b;
@@ -1707,11 +1738,8 @@ const SizeDotButton = styled.button`
 `;
 
 const EditorComposer = styled.form`
-  display: flex;
   flex: none;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 10px 10px;
+  padding: 8px 16px 12px;
   border-top: 1px solid rgba(230, 236, 245, 0.07);
   background: rgba(10, 13, 19, 0.6);
 
@@ -1738,6 +1766,18 @@ const EditorComposer = styled.form`
     border-color: rgba(147, 197, 253, 0.45);
     box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
   }
+`;
+
+/* The bar spans the window, but the controls sit in a centered column with a
+   capped width (ChatGPT-style) so the input doesn't stretch edge to edge on
+   wide editor windows. */
+const EditorComposerInner = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  max-width: 780px;
+  margin: 0 auto;
 `;
 
 const EditorSendButton = styled.button`

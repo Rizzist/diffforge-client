@@ -1401,12 +1401,88 @@ fn architecture_repository_entry(
     }
 }
 
+const ARCHITECTURE_FOLDER_LIST_SKIP_NAMES: [&str; 8] = [
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    "venv",
+    "tmp",
+];
+
 fn architecture_repositories_from_mounts(
     root: &Path,
     mounts: &[WorkspaceProjectMount],
 ) -> ArchitectureRepositoryList {
+    // Simple contract: every visible folder directly under the workspace
+    // root is an architecture scope, git or not. The git topology scan only
+    // supplies the git label (with a direct .git check for folders the scan
+    // didn't mount); deeper project mounts are appended so nested repos stay
+    // reachable.
+    let mut git_by_path = HashMap::new();
+    for mount in mounts {
+        git_by_path.insert(normalized_path_key(&mount.root_path), mount.has_git);
+    }
+    let folder_has_git = |path: &Path| {
+        git_by_path
+            .get(&normalized_path_key(path))
+            .copied()
+            .unwrap_or_else(|| workspace_is_exact_git_root(path))
+    };
+
     let mut seen = HashSet::new();
     let mut repositories = Vec::new();
+
+    let root_has_git = folder_has_git(root);
+    if root_has_git {
+        seen.insert(normalized_path_key(root));
+        repositories.push(architecture_repository_entry(
+            root,
+            root,
+            ".".to_string(),
+            true,
+        ));
+    }
+
+    let mut subdirectories = fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default();
+                    !name.is_empty()
+                        && !name.starts_with('.')
+                        && !ARCHITECTURE_FOLDER_LIST_SKIP_NAMES.contains(&name)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    subdirectories.sort();
+    for directory in subdirectories {
+        let key = normalized_path_key(&directory);
+        if !seen.insert(key) {
+            continue;
+        }
+        let name = directory
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let has_git = folder_has_git(&directory);
+        repositories.push(architecture_repository_entry(
+            root,
+            &directory,
+            name,
+            has_git,
+        ));
+    }
 
     for mount in mounts
         .iter()
@@ -1415,7 +1491,7 @@ fn architecture_repositories_from_mounts(
         let key = normalized_path_key(&mount.root_path);
         if seen.insert(key) {
             repositories.push(architecture_repository_entry(
-                &root,
+                root,
                 &mount.root_path,
                 mount.workspace_relative_path.clone(),
                 mount.has_git,
@@ -1424,14 +1500,13 @@ fn architecture_repositories_from_mounts(
     }
 
     if repositories.is_empty() {
-        let key = normalized_path_key(&root);
+        let key = normalized_path_key(root);
         if seen.insert(key) {
-            let has_git = workspace_is_exact_git_root(&root);
             repositories.push(architecture_repository_entry(
-                &root,
-                &root,
+                root,
+                root,
                 ".".to_string(),
-                has_git,
+                root_has_git,
             ));
         }
     }

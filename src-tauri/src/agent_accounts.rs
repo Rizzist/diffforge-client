@@ -1,10 +1,15 @@
 // Agent account profiles: manual multi-account switching for the coding
 // agent CLIs (Claude Code, Codex).
 //
-// A profile is a pointer to an isolated CLI home directory — Diff Forge never
-// stores or touches credentials; the CLI's own login flow writes them into
-// the profile dir (or the macOS Keychain entry derived from that dir's path,
-// which is why profile dirs must never move once created). The registry holds
+// A profile is a pointer to an isolated CLI home directory. There is no
+// manual "add account" flow: a background watcher pins every authenticated
+// identity it sees in the default CLI homes into its own snapshot profile
+// (credential files copied while they are still valid), so logging into
+// another account in any terminal captures the previous one before the new
+// login overwrites it — both stay switchable afterwards. Keychain-only
+// Claude installs are the one gap: their snapshot carries identity but the
+// OAuth token stays in the Keychain entry keyed to the source dir, so the
+// pinned profile shows "needs login" until used once. The registry holds
 // one `activeProfileId` per agent kind: NEW terminal spawns bind to it via
 // env (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), already-running panes keep the
 // account they were born with, and the webview shows a restart chip when a
@@ -192,6 +197,10 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
     json!({
         "id": id,
         "label": profile.get("label").and_then(Value::as_str).unwrap_or_default(),
+        "alias": profile.get("alias").and_then(Value::as_str).unwrap_or_default(),
+        "showAlias": profile.get("showAlias").and_then(Value::as_bool).unwrap_or(true),
+        "showEmail": profile.get("showEmail").and_then(Value::as_bool).unwrap_or(true),
+        "source": profile.get("source").and_then(Value::as_str).unwrap_or("manual"),
         "dir": dir,
         "createdAtMs": profile.get("createdAtMs").and_then(Value::as_u64).unwrap_or(0),
         "identity": identity,
@@ -199,6 +208,27 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
         "isActive": id == active_id,
         "loginCommand": agent_accounts_login_command(kind, &dir),
     })
+}
+
+/// The name everything outside the pill renderer uses for a profile —
+/// tokenomics account rows and the stale-terminal chips. A user alias wins
+/// over the captured label.
+fn agent_accounts_profile_display_label(profile: &Value) -> String {
+    if let Some(alias) = profile
+        .get("alias")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return alias.to_string();
+    }
+    profile
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Account")
+        .to_string()
 }
 
 fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
@@ -253,9 +283,8 @@ fn agent_accounts_active_profile_label(kind: &str) -> (String, String) {
         .find(|profile| {
             profile.get("id").and_then(Value::as_str).unwrap_or_default() == active_id
         })
-        .and_then(|profile| profile.get("label").and_then(Value::as_str))
-        .unwrap_or("Account")
-        .to_string();
+        .map(agent_accounts_profile_display_label)
+        .unwrap_or_else(|| "Account".to_string());
     (active_id, label)
 }
 
@@ -277,11 +306,7 @@ pub(crate) fn agent_accounts_profiles_for_tokenomics(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?
                 .to_string();
-            let label = profile
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("Account")
-                .to_string();
+            let label = agent_accounts_profile_display_label(profile);
             let dir = profile
                 .get("dir")
                 .and_then(Value::as_str)
@@ -354,6 +379,252 @@ pub(crate) fn agent_accounts_apply_spawn_env(
     }
 }
 
+// ---- Automatic account capture --------------------------------------------
+//
+// While the app runs, a watcher polls the default CLI homes. Every
+// authenticated identity it sees gets pinned into its own snapshot profile
+// before a later login can overwrite the credentials, which is what makes
+// "log into another account anywhere, then switch between both" work with no
+// add-account flow. Deleting a captured profile while that account is still
+// signed in suppresses recapture until the default identity changes.
+
+fn agent_accounts_email_key(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+fn agent_accounts_email_slug(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email);
+    let slug = local
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(32)
+        .collect::<String>();
+    if slug.is_empty() {
+        "account".to_string()
+    } else {
+        slug
+    }
+}
+
+/// The identity a profile is pinned to: the email stored at capture time, or
+/// a live probe of the profile dir for manually created legacy profiles.
+fn agent_accounts_profile_email(kind: &str, profile: &Value) -> String {
+    if let Some(stored) = profile
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return agent_accounts_email_key(stored);
+    }
+    let dir = profile
+        .get("dir")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(dir) = dir else {
+        return String::new();
+    };
+    agent_accounts_profile_identity(kind, Some(Path::new(dir)))
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default()
+}
+
+fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
+    if !source.is_file() {
+        return false;
+    }
+    let newer = match (
+        source.metadata().and_then(|meta| meta.modified()),
+        destination.metadata().and_then(|meta| meta.modified()),
+    ) {
+        (Ok(source_time), Ok(destination_time)) => source_time > destination_time,
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    };
+    newer && fs::copy(source, destination).is_ok()
+}
+
+/// Copies the default home's credential/identity files into a snapshot
+/// profile dir. Callers only invoke this while the default home holds the
+/// SAME account the profile is pinned to, so refreshed tokens keep
+/// propagating into the snapshot without ever mixing identities.
+fn agent_accounts_snapshot_refresh(kind: &str, dir: &Path) {
+    let Some(default_home) = agent_accounts_default_home(kind) else {
+        return;
+    };
+    match kind {
+        "claude" => {
+            let creds_copied = agent_accounts_copy_if_newer(
+                &default_home.join(".credentials.json"),
+                &dir.join(".credentials.json"),
+            );
+            // `.claude.json` (identity + CLI state) lives at `~/.claude.json`
+            // beside the default home and churns constantly with project
+            // state; only mirror it when missing or when credentials moved.
+            if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+                let state_destination = dir.join(".claude.json");
+                if creds_copied || !state_destination.is_file() {
+                    let _ = fs::copy(home.join(".claude.json"), &state_destination);
+                }
+            }
+            let settings_destination = dir.join("settings.json");
+            if !settings_destination.exists() {
+                let _ = fs::copy(default_home.join("settings.json"), &settings_destination);
+            }
+        }
+        _ => {
+            agent_accounts_copy_if_newer(&default_home.join("auth.json"), &dir.join("auth.json"));
+            let config_destination = dir.join("config.toml");
+            if !config_destination.exists() {
+                let _ = fs::copy(default_home.join("config.toml"), &config_destination);
+            }
+        }
+    }
+}
+
+fn agent_accounts_suppressed_emails(registry: &Value, kind: &str) -> Vec<String> {
+    registry
+        .get("agents")
+        .and_then(|agents| agents.get(kind))
+        .and_then(|entry| entry.get("capturedSuppressed"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(agent_accounts_email_key)
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn agent_accounts_ensure_kind_entry(registry: &mut Value, kind: &str) {
+    if !registry.get("agents").is_some_and(Value::is_object) {
+        registry["agents"] = json!({});
+    }
+    if !registry["agents"].get(kind).is_some_and(Value::is_object) {
+        registry["agents"][kind] = json!({
+            "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            "profiles": [],
+        });
+    }
+}
+
+/// One capture pass for one agent kind. Returns true when the registry
+/// changed (a new account was pinned or a stale suppression was cleared).
+fn agent_accounts_capture_kind(kind: &'static str) -> bool {
+    let identity = agent_accounts_profile_identity(kind, None);
+    let email = identity
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    let auth_ready = identity
+        .get("authReady")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if email.is_empty() || !auth_ready {
+        return false;
+    }
+    let mut registry = agent_accounts_registry_read();
+    let suppressed = agent_accounts_suppressed_emails(&registry, kind);
+    if suppressed.iter().any(|entry| entry == &email) {
+        return false;
+    }
+    let mut registry_changed = false;
+    if !suppressed.is_empty() {
+        // Suppressions only block recapture of the identity that was deleted
+        // while still signed in; once the default home moved on, clear them
+        // so a deliberate later login re-pins the account.
+        agent_accounts_ensure_kind_entry(&mut registry, kind);
+        registry["agents"][kind]["capturedSuppressed"] = json!([]);
+        registry_changed = true;
+    }
+    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let existing = profiles
+        .iter()
+        .find(|profile| agent_accounts_profile_email(kind, profile) == email)
+        .cloned();
+    if let Some(existing) = existing {
+        // Same account still signed in: keep its snapshot's tokens fresh so
+        // switching back later doesn't land on an expired refresh token.
+        if existing.get("source").and_then(Value::as_str) == Some("captured") {
+            if let Some(dir) = existing
+                .get("dir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                agent_accounts_snapshot_refresh(kind, Path::new(dir));
+            }
+        }
+        if registry_changed {
+            agent_accounts_registry_write(&registry);
+        }
+        return registry_changed;
+    }
+    // New identity in the default home: pin it. The id is deterministic per
+    // (kind, email) so a deleted-then-relogged account lands back in its dir.
+    let profile_id = format!(
+        "cap-{}-{}",
+        agent_accounts_email_slug(&email),
+        cloud_mcp_short_hash(&format!("{kind}:{email}"))
+    );
+    let Some(dir) = cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_PROFILE_DIR)
+        .map(|root| root.join(kind).join(&profile_id))
+    else {
+        return registry_changed;
+    };
+    if fs::create_dir_all(&dir).is_err() {
+        return registry_changed;
+    }
+    agent_accounts_snapshot_refresh(kind, &dir);
+    agent_accounts_ensure_kind_entry(&mut registry, kind);
+    let label = email.split('@').next().unwrap_or("account").to_string();
+    let profile = json!({
+        "id": profile_id,
+        "label": label,
+        "email": email,
+        "source": "captured",
+        "dir": dir.to_string_lossy().to_string(),
+        "createdAtMs": todo_dispatch_now_ms(),
+    });
+    if let Some(profiles) = registry["agents"][kind]["profiles"].as_array_mut() {
+        profiles.push(profile);
+    }
+    agent_accounts_registry_write(&registry);
+    true
+}
+
+pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("agent-accounts-capture".to_string())
+        .spawn(move || loop {
+            for kind in ["claude", "codex"] {
+                if agent_accounts_capture_kind(kind) {
+                    let _ = app.emit(
+                        AGENT_ACCOUNTS_CHANGED_EVENT,
+                        json!({ "kind": kind, "captured": true }),
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        });
+}
+
 #[tauri::command]
 async fn agent_accounts_state() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -369,87 +640,58 @@ async fn agent_accounts_state() -> Result<Value, String> {
     .map_err(|error| format!("Agent accounts state worker failed: {error}"))?
 }
 
+/// Alias + display preferences for one captured account pill. Only connected
+/// profiles (a signed-in identity is present) can be customized — the alias
+/// names an account, not an empty dir.
 #[tauri::command]
-async fn agent_accounts_add(
+async fn agent_accounts_update_display(
     app: AppHandle,
     agent_kind: String,
-    label: String,
+    profile_id: String,
+    alias: Option<String>,
+    show_alias: Option<bool>,
+    show_email: Option<bool>,
 ) -> Result<Value, String> {
     let kind = agent_accounts_supported_kind(&agent_kind)
         .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
-    let label = label.trim().to_string();
-    if label.is_empty() {
-        return Err("A profile label is required.".to_string());
+    let profile_id = profile_id.trim().to_string();
+    if profile_id.is_empty() || profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        return Err("The default account has no alias settings.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let slug = label
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .chars()
-            .take(40)
-            .collect::<String>();
-        let profile_id = format!(
-            "{}-{}",
-            if slug.is_empty() { "account" } else { &slug },
-            cloud_mcp_short_hash(&format!("{kind}:{label}:{}", todo_dispatch_now_ms()))
-        );
-        let dir = cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_PROFILE_DIR)
-            .map(|root| root.join(kind).join(&profile_id))
-            .ok_or_else(|| "Agent profile storage is unavailable.".to_string())?;
-        fs::create_dir_all(&dir)
-            .map_err(|error| format!("Unable to create agent profile directory: {error}"))?;
-
-        // Seed CLI config from the default account so hooks and preferences
-        // carry over; credentials never copy — the user logs in once.
-        if let Some(default_home) = agent_accounts_default_home(kind) {
-            let seed_file = match kind {
-                "claude" => "settings.json",
-                _ => "config.toml",
-            };
-            let source = default_home.join(seed_file);
-            let destination = dir.join(seed_file);
-            if source.is_file() && !destination.exists() {
-                let _ = fs::copy(&source, &destination);
-            }
-        }
-
         let mut registry = agent_accounts_registry_read();
-        if !registry.get("agents").is_some_and(Value::is_object) {
-            registry["agents"] = json!({});
+        let profile = registry
+            .get_mut("agents")
+            .and_then(|agents| agents.get_mut(kind))
+            .and_then(|entry| entry.get_mut("profiles"))
+            .and_then(Value::as_array_mut)
+            .and_then(|profiles| {
+                profiles.iter_mut().find(|profile| {
+                    profile.get("id").and_then(Value::as_str).unwrap_or_default() == profile_id
+                })
+            })
+            .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
+        if agent_accounts_profile_email(kind, profile).is_empty() {
+            return Err(
+                "Only connected accounts (with a signed-in identity) can be customized."
+                    .to_string(),
+            );
         }
-        if !registry["agents"].get(kind).is_some_and(Value::is_object) {
-            registry["agents"][kind] = json!({
-                "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
-                "profiles": [],
-            });
+        if let Some(alias) = alias {
+            profile["alias"] = json!(alias.trim().chars().take(40).collect::<String>());
         }
-        let dir_text = dir.to_string_lossy().to_string();
-        let profile = json!({
-            "id": profile_id,
-            "label": label,
-            "dir": dir_text,
-            "createdAtMs": todo_dispatch_now_ms(),
-        });
-        registry["agents"][kind]["profiles"]
-            .as_array_mut()
-            .map(|profiles| profiles.push(profile.clone()));
+        if let Some(show_alias) = show_alias {
+            profile["showAlias"] = json!(show_alias);
+        }
+        if let Some(show_email) = show_email {
+            profile["showEmail"] = json!(show_email);
+        }
         agent_accounts_registry_write(&registry);
         let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
-        Ok(json!({
-            "profile": agent_accounts_profile_view(kind, &profile, ""),
-            "loginCommand": agent_accounts_login_command(kind, &dir_text),
-        }))
+        Ok(json!({ "ok": true }))
     })
     .await
-    .map_err(|error| format!("Agent accounts add worker failed: {error}"))?
+    .map_err(|error| format!("Agent accounts update-display worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -506,25 +748,63 @@ async fn agent_accounts_remove(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let mut registry = agent_accounts_registry_read();
-        let (active_id, _) = agent_accounts_kind_entry(&registry, kind);
-        if let Some(profiles) = registry
+        let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+        if active_id == profile_id {
+            return Err(
+                "Switch to another account first — the active account can't be deleted."
+                    .to_string(),
+            );
+        }
+        let removed = profiles
+            .iter()
+            .find(|profile| {
+                profile.get("id").and_then(Value::as_str).unwrap_or_default() == profile_id
+            })
+            .cloned()
+            .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
+        if let Some(entries) = registry
             .get_mut("agents")
             .and_then(|agents| agents.get_mut(kind))
             .and_then(|entry| entry.get_mut("profiles"))
             .and_then(Value::as_array_mut)
         {
-            // The profile dir (and its credentials) is kept on disk so a
-            // re-added account doesn't need a fresh login; only the registry
-            // entry goes away.
-            profiles.retain(|profile| {
+            entries.retain(|profile| {
                 profile.get("id").and_then(Value::as_str).unwrap_or_default() != profile_id
             });
         }
-        if active_id == profile_id {
-            registry["agents"][kind]["activeProfileId"] =
-                json!(AGENT_ACCOUNTS_DEFAULT_PROFILE_ID);
+        // Deleting an account that is still signed into the default home must
+        // not bounce straight back in via the capture watcher: suppress that
+        // identity until the default home moves to a different account.
+        let removed_email = agent_accounts_profile_email(kind, &removed);
+        let current_email = agent_accounts_profile_identity(kind, None)
+            .get("email")
+            .and_then(Value::as_str)
+            .map(agent_accounts_email_key)
+            .unwrap_or_default();
+        if !removed_email.is_empty() && removed_email == current_email {
+            agent_accounts_ensure_kind_entry(&mut registry, kind);
+            let mut suppressed = agent_accounts_suppressed_emails(&registry, kind);
+            if !suppressed.iter().any(|entry| entry == &removed_email) {
+                suppressed.push(removed_email);
+            }
+            registry["agents"][kind]["capturedSuppressed"] = json!(suppressed);
         }
         agent_accounts_registry_write(&registry);
+        // Profiles are credential snapshots, so a delete is a real delete —
+        // but only ever inside the managed agent-profiles root.
+        if let (Some(dir), Some(root)) = (
+            removed
+                .get("dir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_PROFILE_DIR),
+        ) {
+            if dir.starts_with(&root) {
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
         let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
         Ok(json!({ "ok": true }))
     })
@@ -577,6 +857,48 @@ mod agent_accounts_tests {
         let auth = json!({ "tokens": { "id_token": format!("h.{claims}.s") } });
         assert_eq!(agent_accounts_codex_email_from_auth(&auth), "dev@example.com");
         assert_eq!(agent_accounts_codex_email_from_auth(&json!({})), "");
+    }
+
+    #[test]
+    fn email_key_and_slug_normalize() {
+        assert_eq!(agent_accounts_email_key(" Dev@Example.COM "), "dev@example.com");
+        assert_eq!(agent_accounts_email_slug("dev.person+x@example.com"), "dev-person-x");
+        assert_eq!(agent_accounts_email_slug("@nowhere"), "account");
+    }
+
+    #[test]
+    fn profile_email_prefers_stored_capture_identity() {
+        let profile = json!({ "email": " Dev@Example.com ", "dir": "/nonexistent-dir" });
+        assert_eq!(
+            agent_accounts_profile_email("codex", &profile),
+            "dev@example.com"
+        );
+        assert_eq!(agent_accounts_profile_email("codex", &json!({})), "");
+    }
+
+    #[test]
+    fn display_label_prefers_alias_over_label() {
+        assert_eq!(
+            agent_accounts_profile_display_label(&json!({ "alias": "Work", "label": "dev" })),
+            "Work"
+        );
+        assert_eq!(
+            agent_accounts_profile_display_label(&json!({ "alias": "  ", "label": "dev" })),
+            "dev"
+        );
+        assert_eq!(agent_accounts_profile_display_label(&json!({})), "Account");
+    }
+
+    #[test]
+    fn suppressed_emails_read_normalized() {
+        let registry = json!({
+            "agents": { "codex": { "capturedSuppressed": [" A@B.com ", "", 7] } }
+        });
+        assert_eq!(
+            agent_accounts_suppressed_emails(&registry, "codex"),
+            vec!["a@b.com".to_string()]
+        );
+        assert!(agent_accounts_suppressed_emails(&json!({}), "claude").is_empty());
     }
 
     #[test]
