@@ -358,6 +358,8 @@ function normalizeTranscriptionResult(value) {
     return null;
   }
 
+  // Line breaks are intentional structure from the LLM cleanup pass (lists,
+  // paragraph breaks), so whitespace collapses per line, not globally.
   const text = typeof value.text === "string"
     ? value.text
       .split(/\r?\n/)
@@ -372,8 +374,9 @@ function normalizeTranscriptionResult(value) {
           || lowercase.includes("deprecation-warning")
         );
       })
-      .join(" ")
-      .replace(/\s+/g, " ")
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
       .trim()
     : "";
 

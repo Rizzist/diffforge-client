@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  getWorkspaceNotificationSummary,
   reduceThreadLifecycleNotificationEvent,
   reduceTodoCompletedNotificationEvent,
   reduceWorkspaceNotificationEvent,
@@ -177,6 +178,101 @@ test("todo completion that drains the queue cues the drained tone when not watch
     drained.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-2"].status,
     "unread",
   );
+});
+
+test("one completion badges once: todo.completed resolves the terminal.ready twin", () => {
+  const started = reduceThreadLifecycleNotificationEvent({}, {
+    paneId: "pane-1",
+    promptEventId: "turn-1",
+    threadId: "thread-1",
+    type: "provider-turn-started",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const completedTurn = reduceThreadLifecycleNotificationEvent(started, {
+    paneId: "pane-1",
+    promptEventId: "turn-1",
+    terminalIsComplete: true,
+    threadId: "thread-1",
+    type: "provider-turn-completed",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const readyNotifications = Object.values(completedTurn.workspaces["workspace-1"].notifications)
+    .filter((notification) => notification.kind === "terminal.ready");
+  assert.equal(readyNotifications.length, 1);
+  assert.equal(readyNotifications[0].status, "unread");
+
+  const completedTodo = reduceTodoCompletedNotificationEvent(completedTurn, {
+    itemId: "todo-9",
+    paneId: "pane-1",
+    queueDrained: false,
+    terminalIndex: 0,
+    threadId: "thread-1",
+    todoTitle: "Ship it",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const summary = getWorkspaceNotificationSummary(completedTodo, "workspace-1");
+  assert.equal(summary.badgeCount, 1);
+  const resolvedReady = Object.values(completedTodo.workspaces["workspace-1"].notifications)
+    .find((notification) => notification.kind === "terminal.ready");
+  assert.equal(resolvedReady.status, "resolved");
+});
+
+test("one completion badges once: a fresh todo.completed suppresses the terminal.ready twin", () => {
+  const completedTodo = reduceTodoCompletedNotificationEvent({}, {
+    itemId: "todo-10",
+    paneId: "pane-1",
+    queueDrained: false,
+    terminalIndex: 0,
+    threadId: "thread-1",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const started = reduceThreadLifecycleNotificationEvent(completedTodo, {
+    paneId: "pane-1",
+    promptEventId: "turn-2",
+    threadId: "thread-1",
+    type: "provider-turn-started",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const completedTurn = reduceThreadLifecycleNotificationEvent(started, {
+    paneId: "pane-1",
+    promptEventId: "turn-2",
+    terminalIsComplete: true,
+    threadId: "thread-1",
+    type: "provider-turn-completed",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const readyNotifications = Object.values(completedTurn.workspaces["workspace-1"].notifications)
+    .filter((notification) => notification.kind === "terminal.ready");
+  assert.equal(readyNotifications.length, 0);
+  assert.equal(getWorkspaceNotificationSummary(completedTurn, "workspace-1").badgeCount, 1);
+});
+
+test("duplicate completion hooks with a turn id update one notification", () => {
+  const first = reduceTodoCompletedNotificationEvent({}, {
+    itemId: "",
+    paneId: "pane-1",
+    terminalIndex: 0,
+    turnId: "turn-3",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+  const second = reduceTodoCompletedNotificationEvent(first, {
+    itemId: "",
+    paneId: "pane-1",
+    terminalIndex: 0,
+    turnId: "turn-3",
+    workspaceId: "workspace-1",
+  }, { workspaceVisibleAndFocused: false });
+
+  const todoNotifications = Object.values(second.workspaces["workspace-1"].notifications)
+    .filter((notification) => notification.kind === "todo.completed");
+  assert.equal(todoNotifications.length, 1);
+  assert.equal(getWorkspaceNotificationSummary(second, "workspace-1").badgeCount, 1);
 });
 
 test("queue drain while watching the causing workspace stays silent", () => {

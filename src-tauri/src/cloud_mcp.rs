@@ -17447,7 +17447,7 @@ async fn cloud_mcp_list_workspace_assets(
     include_all_workspaces: Option<bool>,
     local_only: Option<bool>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     // Assets are account-global; per-workspace filtering is opt-in.
     let include_all_workspaces = include_all_workspaces.unwrap_or(true);
     let effective_limit = limit
@@ -17504,7 +17504,7 @@ async fn cloud_mcp_list_asset_clouds(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_payload_base(
         &req,
         workspace_id.as_deref().unwrap_or_default(),
@@ -17548,7 +17548,7 @@ async fn cloud_mcp_save_asset_cloud(
     workspace_name: Option<String>,
     cloud: Value,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
         &req,
         workspace_id.as_deref(),
@@ -17570,7 +17570,7 @@ async fn cloud_mcp_validate_asset_cloud(
     workspace_name: Option<String>,
     cloud_id: String,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
         &req,
         workspace_id.as_deref(),
@@ -17598,7 +17598,7 @@ async fn cloud_mcp_set_default_asset_cloud(
     workspace_name: Option<String>,
     cloud_id: String,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
         &req,
         workspace_id.as_deref(),
@@ -17623,7 +17623,7 @@ async fn cloud_mcp_delete_asset_cloud(
     workspace_name: Option<String>,
     cloud_id: String,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
         &req,
         workspace_id.as_deref(),
@@ -17651,7 +17651,7 @@ async fn cloud_mcp_register_workspace_asset(
     upload: Option<bool>,
 ) -> Result<Value, String> {
     diffforge_reject_untracked_asset_path_for_tracking(Path::new(&path), "register a tracked asset")?;
-    let req = cloud_mcp_repo_request(
+    let req = cloud_mcp_asset_scope_request(
         repo_path.clone(),
         Some(workspace_id.clone()),
         workspace_name.clone(),
@@ -17713,7 +17713,7 @@ async fn cloud_mcp_upload_workspace_asset(
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
+    let req = cloud_mcp_asset_scope_request(
         repo_path,
         Some(workspace_id.clone()),
         workspace_name.clone(),
@@ -17932,7 +17932,7 @@ async fn cloud_mcp_download_workspace_asset(
     target_directory: Option<String>,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
+    let req = cloud_mcp_asset_scope_request(
         repo_path.clone(),
         Some(workspace_id.clone()),
         workspace_name.clone(),
@@ -18104,7 +18104,7 @@ async fn cloud_mcp_delete_cloud_workspace_asset(
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
+    let req = cloud_mcp_asset_scope_request(
         repo_path,
         Some(workspace_id.clone()),
         workspace_name.clone(),
@@ -18145,7 +18145,7 @@ async fn cloud_mcp_publish_workspace_asset(
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
+    let req = cloud_mcp_asset_scope_request(
         repo_path,
         Some(workspace_id.clone()),
         workspace_name.clone(),
@@ -18188,7 +18188,7 @@ async fn cloud_mcp_unpublish_workspace_asset(
     workspace_name: Option<String>,
     asset_id: String,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
+    let req = cloud_mcp_asset_scope_request(
         repo_path,
         Some(workspace_id.clone()),
         workspace_name.clone(),
@@ -18234,7 +18234,7 @@ async fn cloud_mcp_delete_local_workspace_asset(
     // sync metadata stays accurate everywhere. Best-effort: a failure here
     // never blocks the local delete.
     if let Some(row) = row {
-        let req = cloud_mcp_repo_request(
+        let req = cloud_mcp_asset_scope_request(
             repo_path,
             Some(workspace_id.clone()),
             workspace_name.clone(),
@@ -18267,7 +18267,7 @@ async fn cloud_mcp_get_workspace_asset_status(
     asset_id: Option<String>,
     transfer_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), None);
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), None);
     let conn = cloud_mcp_open_asset_library_conn()?;
     let assets = if let Some(asset_id) = asset_id.as_deref() {
         vec![cloud_mcp_asset_row_from_file(asset_id)?]
@@ -23436,6 +23436,30 @@ fn cloud_mcp_repo_request(
         workspace_id,
         workspace_name,
     }
+}
+
+/// Fixed scope marker for account-level assets: the cloud keys asset rows by
+/// account_id + asset_id and treats workspace/repo columns as descriptive
+/// metadata, so asset commands never need a real repo behind them.
+const CLOUD_MCP_ACCOUNT_ASSET_REPO_ID: &str = "account-assets";
+
+/// Asset commands are account-level: an empty repo path resolves to the fixed
+/// account scope instead of deriving a repo id from the filesystem, so snips
+/// and other workspace-less assets upload, publish, and delete globally.
+fn cloud_mcp_asset_scope_request(
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> CloudMcpRepoRequest {
+    if repo_path.trim().is_empty() {
+        return CloudMcpRepoRequest {
+            root_display: String::new(),
+            repo_id: CLOUD_MCP_ACCOUNT_ASSET_REPO_ID.to_string(),
+            workspace_id: workspace_id.filter(|value| !value.trim().is_empty()),
+            workspace_name: workspace_name.filter(|value| !value.trim().is_empty()),
+        };
+    }
+    cloud_mcp_repo_request(repo_path, workspace_id, workspace_name)
 }
 
 fn cloud_mcp_task_history_cache_key(req: &CloudMcpRepoRequest) -> String {

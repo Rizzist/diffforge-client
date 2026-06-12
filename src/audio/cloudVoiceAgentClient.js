@@ -270,12 +270,24 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
           return;
         }
         if (kind === "voice_agent_tts_audio") {
+          // Frames the Rust core already played through the macOS
+          // voice-processing unit (echo-cancelled native output) must not be
+          // scheduled a second time here.
+          const nativePlayback = Boolean(
+            event?.audio?.native_playback
+              ?? event?.audio?.nativePlayback
+              ?? event?.native_playback
+              ?? event?.nativePlayback,
+          );
           logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.audio", {
             base64Chars: String(event?.audio?.base64 || "").length,
+            nativePlayback,
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
             utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
           });
-          await playLinear16Chunk(event);
+          if (!nativePlayback) {
+            await playLinear16Chunk(event);
+          }
           return;
         }
         if (kind === "voice_agent_tts_end") {

@@ -225,8 +225,10 @@ import {
   AudioHeroRow,
   AudioStatePill,
   AudioModeGrid,
+  AudioModeList,
   AudioModeButton,
   AudioGeneralToolbar,
+  AudioGeneralColumn,
   AudioProviderPanel,
   AudioRecorderPanel,
   AudioRecorderActions,
@@ -266,13 +268,24 @@ import {
   AudioHistoryStats,
   AudioHistoryStatChip,
   AudioHistoryVirtualList,
-  AudioHistoryListSpacer,
+  AudioHistoryList,
   AudioHistoryRow,
   AudioHistoryRowTopline,
   AudioHistoryRowActions,
+  AudioHistoryRowFootline,
+  AudioHistoryExpandButton,
   AudioHistoryProvider,
   AudioHistoryCopyButton,
   AudioHistoryMeta,
+  AudioInsightCard,
+  AudioInsightCardTopline,
+  AudioInsightLabel,
+  AudioInsightSubValue,
+  AudioInsightValue,
+  AudioWpmGauge,
+  AudioHeatmapGrid,
+  AudioHeatmapColumn,
+  AudioHeatmapCell,
   AudioRuntimeHint,
   AudioProgressPanel,
   AudioProgressTopline,
@@ -292,6 +305,8 @@ import {
   AudioBarStopButton,
   AudioBarStatusText,
   AudioBarUndoButton,
+  AudioBarCopyButton,
+  AudioBarHistoryButton,
   AudioBarNoticeProgress,
   AudioBarIdleShell,
   AudioBarIdleReveal,
@@ -438,6 +453,9 @@ const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
 const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
+// App-wide live dictation mirror: the Activity widget renders the incoming
+// stream (phase + interim text) from these broadcasts while a take is live.
+const AUDIO_DICTATION_STREAM_EVENT = "forge-audio-dictation-stream";
 const AUDIO_RECORDING_MAX_SECONDS = 90;
 const AUDIO_RECORDING_LOCKED_MAX_SECONDS = 900;
 const AUDIO_RECORDING_TIMER_MS = 250;
@@ -461,6 +479,10 @@ const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
+// The cancel notice needs room for its label plus close/copy/undo/history
+// controls, so the pill widens while it is showing. The bubble style reuses
+// the same pill (the window morphs to it in place, then morphs back).
+const AUDIO_WIDGET_BAR_NOTICE_SIZE = { width: 392, height: 52 };
 const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 6;
 // Idle: a thin line hugging the bottom; the window stays this small dock
 // zone so hovering it can reveal the round record button + shortcut hint.
@@ -527,9 +549,8 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
     label: "Bottom bar",
   },
 ];
-const AUDIO_HISTORY_ROW_HEIGHT = 88;
-const AUDIO_HISTORY_VIEWPORT_HEIGHT = 420;
-const AUDIO_HISTORY_OVERSCAN = 5;
+// Transcripts longer than this get the 3-line clamp + "Show more" toggle.
+const AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS = 220;
 
 function isMacPlatform() {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
@@ -1062,40 +1083,80 @@ function getAudioHistoryEntryKey(entry, index = 0) {
   return entry?.id || `${entry?.createdAt || "audio-history"}-${index}`;
 }
 
-function buildAudioHistoryStats(history) {
+function audioHistoryEntryWords(entry) {
+  const entryWordCount = Number(entry?.wordCount || 0);
+  if (Number.isFinite(entryWordCount) && entryWordCount > 0) {
+    return entryWordCount;
+  }
+  return String(entry?.text || "").split(/\s+/).filter(Boolean).length;
+}
+
+// A casual talking pace tops out well under this; it just anchors the gauge.
+const AUDIO_WPM_GAUGE_MAX = 200;
+const AUDIO_HEATMAP_WEEKS = 14;
+
+/// Everything the history header visualizes in one pass: the average-WPM
+/// gauge value, the totals chips, and a GitHub-style words-per-day heatmap
+/// (columns = weeks, rows = weekdays, most recent week last).
+function buildAudioHistoryInsights(history) {
   const entries = Array.isArray(history) ? history : [];
   const total = entries.length;
   const timedEntries = entries.filter((entry) => Number(entry?.audioMs || 0) > 0);
   const audioMs = timedEntries.reduce((sum, entry) => sum + Number(entry.audioMs || 0), 0);
-  const timedWords = timedEntries.reduce((sum, entry) => {
-    const entryWordCount = Number(entry?.wordCount || 0);
-
-    if (Number.isFinite(entryWordCount) && entryWordCount > 0) {
-      return sum + entryWordCount;
-    }
-
-    return sum + String(entry?.text || "").split(/\s+/).filter(Boolean).length;
-  }, 0);
+  const timedWords = timedEntries.reduce((sum, entry) => sum + audioHistoryEntryWords(entry), 0);
   const averageWpm = audioMs > 0 ? Math.round(timedWords / (audioMs / 60000)) : 0;
+  const totalWords = entries.reduce((sum, entry) => sum + audioHistoryEntryWords(entry), 0);
 
-  return [
-    { label: "Dictations", value: formatInteger(total) },
-    { label: "Audio time", value: formatAudioHistoryTotalDuration(audioMs) },
-    { label: "Avg WPM", value: averageWpm > 0 ? `${formatInteger(averageWpm)}` : "--" },
-  ];
-}
+  const wordsByDay = new Map();
+  entries.forEach((entry) => {
+    const created = entry?.createdAt ? new Date(entry.createdAt) : null;
+    if (!created || Number.isNaN(created.getTime())) return;
+    const key = `${created.getFullYear()}-${created.getMonth()}-${created.getDate()}`;
+    wordsByDay.set(key, (wordsByDay.get(key) || 0) + audioHistoryEntryWords(entry));
+  });
 
-function buildVisibleAudioHistoryItems(history, scrollTop) {
-  const entries = Array.isArray(history) ? history : [];
-  const startIndex = Math.max(0, Math.floor((Number(scrollTop) || 0) / AUDIO_HISTORY_ROW_HEIGHT) - AUDIO_HISTORY_OVERSCAN);
-  const visibleCount = Math.ceil(AUDIO_HISTORY_VIEWPORT_HEIGHT / AUDIO_HISTORY_ROW_HEIGHT) + (AUDIO_HISTORY_OVERSCAN * 2);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  // First cell is the Sunday that starts the oldest displayed week.
+  const start = new Date(today);
+  start.setDate(start.getDate() - start.getDay() - (AUDIO_HEATMAP_WEEKS - 1) * 7);
+  let maxDayWords = 0;
+  wordsByDay.forEach((words) => {
+    maxDayWords = Math.max(maxDayWords, words);
+  });
 
-  return entries
-    .slice(startIndex, startIndex + visibleCount)
-    .map((entry, offset) => ({
-      entry,
-      index: startIndex + offset,
-    }));
+  const weeks = [];
+  for (let week = 0; week < AUDIO_HEATMAP_WEEKS; week += 1) {
+    const column = [];
+    for (let weekday = 0; weekday < 7; weekday += 1) {
+      const day = new Date(start);
+      day.setDate(start.getDate() + week * 7 + weekday);
+      if (day > today) {
+        column.push(null);
+        continue;
+      }
+      const key = `${day.getFullYear()}-${day.getMonth()}-${day.getDate()}`;
+      const words = wordsByDay.get(key) || 0;
+      const level = words <= 0 || maxDayWords <= 0
+        ? 0
+        : Math.max(1, Math.min(4, Math.ceil((words / maxDayWords) * 4)));
+      column.push({
+        key,
+        label: `${day.toLocaleDateString([], { month: "short", day: "numeric" })} — ${formatInteger(words)} word${words === 1 ? "" : "s"}`,
+        level,
+        words,
+      });
+    }
+    weeks.push(column);
+  }
+
+  return {
+    audioMs,
+    averageWpm,
+    totalDictations: total,
+    totalWords,
+    weeks,
+  };
 }
 
 export default function AudioWorkspaceView({
@@ -1128,7 +1189,7 @@ export default function AudioWorkspaceView({
   const [orchestratorRealtimeEnabled, setOrchestratorRealtimeEnabled] = useState(readOrchestratorRealtimeEnabled);
   const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
-  const [historyScrollTop, setHistoryScrollTop] = useState(0);
+  const [expandedAudioHistoryIds, setExpandedAudioHistoryIds] = useState(() => new Set());
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
@@ -1245,17 +1306,23 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
-  const audioHistoryStats = useMemo(() => buildAudioHistoryStats(audioHistory), [audioHistory]);
+  const audioHistoryInsights = useMemo(() => buildAudioHistoryInsights(audioHistory), [audioHistory]);
   const voiceRulesPreview = useMemo(() => (
     voiceRulesPreviewInput.trim()
       ? applyVoiceTextPipeline(voiceRulesPreviewInput, voiceRules)
       : null
   ), [voiceRulesPreviewInput, voiceRules]);
-  const visibleAudioHistory = useMemo(
-    () => buildVisibleAudioHistoryItems(audioHistory, historyScrollTop),
-    [audioHistory, historyScrollTop],
-  );
-  const audioHistoryListHeight = audioHistory.length * AUDIO_HISTORY_ROW_HEIGHT;
+  const toggleAudioHistoryExpanded = useCallback((entryKey) => {
+    setExpandedAudioHistoryIds((current) => {
+      const next = new Set(current);
+      if (next.has(entryKey)) {
+        next.delete(entryKey);
+      } else {
+        next.add(entryKey);
+      }
+      return next;
+    });
+  }, []);
 
   const stopAudioInputPreview = useCallback(async () => {
     audioInputRunRef.current += 1;
@@ -1496,10 +1563,6 @@ export default function AudioWorkspaceView({
     setAudioWidgetStyleSetting(nextStyle);
     writeAudioWidgetStyle(nextStyle);
     notifyAudioSettingsChanged("widget-style");
-  }, []);
-
-  const handleAudioHistoryScroll = useCallback((event) => {
-    setHistoryScrollTop(event.currentTarget.scrollTop || 0);
   }, []);
 
   const copyAudioHistoryPrompt = useCallback(async (entry, index) => {
@@ -1905,6 +1968,7 @@ export default function AudioWorkspaceView({
             role="tabpanel"
           >
         <AudioGeneralToolbar>
+          <AudioGeneralColumn>
           <AudioProviderPanel aria-label="Transcription provider">
             <AudioDeviceHeader>
               <div>
@@ -1921,7 +1985,7 @@ export default function AudioWorkspaceView({
                 {audioModeStatusLabel}
               </AudioStatePill>
             </AudioDeviceHeader>
-            <AudioModeGrid role="group" aria-label="Transcription mode">
+            <AudioModeList role="group" aria-label="Transcription mode">
               <AudioModeButton
                 aria-pressed={!isCloudMode && !isForgeMode && !isForgeAgentMode}
                 onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
@@ -1955,7 +2019,7 @@ export default function AudioWorkspaceView({
                   <span>Nova-3 + LLM cleanup</span>
                 </span>
               </AudioModeButton>
-            </AudioModeGrid>
+            </AudioModeList>
             {(isForgeMode || isForgeAgentMode) && (
               <>
                 <AudioRecorderOptionRow>
@@ -1995,6 +2059,77 @@ export default function AudioWorkspaceView({
               </>
             )}
           </AudioProviderPanel>
+
+          <AudioRecorderPanel aria-label="Orchestrator voice controls">
+            <AudioDeviceHeader>
+              <div>
+                <SettingsLabel>Orchestrator</SettingsLabel>
+                <SettingsHint>
+                  {`${orchestratorRealtimeEnabled ? "GPT-Realtime" : "Pipeline"} engine · ${isManualOrchestratorMode ? "manual submit" : "auto submit"}`}
+                </SettingsHint>
+              </div>
+              <AudioStatePill data-installed="true">
+                {isManualOrchestratorMode ? "Manual" : "Auto"}
+              </AudioStatePill>
+            </AudioDeviceHeader>
+            <AudioCloudField as="div">
+              Submission
+              <AudioModeGrid role="group" aria-label="Orchestrator voice submission mode">
+                <AudioModeButton
+                  aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO}
+                  onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO)}
+                  type="button"
+                >
+                  <ButtonCheckIcon aria-hidden="true" />
+                  <span>
+                    <strong>Auto</strong>
+                    <span>Submit on pause</span>
+                  </span>
+                </AudioModeButton>
+                <AudioModeButton
+                  aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL}
+                  onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL)}
+                  type="button"
+                >
+                  <ButtonKeyIcon aria-hidden="true" />
+                  <span>
+                    <strong>Manual</strong>
+                    <span>Press to submit</span>
+                  </span>
+                </AudioModeButton>
+              </AudioModeGrid>
+            </AudioCloudField>
+            <AudioCloudField as="div">
+              Engine
+              <AudioModeGrid role="group" aria-label="Orchestrator voice engine">
+                <AudioModeButton
+                  aria-pressed={orchestratorRealtimeEnabled}
+                  onClick={() => updateOrchestratorRealtimeEnabled(true)}
+                  title="One native speech-to-speech GPT-Realtime session: faster, more natural, with the same orchestrator tools."
+                  type="button"
+                >
+                  <ButtonBotIcon aria-hidden="true" />
+                  <span>
+                    <strong>GPT-Realtime 2.0</strong>
+                    <span>Native speech-to-speech</span>
+                  </span>
+                </AudioModeButton>
+                <AudioModeButton
+                  aria-pressed={!orchestratorRealtimeEnabled}
+                  onClick={() => updateOrchestratorRealtimeEnabled(false)}
+                  title="Classic pipeline: Deepgram transcription, LLM orchestration, Aura speech."
+                  type="button"
+                >
+                  <ButtonHubIcon aria-hidden="true" />
+                  <span>
+                    <strong>Pipeline</strong>
+                    <span>STT → LLM → TTS</span>
+                  </span>
+                </AudioModeButton>
+              </AudioModeGrid>
+            </AudioCloudField>
+          </AudioRecorderPanel>
+          </AudioGeneralColumn>
 
           <AudioRecorderPanel aria-label="Recorder controls">
             <AudioDeviceHeader>
@@ -2067,77 +2202,16 @@ export default function AudioWorkspaceView({
                   </AudioModeButton>
                 ))}
               </AudioModeGrid>
-              <SettingsHint>
-                {audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_BAR
-                  ? "A thin line sits at the bottom of the screen. Hover it for the record button (the orange hint is the shortcut); while recording it becomes a slim bar with an X to cancel."
-                  : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
-                    ? "The bubble stays invisible until you start speaking."
-                    : "The bubble stays visible and draggable at all times."}
-              </SettingsHint>
             </AudioCloudField>
+            <SettingsHint>
+              {audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_BAR
+                ? "A thin line sits at the bottom of the screen. Hover it for the record button (the orange hint is the shortcut); while recording it becomes a slim bar with an X to cancel."
+                : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
+                  ? "The bubble stays invisible until you start speaking."
+                  : "The bubble stays visible and draggable at all times."}
+            </SettingsHint>
           </AudioRecorderPanel>
 
-          <AudioRecorderPanel aria-label="Orchestrator voice controls">
-            <AudioDeviceHeader>
-              <div>
-                <SettingsLabel>Orchestrator</SettingsLabel>
-                <SettingsHint>{isManualOrchestratorMode ? "Manual submit" : "Auto submit"}</SettingsHint>
-              </div>
-              <AudioStatePill data-installed="true">
-                {isManualOrchestratorMode ? "Manual" : "Auto"}
-              </AudioStatePill>
-            </AudioDeviceHeader>
-            <AudioModeGrid role="group" aria-label="Orchestrator voice submission mode">
-              <AudioModeButton
-                aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO}
-                onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO)}
-                type="button"
-              >
-                <ButtonMicIcon aria-hidden="true" />
-                <span>
-                  <strong>Auto</strong>
-                  <span>Submit on pause</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL}
-                onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL)}
-                type="button"
-              >
-                <ButtonKeyIcon aria-hidden="true" />
-                <span>
-                  <strong>Manual</strong>
-                  <span>Press to submit</span>
-                </span>
-              </AudioModeButton>
-            </AudioModeGrid>
-            <AudioModeGrid role="group" aria-label="Orchestrator voice engine">
-              <AudioModeButton
-                aria-pressed={orchestratorRealtimeEnabled}
-                onClick={() => updateOrchestratorRealtimeEnabled(true)}
-                title="One native speech-to-speech GPT-Realtime session: faster, more natural, with the same orchestrator tools."
-                type="button"
-              >
-                <ButtonMicIcon aria-hidden="true" />
-                <span>
-                  <strong>GPT-Realtime 2.0</strong>
-                  <span>Native speech-to-speech</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={!orchestratorRealtimeEnabled}
-                onClick={() => updateOrchestratorRealtimeEnabled(false)}
-                title="Classic pipeline: Deepgram transcription, LLM orchestration, Aura speech."
-                type="button"
-              >
-                <ButtonKeyIcon aria-hidden="true" />
-                <span>
-                  <strong>Pipeline</strong>
-                  <span>STT → LLM → TTS</span>
-                </span>
-              </AudioModeButton>
-            </AudioModeGrid>
-          </AudioRecorderPanel>
         </AudioGeneralToolbar>
 
         {(isCloudMode || isForgeMode) && (
@@ -2648,33 +2722,87 @@ export default function AudioWorkspaceView({
             role="tabpanel"
           >
             <AudioHistoryStats aria-label="Speech to text statistics">
-              {audioHistoryStats.map((stat) => (
-                <AudioHistoryStatChip key={stat.label}>
-                  <span>{stat.label}</span>
-                  <strong>{stat.value}</strong>
+              <AudioInsightCard aria-label="Average words per minute">
+                <AudioInsightValue>
+                  {audioHistoryInsights.averageWpm > 0
+                    ? formatInteger(audioHistoryInsights.averageWpm)
+                    : "0"}
+                </AudioInsightValue>
+                <AudioInsightLabel>Words per minute</AudioInsightLabel>
+                <AudioWpmGauge aria-hidden="true" viewBox="0 0 100 56">
+                  <path
+                    className="track"
+                    d="M 8 50 A 42 42 0 0 1 92 50"
+                  />
+                  <path
+                    className="fill"
+                    d="M 8 50 A 42 42 0 0 1 92 50"
+                    style={{
+                      strokeDasharray: 131.95,
+                      strokeDashoffset: 131.95 * (1 - Math.min(
+                        Math.max(audioHistoryInsights.averageWpm, 0) / AUDIO_WPM_GAUGE_MAX,
+                        1,
+                      )),
+                    }}
+                  />
+                </AudioWpmGauge>
+              </AudioInsightCard>
+              <AudioInsightCard aria-label="Words spoken per day">
+                <AudioInsightCardTopline>
+                  <AudioInsightLabel>Daily speaking</AudioInsightLabel>
+                  <AudioInsightSubValue>
+                    {formatInteger(audioHistoryInsights.totalWords)} words
+                  </AudioInsightSubValue>
+                </AudioInsightCardTopline>
+                <AudioHeatmapGrid role="img" aria-label="Words spoken per day, recent weeks">
+                  {audioHistoryInsights.weeks.map((week, weekIndex) => (
+                    <AudioHeatmapColumn key={`week-${weekIndex}`}>
+                      {week.map((cell, dayIndex) => (
+                        cell ? (
+                          <AudioHeatmapCell
+                            data-level={cell.level}
+                            key={cell.key}
+                            title={cell.label}
+                          />
+                        ) : (
+                          <AudioHeatmapCell data-empty="true" key={`pad-${weekIndex}-${dayIndex}`} />
+                        )
+                      ))}
+                    </AudioHeatmapColumn>
+                  ))}
+                </AudioHeatmapGrid>
+              </AudioInsightCard>
+              <AudioInsightCard data-kind="totals">
+                <AudioHistoryStatChip>
+                  <span>Dictations</span>
+                  <strong>{formatInteger(audioHistoryInsights.totalDictations)}</strong>
                 </AudioHistoryStatChip>
-              ))}
+                <AudioHistoryStatChip>
+                  <span>Audio time</span>
+                  <strong>{formatAudioHistoryTotalDuration(audioHistoryInsights.audioMs)}</strong>
+                </AudioHistoryStatChip>
+              </AudioInsightCard>
             </AudioHistoryStats>
 
             {audioHistory.length ? (
               <AudioHistoryVirtualList
                 aria-label="Speech to text history"
-                onScroll={handleAudioHistoryScroll}
                 role="list"
               >
-                <AudioHistoryListSpacer style={{ height: audioHistoryListHeight }}>
-                  {visibleAudioHistory.map(({ entry, index }) => {
+                <AudioHistoryList>
+                  {audioHistory.map((entry, index) => {
                     const entryKey = getAudioHistoryEntryKey(entry, index);
                     const copied = copiedAudioHistoryId === entryKey;
+                    const entryText = String(entry.text || "");
+                    const clampable = entryText.length > AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS
+                      || entryText.split("\n").length > 3;
+                    const expanded = expandedAudioHistoryIds.has(entryKey);
 
                     return (
                       <AudioHistoryRow
+                        data-expanded={expanded ? "true" : "false"}
                         key={entryKey}
                         role="listitem"
-                        style={{
-                          height: AUDIO_HISTORY_ROW_HEIGHT - 8,
-                          transform: `translateY(${index * AUDIO_HISTORY_ROW_HEIGHT}px)`,
-                        }}
                       >
                         <AudioHistoryRowTopline>
                           <span>{formatHistoryTimestamp(entry.createdAt)}</span>
@@ -2701,12 +2829,23 @@ export default function AudioWorkspaceView({
                             </AudioHistoryCopyButton>
                           </AudioHistoryRowActions>
                         </AudioHistoryRowTopline>
-                        <strong title={entry.text}>{entry.text}</strong>
-                        <AudioHistoryMeta>{formatAudioHistoryMeta(entry)}</AudioHistoryMeta>
+                        <strong>{entryText}</strong>
+                        <AudioHistoryRowFootline>
+                          <AudioHistoryMeta>{formatAudioHistoryMeta(entry)}</AudioHistoryMeta>
+                          {clampable && (
+                            <AudioHistoryExpandButton
+                              aria-expanded={expanded}
+                              onClick={() => toggleAudioHistoryExpanded(entryKey)}
+                              type="button"
+                            >
+                              {expanded ? "Show less" : "Show more"}
+                            </AudioHistoryExpandButton>
+                          )}
+                        </AudioHistoryRowFootline>
                       </AudioHistoryRow>
                     );
                   })}
-                </AudioHistoryListSpacer>
+                </AudioHistoryList>
               </AudioHistoryVirtualList>
             ) : (
               <SettingsHint>No speech to text history yet.</SettingsHint>
@@ -3267,8 +3406,16 @@ export function AudioWidgetWindow() {
     || widgetState === "transcribing"
     || widgetState === "error";
   const usesBottomAnchoredStyle = widgetStyle === AUDIO_WIDGET_STYLE_BAR;
+  const cancelNoticeActive = Boolean(cancelNotice);
   const barVisible = usesBottomAnchoredStyle
-    && (widgetActive || Boolean(cancelNotice));
+    && (widgetActive || cancelNoticeActive);
+  // Bubble style shows the same cancel notice pill as the bar: the window
+  // morphs to the pill in place while it shows, then morphs back.
+  const bubbleCancelNoticeActive = cancelNoticeActive
+    && !usesBottomAnchoredStyle
+    && widgetStyle !== AUDIO_WIDGET_STYLE_HIDDEN;
+  const bubbleCancelNoticeActiveRef = useRef(bubbleCancelNoticeActive);
+  bubbleCancelNoticeActiveRef.current = bubbleCancelNoticeActive;
 
   // The hidden style keeps the window "visible" to the OS (global shortcuts
   // require it) but inert and invisible while idle. The bar style is always
@@ -3297,7 +3444,11 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    const target = barVisible ? AUDIO_WIDGET_BAR_SIZE : AUDIO_WIDGET_BAR_IDLE_SIZE;
+    const target = cancelNoticeActive
+      ? AUDIO_WIDGET_BAR_NOTICE_SIZE
+      : barVisible
+        ? AUDIO_WIDGET_BAR_SIZE
+        : AUDIO_WIDGET_BAR_IDLE_SIZE;
     const margin = barVisible
       ? AUDIO_WIDGET_BAR_BOTTOM_MARGIN
       : AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN;
@@ -3323,7 +3474,7 @@ export function AudioWidgetWindow() {
         await windowHandle.setPosition(new PhysicalPosition(x, y));
       }
     });
-  }, [barVisible, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
+  }, [barVisible, cancelNoticeActive, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
 
   // Bubble-style errors get a small card above the widget: the window grows
   // upward by the card height while the error shows, and the pill stays at
@@ -3377,9 +3528,13 @@ export function AudioWidgetWindow() {
             return;
           }
 
-          runWidgetWindowAction((windowHandle) => (
-            windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
-          ));
+          // The cancel notice owns the window size while it shows; its
+          // dismissal effect restores the compact bubble itself.
+          if (!bubbleCancelNoticeActiveRef.current) {
+            runWidgetWindowAction((windowHandle) => (
+              windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
+            ));
+          }
 
           resizeFrame = window.requestAnimationFrame(() => {
             if (isFocusedAudioWidgetState(widgetStateRef.current)) {
@@ -3398,9 +3553,11 @@ export function AudioWidgetWindow() {
       }, AUDIO_WIDGET_CLOSE_ANIMATION_MS);
     } else if (widgetFrameModeRef.current !== "closing" && widgetFrameModeRef.current !== "compact-handoff") {
       setWidgetFrameMode("compact");
-      runWidgetWindowAction((windowHandle) => (
-        windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
-      ));
+      if (!bubbleCancelNoticeActiveRef.current) {
+        runWidgetWindowAction((windowHandle) => (
+          windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height))
+        ));
+      }
     }
 
     return () => {
@@ -3454,6 +3611,46 @@ export function AudioWidgetWindow() {
       });
     };
   }, [errorFrameActive, runWidgetWindowAction]);
+
+  // Bubble-style cancel notice: morph the window into the notice pill at the
+  // bubble's spot (nudged left if it would run off-screen), then restore the
+  // compact bubble exactly where it was once the notice dismisses.
+  useEffect(() => {
+    if (!bubbleCancelNoticeActive) {
+      return undefined;
+    }
+    let savedPosition = null;
+    runWidgetWindowAction(async (windowHandle) => {
+      const scale = (await windowHandle.scaleFactor().catch(() => 1)) || 1;
+      savedPosition = await windowHandle.outerPosition();
+      await windowHandle.setSize(new LogicalSize(
+        AUDIO_WIDGET_BAR_NOTICE_SIZE.width,
+        AUDIO_WIDGET_BAR_NOTICE_SIZE.height,
+      ));
+      const monitor = await currentMonitor().catch(() => null);
+      if (monitor) {
+        const area = monitor.workArea?.size?.width
+          ? monitor.workArea
+          : { position: monitor.position, size: monitor.size };
+        const maxX = area.position.x
+          + area.size.width
+          - Math.round(AUDIO_WIDGET_BAR_NOTICE_SIZE.width * scale);
+        const x = Math.max(area.position.x, Math.min(savedPosition.x, maxX));
+        await windowHandle.setPosition(new PhysicalPosition(x, savedPosition.y));
+      }
+    });
+    return () => {
+      runWidgetWindowAction(async (windowHandle) => {
+        await windowHandle.setSize(new LogicalSize(
+          AUDIO_WIDGET_COMPACT_SIZE.width,
+          AUDIO_WIDGET_COMPACT_SIZE.height,
+        ));
+        if (savedPosition) {
+          await windowHandle.setPosition(savedPosition);
+        }
+      });
+    };
+  }, [bubbleCancelNoticeActive, runWidgetWindowAction]);
 
   const dragWidget = useCallback((event) => {
     if (event.button !== 0) {
@@ -3685,6 +3882,73 @@ export function AudioWidgetWindow() {
   const dismissCancelNotice = useCallback(() => {
     setCancelNotice(null);
     setCancelNoticePaused(false);
+  }, []);
+
+  // Live-stream mirror for the Activity widget: while a take is in flight,
+  // broadcast the phase and the interim transcript so other windows can show
+  // the audio coming in; one inactive frame closes the stream when it ends.
+  const dictationStreamActiveRef = useRef(false);
+  useEffect(() => {
+    const phase = widgetState === "transcribing" || finishPending
+      ? "transcribing"
+      : widgetState === "recording" || widgetState === "arming"
+        ? "listening"
+        : "";
+    if (!phase) {
+      if (dictationStreamActiveRef.current) {
+        dictationStreamActiveRef.current = false;
+        emit(AUDIO_DICTATION_STREAM_EVENT, { active: false }).catch(() => {});
+      }
+      return;
+    }
+    dictationStreamActiveRef.current = true;
+    emit(AUDIO_DICTATION_STREAM_EVENT, {
+      active: true,
+      atMs: Date.now(),
+      phase,
+      text: realtimeTranscript,
+    }).catch(() => {});
+  }, [finishPending, realtimeTranscript, widgetState]);
+
+  useEffect(() => () => {
+    if (dictationStreamActiveRef.current) {
+      emit(AUDIO_DICTATION_STREAM_EVENT, { active: false }).catch(() => {});
+    }
+  }, []);
+
+  const openDictationHistory = useCallback(async () => {
+    dismissCancelNotice();
+    try {
+      // A freshly created monitor popover reads its tab from storage at
+      // mount; the Rust command's event covers an already-open popover.
+      // Both paths land on the Activity tab.
+      window.localStorage.setItem("diffforge.backgroundMonitor.lastTab.v1", "activity");
+    } catch {
+      // Tab preference is convenience state only.
+    }
+    await invoke("background_monitor_open_activity").catch(() => {});
+  }, [dismissCancelNotice]);
+
+  const copyCancelledTranscript = useCallback(async () => {
+    // The salvage transcription may still be running when the notice shows;
+    // fall back to the newest cancelled history entry once it lands.
+    let transcript = String(lastCancelledRef.current?.entry?.text || "").trim();
+    if (!transcript) {
+      transcript = String(
+        readAudioTranscriptionHistory()
+          .find((entry) => entry?.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED)?.text || "",
+      ).trim();
+    }
+    if (!transcript) {
+      setMessage("Transcript still processing");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(transcript);
+      setMessage("Transcript copied");
+    } catch {
+      setMessage("Unable to copy the transcript");
+    }
   }, []);
 
   const showCancelNotice = useCallback(() => {
@@ -3962,18 +4226,26 @@ export function AudioWidgetWindow() {
     const salvageable = currentState === "transcribing"
       || (currentState === "recording" && Boolean(audioBuffer));
 
-    if (salvage && salvageable && widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+    // Bar and bubble styles share the same cancel notice (copy / undo /
+    // history / drain-to-zero); only the invisible-while-idle hidden style
+    // skips it, since it has no surface to host the card.
+    if (salvage && salvageable && widgetStyleRef.current !== AUDIO_WIDGET_STYLE_HIDDEN) {
       showCancelNotice();
     }
 
+    // Cancel must feel instant: the widget resets to its start state right
+    // away (ready for the next take) and every provider stop / capture
+    // teardown / history salvage runs detached in the background.
     if (currentState === "transcribing") {
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
         forgeVoiceEventsActiveRef.current = false;
-        await stopCloudVoiceAgentStream().catch(() => {});
-        await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
-        forgeVoiceTtsPlayerRef.current = null;
         resetWidgetToStartState();
         setMessage("Cancelled");
+        void (async () => {
+          await stopCloudVoiceAgentStream().catch(() => {});
+          await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+          forgeVoiceTtsPlayerRef.current = null;
+        })();
         return;
       }
 
@@ -3982,7 +4254,7 @@ export function AudioWidgetWindow() {
         // stopRecording run publishes it as cancelled instead of inserting.
         cancelSalvageRunRef.current = recordingRunId;
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
-        await invoke("cancel_whisper_transcription").catch(() => {});
+        void invoke("cancel_whisper_transcription").catch(() => {});
       }
 
       resetWidgetToStartState();
@@ -3993,70 +4265,88 @@ export function AudioWidgetWindow() {
     if (currentState === "recording" && salvage && audioBuffer) {
       const captureStats = audioBuffer.getCaptureStats?.() || null;
       const submittedAt = Date.now();
-
-      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
-        const realtimeResult = await invoke("stop_deepgram_realtime_transcription").catch(() => null);
-        const captureResult = await audioBuffer.finishCapture().catch(() => null);
-        publishCancelledTranscript(
-          {
-            ...(realtimeResult || {}),
-            audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
-            latencyMs: Math.max(0, Date.now() - submittedAt),
-          },
-          AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
-        );
-      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
-        // Cancelled cloud dictation still returns the transcript so far.
-        const dictationResult = await invoke("stop_forge_dictation_transcription", {
-          request: { cancel: true },
-        }).catch(() => null);
-        const captureResult = await audioBuffer.finishCapture().catch(() => null);
-        publishCancelledTranscript(
-          {
-            ...(dictationResult || {}),
-            audioMs: Number(
-              captureResult?.audioMs
-              || Number(dictationResult?.audioSeconds || 0) * 1000
-              || 0,
-            ),
-            latencyMs: Math.max(0, Date.now() - submittedAt),
-          },
-          AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
-        );
-      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
         forgeVoiceEventsActiveRef.current = false;
-        await stopCloudVoiceAgentStream().catch(() => {});
-        await audioBuffer.finishCapture().catch(() => null);
-        await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
-        forgeVoiceTtsPlayerRef.current = null;
-      } else {
-        const captureResult = await audioBuffer.finishCapture().catch(() => null);
-        salvageLocalCancelledCapture(captureResult, captureStats);
       }
-
-      await closeWarmBuffer();
+      // Detach the buffer from the widget synchronously so an immediate new
+      // take warms a fresh one; the detached task below finishes and closes
+      // this captured buffer itself.
+      if (audioBufferRef.current === audioBuffer) {
+        audioBufferGenerationRef.current += 1;
+        audioBufferStartRef.current = null;
+        audioBufferReadyAtRef.current = 0;
+        audioBufferRef.current = null;
+      }
       resetWidgetToStartState();
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
         ? "Cancelled"
-        : "Cancelled, saved to history");
+        : "Cancelled, saving to history");
+
+      void (async () => {
+        if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+          const realtimeResult = await invoke("stop_deepgram_realtime_transcription").catch(() => null);
+          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          publishCancelledTranscript(
+            {
+              ...(realtimeResult || {}),
+              audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+              latencyMs: Math.max(0, Date.now() - submittedAt),
+            },
+            AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
+          );
+        } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
+          // Cancelled cloud dictation still returns the transcript so far.
+          const dictationResult = await invoke("stop_forge_dictation_transcription", {
+            request: { cancel: true },
+          }).catch(() => null);
+          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          publishCancelledTranscript(
+            {
+              ...(dictationResult || {}),
+              audioMs: Number(
+                captureResult?.audioMs
+                || Number(dictationResult?.audioSeconds || 0) * 1000
+                || 0,
+              ),
+              latencyMs: Math.max(0, Date.now() - submittedAt),
+            },
+            AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
+          );
+        } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+          await stopCloudVoiceAgentStream().catch(() => {});
+          await audioBuffer.finishCapture().catch(() => null);
+          await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+          forgeVoiceTtsPlayerRef.current = null;
+        } else {
+          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          salvageLocalCancelledCapture(captureResult, captureStats);
+        }
+
+        await audioBuffer?.close?.().catch(() => {});
+      })();
       return;
     }
 
-    if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
-      await invoke("stop_deepgram_realtime_transcription").catch(() => {});
-    } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
-      await invoke("stop_forge_dictation_transcription", { request: { cancel: true } }).catch(() => {});
-    } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+    if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
       forgeVoiceEventsActiveRef.current = false;
-      await stopCloudVoiceAgentStream().catch(() => {});
-      await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
-      forgeVoiceTtsPlayerRef.current = null;
-    } else {
-      await invoke("cancel_whisper_transcription").catch(() => {});
     }
-
-    await closeWarmBuffer();
+    // closeWarmBuffer detaches the buffer ref synchronously, so an immediate
+    // new take never races the close running in the background.
+    void closeWarmBuffer().catch(() => {});
     resetWidgetToStartState();
+    void (async () => {
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+        await invoke("stop_deepgram_realtime_transcription").catch(() => {});
+      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
+        await invoke("stop_forge_dictation_transcription", { request: { cancel: true } }).catch(() => {});
+      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        await stopCloudVoiceAgentStream().catch(() => {});
+        await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+        forgeVoiceTtsPlayerRef.current = null;
+      } else {
+        await invoke("cancel_whisper_transcription").catch(() => {});
+      }
+    })();
   }, [closeWarmBuffer, publishCancelledTranscript, resetWidgetToStartState, salvageLocalCancelledCapture, showCancelNotice]);
 
   // "Finish and paste" from the bottom bar: stop the active take (locked or
@@ -4640,6 +4930,21 @@ export function AudioWidgetWindow() {
     };
   }, [cancelRecording]);
 
+  // Bare-key cancel shortcuts (plain Escape by default) are only registered
+  // globally while a take is active: tell Rust when the widget enters and
+  // leaves an active phase so ESC cancels even when another app or a
+  // terminal pane has keyboard focus.
+  const cancelScopeActive = ["arming", "processing", "recording", "transcribing"].includes(widgetState);
+  useEffect(() => {
+    invoke("audio_cancel_shortcut_scope", { active: cancelScopeActive }).catch(() => {});
+    if (!cancelScopeActive) {
+      return undefined;
+    }
+    return () => {
+      invoke("audio_cancel_shortcut_scope", { active: false }).catch(() => {});
+    };
+  }, [cancelScopeActive]);
+
   const isCloudWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const isForgeWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
   const isForgeVoiceWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
@@ -4679,6 +4984,64 @@ export function AudioWidgetWindow() {
   const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
   const showWidgetCancelButton = (isRecordingFocus || isProcessingFocus) && !isClosingFocus;
 
+  // One cancel-notice surface for both widget styles: X to dismiss now, copy,
+  // undo (paste into target), open history, and the drain-to-zero auto-close.
+  const cancelNoticeSurface = cancelNotice ? (
+    <AudioBarSurface
+      data-paused={cancelNoticePaused ? "true" : undefined}
+      onMouseEnter={() => setCancelNoticePaused(true)}
+      onMouseLeave={() => setCancelNoticePaused(false)}
+      role="status"
+    >
+      <AudioBarCancelButton
+        aria-label="Dismiss"
+        onClick={dismissCancelNotice}
+        title="Dismiss now"
+        type="button"
+      >
+        ×
+      </AudioBarCancelButton>
+      <AudioBarStatusText style={{ flex: 1 }}>Transcript cancelled</AudioBarStatusText>
+      <AudioBarCopyButton
+        aria-label="Copy transcript"
+        onClick={copyCancelledTranscript}
+        title="Copy the cancelled transcript"
+        type="button"
+      >
+        <svg
+          fill="none"
+          stroke="currentColor"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth="1.3"
+          viewBox="0 0 16 16"
+        >
+          <rect height="8.2" rx="1.5" width="8.2" x="5.6" y="5.6" />
+          <path d="M10.6 3H4.4A1.7 1.7 0 0 0 2.7 4.7V11" />
+        </svg>
+      </AudioBarCopyButton>
+      <AudioBarUndoButton
+        onClick={undoCancelledTranscript}
+        title="Undo the cancel: paste the transcript into the focused app"
+        type="button"
+      >
+        Undo
+      </AudioBarUndoButton>
+      <AudioBarHistoryButton
+        onClick={openDictationHistory}
+        title="Open dictation history in the Activity widget"
+        type="button"
+      >
+        History
+      </AudioBarHistoryButton>
+      <AudioBarNoticeProgress
+        aria-hidden="true"
+        key={cancelNotice.id}
+        onAnimationEnd={dismissCancelNotice}
+      />
+    </AudioBarSurface>
+  ) : null;
+
   if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
     if (!barVisible) {
       const dictateShortcutLabel = formatShortcutLabel(widgetPushToTalkShortcut);
@@ -4711,28 +5074,7 @@ export function AudioWidgetWindow() {
           data-theme={audioWidgetTheme}
           data-visible={barVisible ? "true" : "false"}
         >
-          {cancelNotice ? (
-            <AudioBarSurface
-              data-paused={cancelNoticePaused ? "true" : undefined}
-              onMouseEnter={() => setCancelNoticePaused(true)}
-              onMouseLeave={() => setCancelNoticePaused(false)}
-              role="status"
-            >
-              <AudioBarStatusText>Transcript cancelled</AudioBarStatusText>
-              <AudioBarUndoButton
-                onClick={undoCancelledTranscript}
-                title="Undo the cancel: paste the transcript into the focused app"
-                type="button"
-              >
-                Undo
-              </AudioBarUndoButton>
-              <AudioBarNoticeProgress
-                aria-hidden="true"
-                key={cancelNotice.id}
-                onAnimationEnd={dismissCancelNotice}
-              />
-            </AudioBarSurface>
-          ) : (
+          {cancelNotice ? cancelNoticeSurface : (
             <AudioBarSurface
               onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
               role="status"
@@ -4781,6 +5123,23 @@ export function AudioWidgetWindow() {
               )}
             </AudioBarSurface>
           )}
+        </AudioBarShell>
+      </>
+    );
+  }
+
+  // Bubble style: the cancel notice replaces the bubble while it shows (the
+  // window has already morphed to the pill size; dismissal morphs it back).
+  if (bubbleCancelNoticeActive && cancelNoticeSurface) {
+    return (
+      <>
+        <GlobalStyle />
+        <AudioBarShell
+          aria-label="Transcript cancelled"
+          data-theme={audioWidgetTheme}
+          data-visible="true"
+        >
+          {cancelNoticeSurface}
         </AudioBarShell>
       </>
     );

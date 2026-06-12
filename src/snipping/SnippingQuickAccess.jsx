@@ -1,8 +1,10 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Eraser } from "@styled-icons/boxicons-solid/Eraser";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { BlurOn } from "@styled-icons/material-rounded/BlurOn";
+import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
@@ -14,8 +16,10 @@ import { Grain } from "@styled-icons/material-rounded/Grain";
 import { Highlight } from "@styled-icons/material-rounded/Highlight";
 import { HighlightAlt } from "@styled-icons/material-rounded/HighlightAlt";
 import { HorizontalRule } from "@styled-icons/material-rounded/HorizontalRule";
+import { Link } from "@styled-icons/material-rounded/Link";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { Numbers } from "@styled-icons/material-rounded/Numbers";
+import { Public } from "@styled-icons/material-rounded/Public";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
 import { Rectangle } from "@styled-icons/material-rounded/Rectangle";
 import { Send } from "@styled-icons/material-rounded/Send";
@@ -27,7 +31,7 @@ import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
 import { Folder } from "@styled-icons/material-rounded/Folder";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
-import styled, { createGlobalStyle } from "styled-components";
+import styled, { createGlobalStyle, keyframes } from "styled-components";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
@@ -75,6 +79,9 @@ const TOOL_GROUPS = [
     { id: "text", label: "Text", Icon: TextFields, tool: "text" },
     { id: "number", label: "Number badge", Icon: Numbers, tool: "number" },
     { id: "crop", label: "Crop", Icon: Crop, tool: "crop" },
+  ],
+  [
+    { id: "eraser", label: "Eraser (drag over annotations to remove them)", Icon: Eraser, tool: "eraser" },
   ],
 ];
 
@@ -385,6 +392,157 @@ async function copySnipToClipboard(snip) {
   throw new Error("Clipboard is not available in this webview.");
 }
 
+async function copyTextToClipboard(value) {
+  const normalized = text(value);
+  if (!normalized || !navigator?.clipboard?.writeText) return false;
+  try {
+    await navigator.clipboard.writeText(normalized);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Upload-button state machine shared by the floating preview and the strip
+ * tile: idle -> uploading -> done when the snip upload-public setting mints a
+ * link during upload, or idle -> uploading -> private -> publishing -> done
+ * when snip uploads stay private and "Make public" is an explicit second
+ * step. In "done" the same button becomes "Copy URL" for the public link. A
+ * different adopted snip or an annotation save resets to idle because the
+ * uploaded asset no longer matches the visible pixels.
+ */
+function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
+  const [uploadState, setUploadState] = useState("idle");
+  const [assetId, setAssetId] = useState("");
+  const [publicUrl, setPublicUrl] = useState("");
+  const [urlCopied, setUrlCopied] = useState(false);
+  const copiedTimerRef = useRef(0);
+
+  useEffect(() => {
+    setUploadState("idle");
+    setAssetId("");
+    setPublicUrl("");
+    setUrlCopied(false);
+  }, [imageVersion, localPath]);
+
+  useEffect(() => () => {
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+  }, []);
+
+  const uploadToCloud = useCallback(async () => {
+    setUploadState("uploading");
+    try {
+      const result = await invoke("snipping_upload_untracked_asset_to_cloud", {
+        request: {
+          group: "snips",
+          name,
+          path: localPath,
+        },
+      });
+      setAssetId(text(result?.assetId || result?.asset_id));
+      const url = text(result?.publicUrl || result?.public_url);
+      if (url) {
+        setPublicUrl(url);
+        setUploadState("done");
+        showStatus("Uploaded");
+      } else {
+        setUploadState("private");
+        showStatus("Uploaded privately");
+      }
+    } catch (error) {
+      setUploadState("idle");
+      throw error;
+    }
+  }, [localPath, name, showStatus]);
+
+  const makePublic = useCallback(async () => {
+    if (!assetId) return;
+    setUploadState("publishing");
+    try {
+      const result = await invoke("snipping_publish_uploaded_asset", {
+        request: { assetId },
+      });
+      const url = text(result?.publicUrl || result?.public_url);
+      if (!url) {
+        throw new Error("Publish finished without a public URL.");
+      }
+      setPublicUrl(url);
+      setUploadState("done");
+      showStatus("Public URL ready");
+    } catch (error) {
+      setUploadState("private");
+      throw error;
+    }
+  }, [assetId, showStatus]);
+
+  const copyPublicUrl = useCallback(async () => {
+    const copied = await copyTextToClipboard(publicUrl);
+    showStatus(copied ? "URL copied" : "Clipboard is not available in this webview.");
+    if (!copied) return;
+    setUrlCopied(true);
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = 0;
+      setUrlCopied(false);
+    }, 1400);
+  }, [publicUrl, showStatus]);
+
+  return { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied };
+}
+
+/* Shared icon+label body for the snip upload button across its five states;
+   the surrounding button supplies state styling via data-state. */
+function SnipUploadButtonBody({ uploadState, urlCopied }) {
+  if (uploadState === "uploading" || uploadState === "publishing") {
+    return (
+      <>
+        <FloatUploadSpinner aria-hidden="true" />
+        <span>{uploadState === "publishing" ? "Publishing" : "Uploading"}</span>
+      </>
+    );
+  }
+  if (uploadState === "private") {
+    return (
+      <>
+        <Public aria-hidden="true" />
+        <span>Make public</span>
+      </>
+    );
+  }
+  if (uploadState === "done") {
+    return urlCopied ? (
+      <>
+        <Check aria-hidden="true" />
+        <span>Copied</span>
+      </>
+    ) : (
+      <>
+        <Link aria-hidden="true" />
+        <span>Copy URL</span>
+      </>
+    );
+  }
+  return (
+    <>
+      <CloudUpload aria-hidden="true" />
+      <span>Upload</span>
+    </>
+  );
+}
+
+function snipUploadButtonTitle(uploadState, name) {
+  if (uploadState === "uploading") return `Uploading ${name}`;
+  if (uploadState === "publishing") return `Publishing ${name}`;
+  if (uploadState === "private") return `Make ${name} public`;
+  if (uploadState === "done") return `Copy public URL for ${name}`;
+  return `Upload ${name}`;
+}
+
 function useFloatingWindowBody(kind) {
   useEffect(() => {
     document.documentElement.dataset.snippingFloating = kind;
@@ -589,6 +747,13 @@ export function SnippingFloatWindow() {
     }
   }, []);
 
+  const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
+    imageVersion,
+    localPath,
+    name,
+    showStatus,
+  });
+
   const closeFloat = useCallback(() => {
     getCurrentWindow().close().catch(() => {});
   }, []);
@@ -617,21 +782,20 @@ export function SnippingFloatWindow() {
         await invoke("snipping_open_annotation_editor", { path: localPath });
         showStatus("Editor opened");
       } else if (action === "upload") {
-        await invoke("snipping_upload_untracked_asset", {
-          request: {
-            group: "snips",
-            name,
-            path: localPath,
-          },
-        });
-        showStatus("Tracked for upload");
+        if (uploadState === "done") {
+          await copyPublicUrl();
+        } else if (uploadState === "private") {
+          await makePublic();
+        } else {
+          await uploadToCloud();
+        }
       }
     } catch (error) {
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
       setBusy(false);
     }
-  }, [busy, dismissFloat, localPath, name, previewUrl, showStatus]);
+  }, [busy, copyPublicUrl, dismissFloat, localPath, makePublic, name, previewUrl, showStatus, uploadState, uploadToCloud]);
 
   // Manual double-press detection: the native window drag begins on the
   // first press, so a synthetic dblclick event is not reliable here.
@@ -692,15 +856,18 @@ export function SnippingFloatWindow() {
           <Close aria-hidden="true" />
         </FloatCloseButton>
         <FloatUploadButton
-          aria-label={`Upload ${name}`}
+          aria-label={snipUploadButtonTitle(uploadState, name)}
+          data-state={uploadState}
           disabled={busy}
           onClick={() => runAction("upload")}
-          title="Upload snip"
+          title={snipUploadButtonTitle(uploadState, name)}
           type="button"
         >
-          <CloudUpload aria-hidden="true" />
-          <span>Upload</span>
+          <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
         </FloatUploadButton>
+        {uploadState === "uploading" || uploadState === "publishing"
+          ? <FloatUploadProgress aria-hidden="true" />
+          : null}
         <FloatActionBar>
           <FloatActionButton
             aria-label={`Copy ${name}`}
@@ -893,6 +1060,99 @@ const FloatUploadButton = styled.button`
     opacity: 0.5;
     cursor: default;
   }
+
+  /* Mid-flow and uploaded chrome stays visible without hover (overrides the
+     parent's hidden-until-hover rule): the user must see progress, the
+     pending Make public step, and the Copy URL affordance at a glance. */
+  &[data-state="uploading"],
+  &[data-state="publishing"],
+  &[data-state="private"],
+  &[data-state="done"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  &[data-state="uploading"]:disabled,
+  &[data-state="publishing"]:disabled {
+    opacity: 1;
+    cursor: progress;
+  }
+
+  /* Private = uploaded but not shared yet: amber prompt for the next step. */
+  &[data-state="private"] {
+    border-color: rgba(247, 201, 72, 0.5);
+    color: #f7e8c1;
+  }
+
+  &[data-state="private"]:hover:not(:disabled) {
+    color: #1c1503;
+    background: #f7c948;
+    border-color: transparent;
+  }
+
+  &[data-state="done"] {
+    border-color: rgba(94, 222, 153, 0.45);
+    color: #d9f7e7;
+  }
+
+  &[data-state="done"]:hover:not(:disabled) {
+    color: #06150d;
+    background: #5ede99;
+    border-color: transparent;
+  }
+`;
+
+const floatUploadSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
+const FloatUploadSpinner = styled.span`
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(207, 227, 255, 0.35);
+  border-top-color: #cfe3ff;
+  border-radius: 50%;
+  animation: ${floatUploadSpin} 0.7s linear infinite;
+`;
+
+const floatUploadSlide = keyframes`
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(250%);
+  }
+`;
+
+/* Indeterminate upload bar pinned to the preview's bottom edge. A span on
+   purpose: the hidden-until-hover chrome rule only targets buttons and divs,
+   so the bar stays visible while the cursor wanders off mid-upload. */
+const FloatUploadProgress = styled.span`
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  overflow: hidden;
+  background: rgba(125, 176, 255, 0.18);
+  pointer-events: none;
+  z-index: 3;
+
+  &::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 40%;
+    border-radius: 999px;
+    background: #7db0ff;
+    animation: ${floatUploadSlide} 1.1s ease-in-out infinite;
+  }
 `;
 
 const FloatActionBar = styled.div`
@@ -976,11 +1236,26 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
   const localPath = text(snip?.path);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [imageVersion, setImageVersion] = useState(0);
+  // asset:-protocol load failures fall back to backend-read data URLs so a
+  // tile can never sit blank while its file is perfectly readable.
+  const [fallbackUrl, setFallbackUrl] = useState("");
+  const fallbackRequestedRef = useRef(false);
   const previewUrl = useMemo(() => {
+    if (fallbackUrl) return fallbackUrl;
     const url = assetPreviewUrl({ localPath });
     if (!url || !imageVersion) return url;
     return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
-  }, [imageVersion, localPath]);
+  }, [fallbackUrl, imageVersion, localPath]);
+
+  const onImageError = useCallback(() => {
+    if (fallbackRequestedRef.current || !localPath) return;
+    fallbackRequestedRef.current = true;
+    invoke("snipping_read_asset_data_url", { path: localPath })
+      .then((dataUrl) => {
+        if (text(dataUrl)) setFallbackUrl(dataUrl);
+      })
+      .catch(() => {});
+  }, [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const statusTimerRef = useRef(0);
@@ -1002,6 +1277,9 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
       const edited = text(payload.editedPath || payload.edited_path || payload.path);
       const current = localPathRef.current;
       if (current !== original && current !== edited) return;
+      // Fresh pixels: retry the asset URL before re-falling back.
+      fallbackRequestedRef.current = false;
+      setFallbackUrl("");
       setImageVersion((version) => version + 1);
     })
       .then((nextUnlisten) => {
@@ -1035,6 +1313,13 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
     }
   }, []);
 
+  const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
+    imageVersion,
+    localPath,
+    name,
+    showStatus,
+  });
+
   const runAction = useCallback(async (action) => {
     if (!localPath || busy) return;
     setBusy(true);
@@ -1053,21 +1338,20 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
         await invoke("snipping_open_annotation_editor", { path: localPath });
         showStatus("Editor opened");
       } else if (action === "upload") {
-        await invoke("snipping_upload_untracked_asset", {
-          request: {
-            group: "snips",
-            name,
-            path: localPath,
-          },
-        });
-        showStatus("Tracked for upload");
+        if (uploadState === "done") {
+          await copyPublicUrl();
+        } else if (uploadState === "private") {
+          await makePublic();
+        } else {
+          await uploadToCloud();
+        }
       }
     } catch (error) {
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
       setBusy(false);
     }
-  }, [busy, localPath, name, onRemoved, previewUrl, showStatus]);
+  }, [busy, copyPublicUrl, localPath, makePublic, name, onRemoved, previewUrl, showStatus, uploadState, uploadToCloud]);
 
   const openEditor = useCallback((event) => {
     if (event.target.closest("button")) return;
@@ -1088,7 +1372,7 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
       title={`${name} — click to annotate, drag out for a pinned preview`}
     >
       {previewUrl ? (
-        <img alt={name} draggable={false} src={previewUrl} />
+        <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
       ) : (
         <span data-empty="true">Preview unavailable</span>
       )}
@@ -1104,15 +1388,18 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
         </svg>
       </FloatPinButton>
       <FloatUploadButton
-        aria-label={`Upload ${name}`}
+        aria-label={snipUploadButtonTitle(uploadState, name)}
+        data-state={uploadState}
         disabled={busy}
         onClick={() => runAction("upload")}
-        title="Upload snip"
+        title={snipUploadButtonTitle(uploadState, name)}
         type="button"
       >
-        <CloudUpload aria-hidden="true" />
-        <span>Upload</span>
+        <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
       </FloatUploadButton>
+      {uploadState === "uploading" || uploadState === "publishing"
+        ? <FloatUploadProgress aria-hidden="true" />
+        : null}
       <FloatActionBar>
         <FloatActionButton
           aria-label={`Copy ${name}`}
@@ -1313,32 +1600,49 @@ export function SnippingStripWindow() {
   const [animPhase, setAnimPhase] = useState("closed");
   const [animOrigin, setAnimOrigin] = useState("top");
   const [openNonce, setOpenNonce] = useState(0);
+  const animPhaseRef = useRef("closed");
+  // Epoch-ms of the last close cue: the watchdog must not fight the hide
+  // animation, but a window still visible long after a close cue (or with no
+  // cue at all) has missed its open cue and must force itself visible.
+  const lastCloseCueMsRef = useRef(0);
 
   useFloatingWindowBody("strip");
 
   useEffect(() => {
+    animPhaseRef.current = animPhase;
+  }, [animPhase]);
+
+  useEffect(() => {
     let cancelled = false;
     let unlistenAnim = null;
-    let receivedAnim = false;
     const playOpen = () => {
       // Re-mount the strip on every open so it always shows fresh snips,
-      // and two-frame the transition so the closed state paints first.
+      // and two-frame the transition so the closed state paints first. The
+      // timeout backstop matters: rAF can stall in an unfocused overlay
+      // webview, which used to strand the shell at opacity 0 — a frosted
+      // bar with invisible (but still draggable) tiles.
       setOpenNonce((nonce) => nonce + 1);
       setAnimPhase("closed");
       window.requestAnimationFrame(() => {
         window.requestAnimationFrame(() => setAnimPhase("open"));
       });
+      window.setTimeout(() => {
+        if (!cancelled && animPhaseRef.current !== "open") {
+          setAnimPhase("open");
+        }
+      }, 90);
     };
     listen(SNIPPING_STRIP_ANIM_EVENT, (event) => {
       if (cancelled) return;
-      receivedAnim = true;
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const phase = text(payload.phase) === "open" ? "open" : "closed";
       const origin = text(payload.origin) === "bottom" ? "bottom" : "top";
       setAnimOrigin(origin);
       if (phase === "open") {
+        lastCloseCueMsRef.current = 0;
         playOpen();
       } else {
+        lastCloseCueMsRef.current = Date.now();
         setAnimPhase("closed");
       }
     })
@@ -1348,22 +1652,27 @@ export function SnippingStripWindow() {
           return;
         }
         unlistenAnim = unlisten;
-        // First-show race: when the bar is shown while this webview is still
-        // booting, the open cue is emitted into a page with no listener yet
-        // and the shell stays at opacity 0 — an invisible but clickable bar.
-        // The listener is live now, so a visible window with no cue received
-        // means exactly that race: play the open ourselves.
-        getCurrentWindow()
-          .isVisible()
-          .then((visible) => {
-            if (cancelled || receivedAnim || !visible) return;
-            playOpen();
-          })
-          .catch(() => {});
       })
       .catch(() => {});
+    // Missed-cue watchdog. The open cue is emitted the moment Rust shows the
+    // window, which loses against the first page boot (no listener yet) and
+    // can lose again on re-shows under load. Any tick that finds the window
+    // visible, the shell closed, and no recent close cue plays the open.
+    const watchdog = window.setInterval(() => {
+      if (cancelled || animPhaseRef.current === "open") return;
+      const sinceClose = Date.now() - lastCloseCueMsRef.current;
+      if (lastCloseCueMsRef.current > 0 && sinceClose < 700) return;
+      getCurrentWindow()
+        .isVisible()
+        .then((visible) => {
+          if (cancelled || !visible || animPhaseRef.current === "open") return;
+          playOpen();
+        })
+        .catch(() => {});
+    }, 250);
     return () => {
       cancelled = true;
+      window.clearInterval(watchdog);
       if (unlistenAnim) unlistenAnim();
     };
   }, []);
@@ -1528,6 +1837,10 @@ export function SnippingAnnotationEditorWindow() {
   const cursorRef = useRef({ x: 0, y: 0, inside: false });
   const annotationClipboardRef = useRef(null);
   const pasteSpreadRef = useRef(0);
+  // Eraser drag session: true between mouse-down and release, counting the
+  // annotations removed along the way for the status line.
+  const erasingRef = useRef(false);
+  const erasedCountRef = useRef(0);
   const [hoverIndex, setHoverIndex] = useState(-1);
   const [color, setColor] = useState("#ef4444");
   const [strokeWidth, setStrokeWidth] = useState(5);
@@ -1919,12 +2232,33 @@ export function SnippingAnnotationEditorWindow() {
       : tool === option.tool
   ), [shapeKind, shapeMode, tool]);
 
+  // Removes the topmost annotation under the point, using the same hit
+  // shapes hover and ⌘C use; sweeping back over a spot peels stacked
+  // annotations one pass at a time. Hover is reset because indexes shift.
+  const eraseAtPoint = useCallback((point) => {
+    const context = canvasRef.current?.getContext("2d");
+    if (!context) return;
+    updateActiveAnnotations((current) => {
+      const index = annotationAtPoint(current, point, context);
+      if (index < 0) return current;
+      erasedCountRef.current += 1;
+      return current.filter((_, itemIndex) => itemIndex !== index);
+    });
+    setHoverIndex(-1);
+  }, [updateActiveAnnotations]);
+
   const beginDraw = useCallback((event) => {
     if (event.button !== 0 || !canvasSize.width || !canvasSize.height) return;
     event.preventDefault();
     const point = pointFromEvent(event);
     const hadTextEditor = Boolean(textEditorRef.current);
     if (hadTextEditor) commitTextEditor();
+    if (tool === "eraser") {
+      erasingRef.current = true;
+      erasedCountRef.current = 0;
+      eraseAtPoint(point);
+      return;
+    }
     if (tool === "text") {
       // The first click after an open editor only commits it; the next click
       // starts a fresh label.
@@ -1969,7 +2303,7 @@ export function SnippingAnnotationEditorWindow() {
     draftRef.current = annotation;
     drawingRef.current = true;
     setDraft(annotation);
-  }, [blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, numberRadiusPx, openTextEditor, pointFromEvent, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations]);
+  }, [blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, eraseAtPoint, numberRadiusPx, openTextEditor, pointFromEvent, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations]);
 
   const updateDraw = useCallback((event) => {
     if (!drawingRef.current || !draftRef.current) return;
@@ -1982,6 +2316,14 @@ export function SnippingAnnotationEditorWindow() {
   }, [pointFromEvent]);
 
   const finishDraw = useCallback(() => {
+    if (erasingRef.current) {
+      erasingRef.current = false;
+      setStatus(erasedCountRef.current
+        ? `Erased ${erasedCountRef.current} annotation${erasedCountRef.current === 1 ? "" : "s"}`
+        : "Nothing to erase there");
+      erasedCountRef.current = 0;
+      return;
+    }
     if (!drawingRef.current || !draftRef.current) return;
     const annotation = draftRef.current;
     drawingRef.current = false;
@@ -2006,6 +2348,10 @@ export function SnippingAnnotationEditorWindow() {
   const handleCanvasMouseMove = useCallback((event) => {
     const point = pointFromEvent(event);
     cursorRef.current = { x: point.x, y: point.y, inside: true };
+    if (erasingRef.current) {
+      eraseAtPoint(point);
+      return;
+    }
     if (drawingRef.current) {
       setHoverIndex(-1);
       updateDraw(event);
@@ -2013,7 +2359,7 @@ export function SnippingAnnotationEditorWindow() {
     }
     const context = canvasRef.current?.getContext("2d");
     setHoverIndex(context ? annotationAtPoint(annotations, point, context) : -1);
-  }, [annotations, pointFromEvent, updateDraw]);
+  }, [annotations, eraseAtPoint, pointFromEvent, updateDraw]);
 
   const handleCanvasMouseLeave = useCallback(() => {
     cursorRef.current = { ...cursorRef.current, inside: false };
@@ -2580,39 +2926,41 @@ export function SnippingAnnotationEditorWindow() {
 
           <EditorComposer onSubmit={queueTodo}>
             <EditorComposerInner>
-              <Select
-                aria-label="Target workspace"
-                formatOptionLabel={workspaceOptionLabelRenderer}
-                isDisabled={!dispatchTargets.length}
-                isSearchable={false}
-                menuPlacement="top"
-                onChange={(option) => setTargetWorkspaceId(option?.value || "")}
-                options={workspaceOptions}
-                placeholder="Workspace"
-                styles={TARGET_SELECT_STYLES}
-                value={workspaceOptions.find((option) => option.value === targetWorkspaceId) || null}
-              />
-              <Select
-                aria-label="Target terminal"
-                formatOptionLabel={terminalOptionLabelRenderer}
-                isDisabled={!(targetWorkspace?.threads || []).length}
-                isSearchable={false}
-                menuPlacement="top"
-                onChange={(option) => setTargetThreadId(option?.value || "")}
-                options={threadOptions}
-                placeholder="Any terminal"
-                styles={TARGET_SELECT_STYLES}
-                value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
-              />
               <input
                 aria-label="Todo for coding agent"
                 onChange={(event) => setTodoDraft(event.target.value)}
                 placeholder="Circle an area, describe the fix, send it to an agent…"
                 value={todoDraft}
               />
-              <EditorSendButton aria-label="Queue todo with this image" disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
-                <Send aria-hidden="true" />
-              </EditorSendButton>
+              <EditorComposerControls>
+                <Select
+                  aria-label="Target workspace"
+                  formatOptionLabel={workspaceOptionLabelRenderer}
+                  isDisabled={!dispatchTargets.length}
+                  isSearchable={false}
+                  menuPlacement="top"
+                  onChange={(option) => setTargetWorkspaceId(option?.value || "")}
+                  options={workspaceOptions}
+                  placeholder="Workspace"
+                  styles={TARGET_SELECT_STYLES}
+                  value={workspaceOptions.find((option) => option.value === targetWorkspaceId) || null}
+                />
+                <Select
+                  aria-label="Target terminal"
+                  formatOptionLabel={terminalOptionLabelRenderer}
+                  isDisabled={!(targetWorkspace?.threads || []).length}
+                  isSearchable={false}
+                  menuPlacement="top"
+                  onChange={(option) => setTargetThreadId(option?.value || "")}
+                  options={threadOptions}
+                  placeholder="Any terminal"
+                  styles={TARGET_SELECT_STYLES}
+                  value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
+                />
+                <EditorSendButton aria-label="Queue todo with this image" disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
+                  <Send aria-hidden="true" />
+                </EditorSendButton>
+              </EditorComposerControls>
             </EditorComposerInner>
           </EditorComposer>
         </EditorWindowRoot>
@@ -3485,28 +3833,39 @@ const EditorZoomReadout = styled.button`
   }
 `;
 
+/* The rail spans the stage's full height (it ends above the bottom options
+   pill's band so the two never overlap), with the tool groups centered via
+   auto margins instead of justify-content — overflow-safe, so a short window
+   can still scroll to the first and last tool. */
 const EditorFloatingRail = styled.nav`
   position: absolute;
   left: 8px;
-  top: 50%;
+  top: 8px;
+  bottom: 52px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  max-height: calc(100% - 20px);
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 8px 5px;
+  padding: 10px 5px;
   border: 1px solid rgba(230, 236, 245, 0.12);
   border-radius: 999px;
   background: rgba(10, 13, 19, 0.86);
   backdrop-filter: blur(14px);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
-  transform: translateY(-50%);
   scrollbar-width: none;
 
   &::-webkit-scrollbar {
     display: none;
+  }
+
+  > :first-child {
+    margin-top: auto;
+  }
+
+  > :last-child {
+    margin-bottom: auto;
   }
 `;
 
@@ -3802,15 +4161,16 @@ const EditorComposer = styled.form`
   border-top: 1px solid rgba(230, 236, 245, 0.07);
   background: rgba(10, 13, 19, 0.6);
 
+  /* The prompt line lives inside the composer card; the card carries the
+     border and focus ring, so the input itself stays bare. */
   input {
-    flex: 1;
+    width: 100%;
     min-width: 0;
-    height: 32px;
-    padding: 0 12px;
-    border: 1px solid rgba(230, 236, 245, 0.12);
-    border-radius: 999px;
+    height: 30px;
+    padding: 0 6px;
+    border: 0;
     color: #f8fafc;
-    background: rgba(230, 236, 245, 0.06);
+    background: transparent;
     font: inherit;
     font-size: 12px;
     font-weight: 700;
@@ -3820,23 +4180,39 @@ const EditorComposer = styled.form`
   input::placeholder {
     color: rgba(248, 250, 252, 0.4);
   }
+`;
 
-  input:focus {
+/* One composer card, centered with a capped width (ChatGPT-style) so it
+   doesn't stretch edge to edge on wide editor windows: the prompt line sits
+   on top and the dispatch controls (workspace and terminal pickers
+   bottom-left, send bottom-right) dock inside the card's bottom edge. */
+const EditorComposerInner = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: 100%;
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 8px 9px 9px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 18px;
+  background: rgba(230, 236, 245, 0.06);
+  transition: border-color 120ms ease, box-shadow 140ms ease;
+
+  &:focus-within {
     border-color: rgba(147, 197, 253, 0.45);
     box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
   }
 `;
 
-/* The bar spans the window, but the controls sit in a centered column with a
-   capped width (ChatGPT-style) so the input doesn't stretch edge to edge on
-   wide editor windows. */
-const EditorComposerInner = styled.div`
+const EditorComposerControls = styled.div`
   display: flex;
   align-items: center;
   gap: 7px;
-  width: 100%;
-  max-width: 780px;
-  margin: 0 auto;
+
+  > :last-child {
+    margin-left: auto;
+  }
 `;
 
 const EditorSendButton = styled.button`

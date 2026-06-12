@@ -786,6 +786,9 @@ struct AudioState {
     // True while an active dictation session has borrowed the microphone from
     // a live cloud voice agent session; dictation teardown hands it back.
     forge_dictation_mic_borrowed: Arc<AtomicBool>,
+    // Same lender/borrower contract for the user's own-key Deepgram dictation
+    // stream (a fully separate websocket straight to Deepgram).
+    deepgram_mic_borrowed: Arc<AtomicBool>,
     forge_dictation_warm: Arc<Mutex<Option<ForgeDictationWarmSlot>>>,
     forge_dictation_warm_desired: Arc<AtomicBool>,
     forge_dictation_warm_generation: Arc<AtomicU64>,
@@ -4200,6 +4203,7 @@ pub fn run() {
             forge_dictation_stream: Arc::new(Mutex::new(None)),
             cloud_voice_agent_input_enabled: Arc::new(AtomicBool::new(false)),
             forge_dictation_mic_borrowed: Arc::new(AtomicBool::new(false)),
+            deepgram_mic_borrowed: Arc::new(AtomicBool::new(false)),
             forge_dictation_warm: Arc::new(Mutex::new(None)),
             forge_dictation_warm_desired: Arc::new(AtomicBool::new(false)),
             forge_dictation_warm_generation: Arc::new(AtomicU64::new(0)),
@@ -4282,6 +4286,10 @@ pub fn run() {
             register_snipping_shortcuts(app.handle());
             prewarm_snipping_overlay_window(app.handle());
             register_activity_overlay_shortcut(app.handle());
+            // Pre-create the hidden activity overlay so the first toggle is
+            // instant: the webview is booted, the panel mounted and already
+            // subscribed to store events before the user ever asks for it.
+            let _ = ensure_activity_overlay_window(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
             {
@@ -4389,6 +4397,7 @@ pub fn run() {
             stop_forge_dictation_transcription,
             audio_shortcuts_status,
             audio_push_to_talk_status,
+            audio_cancel_shortcut_scope,
             open_audio_shortcut_permissions,
             open_macos_fn_key_settings,
             set_audio_shortcut,
@@ -4399,6 +4408,7 @@ pub fn run() {
             snipping_shortcuts_status,
             set_snipping_enabled,
             set_snipping_hide_desktop_icons,
+            set_snipping_upload_public,
             set_snipping_shortcut,
             reset_snipping_shortcuts,
             open_snipping_permissions,
@@ -4410,6 +4420,8 @@ pub fn run() {
             snipping_dismiss_capture_toast,
             snipping_set_asset_target,
             snipping_upload_untracked_asset,
+            snipping_upload_untracked_asset_to_cloud,
+            snipping_publish_uploaded_asset,
             snipping_save_edited_untracked_asset,
             snipping_open_annotation_editor,
             snipping_read_asset_data_url,
@@ -4531,6 +4543,7 @@ pub fn run() {
             app_enter_background,
             app_exit_background,
             app_background_mode_state,
+            background_monitor_open_activity,
             background_monitor_open_snip_strip,
             hyperframe_transcribe_audio,
             hyperframe_save_media_transcript,

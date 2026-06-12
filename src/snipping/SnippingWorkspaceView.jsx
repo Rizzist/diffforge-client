@@ -102,6 +102,7 @@ function fallbackSnippingStatus() {
   return {
     enabled: true,
     hideDesktopIcons: true,
+    uploadPublic: true,
     fullScreenshot: {
       shortcut: full,
       defaultShortcut: full,
@@ -265,6 +266,7 @@ export default function SnippingWorkspaceView({
 
   const snippingEnabled = Boolean(status?.enabled);
   const hideDesktopIcons = status?.hideDesktopIcons !== false;
+  const uploadPublic = status?.uploadPublic !== false;
   const permissions = status?.permissions || fallbackPermissions();
   const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
   const areaShortcut = status?.areaSnip?.shortcut || defaultAreaShortcut();
@@ -286,6 +288,7 @@ export default function SnippingWorkspaceView({
   const savingShortcut = actionState === "saving";
   const togglingSnipping = actionState === "toggling";
   const togglingDesktopIcons = actionState === "toggling-desktop-icons";
+  const togglingUploadPublic = actionState === "toggling-upload-public";
   const capturingFull = actionState === "capturing-full";
   const capturingArea = actionState === "capturing-area";
   const openingPermissions = actionState === "opening-permissions";
@@ -334,6 +337,21 @@ export default function SnippingWorkspaceView({
       setStatus(nextStatus || fallbackSnippingStatus());
     } catch (toggleError) {
       setError(getErrorMessage(toggleError, "Unable to update the desktop icons setting."));
+    } finally {
+      setActionState("idle");
+    }
+  }, []);
+
+  const setUploadPublic = useCallback(async (enabled) => {
+    setActionState("toggling-upload-public");
+    setError("");
+    try {
+      const nextStatus = await invoke("set_snipping_upload_public", {
+        request: { enabled },
+      });
+      setStatus(nextStatus || fallbackSnippingStatus());
+    } catch (toggleError) {
+      setError(getErrorMessage(toggleError, "Unable to update the snip upload privacy setting."));
     } finally {
       setActionState("idle");
     }
@@ -551,6 +569,22 @@ export default function SnippingWorkspaceView({
               >
                 <span aria-hidden="true" />
                 {togglingDesktopIcons ? "Switching" : hideDesktopIcons ? "On" : "Off"}
+              </McpSwitchButton>
+            </AudioRecorderOptionRow>
+            <AudioRecorderOptionRow>
+              <SettingsHint>
+                {uploadPublic
+                  ? "Snip uploads mint a public link instantly, ready to copy."
+                  : "Snip uploads stay private; each snip needs an explicit Make public step."}
+              </SettingsHint>
+              <McpSwitchButton
+                aria-pressed={uploadPublic ? "true" : "false"}
+                disabled={togglingUploadPublic}
+                onClick={() => setUploadPublic(!uploadPublic)}
+                type="button"
+              >
+                <span aria-hidden="true" />
+                {togglingUploadPublic ? "Switching" : uploadPublic ? "Public" : "Private"}
               </McpSwitchButton>
             </AudioRecorderOptionRow>
             {lastCapture?.localPath && (

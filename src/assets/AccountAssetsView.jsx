@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openPath } from "@tauri-apps/plugin-opener";
 import styled, { keyframes } from "styled-components";
 import { AddToPhotos } from "@styled-icons/material-rounded/AddToPhotos";
@@ -29,6 +30,7 @@ import HyperframeEditor, {
   assetLooksLikeHyperframe,
   loadHyperframeAsset,
 } from "./HyperframeEditor.jsx";
+import { assetIdentityKeys } from "./useAccountAssetsLibrary.js";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 const DEFAULT_ASSET_CLOUD_ID = "diffforge-ai-cloud";
@@ -442,6 +444,27 @@ async function copyTextToClipboard(value) {
   return false;
 }
 
+/* Library uploads default to private; this device-local preference flips the
+   upload action to also publish a public link (snips have their own separate
+   setting in the Snipping tab). */
+const ASSET_UPLOAD_PUBLIC_STORAGE_KEY = "diffforge.assets.uploadPublicOnUpload";
+
+function readAssetUploadPublicPreference() {
+  try {
+    return window.localStorage.getItem(ASSET_UPLOAD_PUBLIC_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeAssetUploadPublicPreference(enabled) {
+  try {
+    window.localStorage.setItem(ASSET_UPLOAD_PUBLIC_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    // Preference persistence is best-effort.
+  }
+}
+
 export default function AccountAssetsView({
   assetWorkspaces = [],
   defaultWorkingDirectory = "",
@@ -467,12 +490,29 @@ export default function AccountAssetsView({
   const trackedItems = useMemo(() => assetLibraryItems(library), [library]);
   const untrackedItems = useMemo(() => assetLibraryItems(untrackedLibrary), [untrackedLibrary]);
   const allAssetItems = useMemo(() => {
-    const byKey = new Map();
+    // Multi-key identity dedupe (asset id, blob, object key, sha+size, local
+    // path) so a freshly uploading file never renders twice while the local
+    // row and the cloud row are still learning each other's identifiers.
+    const indexByKey = new Map();
+    const rows = [];
     [...trackedItems, ...untrackedItems].forEach((asset, index) => {
-      const key = assetId(asset) || assetLocalPath(asset) || `${assetName(asset, "asset")}:${index}`;
-      if (key && !byKey.has(key)) byKey.set(key, asset);
+      if (!asset || typeof asset !== "object") return;
+      const keys = assetIdentityKeys(asset);
+      if (!keys.length) keys.push(`fallback:${assetName(asset, "asset")}:${index}`);
+      const existingIndex = keys.map((key) => indexByKey.get(key)).find((found) => found !== undefined);
+      if (existingIndex === undefined) {
+        const rowIndex = rows.length;
+        rows.push(asset);
+        keys.forEach((key) => indexByKey.set(key, rowIndex));
+        return;
+      }
+      // Tracked items come first and win; later duplicates only contribute
+      // their extra identity keys so further variants collapse too.
+      keys.forEach((key) => {
+        if (!indexByKey.has(key)) indexByKey.set(key, existingIndex);
+      });
     });
-    return [...byKey.values()];
+    return rows;
   }, [trackedItems, untrackedItems]);
   const trackedCount = trackedItems.length;
   const untrackedCount = untrackedItems.length;
@@ -639,6 +679,15 @@ function AssetsPanel({
   const actionNoticeTimerRef = useRef(0);
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
+  const [uploadPublic, setUploadPublic] = useState(readAssetUploadPublicPreference);
+
+  const toggleUploadPublic = useCallback(() => {
+    setUploadPublic((current) => {
+      const next = !current;
+      writeAssetUploadPublicPreference(next);
+      return next;
+    });
+  }, []);
   const selectedCloud = useMemo(() => (
     clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === selectedCloudId)
       || clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === defaultCloudId)
@@ -908,7 +957,6 @@ function AssetsPanel({
     const id = assetId(asset);
     const name = assetName(asset, "asset");
     const localPath = assetLocalPath(asset);
-    const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
     setActionNotice("");
     if (action === "copyPublic") {
@@ -990,39 +1038,26 @@ function AssetsPanel({
       }
       return;
     }
+    // Assets are account-level: workspace/repo are descriptive metadata, so
+    // actions run with whatever context is known instead of requiring one.
     const actionWorkspace = workspaceOptionForAsset(asset);
-    const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
-    const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
+    const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath || "";
+    const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id || "";
     const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
-    if (!id || !actionRepoPath || !actionWorkspaceId) return;
+    if (!id) return;
     const key = `${action}:${id}`;
     setBusyKey(key);
     setActionError("");
     try {
       if (action === "untrack") {
+        // Untracking only moves the local copy back to scratch; cloud private
+        // and public copies stay until their own delete/unpublish buttons.
         if (!localPath) return;
         await invoke("diffforge_untrack_workspace_asset", {
           assetId: id,
           name,
           path: localPath,
         });
-        if (availability.hasCloud) {
-          try {
-            await invoke("cloud_mcp_delete_cloud_workspace_asset", {
-              assetId: id,
-              cloudId: effectiveCloudId,
-              repoPath: actionRepoPath,
-              workspaceId: actionWorkspaceId,
-              workspaceName: actionWorkspaceName,
-            });
-          } catch (cloudError) {
-            setActionError(
-              `Moved to scratch, but the Cloud copy is still tracked: ${
-                cloudError?.message || String(cloudError || "Cloud delete failed.")
-              }`,
-            );
-          }
-        }
       } else if (action === "publish") {
         const response = await invoke("cloud_mcp_publish_workspace_asset", {
           assetId: id,
@@ -1068,6 +1103,16 @@ function AssetsPanel({
           workspaceId: actionWorkspaceId,
           workspaceName: actionWorkspaceName,
         });
+        if (action === "upload" && uploadPublic) {
+          await invoke("cloud_mcp_publish_workspace_asset", {
+            assetId: id,
+            cloudId: effectiveCloudId,
+            repoPath: actionRepoPath,
+            workspaceId: actionWorkspaceId,
+            workspaceName: actionWorkspaceName,
+          });
+          showActionNotice("Uploaded and published with a public link.");
+        }
       }
       await refresh({ silent: true, force: true });
     } catch (nextError) {
@@ -1075,7 +1120,7 @@ function AssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [effectiveCloudId, onOpenHyperframeAsset, refresh, repoPath, selectedCloudLabel, showActionNotice, workspaceOptionForAsset]);
+  }, [effectiveCloudId, onOpenHyperframeAsset, refresh, repoPath, selectedCloudLabel, showActionNotice, uploadPublic, workspaceOptionForAsset]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
     const id = assetId(asset);
@@ -1120,11 +1165,11 @@ function AssetsPanel({
         for (const asset of selectedAssets) {
           const id = assetId(asset);
           const actionWorkspace = workspaceOptionForAsset(asset);
-          const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
-          const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
+          const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath || "";
+          const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id || "";
           const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
           const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
-          if (!id || !actionRepoPath || !actionWorkspaceId) {
+          if (!id) {
             continue;
           }
           if (availability.hasLocal) {
@@ -1149,7 +1194,7 @@ function AssetsPanel({
           }
         }
         if (!deletedCount) {
-          setActionError("Selected assets could not be deleted from this workspace.");
+          setActionError("Selected assets could not be deleted.");
           return;
         }
         clearSelectedAssets();
@@ -1236,6 +1281,18 @@ function AssetsPanel({
             </AssetCloudButton>
           );
         })}
+        <AssetCloudButton
+          aria-pressed={uploadPublic}
+          data-active={uploadPublic}
+          onClick={toggleUploadPublic}
+          title={uploadPublic
+            ? "New uploads publish a public link immediately. Click to keep uploads private."
+            : "New uploads stay private. Click to also publish a public link on upload."}
+          type="button"
+        >
+          <Public aria-hidden="true" />
+          <span>{uploadPublic ? "Public on upload" : "Private on upload"}</span>
+        </AssetCloudButton>
       </AssetCloudControls>
       {cloudSettingsOpen && (
         <AssetCloudSettingsPanel
@@ -1313,11 +1370,9 @@ function AssetsPanel({
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
             const shouldOpenHyperframeEditor = !shouldShowImagePreview && assetCanContainHyperframe(asset) && Boolean(localPath);
-            const rowWorkspaceOption = workspaceOptionForAsset(asset);
-            const canRunAssetAction = Boolean(
-              (assetRepoPath(asset) || rowWorkspaceOption?.rootDirectory || repoPath)
-                && (assetWorkspaceId(asset) || rowWorkspaceOption?.id),
-            );
+            // Assets are account-level: actions only need the asset id, so
+            // nothing is gated on a resolvable workspace/repo anymore.
+            const canRunAssetAction = Boolean(id);
             const uploadBusy = busyKey === `upload:${id}`;
             const downloadBusy = busyKey === `download:${id}`;
             const deleteLocalBusy = busyKey === `deleteLocal:${id}`;
@@ -1769,6 +1824,62 @@ function AssetCloudSettingsPanel({
   );
 }
 
+const SNIP_FLOATS_CHANGED_EVENT = "forge-snip-floats-changed";
+
+/// Whether this file is currently pinned on screen as a floating snip
+/// preview. Live: pinning/unpinning anywhere (editor, strip, the float's own
+/// close button) flips it through Rust's floats-changed event.
+function useSnipFloatOpen(localPath) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!localPath) {
+      setOpen(false);
+      return undefined;
+    }
+    let cancelled = false;
+    const refresh = () => {
+      invoke("snipping_snip_float_open", { path: localPath })
+        .then((result) => {
+          if (!cancelled) setOpen(Boolean(result?.open));
+        })
+        .catch(() => {});
+    };
+    refresh();
+    let unlisten = () => {};
+    listen(SNIP_FLOATS_CHANGED_EVENT, refresh)
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten();
+    };
+  }, [localPath]);
+  return open;
+}
+
+function UntrackedPinButton({ localPath, name, disabled, onToggle }) {
+  const pinned = useSnipFloatOpen(localPath);
+  return (
+    <AssetFloatPinButton
+      aria-label={pinned ? `Unpin ${name} floating preview` : `Pin ${name} as a floating preview`}
+      aria-pressed={pinned}
+      data-pinned={pinned ? "true" : "false"}
+      disabled={disabled}
+      onClick={onToggle}
+      title={pinned ? "Unpin floating preview" : "Pin as draggable floating preview"}
+      type="button"
+    >
+      <PushPin aria-hidden="true" />
+    </AssetFloatPinButton>
+  );
+}
+
 function UntrackedAssetsPanel({
   assetMode = "untracked",
   assetWorkspaces = [],
@@ -1792,12 +1903,6 @@ function UntrackedAssetsPanel({
   const [actionError, setActionError] = useState("");
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
-  const defaultWorkspace = useMemo(() => (
-    assetWorkspaces.find((workspace) => text(workspace?.id))
-      || assetWorkspaces.find((workspace) => text(workspace?.rootDirectory))
-      || assetWorkspaces[0]
-      || null
-  ), [assetWorkspaces]);
   const selectedAssets = useMemo(() => (
     items.filter((asset) => selectedAssetIds.has(assetId(asset)))
   ), [items, selectedAssetIds]);
@@ -1855,9 +1960,16 @@ function UntrackedAssetsPanel({
       } else if (action === "view") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
       } else if (action === "pin") {
-        // Draggable snip preview for this file; Rust reuses an existing
-        // preview window instead of opening a duplicate.
-        await invoke("snipping_open_snip_float", { path: localPath });
+        // Pin/unpin toggle, same as the snip preview's own pin button: Rust
+        // tracks which files are floating, so query it rather than guessing.
+        const floatState = await invoke("snipping_snip_float_open", { path: localPath })
+          .catch(() => null);
+        if (floatState?.open) {
+          await invoke("snipping_close_snip_float_for_path", { path: localPath });
+        } else {
+          // Unfocused so the assets view keeps focus.
+          await invoke("snipping_open_snip_float", { path: localPath, focused: false });
+        }
       } else if (action === "copy") {
         await invoke("diffforge_copy_asset_to_clipboard", { path: localPath });
       } else if (action === "delete") {
@@ -1872,13 +1984,12 @@ function UntrackedAssetsPanel({
         await onRename(localPath, trimmed);
       } else if (action === "track") {
         if (typeof onPromote !== "function") return;
+        // Tracking is account-level: no workspace/repo scope on the asset.
         await onPromote({
           deleteSource: true,
           name,
           path: localPath,
-          repoPath,
-          workspaceId: text(defaultWorkspace?.id),
-          workspaceName: text(defaultWorkspace?.name),
+          repoPath: "",
         });
         await trackedRefresh({ silent: true, force: true });
       }
@@ -1887,7 +1998,7 @@ function UntrackedAssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [defaultWorkspace, onDelete, onOpenHyperframeAsset, onPromote, onRename, repoPath, trackedRefresh]);
+  }, [onDelete, onOpenHyperframeAsset, onPromote, onRename, trackedRefresh]);
 
   const runSelectedUntrackedAction = useCallback(async (action) => {
     if (!selectedAssets.length) return;
@@ -2047,18 +2158,25 @@ function UntrackedAssetsPanel({
                 >
                   {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
                 </AssetSelectButton>
+                {canCopy && (
+                  <UntrackedPinButton
+                    disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
+                    localPath={localPath}
+                    name={name}
+                    onToggle={() => runUntrackedAction("pin", asset)}
+                  />
+                )}
+                <AssetTrackButton
+                  aria-label={`Track ${name}`}
+                  disabled={!localPath || !onPromote || trackBusy || Boolean(busyKey && !trackBusy)}
+                  onClick={() => runUntrackedAction("track", asset)}
+                  title="Move from untracked scratch into tracked assets"
+                  type="button"
+                >
+                  <AddToPhotos aria-hidden="true" />
+                  <span>Track</span>
+                </AssetTrackButton>
                 <AssetCardActions>
-                  {canView && (
-                    <AssetIconButton
-                      aria-label={`Open big view for ${name}`}
-                      disabled={!localPath || viewBusy || Boolean(busyKey && !viewBusy)}
-                      onClick={() => runUntrackedAction("view", asset)}
-                      title="Open big view and annotate"
-                      type="button"
-                    >
-                      <OpenInFull aria-hidden="true" />
-                    </AssetIconButton>
-                  )}
                   {canCopy && (
                     <AssetIconButton
                       aria-label={`Copy ${name} to clipboard`}
@@ -2070,15 +2188,15 @@ function UntrackedAssetsPanel({
                       <ContentCopy aria-hidden="true" />
                     </AssetIconButton>
                   )}
-                  {canCopy && (
+                  {canView && (
                     <AssetIconButton
-                      aria-label={`Pin ${name} as a floating snip preview`}
-                      disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
-                      onClick={() => runUntrackedAction("pin", asset)}
-                      title="Pin as floating snip preview"
+                      aria-label={`Annotate ${name}`}
+                      disabled={!localPath || viewBusy || Boolean(busyKey && !viewBusy)}
+                      onClick={() => runUntrackedAction("view", asset)}
+                      title="Annotate (big view)"
                       type="button"
                     >
-                      <PushPin aria-hidden="true" />
+                      <ModeEdit aria-hidden="true" />
                     </AssetIconButton>
                   )}
                   <AssetIconButton
@@ -2089,16 +2207,6 @@ function UntrackedAssetsPanel({
                     type="button"
                   >
                     <FileOpen aria-hidden="true" />
-                  </AssetIconButton>
-                  <AssetIconButton
-                    aria-label={`Track ${name}`}
-                    data-primary="true"
-                    disabled={!localPath || !onPromote || trackBusy || Boolean(busyKey && !trackBusy)}
-                    onClick={() => runUntrackedAction("track", asset)}
-                    title="Track this scratch asset"
-                    type="button"
-                  >
-                    <AddToPhotos aria-hidden="true" />
                   </AssetIconButton>
                   <AssetIconButton
                     aria-label={`Rename ${name}`}
@@ -2869,7 +2977,9 @@ const AssetCard = styled.article`
       transform: translate(-50%, 0);
     }
 
-    [data-asset-select="true"] {
+    [data-asset-select="true"],
+    [data-asset-pin="true"],
+    [data-asset-track="true"] {
       opacity: 1;
       pointer-events: auto;
       transform: translateY(0);
@@ -2898,7 +3008,9 @@ const AssetCard = styled.article`
       transform: translate(-50%, 0);
     }
 
-    [data-asset-select="true"] {
+    [data-asset-select="true"],
+    [data-asset-pin="true"],
+    [data-asset-track="true"] {
       opacity: 1;
       pointer-events: auto;
       transform: translateY(0);
@@ -3020,6 +3132,98 @@ const AssetCardStatus = styled.span`
   &[data-status="cancelled"] {
     border-color: rgba(251, 113, 133, 0.24);
     color: rgba(254, 205, 211, 0.86);
+  }
+`;
+
+/* Pin toggle in the snip-preview style: circular, top-left under the status
+   chip, revealed on hover — and held visible while the file is pinned, the
+   same way the select checkbox stays visible while selected. */
+const AssetFloatPinButton = styled.button.attrs({ "data-asset-pin": "true" })`
+  position: absolute;
+  top: 32px;
+  left: 7px;
+  z-index: 5;
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #f8fafc;
+  background: rgba(7, 10, 16, 0.85);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  cursor: pointer;
+  transition: opacity 130ms ease, transform 130ms ease, background 120ms ease, border-color 120ms ease;
+  backdrop-filter: blur(8px);
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 176, 255, 0.55);
+    background: rgba(23, 37, 62, 0.92);
+  }
+
+  &[data-pinned="true"] {
+    border-color: rgba(125, 176, 255, 0.5);
+    color: #cfe3ff;
+    background: rgba(37, 64, 110, 0.9);
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+`;
+
+/* Untracked → tracked, styled like the snip preview's Upload pill. */
+const AssetTrackButton = styled.button.attrs({ "data-asset-track": "true" })`
+  position: absolute;
+  top: 8px;
+  right: 40px;
+  z-index: 5;
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px;
+  border: 1px solid rgba(125, 176, 255, 0.34);
+  border-radius: 999px;
+  color: #cfe3ff;
+  background: rgba(7, 10, 16, 0.85);
+  font-size: 10px;
+  font-weight: 760;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  cursor: pointer;
+  transition: opacity 130ms ease, transform 130ms ease, background 120ms ease, color 120ms ease;
+  backdrop-filter: blur(8px);
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    color: #06121f;
+    background: #7db0ff;
+    border-color: transparent;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
   }
 `;
 

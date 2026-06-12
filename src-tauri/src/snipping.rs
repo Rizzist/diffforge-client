@@ -249,6 +249,7 @@ impl SnippingShortcutManager {
 struct SnippingShortcutManagerState {
     enabled: bool,
     hide_desktop_icons: bool,
+    upload_public: bool,
     full_screenshot: SnippingShortcutRegistration,
     area_snip: SnippingShortcutRegistration,
 }
@@ -258,6 +259,7 @@ impl SnippingShortcutManagerState {
         Self {
             enabled: settings.enabled,
             hide_desktop_icons: settings.hide_desktop_icons,
+            upload_public: settings.upload_public,
             full_screenshot: SnippingShortcutRegistration::new(settings.full_screenshot.clone()),
             area_snip: SnippingShortcutRegistration::new(settings.area_snip.clone()),
         }
@@ -267,6 +269,7 @@ impl SnippingShortcutManagerState {
         SnippingSettings {
             enabled: self.enabled,
             hide_desktop_icons: self.hide_desktop_icons,
+            upload_public: self.upload_public,
             full_screenshot: self.full_screenshot.shortcut.clone(),
             area_snip: self.area_snip.shortcut.clone(),
         }
@@ -391,6 +394,7 @@ struct SnippingPermissionStatus {
 struct SnippingSettingsStatus {
     enabled: bool,
     hide_desktop_icons: bool,
+    upload_public: bool,
     full_screenshot: SnippingShortcutRegistrationStatus,
     area_snip: SnippingShortcutRegistrationStatus,
     permissions: SnippingPermissionStatus,
@@ -405,6 +409,10 @@ fn default_snipping_hide_desktop_icons() -> bool {
     true
 }
 
+fn default_snipping_upload_public() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SnippingSettings {
@@ -412,6 +420,8 @@ struct SnippingSettings {
     enabled: bool,
     #[serde(default = "default_snipping_hide_desktop_icons")]
     hide_desktop_icons: bool,
+    #[serde(default = "default_snipping_upload_public")]
+    upload_public: bool,
     #[serde(default)]
     full_screenshot: String,
     #[serde(default)]
@@ -434,6 +444,18 @@ struct SnippingEnabledUpdateRequest {
 #[serde(rename_all = "camelCase")]
 struct SnippingHideDesktopIconsRequest {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingUploadPublicRequest {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingPublishAssetRequest {
+    asset_id: String,
 }
 
 #[derive(Deserialize)]
@@ -517,6 +539,7 @@ fn default_snipping_settings() -> SnippingSettings {
     SnippingSettings {
         enabled: true,
         hide_desktop_icons: true,
+        upload_public: true,
         full_screenshot: SnippingShortcutAction::FullScreenshot.default_shortcut(),
         area_snip: SnippingShortcutAction::AreaSnip.default_shortcut(),
     }
@@ -616,6 +639,7 @@ fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
     SnippingSettings {
         enabled: settings.enabled,
         hide_desktop_icons: settings.hide_desktop_icons,
+        upload_public: settings.upload_public,
         full_screenshot,
         area_snip,
     }
@@ -1052,6 +1076,7 @@ fn snipping_status_from_state(
     Ok(SnippingSettingsStatus {
         enabled: state.enabled,
         hide_desktop_icons: state.hide_desktop_icons,
+        upload_public: state.upload_public,
         full_screenshot: snipping_shortcut_registration_status(
             SnippingShortcutAction::FullScreenshot,
             state.full_screenshot,
@@ -1362,6 +1387,7 @@ fn set_snipping_enabled_for(
     let settings = SnippingSettings {
         enabled: request.enabled,
         hide_desktop_icons: state.hide_desktop_icons,
+        upload_public: state.upload_public,
         full_screenshot: state.full_screenshot.shortcut.clone(),
         area_snip: state.area_snip.shortcut.clone(),
     };
@@ -1409,6 +1435,27 @@ fn set_snipping_hide_desktop_icons_for(
     }
     emit_snipping_shortcuts_changed(app);
     snipping_status_for(app)
+}
+
+fn set_snipping_upload_public_for(
+    app: &AppHandle,
+    request: SnippingUploadPublicRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    let manager = app.state::<SnippingState>().shortcut_manager.clone();
+    let mut state = manager.snapshot();
+    state.upload_public = request.enabled;
+
+    write_snipping_settings(app, &state.settings())?;
+    manager.replace(state);
+    emit_snipping_shortcuts_changed(app);
+    snipping_status_for(app)
+}
+
+fn snipping_upload_public_enabled(app: &AppHandle) -> bool {
+    app.state::<SnippingState>()
+        .shortcut_manager
+        .snapshot()
+        .upload_public
 }
 
 fn set_snipping_shortcut_for(
@@ -1474,6 +1521,7 @@ fn reset_snipping_shortcuts_for(app: &AppHandle) -> Result<SnippingSettingsStatu
     let settings = SnippingSettings {
         enabled: state.enabled,
         hide_desktop_icons: state.hide_desktop_icons,
+        upload_public: state.upload_public,
         ..default_snipping_settings()
     };
     write_snipping_settings(app, &settings)?;
@@ -2558,9 +2606,11 @@ fn snipping_open_annotation_editor_for_paths(
         .unwrap_or((760.0, 480.0));
     // CSS chrome around the canvas: tool rail + stage padding horizontally;
     // title bar + composer + stage padding vertically (plus the thumbnail
-    // strip when editing several images). Matches the compact editor CSS.
+    // strip when editing several images). Matches the compact editor CSS —
+    // the composer is a two-row card (prompt line over the dispatch
+    // controls), so the vertical chrome is taller than one input row.
     let chrome_width = 62.0;
-    let chrome_height = if files.len() > 1 { 174.0 } else { 138.0 };
+    let chrome_height = if files.len() > 1 { 230.0 } else { 194.0 };
     // Lean editor: cap well below the work area so the window reads as a
     // focused tool, not a second app taking over the screen.
     let (max_width, max_height) = monitor
@@ -2676,27 +2726,17 @@ fn snipping_set_asset_target_for(
     }))
 }
 
-fn snipping_asset_target_for(app: &AppHandle) -> Result<SnippingAssetTarget, String> {
-    app.state::<SnippingState>()
-        .asset_target
-        .lock()
-        .map(|guard| guard.clone())
-        .map_err(|_| "Unable to lock snipping asset target.".to_string())
-}
-
 fn snipping_upload_untracked_asset_for(
     app: &AppHandle,
     request: SnippingUploadAssetRequest,
 ) -> Result<Value, String> {
-    let target = snipping_asset_target_for(app)?;
-    if target.repo_path.trim().is_empty() {
-        return Err("Select a workspace before uploading this snip.".to_string());
-    }
+    // Snips are account-level assets: no workspace target is required, and
+    // the empty repo path resolves to the fixed account scope.
     diffforge_promote_untracked_asset(
         app.clone(),
-        target.repo_path,
-        target.workspace_id,
-        target.workspace_name,
+        String::new(),
+        None,
+        None,
         request.path,
         request.name,
         request.group.or_else(|| Some("snips".to_string())),
@@ -3777,6 +3817,14 @@ fn set_snipping_hide_desktop_icons(
 }
 
 #[tauri::command]
+fn set_snipping_upload_public(
+    app: AppHandle,
+    request: SnippingUploadPublicRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    set_snipping_upload_public_for(&app, request)
+}
+
+#[tauri::command]
 fn set_snipping_shortcut(
     app: AppHandle,
     request: SnippingShortcutUpdateRequest,
@@ -3877,6 +3925,113 @@ fn snipping_upload_untracked_asset(
     request: SnippingUploadAssetRequest,
 ) -> Result<Value, String> {
     snipping_upload_untracked_asset_for(&app, request)
+}
+
+fn snipping_publish_public_url(published: &Value) -> Option<String> {
+    cloud_mcp_payload_text(published, &["public_url", "publicUrl"]).or_else(|| {
+        [
+            "/public_link/public_url",
+            "/publicLink/publicUrl",
+            "/public_link/publicUrl",
+            "/publicLink/public_url",
+        ]
+        .iter()
+        .find_map(|path| {
+            published
+                .pointer(path)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty())
+        })
+    })
+}
+
+/// Publishes an already-uploaded snip asset as a public link and returns the
+/// URL. Backs the "Make public" step of the preview/strip upload button when
+/// the snip upload-public setting is off. Assets are account-level, so the
+/// publish goes through the fixed account scope (empty repo path).
+async fn snipping_publish_uploaded_asset_to_cloud(
+    app: &AppHandle,
+    asset_id: String,
+) -> Result<String, String> {
+    let published = cloud_mcp_publish_workspace_asset(
+        app.state::<CloudMcpState>(),
+        String::new(),
+        String::new(),
+        None,
+        asset_id,
+        None,
+    )
+    .await?;
+    snipping_publish_public_url(&published)
+        .ok_or_else(|| "Snip published, but the cloud did not return a public URL.".to_string())
+}
+
+#[tauri::command]
+async fn snipping_publish_uploaded_asset(
+    app: AppHandle,
+    request: SnippingPublishAssetRequest,
+) -> Result<Value, String> {
+    let asset_id = request.asset_id.trim().to_string();
+    if asset_id.is_empty() {
+        return Err("An asset id is required to publish a snip.".to_string());
+    }
+    let public_url = snipping_publish_uploaded_asset_to_cloud(&app, asset_id.clone()).await?;
+    Ok(json!({
+        "kind": "snip_published",
+        "asset_id": asset_id.clone(),
+        "assetId": asset_id,
+        "public_url": public_url.clone(),
+        "publicUrl": public_url,
+    }))
+}
+
+/// Full snip share chain for the preview/strip upload button: promote the
+/// untracked snip into the tracked library, upload it to the cloud, and —
+/// when the snip upload-public setting is on — publish a public link so the
+/// button can flip straight to "Copy URL". With the setting off the upload
+/// stays private and the button flips to "Make public" instead. Assets are
+/// account-level, so the whole chain runs in the fixed account scope with no
+/// workspace selection. Every step is idempotent (deterministic asset id,
+/// prepare-upload dedupe, publish returns the existing link), so retrying
+/// after a mid-chain failure is safe.
+#[tauri::command]
+async fn snipping_upload_untracked_asset_to_cloud(
+    app: AppHandle,
+    request: SnippingUploadAssetRequest,
+) -> Result<Value, String> {
+    let promoted = snipping_upload_untracked_asset_for(&app, request)?;
+    let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId"])
+        .ok_or_else(|| "Snip was tracked, but no asset id was returned.".to_string())?;
+
+    cloud_mcp_upload_workspace_asset(
+        app.state::<CloudMcpState>(),
+        String::new(),
+        String::new(),
+        None,
+        asset_id.clone(),
+        None,
+    )
+    .await?;
+
+    if !snipping_upload_public_enabled(&app) {
+        return Ok(json!({
+            "kind": "snip_uploaded_to_cloud",
+            "asset_id": asset_id.clone(),
+            "assetId": asset_id,
+            "published": false,
+        }));
+    }
+
+    let public_url = snipping_publish_uploaded_asset_to_cloud(&app, asset_id.clone()).await?;
+    Ok(json!({
+        "kind": "snip_uploaded_to_cloud",
+        "asset_id": asset_id.clone(),
+        "assetId": asset_id,
+        "published": true,
+        "public_url": public_url.clone(),
+        "publicUrl": public_url,
+    }))
 }
 
 #[tauri::command]
@@ -4417,6 +4572,11 @@ fn snipping_open_preview_paths(app: &AppHandle) -> HashSet<String> {
 /// where AppKit silently ignores NSWindow mutations (pool windows, built on
 /// the main thread, worked; direct builds intermittently did not). Same
 /// main-thread + every-show recipe as the strip and monitor overlays.
+/// Collection behavior alone is not enough on a fullscreen Space: tao's
+/// always-on-top floating level (3) renders BEHIND the Space's raised
+/// fullscreen window, so previews join the Space but stay invisible there.
+/// They run at status-bar level like the strip; the strip drag-out level
+/// juggling restores to this same level.
 #[cfg(target_os = "macos")]
 fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
@@ -4433,11 +4593,32 @@ fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
                 | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
                 | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
         );
+        ns_window.setLevel(objc2_app_kit::NSStatusWindowLevel);
         // Hover must work without the window ever having been clicked: a
         // non-key NSWindow drops mouse-moved events by default, which left
         // the preview's hover chrome unreachable until a focusing click
         // (and made every button cost two clicks).
         ns_window.setAcceptsMouseMovedEvents(true);
+    });
+}
+
+/// Orders a preview front even while Diff Forge is NOT the active app (a
+/// capture finishing inside another app's fullscreen Space): tao's show()
+/// relies on makeKeyAndOrderFront, which does nothing visible there;
+/// orderFrontRegardless is the documented way. Same recipe as the overlay
+/// and the strip.
+#[cfg(target_os = "macos")]
+fn snipping_preview_order_front_regardless(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.orderFrontRegardless();
     });
 }
 
@@ -4633,6 +4814,8 @@ fn snipping_open_snip_preview_window_for(
             #[cfg(target_os = "macos")]
             snipping_preview_apply_macos_space_style(&existing);
             let _ = existing.show();
+            #[cfg(target_os = "macos")]
+            snipping_preview_order_front_regardless(&existing);
             if focused {
                 let _ = existing.set_focus();
             }
@@ -4667,6 +4850,8 @@ fn snipping_open_snip_preview_window_for(
         #[cfg(target_os = "macos")]
         snipping_preview_apply_macos_space_style(&window);
         let _ = window.show();
+        #[cfg(target_os = "macos")]
+        snipping_preview_order_front_regardless(&window);
         if focused {
             let _ = window.set_focus();
         }
@@ -4692,6 +4877,8 @@ fn snipping_open_snip_preview_window_for(
     #[cfg(target_os = "macos")]
     snipping_preview_apply_macos_space_style(&window);
     let _ = window.show();
+    #[cfg(target_os = "macos")]
+    snipping_preview_order_front_regardless(&window);
     snipping_start_float_hover_watcher(app);
     // Park a warm window so the next capture takes the fast path.
     snipping_warm_preview_pool(app);
@@ -5198,6 +5385,53 @@ fn snipping_close_snip_float_for_path(app: AppHandle, path: String) -> Result<Va
     Ok(json!({ "ok": true, "closed": closed }))
 }
 
+/// A deleted snip must not linger on screen: dismisses its capture toast and
+/// closes every window presenting it — the draggable preview floats and any
+/// annotation editor whose path list includes it. Runs after the file is
+/// gone, so matching uses the canonical path strings the registries captured
+/// at open time; the canonicalizing path helpers would fail on the missing
+/// file. Rust owns this cleanup end to end: the preview's own delete-button
+/// follow-up never runs once its window is closed under it.
+fn snipping_handle_untracked_asset_deleted(app: &AppHandle, deleted_path: &str) {
+    let _ = snipping_dismiss_capture_toast_for(
+        app,
+        SnippingCaptureToastDismissRequest {
+            id: None,
+            path: Some(deleted_path.to_string()),
+            local_path: None,
+        },
+    );
+    let state = app.state::<SnippingState>();
+    let mut labels: Vec<String> = Vec::new();
+    if let Ok(paths) = state.preview_paths.lock() {
+        for (label, open_path) in paths.iter() {
+            if open_path == deleted_path {
+                labels.push(label.clone());
+            }
+        }
+    }
+    {
+        let mut editors = state
+            .editor_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        editors.retain(|label, open_paths| {
+            let stale = open_paths.iter().any(|open_path| open_path == deleted_path);
+            if stale {
+                labels.push(label.clone());
+            }
+            !stale
+        });
+    }
+    // Close outside the registry locks: the preview Destroyed handler
+    // re-enters preview_paths.
+    for label in labels {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
+    }
+}
+
 // A strip drag-out session: one at a time, owned by whichever strip tile the
 // user is currently holding. The strip webview drives it (pointer events keep
 // flowing to the window that received the press), while Rust follows the
@@ -5219,13 +5453,14 @@ fn snipping_strip_drag_out_track_cursor(app: &AppHandle, window: &tauri::Webview
     )));
 }
 
-/// Window level juggling for strip drag-outs: the strip runs at status-bar
-/// level (so it can overlay fullscreen Spaces), which is ABOVE the previews'
-/// normal floating tier — a preview dragged out of the bar would ride
-/// invisibly behind it until the cursor left the strip band. Raising the held
-/// preview one notch above the strip keeps it visible from the first drag
-/// pixel; the level is restored on release so previews never outrank
-/// menu-bar UI afterwards.
+/// Window level juggling for strip drag-outs: the strip and the previews both
+/// run at status-bar level (so they can overlay fullscreen Spaces), and
+/// same-level stacking depends on ordering calls — a preview dragged out of
+/// the bar could ride invisibly behind it until the cursor left the strip
+/// band. Raising the held preview one notch above the strip keeps it visible
+/// from the first drag pixel; release restores the previews' shared
+/// status-level base (NOT floating level — that tier renders behind a
+/// fullscreen Space's window and would undo the cross-Space fix).
 #[cfg(target_os = "macos")]
 fn snipping_strip_drag_out_set_level(window: &tauri::WebviewWindow, raised: bool) {
     let window_for_main = window.clone();
@@ -5240,7 +5475,7 @@ fn snipping_strip_drag_out_set_level(window: &tauri::WebviewWindow, raised: bool
         ns_window.setLevel(if raised {
             objc2_app_kit::NSStatusWindowLevel + 1
         } else {
-            objc2_app_kit::NSFloatingWindowLevel
+            objc2_app_kit::NSStatusWindowLevel
         });
     });
 }

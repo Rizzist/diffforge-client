@@ -9,6 +9,15 @@ export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.c
 
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
+// Dictation history: written by the audio widget window, shared via the
+// app-wide localStorage; every publish also broadcasts this event.
+const AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY = "diffforge.audio.transcriptionHistory";
+const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
+const AUDIO_DICTATION_STREAM_EVENT = "forge-audio-dictation-stream";
+const DICTATION_CARD_LIMIT = 8;
+// A live stream frame older than this is a dead take (widget window went
+// away without its closing frame): drop it instead of pinning "LIVE".
+const DICTATION_STREAM_STALE_MS = 12_000;
 
 const REFRESH_DEBOUNCE_MS = 40;
 const CARD_LIMIT = 30;
@@ -108,6 +117,33 @@ function readCachedWorkspaceTodos(context = {}) {
   }
 }
 
+// Last-known overview snapshot (small: capped todo rows, 180-char texts) so
+// a freshly booted overlay webview paints real cards on its very first
+// frame; the live fetch then converges it.
+const TODO_OVERVIEW_CACHE_KEY = "diffforge.activityOverlay.todoOverview";
+
+function readCachedTodoOverview() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return jsonObject(JSON.parse(window.localStorage.getItem(TODO_OVERVIEW_CACHE_KEY) || "null"));
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedTodoOverview(overview) {
+  if (typeof window === "undefined" || !jsonObject(overview)) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(TODO_OVERVIEW_CACHE_KEY, JSON.stringify(overview));
+  } catch {
+    // Snapshot cache is best-effort; the live fetch remains authoritative.
+  }
+}
+
 function writeCachedWorkspaceTodos(value, context = {}) {
   const workspaceTodos = jsonObject(value);
   if (typeof window === "undefined" || !workspaceTodos) {
@@ -123,6 +159,45 @@ function writeCachedWorkspaceTodos(value, context = {}) {
 function numberValue(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function readDictationHistoryEntries() {
+  if (typeof window === "undefined") {
+    return [];
+  }
+  let raw = [];
+  try {
+    raw = JSON.parse(window.localStorage.getItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+  return jsonArray(raw)
+    .map((entry, index) => {
+      const object = jsonObject(entry);
+      const entryText = text(object?.text);
+      if (!entryText) {
+        return null;
+      }
+      const createdAt = timestampMs(object?.createdAt);
+      return {
+        createdAt,
+        id: text(object?.id, `dictation-${createdAt || index}`),
+        status: text(object?.status, "inserted"),
+        text: entryText,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.createdAt - left.createdAt)
+    .slice(0, DICTATION_CARD_LIMIT);
+}
+
+function dictationClockLabel(createdAt) {
+  const at = timestampMs(createdAt);
+  if (!at) {
+    return "--:--";
+  }
+  const date = new Date(at);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 function clampPercent(value) {
@@ -1025,7 +1100,7 @@ function useActivityOverlayData(context) {
     cloudStatus: null,
     errors: [],
     library: null,
-    todoOverview: null,
+    todoOverview: readCachedTodoOverview(),
     updatedAt: 0,
   }));
   const contextRef = useRef(context);
@@ -1051,6 +1126,7 @@ function useActivityOverlayData(context) {
         overviewPendingRef.current = false;
         try {
           const overview = await invoke("todo_dispatch_overview");
+          writeCachedTodoOverview(overview);
           setState((current) => ({
             ...current,
             todoOverview: overview,
@@ -1127,6 +1203,9 @@ function useActivityOverlayData(context) {
       const refreshedWorkspaceTodos = await cachedTodosPromise;
       if (contextKeyRef.current !== refreshContextKey) {
         return;
+      }
+      if (todoOverviewResult.status === "fulfilled") {
+        writeCachedTodoOverview(todoOverviewResult.value);
       }
       setState((current) => {
         const errors = [];
@@ -1212,6 +1291,12 @@ function useActivityOverlayData(context) {
     // updates them instantly, the debounced full refresh converges the rest.
     void addListener("todo-store-changed", { onEvent: refreshTodoOverview });
     void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
+    // The pre-created window keeps this panel mounted while hidden; the
+    // moment Rust shows it, converge immediately instead of riding the poll.
+    void addListener("forge-activity-overlay-visibility-changed", {
+      onEvent: refreshTodoOverview,
+      refreshOptions: { localOnly: false },
+    });
 
     // Safety-net poll: overlay windows are separate webviews that can open
     // before listeners attach or miss an event entirely; the interval keeps
@@ -1395,6 +1480,102 @@ export function ActivityOverlayPanel({ embedded = false }) {
     [todoCards, liveTransferCards],
   );
 
+  // Recent dictation inputs, timestamped, with one-tap copy. The audio
+  // widget window owns the history; this panel mirrors it live.
+  const [dictationEntries, setDictationEntries] = useState(readDictationHistoryEntries);
+  const [copiedDictationId, setCopiedDictationId] = useState("");
+  const copiedDictationTimerRef = useRef(0);
+
+  // Live take: the audio widget broadcasts phase + interim transcript while
+  // recording/transcribing, so the incoming stream shows here in real time.
+  const [dictationStream, setDictationStream] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenStream = null;
+    listen(AUDIO_DICTATION_STREAM_EVENT, (event) => {
+      if (cancelled) return;
+      const payload = jsonObject(event?.payload) || {};
+      if (!payload.active) {
+        setDictationStream(null);
+        return;
+      }
+      const phase = text(payload.phase) === "transcribing" ? "transcribing" : "listening";
+      setDictationStream({
+        atMs: numberValue(payload.atMs, Date.now()),
+        phase,
+        text: text(payload.text),
+      });
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenStream = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenStream) unlistenStream();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!dictationStream) {
+      return undefined;
+    }
+    const expiresInMs = dictationStream.atMs + DICTATION_STREAM_STALE_MS - Date.now();
+    if (expiresInMs <= 0) {
+      setDictationStream(null);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setDictationStream(null), expiresInMs + 30);
+    return () => window.clearTimeout(timer);
+  }, [dictationStream]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenResult = null;
+    listen(AUDIO_TRANSCRIPTION_RESULT_EVENT, () => {
+      if (cancelled) return;
+      // The publisher writes localStorage before emitting, so a fresh read
+      // here always sees the new entry.
+      setDictationEntries(readDictationHistoryEntries());
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenResult = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenResult) unlistenResult();
+    };
+  }, []);
+
+  useEffect(() => () => {
+    if (copiedDictationTimerRef.current) {
+      window.clearTimeout(copiedDictationTimerRef.current);
+    }
+  }, []);
+
+  const copyDictationEntry = useCallback(async (entry) => {
+    try {
+      await navigator.clipboard.writeText(entry.text);
+    } catch {
+      return;
+    }
+    setCopiedDictationId(entry.id);
+    window.clearTimeout(copiedDictationTimerRef.current);
+    copiedDictationTimerRef.current = window.setTimeout(() => {
+      setCopiedDictationId("");
+    }, 1400);
+  }, []);
+
   // Exit lifecycle: when an active row leaves, keep it around to celebrate
   // (pop/shake/fade on its glyph), then collapse it out of the list.
   const [exitRows, setExitRows] = useState([]);
@@ -1462,7 +1643,9 @@ export function ActivityOverlayPanel({ embedded = false }) {
   }), [todoCards]);
   const hasTransfers = liveTransferCards.length > 0 || exitTransferRows.length > 0;
   const hasTodos = sortedTodoCards.length > 0 || exitTodoRows.length > 0;
-  const hasWork = hasTransfers || hasTodos;
+  const hasDictation = dictationEntries.length > 0;
+  const hasLiveDictation = Boolean(dictationStream);
+  const hasWork = hasTransfers || hasTodos || hasDictation || hasLiveDictation;
   const statusToneName = data.errors.length
     ? "warn"
     : stats.transfers > 0
@@ -1537,6 +1720,20 @@ export function ActivityOverlayPanel({ embedded = false }) {
       </OverlayHeader>
 
       <OverlayBody data-tauri-drag-region={embedded ? undefined : true} aria-live="polite">
+        {hasLiveDictation && (
+          <LiveStreamRow data-tauri-drag-region={embedded ? undefined : true}>
+            <LiveStreamBadge>
+              <LiveStreamDot aria-hidden="true" />
+              {dictationStream.phase === "transcribing" ? "Transcribing" : "Streaming"}
+            </LiveStreamBadge>
+            <LiveStreamText>
+              <span>
+                {dictationStream.text
+                  || (dictationStream.phase === "transcribing" ? "finalizing transcript…" : "listening…")}
+              </span>
+            </LiveStreamText>
+          </LiveStreamRow>
+        )}
         {hasTransfers && (
           <>
             <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>Assets</SectionLabel>
@@ -1549,6 +1746,61 @@ export function ActivityOverlayPanel({ embedded = false }) {
         )}
         {sortedTodoCards.map((card) => renderRow(card))}
         {exitTodoRows.map((row) => renderRow(row.card, row))}
+        {hasDictation && (
+          <>
+            <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>
+              Dictation
+            </SectionLabel>
+            {dictationEntries.map((entry) => (
+              <DictationRow
+                data-tauri-drag-region={embedded ? undefined : true}
+                key={entry.id}
+              >
+                <DictationTime title={entry.createdAt ? new Date(entry.createdAt).toLocaleString() : undefined}>
+                  {dictationClockLabel(entry.createdAt)}
+                </DictationTime>
+                <DictationText
+                  data-cancelled={entry.status === "cancelled" ? "true" : undefined}
+                  title={entry.text}
+                >
+                  {entry.text}
+                </DictationText>
+                <DictationCopyButton
+                  aria-label="Copy transcript"
+                  data-copied={copiedDictationId === entry.id ? "true" : undefined}
+                  onClick={() => void copyDictationEntry(entry)}
+                  title="Copy transcript"
+                  type="button"
+                >
+                  {copiedDictationId === entry.id ? (
+                    <svg
+                      fill="none"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="1.6"
+                      viewBox="0 0 16 16"
+                    >
+                      <path d="M3.5 8.4l3 3 6-6.8" />
+                    </svg>
+                  ) : (
+                    <svg
+                      fill="none"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="1.3"
+                      viewBox="0 0 16 16"
+                    >
+                      <rect height="8.2" rx="1.5" width="8.2" x="5.6" y="5.6" />
+                      <path d="M10.6 3H4.4A1.7 1.7 0 0 0 2.7 4.7V11" />
+                    </svg>
+                  )}
+                </DictationCopyButton>
+              </DictationRow>
+            ))}
+          </>
+        )}
         {!hasWork && (
           <OverlayEmpty data-tauri-drag-region={embedded ? undefined : true}>
             <EmptyGlyph aria-hidden="true">
@@ -1990,6 +2242,143 @@ const SectionLabel = styled.span`
   letter-spacing: 0.14em;
   line-height: 1;
   text-transform: uppercase;
+`;
+
+/* Live take banner pinned at the top of the panel: pulsing dot + phase
+   badge, with the interim transcript clipped from the LEFT so the newest
+   words stay visible as the stream grows. */
+const LiveStreamRow = styled.div`
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  height: 30px;
+  margin: 1px 0 2px;
+  padding: 0 9px;
+  overflow: hidden;
+  border: 1px solid rgba(242, 85, 85, 0.28);
+  border-radius: 9px;
+  background: linear-gradient(180deg, rgba(242, 85, 85, 0.1), rgba(242, 85, 85, 0.04));
+`;
+
+const liveStreamPulse = keyframes`
+  0%, 100% { opacity: 0.5; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.12); }
+`;
+
+const LiveStreamDot = styled.span`
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #f25555;
+  animation: ${liveStreamPulse} 1.1s ease-in-out infinite;
+`;
+
+const LiveStreamBadge = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: rgba(242, 120, 120, 0.95);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  line-height: 1;
+  text-transform: uppercase;
+`;
+
+const LiveStreamText = styled.div`
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  overflow: hidden;
+
+  & > span {
+    color: rgba(240, 244, 249, 0.88);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.15;
+    white-space: nowrap;
+  }
+`;
+
+const DictationRow = styled.div`
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  min-width: 0;
+  overflow: hidden;
+  cursor: grab;
+  -webkit-app-region: drag;
+
+  & + & {
+    border-top: 1px solid rgba(255, 255, 255, 0.045);
+  }
+
+  &:active {
+    cursor: grabbing;
+  }
+`;
+
+const DictationTime = styled.span`
+  flex: 0 0 auto;
+  color: rgba(122, 132, 147, 0.7);
+  font-size: 9.5px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+`;
+
+const DictationText = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(225, 231, 239, 0.85);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &[data-cancelled="true"] {
+    color: rgba(150, 158, 170, 0.6);
+    text-decoration: line-through;
+  }
+`;
+
+const DictationCopyButton = styled.button`
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: rgba(150, 158, 170, 0.75);
+  background: transparent;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: background 120ms ease, color 120ms ease;
+
+  & > svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover {
+    color: rgba(240, 244, 249, 0.95);
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  &[data-copied="true"] {
+    color: rgba(78, 213, 152, 0.95);
+  }
 `;
 
 const OverlayEmpty = styled.div`

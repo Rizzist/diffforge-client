@@ -9,6 +9,7 @@ import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 const LAST_TAB_STORAGE_KEY = "diffforge.backgroundMonitor.lastTab.v1";
 const MONITOR_ANIM_EVENT = "forge-background-monitor-anim";
+const MONITOR_OPEN_TAB_EVENT = "forge-background-monitor-open-tab";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -72,6 +73,32 @@ export default function BackgroundMonitorWindow() {
       if (unlistenAnim) unlistenAnim();
     };
   }, []);
+
+  // Entry points like the dictation bar's History button land the popover on
+  // a specific tab (a fresh mount reads the same choice from storage).
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenTab = null;
+    listen(MONITOR_OPEN_TAB_EVENT, (event) => {
+      if (cancelled) return;
+      const nextTab = text(event?.payload?.tab);
+      if (nextTab === "activity" || nextTab === "tokenomics") {
+        setTab(nextTab);
+      }
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenTab = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenTab) unlistenTab();
+    };
+  }, [setTab]);
 
   const returnToApp = useCallback(() => {
     void invoke("app_exit_background").catch(() => {});
@@ -144,6 +171,15 @@ const MonitorGlobalStyle = createGlobalStyle`
     height: 100%;
     margin: 0;
     background: transparent !important;
+  }
+
+  /* The embedded panels (Activity, Tokenomics) are written for the main
+     app's border-box world; without this their "width: 100% + padding"
+     surfaces overflow the popover and clip on the right. */
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
   }
 `;
 

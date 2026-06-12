@@ -530,6 +530,56 @@ fn audio_cancel_shortcut_defers_global_registration(shortcut: &str) -> bool {
     !audio_shortcut_has_explicit_modifier(shortcut)
 }
 
+/// Tracks whether a deferred bare-key cancel shortcut (typically plain
+/// Escape) is currently scope-registered as a global shortcut.
+static AUDIO_CANCEL_SCOPE_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Scope-registers a bare cancel shortcut globally only while the audio
+/// widget has an active take. Bare keys must never be swallowed system-wide
+/// while idle, so startup registration defers them (see
+/// `audio_cancel_shortcut_defers_global_registration`); the widget calls this
+/// when it enters/leaves arming/recording/transcribing so ESC cancels even
+/// when another app or terminal has keyboard focus.
+#[tauri::command]
+fn audio_cancel_shortcut_scope(app: AppHandle, active: bool) -> Result<(), String> {
+    let manager = app.state::<AudioState>().shortcut_manager.clone();
+    let cancel = manager.snapshot().registration(AudioShortcutAction::Cancel);
+    let shortcut = cancel.shortcut;
+    if !audio_cancel_shortcut_defers_global_registration(&shortcut) {
+        // Modifier shortcuts are globally registered at startup already.
+        return Ok(());
+    }
+    if active {
+        if AUDIO_CANCEL_SCOPE_REGISTERED.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Err(error) =
+            register_audio_shortcut_handler(&app, AudioShortcutAction::Cancel, &shortcut)
+        {
+            AUDIO_CANCEL_SCOPE_REGISTERED.store(false, Ordering::Release);
+            log_audio_diagnostic_event(
+                "audio.shortcut.cancel_scope.register_error",
+                json!({
+                    "shortcut": shortcut,
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+        log_audio_diagnostic_event(
+            "audio.shortcut.cancel_scope.registered",
+            json!({ "shortcut": shortcut }),
+        );
+    } else if AUDIO_CANCEL_SCOPE_REGISTERED.swap(false, Ordering::AcqRel) {
+        unregister_audio_shortcut(&app, &shortcut);
+        log_audio_diagnostic_event(
+            "audio.shortcut.cancel_scope.unregistered",
+            json!({ "shortcut": shortcut }),
+        );
+    }
+    Ok(())
+}
+
 fn deferred_audio_cancel_registration(shortcut: String) -> AudioShortcutRegistration {
     AudioShortcutRegistration {
         shortcut,

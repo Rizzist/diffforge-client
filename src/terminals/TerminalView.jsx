@@ -18230,6 +18230,17 @@ function TerminalView({
               threadId: payload.threadId || "",
               todoText: String(payload.userMessage || payload.message || "").slice(0, 200),
               todoTitle: "",
+              // Stable per-turn key: a completion hook delivered twice updates
+              // one notification instead of minting a second unread.
+              turnId: String(
+                payload.promptEventId
+                  || payload.prompt_event_id
+                  || payload.turnId
+                  || payload.turn_id
+                  || payload.pendingPromptId
+                  || payload.promptId
+                  || "",
+              ).trim(),
               workspaceId: eventWorkspaceId || terminalWorkspace?.id || "",
             },
           }));

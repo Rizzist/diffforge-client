@@ -548,6 +548,7 @@ fn diffforge_delete_untracked_asset(app: AppHandle, path: String) -> Result<Valu
         )
     })?;
     diffforge_remove_empty_untracked_parents(&file);
+    snipping_handle_untracked_asset_deleted(&app, &file.display().to_string());
     diffforge_emit_untracked_assets_updated(&app, "deleted", None);
     Ok(json!({
         "kind": "untracked_asset_deleted",
@@ -865,7 +866,7 @@ fn diffforge_promote_untracked_asset(
     let untracked_root = diffforge_prepare_untracked_asset_root()?;
     let (sha256, size_bytes) = cloud_mcp_file_sha256_and_size(&source)?;
     let workspace_id_text = workspace_id.as_deref().unwrap_or_default();
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let asset_id = format!(
         "asset-snip-{}",
         cloud_mcp_short_hash(&format!(

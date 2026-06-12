@@ -6540,6 +6540,24 @@ export const AudioGeneralToolbar = styled.div`
   }
 `;
 
+/* Stacks the short panels (provider, orchestrator) into one toolbar column
+   so the tall recorder panel beside them never leaves a dead gap. */
+export const AudioGeneralColumn = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+`;
+
+/* Full-width option rows: the radio-list variant of AudioModeGrid for
+   choices whose descriptions deserve the whole panel width. */
+export const AudioModeList = styled.div`
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  min-width: 0;
+`;
+
 export const AudioProviderPanel = styled.section`
   display: grid;
   align-content: start;
@@ -6627,22 +6645,25 @@ export const AudioModeButton = styled.button`
     gap: 2px;
   }
 
-  strong,
-  > span > span {
+  strong {
     overflow: hidden;
+    font-size: 12px;
+    font-weight: 780;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  strong {
-    font-size: 12px;
-    font-weight: 780;
-  }
-
+  /* Details wrap to a second line instead of truncating mid-word ("Appears
+     while speaki..."); anything longer still clamps cleanly. */
   > span > span {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
     color: var(--forge-text-muted);
     font-size: 11px;
     font-weight: 650;
+    line-height: 1.3;
   }
 
   html[data-forge-theme="light"] & {
@@ -7421,12 +7442,181 @@ export const AudioHistoryPanel = styled.section`
 
 export const AudioHistoryStats = styled.div`
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(168px, 0.8fr) minmax(0, 1.5fr) minmax(150px, 0.7fr);
+  align-items: stretch;
   gap: 8px;
   min-width: 0;
 
-  @media (max-width: 760px) {
+  @media (max-width: 860px) {
     grid-template-columns: 1fr;
+  }
+`;
+
+/* Shared stat-card surface for the history header (gauge, heatmap, totals). */
+export const AudioInsightCard = styled.div`
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--forge-border);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
+    rgba(13, 17, 23, 0.66);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.035),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
+  /* Totals column reuses the existing chips, stacked borderless. */
+  &[data-kind="totals"] {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    gap: 8px;
+    align-content: stretch;
+
+    html[data-forge-theme="light"] & {
+      background: transparent;
+      box-shadow: none;
+    }
+  }
+`;
+
+export const AudioInsightCardTopline = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+`;
+
+export const AudioInsightValue = styled.strong`
+  color: var(--forge-text);
+  font-size: 30px;
+  font-weight: 850;
+  line-height: 1;
+`;
+
+export const AudioInsightLabel = styled.span`
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+export const AudioInsightSubValue = styled.span`
+  overflow: hidden;
+  color: var(--forge-text-soft);
+  font-size: 12px;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+/* Wispr-style half-circle gauge: a muted track arc with a blue progress arc
+   drawn by stroke-dashoffset. */
+export const AudioWpmGauge = styled.svg`
+  width: min(150px, 100%);
+  margin: 2px auto 0;
+
+  path {
+    fill: none;
+    stroke-width: 9;
+    stroke-linecap: round;
+  }
+
+  .track {
+    stroke: rgba(125, 160, 205, 0.18);
+  }
+
+  .fill {
+    stroke: #5f9cff;
+    transition: stroke-dashoffset 420ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  html[data-forge-theme="light"] & .track {
+    stroke: rgba(29, 29, 31, 0.1);
+  }
+
+  html[data-forge-theme="light"] & .fill {
+    stroke: var(--forge-blue, #0066cc);
+  }
+`;
+
+/* Contribution-style heatmap: one cell per day, columns are weeks. */
+export const AudioHeatmapGrid = styled.div`
+  display: flex;
+  justify-content: flex-start;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+  margin-top: 2px;
+`;
+
+export const AudioHeatmapColumn = styled.div`
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-rows: repeat(7, 11px);
+  gap: 3px;
+`;
+
+export const AudioHeatmapCell = styled.span`
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background: rgba(125, 160, 205, 0.1);
+
+  &[data-empty="true"] {
+    background: transparent;
+  }
+
+  &[data-level="1"] {
+    background: rgba(95, 156, 255, 0.28);
+  }
+
+  &[data-level="2"] {
+    background: rgba(95, 156, 255, 0.48);
+  }
+
+  &[data-level="3"] {
+    background: rgba(95, 156, 255, 0.7);
+  }
+
+  &[data-level="4"] {
+    background: #5f9cff;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(29, 29, 31, 0.07);
+
+    &[data-empty="true"] {
+      background: transparent;
+    }
+
+    &[data-level="1"] {
+      background: rgba(0, 102, 204, 0.22);
+    }
+
+    &[data-level="2"] {
+      background: rgba(0, 102, 204, 0.42);
+    }
+
+    &[data-level="3"] {
+      background: rgba(0, 102, 204, 0.66);
+    }
+
+    &[data-level="4"] {
+      background: var(--forge-blue, #0066cc);
+    }
   }
 `;
 
@@ -7490,20 +7680,18 @@ export const AudioHistoryVirtualList = styled.div`
   }
 `;
 
-export const AudioHistoryListSpacer = styled.div`
-  position: relative;
+export const AudioHistoryList = styled.div`
+  display: grid;
+  gap: 8px;
   min-width: 0;
 `;
 
 export const AudioHistoryRow = styled.div`
-  position: absolute;
-  left: 0;
-  right: 0;
   display: grid;
   min-width: 0;
   align-content: start;
   gap: 4px;
-  padding: 7px 12px;
+  padding: 8px 12px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.5);
@@ -7516,8 +7704,8 @@ export const AudioHistoryRow = styled.div`
       inset 0 1px 0 rgba(255, 255, 255, 0.92);
   }
 
-  /* One line per card keeps the virtualized rows thin; the title tooltip and
-     the Copy button still carry the full transcript. */
+  /* Up to three lines per card; "Show more" lifts the clamp. The Copy
+     button always carries the full transcript either way. */
   > strong {
     display: -webkit-box;
     min-width: 0;
@@ -7526,14 +7714,45 @@ export const AudioHistoryRow = styled.div`
     font-size: 13px;
     font-weight: 720;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 1;
-    line-height: 1.35;
+    -webkit-line-clamp: 3;
+    line-height: 1.4;
     text-overflow: ellipsis;
-    white-space: normal;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  &[data-expanded="true"] > strong {
+    -webkit-line-clamp: unset;
   }
 
   html[data-forge-theme="light"] & > strong {
     color: var(--forge-text);
+  }
+`;
+
+export const AudioHistoryRowFootline = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+`;
+
+export const AudioHistoryExpandButton = styled.button`
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  font-size: 10.5px;
+  font-weight: 760;
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(95, 156, 255, 0.4);
+    color: var(--forge-text-soft);
+    background: rgba(95, 156, 255, 0.08);
   }
 `;
 
@@ -8023,9 +8242,13 @@ export const AudioWidgetShell = styled.main`
 // Small error card shown above the bubble widget while a dictation run
 // fails (cloud stream errors included); the widget window grows upward to
 // make room and the card auto-dismisses with the error state.
+/* Anchored to the BOTTOM of the reserved error zone, hugging the bubble
+   (3px gap): short one-line errors used to pin to the window top and float
+   ~27px above the widget. Taller errors grow upward into the zone. */
 export const AudioWidgetErrorPopover = styled.div`
   position: fixed;
-  top: 0;
+  top: auto;
+  bottom: 67px;
   left: 0;
   right: 0;
   z-index: 30;
@@ -8034,7 +8257,7 @@ export const AudioWidgetErrorPopover = styled.div`
   -webkit-line-clamp: 2;
   max-height: 54px;
   overflow: hidden;
-  margin: 2px 2px 0;
+  margin: 0 2px;
   padding: 8px 12px;
   border: 1px solid rgba(239, 107, 107, 0.42);
   border-radius: 12px;
@@ -8295,15 +8518,90 @@ export const AudioBarUndoButton = styled.button`
   }
 `;
 
+export const AudioBarCopyButton = styled.button`
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: rgba(230, 236, 245, 0.78);
+  background: rgba(230, 236, 245, 0.12);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+
+  & > svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover {
+    color: #0c0f13;
+    background: rgba(230, 236, 245, 0.92);
+  }
+
+  ${AudioBarShell}[data-theme="light"] & {
+    color: rgba(29, 29, 31, 0.7);
+    background: rgba(29, 29, 31, 0.08);
+  }
+
+  ${AudioBarShell}[data-theme="light"] &:hover {
+    color: #fff;
+    background: rgba(29, 29, 31, 0.85);
+  }
+`;
+
+export const AudioBarHistoryButton = styled.button`
+  display: inline-flex;
+  min-height: 24px;
+  flex: none;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid rgba(230, 236, 245, 0.22);
+  border-radius: 999px;
+  color: var(--forge-text-soft, rgba(230, 236, 245, 0.86));
+  background: rgba(230, 236, 245, 0.08);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease;
+
+  &:hover {
+    color: #0c0f13;
+    background: rgba(230, 236, 245, 0.92);
+  }
+
+  ${AudioBarShell}[data-theme="light"] & {
+    border-color: rgba(29, 29, 31, 0.18);
+    color: rgba(29, 29, 31, 0.8);
+    background: rgba(29, 29, 31, 0.06);
+  }
+
+  ${AudioBarShell}[data-theme="light"] &:hover {
+    color: #fff;
+    background: rgba(29, 29, 31, 0.85);
+  }
+`;
+
+/* Drain bar for the cancel notice. Inset from the pill's rounded ends (the
+   surface clips overflow, so a full-bleed bottom line would lose its edges
+   to the corner radius and look like it never reaches 0). The short delay
+   with fill-mode both holds it at 100% until the resized bar has painted. */
 export const AudioBarNoticeProgress = styled.span`
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
+  left: 16px;
+  right: 16px;
+  bottom: 4px;
+  height: 3px;
+  border-radius: 999px;
   background: var(--forge-orange, #ff9f43);
   transform-origin: left center;
-  animation: audioBarNoticeDrain 1s linear forwards;
+  animation: audioBarNoticeDrain 3400ms linear 240ms both;
 
   @keyframes audioBarNoticeDrain {
     from { transform: scaleX(1); }
@@ -8350,8 +8648,8 @@ export const AudioBarIdleReveal = styled.div`
 
 export const AudioBarRecordButton = styled.button`
   display: inline-flex;
-  width: 42px;
-  height: 42px;
+  width: 32px;
+  height: 32px;
   flex: none;
   align-items: center;
   justify-content: center;
@@ -8367,8 +8665,8 @@ export const AudioBarRecordButton = styled.button`
 
   &::after {
     content: "";
-    width: 15px;
-    height: 15px;
+    width: 11px;
+    height: 11px;
     border-radius: 50%;
     background: #f25555;
     transition: transform 130ms ease;

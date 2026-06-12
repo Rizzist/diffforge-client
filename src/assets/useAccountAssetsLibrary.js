@@ -57,7 +57,7 @@ function text(value) {
   return String(value ?? "").trim();
 }
 
-function assetIdentityKeys(asset) {
+export function assetIdentityKeys(asset) {
   const keys = [];
   const add = (prefix, value) => {
     const key = text(value);

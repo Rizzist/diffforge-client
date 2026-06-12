@@ -10,6 +10,11 @@ const APPROVAL_CUE_COOLDOWN_MS = 5000;
 const ALL_DONE_CUE_COOLDOWN_MS = 1200;
 const NOTIFICATION_CUE_COOLDOWN_MS = 800;
 const TERMINAL_READY_NOTIFICATION_KIND = "terminal.ready";
+// One physical completion arrives twice: the lifecycle reducer's generic
+// terminal.ready and TerminalView's richer todo.completed both describe the
+// same finishing terminal, in racy order. Within this window the pair is
+// collapsed so the workspace badge counts one, not two.
+const TERMINAL_READY_TODO_SUPPRESSION_WINDOW_MS = 15_000;
 
 const ACTIVE_LIFECYCLE_TYPES = new Set([
   "agent-output",
@@ -985,6 +990,33 @@ function resolvePromptingNotificationsForLifecycle(bucket, event) {
   return changed ? { ...bucket, notifications } : bucket;
 }
 
+/// Whether two notifications point at the same terminal: pane identity wins,
+/// then thread, then terminal index. Used to collapse the terminal.ready /
+/// todo.completed pair a single completion produces.
+function notificationTargetsSameTerminal(left, right) {
+  const leftPane = cleanText(left?.paneId);
+  const rightPane = cleanText(right?.paneId);
+  if (leftPane && rightPane) return leftPane === rightPane;
+  const leftThread = cleanText(left?.threadId);
+  const rightThread = cleanText(right?.threadId);
+  if (leftThread && rightThread) return leftThread === rightThread;
+  if (left?.terminalIndex != null && right?.terminalIndex != null) {
+    return String(left.terminalIndex) === String(right.terminalIndex);
+  }
+  return false;
+}
+
+function bucketHasFreshTodoCompletionForTarget(bucket, candidate) {
+  const nowMs = Date.now();
+  return Object.values(bucket.notifications || {}).some((notification) => (
+    notification.kind === "todo.completed"
+    && notification.status !== "dismissed"
+    && notificationTargetsSameTerminal(notification, candidate)
+    && nowMs - parseTimestampMs(notification.updatedAt || notification.createdAt)
+      < TERMINAL_READY_TODO_SUPPRESSION_WINDOW_MS
+  ));
+}
+
 function workspacePendingActionCount(bucket) {
   return Object.values(bucket.notifications || {}).filter((notification) => (
     notification.pendingAction
@@ -1093,6 +1125,11 @@ function addTerminalReadyNotification(state, bucket, workspaceId, lifecycleEvent
   const id = terminalReadyNotificationId(lifecycleEvent, workspaceId);
   const existing = bucket.notifications?.[id] || null;
   const notification = buildTerminalReadyNotification(lifecycleEvent, workspaceId, existing, options);
+  // TerminalView already turned this completion into a todo.completed for the
+  // same terminal: skip the generic ready ping so the badge counts one.
+  if (bucketHasFreshTodoCompletionForTarget(bucket, notification)) {
+    return state;
+  }
   let nextBucket = {
     ...bucket,
     notifications: {
@@ -1362,7 +1399,13 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
   const createdAt = nowIso();
   const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
   const rawTerminalIndex = Number(completionEvent?.terminalIndex ?? completionEvent?.terminal_index);
-  const id = `todo-completed:${workspaceId}:${cleanText(completionEvent?.itemId, String(Date.now()))}`;
+  // Stable per-completion id: the todo item id, else the turn id (so a hook
+  // delivered twice updates one notification instead of minting a second),
+  // else the arrival time.
+  const completionKey = cleanText(completionEvent?.itemId)
+    || cleanText(completionEvent?.turnId || completionEvent?.turn_id)
+    || String(Date.now());
+  const id = `todo-completed:${workspaceId}:${completionKey}`;
   const notification = {
     actionability: "open_thread",
     agentId: cleanText(completionEvent?.agentId || completionEvent?.agent_id),
@@ -1388,10 +1431,30 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
     updatedAt: createdAt,
     workspaceId,
   };
+  // The lifecycle reducer may have already (or may yet — see the suppression
+  // in addTerminalReadyNotification) logged a generic terminal.ready for this
+  // same completion: resolve it so the pair counts as one badge increment.
+  const notifications = Object.fromEntries(
+    Object.entries(bucket.notifications).map(([existingId, existingNotification]) => {
+      if (
+        existingNotification.kind === TERMINAL_READY_NOTIFICATION_KIND
+        && !["dismissed", "resolved"].includes(existingNotification.status)
+        && notificationTargetsSameTerminal(existingNotification, notification)
+      ) {
+        return [existingId, {
+          ...existingNotification,
+          seenAt: existingNotification.seenAt || createdAt,
+          status: "resolved",
+          updatedAt: createdAt,
+        }];
+      }
+      return [existingId, existingNotification];
+    }),
+  );
   let nextBucket = {
     ...bucket,
     notifications: {
-      ...bucket.notifications,
+      ...notifications,
       [id]: notification,
     },
   };

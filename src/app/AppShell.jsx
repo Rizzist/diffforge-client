@@ -8975,6 +8975,30 @@ export default function App() {
     showView("settings");
   }, [showView]);
 
+  // The dictation bar's History button (foreground path): Rust focuses the
+  // main window and asks for the Audio view, where dictation history lives.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenOpenAudio = null;
+    listen("forge-open-audio-history", () => {
+      if (!cancelled) {
+        showView("audio");
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenOpenAudio = unlisten;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenOpenAudio) {
+        unlistenOpenAudio();
+      }
+    };
+  }, [showView]);
+
   const animateWorkspaceRailWidth = useCallback((nextCollapsed) => {
     const shell = dashboardShellRef.current;
     const rail = workspaceRailRef.current;

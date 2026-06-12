@@ -243,8 +243,9 @@ fn write_voice_text_rules(app: &AppHandle, rules: &VoiceTextRules) -> Result<(),
 }
 
 /// Enabled dictionary phrases used to bias speech recognition (Whisper initial
-/// prompt and Deepgram keyterms). Capped so neither backend gets an oversized
-/// vocabulary payload.
+/// prompt, own-key Deepgram keyterms, and the cloud dictation start frame,
+/// which forwards them to Deepgram server-side). Capped so no backend gets an
+/// oversized vocabulary payload.
 fn voice_dictionary_bias_terms(app: &AppHandle) -> Vec<String> {
     read_voice_text_rules(app)
         .dictionary

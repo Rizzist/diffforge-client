@@ -12,6 +12,8 @@ const BACKGROUND_MONITOR_WIDTH: f64 = 430.0;
 const BACKGROUND_MONITOR_HEIGHT: f64 = 600.0;
 const BACKGROUND_MONITOR_BLUR_TOGGLE_GRACE_MS: u64 = 350;
 const BACKGROUND_MONITOR_ANIM_EVENT: &str = "forge-background-monitor-anim";
+const BACKGROUND_MONITOR_OPEN_TAB_EVENT: &str = "forge-background-monitor-open-tab";
+const OPEN_AUDIO_HISTORY_EVENT: &str = "forge-open-audio-history";
 const BACKGROUND_MONITOR_CLOSE_ANIM_MS: u64 = 190;
 
 static APP_BACKGROUND_MODE: AtomicBool = AtomicBool::new(false);
@@ -346,6 +348,34 @@ async fn app_exit_background(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn app_background_mode_state() -> Result<Value, String> {
     Ok(json!({ "background": app_is_in_background_mode() }))
+}
+
+/// The dictation bar's History button: surface dictation history wherever it
+/// lives right now. In background mode (or with the main window hidden) that
+/// is the tray popover's Activity tab; otherwise the main window comes
+/// forward on its Audio view.
+#[tauri::command]
+async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> {
+    let main_visible = app
+        .get_webview_window("main")
+        .map(|main| main.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+    if app_is_in_background_mode() || !main_visible {
+        let monitor_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            background_monitor_show_near_tray_corner(&monitor_app);
+            // After show so a pre-created popover's listener is live; a
+            // freshly created one reads the same tab from localStorage.
+            let _ = monitor_app.emit(BACKGROUND_MONITOR_OPEN_TAB_EVENT, json!({ "tab": "activity" }));
+        });
+        return Ok(());
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    let _ = app.emit(OPEN_AUDIO_HISTORY_EVENT, json!({}));
+    Ok(())
 }
 
 /// The monitor popover's Snippets button: the strip is its own full-width

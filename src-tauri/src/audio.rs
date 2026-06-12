@@ -116,14 +116,19 @@ fn emit_voice_agent_mic_event(app: &AppHandle, state: &str, reason: &str) {
 }
 
 /// Returns the microphone after a dictation session ends (any path): detaches
-/// dictation's feed and, when a live voice agent session lent the mic, quietly
-/// re-attaches the agent's audio stream so it resumes listening without a
-/// session restart — and without replaying what was dictated meanwhile.
-async fn forge_dictation_release_mic(app: &AppHandle, audio_state: &AudioState) {
-    let borrowed = audio_state
-        .forge_dictation_mic_borrowed
-        .swap(false, Ordering::SeqCst);
-    if realtime_mic_holder_get(audio_state) != RealtimeMicHolder::Dictation {
+/// that consumer's feed and, when a live voice agent session lent the mic,
+/// quietly re-attaches the agent's audio stream so it resumes listening
+/// without a session restart — and without replaying what was dictated
+/// meanwhile. Shared by Forge Cloud dictation and the user's own-key Deepgram
+/// stream; each runs its own websocket and only arbitrates the one mic here.
+async fn realtime_dictation_release_mic(
+    app: &AppHandle,
+    audio_state: &AudioState,
+    holder: RealtimeMicHolder,
+    borrowed_flag: &AtomicBool,
+) {
+    let borrowed = borrowed_flag.swap(false, Ordering::SeqCst);
+    if realtime_mic_holder_get(audio_state) != holder {
         return;
     }
     realtime_mic_holder_set(audio_state, RealtimeMicHolder::None);
@@ -175,6 +180,26 @@ async fn forge_dictation_release_mic(app: &AppHandle, audio_state: &AudioState) 
     }
 }
 
+async fn forge_dictation_release_mic(app: &AppHandle, audio_state: &AudioState) {
+    realtime_dictation_release_mic(
+        app,
+        audio_state,
+        RealtimeMicHolder::Dictation,
+        &audio_state.forge_dictation_mic_borrowed,
+    )
+    .await
+}
+
+async fn deepgram_release_mic(app: &AppHandle, audio_state: &AudioState) {
+    realtime_dictation_release_mic(
+        app,
+        audio_state,
+        RealtimeMicHolder::Deepgram,
+        &audio_state.deepgram_mic_borrowed,
+    )
+    .await
+}
+
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
 }
@@ -222,12 +247,20 @@ fn write_whisper_local_audio_log_entry(entry: Value) {
 }
 
 fn log_whisper_local_audio_event(phase: &str, elapsed: Option<Duration>, fields: Value) {
-    write_whisper_local_audio_log(json!({
+    let entry = json!({
         "ts_ms": current_time_ms(),
         "phase": clean_whisper_local_audio_log_text(phase),
         "elapsed_ms": elapsed.map(|duration| duration.as_secs_f64() * 1000.0),
         "fields": fields,
-    }));
+    });
+    // Capture-session starts always log: they record which capture engine
+    // (voice-processing vs raw cpal) the mic is on, the one fact needed to
+    // debug echo-cancellation reports from the field.
+    if phase.starts_with("audio.monitor.start") {
+        write_whisper_local_audio_log_entry(entry);
+        return;
+    }
+    write_whisper_local_audio_log(entry);
 }
 
 fn audio_debug_thread_label() -> String {
@@ -1034,6 +1067,68 @@ fn log_native_audio_stream_error(device_id: &str, error: cpal::StreamError) {
 #[cfg(target_os = "macos")]
 const MACOS_VOICE_PROCESSING_SAMPLE_RATE: u32 = 48_000;
 
+/// True while a VoiceProcessingIO capture session is live. The cloud voice
+/// agent checks it to route TTS playback through the unit's own output
+/// element instead of the webview, which hands the echo canceller the exact
+/// far-end signal.
+#[cfg(target_os = "macos")]
+static MACOS_VOICE_PROCESSING_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_VOICE_PLAYBACK_QUEUE: OnceLock<Arc<StdMutex<VecDeque<f32>>>> = OnceLock::new();
+/// Hard cap on queued native playback (30s at the unit rate) so a runaway
+/// stream cannot grow the buffer unbounded.
+#[cfg(target_os = "macos")]
+const MACOS_VOICE_PLAYBACK_MAX_SAMPLES: usize =
+    (MACOS_VOICE_PROCESSING_SAMPLE_RATE as usize) * 30;
+
+#[cfg(target_os = "macos")]
+fn macos_voice_playback_queue() -> &'static Arc<StdMutex<VecDeque<f32>>> {
+    MACOS_VOICE_PLAYBACK_QUEUE.get_or_init(|| Arc::new(StdMutex::new(VecDeque::new())))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_voice_playback_clear() {
+    if let Ok(mut queue) = macos_voice_playback_queue().lock() {
+        queue.clear();
+    }
+}
+
+/// Converts a linear16 mono TTS chunk to the voice-processing unit's rate
+/// and queues it for the render callback.
+#[cfg(target_os = "macos")]
+fn macos_voice_playback_enqueue_linear16(bytes: &[u8], source_rate: u32) {
+    if bytes.len() < 2 || source_rate == 0 {
+        return;
+    }
+    let samples: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+        .collect();
+    let target_rate = MACOS_VOICE_PROCESSING_SAMPLE_RATE;
+    let resampled = if source_rate == target_rate {
+        samples
+    } else {
+        let output_len = ((samples.len() as u64 * u64::from(target_rate)
+            + u64::from(source_rate) / 2)
+            / u64::from(source_rate))
+        .max(1) as usize;
+        let step = f64::from(source_rate) / f64::from(target_rate);
+        let mut output = Vec::with_capacity(output_len);
+        for index in 0..output_len {
+            let position = index as f64 * step;
+            let left = (position.floor() as usize).min(samples.len() - 1);
+            let right = (left + 1).min(samples.len() - 1);
+            let blend = (position - left as f64) as f32;
+            output.push(samples[left] + (samples[right] - samples[left]) * blend);
+        }
+        output
+    };
+    if let Ok(mut queue) = macos_voice_playback_queue().lock() {
+        let room = MACOS_VOICE_PLAYBACK_MAX_SAMPLES.saturating_sub(queue.len());
+        queue.extend(resampled.into_iter().take(room));
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct MacosVoiceProcessingCapture {
     unit: coreaudio::audio_unit::AudioUnit,
@@ -1042,6 +1137,8 @@ struct MacosVoiceProcessingCapture {
 #[cfg(target_os = "macos")]
 impl Drop for MacosVoiceProcessingCapture {
     fn drop(&mut self) {
+        MACOS_VOICE_PROCESSING_ACTIVE.store(false, Ordering::Release);
+        macos_voice_playback_clear();
         // AudioUnit's own Drop uninitializes and disposes; stopping first
         // keeps CoreAudio from rendering into a half-torn-down unit.
         let _ = self.unit.stop();
@@ -1092,29 +1189,42 @@ fn build_macos_voice_processing_capture(
         .map_err(|error| describe("create", error))?;
     // EnableIO and formats only apply to an uninitialized unit.
     unit.uninitialize().map_err(|error| describe("uninitialize", error))?;
-    let enable_input: u32 = 1;
+    let enable: u32 = 1;
     unit.set_property(
         kAudioOutputUnitProperty_EnableIO,
         Scope::Input,
         Element::Input,
-        Some(&enable_input),
+        Some(&enable),
     )
     .map_err(|error| describe("enable input", error))?;
-    let disable_output: u32 = 0;
+    // The output element stays enabled and renders the voice agent's TTS
+    // (silence otherwise): voice processing treats exactly what this unit
+    // renders as the echo far-end, so agent speech mathematically cannot
+    // come back as mic input.
     unit.set_property(
         kAudioOutputUnitProperty_EnableIO,
         Scope::Output,
         Element::Output,
-        Some(&disable_output),
+        Some(&enable),
     )
-    .map_err(|error| describe("disable output", error))?;
+    .map_err(|error| describe("enable output", error))?;
     unit.set_property(
         kAudioOutputUnitProperty_CurrentDevice,
         Scope::Global,
-        Element::Output,
+        Element::Input,
         Some(&core_device),
     )
-    .map_err(|error| describe("select device", error))?;
+    .map_err(|error| describe("select input device", error))?;
+    if let Some(output_device) =
+        coreaudio::audio_unit::macos_helpers::get_default_device_id(false)
+    {
+        let _ = unit.set_property(
+            kAudioOutputUnitProperty_CurrentDevice,
+            Scope::Global,
+            Element::Output,
+            Some(&output_device),
+        );
+    }
     let stream_format = StreamFormat {
         sample_rate: f64::from(MACOS_VOICE_PROCESSING_SAMPLE_RATE),
         sample_format: SampleFormat::F32,
@@ -1127,7 +1237,14 @@ fn build_macos_voice_processing_capture(
         Element::Input,
         Some(&stream_format.to_asbd()),
     )
-    .map_err(|error| describe("set format", error))?;
+    .map_err(|error| describe("set capture format", error))?;
+    unit.set_property(
+        kAudioUnitProperty_StreamFormat,
+        Scope::Input,
+        Element::Output,
+        Some(&stream_format.to_asbd()),
+    )
+    .map_err(|error| describe("set render format", error))?;
 
     let shared = Arc::new(StdMutex::new(NativeAudioShared::new(
         MACOS_VOICE_PROCESSING_SAMPLE_RATE,
@@ -1145,8 +1262,23 @@ fn build_macos_voice_processing_capture(
         Ok(())
     })
     .map_err(|error| describe("install callback", error))?;
+    let render_queue = Arc::clone(macos_voice_playback_queue());
+    type VoiceRenderArgs = render_callback::Args<data::Interleaved<f32>>;
+    unit.set_render_callback(move |args: VoiceRenderArgs| {
+        let VoiceRenderArgs { data, .. } = args;
+        let mut queue = render_queue.lock().ok();
+        for sample in data.buffer.iter_mut() {
+            *sample = queue
+                .as_mut()
+                .and_then(|queue| queue.pop_front())
+                .unwrap_or(0.0);
+        }
+        Ok(())
+    })
+    .map_err(|error| describe("install render callback", error))?;
     unit.initialize().map_err(|error| describe("initialize", error))?;
     unit.start().map_err(|error| describe("start", error))?;
+    MACOS_VOICE_PROCESSING_ACTIVE.store(true, Ordering::Release);
 
     Ok((
         MacosVoiceProcessingCapture { unit },
@@ -3663,7 +3795,50 @@ fn cloud_voice_agent_ws_request(
     Ok(request)
 }
 
+/// On macOS with a live voice-processing capture, TTS audio plays through
+/// the capture unit's own output element (perfect echo-cancellation
+/// reference) instead of the webview. The payload is tagged so the webview
+/// player skips scheduling those frames.
+fn cloud_voice_agent_route_tts_playback(payload: Value) -> Value {
+    #[cfg(target_os = "macos")]
+    {
+        let mut payload = payload;
+        match cloud_voice_agent_event_kind(&payload) {
+            "voice_agent_tts_audio" => {
+                if MACOS_VOICE_PROCESSING_ACTIVE.load(Ordering::Acquire) {
+                    let sample_rate = payload
+                        .pointer("/audio/sample_rate")
+                        .or_else(|| payload.pointer("/audio/sampleRate"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(24_000) as u32;
+                    let decoded = payload
+                        .pointer("/audio/base64")
+                        .and_then(Value::as_str)
+                        .and_then(|base64_text| {
+                            general_purpose::STANDARD.decode(base64_text).ok()
+                        });
+                    if let Some(bytes) = decoded {
+                        macos_voice_playback_enqueue_linear16(&bytes, sample_rate);
+                        if let Some(audio) = payload.get_mut("audio") {
+                            audio["native_playback"] = json!(true);
+                        }
+                        payload["native_playback"] = json!(true);
+                    }
+                }
+            }
+            "voice_agent_tts_error" | "voice_agent_error" => {
+                macos_voice_playback_clear();
+            }
+            _ => {}
+        }
+        return payload;
+    }
+    #[cfg(not(target_os = "macos"))]
+    payload
+}
+
 fn emit_cloud_voice_agent_event(app: &AppHandle, payload: Value) {
+    let payload = cloud_voice_agent_route_tts_playback(payload);
     let _ = app.emit(CLOUD_VOICE_AGENT_EVENT, payload);
 }
 
@@ -5294,11 +5469,23 @@ async fn set_cloud_voice_agent_input_enabled(
             }))
         }
         RealtimeMicHolder::Deepgram => {
+            // Own-key Deepgram dictation is a borrower like Forge dictation:
+            // its teardown hands the mic back, so enabling agent input waits
+            // instead of failing.
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(true, Ordering::SeqCst);
+            emit_voice_agent_mic_event(&app, "paused", "dictation_active");
             log_audio_diagnostic_event(
-                "audio.cloud_voice.input_enabled.blocked",
+                "audio.cloud_voice.input_enabled.waiting_for_dictation",
                 json!({ "holder": "deepgram" }),
             );
-            Err("Deepgram realtime transcription is using the microphone.".to_string())
+            Ok(json!({
+                "active": true,
+                "enabled": true,
+                "mic_attached": false,
+                "reason": "dictation_active",
+            }))
         }
         RealtimeMicHolder::None => {
             match audio_state.input_worker.attach_realtime_stream_silent(audio_tx) {
@@ -5522,6 +5709,8 @@ async fn send_cloud_voice_agent_text_message(
 #[tauri::command]
 async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Result<(), String> {
     log_audio_diagnostic_event("audio.cloud_voice.stop.command", json!({}));
+    #[cfg(target_os = "macos")]
+    macos_voice_playback_clear();
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let session = {
         let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
@@ -5756,24 +5945,75 @@ async fn start_deepgram_realtime_transcription(
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let mut session_guard = audio_state.deepgram_stream.lock().await;
 
+    if let Some(session) = session_guard.as_mut() {
+        // Reap a session that ended without a stop command (for example a
+        // dropped websocket) instead of refusing the new start.
+        match session.finished_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                *session_guard = None;
+                let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+    }
     if session_guard.is_some() {
         return Err("Deepgram realtime transcription is already active.".to_string());
     }
-    if audio_state.cloud_voice_agent_stream.lock().await.is_some() {
-        return Err("Cloud voice agent stream is already active.".to_string());
+    {
+        let mut dictation_guard = audio_state.forge_dictation_stream.lock().await;
+        if let Some(session) = dictation_guard.as_mut() {
+            match session.finished_rx.try_recv() {
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    *dictation_guard = None;
+                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Dictation);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        if dictation_guard.is_some() {
+            return Err("Diff Forge Cloud dictation is already active.".to_string());
+        }
     }
-    if audio_state.forge_dictation_stream.lock().await.is_some() {
-        return Err("Diff Forge Cloud dictation is already active.".to_string());
+
+    // Mic arbitration: a live voice agent session no longer blocks the
+    // own-key Deepgram stream. This path is its own websocket straight to
+    // Deepgram (separate from the cloud control and voice agent sockets), so
+    // the only shared resource is the microphone — borrow it like Forge
+    // dictation does and hand it back on teardown. Dead agent sessions
+    // (provider switch, dropped socket) are reaped instead of blocking.
+    let mut borrowed_from_voice_agent = false;
+    {
+        let mut agent_guard = audio_state.cloud_voice_agent_stream.lock().await;
+        if let Some(agent) = agent_guard.as_mut() {
+            match agent.finished_rx.try_recv() {
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    *agent_guard = None;
+                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    if realtime_mic_holder_get(&audio_state) == RealtimeMicHolder::VoiceAgent {
+                        borrowed_from_voice_agent = true;
+                    }
+                }
+            }
+        }
     }
 
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;
     realtime_mic_holder_set(&audio_state, RealtimeMicHolder::Deepgram);
+    audio_state
+        .deepgram_mic_borrowed
+        .store(borrowed_from_voice_agent, Ordering::SeqCst);
+    if borrowed_from_voice_agent {
+        emit_voice_agent_mic_event(&app, "paused", "dictation_started");
+        log_audio_diagnostic_event("audio.cloud_voice.mic.paused", json!({}));
+    }
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
 
     tauri::async_runtime::spawn(run_deepgram_realtime_stream(
-        app,
+        app.clone(),
         api_key,
         language.clone(),
         status.sample_rate,
@@ -5785,15 +6025,15 @@ async fn start_deepgram_realtime_transcription(
     match timeout(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS), ready_rx).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
-            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+            deepgram_release_mic(&app, &audio_state).await;
             return Err(error);
         }
         Ok(Err(_closed)) => {
-            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+            deepgram_release_mic(&app, &audio_state).await;
             return Err("Deepgram realtime stream closed before it was ready.".to_string());
         }
         Err(_elapsed) => {
-            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+            deepgram_release_mic(&app, &audio_state).await;
             return Err("Deepgram realtime stream timed out while connecting.".to_string());
         }
     }
@@ -5818,6 +6058,7 @@ async fn start_deepgram_realtime_transcription(
 
 #[tauri::command]
 async fn stop_deepgram_realtime_transcription(
+    app: AppHandle,
     audio_state: State<'_, AudioState>,
 ) -> Result<WhisperTranscriptionResult, String> {
     log_audio_diagnostic_event("audio.deepgram.stop.command", json!({}));
@@ -5835,7 +6076,8 @@ async fn stop_deepgram_realtime_transcription(
         });
     };
 
-    realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram)?;
+    // Detach and hand the mic back when a live voice agent session lent it.
+    deepgram_release_mic(&app, &audio_state).await;
 
     let result = timeout(
         Duration::from_secs(DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS),
@@ -6565,8 +6807,22 @@ async fn start_forge_dictation_transcription(
     if session_guard.is_some() {
         return Err("Diff Forge Cloud dictation is already active.".to_string());
     }
-    if audio_state.deepgram_stream.lock().await.is_some() {
-        return Err("Deepgram realtime transcription is already active.".to_string());
+    {
+        let mut deepgram_guard = audio_state.deepgram_stream.lock().await;
+        if let Some(session) = deepgram_guard.as_mut() {
+            // Same reap rule for a stale own-key Deepgram session (provider
+            // switch mid-take, dropped websocket).
+            match session.finished_rx.try_recv() {
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    *deepgram_guard = None;
+                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        if deepgram_guard.is_some() {
+            return Err("Deepgram realtime transcription is already active.".to_string());
+        }
     }
 
     // Mic arbitration: a live voice agent session no longer blocks dictation.
@@ -6641,6 +6897,11 @@ async fn start_forge_dictation_transcription(
     // The run task takes `app`; keep a handle for mic release on failure.
     let app_handle = app.clone();
 
+    // Dictionary phrases ride the start frame so the cloud passes them to
+    // Deepgram as keyterm prompts: recognition itself prefers the user's
+    // vocabulary instead of leaning on post-hoc text correction alone.
+    let keyterms = voice_dictionary_bias_terms(&app);
+    let keyterm_count = keyterms.len();
     let start_request = json!({
         "kind": "start",
         "contract": CLOUD_DICTATION_CONTRACT,
@@ -6651,6 +6912,7 @@ async fn start_forge_dictation_transcription(
         // Raw-first finalization: final raw transcript immediately after the
         // Deepgram flush, cleaned text as a follow-up frame.
         "raw_first": true,
+        "keyterms": keyterms,
     });
 
     tauri::async_runtime::spawn(run_forge_dictation_stream(
@@ -6690,6 +6952,7 @@ async fn start_forge_dictation_transcription(
             "language": language.clone(),
             "sample_rate": status.sample_rate,
             "llm_cleanup": llm_cleanup,
+            "keyterms": keyterm_count,
             "warm_socket": used_warm_socket,
             "elapsed_ms": command_started_at.elapsed().as_millis() as u64,
         }),
