@@ -4,29 +4,44 @@ const VOICE_TEXT_RULES_MAX_ENTRIES: usize = 500;
 const VOICE_TEXT_RULES_MAX_PHRASE_CHARS: usize = 160;
 const VOICE_TEXT_RULES_MAX_EXPANSION_CHARS: usize = 32_000;
 const VOICE_TEXT_RULES_MAX_TOTAL_BYTES: usize = 512 * 1024;
-const VOICE_DICTIONARY_BIAS_TERM_LIMIT: usize = 64;
+const VOICE_DICTIONARY_MAX_LISTS: usize = 50;
+const VOICE_DICTIONARY_MAX_TERMS_PER_LIST: usize = 400;
+const VOICE_DICTIONARY_LIST_NAME_CHARS: usize = 80;
+const VOICE_DICTIONARY_BIAS_TERM_LIMIT: usize = 100;
 const VOICE_DICTIONARY_BIAS_TERM_CHARS: usize = 64;
+const VOICE_DICTIONARY_WHISPER_PROMPT_CHARS: usize = 600;
 
 fn voice_rule_default_enabled() -> bool {
     true
 }
 
+/// A named word list. Terms from selected lists bias recognition on every
+/// dictation backend: Deepgram keyterms (own key and via the cloud start
+/// frame) and the local Whisper glossary prompt.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
-struct VoiceDictionaryEntry {
+struct VoiceDictionaryList {
     id: String,
-    phrase: String,
-    sounds_like: Vec<String>,
+    name: String,
+    terms: Vec<String>,
     #[serde(default = "voice_rule_default_enabled")]
+    selected: bool,
+    /// Legacy single-phrase dictionary entry (pre-lists format). Read so old
+    /// files migrate into one "Imported" list; never written back.
+    #[serde(skip_serializing)]
+    phrase: String,
+    #[serde(skip_serializing, default = "voice_rule_default_enabled")]
     enabled: bool,
 }
 
-impl Default for VoiceDictionaryEntry {
+impl Default for VoiceDictionaryList {
     fn default() -> Self {
         Self {
             id: String::new(),
+            name: String::new(),
+            terms: Vec::new(),
+            selected: true,
             phrase: String::new(),
-            sounds_like: Vec::new(),
             enabled: true,
         }
     }
@@ -80,7 +95,7 @@ impl Default for VoiceTransformEntry {
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct VoiceTextRules {
-    dictionary: Vec<VoiceDictionaryEntry>,
+    dictionary: Vec<VoiceDictionaryList>,
     snippets: Vec<VoiceSnippetEntry>,
     transforms: Vec<VoiceTransformEntry>,
 }
@@ -128,34 +143,73 @@ fn normalized_voice_rule_id(id: &str, prefix: &str, index: usize) -> String {
     }
 }
 
+fn normalize_voice_dictionary_terms(terms: &[String]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut normalized: Vec<String> = Vec::new();
+
+    for term in terms {
+        let cleaned = truncate_voice_rule_text(term, VOICE_DICTIONARY_BIAS_TERM_CHARS);
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        let key = cleaned.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+
+        seen.push(key);
+        normalized.push(cleaned);
+        if normalized.len() >= VOICE_DICTIONARY_MAX_TERMS_PER_LIST {
+            break;
+        }
+    }
+
+    normalized
+}
+
 fn normalize_voice_text_rules(rules: VoiceTextRules) -> VoiceTextRules {
-    let dictionary = rules
-        .dictionary
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            let phrase = truncate_voice_rule_text(&entry.phrase, VOICE_TEXT_RULES_MAX_PHRASE_CHARS);
-            if phrase.is_empty() {
-                return None;
+    let mut legacy_terms: Vec<String> = Vec::new();
+    let mut dictionary: Vec<VoiceDictionaryList> = Vec::new();
+
+    for (index, list) in rules.dictionary.into_iter().enumerate() {
+        let name = truncate_voice_rule_text(&list.name, VOICE_DICTIONARY_LIST_NAME_CHARS);
+        let terms = normalize_voice_dictionary_terms(&list.terms);
+
+        if name.is_empty() && terms.is_empty() {
+            // Pre-lists dictionary entry: gather its phrase for migration.
+            if list.enabled {
+                let phrase =
+                    truncate_voice_rule_text(&list.phrase, VOICE_DICTIONARY_BIAS_TERM_CHARS);
+                if !phrase.is_empty() {
+                    legacy_terms.push(phrase);
+                }
             }
+            continue;
+        }
 
-            let sounds_like = entry
-                .sounds_like
-                .iter()
-                .map(|alias| truncate_voice_rule_text(alias, VOICE_TEXT_RULES_MAX_PHRASE_CHARS))
-                .filter(|alias| !alias.is_empty())
-                .take(16)
-                .collect::<Vec<_>>();
+        if dictionary.len() >= VOICE_DICTIONARY_MAX_LISTS {
+            continue;
+        }
 
-            Some(VoiceDictionaryEntry {
-                id: normalized_voice_rule_id(&entry.id, "dict", index),
-                phrase,
-                sounds_like,
-                enabled: entry.enabled,
-            })
-        })
-        .take(VOICE_TEXT_RULES_MAX_ENTRIES)
-        .collect::<Vec<_>>();
+        dictionary.push(VoiceDictionaryList {
+            id: normalized_voice_rule_id(&list.id, "list", index),
+            name,
+            terms,
+            selected: list.selected,
+            ..Default::default()
+        });
+    }
+
+    if !legacy_terms.is_empty() && dictionary.len() < VOICE_DICTIONARY_MAX_LISTS {
+        dictionary.push(VoiceDictionaryList {
+            id: "imported-legacy".to_string(),
+            name: "Imported".to_string(),
+            terms: normalize_voice_dictionary_terms(&legacy_terms),
+            selected: true,
+            ..Default::default()
+        });
+    }
 
     let snippets = rules
         .snippets
@@ -242,29 +296,68 @@ fn write_voice_text_rules(app: &AppHandle, rules: &VoiceTextRules) -> Result<(),
     fs::write(path, contents).map_err(|error| format!("Unable to save voice text rules: {error}"))
 }
 
-/// Enabled dictionary phrases used to bias speech recognition (Whisper initial
-/// prompt, own-key Deepgram keyterms, and the cloud dictation start frame,
-/// which forwards them to Deepgram server-side). Capped so no backend gets an
-/// oversized vocabulary payload.
+/// Union of terms across selected dictionary lists, used to bias speech
+/// recognition (Whisper initial prompt, own-key Deepgram keyterms, and the
+/// cloud dictation start frame, which forwards them to Deepgram server-side).
+/// Deduplicated case-insensitively in list order and capped so no backend
+/// gets an oversized vocabulary payload.
 fn voice_dictionary_bias_terms(app: &AppHandle) -> Vec<String> {
-    read_voice_text_rules(app)
-        .dictionary
-        .into_iter()
-        .filter(|entry| entry.enabled)
-        .map(|entry| truncate_voice_rule_text(&entry.phrase, VOICE_DICTIONARY_BIAS_TERM_CHARS))
-        .filter(|phrase| !phrase.is_empty())
-        .take(VOICE_DICTIONARY_BIAS_TERM_LIMIT)
-        .collect()
+    let mut seen: Vec<String> = Vec::new();
+    let mut terms: Vec<String> = Vec::new();
+
+    for list in read_voice_text_rules(app).dictionary {
+        if !list.selected {
+            continue;
+        }
+
+        for term in list.terms {
+            let cleaned = truncate_voice_rule_text(&term, VOICE_DICTIONARY_BIAS_TERM_CHARS);
+            if cleaned.is_empty() {
+                continue;
+            }
+
+            let key = cleaned.to_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+
+            seen.push(key);
+            terms.push(cleaned);
+            if terms.len() >= VOICE_DICTIONARY_BIAS_TERM_LIMIT {
+                return terms;
+            }
+        }
+    }
+
+    terms
 }
 
+/// Whisper has no keyterm boosting; the closest equivalent is seeding the
+/// decoder with a glossary prompt. Budgeted by characters so the prompt stays
+/// well under the model's ~224-token prompt window.
 fn voice_dictionary_whisper_prompt(app: &AppHandle) -> Option<String> {
     let terms = voice_dictionary_bias_terms(app);
+    let mut joined = String::new();
 
-    if terms.is_empty() {
+    for term in terms {
+        let separator_chars = if joined.is_empty() { 0 } else { 2 };
+        if joined.chars().count() + separator_chars + term.chars().count()
+            > VOICE_DICTIONARY_WHISPER_PROMPT_CHARS
+        {
+            break;
+        }
+
+        if !joined.is_empty() {
+            joined.push_str(", ");
+        }
+        joined.push_str(&term);
+    }
+
+    if joined.is_empty() {
         return None;
     }
 
-    Some(format!("Glossary: {}.", terms.join(", ")))
+    Some(format!("Glossary: {joined}."))
 }
 
 fn percent_encode_query_component(value: &str) -> String {
@@ -306,15 +399,20 @@ mod voice_text_rules_tests {
     use super::*;
 
     #[test]
-    fn normalize_drops_empty_entries_and_trims() {
+    fn normalize_trims_lists_and_dedupes_terms() {
         let rules = normalize_voice_text_rules(VoiceTextRules {
             dictionary: vec![
-                VoiceDictionaryEntry {
-                    phrase: "  Tauri  ".to_string(),
-                    sounds_like: vec!["  towery ".to_string(), "   ".to_string()],
+                VoiceDictionaryList {
+                    name: "  Project jargon  ".to_string(),
+                    terms: vec![
+                        "  Tauri ".to_string(),
+                        "tauri".to_string(),
+                        "Deepgram".to_string(),
+                        "   ".to_string(),
+                    ],
                     ..Default::default()
                 },
-                VoiceDictionaryEntry::default(),
+                VoiceDictionaryList::default(),
             ],
             snippets: vec![
                 VoiceSnippetEntry {
@@ -336,9 +434,12 @@ mod voice_text_rules_tests {
         });
 
         assert_eq!(rules.dictionary.len(), 1);
-        assert_eq!(rules.dictionary[0].phrase, "Tauri");
-        assert_eq!(rules.dictionary[0].sounds_like, vec!["towery".to_string()]);
-        assert!(rules.dictionary[0].enabled);
+        assert_eq!(rules.dictionary[0].name, "Project jargon");
+        assert_eq!(
+            rules.dictionary[0].terms,
+            vec!["Tauri".to_string(), "Deepgram".to_string()]
+        );
+        assert!(rules.dictionary[0].selected);
         assert!(!rules.dictionary[0].id.is_empty());
         assert_eq!(rules.snippets.len(), 1);
         assert_eq!(rules.snippets[0].trigger, "gstack");
@@ -348,11 +449,14 @@ mod voice_text_rules_tests {
     }
 
     #[test]
-    fn normalize_caps_entry_counts_and_lengths() {
+    fn normalize_caps_list_counts_and_term_lengths() {
         let rules = normalize_voice_text_rules(VoiceTextRules {
-            dictionary: (0..(VOICE_TEXT_RULES_MAX_ENTRIES + 20))
-                .map(|index| VoiceDictionaryEntry {
-                    phrase: format!("term-{index}{}", "x".repeat(400)),
+            dictionary: (0..(VOICE_DICTIONARY_MAX_LISTS + 20))
+                .map(|index| VoiceDictionaryList {
+                    name: format!("List {index}"),
+                    terms: (0..(VOICE_DICTIONARY_MAX_TERMS_PER_LIST + 50))
+                        .map(|term| format!("term-{term}{}", "x".repeat(100)))
+                        .collect(),
                     ..Default::default()
                 })
                 .collect(),
@@ -360,25 +464,77 @@ mod voice_text_rules_tests {
             transforms: Vec::new(),
         });
 
-        assert_eq!(rules.dictionary.len(), VOICE_TEXT_RULES_MAX_ENTRIES);
-        assert!(rules.dictionary[0].phrase.chars().count() <= VOICE_TEXT_RULES_MAX_PHRASE_CHARS);
+        assert_eq!(rules.dictionary.len(), VOICE_DICTIONARY_MAX_LISTS);
+        assert_eq!(
+            rules.dictionary[0].terms.len(),
+            VOICE_DICTIONARY_MAX_TERMS_PER_LIST
+        );
+        assert!(
+            rules.dictionary[0].terms[0].chars().count() <= VOICE_DICTIONARY_BIAS_TERM_CHARS
+        );
     }
 
     #[test]
-    fn rules_deserialize_with_enabled_defaulting_true() {
+    fn legacy_phrase_entries_migrate_into_one_imported_list() {
         let rules: VoiceTextRules = serde_json::from_str(
             r#"{
-                "dictionary": [{ "phrase": "Tauri" }],
+                "dictionary": [
+                    { "phrase": "Tauri", "soundsLike": ["towery"] },
+                    { "phrase": "Deepgram" },
+                    { "phrase": "Skipped", "enabled": false }
+                ],
+                "snippets": [],
+                "transforms": []
+            }"#,
+        )
+        .expect("rules parse");
+        let rules = normalize_voice_text_rules(rules);
+
+        assert_eq!(rules.dictionary.len(), 1);
+        assert_eq!(rules.dictionary[0].name, "Imported");
+        assert_eq!(
+            rules.dictionary[0].terms,
+            vec!["Tauri".to_string(), "Deepgram".to_string()]
+        );
+        assert!(rules.dictionary[0].selected);
+    }
+
+    #[test]
+    fn rules_deserialize_with_selected_and_enabled_defaulting_true() {
+        let rules: VoiceTextRules = serde_json::from_str(
+            r#"{
+                "dictionary": [{ "name": "Jargon", "terms": ["Tauri"] }],
                 "snippets": [{ "trigger": "gstack", "expansion": "do the thing" }],
                 "transforms": [{ "match": "new line", "replacement": "\n" }]
             }"#,
         )
         .expect("rules parse");
 
-        assert!(rules.dictionary[0].enabled);
+        assert!(rules.dictionary[0].selected);
         assert!(rules.snippets[0].enabled);
         assert!(rules.transforms[0].enabled);
         assert_eq!(rules.transforms[0].match_text, "new line");
+    }
+
+    #[test]
+    fn serialized_lists_omit_legacy_fields() {
+        let rules = normalize_voice_text_rules(VoiceTextRules {
+            dictionary: vec![VoiceDictionaryList {
+                name: "Jargon".to_string(),
+                terms: vec!["Tauri".to_string()],
+                ..Default::default()
+            }],
+            snippets: Vec::new(),
+            transforms: Vec::new(),
+        });
+        let json = serde_json::to_string(&rules).expect("rules serialize");
+
+        assert!(json.contains("\"terms\""));
+        assert!(json.contains("\"selected\""));
+        assert!(!json.contains("\"phrase\""));
+        // Snippets and transforms are empty, so any "enabled" key would have
+        // leaked from the dictionary list's skipped legacy field.
+        assert!(!json.contains("\"enabled\""));
     }
 
     #[test]

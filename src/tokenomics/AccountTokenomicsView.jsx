@@ -818,11 +818,7 @@ function addUtcDays(date, days) {
   return next;
 }
 
-function compactDayLabel(key, todayKey) {
-  const today = dateFromDayKey(todayKey);
-  const yesterdayKey = dayKeyUtc(addUtcDays(today, -1));
-  if (key === todayKey) return "T";
-  if (key === yesterdayKey) return "Y";
+function compactDayLabel(key) {
   return dateFromDayKey(key)
     .toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" })
     .slice(0, 1);
@@ -841,7 +837,138 @@ function fullDayLabel(key, todayKey) {
   });
 }
 
-function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+function weeklyLimitUsedPercent(row = {}) {
+  return limitNumberOrNull(
+    row.used_percent,
+    row.usedPercent,
+    row.limit_used_percent,
+    row.limitUsedPercent,
+    row.used,
+  );
+}
+
+function weeklyLimitRowTime(row = {}) {
+  return parseLimitTimestamp(
+    row.sample_at
+      ?? row.sampleAt
+      ?? row.sample_bucket_start
+      ?? row.sampleBucketStart
+      ?? row.updated_at
+      ?? row.updatedAt
+      ?? row.last_known_at
+      ?? row.lastKnownAt,
+  );
+}
+
+function weeklyLimitRowResetKey(row = {}) {
+  return String(row.reset_at ?? row.resetAt ?? row.limit_resets_at ?? row.limitResetsAt ?? "");
+}
+
+function weeklyLimitSeriesKey(row = {}) {
+  return [rowScopeKey(row), providerKey(row), rowProviderAccountKey(row)].join("::");
+}
+
+function matchingWeeklyLimitRows(rows, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+  return (Array.isArray(rows) ? rows : []).filter((row) => (
+    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "") === "weekly"
+      && (selectedProvider === "all" || providerKey(row) === selectedProvider)
+      && (selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey)
+      && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
+  ));
+}
+
+function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+  const bySeries = new Map();
+  for (const row of matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey)) {
+    const used = weeklyLimitUsedPercent(row);
+    const time = weeklyLimitRowTime(row);
+    if (used == null || !time) continue;
+    const key = weeklyLimitSeriesKey(row);
+    const series = bySeries.get(key) || [];
+    series.push({
+      day: dayKeyUtc(time),
+      resetKey: weeklyLimitRowResetKey(row),
+      time: time.getTime(),
+      used: Math.max(0, Math.min(100, used)),
+    });
+    bySeries.set(key, series);
+  }
+
+  const byDay = new Map();
+  for (const series of bySeries.values()) {
+    series.sort((left, right) => left.time - right.time);
+    let previous = null;
+    for (const entry of series) {
+      if (previous) {
+        const sameWindow = !entry.resetKey || !previous.resetKey || entry.resetKey === previous.resetKey;
+        const delta = sameWindow && entry.used >= previous.used ? entry.used - previous.used : entry.used;
+        if (delta > 0) {
+          byDay.set(entry.day, Math.max(byDay.get(entry.day) || 0, delta));
+        }
+      }
+      previous = entry;
+    }
+  }
+  return byDay;
+}
+
+function latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+  const candidates = [
+    ...matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey),
+    ...matchingWeeklyLimitRows(limits, selectedProvider, selectedAccountKey, selectedScopeKey),
+  ]
+    .map((row) => ({
+      time: weeklyLimitRowTime(row)?.getTime() || 0,
+      used: weeklyLimitUsedPercent(row),
+    }))
+    .filter((row) => row.used != null)
+    .sort((left, right) => right.time - left.time);
+  if (!candidates.length) return null;
+  const latestTime = candidates[0].time;
+  return Math.max(
+    ...candidates
+      .filter((row) => row.time === latestTime || latestTime === 0)
+      .map((row) => Math.max(0, Math.min(100, row.used))),
+  );
+}
+
+function withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+  const directPercents = directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey);
+  let knownTokenTotal = 0;
+  let knownPercentTotal = 0;
+  const seeded = rows.map((row) => {
+    const weeklyLimitPercent = directPercents.get(row.key);
+    const total = dailyUsageValue(row);
+    if (weeklyLimitPercent != null && total > 0) {
+      knownTokenTotal += total;
+      knownPercentTotal += weeklyLimitPercent;
+    }
+    return { ...row, weeklyLimitPercent, weeklyLimitPercentEstimated: false };
+  });
+
+  const tokenPercentRatio = knownTokenTotal > 0 && knownPercentTotal > 0
+    ? knownPercentTotal / knownTokenTotal
+    : null;
+  const latestUsedPercent = latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey);
+  const visibleTokenTotal = seeded.reduce((sum, row) => sum + dailyUsageValue(row), 0);
+
+  return seeded.map((row) => {
+    if (row.weeklyLimitPercent != null || dailyUsageValue(row) <= 0) return row;
+    let weeklyLimitPercent = null;
+    if (tokenPercentRatio != null) {
+      weeklyLimitPercent = dailyUsageValue(row) * tokenPercentRatio;
+    } else if (latestUsedPercent != null && visibleTokenTotal > 0) {
+      weeklyLimitPercent = (dailyUsageValue(row) / visibleTokenTotal) * latestUsedPercent;
+    }
+    return {
+      ...row,
+      weeklyLimitPercent: weeklyLimitPercent == null ? null : Math.max(0, Math.min(100, weeklyLimitPercent)),
+      weeklyLimitPercentEstimated: weeklyLimitPercent != null,
+    };
+  });
+}
+
+function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
   const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
   const byDay = new Map();
   for (const row of filtered) {
@@ -867,11 +994,12 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, selecte
       ...aggregate,
     });
   }
-  return buckets.map((row) => ({
+  const rows = buckets.map((row) => ({
     ...row,
-    label: compactDayLabel(row.key, todayKey),
+    label: compactDayLabel(row.key),
     titleLabel: fullDayLabel(row.key, todayKey),
   }));
+  return withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey);
 }
 
 function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
@@ -1280,8 +1408,8 @@ function limitPercentTone(percent) {
   if (percent == null) return "unknown";
   const value = Number(percent);
   if (!Number.isFinite(value)) return "unknown";
-  if (value < 25) return "danger";
-  if (value < 40) return "warn";
+  if (value >= 82) return "danger";
+  if (value >= 62) return "warn";
   return "good";
 }
 
@@ -1292,11 +1420,23 @@ function toneColor(tone) {
   return "#60a5fa";
 }
 
-function dailyTone(value, average) {
+function dailyPercentTone(value, weeklyLimitPercent) {
   if (value <= 0) return "quiet";
-  if (!average || value <= average * 1.15) return "good";
-  if (value <= average * 1.55) return "warn";
-  return "danger";
+  if (weeklyLimitPercent == null) return "good";
+  if (weeklyLimitPercent > 20) return "danger";
+  if (weeklyLimitPercent > 13) return "warn";
+  return "good";
+}
+
+function dailyLimitTitle(row) {
+  const percent = limitNumberOrNull(row?.weeklyLimitPercent);
+  if (percent == null) return dailyUsageTitle(row);
+  const source = row?.weeklyLimitPercentEstimated ? "est. weekly limit" : "weekly limit";
+  return `${dailyUsageTitle(row)} · ${source} ${Math.round(percent)}%`;
+}
+
+function dailyLimitTone(row) {
+  return dailyPercentTone(dailyUsageValue(row), limitNumberOrNull(row?.weeklyLimitPercent));
 }
 
 function dailyBarHeight(value, maxValue) {
@@ -2023,9 +2163,12 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, [accountOptions, selectedAccountKey, selectedProvider]);
   const dailyRaw = Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : [];
   const hourlyRaw = Array.isArray(summary?.hourly) ? summary.hourly : [];
+  const limitSamplesRaw = Array.isArray(summary?.limit_samples)
+    ? summary.limit_samples
+    : (Array.isArray(summary?.limitSamples) ? summary.limitSamples : []);
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
-    [dailyRaw, dailyWindowDays, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
+    () => buildDailyRows(dailyRaw, limitSamplesRaw, summary?.limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, limitSamplesRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, summary?.limits],
   );
   const today = useMemo(
     () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
@@ -2060,7 +2203,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
   const averageSessionUsage = activeSessionRows.reduce((sum, row) => sum + row.total, 0) / Math.max(1, activeSessionRows.length);
   const openAiCredits = useMemo(() => selectedProvider === "codex" ? codexCreditBalance(limits) : null, [limits, selectedProvider]);
-  const dailyAverage = dailyRows.reduce((sum, row) => sum + dailyUsageValue(row), 0) / Math.max(1, dailyRows.filter((row) => dailyUsageValue(row) > 0).length);
   const maxDaily = Math.max(1, ...dailyRows.map((row) => dailyUsageValue(row)));
   const breakdown = useMemo(
     () => modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
@@ -2268,9 +2410,9 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
               {dailyRows.map((row) => (
                 <DailyColumn key={row.key}>
                   <DailyBar
-                    $tone={dailyTone(dailyUsageValue(row), dailyAverage)}
+                    $tone={dailyLimitTone(row)}
                     style={{ height: `${dailyBarHeight(dailyUsageValue(row), maxDaily)}%` }}
-                    title={dailyUsageTitle({ ...row, label: row.titleLabel || row.label })}
+                    title={dailyLimitTitle({ ...row, label: row.titleLabel || row.label })}
                   />
                   <small>{row.label}</small>
                 </DailyColumn>
@@ -3068,7 +3210,7 @@ const DailyBar = styled.div`
   border-radius: 5px 5px 2px 2px;
   background: ${({ $tone }) => {
     if ($tone === "danger") return "#ff5a5f";
-    if ($tone === "warn") return "#fb923c";
+    if ($tone === "warn") return "#facc15";
     if ($tone === "quiet") return "rgba(114, 130, 150, 0.25)";
     return "#60a5fa";
   }};

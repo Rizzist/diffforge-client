@@ -6884,6 +6884,35 @@ export const AudioDeviceSelect = styled.select`
   }
 `;
 
+/* Borderless variant that sits flush inside the input-source capsule. */
+export const AudioInputPillSelect = styled(AudioDeviceSelect)`
+  min-height: 34px;
+  border-color: transparent;
+  background-color: transparent;
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 8px center;
+  background-repeat: no-repeat;
+  background-size: 16px 16px;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 160, 205, 0.24);
+    background-color: rgba(24, 31, 42, 0.6);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: transparent;
+    background-color: transparent;
+    background-image:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    border-color: rgba(0, 102, 204, 0.18);
+    background-color: var(--forge-surface-control);
+  }
+`;
+
 const audioInputBarFlow = keyframes`
   0%,
   100% {
@@ -6902,18 +6931,155 @@ const audioInputBarFlow = keyframes`
   }
 `;
 
+/* Capsule input-source row matching the recorder bar/bubble design: round
+   mic toggle, borderless device select, inline level bars, icon refresh. */
+export const AudioInputPill = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 52px;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px 7px 7px;
+  border: 1px solid rgba(125, 160, 205, 0.22);
+  border-radius: 999px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.045), rgba(244, 247, 250, 0.008)),
+    rgba(7, 9, 13, 0.62);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.18);
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+
+  &[data-live="true"] {
+    border-color: rgba(75, 212, 170, 0.42);
+    box-shadow:
+      0 0 0 3px rgba(75, 212, 170, 0.08),
+      0 10px 26px rgba(0, 0, 0, 0.22);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.05),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  }
+
+  html[data-forge-theme="light"] &[data-live="true"] {
+    border-color: rgba(18, 170, 120, 0.4);
+    box-shadow:
+      0 0 0 3px rgba(18, 170, 120, 0.1),
+      0 1px 2px rgba(0, 0, 0, 0.05);
+  }
+
+  @media (max-width: 620px) {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+
+    > div[aria-hidden="true"] {
+      display: none;
+    }
+  }
+`;
+
+export const AudioInputMicButton = styled.button`
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(95, 156, 255, 0.4);
+  border-radius: 50%;
+  color: #8bb9ff;
+  background:
+    linear-gradient(180deg, rgba(59, 130, 246, 0.24), rgba(59, 130, 246, 0.1)),
+    rgba(21, 27, 35, 0.8);
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    transform 120ms ease;
+
+  > svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover:not(:disabled) {
+    transform: scale(1.05);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+
+  &[data-live="true"] {
+    border-color: rgba(239, 107, 107, 0.5);
+    color: #ffb1b1;
+    background:
+      linear-gradient(180deg, rgba(239, 107, 107, 0.26), rgba(239, 107, 107, 0.1)),
+      rgba(21, 27, 35, 0.8);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.3);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-live="true"] {
+    border-color: rgba(214, 69, 69, 0.4);
+    color: #c93b3b;
+    background: rgba(214, 69, 69, 0.08);
+  }
+`;
+
+export const AudioInputPillIconButton = styled.button`
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+
+  > svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled) {
+    color: var(--forge-text);
+    background: rgba(244, 247, 250, 0.08);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.06);
+  }
+`;
+
 export const AudioInputMeter = styled.div`
   display: grid;
-  height: 54px;
-  grid-template-columns: repeat(32, minmax(2px, 1fr));
+  width: 108px;
+  height: 30px;
+  flex: 0 0 auto;
+  grid-template-columns: repeat(18, minmax(2px, 1fr));
   align-items: center;
   gap: 3px;
-  padding: 9px;
-  border: 1px solid var(--forge-border);
-  border-radius: 8px;
-  background:
-    linear-gradient(90deg, rgba(125, 176, 255, 0.05) 0 1px, transparent 1px 10px),
-    rgba(7, 9, 13, 0.5);
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: rgba(125, 176, 255, 0.05);
 
   span {
     display: block;
@@ -6955,11 +7121,7 @@ export const AudioInputMeter = styled.div`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.08);
-    background:
-      linear-gradient(90deg, rgba(0, 102, 204, 0.055) 0 1px, transparent 1px 10px),
-      #ffffff;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    background: rgba(0, 102, 204, 0.05);
   }
 
   html[data-forge-theme="light"] & span {
@@ -7457,8 +7619,8 @@ export const AudioInsightCard = styled.div`
   display: grid;
   min-width: 0;
   align-content: start;
-  gap: 6px;
-  padding: 12px 14px;
+  gap: 4px;
+  padding: 9px 12px;
   border: 1px solid var(--forge-border);
   border-radius: 10px;
   background:
@@ -7499,7 +7661,7 @@ export const AudioInsightCardTopline = styled.div`
 
 export const AudioInsightValue = styled.strong`
   color: var(--forge-text);
-  font-size: 30px;
+  font-size: 24px;
   font-weight: 850;
   line-height: 1;
 `;
@@ -7523,14 +7685,15 @@ export const AudioInsightSubValue = styled.span`
 `;
 
 /* Wispr-style half-circle gauge: a muted track arc with a blue progress arc
-   drawn by stroke-dashoffset. */
+   drawn by stroke-dashoffset, plus an optional percentile badge ("TOP 10%")
+   centered in the open space under the arc. */
 export const AudioWpmGauge = styled.svg`
-  width: min(150px, 100%);
+  width: min(124px, 100%);
   margin: 2px auto 0;
 
   path {
     fill: none;
-    stroke-width: 9;
+    stroke-width: 8;
     stroke-linecap: round;
   }
 
@@ -7541,6 +7704,13 @@ export const AudioWpmGauge = styled.svg`
   .fill {
     stroke: #5f9cff;
     transition: stroke-dashoffset 420ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .tier {
+    fill: var(--forge-text-soft);
+    font-size: 8.5px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
   }
 
   html[data-forge-theme="light"] & .track {
@@ -7565,14 +7735,14 @@ export const AudioHeatmapGrid = styled.div`
 export const AudioHeatmapColumn = styled.div`
   display: grid;
   flex: 0 0 auto;
-  grid-template-rows: repeat(7, 11px);
+  grid-template-rows: repeat(7, 9px);
   gap: 3px;
 `;
 
 export const AudioHeatmapCell = styled.span`
-  width: 11px;
-  height: 11px;
-  border-radius: 3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 2.5px;
   background: rgba(125, 160, 205, 0.1);
 
   &[data-empty="true"] {
@@ -7624,7 +7794,7 @@ export const AudioHistoryStatChip = styled.div`
   display: grid;
   min-width: 0;
   gap: 3px;
-  padding: 10px 12px;
+  padding: 8px 12px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
@@ -7652,7 +7822,7 @@ export const AudioHistoryStatChip = styled.div`
     min-width: 0;
     overflow: hidden;
     color: var(--forge-text-soft);
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 800;
     text-overflow: ellipsis;
     white-space: nowrap;

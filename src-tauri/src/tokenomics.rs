@@ -6581,7 +6581,7 @@ fn tokenomics_claude_window_snapshot(
     )
     .unwrap_or(0)
     .clamp(0, 100);
-    let used_percent = (100 - provider_reported_percent).clamp(0, 100);
+    let used_percent = provider_reported_percent;
     let remaining_percent = (100 - used_percent).clamp(0, 100);
     let reset_at = tokenomics_value_string(
         window,
@@ -6635,7 +6635,7 @@ fn tokenomics_claude_window_snapshot(
         "used_percent": used_percent,
         "remaining_percent": remaining_percent,
         "provider_reported_percent": provider_reported_percent,
-        "provider_reported_direction": "remaining",
+        "provider_reported_direction": "used",
         "status_label": tokenomics_claude_status_label(remaining_percent),
         "reset_label": reset_label,
         "reset_after_seconds": reset_after_seconds,
@@ -8319,10 +8319,12 @@ mod tokenomics_tests {
             &account,
         );
 
-        assert_eq!(snapshot["used_percent"], json!(5));
-        assert_eq!(snapshot["remaining_percent"], json!(95));
+        assert_eq!(snapshot["used_percent"], json!(95));
+        assert_eq!(snapshot["remaining_percent"], json!(5));
         assert_eq!(snapshot["provider_reported_percent"], json!(95));
-        assert_eq!(snapshot["provider_reported_direction"], json!("remaining"));
+        assert_eq!(snapshot["provider_reported_direction"], json!("used"));
+        assert_eq!(snapshot["pace_status"], json!("over_pace"));
+        assert_eq!(snapshot["pace_exhausts_before_reset"], json!(true));
         assert_eq!(snapshot["reset_after_seconds"], json!(3600));
         assert_eq!(snapshot["reset_at"], json!("1781061600"));
         assert_eq!(snapshot["limit_resets_at"], json!("1781061600"));
@@ -8355,13 +8357,14 @@ mod tokenomics_tests {
 
         assert_eq!(limits.len(), 2);
         assert_eq!(limits[0]["limit_source"], json!("claude_oauth_usage_api"));
-        assert_eq!(limits[0]["used_percent"], json!(5));
-        assert_eq!(limits[0]["remaining_percent"], json!(95));
+        assert_eq!(limits[0]["used_percent"], json!(95));
+        assert_eq!(limits[0]["remaining_percent"], json!(5));
         assert_eq!(limits[0]["provider_reported_percent"], json!(95));
+        assert_eq!(limits[0]["provider_reported_direction"], json!("used"));
         assert_eq!(limits[0]["reset_after_seconds"], json!(3600));
         assert_eq!(limits[1]["window_kind"], json!("weekly"));
-        assert_eq!(limits[1]["used_percent"], json!(80));
-        assert_eq!(limits[1]["remaining_percent"], json!(20));
+        assert_eq!(limits[1]["used_percent"], json!(20));
+        assert_eq!(limits[1]["remaining_percent"], json!(80));
     }
 
     #[test]

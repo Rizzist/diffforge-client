@@ -28,8 +28,12 @@ const OVERVIEW_FINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Event-driven refreshes lead; the interval is a safety net so the overlay
 // window converges even if a tauri event never reaches it.
 const OVERVIEW_REFRESH_INTERVAL_MS = 5_000;
-const RECENT_FINISHED_MS = 5 * 60 * 1000;
-const TRANSFER_LINGER_MS = 8000;
+// Just-finished work (todo or transfer reaching done/failed/stopped) stays
+// pinned with the active items briefly before settling into history.
+const ACTIVE_FINISH_PIN_MS = 5_000;
+// Terminal transfers (success or fail) stay in the history list for the same
+// window as finished todos, capped so they can't flood the widget.
+const TRANSFER_HISTORY_CARD_LIMIT = 10;
 const EXIT_CELEBRATE_MS = 1400;
 const EXIT_COLLAPSE_MS = 380;
 const TERMINAL_TODO_WINDOW_MS = 20000;
@@ -964,10 +968,8 @@ function isOpenTransferStatus(transfer) {
   );
 }
 
-function isRecentlyFinishedTransfer(transfer) {
-  const status = statusKey(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, "active");
-  const updatedAt = transferUpdatedAt(transfer);
-  return status === "done" && updatedAt > 0 && Date.now() - updatedAt <= RECENT_FINISHED_MS;
+function isTerminalTransferStatus(status) {
+  return ["done", "failed", "stopped"].includes(statusKey(status, ""));
 }
 
 function transferDisplayStatus(transfer, asset) {
@@ -984,11 +986,13 @@ function transferActivityAt(transfer, asset) {
 
 function isVisibleTransfer(transfer, asset) {
   const status = transferDisplayStatus(transfer, asset);
-  if (status === "done") {
+  if (isTerminalTransferStatus(status)) {
+    // Terminal transfers (done/failed/stopped) are history rows; keep them
+    // for the same retention window as finished todos.
     const updatedAt = transferActivityAt(transfer, asset);
-    return updatedAt > 0 && Date.now() - updatedAt <= RECENT_FINISHED_MS;
+    return updatedAt > 0 && Date.now() - updatedAt <= OVERVIEW_FINISHED_WINDOW_MS;
   }
-  return isOpenTransferStatus(transfer) || isRecentlyFinishedTransfer(transfer);
+  return isOpenTransferStatus(transfer);
 }
 
 function transferTitle(transfer, asset) {
@@ -1036,7 +1040,14 @@ function normalizeTransferCards(library) {
       updatedAt: transferActivityAt(object, asset),
     };
   }).filter(Boolean);
-  return uniqueCards(cards);
+  // Open transfers all show; terminal ones (the history ledger) keep only
+  // the most recent few so old uploads/downloads can't flood the widget.
+  const openCards = cards.filter((card) => !isTerminalTransferStatus(card.status));
+  const terminalCards = cards
+    .filter((card) => isTerminalTransferStatus(card.status))
+    .sort((left, right) => numberValue(right.updatedAt, 0) - numberValue(left.updatedAt, 0))
+    .slice(0, TRANSFER_HISTORY_CARD_LIMIT);
+  return uniqueCards([...openCards, ...terminalCards]);
 }
 
 function summaryStats(todoCards, transferCards) {
@@ -1064,14 +1075,23 @@ function hudCardKind(card) {
   return "todo";
 }
 
-function activityCardPriority(card) {
+/// Unified list tiers: 0 = active work (running todos, live transfers, and
+/// anything that just finished — pinned for ACTIVE_FINISH_PIN_MS), 1 = queued
+/// (top of the history list, under the active items), 2 = history (finished
+/// todos, terminal transfers, listed todos, dictation entries) by recency.
+function activityCardTier(card, now = Date.now()) {
   const status = statusKey(card?.status);
-  const kind = hudCardKind(card);
-  if (status === "active" && kind !== "todo") return 5;
-  if (status === "queued") return 4;
-  if (status === "done") return 3;
-  if (kind !== "todo") return 2;
-  return 1;
+  if (status === "active") {
+    return 0;
+  }
+  if (["done", "failed", "stopped"].includes(status)) {
+    const finishedAt = numberValue(card?.updatedAt, 0);
+    return finishedAt && now - finishedAt <= ACTIVE_FINISH_PIN_MS ? 0 : 2;
+  }
+  if (status === "queued") {
+    return 1;
+  }
+  return 2;
 }
 
 
@@ -1446,38 +1466,13 @@ export function ActivityOverlayPanel({ embedded = false }) {
     () => normalizeTransferCards(data.library),
     [data.library],
   );
-  // Done transfers linger briefly, then exit; stale ones drop immediately.
-  // Purely event-driven otherwise, so a UI-only tick re-renders exactly when
-  // the soonest linger expires (no backend polling).
-  const [lingerTick, setLingerTick] = useState(0);
-  const liveTransferCards = useMemo(() => {
-    void lingerTick;
-    return transferCards.filter((card) => {
-      if (statusKey(card.status) !== "done") {
-        return true;
-      }
-      const updatedAt = numberValue(card.updatedAt, 0);
-      return updatedAt > 0 && Date.now() - updatedAt <= TRANSFER_LINGER_MS;
-    });
-  }, [lingerTick, transferCards]);
-
-  useEffect(() => {
-    const expiries = liveTransferCards
-      .filter((card) => statusKey(card.status) === "done")
-      .map((card) => numberValue(card.updatedAt, 0) + TRANSFER_LINGER_MS - Date.now())
-      .filter((delay) => Number.isFinite(delay));
-    if (!expiries.length) {
-      return undefined;
-    }
-    const timer = window.setTimeout(
-      () => setLingerTick((current) => current + 1),
-      Math.max(60, Math.min(...expiries) + 30),
-    );
-    return () => window.clearTimeout(timer);
-  }, [liveTransferCards]);
+  // Just-finished cards stay pinned with the active work for a few seconds,
+  // then settle into history. A UI-only tick re-renders exactly when the
+  // soonest pin expires (no backend polling).
+  const [pinTick, setPinTick] = useState(0);
   const stats = useMemo(
-    () => summaryStats(todoCards, liveTransferCards),
-    [todoCards, liveTransferCards],
+    () => summaryStats(todoCards, transferCards),
+    [todoCards, transferCards],
   );
 
   // Recent dictation inputs, timestamped, with one-tap copy. The audio
@@ -1621,7 +1616,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
   }, [beginExit, terminalTodoStates, todoCards]);
 
   useEffect(() => {
-    const nextMap = new Map(liveTransferCards.map((card) => [card.id, card]));
+    const nextMap = new Map(transferCards.map((card) => [card.id, card]));
     prevTransferMapRef.current.forEach((card, id) => {
       if (!nextMap.has(id)) {
         const state = statusKey(card.status);
@@ -1629,23 +1624,66 @@ export function ActivityOverlayPanel({ embedded = false }) {
       }
     });
     prevTransferMapRef.current = nextMap;
-  }, [beginExit, liveTransferCards]);
+  }, [beginExit, transferCards]);
 
-  const exitTransferRows = exitRows.filter((row) => row.card.lane === "transfers");
-  const exitTodoRows = exitRows.filter((row) => row.card.lane !== "transfers");
-  const sortedTodoCards = useMemo(() => [...todoCards].sort((left, right) => {
-    const leftQueued = statusKey(left.status) === "queued" ? 0 : 1;
-    const rightQueued = statusKey(right.status) === "queued" ? 0 : 1;
-    if (leftQueued !== rightQueued) {
-      return leftQueued - rightQueued;
+  // One unified, tier-ordered list: active work first (running todos, live
+  // transfers, just-finished pins), then queued todos, then the mixed
+  // history ledger (dictation, transfer outcomes, finished/listed todos)
+  // by recency.
+  const unifiedItems = useMemo(() => {
+    void pinTick;
+    const now = Date.now();
+    const items = [...todoCards, ...transferCards].map((card) => ({
+      card,
+      key: card.id,
+      sortTime: numberValue(card.updatedAt, 0),
+      tier: activityCardTier(card, now),
+      type: "card",
+    }));
+    dictationEntries.forEach((entry) => {
+      items.push({
+        entry,
+        key: `dictation-${entry.id}`,
+        sortTime: numberValue(entry.createdAt, 0),
+        tier: 2,
+        type: "dictation",
+      });
+    });
+    return items.sort((left, right) => (
+      (left.tier - right.tier) || (right.sortTime - left.sortTime)
+    ));
+  }, [dictationEntries, pinTick, todoCards, transferCards]);
+  const activeItems = useMemo(
+    () => unifiedItems.filter((item) => item.tier === 0),
+    [unifiedItems],
+  );
+  const historyItems = useMemo(
+    () => unifiedItems.filter((item) => item.tier > 0),
+    [unifiedItems],
+  );
+
+  // Re-render when the soonest just-finished pin expires so those cards
+  // drop into history on time.
+  useEffect(() => {
+    const expiries = activeItems
+      .filter((item) => item.type === "card"
+        && ["done", "failed", "stopped"].includes(statusKey(item.card.status)))
+      .map((item) => item.sortTime + ACTIVE_FINISH_PIN_MS - Date.now())
+      .filter((delay) => Number.isFinite(delay));
+    if (!expiries.length) {
+      return undefined;
     }
-    return numberValue(right.updatedAt, 0) - numberValue(left.updatedAt, 0);
-  }), [todoCards]);
-  const hasTransfers = liveTransferCards.length > 0 || exitTransferRows.length > 0;
-  const hasTodos = sortedTodoCards.length > 0 || exitTodoRows.length > 0;
-  const hasDictation = dictationEntries.length > 0;
+    const timer = window.setTimeout(
+      () => setPinTick((current) => current + 1),
+      Math.max(60, Math.min(...expiries) + 30),
+    );
+    return () => window.clearTimeout(timer);
+  }, [activeItems]);
+
   const hasLiveDictation = Boolean(dictationStream);
-  const hasWork = hasTransfers || hasTodos || hasDictation || hasLiveDictation;
+  const hasActive = activeItems.length > 0 || exitRows.length > 0;
+  const hasHistory = historyItems.length > 0;
+  const hasWork = hasActive || hasHistory || hasLiveDictation;
   const statusToneName = data.errors.length
     ? "warn"
     : stats.transfers > 0
@@ -1675,7 +1713,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
     const statusLabel = exit
       ? exit.exitState === "done" ? "done" : exit.exitState === "failed" ? "failed" : "stopped"
       : isTransfer
-        ? state === "done" ? "done" : firstText(card.meta, `${progress}%`)
+        ? isTerminalTransferStatus(state) ? state : firstText(card.meta, `${progress}%`)
         : text(card.eyebrow, "listed");
     return (
       <OverlayRow
@@ -1696,7 +1734,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
             {detail ? <RowDetail>{detail}</RowDetail> : null}
             <RowStatus data-tone={tone}>{statusLabel}</RowStatus>
           </RowLine>
-          {!exit && isTransfer && state !== "done" && state !== "failed" ? (
+          {!exit && isTransfer && !isTerminalTransferStatus(state) ? (
             <RowTrack aria-hidden="true">
               <RowTrackFill data-tone={tone} style={{ width: `${progress}%` }} />
             </RowTrack>
@@ -1705,6 +1743,55 @@ export function ActivityOverlayPanel({ embedded = false }) {
       </OverlayRow>
     );
   }, [embedded]);
+
+  const renderDictationRow = useCallback((entry) => (
+    <DictationRow
+      data-tauri-drag-region={embedded ? undefined : true}
+      key={`dictation-${entry.id}`}
+    >
+      <DictationTime title={entry.createdAt ? new Date(entry.createdAt).toLocaleString() : undefined}>
+        {dictationClockLabel(entry.createdAt)}
+      </DictationTime>
+      <DictationText
+        data-cancelled={entry.status === "cancelled" ? "true" : undefined}
+        title={entry.text}
+      >
+        {entry.text}
+      </DictationText>
+      <DictationCopyButton
+        aria-label="Copy transcript"
+        data-copied={copiedDictationId === entry.id ? "true" : undefined}
+        onClick={() => void copyDictationEntry(entry)}
+        title="Copy transcript"
+        type="button"
+      >
+        {copiedDictationId === entry.id ? (
+          <svg
+            fill="none"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="1.6"
+            viewBox="0 0 16 16"
+          >
+            <path d="M3.5 8.4l3 3 6-6.8" />
+          </svg>
+        ) : (
+          <svg
+            fill="none"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="1.3"
+            viewBox="0 0 16 16"
+          >
+            <rect height="8.2" rx="1.5" width="8.2" x="5.6" y="5.6" />
+            <path d="M10.6 3H4.4A1.7 1.7 0 0 0 2.7 4.7V11" />
+          </svg>
+        )}
+      </DictationCopyButton>
+    </DictationRow>
+  ), [copiedDictationId, copyDictationEntry, embedded]);
 
   return (
     <OverlayCard
@@ -1734,70 +1821,20 @@ export function ActivityOverlayPanel({ embedded = false }) {
             </LiveStreamText>
           </LiveStreamRow>
         )}
-        {hasTransfers && (
+        {hasActive && (
           <>
-            <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>Assets</SectionLabel>
-            {liveTransferCards.map((card) => renderRow(card))}
-            {exitTransferRows.map((row) => renderRow(row.card, row))}
+            <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>Active</SectionLabel>
+            {activeItems.map((item) => renderRow(item.card))}
+            {exitRows.map((row) => renderRow(row.card, row))}
           </>
         )}
-        {hasTransfers && hasTodos && (
-          <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>Todos</SectionLabel>
-        )}
-        {sortedTodoCards.map((card) => renderRow(card))}
-        {exitTodoRows.map((row) => renderRow(row.card, row))}
-        {hasDictation && (
+        {hasHistory && (
           <>
-            <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>
-              Dictation
-            </SectionLabel>
-            {dictationEntries.map((entry) => (
-              <DictationRow
-                data-tauri-drag-region={embedded ? undefined : true}
-                key={entry.id}
-              >
-                <DictationTime title={entry.createdAt ? new Date(entry.createdAt).toLocaleString() : undefined}>
-                  {dictationClockLabel(entry.createdAt)}
-                </DictationTime>
-                <DictationText
-                  data-cancelled={entry.status === "cancelled" ? "true" : undefined}
-                  title={entry.text}
-                >
-                  {entry.text}
-                </DictationText>
-                <DictationCopyButton
-                  aria-label="Copy transcript"
-                  data-copied={copiedDictationId === entry.id ? "true" : undefined}
-                  onClick={() => void copyDictationEntry(entry)}
-                  title="Copy transcript"
-                  type="button"
-                >
-                  {copiedDictationId === entry.id ? (
-                    <svg
-                      fill="none"
-                      stroke="currentColor"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="1.6"
-                      viewBox="0 0 16 16"
-                    >
-                      <path d="M3.5 8.4l3 3 6-6.8" />
-                    </svg>
-                  ) : (
-                    <svg
-                      fill="none"
-                      stroke="currentColor"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="1.3"
-                      viewBox="0 0 16 16"
-                    >
-                      <rect height="8.2" rx="1.5" width="8.2" x="5.6" y="5.6" />
-                      <path d="M10.6 3H4.4A1.7 1.7 0 0 0 2.7 4.7V11" />
-                    </svg>
-                  )}
-                </DictationCopyButton>
-              </DictationRow>
+            <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>History</SectionLabel>
+            {historyItems.map((item) => (
+              item.type === "dictation"
+                ? renderDictationRow(item.entry)
+                : renderRow(item.card)
             ))}
           </>
         )}

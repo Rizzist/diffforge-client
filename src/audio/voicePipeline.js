@@ -7,6 +7,10 @@ export const EMPTY_VOICE_TEXT_RULES = Object.freeze({
 const MAX_VOICE_RULE_ENTRIES = 500;
 const MAX_VOICE_PHRASE_CHARS = 160;
 const MAX_VOICE_EXPANSION_CHARS = 32000;
+const MAX_VOICE_DICTIONARY_LISTS = 50;
+const MAX_VOICE_DICTIONARY_TERMS = 400;
+const MAX_VOICE_DICTIONARY_TERM_CHARS = 64;
+const MAX_VOICE_DICTIONARY_NAME_CHARS = 80;
 
 function cleanRuleText(value, maxChars) {
   const text = String(value ?? "").trim();
@@ -34,30 +38,77 @@ function ruleEnabled(value) {
   return value !== false;
 }
 
+function normalizeDictionaryTerms(terms) {
+  const seen = new Set();
+  const normalized = [];
+
+  for (const term of Array.isArray(terms) ? terms : []) {
+    const cleaned = cleanRuleText(term, MAX_VOICE_DICTIONARY_TERM_CHARS);
+    if (!cleaned) {
+      continue;
+    }
+
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    normalized.push(cleaned);
+    if (normalized.length >= MAX_VOICE_DICTIONARY_TERMS) {
+      break;
+    }
+  }
+
+  return normalized;
+}
+
+/**
+ * Splits pasted text into dictionary terms: comma or newline separated,
+ * trimmed, deduplicated case-insensitively, and capped.
+ */
+export function parseDictionaryTerms(value) {
+  return normalizeDictionaryTerms(String(value ?? "").split(/[\n,]+/));
+}
+
 export function normalizeVoiceTextRules(value) {
   const source = value && typeof value === "object" ? value : {};
 
-  const dictionary = (Array.isArray(source.dictionary) ? source.dictionary : [])
-    .map((entry, index) => {
-      const phrase = cleanRuleText(entry?.phrase, MAX_VOICE_PHRASE_CHARS);
-      if (!phrase) {
-        return null;
+  const legacyTerms = [];
+  const dictionary = [];
+  (Array.isArray(source.dictionary) ? source.dictionary : []).forEach((list, index) => {
+    const name = cleanRuleText(list?.name, MAX_VOICE_DICTIONARY_NAME_CHARS);
+    const terms = normalizeDictionaryTerms(list?.terms);
+
+    if (!name && !terms.length) {
+      // Pre-lists dictionary entry: gather its phrase for migration.
+      const phrase = cleanRuleText(list?.phrase, MAX_VOICE_DICTIONARY_TERM_CHARS);
+      if (phrase && ruleEnabled(list?.enabled)) {
+        legacyTerms.push(phrase);
       }
+      return;
+    }
 
-      const soundsLike = (Array.isArray(entry?.soundsLike) ? entry.soundsLike : [])
-        .map((alias) => cleanRuleText(alias, MAX_VOICE_PHRASE_CHARS))
-        .filter(Boolean)
-        .slice(0, 16);
+    if (dictionary.length >= MAX_VOICE_DICTIONARY_LISTS) {
+      return;
+    }
 
-      return {
-        id: cleanRuleId(entry?.id, "dict", index),
-        phrase,
-        soundsLike,
-        enabled: ruleEnabled(entry?.enabled),
-      };
-    })
-    .filter(Boolean)
-    .slice(0, MAX_VOICE_RULE_ENTRIES);
+    dictionary.push({
+      id: cleanRuleId(list?.id, "list", index),
+      name,
+      terms,
+      selected: ruleEnabled(list?.selected),
+    });
+  });
+
+  if (legacyTerms.length && dictionary.length < MAX_VOICE_DICTIONARY_LISTS) {
+    dictionary.push({
+      id: "imported-legacy",
+      name: "Imported",
+      terms: normalizeDictionaryTerms(legacyTerms),
+      selected: true,
+    });
+  }
 
   const snippets = (Array.isArray(source.snippets) ? source.snippets : [])
     .map((entry, index) => {
@@ -131,28 +182,31 @@ function replaceSpokenPhrase(text, phrase, replacement) {
   return { text: result, replacements };
 }
 
-function applyDictionaryCorrections(text, entries) {
+function applyDictionaryCorrections(text, lists) {
   let nextText = text;
   let replacements = 0;
+  const seen = new Set();
 
-  for (const entry of entries) {
-    if (!entry.enabled) {
+  for (const list of lists) {
+    if (!list.selected) {
       continue;
     }
 
-    for (const alias of entry.soundsLike) {
-      if (alias.toLowerCase() === entry.phrase.toLowerCase()) {
+    for (const term of list.terms) {
+      const key = term.toLowerCase();
+      if (seen.has(key)) {
         continue;
       }
+      seen.add(key);
 
-      const outcome = replaceSpokenPhrase(nextText, alias, entry.phrase);
-      nextText = outcome.text;
-      replacements += outcome.replacements;
+      // Re-cased exact matches: "tauri" spoken becomes "Tauri". Recognition
+      // biasing itself happens upstream (Deepgram keyterms, Whisper prompt).
+      const outcome = replaceSpokenPhrase(nextText, term, term);
+      if (outcome.text !== nextText) {
+        replacements += outcome.replacements;
+        nextText = outcome.text;
+      }
     }
-
-    // Re-cased exact matches: "tauri" spoken becomes "Tauri".
-    const recased = replaceSpokenPhrase(nextText, entry.phrase, entry.phrase);
-    nextText = recased.text;
   }
 
   return { text: nextText, replacements };
@@ -207,8 +261,8 @@ function applyTransformRules(text, entries) {
 }
 
 /**
- * Dictation post-processing in Wispr Flow order: dictionary corrections fix
- * recognition errors first so snippet triggers and transform matches see the
+ * Dictation post-processing in Wispr Flow order: dictionary word lists re-case
+ * known terms first so snippet triggers and transform matches see the
  * corrected words, then snippets expand, then transforms reshape.
  */
 export function applyVoiceTextPipeline(text, rules) {

@@ -1524,10 +1524,17 @@ export function SnippingStripWindow() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
+  const closeStrip = useCallback(() => {
+    invoke("snipping_toggle_snip_strip").catch(() => {});
+  }, []);
+
   return (
     <>
       <SnipFloatingGlobalStyle />
       <StripWindowShell data-anim={animPhase} data-origin={animOrigin}>
+        <StripCloseButton aria-label="Undock strip" onClick={closeStrip} title="Undock" type="button">
+          <Close aria-hidden="true" />
+        </StripCloseButton>
         <SnippingRecentStrip key={openNonce} />
       </StripWindowShell>
     </>
@@ -1538,6 +1545,7 @@ export function SnippingStripWindow() {
    and the native vibrancy layer (Rust applies it with a matching 14px corner
    radius) provides the glass — the webview only tints it. */
 const StripWindowShell = styled.main`
+  position: relative;
   box-sizing: border-box;
   display: grid;
   height: 100vh;
@@ -1561,6 +1569,45 @@ const StripWindowShell = styled.main`
   &[data-anim="open"][data-origin="bottom"] {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+`;
+
+const StripCloseButton = styled.button`
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  z-index: 3;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.9);
+  background: rgba(5, 8, 13, 0.62);
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transform: translateY(-50%);
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  &:hover {
+    border-color: rgba(255, 255, 255, 0.3);
+    background: rgba(15, 23, 42, 0.78);
+    transform: translateY(-50%) scale(1.04);
+  }
+
+  &:active {
+    transform: translateY(-50%) scale(0.97);
   }
 `;
 

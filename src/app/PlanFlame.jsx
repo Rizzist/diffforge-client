@@ -13,59 +13,71 @@ const PLAN_FLAME_KEYS = new Set(PLAN_FLAME_OPTIONS.map((option) => option.key));
 const PLAN_FLAME_PRESETS = {
   free: {
     height: 178,
-    core: [1, 0.88, 0.78],
-    mid: [1, 0.29, 0.25],
-    outer: [0.52, 0.04, 0.02],
-    accent: [1, 0.56, 0.21],
+    core: [1, 0.93, 0.72],
+    mid: [1, 0.42, 0.12],
+    outer: [0.45, 0.03, 0.01],
+    accent: [1, 0.64, 0.16],
+    accent2: [0.92, 0.1, 0.04],
     glow: "rgba(255, 73, 63, 0.42)",
     heat: "#ff493f",
-    intensity: 0.76,
-    speed: 1.24,
-    top: 0.58,
-    volatility: 0.96,
-    flash: 0.84,
+    intensity: 0.82,
+    speed: 1.32,
+    top: 0.6,
+    volatility: 1.04,
+    flash: 0.92,
+    sparks: 0.7,
+    accentMix: 0.32,
   },
   plus: {
     height: 220,
-    core: [1, 0.98, 0.76],
-    mid: [1, 0.76, 0.28],
-    outer: [0.82, 0.23, 0.06],
-    accent: [1, 0.56, 0.12],
+    core: [1, 0.99, 0.84],
+    mid: [1, 0.74, 0.22],
+    outer: [0.58, 0.16, 0.02],
+    accent: [1, 0.47, 0.1],
+    accent2: [0.96, 0.2, 0.06],
     glow: "rgba(255, 194, 71, 0.46)",
     heat: "#ffc247",
-    intensity: 0.88,
-    speed: 1.08,
-    top: 0.64,
-    volatility: 1.05,
-    flash: 0.98,
+    intensity: 0.9,
+    speed: 1.22,
+    top: 0.66,
+    volatility: 1.14,
+    flash: 1.02,
+    sparks: 0.95,
+    accentMix: 0.6,
   },
   pro: {
     height: 258,
     core: [1, 1, 1],
-    mid: [0.89, 0.94, 0.99],
-    outer: [0.32, 0.56, 0.84],
-    accent: [0.47, 0.77, 1],
+    mid: [0.74, 0.87, 1],
+    outer: [0.1, 0.3, 0.74],
+    accent: [0.42, 0.86, 1],
+    accent2: [0.3, 0.5, 1],
     glow: "rgba(198, 220, 246, 0.42)",
     heat: "#f4fbff",
-    intensity: 0.94,
-    speed: 0.98,
-    top: 0.69,
-    volatility: 1.11,
-    flash: 1.04,
+    intensity: 0.96,
+    speed: 1.12,
+    top: 0.71,
+    volatility: 1.22,
+    flash: 1.08,
+    sparks: 1.15,
+    accentMix: 0.85,
   },
   ultra: {
     height: 310,
-    core: [0.9, 0.96, 1],
-    mid: [0.33, 0.66, 0.98],
-    outer: [0.55, 0.2, 0.94],
-    accent: [0.09, 0.78, 1],
+    core: [0.95, 0.97, 1],
+    mid: [0.5, 0.45, 1],
+    outer: [0.26, 0.06, 0.56],
+    accent: [0.1, 0.85, 1],
+    accent2: [0.95, 0.28, 1],
     glow: "rgba(126, 88, 250, 0.5)",
     heat: "#8d6bff",
     intensity: 1,
-    speed: 0.88,
-    top: 0.75,
-    volatility: 1.24,
-    flash: 1.14,
+    speed: 1.02,
+    top: 0.78,
+    volatility: 1.34,
+    flash: 1.18,
+    sparks: 1.4,
+    accentMix: 1,
   },
 };
 
@@ -88,10 +100,13 @@ const FRAGMENT_SHADER_SOURCE = `
   uniform float u_top;
   uniform float u_volatility;
   uniform float u_flash;
+  uniform float u_sparks;
+  uniform float u_accentMix;
   uniform vec3 u_core;
   uniform vec3 u_mid;
   uniform vec3 u_outer;
   uniform vec3 u_accent;
+  uniform vec3 u_accent2;
 
   varying vec2 v_uv;
 
@@ -118,7 +133,7 @@ const FRAGMENT_SHADER_SOURCE = `
     float amplitude = 0.5;
     mat2 warp = mat2(1.62, 1.18, -1.18, 1.62);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
       value += amplitude * noise(p);
       p = warp * p + 17.71;
       amplitude *= 0.52;
@@ -127,54 +142,99 @@ const FRAGMENT_SHADER_SOURCE = `
     return value;
   }
 
+  float ridge(vec2 p) {
+    float value = 0.0;
+    float amplitude = 0.55;
+    mat2 warp = mat2(1.7, 1.1, -1.1, 1.7);
+
+    for (int i = 0; i < 4; i++) {
+      value += amplitude * abs(noise(p) * 2.0 - 1.0);
+      p = warp * p + 11.3;
+      amplitude *= 0.52;
+    }
+
+    return value;
+  }
+
+  float emberLayer(vec2 p, float t, float seed, float speed, float scale) {
+    vec2 g = vec2(p.x * scale + seed, (p.y - t * speed) * scale);
+    g.x += sin(t * (1.1 + seed * 0.13) + p.y * 9.0 + seed) * 0.9;
+
+    vec2 cell = floor(g);
+    vec2 f = fract(g);
+    float rnd = hash(cell + seed);
+    if (rnd < 0.84) {
+      return 0.0;
+    }
+
+    vec2 center = vec2(0.2) + 0.6 * vec2(hash(cell + 4.7 + seed), hash(cell + 9.3 + seed));
+    float d = length(f - center);
+    float blink = 0.55 + 0.45 * sin(t * (3.0 + rnd * 5.0) + rnd * 39.0);
+    return smoothstep(0.22 + rnd * 0.12, 0.0, d) * blink;
+  }
+
   void main() {
     vec2 uv = v_uv;
-    float x = uv.x;
-    float y = uv.y;
     float t = u_time;
+    float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+    vec2 p = vec2(uv.x * aspect, uv.y);
 
-    float wind = sin(t * 0.74 + y * 8.0) * 0.028
-      + sin(t * 1.63 + y * 18.0) * 0.012;
-    vec2 wideField = vec2(x * 2.18 + wind, y * 2.75 - t * 0.78);
-    float wide = fbm(wideField + vec2(fbm(wideField * 1.72 + t * 0.13), -t * 0.24));
-    float middle = fbm(vec2(x * 5.4 + wide * 1.26 + t * 0.05, y * 5.85 - t * 1.55));
-    float fine = fbm(vec2(x * 15.0 + middle * 2.4 - t * 0.18, y * 13.4 - t * 2.9));
+    float gust = (fbm(vec2(t * 0.32, 4.7)) - 0.5) * 2.0;
+    p.x += gust * uv.y * 0.55 * u_volatility
+      + sin(t * 1.4 + uv.y * 5.0) * 0.05 * uv.y;
 
-    float crownNoise = fbm(vec2(x * 3.55 + t * 0.11, t * 0.42)) * 0.18
-      + fbm(vec2(x * 12.0 - t * 0.2, t * 0.73)) * 0.08;
-    float crownTop = u_top + crownNoise * u_volatility;
-    float crown = 1.0 - smoothstep(
-      crownTop - 0.2,
-      crownTop + 0.16,
-      y + (0.5 - middle) * 0.18 * u_volatility
+    vec2 q = vec2(
+      fbm(p * 1.8 + vec2(0.0, -t * 1.15)),
+      fbm(p * 1.8 + vec2(5.2, -t * 1.45))
     );
+    float turb = fbm(p * 2.6 + (q - 0.5) * 2.3 + vec2(0.0, -t * 1.9));
+    float licks = ridge(p * vec2(3.4, 2.2) + (q - 0.5) * 1.7 + vec2(0.0, -t * 2.6));
 
-    float baseHeat = pow(max(0.0, 1.0 - y), 1.28);
-    float turbulence = wide * 0.52 + middle * 0.34 + fine * 0.18;
-    float body = baseHeat + turbulence * 0.62 * u_volatility - y * 0.26;
-    float fire = smoothstep(0.42, 1.02, body) * crown;
+    float tongueField = fbm(vec2(p.x * 1.45 + t * 0.16, t * 0.75));
+    float tongues = pow(tongueField, 1.6) * 1.9;
 
-    float bottomFlashWave = sin(t * 4.8 + x * 13.0 + wide * 5.5) * 0.5 + 0.5;
-    float bottomFlash = (1.0 - smoothstep(0.0, 0.18, y))
-      * (0.45 + 0.55 * bottomFlashWave)
-      * u_flash;
-    float glow = (1.0 - smoothstep(0.02, crownTop + 0.3, y))
-      * smoothstep(0.0, 0.25, fire + baseHeat * 0.7);
+    float flareField = fbm(vec2(p.x * 0.55 - t * 0.09, t * 0.5));
+    float flare = pow(smoothstep(0.52, 0.8, flareField), 2.0) * u_flash;
 
-    float core = smoothstep(0.63, 1.16, fire + (0.17 - y) * 1.9 + fine * 0.14);
-    float whiteCore = smoothstep(0.82, 1.22, fire + (0.09 - y) * 2.2);
-    float accentField = smoothstep(0.34, 0.78, wide)
-      * (1.0 - smoothstep(0.48, 0.9, y))
-      * 0.25;
+    float ceiling = u_top * (0.34 + tongues * u_volatility) + flare * 0.85 * u_top;
+    ceiling = max(ceiling, 0.07);
 
-    vec3 color = mix(u_outer, u_mid, clamp(fire * 1.25 + bottomFlash * 0.18, 0.0, 1.0));
-    color = mix(color, u_accent, accentField);
-    color = mix(color, u_core, core);
-    color = mix(color, vec3(1.0), whiteCore * 0.55);
+    float h = uv.y / ceiling;
+    float shape = 1.0 - h;
+    shape += (turb - 0.5) * mix(0.3, 1.6, clamp(uv.y * 1.6, 0.0, 1.0)) * u_volatility;
+    shape -= licks * 0.22 * h;
 
-    float topFade = 1.0 - smoothstep(0.58, 0.96, y);
-    float alpha = clamp((fire * 0.92 + glow * 0.36 + bottomFlash * 0.42) * u_intensity, 0.0, 1.0);
-    gl_FragColor = vec4(color, alpha * topFade);
+    float fire = smoothstep(0.04, 0.42, shape);
+
+    float pulse = 0.86 + (fbm(vec2(t * 2.4, 17.0)) - 0.5) * 0.55 * u_flash;
+
+    float heat = fire * (0.5 + turb * 0.8 + flare * 0.5);
+    heat += smoothstep(0.32, 0.0, uv.y) * (0.5 + 0.2 * turb);
+    heat *= pulse;
+
+    float streakA = smoothstep(0.56, 0.92, fbm(p * 3.2 + (q - 0.5) * 2.6 + vec2(2.3, -t * 1.6)));
+    float streakB = smoothstep(0.6, 0.95, fbm(p * 4.1 - (q - 0.5) * 2.1 + vec2(7.7, -t * 2.2)));
+
+    vec3 color = u_outer;
+    color = mix(color, u_mid, smoothstep(0.12, 0.58, heat));
+    color = mix(color, u_accent, streakA * u_accentMix * fire);
+    color = mix(color, u_accent2, streakB * u_accentMix * fire * 0.85);
+    color = mix(color, u_core, smoothstep(0.55, 0.92, heat));
+    color = mix(color, vec3(1.0), smoothstep(0.9, 1.25, heat + (0.1 - uv.y) * 1.6) * 0.8);
+
+    float ember = emberLayer(p, t, 0.0, 0.5, 15.0)
+      + emberLayer(p, t, 13.0, 0.85, 23.0) * 0.8;
+    float emberMask = smoothstep(0.03, 0.15, uv.y) * (1.0 - smoothstep(0.7, 1.0, uv.y));
+    ember *= emberMask * u_sparks * (0.35 + 0.65 * flare + 0.4 * pulse);
+    color += (mix(u_accent, u_core, 0.5) + 0.35) * ember;
+
+    float glow = (1.0 - smoothstep(0.0, ceiling + 0.4, uv.y))
+      * smoothstep(0.05, 0.4, heat) * 0.3;
+
+    float alpha = fire * (0.8 + 0.35 * turb) + glow + ember;
+    alpha *= u_intensity * pulse;
+    alpha *= 1.0 - smoothstep(0.86, 1.0, uv.y);
+    gl_FragColor = vec4(color, clamp(alpha, 0.0, 1.0));
   }
 `;
 
@@ -263,12 +323,15 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       const positionLocation = gl.getAttribLocation(program, "a_position");
       const uniforms = {
         accent: gl.getUniformLocation(program, "u_accent"),
+        accent2: gl.getUniformLocation(program, "u_accent2"),
+        accentMix: gl.getUniformLocation(program, "u_accentMix"),
         core: gl.getUniformLocation(program, "u_core"),
         flash: gl.getUniformLocation(program, "u_flash"),
         intensity: gl.getUniformLocation(program, "u_intensity"),
         mid: gl.getUniformLocation(program, "u_mid"),
         outer: gl.getUniformLocation(program, "u_outer"),
         resolution: gl.getUniformLocation(program, "u_resolution"),
+        sparks: gl.getUniformLocation(program, "u_sparks"),
         time: gl.getUniformLocation(program, "u_time"),
         top: gl.getUniformLocation(program, "u_top"),
         volatility: gl.getUniformLocation(program, "u_volatility"),
@@ -278,6 +341,7 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       let reportedReady = false;
       const colors = {
         accent: normalizedColor(preset.accent),
+        accent2: normalizedColor(preset.accent2),
         core: normalizedColor(preset.core),
         mid: normalizedColor(preset.mid),
         outer: normalizedColor(preset.outer),
@@ -325,10 +389,13 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
         gl.uniform1f(uniforms.top, preset.top);
         gl.uniform1f(uniforms.volatility, preset.volatility);
         gl.uniform1f(uniforms.flash, preset.flash);
+        gl.uniform1f(uniforms.sparks, preset.sparks);
+        gl.uniform1f(uniforms.accentMix, preset.accentMix);
         gl.uniform3fv(uniforms.core, colors.core);
         gl.uniform3fv(uniforms.mid, colors.mid);
         gl.uniform3fv(uniforms.outer, colors.outer);
         gl.uniform3fv(uniforms.accent, colors.accent);
+        gl.uniform3fv(uniforms.accent2, colors.accent2);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         if (!reportedReady) {
           reportedReady = true;
@@ -454,12 +521,12 @@ const FlameStage = styled.div`
     right: 0;
     bottom: 0;
     left: 0;
-    height: 54%;
+    height: 42%;
     background:
       linear-gradient(0deg, var(--flame-glow), transparent 82%),
-      linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+      linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
     filter: blur(16px);
-    opacity: 0.78;
+    opacity: 0.5;
     mix-blend-mode: screen;
   }
 
@@ -474,11 +541,11 @@ const FlameStage = styled.div`
 const FlameBackdrop = styled.div`
   position: absolute;
   inset: auto 0 0;
-  height: 42%;
+  height: 36%;
   background:
     radial-gradient(ellipse at 50% 100%, var(--flame-glow), transparent 68%),
-    linear-gradient(0deg, rgba(255, 255, 255, 0.1), transparent 72%);
-  opacity: 0.72;
+    linear-gradient(0deg, rgba(255, 255, 255, 0.06), transparent 72%);
+  opacity: 0.42;
   mix-blend-mode: screen;
 `;
 
@@ -511,7 +578,7 @@ const FlameFallback = styled.div`
   mix-blend-mode: screen;
 
   &[data-ready="true"] {
-    opacity: 0.16;
+    opacity: 0.08;
   }
 `;
 

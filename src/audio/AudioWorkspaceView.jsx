@@ -65,7 +65,7 @@ import {
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
 } from "./cloudVoiceAgentClient.js";
-import { applyVoiceTextPipeline } from "./voicePipeline.js";
+import { applyVoiceTextPipeline, parseDictionaryTerms } from "./voicePipeline.js";
 import {
   loadVoiceTextRules,
   peekVoiceTextRules,
@@ -234,13 +234,15 @@ import {
   AudioRecorderActions,
   AudioDevicePanel,
   AudioDeviceHeader,
-  AudioDeviceControls,
   AudioDeviceSelect,
-  AudioCloudGrid,
   AudioCloudField,
   AudioCloudInput,
   AudioInputMeter,
   AudioInputMeta,
+  AudioInputMicButton,
+  AudioInputPill,
+  AudioInputPillIconButton,
+  AudioInputPillSelect,
   AudioRecorderOptionRow,
   AudioShortcutGrid,
   AudioShortcutCard,
@@ -472,7 +474,8 @@ const FORGE_RELEASE_POST_BUFFER_MS = 350;
 // of flashing "Checking credits" while the network refresh runs.
 let lastKnownForgeBilling = null;
 const AUDIO_WIDGET_PREROLL_READY_MS = 500;
-const AUDIO_INPUT_METER_BARS = 32;
+// Matches the 18-column track inside the input-source capsule meter.
+const AUDIO_INPUT_METER_BARS = 18;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
@@ -1095,6 +1098,23 @@ function audioHistoryEntryWords(entry) {
 const AUDIO_WPM_GAUGE_MAX = 200;
 const AUDIO_HEATMAP_WEEKS = 14;
 
+// Rounded population benchmarks for sustained dictation pace (conversational
+// speech sits around 110-150 WPM); first matching tier wins, below the ladder
+// no badge shows.
+const AUDIO_WPM_PERCENTILE_TIERS = [
+  { label: "Top 0.01%", minWpm: 205 },
+  { label: "Top 0.1%", minWpm: 185 },
+  { label: "Top 1%", minWpm: 165 },
+  { label: "Top 10%", minWpm: 145 },
+  { label: "Top 20%", minWpm: 125 },
+];
+
+function audioWpmPercentileLabel(wpm) {
+  const value = Number(wpm) || 0;
+  const tier = AUDIO_WPM_PERCENTILE_TIERS.find((entry) => value >= entry.minWpm);
+  return tier ? tier.label : "";
+}
+
 /// Everything the history header visualizes in one pass: the average-WPM
 /// gauge value, the totals chips, and a GitHub-style words-per-day heatmap
 /// (columns = weeks, rows = weekdays, most recent week last).
@@ -1312,6 +1332,21 @@ export default function AudioWorkspaceView({
       ? applyVoiceTextPipeline(voiceRulesPreviewInput, voiceRules)
       : null
   ), [voiceRulesPreviewInput, voiceRules]);
+  const activeDictionaryTermCount = useMemo(() => {
+    const seen = new Set();
+    for (const list of voiceRules.dictionary || []) {
+      if (list?.selected === false) {
+        continue;
+      }
+      for (const term of list?.terms || []) {
+        const key = String(term).trim().toLowerCase();
+        if (key) {
+          seen.add(key);
+        }
+      }
+    }
+    return seen.size;
+  }, [voiceRules]);
   const toggleAudioHistoryExpanded = useCallback((entryKey) => {
     setExpandedAudioHistoryIds((current) => {
       const next = new Set(current);
@@ -1532,12 +1567,14 @@ export default function AudioWorkspaceView({
 
   const addVoiceRuleEntry = useCallback((kind) => {
     const id = `${kind}-${Date.now()}`;
-    const blankEntry = kind === "dictionary"
-      ? { id, phrase: "", soundsLike: [], soundsLikeText: "", enabled: true }
-      : kind === "snippets"
-        ? { id, trigger: "", expansion: "", enabled: true }
-        : { id, match: "", replacement: "", isRegex: false, enabled: true };
-    updateVoiceRulesList(kind, (entries) => [...entries, blankEntry]);
+    updateVoiceRulesList(kind, (entries) => {
+      const blankEntry = kind === "dictionary"
+        ? { id, name: `List ${entries.length + 1}`, terms: [], termsText: "", selected: true }
+        : kind === "snippets"
+          ? { id, trigger: "", expansion: "", enabled: true }
+          : { id, match: "", replacement: "", isRegex: false, enabled: true };
+      return [...entries, blankEntry];
+    });
   }, [updateVoiceRulesList]);
 
   const updateOrchestratorRealtimeEnabled = useCallback((enabled) => {
@@ -2020,6 +2057,44 @@ export default function AudioWorkspaceView({
                 </span>
               </AudioModeButton>
             </AudioModeList>
+            {(isCloudMode || isForgeMode) && (
+              <AudioCloudField>
+                Language
+                <AudioDeviceSelect
+                  aria-label="Transcription language"
+                  onChange={updateDeepgramLanguage}
+                  value={deepgramLanguage}
+                >
+                  {DEEPGRAM_LANGUAGE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </AudioDeviceSelect>
+              </AudioCloudField>
+            )}
+            {isCloudMode && (
+              <>
+                <AudioCloudField>
+                  API key
+                  <AudioCloudInput
+                    autoComplete="off"
+                    onChange={updateDeepgramApiKey}
+                    placeholder="Deepgram API key"
+                    type="password"
+                    value={deepgramApiKey}
+                  />
+                </AudioCloudField>
+                <AudioRecorderOptionRow>
+                  <SettingsHint>
+                    Deepgram Nova-3 streams push-to-talk audio over a live WebSocket.
+                  </SettingsHint>
+                  <AudioStatePill data-installed={deepgramReady}>
+                    {deepgramReady ? "Key saved" : "Key required"}
+                  </AudioStatePill>
+                </AudioRecorderOptionRow>
+              </>
+            )}
             {(isForgeMode || isForgeAgentMode) && (
               <>
                 <AudioRecorderOptionRow>
@@ -2214,54 +2289,6 @@ export default function AudioWorkspaceView({
 
         </AudioGeneralToolbar>
 
-        {(isCloudMode || isForgeMode) && (
-          <AudioDevicePanel aria-label="Cloud transcription settings">
-            <AudioDeviceHeader>
-              <div>
-                <SettingsLabel>Cloud transcription</SettingsLabel>
-                <SettingsHint>
-                  {isForgeMode
-                    ? "Diff Forge Cloud streams Nova-3 over a live WebSocket; the language applies to the realtime transcript."
-                    : "Deepgram Nova-3 streams push-to-talk audio over a live WebSocket."}
-                </SettingsHint>
-              </div>
-              {isCloudMode && (
-                <AudioStatePill data-installed={deepgramReady}>
-                  {deepgramReady ? "Key saved" : "Key required"}
-                </AudioStatePill>
-              )}
-            </AudioDeviceHeader>
-            <AudioCloudGrid>
-              {isCloudMode && (
-                <AudioCloudField>
-                  API key
-                  <AudioCloudInput
-                    autoComplete="off"
-                    onChange={updateDeepgramApiKey}
-                    placeholder="Deepgram API key"
-                    type="password"
-                    value={deepgramApiKey}
-                  />
-                </AudioCloudField>
-              )}
-              <AudioCloudField>
-                Language
-                <AudioDeviceSelect
-                  aria-label="Transcription language"
-                  onChange={updateDeepgramLanguage}
-                  value={deepgramLanguage}
-                >
-                  {DEEPGRAM_LANGUAGE_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </AudioDeviceSelect>
-              </AudioCloudField>
-            </AudioCloudGrid>
-          </AudioDevicePanel>
-        )}
-
         <AudioDevicePanel aria-label="Audio input settings">
           <AudioDeviceHeader>
             <div>
@@ -2273,8 +2300,22 @@ export default function AudioWorkspaceView({
             </AudioStatePill>
           </AudioDeviceHeader>
 
-          <AudioDeviceControls>
-            <AudioDeviceSelect
+          <AudioInputPill data-live={audioInputState === "previewing" ? "true" : "false"}>
+            <AudioInputMicButton
+              aria-label={audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
+              data-live={audioInputState === "previewing" ? "true" : "false"}
+              disabled={audioInputState === "checking" || audioInputState === "starting"}
+              onClick={toggleAudioInputPreview}
+              title={audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
+              type="button"
+            >
+              {audioInputState === "previewing" ? (
+                <ButtonCloseIcon aria-hidden="true" />
+              ) : (
+                <ButtonMicIcon aria-hidden="true" />
+              )}
+            </AudioInputMicButton>
+            <AudioInputPillSelect
               aria-label="Microphone input source"
               disabled={audioInputState === "checking" || audioInputState === "starting"}
               onChange={selectAudioInputDevice}
@@ -2289,29 +2330,29 @@ export default function AudioWorkspaceView({
               ) : (
                 <option value="default">Default microphone</option>
               )}
-            </AudioDeviceSelect>
-            <SecondaryButton disabled={audioInputState === "checking" || audioInputState === "starting"} onClick={loadAudioInputDevices} type="button">
+            </AudioInputPillSelect>
+            <AudioInputMeter
+              aria-hidden="true"
+              data-active={audioInputState === "previewing"}
+              data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
+            >
+              {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
+                <span
+                  key={index}
+                  style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
+                />
+              ))}
+            </AudioInputMeter>
+            <AudioInputPillIconButton
+              aria-label="Refresh input sources"
+              disabled={audioInputState === "checking" || audioInputState === "starting"}
+              onClick={loadAudioInputDevices}
+              title="Refresh input sources"
+              type="button"
+            >
               <ButtonRefreshIcon aria-hidden="true" />
-              <span>Refresh sources</span>
-            </SecondaryButton>
-            <PrimaryButton disabled={audioInputState === "checking" || audioInputState === "starting"} onClick={toggleAudioInputPreview} type="button">
-              <ButtonMicIcon aria-hidden="true" />
-              <span>{audioInputState === "previewing" ? "Stop monitor" : "Enable input"}</span>
-            </PrimaryButton>
-          </AudioDeviceControls>
-
-          <AudioInputMeter
-            aria-hidden="true"
-            data-active={audioInputState === "previewing"}
-            data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
-          >
-            {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
-              <span
-                key={index}
-                style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
-              />
-            ))}
-          </AudioInputMeter>
+            </AudioInputPillIconButton>
+          </AudioInputPill>
           <AudioInputMeta>
             {selectedAudioInputLabel} / level {formatAudioLevel(audioInputLevel)} / buffer {Math.round((audioInputStats.bufferMs || 0) / 1000)}s
           </AudioInputMeta>
@@ -2548,43 +2589,49 @@ export default function AudioWorkspaceView({
 
             <AudioRulesHint>
               {voiceRulesTab === "dictionary"
-                ? "Teach transcription your vocabulary. The phrase biases recognition (local Whisper and Deepgram) and “sounds like” aliases are auto-corrected to it."
+                ? "Word lists of expected terms. Paste 20–150 words per list, then select the lists to use: their words become Deepgram keyterms (your key or Diff Forge Cloud) and the local Whisper glossary prompt."
                 : voiceRulesTab === "snippets"
                   ? "Say a trigger word and it expands into the full text, like saying “gstack” to insert an entire prompt."
                   : "Find-and-replace rules applied last, in order. Use them for spoken commands like “new line” or regex cleanups."}
             </AudioRulesHint>
 
             <AudioRulesList>
-              {voiceRulesTab === "dictionary" && (voiceRules.dictionary || []).map((entry) => (
-                <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
+              {voiceRulesTab === "dictionary" && (voiceRules.dictionary || []).map((list) => (
+                <AudioRuleRow data-disabled={list.selected === false ? "true" : undefined} key={list.id}>
                   <AudioRuleToggle
-                    aria-label={entry.enabled === false ? "Enable dictionary entry" : "Disable dictionary entry"}
-                    aria-pressed={entry.enabled !== false}
-                    onClick={() => updateVoiceRuleEntry("dictionary", entry.id, { enabled: entry.enabled === false })}
+                    aria-label={list.selected === false ? "Include word list in dictation" : "Exclude word list from dictation"}
+                    aria-pressed={list.selected !== false}
+                    onClick={() => updateVoiceRuleEntry("dictionary", list.id, { selected: list.selected === false })}
                     type="button"
                   />
                   <AudioRuleFields>
-                    <AudioRuleFieldRow>
+                    <AudioRuleFieldRow data-single="true">
                       <AudioCloudInput
-                        aria-label="Phrase"
-                        onChange={(event) => updateVoiceRuleEntry("dictionary", entry.id, { phrase: event.target.value })}
-                        placeholder="Phrase, e.g. Tauri"
-                        value={entry.phrase || ""}
-                      />
-                      <AudioCloudInput
-                        aria-label="Sounds like"
-                        onChange={(event) => updateVoiceRuleEntry("dictionary", entry.id, {
-                          soundsLikeText: event.target.value,
-                          soundsLike: event.target.value.split(",").map((alias) => alias.trim()).filter(Boolean),
-                        })}
-                        placeholder="Sounds like (comma separated), e.g. towery, tory"
-                        value={entry.soundsLikeText ?? (entry.soundsLike || []).join(", ")}
+                        aria-label="Word list name"
+                        onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, { name: event.target.value })}
+                        placeholder="List name, e.g. Project jargon"
+                        value={list.name || ""}
                       />
                     </AudioRuleFieldRow>
+                    <AudioRuleFieldRow data-single="true">
+                      <AudioRuleTextarea
+                        aria-label="Word list terms"
+                        onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, {
+                          termsText: event.target.value,
+                          terms: parseDictionaryTerms(event.target.value),
+                        })}
+                        placeholder="Paste the words you expect to say, separated by commas or new lines"
+                        value={list.termsText ?? (list.terms || []).join(", ")}
+                      />
+                    </AudioRuleFieldRow>
+                    <SettingsHint>
+                      {(list.terms || []).length} {(list.terms || []).length === 1 ? "word" : "words"}
+                      {list.selected === false ? " · not sent to dictation" : ""}
+                    </SettingsHint>
                   </AudioRuleFields>
                   <AudioRuleIconButton
-                    aria-label="Delete dictionary entry"
-                    onClick={() => removeVoiceRuleEntry("dictionary", entry.id)}
+                    aria-label="Delete word list"
+                    onClick={() => removeVoiceRuleEntry("dictionary", list.id)}
                     type="button"
                   >
                     <ButtonDeleteIcon aria-hidden="true" />
@@ -2676,7 +2723,7 @@ export default function AudioWorkspaceView({
               {!(voiceRules[voiceRulesTab] || []).length && (
                 <AudioRulesHint>
                   {voiceRulesTab === "dictionary"
-                    ? "No vocabulary yet. Add product names, APIs, or people the model mishears."
+                    ? "No word lists yet. Create one and paste the product names, APIs, and people you expect to say."
                     : voiceRulesTab === "snippets"
                       ? "No snippets yet. Map a short spoken trigger to a long prompt."
                       : "No transforms yet. Try “new line” → a line break."}
@@ -2684,12 +2731,21 @@ export default function AudioWorkspaceView({
               )}
             </AudioRulesList>
 
+            {voiceRulesTab === "dictionary" && (voiceRules.dictionary || []).length > 0 && (
+              <AudioRulesHint>
+                {activeDictionaryTermCount === 1
+                  ? "1 unique word from selected lists rides"
+                  : `${activeDictionaryTermCount} unique words from selected lists ride`}
+                {" every dictation start; the first 100 become Deepgram keyterms and the local Whisper glossary."}
+              </AudioRulesHint>
+            )}
+
             <AudioRulesActionsRow>
               <SecondaryButton onClick={() => addVoiceRuleEntry(voiceRulesTab)} type="button">
                 <ButtonMicIcon aria-hidden="true" />
                 <span>
                   {voiceRulesTab === "dictionary"
-                    ? "Add phrase"
+                    ? "New word list"
                     : voiceRulesTab === "snippets"
                       ? "Add snippet"
                       : "Add transform"}
@@ -2705,7 +2761,7 @@ export default function AudioWorkspaceView({
               <AudioCloudInput
                 aria-label="Preview input"
                 onChange={(event) => setVoiceRulesPreviewInput(event.target.value)}
-                placeholder="Type what you'd say, e.g. run gstack with towery new line done"
+                placeholder="Type what you'd say, e.g. run gstack with tauri new line done"
                 value={voiceRulesPreviewInput}
               />
               {voiceRulesPreview && (
@@ -2722,7 +2778,13 @@ export default function AudioWorkspaceView({
             role="tabpanel"
           >
             <AudioHistoryStats aria-label="Speech to text statistics">
-              <AudioInsightCard aria-label="Average words per minute">
+              <AudioInsightCard
+                aria-label={`Average words per minute${
+                  audioWpmPercentileLabel(audioHistoryInsights.averageWpm)
+                    ? `, ${audioWpmPercentileLabel(audioHistoryInsights.averageWpm)} of speakers`
+                    : ""
+                }`}
+              >
                 <AudioInsightValue>
                   {audioHistoryInsights.averageWpm > 0
                     ? formatInteger(audioHistoryInsights.averageWpm)
@@ -2745,6 +2807,11 @@ export default function AudioWorkspaceView({
                       )),
                     }}
                   />
+                  {audioWpmPercentileLabel(audioHistoryInsights.averageWpm) && (
+                    <text className="tier" textAnchor="middle" x="50" y="49">
+                      {audioWpmPercentileLabel(audioHistoryInsights.averageWpm).toUpperCase()}
+                    </text>
+                  )}
                 </AudioWpmGauge>
               </AudioInsightCard>
               <AudioInsightCard aria-label="Words spoken per day">

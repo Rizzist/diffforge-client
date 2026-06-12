@@ -4392,35 +4392,6 @@ fn snipping_mark_preview_docked(app: &AppHandle, label: &str, docked: bool) {
     }
 }
 
-fn snipping_open_preview_labels_for_path(app: &AppHandle, path_string: &str) -> Vec<String> {
-    let closing = snipping_preview_closing_labels(app);
-    app.state::<SnippingState>()
-        .preview_paths
-        .lock()
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(|(label, open_path)| {
-                    (open_path == path_string
-                        && !closing.contains(label)
-                        && app.get_webview_window(label.as_str()).is_some())
-                    .then(|| label.clone())
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn snipping_path_has_detached_preview(app: &AppHandle, path_string: &str) -> bool {
-    let detached = snipping_preview_detached_labels(app);
-    if detached.is_empty() {
-        return false;
-    }
-    snipping_open_preview_labels_for_path(app, path_string)
-        .iter()
-        .any(|label| detached.contains(label))
-}
-
 fn snipping_begin_preview_drag_session(
     app: &AppHandle,
     label: &str,
@@ -5149,8 +5120,7 @@ fn snipping_emit_preview_drag_over(app: &AppHandle, label: &str) {
 
 const SNIPPING_FLOAT_ASSIGN_EVENT: &str = "forge-snip-float-assign";
 // Fired whenever the set of open floating previews changes (open, close,
-// destroy): the recent-snips strip hides snips that are already on screen as
-// draggable previews, so it re-lists on this signal.
+// destroy), so any quick-access UI watching preview state can refresh.
 const SNIPPING_FLOATS_CHANGED_EVENT: &str = "forge-snip-floats-changed";
 // One parked window is enough: refilling starts the moment a capture adopts
 // it, long before the user can finish the next selection.
@@ -5161,30 +5131,6 @@ fn snipping_emit_floats_changed(app: &AppHandle) {
         SNIPPING_FLOATS_CHANGED_EVENT,
         json!({ "kind": "snip_floats_changed" }),
     );
-}
-
-/// Paths currently shown as floating snip previews (windows still alive).
-fn snipping_open_preview_paths(app: &AppHandle) -> HashSet<String> {
-    let closing = snipping_preview_closing_labels(app);
-    app.state::<SnippingState>()
-        .preview_paths
-        .lock()
-        .map(|paths| {
-            paths
-                .iter()
-                .filter(|(label, _)| {
-                    !closing.contains(*label) && app.get_webview_window(label.as_str()).is_some()
-                })
-                .map(|(_, path)| {
-                    PathBuf::from(path)
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(path))
-                        .display()
-                        .to_string()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Builds a snip preview window (hidden) with all of its chrome and window
@@ -5663,30 +5609,23 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
 const SNIPPING_STRIP_WINDOW_LABEL: &str = "snipping-strip";
 const SNIPPING_STRIP_ANIM_EVENT: &str = "forge-snip-strip-anim";
 const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 148.0;
+const SNIPPING_STRIP_CONTROL_LOGICAL_WIDTH: f64 = 56.0;
 // Pre-show placeholder only: every show resizes the bar to the full logical
 // width of the monitor under the cursor.
 const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
 const SNIPPING_STRIP_RECENT_LIMIT: usize = 16;
-const SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS: u64 = 350;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
-static SNIPPING_STRIP_LAST_BLUR_HIDE_MS: AtomicU64 = AtomicU64::new(0);
-static SNIPPING_STRIP_DISMISS_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Newest-first listing of saved snip files. The on-disk `snips` directory is
-/// the durable history (the in-memory toast list only ever holds six). Regular
-/// callers exclude previews already on screen; the strip may include open
-/// queue-owned previews so it can move the same real windows into its row.
-fn snipping_recent_snip_items_for_mode(
-    app: &AppHandle,
-    limit: usize,
-    include_dockable_open_previews: bool,
-) -> Result<Vec<Value>, String> {
+/// the durable history (the in-memory toast list only ever holds six). Open
+/// previews are intentionally not filtered: each snip has one preview object,
+/// and callers switch that object's docked/free mode instead of deduping it.
+fn snipping_recent_snip_items(limit: usize) -> Result<Vec<Value>, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
     let Ok(entries) = fs::read_dir(root.join("snips")) else {
         return Ok(Vec::new());
     };
-    let floating = snipping_open_preview_paths(app);
     let mut snips: Vec<(u128, Value)> = entries
         .flatten()
         .filter_map(|entry| {
@@ -5715,13 +5654,6 @@ fn snipping_recent_snip_items_for_mode(
                 .unwrap_or_else(|_| path.clone())
                 .display()
                 .to_string();
-            if floating.contains(&path_string) {
-                if !include_dockable_open_previews
-                    || snipping_path_has_detached_preview(app, &path_string)
-                {
-                    return None;
-                }
-            }
             Some((
                 modified_ms,
                 json!({
@@ -5740,18 +5672,14 @@ fn snipping_recent_snip_items_for_mode(
         .collect())
 }
 
-fn snipping_recent_snip_items(app: &AppHandle, limit: usize) -> Result<Vec<Value>, String> {
-    snipping_recent_snip_items_for_mode(app, limit, false)
-}
-
 #[tauri::command]
-fn snipping_recent_snips(app: AppHandle, limit: Option<usize>) -> Result<Value, String> {
+fn snipping_recent_snips(_app: AppHandle, limit: Option<usize>) -> Result<Value, String> {
     let limit = limit
         .unwrap_or(SNIPPING_STRIP_RECENT_LIMIT)
         .clamp(1, SNIPPING_STRIP_RECENT_LIMIT);
     Ok(json!({
         "kind": "snipping_recent_snips",
-        "items": snipping_recent_snip_items(&app, limit)?,
+        "items": snipping_recent_snip_items(limit)?,
     }))
 }
 
@@ -5816,23 +5744,6 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         snipping_convert_overlay_window_to_panel(&window);
         snipping_strip_apply_macos_overlay_style(&window);
     }
-    let blur_window = window.clone();
-    let blur_app = app.clone();
-    window.on_window_event(move |event| {
-        if let WindowEvent::Focused(false) = event {
-            if !blur_window.is_visible().unwrap_or(false) {
-                return;
-            }
-            // Clicking a preview parked on the bar steals the bar's focus,
-            // but the cursor is still inside the band: that is queue
-            // interaction, not dismissal.
-            if snipping_strip_contains_cursor(&blur_app) {
-                return;
-            }
-            SNIPPING_STRIP_LAST_BLUR_HIDE_MS.store(cloud_mcp_now_ms(), Ordering::Release);
-            snipping_strip_hide_animated(&blur_app, blur_window.clone(), true);
-        }
-    });
     Some(window)
 }
 
@@ -5975,10 +5886,10 @@ fn snipping_strip_hide_animated(
             if only_if_unfocused && window.is_focused().unwrap_or(false) {
                 return;
             }
-            // The row's previews dismiss with the bar; anything the user
-            // dragged off the band stays floating. Must run while the bar is
-            // still visible — the band geometry is derived from it.
-            snipping_strip_close_row_floats(&app_for_close);
+            // Explicit strip dismissal leaves the one-preview-per-snip objects
+            // alive; it only clears dock mode and returns them to the normal
+            // floating queue.
+            snipping_strip_undock_row_previews(&app_for_close);
             snipping_hide_window_now(&window, "strip_hide_animated");
         });
     });
@@ -6001,14 +5912,6 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     snipping_strip_order_front_regardless(&window);
     #[cfg(target_os = "macos")]
     snipping_make_overlay_key(&window);
-    // The strip is a non-activating panel on macOS, so makeKeyAndOrderFront
-    // gives the webview key status without activating Diff Forge or switching
-    // away from the fullscreen Space that invoked it. Click-outside dismissal
-    // still needs the global monitor because the app may remain inactive.
-    #[cfg(target_os = "macos")]
-    {
-        snipping_strip_install_dismiss_monitor(app);
-    }
     #[cfg(not(target_os = "macos"))]
     snipping_focus_window_now(&window, "strip_focus");
     snipping_strip_emit_anim(app, "open", Some(origin));
@@ -6017,68 +5920,14 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     snipping_strip_populate_row(app);
 }
 
-/// App-lifetime global mouse-down monitor that dismisses the strip on a
-/// click outside it. The focus-loss handler only covers dismissal when the
-/// strip actually became key — showing it from another app's fullscreen
-/// Space deliberately skips focus (see snipping_strip_show), and global
-/// monitors only observe OTHER apps' events, which is exactly that case.
-#[cfg(target_os = "macos")]
-fn snipping_strip_install_dismiss_monitor(app: &AppHandle) {
-    if SNIPPING_STRIP_DISMISS_MONITOR_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let app_for_monitor = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        snipping_catch_objc("strip_install_dismiss_monitor", || {
-            use objc2_app_kit::{NSEvent, NSEventMask};
-            let mask = NSEventMask::LeftMouseDown
-                | NSEventMask::RightMouseDown
-                | NSEventMask::OtherMouseDown;
-            let block =
-                block2::RcBlock::new(move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
-                    snipping_catch_objc("strip_dismiss_monitor_callback", || {
-                        let Some(strip) =
-                            app_for_monitor.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)
-                        else {
-                            return;
-                        };
-                        if !strip.is_visible().unwrap_or(false) {
-                            return;
-                        }
-                        if snipping_strip_contains_cursor(&app_for_monitor) {
-                            return;
-                        }
-                        // Same grace stamp as the focus-loss path so the click
-                        // that dismissed the bar cannot instantly re-toggle it open.
-                        SNIPPING_STRIP_LAST_BLUR_HIDE_MS
-                            .store(cloud_mcp_now_ms(), Ordering::Release);
-                        snipping_strip_hide_animated(&app_for_monitor, strip, false);
-                    });
-                });
-            if let Some(token) =
-                NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block)
-            {
-                // Lives for the app's lifetime; it early-returns while hidden.
-                std::mem::forget(token);
-            }
-        });
-    });
-}
-
-/// Tray-click toggle for the recent-snips bar, mirroring the background
-/// monitor's blur-grace dance (clicking the tray blurs the bar first; without
-/// the grace window it would hide and instantly reopen).
+/// Tray-click toggle for the recent-snips bar. The strip is persistent now:
+/// only this explicit toggle, Escape, or the strip's close button undocks it.
 pub(crate) fn snipping_strip_toggle(app: &AppHandle) {
     let Some(window) = snipping_strip_window(app) else {
         return;
     };
     if window.is_visible().unwrap_or(false) {
         snipping_strip_hide_animated(app, window, false);
-        return;
-    }
-    if cloud_mcp_now_ms().saturating_sub(SNIPPING_STRIP_LAST_BLUR_HIDE_MS.load(Ordering::Acquire))
-        < SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS
-    {
         return;
     }
     snipping_strip_show(app);
@@ -6102,8 +5951,8 @@ fn snipping_open_snip_float(
         (Some(x), Some(y)) => Some((x, y)),
         _ => None,
     };
-    // `focused: false` is the strip's pin path: stealing focus would blur-hide
-    // the strip the moment a snip is pinned.
+    // `focused: false` keeps quick-access opens from stealing focus away from
+    // the strip/background workflow.
     snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))
 }
 
@@ -6220,27 +6069,6 @@ fn snipping_handle_untracked_asset_deleted(app: &AppHandle, deleted_path: &str) 
             }
         }
     }
-}
-
-/// True while the global cursor is inside the recent-snips strip window.
-fn snipping_strip_contains_cursor(app: &AppHandle) -> bool {
-    let Some(strip) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
-        return false;
-    };
-    if !strip.is_visible().unwrap_or(false) {
-        return false;
-    }
-    let (Ok(cursor), Ok(position), Ok(size)) = (
-        app.cursor_position(),
-        strip.outer_position(),
-        strip.outer_size(),
-    ) else {
-        return false;
-    };
-    cursor.x >= position.x as f64
-        && cursor.x <= (position.x + size.width as i32) as f64
-        && cursor.y >= position.y as f64
-        && cursor.y <= (position.y + size.height as i32) as f64
 }
 
 /// Geometry of the strip's horizontal queue while the bar is visible:
@@ -6364,9 +6192,8 @@ fn snipping_strip_row_reflow_moves(
 /// Fills the freshly shown bar with real preview float windows for the most
 /// recent snips: the strip's tiles ARE snip previews now — same window, same
 /// actions, same drag — so the open bar is a horizontal queue unified with
-/// the bottom-left column. Only as many tiles as fit the row are opened, and
-/// snips detached elsewhere stay out of the strip, while queue-owned previews
-/// can be moved into this row.
+/// the bottom-left column. Only as many tiles as fit the row are opened; if a
+/// snip already has a preview, that same object is moved into dock mode.
 fn snipping_strip_populate_row(app: &AppHandle) {
     let Some(strip) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
         return;
@@ -6375,14 +6202,17 @@ fn snipping_strip_populate_row(app: &AppHandle) {
         return;
     };
     let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
-    let usable = size.width as f64 / scale - SNIPPING_FLOAT_STACK_MARGIN * 2.0;
+    let usable = (size.width as f64 / scale
+        - SNIPPING_FLOAT_STACK_MARGIN * 2.0
+        - SNIPPING_STRIP_CONTROL_LOGICAL_WIDTH)
+        .max(0.0);
     let per_tile = SNIPPING_FLOAT_LOGICAL_WIDTH + SNIPPING_FLOAT_STACK_GAP;
     let fit = (((usable + SNIPPING_FLOAT_STACK_GAP) / per_tile).floor() as usize)
         .min(SNIPPING_STRIP_RECENT_LIMIT);
     if fit == 0 {
         return;
     }
-    let items = snipping_recent_snip_items_for_mode(app, fit, true).unwrap_or_default();
+    let items = snipping_recent_snip_items(fit).unwrap_or_default();
     let origin_x = position.x as f64 / scale + SNIPPING_FLOAT_STACK_MARGIN;
     let origin_y = position.y as f64 / scale
         + (size.height as f64 / scale - SNIPPING_FLOAT_LOGICAL_HEIGHT).max(0.0) / 2.0;
@@ -6409,17 +6239,29 @@ fn snipping_strip_populate_row(app: &AppHandle) {
     snipping_strip_reassert_docked_previews(app);
 }
 
-/// Closes every preview still parked in the row when the bar dismisses.
-/// Previews the user dragged out of the band live on as normal floats.
-fn snipping_strip_close_row_floats(app: &AppHandle) {
+/// Releases every docked preview back into normal floating mode when the strip
+/// is explicitly toggled off. There is still only one preview object per snip:
+/// closing the strip changes state, it does not close/dedupe/recreate previews.
+fn snipping_strip_undock_row_previews(app: &AppHandle) {
     let dragging_labels = snipping_preview_dragging_labels(app);
     let docked_labels = snipping_preview_docked_labels(app);
     for label in docked_labels {
-        if dragging_labels.contains(&label) {
+        if dragging_labels.contains(&label) || snipping_preview_is_closing(app, &label) {
             continue;
         }
-        snipping_close_preview_window(app, &label, "strip-dismissed");
+        let Some(window) = app.get_webview_window(&label) else {
+            snipping_mark_preview_docked(app, &label, false);
+            continue;
+        };
+        snipping_mark_preview_docked(app, &label, false);
+        if let Ok(mut detached) = app.state::<SnippingState>().preview_detached_labels.lock() {
+            detached.remove(&label);
+        }
+        snipping_position_preview_window(app, &window, None);
+        #[cfg(target_os = "macos")]
+        snipping_preview_set_strip_docked_level(&window, false);
     }
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
 }
 
 /// Called by a preview window's webview right before it starts the native
