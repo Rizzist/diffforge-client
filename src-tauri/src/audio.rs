@@ -4252,10 +4252,20 @@ fn spawn_cloud_voice_agent_desktop_log(
 async fn prewarm_cloud_voice_agent_stream(
     cloud_mcp_state: State<'_, CloudMcpState>,
 ) -> Result<bool, String> {
+    prewarm_cloud_voice_agent_stream_for_state(cloud_mcp_state.inner(), false).await
+}
+
+async fn prewarm_cloud_voice_agent_stream_for_state(
+    cloud_mcp_state: &CloudMcpState,
+    ensure_billing: bool,
+) -> Result<bool, String> {
     log_audio_diagnostic_event("audio.cloud_voice.prewarm.command", json!({}));
-    ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state.inner()).await?;
+    ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state).await?;
+    if ensure_billing {
+        let _ = cloud_mcp_get_billing_status_for_state(cloud_mcp_state).await;
+    }
     let _ = cloud_mcp_ws_request_with_timeout(
-        cloud_mcp_state.inner(),
+        cloud_mcp_state,
         "voice_agent_prewarm",
         &json!({ "kind": "voice_agent_prewarm" }),
         Duration::from_secs(CLOUD_VOICE_AGENT_TEXT_CONNECT_TIMEOUT_SECS),
@@ -4268,9 +4278,9 @@ async fn prewarm_cloud_voice_agent_stream(
         );
         return Ok(true);
     }
-    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
+    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state).await?;
     let ws_target = cloud_mcp_resolve_ws_target(
-        cloud_mcp_state.inner(),
+        cloud_mcp_state,
         &cloud_mcp_base_url(),
         CLOUD_VOICE_AGENT_WS_PATH,
     )

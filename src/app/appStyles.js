@@ -408,6 +408,7 @@ export const WindowResizeHandle = styled.div`
 
 export const WindowTitleBar = styled.header`
   display: grid;
+  position: relative;
   height: ${TITLE_BAR_HEIGHT};
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -458,11 +459,15 @@ export const WindowTitle = styled.div`
   }
 
   ${WindowTitleBar}[data-platform="macos"] & {
-    grid-column: 2;
+    position: absolute;
+    top: 0;
+    left: 50%;
+    grid-column: 1 / -1;
     grid-row: 1;
-    justify-self: center;
-    padding-right: 86px;
-    padding-left: 0;
+    max-width: calc(100% - 24px);
+    padding: 0 12px;
+    pointer-events: none;
+    transform: translateX(-50%);
   }
 `;
 

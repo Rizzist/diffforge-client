@@ -296,9 +296,16 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         .and_then(Value::as_str)
         .map(agent_accounts_email_key)
         .unwrap_or_default();
+    let default_alias = registry
+        .get("agents")
+        .and_then(|agents| agents.get(kind))
+        .and_then(|entry| entry.get("defaultAlias"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let mut views = vec![json!({
         "id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
         "label": "Default",
+        "alias": default_alias,
         "dir": agent_accounts_default_home(kind)
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
@@ -719,7 +726,10 @@ async fn agent_accounts_state() -> Result<Value, String> {
     .map_err(|error| format!("Agent accounts state worker failed: {error}"))?
 }
 
-/// Alias + display preferences for one captured account pill. Only connected
+/// Alias + display preferences for one account pill. The pill shows the alias
+/// INSTEAD of the email when one is set (streaming privacy), so the default
+/// profile is aliasable too — its alias lives at the kind entry level because
+/// the default view is synthesized, not a registry profile. Only connected
 /// profiles (a signed-in identity is present) can be customized — the alias
 /// names an account, not an empty dir.
 #[tauri::command]
@@ -734,11 +744,28 @@ async fn agent_accounts_update_display(
     let kind = agent_accounts_supported_kind(&agent_kind)
         .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
     let profile_id = profile_id.trim().to_string();
-    if profile_id.is_empty() || profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
-        return Err("The default account has no alias settings.".to_string());
+    if profile_id.is_empty() {
+        return Err("A profile id is required.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
         let mut registry = agent_accounts_registry_read();
+        if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+            let default_email = agent_accounts_default_email(kind);
+            if default_email.is_empty() {
+                return Err(
+                    "Only connected accounts (with a signed-in identity) can be customized."
+                        .to_string(),
+                );
+            }
+            agent_accounts_ensure_kind_entry(&mut registry, kind);
+            if let Some(alias) = alias {
+                registry["agents"][kind]["defaultAlias"] =
+                    json!(alias.trim().chars().take(40).collect::<String>());
+            }
+            agent_accounts_registry_write(&registry);
+            let _ = app.emit(AGENT_ACCOUNTS_CHANGED_EVENT, json!({ "kind": kind }));
+            return Ok(json!({ "ok": true }));
+        }
         let profile = registry
             .get_mut("agents")
             .and_then(|agents| agents.get_mut(kind))

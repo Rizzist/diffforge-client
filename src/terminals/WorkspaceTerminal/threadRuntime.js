@@ -1845,7 +1845,11 @@ export const TERMINAL_ROLE_SWITCH_OPTIONS = [
   { id: "opencode", label: "OpenCode" },
 ];
 export const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
-export const TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS = [0, 80, 190, 280];
+// Slot sizes snap immediately (the fullscreen open/close motion is
+// transform-only), so one immediate resize plus a single settle pass is
+// enough; the old [0, 80, 190, 280] fan chased a since-removed
+// width/height transition.
+export const TERMINAL_FULLSCREEN_RESIZE_DELAYS_MS = [0, 120];
 
 export function getErrorMessage(error, fallback) {
   if (typeof error === "string" && error.trim()) {

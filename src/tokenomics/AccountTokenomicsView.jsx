@@ -119,6 +119,46 @@ const AgentAccountsKindLabel = styled.span`
   font-weight: 750;
 `;
 
+const AgentAccountAddButton = styled.button`
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  color: rgba(148, 163, 184, 0.9);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.6);
+    color: rgba(226, 232, 240, 0.95);
+    background: rgba(125, 176, 255, 0.18);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(100, 116, 139, 0.45);
+    color: rgba(30, 41, 59, 0.75);
+  }
+`;
+
+const AgentAccountLoginHint = styled.div`
+  color: rgba(148, 163, 184, 0.8);
+  font-size: 11px;
+  line-height: 1.45;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+`;
+
 const AgentAccountPill = styled.button`
   display: inline-flex;
   align-items: center;
@@ -293,16 +333,18 @@ const AgentAccountEditorForm = styled.form`
 `;
 
 /* Agent account profiles: per-CLI account switching managed beside the usage
-   data that motivates the switch. There is no add flow — signing into another
-   account in any terminal is captured automatically by the Rust watcher.
-   Switching only affects NEW terminal spawns; running panes show a restart
-   chip instead (never forced). */
+   data that motivates the switch. The per-kind "+" only opens the CLI's login
+   in a terminal — signing into another account in any terminal is captured
+   automatically by the Rust watcher. Switching only affects NEW terminal
+   spawns; running panes show a restart chip instead (never forced). */
 function AgentAccountsManager() {
   const [accounts, setAccounts] = useState(null);
   const [editing, setEditing] = useState(null);
   const [confirmDeleteKey, setConfirmDeleteKey] = useState("");
   const [actionError, setActionError] = useState("");
+  const [loginPendingKind, setLoginPendingKind] = useState("");
   const confirmDeleteTimerRef = useRef(null);
+  const loginPendingTimerRef = useRef(null);
 
   const refresh = useCallback(() => {
     invoke("agent_accounts_state").then((state) => {
@@ -317,8 +359,11 @@ function AgentAccountsManager() {
     // Logins inside profile dirs change identity dots without any event, so
     // a slow poll backs up the capture-watcher events.
     const interval = window.setInterval(refresh, 6000);
-    listen(AGENT_ACCOUNTS_CHANGED_EVENT, () => {
+    listen(AGENT_ACCOUNTS_CHANGED_EVENT, (event) => {
       if (!cancelled) {
+        if (event?.payload?.captured) {
+          setLoginPendingKind("");
+        }
         refresh();
       }
     }).then((next) => {
@@ -334,6 +379,9 @@ function AgentAccountsManager() {
       if (confirmDeleteTimerRef.current) {
         window.clearTimeout(confirmDeleteTimerRef.current);
       }
+      if (loginPendingTimerRef.current) {
+        window.clearTimeout(loginPendingTimerRef.current);
+      }
       if (unlisten) {
         unlisten();
       }
@@ -346,6 +394,19 @@ function AgentAccountsManager() {
       .then(refresh)
       .catch((error) => setActionError(String(error?.message || error || "Unable to switch account.")));
   }, [refresh]);
+
+  const beginLogin = useCallback((kind) => {
+    setActionError("");
+    invoke("start_agent_account_login", { provider: kind }).then(() => {
+      setLoginPendingKind(kind);
+      if (loginPendingTimerRef.current) {
+        window.clearTimeout(loginPendingTimerRef.current);
+      }
+      // The hint is only a pointer at the terminal that just opened; the
+      // capture watcher clears it sooner once the new login is pinned.
+      loginPendingTimerRef.current = window.setTimeout(() => setLoginPendingKind(""), 30000);
+    }).catch((error) => setActionError(String(error?.message || error || "Unable to open the login terminal.")));
+  }, []);
 
   const requestDelete = useCallback((kind, profileId) => {
     const key = `${kind}:${profileId}`;
@@ -374,8 +435,6 @@ function AgentAccountsManager() {
       agentKind: editing.kind,
       profileId: editing.profileId,
       alias: editing.alias,
-      showAlias: editing.showAlias,
-      showEmail: editing.showEmail,
     }).then(() => {
       setEditing(null);
       refresh();
@@ -404,15 +463,25 @@ function AgentAccountsManager() {
               <AgentAccountsKindLabel>
                 {kind === "claude" ? "Claude" : "Codex"}
               </AgentAccountsKindLabel>
+              <AgentAccountAddButton
+                aria-label={`Add ${kind === "claude" ? "Claude" : "Codex"} account`}
+                onClick={() => beginLogin(kind)}
+                title={`Open the ${kind === "claude" ? "Claude Code" : "Codex"} login in a terminal to add another account`}
+                type="button"
+              >
+                +
+              </AgentAccountAddButton>
               {profiles.map((profile) => {
                 const email = profile.identity?.email || "";
                 const alias = String(profile.alias || "").trim();
-                const showAlias = profile.showAlias !== false;
-                const showEmail = profile.showEmail !== false;
+                // The alias HIDES the email (streaming privacy): captured
+                // pills show the alias as their name, the default pill keeps
+                // "Default" and shows the alias where the email was.
                 const name = profile.isDefault
                   ? (profile.label || "Default")
-                  : ((showAlias && alias) || profile.label || "Account");
-                const canEdit = !profile.isDefault && Boolean(email);
+                  : (alias || profile.label || "Account");
+                const detail = profile.isDefault ? (alias || email) : (alias ? "" : email);
+                const canEdit = Boolean(email);
                 const canDelete = !profile.isDefault && !profile.isActive;
                 const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
                 return (
@@ -436,7 +505,7 @@ function AgentAccountsManager() {
                         : profile.identity?.authReady ? "none" : "needs-login"}
                     />
                     <span>{name}</span>
-                    {email && (profile.isDefault || showEmail) ? <em>{email}</em> : null}
+                    {detail ? <em>{detail}</em> : null}
                     {!profile.identity?.authReady && !profile.isDefault ? <em>needs login</em> : null}
                     {canEdit && (
                       <AgentAccountIconButton
@@ -449,12 +518,10 @@ function AgentAccountsManager() {
                             profileId: profile.id,
                             name,
                             alias,
-                            showAlias,
-                            showEmail,
                           });
                         }}
                         role="button"
-                        title="Edit alias & what the pill shows"
+                        title="Set an alias to show instead of the email"
                       >
                         ✎
                       </AgentAccountIconButton>
@@ -482,36 +549,16 @@ function AgentAccountsManager() {
             {editing?.kind === kind ? (
               <AgentAccountEditorForm onSubmit={submitEdit}>
                 <input
-                  aria-label="Account alias"
+                  aria-label="Account alias (shown instead of the email)"
                   autoFocus
                   maxLength={40}
                   onChange={(event) => setEditing((current) => (
                     current ? { ...current, alias: event.target.value } : current
                   ))}
-                  placeholder={`Alias for ${editing.name}`}
+                  placeholder={`Alias for ${editing.name} — hides the email`}
                   type="text"
                   value={editing.alias}
                 />
-                <label>
-                  <input
-                    checked={editing.showAlias}
-                    onChange={(event) => setEditing((current) => (
-                      current ? { ...current, showAlias: event.target.checked } : current
-                    ))}
-                    type="checkbox"
-                  />
-                  show alias
-                </label>
-                <label>
-                  <input
-                    checked={editing.showEmail}
-                    onChange={(event) => setEditing((current) => (
-                      current ? { ...current, showEmail: event.target.checked } : current
-                    ))}
-                    type="checkbox"
-                  />
-                  show email
-                </label>
                 <button type="submit">Save</button>
                 <button onClick={() => setEditing(null)} type="button">Cancel</button>
               </AgentAccountEditorForm>
@@ -519,6 +566,11 @@ function AgentAccountsManager() {
           </Fragment>
         );
       })}
+      {loginPendingKind ? (
+        <AgentAccountLoginHint role="status">
+          {`Finish signing in inside the ${loginPendingKind === "claude" ? "Claude Code" : "Codex"} terminal that just opened — the account appears here automatically.`}
+        </AgentAccountLoginHint>
+      ) : null}
       {actionError ? <TokenomicsError>{actionError}</TokenomicsError> : null}
     </AgentAccountsSection>
   );
@@ -2515,7 +2567,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 <strong>{item.percent}%</strong>
               </ModelRow>
             )) : (
-              <TokenomicsEmpty>Rescan after using Codex or Claude Code to populate usage.</TokenomicsEmpty>
+              <TokenomicsEmpty>Usage populates automatically after using Codex or Claude Code.</TokenomicsEmpty>
             )}
           </ModelList>
         </UsageCard>
@@ -2565,9 +2617,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>
-          <FooterButton disabled={status === "scanning"} onClick={() => refresh({ scan: true })} type="button">
-            {status === "scanning" ? "Scanning" : "Rescan"}
-          </FooterButton>
         </TokenomicsFooter>
       </TokenomicsPanel>
     </TokenomicsShell>
@@ -3571,22 +3620,6 @@ const TokenomicsFooter = styled.footer`
 
   html[data-forge-theme="light"] & {
     color: #64748b;
-  }
-`;
-
-const FooterButton = styled.button`
-  min-height: 30px;
-  padding: 0 10px;
-  border: 1px solid rgba(96, 165, 250, 0.28);
-  border-radius: 999px;
-  color: #60a5fa;
-  background: rgba(37, 99, 235, 0.12);
-  font: inherit;
-  font-size: 10px;
-  font-weight: 900;
-
-  html[data-forge-theme="light"] & {
-    background: #ffffff;
   }
 `;
 

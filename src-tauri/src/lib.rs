@@ -4233,7 +4233,10 @@ pub fn run() {
                 let _ =
                     cloud_mcp_restore_persisted_desktop_session(&cloud_mcp_app, &cloud_mcp_state)
                         .await;
-                let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
+                if cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok() {
+                    let _ =
+                        prewarm_cloud_voice_agent_stream_for_state(&cloud_mcp_state, true).await;
+                }
             });
             cloud_mcp_start_tokenomics_scheduler(
                 app.handle().clone(),
@@ -4324,6 +4327,7 @@ pub fn run() {
             app_local_state_merge_command,
             agent_statuses,
             start_agent_login,
+            start_agent_account_login,
             disconnect_agent,
             install_agent,
             update_agent,

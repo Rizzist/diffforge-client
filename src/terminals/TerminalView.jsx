@@ -1020,13 +1020,15 @@ const TerminalSurfaceSlot = styled.div`
   pointer-events: auto;
   transform: translate3d(var(--terminal-slot-x, 0px), var(--terminal-slot-y, 0px), 0) scale(var(--terminal-slot-scale, 1));
   transform-origin: 0 0;
+  /* Never transition width/height: animating the slot box re-layouts every
+     frame, so each pane's ResizeObserver fires per frame and xterm reflows
+     its whole scrollback repeatedly during maximize/restore. Sizes snap;
+     only transform (position/scale) and paint-only properties animate. */
   transition:
-    width 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    height 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
     transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
     filter 140ms ease,
     opacity 140ms ease;
-  will-change: width, height, transform;
+  will-change: transform;
 
   &[data-terminal-tab-hidden="true"] {
     visibility: hidden;

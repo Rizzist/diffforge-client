@@ -414,6 +414,7 @@ import {
   TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_DELAYS_MS,
   TERMINAL_CODEX_SLASH_MENU_CLOSE_CLEANUP_MS,
   TERMINAL_CODEX_SLASH_MENU_CLOSE_OUTPUT_QUIET_MS,
+  TERMINAL_BACKGROUND_SCROLLBACK_ROWS,
   TERMINAL_DEFAULT_COLS,
   TERMINAL_DEFAULT_ROWS,
   TERMINAL_DEFAULT_SCROLLBACK_ROWS,
@@ -2632,6 +2633,14 @@ function WorkspaceTerminal({
     if (previousState.cursorBlink !== acceptsInteractiveInput) {
       terminal.options.cursorBlink = acceptsInteractiveInput;
     }
+    // Breakout-hosted panes stay on the full budget: they can be read in
+    // their own window while inactive in the grid.
+    const scrollbackRows = active || windowBreakoutHostedRef.current
+      ? TERMINAL_DEFAULT_SCROLLBACK_ROWS
+      : TERMINAL_BACKGROUND_SCROLLBACK_ROWS;
+    if (terminal.options.scrollback !== scrollbackRows) {
+      terminal.options.scrollback = scrollbackRows;
+    }
 
     if (!acceptsInteractiveInput && previousState.acceptsInteractiveInput !== false) {
       terminal.blur?.();
@@ -4423,6 +4432,9 @@ function WorkspaceTerminal({
       setTerminalAudioInputTarget(true, instanceId, "terminal_active_prop");
       if (!wasActiveProp) {
         attachDeferredWebglRef.current?.("terminal_activated");
+        // Resizes are skipped while a pane's surface is hidden; activation is
+        // the reveal path, so reconcile any size drift now.
+        resizeControllerRef.current?.schedule("terminal_activated", 0);
       }
       return undefined;
     }
@@ -5804,18 +5816,36 @@ function WorkspaceTerminal({
       return true;
     };
 
+    let paintBoundsSyncTimer = 0;
+    let paintBoundsSyncDueAtMs = 0;
     scheduleTerminalPaintBoundsSync = (reason = "scheduled", delaysMs = [0, 34, 120]) => {
       if (isDisposed) {
         return;
       }
 
-      delaysMs.forEach((delayMs) => {
-        const timer = window.setTimeout(() => {
-          startupMetricTimers.delete(timer);
-          syncTerminalPaintBounds(reason);
-        }, Math.max(0, Number(delayMs || 0)));
-        startupMetricTimers.add(timer);
-      });
+      // One trailing sync per burst. Resize storms used to fan out timer
+      // batches ([34, 120, 260]) from multiple callbacks per resize, each
+      // forcing layout reads; the furthest requested settle point wins.
+      const delayMs = Math.max(0, ...delaysMs.map((value) => Number(value || 0)));
+      const dueAtMs = performance.now() + delayMs;
+      if (paintBoundsSyncTimer && paintBoundsSyncDueAtMs >= dueAtMs) {
+        return;
+      }
+      if (paintBoundsSyncTimer) {
+        window.clearTimeout(paintBoundsSyncTimer);
+        startupMetricTimers.delete(paintBoundsSyncTimer);
+      }
+      const timer = window.setTimeout(() => {
+        startupMetricTimers.delete(timer);
+        if (paintBoundsSyncTimer === timer) {
+          paintBoundsSyncTimer = 0;
+          paintBoundsSyncDueAtMs = 0;
+        }
+        syncTerminalPaintBounds(reason);
+      }, delayMs);
+      paintBoundsSyncTimer = timer;
+      paintBoundsSyncDueAtMs = dueAtMs;
+      startupMetricTimers.add(timer);
     };
 
     let windowsTerminalLastResizeLogAt = 0;
@@ -9149,6 +9179,17 @@ function WorkspaceTerminal({
       // behind the agent-tuned commit window leaves zsh wrapping the input line at a stale width.
       ...(isGenericTerminal ? { nativeResizeCommitMs: 0, nativeResizeTrailingMs: 0 } : {}),
       instanceId: () => terminalInstanceId,
+      isPriority: () => terminalActiveRef.current === true,
+      // Hidden slots (inactive tab, unmeasured rect) keep layout, so their
+      // ResizeObservers still fire; skip the reflow until the slot is shown.
+      isVisible: () => {
+        const slot = container.closest?.('[data-terminal-surface-slot="true"]');
+        return !slot
+          || (
+            slot.getAttribute("data-terminal-tab-hidden") !== "true"
+            && slot.getAttribute("data-terminal-hidden") !== "true"
+          );
+      },
       maxCols: TERMINAL_MAX_COLS,
       maxRows: TERMINAL_MAX_ROWS,
       minCols: TERMINAL_MIN_COLS,
@@ -9171,7 +9212,9 @@ function WorkspaceTerminal({
           source: "resize_controller_done",
         });
         markClaudeResizeBlankFrameGuardActive(event.reason || "resize_done", event);
-        syncTerminalPaintBounds("resize_done");
+        // No immediate sync here: term.resize already ran the xterm onResize
+        // handler (sync + settle schedule) when dimensions changed, and the
+        // trailing sync below covers container drift that kept cols/rows.
         scheduleTerminalPaintBoundsSync("resize_done_settled", [34, 120, 260]);
         scheduleTerminalStabilityResizeProbe(event.reason || "resize_done", "resize_done", {
           elapsedMs: Number(event.elapsedMs || 0),

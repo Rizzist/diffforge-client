@@ -383,6 +383,24 @@ async fn start_agent_login(provider: String) -> Result<AgentLoginStart, String> 
 }
 
 #[tauri::command]
+async fn start_agent_account_login(provider: String) -> Result<AgentLoginStart, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let provider = parse_agent_provider(&provider)?;
+        let definition = agent_definition(provider);
+
+        launch_account_login_terminal(provider)?;
+
+        Ok(AgentLoginStart {
+            provider: definition.id,
+            command: definition.connect_command,
+            message: format!("Opened {} login in a terminal.", definition.label),
+        })
+    })
+    .await
+    .map_err(|error| format!("Unable to start terminal CLI login: {error}"))?
+}
+
+#[tauri::command]
 async fn disconnect_agent(provider: String) -> Result<AgentLogoutResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;

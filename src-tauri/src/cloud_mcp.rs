@@ -13814,12 +13814,11 @@ async fn cloud_mcp_refresh_live_runtime_status_if_connected(
     Ok(())
 }
 
-#[tauri::command]
-async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result<Value, String> {
-    let token = cloud_mcp_authorization_bearer(state.inner())
+async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result<Value, String> {
+    let token = cloud_mcp_authorization_bearer(state)
         .await?
         .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
@@ -13836,6 +13835,11 @@ async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result
     let billing = read_api_response(response, "Unable to load billing status.").await?;
     let ledger = cloud_mcp_diffforge_credit_ledger_summary(100);
     Ok(cloud_mcp_merge_diffforge_credit_ledger(billing, ledger))
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result<Value, String> {
+    cloud_mcp_get_billing_status_for_state(state.inner()).await
 }
 
 #[tauri::command]

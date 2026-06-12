@@ -49,6 +49,11 @@ export const TERMINAL_START_METRIC_POLL_MS = 16;
 export const TERMINAL_START_GEOMETRY_WAIT_MS = 1400;
 export const TERMINAL_START_GEOMETRY_POLL_MS = 16;
 export const TERMINAL_DEFAULT_SCROLLBACK_ROWS = 10000;
+// Inactive panes keep a shallow buffer: xterm resize reflows are linear in
+// buffer rows, so 24 background panes at 10k rows dominate maximize cost
+// (and memory). History beyond this depth is trimmed while a pane is
+// inactive; activation restores the full scrollback budget going forward.
+export const TERMINAL_BACKGROUND_SCROLLBACK_ROWS = 2000;
 export const TERMINAL_WEBGL_IDLE_DELAY_MS = 420;
 export const TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS = 80;
 export const TERMINAL_WEBGL_BACKGROUND_DELAY_MS = 650;

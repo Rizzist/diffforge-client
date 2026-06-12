@@ -8,7 +8,16 @@ const DEFAULT_MAX_COLS = 400;
 const DEFAULT_MAX_ROWS = 160;
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
-const DEFAULT_DEBOUNCE_MS = 0;
+// Trailing coalesce window for resize bursts (continuous window/divider
+// resizes emit one ResizeObserver tick per frame; reflowing xterm's whole
+// scrollback per tick is what makes maximize/restore lag). The first tick
+// after an idle gap still applies immediately (leading edge) so discrete
+// resizes stay instant.
+const DEFAULT_DEBOUNCE_MS = 80;
+const RESIZE_BURST_IDLE_MS = 160;
+// At most this many terminals commit a frontend resize (full buffer reflow)
+// in a single animation frame; the rest stay queued for following frames.
+const MAX_RESIZE_FLUSHES_PER_FRAME = 3;
 const DEFAULT_NATIVE_RESIZE_TRAILING_MS = 260;
 const DEFAULT_NATIVE_RESIZE_COMMIT_MS = 260;
 const MAX_INVALID_CELL_RETRIES = 30;
@@ -39,11 +48,43 @@ function requestResizeFrame() {
     resizeFrameHandle = 0;
     const controllers = Array.from(pendingFrameResizeControllers);
     pendingFrameResizeControllers.clear();
-    controllers.forEach((controller) => controller.flushScheduledResize());
+
+    const due = [];
+    controllers.forEach((controller) => {
+      // Disposed or already-flushed controllers must drop out here, or the
+      // frame loop would re-queue them forever.
+      if (!controller.isResizeQueued()) {
+        return;
+      }
+      if (controller.isResizeDue(frameStartedAt)) {
+        due.push(controller);
+      } else {
+        pendingFrameResizeControllers.add(controller);
+      }
+    });
+    due.sort((left, right) => {
+      const leftPriority = left.isPriorityResize() ? 1 : 0;
+      const rightPriority = right.isPriorityResize() ? 1 : 0;
+      if (leftPriority !== rightPriority) {
+        return rightPriority - leftPriority;
+      }
+      return left.getResizeDeadlineMs() - right.getResizeDeadlineMs();
+    });
+    due.forEach((controller, index) => {
+      if (index < MAX_RESIZE_FLUSHES_PER_FRAME) {
+        controller.flushScheduledResize();
+      } else {
+        pendingFrameResizeControllers.add(controller);
+      }
+    });
     logTerminalDiagnosticDuration(
       "frontend.resize_frame.slow",
       frameStartedAt,
-      { controllers: controllers.length },
+      {
+        controllers: controllers.length,
+        deferred: Math.max(0, due.length - MAX_RESIZE_FLUSHES_PER_FRAME),
+        flushed: Math.min(due.length, MAX_RESIZE_FLUSHES_PER_FRAME),
+      },
       { minElapsedMs: RESIZE_DIAGNOSTIC_SLOW_MS },
     );
 
@@ -268,6 +309,8 @@ export function createTerminalResizeController({
   defaultCols = DEFAULT_COLS,
   defaultRows = DEFAULT_ROWS,
   instanceId,
+  isPriority,
+  isVisible,
   maxCols = DEFAULT_MAX_COLS,
   maxRows = DEFAULT_MAX_ROWS,
   minCols = DEFAULT_MIN_COLS,
@@ -301,6 +344,7 @@ export function createTerminalResizeController({
   let pendingNativeForce = false;
   let pendingNativeRequest = null;
   let pendingNativeReason = "";
+  let lastScheduleAtMs = 0;
   let queuedForResizeFrame = false;
   let queuedResizeDeadlineMs = 0;
   let queuedResizeOptions = null;
@@ -310,6 +354,8 @@ export function createTerminalResizeController({
   const getPaneId = () => getOptionValue(paneId, "");
   const getInstanceId = () => getOptionValue(instanceId, undefined);
   const getCanResize = () => (typeof canResize === "function" ? canResize() : canResize !== false);
+  const getIsPriority = () => (typeof isPriority === "function" ? Boolean(isPriority()) : Boolean(isPriority));
+  const getIsVisible = () => (typeof isVisible === "function" ? isVisible() !== false : isVisible !== false);
 
   const clearNativeResizeTimer = () => {
     if (!nativeResizeTimer) {
@@ -515,7 +561,13 @@ export function createTerminalResizeController({
       return;
     }
 
-    const normalizedDelayMs = Math.max(0, delayMs);
+    // Leading edge: the first event after an idle gap applies on the next
+    // frame so one-off resizes feel instant; events inside a burst keep the
+    // caller's trailing delay so per-frame ResizeObserver storms coalesce.
+    const scheduledAtMs = nowMs();
+    const burstActive = scheduledAtMs - lastScheduleAtMs < RESIZE_BURST_IDLE_MS;
+    lastScheduleAtMs = scheduledAtMs;
+    const normalizedDelayMs = burstActive ? Math.max(0, delayMs) : 0;
     callSafely(onSchedule, {
       canResize: getCanResize(),
       cols: term.cols,
@@ -587,6 +639,14 @@ export function createTerminalResizeController({
 
     if (!getCanResize()) {
       callSafely(onSkip, { reason, skipped: "backend_not_ready" });
+      return false;
+    }
+
+    // Hidden surfaces keep layout (visibility: hidden), so their observers
+    // still fire; skip before measuring. Reveal paths (activation, slot rect
+    // arriving) schedule a fresh resize, so no state is left stale.
+    if (!getIsVisible()) {
+      callSafely(onSkip, { reason, skipped: "surface_hidden" });
       return false;
     }
 
@@ -750,7 +810,11 @@ export function createTerminalResizeController({
     },
     flushScheduledResize,
     getLastNativeAppliedSize: () => (lastNativeAppliedSize ? { ...lastNativeAppliedSize } : null),
+    getResizeDeadlineMs: () => queuedResizeDeadlineMs,
     hasPendingNativeResize: () => Boolean(pendingNativeRequest || nativeInFlight),
+    isPriorityResize: () => getIsPriority(),
+    isResizeDue: (now = nowMs()) => !disposed && queuedForResizeFrame && now >= queuedResizeDeadlineMs,
+    isResizeQueued: () => !disposed && queuedForResizeFrame,
     resizeNow,
     schedule,
   };

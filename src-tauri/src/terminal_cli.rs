@@ -5282,6 +5282,26 @@ fn launch_login_terminal(provider: AgentProvider) -> Result<(), String> {
     }
 }
 
+/// Like `launch_login_terminal`, but forces the sign-in flow even when the
+/// default home is already authenticated, so a second account can be added
+/// for the capture watcher to pin. Plain `claude` would just open the REPL.
+fn launch_account_login_terminal(provider: AgentProvider) -> Result<(), String> {
+    ensure_app_not_shutting_down("agent account login terminal")?;
+
+    let definition = agent_definition(provider);
+    let binary = npm_global_executable_path(definition)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| definition.binary.to_string());
+
+    match provider {
+        AgentProvider::Codex => run_login_terminal(definition.label, &binary, &["login"]),
+        AgentProvider::Claude => run_login_terminal(definition.label, &binary, &["/login"]),
+        AgentProvider::OpenCode => {
+            run_login_terminal(definition.label, &binary, &["auth", "login"])
+        }
+    }
+}
+
 fn logout_agent_credentials(provider: AgentProvider) -> Result<AgentLogoutResult, String> {
     let definition = agent_definition(provider);
     let args = match provider {

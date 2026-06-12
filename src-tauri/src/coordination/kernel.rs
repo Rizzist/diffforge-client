@@ -25114,7 +25114,12 @@ fn prepare_managed_codex_profile_for_terminal(
             }
         });
     let profile = codex_managed_profile_name(&paths.repo_path, &slot_segment);
-    let profile_home = codex_profile_home_for_launch(paths, &slot_segment)?;
+    let profile_home = codex_profile_home_for_launch(
+        paths,
+        &slot_segment,
+        Path::new(write_root),
+        enforcement_mode,
+    )?;
     let profile_path = profile_home.join(format!("{profile}.config.toml"));
     let hooks_json = codex_managed_hooks_config_json(
         mcp_command,
@@ -25171,6 +25176,8 @@ fn prepare_managed_codex_profile_for_terminal(
 fn codex_profile_home_for_launch(
     paths: &StoragePaths,
     slot_segment: &str,
+    write_root: &Path,
+    enforcement_mode: &str,
 ) -> Result<PathBuf, String> {
     let home = crate::coordination::db::coordination_repo_state_root(&paths.repo_path)
         .join("codex-home")
@@ -25182,15 +25189,20 @@ fn codex_profile_home_for_launch(
             home.display()
         )
     })?;
-    codex_prepare_private_home(&home)?;
+    codex_prepare_private_home(&home, &paths.repo_path, write_root, enforcement_mode)?;
     Ok(home)
 }
 
-fn codex_prepare_private_home(home: &Path) -> Result<(), String> {
-    write_text_file_atomic(
-        &home.join("config.toml"),
-        "# Diff Forge managed Codex home. Workspace terminals do not inherit global plugins or apps.\n",
-    )?;
+fn codex_prepare_private_home(
+    home: &Path,
+    repo_path: &Path,
+    write_root: &Path,
+    enforcement_mode: &str,
+) -> Result<(), String> {
+    let trust_sources = codex_private_home_project_trust_source_paths(home);
+    let config =
+        codex_private_home_base_config(&trust_sources, repo_path, write_root, enforcement_mode);
+    write_text_file_atomic(&home.join("config.toml"), &config)?;
 
     let Some(source_home) = codex_user_home_for_auth_bridge() else {
         return Ok(());
@@ -25199,6 +25211,143 @@ fn codex_prepare_private_home(home: &Path) -> Result<(), String> {
         codex_bridge_private_home_file(&source_home, home, file_name)?;
     }
     Ok(())
+}
+
+fn codex_private_home_base_config(
+    trust_source_paths: &[PathBuf],
+    repo_path: &Path,
+    write_root: &Path,
+    enforcement_mode: &str,
+) -> String {
+    let mut config = "# Diff Forge managed Codex home. Workspace terminals inherit trusted project entries, but not global plugins, apps, or MCP servers.\n".to_string();
+    let mut seen = HashSet::new();
+    for path in trust_source_paths {
+        let Ok(body) = fs::read_to_string(path) else {
+            continue;
+        };
+        append_codex_trusted_project_entries(&mut config, &body, &mut seen);
+    }
+
+    config = ensure_codex_project_trust_entry(&config, repo_path);
+    config = ensure_codex_project_trust_entry(&config, write_root);
+    if codex_architecture_graphs_write_enabled(enforcement_mode) {
+        config =
+            ensure_codex_project_trust_entry(&config, &codex_architecture_graphs_root(repo_path));
+    }
+    if !config.ends_with('\n') {
+        config.push('\n');
+    }
+    config
+}
+
+fn codex_private_home_project_trust_source_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_codex_config_path(&mut paths, &mut seen, home.join("config.toml"));
+
+    if let Some(source_home) = codex_user_home_for_auth_bridge() {
+        push_unique_codex_config_path(&mut paths, &mut seen, source_home.join("config.toml"));
+    }
+
+    if let Some(parent) = home.parent() {
+        let mut sibling_paths = fs::read_dir(parent)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| path != home)
+            .collect::<Vec<_>>();
+        sibling_paths.sort();
+        for sibling in sibling_paths {
+            if !sibling.is_dir() {
+                continue;
+            }
+            push_unique_codex_config_path(&mut paths, &mut seen, sibling.join("config.toml"));
+            let mut profile_paths = fs::read_dir(&sibling)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|name| name.ends_with(".config.toml"))
+                })
+                .collect::<Vec<_>>();
+            profile_paths.sort();
+            for path in profile_paths {
+                push_unique_codex_config_path(&mut paths, &mut seen, path);
+            }
+        }
+    }
+
+    paths
+}
+
+fn push_unique_codex_config_path(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+    path: PathBuf,
+) {
+    let key = process_path_text(&path);
+    if seen.insert(key) {
+        paths.push(path);
+    }
+}
+
+fn append_codex_trusted_project_entries(
+    config: &mut String,
+    body: &str,
+    seen_sections: &mut HashSet<String>,
+) {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(section) = toml_section_name(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        if !section.starts_with("projects.") {
+            index += 1;
+            continue;
+        }
+
+        let header = lines[index].trim();
+        index += 1;
+        let mut trusted = false;
+        while index < lines.len() && toml_section_name(lines[index]).is_none() {
+            if codex_project_trust_line_is_trusted(lines[index]) {
+                trusted = true;
+            }
+            index += 1;
+        }
+
+        if trusted && seen_sections.insert(section) {
+            if !config.trim().is_empty() {
+                config.push('\n');
+            }
+            config.push_str(header);
+            config.push('\n');
+            config.push_str("trust_level = \"trusted\"\n");
+        }
+    }
+}
+
+fn codex_project_trust_line_is_trusted(line: &str) -> bool {
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+    if key.trim() != "trust_level" {
+        return false;
+    }
+    let value = value
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    value == "trusted"
 }
 
 fn codex_user_home_for_auth_bridge() -> Option<PathBuf> {
@@ -29048,6 +29197,60 @@ APPWRITE_PROJECT_ID = "project"
         assert!(config.contains("--diff-forge-write-guard"));
         assert!(!config.contains("[[hooks.user_prompt_submit]]"));
         assert!(!config.contains("hooksPath ="));
+    }
+
+    #[test]
+    fn managed_codex_private_home_config_inherits_only_trusted_projects() {
+        let repo = init_git_repo("managed_codex_private_home_trust");
+        let worktree = repo.join(".agents").join("worktrees").join("2");
+        fs::create_dir_all(&worktree).unwrap();
+        let trusted_project = repo.join("trusted-project");
+        let untrusted_project = repo.join("untrusted-project");
+        let source_home = temp_repo("managed_codex_private_home_source");
+        let source_config = source_home.join("config.toml");
+        fs::write(
+            &source_config,
+            format!(
+                r#"model = "gpt-5.5"
+
+[projects."{}"]
+trust_level = "trusted"
+custom = "ignored"
+
+[projects."{}"]
+trust_level = "untrusted"
+
+[mcp_servers.appwrite-api]
+command = "uvx"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#,
+                toml_escape(&process_path_text(&trusted_project)),
+                toml_escape(&process_path_text(&untrusted_project)),
+            ),
+        )
+        .unwrap();
+
+        let config =
+            codex_private_home_base_config(&[source_config], &repo, &worktree, "worktree_required");
+
+        assert!(config.contains(&format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"",
+            toml_escape(&process_path_text(&trusted_project))
+        )));
+        assert!(config.contains(&format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"",
+            toml_escape(&process_path_text(&repo))
+        )));
+        assert!(config.contains(&format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"",
+            toml_escape(&process_path_text(&worktree))
+        )));
+        assert!(!config.contains(&process_path_text(&untrusted_project)));
+        assert!(!config.contains("mcp_servers"));
+        assert!(!config.contains("plugins."));
+        assert!(!config.contains("custom ="));
     }
 
     #[test]
