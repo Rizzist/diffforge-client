@@ -13,6 +13,7 @@ import {
   skillSlug,
   skillToneColor,
 } from "./skillsLibrary.js";
+import { noteAccountSkillsMarkdown } from "./workspaceToolsStore.js";
 
 const SECTIONS = [
   { id: "architectures", label: "Architectures" },
@@ -173,6 +174,7 @@ export default function ToolsWorkspaceView({
       const skills = data?.skills || {};
       const skillsMd = text(skills.skills_md ?? skills.skillsMd, "");
       setSkillsLibrary(parseSkillsLibrary(skillsMd));
+      noteAccountSkillsMarkdown(skillsMd);
       setSkillsRevision(
         Number.isFinite(Number(skills.revision)) && skills.revision !== null
           ? Number(skills.revision)
@@ -270,12 +272,15 @@ export default function ToolsWorkspaceView({
   // offline cache, so the save completes even if the user navigates away).
   const persistSkillsLibrary = useCallback(async (nextSkills) => {
     const nextLibrary = { preamble: skillsLibrary.preamble, skills: nextSkills };
+    const serializedSkillsMd = serializeSkillsLibrary(nextLibrary.skills, nextLibrary.preamble);
     setSkillsLibrary(nextLibrary);
     setSkillsState("saving");
     setSkillsError("");
+    // Keep the orchestrator Tools tab cache in lockstep with the edit.
+    noteAccountSkillsMarkdown(serializedSkillsMd);
     try {
       const result = await invoke("cloud_mcp_save_account_skills", {
-        skillsMd: serializeSkillsLibrary(nextLibrary.skills, nextLibrary.preamble),
+        skillsMd: serializedSkillsMd,
         baseRevision: skillsRevision,
       });
       setSkillsRevision(

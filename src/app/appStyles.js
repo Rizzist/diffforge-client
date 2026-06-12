@@ -8179,7 +8179,7 @@ export const AudioBarMeter = styled.div`
   display: flex;
   flex: 1;
   min-width: 0;
-  height: 14px;
+  height: 20px;
   align-items: center;
   justify-content: center;
   gap: 2.5px;

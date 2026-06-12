@@ -1947,6 +1947,17 @@ fn todo_dispatch_parse_iso_ms(value: &str) -> Option<u64> {
 /// a deliberate flip (history Queue/Unqueue/retarget issued while this
 /// webview held a stale replica) — graft that status and its target fields
 /// onto the incoming row instead of letting the stale claim overwrite it.
+/// Lifecycle progress rank for the forward-only status rule on Rust-owned
+/// rows: listed (or missing) < queued < running family < settled family.
+fn todo_store_status_rank(status: &str) -> u8 {
+    match status {
+        "queued" => 1,
+        "sending" | "dispatching" | "running" => 2,
+        "completed" | "cancelled" | "failed" | "interrupted" | "timed_out" | "done" => 3,
+        _ => 0,
+    }
+}
+
 fn todo_store_apply_newer_store_status_core(
     stored_items: &[Value],
     items: Vec<Value>,
@@ -1980,7 +1991,20 @@ fn todo_store_apply_newer_store_status_core(
             let incoming_at = todo_dispatch_text(&item, &["todoStatusUpdatedAt"]);
             // Both sides stamp identical 24-char ISO; lexicographic compare
             // is chronological. The store only wins when strictly newer.
-            if stored_at.is_empty() || (!incoming_at.is_empty() && incoming_at >= stored_at) {
+            let store_wins_by_stamp =
+                !stored_at.is_empty() && (incoming_at.is_empty() || incoming_at < stored_at);
+            // Rust-owned rows additionally obey a forward-only lifecycle
+            // through sync: a webview snapshot echo may advance them
+            // (queued → running → settled) but never drag one backwards —
+            // a stale or status-less replica copy of a running direct
+            // capture must not demote it to listed. Backward flips for
+            // these rows only happen through the Rust doors
+            // (todo_store_set_status / settlement), which write the store
+            // directly with a fresh stamp.
+            let store_wins_by_rank = todo_store_item_is_rust_owned(stored)
+                && todo_store_status_rank(&todo_store_item_status(&item))
+                    < todo_store_status_rank(&stored_status);
+            if !store_wins_by_stamp && !store_wins_by_rank {
                 return item;
             }
             if let Some(object) = item.as_object_mut() {
@@ -2025,7 +2049,12 @@ fn todo_store_apply_newer_store_status_core(
 /// able to erase one it doesn't know about.
 fn todo_store_item_is_rust_owned(item: &Value) -> bool {
     let source = todo_dispatch_text(item, &["source", "sourceKind", "source_kind"]);
-    if source == "terminal_direct" {
+    // "terminal_direct" is the Rust capture's own source; the webview's
+    // prompt-submit bridge materializes the SAME item id with its
+    // "tui-terminal-direct-input" source, and its full-snapshot echo replaces
+    // the row wholesale — the rewritten row must stay recognizable as
+    // Rust-owned or every downstream protection silently disarms.
+    if source == "terminal_direct" || source.starts_with("tui-terminal-direct") {
         return true;
     }
     if todo_dispatch_text(item, &["todoStatusReason", "statusReason"])
@@ -2496,6 +2525,65 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn rust_owned_running_row_survives_statusless_webview_echo() {
+        // The webview prompt-submit bridge materializes the same item id with
+        // its own source and no lifecycle status; its snapshot echo must not
+        // demote the Rust capture's running row back to listed.
+        let stored = vec![json!({
+            "id": "direct-1",
+            "todoStatus": "running",
+            "source": "terminal_direct",
+        })];
+        let incoming = vec![json!({
+            "id": "direct-1",
+            "text": "what do you think about balancer-diffforge?",
+            "source": "tui-terminal-direct-input",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(todo_store_item_status(&merged[0]), "running");
+        // The row stays recognizable as Rust-owned under the webview source.
+        assert!(todo_store_item_is_rust_owned(&merged[0]));
+    }
+
+    #[test]
+    fn rust_owned_forward_transition_from_webview_is_accepted() {
+        // queued → running through the webview dispatcher is a legitimate
+        // forward flip; the rank rule only blocks backward movement.
+        let stored = vec![json!({
+            "id": "remote-1",
+            "todoStatus": "queued",
+            "todoStatusReason": "todo_queue_backend_submit",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let incoming = vec![json!({
+            "id": "remote-1",
+            "todoStatus": "running",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(todo_store_item_status(&merged[0]), "running");
+    }
+
+    #[test]
+    fn webview_owned_rows_keep_plain_lww_semantics() {
+        // Non-Rust-owned rows are webview property: a fresher listed claim
+        // still downgrades queued, exactly as before the rank rule.
+        let stored = vec![json!({
+            "id": "ui-1",
+            "todoStatus": "queued",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let incoming = vec![json!({
+            "id": "ui-1",
+            "todoStatus": "listed",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(todo_store_item_status(&merged[0]), "listed");
+    }
+
+    #[test]
     fn settled_retention_keeps_consumed_completed_rows() {
         let stored = vec![
             json!({
@@ -2744,6 +2832,9 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         "text": prompt,
         "todoStatus": "running",
         "status": "running",
+        // The stamp gives the running status LWW teeth against webview
+        // snapshot echoes; the forward-only rank rule is the backstop.
+        "todoStatusUpdatedAt": now_iso,
         // Backend-submit reason routes the item through the existing Rust
         // ledger settlement machinery (crash sweep exclusion, drain reconcile).
         "todoStatusReason": "todo_queue_backend_submit",
@@ -2764,11 +2855,25 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
             .unwrap_or_default();
         // Ids are deterministic per prompt event now, so a second observer of
         // the same prompt converges on the existing row instead of doubling.
-        if !items
-            .iter()
-            .any(|existing| todo_store_item_matches_id(existing, &item_id))
+        // When the webview's materialization landed first (its copy carries
+        // no lifecycle status), graft the running flip onto that row so the
+        // prompt never sits status-less in history while the agent works.
+        let mut wrote = false;
+        if let Some(existing) = items
+            .iter_mut()
+            .find(|existing| todo_store_item_matches_id(existing, &item_id))
         {
+            if todo_store_status_rank(&todo_store_item_status(existing))
+                < todo_store_status_rank("running")
+            {
+                todo_store_set_item_status(existing, "running", "todo_queue_backend_submit");
+                wrote = true;
+            }
+        } else {
             items.push(item.clone());
+            wrote = true;
+        }
+        if wrote {
             todo_dispatch_queue_write(workspace_id, &items);
         }
     }

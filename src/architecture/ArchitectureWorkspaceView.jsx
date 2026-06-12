@@ -15,7 +15,13 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import styled, { keyframes } from "styled-components";
+import { Apple as TodoDeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
+import { Linux as TodoDeviceLinuxIcon } from "@styled-icons/fa-brands/Linux";
+import { Windows as TodoDeviceWindowsIcon } from "@styled-icons/fa-brands/Windows";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { Devices as TodoDeviceGenericIcon } from "@styled-icons/material-rounded/Devices";
+import { Language as TodoDeviceWebIcon } from "@styled-icons/material-rounded/Language";
+import { Smartphone as TodoDeviceMobileIcon } from "@styled-icons/material-rounded/Smartphone";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { AllInbox } from "@styled-icons/material-rounded/AllInbox";
 import { Api } from "@styled-icons/material-rounded/Api";
@@ -455,6 +461,91 @@ function architectureTodoEndpointLabel(endpoint, fallback = "unknown") {
   const workspace = text(endpoint.workspaceName || endpoint.workspaceId);
   if (device && workspace) return `${device} / ${workspace}`;
   return device || workspace || fallback;
+}
+
+function todoDeviceKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+// Friendly-name + platform directory for the todo history's device chips,
+// built from the cloud presence lists (known + connected devices).
+function buildTodoDeviceDirectory(...deviceLists) {
+  const byId = new Map();
+  deviceLists.flat().forEach((device) => {
+    if (!device || typeof device !== "object") return;
+    const deviceId = todoDeviceKey(
+      device.deviceId || device.device_id || device.machineId || device.machine_id || device.id,
+    );
+    if (!deviceId) return;
+    const displayName = text(
+      device.displayName
+        || device.display_name
+        || device.label
+        || device.deviceName
+        || device.device_name
+        || device.machineName
+        || device.machine_name
+        || device.hostname
+        || device.name,
+    );
+    const previous = byId.get(deviceId) || {};
+    byId.set(deviceId, {
+      displayName: displayName || previous.displayName || "",
+      icon: todoDeviceKey(device.platformIcon || device.platform_icon || device.icon) || previous.icon || "",
+      platform: todoDeviceKey(device.platform || device.os) || previous.platform || "",
+    });
+  });
+  return byId;
+}
+
+const TODO_DEVICE_PLATFORM_ICONS = {
+  apple: TodoDeviceAppleIcon,
+  device: TodoDeviceGenericIcon,
+  linux: TodoDeviceLinuxIcon,
+  mobile: TodoDeviceMobileIcon,
+  web: TodoDeviceWebIcon,
+  windows: TodoDeviceWindowsIcon,
+};
+
+const TODO_DEVICE_PLATFORM_LABELS = {
+  apple: "macOS",
+  device: "Device",
+  linux: "Linux",
+  mobile: "Mobile",
+  web: "Web",
+  windows: "Windows",
+};
+
+// Device ids carry a platform prefix (e.g. "macos-24c1b00d-..."), so the
+// platform stays resolvable even when the presence directory has no entry.
+function todoDevicePlatformToken(endpoint, directoryEntry) {
+  const hints = [directoryEntry?.icon, directoryEntry?.platform, endpoint?.deviceId, endpoint?.deviceName]
+    .map(todoDeviceKey)
+    .join(" ");
+  if (/iphone|ipad|android|mobile|phone|tablet/u.test(hints)) return "mobile";
+  if (/apple|mac|darwin|\bios\b/u.test(hints)) return "apple";
+  if (/windows|win32|\bwin\b/u.test(hints)) return "windows";
+  if (/linux/u.test(hints)) return "linux";
+  if (/\bweb\b|browser|dashboard/u.test(hints)) return "web";
+  return "device";
+}
+
+function todoDeviceLooksLikeId(value) {
+  return /^[a-z0-9]+-[0-9a-f]{6,}/u.test(todoDeviceKey(value));
+}
+
+function todoDeviceDisplayName(endpoint, directory) {
+  const deviceId = todoDeviceKey(endpoint?.deviceId);
+  const entry = deviceId ? directory?.get?.(deviceId) : null;
+  if (entry?.displayName) return entry.displayName;
+  const rawName = text(endpoint?.deviceName);
+  if (rawName && todoDeviceKey(rawName) !== deviceId && !todoDeviceLooksLikeId(rawName)) return rawName;
+  if (!deviceId && !rawName) return "Unknown device";
+  const platformLabel = TODO_DEVICE_PLATFORM_LABELS[todoDevicePlatformToken(endpoint, entry)];
+  const idTail = (deviceId || todoDeviceKey(rawName))
+    .split("-")
+    .find((part) => /^[0-9a-f]{6,}$/u.test(part)) || "";
+  return idTail ? `${platformLabel} · ${idTail.slice(0, 8)}` : platformLabel;
 }
 
 function architectureTodoSourceEndpoint(item) {
@@ -5242,6 +5333,8 @@ export default function ArchitectureWorkspaceView({
   architectureSelectedRepoPath = "",
   architectureSnapshot = null,
   architectureState = "idle",
+  connectedDevices = [],
+  knownDevices = [],
   onArchitectureGraphListRefresh = null,
   onArchitectureSelectionChange = null,
   workspace,
@@ -5255,6 +5348,10 @@ export default function ArchitectureWorkspaceView({
 	  const [finishPlanState, setFinishPlanState] = useState({ error: "", planRef: "" });
 	  const [finishedPlanRefs, setFinishedPlanRefs] = useState(() => new Set());
   const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
+  const todoDeviceDirectory = useMemo(
+    () => buildTodoDeviceDirectory(knownDevices, connectedDevices),
+    [connectedDevices, knownDevices],
+  );
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
   const visibleTasks = useMemo(() => {
@@ -5484,6 +5581,7 @@ export default function ArchitectureWorkspaceView({
         />
       ) : (
         <TodosHistoryPanel
+          deviceDirectory={todoDeviceDirectory}
           finishPlanError={finishPlanState.error}
           finishedPlanRefs={finishedPlanRefs}
           finishingPlanRef={finishPlanState.planRef}
@@ -9206,6 +9304,7 @@ function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }
 }
 
 function TodosHistoryPanel({
+  deviceDirectory = null,
   finishPlanError = "",
   finishedPlanRefs = null,
   finishingPlanRef = "",
@@ -9544,6 +9643,7 @@ function TodosHistoryPanel({
           })}
         </TodoHistoryRail>
         <TodoDetailPanel
+          deviceDirectory={deviceDirectory}
           finishPlanError={finishPlanError}
           finishedPlanRefs={finishedPlanRefs}
           finishingPlanRef={finishingPlanRef}
@@ -9663,6 +9763,7 @@ function TodoTaskAccordionItem({ task }) {
 }
 
 function TodoDetailPanel({
+  deviceDirectory = null,
   finishPlanError = "",
   finishedPlanRefs = null,
   finishingPlanRef = "",
@@ -9686,6 +9787,19 @@ function TodoDetailPanel({
   ) || "unknown";
   const sourceDevice = item.sourceDevice || {};
   const targetDevice = item.targetDevice || {};
+  const sourceName = todoDeviceDisplayName(sourceDevice, deviceDirectory);
+  const targetName = todoDeviceDisplayName(targetDevice, deviceDirectory);
+  const sourceWorkspace = sourceDevice.workspaceName || sourceDevice.workspaceId || "unknown workspace";
+  const targetWorkspace = targetDevice.workspaceName || targetDevice.workspaceId || "unknown workspace";
+  const SourceDeviceIcon = TODO_DEVICE_PLATFORM_ICONS[
+    todoDevicePlatformToken(sourceDevice, deviceDirectory?.get?.(todoDeviceKey(sourceDevice.deviceId)))
+  ];
+  const TargetDeviceIcon = TODO_DEVICE_PLATFORM_ICONS[
+    todoDevicePlatformToken(targetDevice, deviceDirectory?.get?.(todoDeviceKey(targetDevice.deviceId)))
+  ];
+  // Same device + workspace on both ends collapses to one chip — half the
+  // detail panel's todos are self-dispatched and the duplication reads noisy.
+  const sameEndpoint = sourceName === targetName && sourceWorkspace === targetWorkspace;
   const inputBlocks = todoInputBlocks(item.raw || item, item.relatedTasks);
 
   return (
@@ -9716,17 +9830,21 @@ function TodoDetailPanel({
           <strong>{item.planCount}</strong>
         </TaskMetaChip>
       </TaskMetaStrip>
-      <TodoDeviceGrid>
-        <TodoDeviceCard>
-          <span>Source</span>
-          <strong>{sourceDevice.deviceName || sourceDevice.deviceId || "unknown device"}</strong>
-          <em>{sourceDevice.workspaceName || sourceDevice.workspaceId || "unknown workspace"}</em>
+      <TodoDeviceGrid data-single={sameEndpoint ? "true" : undefined}>
+        <TodoDeviceCard title={text(sourceDevice.deviceId) || undefined}>
+          <span>{sameEndpoint ? "Device" : "Source"}</span>
+          <TodoDeviceIcon aria-hidden="true"><SourceDeviceIcon /></TodoDeviceIcon>
+          <strong>{sourceName}</strong>
+          <em>{sourceWorkspace}</em>
         </TodoDeviceCard>
-        <TodoDeviceCard>
-          <span>Target</span>
-          <strong>{targetDevice.deviceName || targetDevice.deviceId || "unknown device"}</strong>
-          <em>{targetDevice.workspaceName || targetDevice.workspaceId || "unknown workspace"}</em>
-        </TodoDeviceCard>
+        {!sameEndpoint && (
+          <TodoDeviceCard title={text(targetDevice.deviceId) || undefined}>
+            <span>Target</span>
+            <TodoDeviceIcon aria-hidden="true"><TargetDeviceIcon /></TodoDeviceIcon>
+            <strong>{targetName}</strong>
+            <em>{targetWorkspace}</em>
+          </TodoDeviceCard>
+        )}
       </TodoDeviceGrid>
       <TaskInputPanel>
         {(inputBlocks.length ? inputBlocks : [{ content: item.body || item.title || "No todo input recorded.", label: "Todo" }])
@@ -13147,21 +13265,28 @@ const TodoDeviceGrid = styled.div`
   gap: 8px;
   min-width: 0;
 
+  &[data-single="true"] {
+    grid-template-columns: 1fr;
+  }
+
   @media (max-width: 700px) {
     grid-template-columns: 1fr;
   }
 `;
 
 const TodoDeviceCard = styled.div`
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
   min-width: 0;
-  padding: 9px 10px;
+  min-height: 30px;
+  padding: 5px 10px;
   border: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 8px;
   background: rgba(2, 6, 23, 0.22);
 
   span {
+    flex: none;
     color: var(--forge-text-muted);
     font-size: 10px;
     font-weight: 900;
@@ -13183,10 +13308,28 @@ const TodoDeviceCard = styled.div`
   }
 
   em {
+    margin-left: auto;
     color: rgba(203, 213, 225, 0.7);
     font-size: 10px;
     font-style: normal;
     font-weight: 720;
+  }
+`;
+
+const TodoDeviceIcon = styled.span`
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: rgba(148, 163, 184, 0.12);
+  color: rgba(203, 213, 225, 0.88);
+
+  svg {
+    width: 11px;
+    height: 11px;
   }
 `;
 

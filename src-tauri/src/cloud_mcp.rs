@@ -3706,6 +3706,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                         "has_route_token": target.route_token.is_some(),
                     }),
                 );
+                // Dedicated websocket routes (voice, dictation, proxy) derive
+                // from this host while live sync is connected.
+                cloud_mcp_live_app_ws_host_store(&target.ws_url, &target.transport);
+                cloud_mcp_note_direct_route(&target);
                 target
             }
             Err(error) => {
@@ -5286,6 +5290,7 @@ async fn cloud_mcp_start_remote_command_listener(
             cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
+            cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
             let (status, message) = if emit_result.is_ok() {
                 ("received", "Remote command received by desktop.")
@@ -5756,8 +5761,22 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
     let action = match command_kind.as_str() {
         "terminal_close_idle" | "close_idle_terminal" => "close_one",
         "workspace_close_idle_terminals" | "close_idle_terminals" => "close_workspace",
+        "terminal_close" | "close_terminal" | "terminal_force_close"
+        | "force_close_terminal" => "close_force",
+        "terminal_interrupt" | "interrupt_terminal" | "terminal_stop" | "stop_terminal"
+        | "terminal_cancel" => "interrupt",
         "terminal_relaunch_agent" | "relaunch_terminal_agent" | "relaunch_terminal"
         | "terminal_relaunch" | "terminal_switch_agent" | "switch_terminal_agent" => "relaunch",
+        // Terminal spawn, todo dispatch, and breakout-window actuation live
+        // in the webview, so these replay as remote commands on the next
+        // foreground session.
+        "terminal_open" | "open_terminal" | "open_terminals" | "terminal_spawn"
+        | "spawn_terminals" => "defer_open",
+        "todo_requeue" | "requeue_todo" | "todo_retry" | "retry_todo" => "defer_requeue",
+        "terminal_window_breakout" | "breakout_terminal" | "breakout_terminals"
+        | "terminal_breakout" | "open_terminal_window" | "terminal_window_open"
+        | "terminal_window_return" | "return_terminal_window" | "return_terminal_to_grid"
+        | "close_terminal_window" | "terminal_window_close" => "defer_window",
         _ => return,
     };
     let workspace_id =
@@ -5782,13 +5801,28 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
     let event = event.clone();
     let action = action.to_string();
     tauri::async_runtime::spawn(async move {
-        if action == "relaunch" {
+        if matches!(
+            action.as_str(),
+            "relaunch" | "defer_open" | "defer_requeue" | "defer_window"
+        ) {
             cloud_mcp_defer_remote_command_for_foreground(&app, &event);
+            let deferred_message = match action.as_str() {
+                "defer_open" => {
+                    "Terminal open queued; it completes when the desktop window next opens."
+                }
+                "defer_requeue" => {
+                    "Todo requeue queued; it completes when the desktop window next opens."
+                }
+                "defer_window" => {
+                    "Terminal window breakout queued; it completes when the desktop window next opens."
+                }
+                _ => "Terminal relaunch queued; it completes when the desktop window next opens.",
+            };
             let _ = cloud_mcp_send_remote_command_status_event(
                 &state,
                 &event,
                 "queued",
-                "Terminal relaunch queued; it completes when the desktop window next opens.",
+                deferred_message,
                 None,
             )
             .await;
@@ -5868,7 +5902,7 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
             }
             false
         };
-        let candidates = if action == "close_one" {
+        let candidates = if matches!(action.as_str(), "close_one" | "close_force" | "interrupt") {
             let matched = workspace_terminals
                 .iter()
                 .find(|terminal| matches_target(terminal))
@@ -5890,12 +5924,44 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         } else {
             workspace_terminals
         };
+        if action == "interrupt" {
+            let terminal = candidates.first().cloned().unwrap_or(Value::Null);
+            let pane_id =
+                cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]).unwrap_or_default();
+            let terminal_state = app.state::<TerminalState>();
+            let result = if pane_id.is_empty() {
+                Err("Terminal pane id is unknown.".to_string())
+            } else {
+                write_terminal_input(
+                    Some(&app),
+                    terminal_state.inner(),
+                    &pane_id,
+                    None,
+                    "\u{3}",
+                    "remote_interrupt",
+                )
+                .await
+                .map(|_| ())
+            };
+            let (status, message) = match result {
+                Ok(()) => (
+                    "completed",
+                    "Interrupt sent to the terminal headless.".to_string(),
+                ),
+                Err(error) => ("failed", format!("Unable to interrupt the terminal: {error}")),
+            };
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state, &event, status, &message, None,
+            )
+            .await;
+            return;
+        }
         let mut closed = 0usize;
         let mut skipped_busy = 0usize;
         let mut failed = 0usize;
         let terminal_state = app.state::<TerminalState>();
         for terminal in candidates {
-            if !cloud_mcp_presence_terminal_is_idle(&terminal) {
+            if action != "close_force" && !cloud_mcp_presence_terminal_is_idle(&terminal) {
                 skipped_busy += 1;
                 continue;
             }
@@ -5919,7 +5985,16 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
                 Err(_) => failed += 1,
             }
         }
-        let (status, message) = if action == "close_one" {
+        let (status, message) = if action == "close_force" {
+            if closed > 0 {
+                (
+                    "completed",
+                    "Terminal force-closed headless; its process tree was killed.".to_string(),
+                )
+            } else {
+                ("failed", "Terminal could not be force-closed.".to_string())
+            }
+        } else if action == "close_one" {
             if closed > 0 {
                 ("completed", "Terminal closed headless.".to_string())
             } else if skipped_busy > 0 {
@@ -5946,6 +6021,314 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         // remains cached, so dashboards drop the closed terminals quickly.
         cloud_mcp_emit_sync_status(None);
     });
+}
+
+/// Device-level levers Rust always owns, with or without the webview: window
+/// visibility, native notifications, agent account switching, and terminal
+/// output status (served from the native PTY tail buffer). The webview
+/// remote-command listener stays silent on these kinds, so this function is
+/// the single reply path. Plan release is cloud-owned and answered here only
+/// so a stray desktop-routed command does not hang.
+fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+    let command_kind = cloud_mcp_payload_text(
+        event,
+        &["command_kind", "commandKind", "action", "command"],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase()
+    .replace(['.', ' ', '-'], "_");
+    let action = match command_kind.as_str() {
+        "app_show_window" | "show_window" | "open_app_window" | "app_open_window" => "show",
+        "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => "hide",
+        "device_notify" | "notify_device" | "device_notification" | "send_notification" => {
+            "notify"
+        }
+        "agent_account_switch" | "switch_agent_account" | "agent_profile_switch"
+        | "account_switch" => "account_switch",
+        "terminal_output_status" | "terminal_status" | "terminal_output"
+        | "terminal_activity_status" => "output_status",
+        "plan_release_stage" | "release_plan_stage" | "plan_release" | "release_stage" => {
+            "plan_release"
+        }
+        _ => return,
+    };
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    let action = action.to_string();
+    tauri::async_runtime::spawn(async move {
+        match action.as_str() {
+            "show" => {
+                app_exit_background_internal(&app);
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "completed",
+                    "Diff Forge window shown on this desktop.",
+                    None,
+                )
+                .await;
+            }
+            "hide" => {
+                app_enter_background_internal(&app);
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "completed",
+                    "Diff Forge window hidden into background mode; terminals and queues keep running.",
+                    None,
+                )
+                .await;
+            }
+            "notify" => {
+                let message = cloud_mcp_payload_text(&event, &["message", "text", "body"])
+                    .or_else(|| cloud_mcp_payload_text(&event, &["payload", "message"]))
+                    .unwrap_or_default();
+                if message.is_empty() {
+                    let _ = cloud_mcp_send_remote_command_status_event(
+                        &state,
+                        &event,
+                        "failed",
+                        "Notification command did not include a message.",
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+                let shown = app
+                    .notification()
+                    .builder()
+                    .title("Diff Forge")
+                    .body(&message)
+                    .show()
+                    .is_ok();
+                let (status, reply) = if shown {
+                    ("completed", "Notification shown on this desktop.")
+                } else {
+                    ("failed", "Notification could not be shown on this desktop.")
+                };
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state, &event, status, reply, None,
+                )
+                .await;
+            }
+            "account_switch" => {
+                let provider = cloud_mcp_payload_text(
+                    &event,
+                    &[
+                        "provider",
+                        "agent_provider",
+                        "agentProvider",
+                        "agent_id",
+                        "agentId",
+                        "target_agent_id",
+                        "targetAgentId",
+                    ],
+                )
+                .unwrap_or_default();
+                let profile_id = cloud_mcp_payload_text(
+                    &event,
+                    &["account_id", "accountId", "profile_id", "profileId"],
+                )
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "account_id"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "accountId"]))
+                .unwrap_or_default();
+                let result =
+                    agent_accounts_set_active(app.clone(), provider.clone(), profile_id.clone())
+                        .await;
+                let (status, message) = match result {
+                    Ok(_) => (
+                        "completed",
+                        format!("Active {provider} account switched to {profile_id}."),
+                    ),
+                    Err(error) => ("failed", error),
+                };
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state, &event, status, &message, None,
+                )
+                .await;
+            }
+            "output_status" => {
+                cloud_mcp_report_terminal_output_status(&app, &state, &event).await;
+            }
+            "plan_release" => {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Plan stages are cloud-owned; release them through the voice orchestrator's plan_release_stage action instead of a desktop command.",
+                    None,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Answers `terminal_output_status`: resolves the target terminal from the
+/// cached presence snapshot, then reads the native PTY tail buffer so the
+/// answer works identically headless and with the webview open.
+async fn cloud_mcp_report_terminal_output_status(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) {
+    let workspace_id =
+        cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let target_terminal_id = cloud_mcp_payload_text(
+        event,
+        &["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId"],
+    )
+    .unwrap_or_default();
+    let target_terminal_name = cloud_mcp_payload_text(
+        event,
+        &["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let target_terminal_index = event
+        .get("target_terminal_index")
+        .or_else(|| event.get("targetTerminalIndex"))
+        .and_then(Value::as_i64);
+    let snapshot = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        snapshots.terminal_presence.clone()
+    };
+    let terminal = snapshot
+        .as_ref()
+        .and_then(|payload| payload.get("workspaces"))
+        .and_then(Value::as_array)
+        .map(|workspaces| {
+            workspaces
+                .iter()
+                .filter(|workspace| {
+                    workspace_id.is_empty()
+                        || cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"])
+                            .as_deref()
+                            == Some(workspace_id.as_str())
+                })
+                .flat_map(|workspace| {
+                    workspace
+                        .get("terminals")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .find(|terminal| {
+            let pane_id =
+                cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]).unwrap_or_default();
+            if !target_terminal_id.is_empty() {
+                return pane_id == target_terminal_id
+                    || cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId"])
+                        .as_deref()
+                        == Some(target_terminal_id.as_str());
+            }
+            if !target_terminal_name.is_empty() {
+                return cloud_mcp_payload_text(
+                    terminal,
+                    &["terminal_nickname", "terminalNickname", "terminal_name", "terminalName"],
+                )
+                .map(|name| name.to_ascii_lowercase() == target_terminal_name)
+                .unwrap_or(false);
+            }
+            if let Some(index) = target_terminal_index {
+                return terminal
+                    .get("terminal_index")
+                    .or_else(|| terminal.get("terminalIndex"))
+                    .and_then(Value::as_i64)
+                    == Some(index);
+            }
+            false
+        });
+    let Some(terminal) = terminal else {
+        let _ = cloud_mcp_send_remote_command_status_event(
+            state,
+            event,
+            "failed",
+            "No terminal matched the requested name, index, or id.",
+            None,
+        )
+        .await;
+        return;
+    };
+    let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]).unwrap_or_default();
+    let terminal_label = cloud_mcp_payload_text(
+        &terminal,
+        &["terminal_nickname", "terminalNickname", "terminal_name", "terminalName"],
+    )
+    .unwrap_or_else(|| pane_id.clone());
+    let busy = !cloud_mcp_presence_terminal_is_idle(&terminal);
+    let agent = cloud_mcp_payload_text(&terminal, &["agent_id", "agentId", "agent_type", "agentType"])
+        .unwrap_or_default();
+    let tail_text = {
+        let terminal_state = app.state::<TerminalState>();
+        let instance = {
+            let terminals = terminal_state.terminals.read().await;
+            terminals.get(&pane_id).cloned()
+        };
+        instance
+            .and_then(|instance| {
+                instance
+                    .headless_output
+                    .lock()
+                    .ok()
+                    .map(|output| output.tail.iter().copied().collect::<Vec<u8>>())
+            })
+            .map(|bytes| {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                let cleaned = clean_terminal_telemetry_text(&text);
+                cleaned
+                    .chars()
+                    .rev()
+                    .take(600)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    };
+    let state_label = if busy { "busy" } else { "idle" };
+    let message = if tail_text.is_empty() {
+        format!(
+            "Terminal '{terminal_label}'{} is {state_label}; no recent output is buffered.",
+            if agent.is_empty() {
+                String::new()
+            } else {
+                format!(" ({agent})")
+            }
+        )
+    } else {
+        format!(
+            "Terminal '{terminal_label}'{} is {state_label}. Recent output: {tail_text}",
+            if agent.is_empty() {
+                String::new()
+            } else {
+                format!(" ({agent})")
+            }
+        )
+    };
+    let details = json!({
+        "agent_id": agent,
+        "busy": busy,
+        "pane_id": pane_id,
+        "terminal_name": terminal_label,
+        "output_tail": tail_text,
+        "workspace_id": workspace_id,
+    });
+    let _ = cloud_mcp_send_remote_command_status_event(
+        state,
+        event,
+        "completed",
+        &message,
+        Some(&details),
+    )
+    .await;
 }
 
 fn cloud_mcp_is_tokenomics_state_event(event_kind: &str) -> bool {
@@ -7214,6 +7597,176 @@ fn cloud_mcp_app_ws_url(base_url: &str) -> String {
     format!("{ws_base}/v1/app/ws")
 }
 
+/// Host and transport of the most recently resolved app websocket target.
+/// While live sync is connected this is the proven-reachable cloud host, so
+/// dedicated websocket routes (voice, dictation, terminal proxy) derive from
+/// it instead of depending on a balancer round trip.
+static CLOUD_MCP_LIVE_APP_WS_HOST: OnceLock<StdMutex<Option<(String, String)>>> = OnceLock::new();
+
+/// Last direct route observed from any successful resolve. Blocking resolvers
+/// cannot reach the app websocket request path, so they reuse this while the
+/// token is still valid when the balancer is unreachable.
+#[derive(Clone)]
+struct CloudMcpLastDirectRoute {
+    ws_url: String,
+    transport: String,
+    route_token: String,
+    expires_at_s: u64,
+}
+
+static CLOUD_MCP_LAST_DIRECT_ROUTE: OnceLock<StdMutex<Option<CloudMcpLastDirectRoute>>> =
+    OnceLock::new();
+
+const CLOUD_MCP_ROUTE_TOKEN_REUSE_MARGIN_SECS: u64 = 30;
+
+fn cloud_mcp_live_app_ws_host_store(ws_url: &str, transport: &str) {
+    if let Ok(mut slot) = CLOUD_MCP_LIVE_APP_WS_HOST
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+    {
+        *slot = Some((ws_url.to_string(), transport.to_string()));
+    }
+}
+
+fn cloud_mcp_live_app_ws_host() -> Option<(String, String)> {
+    CLOUD_MCP_LIVE_APP_WS_HOST
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .ok()?
+        .clone()
+}
+
+fn cloud_mcp_route_token_expiry_seconds(route_token: &str) -> Option<u64> {
+    let (payload_b64, _) = route_token.split_once('.')?;
+    let payload = general_purpose::URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    serde_json::from_slice::<Value>(&payload)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
+fn cloud_mcp_note_direct_route(target: &CloudMcpWsTarget) {
+    let Some(route_token) = target.route_token.clone() else {
+        return;
+    };
+    let Some(expires_at_s) = cloud_mcp_route_token_expiry_seconds(&route_token) else {
+        return;
+    };
+    if let Ok(mut slot) = CLOUD_MCP_LAST_DIRECT_ROUTE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+    {
+        *slot = Some(CloudMcpLastDirectRoute {
+            ws_url: target.ws_url.clone(),
+            transport: target.transport.clone(),
+            route_token,
+            expires_at_s,
+        });
+    }
+}
+
+fn cloud_mcp_last_direct_route_fresh(endpoint_path: &str) -> Option<CloudMcpWsTarget> {
+    let cached = CLOUD_MCP_LAST_DIRECT_ROUTE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .ok()?
+        .clone()?;
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if cached.expires_at_s <= now_s.saturating_add(CLOUD_MCP_ROUTE_TOKEN_REUSE_MARGIN_SECS) {
+        return None;
+    }
+    Some(CloudMcpWsTarget {
+        ws_url: cloud_mcp_rewrite_ws_endpoint(&cached.ws_url, endpoint_path),
+        route_token: Some(cached.route_token),
+        transport: cached.transport,
+    })
+}
+
+/// Mints a fresh direct route token over the always-open app websocket and
+/// derives the endpoint target from the connected host. Route tokens are
+/// backend-bound, not path-bound, so a token minted by the connected backend
+/// authorizes any of its dedicated websocket endpoints.
+async fn cloud_mcp_resolve_ws_target_via_app_ws(
+    state: &CloudMcpState,
+    endpoint_path: &str,
+) -> Result<CloudMcpWsTarget, String> {
+    let (app_ws_url, transport) = cloud_mcp_live_app_ws_host()
+        .ok_or_else(|| "Cloud app websocket host is not known yet.".to_string())?;
+    // Minimal inline request path on purpose: cloud_mcp_ws_request_* starts
+    // the global ws loop, and that loop awaits this resolver — calling it
+    // here would make the resolver futures cyclic. The caller already gates
+    // on a connected app websocket, so only an existing sender is used.
+    let tx = state
+        .global_ws_tx
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .filter(|tx| !tx.is_closed())
+        .ok_or_else(|| "Cloud app websocket is not accepting messages.".to_string())?;
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    let request_id = format!("ws-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    let (response_tx, response_rx) = oneshot::channel::<Value>();
+    state
+        .global_ws_pending
+        .lock()
+        .await
+        .insert(request_id.clone(), response_tx);
+    let envelope = json!({
+        "kind": "direct_route_token_refresh",
+        "id": request_id,
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "request": json!({}),
+    });
+    if tx.send(envelope).is_err() {
+        state.global_ws_pending.lock().await.remove(&request_id);
+        return Err("Cloud app websocket is not accepting messages.".to_string());
+    }
+    let response = match timeout(
+        Duration::from_secs(CLOUD_MCP_WS_READY_TIMEOUT_SECS),
+        response_rx,
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            return Err("Cloud app websocket route token response was cancelled.".to_string());
+        }
+        Err(_) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            return Err("Cloud app websocket route token request timed out.".to_string());
+        }
+    };
+    if response.get("ok").and_then(Value::as_bool) == Some(false)
+        || response.get("kind").and_then(Value::as_str) == Some("error")
+    {
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or("Cloud app websocket route token refresh failed.");
+        return Err(message.to_string());
+    }
+    let route_token = response["route_token"]
+        .as_str()
+        .or_else(|| response["routeToken"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Cloud app websocket returned no route token.".to_string())?
+        .to_string();
+    let target = CloudMcpWsTarget {
+        ws_url: cloud_mcp_rewrite_ws_endpoint(&app_ws_url, endpoint_path),
+        route_token: Some(route_token),
+        transport,
+    };
+    cloud_mcp_note_direct_route(&target);
+    Ok(target)
+}
+
 async fn cloud_mcp_resolve_ws_target(
     state: &CloudMcpState,
     base_url: &str,
@@ -7239,6 +7792,48 @@ async fn cloud_mcp_resolve_ws_target(
             json!({"transport": target.transport, "ws_url": target.ws_url}),
         )
         .await;
+    }
+
+    // The always-open live sync websocket is the primary route source for
+    // dedicated websockets: while it is connected, the cloud mints a fresh
+    // route token over it and the endpoint target derives from the proven
+    // connected host — no balancer round trip, and voice/dictation sessions
+    // keep starting while the balancer is unreachable. The app websocket
+    // itself keeps resolving through the balancer so placement and failover
+    // stay balancer-authoritative.
+    if endpoint_path != "/v1/app/ws" {
+        let app_ws_connected = { state.inner.lock().await.global_ws_connected };
+        if app_ws_connected {
+            match cloud_mcp_resolve_ws_target_via_app_ws(state, endpoint_path).await {
+                Ok(target) => {
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "route.resolve",
+                        "ok",
+                        "Cloud MCP route derived from the live app websocket",
+                        json!({
+                            "transport": target.transport,
+                            "ws_url": target.ws_url,
+                            "source": "app_ws",
+                        }),
+                    )
+                    .await;
+                    return Ok(target);
+                }
+                Err(error) => {
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "route.resolve",
+                        "warn",
+                        &format!(
+                            "Live app websocket route derivation failed; falling back to the balancer: {error}"
+                        ),
+                        json!({"transport": "app_ws_derive"}),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     cloud_mcp_set_global_ws_phase(state, "authenticating", "authenticating").await;
@@ -7303,6 +7898,7 @@ async fn cloud_mcp_resolve_ws_target(
     .await
     {
         Ok(Some(target)) => {
+            cloud_mcp_note_direct_route(&target);
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "route.resolve",
@@ -7315,6 +7911,17 @@ async fn cloud_mcp_resolve_ws_target(
         }
         Ok(None) => {
             let message = "Balancer did not offer a direct route (direct routing disabled or backend unsupported).".to_string();
+            if let Some(target) = cloud_mcp_last_direct_route_fresh(endpoint_path) {
+                cloud_mcp_record_signin_diagnostic(
+                    state,
+                    "route.resolve",
+                    "warn",
+                    "Balancer offered no direct route; reusing the last known direct route",
+                    json!({"transport": target.transport, "ws_url": target.ws_url}),
+                )
+                .await;
+                return Ok(target);
+            }
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "route.resolve",
@@ -7327,6 +7934,17 @@ async fn cloud_mcp_resolve_ws_target(
         }
         Err(error) => {
             let message = format!("Cloud MCP direct route unavailable: {error}");
+            if let Some(target) = cloud_mcp_last_direct_route_fresh(endpoint_path) {
+                cloud_mcp_record_signin_diagnostic(
+                    state,
+                    "route.resolve",
+                    "warn",
+                    &format!("Balancer route request failed; reusing the last known direct route: {error}"),
+                    json!({"transport": target.transport, "ws_url": target.ws_url}),
+                )
+                .await;
+                return Ok(target);
+            }
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "route.resolve",
@@ -22936,6 +23554,46 @@ mod cloud_mcp_tests {
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
+    #[test]
+    fn route_token_expiry_decodes_and_gates_last_direct_route_reuse() {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let make_token = |exp: u64| {
+            let payload = general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&json!({ "exp": exp })).expect("encode claims"));
+            format!("{payload}.test-signature")
+        };
+        let fresh_exp = now_s + 120;
+        assert_eq!(
+            cloud_mcp_route_token_expiry_seconds(&make_token(fresh_exp)),
+            Some(fresh_exp)
+        );
+
+        cloud_mcp_note_direct_route(&CloudMcpWsTarget {
+            ws_url: "wss://node.example/_diffforge/instances/abc/v1/app/ws".to_string(),
+            route_token: Some(make_token(fresh_exp)),
+            transport: "direct_cloud_container".to_string(),
+        });
+        let derived =
+            cloud_mcp_last_direct_route_fresh("/v1/voice/ws").expect("fresh cached route");
+        assert_eq!(
+            derived.ws_url,
+            "wss://node.example/_diffforge/instances/abc/v1/voice/ws"
+        );
+        assert_eq!(derived.transport, "direct_cloud_container");
+        assert!(derived.route_token.is_some());
+
+        // An expired (or nearly expired) token must not be offered for reuse.
+        cloud_mcp_note_direct_route(&CloudMcpWsTarget {
+            ws_url: "wss://node.example/v1/app/ws".to_string(),
+            route_token: Some(make_token(now_s + 5)),
+            transport: "direct_cloud_container".to_string(),
+        });
+        assert!(cloud_mcp_last_direct_route_fresh("/v1/voice/ws").is_none());
+    }
+
     struct ScopedCloudMcpEnv {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -28508,12 +29166,19 @@ fn cloud_mcp_proxy_resolve_blocking_target(
         device_limit,
         device_id.as_deref(),
     ) {
-        Ok(Some(target)) => Ok(target),
-        Ok(None) => Err(
+        Ok(Some(target)) => {
+            cloud_mcp_note_direct_route(&target);
+            Ok(target)
+        }
+        // Balancer unreachable or declining: reuse the last direct route from
+        // any resolver (the live app websocket keeps it fresh) while its
+        // token is still valid.
+        Ok(None) => cloud_mcp_last_direct_route_fresh(endpoint_path).ok_or_else(|| {
             "Balancer did not offer a direct route (direct routing disabled or backend unsupported)."
-                .to_string(),
-        ),
-        Err(error) => Err(format!("Cloud MCP direct route unavailable: {error}")),
+                .to_string()
+        }),
+        Err(error) => cloud_mcp_last_direct_route_fresh(endpoint_path)
+            .ok_or_else(|| format!("Cloud MCP direct route unavailable: {error}")),
     }
 }
 

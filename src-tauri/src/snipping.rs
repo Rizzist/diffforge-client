@@ -162,6 +162,10 @@ struct SnippingState {
     /// of the capture hot path).
     preview_pool: Arc<StdMutex<Vec<String>>>,
     preview_pool_spawning: Arc<AtomicBool>,
+    /// Annotation editor window label -> the asset paths it is editing. One
+    /// asset gets at most one live editor: re-annotating focuses the existing
+    /// window instead of opening a duplicate that would fight over saves.
+    editor_paths: Arc<StdMutex<HashMap<String, Vec<String>>>>,
 }
 
 impl SnippingState {
@@ -181,6 +185,7 @@ impl SnippingState {
             preview_live_reflow_last_ms: Arc::new(AtomicU64::new(0)),
             preview_pool: Arc::new(StdMutex::new(Vec::new())),
             preview_pool_spawning: Arc::new(AtomicBool::new(false)),
+            editor_paths: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -2041,48 +2046,6 @@ fn snipping_center_floating_window(app: &AppHandle, window: &tauri::WebviewWindo
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
-fn snipping_open_floating_asset_window(
-    app: &AppHandle,
-    path: String,
-    prefix: &str,
-    route: &str,
-    title: &str,
-    width: f64,
-    height: f64,
-) -> Result<Value, String> {
-    let file = diffforge_local_asset_file(&path)?;
-    let label = format!("{prefix}-{}", snipping_window_token(&file));
-    let encoded_path = snipping_url_token(&file.display().to_string());
-    let window = WebviewWindowBuilder::new(
-        app,
-        label.clone(),
-        WebviewUrl::App(format!("index.html#{route}/{encoded_path}").into()),
-    )
-    .title(title)
-    .inner_size(width, height)
-    .min_inner_size(260.0, 180.0)
-    .resizable(true)
-    .decorations(false)
-    .always_on_top(true)
-    .focused(true)
-    .accept_first_mouse(true)
-    .transparent(false)
-    .visible(false)
-    .shadow(true)
-    .build()
-    .map_err(|error| format!("Unable to create {title} window: {error}"))?;
-    snipping_center_floating_window(app, &window);
-    window
-        .show()
-        .map_err(|error| format!("Unable to show {title} window: {error}"))?;
-    let _ = window.set_focus();
-    Ok(json!({
-        "kind": "snipping_floating_asset_window_opened",
-        "label": label,
-        "path": file.display().to_string(),
-    }))
-}
-
 /// Width/height from a PNG header (snips are always PNG); None for other
 /// formats or unreadable files.
 fn snipping_png_dimensions(path: &Path) -> Option<(u32, u32)> {
@@ -2122,8 +2085,42 @@ fn snipping_open_annotation_editor_for_paths(
         .iter()
         .map(|file| file.display().to_string())
         .collect::<Vec<_>>();
-    let seed = format!("{}:{}", path_values.join("|"), uuid::Uuid::new_v4());
-    let label = format!("{}-{}", SNIPPING_EDITOR_WINDOW_PREFIX, cloud_mcp_short_hash(&seed));
+    // One live editor per asset: if any requested path is already open in an
+    // annotation editor, focus that window instead of spawning a second one
+    // that would race it on autosave.
+    let editor_paths = app.state::<SnippingState>().editor_paths.clone();
+    let label = format!(
+        "{}-{}",
+        SNIPPING_EDITOR_WINDOW_PREFIX,
+        cloud_mcp_short_hash(&path_values.join("|"))
+    );
+    {
+        let mut open = editor_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        open.retain(|open_label, _| app.get_webview_window(open_label).is_some());
+        let existing = open
+            .iter()
+            .find(|(_, open_paths)| {
+                open_paths
+                    .iter()
+                    .any(|open_path| path_values.contains(open_path))
+            })
+            .map(|(open_label, open_paths)| (open_label.clone(), open_paths.clone()));
+        if let Some((existing_label, existing_paths)) = existing {
+            if let Some(window) = app.get_webview_window(&existing_label) {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                return Ok(json!({
+                    "kind": "snipping_floating_asset_window_focused",
+                    "label": existing_label,
+                    "paths": existing_paths,
+                }));
+            }
+        }
+        open.insert(label.clone(), path_values.clone());
+    }
     let encoded_paths = snipping_url_token(
         &serde_json::to_string(&path_values)
             .map_err(|error| format!("Unable to encode annotation paths: {error}"))?,
@@ -3534,28 +3531,24 @@ fn snipping_preview_stack_position(
     Some(tauri::PhysicalPosition::new(x, y))
 }
 
-// Two tween profiles: mid-drag re-packs keep an ease-out so the parting
-// still tracks the hand (an ease-in ramp there reads as input lag under the
-// 33ms re-target stream), while reorder settles take a longer smootherstep —
-// soft start AND soft stop — so the queue glides instead of jumping.
+// One snappy tween profile for both mid-drag re-packs and release settles:
+// an ease-out starts at full speed so the queue reacts instantly (an ease-in
+// ramp reads as input lag under the 33ms re-target stream) and still lands
+// softly.
 const SNIPPING_FLOAT_ANIMATE_MS: f64 = 360.0;
-const SNIPPING_FLOAT_SETTLE_ANIMATE_MS: f64 = 520.0;
 const SNIPPING_FLOAT_ANIMATE_FRAME_MS: u64 = 12;
 const SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS: u64 = 33;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SnippingTweenEasing {
-    /// Ease-out cubic: starts at full speed — for live drag tracking.
+    /// Ease-out cubic: starts at full speed, lands softly.
     Track,
-    /// Smootherstep (6t⁵−15t⁴+10t³): eases both ends — for queue settles.
-    Gentle,
 }
 
 fn snipping_tween_eased(progress: f64, easing: SnippingTweenEasing) -> f64 {
     let t = progress.clamp(0.0, 1.0);
     match easing {
         SnippingTweenEasing::Track => 1.0 - (1.0 - t).powi(3),
-        SnippingTweenEasing::Gentle => t * t * t * (t * (t * 6.0 - 15.0) + 10.0),
     }
 }
 
@@ -3823,11 +3816,7 @@ fn snipping_settle_preview_windows(app: &AppHandle) {
         return;
     }
     snipping_resolve_preview_drop_candidates(app);
-    snipping_reflow_preview_stack(
-        app,
-        SNIPPING_FLOAT_SETTLE_ANIMATE_MS,
-        SnippingTweenEasing::Gentle,
-    );
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
 }
 
 /// Maps a preview window's center to main-webview CSS coordinates, or None
@@ -4292,6 +4281,223 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
     });
 }
 
+// === Recent-snips strip: a CleanShot-style bar of the latest captures. ===
+// Toggled from the always-present tray icon while the main window is up, and
+// embedded as the Snippets tab of the background monitor popover. Tiles reuse
+// the floating-preview look and actions (no close button — that belongs to
+// the queue surface only).
+
+const SNIPPING_STRIP_WINDOW_LABEL: &str = "snipping-strip";
+const SNIPPING_STRIP_ANIM_EVENT: &str = "forge-snip-strip-anim";
+const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 196.0;
+const SNIPPING_STRIP_LOGICAL_MAX_WIDTH: f64 = 1080.0;
+const SNIPPING_STRIP_RECENT_LIMIT: usize = 16;
+const SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS: u64 = 350;
+const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
+static SNIPPING_STRIP_LAST_BLUR_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Newest-first listing of saved snip files. The on-disk `snips` directory is
+/// the durable history (the in-memory toast list only ever holds six).
+fn snipping_recent_snip_items(limit: usize) -> Result<Vec<Value>, String> {
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let Ok(entries) = fs::read_dir(root.join("snips")) else {
+        return Ok(Vec::new());
+    };
+    let mut snips: Vec<(u128, Value)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("png"))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default();
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some((
+                modified_ms,
+                json!({
+                    "path": path.display().to_string(),
+                    "name": name,
+                    "modifiedMs": modified_ms as u64,
+                }),
+            ))
+        })
+        .collect();
+    snips.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(snips
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect())
+}
+
+#[tauri::command]
+fn snipping_recent_snips(limit: Option<usize>) -> Result<Value, String> {
+    let limit = limit
+        .unwrap_or(SNIPPING_STRIP_RECENT_LIMIT)
+        .clamp(1, SNIPPING_STRIP_RECENT_LIMIT);
+    Ok(json!({
+        "kind": "snipping_recent_snips",
+        "items": snipping_recent_snip_items(limit)?,
+    }))
+}
+
+fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    if let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) {
+        return Some(window);
+    }
+    let window = WebviewWindowBuilder::new(
+        app,
+        SNIPPING_STRIP_WINDOW_LABEL,
+        WebviewUrl::App("index.html#/snipping-strip".into()),
+    )
+    .title("Recent Snips")
+    .inner_size(SNIPPING_STRIP_LOGICAL_MAX_WIDTH, SNIPPING_STRIP_LOGICAL_HEIGHT)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .accept_first_mouse(true)
+    .visible_on_all_workspaces(true)
+    .focused(false)
+    .visible(false)
+    .build()
+    .ok()?;
+    #[cfg(target_os = "macos")]
+    if let Ok(ns_window) = window.ns_window() {
+        if !ns_window.is_null() {
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+            );
+            ns_window.setAcceptsMouseMovedEvents(true);
+        }
+    }
+    let blur_window = window.clone();
+    let blur_app = app.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::Focused(false) = event {
+            if !blur_window.is_visible().unwrap_or(false) {
+                return;
+            }
+            SNIPPING_STRIP_LAST_BLUR_HIDE_MS.store(cloud_mcp_now_ms(), Ordering::Release);
+            snipping_strip_hide_animated(&blur_app, blur_window.clone(), true);
+        }
+    });
+    Some(window)
+}
+
+/// Top-center bar on macOS (just under the menu bar, CleanShot-style);
+/// bottom-center above the taskbar elsewhere. Sized to the monitor the
+/// cursor is on. Returns the animation origin edge.
+fn snipping_strip_position(app: &AppHandle, window: &tauri::WebviewWindow) -> &'static str {
+    let monitor = app
+        .cursor_position()
+        .ok()
+        .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    let (position, size, scale) = monitor
+        .map(|monitor| (*monitor.position(), *monitor.size(), monitor.scale_factor()))
+        .unwrap_or((
+            tauri::PhysicalPosition::new(0, 0),
+            tauri::PhysicalSize::new(1920, 1080),
+            1.0,
+        ));
+    let width_logical =
+        (size.width as f64 / scale - 48.0).clamp(360.0, SNIPPING_STRIP_LOGICAL_MAX_WIDTH);
+    let _ = window.set_size(tauri::LogicalSize::new(
+        width_logical,
+        SNIPPING_STRIP_LOGICAL_HEIGHT,
+    ));
+    let width = (width_logical * scale).round() as i32;
+    let x = position.x + ((size.width as i32 - width) / 2).max(0);
+    #[cfg(target_os = "macos")]
+    let (y, origin) = (position.y + (44.0 * scale).round() as i32, "top");
+    #[cfg(not(target_os = "macos"))]
+    let (y, origin) = {
+        let height = (SNIPPING_STRIP_LOGICAL_HEIGHT * scale).round() as i32;
+        (
+            position.y + size.height as i32 - height - (56.0 * scale).round() as i32,
+            "bottom",
+        )
+    };
+    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+    origin
+}
+
+fn snipping_strip_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) {
+    let mut payload = json!({ "phase": phase });
+    if let Some(origin) = origin {
+        payload["origin"] = json!(origin);
+    }
+    let _ = app.emit_to(SNIPPING_STRIP_WINDOW_LABEL, SNIPPING_STRIP_ANIM_EVENT, payload);
+}
+
+fn snipping_strip_hide_animated(
+    app: &AppHandle,
+    window: tauri::WebviewWindow,
+    only_if_unfocused: bool,
+) {
+    snipping_strip_emit_anim(app, "close", None);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(SNIPPING_STRIP_CLOSE_ANIM_MS)).await;
+        let _ = app.run_on_main_thread(move || {
+            if only_if_unfocused && window.is_focused().unwrap_or(false) {
+                return;
+            }
+            let _ = window.hide();
+        });
+    });
+}
+
+/// Tray-click toggle for the recent-snips bar, mirroring the background
+/// monitor's blur-grace dance (clicking the tray blurs the bar first; without
+/// the grace window it would hide and instantly reopen).
+pub(crate) fn snipping_strip_toggle(app: &AppHandle) {
+    let Some(window) = snipping_strip_window(app) else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        snipping_strip_hide_animated(app, window, false);
+        return;
+    }
+    if cloud_mcp_now_ms()
+        .saturating_sub(SNIPPING_STRIP_LAST_BLUR_HIDE_MS.load(Ordering::Acquire))
+        < SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS
+    {
+        return;
+    }
+    let origin = snipping_strip_position(app, &window);
+    let _ = window.show();
+    let _ = window.set_focus();
+    snipping_strip_emit_anim(app, "open", Some(origin));
+}
+
+#[tauri::command]
+fn snipping_toggle_snip_strip(app: AppHandle) -> Result<(), String> {
+    snipping_strip_toggle(&app);
+    Ok(())
+}
+
 #[tauri::command]
 fn snipping_open_snip_float(
     app: AppHandle,
@@ -4397,15 +4603,9 @@ fn snipping_read_asset_data_url(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn snipping_open_annotation_editor(app: AppHandle, path: String) -> Result<Value, String> {
-    snipping_open_floating_asset_window(
-        &app,
-        path,
-        SNIPPING_EDITOR_WINDOW_PREFIX,
-        "/snipping-editor",
-        "Annotate Snip",
-        980.0,
-        720.0,
-    )
+    // Same builder as the batch path: transparent rounded window sized to the
+    // snip, plus the one-editor-per-asset focus dedupe.
+    snipping_open_annotation_editor_for_paths(&app, vec![path])
 }
 
 #[tauri::command]

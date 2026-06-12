@@ -1,7 +1,9 @@
 // Background mode: the app keeps running with the main window hidden, with a
-// cross-platform tray icon and a small monitor window (activity + tokenomics)
-// as the visible surface. Entering/leaving background never tears anything
-// down — terminals, sync, hotkeys, and the todo ledger are process-scoped.
+// small monitor window (activity + tokenomics + snippets) as the visible
+// surface. The cross-platform tray icon lives for the whole app lifetime —
+// while the main window is up its click toggles the recent-snips strip.
+// Entering/leaving background never tears anything down — terminals, sync,
+// hotkeys, and the todo ledger are process-scoped.
 
 const BACKGROUND_MONITOR_WINDOW_LABEL: &str = "background-monitor";
 const BACKGROUND_MODE_CHANGED_EVENT: &str = "forge-background-mode-changed";
@@ -41,11 +43,17 @@ fn background_monitor_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     .accept_first_mouse(true)
     .focused(false)
     .visible(false)
+    .background_color(Color(0, 0, 0, 0))
     .build()
     .ok()?;
+    // A transparent window still paints the webview's default backdrop until
+    // the background color is cleared — that backdrop is the faint full-size
+    // square visible around the popover card.
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
     #[cfg(target_os = "macos")]
     {
         let _ = window.set_visible_on_all_workspaces(true);
+        background_monitor_apply_macos_popover_style(&window);
     }
     let blur_window = window.clone();
     let blur_app = app.clone();
@@ -60,6 +68,51 @@ fn background_monitor_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         }
     });
     Some(window)
+}
+
+/// Menu-bar dropdown window style, the same recipe the snipping overlay uses
+/// to appear over OTHER apps' fullscreen Spaces: CanJoinAllSpaces alone does
+/// not join fullscreen Spaces — the popover also needs FullScreenAuxiliary —
+/// and tao's always-on-top floating level is not reliably above a fullscreen
+/// Space's window, so the popover runs at status-bar level like a real
+/// NSStatusItem dropdown. Re-asserted on every show since both values are
+/// plain NSWindow state that other window calls may rewrite.
+#[cfg(target_os = "macos")]
+fn background_monitor_apply_macos_popover_style(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setCollectionBehavior(
+            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        ns_window.setLevel(objc2_app_kit::NSStatusWindowLevel);
+    });
+}
+
+/// Surfaces the popover even while Diff Forge is NOT the active app (tray
+/// clicks from another app's fullscreen Space): makeKeyAndOrderFront does
+/// nothing visible there, orderFrontRegardless is the documented way.
+#[cfg(target_os = "macos")]
+fn background_monitor_order_front_regardless(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.orderFrontRegardless();
+    });
 }
 
 /// Anchor the popover to a screen point: panels near the top of the monitor
@@ -158,7 +211,11 @@ fn background_monitor_show_at(app: &AppHandle, anchor: Option<(f64, f64)>) {
         origin = anchor_origin;
         let _ = window.set_position(tauri::Position::Physical(position));
     }
+    #[cfg(target_os = "macos")]
+    background_monitor_apply_macos_popover_style(&window);
     let _ = window.show();
+    #[cfg(target_os = "macos")]
+    background_monitor_order_front_regardless(&window);
     let _ = window.set_focus();
     background_monitor_emit_anim(app, "open", Some(origin));
 }
@@ -218,6 +275,12 @@ pub(crate) fn app_enter_background_internal(app: &AppHandle) {
     let main_app = app.clone();
     let scheduled = app.run_on_main_thread(move || {
         background_tray_create(&main_app);
+        // Run as an accessory app (no Dock icon) while backgrounded, the way
+        // menu-bar apps do: activating the popover from another app's
+        // fullscreen Space then cannot trigger a Space switch (which showed
+        // as a black menu bar instead of the dropdown).
+        #[cfg(target_os = "macos")]
+        let _ = main_app.set_activation_policy(tauri::ActivationPolicy::Accessory);
         if let Some(main) = main_app.get_webview_window("main") {
             let _ = main.hide();
         }
@@ -242,6 +305,8 @@ pub(crate) fn app_exit_background_internal(app: &AppHandle) {
     APP_BACKGROUND_MODE.store(false, Ordering::Release);
     let main_app = app.clone();
     let scheduled = app.run_on_main_thread(move || {
+        #[cfg(target_os = "macos")]
+        let _ = main_app.set_activation_policy(tauri::ActivationPolicy::Regular);
         // Restore the main window FIRST: even if tray/popover teardown were
         // to fail, the user always gets their window back.
         let _ = restore_main_window(&main_app);
@@ -252,7 +317,8 @@ pub(crate) fn app_exit_background_internal(app: &AppHandle) {
         if let Some(monitor) = main_app.get_webview_window(BACKGROUND_MONITOR_WINDOW_LABEL) {
             let _ = monitor.hide();
         }
-        background_tray_remove(&main_app);
+        // The tray icon stays: with the main window up it serves as the
+        // recent-snips strip toggle.
         background_mode_emit_changed(&main_app, false);
         log_terminal_status_event("backend.background_mode.exited", json!({}));
     });
@@ -281,11 +347,12 @@ fn app_background_mode_state() -> Result<Value, String> {
     Ok(json!({ "background": app_is_in_background_mode() }))
 }
 
-/// Cross-platform tray icon, present only while background mode is active:
-/// left click opens the monitor; the menu offers open / monitor / quit.
+/// Cross-platform tray icon, present for the whole app lifetime. Left click
+/// is mode-aware: with the main window up it toggles the recent-snips strip
+/// (CleanShot-style bar); in background mode it toggles the monitor popover.
 /// Quit routes through the existing graceful-shutdown choreography by
 /// emitting the same close-requested event the window close path uses.
-fn background_tray_create(app: &AppHandle) {
+pub(crate) fn background_tray_create(app: &AppHandle) {
     if app.tray_by_id("diffforge-tray").is_some() {
         return;
     }
@@ -295,26 +362,35 @@ fn background_tray_create(app: &AppHandle) {
     let menu_items = (
         tauri::menu::MenuItem::with_id(app, "diffforge-open", "Open Diff Forge", true, None::<&str>),
         tauri::menu::MenuItem::with_id(app, "diffforge-monitor", "Activity Monitor", true, None::<&str>),
+        tauri::menu::MenuItem::with_id(app, "diffforge-snips", "Recent Snips", true, None::<&str>),
         tauri::menu::MenuItem::with_id(app, "diffforge-quit", "Quit Diff Forge", true, None::<&str>),
     );
-    let (Ok(open_item), Ok(monitor_item), Ok(quit_item)) = menu_items else {
+    let (Ok(open_item), Ok(monitor_item), Ok(snips_item), Ok(quit_item)) = menu_items else {
         return;
     };
-    let Ok(menu) = tauri::menu::Menu::with_items(app, &[&open_item, &monitor_item, &quit_item])
+    let Ok(menu) =
+        tauri::menu::Menu::with_items(app, &[&open_item, &monitor_item, &snips_item, &quit_item])
     else {
         return;
     };
     let tray = tauri::tray::TrayIconBuilder::with_id("diffforge-tray")
         .icon(icon)
-        .tooltip("Diff Forge AI — running in background")
+        .tooltip("Diff Forge AI")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "diffforge-open" => {
-                app_exit_background_internal(app);
+                if app_is_in_background_mode() {
+                    app_exit_background_internal(app);
+                } else {
+                    let _ = restore_main_window(app);
+                }
             }
             "diffforge-monitor" => {
                 background_monitor_show_near_tray_corner(app);
+            }
+            "diffforge-snips" => {
+                snipping_strip_toggle(app);
             }
             "diffforge-quit" => {
                 // Surface the main window so the shutdown progress and any
@@ -343,7 +419,10 @@ fn background_tray_create(app: &AppHandle) {
                 if app_is_in_background_mode() {
                     background_monitor_toggle_at(app, Some((position.x, position.y)));
                 } else {
-                    let _ = restore_main_window(app);
+                    // Main window is up: the tray becomes the recent-snips
+                    // bar toggle (the monitor popover stays a background-mode
+                    // surface — its restore button makes no sense here).
+                    snipping_strip_toggle(app);
                 }
             }
         })
@@ -356,6 +435,3 @@ fn background_tray_create(app: &AppHandle) {
     }
 }
 
-fn background_tray_remove(app: &AppHandle) {
-    let _ = app.remove_tray_by_id("diffforge-tray");
-}

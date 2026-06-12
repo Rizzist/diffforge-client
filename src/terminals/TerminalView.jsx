@@ -82,6 +82,7 @@ import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
 import WorkspaceToolsDragPanel from "../tools/WorkspaceToolsDragPanel.jsx";
+import { warmWorkspaceTools } from "../tools/workspaceToolsStore.js";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
@@ -246,6 +247,8 @@ const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
 const TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT = "todo-store-cancel-requested";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
+const REMOTE_TODO_REQUEUE_EVENT = "diffforge:remote-todo-requeue";
+const REMOTE_TERMINAL_WINDOW_EVENT = "diffforge:remote-terminal-window";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
@@ -2706,6 +2709,35 @@ const OrchestratorVoiceControls = styled.div`
   align-items: center;
   justify-content: center;
   gap: 10px;
+`;
+
+const OrchestratorVoiceMicChip = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid rgba(245, 184, 86, 0.35);
+  border-radius: 999px;
+  color: rgba(250, 211, 144, 0.95);
+  background: rgba(120, 80, 18, 0.22);
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+
+  &::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(245, 184, 86, 0.9);
+    animation: orchestratorMicChipPulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes orchestratorMicChipPulse {
+    0%, 100% { opacity: 0.45; }
+    50% { opacity: 1; }
+  }
 `;
 
 const OrchestratorVoiceButton = styled.button`
@@ -11733,6 +11765,39 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     [orchestratorPanelWorkspaceId, rootDirectory],
   );
   const [activeWorkspaceTool, setActiveWorkspaceTool] = useState("orchestrator");
+
+  // Prefetch the app-level tools cache (architectures + skills) as soon as the
+  // orchestrator panel mounts so the Tools tab opens instantly, never "loading".
+  useEffect(() => {
+    warmWorkspaceTools(coordinationTargets, rootDirectory);
+  }, [coordinationTargets, rootDirectory]);
+
+  // Mic arbitration events from Rust: dictation borrows the voice agent's
+  // microphone and hands it back when it finishes.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen("forge-voice-agent-mic", (event) => {
+      if (disposed) return;
+      setOrchestratorVoiceMicBorrowed(String(event?.payload?.state || "") === "paused");
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (orchestratorVoiceState === "idle") {
+      setOrchestratorVoiceMicBorrowed(false);
+    }
+  }, [orchestratorVoiceState]);
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
   const [editingItemId, setEditingItemId] = useState("");
   const [editingDraft, setEditingDraft] = useState("");
@@ -11741,6 +11806,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState([]);
   const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
+  // Mic arbitration: true while dictation has borrowed the microphone from a
+  // live voice agent session (Rust pauses/resumes the agent's audio feed).
+  const [orchestratorVoiceMicBorrowed, setOrchestratorVoiceMicBorrowed] = useState(false);
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
   const [orchestratorChatDraft, setOrchestratorChatDraft] = useState("");
   const [orchestratorChatSubmitting, setOrchestratorChatSubmitting] = useState(false);
@@ -13638,6 +13706,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               </OrchestratorVoiceCancelButton>
             )}
             <OrchestratorVoiceControls>
+              {orchestratorVoiceMicBorrowed
+                && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing") && (
+                <OrchestratorVoiceMicChip title="Dictation borrowed the microphone — the voice agent resumes listening when dictation finishes.">
+                  Mic with dictation
+                </OrchestratorVoiceMicChip>
+              )}
               <OrchestratorVoiceButton
                 aria-label={orchestratorVoiceButtonLabel}
                 data-error={orchestratorVoiceError ? "true" : undefined}
@@ -18753,6 +18827,25 @@ function TerminalView({
     });
   }, [getTerminalAgent, getTerminalWindowTitle]);
 
+  // Individual pop-out: one grid terminal becomes its own native window (the
+  // pane-level button next to the UI View toggle). Same machinery as the
+  // all-panes Window Breakout — the PTY never restarts, the window attaches
+  // as an extra output subscriber, and the grid keeps a placeholder card
+  // until the pane returns (close housekeeping shares the same closed-event
+  // listener).
+  const popOutTerminalWindowForIndex = useCallback(async (terminalIndex, paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId || windowBreakoutPanesRef.current[safePaneId]) {
+      return;
+    }
+    try {
+      await openTerminalWindowForIndex(terminalIndex, safePaneId);
+      setWindowBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
+    } catch {
+      // Panes that have not launched a PTY yet simply stay in the grid.
+    }
+  }, [openTerminalWindowForIndex]);
+
   // Window Breakout: every grid terminal becomes its own native window. The
   // PTYs never restart; the windows attach as extra output subscribers, and
   // the grid keeps slim placeholder cards until the panes return.
@@ -18820,6 +18913,53 @@ function TerminalView({
   const returnTerminalWindowToGrid = useCallback((paneId) => {
     invoke("terminal_window_close", { paneId }).catch(() => {});
   }, []);
+
+  // Remote window breakout (voice orchestrator device_control): AppShell
+  // validates and replies; this listener only actuates against the live
+  // grid panes, mirroring the manual breakout buttons.
+  useEffect(() => {
+    const handleRemoteTerminalWindowEvent = (event) => {
+      const detail = event?.detail || {};
+      const eventWorkspaceId = String(detail.workspaceId || "").trim();
+      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const action = String(detail.action || "").trim();
+      const paneId = String(detail.paneId || "").trim();
+      logTerminalStatus("frontend.terminal_window.remote_control", {
+        action,
+        commandId: detail.commandId || "",
+        paneId,
+        workspaceId: terminalWorkspace.id,
+      });
+      if (action === "return") {
+        if (paneId) {
+          returnTerminalWindowToGrid(paneId);
+        } else {
+          closeWindowBreakout();
+        }
+        return;
+      }
+      if (paneId) {
+        const terminalIndex = logicalTerminalIndexes.find((index) => getTerminalPaneId(index) === paneId);
+        if (Number.isInteger(terminalIndex)) {
+          void popOutTerminalWindowForIndex(terminalIndex, paneId);
+        }
+        return;
+      }
+      void openWindowBreakout();
+    };
+    window.addEventListener(REMOTE_TERMINAL_WINDOW_EVENT, handleRemoteTerminalWindowEvent);
+    return () => window.removeEventListener(REMOTE_TERMINAL_WINDOW_EVENT, handleRemoteTerminalWindowEvent);
+  }, [
+    closeWindowBreakout,
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    openWindowBreakout,
+    popOutTerminalWindowForIndex,
+    returnTerminalWindowToGrid,
+    terminalWorkspace?.id,
+  ]);
 
   const focusTerminalWindow = useCallback((terminalIndex, paneId) => {
     invoke("terminal_window_focus", { paneId })
@@ -24531,11 +24671,68 @@ function TerminalView({
       removeTodoQueueItem(todoId);
     };
 
+    const handleRemoteTodoRequeueEvent = (event) => {
+      const detail = event?.detail || {};
+      const eventWorkspaceId = String(detail.workspaceId || "").trim();
+      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const todoId = String(detail.todoId || "").trim();
+      if (!todoId) {
+        return;
+      }
+      const item = todoQueueItemsRef.current.find((candidate) => candidate.id === todoId);
+      if (!item) {
+        logTerminalStatus("frontend.todo_queue.remote_requeue_missing", {
+          commandId: detail.commandId || todoId,
+          itemId: todoId,
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          workspaceId: terminalWorkspace.id,
+        });
+        return;
+      }
+      if (todoQueuePendingItemsRef.current[item.id]) {
+        logTerminalStatus("frontend.todo_queue.remote_requeue_skip", {
+          commandId: detail.commandId || todoId,
+          itemId: todoId,
+          pendingPhase: getTodoQueuePendingPhase(todoQueuePendingItemsRef.current[item.id]),
+          reason: "already_pending",
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          workspaceId: terminalWorkspace.id,
+        });
+        return;
+      }
+      logTerminalStatus("frontend.todo_queue.remote_requeue", {
+        commandId: detail.commandId || todoId,
+        itemId: todoId,
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        workspaceId: terminalWorkspace.id,
+      });
+      const remoteTargetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
+      setTodoQueueItemPending(item.id, {
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        phase: "queued",
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        targetRole: getTodoQueueTargetAgentId(item),
+        targetColorSlot: getTodoQueueTargetColorSlot(item),
+        targetTerminalColor: getTodoQueueTargetTerminalColor(item),
+        targetTerminalId: getTodoQueueTargetTerminalId(item),
+        targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+        targetTerminalName: getTodoQueueTargetTerminalName(item),
+        targetThreadId: getTodoQueueTargetThreadId(item),
+        targetExplicit: remoteTargetInfo.hasExplicitTerminalTarget,
+        workspaceId: terminalWorkspace.id,
+      });
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+    };
+
     window.addEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
     window.addEventListener(REMOTE_TODO_DELETE_EVENT, handleRemoteTodoDeleteEvent);
+    window.addEventListener(REMOTE_TODO_REQUEUE_EVENT, handleRemoteTodoRequeueEvent);
     return () => {
       window.removeEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
       window.removeEventListener(REMOTE_TODO_DELETE_EVENT, handleRemoteTodoDeleteEvent);
+      window.removeEventListener(REMOTE_TODO_REQUEUE_EVENT, handleRemoteTodoRequeueEvent);
     };
   }, [
     recordTodoQueueRemoteCommandReceipt,
@@ -26999,6 +27196,7 @@ function TerminalView({
                 onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
                   onThreadTerminalLifecycle={handleWorkspaceTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
+                onPopOutTerminalWindow={popOutTerminalWindowForIndex}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
                 projectRoot={terminalProjectTarget?.mountId ? terminalProjectTarget.repoPath : ""}
                 mountId={terminalProjectTarget?.mountId || ""}
@@ -27161,6 +27359,7 @@ function TerminalView({
       onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
         onThreadTerminalLifecycle={handleWorkspaceTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
+      onPopOutTerminalWindow={popOutTerminalWindowForIndex}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
       projectRoot={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId
         ? getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.repoPath

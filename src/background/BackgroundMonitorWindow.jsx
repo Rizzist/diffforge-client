@@ -5,6 +5,7 @@ import styled, { createGlobalStyle } from "styled-components";
 
 import { ActivityOverlayPanel } from "../activity/ActivityOverlay.jsx";
 import { useAuthSnapshot } from "../authStore";
+import { SnippingRecentStrip } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 const LAST_TAB_STORAGE_KEY = "diffforge.backgroundMonitor.lastTab.v1";
@@ -18,7 +19,7 @@ function text(value, fallback = "") {
 function readLastTab() {
   try {
     const stored = text(window.localStorage.getItem(LAST_TAB_STORAGE_KEY));
-    return stored === "activity" ? "activity" : "tokenomics";
+    return stored === "activity" || stored === "snippets" ? stored : "tokenomics";
   } catch {
     return "tokenomics";
   }
@@ -107,11 +108,23 @@ export default function BackgroundMonitorWindow() {
           >
             Activity
           </MonitorTabButton>
+          <MonitorTabButton
+            data-active={tab === "snippets" ? "true" : "false"}
+            onClick={() => setTab("snippets")}
+            role="tab"
+            type="button"
+          >
+            Snippets
+          </MonitorTabButton>
         </MonitorTabs>
 
         <MonitorFill>
           {tab === "tokenomics" ? (
             <AccountTokenomicsView accountKey={user?.id || user?.email || ""} />
+          ) : tab === "snippets" ? (
+            <MonitorSnipsHost>
+              <SnippingRecentStrip embedded />
+            </MonitorSnipsHost>
           ) : (
             <MonitorActivityHost>
               <ActivityOverlayPanel embedded />
@@ -187,6 +200,16 @@ const MonitorActivityHost = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: linear-gradient(180deg, rgba(13, 16, 22, 0.65), rgba(7, 10, 15, 0.2));
+`;
+
+const MonitorSnipsHost = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  align-content: center;
+  overflow: hidden;
+  padding: 8px 2px;
   background: linear-gradient(180deg, rgba(13, 16, 22, 0.65), rgba(7, 10, 15, 0.2));
 `;
 

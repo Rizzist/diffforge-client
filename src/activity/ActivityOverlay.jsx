@@ -1033,6 +1033,37 @@ function useActivityOverlayData(context) {
   const refreshTimerRef = useRef(0);
   const refreshInFlightRef = useRef(false);
   const refreshPendingOptionsRef = useRef(null);
+  const overviewInFlightRef = useRef(false);
+  const overviewPendingRef = useRef(false);
+
+  // Fast path for the authoritative todo cards: a store change re-reads only
+  // `todo_dispatch_overview` (a local queue-file read) and lands immediately,
+  // instead of waiting behind the debounced full refresh whose cloud status
+  // and asset calls are orders of magnitude slower.
+  const refreshTodoOverview = useCallback(async () => {
+    if (overviewInFlightRef.current) {
+      overviewPendingRef.current = true;
+      return;
+    }
+    overviewInFlightRef.current = true;
+    try {
+      do {
+        overviewPendingRef.current = false;
+        try {
+          const overview = await invoke("todo_dispatch_overview");
+          setState((current) => ({
+            ...current,
+            todoOverview: overview,
+            updatedAt: Date.now(),
+          }));
+        } catch {
+          break;
+        }
+      } while (overviewPendingRef.current);
+    } finally {
+      overviewInFlightRef.current = false;
+    }
+  }, []);
 
   useEffect(() => {
     contextRef.current = context;
@@ -1160,6 +1191,9 @@ function useActivityOverlayData(context) {
           if (cancelled) {
             return;
           }
+          if (options.onEvent) {
+            void options.onEvent();
+          }
           scheduleRefresh(options.refreshOptions || {});
         });
         if (cancelled) {
@@ -1172,10 +1206,11 @@ function useActivityOverlayData(context) {
       }
     };
 
-    void addListener(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT);
+    void addListener(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, { onEvent: refreshTodoOverview });
     // Rust store mutations (direct captures, queue syncs, settlements,
-    // deletes, sweeps) drive the authoritative todo cards.
-    void addListener("todo-store-changed");
+    // deletes, sweeps) drive the authoritative todo cards; the fast path
+    // updates them instantly, the debounced full refresh converges the rest.
+    void addListener("todo-store-changed", { onEvent: refreshTodoOverview });
     void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
 
     // Safety-net poll: overlay windows are separate webviews that can open
@@ -1202,7 +1237,7 @@ function useActivityOverlayData(context) {
         }
       });
     };
-  }, [refresh, scheduleRefresh]);
+  }, [refresh, refreshTodoOverview, scheduleRefresh]);
 
   useEffect(() => {
     void refresh({ localOnly: false });

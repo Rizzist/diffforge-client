@@ -460,7 +460,7 @@ const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
-const AUDIO_WIDGET_BAR_SIZE = { width: 248, height: 34 };
+const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
 const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 6;
 // Idle: a thin line hugging the bottom; the window stays this small dock
 // zone so hovering it can reveal the round record button + shortcut hint.
@@ -470,7 +470,9 @@ const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 // window shifts up by the same amount so the pill stays put on screen.
 const AUDIO_WIDGET_ERROR_POPOVER_HEIGHT = 62;
 const AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS = 6500;
-const AUDIO_BAR_METER_BARS = 18;
+// Compact bar: 8 bars fill the ~38px of meter room left between the cancel
+// and stop controls at the 124px bar width.
+const AUDIO_BAR_METER_BARS = 8;
 const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
 const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
 const AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK = "push-to-talk";
@@ -1031,7 +1033,12 @@ function extractRemainingForgeCredits(billing) {
 function formatAudioHistoryMeta(entry) {
   const pieces = [];
   const source = String(entry?.source || "").trim();
-  const duration = formatHistoryDuration(entry?.audioMs);
+  // Time shown = turnaround since releasing the record button (request
+  // submitted) to the transcript landing. Older entries only stored the
+  // audio length, so they fall back to it.
+  const duration = formatHistoryDuration(
+    Number(entry?.latencyMs || 0) > 0 ? entry.latencyMs : entry?.audioMs,
+  );
   const wordCount = Number(entry?.wordCount || 0);
   const language = String(entry?.language || "").trim();
 
@@ -3641,6 +3648,7 @@ export function AudioWidgetWindow() {
       audioMs,
       createdAt: new Date().toISOString(),
       id: `${Date.now()}`,
+      latencyMs: Number(result?.latencyMs || 0),
       language: provider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
       provider,
       source: provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
@@ -3724,6 +3732,9 @@ export function AudioWidgetWindow() {
     recordingLockedRef.current = false;
     setRecordingLocked(false);
     hybridLastTapAtRef.current = 0;
+    // History shows turnaround from this moment (record button released /
+    // request submitted) until the transcript lands.
+    const submittedAt = Date.now();
     widgetStateRef.current = "transcribing";
     setWidgetState("transcribing");
     playNotificationSfx("voice.off");
@@ -3805,7 +3816,10 @@ export function AudioWidgetWindow() {
       if (recordingRunRef.current !== recordingRunId) {
         if (cancelSalvageRunRef.current === recordingRunId) {
           cancelSalvageRunRef.current = 0;
-          publishCancelledTranscript(result, currentProvider);
+          publishCancelledTranscript(
+            { ...result, latencyMs: Math.max(0, Date.now() - submittedAt) },
+            currentProvider,
+          );
         }
         return;
       }
@@ -3833,6 +3847,7 @@ export function AudioWidgetWindow() {
         audioMs: Number(result?.audioMs || 0),
         createdAt: new Date().toISOString(),
         id: `${Date.now()}`,
+        latencyMs: Math.max(0, Date.now() - submittedAt),
         language: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
         provider: currentProvider,
         source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
@@ -3907,6 +3922,7 @@ export function AudioWidgetWindow() {
     }
 
     const audioBase64 = arrayBufferToBase64(captureResult.wavBuffer);
+    const submittedAt = Date.now();
 
     invoke("transcribe_whisper_audio", {
       request: {
@@ -3917,7 +3933,11 @@ export function AudioWidgetWindow() {
       },
     })
       .then((transcriptionResult) => publishCancelledTranscript(
-        { ...(transcriptionResult || {}), audioMs },
+        {
+          ...(transcriptionResult || {}),
+          audioMs,
+          latencyMs: Math.max(0, Date.now() - submittedAt),
+        },
         AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
       ))
       .catch(() => {});
@@ -3971,6 +3991,7 @@ export function AudioWidgetWindow() {
 
     if (currentState === "recording" && salvage && audioBuffer) {
       const captureStats = audioBuffer.getCaptureStats?.() || null;
+      const submittedAt = Date.now();
 
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
         const realtimeResult = await invoke("stop_deepgram_realtime_transcription").catch(() => null);
@@ -3979,6 +4000,7 @@ export function AudioWidgetWindow() {
           {
             ...(realtimeResult || {}),
             audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+            latencyMs: Math.max(0, Date.now() - submittedAt),
           },
           AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
         );
@@ -3996,6 +4018,7 @@ export function AudioWidgetWindow() {
               || Number(dictationResult?.audioSeconds || 0) * 1000
               || 0,
             ),
+            latencyMs: Math.max(0, Date.now() - submittedAt),
           },
           AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
         );

@@ -556,8 +556,10 @@ import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } f
 import SnippingQuickAccess, {
   SnippingAnnotationEditorWindow,
   SnippingFloatWindow,
+  SnippingStripWindow,
   SNIPPING_EDITOR_HASH,
   SNIPPING_FLOAT_HASH,
+  SNIPPING_STRIP_HASH,
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
@@ -1113,6 +1115,8 @@ const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
+const REMOTE_TODO_REQUEUE_EVENT = "diffforge:remote-todo-requeue";
+const REMOTE_TERMINAL_WINDOW_EVENT = "diffforge:remote-terminal-window";
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
@@ -6222,6 +6226,10 @@ export default function App() {
 
   if (window.location.hash.startsWith(SNIPPING_EDITOR_HASH)) {
     return <SnippingAnnotationEditorWindow />;
+  }
+
+  if (window.location.hash === SNIPPING_STRIP_HASH) {
+    return <SnippingStripWindow />;
   }
 
   if (window.location.hash.startsWith(SNIPPING_FLOAT_HASH)) {
@@ -18676,6 +18684,209 @@ export default function App() {
           });
         return;
       }
+      if (["terminal_close", "close_terminal", "terminal_force_close", "force_close_terminal"].includes(normalizedKind)) {
+        const { terminal } = findRemoteControlTerminal(workspaceId, target);
+        if (!terminal) {
+          await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
+            commandId,
+            commandKind,
+            target,
+            workspaceId,
+          });
+          return;
+        }
+        if (remoteControlTerminalLooksClosed(terminal)) {
+          await recordRemoteCommandStatus(event, "completed", "Terminal is already closed.", {
+            commandId,
+            commandKind,
+            terminal: remoteControlTerminalSummary(terminal, target),
+            workspaceId,
+          });
+          return;
+        }
+        const result = await closeRemoteControlTerminal(workspaceId, terminal, target);
+        await syncRemoteControlState("remote_terminal_force_close");
+        await recordRemoteCommandStatus(event, result.closed ? "completed" : "failed", result.closed
+          ? "Terminal force-closed from the web dashboard; its process tree was killed."
+          : "Terminal could not be force-closed.", {
+            commandId,
+            commandKind,
+            result,
+            workspaceId,
+          });
+        return;
+      }
+      if (["terminal_interrupt", "interrupt_terminal", "terminal_stop", "stop_terminal", "terminal_cancel"].includes(normalizedKind)) {
+        const { terminal } = findRemoteControlTerminal(workspaceId, target);
+        const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+        if (!terminal || !paneId) {
+          await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
+            commandId,
+            commandKind,
+            target,
+            workspaceId,
+          });
+          return;
+        }
+        if (remoteControlTerminalLooksClosed(terminal)) {
+          await recordRemoteCommandStatus(event, "blocked", "Terminal is already closed, so there is nothing to interrupt.", {
+            commandId,
+            commandKind,
+            terminal: remoteControlTerminalSummary(terminal, target),
+            workspaceId,
+          });
+          return;
+        }
+        try {
+          await invoke("terminal_write", {
+            data: "\u0003",
+            paneId,
+          });
+          await recordRemoteCommandStatus(event, "completed", "Interrupt sent to the terminal; its current turn should stop.", {
+            commandId,
+            commandKind,
+            terminal: remoteControlTerminalSummary(terminal, target),
+            workspaceId,
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to interrupt the terminal."), {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+        }
+        return;
+      }
+      if (["terminal_open", "open_terminal", "open_terminals", "terminal_spawn", "spawn_terminals"].includes(normalizedKind)) {
+        const count = Math.max(1, Math.min(12, remoteCommandIntegerField(event, ["count"]) ?? 1));
+        const rawOpenMode = remoteCommandStringField(event, ["open_mode", "openMode", "mode"])
+          .trim().toLowerCase();
+        const openAction = rawOpenMode === "spawn_count" ? "spawn_count" : "ensure_count";
+        await recordRemoteCommandStatus(event, "running", `Opening coding-agent terminals (${openAction} ${count}).`, {
+          commandId,
+          commandKind,
+          workspaceId,
+        });
+        try {
+          const result = await manageWorkspaceAgents({
+            action: openAction,
+            agentType: agentId || "any",
+            count,
+            source: "remote_control_terminal_open",
+            workspaceId,
+          });
+          await syncRemoteControlState("remote_terminal_open");
+          await recordRemoteCommandStatus(event, "completed", result?.message || "Coding-agent terminals updated.", {
+            commandId,
+            commandKind,
+            result: result || null,
+            workspaceId,
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "blocked", getErrorMessage(error, "Unable to open coding-agent terminals."), {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+        }
+        return;
+      }
+      if (["todo_requeue", "requeue_todo", "todo_retry", "retry_todo"].includes(normalizedKind)) {
+        const todoId = remoteCommandStringField(event, [
+          "todo_id",
+          "todoId",
+          "item_id",
+          "itemId",
+          "target_todo_id",
+          "targetTodoId",
+        ]);
+        if (!todoId) {
+          await recordRemoteCommandStatus(event, "failed", "Todo requeue command did not include a todo id.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        // Same authority split as remote delete: the queue panel owns the
+        // local todo state and promotes the listed todo into dispatch.
+        window.dispatchEvent(new CustomEvent(REMOTE_TODO_REQUEUE_EVENT, {
+          detail: {
+            commandId,
+            todoId,
+            workspaceId,
+          },
+        }));
+        await recordRemoteCommandStatus(event, "completed", "Todo requeued for dispatch on the desktop.", {
+          commandId,
+          commandKind,
+          todoId,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "terminal_window_breakout", "breakout_terminal", "breakout_terminals", "terminal_breakout",
+        "open_terminal_window", "terminal_window_open",
+        "terminal_window_return", "return_terminal_window", "return_terminal_to_grid",
+        "close_terminal_window", "terminal_window_close",
+      ].includes(normalizedKind)) {
+        const windowAction = [
+          "terminal_window_return", "return_terminal_window", "return_terminal_to_grid",
+          "close_terminal_window", "terminal_window_close",
+        ].includes(normalizedKind) ? "return" : "breakout";
+        // Breakout windows attach to the activated workspace's live panes;
+        // other workspaces have no grid panes to break out.
+        if (activatedWorkspaceIdRef.current !== workspaceId) {
+          await recordRemoteCommandStatus(event, "blocked", "Workspace is not the active one on this desktop; activate it before managing terminal windows.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const hasExplicitTarget = Boolean(
+          targetTerminalId || targetTerminalName || targetThreadId || Number.isInteger(targetTerminalIndex),
+        );
+        let paneId = "";
+        if (hasExplicitTarget) {
+          const { terminal } = findRemoteControlTerminal(workspaceId, target);
+          paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+          if (!paneId) {
+            await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
+              commandId,
+              commandKind,
+              target,
+              workspaceId,
+            });
+            return;
+          }
+        }
+        // The terminal grid owns the breakout windows; same fire-and-forget
+        // authority split as remote todo delete/requeue.
+        window.dispatchEvent(new CustomEvent(REMOTE_TERMINAL_WINDOW_EVENT, {
+          detail: {
+            action: windowAction,
+            commandId,
+            paneId,
+            workspaceId,
+          },
+        }));
+        await recordRemoteCommandStatus(event, "completed", windowAction === "return"
+          ? (paneId
+            ? "Terminal window returned to the Diff Forge grid."
+            : "All broken-out terminal windows returned to the Diff Forge grid.")
+          : (paneId
+            ? "Terminal broken out into its own native window."
+            : "All workspace terminals broken out into their own native windows."), {
+          commandId,
+          commandKind,
+          paneId,
+          windowAction,
+          workspaceId,
+        });
+        return;
+      }
       if (normalizedKind === "workspace_close_idle_terminals" || normalizedKind === "close_idle_terminals") {
         const { terminals } = findRemoteControlTerminal(workspaceId, target);
         const closeResults = [];
@@ -19023,10 +19234,19 @@ export default function App() {
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
           const agentPackageAction = remoteCommandIsAgentPackageAction(commandKind);
-          // Agent uninstall has no webview UI path; the Rust lever always
-          // owns it (and replies), so the webview stays silent here.
-          if (["agent_uninstall", "uninstall_agent", "cli_uninstall"]
-            .includes(String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_"))) {
+          // Rust-owned levers reply on every path (with or without the
+          // webview), so the webview stays silent here: agent uninstall,
+          // window visibility, native notifications, agent account
+          // switching, terminal output status, and cloud-owned plan release.
+          if ([
+            "agent_uninstall", "uninstall_agent", "cli_uninstall",
+            "app_show_window", "show_window", "open_app_window", "app_open_window",
+            "app_hide_window", "hide_window", "app_background", "hide_app_window",
+            "device_notify", "notify_device", "device_notification", "send_notification",
+            "agent_account_switch", "switch_agent_account", "agent_profile_switch", "account_switch",
+            "terminal_output_status", "terminal_status", "terminal_output", "terminal_activity_status",
+            "plan_release_stage", "release_plan_stage", "plan_release", "release_stage",
+          ].includes(String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_"))) {
             return;
           }
           const receiptWorkspaceId = workspaceId || (agentPackageAction ? "device" : "");
@@ -19207,7 +19427,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, manageWorkspaceAgents, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
 
   const openSelectedWorkspaceSettings = useCallback(() => {
     if (selectedWorkspace) {
@@ -24901,6 +25121,8 @@ export default function App() {
                       architectureSelectedRepoPath={selectedWorkspaceGraphState.architectureSelectedRepoPath || ""}
                       architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
                       architectureState={selectedWorkspaceGraphState.architectureState || "idle"}
+                      connectedDevices={cloudWorkspaceProgress.connectedDevices}
+                      knownDevices={cloudWorkspaceProgress.knownDevices}
                       onArchitectureGraphListRefresh={refreshSelectedWorkspaceArchitectureGraphList}
                       onArchitectureSelectionChange={updateSelectedWorkspaceArchitectureSelection}
                       workspace={selectedWorkspace}

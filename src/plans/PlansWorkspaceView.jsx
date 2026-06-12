@@ -154,10 +154,112 @@ function dedupeRepoTargets(targets) {
     });
 }
 
-function initialSelectedRepoPath(repoTargets, rootDirectory, target) {
-  const preferred = cleanText(target?.repoPath || rootDirectory);
-  if (preferred) return preferred;
-  return dedupeRepoTargets(repoTargets)[0]?.repoPath || "";
+const TODO_DISPATCH_RECEIPTS_UPDATED_EVENT = "todo-dispatch-receipts-updated";
+const TERMINAL_TODO_HISTORY_REFRESH_MS = 15_000;
+const TERMINAL_TODO_NOW_TICK_MS = 30_000;
+const RECEIPT_SETTLED_STATUSES = new Set([
+  "completed",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "canceled",
+  "timed_out",
+]);
+
+function receiptStatusKind(status) {
+  const normalized = cleanText(status).toLowerCase();
+  if (normalized === "completed") return "completed";
+  if (["running", "dispatched", "accepted", "in_progress"].includes(normalized)) return "active";
+  if (["failed", "timed_out"].includes(normalized)) return "danger";
+  if (["interrupted", "cancelled", "canceled"].includes(normalized)) return "warn";
+  return "queued";
+}
+
+function receiptStatusLabel(status) {
+  const normalized = cleanText(status).toLowerCase();
+  if (normalized === "completed") return "Completed";
+  if (["running", "dispatched", "accepted", "in_progress"].includes(normalized)) return "Running";
+  if (normalized === "failed") return "Failed";
+  if (normalized === "timed_out") return "Timed out";
+  if (normalized === "interrupted") return "Interrupted";
+  if (["cancelled", "canceled"].includes(normalized)) return "Cancelled";
+  if (normalized === "listed") return "Listed";
+  return "Queued";
+}
+
+function relativeTimeLabel(ms, nowMs) {
+  const timestamp = Number(ms);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+  const elapsed = Math.max(0, (Number(nowMs) || Date.now()) - timestamp);
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  if (days < 31) return `${Math.floor(days / 7)}w ago`;
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}
+
+function durationLabel(startMs, endMs) {
+  const start = Number(startMs);
+  const end = Number(endMs);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start <= 0 || end <= start) {
+    return "";
+  }
+  const totalSeconds = Math.floor((end - start) / 1000);
+  if (totalSeconds < 60) return `${Math.max(totalSeconds, 1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 10) return `${minutes}m ${totalSeconds % 60}s`;
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
+function receiptIsSettled(status) {
+  return RECEIPT_SETTLED_STATUSES.has(cleanText(status).toLowerCase());
+}
+
+function receiptDurationParts(item, nowMs) {
+  if (!item?.receivedAtMs) return null;
+  if (receiptIsSettled(item.status)) {
+    const label = durationLabel(item.receivedAtMs, item.updatedAtMs);
+    return label ? { label, prefix: "took" } : null;
+  }
+  if (receiptStatusKind(item.status) === "active") {
+    const label = durationLabel(item.receivedAtMs, nowMs);
+    return label ? { label, prefix: "running" } : null;
+  }
+  return null;
+}
+
+function normalizeTerminalReceipts(receipts, paneId) {
+  const pane = cleanText(paneId);
+  if (!pane || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
+    return [];
+  }
+  return Object.entries(receipts)
+    .map(([key, receipt]) => {
+      if (!receipt || typeof receipt !== "object") return null;
+      if (cleanText(receipt.paneId) !== pane) return null;
+      const receivedAtMs = Number(receipt.receivedAtMs) || 0;
+      const updatedAtMs = Number(receipt.updatedAtMs) || receivedAtMs;
+      if (!receivedAtMs && !updatedAtMs) return null;
+      return {
+        commandId: cleanText(receipt.commandId) || cleanText(key),
+        itemId: cleanText(receipt.itemId),
+        receivedAtMs: receivedAtMs || updatedAtMs,
+        status: cleanText(receipt.status).toLowerCase() || "queued",
+        text: cleanText(receipt.text),
+        updatedAtMs,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.receivedAtMs - left.receivedAtMs);
 }
 
 function stepStatusLabel(status) {
@@ -484,9 +586,9 @@ export default function PlansWorkspaceView({
   workspace,
 }) {
   const target = selectedTerminal || EMPTY_TARGET;
-  const [selectedRepoPath, setSelectedRepoPath] = useState(() => (
-    initialSelectedRepoPath(repoTargets, rootDirectory, target)
-  ));
+  const [terminalTodoItems, setTerminalTodoItems] = useState([]);
+  const [selectedTodoKey, setSelectedTodoKey] = useState("");
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
   const [editingStepIndex, setEditingStepIndex] = useState(null);
@@ -516,17 +618,18 @@ export default function PlansWorkspaceView({
     }]);
   }, [repoTargets, rootDirectory, target.dbPath, target.mountId, target.repoPath]);
   const preferredRepoPath = target.repoPath || rootDirectory;
+  // The Plans tab is terminal-scoped: it always shows the selected terminal's
+  // repo — no repository picker.
   const activeRepoPath = useMemo(() => {
-    const selectedKey = pathIdentity(selectedRepoPath);
-    const selectedTarget = selectedKey
-      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === selectedKey)
-      : null;
     const preferredKey = pathIdentity(preferredRepoPath);
     const preferredTarget = preferredKey
       ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === preferredKey)
       : null;
-    return selectedTarget?.repoPath || preferredTarget?.repoPath || normalizedRepoTargets[0]?.repoPath || "";
-  }, [normalizedRepoTargets, preferredRepoPath, selectedRepoPath]);
+    return preferredTarget?.repoPath
+      || cleanText(preferredRepoPath)
+      || normalizedRepoTargets[0]?.repoPath
+      || "";
+  }, [normalizedRepoTargets, preferredRepoPath]);
   const activeRepoTarget = useMemo(() => {
     const activeKey = pathIdentity(activeRepoPath);
     return activeKey
@@ -581,9 +684,47 @@ export default function PlansWorkspaceView({
   const planCandidates = Array.isArray(scopedSnapshot?.history) ? scopedSnapshot.history : [];
   const activePlanCandidate = planCandidates.find((plan) => !planIsTerminal(plan)) || null;
   const latestPlanCandidate = planCandidates[0] || null;
-  const displayedPlan = selectedPlan && !planIsTerminal(selectedPlan)
+  const fallbackPlan = selectedPlan && !planIsTerminal(selectedPlan)
     ? selectedPlan
     : activePlanCandidate || selectedPlan || latestPlanCandidate || null;
+
+  // Plans link to todos by todo_id; receipts carry the queue item id and the
+  // remote command id, so try both.
+  const plansByTodoRef = useMemo(() => {
+    const map = new Map();
+    const register = (plan) => {
+      const todoRef = cleanText(plan?.todo_id || plan?.todoId);
+      if (todoRef && !map.has(todoRef)) {
+        map.set(todoRef, plan);
+      }
+    };
+    planCandidates.forEach(register);
+    if (selectedPlan) register(selectedPlan);
+    return map;
+  }, [planCandidates, selectedPlan]);
+  const planForTodo = useCallback((item) => {
+    if (!item) return null;
+    return (item.itemId && plansByTodoRef.get(item.itemId))
+      || (item.commandId && plansByTodoRef.get(item.commandId))
+      || null;
+  }, [plansByTodoRef]);
+
+  const openedTodo = useMemo(() => {
+    if (!terminalTodoItems.length) return null;
+    if (selectedTodoKey) {
+      const match = terminalTodoItems.find((item) => item.commandId === selectedTodoKey);
+      if (match) return match;
+    }
+    return terminalTodoItems[0];
+  }, [selectedTodoKey, terminalTodoItems]);
+  const openedTodoIsNewest = Boolean(openedTodo) && openedTodo === terminalTodoItems[0];
+  const openedTodoLinkedPlan = planForTodo(openedTodo);
+  // The newest todo also claims the terminal's active unlinked plan: plan ids
+  // and todo ids can come from different creation paths (voice, kernel), and
+  // an in-flight plan on this terminal belongs to the current todo.
+  const openedTodoPlan = openedTodoLinkedPlan
+    || (openedTodoIsNewest && fallbackPlan && !planIsTerminal(fallbackPlan) ? fallbackPlan : null);
+  const displayedPlan = openedTodo ? openedTodoPlan : fallbackPlan;
   const displayedPlanId = planIdentity(displayedPlan);
   const displayedPlanCanContinue = planCanContinue(displayedPlan);
   const titleMaxChars = Number(scopedSnapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
@@ -646,18 +787,58 @@ export default function PlansWorkspaceView({
     setError("");
   }, [activeSnapshotRequestKey, hasSnapshotScope, snapshotCacheKeys]);
 
+  // Per-terminal todo history from the Rust receipts ledger: every todo
+  // dispatched to this pane, with sent time and settle time.
   useEffect(() => {
-    if (activeRepoPath !== selectedRepoPath) {
-      setSelectedRepoPath(activeRepoPath);
+    const receiptsWorkspaceId = cleanText(workspaceId);
+    const paneId = cleanText(target.paneId);
+    setSelectedTodoKey("");
+    if (!receiptsWorkspaceId || !paneId) {
+      setTerminalTodoItems([]);
+      return undefined;
     }
-  }, [activeRepoPath, selectedRepoPath]);
+    let cancelled = false;
+    let unlisten = null;
+    const applyReceipts = (receipts) => {
+      if (cancelled) return;
+      setTerminalTodoItems(normalizeTerminalReceipts(receipts, paneId));
+    };
+    const refresh = () => {
+      invoke("todo_dispatch_receipts_get", { workspaceId: receiptsWorkspaceId })
+        .then((result) => applyReceipts(result?.receipts))
+        .catch(() => {});
+    };
+    refresh();
+    listen(TODO_DISPATCH_RECEIPTS_UPDATED_EVENT, (event) => {
+      if (cancelled) return;
+      const eventWorkspaceId = cleanText(event?.payload?.workspaceId || event?.payload?.workspace_id);
+      if (eventWorkspaceId && eventWorkspaceId !== receiptsWorkspaceId) return;
+      const receipts = event?.payload?.receipts;
+      if (receipts && typeof receipts === "object") {
+        applyReceipts(receipts);
+      } else {
+        refresh();
+      }
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+    const intervalId = window.setInterval(refresh, TERMINAL_TODO_HISTORY_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      if (typeof unlisten === "function") unlisten();
+    };
+  }, [target.paneId, workspaceId]);
 
+  // Relative "sent x ago" labels and live running durations stay current.
   useEffect(() => {
-    const preferredKey = pathIdentity(preferredRepoPath);
-    if (preferredKey && preferredKey !== pathIdentity(selectedRepoPath)) {
-      setSelectedRepoPath(preferredRepoPath);
-    }
-  }, [preferredRepoPath, selectedRepoPath]);
+    const intervalId = window.setInterval(() => setNowMs(Date.now()), TERMINAL_TODO_NOW_TICK_MS);
+    return () => window.clearInterval(intervalId);
+  }, []);
 
   const loadSnapshot = useCallback(async (options = {}) => {
     const silent = options?.silent === true;
@@ -987,24 +1168,35 @@ export default function PlansWorkspaceView({
           <PlansEyebrow>{headerMeta || "Terminal todo plan"}</PlansEyebrow>
           <PlansTitle>Plans</PlansTitle>
         </div>
-        {normalizedRepoTargets.length > 1 && (
-          <PlanRepoSelect
-            aria-label="Plan repository"
-            onChange={(event) => setSelectedRepoPath(event.target.value)}
-            value={activeRepoPath}
-          >
-            {normalizedRepoTargets.map((repoTarget) => (
-              <option key={repoTarget.repoPath} value={repoTarget.repoPath}>
-                {repoTargetLabel(repoTarget)}
-              </option>
-            ))}
-          </PlanRepoSelect>
+        {terminalTodoItems.length > 0 && (
+          <PlansCount>
+            {terminalTodoItems.length} todo{terminalTodoItems.length === 1 ? "" : "s"}
+          </PlansCount>
         )}
       </PlansHeader>
 
       {error && <FormMessage data-tone="danger">{error}</FormMessage>}
 
       <PlansBody>
+        {openedTodo && (
+          <TodoCard>
+            <TodoCardHeader>
+              <TodoCardLabel>{openedTodoIsNewest ? "Current todo" : "Todo"}</TodoCardLabel>
+              <TodoBadge data-kind={receiptStatusKind(openedTodo.status)}>
+                {receiptStatusLabel(openedTodo.status)}
+              </TodoBadge>
+            </TodoCardHeader>
+            <TodoCardText>{openedTodo.text || "(no todo text)"}</TodoCardText>
+            <TodoCardMeta>
+              <span>Sent {relativeTimeLabel(openedTodo.receivedAtMs, nowMs)}</span>
+              {(() => {
+                const duration = receiptDurationParts(openedTodo, nowMs);
+                return duration ? <span>{duration.prefix} {duration.label}</span> : null;
+              })()}
+              {!openedTodoPlan && <span>No plan</span>}
+            </TodoCardMeta>
+          </TodoCard>
+        )}
         {displayedPlan ? (
           <PlanPanel>
             <PlanPanelHeader>
@@ -1112,10 +1304,44 @@ export default function PlansWorkspaceView({
               })}
             </StepList>
           </PlanPanel>
-        ) : (
+        ) : !openedTodo ? (
           <EmptyPanel>
-            <PlanName>No plan</PlanName>
+            <PlanName>No todos yet</PlanName>
+            <EmptyHint>Todos sent to this terminal appear here with their plans.</EmptyHint>
           </EmptyPanel>
+        ) : null}
+
+        {terminalTodoItems.length > 1 && (
+          <>
+            <HistorySectionLabel>History</HistorySectionLabel>
+            <HistoryList>
+              {terminalTodoItems.map((item, index) => {
+                const kind = receiptStatusKind(item.status);
+                const duration = receiptDurationParts(item, nowMs);
+                const hasPlan = Boolean(planForTodo(item))
+                  || (index === 0 && Boolean(fallbackPlan && !planIsTerminal(fallbackPlan)));
+                return (
+                  <HistoryRow
+                    data-selected={openedTodo === item ? "true" : "false"}
+                    key={item.commandId}
+                    onClick={() => setSelectedTodoKey(item.commandId)}
+                    type="button"
+                  >
+                    <HistoryRowTop>
+                      <HistoryStatusDot aria-hidden="true" data-kind={kind} />
+                      <HistoryRowText>{item.text || "(no todo text)"}</HistoryRowText>
+                      {hasPlan && <HistoryPlanChip>Plan</HistoryPlanChip>}
+                    </HistoryRowTop>
+                    <HistoryRowMeta>
+                      <HistoryBadge data-kind={kind}>{receiptStatusLabel(item.status)}</HistoryBadge>
+                      <span>{relativeTimeLabel(item.receivedAtMs, nowMs)}</span>
+                      {duration && <span>{duration.prefix} {duration.label}</span>}
+                    </HistoryRowMeta>
+                  </HistoryRow>
+                );
+              })}
+            </HistoryList>
+          </>
         )}
       </PlansBody>
     </PlansSurface>
@@ -1157,28 +1383,219 @@ const PlansTitle = styled.h2`
   line-height: 1.1;
 `;
 
-const PlanRepoSelect = styled.select`
+const PlansCount = styled.span`
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border: 1px solid rgba(216, 226, 240, 0.14);
+  border-radius: 999px;
+  color: rgba(216, 226, 240, 0.66);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+`;
+
+const TodoCard = styled.article`
+  flex: 0 0 auto;
   min-width: 0;
-  width: min(150px, 42%);
-  height: 30px;
-  padding: 0 26px 0 10px;
-  border: 1px solid rgba(216, 226, 240, 0.16);
-  border-radius: 7px;
-  color: #dbe7f8;
-  background: rgba(255, 255, 255, 0.055);
-  color-scheme: dark;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 760;
-  line-height: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  margin-bottom: 10px;
+  padding: 11px 12px;
+  border: 1px solid rgba(216, 226, 240, 0.12);
+  border-radius: 8px;
+  background: rgba(11, 16, 24, 0.68);
+`;
+
+const TodoCardHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const TodoCardLabel = styled.span`
+  color: rgba(214, 225, 241, 0.6);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+`;
+
+const TodoBadge = styled.span`
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 999px;
+  color: #c7d2e5;
+  background: rgba(148, 163, 184, 0.09);
+  font-size: 10.5px;
+  font-weight: 800;
   white-space: nowrap;
 
-  option {
-    color: #f4f7fa;
-    background: #0d1117;
+  &[data-kind="completed"] {
+    color: #baf0ca;
+    border-color: rgba(92, 214, 132, 0.24);
+    background: rgba(52, 180, 96, 0.12);
   }
+
+  &[data-kind="active"] {
+    color: #a9d2ff;
+    border-color: rgba(100, 180, 255, 0.22);
+    background: rgba(46, 126, 245, 0.12);
+  }
+
+  &[data-kind="danger"] {
+    color: #ffb3b3;
+    border-color: rgba(255, 110, 110, 0.26);
+    background: rgba(190, 50, 50, 0.14);
+  }
+
+  &[data-kind="warn"] {
+    color: #ffd2a6;
+    border-color: rgba(255, 167, 84, 0.24);
+    background: rgba(214, 113, 48, 0.14);
+  }
+`;
+
+const TodoCardText = styled.p`
+  display: -webkit-box;
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: #ecf4ff;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+`;
+
+const TodoCardMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 8px;
+  color: rgba(216, 226, 240, 0.58);
+  font-size: 11px;
+  line-height: 1.3;
+`;
+
+const EmptyHint = styled.p`
+  margin: 0;
+  color: rgba(216, 226, 240, 0.55);
+  font-size: 11.5px;
+  line-height: 1.4;
+`;
+
+const HistorySectionLabel = styled.span`
+  flex: 0 0 auto;
+  margin: 12px 2px 6px;
+  color: rgba(214, 225, 241, 0.55);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+`;
+
+const HistoryList = styled.div`
+  display: grid;
+  flex: 0 0 auto;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const HistoryRow = styled.button`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(216, 226, 240, 0.1);
+  border-radius: 8px;
+  color: inherit;
+  background: rgba(11, 16, 24, 0.5);
+  cursor: pointer;
+  text-align: left;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.28);
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(125, 176, 255, 0.4);
+    background: rgba(34, 64, 110, 0.18);
+  }
+`;
+
+const HistoryRowTop = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+`;
+
+const HistoryStatusDot = styled.span`
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(216, 226, 240, 0.45);
+
+  &[data-kind="completed"] {
+    background: #5cd684;
+  }
+
+  &[data-kind="active"] {
+    background: #74abff;
+    box-shadow: 0 0 0 3px rgba(116, 171, 255, 0.16);
+  }
+
+  &[data-kind="danger"] {
+    background: #ff7a7a;
+  }
+
+  &[data-kind="warn"] {
+    background: #ffa754;
+  }
+`;
+
+const HistoryRowText = styled.span`
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #e7eefb;
+  font-size: 12px;
+  font-weight: 680;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const HistoryPlanChip = styled.span`
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid rgba(167, 139, 250, 0.3);
+  border-radius: 999px;
+  color: #d6c9ff;
+  background: rgba(124, 92, 230, 0.14);
+  font-size: 10px;
+  font-weight: 850;
+`;
+
+const HistoryRowMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  color: rgba(216, 226, 240, 0.55);
+  font-size: 10.5px;
+  line-height: 1.3;
+`;
+
+const HistoryBadge = styled(TodoBadge)`
+  padding: 2px 7px;
+  font-size: 10px;
 `;
 
 const IconButton = styled.button`

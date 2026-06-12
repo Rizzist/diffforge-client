@@ -392,6 +392,9 @@ function normalizeTranscriptionResult(value) {
         ? "forge-nova3-dictation"
         : "whisper-local";
   const audioMs = Number(value.audioMs || value.durationMs || 0);
+  // Turnaround time: releasing the record button (request submitted) to the
+  // transcript landing.
+  const latencyMs = Number(value.latencyMs || 0);
   const rawLanguage = typeof value.language === "string" ? value.language.trim() : "";
   const wordCount = text.split(/\s+/).filter(Boolean).length;
 
@@ -404,6 +407,7 @@ function normalizeTranscriptionResult(value) {
     id: typeof value.id === "string" ? value.id : String(Date.now()),
     audioMs: Number.isFinite(audioMs) && audioMs > 0 ? Math.round(audioMs) : 0,
     language: rawLanguage ? normalizeDeepgramLanguage(rawLanguage) : "",
+    latencyMs: Number.isFinite(latencyMs) && latencyMs > 0 ? Math.round(latencyMs) : 0,
     provider,
     source,
     sourceText,

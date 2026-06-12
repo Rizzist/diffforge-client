@@ -780,17 +780,35 @@ struct AudioState {
     cloud_voice_agent_stream: Arc<Mutex<Option<CloudVoiceAgentSession>>>,
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
     forge_dictation_stream: Arc<Mutex<Option<ForgeDictationSession>>>,
+    // True while an active dictation session has borrowed the microphone from
+    // a live cloud voice agent session; dictation teardown hands it back.
+    forge_dictation_mic_borrowed: Arc<AtomicBool>,
     forge_dictation_warm: Arc<Mutex<Option<ForgeDictationWarmSlot>>>,
     forge_dictation_warm_desired: Arc<AtomicBool>,
     forge_dictation_warm_generation: Arc<AtomicU64>,
     input_worker: NativeAudioWorker,
     realtime_stream_lock: Arc<Mutex<()>>,
+    // Who currently owns the single realtime microphone outlet. Teardown
+    // paths only detach when they still own it, so one consumer releasing
+    // never rips the stream away from another (mic arbitration).
+    realtime_mic_holder: Arc<StdMutex<RealtimeMicHolder>>,
     shortcut_manager: AudioShortcutManager,
     whisper_cancel_token: Arc<AtomicU64>,
     whisper_engine: WhisperCliWarmCache,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RealtimeMicHolder {
+    None,
+    VoiceAgent,
+    Dictation,
+    Deepgram,
+}
+
 struct CloudVoiceAgentSession {
+    // Kept so mic arbitration can re-attach the agent's audio feed after a
+    // dictation session that borrowed the microphone finishes.
+    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     control_tx: mpsc::UnboundedSender<CloudVoiceAgentControl>,
     finished_rx: oneshot::Receiver<Result<(), String>>,
 }
@@ -4165,11 +4183,13 @@ pub fn run() {
             cloud_voice_agent_stream: Arc::new(Mutex::new(None)),
             deepgram_stream: Arc::new(Mutex::new(None)),
             forge_dictation_stream: Arc::new(Mutex::new(None)),
+            forge_dictation_mic_borrowed: Arc::new(AtomicBool::new(false)),
             forge_dictation_warm: Arc::new(Mutex::new(None)),
             forge_dictation_warm_desired: Arc::new(AtomicBool::new(false)),
             forge_dictation_warm_generation: Arc::new(AtomicU64::new(0)),
             input_worker: NativeAudioWorker::new(),
             realtime_stream_lock: Arc::new(Mutex::new(())),
+            realtime_mic_holder: Arc::new(StdMutex::new(RealtimeMicHolder::None)),
             shortcut_manager: AudioShortcutManager::new(),
             whisper_cancel_token: Arc::new(AtomicU64::new(0)),
             whisper_engine: WhisperCliWarmCache::new(),
@@ -4212,8 +4232,11 @@ pub fn run() {
             );
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
-            // (The tray icon is created only when background mode is entered.)
             todo_dispatch_start_background_dispatcher(app.handle().clone());
+            // Always-present tray: with the main window up its click toggles
+            // the recent-snips strip; in background mode, the monitor popover.
+            // (Setup runs on the main thread, which NSStatusItem requires.)
+            background_tray_create(app.handle());
             todo_store_orphan_sweep_start(app.handle().clone());
             agent_accounts_capture_watch_start(app.handle().clone());
             {
@@ -4375,6 +4398,8 @@ pub fn run() {
             snipping_open_annotation_editor,
             snipping_read_asset_data_url,
             snipping_open_snip_float,
+            snipping_recent_snips,
+            snipping_toggle_snip_strip,
             snipping_float_assigned_path,
             snipping_preview_drag_started,
             snipping_consume_snip_preview,

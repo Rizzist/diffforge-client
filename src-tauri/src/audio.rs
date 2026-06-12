@@ -72,6 +72,92 @@ fn forge_voice_route_cache_fresh(ws_path: &str) -> Option<(CloudMcpWsTarget, Opt
     Some((cached.ws_target.clone(), cached.auth_bearer.clone()))
 }
 
+/// Frontend notification for mic arbitration: the voice agent's microphone
+/// feed was paused (dictation borrowed the mic) or resumed (dictation ended).
+const FORGE_VOICE_AGENT_MIC_EVENT: &str = "forge-voice-agent-mic";
+
+fn realtime_mic_holder_get(audio_state: &AudioState) -> RealtimeMicHolder {
+    audio_state
+        .realtime_mic_holder
+        .lock()
+        .map(|holder| *holder)
+        .unwrap_or(RealtimeMicHolder::None)
+}
+
+fn realtime_mic_holder_set(audio_state: &AudioState, holder: RealtimeMicHolder) {
+    if let Ok(mut slot) = audio_state.realtime_mic_holder.lock() {
+        *slot = holder;
+    }
+}
+
+/// Detaches the realtime microphone outlet only while `path` still owns it.
+/// A consumer whose mic was borrowed (or that already released it) must not
+/// rip the stream away from the current holder.
+fn realtime_mic_detach_for(
+    audio_state: &AudioState,
+    path: RealtimeMicHolder,
+) -> Result<(), String> {
+    if realtime_mic_holder_get(audio_state) != path {
+        return Ok(());
+    }
+    realtime_mic_holder_set(audio_state, RealtimeMicHolder::None);
+    audio_state.input_worker.detach_realtime_stream()
+}
+
+fn emit_voice_agent_mic_event(app: &AppHandle, state: &str, reason: &str) {
+    let _ = app.emit(
+        FORGE_VOICE_AGENT_MIC_EVENT,
+        json!({ "state": state, "reason": reason }),
+    );
+}
+
+/// Returns the microphone after a dictation session ends (any path): detaches
+/// dictation's feed and, when a live voice agent session lent the mic, quietly
+/// re-attaches the agent's audio stream so it resumes listening without a
+/// session restart — and without replaying what was dictated meanwhile.
+async fn forge_dictation_release_mic(app: &AppHandle, audio_state: &AudioState) {
+    let borrowed = audio_state
+        .forge_dictation_mic_borrowed
+        .swap(false, Ordering::SeqCst);
+    if realtime_mic_holder_get(audio_state) != RealtimeMicHolder::Dictation {
+        return;
+    }
+    realtime_mic_holder_set(audio_state, RealtimeMicHolder::None);
+    let _ = audio_state.input_worker.detach_realtime_stream();
+    if !borrowed {
+        return;
+    }
+    let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
+    let Some(session) = session_guard.as_mut() else {
+        return;
+    };
+    // The lender finished while dictation held the mic: reap it instead of
+    // re-attaching a dead consumer.
+    match session.finished_rx.try_recv() {
+        Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            *session_guard = None;
+            return;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+    }
+    match audio_state
+        .input_worker
+        .attach_realtime_stream_silent(session.audio_tx.clone())
+    {
+        Ok(_) => {
+            realtime_mic_holder_set(audio_state, RealtimeMicHolder::VoiceAgent);
+            emit_voice_agent_mic_event(app, "resumed", "dictation_finished");
+            log_audio_diagnostic_event("audio.cloud_voice.mic.resumed", json!({}));
+        }
+        Err(error) => {
+            log_audio_diagnostic_event(
+                "audio.cloud_voice.mic.resume_failed",
+                json!({ "error": error }),
+            );
+        }
+    }
+}
+
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
 }
@@ -316,6 +402,10 @@ struct NativeAudioSession {
 enum NativeAudioCommand {
     AttachRealtime {
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+        // When false, skip replaying buffered capture-window audio into the
+        // new consumer (used when mic arbitration resumes a paused consumer:
+        // it must not hear what was spoken while another consumer held the mic).
+        replay_buffered: bool,
         response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
     },
     Begin {
@@ -356,9 +446,31 @@ impl NativeAudioWorker {
         &self,
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<AudioInputMonitorStatus, String> {
+        self.attach_realtime_stream_with_replay(audio_tx, true)
+    }
+
+    /// Attach without replaying buffered capture-window audio: mic
+    /// arbitration resume must not feed a paused consumer the speech that was
+    /// captured while another consumer held the microphone.
+    fn attach_realtime_stream_silent(
+        &self,
+        audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<AudioInputMonitorStatus, String> {
+        self.attach_realtime_stream_with_replay(audio_tx, false)
+    }
+
+    fn attach_realtime_stream_with_replay(
+        &self,
+        audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+        replay_buffered: bool,
+    ) -> Result<AudioInputMonitorStatus, String> {
         let (response, response_rx) = std::sync::mpsc::channel();
         self.command_tx
-            .send(NativeAudioCommand::AttachRealtime { audio_tx, response })
+            .send(NativeAudioCommand::AttachRealtime {
+                audio_tx,
+                replay_buffered,
+                response,
+            })
             .map_err(|_| "Native audio worker is unavailable.".to_string())?;
         response_rx
             .recv()
@@ -442,8 +554,13 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
 
     while let Ok(command) = command_rx.recv() {
         match command {
-            NativeAudioCommand::AttachRealtime { audio_tx, response } => {
-                let result = attach_native_audio_realtime_stream(session.as_ref(), audio_tx);
+            NativeAudioCommand::AttachRealtime {
+                audio_tx,
+                replay_buffered,
+                response,
+            } => {
+                let result =
+                    attach_native_audio_realtime_stream(session.as_ref(), audio_tx, replay_buffered);
                 let _ = response.send(result);
             }
             NativeAudioCommand::Begin { response } => {
@@ -1184,6 +1301,7 @@ fn native_audio_status(session: &NativeAudioSession) -> AudioInputMonitorStatus 
 fn attach_native_audio_realtime_stream(
     session: Option<&NativeAudioSession>,
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    replay_buffered: bool,
 ) -> Result<AudioInputMonitorStatus, String> {
     let active_session = session
         .ok_or_else(|| "Enable an input source before starting cloud transcription.".to_string())?;
@@ -1196,15 +1314,17 @@ fn attach_native_audio_realtime_stream(
         let mut buffered_chunks = 0u64;
         let mut buffered_input_ms = 0.0f64;
 
-        if let Some(capture_started_at) = shared.capture_started_at {
-            for chunk in shared
-                .chunks
-                .iter()
-                .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
-            {
-                buffered_chunks += 1;
-                buffered_input_ms += chunk.duration_ms;
-                buffered_audio.push(encode_linear16_audio(&chunk.samples));
+        if replay_buffered {
+            if let Some(capture_started_at) = shared.capture_started_at {
+                for chunk in shared
+                    .chunks
+                    .iter()
+                    .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
+                {
+                    buffered_chunks += 1;
+                    buffered_input_ms += chunk.duration_ms;
+                    buffered_audio.push(encode_linear16_audio(&chunk.samples));
+                }
             }
         }
 
@@ -4591,7 +4711,7 @@ async fn start_cloud_voice_agent_stream(
             match session.finished_rx.try_recv() {
                 Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     *session_guard = None;
-                    let _ = audio_state.input_worker.detach_realtime_stream();
+                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
@@ -4602,7 +4722,17 @@ async fn start_cloud_voice_agent_stream(
         if audio_state.deepgram_stream.lock().await.is_some() {
             return Err("Deepgram realtime transcription is already active.".to_string());
         }
+        // Mic arbitration is one-directional on purpose: dictation may borrow
+        // the mic from a live agent session, but a new agent session must not
+        // steal the mic from an in-flight dictation.
+        if audio_state.forge_dictation_stream.lock().await.is_some() {
+            return Err(
+                "Diff Forge Cloud dictation is active. Finish dictating before starting the voice agent."
+                    .to_string(),
+            );
+        }
 
+        let session_audio_tx = audio_tx.clone();
         let status = match audio_state.input_worker.attach_realtime_stream(audio_tx) {
             Ok(status) => status,
             Err(error) => {
@@ -4619,6 +4749,7 @@ async fn start_cloud_voice_agent_stream(
                 return Err(error);
             }
         };
+        realtime_mic_holder_set(&audio_state, RealtimeMicHolder::VoiceAgent);
         spawn_cloud_voice_agent_desktop_log(
             cloud_mcp_state.inner(),
             "audio_input_attached",
@@ -4719,6 +4850,7 @@ async fn start_cloud_voice_agent_stream(
             finished_tx,
         ));
         *session_guard = Some(CloudVoiceAgentSession {
+            audio_tx: session_audio_tx,
             control_tx,
             finished_rx,
         });
@@ -4752,7 +4884,7 @@ async fn start_cloud_voice_agent_stream(
             let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
             let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
             *session_guard = None;
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
         }
         spawn_cloud_voice_agent_desktop_log(
             cloud_mcp_state.inner(),
@@ -4988,7 +5120,9 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
     };
 
     let _ = session.control_tx.send(CloudVoiceAgentControl::Stop);
-    audio_state.input_worker.detach_realtime_stream()?;
+    // Guarded detach: when dictation borrowed the mic, the agent no longer
+    // owns it and must leave dictation's feed untouched.
+    realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent)?;
 
     timeout(
         Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS),
@@ -5015,7 +5149,7 @@ async fn finish_cloud_voice_agent_input(audio_state: State<'_, AudioState>) -> R
     };
 
     let _ = control_tx.send(CloudVoiceAgentControl::FinishInput);
-    audio_state.input_worker.detach_realtime_stream()?;
+    realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent)?;
     log_audio_diagnostic_event("audio.cloud_voice.finish_input.done", json!({}));
     Ok(())
 }
@@ -5203,9 +5337,13 @@ async fn start_deepgram_realtime_transcription(
     if audio_state.cloud_voice_agent_stream.lock().await.is_some() {
         return Err("Cloud voice agent stream is already active.".to_string());
     }
+    if audio_state.forge_dictation_stream.lock().await.is_some() {
+        return Err("Diff Forge Cloud dictation is already active.".to_string());
+    }
 
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;
+    realtime_mic_holder_set(&audio_state, RealtimeMicHolder::Deepgram);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
 
@@ -5222,15 +5360,15 @@ async fn start_deepgram_realtime_transcription(
     match timeout(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS), ready_rx).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
             return Err(error);
         }
         Ok(Err(_closed)) => {
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
             return Err("Deepgram realtime stream closed before it was ready.".to_string());
         }
         Err(_elapsed) => {
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
             return Err("Deepgram realtime stream timed out while connecting.".to_string());
         }
     }
@@ -5272,7 +5410,7 @@ async fn stop_deepgram_realtime_transcription(
         });
     };
 
-    audio_state.input_worker.detach_realtime_stream()?;
+    realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram)?;
 
     let result = timeout(
         Duration::from_secs(DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS),
@@ -5927,14 +6065,45 @@ async fn start_forge_dictation_transcription(
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let mut session_guard = audio_state.forge_dictation_stream.lock().await;
 
+    if let Some(session) = session_guard.as_mut() {
+        // Reap a dictation session that ended without a stop command (for
+        // example a dropped websocket) instead of refusing the new start.
+        match session.finished_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                *session_guard = None;
+                let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Dictation);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+    }
     if session_guard.is_some() {
         return Err("Diff Forge Cloud dictation is already active.".to_string());
     }
     if audio_state.deepgram_stream.lock().await.is_some() {
         return Err("Deepgram realtime transcription is already active.".to_string());
     }
-    if audio_state.cloud_voice_agent_stream.lock().await.is_some() {
-        return Err("Cloud voice agent stream is already active.".to_string());
+
+    // Mic arbitration: a live voice agent session no longer blocks dictation.
+    // Dictation borrows the microphone (attaching below replaces the agent's
+    // feed, which to the cloud session is indistinguishable from silence) and
+    // teardown hands it back. A session that already released its input
+    // (manual finish) or has finished is not a lender.
+    let mut borrowed_from_voice_agent = false;
+    {
+        let mut agent_guard = audio_state.cloud_voice_agent_stream.lock().await;
+        if let Some(agent) = agent_guard.as_mut() {
+            match agent.finished_rx.try_recv() {
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    *agent_guard = None;
+                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    if realtime_mic_holder_get(&audio_state) == RealtimeMicHolder::VoiceAgent {
+                        borrowed_from_voice_agent = true;
+                    }
+                }
+            }
+        }
     }
 
     // Attach the microphone before any network work: captured audio buffers
@@ -5942,6 +6111,14 @@ async fn start_forge_dictation_transcription(
     // none of the user's speech.
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;
+    realtime_mic_holder_set(&audio_state, RealtimeMicHolder::Dictation);
+    audio_state
+        .forge_dictation_mic_borrowed
+        .store(borrowed_from_voice_agent, Ordering::SeqCst);
+    if borrowed_from_voice_agent {
+        emit_voice_agent_mic_event(&app, "paused", "dictation_started");
+        log_audio_diagnostic_event("audio.cloud_voice.mic.paused", json!({}));
+    }
 
     // Prefer the parked warm websocket (already authenticated and ready on
     // the cloud side); fall back to a cold connect when none is available.
@@ -5965,7 +6142,7 @@ async fn start_forge_dictation_transcription(
                     auth_bearer,
                 },
                 Err(error) => {
-                    let _ = audio_state.input_worker.detach_realtime_stream();
+                    forge_dictation_release_mic(&app, &audio_state).await;
                     return Err(error);
                 }
             },
@@ -5975,6 +6152,8 @@ async fn start_forge_dictation_transcription(
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ForgeDictationControl>();
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
+    // The run task takes `app`; keep a handle for mic release on failure.
+    let app_handle = app.clone();
 
     let start_request = json!({
         "kind": "start",
@@ -6001,15 +6180,15 @@ async fn start_forge_dictation_transcription(
     match timeout(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS), ready_rx).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            forge_dictation_release_mic(&app_handle, &audio_state).await;
             return Err(error);
         }
         Ok(Err(_closed)) => {
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            forge_dictation_release_mic(&app_handle, &audio_state).await;
             return Err("Cloud dictation closed before it was ready.".to_string());
         }
         Err(_elapsed) => {
-            let _ = audio_state.input_worker.detach_realtime_stream();
+            forge_dictation_release_mic(&app_handle, &audio_state).await;
             return Err("Cloud dictation timed out while connecting.".to_string());
         }
     }
@@ -6041,6 +6220,7 @@ async fn start_forge_dictation_transcription(
 
 #[tauri::command]
 async fn stop_forge_dictation_transcription(
+    app: AppHandle,
     audio_state: State<'_, AudioState>,
     request: Option<ForgeDictationStopRequest>,
 ) -> Result<ForgeDictationResult, String> {
@@ -6073,7 +6253,9 @@ async fn stop_forge_dictation_transcription(
     } else {
         ForgeDictationControl::Finish
     });
-    audio_state.input_worker.detach_realtime_stream()?;
+    // Hands the mic back to a voice agent session that lent it (mic
+    // arbitration); plain dictation just detaches.
+    forge_dictation_release_mic(&app, &audio_state).await;
 
     let result = timeout(
         Duration::from_secs(CLOUD_DICTATION_RESULT_TIMEOUT_SECS),

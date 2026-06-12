@@ -738,6 +738,21 @@ function AssetsPanel({
     });
   }, [cloudSettingsOpen, refreshClouds]);
 
+  // Custom clouds should be selectable chips from the first render, not only
+  // after the settings panel has been opened once.
+  useEffect(() => {
+    void refreshClouds().catch(() => {});
+  }, [refreshClouds]);
+
+  useEffect(() => {
+    if (!cloudSettingsOpen) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") setCloudSettingsOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [cloudSettingsOpen]);
+
   const runCloudSettingsAction = useCallback(async (action, payload = {}) => {
     const cloudId = text(payload.cloudId || payload.cloud_id || payload.id);
     const key = `${action}:${cloudId || "new"}`;
@@ -752,6 +767,26 @@ function AssetsPanel({
           workspaceName: null,
           cloud: payload,
         });
+        const savedCloud = jsonObject(response?.cloud) || {};
+        const savedCloudId = text(savedCloud.cloudId || savedCloud.cloud_id || savedCloud.id);
+        if (savedCloudId) {
+          // A freshly added bucket becomes the active sync target right away
+          // and is probed immediately so its verified/error status is honest.
+          setSelectedCloudId(savedCloudId);
+          try {
+            await invoke("cloud_mcp_validate_asset_cloud", {
+              repoPath,
+              workspaceId: null,
+              workspaceName: null,
+              cloudId: savedCloudId,
+            });
+          } catch (validationError) {
+            setCloudSettingsError(
+              `Cloud added, but the bucket check failed: ${validationError?.message || validationError}`,
+            );
+          }
+          response = { clouds: await refreshClouds() };
+        }
       } else if (action === "validate") {
         response = await invoke("cloud_mcp_validate_asset_cloud", {
           repoPath,
@@ -1111,6 +1146,7 @@ function AssetsPanel({
           clouds={clouds}
           error={cloudSettingsError}
           onAction={runCloudSettingsAction}
+          onClose={() => setCloudSettingsOpen(false)}
           selectedCloudId={effectiveCloudId}
         />
       )}
@@ -1397,6 +1433,7 @@ function AssetCloudSettingsPanel({
   clouds = [],
   error = "",
   onAction,
+  onClose = null,
   selectedCloudId = DEFAULT_ASSET_CLOUD_ID,
 }) {
   const [form, setForm] = useState({
@@ -1414,14 +1451,24 @@ function AssetCloudSettingsPanel({
     setForm((current) => ({ ...current, [key]: value }));
   }, []);
   const providerKind = text(form.providerKind, "s3");
+  // AWS S3 endpoints are derivable from the region; R2/B2 endpoints carry the
+  // account/cluster and must be supplied.
+  const endpointRequired = providerKind !== "s3";
+  const endpointPlaceholder = providerKind === "r2"
+    ? "https://<account-id>.r2.cloudflarestorage.com"
+    : providerKind === "b2"
+      ? "https://s3.<region>.backblazeb2.com"
+      : "Endpoint URL (optional for AWS S3)";
   const canSave = text(form.label)
     && text(form.bucket)
-    && text(form.endpoint)
+    && (!endpointRequired || text(form.endpoint))
     && text(form.accessKeyId)
     && text(form.secretAccessKey);
   const submit = useCallback(async (event) => {
     event.preventDefault();
     if (!canSave || typeof onAction !== "function") return;
+    const endpoint = text(form.endpoint)
+      || (providerKind === "s3" ? `https://s3.${text(form.region, "us-east-1")}.amazonaws.com` : "");
     const response = await onAction("save", {
       bucket: form.bucket,
       credentials: {
@@ -1432,7 +1479,7 @@ function AssetCloudSettingsPanel({
       },
       defaultCloud: form.makeDefault,
       default_cloud: form.makeDefault,
-      endpoint: form.endpoint,
+      endpoint,
       keyPrefix: form.keyPrefix,
       key_prefix: form.keyPrefix,
       label: form.label,
@@ -1455,17 +1502,38 @@ function AssetCloudSettingsPanel({
 
   return (
     <AssetCloudSettings>
+      <AssetCloudSettingsHeader>
+        <div>
+          <strong>Asset clouds</strong>
+          <span>Diff Forge AI Cloud is built in. Add your own S3, R2, or B2 buckets for asset syncing.</span>
+        </div>
+        {typeof onClose === "function" && (
+          <AssetMiniButton aria-label="Close asset cloud settings" onClick={() => onClose()} type="button">
+            Close
+          </AssetMiniButton>
+        )}
+      </AssetCloudSettingsHeader>
       <AssetCloudList>
         {clouds.map((cloud) => {
           const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
           const builtin = cloudId === DEFAULT_ASSET_CLOUD_ID || cloud.builtin;
           const isDefault = Boolean(cloud.defaultCloud || cloud.default_cloud);
+          const status = text(cloud.status, "active");
+          const verified = Boolean(text(cloud.validatedAt || cloud.validated_at)) && status === "active";
+          const detail = (builtin
+            ? ["Managed by Diff Forge", isDefault ? "default" : ""]
+            : [
+              text(cloud.providerKind || cloud.provider_kind || cloud.provider, "cloud"),
+              verified ? "verified" : status,
+              isDefault ? "default" : "",
+            ]
+          ).filter(Boolean).join(" · ");
           return (
             <AssetCloudRow data-active={cloudId === selectedCloudId} key={cloudId}>
               <Cloud aria-hidden="true" />
               <AssetCloudRowText>
                 <strong>{text(cloud.label || cloud.name, cloudId)}</strong>
-                <span>{text(cloud.providerKind || cloud.provider_kind || cloud.provider, "cloud")} {isDefault ? "· default" : ""}</span>
+                <span>{detail}</span>
               </AssetCloudRowText>
               <AssetCloudRowActions>
                 {!builtin && (
@@ -1506,6 +1574,10 @@ function AssetCloudSettingsPanel({
         })}
       </AssetCloudList>
       <AssetCloudForm onSubmit={submit}>
+        <AssetCloudFormTitle>
+          <strong>Add custom cloud</strong>
+          <span>Bucket credentials are stored cloud-side and verified with a write probe after adding.</span>
+        </AssetCloudFormTitle>
         <AssetProviderTabs aria-label="Cloud provider">
           {["s3", "r2", "b2"].map((provider) => (
             <AssetProviderButton
@@ -1526,7 +1598,7 @@ function AssetCloudSettingsPanel({
         <AssetCloudFields>
           <AssetCloudInput aria-label="Cloud label" placeholder="Cloud label" value={form.label} onChange={(event) => setField("label", event.target.value)} />
           <AssetCloudInput aria-label="Bucket" placeholder="Bucket" value={form.bucket} onChange={(event) => setField("bucket", event.target.value)} />
-          <AssetCloudInput aria-label="Endpoint" placeholder="Endpoint URL" value={form.endpoint} onChange={(event) => setField("endpoint", event.target.value)} />
+          <AssetCloudInput aria-label="Endpoint" placeholder={endpointPlaceholder} value={form.endpoint} onChange={(event) => setField("endpoint", event.target.value)} />
           <AssetCloudInput aria-label="Region" placeholder="Region" value={form.region} onChange={(event) => setField("region", event.target.value)} />
           <AssetCloudInput aria-label="Key prefix" placeholder="Key prefix" value={form.keyPrefix} onChange={(event) => setField("keyPrefix", event.target.value)} />
           <AssetCloudInput aria-label="Access key id" placeholder="Access key id" value={form.accessKeyId} onChange={(event) => setField("accessKeyId", event.target.value)} />
@@ -2163,6 +2235,57 @@ const AssetCloudSettings = styled.div`
 
   @media (max-width: 820px) {
     grid-template-columns: 1fr;
+  }
+`;
+
+const AssetCloudSettingsHeader = styled.div`
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+
+  > div {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  strong {
+    color: rgba(241, 245, 249, 0.94);
+    font-size: 11px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 9px;
+    font-weight: 720;
+  }
+`;
+
+const AssetCloudFormTitle = styled.div`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+
+  strong {
+    color: rgba(226, 232, 240, 0.92);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.78);
+    font-size: 9px;
+    font-weight: 720;
   }
 `;
 

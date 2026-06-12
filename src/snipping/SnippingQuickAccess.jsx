@@ -22,7 +22,9 @@ import { Send } from "@styled-icons/material-rounded/Send";
 import { TextFields } from "@styled-icons/material-rounded/TextFields";
 import { Texture } from "@styled-icons/material-rounded/Texture";
 import { Undo } from "@styled-icons/material-rounded/Undo";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
+import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import styled, { createGlobalStyle } from "styled-components";
 
@@ -40,6 +42,10 @@ const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
 export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
 export const SNIPPING_FLOAT_HASH = "#/snipping-float";
+export const SNIPPING_STRIP_HASH = "#/snipping-strip";
+
+const SNIPPING_STRIP_ANIM_EVENT = "forge-snip-strip-anim";
+const SNIPPING_STRIP_RECENT_LIMIT = 16;
 
 
 // Quick-access tools. Closed shapes (rect/oval) are one abstract "shape" tool
@@ -835,6 +841,429 @@ const FloatStatusPill = styled.span`
   white-space: nowrap;
 `;
 
+/**
+ * One recent-snip tile: the floating preview's exact look and hover actions
+ * (upload, copy, annotate, delete) minus the close button — dismissal belongs
+ * to the queue surface only. Click opens the standalone draggable preview.
+ */
+function SnipStripTile({ snip, onRemoved }) {
+  const localPath = text(snip?.path);
+  const name = useMemo(() => assetName({ localPath }), [localPath]);
+  const [imageVersion, setImageVersion] = useState(0);
+  const previewUrl = useMemo(() => {
+    const url = assetPreviewUrl({ localPath });
+    if (!url || !imageVersion) return url;
+    return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
+  }, [imageVersion, localPath]);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const statusTimerRef = useRef(0);
+  const localPathRef = useRef(localPath);
+
+  useEffect(() => {
+    localPathRef.current = localPath;
+  }, [localPath]);
+
+  // Annotated saves land in the same file (or an edited copy event): bump the
+  // cache-buster so the tile tracks the latest pixels.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const original = text(payload.originalPath || payload.original_path);
+      const edited = text(payload.editedPath || payload.edited_path || payload.path);
+      const current = localPathRef.current;
+      if (current !== original && current !== edited) return;
+      setImageVersion((version) => version + 1);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  const showStatus = useCallback((nextStatus) => {
+    setStatus(nextStatus);
+    if (statusTimerRef.current) {
+      window.clearTimeout(statusTimerRef.current);
+    }
+    statusTimerRef.current = window.setTimeout(() => {
+      statusTimerRef.current = 0;
+      setStatus("");
+    }, 2400);
+  }, []);
+
+  useEffect(() => () => {
+    if (statusTimerRef.current) {
+      window.clearTimeout(statusTimerRef.current);
+    }
+  }, []);
+
+  const runAction = useCallback(async (action) => {
+    if (!localPath || busy) return;
+    setBusy(true);
+    try {
+      if (action === "delete") {
+        await invoke("diffforge_delete_untracked_asset", { path: localPath });
+        if (onRemoved) onRemoved(localPath);
+      } else if (action === "copy") {
+        const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
+        showStatus(copyStatus);
+      } else if (action === "edit") {
+        await invoke("snipping_open_annotation_editor", { path: localPath });
+        showStatus("Editor opened");
+      } else if (action === "upload") {
+        await invoke("snipping_upload_untracked_asset", {
+          request: {
+            group: "snips",
+            name,
+            path: localPath,
+          },
+        });
+        showStatus("Tracked for upload");
+      }
+    } catch (error) {
+      showStatus(error?.message || String(error || "Action failed"));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, localPath, name, onRemoved, previewUrl, showStatus]);
+
+  const openFloat = useCallback((event) => {
+    if (event.target.closest("button")) return;
+    invoke("snipping_open_snip_float", { path: localPath }).catch(() => {});
+  }, [localPath]);
+
+  return (
+    <StripTileRoot
+      data-busy={busy ? "true" : "false"}
+      onClick={openFloat}
+      onDoubleClick={() => runAction("edit")}
+      title={`${name} — click for a draggable preview, double-click to annotate`}
+    >
+      {previewUrl ? (
+        <img alt={name} draggable={false} src={previewUrl} />
+      ) : (
+        <span data-empty="true">Preview unavailable</span>
+      )}
+      <FloatUploadButton
+        aria-label={`Upload ${name}`}
+        disabled={busy}
+        onClick={() => runAction("upload")}
+        title="Upload snip"
+        type="button"
+      >
+        <CloudUpload aria-hidden="true" />
+        <span>Upload</span>
+      </FloatUploadButton>
+      <FloatActionBar>
+        <FloatActionButton
+          aria-label={`Copy ${name}`}
+          disabled={busy}
+          onClick={() => runAction("copy")}
+          title="Copy image"
+          type="button"
+        >
+          <ContentCopy aria-hidden="true" />
+        </FloatActionButton>
+        <FloatActionButton
+          aria-label={`Annotate ${name}`}
+          disabled={busy}
+          onClick={() => runAction("edit")}
+          title="Annotate copy"
+          type="button"
+        >
+          <ModeEdit aria-hidden="true" />
+        </FloatActionButton>
+        <FloatActionButton
+          aria-label={`Delete ${name}`}
+          data-danger="true"
+          disabled={busy}
+          onClick={() => runAction("delete")}
+          title="Delete file"
+          type="button"
+        >
+          <Delete aria-hidden="true" />
+        </FloatActionButton>
+      </FloatActionBar>
+      {status ? <FloatStatusPill aria-live="polite">{status}</FloatStatusPill> : null}
+    </StripTileRoot>
+  );
+}
+
+/**
+ * The last 16 snips as a horizontally scrollable row (wheel, trackpad, and
+ * drag-scroll all work). Shared by the CleanShot-style strip window and the
+ * background monitor's Snippets tab.
+ */
+export function SnippingRecentStrip({ embedded = false }) {
+  const [snips, setSnips] = useState([]);
+  const scrollRef = useRef(null);
+
+  const refresh = useCallback(() => {
+    invoke("snipping_recent_snips", { limit: SNIPPING_STRIP_RECENT_LIMIT })
+      .then((result) => {
+        setSnips(Array.isArray(result?.items) ? result.items : []);
+      })
+      .catch(() => setSnips([]));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners = [];
+    const addListener = (eventName) => {
+      listen(eventName, () => {
+        if (!cancelled) refresh();
+      })
+        .then((unlisten) => {
+          if (cancelled) {
+            unlisten();
+          } else {
+            unlisteners.push(unlisten);
+          }
+        })
+        .catch(() => {});
+    };
+    addListener(SNIPPING_CAPTURE_SAVED_EVENT);
+    addListener(SNIPPING_SOURCE_UPDATED_EVENT);
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => {
+        try {
+          unlisten();
+        } catch {
+          // Listener teardown is best-effort.
+        }
+      });
+    };
+  }, [refresh]);
+
+  const onWheel = useCallback((event) => {
+    const node = scrollRef.current;
+    if (!node) return;
+    // Trackpads already produce horizontal deltas; translate the dominant
+    // vertical ticks of a plain mouse wheel so it walks the strip too.
+    if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+      node.scrollLeft += event.deltaY;
+    }
+  }, []);
+
+  const handleRemoved = useCallback((removedPath) => {
+    setSnips((current) => current.filter((snip) => text(snip?.path) !== removedPath));
+    refresh();
+  }, [refresh]);
+
+  return (
+    <StripScroller data-embedded={embedded ? "true" : "false"} onWheel={onWheel} ref={scrollRef}>
+      {snips.length === 0 ? (
+        <StripEmpty>No snips yet — capture one with the snipping shortcut.</StripEmpty>
+      ) : (
+        snips.map((snip) => (
+          <SnipStripTile key={text(snip?.path)} onRemoved={handleRemoved} snip={snip} />
+        ))
+      )}
+    </StripScroller>
+  );
+}
+
+/**
+ * The tray-toggled recent-snips bar: top-center on macOS, bottom-center on
+ * Windows/Linux (Rust owns placement and the open/close animation cues).
+ */
+export function SnippingStripWindow() {
+  const [animPhase, setAnimPhase] = useState("closed");
+  const [animOrigin, setAnimOrigin] = useState("top");
+  const [openNonce, setOpenNonce] = useState(0);
+
+  useFloatingWindowBody("strip");
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenAnim = null;
+    listen(SNIPPING_STRIP_ANIM_EVENT, (event) => {
+      if (cancelled) return;
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const phase = text(payload.phase) === "open" ? "open" : "closed";
+      const origin = text(payload.origin) === "bottom" ? "bottom" : "top";
+      setAnimOrigin(origin);
+      if (phase === "open") {
+        // Re-mount the strip on every open so it always shows fresh snips,
+        // and two-frame the transition so the closed state paints first.
+        setOpenNonce((nonce) => nonce + 1);
+        setAnimPhase("closed");
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => setAnimPhase("open"));
+        });
+      } else {
+        setAnimPhase("closed");
+      }
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenAnim = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenAnim) unlistenAnim();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        invoke("snipping_toggle_snip_strip").catch(() => {});
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, []);
+
+  return (
+    <>
+      <SnipFloatingGlobalStyle />
+      <StripWindowShell data-anim={animPhase} data-origin={animOrigin}>
+        <SnippingRecentStrip key={openNonce} />
+      </StripWindowShell>
+    </>
+  );
+}
+
+const StripWindowShell = styled.main`
+  box-sizing: border-box;
+  display: grid;
+  height: 100vh;
+  padding: 10px;
+  overflow: hidden;
+  background: transparent;
+  opacity: 0;
+  transform: translateY(-10px) scale(0.98);
+  transform-origin: top center;
+  transition:
+    opacity 150ms ease,
+    transform 180ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  will-change: opacity, transform;
+
+  &[data-origin="bottom"] {
+    transform: translateY(10px) scale(0.98);
+    transform-origin: bottom center;
+  }
+
+  &[data-anim="open"],
+  &[data-anim="open"][data-origin="bottom"] {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+`;
+
+const StripScroller = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  padding: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 16px;
+  background: rgba(7, 10, 15, 0.96);
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5);
+  scrollbar-width: thin;
+
+  &::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.35);
+  }
+
+  &[data-embedded="true"] {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+`;
+
+const StripEmpty = styled.span`
+  flex: 1;
+  color: rgba(248, 250, 252, 0.55);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+`;
+
+const StripTileRoot = styled.div`
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 232px;
+  height: 144px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 12px;
+  background: rgba(9, 12, 18, 0.85);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+
+  img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    object-position: center;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  > span[data-empty="true"] {
+    color: rgba(248, 250, 252, 0.6);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  /* Same resting-bare/hover-chrome contract as the floating preview. The
+     strip window is focused while visible, so CSS :hover is reliable here. */
+  > button,
+  > div {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 140ms ease;
+  }
+
+  &:hover > button,
+  &:hover > div {
+    opacity: 1;
+    pointer-events: auto;
+  }
+`;
+
 export function SnippingAnnotationEditorWindow() {
   const localPaths = useMemo(() => pathsFromHash(SNIPPING_EDITOR_HASH), []);
   const [activePath, setActivePath] = useState(() => localPaths[0] || "");
@@ -867,6 +1296,14 @@ export function SnippingAnnotationEditorWindow() {
   const [draft, setDraft] = useState(null);
   const [status, setStatus] = useState("Loading image...");
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
+  // Zoom is relative to "fit the stage" (1 = the image fills the available
+  // area, upscaling small snips); wheel / pinch / buttons move it, anchored
+  // on the cursor so the point under the pointer stays put.
+  const viewportRef = useRef(null);
+  const zoomRef = useRef(1);
+  const pendingZoomAnchorRef = useRef(null);
+  const [zoom, setZoom] = useState(1);
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [todoDraft, setTodoDraft] = useState("");
   const [dispatchTargets, setDispatchTargets] = useState([]);
   const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
@@ -984,6 +1421,109 @@ export function SnippingAnnotationEditorWindow() {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [activeIndex, localPaths.length, multiImage, previewUrl]);
+
+  // Stage size drives the fit scale; track it live so window resizes keep
+  // the image filling the available area.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || typeof window.ResizeObserver !== "function") return undefined;
+    const observer = new window.ResizeObserver(() => {
+      setViewportSize({ width: viewport.clientWidth, height: viewport.clientHeight });
+    });
+    observer.observe(viewport);
+    setViewportSize({ width: viewport.clientWidth, height: viewport.clientHeight });
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  // Switching images resets to fit.
+  useEffect(() => {
+    setZoom(1);
+  }, [activePath]);
+
+  const fitScale = useMemo(() => {
+    if (!canvasSize.width || !canvasSize.height || !viewportSize.width || !viewportSize.height) return 1;
+    // The sizer adds 4px padding per side; account for it so "fit" never
+    // shows scrollbars.
+    return Math.max(
+      0.05,
+      Math.min(
+        (viewportSize.width - 8) / canvasSize.width,
+        (viewportSize.height - 8) / canvasSize.height,
+      ),
+    );
+  }, [canvasSize.height, canvasSize.width, viewportSize.height, viewportSize.width]);
+  const displayWidth = Math.max(1, Math.round(canvasSize.width * fitScale * zoom));
+  const displayHeight = Math.max(1, Math.round(canvasSize.height * fitScale * zoom));
+
+  const setZoomAnchored = useCallback((nextZoom, clientX, clientY) => {
+    const clamped = Math.min(8, Math.max(0.25, nextZoom));
+    const viewport = viewportRef.current;
+    const canvas = canvasRef.current;
+    if (viewport && canvas) {
+      const canvasRect = canvas.getBoundingClientRect();
+      const viewportRect = viewport.getBoundingClientRect();
+      const anchorX = typeof clientX === "number" ? clientX : viewportRect.left + viewportRect.width / 2;
+      const anchorY = typeof clientY === "number" ? clientY : viewportRect.top + viewportRect.height / 2;
+      pendingZoomAnchorRef.current = {
+        fractionX: (anchorX - canvasRect.left) / Math.max(1, canvasRect.width),
+        fractionY: (anchorY - canvasRect.top) / Math.max(1, canvasRect.height),
+        viewportX: anchorX - viewportRect.left,
+        viewportY: anchorY - viewportRect.top,
+      };
+    }
+    setZoom(clamped);
+  }, []);
+
+  // After the zoom re-render, scroll so the anchored image point stays under
+  // the pointer instead of the view jumping back to center.
+  useLayoutEffect(() => {
+    const anchor = pendingZoomAnchorRef.current;
+    if (!anchor) return;
+    pendingZoomAnchorRef.current = null;
+    const viewport = viewportRef.current;
+    const canvas = canvasRef.current;
+    if (!viewport || !canvas) return;
+    const canvasRect = canvas.getBoundingClientRect();
+    const viewportRect = viewport.getBoundingClientRect();
+    const contentX = canvasRect.left - viewportRect.left + viewport.scrollLeft;
+    const contentY = canvasRect.top - viewportRect.top + viewport.scrollTop;
+    viewport.scrollLeft = contentX + anchor.fractionX * canvasRect.width - anchor.viewportX;
+    viewport.scrollTop = contentY + anchor.fractionY * canvasRect.height - anchor.viewportY;
+  }, [zoom]);
+
+  // Native listeners: WKWebView treats React's synthetic onWheel as passive
+  // (preventDefault dropped), and trackpad pinches arrive as gesture events,
+  // not ctrl-wheels.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return undefined;
+    const handleWheel = (event) => {
+      event.preventDefault();
+      const step = event.ctrlKey ? -event.deltaY * 0.01 : -event.deltaY * 0.0022;
+      setZoomAnchored(zoomRef.current * Math.exp(step), event.clientX, event.clientY);
+    };
+    let gestureStartZoom = 1;
+    const handleGestureStart = (event) => {
+      event.preventDefault();
+      gestureStartZoom = zoomRef.current;
+    };
+    const handleGestureChange = (event) => {
+      event.preventDefault();
+      setZoomAnchored(gestureStartZoom * (event.scale || 1), event.clientX, event.clientY);
+    };
+    viewport.addEventListener("wheel", handleWheel, { passive: false });
+    viewport.addEventListener("gesturestart", handleGestureStart);
+    viewport.addEventListener("gesturechange", handleGestureChange);
+    return () => {
+      viewport.removeEventListener("wheel", handleWheel);
+      viewport.removeEventListener("gesturestart", handleGestureStart);
+      viewport.removeEventListener("gesturechange", handleGestureChange);
+    };
+  }, [setZoomAnchored]);
 
   const drawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1494,14 +2034,19 @@ export function SnippingAnnotationEditorWindow() {
           )}
 
           <EditorStage ref={stageRef}>
-            <canvas
-              aria-label="Snip annotation canvas"
-              onMouseDown={beginDraw}
-              onMouseLeave={handleCanvasMouseLeave}
-              onMouseMove={handleCanvasMouseMove}
-              onMouseUp={finishDraw}
-              ref={canvasRef}
-            />
+            <EditorCanvasViewport ref={viewportRef}>
+              <EditorCanvasSizer>
+                <canvas
+                  aria-label="Snip annotation canvas"
+                  onMouseDown={beginDraw}
+                  onMouseLeave={handleCanvasMouseLeave}
+                  onMouseMove={handleCanvasMouseMove}
+                  onMouseUp={finishDraw}
+                  ref={canvasRef}
+                  style={canvasSize.width > 0 ? { width: displayWidth, height: displayHeight } : undefined}
+                />
+              </EditorCanvasSizer>
+            </EditorCanvasViewport>
             {textEditor && (() => {
               const card = resolveTextCardStyle(textBg, color);
               return (
@@ -1539,6 +2084,21 @@ export function SnippingAnnotationEditorWindow() {
                 buttons live top-right (under the batch strip when several
                 images are selected) where they are quickest to reach. */}
             <EditorActionCluster aria-label="Annotation actions">
+              <EditorToolButton aria-label="Zoom out" onClick={() => setZoomAnchored(zoom / 1.25)} title="Zoom out" type="button">
+                <ZoomOut aria-hidden="true" />
+              </EditorToolButton>
+              <EditorZoomReadout
+                aria-label="Reset zoom to fit"
+                onClick={() => setZoom(1)}
+                title="Reset zoom to fit"
+                type="button"
+              >
+                {Math.round(fitScale * zoom * 100)}%
+              </EditorZoomReadout>
+              <EditorToolButton aria-label="Zoom in" onClick={() => setZoomAnchored(zoom * 1.25)} title="Zoom in" type="button">
+                <ZoomIn aria-hidden="true" />
+              </EditorToolButton>
+              <EditorBarDivider aria-hidden="true" />
               <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
                 <Undo aria-hidden="true" />
               </EditorToolButton>
@@ -2555,8 +3115,6 @@ const EditorStage = styled.section`
 
   canvas {
     display: block;
-    max-width: 100%;
-    max-height: 100%;
     border-radius: 8px;
     /* Crisp capture edge: a 1px light hairline ringed by a 1px dark halo
        reads clearly against the dark stage and against light screenshots. */
@@ -2565,6 +3123,53 @@ const EditorStage = styled.section`
       0 0 0 2px rgba(2, 4, 8, 0.95),
       0 18px 54px rgba(0, 0, 0, 0.55);
     cursor: crosshair;
+  }
+`;
+
+// Scrollable zoom viewport: the canvas's display size is set inline (image
+// size × fit scale × zoom); when it overflows, this pane pans it.
+const EditorCanvasViewport = styled.div`
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  align-self: stretch;
+  overflow: auto;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+`;
+
+// Grows with the zoomed canvas so scroll reaches every edge, but stretches
+// to the viewport and centers when the canvas is smaller than it.
+const EditorCanvasSizer = styled.div`
+  display: grid;
+  place-items: center;
+  min-width: 100%;
+  min-height: 100%;
+  width: max-content;
+  height: max-content;
+  padding: 4px;
+`;
+
+const EditorZoomReadout = styled.button`
+  flex: none;
+  min-width: 38px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.62);
+  background: transparent;
+  font-size: 10.5px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 24px;
+  cursor: pointer;
+
+  &:hover {
+    color: #f8fafc;
+    background: rgba(255, 255, 255, 0.08);
   }
 `;
 

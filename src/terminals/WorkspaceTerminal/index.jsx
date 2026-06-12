@@ -1710,6 +1710,82 @@ function isTerminalViewArrowShortcutEditableTarget(target, terminalKeyboardConta
   ));
 }
 
+// Per-terminal xterm zoom: each pane owns its font size (TUI surface only —
+// UI View and Thread Details are untouched), persisted per workspace slot.
+const TERMINAL_FONT_SIZE_DEFAULT = 12;
+const TERMINAL_FONT_SIZE_MIN = 8;
+const TERMINAL_FONT_SIZE_MAX = 24;
+const TERMINAL_FONT_SIZE_STEP = 1;
+
+function clampTerminalFontSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size)) {
+    return TERMINAL_FONT_SIZE_DEFAULT;
+  }
+  return Math.min(TERMINAL_FONT_SIZE_MAX, Math.max(TERMINAL_FONT_SIZE_MIN, Math.round(size)));
+}
+
+function terminalFontSizeStorageKey(workspaceId, terminalIndex) {
+  return `diffforge.terminal.fontSize.v1:${String(workspaceId || "").trim()}:${Number(terminalIndex) || 0}`;
+}
+
+function readStoredTerminalFontSize(workspaceId, terminalIndex) {
+  try {
+    const stored = window.localStorage.getItem(terminalFontSizeStorageKey(workspaceId, terminalIndex));
+    if (stored === null || stored === "") {
+      return TERMINAL_FONT_SIZE_DEFAULT;
+    }
+    return clampTerminalFontSize(stored);
+  } catch {
+    return TERMINAL_FONT_SIZE_DEFAULT;
+  }
+}
+
+function writeStoredTerminalFontSize(workspaceId, terminalIndex, size) {
+  try {
+    if (clampTerminalFontSize(size) === TERMINAL_FONT_SIZE_DEFAULT) {
+      window.localStorage.removeItem(terminalFontSizeStorageKey(workspaceId, terminalIndex));
+    } else {
+      window.localStorage.setItem(
+        terminalFontSizeStorageKey(workspaceId, terminalIndex),
+        String(clampTerminalFontSize(size)),
+      );
+    }
+  } catch {
+    // Zoom persistence is convenience state only.
+  }
+}
+
+function ButtonPopOutIcon(props) {
+  return (
+    <svg fill="none" height="12" viewBox="0 0 24 24" width="12" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <path d="M14 4h6v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+      <path d="M20 4 11 13" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+      <path d="M9 6H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+    </svg>
+  );
+}
+
+function ButtonFontMinusIcon(props) {
+  return (
+    <svg fill="none" height="12" viewBox="0 0 24 24" width="12" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <path d="M4 19 10.5 5h1L18 19" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+      <path d="M6.6 14.4h8.8" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+      <path d="M16 8h6" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+    </svg>
+  );
+}
+
+function ButtonFontPlusIcon(props) {
+  return (
+    <svg fill="none" height="12" viewBox="0 0 24 24" width="12" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <path d="M3 19 9.5 5h1L16 19" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+      <path d="M5.6 14.4h8.8" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+      <path d="M19 5v6M16 8h6" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+    </svg>
+  );
+}
+
 function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
@@ -1735,6 +1811,7 @@ function WorkspaceTerminal({
   onToggleWorkspaceThreadPinned,
   onThreadTerminalLifecycle,
   onToggleFullscreenTerminal,
+  onPopOutTerminalWindow,
   prewarmShell = false,
   projectRoot = "",
   mountId = "",
@@ -1780,6 +1857,47 @@ function WorkspaceTerminal({
   }, [windowBreakoutHosted]);
   const surfaceRef = useRef(null);
   const xtermRef = useRef(null);
+  // Per-terminal zoom (xterm only): the ref seeds the constructor, the effect
+  // below applies live changes and pushes the new grid through the resize
+  // controller (the same guarded path a container resize takes).
+  const [terminalFontSize, setTerminalFontSize] = useState(
+    () => readStoredTerminalFontSize(workspace?.id, terminalIndex),
+  );
+  const terminalFontSizeRef = useRef(terminalFontSize);
+
+  useEffect(() => {
+    terminalFontSizeRef.current = terminalFontSize;
+    const terminal = xtermRef.current;
+    if (!terminal || terminal.options.fontSize === terminalFontSize) {
+      return;
+    }
+    terminal.options.fontSize = terminalFontSize;
+    const applyResize = () => {
+      resizeControllerRef.current?.resizeNow("font_size_change", {
+        force: true,
+        forceNative: true,
+      });
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      // Two frames so the renderer publishes the new cell metrics before the
+      // grid is re-measured against them.
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(applyResize);
+      });
+    } else {
+      applyResize();
+    }
+  }, [terminalFontSize]);
+
+  const adjustTerminalFontSize = useCallback((delta) => {
+    setTerminalFontSize((current) => {
+      const next = clampTerminalFontSize(
+        (Number(current) || TERMINAL_FONT_SIZE_DEFAULT) + delta,
+      );
+      writeStoredTerminalFontSize(workspace?.id, terminalIndex, next);
+      return next;
+    });
+  }, [terminalIndex, workspace?.id]);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
@@ -5006,7 +5124,9 @@ function WorkspaceTerminal({
       fastScrollModifier: "alt",
       fastScrollSensitivity: 5,
       fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
-      fontSize: 12,
+      // Per-terminal zoom: seeded from the persisted per-pane size; the
+      // dedicated effect applies live +/- changes.
+      fontSize: terminalFontSizeRef.current,
       lineHeight: 1.0,
       macOptionIsMeta: true,
       // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
@@ -13734,6 +13854,56 @@ function WorkspaceTerminal({
             type="button"
           >
             <ButtonBrowserIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Open this terminal in its own window"
+            disabled={
+              terminalClosed
+              || terminalClosing
+              || threadsViewActive
+              || windowBreakoutHosted
+              || !paneId
+              || typeof onPopOutTerminalWindow !== "function"
+            }
+            onClick={() => onPopOutTerminalWindow?.(terminalIndex, paneId)}
+            title={
+              windowBreakoutHosted
+                ? "Already open in its own window"
+                : threadsViewActive
+                  ? "Exit threads view to pop out"
+                  : "Open this terminal in its own window"
+            }
+            type="button"
+          >
+            <ButtonPopOutIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Decrease terminal font size"
+            disabled={
+              terminalClosed
+              || terminalClosing
+              || windowBreakoutHosted
+              || terminalFontSize <= TERMINAL_FONT_SIZE_MIN
+            }
+            onClick={() => adjustTerminalFontSize(-TERMINAL_FONT_SIZE_STEP)}
+            title={`Decrease terminal font size (${terminalFontSize}px)`}
+            type="button"
+          >
+            <ButtonFontMinusIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Increase terminal font size"
+            disabled={
+              terminalClosed
+              || terminalClosing
+              || windowBreakoutHosted
+              || terminalFontSize >= TERMINAL_FONT_SIZE_MAX
+            }
+            onClick={() => adjustTerminalFontSize(TERMINAL_FONT_SIZE_STEP)}
+            title={`Increase terminal font size (${terminalFontSize}px)`}
+            type="button"
+          >
+            <ButtonFontPlusIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
             aria-label="Split terminal horizontally"

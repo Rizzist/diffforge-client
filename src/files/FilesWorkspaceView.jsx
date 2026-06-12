@@ -332,6 +332,27 @@ import {
   setActiveWorkspaceFileDrag,
 } from "../terminals/WorkspaceTerminal/threadRuntime.js";
 
+// The Files view unmounts on every tab switch, dropping the tree. This
+// module-level cache survives that: on remount the cached listings and
+// expanded folders paint instantly while every visible directory re-lists
+// silently in the background (stale-while-revalidate). Listings are tiny
+// (~100 bytes/entry), so even several workspaces stay in the low MBs; file
+// previews and image data URLs are intentionally never cached.
+const FILES_EXPLORER_CACHE_LIMIT = 8;
+const FILES_EXPLORER_REVALIDATE_LIMIT = 16;
+const filesExplorerListingCache = new Map();
+
+function rememberFilesExplorerListings(workspaceRoot, snapshot) {
+  if (!workspaceRoot) return;
+  filesExplorerListingCache.delete(workspaceRoot);
+  filesExplorerListingCache.set(workspaceRoot, snapshot);
+  while (filesExplorerListingCache.size > FILES_EXPLORER_CACHE_LIMIT) {
+    const oldestKey = filesExplorerListingCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    filesExplorerListingCache.delete(oldestKey);
+  }
+}
+
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -1481,6 +1502,7 @@ export default function FilesWorkspaceView({
   const filePreviewScrollRef = useRef(null);
   const fileRequestIdRef = useRef(0);
   const renameCommitInFlightRef = useRef(false);
+  const cacheWriteGateRef = useRef({ armed: false, root: "" });
   const internalFileDragRef = useRef({
     dropTargetPath: null,
     entry: null,
@@ -1549,7 +1571,7 @@ export default function FilesWorkspaceView({
     });
   }, [fileExplorerLayoutOwner, fileExplorerPanelId, filePreviewPanelId]);
 
-  const loadDirectory = useCallback(async (relativePath = "") => {
+  const loadDirectory = useCallback(async (relativePath = "", { silent = false } = {}) => {
     const directoryPath = relativePath || "";
 
     if (!workspaceRoot) {
@@ -1561,7 +1583,11 @@ export default function FilesWorkspaceView({
       return;
     }
 
-    setDirectoryStates((states) => ({ ...states, [directoryPath]: "loading" }));
+    // Silent revalidate: cached entries stay on screen while the fresh
+    // listing replaces them, instead of collapsing into a "Loading..." row.
+    if (!silent) {
+      setDirectoryStates((states) => ({ ...states, [directoryPath]: "loading" }));
+    }
     setDirectoryErrors((errors) => ({ ...errors, [directoryPath]: "" }));
 
     try {
@@ -1703,8 +1729,10 @@ export default function FilesWorkspaceView({
       [directoryPath]: shouldExpand,
     }));
 
-    if (shouldExpand && !directoryEntries[directoryPath] && directoryStates[directoryPath] !== "loading") {
-      loadDirectory(directoryPath);
+    if (shouldExpand && directoryStates[directoryPath] !== "loading") {
+      // Cached entries paint immediately; the re-list is silent so opening a
+      // previously visited folder never flashes back to "Loading...".
+      loadDirectory(directoryPath, { silent: Boolean(directoryEntries[directoryPath]) });
     }
   }, [directoryEntries, directoryStates, expandedDirectories, loadDirectory]);
 
@@ -1734,9 +1762,11 @@ export default function FilesWorkspaceView({
       folders.add(safeTargetPath);
     }
     folders.forEach((folderPath) => {
-      void loadDirectory(folderPath);
+      // Post-operation refreshes keep the tree on screen; the listed result
+      // simply swaps in.
+      void loadDirectory(folderPath, { silent: Boolean(directoryEntries[folderPath]) });
     });
-  }, [expandedDirectories, loadDirectory]);
+  }, [directoryEntries, expandedDirectories, loadDirectory]);
 
   const rebaseExpandedDirectories = useCallback((sourcePath, targetPath = "") => {
     const safeSourcePath = normalizeWorkspaceRelativePath(sourcePath);
@@ -1966,10 +1996,28 @@ export default function FilesWorkspaceView({
   }, []);
 
   useEffect(() => {
-    setDirectoryEntries({});
-    setDirectoryStates({});
+    // Instant remount: hydrate the tree from the module cache (tab switches
+    // unmount this view), then silently re-list what is visible so the
+    // snapshot corrects itself without a "Loading..." pass.
+    const cached = workspaceRoot ? filesExplorerListingCache.get(workspaceRoot) : null;
+    const cachedEntries = cached?.directoryEntries && Object.keys(cached.directoryEntries).length
+      ? cached.directoryEntries
+      : null;
+    const cachedExpanded = cached?.expandedDirectories && Object.keys(cached.expandedDirectories).length
+      ? cached.expandedDirectories
+      : null;
+    cacheWriteGateRef.current = { armed: false, root: workspaceRoot };
+    setDirectoryEntries(cachedEntries ? { ...cachedEntries } : {});
+    setDirectoryStates(() => {
+      if (!cachedEntries) return {};
+      const states = {};
+      Object.keys(cachedEntries).forEach((directoryPath) => {
+        states[directoryPath] = "idle";
+      });
+      return states;
+    });
     setDirectoryErrors({});
-    setExpandedDirectories({ "": true });
+    setExpandedDirectories(cachedExpanded ? { ...cachedExpanded } : { "": true });
     setSelectedFile(null);
     setFileContent("");
     setFileImageDataUrl("");
@@ -2000,9 +2048,39 @@ export default function FilesWorkspaceView({
     fileRequestIdRef.current += 1;
 
     if (workspaceRoot) {
-      loadDirectory("");
+      if (cachedEntries) {
+        const expanded = cachedExpanded || { "": true };
+        const visibleDirectories = Object.keys(cachedEntries)
+          .filter((directoryPath) => directoryPath === "" || expanded[directoryPath]);
+        if (!visibleDirectories.includes("")) {
+          visibleDirectories.unshift("");
+        }
+        visibleDirectories
+          .slice(0, FILES_EXPLORER_REVALIDATE_LIMIT)
+          .forEach((directoryPath) => {
+            void loadDirectory(directoryPath, { silent: true });
+          });
+      } else {
+        loadDirectory("");
+      }
     }
   }, [loadDirectory, workspace?.id, workspaceRoot]);
+
+  // Write-through: every committed tree change refreshes the cache snapshot.
+  // The gate skips the one stale invocation that fires in the same commit as
+  // a workspace switch (state still holds the previous workspace's tree).
+  useEffect(() => {
+    const gate = cacheWriteGateRef.current;
+    if (!workspaceRoot || gate.root !== workspaceRoot) return;
+    if (!gate.armed) {
+      gate.armed = true;
+      return;
+    }
+    rememberFilesExplorerListings(workspaceRoot, {
+      directoryEntries,
+      expandedDirectories,
+    });
+  }, [directoryEntries, expandedDirectories, workspaceRoot]);
 
   useEffect(() => {
     if (!fileContextMenu) {

@@ -1,6 +1,14 @@
-import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import styled from "styled-components";
+import {
+  ensureWorkspaceToolsFresh,
+  getWorkspaceToolsArchitectures,
+  getWorkspaceToolsSkills,
+  getWorkspaceToolsVersion,
+  hasWorkspaceToolsLoaded,
+  subscribeWorkspaceTools,
+  workspaceToolsRepoDescriptors,
+} from "./workspaceToolsStore.js";
 
 const FILTERS = [
   { id: "all", label: "All" },
@@ -37,30 +45,6 @@ function writeStorage(prefix, workspaceId, value) {
   }
 }
 
-function parseSkillsEntries(skillsMd) {
-  const content = text(skillsMd);
-  if (!content) return [];
-  const lines = content.split("\n");
-  const entries = [];
-  let current = null;
-  lines.forEach((line) => {
-    // Structured skill metadata from the Tools tab library; not todo content.
-    if (/^<!--\s*diffforge-skill\b.*-->\s*$/u.test(line.trim())) return;
-    const heading = line.match(/^#{1,3}\s+(.+)$/u);
-    if (heading) {
-      if (current && (current.title || current.body.trim())) entries.push(current);
-      current = { title: heading[1].trim(), body: "" };
-      return;
-    }
-    if (!current) current = { title: "", body: "" };
-    current.body += `${line}\n`;
-  });
-  if (current && (current.title || current.body.trim())) entries.push(current);
-  const named = entries.filter((entry) => entry.title);
-  if (named.length) return named;
-  return [{ title: "SKILLS.md", body: content }];
-}
-
 function architectureTodoText(item) {
   return `Use the architecture graph "${item.title}" at .agents/architectures/graphs/${item.graphId}.arch in ${item.repoLabel} as the working context for this task.`;
 }
@@ -76,7 +60,9 @@ function skillTodoText(entry) {
  * Drag-and-drop sources for the workspace tools tab: architecture graphs and
  * account skills. Items can be dragged into the todo composer (plain text) or
  * clicked; the send-on-drop toggle decides whether a dropped/clicked item is
- * queued immediately or just listed.
+ * queued immediately or just listed. Data comes from the app-level workspace
+ * tools store, so the tab renders instantly from cache and updates live as
+ * background sync and change events land — no manual refresh.
  */
 export default function WorkspaceToolsDragPanel({
   coordinationTargets = [],
@@ -91,10 +77,29 @@ export default function WorkspaceToolsDragPanel({
   const [sendOnDrop, setSendOnDrop] = useState(
     () => readStorage(SEND_STORAGE_PREFIX, workspaceId, "false") === "true",
   );
-  const [architectures, setArchitectures] = useState([]);
-  const [skills, setSkills] = useState([]);
-  const [state, setState] = useState("loading");
   const [notice, setNotice] = useState("");
+
+  const repoDescriptors = useMemo(
+    () => workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory),
+    [coordinationTargets, rootDirectory],
+  );
+  const storeVersion = useSyncExternalStore(subscribeWorkspaceTools, getWorkspaceToolsVersion);
+
+  useEffect(() => {
+    ensureWorkspaceToolsFresh(repoDescriptors);
+  }, [repoDescriptors]);
+
+  const architectures = useMemo(
+    () => getWorkspaceToolsArchitectures(repoDescriptors),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [repoDescriptors, storeVersion],
+  );
+  const skills = useMemo(
+    () => getWorkspaceToolsSkills(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [storeVersion],
+  );
+  const toolsLoaded = hasWorkspaceToolsLoaded(repoDescriptors);
 
   useEffect(() => {
     const stored = readStorage(FILTER_STORAGE_PREFIX, workspaceId, "all");
@@ -113,49 +118,6 @@ export default function WorkspaceToolsDragPanel({
       return !current;
     });
   }, [workspaceId]);
-
-  const refresh = useCallback(async () => {
-    setState("loading");
-    const repoPaths = [];
-    const seen = new Set();
-    const addRepo = (repoPath, label) => {
-      const cleaned = text(repoPath);
-      if (!cleaned || seen.has(cleaned)) return;
-      seen.add(cleaned);
-      repoPaths.push({ repoPath: cleaned, label: text(label, cleaned.split(/[\\/]/u).pop()) });
-    };
-    (Array.isArray(coordinationTargets) ? coordinationTargets : []).forEach((target) => {
-      addRepo(target?.repoPath, target?.projectName || target?.repoLabel);
-    });
-    addRepo(rootDirectory, rootDirectory.split(/[\\/]/u).pop());
-
-    const archResults = await Promise.allSettled(repoPaths.map(async ({ repoPath, label }) => {
-      const list = await invoke("architecture_graphs_list", { repoPath });
-      return (Array.isArray(list?.graphs) ? list.graphs : []).map((graph) => ({
-        graphId: text(graph?.graphId || graph?.graph_id || graph?.id),
-        repoLabel: label,
-        repoPath,
-        title: text(graph?.title || graph?.name || graph?.graphId || graph?.graph_id, "architecture"),
-      }));
-    }));
-    const nextArchitectures = archResults
-      .flatMap((result) => (result.status === "fulfilled" ? result.value : []))
-      .filter((item) => item.graphId);
-    setArchitectures(nextArchitectures);
-
-    try {
-      const tools = await invoke("cloud_mcp_get_account_tools");
-      const skillsMd = text(tools?.skills?.skills_md ?? tools?.skills?.skillsMd);
-      setSkills(parseSkillsEntries(skillsMd));
-    } catch {
-      setSkills([]);
-    }
-    setState("ready");
-  }, [coordinationTargets, rootDirectory]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
 
   const handleAdd = useCallback((todoText, { forceSend = null } = {}) => {
     if (typeof onAddToolTodo !== "function") return;
@@ -213,9 +175,6 @@ export default function WorkspaceToolsDragPanel({
             <SendToggleKnob aria-hidden="true" data-active={sendOnDrop ? "true" : "false"} />
             Send on drop
           </SendToggle>
-          <GhostButton disabled={state === "loading"} onClick={() => void refresh()} type="button">
-            {state === "loading" ? "Loading…" : "Refresh"}
-          </GhostButton>
         </ToolbarActions>
       </Toolbar>
       {notice && <Notice aria-live="polite">{notice}</Notice>}
@@ -281,7 +240,7 @@ export default function WorkspaceToolsDragPanel({
             })}
           </>
         )}
-        {state === "ready" && !visibleArchitectures.length && !visibleSkills.length && (
+        {toolsLoaded && !visibleArchitectures.length && !visibleSkills.length && (
           <Empty>
             {filter === "skills"
               ? "No skills yet — write SKILLS.md in the Tools tab."
@@ -290,7 +249,9 @@ export default function WorkspaceToolsDragPanel({
                 : "No architectures or skills yet."}
           </Empty>
         )}
-        {state === "loading" && <Empty>Loading tools…</Empty>}
+        {!toolsLoaded && !visibleArchitectures.length && !visibleSkills.length && (
+          <Empty>Loading tools…</Empty>
+        )}
       </ItemsScroll>
     </Panel>
   );
@@ -389,26 +350,6 @@ const SendToggleKnob = styled.span`
 
   &[data-active="true"]::after {
     transform: translateX(10px);
-  }
-`;
-
-const GhostButton = styled.button`
-  padding: 5px 10px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
-  border-radius: 7px;
-  color: var(--forge-text-muted, #7a8493);
-  background: transparent;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-
-  &:hover:not(:disabled) {
-    color: var(--forge-text, #f4f7fa);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.55;
   }
 `;
 
