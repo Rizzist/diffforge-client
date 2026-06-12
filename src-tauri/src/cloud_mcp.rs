@@ -8159,46 +8159,15 @@ fn cloud_mcp_http_url_from_ws_url(ws_url: &str) -> Option<String> {
     None
 }
 
-fn cloud_mcp_http_path_from_endpoint(endpoint_path: &str) -> Option<String> {
-    let trimmed = endpoint_path.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let parsed = tauri::Url::parse(trimmed).ok()?;
-        let mut path = parsed.path().to_string();
-        if path.is_empty() {
-            path.push('/');
-        }
-        if let Some(query) = parsed.query() {
-            path.push('?');
-            path.push_str(query);
-        }
-        return Some(path);
-    }
-
-    if trimmed.starts_with('/') {
-        Some(trimmed.to_string())
-    } else {
-        Some(format!("/{trimmed}"))
-    }
-}
-
-fn cloud_mcp_asset_balancer_forward_target(
-    base_url: &str,
-    endpoint_path: &str,
-) -> Option<CloudMcpAssetHttpTarget> {
-    let base = cloud_mcp_normalized_base_url(base_url)?;
-    let parsed = tauri::Url::parse(&base).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return None;
-    }
-    let endpoint_path = cloud_mcp_http_path_from_endpoint(endpoint_path)?;
-    Some(CloudMcpAssetHttpTarget {
-        url: format!("{}/v1/forward{}", base.trim_end_matches('/'), endpoint_path),
-        route_token: None,
-    })
+fn cloud_mcp_http_url_with_route_token(url: String, route_token: Option<&str>) -> String {
+    let Some(route_token) = route_token
+        .map(str::trim)
+        .filter(|route_token| !route_token.is_empty())
+    else {
+        return url;
+    };
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}route_token={route_token}")
 }
 
 async fn cloud_mcp_asset_http_target_async(
@@ -8207,10 +8176,6 @@ async fn cloud_mcp_asset_http_target_async(
     fallback_url: &str,
 ) -> CloudMcpAssetHttpTarget {
     let base_url = cloud_mcp_base_url();
-    if let Some(target) = cloud_mcp_asset_balancer_forward_target(&base_url, endpoint_path) {
-        return target;
-    }
-
     let target = cloud_mcp_resolve_ws_target(state, &base_url, endpoint_path)
         .await
         .ok();
@@ -8218,10 +8183,11 @@ async fn cloud_mcp_asset_http_target_async(
         .as_ref()
         .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
         .map(|url| CloudMcpAssetHttpTarget {
-            url,
-            route_token: target
-                .as_ref()
-                .and_then(|target| target.route_token.clone()),
+            url: cloud_mcp_http_url_with_route_token(
+                url,
+                target.as_ref().and_then(|target| target.route_token.as_deref()),
+            ),
+            route_token: None,
         })
         .unwrap_or_else(|| CloudMcpAssetHttpTarget {
             url: fallback_url.to_string(),
@@ -8234,19 +8200,16 @@ fn cloud_mcp_asset_http_target_blocking(
     endpoint_path: &str,
     fallback_url: &str,
 ) -> CloudMcpAssetHttpTarget {
-    if let Some(target) = cloud_mcp_asset_balancer_forward_target(base_url, endpoint_path) {
-        return target;
-    }
-
     let target = cloud_mcp_proxy_resolve_blocking_target(base_url, endpoint_path).ok();
     target
         .as_ref()
         .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
         .map(|url| CloudMcpAssetHttpTarget {
-            url,
-            route_token: target
-                .as_ref()
-                .and_then(|target| target.route_token.clone()),
+            url: cloud_mcp_http_url_with_route_token(
+                url,
+                target.as_ref().and_then(|target| target.route_token.as_deref()),
+            ),
+            route_token: None,
         })
         .unwrap_or_else(|| CloudMcpAssetHttpTarget {
             url: fallback_url.to_string(),
@@ -18091,8 +18054,8 @@ async fn cloud_mcp_upload_workspace_asset(
     } else {
         cloud_mcp_asset_http_target_async(state.inner(), &upload_path, &server_upload_url).await
     };
-    // The balancer forward path is the normal cloud transfer route. Keep the
-    // prepared URL as a fallback for local/dev clouds that do not expose it.
+    // Asset bytes go to the assigned cloud-diffforge route, not through the
+    // balancer. Keep the prepared URL as a fallback for local/dev clouds.
     let mut attempts: Vec<(String, reqwest::header::HeaderMap)> = Vec::new();
     if direct_transfer {
         attempts.push((http_target.url.clone(), reqwest::header::HeaderMap::new()));
@@ -18322,8 +18285,8 @@ async fn cloud_mcp_download_workspace_asset(
     } else {
         cloud_mcp_asset_http_target_async(state.inner(), &download_path, &download_url).await
     };
-    // Same ordered attempts as upload: balancer forward first, prepared cloud
-    // URL as the fallback for local/dev clouds.
+    // Same ordered attempts as upload: assigned cloud route first, prepared
+    // cloud URL as the fallback for local/dev clouds.
     let mut attempts: Vec<(String, reqwest::header::HeaderMap)> = Vec::new();
     if direct_transfer {
         attempts.push((http_target.url.clone(), reqwest::header::HeaderMap::new()));
