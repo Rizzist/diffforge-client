@@ -8170,13 +8170,88 @@ fn cloud_mcp_http_url_with_route_token(url: String, route_token: Option<&str>) -
     format!("{url}{separator}route_token={route_token}")
 }
 
+async fn cloud_mcp_asset_resolve_direct_target_async(
+    state: &CloudMcpState,
+    base_url: &str,
+    endpoint_path: &str,
+) -> Result<CloudMcpWsTarget, String> {
+    if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
+        if cloud_mcp_ws_target_reachable_async(&target.ws_url).await {
+            return Ok(target);
+        }
+    }
+
+    let bearer = cloud_mcp_authorization_bearer(state).await?;
+    let Some(bearer) = bearer else {
+        return Err(
+            "Cloud MCP auth token is unavailable; waiting for sign-in before resolving an asset route."
+                .to_string(),
+        );
+    };
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
+    cloud_mcp_fetch_direct_route_async(
+        base_url,
+        endpoint_path,
+        &bearer,
+        &billing_scope_type,
+        team_id.as_deref(),
+        &plan_name,
+        device_limit,
+        device_id.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| {
+        "Balancer did not offer a direct asset route (direct routing disabled or backend unsupported)."
+            .to_string()
+    })
+}
+
+fn cloud_mcp_asset_resolve_direct_target_blocking(
+    base_url: &str,
+    endpoint_path: &str,
+) -> Result<CloudMcpWsTarget, String> {
+    if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
+        if cloud_mcp_ws_target_reachable_blocking(&target.ws_url) {
+            return Ok(target);
+        }
+    }
+
+    let Some(bearer) = cloud_mcp_process_authorization_bearer() else {
+        return Err(
+            "Cloud MCP auth token is unavailable; waiting for sign-in before resolving an asset route."
+                .to_string(),
+        );
+    };
+    let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
+    let (plan_name, device_limit) = cloud_mcp_process_account_plan();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
+    cloud_mcp_fetch_direct_route_blocking(
+        base_url,
+        endpoint_path,
+        &bearer,
+        &billing_scope_type,
+        team_id.as_deref(),
+        &plan_name,
+        device_limit,
+        device_id.as_deref(),
+    )?
+    .ok_or_else(|| {
+        "Balancer did not offer a direct asset route (direct routing disabled or backend unsupported)."
+            .to_string()
+    })
+}
+
 async fn cloud_mcp_asset_http_target_async(
     state: &CloudMcpState,
     endpoint_path: &str,
     fallback_url: &str,
 ) -> CloudMcpAssetHttpTarget {
     let base_url = cloud_mcp_base_url();
-    let target = cloud_mcp_resolve_ws_target(state, &base_url, endpoint_path)
+    let target = cloud_mcp_asset_resolve_direct_target_async(state, &base_url, endpoint_path)
         .await
         .ok();
     target
@@ -8200,7 +8275,7 @@ fn cloud_mcp_asset_http_target_blocking(
     endpoint_path: &str,
     fallback_url: &str,
 ) -> CloudMcpAssetHttpTarget {
-    let target = cloud_mcp_proxy_resolve_blocking_target(base_url, endpoint_path).ok();
+    let target = cloud_mcp_asset_resolve_direct_target_blocking(base_url, endpoint_path).ok();
     target
         .as_ref()
         .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
@@ -17602,13 +17677,15 @@ fn cloud_mcp_asset_http_headers(
     route_token: Option<&str>,
 ) -> Result<reqwest::header::HeaderMap, String> {
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = token {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|error| format!("Invalid asset transfer auth header: {error}"))?,
-        );
-    }
+    let token = token.ok_or_else(|| {
+        "Cloud MCP auth token is unavailable; waiting for sign-in before transferring assets."
+            .to_string()
+    })?;
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|error| format!("Invalid asset transfer auth header: {error}"))?,
+    );
     headers.insert(
         "x-diffforge-client-id",
         reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
