@@ -8248,48 +8248,31 @@ fn cloud_mcp_asset_resolve_direct_target_blocking(
 async fn cloud_mcp_asset_http_target_async(
     state: &CloudMcpState,
     endpoint_path: &str,
-    fallback_url: &str,
-) -> CloudMcpAssetHttpTarget {
+) -> Result<CloudMcpAssetHttpTarget, String> {
     let base_url = cloud_mcp_base_url();
     let target = cloud_mcp_asset_resolve_direct_target_async(state, &base_url, endpoint_path)
         .await
-        .ok();
-    target
-        .as_ref()
-        .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
-        .map(|url| CloudMcpAssetHttpTarget {
-            url: cloud_mcp_http_url_with_route_token(
-                url,
-                target.as_ref().and_then(|target| target.route_token.as_deref()),
-            ),
-            route_token: None,
-        })
-        .unwrap_or_else(|| CloudMcpAssetHttpTarget {
-            url: fallback_url.to_string(),
-            route_token: None,
-        })
+        .map_err(|error| format!("Cloud asset direct route unavailable: {error}"))?;
+    let url = cloud_mcp_http_url_from_ws_url(&target.ws_url)
+        .ok_or_else(|| "Cloud asset direct route URL is invalid.".to_string())?;
+    Ok(CloudMcpAssetHttpTarget {
+        url: cloud_mcp_http_url_with_route_token(url, target.route_token.as_deref()),
+        route_token: None,
+    })
 }
 
 fn cloud_mcp_asset_http_target_blocking(
     base_url: &str,
     endpoint_path: &str,
-    fallback_url: &str,
-) -> CloudMcpAssetHttpTarget {
-    let target = cloud_mcp_asset_resolve_direct_target_blocking(base_url, endpoint_path).ok();
-    target
-        .as_ref()
-        .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
-        .map(|url| CloudMcpAssetHttpTarget {
-            url: cloud_mcp_http_url_with_route_token(
-                url,
-                target.as_ref().and_then(|target| target.route_token.as_deref()),
-            ),
-            route_token: None,
-        })
-        .unwrap_or_else(|| CloudMcpAssetHttpTarget {
-            url: fallback_url.to_string(),
-            route_token: None,
-        })
+) -> Result<CloudMcpAssetHttpTarget, String> {
+    let target = cloud_mcp_asset_resolve_direct_target_blocking(base_url, endpoint_path)
+        .map_err(|error| format!("Cloud asset direct route unavailable: {error}"))?;
+    let url = cloud_mcp_http_url_from_ws_url(&target.ws_url)
+        .ok_or_else(|| "Cloud asset direct route URL is invalid.".to_string())?;
+    Ok(CloudMcpAssetHttpTarget {
+        url: cloud_mcp_http_url_with_route_token(url, target.route_token.as_deref()),
+        route_token: None,
+    })
 }
 
 fn cloud_mcp_asset_direct_presigned(_payload: &Value) -> bool {
@@ -18129,10 +18112,10 @@ async fn cloud_mcp_upload_workspace_asset(
             route_token: None,
         }
     } else {
-        cloud_mcp_asset_http_target_async(state.inner(), &upload_path, &server_upload_url).await
+        cloud_mcp_asset_http_target_async(state.inner(), &upload_path).await?
     };
-    // Asset bytes go to the assigned cloud-diffforge route, not through the
-    // balancer. Keep the prepared URL as a fallback for local/dev clouds.
+    // Asset bytes go to the assigned cloud-diffforge route. The balancer only
+    // mints the route token; it never proxies upload bytes.
     let mut attempts: Vec<(String, reqwest::header::HeaderMap)> = Vec::new();
     if direct_transfer {
         attempts.push((http_target.url.clone(), reqwest::header::HeaderMap::new()));
@@ -18147,17 +18130,6 @@ async fn cloud_mcp_upload_workspace_asset(
                 http_target.route_token.as_deref(),
             )?,
         ));
-        if http_target.url != server_upload_url {
-            attempts.push((
-                server_upload_url.clone(),
-                cloud_mcp_asset_http_headers(
-                    token.as_deref(),
-                    &req.repo_id,
-                    &scope_workspace_id,
-                    None,
-                )?,
-            ));
-        }
     }
     let transfer_id = cloud_mcp_asset_prepare_transfer_id(&data, "upload")?;
     cloud_mcp_clear_asset_transfer_cancel(&[&asset_id, &transfer_id]);
@@ -18360,10 +18332,10 @@ async fn cloud_mcp_download_workspace_asset(
             route_token: None,
         }
     } else {
-        cloud_mcp_asset_http_target_async(state.inner(), &download_path, &download_url).await
+        cloud_mcp_asset_http_target_async(state.inner(), &download_path).await?
     };
-    // Same ordered attempts as upload: assigned cloud route first, prepared
-    // cloud URL as the fallback for local/dev clouds.
+    // Same policy as upload: download bytes use the assigned cloud route, with
+    // the balancer only minting the route token.
     let mut attempts: Vec<(String, reqwest::header::HeaderMap)> = Vec::new();
     if direct_transfer {
         attempts.push((http_target.url.clone(), reqwest::header::HeaderMap::new()));
@@ -18378,17 +18350,6 @@ async fn cloud_mcp_download_workspace_asset(
                 http_target.route_token.as_deref(),
             )?,
         ));
-        if http_target.url != download_url {
-            attempts.push((
-                download_url.clone(),
-                cloud_mcp_asset_http_headers(
-                    token.as_deref(),
-                    &req.repo_id,
-                    &scope_workspace_id,
-                    None,
-                )?,
-            ));
-        }
     }
     let transfer_id = cloud_mcp_asset_prepare_transfer_id(&data, "download")?;
     cloud_mcp_clear_asset_transfer_cancel(&[&asset_id, &transfer_id]);
@@ -26872,7 +26833,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                 route_token: None,
             }
         } else {
-            cloud_mcp_asset_http_target_blocking(&base_url, &upload_path, &upload_url)
+            cloud_mcp_asset_http_target_blocking(&base_url, &upload_path)?
         };
         let mut attempts: Vec<(String, reqwest::header::HeaderMap)> = Vec::new();
         if direct_transfer {
@@ -26888,17 +26849,6 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                     http_target.route_token.as_deref(),
                 )?,
             ));
-            if http_target.url != upload_url {
-                attempts.push((
-                    upload_url.clone(),
-                    cloud_mcp_asset_http_headers(
-                        token.as_deref(),
-                        &req.repo_id,
-                        workspace_id_text,
-                        None,
-                    )?,
-                ));
-            }
         }
         let transfer_id = cloud_mcp_asset_prepare_transfer_id(&prepare, "upload")?;
         let transfer_cloud_id = cloud_mcp_payload_text(&prepare, &["cloud_id", "cloudId"])
@@ -27146,7 +27096,7 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
             route_token: None,
         }
     } else {
-        cloud_mcp_asset_http_target_blocking(&base_url, &download_path, &download_url)
+        cloud_mcp_asset_http_target_blocking(&base_url, &download_path)?
     };
     let mut attempts: Vec<(String, reqwest::header::HeaderMap)> = Vec::new();
     if direct_transfer {
@@ -27162,17 +27112,6 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
                 http_target.route_token.as_deref(),
             )?,
         ));
-        if http_target.url != download_url {
-            attempts.push((
-                download_url.clone(),
-                cloud_mcp_asset_http_headers(
-                    token.as_deref(),
-                    &req.repo_id,
-                    workspace_id.unwrap_or_default(),
-                    None,
-                )?,
-            ));
-        }
     }
     let transfer_id = cloud_mcp_asset_prepare_transfer_id(&prepare, "download")?;
     let transfer_cloud_id = cloud_mcp_payload_text(&prepare, &["cloud_id", "cloudId"])
