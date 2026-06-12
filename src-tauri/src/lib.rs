@@ -4286,10 +4286,6 @@ pub fn run() {
             register_snipping_shortcuts(app.handle());
             prewarm_snipping_overlay_window(app.handle());
             register_activity_overlay_shortcut(app.handle());
-            // Pre-create the hidden activity overlay so the first toggle is
-            // instant: the webview is booted, the panel mounted and already
-            // subscribed to store events before the user ever asks for it.
-            let _ = ensure_activity_overlay_window(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
             {
@@ -4427,12 +4423,11 @@ pub fn run() {
             snipping_read_asset_data_url,
             snipping_open_snip_float,
             snipping_snip_float_open,
+            snipping_close_snip_float,
             snipping_close_snip_float_for_path,
+            snipping_close_annotation_editor,
             snipping_recent_snips,
             snipping_toggle_snip_strip,
-            snipping_strip_drag_out_begin,
-            snipping_strip_drag_out_move,
-            snipping_strip_drag_out_end,
             snipping_float_assigned_path,
             snipping_preview_drag_started,
             snipping_consume_snip_preview,

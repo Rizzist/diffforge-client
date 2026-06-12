@@ -213,13 +213,38 @@ function assetTransferCloudId(transfer) {
   return text(transfer?.cloudId || transfer?.cloud_id || transfer?.assetCloudId || transfer?.asset_cloud_id, DEFAULT_ASSET_CLOUD_ID);
 }
 
+function assetTransferCacheKey(assetIdValue, cloudId = DEFAULT_ASSET_CLOUD_ID, direction = "upload") {
+  const id = text(assetIdValue);
+  if (!id) return "";
+  return `${id}:${text(cloudId, DEFAULT_ASSET_CLOUD_ID).toLowerCase()}:${text(direction, "upload").toLowerCase()}`;
+}
+
+function assetTransferShadowedByAsset(transfer, asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
+  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  if (!["failed", "interrupted"].includes(status)) return false;
+  const direction = text(transfer?.direction).toLowerCase();
+  if (direction && !direction.includes("upload")) return false;
+  return assetCloudAvailable(asset, cloudId);
+}
+
+function assetTransferClearedOnRestart(transfer) {
+  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  if (status !== "interrupted") return false;
+  const error = text(transfer?.error || transfer?.errorMessage || transfer?.error_message).toLowerCase();
+  return error.includes("diff forge reopened") || error.includes("previous-process asset transfer");
+}
+
 function latestAssetTransfer(transfers, asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   const id = assetId(asset);
   if (!id) return null;
   const selectedCloud = text(cloudId, DEFAULT_ASSET_CLOUD_ID);
-  return transfers
+  const rows = transfers
     .filter((transfer) => assetTransferAssetId(transfer) === id && assetTransferCloudId(transfer) === selectedCloud)
-    .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left))[0] || null;
+    .filter((transfer) => !assetTransferClearedOnRestart(transfer))
+    .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left));
+  return rows.find((transfer) => assetTransferStatusKind(transfer) === "active")
+    || rows.find((transfer) => !assetTransferShadowedByAsset(transfer, asset, selectedCloud))
+    || null;
 }
 
 function assetTransferId(transfer) {
@@ -680,6 +705,7 @@ function AssetsPanel({
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
   const [uploadPublic, setUploadPublic] = useState(readAssetUploadPublicPreference);
+  const [optimisticTransfers, setOptimisticTransfers] = useState({});
 
   const toggleUploadPublic = useCallback(() => {
     setUploadPublic((current) => {
@@ -778,12 +804,15 @@ function AssetsPanel({
     () => new Set(filteredItems.map((asset) => assetId(asset)).filter(Boolean)),
     [filteredItems],
   );
-  const visibleTransfers = useMemo(() => (
-    (selectedWorkspaceFilterOptions.length
-      ? transfers.filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
-      : transfers
-    ).filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId)
-  ), [effectiveCloudId, selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
+  const optimisticTransferRows = useMemo(() => Object.values(optimisticTransfers), [optimisticTransfers]);
+  const visibleTransfers = useMemo(() => {
+    const rows = [...transfers, ...optimisticTransferRows];
+    return (
+      selectedWorkspaceFilterOptions.length
+        ? rows.filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
+        : rows
+    ).filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId);
+  }, [effectiveCloudId, optimisticTransferRows, selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
   const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
   const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
   const activeTransfers = selectedWorkspaceFilterOptions.length
@@ -953,6 +982,51 @@ function AssetsPanel({
     setSelectedAssetIds(new Set());
   }, []);
 
+  const setOptimisticUploadTransfer = useCallback((asset, cloudId, status, fields = {}) => {
+    const id = assetId(asset);
+    const key = assetTransferCacheKey(id, cloudId, "upload");
+    if (!key) return;
+    const now = new Date().toISOString();
+    const sizeBytes = numberValue(asset?.sizeBytes ?? asset?.size_bytes, 0);
+    setOptimisticTransfers((current) => {
+      const currentRow = current[key] || {};
+      const transferId = currentRow.transferId || currentRow.transfer_id || `local-upload-${id}-${Date.now()}`;
+      const bytesDone = status === "completed" ? sizeBytes : numberValue(fields.bytesDone ?? fields.bytes_done, 0);
+      return {
+        ...current,
+        [key]: {
+          ...currentRow,
+          transferId,
+          transfer_id: transferId,
+          assetId: id,
+          asset_id: id,
+          cloudId,
+          cloud_id: cloudId,
+          direction: "upload",
+          status,
+          bytesTotal: sizeBytes,
+          bytes_total: sizeBytes,
+          bytesDone,
+          bytes_done: bytesDone,
+          updatedAt: now,
+          updated_at: now,
+          ...fields,
+        },
+      };
+    });
+  }, []);
+
+  const clearOptimisticUploadTransfer = useCallback((asset, cloudId) => {
+    const key = assetTransferCacheKey(assetId(asset), cloudId, "upload");
+    if (!key) return;
+    setOptimisticTransfers((current) => {
+      if (!current[key]) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
   const runAssetAction = useCallback(async (action, asset) => {
     const id = assetId(asset);
     const name = assetName(asset, "asset");
@@ -1048,6 +1122,9 @@ function AssetsPanel({
     const key = `${action}:${id}`;
     setBusyKey(key);
     setActionError("");
+    if (action === "upload") {
+      setOptimisticUploadTransfer(asset, effectiveCloudId, "preparing");
+    }
     try {
       if (action === "untrack") {
         // Untracking only moves the local copy back to scratch; cloud private
@@ -1083,6 +1160,7 @@ function AssetsPanel({
       } else if (action === "unpublish") {
         await invoke("cloud_mcp_unpublish_workspace_asset", {
           assetId: id,
+          cloudId: effectiveCloudId,
           repoPath: actionRepoPath,
           workspaceId: actionWorkspaceId,
           workspaceName: actionWorkspaceName,
@@ -1103,24 +1181,59 @@ function AssetsPanel({
           workspaceId: actionWorkspaceId,
           workspaceName: actionWorkspaceName,
         });
-        if (action === "upload" && uploadPublic) {
-          await invoke("cloud_mcp_publish_workspace_asset", {
-            assetId: id,
-            cloudId: effectiveCloudId,
-            repoPath: actionRepoPath,
-            workspaceId: actionWorkspaceId,
-            workspaceName: actionWorkspaceName,
-          });
-          showActionNotice("Uploaded and published with a public link.");
+        if (action === "upload") {
+          setOptimisticUploadTransfer(asset, effectiveCloudId, "completed");
+          await refresh({ silent: true, force: true });
+          if (!uploadPublic) {
+            showActionNotice("Uploaded to Cloud.");
+            clearOptimisticUploadTransfer(asset, effectiveCloudId);
+            return;
+          }
+          try {
+            await invoke("cloud_mcp_publish_workspace_asset", {
+              assetId: id,
+              cloudId: effectiveCloudId,
+              repoPath: actionRepoPath,
+              workspaceId: actionWorkspaceId,
+              workspaceName: actionWorkspaceName,
+            });
+            await refresh({ silent: true, force: true });
+            showActionNotice("Uploaded and published with a public link.");
+          } catch (publishError) {
+            setActionError(
+              `Uploaded privately, but public link failed: ${
+                publishError?.message || String(publishError || "Publish failed.")
+              }`,
+            );
+          } finally {
+            clearOptimisticUploadTransfer(asset, effectiveCloudId);
+          }
+          return;
         }
       }
       await refresh({ silent: true, force: true });
     } catch (nextError) {
+      if (action === "upload") {
+        setOptimisticUploadTransfer(asset, effectiveCloudId, "failed", {
+          error: nextError?.message || String(nextError || "Upload failed."),
+        });
+      }
       setActionError(nextError?.message || String(nextError || `Unable to ${action} asset.`));
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [effectiveCloudId, onOpenHyperframeAsset, refresh, repoPath, selectedCloudLabel, showActionNotice, uploadPublic, workspaceOptionForAsset]);
+  }, [
+    clearOptimisticUploadTransfer,
+    effectiveCloudId,
+    onOpenHyperframeAsset,
+    refresh,
+    repoPath,
+    selectedCloudLabel,
+    setOptimisticUploadTransfer,
+    showActionNotice,
+    uploadPublic,
+    workspaceOptionForAsset,
+  ]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
     const id = assetId(asset);

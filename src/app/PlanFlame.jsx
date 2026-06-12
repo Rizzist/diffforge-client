@@ -1,191 +1,440 @@
+import { useEffect, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
-// Forge fire for the no-workspace idle surface: the user's billing plan
-// rendered as a wall of flames across the entire bottom of the pane. Higher
-// plans burn taller, brighter, and with more layers — Free is a low ember
-// line, Ultra is a full blue/violet blaze. Built for low-end machines on
-// purpose: every tongue is a blurred gradient teardrop whose blur is static
-// (rasterized once) and whose motion is transform-only (compositor path, no
-// per-frame JS, no canvas, no animated filters). The volatility comes from
-// dozens of overlapping screen-blended tongues, each flickering on its own
-// duration, phase, and sway pattern, so the wall never repeats visibly.
+export const PLAN_FLAME_OPTIONS = [
+  { key: "free", label: "Free" },
+  { key: "plus", label: "Plus" },
+  { key: "pro", label: "Pro" },
+  { key: "ultra", label: "Ultra" },
+];
+
+const PLAN_FLAME_KEYS = new Set(PLAN_FLAME_OPTIONS.map((option) => option.key));
+
 const PLAN_FLAME_PRESETS = {
   free: {
-    height: 72,
-    core: "#ffd2bd",
-    mid: "#ff5a3c",
-    outer: "#8f1208",
-    glow: "rgba(255, 74, 38, 0.30)",
-    ember: "#ff8a5c",
-    intensity: 0.62,
-    speed: 1.4,
-    embers: 5,
-    bands: { aura: 0, back: 8, front: 0, mid: 6 },
-    aura: "",
+    height: 178,
+    core: [1, 0.88, 0.78],
+    mid: [1, 0.29, 0.25],
+    outer: [0.52, 0.04, 0.02],
+    accent: [1, 0.56, 0.21],
+    glow: "rgba(255, 73, 63, 0.42)",
+    heat: "#ff493f",
+    intensity: 0.76,
+    speed: 1.24,
+    top: 0.58,
+    volatility: 0.96,
+    flash: 0.84,
   },
   plus: {
-    height: 118,
-    core: "#fff6d0",
-    mid: "#ffb224",
-    outer: "#d24a12",
-    glow: "rgba(255, 170, 40, 0.38)",
-    ember: "#ffc14d",
-    intensity: 0.85,
-    speed: 1.1,
-    embers: 8,
-    bands: { aura: 0, back: 9, front: 5, mid: 7 },
-    aura: "",
+    height: 220,
+    core: [1, 0.98, 0.76],
+    mid: [1, 0.76, 0.28],
+    outer: [0.82, 0.23, 0.06],
+    accent: [1, 0.56, 0.12],
+    glow: "rgba(255, 194, 71, 0.46)",
+    heat: "#ffc247",
+    intensity: 0.88,
+    speed: 1.08,
+    top: 0.64,
+    volatility: 1.05,
+    flash: 0.98,
   },
   pro: {
-    height: 154,
-    core: "#ffffff",
-    mid: "#dde9f7",
-    outer: "#6f96c7",
-    glow: "rgba(198, 220, 246, 0.34)",
-    ember: "#eaf3fd",
-    intensity: 0.92,
-    speed: 1,
-    embers: 11,
-    bands: { aura: 0, back: 10, front: 6, mid: 8 },
-    aura: "",
+    height: 258,
+    core: [1, 1, 1],
+    mid: [0.89, 0.94, 0.99],
+    outer: [0.32, 0.56, 0.84],
+    accent: [0.47, 0.77, 1],
+    glow: "rgba(198, 220, 246, 0.42)",
+    heat: "#f4fbff",
+    intensity: 0.94,
+    speed: 0.98,
+    top: 0.69,
+    volatility: 1.11,
+    flash: 1.04,
   },
   ultra: {
-    height: 198,
-    core: "#e4f4ff",
-    mid: "#55a8fa",
-    outer: "#8b34f0",
-    glow: "rgba(126, 88, 250, 0.44)",
-    ember: "#c4b5fd",
+    height: 310,
+    core: [0.9, 0.96, 1],
+    mid: [0.33, 0.66, 0.98],
+    outer: [0.55, 0.2, 0.94],
+    accent: [0.09, 0.78, 1],
+    glow: "rgba(126, 88, 250, 0.5)",
+    heat: "#8d6bff",
     intensity: 1,
-    speed: 0.85,
-    embers: 14,
-    bands: { aura: 4, back: 10, front: 7, mid: 8 },
-    aura: "#7c3aed",
+    speed: 0.88,
+    top: 0.75,
+    volatility: 1.24,
+    flash: 1.14,
   },
 };
 
-// Deterministic per-tongue jitter (position, size, tempo, phase, sway
-// pattern) from index math — no Math.random, so renders are stable and the
-// wall still reads as chaotic because no two tongues share a cycle.
-function flameTongueSlots(count, salt) {
-  return Array.from({ length: count }, (_, index) => ({
-    delay: -(((index * 41 + salt * 23) % 170) / 100),
-    duration: 1 + (((index * 53 + salt * 17) % 90) / 100),
-    left: ((index + 0.5) / count) * 100 + (((index * 37 + salt * 13) % 11) - 5),
-    scale: 0.62 + (((index * 29 + salt * 7) % 41) / 100),
-    sway: (index + salt) % 3,
-  }));
+const VERTEX_SHADER_SOURCE = `
+  attribute vec2 a_position;
+  varying vec2 v_uv;
+
+  void main() {
+    v_uv = a_position * 0.5 + 0.5;
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+`;
+
+const FRAGMENT_SHADER_SOURCE = `
+  precision highp float;
+
+  uniform vec2 u_resolution;
+  uniform float u_time;
+  uniform float u_intensity;
+  uniform float u_top;
+  uniform float u_volatility;
+  uniform float u_flash;
+  uniform vec3 u_core;
+  uniform vec3 u_mid;
+  uniform vec3 u_outer;
+  uniform vec3 u_accent;
+
+  varying vec2 v_uv;
+
+  float hash(vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+  }
+
+  float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+
+    return mix(
+      mix(hash(i + vec2(0.0, 0.0)), hash(i + vec2(1.0, 0.0)), u.x),
+      mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
+      u.y
+    );
+  }
+
+  float fbm(vec2 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    mat2 warp = mat2(1.62, 1.18, -1.18, 1.62);
+
+    for (int i = 0; i < 5; i++) {
+      value += amplitude * noise(p);
+      p = warp * p + 17.71;
+      amplitude *= 0.52;
+    }
+
+    return value;
+  }
+
+  void main() {
+    vec2 uv = v_uv;
+    float x = uv.x;
+    float y = uv.y;
+    float t = u_time;
+
+    float wind = sin(t * 0.74 + y * 8.0) * 0.028
+      + sin(t * 1.63 + y * 18.0) * 0.012;
+    vec2 wideField = vec2(x * 2.18 + wind, y * 2.75 - t * 0.78);
+    float wide = fbm(wideField + vec2(fbm(wideField * 1.72 + t * 0.13), -t * 0.24));
+    float middle = fbm(vec2(x * 5.4 + wide * 1.26 + t * 0.05, y * 5.85 - t * 1.55));
+    float fine = fbm(vec2(x * 15.0 + middle * 2.4 - t * 0.18, y * 13.4 - t * 2.9));
+
+    float crownNoise = fbm(vec2(x * 3.55 + t * 0.11, t * 0.42)) * 0.18
+      + fbm(vec2(x * 12.0 - t * 0.2, t * 0.73)) * 0.08;
+    float crownTop = u_top + crownNoise * u_volatility;
+    float crown = 1.0 - smoothstep(
+      crownTop - 0.2,
+      crownTop + 0.16,
+      y + (0.5 - middle) * 0.18 * u_volatility
+    );
+
+    float baseHeat = pow(max(0.0, 1.0 - y), 1.28);
+    float turbulence = wide * 0.52 + middle * 0.34 + fine * 0.18;
+    float body = baseHeat + turbulence * 0.62 * u_volatility - y * 0.26;
+    float fire = smoothstep(0.42, 1.02, body) * crown;
+
+    float bottomFlashWave = sin(t * 4.8 + x * 13.0 + wide * 5.5) * 0.5 + 0.5;
+    float bottomFlash = (1.0 - smoothstep(0.0, 0.18, y))
+      * (0.45 + 0.55 * bottomFlashWave)
+      * u_flash;
+    float glow = (1.0 - smoothstep(0.02, crownTop + 0.3, y))
+      * smoothstep(0.0, 0.25, fire + baseHeat * 0.7);
+
+    float core = smoothstep(0.63, 1.16, fire + (0.17 - y) * 1.9 + fine * 0.14);
+    float whiteCore = smoothstep(0.82, 1.22, fire + (0.09 - y) * 2.2);
+    float accentField = smoothstep(0.34, 0.78, wide)
+      * (1.0 - smoothstep(0.48, 0.9, y))
+      * 0.25;
+
+    vec3 color = mix(u_outer, u_mid, clamp(fire * 1.25 + bottomFlash * 0.18, 0.0, 1.0));
+    color = mix(color, u_accent, accentField);
+    color = mix(color, u_core, core);
+    color = mix(color, vec3(1.0), whiteCore * 0.55);
+
+    float topFade = 1.0 - smoothstep(0.58, 0.96, y);
+    float alpha = clamp((fire * 0.92 + glow * 0.36 + bottomFlash * 0.42) * u_intensity, 0.0, 1.0);
+    gl_FragColor = vec4(color, alpha * topFade);
+  }
+`;
+
+function compileShader(gl, type, source) {
+  const shader = gl.createShader(type);
+  if (!shader) {
+    throw new Error("Unable to create WebGL shader.");
+  }
+
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const error = gl.getShaderInfoLog(shader) || "Shader compile failed.";
+    gl.deleteShader(shader);
+    throw new Error(error);
+  }
+
+  return shader;
 }
 
-const PLAN_FLAME_EMBER_SLOTS = Array.from({ length: 14 }, (_, index) => ({
-  delay: ((index * 0.47) % 2.7).toFixed(2),
-  drift: ((index % 5) - 2) * 11,
-  duration: (2.2 + ((index * 0.83) % 1.9)).toFixed(2),
-  left: 2 + ((index * 83) % 96),
-  size: 2 + (index % 2),
-}));
+function createProgram(gl) {
+  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SOURCE);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
+  const program = gl.createProgram();
 
-const FLAME_BAND_SALTS = { aura: 5, back: 1, front: 3, mid: 2 };
-const FLAME_BAND_TEMPO = { aura: 2.4, back: 1.7, front: 0.95, mid: 1.25 };
+  if (!program) {
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    throw new Error("Unable to create WebGL program.");
+  }
 
-function FlameBand({ band, count }) {
-  if (!count) return null;
-  return flameTongueSlots(count, FLAME_BAND_SALTS[band]).map((slot) => (
-    <FlameShell
-      data-band={band}
-      data-sway={slot.sway}
-      key={`${band}-${slot.left.toFixed(1)}`}
-      style={{
-        "--sway-delay": `${slot.delay.toFixed(2)}s`,
-        "--sway-duration": `${(slot.duration * FLAME_BAND_TEMPO[band]).toFixed(2)}s`,
-        "--tongue-scale": slot.scale.toFixed(2),
-        left: `${slot.left.toFixed(1)}%`,
-      }}
-    >
-      <FlameTongue data-band={band} />
-    </FlameShell>
-  ));
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const error = gl.getProgramInfoLog(program) || "Shader link failed.";
+    gl.deleteProgram(program);
+    throw new Error(error);
+  }
+
+  return program;
 }
 
-export function PlanFlame({ plan }) {
-  const planKey = String(plan || "").trim().toLowerCase();
-  const preset = PLAN_FLAME_PRESETS[planKey];
+function normalizedColor(color) {
+  return new Float32Array(color);
+}
+
+export function normalizePlanFlameKey(plan, fallback = "") {
+  const key = String(plan || "").trim().toLowerCase();
+  return PLAN_FLAME_KEYS.has(key) ? key : fallback;
+}
+
+function FlameShaderCanvas({ preset, planKey, onReady }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof window === "undefined") {
+      return undefined;
+    }
+
+    onReady(false);
+
+    let frame = 0;
+    let resizeObserver = null;
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    const gl = canvas.getContext("webgl", {
+      alpha: true,
+      antialias: false,
+      depth: false,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: false,
+      stencil: false,
+    });
+
+    if (!gl) {
+      return undefined;
+    }
+
+    try {
+      const program = createProgram(gl);
+      const positionLocation = gl.getAttribLocation(program, "a_position");
+      const uniforms = {
+        accent: gl.getUniformLocation(program, "u_accent"),
+        core: gl.getUniformLocation(program, "u_core"),
+        flash: gl.getUniformLocation(program, "u_flash"),
+        intensity: gl.getUniformLocation(program, "u_intensity"),
+        mid: gl.getUniformLocation(program, "u_mid"),
+        outer: gl.getUniformLocation(program, "u_outer"),
+        resolution: gl.getUniformLocation(program, "u_resolution"),
+        time: gl.getUniformLocation(program, "u_time"),
+        top: gl.getUniformLocation(program, "u_top"),
+        volatility: gl.getUniformLocation(program, "u_volatility"),
+      };
+      const buffer = gl.createBuffer();
+      const startTime = performance.now();
+      let reportedReady = false;
+      const colors = {
+        accent: normalizedColor(preset.accent),
+        core: normalizedColor(preset.core),
+        mid: normalizedColor(preset.mid),
+        outer: normalizedColor(preset.outer),
+      };
+
+      if (!buffer) {
+        throw new Error("Unable to create WebGL buffer.");
+      }
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 3, -1, -1, 3]),
+        gl.STATIC_DRAW,
+      );
+      gl.useProgram(program);
+      gl.enableVertexAttribArray(positionLocation);
+      gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+      gl.disable(gl.DEPTH_TEST);
+      gl.disable(gl.CULL_FACE);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+      function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        const width = Math.max(1, Math.floor(rect.width * ratio));
+        const height = Math.max(1, Math.floor(rect.height * ratio));
+
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+          gl.viewport(0, 0, width, height);
+        }
+      }
+
+      function render(now) {
+        resize();
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(program);
+        gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
+        gl.uniform1f(uniforms.time, ((now - startTime) / 1000) * preset.speed);
+        gl.uniform1f(uniforms.intensity, preset.intensity);
+        gl.uniform1f(uniforms.top, preset.top);
+        gl.uniform1f(uniforms.volatility, preset.volatility);
+        gl.uniform1f(uniforms.flash, preset.flash);
+        gl.uniform3fv(uniforms.core, colors.core);
+        gl.uniform3fv(uniforms.mid, colors.mid);
+        gl.uniform3fv(uniforms.outer, colors.outer);
+        gl.uniform3fv(uniforms.accent, colors.accent);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        if (!reportedReady) {
+          reportedReady = true;
+          onReady(true);
+        }
+
+        if (!reduceMotion) {
+          frame = window.requestAnimationFrame(render);
+        }
+      }
+
+      if (typeof ResizeObserver !== "undefined") {
+        resizeObserver = new ResizeObserver(resize);
+        resizeObserver.observe(canvas);
+      } else {
+        window.addEventListener("resize", resize);
+      }
+
+      render(startTime);
+
+      return () => {
+        if (frame) {
+          window.cancelAnimationFrame(frame);
+        }
+        if (resizeObserver) {
+          resizeObserver.disconnect();
+        } else {
+          window.removeEventListener("resize", resize);
+        }
+        if (buffer) {
+          gl.deleteBuffer(buffer);
+        }
+        gl.deleteProgram(program);
+      };
+    } catch {
+      onReady(false);
+      return undefined;
+    }
+  }, [onReady, planKey, preset]);
+
+  return <FlameCanvas ref={canvasRef} />;
+}
+
+export function PlanFlame({ plan, showControls = false }) {
+  const planKey = normalizePlanFlameKey(plan);
+  const [previewPlan, setPreviewPlan] = useState(planKey);
+  const [shaderReady, setShaderReady] = useState(false);
+
+  useEffect(() => {
+    setPreviewPlan(planKey);
+  }, [planKey]);
+
+  const activePlan = normalizePlanFlameKey(previewPlan, planKey);
+  const preset = PLAN_FLAME_PRESETS[activePlan];
+
   if (!preset) return null;
 
   return (
     <FlameStage
-      aria-hidden="true"
-      data-plan={planKey}
+      aria-hidden={showControls ? undefined : true}
+      data-plan={activePlan}
+      data-ready={shaderReady ? "true" : "false"}
       style={{
-        "--flame-h": `${preset.height}px`,
-        "--flame-core": preset.core,
-        "--flame-mid": preset.mid,
-        "--flame-outer": preset.outer,
         "--flame-glow": preset.glow,
-        "--flame-ember": preset.ember,
-        "--flame-aura": preset.aura || preset.outer,
-        "--flame-intensity": preset.intensity,
-        "--flame-speed": preset.speed,
+        "--flame-h": `${preset.height}px`,
+        "--flame-heat": preset.heat,
       }}
     >
-      <FlameBedGlow />
-      <FlameBand band="aura" count={preset.bands.aura} />
-      <FlameBand band="back" count={preset.bands.back} />
-      <FlameBand band="mid" count={preset.bands.mid} />
-      <FlameBand band="front" count={preset.bands.front} />
-      <FlameEmberField>
-        {PLAN_FLAME_EMBER_SLOTS.slice(0, preset.embers).map((ember) => (
-          <i
-            key={`${ember.left}-${ember.delay}`}
-            style={{
-              "--ember-delay": `${ember.delay}s`,
-              "--ember-drift": `${ember.drift}px`,
-              "--ember-duration": `${ember.duration}s`,
-              left: `${ember.left}%`,
-              width: `${ember.size}px`,
-              height: `${ember.size}px`,
-            }}
-          />
-        ))}
-      </FlameEmberField>
+      <FlameBackdrop />
+      <FlameShaderCanvas
+        key={activePlan}
+        onReady={setShaderReady}
+        planKey={activePlan}
+        preset={preset}
+      />
+      <FlameFallback data-ready={shaderReady ? "true" : "false"} />
+      {showControls && (
+        <FlameSwitch aria-label="Switch fire plan preview">
+          {PLAN_FLAME_OPTIONS.map((option) => (
+            <FlameSwitchButton
+              aria-label={`Preview ${option.label} fire`}
+              data-active={activePlan === option.key}
+              key={option.key}
+              onClick={() => setPreviewPlan(option.key)}
+              title={`${option.label} fire`}
+              type="button"
+            >
+              {option.label}
+            </FlameSwitchButton>
+          ))}
+        </FlameSwitch>
+      )}
     </FlameStage>
   );
 }
 
-// Three sway patterns spread across the tongues so neighbours never move
-// alike: a breathing flicker, a wind-blown lean, and a spiking lick. All
-// transform-only (scale/skew/translate around the flame base).
-const flameSwayBreathe = keyframes`
-  0%, 100% { transform: translateX(-50%) scale(1, 1) skewX(0.001deg); }
-  30% { transform: translateX(-50.6%) scale(0.96, 1.07) skewX(-2deg); }
-  55% { transform: translateX(-49.5%) scale(1.04, 0.92) skewX(1.6deg); }
-  78% { transform: translateX(-50.3%) scale(0.98, 1.05) skewX(-1.2deg); }
-`;
+const fallbackFlicker = keyframes`
+  0%, 100% {
+    opacity: 0.84;
+    transform: translate3d(0, 2px, 0) scaleY(0.98);
+  }
 
-const flameSwayLean = keyframes`
-  0%, 100% { transform: translateX(-50%) scale(1, 1) skewX(0.001deg); }
-  22% { transform: translateX(-49.2%) scale(1.02, 0.97) skewX(3deg); }
-  48% { transform: translateX(-50.9%) scale(0.95, 1.1) skewX(-2.6deg); }
-  74% { transform: translateX(-49.6%) scale(1.03, 0.95) skewX(1.8deg); }
-`;
-
-const flameSwayLick = keyframes`
-  0%, 100% { transform: translateX(-50%) scale(1, 1) skewX(0.001deg); }
-  18% { transform: translateX(-50.4%) scale(0.97, 1.04) skewX(-1deg); }
-  42% { transform: translateX(-50.2%) scale(0.92, 1.22) skewX(-3deg); }
-  60% { transform: translateX(-49.4%) scale(1.05, 0.88) skewX(2.4deg); }
-  85% { transform: translateX(-50.6%) scale(0.98, 1.06) skewX(-1.6deg); }
-`;
-
-const flameGlowPulse = keyframes`
-  0%, 100% { opacity: 0.78; }
-  50% { opacity: 1; }
-`;
-
-const flameEmberRise = keyframes`
-  0% { transform: translate3d(0, 0, 0); opacity: 0; }
-  12% { opacity: 0.9; }
-  100% { transform: translate3d(var(--ember-drift), calc(var(--flame-h) * -1.35), 0); opacity: 0; }
+  50% {
+    opacity: 1;
+    transform: translate3d(0, -3px, 0) scaleY(1.04);
+  }
 `;
 
 const FlameStage = styled.div`
@@ -194,153 +443,156 @@ const FlameStage = styled.div`
   bottom: 0;
   left: 0;
   z-index: 0;
-  height: calc(var(--flame-h) * 1.7);
+  height: min(38vh, var(--flame-h));
+  min-height: min(26vh, var(--flame-h));
   pointer-events: none;
+  isolation: isolate;
+
+  &::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 54%;
+    background:
+      linear-gradient(0deg, var(--flame-glow), transparent 82%),
+      linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+    filter: blur(16px);
+    opacity: 0.78;
+    mix-blend-mode: screen;
+  }
 
   @media (prefers-reduced-motion: reduce) {
-    & * {
+    &,
+    * {
       animation: none !important;
     }
   }
 `;
 
-// Full-width coal bed the wall stands in: a hot line at the very bottom
-// inside a taller soft wash.
-const FlameBedGlow = styled.span`
+const FlameBackdrop = styled.div`
   position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: calc(var(--flame-h) * 0.6);
+  inset: auto 0 0;
+  height: 42%;
   background:
-    linear-gradient(0deg, color-mix(in srgb, var(--flame-mid) 34%, transparent), transparent 24%),
-    linear-gradient(0deg, var(--flame-glow), transparent 80%);
-  opacity: calc(0.9 * var(--flame-intensity));
-  animation: ${flameGlowPulse} calc(var(--flame-speed) * 3.1s) ease-in-out infinite;
+    radial-gradient(ellipse at 50% 100%, var(--flame-glow), transparent 68%),
+    linear-gradient(0deg, rgba(255, 255, 255, 0.1), transparent 72%);
+  opacity: 0.72;
+  mix-blend-mode: screen;
 `;
 
-// One animated tongue anchored on the bed. Sizes carry the per-tongue jitter
-// so the wall's silhouette is ragged instead of a repeated scallop.
-const FlameShell = styled.span`
-  position: absolute;
-  bottom: 0;
-  width: calc(var(--flame-h) * 0.52 * var(--tongue-scale));
-  height: calc(var(--flame-h) * var(--tongue-scale));
-  transform: translateX(-50%);
-  transform-origin: 50% 100%;
-  animation-duration: calc(var(--sway-duration) * var(--flame-speed));
-  animation-timing-function: ease-in-out;
-  animation-iteration-count: infinite;
-  animation-delay: var(--sway-delay);
-  will-change: transform;
-
-  &[data-sway="0"] {
-    animation-name: ${flameSwayBreathe};
-  }
-
-  &[data-sway="1"] {
-    animation-name: ${flameSwayLean};
-  }
-
-  &[data-sway="2"] {
-    animation-name: ${flameSwayLick};
-  }
-
-  &[data-band="back"] {
-    width: calc(var(--flame-h) * 0.68 * var(--tongue-scale));
-  }
-
-  &[data-band="front"] {
-    bottom: 2px;
-    width: calc(var(--flame-h) * 0.32 * var(--tongue-scale));
-    height: calc(var(--flame-h) * 0.58 * var(--tongue-scale));
-  }
-
-  &[data-band="aura"] {
-    width: calc(var(--flame-h) * 0.95 * var(--tongue-scale));
-    height: calc(var(--flame-h) * 1.2 * var(--tongue-scale));
-  }
-`;
-
-// The teardrop itself: a square with one sharp corner rotated tip-up, then
-// stretched vertically — the post-rotation stretch shears it slightly, which
-// is what makes each lick read as bent by heat rather than stamped. The
-// radial gradient sits on the corner that lands at the base so heat fades
-// upward into the tip. Static blur per depth band; screen blending fuses
-// overlapping tongues into one continuous fire on the dark surface.
-const FlameTongue = styled.i`
+const FlameCanvas = styled.canvas`
   position: absolute;
   inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
   display: block;
-  border-radius: 0 50% 50% 50%;
-  transform: scaleY(1.45) rotate(-45deg);
-  transform-origin: 50% 100%;
+  opacity: 0.98;
   mix-blend-mode: screen;
 
   html[data-forge-theme="light"] & {
     mix-blend-mode: normal;
   }
+`;
 
-  &[data-band="back"] {
-    background: radial-gradient(
-      circle at 76% 76%,
-      var(--flame-mid) 0%,
-      var(--flame-outer) 50%,
-      transparent 78%
-    );
-    opacity: calc(0.62 * var(--flame-intensity));
-    filter: blur(12px);
-  }
+const FlameFallback = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse at 50% 100%, rgba(255, 255, 255, 0.86) 0%, transparent 20%),
+    linear-gradient(0deg, var(--flame-heat) 0%, var(--flame-glow) 44%, transparent 86%);
+  filter: blur(12px);
+  opacity: 0.62;
+  transform-origin: 50% 100%;
+  animation: ${fallbackFlicker} 1.4s ease-in-out infinite;
+  mix-blend-mode: screen;
 
-  &[data-band="mid"] {
-    background: radial-gradient(
-      circle at 76% 76%,
-      var(--flame-core) 0%,
-      var(--flame-mid) 54%,
-      transparent 80%
-    );
-    opacity: calc(0.82 * var(--flame-intensity));
-    filter: blur(7px);
-  }
-
-  &[data-band="front"] {
-    background: radial-gradient(
-      circle at 74% 74%,
-      #ffffff 0%,
-      var(--flame-core) 42%,
-      var(--flame-mid) 68%,
-      transparent 82%
-    );
-    opacity: calc(0.92 * var(--flame-intensity));
-    filter: blur(3px);
-  }
-
-  &[data-band="aura"] {
-    background: radial-gradient(
-      circle at 76% 76%,
-      var(--flame-aura) 0%,
-      transparent 72%
-    );
-    opacity: calc(0.4 * var(--flame-intensity));
-    filter: blur(22px);
+  &[data-ready="true"] {
+    opacity: 0.16;
   }
 `;
 
-const FlameEmberField = styled.span`
+const FlameSwitch = styled.div`
   position: absolute;
-  right: 0;
-  bottom: calc(var(--flame-h) * 0.2);
-  left: 0;
-  height: 1px;
+  right: 18px;
+  bottom: 18px;
+  z-index: 3;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(46px, 1fr);
+  gap: 3px;
+  max-width: calc(100% - 36px);
+  padding: 4px;
+  border: 1px solid rgba(232, 238, 248, 0.16);
+  border-radius: 8px;
+  background: rgba(2, 4, 8, 0.72);
+  box-shadow:
+    0 12px 36px rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  pointer-events: auto;
+  backdrop-filter: blur(14px);
 
-  i {
-    position: absolute;
-    bottom: 0;
-    border-radius: 999px;
-    background: var(--flame-ember);
-    box-shadow: 0 0 6px var(--flame-ember);
-    opacity: 0;
-    animation: ${flameEmberRise} var(--ember-duration) linear infinite;
-    animation-delay: var(--ember-delay);
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: rgba(255, 255, 255, 0.78);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.12);
+  }
+
+  @media (max-width: 620px) {
+    right: 12px;
+    bottom: 12px;
+    left: 12px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-auto-flow: row;
+  }
+`;
+
+const FlameSwitchButton = styled.button`
+  min-width: 0;
+  height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  color: rgba(232, 238, 248, 0.72);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease;
+
+  &[data-active="true"] {
+    color: #ffffff;
+    background: color-mix(in srgb, var(--flame-heat) 28%, rgba(255, 255, 255, 0.1));
+    box-shadow:
+      0 0 22px color-mix(in srgb, var(--flame-heat) 46%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  }
+
+  &:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--flame-heat);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &:hover {
+    color: var(--forge-text);
   }
 `;

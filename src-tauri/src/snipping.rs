@@ -16,6 +16,7 @@ const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-s
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_OVERLAY_WINDOW_PREFIX: &str = "snipping-overlay";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
+const SNIPPING_EDITOR_DISPOSE_EVENT: &str = "forge-snip-editor-dispose";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
 const SNIPPING_DISMISSED_TOASTS_FILE: &str = "snipping-dismissed-toasts.json";
 /// Restore recipe written while this app has the user's desktop icons hidden
@@ -94,8 +95,7 @@ fn snipping_left_mouse_button_pressed() -> bool {
 /// VK_LBUTTON via GetAsyncKeyState: high bit set while the button is held.
 #[cfg(windows)]
 fn snipping_left_mouse_button_pressed() -> bool {
-    let state =
-        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) };
+    let state = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) };
     (state as u16 & 0x8000) != 0
 }
 
@@ -159,6 +159,16 @@ struct SnippingState {
     /// Presence marks an in-flight user drag; the start position separates
     /// real drags from plain clicks when the drag settles.
     preview_drag_sessions: Arc<StdMutex<HashMap<String, (i32, i32)>>>,
+    /// Preview labels the user has manually moved. These may still block the
+    /// bottom-left queue, but the queue must not pull them into an auto slot
+    /// after release.
+    preview_detached_labels: Arc<StdMutex<HashSet<String>>>,
+    /// Preview labels currently owned by the top strip row. These are real
+    /// preview windows, but the strip owns their lifecycle while docked.
+    preview_docked_labels: Arc<StdMutex<HashSet<String>>>,
+    /// Preview labels whose webviews have been told to dispose and whose native
+    /// windows are waiting for the close grace/release gate.
+    preview_closing: Arc<StdMutex<HashSet<String>>>,
     preview_drag_over_last_emit_ms: Arc<AtomicU64>,
     /// Bumped whenever a new stack animation starts; in-flight tween threads
     /// compare their ticket and stop, so re-targeted reflows never fight.
@@ -187,6 +197,9 @@ impl SnippingState {
             preview_restack_watcher_active: Arc::new(AtomicBool::new(false)),
             preview_paths: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
+            preview_detached_labels: Arc::new(StdMutex::new(HashSet::new())),
+            preview_docked_labels: Arc::new(StdMutex::new(HashSet::new())),
+            preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
             preview_animation_generation: Arc::new(AtomicU64::new(0)),
             preview_live_reflow_last_ms: Arc::new(AtomicU64::new(0)),
@@ -345,7 +358,6 @@ impl SnippingShortcutAction {
             Self::AreaSnip => "area snip",
         }
     }
-
 }
 
 #[cfg(target_os = "macos")]
@@ -580,7 +592,10 @@ fn normalize_snipping_shortcut_text(value: &str) -> Result<String, String> {
 }
 
 fn snipping_shortcuts_conflict(left: &str, right: &str) -> bool {
-    match (parse_snipping_shortcut(left), parse_snipping_shortcut(right)) {
+    match (
+        parse_snipping_shortcut(left),
+        parse_snipping_shortcut(right),
+    ) {
         (Ok(left), Ok(right)) => left.id() == right.id(),
         _ => false,
     }
@@ -600,7 +615,9 @@ fn validate_snipping_shortcut_for_action(
 ) -> Result<(), String> {
     parse_snipping_shortcut(shortcut)?;
 
-    if !snipping_shortcut_has_explicit_modifier(shortcut) && !snipping_shortcut_is_print_screen(shortcut) {
+    if !snipping_shortcut_has_explicit_modifier(shortcut)
+        && !snipping_shortcut_is_print_screen(shortcut)
+    {
         return Err(format!(
             "The {} shortcut needs a modifier such as Control, Command, Alt, or Shift.",
             action.label()
@@ -614,8 +631,8 @@ fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
     let defaults = default_snipping_settings();
     let mut full_screenshot = normalize_snipping_shortcut_text(&settings.full_screenshot)
         .unwrap_or(defaults.full_screenshot.clone());
-    let mut area_snip = normalize_snipping_shortcut_text(&settings.area_snip)
-        .unwrap_or(defaults.area_snip.clone());
+    let mut area_snip =
+        normalize_snipping_shortcut_text(&settings.area_snip).unwrap_or(defaults.area_snip.clone());
 
     if validate_snipping_shortcut_for_action(
         SnippingShortcutAction::FullScreenshot,
@@ -626,8 +643,7 @@ fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
         full_screenshot = defaults.full_screenshot.clone();
     }
 
-    if validate_snipping_shortcut_for_action(SnippingShortcutAction::AreaSnip, &area_snip)
-        .is_err()
+    if validate_snipping_shortcut_for_action(SnippingShortcutAction::AreaSnip, &area_snip).is_err()
     {
         area_snip = defaults.area_snip.clone();
     }
@@ -658,10 +674,7 @@ fn read_snipping_settings(app: &AppHandle) -> SnippingSettings {
         .unwrap_or_else(|_| default_snipping_settings())
 }
 
-fn write_snipping_settings(
-    app: &AppHandle,
-    settings: &SnippingSettings,
-) -> Result<(), String> {
+fn write_snipping_settings(app: &AppHandle, settings: &SnippingSettings) -> Result<(), String> {
     let path = snipping_shortcut_settings_path(app)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -711,10 +724,7 @@ fn snipping_desktop_icons_marker_path(app: &AppHandle) -> Result<PathBuf, String
 // Only the Windows/Linux screen-side hides leave state worth a crash marker;
 // macOS hides capture-side and changes nothing on the system.
 #[cfg(any(windows, target_os = "linux"))]
-fn snipping_write_desktop_icons_marker(
-    app: &AppHandle,
-    marker: &SnippingDesktopIconsMarker,
-) {
+fn snipping_write_desktop_icons_marker(app: &AppHandle, marker: &SnippingDesktopIconsMarker) {
     let Ok(path) = snipping_desktop_icons_marker_path(app) else {
         return;
     };
@@ -740,7 +750,13 @@ fn snipping_take_desktop_icons_marker(app: &AppHandle) -> Option<SnippingDesktop
 #[cfg(target_os = "macos")]
 fn snipping_macos_restore_finder_desktop_icons() {
     let wrote = Command::new("defaults")
-        .args(["write", "com.apple.finder", "CreateDesktop", "-bool", "true"])
+        .args([
+            "write",
+            "com.apple.finder",
+            "CreateDesktop",
+            "-bool",
+            "true",
+        ])
         .status()
         .map(|status| status.success())
         .unwrap_or(false);
@@ -894,7 +910,14 @@ fn snipping_desktop_icons_hide_platform(app: &AppHandle) -> bool {
     ) {
         if style.parse::<i64>().map(|value| value > 0).unwrap_or(false) {
             let set = Command::new("xfconf-query")
-                .args(["-c", "xfce4-desktop", "-p", "/desktop-icons/style", "-s", "0"])
+                .args([
+                    "-c",
+                    "xfce4-desktop",
+                    "-p",
+                    "/desktop-icons/style",
+                    "-s",
+                    "0",
+                ])
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false);
@@ -1142,10 +1165,7 @@ fn unregister_snipping_shortcut(app: &AppHandle, shortcut_text: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn snipping_is_macos_default_shortcut(
-    action: SnippingShortcutAction,
-    shortcut_text: &str,
-) -> bool {
+fn snipping_is_macos_default_shortcut(action: SnippingShortcutAction, shortcut_text: &str) -> bool {
     snipping_shortcuts_conflict(shortcut_text, &action.default_shortcut())
 }
 
@@ -1213,7 +1233,8 @@ extern "C" fn snipping_macos_event_tap_callback(
         return event;
     }
 
-    let keycode = unsafe { CGEventGetIntegerValueField(event, SNIPPING_MACOS_CG_KEYBOARD_EVENT_KEYCODE) };
+    let keycode =
+        unsafe { CGEventGetIntegerValueField(event, SNIPPING_MACOS_CG_KEYBOARD_EVENT_KEYCODE) };
     let Some(app) = snipping_macos_event_tap_app() else {
         return event;
     };
@@ -1275,9 +1296,7 @@ fn register_snipping_macos_event_tap(app: &AppHandle) -> Result<(), String> {
             return;
         }
 
-        let source = unsafe {
-            CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0)
-        };
+        let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
         if source.is_null() {
             let _ = sender.send(false);
             return;
@@ -1619,7 +1638,11 @@ fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor,
         .map_err(|error| format!("Unable to list monitors: {error}"))?
         .into_iter()
         .find(|monitor| monitor.is_primary().unwrap_or(false))
-        .or_else(|| XcapMonitor::all().ok().and_then(|mut monitors| monitors.drain(..).next()))
+        .or_else(|| {
+            XcapMonitor::all()
+                .ok()
+                .and_then(|mut monitors| monitors.drain(..).next())
+        })
         .ok_or_else(|| "No monitor is available for snipping.".to_string())?;
 
     Ok(snipping_area_monitor_from_xcap_monitor(&monitor))
@@ -1638,8 +1661,8 @@ fn snipping_area_monitors(app: &AppHandle) -> Result<Vec<SnippingAreaMonitor>, S
         }
     }
 
-    let monitors = XcapMonitor::all()
-        .map_err(|error| format!("Unable to list monitors: {error}"))?;
+    let monitors =
+        XcapMonitor::all().map_err(|error| format!("Unable to list monitors: {error}"))?;
     let mapped: Vec<SnippingAreaMonitor> = monitors
         .iter()
         .map(snipping_area_monitor_from_xcap_monitor)
@@ -1704,7 +1727,11 @@ fn xcap_monitor_for_full(app: &AppHandle) -> Result<XcapMonitor, String> {
         .map_err(|error| format!("Unable to list monitors: {error}"))?
         .into_iter()
         .find(|monitor| monitor.is_primary().unwrap_or(false))
-        .or_else(|| XcapMonitor::all().ok().and_then(|mut monitors| monitors.drain(..).next()))
+        .or_else(|| {
+            XcapMonitor::all()
+                .ok()
+                .and_then(|mut monitors| monitors.drain(..).next())
+        })
         .ok_or_else(|| "No monitor is available for screenshot capture.".to_string())
 }
 
@@ -1744,10 +1771,7 @@ fn snipping_crop_snapshot_image(
     let crop_y = y.min(image_height.saturating_sub(1));
     let crop_width = width.min(image_width.saturating_sub(crop_x)).max(1);
     let crop_height = height.min(image_height.saturating_sub(crop_y)).max(1);
-    Ok(
-        xcap::image::imageops::crop_imm(image, crop_x, crop_y, crop_width, crop_height)
-            .to_image(),
-    )
+    Ok(xcap::image::imageops::crop_imm(image, crop_x, crop_y, crop_width, crop_height).to_image())
 }
 
 fn snipping_crop_area_preview_snapshot(
@@ -1771,15 +1795,21 @@ fn snipping_crop_area_preview_snapshot(
 
 #[cfg(target_os = "macos")]
 fn snipping_macos_window_number(window: &tauri::WebviewWindow) -> Option<u32> {
-    let ns_window = window.ns_window().ok()?;
-    if ns_window.is_null() {
-        return None;
-    }
+    snipping_catch_objc_result("macos_window_number", || {
+        let Some(ns_window) = window.ns_window().ok() else {
+            return Ok(None);
+        };
+        if ns_window.is_null() {
+            return Ok(None);
+        }
 
-    let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-    u32::try_from(ns_window.windowNumber())
-        .ok()
-        .filter(|window_number| *window_number > 0)
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        Ok(u32::try_from(ns_window.windowNumber())
+            .ok()
+            .filter(|window_number| *window_number > 0))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Window numbers of every snip overlay window, for excluding them from
@@ -1894,8 +1924,7 @@ fn snipping_macos_sck_capture_display(
         SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
     };
 
-    let (sender, receiver) =
-        std::sync::mpsc::channel::<Result<xcap::image::RgbaImage, String>>();
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<xcap::image::RgbaImage, String>>();
     let exclude_window_numbers = exclude_window_numbers.to_vec();
     let width = width.max(1);
     let height = height.max(1);
@@ -1906,7 +1935,7 @@ fn snipping_macos_sck_capture_display(
     let content_sender = sender.clone();
     let content_block = block2::RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut objc2_foundation::NSError| {
-            let outcome = (|| -> Result<(), String> {
+            let outcome = snipping_catch_objc_result("sck_shareable_content_callback", || {
                 let content = unsafe { content.as_ref() }.ok_or_else(|| {
                     unsafe { error.as_ref() }
                         .map(|error| error.localizedDescription().to_string())
@@ -1961,15 +1990,20 @@ fn snipping_macos_sck_capture_display(
                 let image_sender = content_sender.clone();
                 let image_block = block2::RcBlock::new(
                     move |cg_image: *mut CGImage, error: *mut objc2_foundation::NSError| {
-                        let result = if cg_image.is_null() {
-                            Err(unsafe { error.as_ref() }
-                                .map(|error| error.localizedDescription().to_string())
-                                .unwrap_or_else(|| {
-                                    "ScreenCaptureKit returned no snip image.".to_string()
-                                }))
-                        } else {
-                            snipping_macos_cg_image_to_rgba_image(unsafe { cg_image.as_ref() })
-                        };
+                        let result =
+                            snipping_catch_objc_result("sck_capture_image_callback", || {
+                                if cg_image.is_null() {
+                                    Err(unsafe { error.as_ref() }
+                                        .map(|error| error.localizedDescription().to_string())
+                                        .unwrap_or_else(|| {
+                                            "ScreenCaptureKit returned no snip image.".to_string()
+                                        }))
+                                } else {
+                                    snipping_macos_cg_image_to_rgba_image(unsafe {
+                                        cg_image.as_ref()
+                                    })
+                                }
+                            });
                         let _ = image_sender.send(result);
                     },
                 );
@@ -1981,7 +2015,7 @@ fn snipping_macos_sck_capture_display(
                     )
                 };
                 Ok(())
-            })();
+            });
             if let Err(error) = outcome {
                 let _ = content_sender.send(Err(error));
             }
@@ -1991,13 +2025,16 @@ fn snipping_macos_sck_capture_display(
     // (wallpaper, Finder's icon layer) from the enumeration depending on the
     // macOS version — then the icon exclusion above matches nothing and the
     // icons stay baked into the capture. Ask for desktop windows explicitly.
-    unsafe {
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            false,
-            false,
-            &content_block,
-        )
-    };
+    snipping_catch_objc_result("sck_get_shareable_content", || {
+        unsafe {
+            SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+                false,
+                false,
+                &content_block,
+            );
+        }
+        Ok(())
+    })?;
 
     receiver
         .recv_timeout(Duration::from_millis(6000))
@@ -2016,8 +2053,12 @@ fn snipping_macos_sck_capture_monitor(
         .id()
         .map_err(|error| format!("Unable to read display id for snip capture: {error}"))?;
     let scale = f64::from(monitor.scale_factor().unwrap_or(1.0)).max(0.1);
-    let width = (f64::from(monitor.width().unwrap_or(1)) * scale).round().max(1.0) as u32;
-    let height = (f64::from(monitor.height().unwrap_or(1)) * scale).round().max(1.0) as u32;
+    let width = (f64::from(monitor.width().unwrap_or(1)) * scale)
+        .round()
+        .max(1.0) as u32;
+    let height = (f64::from(monitor.height().unwrap_or(1)) * scale)
+        .round()
+        .max(1.0) as u32;
     snipping_macos_sck_capture_display(
         display_id,
         exclude_window_numbers,
@@ -2078,9 +2119,14 @@ fn snipping_capture_area_image(
             .as_ref()
             .and_then(snipping_macos_window_number)
         {
-            if let Ok(image) =
-                snipping_macos_capture_region_below_window(monitor, x, y, width, height, window_number)
-            {
+            if let Ok(image) = snipping_macos_capture_region_below_window(
+                monitor,
+                x,
+                y,
+                width,
+                height,
+                window_number,
+            ) {
                 return Ok(image);
             }
         }
@@ -2089,7 +2135,9 @@ fn snipping_capture_area_image(
     let _ = overlay_label;
 
     snipping_hide_area_overlay(app);
-    thread::sleep(Duration::from_millis(SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS));
+    thread::sleep(Duration::from_millis(
+        SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS,
+    ));
     monitor
         .capture_region(x, y, width, height)
         .map_err(|error| format!("Unable to capture selected area: {error}"))
@@ -2147,14 +2195,14 @@ fn snipping_capture_monitor_image_keeping_session(
 
     let overlay = app.get_webview_window(overlay_label);
     if let Some(overlay) = overlay.as_ref() {
-        let _ = overlay.hide();
+        snipping_hide_window_now(overlay, "capture_region_hide_overlay");
     }
     thread::sleep(Duration::from_millis(60));
     let captured = monitor
         .capture_region(0, 0, width, height)
         .map_err(|error| format!("Unable to capture screen for snip re-freeze: {error}"));
     if let Some(overlay) = overlay.as_ref() {
-        let _ = overlay.show();
+        snipping_show_window_now(overlay, "capture_region_show_overlay");
         // Space-change re-freezes can run while Diff Forge is not the active
         // app (the user just swiped into another app's fullscreen Space);
         // makeKeyAndOrderFront alone would leave the overlay hidden there.
@@ -2227,8 +2275,12 @@ fn snipping_write_dismissed_toast_paths(
         paths: sorted_paths,
     })
     .map_err(|error| format!("Unable to serialize dismissed snips: {error}"))?;
-    fs::write(&file, contents)
-        .map_err(|error| format!("Unable to write dismissed snips {}: {error}", file.display()))
+    fs::write(&file, contents).map_err(|error| {
+        format!(
+            "Unable to write dismissed snips {}: {error}",
+            file.display()
+        )
+    })
 }
 
 fn snipping_capture_toast_is_dismissed(value: &Value, dismissed_paths: &HashSet<String>) -> bool {
@@ -2304,7 +2356,9 @@ fn snipping_dismiss_capture_toast_for(
         guard.retain(|item| {
             let path_matches = dismissed_path
                 .as_ref()
-                .and_then(|path| snipping_capture_toast_path(item).map(|item_path| item_path == *path))
+                .and_then(|path| {
+                    snipping_capture_toast_path(item).map(|item_path| item_path == *path)
+                })
                 .unwrap_or(false);
             let id_matches = dismissed_id
                 .as_ref()
@@ -2380,7 +2434,8 @@ fn snipping_emit_untracked_image_saved_with_toast(
         let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
         let _ = app.run_on_main_thread(move || {
-            let _ = snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
+            let _ =
+                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
         });
     }
     let root = diffforge_prepare_untracked_asset_root()?;
@@ -2437,10 +2492,7 @@ fn snipping_emit_untracked_image_saved(
 /// Writes a capture as PNG with fast compression. Default PNG settings spend
 /// seconds compressing a retina-sized frame, which is the difference between
 /// the capture toast appearing instantly and appearing after a long pause.
-fn snipping_write_png_fast(
-    image: &xcap::image::RgbaImage,
-    path: &Path,
-) -> Result<(), String> {
+fn snipping_write_png_fast(image: &xcap::image::RgbaImage, path: &Path) -> Result<(), String> {
     use xcap::image::ImageEncoder;
     let file = fs::File::create(path)
         .map_err(|error| format!("Unable to create snip image {}: {error}", path.display()))?;
@@ -2512,10 +2564,8 @@ fn snipping_center_floating_window(app: &AppHandle, window: &tauri::WebviewWindo
         let _ = window.center();
         return;
     };
-    let x = work_area.position.x
-        + ((work_area.size.width as i32 - size.width as i32) / 2).max(0);
-    let y = work_area.position.y
-        + ((work_area.size.height as i32 - size.height as i32) / 2).max(0);
+    let x = work_area.position.x + ((work_area.size.width as i32 - size.width as i32) / 2).max(0);
+    let y = work_area.position.y + ((work_area.size.height as i32 - size.height as i32) / 2).max(0);
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
@@ -2582,9 +2632,9 @@ fn snipping_open_annotation_editor_for_paths(
             .map(|(open_label, open_paths)| (open_label.clone(), open_paths.clone()));
         if let Some((existing_label, existing_paths)) = existing {
             if let Some(window) = app.get_webview_window(&existing_label) {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
+                snipping_unminimize_window_now(&window, "focus_existing_editor_unminimize");
+                snipping_show_window_now(&window, "focus_existing_editor_show");
+                snipping_focus_window_now(&window, "focus_existing_editor_focus");
                 return Ok(json!({
                     "kind": "snipping_floating_asset_window_focused",
                     "label": existing_label,
@@ -2650,18 +2700,25 @@ fn snipping_open_annotation_editor_for_paths(
         .max(0.05);
     inner_width *= fit;
     inner_height *= fit;
-    let min_inner_width = 420.0;
-    let min_inner_height = min_inner_width / SNIPPING_FLOAT_GOLDEN_RATIO;
-    if inner_width < min_inner_width {
-        inner_width = min_inner_width;
-        inner_height = min_inner_height;
-    }
+    // Comfortable editing floor: small snips still open a workable editor —
+    // room for the full-height tool rail, the options pill, the action
+    // cluster, and the two-row composer — while bigger snips keep growing
+    // through the golden-ratio fit above. Clamped per axis so a wide-short
+    // or tall-narrow fit cannot duck under either minimum.
+    let min_inner_width = 760.0;
+    let min_inner_height = 560.0;
+    inner_width = inner_width.max(min_inner_width);
+    inner_height = inner_height.max(min_inner_height);
     let window = WebviewWindowBuilder::new(
         app,
         label.clone(),
         WebviewUrl::App(format!("index.html#/snipping-editor/{encoded_paths}").into()),
     )
-    .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
+    .title(if path_values.len() > 1 {
+        "Annotate Assets"
+    } else {
+        "Annotate Snip"
+    })
     .inner_size(inner_width, inner_height)
     .min_inner_size(min_inner_width, min_inner_height)
     .resizable(true)
@@ -2680,18 +2737,36 @@ fn snipping_open_annotation_editor_for_paths(
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
+    {
+        let editor_paths = app.state::<SnippingState>().editor_paths.clone();
+        let label_for_destroy = label.clone();
+        window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::Destroyed) {
+                if let Ok(mut open) = editor_paths.lock() {
+                    open.remove(&label_for_destroy);
+                }
+            }
+        });
+    }
     snipping_center_floating_window(app, &window);
     // The editor webview reveals the window itself right after its first
     // painted frame, so the user never sees an unpainted flash. The fallback
     // below only fires if the page fails to boot.
     {
-        let window = window.clone();
+        let app_for_reveal = app.clone();
+        let label_for_reveal = label.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(1500));
-            if !window.is_visible().unwrap_or(false) {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            let app_for_main = app_for_reveal.clone();
+            let _ = app_for_reveal.run_on_main_thread(move || {
+                let Some(window) = app_for_main.get_webview_window(&label_for_reveal) else {
+                    return;
+                };
+                if matches!(window.is_visible(), Ok(false)) {
+                    snipping_show_window_now(&window, "editor_reveal_fallback_show");
+                    snipping_focus_window_now(&window, "editor_reveal_fallback_focus");
+                }
+            });
         });
     }
     Ok(json!({
@@ -2705,11 +2780,7 @@ fn snipping_set_asset_target_for(
     app: &AppHandle,
     request: SnippingAssetTargetRequest,
 ) -> Result<Value, String> {
-    let repo_path = request
-        .repo_path
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let repo_path = request.repo_path.unwrap_or_default().trim().to_string();
     let workspace_id = request
         .workspace_id
         .map(|value| value.trim().to_string())
@@ -2811,10 +2882,7 @@ fn snipping_save_edited_untracked_asset_for(
             Some(source.display().to_string()),
         )
     };
-    let tmp = tmp_dir.join(format!(
-        ".snip-edited-{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
+    let tmp = tmp_dir.join(format!(".snip-edited-{}.tmp", uuid::Uuid::new_v4()));
     fs::write(&tmp, &bytes)
         .map_err(|error| format!("Unable to write edited snip {}: {error}", tmp.display()))?;
     fs::rename(&tmp, &target).map_err(|error| {
@@ -2841,9 +2909,7 @@ fn snipping_save_edited_untracked_asset_for(
     )?;
 
     let target_path = target.display().to_string();
-    let original_for_event = original_path
-        .clone()
-        .unwrap_or_else(|| target_path.clone());
+    let original_for_event = original_path.clone().unwrap_or_else(|| target_path.clone());
     let _ = app.emit(
         SNIPPING_SOURCE_UPDATED_EVENT,
         json!({
@@ -2864,13 +2930,34 @@ fn snipping_save_edited_untracked_asset_for(
     // preview window: if no preview is showing (dismissed, or opened through
     // the editor directly), the save is just a save.
     if !source_is_edited_copy {
-        let preview_label = format!(
-            "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
-            snipping_window_token(&source)
-        );
-        if app.get_webview_window(&preview_label).is_some() {
-            if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+        let source_path = source.display().to_string();
+        let closing_labels = snipping_preview_closing_labels(app);
+        if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+            let mut retargeted = false;
+            for (label, open_path) in paths.iter_mut() {
+                if open_path == &source_path && !closing_labels.contains(label) {
+                    *open_path = target_path.clone();
+                    retargeted = true;
+                }
+            }
+            let preview_label = format!(
+                "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+                snipping_window_token(&source)
+            );
+            if !retargeted
+                && !closing_labels.contains(&preview_label)
+                && app.get_webview_window(&preview_label).is_some()
+            {
                 paths.insert(preview_label, target_path.clone());
+            }
+        }
+        if let Ok(mut editors) = app.state::<SnippingState>().editor_paths.lock() {
+            for open_paths in editors.values_mut() {
+                if open_paths.iter().any(|open_path| open_path == &source_path)
+                    && !open_paths.iter().any(|open_path| open_path == &target_path)
+                {
+                    open_paths.push(target_path.clone());
+                }
             }
         }
     }
@@ -2907,10 +2994,7 @@ fn snipping_capture_full_for(
     snipping_save_image(app, image_result?, "full", reason, shortcut)
 }
 
-fn size_snipping_overlay_window(
-    window: &tauri::WebviewWindow,
-    monitor: &SnippingAreaMonitor,
-) {
+fn size_snipping_overlay_window(window: &tauri::WebviewWindow, monitor: &SnippingAreaMonitor) {
     // macOS/Linux: position in logical points — physical coordinates are not
     // a uniform space across mixed-DPI displays, so a physical set_position
     // lands a secondary-display overlay in the wrong place. capture_* already
@@ -2988,20 +3072,22 @@ fn ensure_snipping_overlay_window(
 fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.setCollectionBehavior(
-            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                | objc2_app_kit::NSWindowCollectionBehavior::Stationary
-                | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
-        );
-        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+        snipping_catch_objc("apply_overlay_fullscreen_window_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+        });
     });
 }
 
@@ -3014,14 +3100,16 @@ fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow)
 fn snipping_order_overlay_front_regardless(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.orderFrontRegardless();
+        snipping_catch_objc("order_overlay_front_regardless", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.orderFrontRegardless();
+        });
     });
 }
 
@@ -3052,8 +3140,7 @@ fn snipping_overlay_panel_class() -> Option<&'static objc2::runtime::AnyClass> {
     static PANEL_CLASS: OnceLock<Option<&'static objc2::runtime::AnyClass>> = OnceLock::new();
     *PANEL_CLASS.get_or_init(|| {
         let superclass = objc2::class!(NSPanel);
-        let mut builder =
-            objc2::runtime::ClassBuilder::new(c"DiffForgeSnipPanel", superclass)?;
+        let mut builder = objc2::runtime::ClassBuilder::new(c"DiffForgeSnipPanel", superclass)?;
         builder.add_ivar::<objc2::runtime::Bool>(c"focusable");
         unsafe {
             builder.add_method(
@@ -3069,6 +3156,56 @@ fn snipping_overlay_panel_class() -> Option<&'static objc2::runtime::AnyClass> {
     })
 }
 
+/// AppKit exception guard for raw main-thread window calls. An NSException
+/// that unwinds out of a runloop callback crosses Rust's catch_unwind in
+/// tao's observer as a FOREIGN exception, which aborts the whole process
+/// (SIGABRT in __rust_foreign_exception — seen closing a re-classed snip
+/// preview). Catch at the ObjC boundary and log instead.
+#[cfg(target_os = "macos")]
+fn snipping_catch_objc<F: FnOnce()>(context: &'static str, work: F) {
+    let outcome = objc2::exception::catch(std::panic::AssertUnwindSafe(work));
+    if let Err(exception) = outcome {
+        let exception = exception
+            .map(|error| format!("{error:?}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        log_terminal_status_event(
+            "backend.snipping.objc_exception",
+            json!({
+                "context": context,
+                "exception": exception,
+            }),
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_catch_objc_result<T, F>(context: &'static str, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    match objc2::exception::catch(std::panic::AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(exception) => {
+            let exception = exception
+                .map(|error| format!("{error:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            log_terminal_status_event(
+                "backend.snipping.objc_exception",
+                json!({
+                    "context": context,
+                    "exception": exception,
+                }),
+            );
+            Err(format!("macOS snipping window operation failed: {context}"))
+        }
+    }
+}
+
+/// The class tao gave our windows before any panel re-classing, captured the
+/// first time a conversion runs so teardown can restore it.
+#[cfg(target_os = "macos")]
+static SNIPPING_PANEL_ORIGINAL_CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
+
 /// Re-classes the tao NSWindow into a non-activating NSPanel. A regular
 /// NSWindow of an inactive app can never become key, and activating the app
 /// (tao's set_focus) either gets denied by macOS 14+ cooperative activation
@@ -3080,33 +3217,135 @@ fn snipping_overlay_panel_class() -> Option<&'static objc2::runtime::AnyClass> {
 fn snipping_convert_overlay_window_to_panel(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Some(panel_class) = snipping_overlay_panel_class() else {
-            return;
-        };
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let object: &objc2::runtime::AnyObject =
-            unsafe { &*ns_window.cast::<objc2::runtime::AnyObject>() };
-        if !std::ptr::eq(object.class(), panel_class) {
-            unsafe {
-                objc2::runtime::AnyObject::set_class(object, panel_class);
+        snipping_catch_objc("convert_overlay_window_to_panel", || {
+            let Some(panel_class) = snipping_overlay_panel_class() else {
+                return;
+            };
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
             }
-        }
-        let panel: &objc2_app_kit::NSPanel =
-            unsafe { &*ns_window.cast::<objc2_app_kit::NSPanel>() };
-        panel.setStyleMask(
-            panel.styleMask() | objc2_app_kit::NSWindowStyleMask::NonactivatingPanel,
-        );
-        panel.setBecomesKeyOnlyIfNeeded(false);
-        panel.setWorksWhenModal(true);
-        // NSPanel semantics would otherwise order the overlay out whenever
-        // the app deactivates — which is the normal state during a snip.
-        panel.setHidesOnDeactivate(false);
+            let object: &objc2::runtime::AnyObject =
+                unsafe { &*ns_window.cast::<objc2::runtime::AnyObject>() };
+            if !std::ptr::eq(object.class(), panel_class) {
+                let _ = SNIPPING_PANEL_ORIGINAL_CLASS.set(object.class());
+                unsafe {
+                    objc2::runtime::AnyObject::set_class(object, panel_class);
+                }
+            }
+            let panel: &objc2_app_kit::NSPanel =
+                unsafe { &*ns_window.cast::<objc2_app_kit::NSPanel>() };
+            panel.setStyleMask(
+                panel.styleMask() | objc2_app_kit::NSWindowStyleMask::NonactivatingPanel,
+            );
+            panel.setBecomesKeyOnlyIfNeeded(false);
+            panel.setWorksWhenModal(true);
+            // NSPanel semantics would otherwise order the overlay out whenever
+            // the app deactivates — which is the normal state during a snip.
+            panel.setHidesOnDeactivate(false);
+        });
     });
+}
+
+/// Undoes the panel re-class right before a converted window closes: AppKit
+/// tears the window down through NSPanel code paths the instance was never
+/// initialized for (it was allocated as tao's plain NSWindow subclass), and
+/// that teardown can raise — crashing the app — once the window is in an
+/// ordering transaction. Restoring the original class makes close boring.
+#[cfg(target_os = "macos")]
+fn snipping_restore_window_class_for_close_now(window: &tauri::WebviewWindow) {
+    let Some(panel_class) = snipping_overlay_panel_class() else {
+        return;
+    };
+    let Some(original_class) = SNIPPING_PANEL_ORIGINAL_CLASS.get().copied() else {
+        return;
+    };
+    let Ok(ns_window) = window.ns_window() else {
+        return;
+    };
+    if ns_window.is_null() {
+        return;
+    }
+    let object: &objc2::runtime::AnyObject = unsafe { &*ns_window.cast::<objc2::runtime::AnyObject>() };
+    if std::ptr::eq(object.class(), panel_class) {
+        unsafe {
+            objc2::runtime::AnyObject::set_class(object, original_class);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_close_window_now(window: &tauri::WebviewWindow, context: &'static str) {
+    snipping_catch_objc(context, || {
+        snipping_restore_window_class_for_close_now(window);
+        let _ = window.close();
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_close_window_now(window: &tauri::WebviewWindow, _context: &'static str) {
+    let _ = window.close();
+}
+
+fn snipping_close_window_guarded(window: &tauri::WebviewWindow, context: &'static str) {
+    let window_for_main = window.clone();
+    let window_for_close = window_for_main.clone();
+    let _ = window_for_main.run_on_main_thread(move || {
+        snipping_close_window_now(&window_for_close, context);
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_hide_window_now(window: &tauri::WebviewWindow, context: &'static str) {
+    snipping_catch_objc(context, || {
+        let _ = window.hide();
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_hide_window_now(window: &tauri::WebviewWindow, _context: &'static str) {
+    let _ = window.hide();
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_show_window_now(window: &tauri::WebviewWindow, context: &'static str) -> bool {
+    snipping_catch_objc_result(context, || {
+        window.show().map_err(|error| format!("{error}"))
+    })
+    .is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_show_window_now(window: &tauri::WebviewWindow, _context: &'static str) -> bool {
+    window.show().is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_focus_window_now(window: &tauri::WebviewWindow, context: &'static str) -> bool {
+    snipping_catch_objc_result(context, || {
+        window.set_focus().map_err(|error| format!("{error}"))
+    })
+    .is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_focus_window_now(window: &tauri::WebviewWindow, _context: &'static str) -> bool {
+    window.set_focus().is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_unminimize_window_now(window: &tauri::WebviewWindow, context: &'static str) -> bool {
+    snipping_catch_objc_result(context, || {
+        window.unminimize().map_err(|error| format!("{error}"))
+    })
+    .is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_unminimize_window_now(window: &tauri::WebviewWindow, _context: &'static str) -> bool {
+    window.unminimize().is_ok()
 }
 
 /// Makes one overlay panel the key window WITHOUT activating the app — the
@@ -3117,14 +3356,16 @@ fn snipping_convert_overlay_window_to_panel(window: &tauri::WebviewWindow) {
 fn snipping_make_overlay_key(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.makeKeyAndOrderFront(None);
+        snipping_catch_objc("make_overlay_key", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.makeKeyAndOrderFront(None);
+        });
     });
 }
 
@@ -3145,34 +3386,36 @@ fn snipping_overlay_handle_mouse_moved() {
     if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    let Some(app) = snipping_macos_event_tap_app() else {
-        return;
-    };
-    let location = objc2_app_kit::NSEvent::mouseLocation();
-    for (_, window) in snipping_overlay_windows(&app) {
-        let Ok(ns_ptr) = window.ns_window() else {
-            continue;
+    snipping_catch_objc("overlay_handle_mouse_moved", || {
+        let Some(app) = snipping_macos_event_tap_app() else {
+            return;
         };
-        if ns_ptr.is_null() {
-            continue;
+        let location = objc2_app_kit::NSEvent::mouseLocation();
+        for (_, window) in snipping_overlay_windows(&app) {
+            let Ok(ns_ptr) = window.ns_window() else {
+                continue;
+            };
+            if ns_ptr.is_null() {
+                continue;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+            if !ns_window.isVisible() {
+                continue;
+            }
+            let frame = ns_window.frame();
+            let inside = location.x >= frame.origin.x
+                && location.x < frame.origin.x + frame.size.width
+                && location.y >= frame.origin.y
+                && location.y < frame.origin.y + frame.size.height;
+            if !inside {
+                continue;
+            }
+            if !ns_window.isKeyWindow() {
+                ns_window.makeKeyAndOrderFront(None);
+            }
+            break;
         }
-        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
-        if !ns_window.isVisible() {
-            continue;
-        }
-        let frame = ns_window.frame();
-        let inside = location.x >= frame.origin.x
-            && location.x < frame.origin.x + frame.size.width
-            && location.y >= frame.origin.y
-            && location.y < frame.origin.y + frame.size.height;
-        if !inside {
-            continue;
-        }
-        if !ns_window.isKeyWindow() {
-            ns_window.makeKeyAndOrderFront(None);
-        }
-        break;
-    }
+    });
 }
 
 /// Installs the app-lifetime mouse-move monitors that drive cross-display
@@ -3186,34 +3429,34 @@ fn register_snipping_overlay_mouse_monitors(app: &AppHandle) {
         return;
     }
     let _ = app.run_on_main_thread(move || {
-        use objc2_app_kit::{NSEvent, NSEventMask};
+        snipping_catch_objc("register_overlay_mouse_monitors", || {
+            use objc2_app_kit::{NSEvent, NSEventMask};
 
-        let mask = NSEventMask::MouseMoved;
+            let mask = NSEventMask::MouseMoved;
 
-        let global_block = block2::RcBlock::new(
-            move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
-                snipping_overlay_handle_mouse_moved();
-            },
-        );
-        if let Some(token) =
-            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
-        {
-            // The monitors live for the app's lifetime.
-            std::mem::forget(token);
-        }
+            let global_block =
+                block2::RcBlock::new(move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                    snipping_overlay_handle_mouse_moved();
+                });
+            if let Some(token) =
+                NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
+            {
+                // The monitors live for the app's lifetime.
+                std::mem::forget(token);
+            }
 
-        let local_block = block2::RcBlock::new(
-            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
-                snipping_overlay_handle_mouse_moved();
-                event.as_ptr()
-            },
-        );
-        let local_token = unsafe {
-            NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block)
-        };
-        if let Some(token) = local_token {
-            std::mem::forget(token);
-        }
+            let local_block = block2::RcBlock::new(
+                move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
+                    snipping_overlay_handle_mouse_moved();
+                    event.as_ptr()
+                },
+            );
+            let local_token =
+                unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block) };
+            if let Some(token) = local_token {
+                std::mem::forget(token);
+            }
+        });
     });
 }
 
@@ -3225,11 +3468,10 @@ fn prewarm_snipping_overlay_window(app: &AppHandle) {
         };
         for (index, monitor) in monitors.iter().enumerate() {
             let label = snipping_overlay_label(index);
-            let Ok(window) = ensure_snipping_overlay_window(&app_for_task, &label, monitor)
-            else {
+            let Ok(window) = ensure_snipping_overlay_window(&app_for_task, &label, monitor) else {
                 continue;
             };
-            let _ = window.hide();
+            snipping_hide_window_now(&window, "prewarm_overlay_hide");
         }
     });
 }
@@ -3359,8 +3601,7 @@ fn snipping_begin_area_snip_for(
     }
 
     let mut sessions = HashMap::new();
-    let mut ordered: Vec<(String, SnippingAreaMonitor, Arc<xcap::image::RgbaImage>)> =
-        Vec::new();
+    let mut ordered: Vec<(String, SnippingAreaMonitor, Arc<xcap::image::RgbaImage>)> = Vec::new();
     let mut first_error: Option<String> = None;
     for handle in capture_handles {
         let Ok((index, mut monitor, result)) = handle.join() else {
@@ -3394,8 +3635,9 @@ fn snipping_begin_area_snip_for(
 
     if ordered.is_empty() {
         snipping_restore_desktop_icons_after_capture(app);
-        return Err(first_error
-            .unwrap_or_else(|| "Unable to capture screen for area snip.".to_string()));
+        return Err(
+            first_error.unwrap_or_else(|| "Unable to capture screen for area snip.".to_string())
+        );
     }
 
     snipping_replace_area_sessions(app, sessions)?;
@@ -3404,11 +3646,10 @@ fn snipping_begin_area_snip_for(
 
     // Overlay windows left over from a display that disappeared since the
     // prewarm must not linger as stale full-screen surfaces.
-    let active_labels: HashSet<&str> =
-        ordered.iter().map(|(label, _, _)| label.as_str()).collect();
+    let active_labels: HashSet<&str> = ordered.iter().map(|(label, _, _)| label.as_str()).collect();
     for (label, window) in snipping_overlay_windows(app) {
         if !active_labels.contains(label.as_str()) {
-            let _ = window.hide();
+            snipping_hide_window_now(&window, "begin_area_hide_stale_overlay");
         }
     }
 
@@ -3442,7 +3683,7 @@ fn snipping_begin_area_snip_for(
             snipping_convert_overlay_window_to_panel(&window);
             snipping_apply_overlay_fullscreen_window_style(&window);
         }
-        if window.show().is_err() {
+        if !snipping_show_window_now(&window, "begin_area_show_overlay") {
             continue;
         }
         // Surface the overlay even while Diff Forge is inactive and the user
@@ -3478,7 +3719,7 @@ fn snipping_begin_area_snip_for(
         #[cfg(target_os = "macos")]
         snipping_make_overlay_key(window);
         #[cfg(not(target_os = "macos"))]
-        let _ = window.set_focus();
+        snipping_focus_window_now(window, "begin_area_focus_overlay");
     }
     snipping_register_escape_cancel(app);
     #[cfg(target_os = "macos")]
@@ -3613,28 +3854,31 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
     }
     snipping_set_macos_event_tap_app(app);
     let _ = app.run_on_main_thread(move || {
-        let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
-        let center = workspace.notificationCenter();
-        let block = block2::RcBlock::new(
-            move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
-                if let Some(app) = snipping_macos_event_tap_app() {
-                    snipping_refreeze_area_snapshot_for_space_change(&app);
-                }
-            },
-        );
-        let token = unsafe {
-            center.addObserverForName_object_queue_usingBlock(
-                Some(objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification),
-                None,
-                None,
-                &block,
-            )
-        };
-        // The observer lives for the app's lifetime.
-        std::mem::forget(token);
+        snipping_catch_objc("register_space_change_observer", || {
+            let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+            let center = workspace.notificationCenter();
+            let block = block2::RcBlock::new(
+                move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                    snipping_catch_objc("space_change_observer_callback", || {
+                        if let Some(app) = snipping_macos_event_tap_app() {
+                            snipping_refreeze_area_snapshot_for_space_change(&app);
+                        }
+                    });
+                },
+            );
+            let token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
+            // The observer lives for the app's lifetime.
+            std::mem::forget(token);
+        });
     });
 }
-
 
 /// While area-snip mode is active, Escape is grabbed globally so it always
 /// exits the mode — even when the overlay webview does not hold keyboard
@@ -3666,7 +3910,7 @@ fn snipping_hide_area_overlay(app: &AppHandle) {
     SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
     snipping_unregister_escape_cancel(app);
     for (_, window) in snipping_overlay_windows(app) {
-        let _ = window.hide();
+        snipping_hide_window_now(&window, "hide_area_overlay");
     }
     // Windows/Linux hide the real desktop icons for the whole area session;
     // teardown (finish, cancel, Escape) is where they come back.
@@ -3675,7 +3919,7 @@ fn snipping_hide_area_overlay(app: &AppHandle) {
 
 fn snipping_close_area_overlay(app: &AppHandle) {
     for (_, window) in snipping_overlay_windows(app) {
-        let _ = window.close();
+        snipping_close_window_guarded(&window, "close_area_overlay");
     }
 }
 
@@ -3745,7 +3989,12 @@ fn snipping_finish_area_snip_for(
         ) {
             return Ok(image);
         }
-        if area_monitor.snapshot_path.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()) {
+        if area_monitor
+            .snapshot_path
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
             if let Ok(image) = snipping_crop_area_preview_snapshot(
                 &area_monitor,
                 selection_x,
@@ -3772,11 +4021,16 @@ fn snipping_finish_area_snip_for(
         #[cfg(not(target_os = "macos"))]
         {
             let monitor_width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
-            let monitor_height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
+            let monitor_height = monitor
+                .height()
+                .unwrap_or(area_monitor.capture_height)
+                .max(1);
             let x = selection_x.min(monitor_width.saturating_sub(1));
             let y = selection_y.min(monitor_height.saturating_sub(1));
             let width = selection_width.min(monitor_width.saturating_sub(x)).max(1);
-            let height = selection_height.min(monitor_height.saturating_sub(y)).max(1);
+            let height = selection_height
+                .min(monitor_height.saturating_sub(y))
+                .max(1);
             snipping_capture_area_image(app, overlay_label, &monitor, x, y, width, height)
         }
     })();
@@ -4043,7 +4297,8 @@ const SNIPPING_FLOAT_GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
 // Every preview is the same golden-ratio rectangle; the capture scales to
 // fit inside it (object-fit: contain in the webview, centered, never
 // cropped) instead of sizing the window.
-const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
+const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 =
+    SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
 // Fallback settle deadline pushed forward by every Moved event. On platforms
@@ -4067,6 +4322,302 @@ const SNIPPING_PREVIEW_DRAG_OVER_EVENT: &str = "forge-snip-preview-drag-over";
 const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 16;
 // Anything closer than this to the grab position is a click, not a drop.
 const SNIPPING_PREVIEW_DRAG_MIN_DISTANCE: i32 = 8;
+const SNIPPING_FLOAT_DISPOSE_EVENT: &str = "forge-snip-float-dispose";
+// One paint turn for the webview to unhook live-preview listeners and clear its
+// image src before the native WebKit window starts teardown.
+const SNIPPING_FLOAT_CLOSE_GRACE_MS: u64 = 45;
+const SNIPPING_FLOAT_CLOSE_RELEASE_WAIT_MS: u64 = 1200;
+
+fn snipping_preview_closing_labels(app: &AppHandle) -> HashSet<String> {
+    app.state::<SnippingState>()
+        .preview_closing
+        .lock()
+        .map(|closing| closing.clone())
+        .unwrap_or_default()
+}
+
+fn snipping_preview_is_closing(app: &AppHandle, label: &str) -> bool {
+    app.state::<SnippingState>()
+        .preview_closing
+        .lock()
+        .map(|closing| closing.contains(label))
+        .unwrap_or(false)
+}
+
+fn snipping_preview_dragging_labels(app: &AppHandle) -> HashSet<String> {
+    app.state::<SnippingState>()
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn snipping_preview_is_dragging(app: &AppHandle, label: &str) -> bool {
+    app.state::<SnippingState>()
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(label))
+        .unwrap_or(false)
+}
+
+fn snipping_preview_detached_labels(app: &AppHandle) -> HashSet<String> {
+    app.state::<SnippingState>()
+        .preview_detached_labels
+        .lock()
+        .map(|labels| labels.clone())
+        .unwrap_or_default()
+}
+
+fn snipping_preview_docked_labels(app: &AppHandle) -> HashSet<String> {
+    app.state::<SnippingState>()
+        .preview_docked_labels
+        .lock()
+        .map(|labels| labels.clone())
+        .unwrap_or_default()
+}
+
+fn snipping_mark_preview_docked(app: &AppHandle, label: &str, docked: bool) {
+    let state = app.state::<SnippingState>();
+    if let Ok(mut docked_labels) = state.preview_docked_labels.lock() {
+        if docked {
+            docked_labels.insert(label.to_string());
+        } else {
+            docked_labels.remove(label);
+        }
+    }
+    if docked {
+        if let Ok(mut detached) = state.preview_detached_labels.lock() {
+            detached.remove(label);
+        }
+    }
+}
+
+fn snipping_open_preview_labels_for_path(app: &AppHandle, path_string: &str) -> Vec<String> {
+    let closing = snipping_preview_closing_labels(app);
+    app.state::<SnippingState>()
+        .preview_paths
+        .lock()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|(label, open_path)| {
+                    (open_path == path_string
+                        && !closing.contains(label)
+                        && app.get_webview_window(label.as_str()).is_some())
+                    .then(|| label.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snipping_path_has_detached_preview(app: &AppHandle, path_string: &str) -> bool {
+    let detached = snipping_preview_detached_labels(app);
+    if detached.is_empty() {
+        return false;
+    }
+    snipping_open_preview_labels_for_path(app, path_string)
+        .iter()
+        .any(|label| detached.contains(label))
+}
+
+fn snipping_begin_preview_drag_session(
+    app: &AppHandle,
+    label: &str,
+    position: tauri::PhysicalPosition<i32>,
+) {
+    let state = app.state::<SnippingState>();
+    if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
+        sessions.insert(label.to_string(), (position.x, position.y));
+    }
+    // A pack animation may have captured this preview as movable just before
+    // the press. Kill it immediately so left-side queue alignment wins over any
+    // stale side/center tug.
+    state
+        .preview_animation_generation
+        .fetch_add(1, Ordering::SeqCst);
+    state.preview_live_reflow_last_ms.store(0, Ordering::SeqCst);
+}
+
+fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
+    let state = app.state::<SnippingState>();
+    if let Ok(mut closing) = state.preview_closing.lock() {
+        closing.remove(label);
+    }
+    if let Ok(mut paths) = state.preview_paths.lock() {
+        paths.remove(label);
+    }
+    if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
+        sessions.remove(label);
+    }
+    if let Ok(mut detached) = state.preview_detached_labels.lock() {
+        detached.remove(label);
+    }
+    if let Ok(mut docked) = state.preview_docked_labels.lock() {
+        docked.remove(label);
+    }
+    if let Ok(mut pool) = state.preview_pool.lock() {
+        pool.retain(|pooled| pooled != label);
+    };
+}
+
+fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
+    let state = app.state::<SnippingState>();
+    let first_close = state
+        .preview_closing
+        .lock()
+        .map(|mut closing| closing.insert(label.to_string()))
+        .unwrap_or(true);
+    if !first_close {
+        return false;
+    }
+    if let Ok(mut paths) = state.preview_paths.lock() {
+        paths.remove(label);
+    }
+    if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
+        sessions.remove(label);
+    }
+    if let Ok(mut detached) = state.preview_detached_labels.lock() {
+        detached.remove(label);
+    }
+    if let Ok(mut docked) = state.preview_docked_labels.lock() {
+        docked.remove(label);
+    }
+    if let Ok(mut pool) = state.preview_pool.lock() {
+        pool.retain(|pooled| pooled != label);
+    }
+    state
+        .preview_animation_generation
+        .fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::WebviewWindow) {
+    snipping_hide_window_now(window, "park_preview_window");
+
+    let state = app.state::<SnippingState>();
+    if let Ok(mut closing) = state.preview_closing.lock() {
+        closing.remove(label);
+    }
+    if let Ok(mut paths) = state.preview_paths.lock() {
+        paths.remove(label);
+    }
+    if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
+        sessions.remove(label);
+    }
+    if let Ok(mut detached) = state.preview_detached_labels.lock() {
+        detached.remove(label);
+    }
+    if let Ok(mut docked) = state.preview_docked_labels.lock() {
+        docked.remove(label);
+    }
+    if let Ok(mut pool) = state.preview_pool.lock() {
+        if !pool.iter().any(|pooled| pooled == label) {
+            pool.push(label.to_string());
+        }
+    };
+}
+
+fn snipping_close_preview_window(app: &AppHandle, label: &str, reason: &'static str) -> bool {
+    let label = label.trim().to_string();
+    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        return false;
+    }
+    let Some(_) = app.get_webview_window(&label) else {
+        snipping_cleanup_preview_registry(app, &label);
+        return false;
+    };
+    if !snipping_begin_preview_close(app, &label) {
+        return true;
+    }
+
+    let _ = app.emit_to(
+        label.as_str(),
+        SNIPPING_FLOAT_DISPOSE_EVENT,
+        json!({
+            "kind": "snip_float_dispose",
+            "label": label.clone(),
+            "reason": reason,
+        }),
+    );
+    snipping_emit_floats_changed(app);
+    schedule_snipping_preview_stack_reflow(app);
+
+    let app_for_thread = app.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(SNIPPING_FLOAT_CLOSE_GRACE_MS));
+        if snipping_mouse_button_state_supported() {
+            let started = Instant::now();
+            while snipping_left_mouse_button_pressed()
+                && started.elapsed() < Duration::from_millis(SNIPPING_FLOAT_CLOSE_RELEASE_WAIT_MS)
+            {
+                thread::sleep(Duration::from_millis(SNIPPING_FLOAT_SETTLE_POLL_MS));
+            }
+        }
+        let app_for_main = app_for_thread.clone();
+        let label_for_main = label.clone();
+        let _ = app_for_thread.run_on_main_thread(move || {
+            if let Some(window) = app_for_main.get_webview_window(&label_for_main) {
+                snipping_park_preview_window(&app_for_main, &label_for_main, &window);
+                snipping_emit_floats_changed(&app_for_main);
+            } else {
+                snipping_cleanup_preview_registry(&app_for_main, &label_for_main);
+                snipping_emit_floats_changed(&app_for_main);
+            }
+        });
+    });
+    true
+}
+
+fn snipping_close_editor_window(app: &AppHandle, label: &str, reason: &'static str) -> bool {
+    let label = label.trim().to_string();
+    if !label.starts_with(SNIPPING_EDITOR_WINDOW_PREFIX) {
+        return false;
+    }
+    if app.get_webview_window(&label).is_none() {
+        if let Ok(mut editors) = app.state::<SnippingState>().editor_paths.lock() {
+            editors.remove(&label);
+        }
+        return false;
+    }
+
+    let _ = app.emit_to(
+        label.as_str(),
+        SNIPPING_EDITOR_DISPOSE_EVENT,
+        json!({
+            "kind": "snip_editor_dispose",
+            "label": label.clone(),
+            "reason": reason,
+        }),
+    );
+
+    let app_for_thread = app.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(SNIPPING_FLOAT_CLOSE_GRACE_MS));
+        let app_for_main = app_for_thread.clone();
+        let label_for_main = label.clone();
+        let _ = app_for_thread.run_on_main_thread(move || {
+            if let Some(window) = app_for_main.get_webview_window(&label_for_main) {
+                snipping_close_window_now(&window, "close_editor_window");
+            } else if let Ok(mut editors) = app_for_main.state::<SnippingState>().editor_paths.lock() {
+                editors.remove(&label_for_main);
+            }
+        });
+    });
+    true
+}
+
+/// Horizontal ownership for the bottom-left preview queue. If a preview
+/// overlaps this column at all, the queue owns its final alignment; generic
+/// left-edge centering must only apply outside this band.
+fn snipping_preview_in_stack_column(position_x: i32, preview_width: i32, stack_x: i32) -> bool {
+    let width = preview_width.max(1);
+    let preview_left = position_x;
+    let preview_right = position_x + width;
+    let stack_left = stack_x;
+    let stack_right = stack_x + width;
+    preview_right >= stack_left && preview_left <= stack_right
+}
 
 /// Bottom-left stacking slot for a new preview window: directly above the
 /// highest preview still sitting in the left column, or the bottom corner of
@@ -4086,12 +4637,15 @@ fn snipping_preview_stack_position(
     let width_physical = (width * scale).round() as i32;
     let height_physical = (height * scale).round() as i32;
     let x = work_area.position.x + margin;
-    let bottom_y =
-        work_area.position.y + work_area.size.height as i32 - height_physical - margin;
+    let bottom_y = work_area.position.y + work_area.size.height as i32 - height_physical - margin;
 
     let mut highest_top: Option<i32> = None;
+    let closing_labels = snipping_preview_closing_labels(app);
     for (label, window) in app.webview_windows() {
         if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+            continue;
+        }
+        if closing_labels.contains(&label) {
             continue;
         }
         if !window.is_visible().unwrap_or(false) {
@@ -4101,8 +4655,16 @@ fn snipping_preview_stack_position(
             continue;
         };
         // Only stack against previews still parked in the left column; ones
-        // the user dragged away stop reserving a slot.
-        if (position.x - x).abs() > width_physical {
+        // the user dragged away stop reserving a slot, and ones parked on the
+        // strip's horizontal row belong to that queue.
+        if !snipping_preview_in_stack_column(position.x, width_physical, x) {
+            continue;
+        }
+        let height = window
+            .outer_size()
+            .map(|size| size.height.max(1) as i32)
+            .unwrap_or(height_physical);
+        if snipping_preview_in_strip_row(app, position.y, height) {
             continue;
         }
         highest_top = Some(highest_top.map_or(position.y, |current| current.min(position.y)));
@@ -4167,8 +4729,7 @@ fn snipping_animate_previews(
             if generation.load(Ordering::SeqCst) != ticket {
                 return;
             }
-            let progress =
-                (started.elapsed().as_millis() as f64 / duration_ms).min(1.0);
+            let progress = (started.elapsed().as_millis() as f64 / duration_ms).min(1.0);
             let eased = snipping_tween_eased(progress, easing);
             let frame: Vec<(tauri::WebviewWindow, i32, i32)> = moves
                 .iter()
@@ -4181,11 +4742,20 @@ fn snipping_animate_previews(
                 })
                 .collect();
             let frame_generation = generation.clone();
+            let app_for_frame = app.clone();
             let _ = app.run_on_main_thread(move || {
                 if frame_generation.load(Ordering::SeqCst) != ticket {
                     return;
                 }
                 for (window, x, y) in frame {
+                    // A preview can close mid-tween (its captured handle
+                    // outlives the window): never poke a dead window.
+                    if app_for_frame.get_webview_window(window.label()).is_none()
+                        || snipping_preview_is_closing(&app_for_frame, window.label())
+                        || snipping_preview_is_dragging(&app_for_frame, window.label())
+                    {
+                        continue;
+                    }
                     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
                 }
             });
@@ -4197,18 +4767,17 @@ fn snipping_animate_previews(
     });
 }
 
-/// Re-packs every preview parked in the bottom-left column into a tight
-/// bottom-up stack, animating each window to its slot. A preview dragged out
-/// of the column stops reserving a slot (the ones above slide down to fill
-/// it); a preview being dragged OVER the column blocks the exact band it
-/// covers so the others part around it live without ever overlapping it, and
-/// a preview dropped back over the column is adopted into the stack at the
-/// height it was dropped.
+/// Re-packs every queue-owned preview parked in the bottom-left column into a
+/// tight bottom-up stack. A manually dragged preview becomes detached after
+/// release: it can still block the column, but the queue no longer pulls it
+/// into an auto slot.
 fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: SnippingTweenEasing) {
     let Some(monitor) = app
         .get_webview_window("main")
         .and_then(|main_window| main_window.current_monitor().ok().flatten())
     else {
+        let moves = snipping_strip_row_reflow_moves(app);
+        snipping_animate_previews(app, moves, animate_ms, easing);
         return;
     };
     let work_area = monitor.work_area();
@@ -4220,21 +4789,26 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
     let x = work_area.position.x + margin;
     let top_limit = work_area.position.y + margin;
 
-    let dragging_labels: HashSet<String> = app
-        .state::<SnippingState>()
-        .preview_drag_sessions
-        .lock()
-        .map(|sessions| sessions.keys().cloned().collect())
-        .unwrap_or_default();
+    let dragging_labels = snipping_preview_dragging_labels(app);
+    let detached_labels = snipping_preview_detached_labels(app);
+    let docked_labels = snipping_preview_docked_labels(app);
+    let closing_labels = snipping_preview_closing_labels(app);
 
     let mut docked: Vec<(
         tauri::PhysicalPosition<i32>,
         i32,
         tauri::WebviewWindow,
         bool,
+        bool,
     )> = Vec::new();
     for (label, window) in app.webview_windows() {
         if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+            continue;
+        }
+        if closing_labels.contains(&label) {
+            continue;
+        }
+        if docked_labels.contains(&label) {
             continue;
         }
         if !window.is_visible().unwrap_or(false) {
@@ -4243,36 +4817,45 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         let Ok(position) = window.outer_position() else {
             continue;
         };
-        // Same column membership test as snipping_preview_stack_position.
-        if (position.x - x).abs() > width_physical {
+        let (width, height) = window
+            .outer_size()
+            .map(|size| (size.width as i32, size.height as i32))
+            .unwrap_or((width_physical, height_physical));
+        // Same queue-ownership test as snipping_preview_stack_position; the
+        // strip's horizontal row owns anything parked on the visible bar.
+        if !snipping_preview_in_stack_column(position.x, width, x) {
             continue;
         }
-        let height = window
-            .outer_size()
-            .map(|size| size.height as i32)
-            .unwrap_or(height_physical)
-            .max(1);
-        docked.push((position, height, window, dragging_labels.contains(&label)));
+        if snipping_preview_in_strip_row(app, position.y, height.max(1)) {
+            continue;
+        }
+        let height = height.max(1);
+        docked.push((
+            position,
+            height,
+            window,
+            dragging_labels.contains(&label),
+            detached_labels.contains(&label),
+        ));
     }
 
     // The lowest window keeps the bottom slot; on-screen order is preserved.
     docked.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
     // A held window is an obstacle at its REAL on-screen band, not at a
-    // canonical packed slot: packed slots must never intersect it, so the
-    // stack visibly makes room under the cursor instead of letting the
-    // others slide underneath the held preview (which read as overlap).
+    // canonical packed slot. Detached windows use the same treatment after
+    // release, preventing the old left-side auto-align from grabbing them.
     let mut obstacle_bands: Vec<(i32, i32)> = docked
         .iter()
-        .filter(|(_, _, _, dragging)| *dragging)
-        .map(|(position, height, _, _)| (position.y, position.y + height))
+        .filter(|(_, _, _, dragging, detached)| *dragging || *detached)
+        .map(|(position, height, _, _, _)| (position.y, position.y + height))
         .collect();
     obstacle_bands.sort_by(|a, b| b.1.cmp(&a.1));
     let mut bottom_edge = work_area.position.y + work_area.size.height as i32 - margin;
     let mut moves = Vec::new();
-    for (position, height, window, dragging) in docked {
-        if dragging {
-            // The OS drag owns the held window's position; its band above
-            // already blocks every slot it covers.
+    for (position, height, window, dragging, detached) in docked {
+        if dragging || detached {
+            // The OS drag owns a held window's position; a detached window is
+            // user-positioned. Their bands above already block slots.
             continue;
         }
         let mut y = bottom_edge - height;
@@ -4291,6 +4874,9 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         }
         bottom_edge = y - gap;
     }
+    // One tween generation drives both queues: animating the column and the
+    // strip row separately would cancel each other's in-flight frames.
+    moves.extend(snipping_strip_row_reflow_moves(app));
     snipping_animate_previews(app, moves, animate_ms, easing);
 }
 
@@ -4347,9 +4933,10 @@ fn snipping_restack_settle_ms() -> u64 {
 /// instead of one spawned per Moved event.
 fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
     let state = app.state::<SnippingState>();
-    state
-        .preview_restack_deadline_ms
-        .store(snipping_now_epoch_ms() + snipping_restack_settle_ms(), Ordering::SeqCst);
+    state.preview_restack_deadline_ms.store(
+        snipping_now_epoch_ms() + snipping_restack_settle_ms(),
+        Ordering::SeqCst,
+    );
     if state
         .preview_restack_watcher_active
         .swap(true, Ordering::SeqCst)
@@ -4463,6 +5050,39 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
         {
             continue;
         }
+        // A drop inside either queue band adopts the preview (the reflow then
+        // packs it); anywhere else detaches it at the user's position.
+        let (in_row, adopted_by_queue) = {
+            let (width, height) = window
+                .outer_size()
+                .map(|size| (size.width.max(1) as i32, size.height.max(1) as i32))
+                .unwrap_or((1, 1));
+            let in_row = snipping_preview_in_strip_row(app, position.y, height);
+            let in_column = !in_row
+                && app
+                    .get_webview_window("main")
+                    .and_then(|main_window| main_window.current_monitor().ok().flatten())
+                    .map(|monitor| {
+                        let column_x = monitor.work_area().position.x
+                            + (SNIPPING_FLOAT_STACK_MARGIN * monitor.scale_factor().max(0.1))
+                                .round() as i32;
+                        snipping_preview_in_stack_column(position.x, width, column_x)
+                    })
+                    .unwrap_or(false);
+            (in_row, in_row || in_column)
+        };
+        if let Ok(mut detached) = state.preview_detached_labels.lock() {
+            if adopted_by_queue {
+                detached.remove(&label);
+            } else {
+                detached.insert(label.clone());
+            }
+        }
+        snipping_mark_preview_docked(app, &label, adopted_by_queue && in_row);
+        if let Some(window) = app.get_webview_window(&label) {
+            #[cfg(target_os = "macos")]
+            snipping_preview_set_strip_docked_level(&window, adopted_by_queue && in_row);
+        }
         let Some((client_x, client_y)) = snipping_preview_point_in_main(app, &window) else {
             continue;
         };
@@ -4545,14 +5165,23 @@ fn snipping_emit_floats_changed(app: &AppHandle) {
 
 /// Paths currently shown as floating snip previews (windows still alive).
 fn snipping_open_preview_paths(app: &AppHandle) -> HashSet<String> {
+    let closing = snipping_preview_closing_labels(app);
     app.state::<SnippingState>()
         .preview_paths
         .lock()
         .map(|paths| {
             paths
                 .iter()
-                .filter(|(label, _)| app.get_webview_window(label.as_str()).is_some())
-                .map(|(_, path)| path.clone())
+                .filter(|(label, _)| {
+                    !closing.contains(*label) && app.get_webview_window(label.as_str()).is_some()
+                })
+                .map(|(_, path)| {
+                    PathBuf::from(path)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(path))
+                        .display()
+                        .to_string()
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -4578,25 +5207,27 @@ fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
     snipping_convert_overlay_window_to_panel(window);
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.setCollectionBehavior(
-            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
-                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
-        );
-        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
-        // Hover must work without the window ever having been clicked: a
-        // non-key NSWindow drops mouse-moved events by default, which left
-        // the preview's hover chrome unreachable until a focusing click
-        // (and made every button cost two clicks).
-        ns_window.setAcceptsMouseMovedEvents(true);
+        snipping_catch_objc("preview_apply_macos_space_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+            );
+            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+            // Hover must work without the window ever having been clicked: a
+            // non-key NSWindow drops mouse-moved events by default, which left
+            // the preview's hover chrome unreachable until a focusing click
+            // (and made every button cost two clicks).
+            ns_window.setAcceptsMouseMovedEvents(true);
+        });
     });
 }
 
@@ -4609,15 +5240,61 @@ fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
 fn snipping_preview_order_front_regardless(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.orderFrontRegardless();
+        snipping_catch_objc("preview_order_front_regardless", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.orderFrontRegardless();
+        });
     });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_preview_set_strip_docked_level(window: &tauri::WebviewWindow, docked: bool) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("preview_set_strip_docked_level", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setLevel(if docked {
+                objc2_app_kit::NSScreenSaverWindowLevel + 1
+            } else {
+                objc2_app_kit::NSScreenSaverWindowLevel
+            });
+        });
+    });
+}
+
+fn snipping_strip_reassert_docked_previews(app: &AppHandle) {
+    let docked_labels = snipping_preview_docked_labels(app);
+    if docked_labels.is_empty() {
+        return;
+    }
+    let dragging_labels = snipping_preview_dragging_labels(app);
+    for label in docked_labels {
+        if dragging_labels.contains(&label) || snipping_preview_is_closing(app, &label) {
+            continue;
+        }
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        snipping_show_window_now(&window, "reassert_docked_preview_show");
+        #[cfg(target_os = "macos")]
+        {
+            snipping_preview_apply_macos_space_style(&window);
+            snipping_preview_set_strip_docked_level(&window, true);
+            snipping_preview_order_front_regardless(&window);
+        }
+    }
 }
 
 fn snipping_build_preview_window(
@@ -4665,17 +5342,20 @@ fn snipping_build_preview_window(
                     snipping_live_reflow_on_drag(&app_for_events, &label_for_events);
                     schedule_snipping_preview_stack_reflow(&app_for_events);
                 }
+                WindowEvent::CloseRequested { api, .. } => {
+                    // Preview windows are re-classed AppKit panels. A real
+                    // native close can still throw after close() returns, so
+                    // treat close requests as dismissals: prevent destruction
+                    // and park the hidden webview for the next snip.
+                    api.prevent_close();
+                    snipping_close_preview_window(
+                        &app_for_events,
+                        &label_for_events,
+                        "close-requested",
+                    );
+                }
                 WindowEvent::Destroyed => {
-                    let state = app_for_events.state::<SnippingState>();
-                    if let Ok(mut paths) = state.preview_paths.lock() {
-                        paths.remove(&label_for_events);
-                    }
-                    if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
-                        sessions.remove(&label_for_events);
-                    }
-                    if let Ok(mut pool) = state.preview_pool.lock() {
-                        pool.retain(|pooled| pooled != &label_for_events);
-                    }
+                    snipping_cleanup_preview_registry(&app_for_events, &label_for_events);
                     schedule_snipping_preview_stack_reflow(&app_for_events);
                     snipping_emit_floats_changed(&app_for_events);
                 }
@@ -4693,7 +5373,7 @@ fn snipping_position_preview_window(
 ) {
     match explicit_position {
         Some((x, y)) => {
-            let _ = window.set_position(tauri::LogicalPosition::new(x.max(0.0), y.max(0.0)));
+            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
         }
         None => {
             if let Some(position) = snipping_preview_stack_position(
@@ -4713,7 +5393,11 @@ fn snipping_position_preview_window(
 /// the capture hot path.
 fn snipping_warm_preview_pool(app: &AppHandle) {
     let state = app.state::<SnippingState>();
-    let parked = state.preview_pool.lock().map(|pool| pool.len()).unwrap_or(0);
+    let parked = state
+        .preview_pool
+        .lock()
+        .map(|pool| pool.len())
+        .unwrap_or(0);
     if parked >= SNIPPING_FLOAT_POOL_TARGET {
         return;
     }
@@ -4789,34 +5473,45 @@ fn snipping_open_snip_preview_window_for(
     let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
     let height = SNIPPING_FLOAT_LOGICAL_HEIGHT;
     let path_string = file.display().to_string();
-    let label = format!("{SNIPPING_FLOAT_WINDOW_PREFIX}-{}", snipping_window_token(&file));
+    let label = format!(
+        "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+        snipping_window_token(&file)
+    );
+    let closing_labels = snipping_preview_closing_labels(app);
 
-    // Already previewed: token-labelled windows match by label; adopted pool
-    // windows match through the label -> path registry.
-    let existing_label = if app.get_webview_window(&label).is_some() {
-        Some(label.clone())
-    } else {
-        app.state::<SnippingState>()
-            .preview_paths
-            .lock()
-            .ok()
-            .and_then(|paths| {
-                paths.iter().find_map(|(open_label, open_path)| {
-                    (open_path == &path_string && app.get_webview_window(open_label).is_some())
-                        .then(|| open_label.clone())
-                })
+    // The path registry is authoritative: parked preview windows are reused
+    // across snips, so a native window label may outlive the path it was first
+    // derived from.
+    let existing_label = app
+        .state::<SnippingState>()
+        .preview_paths
+        .lock()
+        .ok()
+        .and_then(|paths| {
+            paths.iter().find_map(|(open_label, open_path)| {
+                (open_path == &path_string
+                    && !closing_labels.contains(open_label)
+                    && app
+                        .get_webview_window(open_label)
+                        .is_some_and(|window| window.is_visible().unwrap_or(false)))
+                .then(|| open_label.clone())
             })
-    };
+        });
     if let Some(existing_label) = existing_label {
         if let Some(existing) = app.get_webview_window(&existing_label) {
+            if explicit_position.is_some() {
+                snipping_position_preview_window(app, &existing, explicit_position);
+            }
             #[cfg(target_os = "macos")]
             snipping_preview_apply_macos_space_style(&existing);
-            let _ = existing.show();
+            snipping_show_window_now(&existing, "open_existing_preview_show");
             #[cfg(target_os = "macos")]
             snipping_preview_order_front_regardless(&existing);
             if focused {
-                let _ = existing.set_focus();
+                snipping_focus_window_now(&existing, "open_existing_preview_focus");
             }
+            snipping_start_float_hover_watcher(app);
+            snipping_emit_floats_changed(app);
             return Ok(json!({
                 "kind": "snip_float_opened",
                 "label": existing_label,
@@ -4847,11 +5542,11 @@ fn snipping_open_snip_preview_window_for(
         );
         #[cfg(target_os = "macos")]
         snipping_preview_apply_macos_space_style(&window);
-        let _ = window.show();
+        snipping_show_window_now(&window, "open_pooled_preview_show");
         #[cfg(target_os = "macos")]
         snipping_preview_order_front_regardless(&window);
         if focused {
-            let _ = window.set_focus();
+            snipping_focus_window_now(&window, "open_pooled_preview_focus");
         }
         snipping_start_float_hover_watcher(app);
         snipping_warm_preview_pool(app);
@@ -4874,7 +5569,7 @@ fn snipping_open_snip_preview_window_for(
     }
     #[cfg(target_os = "macos")]
     snipping_preview_apply_macos_space_style(&window);
-    let _ = window.show();
+    snipping_show_window_now(&window, "open_preview_show");
     #[cfg(target_os = "macos")]
     snipping_preview_order_front_regardless(&window);
     snipping_start_float_hover_watcher(app);
@@ -4915,6 +5610,7 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
                 .into_iter()
                 .filter(|(label, window)| {
                     label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX)
+                        && !snipping_preview_is_closing(&app, label)
                         // Parked pool windows are hidden; they neither hover
                         // nor keep the watcher alive on their own.
                         && window.is_visible().unwrap_or(false)
@@ -4966,7 +5662,7 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
 
 const SNIPPING_STRIP_WINDOW_LABEL: &str = "snipping-strip";
 const SNIPPING_STRIP_ANIM_EVENT: &str = "forge-snip-strip-anim";
-const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 196.0;
+const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 148.0;
 // Pre-show placeholder only: every show resizes the bar to the full logical
 // width of the monitor under the cursor.
 const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
@@ -4978,10 +5674,14 @@ static SNIPPING_STRIP_LAST_BLUR_HIDE_MS: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_STRIP_DISMISS_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Newest-first listing of saved snip files. The on-disk `snips` directory is
-/// the durable history (the in-memory toast list only ever holds six). Snips
-/// currently shown as floating previews are excluded — they are already on
-/// screen, and the strip re-lists them when their preview closes.
-fn snipping_recent_snip_items(app: &AppHandle, limit: usize) -> Result<Vec<Value>, String> {
+/// the durable history (the in-memory toast list only ever holds six). Regular
+/// callers exclude previews already on screen; the strip may include open
+/// queue-owned previews so it can move the same real windows into its row.
+fn snipping_recent_snip_items_for_mode(
+    app: &AppHandle,
+    limit: usize,
+    include_dockable_open_previews: bool,
+) -> Result<Vec<Value>, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
     let Ok(entries) = fs::read_dir(root.join("snips")) else {
         return Ok(Vec::new());
@@ -5010,9 +5710,17 @@ fn snipping_recent_snip_items(app: &AppHandle, limit: usize) -> Result<Vec<Value
                 .map(|elapsed| elapsed.as_millis())
                 .unwrap_or_default();
             let name = path.file_name()?.to_string_lossy().to_string();
-            let path_string = path.display().to_string();
+            let path_string = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .display()
+                .to_string();
             if floating.contains(&path_string) {
-                return None;
+                if !include_dockable_open_previews
+                    || snipping_path_has_detached_preview(app, &path_string)
+                {
+                    return None;
+                }
             }
             Some((
                 modified_ms,
@@ -5030,6 +5738,10 @@ fn snipping_recent_snip_items(app: &AppHandle, limit: usize) -> Result<Vec<Value
         .take(limit)
         .map(|(_, item)| item)
         .collect())
+}
+
+fn snipping_recent_snip_items(app: &AppHandle, limit: usize) -> Result<Vec<Value>, String> {
+    snipping_recent_snip_items_for_mode(app, limit, false)
 }
 
 #[tauri::command]
@@ -5053,7 +5765,10 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         WebviewUrl::App("index.html#/snipping-strip".into()),
     )
     .title("Recent Snips")
-    .inner_size(SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH, SNIPPING_STRIP_LOGICAL_HEIGHT)
+    .inner_size(
+        SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH,
+        SNIPPING_STRIP_LOGICAL_HEIGHT,
+    )
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -5079,15 +5794,19 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         let vibrancy_window = window.clone();
         let _ = window.run_on_main_thread(move || {
             #[cfg(target_os = "macos")]
-            let _ = window_vibrancy::apply_vibrancy(
-                &vibrancy_window,
-                window_vibrancy::NSVisualEffectMaterial::HudWindow,
-                Some(window_vibrancy::NSVisualEffectState::Active),
-                Some(14.0),
-            );
+            snipping_catch_objc("strip_apply_vibrancy", || {
+                let _ = window_vibrancy::apply_vibrancy(
+                    &vibrancy_window,
+                    window_vibrancy::NSVisualEffectMaterial::HudWindow,
+                    Some(window_vibrancy::NSVisualEffectState::Active),
+                    Some(14.0),
+                );
+            });
             #[cfg(target_os = "windows")]
             let _ = window_vibrancy::apply_acrylic(&vibrancy_window, Some((10, 14, 22, 150)))
-                .or_else(|_| window_vibrancy::apply_blur(&vibrancy_window, Some((10, 14, 22, 150))));
+                .or_else(|_| {
+                    window_vibrancy::apply_blur(&vibrancy_window, Some((10, 14, 22, 150)))
+                });
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = &vibrancy_window;
         });
@@ -5102,6 +5821,12 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     window.on_window_event(move |event| {
         if let WindowEvent::Focused(false) = event {
             if !blur_window.is_visible().unwrap_or(false) {
+                return;
+            }
+            // Clicking a preview parked on the bar steals the bar's focus,
+            // but the cursor is still inside the band: that is queue
+            // interaction, not dismissal.
+            if snipping_strip_contains_cursor(&blur_app) {
                 return;
             }
             SNIPPING_STRIP_LAST_BLUR_HIDE_MS.store(cloud_mcp_now_ms(), Ordering::Release);
@@ -5123,22 +5848,24 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 fn snipping_strip_apply_macos_overlay_style(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.setCollectionBehavior(
-            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
-                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                | objc2_app_kit::NSWindowCollectionBehavior::Stationary
-                | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
-        );
-        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
-        ns_window.setAcceptsMouseMovedEvents(true);
+        snipping_catch_objc("strip_apply_macos_overlay_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+            ns_window.setAcceptsMouseMovedEvents(true);
+        });
     });
 }
 
@@ -5149,14 +5876,16 @@ fn snipping_strip_apply_macos_overlay_style(window: &tauri::WebviewWindow) {
 fn snipping_strip_order_front_regardless(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.orderFrontRegardless();
+        snipping_catch_objc("strip_order_front_regardless", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.orderFrontRegardless();
+        });
     });
 }
 
@@ -5192,7 +5921,9 @@ fn snipping_strip_position(app: &AppHandle, window: &tauri::WebviewWindow) -> &'
         let height = (SNIPPING_STRIP_LOGICAL_HEIGHT * scale).round() as i32;
         area.position.y + area.size.height as i32 - height
     };
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+        x, y,
+    )));
     SNIPPING_STRIP_ORIGIN
 }
 
@@ -5201,7 +5932,11 @@ fn snipping_strip_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) 
     if let Some(origin) = origin {
         payload["origin"] = json!(origin);
     }
-    let _ = app.emit_to(SNIPPING_STRIP_WINDOW_LABEL, SNIPPING_STRIP_ANIM_EVENT, payload);
+    let _ = app.emit_to(
+        SNIPPING_STRIP_WINDOW_LABEL,
+        SNIPPING_STRIP_ANIM_EVENT,
+        payload,
+    );
 }
 
 fn snipping_strip_emit_open_reassert(app: &AppHandle, origin: &'static str) {
@@ -5222,6 +5957,7 @@ fn snipping_strip_emit_open_reassert(app: &AppHandle, origin: &'static str) {
             snipping_make_overlay_key(&window);
         }
         snipping_strip_emit_anim(&app, "open", Some(origin));
+        snipping_strip_reassert_docked_previews(&app);
     });
 }
 
@@ -5234,11 +5970,16 @@ fn snipping_strip_hide_animated(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(SNIPPING_STRIP_CLOSE_ANIM_MS)).await;
+        let app_for_close = app.clone();
         let _ = app.run_on_main_thread(move || {
             if only_if_unfocused && window.is_focused().unwrap_or(false) {
                 return;
             }
-            let _ = window.hide();
+            // The row's previews dismiss with the bar; anything the user
+            // dragged off the band stays floating. Must run while the bar is
+            // still visible — the band geometry is derived from it.
+            snipping_strip_close_row_floats(&app_for_close);
+            snipping_hide_window_now(&window, "strip_hide_animated");
         });
     });
 }
@@ -5255,7 +5996,7 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     snipping_convert_overlay_window_to_panel(&window);
     #[cfg(target_os = "macos")]
     snipping_strip_apply_macos_overlay_style(&window);
-    let _ = window.show();
+    snipping_show_window_now(&window, "strip_show");
     #[cfg(target_os = "macos")]
     snipping_strip_order_front_regardless(&window);
     #[cfg(target_os = "macos")]
@@ -5269,9 +6010,11 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
         snipping_strip_install_dismiss_monitor(app);
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = window.set_focus();
+    snipping_focus_window_now(&window, "strip_focus");
     snipping_strip_emit_anim(app, "open", Some(origin));
     snipping_strip_emit_open_reassert(app, origin);
+    // The bar's tiles are real preview windows parked on a horizontal queue.
+    snipping_strip_populate_row(app);
 }
 
 /// App-lifetime global mouse-down monitor that dismisses the strip on a
@@ -5286,33 +6029,39 @@ fn snipping_strip_install_dismiss_monitor(app: &AppHandle) {
     }
     let app_for_monitor = app.clone();
     let _ = app.run_on_main_thread(move || {
-        use objc2_app_kit::{NSEvent, NSEventMask};
-        let mask = NSEventMask::LeftMouseDown
-            | NSEventMask::RightMouseDown
-            | NSEventMask::OtherMouseDown;
-        let block = block2::RcBlock::new(
-            move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
-                let Some(strip) =
-                    app_for_monitor.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)
-                else {
-                    return;
-                };
-                if !strip.is_visible().unwrap_or(false) {
-                    return;
-                }
-                if snipping_strip_contains_cursor(&app_for_monitor) {
-                    return;
-                }
-                // Same grace stamp as the focus-loss path so the click that
-                // dismissed the bar cannot instantly re-toggle it open.
-                SNIPPING_STRIP_LAST_BLUR_HIDE_MS.store(cloud_mcp_now_ms(), Ordering::Release);
-                snipping_strip_hide_animated(&app_for_monitor, strip, false);
-            },
-        );
-        if let Some(token) = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block) {
-            // Lives for the app's lifetime; it early-returns while hidden.
-            std::mem::forget(token);
-        }
+        snipping_catch_objc("strip_install_dismiss_monitor", || {
+            use objc2_app_kit::{NSEvent, NSEventMask};
+            let mask = NSEventMask::LeftMouseDown
+                | NSEventMask::RightMouseDown
+                | NSEventMask::OtherMouseDown;
+            let block =
+                block2::RcBlock::new(move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                    snipping_catch_objc("strip_dismiss_monitor_callback", || {
+                        let Some(strip) =
+                            app_for_monitor.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)
+                        else {
+                            return;
+                        };
+                        if !strip.is_visible().unwrap_or(false) {
+                            return;
+                        }
+                        if snipping_strip_contains_cursor(&app_for_monitor) {
+                            return;
+                        }
+                        // Same grace stamp as the focus-loss path so the click
+                        // that dismissed the bar cannot instantly re-toggle it open.
+                        SNIPPING_STRIP_LAST_BLUR_HIDE_MS
+                            .store(cloud_mcp_now_ms(), Ordering::Release);
+                        snipping_strip_hide_animated(&app_for_monitor, strip, false);
+                    });
+                });
+            if let Some(token) =
+                NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block)
+            {
+                // Lives for the app's lifetime; it early-returns while hidden.
+                std::mem::forget(token);
+            }
+        });
     });
 }
 
@@ -5327,8 +6076,7 @@ pub(crate) fn snipping_strip_toggle(app: &AppHandle) {
         snipping_strip_hide_animated(app, window, false);
         return;
     }
-    if cloud_mcp_now_ms()
-        .saturating_sub(SNIPPING_STRIP_LAST_BLUR_HIDE_MS.load(Ordering::Acquire))
+    if cloud_mcp_now_ms().saturating_sub(SNIPPING_STRIP_LAST_BLUR_HIDE_MS.load(Ordering::Acquire))
         < SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS
     {
         return;
@@ -5359,15 +6107,13 @@ fn snipping_open_snip_float(
     snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))
 }
 
-/// Every preview window label currently showing this snip: the token label
-/// (direct opens) plus any adopted pool windows from the path registry.
+/// Every preview window label currently showing this snip. The path registry is
+/// authoritative because pooled windows are retargeted and direct labels include
+/// a random token that cannot be reconstructed later.
 fn snipping_float_labels_for_path(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
     let file = diffforge_local_asset_file(path)?;
     let path_string = file.display().to_string();
-    let mut labels = vec![format!(
-        "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
-        snipping_window_token(&file)
-    )];
+    let mut labels = Vec::new();
     if let Ok(paths) = app.state::<SnippingState>().preview_paths.lock() {
         for (label, open_path) in paths.iter() {
             if open_path == &path_string && !labels.contains(label) {
@@ -5384,22 +6130,43 @@ fn snipping_float_labels_for_path(app: &AppHandle, path: &str) -> Result<Vec<Str
 fn snipping_snip_float_open(app: AppHandle, path: String) -> Result<Value, String> {
     let open = snipping_float_labels_for_path(&app, &path)?
         .iter()
-        .any(|label| app.get_webview_window(label).is_some());
+        .any(|label| {
+            !snipping_preview_is_closing(&app, label) && app.get_webview_window(label).is_some()
+        });
     Ok(json!({ "kind": "snip_float_open", "open": open }))
 }
 
-/// Closes the floating preview showing this snip, if one is open. The window
-/// Destroyed handler cleans the registries and emits floats-changed.
+/// Closes a specific floating preview through the shared dispose lifecycle.
+#[tauri::command]
+fn snipping_close_snip_float(app: AppHandle, label: String) -> Result<Value, String> {
+    let label = label.trim().to_string();
+    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        return Err("Not a snip preview window.".to_string());
+    }
+    let closed = snipping_close_preview_window(&app, &label, "preview-command");
+    Ok(json!({ "ok": true, "closed": closed, "label": label }))
+}
+
 #[tauri::command]
 fn snipping_close_snip_float_for_path(app: AppHandle, path: String) -> Result<Value, String> {
     let mut closed = false;
     for label in snipping_float_labels_for_path(&app, &path)? {
-        if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.close();
+        if app.get_webview_window(&label).is_some() {
+            snipping_close_preview_window(&app, &label, "path-command");
             closed = true;
         }
     }
     Ok(json!({ "ok": true, "closed": closed }))
+}
+
+#[tauri::command]
+fn snipping_close_annotation_editor(app: AppHandle, label: String) -> Result<Value, String> {
+    let label = label.trim().to_string();
+    if !label.starts_with(SNIPPING_EDITOR_WINDOW_PREFIX) {
+        return Err("Not a snip annotation editor window.".to_string());
+    }
+    let closed = snipping_close_editor_window(&app, &label, "editor-command");
+    Ok(json!({ "ok": true, "closed": closed, "label": label }))
 }
 
 /// A deleted snip must not linger on screen: dismisses its capture toast and
@@ -5440,61 +6207,19 @@ fn snipping_handle_untracked_asset_deleted(app: &AppHandle, deleted_path: &str) 
             !stale
         });
     }
-    // Close outside the registry locks: the preview Destroyed handler
-    // re-enters preview_paths.
+    // Close outside the registry locks: preview disposal also touches these
+    // registries, while editor windows close normally.
     for label in labels {
         if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.close();
+            if label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+                snipping_close_preview_window(app, &label, "asset-deleted");
+            } else if label.starts_with(SNIPPING_EDITOR_WINDOW_PREFIX) {
+                snipping_close_editor_window(app, &label, "asset-deleted");
+            } else {
+                snipping_close_window_guarded(&window, "asset-deleted-window");
+            }
         }
     }
-}
-
-// A strip drag-out session: one at a time, owned by whichever strip tile the
-// user is currently holding. The strip webview drives it (pointer events keep
-// flowing to the window that received the press), while Rust follows the
-// global cursor so coordinates stay correct across monitors and scales.
-static SNIPPING_STRIP_DRAG_OUT_LABEL: StdMutex<Option<String>> = StdMutex::new(None);
-
-/// Centers a preview window on the global cursor in physical pixels.
-fn snipping_strip_drag_out_track_cursor(app: &AppHandle, window: &tauri::WebviewWindow) {
-    let Ok(cursor) = app.cursor_position() else {
-        return;
-    };
-    let size = window.outer_size().unwrap_or(tauri::PhysicalSize {
-        width: SNIPPING_FLOAT_LOGICAL_WIDTH as u32,
-        height: SNIPPING_FLOAT_LOGICAL_HEIGHT as u32,
-    });
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
-        cursor.x as i32 - size.width as i32 / 2,
-        cursor.y as i32 - size.height as i32 / 2,
-    )));
-}
-
-/// Window level juggling for strip drag-outs: the strip and the previews both
-/// run at screen-saver level (so they can overlay other apps' fullscreen
-/// Spaces), and same-level stacking depends on ordering calls — a preview
-/// dragged out of the bar could ride invisibly behind it until the cursor
-/// left the strip band. Raising the held preview one notch above the strip
-/// keeps it visible from the first drag pixel; release restores the previews'
-/// shared fullscreen-safe base (NOT floating level — that tier renders
-/// behind a fullscreen Space's window and would undo the cross-Space fix).
-#[cfg(target_os = "macos")]
-fn snipping_strip_drag_out_set_level(window: &tauri::WebviewWindow, raised: bool) {
-    let window_for_main = window.clone();
-    let _ = window.run_on_main_thread(move || {
-        let Ok(ns_window) = window_for_main.ns_window() else {
-            return;
-        };
-        if ns_window.is_null() {
-            return;
-        }
-        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-        ns_window.setLevel(if raised {
-            objc2_app_kit::NSScreenSaverWindowLevel + 1
-        } else {
-            objc2_app_kit::NSScreenSaverWindowLevel
-        });
-    });
 }
 
 /// True while the global cursor is inside the recent-snips strip window.
@@ -5505,9 +6230,11 @@ fn snipping_strip_contains_cursor(app: &AppHandle) -> bool {
     if !strip.is_visible().unwrap_or(false) {
         return false;
     }
-    let (Ok(cursor), Ok(position), Ok(size)) =
-        (app.cursor_position(), strip.outer_position(), strip.outer_size())
-    else {
+    let (Ok(cursor), Ok(position), Ok(size)) = (
+        app.cursor_position(),
+        strip.outer_position(),
+        strip.outer_size(),
+    ) else {
         return false;
     };
     cursor.x >= position.x as f64
@@ -5516,94 +6243,183 @@ fn snipping_strip_contains_cursor(app: &AppHandle) -> bool {
         && cursor.y <= (position.y + size.height as i32) as f64
 }
 
-/// Starts dragging a snip out of the strip: opens its floating preview
-/// (unfocused — focus would blur-hide the strip mid-drag) centered under the
-/// cursor. The strip re-lists immediately, so the tile visibly leaves the bar.
-#[tauri::command]
-fn snipping_strip_drag_out_begin(app: AppHandle, path: String) -> Result<Value, String> {
-    let cursor = app
-        .cursor_position()
-        .map_err(|error| format!("Unable to read cursor position: {error}"))?;
-    let scale = app
-        .monitor_from_point(cursor.x, cursor.y)
-        .ok()
-        .flatten()
-        .or_else(|| app.primary_monitor().ok().flatten())
-        .map(|monitor| monitor.scale_factor())
-        .unwrap_or(1.0)
-        .max(0.1);
-    let opened = snipping_open_snip_preview_window_for(
-        &app,
-        &path,
-        Some((
-            cursor.x / scale - SNIPPING_FLOAT_LOGICAL_WIDTH / 2.0,
-            cursor.y / scale - SNIPPING_FLOAT_LOGICAL_HEIGHT / 2.0,
-        )),
-        false,
-    )?;
-    let label = opened
-        .get("label")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if let Some(window) = app.get_webview_window(&label) {
-        // Re-anchor in pure physical math: the logical open position above is
-        // best-effort on mixed-scale monitor layouts.
-        snipping_strip_drag_out_track_cursor(&app, &window);
-        #[cfg(target_os = "macos")]
-        snipping_strip_drag_out_set_level(&window, true);
+/// Geometry of the strip's horizontal queue while the bar is visible:
+/// (band_top, band_bottom, row_left_x, gap) in physical pixels. None while
+/// the bar is hidden — the row then owns nothing and the bottom-left column
+/// is the only queue.
+fn snipping_strip_row_band(app: &AppHandle) -> Option<(i32, i32, i32, i32)> {
+    let strip = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)?;
+    if !strip.is_visible().unwrap_or(false) {
+        return None;
     }
-    if let Ok(mut guard) = SNIPPING_STRIP_DRAG_OUT_LABEL.lock() {
-        *guard = (!label.is_empty()).then(|| label.clone());
-    }
-    Ok(opened)
+    let position = strip.outer_position().ok()?;
+    let size = strip.outer_size().ok()?;
+    let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
+    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
+    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
+    Some((
+        position.y,
+        position.y + size.height as i32,
+        position.x + margin,
+        gap,
+    ))
 }
 
-/// Follows the cursor while a strip drag-out is in flight (the strip webview
-/// streams pointer moves; the actual position comes from the global cursor).
-#[tauri::command]
-fn snipping_strip_drag_out_move(app: AppHandle) -> Result<(), String> {
-    let label = SNIPPING_STRIP_DRAG_OUT_LABEL
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone());
-    let Some(label) = label else {
-        return Ok(());
+/// Vertical ownership for the strip's horizontal queue: a preview whose
+/// center sits inside the visible bar belongs to the row, never to the
+/// bottom-left column (the first row slot shares the column's x).
+fn snipping_preview_in_strip_row(app: &AppHandle, position_y: i32, height: i32) -> bool {
+    let Some((band_top, band_bottom, _, _)) = snipping_strip_row_band(app) else {
+        return false;
     };
-    if let Some(window) = app.get_webview_window(&label) {
-        snipping_strip_drag_out_track_cursor(&app, &window);
-    }
-    Ok(())
+    let center = position_y + height.max(1) / 2;
+    center >= band_top && center < band_bottom
 }
 
-/// Ends a strip drag-out. Releasing back over the strip cancels (the preview
-/// closes and the tile returns to the list); anywhere else the preview stays
-/// where it was dropped — including adoption into the bottom-left queue when
-/// dropped over that column.
-#[tauri::command]
-fn snipping_strip_drag_out_end(app: AppHandle) -> Result<Value, String> {
-    let label = SNIPPING_STRIP_DRAG_OUT_LABEL
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    let Some(label) = label else {
-        return Ok(json!({ "ok": true, "dropped": false }));
+/// Pending moves that re-pack every preview parked on the visible bar into a
+/// tight left-to-right row — the horizontal twin of the bottom-left column.
+/// Held and detached windows are obstacles at their real bands, exactly like
+/// the column, so the row parts around a drag and collapses behind it.
+fn snipping_strip_row_reflow_moves(
+    app: &AppHandle,
+) -> Vec<(
+    tauri::WebviewWindow,
+    tauri::PhysicalPosition<i32>,
+    tauri::PhysicalPosition<i32>,
+)> {
+    let Some((band_top, band_bottom, row_x, gap)) = snipping_strip_row_band(app) else {
+        return Vec::new();
     };
-    let Some(window) = app.get_webview_window(&label) else {
-        return Ok(json!({ "ok": true, "dropped": false }));
-    };
-    snipping_strip_drag_out_track_cursor(&app, &window);
-    #[cfg(target_os = "macos")]
-    snipping_strip_drag_out_set_level(&window, false);
-    #[cfg(target_os = "macos")]
-    snipping_preview_apply_macos_space_style(&window);
-    if snipping_strip_contains_cursor(&app) {
-        let _ = window.close();
-        return Ok(json!({ "ok": true, "dropped": false }));
+    let dragging_labels = snipping_preview_dragging_labels(app);
+    let detached_labels = snipping_preview_detached_labels(app);
+    let docked_labels = snipping_preview_docked_labels(app);
+    let closing_labels = snipping_preview_closing_labels(app);
+
+    let mut docked: Vec<(
+        tauri::PhysicalPosition<i32>,
+        i32,
+        i32,
+        tauri::WebviewWindow,
+        bool,
+    )> = Vec::new();
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) || closing_labels.contains(&label) {
+            continue;
+        }
+        if !window.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let Ok(position) = window.outer_position() else {
+            continue;
+        };
+        let Ok(size) = window.outer_size() else {
+            continue;
+        };
+        let width = size.width.max(1) as i32;
+        let height = size.height.max(1) as i32;
+        let center = position.y + height / 2;
+        if center < band_top || center >= band_bottom {
+            continue;
+        }
+        let is_docked = docked_labels.contains(&label);
+        let dragging = dragging_labels.contains(&label);
+        if !is_docked && !dragging {
+            continue;
+        }
+        let held = dragging || detached_labels.contains(&label);
+        docked.push((position, width, height, window, held));
     }
-    // Dropped over the bottom-left column? The normal settle pass adopts it.
-    schedule_snipping_preview_stack_reflow(&app);
-    Ok(json!({ "ok": true, "dropped": true, "label": label }))
+
+    // The left-most window keeps the first slot; on-screen order is preserved.
+    docked.sort_by(|a, b| a.0.x.cmp(&b.0.x));
+    let mut obstacle_bands: Vec<(i32, i32)> = docked
+        .iter()
+        .filter(|(_, _, _, _, held)| *held)
+        .map(|(position, width, _, _, _)| (position.x, position.x + width))
+        .collect();
+    obstacle_bands.sort_by(|a, b| a.0.cmp(&b.0));
+    let band_center = band_top + (band_bottom - band_top) / 2;
+    let mut left_edge = row_x;
+    let mut moves = Vec::new();
+    for (position, width, height, window, held) in docked {
+        if held {
+            continue;
+        }
+        let mut x = left_edge;
+        for (obstacle_left, obstacle_right) in &obstacle_bands {
+            let intersects = x < obstacle_right + gap && x + width > obstacle_left - gap;
+            if intersects {
+                x = obstacle_right + gap;
+            }
+        }
+        let y = band_center - height / 2;
+        if position.x != x || position.y != y {
+            moves.push((window, position, tauri::PhysicalPosition::new(x, y)));
+        }
+        left_edge = x + width + gap;
+    }
+    moves
+}
+
+/// Fills the freshly shown bar with real preview float windows for the most
+/// recent snips: the strip's tiles ARE snip previews now — same window, same
+/// actions, same drag — so the open bar is a horizontal queue unified with
+/// the bottom-left column. Only as many tiles as fit the row are opened, and
+/// snips detached elsewhere stay out of the strip, while queue-owned previews
+/// can be moved into this row.
+fn snipping_strip_populate_row(app: &AppHandle) {
+    let Some(strip) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+        return;
+    };
+    let (Ok(position), Ok(size)) = (strip.outer_position(), strip.outer_size()) else {
+        return;
+    };
+    let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
+    let usable = size.width as f64 / scale - SNIPPING_FLOAT_STACK_MARGIN * 2.0;
+    let per_tile = SNIPPING_FLOAT_LOGICAL_WIDTH + SNIPPING_FLOAT_STACK_GAP;
+    let fit = (((usable + SNIPPING_FLOAT_STACK_GAP) / per_tile).floor() as usize)
+        .min(SNIPPING_STRIP_RECENT_LIMIT);
+    if fit == 0 {
+        return;
+    }
+    let items = snipping_recent_snip_items_for_mode(app, fit, true).unwrap_or_default();
+    let origin_x = position.x as f64 / scale + SNIPPING_FLOAT_STACK_MARGIN;
+    let origin_y = position.y as f64 / scale
+        + (size.height as f64 / scale - SNIPPING_FLOAT_LOGICAL_HEIGHT).max(0.0) / 2.0;
+    for (index, item) in items.iter().enumerate() {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let x = origin_x + index as f64 * per_tile;
+        if let Ok(opened) = snipping_open_snip_preview_window_for(app, path, Some((x, origin_y)), false)
+        {
+            if let Some(label) = opened.get("label").and_then(Value::as_str) {
+                snipping_mark_preview_docked(app, label, true);
+                if let Some(window) = app.get_webview_window(label) {
+                    #[cfg(target_os = "macos")]
+                    {
+                        snipping_preview_set_strip_docked_level(&window, true);
+                        snipping_preview_order_front_regardless(&window);
+                    }
+                }
+            }
+        }
+    }
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
+    snipping_strip_reassert_docked_previews(app);
+}
+
+/// Closes every preview still parked in the row when the bar dismisses.
+/// Previews the user dragged out of the band live on as normal floats.
+fn snipping_strip_close_row_floats(app: &AppHandle) {
+    let dragging_labels = snipping_preview_dragging_labels(app);
+    let docked_labels = snipping_preview_docked_labels(app);
+    for label in docked_labels {
+        if dragging_labels.contains(&label) {
+            continue;
+        }
+        snipping_close_preview_window(app, &label, "strip-dismissed");
+    }
 }
 
 /// Called by a preview window's webview right before it starts the native
@@ -5615,19 +6431,16 @@ fn snipping_preview_drag_started(app: AppHandle, label: String) -> Result<Value,
     if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
         return Err("Not a snip preview window.".to_string());
     }
+    if snipping_preview_is_closing(&app, &label) {
+        return Err("Snip preview window is closing.".to_string());
+    }
     let Some(window) = app.get_webview_window(&label) else {
         return Err("Snip preview window is not open.".to_string());
     };
     let position = window
         .outer_position()
         .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
-    if let Ok(mut sessions) = app
-        .state::<SnippingState>()
-        .preview_drag_sessions
-        .lock()
-    {
-        sessions.insert(label, (position.x, position.y));
-    }
+    snipping_begin_preview_drag_session(&app, &label, position);
     // A plain click never emits Moved events, so make sure the session still
     // gets settled (and cleared) shortly after.
     schedule_snipping_preview_stack_reflow(&app);
@@ -5637,7 +6450,11 @@ fn snipping_preview_drag_started(app: AppHandle, label: String) -> Result<Value,
 /// A drop target in the main webview accepted the snip: the preview window
 /// closes and its capture toast is dismissed, like a manual dismiss.
 #[tauri::command]
-fn snipping_consume_snip_preview(app: AppHandle, label: String, path: String) -> Result<Value, String> {
+fn snipping_consume_snip_preview(
+    app: AppHandle,
+    label: String,
+    path: String,
+) -> Result<Value, String> {
     let label = label.trim().to_string();
     if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
         return Err("Not a snip preview window.".to_string());
@@ -5652,9 +6469,7 @@ fn snipping_consume_snip_preview(app: AppHandle, label: String, path: String) ->
             },
         );
     }
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.close();
-    }
+    snipping_close_preview_window(&app, &label, "drop-consumed");
     Ok(json!({ "ok": true, "label": label }))
 }
 
@@ -5665,7 +6480,11 @@ fn snipping_set_dispatch_targets(app: AppHandle, targets: Value) -> Result<Value
         .dispatch_targets
         .lock()
         .map_err(|_| "Unable to lock snipping dispatch targets.".to_string())?;
-    *guard = if targets.is_array() { targets } else { Value::Array(Vec::new()) };
+    *guard = if targets.is_array() {
+        targets
+    } else {
+        Value::Array(Vec::new())
+    };
     Ok(json!({"ok": true}))
 }
 

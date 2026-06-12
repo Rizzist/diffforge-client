@@ -47,7 +47,10 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.12"
-objc2 = "0.6"
+# "exception": AppKit NSExceptions raised inside our main-thread window calls
+# must be caught at the ObjC boundary — one unwinding into the runloop
+# observer's catch_unwind is a foreign exception and aborts the process.
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"

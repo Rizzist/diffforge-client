@@ -15,12 +15,12 @@ window.addEventListener("unhandledrejection", (event) => {
 const hash = window.location.hash || "";
 const loadRootComponent = hash.startsWith("#/snipping-editor")
   || hash.startsWith("#/snipping-float")
-  || hash === "#/snipping-strip"
+  || hash.startsWith("#/snipping-strip")
   || hash === "#/snipping-toasts"
   ? import("./snipping/SnippingQuickAccess.jsx").then((module) => {
     if (hash.startsWith("#/snipping-editor")) return module.SnippingAnnotationEditorWindow;
     if (hash.startsWith("#/snipping-float")) return module.SnippingFloatWindow;
-    if (hash === "#/snipping-strip") return module.SnippingStripWindow;
+    if (hash.startsWith("#/snipping-strip")) return module.SnippingStripWindow;
     return module.default;
   })
   : import("./App.jsx").then((module) => module.default);

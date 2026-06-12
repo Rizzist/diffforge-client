@@ -192,7 +192,13 @@ fn todo_dispatch_prune(receipts: &Value, now_ms: u64) -> Value {
             .get("updatedAtMs")
             .and_then(Value::as_u64)
             .unwrap_or(0)
-            .cmp(&left.1.get("updatedAtMs").and_then(Value::as_u64).unwrap_or(0))
+            .cmp(
+                &left
+                    .1
+                    .get("updatedAtMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
     });
     entries.truncate(TODO_DISPATCH_RECEIPT_MAX_ITEMS);
     Value::Object(entries.into_iter().collect())
@@ -201,11 +207,7 @@ fn todo_dispatch_prune(receipts: &Value, now_ms: u64) -> Value {
 fn todo_dispatch_load(workspace_id: &str) -> Value {
     let safe_id = todo_dispatch_safe_workspace_id(workspace_id);
     let cache = TODO_DISPATCH_RECEIPTS_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
-    if let Some(cached) = cache
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&safe_id).cloned())
-    {
+    if let Some(cached) = cache.lock().ok().and_then(|map| map.get(&safe_id).cloned()) {
         return cached;
     }
     let loaded = todo_dispatch_store_path(workspace_id)
@@ -275,12 +277,7 @@ fn todo_dispatch_native_notify(app: &AppHandle, title: &str, body: &str) {
     if todo_dispatch_main_window_focused(app) {
         return;
     }
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn todo_dispatch_maybe_notify_drained(
@@ -424,10 +421,7 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
 /// raise the arrival notification even when no window is alive.
 pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value) {
     let command_kind = {
-        let raw = todo_dispatch_text(
-            event,
-            &["command_kind", "commandKind", "action", "command"],
-        );
+        let raw = todo_dispatch_text(event, &["command_kind", "commandKind", "action", "command"]);
         let kind = if raw.is_empty() {
             "create_task".to_string()
         } else {
@@ -437,10 +431,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     };
     let is_create_task = matches!(
         command_kind.as_str(),
-        "create_task"
-            | "remote_command_create_task"
-            | "task_create"
-            | "todo_create"
+        "create_task" | "remote_command_create_task" | "task_create" | "todo_create"
     ) || command_kind.is_empty();
     if !is_create_task {
         return;
@@ -471,12 +462,8 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         "text": text.chars().take(180).collect::<String>(),
         "workspaceName": workspace_name.clone(),
     });
-    let _ = todo_dispatch_record_receipt_internal(
-        Some(app),
-        &workspace_id,
-        receipt,
-        "remote_intake",
-    );
+    let _ =
+        todo_dispatch_record_receipt_internal(Some(app), &workspace_id, receipt, "remote_intake");
     // Headless intake: the remote todo is appended into the Rust queue store
     // (matching the webview's commandId-keyed item id) so the background
     // dispatcher can submit it and a later webview mount adopts it from the
@@ -648,9 +635,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     };
     let submitted = entries
         .iter()
-        .filter(|(_, receipt)| {
-            receipt.get("status").and_then(Value::as_str) == Some("submitted")
-        })
+        .filter(|(_, receipt)| receipt.get("status").and_then(Value::as_str) == Some("submitted"))
         .collect::<Vec<_>>();
     if submitted.is_empty() {
         return;
@@ -664,8 +649,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         .iter()
         .find(|(_, receipt)| {
             !pane_id.is_empty()
-                && receipt.get("paneId").and_then(Value::as_str).map(str::trim)
-                    == Some(pane_id)
+                && receipt.get("paneId").and_then(Value::as_str).map(str::trim) == Some(pane_id)
         })
         .or(if submitted.len() == 1 {
             submitted.first()
@@ -725,8 +709,7 @@ const TODO_DISPATCH_TERMINAL_RUNTIME_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const TODO_DISPATCH_JOURNAL_MAX_ENTRIES: usize = 200;
 
 static TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
-static TODO_DISPATCH_TERMINAL_RUNTIME: OnceLock<StdMutex<HashMap<String, Value>>> =
-    OnceLock::new();
+static TODO_DISPATCH_TERMINAL_RUNTIME: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 
 fn todo_dispatch_data_path(kind: &str, workspace_id: &str) -> Option<PathBuf> {
     let root = cloud_mcp_local_data_file_path("todo-dispatch")?.join(kind);
@@ -952,7 +935,10 @@ pub(crate) fn todo_store_add_tombstones(
             .map(|(key, value)| {
                 (
                     key.clone(),
-                    value.get("deletedAtMs").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("deletedAtMs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                 )
             })
             .collect::<Vec<_>>();
@@ -996,7 +982,9 @@ fn todo_store_item_matches_id(item: &Value, todo_id: &str) -> bool {
 }
 
 fn todo_store_item_is_tombstoned(item: &Value, tombstoned: &HashSet<String>) -> bool {
-    tombstoned.iter().any(|id| todo_store_item_matches_id(item, id))
+    tombstoned
+        .iter()
+        .any(|id| todo_store_item_matches_id(item, id))
 }
 
 /// Splits incoming items into the kept set and the ids rejected because a
@@ -1030,7 +1018,12 @@ fn todo_store_item_status(item: &Value) -> String {
 fn todo_store_item_pane_id(item: &Value) -> String {
     todo_dispatch_text(
         item,
-        &["targetTerminalId", "target_terminal_id", "paneId", "pane_id"],
+        &[
+            "targetTerminalId",
+            "target_terminal_id",
+            "paneId",
+            "pane_id",
+        ],
     )
 }
 
@@ -1149,7 +1142,11 @@ pub(crate) fn todo_store_delete_internal(
         let before = items.len();
         let next_items = items
             .into_iter()
-            .filter(|item| !all_ids.iter().any(|id| todo_store_item_matches_id(item, id)))
+            .filter(|item| {
+                !all_ids
+                    .iter()
+                    .any(|id| todo_store_item_matches_id(item, id))
+            })
             .collect::<Vec<_>>();
         if next_items.len() != before {
             todo_dispatch_queue_write(workspace_id, &next_items);
@@ -1279,7 +1276,10 @@ async fn todo_store_cancel(
                 .cloned()
                 .unwrap_or_default();
             for item in items.iter_mut() {
-                if refs.iter().any(|reference| todo_store_item_matches_id(item, reference)) {
+                if refs
+                    .iter()
+                    .any(|reference| todo_store_item_matches_id(item, reference))
+                {
                     todo_store_set_item_status(item, "cancelled", &reason);
                     matched_item = Some(item.clone());
                     break;
@@ -1389,8 +1389,8 @@ async fn todo_read_image_data_url(path: String) -> Result<String, String> {
         ) {
             return Err(format!("Not an image file: .{extension}"));
         }
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("Unable to read dropped file: {error}"))?;
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("Unable to read dropped file: {error}"))?;
         if !metadata.is_file() {
             return Err("Dropped path is not a file.".to_string());
         }
@@ -1519,7 +1519,10 @@ async fn todo_store_set_status(
                 .cloned()
                 .unwrap_or_default();
             for item in items.iter_mut() {
-                if refs.iter().any(|reference| todo_store_item_matches_id(item, reference)) {
+                if refs
+                    .iter()
+                    .any(|reference| todo_store_item_matches_id(item, reference))
+                {
                     todo_store_set_item_status(item, &status, &reason);
                     apply_targets(item);
                     matched_item = Some(item.clone());
@@ -1586,8 +1589,12 @@ async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
             if workspace_id.is_empty() {
                 continue;
             }
-            let file_age_ms = now_ms
-                .saturating_sub(snapshot.get("updatedAtMs").and_then(Value::as_u64).unwrap_or(0));
+            let file_age_ms = now_ms.saturating_sub(
+                snapshot
+                    .get("updatedAtMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
             if file_age_ms < TODO_STORE_ORPHAN_AFTER_MS {
                 continue;
             }
@@ -1744,7 +1751,10 @@ pub(crate) fn todo_store_startup_sweep(app: &AppHandle) {
 
 pub(crate) fn todo_store_orphan_sweep_start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS)).await;
+        sleep(Duration::from_secs(
+            TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS,
+        ))
+        .await;
         loop {
             todo_store_orphan_sweep_tick(&app).await;
             sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS)).await;
@@ -1752,8 +1762,11 @@ pub(crate) fn todo_store_orphan_sweep_start(app: AppHandle) {
     });
 }
 
-const TODO_STORE_SWEEP_REASONS: [&str; 3] =
-    ["app_restart", "app_crash_recovered", "todo_store_orphan_sweep"];
+const TODO_STORE_SWEEP_REASONS: [&str; 3] = [
+    "app_restart",
+    "app_crash_recovered",
+    "todo_store_orphan_sweep",
+];
 const TODO_STORE_SWEPT_ACTIVE_STATUSES: [&str; 5] =
     ["queued", "sending", "submitted", "running", "dispatching"];
 
@@ -1782,9 +1795,7 @@ fn todo_store_keep_settled_sweep_flips_core(
     items
         .into_iter()
         .map(|item| {
-            if !TODO_STORE_SWEPT_ACTIVE_STATUSES
-                .contains(&todo_store_item_status(&item).as_str())
-            {
+            if !TODO_STORE_SWEPT_ACTIVE_STATUSES.contains(&todo_store_item_status(&item).as_str()) {
                 return item;
             }
             let item_id = item
@@ -1822,8 +1833,13 @@ fn todo_store_keep_settled_sweep_flips_core(
 // whole id family so one logical todo is always one history entry.
 // ---------------------------------------------------------------------------
 
-const TODO_STORE_SETTLED_RETENTION_STATUSES: [&str; 5] =
-    ["completed", "cancelled", "failed", "interrupted", "timed_out"];
+const TODO_STORE_SETTLED_RETENTION_STATUSES: [&str; 5] = [
+    "completed",
+    "cancelled",
+    "failed",
+    "interrupted",
+    "timed_out",
+];
 const TODO_STORE_SETTLED_RETENTION_MAX: usize = 200;
 const TODO_STORE_HISTORY_MAX_ITEMS: usize = 300;
 
@@ -2086,10 +2102,11 @@ fn todo_store_retain_settled_items_core(
         .iter()
         .flat_map(|item| todo_store_history_item_tokens(item))
         .collect::<HashSet<_>>();
-    let (mut retained_settled, mut retained_active): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+    let (mut retained_settled, mut retained_active): (Vec<Value>, Vec<Value>) =
+        (Vec::new(), Vec::new());
     for item in stored_items {
-        let settled = TODO_STORE_SETTLED_RETENTION_STATUSES
-            .contains(&todo_store_item_status(&item).as_str());
+        let settled =
+            TODO_STORE_SETTLED_RETENTION_STATUSES.contains(&todo_store_item_status(&item).as_str());
         if !settled && !todo_store_item_is_rust_owned(&item) {
             continue;
         }
@@ -2145,9 +2162,7 @@ fn todo_store_history_merge(
                 continue;
             }
             let tokens = todo_store_history_item_tokens(&item);
-            if tokens.is_empty()
-                || tokens.iter().any(|token| tombstoned.contains(token))
-            {
+            if tokens.is_empty() || tokens.iter().any(|token| tombstoned.contains(token)) {
                 continue;
             }
             if let Some(existing_index) = tokens
@@ -2155,22 +2170,20 @@ fn todo_store_history_merge(
                 .find_map(|token| index_by_token.get(token).copied())
             {
                 if is_mirror {
-                    if let Some(existing) =
-                        merged.get_mut(existing_index).and_then(Value::as_object_mut)
+                    if let Some(existing) = merged
+                        .get_mut(existing_index)
+                        .and_then(Value::as_object_mut)
                     {
                         for key in ENRICH_KEYS {
                             let missing = existing
                                 .get(key)
                                 .map(|value| {
                                     value.is_null()
-                                        || value
-                                            .as_str()
-                                            .is_some_and(|text| text.trim().is_empty())
+                                        || value.as_str().is_some_and(|text| text.trim().is_empty())
                                 })
                                 .unwrap_or(true);
                             if missing {
-                                if let Some(value) =
-                                    item.get(key).filter(|value| !value.is_null())
+                                if let Some(value) = item.get(key).filter(|value| !value.is_null())
                                 {
                                     existing.insert(key.to_string(), value.clone());
                                 }
@@ -2599,11 +2612,11 @@ mod todo_store_tests {
         // The webview's snapshot omits the completed item (it consumed it)
         // and rewrites the live one.
         let incoming = vec![json!({ "id": "todo-live", "todoStatus": "queued" })];
-        let merged =
-            todo_store_retain_settled_items_core(stored, incoming, &HashSet::new());
+        let merged = todo_store_retain_settled_items_core(stored, incoming, &HashSet::new());
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|item| item["id"] == "todo-done"
-            && todo_store_item_status(item) == "completed"));
+        assert!(merged
+            .iter()
+            .any(|item| item["id"] == "todo-done" && todo_store_item_status(item) == "completed"));
     }
 
     #[test]
@@ -2627,8 +2640,7 @@ mod todo_store_tests {
             json!({ "id": "webview-owned", "todoStatus": "queued" }),
         ];
         let incoming = vec![json!({ "id": "other", "todoStatus": "listed" })];
-        let merged =
-            todo_store_retain_settled_items_core(stored, incoming, &HashSet::new());
+        let merged = todo_store_retain_settled_items_core(stored, incoming, &HashSet::new());
         let ids = merged
             .iter()
             .map(|item| item["id"].as_str().unwrap_or_default())
@@ -2717,7 +2729,10 @@ mod todo_store_tests {
         let now_iso = chrono_like_now_iso();
         let parsed = todo_dispatch_parse_iso_ms(&now_iso).expect("own stamps parse");
         let now_ms = todo_dispatch_now_ms();
-        assert!(now_ms.abs_diff(parsed) < 5_000, "{now_iso} -> {parsed} vs {now_ms}");
+        assert!(
+            now_ms.abs_diff(parsed) < 5_000,
+            "{now_iso} -> {parsed} vs {now_ms}"
+        );
     }
 }
 
@@ -2774,7 +2789,10 @@ const TODO_DISPATCH_DIRECT_CAPTURE_EVENT: &str = "todo-dispatch-direct-todo-capt
 /// derive the SAME item id from the prompt event so one direct prompt is one
 /// todo everywhere (queue store, journal, receipts, webview item, cloud row).
 fn todo_dispatch_direct_prompt_item_id(prompt_event_id: Option<&str>) -> String {
-    if let Some(event_id) = prompt_event_id.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(event_id) = prompt_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let mut safe = String::new();
         let mut last_was_separator = false;
         for character in event_id.chars() {
@@ -2920,12 +2938,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
     // only appears after the next poll tick.
     todo_store_emit_changed(app, workspace_id, "terminal_direct_submit", "store");
     if !todo_dispatch_webview_dispatcher_active() {
-        todo_dispatch_push_queue_snapshot(
-            app,
-            workspace_id,
-            Vec::new(),
-            "terminal_direct_submit",
-        );
+        todo_dispatch_push_queue_snapshot(app, workspace_id, Vec::new(), "terminal_direct_submit");
     }
     Some(item_id)
 }
@@ -2997,15 +3010,16 @@ fn todo_dispatch_push_queue_snapshot(
 /// webview's localStorage mirror on restore. Idempotent next to the webview
 /// path (both remove the same id).
 pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) {
-    let command_kind = todo_dispatch_text(
-        event,
-        &["command_kind", "commandKind", "action", "command"],
-    )
-    .to_ascii_lowercase()
-    .replace(['.', ' ', '-'], "_");
+    let command_kind =
+        todo_dispatch_text(event, &["command_kind", "commandKind", "action", "command"])
+            .to_ascii_lowercase()
+            .replace(['.', ' ', '-'], "_");
     if !matches!(
         command_kind.as_str(),
-        "workspace_todo_delete" | "todo_delete" | "delete_todo" | "delete_task"
+        "workspace_todo_delete"
+            | "todo_delete"
+            | "delete_todo"
+            | "delete_task"
             | "remote_todo_delete"
     ) {
         return;
@@ -3335,7 +3349,11 @@ fn todo_dispatch_backend_item_dispatchable(item: &Value) -> bool {
     !todo_dispatch_backend_item_text(item).is_empty()
 }
 
-fn todo_dispatch_backend_pick_target(workspace_id: &str, item: &Value, busy: &HashSet<String>) -> Option<Value> {
+fn todo_dispatch_backend_pick_target(
+    workspace_id: &str,
+    item: &Value,
+    busy: &HashSet<String>,
+) -> Option<Value> {
     let registry = TODO_DISPATCH_TERMINAL_RUNTIME.get_or_init(|| StdMutex::new(HashMap::new()));
     let map = registry.lock().ok()?;
     let entries = map
@@ -3358,18 +3376,22 @@ fn todo_dispatch_backend_pick_target(workspace_id: &str, item: &Value, busy: &Ha
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let target_thread = item
-        .get("targetThreadId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let target_index = item.get("targetTerminalIndex").and_then(Value::as_u64);
+    let has_non_id_terminal_hint = target_pane.is_none()
+        && (item
+            .get("targetThreadId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || item
+                .get("targetTerminalIndex")
+                .and_then(Value::as_u64)
+                .is_some());
     let target_agent = item
         .get("targetAgentId")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let has_explicit_target = target_pane.is_some() || target_thread.is_some() || target_index.is_some();
+    let has_explicit_target = target_pane.is_some() || has_non_id_terminal_hint;
 
     let matched = entries
         .iter()
@@ -3377,21 +3399,10 @@ fn todo_dispatch_backend_pick_target(workspace_id: &str, item: &Value, busy: &Ha
             target_pane.is_some() && entry.get("paneId").and_then(Value::as_str) == target_pane
         })
         .or_else(|| {
-            entries.iter().find(|entry| {
-                target_thread.is_some()
-                    && entry.get("threadId").and_then(Value::as_str) == target_thread
-            })
-        })
-        .or_else(|| {
-            entries.iter().find(|entry| {
-                target_index.is_some()
-                    && entry.get("terminalIndex").and_then(Value::as_u64) == target_index
-            })
-        })
-        .or_else(|| {
             if has_explicit_target {
-                // An explicit target that is not currently available: hold the
-                // item instead of sending it somewhere else.
+                // An explicit terminal target must be a pane id. Legacy
+                // thread/index hints are retained as metadata, but cannot
+                // select an execution target.
                 None
             } else if let Some(agent) = target_agent {
                 entries.iter().find(|entry| {
@@ -3416,7 +3427,10 @@ async fn todo_dispatch_backend_submit(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let target_instance_id = target.get("instanceId").and_then(Value::as_u64).unwrap_or(0);
+    let target_instance_id = target
+        .get("instanceId")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let prompt = todo_dispatch_backend_item_text(item);
     if pane_id.is_empty() || prompt.is_empty() {
         return false;
@@ -3469,7 +3483,10 @@ async fn todo_dispatch_backend_submit(
             return false;
         }
     }
-    sleep(Duration::from_millis(TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS)).await;
+    sleep(Duration::from_millis(
+        TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+    ))
+    .await;
     {
         let still_current = {
             let guard = terminal_state.terminals.read().await;
@@ -3644,7 +3661,8 @@ pub(crate) fn todo_dispatch_start_background_dispatcher(app: AppHandle) {
 }
 
 fn todo_dispatch_store_workspace_ids() -> Vec<String> {
-    let Some(root) = cloud_mcp_local_data_file_path("todo-dispatch").map(|root| root.join("receipts"))
+    let Some(root) =
+        cloud_mcp_local_data_file_path("todo-dispatch").map(|root| root.join("receipts"))
     else {
         return Vec::new();
     };
@@ -3715,7 +3733,11 @@ pub(crate) fn todo_dispatch_mark_active_receipts_interrupted(
 async fn todo_dispatch_receipts_get(workspace_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let receipts = todo_dispatch_load(&workspace_id);
-        Ok(todo_dispatch_receipts_payload(&workspace_id, &receipts, "get"))
+        Ok(todo_dispatch_receipts_payload(
+            &workspace_id,
+            &receipts,
+            "get",
+        ))
     })
     .await
     .map_err(|error| format!("Todo dispatch receipts worker failed: {error}"))?
@@ -3735,7 +3757,11 @@ async fn todo_dispatch_receipt_record(
             receipt,
             reason.as_deref().unwrap_or("frontend_record"),
         )?;
-        Ok(todo_dispatch_receipts_payload(&workspace_id, &receipts, "record"))
+        Ok(todo_dispatch_receipts_payload(
+            &workspace_id,
+            &receipts,
+            "record",
+        ))
     })
     .await
     .map_err(|error| format!("Todo dispatch record worker failed: {error}"))?
@@ -3782,7 +3808,11 @@ async fn todo_dispatch_receipts_import(
                 todo_dispatch_receipts_payload(&workspace_id, &next, "import"),
             );
         }
-        Ok(todo_dispatch_receipts_payload(&workspace_id, &next, "import"))
+        Ok(todo_dispatch_receipts_payload(
+            &workspace_id,
+            &next,
+            "import",
+        ))
     })
     .await
     .map_err(|error| format!("Todo dispatch import worker failed: {error}"))?

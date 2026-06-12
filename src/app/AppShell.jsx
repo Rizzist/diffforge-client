@@ -3027,7 +3027,7 @@ function WorkspaceIdleState({ detail = "No workspace selected.", plan = "", view
     <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
       <AuthSquareBackdrop tone="quiet" />
       {/* The signed-in plan rendered as its pricing-page flame tier. */}
-      <PlanFlame plan={plan} />
+      <PlanFlame plan={plan} showControls={Boolean(plan)} />
       <WorkspaceIdlePanel>
         <WorkspaceIdleLogo src="/logo.webp" alt="" />
         <WorkspaceIdleTitle>{BRAND_NAME}</WorkspaceIdleTitle>
@@ -18343,22 +18343,6 @@ export default function App() {
       }
       return "";
     };
-    const remoteControlTerminalNameKey = (value) => String(value || "")
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "");
-    const remoteControlTerminalNameCandidates = (terminal) => [
-      terminal?.terminalNickname,
-      terminal?.terminal_nickname,
-      terminal?.terminalName,
-      terminal?.terminal_name,
-      terminal?.displayName,
-      terminal?.display_name,
-      terminal?.agentDisplayName,
-      terminal?.agent_display_name,
-      terminal?.agentType,
-      terminal?.agent_type,
-    ].map((value) => String(value || "").trim()).filter(Boolean);
     const remoteControlTerminalNumber = (terminal, keys) => {
       for (const key of keys) {
         const number = Number.parseInt(terminal?.[key], 10);
@@ -18428,34 +18412,16 @@ export default function App() {
       const presenceWorkspace = findRemoteControlPresenceWorkspace(workspaceId);
       const terminals = Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [];
       const targetTerminalId = String(target.targetTerminalId || "").trim();
-      const targetThreadId = String(target.targetThreadId || "").trim();
-      const targetTerminalName = String(target.targetTerminalName || "").trim();
-      const targetTerminalNameKey = remoteControlTerminalNameKey(targetTerminalName);
-      const targetTerminalIndex = Number.isInteger(target.targetTerminalIndex)
-        ? target.targetTerminalIndex
-        : null;
-      const terminal = terminals.find((candidate) => (
-        targetTerminalId
-          && [
+      const terminal = targetTerminalId
+        ? terminals.find((candidate) => (
+          [
             candidate?.paneId,
             candidate?.pane_id,
             candidate?.terminalId,
             candidate?.terminal_id,
           ].map((value) => String(value || "").trim()).includes(targetTerminalId)
-      )) || terminals.find((candidate) => (
-        targetThreadId
-          && [
-            candidate?.threadId,
-            candidate?.thread_id,
-          ].map((value) => String(value || "").trim()).includes(targetThreadId)
-      )) || terminals.find((candidate) => (
-        Number.isInteger(targetTerminalIndex)
-          && remoteControlTerminalNumber(candidate, ["terminalIndex", "terminal_index"]) === targetTerminalIndex
-      )) || terminals.find((candidate) => (
-        targetTerminalNameKey
-          && remoteControlTerminalNameCandidates(candidate)
-            .some((name) => remoteControlTerminalNameKey(name) === targetTerminalNameKey)
-      )) || null;
+        )) || null
+        : null;
       return {
         presenceWorkspace,
         terminal,
@@ -18472,12 +18438,11 @@ export default function App() {
     });
     const closeRemoteControlTerminal = async (workspaceId, terminal, target = {}) => {
       const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
-      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"])
-        ?? (Number.isInteger(target.targetTerminalIndex) ? target.targetTerminalIndex : null);
+      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]);
       const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"])
         || String(target.targetThreadId || "").trim();
       const instanceId = remoteControlTerminalText(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
-      if (!paneId && !Number.isInteger(terminalIndex)) {
+      if (!paneId) {
         return {
           closed: false,
           reason: "missing_pane_id",
@@ -19018,8 +18983,7 @@ export default function App() {
           return;
         }
         const { terminal } = findRemoteControlTerminal(workspaceId, target);
-        const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"])
-          ?? (Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null);
+        const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]);
         if (!Number.isInteger(terminalIndex)) {
           await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
             commandId,
@@ -19279,11 +19243,8 @@ export default function App() {
               || Number.isInteger(targetTerminalIndex)
               || targetTerminalName,
           );
-          const hasResolvedTerminalTarget = Boolean(
-            targetTerminalId
-              || targetThreadId
-              || Number.isInteger(targetTerminalIndex),
-          );
+          const terminalTargetHintWithoutId = hasTerminalTarget && !targetTerminalId;
+          const hasResolvedTerminalTarget = Boolean(targetTerminalId);
           const targetTerminalColor = hasTerminalTarget
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
@@ -19310,6 +19271,22 @@ export default function App() {
               "failed",
               "No local workspace is available for the remote command.",
               { commandId, commandKind },
+            );
+            return;
+          }
+          if (terminalTargetHintWithoutId) {
+            await recordRemoteCommandStatus(
+              event,
+              "failed",
+              "Remote terminal target hints must include an exact terminal id.",
+              {
+                commandId,
+                commandKind,
+                targetTerminalIndex,
+                targetTerminalName,
+                targetThreadId,
+                workspaceId,
+              },
             );
             return;
           }

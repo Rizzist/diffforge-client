@@ -9037,10 +9037,6 @@ function normalizeTodoTerminalName(value) {
   return String(value || "").trim().slice(0, 120);
 }
 
-function normalizeTodoTerminalNameKey(value) {
-  return normalizeTodoTerminalName(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
 function normalizeTodoTerminalIndex(value) {
   const number = Number.parseInt(value, 10);
   return Number.isInteger(number) && number >= 0 ? number : null;
@@ -10002,7 +9998,10 @@ function todoQueueRemoteItemsMatch(left, right) {
 function todoQueueSendTargetMatchesIdentity(candidate, targetTerminalId, targetThreadId) {
   const requestedTerminalId = normalizeTodoTerminalIdentity(targetTerminalId);
   const requestedThreadId = normalizeTodoTerminalIdentity(targetThreadId);
-  if (!requestedTerminalId && !requestedThreadId) {
+  if (!requestedTerminalId) {
+    if (requestedThreadId) {
+      return false;
+    }
     return true;
   }
   const candidateTerminalIds = [
@@ -10013,13 +10012,7 @@ function todoQueueSendTargetMatchesIdentity(candidate, targetTerminalId, targetT
     candidate?.liveTerminal?.terminalId,
     candidate?.terminalAgent?.paneId,
   ].map(normalizeTodoTerminalIdentity).filter(Boolean);
-  const candidateThreadIds = [
-    candidate?.targetThread?.id,
-    candidate?.liveTerminal?.threadId,
-    candidate?.terminalAgent?.threadId,
-  ].map(normalizeTodoTerminalIdentity).filter(Boolean);
-  return (!requestedTerminalId || candidateTerminalIds.includes(requestedTerminalId))
-    && (!requestedThreadId || candidateThreadIds.includes(requestedThreadId));
+  return candidateTerminalIds.includes(requestedTerminalId);
 }
 
 function getTodoQueueAgentAccentColor(agentId) {
@@ -15580,11 +15573,11 @@ function TerminalView({
     );
 
     if (hasTerminalTarget) {
-      const identityMatchedIndex = (targetTerminalId || targetThreadId)
+      const identityMatchedIndex = targetTerminalId
         ? logicalTerminalIndexes.find((terminalIndex) => todoQueueSendTargetMatchesIdentity({
           paneId: getTerminalPaneId(terminalIndex),
           targetThread: getTerminalThread(terminalIndex),
-        }, targetTerminalId, targetThreadId))
+        }, targetTerminalId, ""))
         : null;
       const liveTerminalIndex = Number.isInteger(identityMatchedIndex)
         ? identityMatchedIndex
@@ -15994,73 +15987,6 @@ function TerminalView({
     getTerminalThread,
     terminalWorkspace?.id,
     workspaceThreadEntry,
-  ]);
-  const resolveTodoQueueTerminalTargetByName = useCallback((fields = {}) => {
-    const requestedName = normalizeTodoTerminalName(
-      fields.targetTerminalName
-        || fields.target_terminal_name
-        || fields.terminalName
-        || fields.terminal_name
-        || fields.targetName
-        || fields.target_name
-        || "",
-    );
-    const requestedNameKey = normalizeTodoTerminalNameKey(requestedName);
-    if (!requestedNameKey) {
-      return null;
-    }
-
-    const matches = logicalTerminalIndexes
-      .map((terminalIndex) => {
-        const role = getTerminalRole(terminalIndex);
-        const thread = getTerminalThread(terminalIndex);
-        const providerBinding = getWorkspaceThreadProviderBinding(thread, role);
-        const { liveTerminal } = resolveTodoQueueLiveTerminal(terminalIndex);
-        const paneId = getTerminalPaneId(terminalIndex);
-        const nameCandidates = [
-          liveTerminal?.terminalName,
-          liveTerminal?.terminal_name,
-          liveTerminal?.displayName,
-          liveTerminal?.display_name,
-          liveTerminal?.agentDisplayName,
-          liveTerminal?.agent_display_name,
-          liveTerminal?.agentType,
-          liveTerminal?.agent_type,
-          providerBinding?.terminalName,
-          providerBinding?.terminal_name,
-          providerBinding?.agentDisplayName,
-          providerBinding?.agent_display_name,
-          providerBinding?.agentType,
-          providerBinding?.agent_type,
-        ].map(normalizeTodoTerminalName).filter(Boolean);
-        const matched = nameCandidates.some((name) => (
-          normalizeTodoTerminalNameKey(name) === requestedNameKey
-        ));
-        if (!matched) {
-          return null;
-        }
-        return {
-          targetAgentId: normalizeTodoTerminalAgentId(role),
-          targetTerminalId: paneId,
-          targetTerminalIndex: terminalIndex,
-          targetTerminalName: requestedName,
-          targetThreadId: thread?.id || liveTerminal?.threadId || liveTerminal?.thread_id || "",
-        };
-      })
-      .filter(Boolean);
-
-    if (!matches.length) {
-      return {
-        targetTerminalName: requestedName,
-      };
-    }
-    return matches[0];
-  }, [
-    getTerminalPaneId,
-    getTerminalRole,
-    getTerminalThread,
-    logicalTerminalIndexes,
-    resolveTodoQueueLiveTerminal,
   ]);
   const selectedTerminalPlanTarget = useMemo(() => {
     const normalizePlanTerminalIndex = (value) => {
@@ -24617,9 +24543,7 @@ function TerminalView({
       return null;
     }
 
-    const items = createTodoQueueItemsFromVoiceAgentToolCall(toolCall, {
-      resolveTerminalTarget: resolveTodoQueueTerminalTargetByName,
-    });
+    const items = createTodoQueueItemsFromVoiceAgentToolCall(toolCall);
     if (!items.length) {
       logTerminalStatus("frontend.voice_agent.tool_call_skip", {
         reason: "invalid_queue_item",
@@ -24700,7 +24624,6 @@ function TerminalView({
     handleVoicePlanServerResult,
     queueReleasedVoicePlanTasks,
     recordVoicePlanTaskStatus,
-    resolveTodoQueueTerminalTargetByName,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
@@ -24845,10 +24768,8 @@ function TerminalView({
         return;
       }
 
-      const resolvedRemoteTarget = resolveTodoQueueTerminalTargetByName(detail.item || {}) || null;
       const item = normalizeTodoQueueItem({
         ...(detail.item || {}),
-        ...(resolvedRemoteTarget || {}),
         kind: "todo",
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         workspaceId: eventWorkspaceId,
@@ -25044,7 +24965,6 @@ function TerminalView({
   }, [
     recordTodoQueueRemoteCommandReceipt,
     removeTodoQueueItem,
-    resolveTodoQueueTerminalTargetByName,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
@@ -25154,23 +25074,28 @@ function TerminalView({
         hasExplicitTerminalTarget,
         requestedTargetTerminalName,
       } = explicitTargetInfo;
-      const resolvedNameTarget = requestedTargetTerminalName
-        ? resolveTodoQueueTerminalTargetByName({ targetTerminalName: requestedTargetTerminalName }) || null
-        : null;
-      const requestedTargetTerminalId = explicitTargetInfo.requestedTargetTerminalId
-        || resolvedNameTarget?.targetTerminalId
-        || "";
+      const requestedTargetTerminalId = explicitTargetInfo.requestedTargetTerminalId || "";
       const requestedTargetTerminalIndex = Number.isInteger(explicitTargetInfo.requestedTargetTerminalIndex)
         ? explicitTargetInfo.requestedTargetTerminalIndex
-        : normalizeTodoTerminalIndex(resolvedNameTarget?.targetTerminalIndex);
-      const requestedTargetThreadId = explicitTargetInfo.requestedTargetThreadId
-        || resolvedNameTarget?.targetThreadId
-        || "";
+        : null;
+      const requestedTargetThreadId = explicitTargetInfo.requestedTargetThreadId || "";
 
       if (hasExplicitTerminalTarget) {
-        const candidateIndexes = Number.isInteger(requestedTargetTerminalIndex)
-          ? [requestedTargetTerminalIndex]
-          : logicalTerminalIndexes;
+        if (!requestedTargetTerminalId) {
+          return {
+            available: false,
+            hasExplicitTerminalTarget,
+            reason: "target_terminal_id_required",
+            requestedTargetAgentId,
+            requestedTargetTerminalId,
+            requestedTargetTerminalIndex,
+            requestedTargetTerminalName,
+            requestedTargetThreadId,
+            target: null,
+            unavailable: null,
+          };
+        }
+        const candidateIndexes = logicalTerminalIndexes;
         let matchedUnavailableTarget = null;
         for (const terminalIndex of candidateIndexes) {
           if (!logicalTerminalIndexes.includes(terminalIndex)) {
@@ -25670,7 +25595,6 @@ function TerminalView({
     recordTodoQueueRemoteCommandReceipt,
     recordVoicePlanTaskStatus,
     replaceTodoQueuePendingItems,
-    resolveTodoQueueTerminalTargetByName,
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,
     terminalWorkspace?.id,

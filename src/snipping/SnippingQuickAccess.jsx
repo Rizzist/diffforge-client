@@ -38,6 +38,8 @@ const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
 const SNIPPING_LIVE_PREVIEW_EVENT = "forge-snip-live-preview";
 const SNIPPING_FLOAT_ASSIGN_EVENT = "forge-snip-float-assign";
+const SNIPPING_FLOAT_DISPOSE_EVENT = "forge-snip-float-dispose";
+const SNIPPING_EDITOR_DISPOSE_EVENT = "forge-snip-editor-dispose";
 // ~22fps: frames are tiny (max edge capped below), so the encode+emit cost
 // per frame stays in the low milliseconds and the preview tracks the pen in
 // realtime without pinning a core.
@@ -50,6 +52,8 @@ export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
 export const SNIPPING_FLOAT_HASH = "#/snipping-float";
 export const SNIPPING_STRIP_HASH = "#/snipping-strip";
 
+const SNIPPING_EDITOR_WINDOW_PREFIX = "snipping-editor";
+const SNIPPING_FLOAT_WINDOW_PREFIX = "snip-float";
 const SNIPPING_STRIP_ANIM_EVENT = "forge-snip-strip-anim";
 const SNIPPING_STRIP_RECENT_LIMIT = 16;
 const SNIPPING_FLOATS_CHANGED_EVENT = "forge-snip-floats-changed";
@@ -306,10 +310,10 @@ function versionedAssetPreviewUrl(localPath, imageVersion = 0) {
   return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
 }
 
-function useStripTilePreviewUrl(localPath, imageVersion = 0) {
+function useStripTilePreviewUrl(localPath, imageVersion = 0, assetFallback = true) {
   const assetUrl = useMemo(
-    () => versionedAssetPreviewUrl(localPath, imageVersion),
-    [imageVersion, localPath],
+    () => (assetFallback ? versionedAssetPreviewUrl(localPath, imageVersion) : ""),
+    [assetFallback, imageVersion, localPath],
   );
   const [dataUrl, setDataUrl] = useState("");
   const [assetUrlFailed, setAssetUrlFailed] = useState(false);
@@ -351,7 +355,7 @@ function useStripTilePreviewUrl(localPath, imageVersion = 0) {
   }, [dataUrl]);
 
   return {
-    previewUrl: dataUrl || (assetUrlFailed ? "" : assetUrl),
+    previewUrl: dataUrl || (assetFallback && !assetUrlFailed ? assetUrl : ""),
     onImageError,
   };
 }
@@ -631,7 +635,15 @@ function useFloatingWindowBody(kind) {
 // window from an older session simply closes itself.
 export default function SnippingQuickAccess() {
   useEffect(() => {
-    getCurrentWindow().close().catch(() => {});
+    const current = getCurrentWindow();
+    const label = text(current.label);
+    if (label.startsWith(SNIPPING_FLOAT_WINDOW_PREFIX)) {
+      invoke("snipping_close_snip_float", { label }).catch(() => {
+        current.close().catch(() => {});
+      });
+      return;
+    }
+    current.close().catch(() => {});
   }, []);
 
   return <SnipFloatingGlobalStyle />;
@@ -652,16 +664,19 @@ export function SnippingFloatWindow() {
   // While the annotation editor is open, it streams composited frames here so
   // edits are visible live; the autosaved file takes back over on each save.
   const [liveFrameUrl, setLiveFrameUrl] = useState("");
+  const [closing, setClosing] = useState(false);
   const localPathRef = useRef(initialPath);
+  const closingRef = useRef(false);
+  const { previewUrl: filePreviewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion);
   const previewUrl = useMemo(() => {
+    if (closing) return "";
     if (liveFrameUrl) return liveFrameUrl;
-    const url = assetPreviewUrl({ localPath });
-    if (!url || !imageVersion) return url;
-    return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
-  }, [imageVersion, liveFrameUrl, localPath]);
+    return filePreviewUrl;
+  }, [closing, filePreviewUrl, liveFrameUrl]);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  const busyRef = useRef(false);
   // Rust watches the global cursor and arms the hover chrome — CSS :hover
   // alone never fires while this window is unfocused, which used to hide the
   // buttons until a focusing click (and made every action cost two clicks).
@@ -669,6 +684,49 @@ export function SnippingFloatWindow() {
   const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  const beginClosing = useCallback(() => {
+    closingRef.current = true;
+    setClosing(true);
+    setBusy(true);
+    setHoverArmed(false);
+    setLiveFrameUrl("");
+    setStatus("");
+  }, []);
+
+  useEffect(() => {
+    closingRef.current = closing;
+  }, [closing]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    const ownLabel = getCurrentWindow().label;
+
+    listen(SNIPPING_FLOAT_DISPOSE_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      if (text(payload.label) !== ownLabel) return;
+      beginClosing();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [beginClosing]);
 
   // Warm-pool adoption: this window may have booted with no path in its URL,
   // parked hidden until a capture claims it. The path arrives by event, plus
@@ -679,6 +737,12 @@ export function SnippingFloatWindow() {
     const ownLabel = getCurrentWindow().label;
     const adopt = (path) => {
       if (disposed || !path) return;
+      closingRef.current = false;
+      setClosing(false);
+      setBusy(false);
+      setStatus("");
+      setHoverArmed(false);
+      localPathRef.current = path;
       setLocalPath(path);
       setImageVersion((version) => version + 1);
       setLiveFrameUrl("");
@@ -745,7 +809,7 @@ export function SnippingFloatWindow() {
     let unlisten = () => {};
 
     listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
-      if (disposed) return;
+      if (disposed || closingRef.current) return;
       const payload = event?.payload || {};
       const original = text(payload.originalPath || payload.original_path);
       const edited = text(payload.editedPath || payload.edited_path || payload.path);
@@ -777,7 +841,7 @@ export function SnippingFloatWindow() {
     let unlisten = () => {};
 
     listen(SNIPPING_LIVE_PREVIEW_EVENT, (event) => {
-      if (disposed) return;
+      if (disposed || closingRef.current) return;
       const payload = event?.payload || {};
       const sourcePath = text(payload.sourcePath || payload.source_path);
       const targetPath = text(payload.targetPath || payload.target_path);
@@ -827,10 +891,20 @@ export function SnippingFloatWindow() {
   });
 
   const closeFloat = useCallback(() => {
-    getCurrentWindow().close().catch(() => {});
-  }, []);
+    if (closingRef.current) return;
+    beginClosing();
+    const label = getCurrentWindow().label;
+    invoke("snipping_close_snip_float", { label })
+      .catch((error) => {
+        closingRef.current = false;
+        setClosing(false);
+        setBusy(false);
+        showStatus(error?.message || String(error || "Unable to close snip preview."));
+      });
+  }, [beginClosing, showStatus]);
 
   const dismissFloat = useCallback(() => {
+    if (closingRef.current) return;
     if (localPath) {
       invoke("snipping_dismiss_capture_toast", {
         request: { path: localPath },
@@ -840,18 +914,21 @@ export function SnippingFloatWindow() {
   }, [closeFloat, localPath]);
 
   const runAction = useCallback(async (action) => {
-    if (!localPath || busy) return;
+    if (!localPath || busyRef.current || closingRef.current) return;
+    const actionPath = localPath;
+    if (action === "delete") {
+      beginClosing();
+    }
     setBusy(true);
 
     try {
       if (action === "delete") {
-        await invoke("diffforge_delete_untracked_asset", { path: localPath });
-        dismissFloat();
+        await invoke("diffforge_delete_untracked_asset", { path: actionPath });
       } else if (action === "copy") {
-        const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
+        const copyStatus = await copySnipToClipboard({ localPath: actionPath, name, previewUrl });
         showStatus(copyStatus);
       } else if (action === "edit") {
-        await invoke("snipping_open_annotation_editor", { path: localPath });
+        await invoke("snipping_open_annotation_editor", { path: actionPath });
         showStatus("Editor opened");
       } else if (action === "upload") {
         if (uploadState === "done") {
@@ -863,16 +940,23 @@ export function SnippingFloatWindow() {
         }
       }
     } catch (error) {
+      if (action === "delete") {
+        closingRef.current = false;
+        setClosing(false);
+      }
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
-      setBusy(false);
+      if (action !== "delete") {
+        setBusy(false);
+      }
     }
-  }, [busy, copyPublicUrl, dismissFloat, localPath, makePublic, name, previewUrl, showStatus, uploadState, uploadToCloud]);
+  }, [beginClosing, copyPublicUrl, localPath, makePublic, name, previewUrl, showStatus, uploadState, uploadToCloud]);
 
   // Manual double-press detection: the native window drag begins on the
   // first press, so a synthetic dblclick event is not reliable here.
   const lastPressAtRef = useRef(0);
   const beginDrag = useCallback((event) => {
+    if (closing) return;
     if (event.button !== 0 || event.target.closest("button")) return;
     // Stop WebKit from starting a selection highlight while the native
     // window drag takes over.
@@ -891,7 +975,7 @@ export function SnippingFloatWindow() {
       label: getCurrentWindow().label,
     }).catch(() => {});
     getCurrentWindow().startDragging().catch(() => {});
-  }, [runAction]);
+  }, [closing, runAction]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -909,18 +993,20 @@ export function SnippingFloatWindow() {
       <SnipFloatingGlobalStyle />
       <FloatWindowRoot
         data-busy={busy ? "true" : "false"}
+        data-closing={closing ? "true" : "false"}
         data-hovered={hoverArmed ? "true" : "false"}
         onDoubleClick={() => runAction("edit")}
         onMouseDown={beginDrag}
         title={`${name} — drag anywhere, double-click to annotate`}
       >
         {previewUrl ? (
-          <img alt={name} draggable={false} src={previewUrl} />
+          <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
         ) : (
           <span data-empty="true">Preview unavailable</span>
         )}
         <FloatCloseButton
           aria-label={`Dismiss ${name}`}
+          disabled={closing}
           onClick={dismissFloat}
           title="Dismiss"
           type="button"
@@ -930,7 +1016,7 @@ export function SnippingFloatWindow() {
         <FloatUploadButton
           aria-label={snipUploadButtonTitle(uploadState, name)}
           data-state={uploadState}
-          disabled={busy}
+          disabled={busy || closing}
           onClick={() => runAction("upload")}
           title={snipUploadButtonTitle(uploadState, name)}
           type="button"
@@ -943,7 +1029,7 @@ export function SnippingFloatWindow() {
         <FloatActionBar>
           <FloatActionButton
             aria-label={`Copy ${name}`}
-            disabled={busy}
+            disabled={busy || closing}
             onClick={() => runAction("copy")}
             title="Copy image"
             type="button"
@@ -952,7 +1038,7 @@ export function SnippingFloatWindow() {
           </FloatActionButton>
           <FloatActionButton
             aria-label={`Annotate ${name}`}
-            disabled={busy}
+            disabled={busy || closing}
             onClick={() => runAction("edit")}
             title="Annotate copy"
             type="button"
@@ -962,7 +1048,7 @@ export function SnippingFloatWindow() {
           <FloatActionButton
             aria-label={`Delete ${name}`}
             data-danger="true"
-            disabled={busy}
+            disabled={busy || closing}
             onClick={() => runAction("delete")}
             title="Delete file"
             type="button"
@@ -1280,7 +1366,7 @@ const FloatStatusPill = styled.span`
   left: 50%;
   display: inline-flex;
   min-height: 25px;
-  max-width: calc(100% - 132px);
+  max-width: calc(100% - 96px);
   align-items: center;
   gap: 6px;
   overflow: hidden;
@@ -1326,351 +1412,14 @@ const FloatStatusPill = styled.span`
 `;
 
 /**
- * One recent-snip tile: the floating preview's exact look and hover actions
- * (upload, copy, annotate, delete), with a pin button where the preview's
- * close button sits — pinning opens the snip as a draggable preview in the
- * bottom-left queue. Click opens the annotation editor directly, and holding
- * and dragging hands the tile off to a floating preview under the cursor
- * (the drag engine lives in the strip, which never unmounts mid-drag).
- */
-function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
-  const localPath = text(snip?.path);
-  const name = useMemo(() => assetName({ localPath }), [localPath]);
-  const [imageVersion, setImageVersion] = useState(0);
-  // The strip lives in a transparent macOS auxiliary webview. Use the backend
-  // data URL as the steady-state paint source so WebKit's local asset protocol
-  // cannot silently leave the tile blank while drag-out still works.
-  const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-  const statusTimerRef = useRef(0);
-  const localPathRef = useRef(localPath);
-
-  useEffect(() => {
-    localPathRef.current = localPath;
-  }, [localPath]);
-
-  // Annotated saves land in the same file (or an edited copy event): bump the
-  // cache-buster so the tile tracks the latest pixels.
-  useEffect(() => {
-    let disposed = false;
-    let unlisten = () => {};
-    listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
-      if (disposed) return;
-      const payload = event?.payload || {};
-      const original = text(payload.originalPath || payload.original_path);
-      const edited = text(payload.editedPath || payload.edited_path || payload.path);
-      const current = localPathRef.current;
-      if (current !== original && current !== edited) return;
-      setImageVersion((version) => version + 1);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-      unlisten();
-    };
-  }, []);
-
-  const showStatus = useCallback((nextStatus) => {
-    setStatus(nextStatus);
-    if (statusTimerRef.current) {
-      window.clearTimeout(statusTimerRef.current);
-    }
-    statusTimerRef.current = window.setTimeout(() => {
-      statusTimerRef.current = 0;
-      setStatus("");
-    }, 2400);
-  }, []);
-
-  useEffect(() => () => {
-    if (statusTimerRef.current) {
-      window.clearTimeout(statusTimerRef.current);
-    }
-  }, []);
-
-  const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
-    imageVersion,
-    localPath,
-    name,
-    showStatus,
-  });
-
-  const runAction = useCallback(async (action) => {
-    if (!localPath || busy) return;
-    setBusy(true);
-    try {
-      if (action === "delete") {
-        await invoke("diffforge_delete_untracked_asset", { path: localPath });
-        if (onRemoved) onRemoved(localPath);
-      } else if (action === "pin") {
-        // Unfocused open: stealing focus would blur-hide the strip. The
-        // floats-changed event then drops this tile from the list.
-        await invoke("snipping_open_snip_float", { path: localPath, focused: false });
-      } else if (action === "copy") {
-        const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
-        showStatus(copyStatus);
-      } else if (action === "edit") {
-        await invoke("snipping_open_annotation_editor", { path: localPath });
-        showStatus("Editor opened");
-      } else if (action === "upload") {
-        if (uploadState === "done") {
-          await copyPublicUrl();
-        } else if (uploadState === "private") {
-          await makePublic();
-        } else {
-          await uploadToCloud();
-        }
-      }
-    } catch (error) {
-      showStatus(error?.message || String(error || "Action failed"));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, copyPublicUrl, localPath, makePublic, name, onRemoved, previewUrl, showStatus, uploadState, uploadToCloud]);
-
-  const openEditor = useCallback((event) => {
-    if (event.target.closest("button")) return;
-    runAction("edit");
-  }, [runAction]);
-
-  const onPointerDown = useCallback((event) => {
-    if (event.button !== 0) return;
-    if (event.target.closest("button")) return;
-    if (onDragOutStart) onDragOutStart(localPath, event);
-  }, [localPath, onDragOutStart]);
-
-  return (
-    <StripTileRoot
-      data-busy={busy ? "true" : "false"}
-      onClick={openEditor}
-      onPointerDown={onPointerDown}
-      title={`${name} — click to annotate, drag out for a pinned preview`}
-    >
-      {previewUrl ? (
-        <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
-      ) : (
-        <span data-empty="true">Preview unavailable</span>
-      )}
-      <FloatPinButton
-        aria-label={`Pin ${name} to the screen`}
-        disabled={busy}
-        onClick={() => runAction("pin")}
-        title="Pin as draggable preview"
-        type="button"
-      >
-        <svg aria-hidden="true" fill="currentColor" viewBox="0 0 24 24">
-          <path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z" />
-        </svg>
-      </FloatPinButton>
-      <FloatUploadButton
-        aria-label={snipUploadButtonTitle(uploadState, name)}
-        data-state={uploadState}
-        disabled={busy}
-        onClick={() => runAction("upload")}
-        title={snipUploadButtonTitle(uploadState, name)}
-        type="button"
-      >
-        <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
-      </FloatUploadButton>
-      {uploadState === "uploading" || uploadState === "publishing"
-        ? <FloatUploadProgress aria-hidden="true" />
-        : null}
-      <FloatActionBar>
-        <FloatActionButton
-          aria-label={`Copy ${name}`}
-          disabled={busy}
-          onClick={() => runAction("copy")}
-          title="Copy image"
-          type="button"
-        >
-          <ContentCopy aria-hidden="true" />
-        </FloatActionButton>
-        <FloatActionButton
-          aria-label={`Annotate ${name}`}
-          disabled={busy}
-          onClick={() => runAction("edit")}
-          title="Annotate copy"
-          type="button"
-        >
-          <ModeEdit aria-hidden="true" />
-        </FloatActionButton>
-        <FloatActionButton
-          aria-label={`Delete ${name}`}
-          data-danger="true"
-          disabled={busy}
-          onClick={() => runAction("delete")}
-          title="Delete file"
-          type="button"
-        >
-          <Delete aria-hidden="true" />
-        </FloatActionButton>
-      </FloatActionBar>
-      <SnipStatusPill status={status} />
-    </StripTileRoot>
-  );
-}
-
-// Pointer travel before a press becomes a drag-out instead of a click.
-const STRIP_DRAG_OUT_THRESHOLD_PX = 8;
-
-/**
- * The last 16 snips as a horizontally scrollable row (wheel, trackpad, and
- * drag-scroll all work), hosted by the CleanShot-style strip window. Snips
- * already pinned on screen as floating previews are excluded (Rust filters
- * them and signals re-lists via the floats-changed event). Tiles can be
- * dragged out of the bar: past a small threshold the snip opens as a floating
- * preview that follows the cursor until release.
+ * Backdrop content for the strip bar. Every tile on the bar is a real snip
+ * preview window now — Rust parks them on a horizontal queue over this band
+ * (one unified queue system with the bottom-left column), so the webview
+ * renders no tiles, no drag ghost, and no drag-out bridge: dragging a tile
+ * out of (or into) the bar is just dragging the preview window itself.
  */
 export function SnippingRecentStrip() {
-  const [snips, setSnips] = useState([]);
-  const scrollRef = useRef(null);
-  // The drag engine lives here, on window-level listeners: the dragged tile
-  // unmounts the moment its float opens (it leaves the list), which would
-  // kill any listener or pointer capture owned by the tile itself.
-  const dragRef = useRef(null);
-  const suppressClickRef = useRef(false);
-
-  const refresh = useCallback(() => {
-    invoke("snipping_recent_snips", { limit: SNIPPING_STRIP_RECENT_LIMIT })
-      .then((result) => {
-        setSnips(Array.isArray(result?.items) ? result.items : []);
-      })
-      .catch(() => setSnips([]));
-  }, []);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const unlisteners = [];
-    const addListener = (eventName) => {
-      listen(eventName, () => {
-        if (!cancelled) refresh();
-      })
-        .then((unlisten) => {
-          if (cancelled) {
-            unlisten();
-          } else {
-            unlisteners.push(unlisten);
-          }
-        })
-        .catch(() => {});
-    };
-    addListener(SNIPPING_CAPTURE_SAVED_EVENT);
-    addListener(SNIPPING_SOURCE_UPDATED_EVENT);
-    addListener(SNIPPING_FLOATS_CHANGED_EVENT);
-    return () => {
-      cancelled = true;
-      unlisteners.forEach((unlisten) => {
-        try {
-          unlisten();
-        } catch {
-          // Listener teardown is best-effort.
-        }
-      });
-    };
-  }, [refresh]);
-
-  const onDragOutStart = useCallback((path, event) => {
-    dragRef.current = {
-      path,
-      startX: event.clientX,
-      startY: event.clientY,
-      active: false,
-      moveQueued: false,
-    };
-  }, []);
-
-  useEffect(() => {
-    const onPointerMove = (event) => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      if (!drag.active) {
-        const travel = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-        if (travel < STRIP_DRAG_OUT_THRESHOLD_PX) return;
-        drag.active = true;
-        suppressClickRef.current = true;
-        invoke("snipping_strip_drag_out_begin", { path: drag.path }).catch(() => {
-          dragRef.current = null;
-        });
-        return;
-      }
-      // Rust reads the global cursor itself; the pointer stream just paces
-      // the follow calls, throttled to one per frame.
-      if (drag.moveQueued) return;
-      drag.moveQueued = true;
-      window.requestAnimationFrame(() => {
-        drag.moveQueued = false;
-        if (dragRef.current === drag && drag.active) {
-          invoke("snipping_strip_drag_out_move").catch(() => {});
-        }
-      });
-    };
-    const onPointerEnd = () => {
-      const drag = dragRef.current;
-      dragRef.current = null;
-      if (!drag?.active) return;
-      invoke("snipping_strip_drag_out_end").catch(() => {});
-    };
-    window.addEventListener("pointermove", onPointerMove, true);
-    window.addEventListener("pointerup", onPointerEnd, true);
-    window.addEventListener("pointercancel", onPointerEnd, true);
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove, true);
-      window.removeEventListener("pointerup", onPointerEnd, true);
-      window.removeEventListener("pointercancel", onPointerEnd, true);
-    };
-  }, []);
-
-  // A release that finished a drag-out must not fall through as a tile click
-  // (which would open the annotation editor).
-  const onClickCapture = useCallback((event) => {
-    if (!suppressClickRef.current) return;
-    suppressClickRef.current = false;
-    event.preventDefault();
-    event.stopPropagation();
-  }, []);
-
-  const onWheel = useCallback((event) => {
-    const node = scrollRef.current;
-    if (!node) return;
-    // Trackpads already produce horizontal deltas; translate the dominant
-    // vertical ticks of a plain mouse wheel so it walks the strip too.
-    if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
-      node.scrollLeft += event.deltaY;
-    }
-  }, []);
-
-  const handleRemoved = useCallback((removedPath) => {
-    setSnips((current) => current.filter((snip) => text(snip?.path) !== removedPath));
-    refresh();
-  }, [refresh]);
-
-  return (
-    <StripScroller onClickCapture={onClickCapture} onWheel={onWheel} ref={scrollRef}>
-      {snips.length === 0 ? (
-        <StripEmpty>No snips yet — capture one with the snipping shortcut.</StripEmpty>
-      ) : (
-        snips.map((snip) => (
-          <SnipStripTile
-            key={text(snip?.path)}
-            onDragOutStart={onDragOutStart}
-            onRemoved={handleRemoved}
-            snip={snip}
-          />
-        ))
-      )}
-    </StripScroller>
-  );
+  return null;
 }
 
 /**
@@ -1815,98 +1564,6 @@ const StripWindowShell = styled.main`
   }
 `;
 
-const StripScroller = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  box-sizing: border-box;
-  padding: 14px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 14px;
-  /* Light tint only — the frosted glass is the OS vibrancy layer behind the
-     transparent window, identical on light and dark themes. */
-  background: rgba(10, 14, 22, 0.38);
-  scrollbar-width: thin;
-
-  &::-webkit-scrollbar {
-    height: 6px;
-  }
-
-  &::-webkit-scrollbar-thumb {
-    border-radius: 999px;
-    background: rgba(148, 163, 184, 0.35);
-  }
-`;
-
-const StripEmpty = styled.span`
-  flex: 1;
-  color: rgba(248, 250, 252, 0.55);
-  font-size: 12px;
-  font-weight: 700;
-  text-align: center;
-`;
-
-const StripTileRoot = styled.div`
-  position: relative;
-  isolation: isolate;
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  width: 232px;
-  height: 144px;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 12px;
-  background: rgba(9, 12, 18, 0.85);
-  cursor: pointer;
-  transform: translateZ(0);
-  user-select: none;
-  -webkit-user-select: none;
-
-  img {
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    display: block;
-    width: 100%;
-    height: 100%;
-    min-width: 0;
-    min-height: 0;
-    object-fit: contain;
-    object-position: center;
-    pointer-events: none;
-    transform: translateZ(0);
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-user-drag: none;
-  }
-
-  > span[data-empty="true"] {
-    color: rgba(248, 250, 252, 0.6);
-    font-size: 11px;
-    font-weight: 700;
-  }
-
-  /* Same resting-bare/hover-chrome contract as the floating preview. The
-     strip window is focused while visible, so CSS :hover is reliable here. */
-  > button,
-  > div {
-    z-index: 2;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 140ms ease;
-  }
-
-  &:hover > button,
-  &:hover > div {
-    opacity: 1;
-    pointer-events: auto;
-  }
-`;
-
 export function SnippingAnnotationEditorWindow() {
   const localPaths = useMemo(() => pathsFromHash(SNIPPING_EDITOR_HASH), []);
   const [activePath, setActivePath] = useState(() => localPaths[0] || "");
@@ -1919,6 +1576,16 @@ export function SnippingAnnotationEditorWindow() {
   const imageRef = useRef(null);
   const draftRef = useRef(null);
   const drawingRef = useRef(false);
+  const editorClosingRef = useRef(false);
+  // Autosave chain: the first save of an original returns the new edited-copy
+  // path; every later autosave for that original updates the same copy in
+  // place. Re-opening the original in a fresh editor session starts a new
+  // version. Edited copies always update in place.
+  const autosaveTargetsRef = useRef({});
+  const autosaveTimerRef = useRef(0);
+  const livePreviewTimerRef = useRef(0);
+  const livePreviewLastSentRef = useRef(0);
+  const livePreviewFrameCanvasRef = useRef(null);
   const [tool, setTool] = useState("pen");
   const [shapeKind, setShapeKind] = useState("rect");
   const [shapeMode, setShapeMode] = useState("outline");
@@ -1942,6 +1609,7 @@ export function SnippingAnnotationEditorWindow() {
   const [annotationsByPath, setAnnotationsByPath] = useState({});
   const [draft, setDraft] = useState(null);
   const [status, setStatus] = useState("Loading image...");
+  const [editorClosing, setEditorClosing] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   // Zoom is relative to "fit the stage" (1 = the image fills the available
   // area, upscaling small snips); wheel / pinch / buttons move it, anchored
@@ -2060,6 +1728,59 @@ export function SnippingAnnotationEditorWindow() {
 
   useFloatingWindowBody("editor");
 
+  const beginEditorDispose = useCallback(() => {
+    editorClosingRef.current = true;
+    setEditorClosing(true);
+    drawingRef.current = false;
+    draftRef.current = null;
+    imageRef.current = null;
+    setDraft(null);
+    setTextEditor(null);
+    setHoverIndex(-1);
+    setStatus("");
+    if (autosaveTimerRef.current) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = 0;
+    }
+    if (livePreviewTimerRef.current) {
+      window.clearTimeout(livePreviewTimerRef.current);
+      livePreviewTimerRef.current = 0;
+    }
+    if (livePreviewFrameCanvasRef.current) {
+      livePreviewFrameCanvasRef.current.width = 0;
+      livePreviewFrameCanvasRef.current.height = 0;
+    }
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    const ownLabel = getCurrentWindow().label;
+
+    listen(SNIPPING_EDITOR_DISPOSE_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      if (text(payload.label) !== ownLabel) return;
+      beginEditorDispose();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      editorClosingRef.current = true;
+      if (autosaveTimerRef.current) window.clearTimeout(autosaveTimerRef.current);
+      if (livePreviewTimerRef.current) window.clearTimeout(livePreviewTimerRef.current);
+      unlisten();
+    };
+  }, [beginEditorDispose]);
+
   // The native window is created hidden; reveal it only once this webview has
   // committed its first painted frame (double rAF) so opening never flashes
   // an unpainted window.
@@ -2074,6 +1795,7 @@ export function SnippingAnnotationEditorWindow() {
   }, []);
 
   const updateActiveAnnotations = useCallback((updater) => {
+    if (editorClosingRef.current) return;
     if (!activePath) return;
     setAnnotationsByPath((current) => {
       const currentAnnotations = current[activePath] || [];
@@ -2086,6 +1808,7 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath]);
 
   useEffect(() => {
+    if (editorClosingRef.current) return undefined;
     if (!previewUrl) {
       setStatus("No snip selected.");
       return undefined;
@@ -2100,28 +1823,33 @@ export function SnippingAnnotationEditorWindow() {
     setCanvasSize({ width: 0, height: 0 });
     setStatus("Loading image...");
     image.onload = () => {
-      if (disposed) return;
+      if (disposed || editorClosingRef.current) return;
       imageRef.current = image;
       setCanvasSize({ width: image.naturalWidth || image.width, height: image.naturalHeight || image.height });
       setStatus(multiImage ? `Ready ${activeIndex + 1}/${localPaths.length}` : "Ready");
     };
     image.onerror = () => {
-      if (!disposed) setStatus("Unable to load snip.");
+      if (!disposed && !editorClosingRef.current) setStatus("Unable to load snip.");
     };
 
     // WebKit blocks fetch() on asset: URLs ("Load failed"); read the bytes
     // through the backend instead, which also keeps the canvas untainted.
     invoke("snipping_read_asset_data_url", { path: activePath })
       .then((dataUrl) => {
-        if (disposed) return;
+        if (disposed || editorClosingRef.current) return;
         image.src = dataUrl;
       })
       .catch((error) => {
-        if (!disposed) setStatus(error?.message || String(error || "Unable to load snip."));
+        if (!disposed && !editorClosingRef.current) {
+          setStatus(error?.message || String(error || "Unable to load snip."));
+        }
       });
 
     return () => {
       disposed = true;
+      image.onload = null;
+      image.onerror = null;
+      image.src = "";
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [activeIndex, localPaths.length, multiImage, previewUrl]);
@@ -2558,19 +2286,10 @@ export function SnippingAnnotationEditorWindow() {
     }
   }, [exportActiveDataUrl]);
 
-  // Autosave chain: the first save of an original returns the new edited-copy
-  // path; every later autosave for that original updates the same copy in
-  // place. Re-opening the original in a fresh editor session starts a new
-  // version. Edited copies always update in place.
-  const autosaveTargetsRef = useRef({});
-  const autosaveTimerRef = useRef(0);
-  const livePreviewTimerRef = useRef(0);
-  const livePreviewLastSentRef = useRef(0);
-  const livePreviewFrameCanvasRef = useRef(null);
-
   // Streams the composited canvas to the snip preview window while drawing,
   // so edits are visible there live (downscaled JPEG frames, throttled).
   const emitLivePreviewFrame = useCallback(() => {
+    if (editorClosingRef.current) return;
     const canvas = canvasRef.current;
     if (!canvas || !activePath || !canvas.width || !canvas.height) return;
 
@@ -2614,6 +2333,7 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath]);
 
   useEffect(() => {
+    if (editorClosingRef.current) return undefined;
     if (!canvasSize.width || !canvasSize.height) return undefined;
     if (!draft && !(annotationsByPath[activePath] || []).length) return undefined;
 
@@ -2624,6 +2344,7 @@ export function SnippingAnnotationEditorWindow() {
     }
     livePreviewTimerRef.current = window.setTimeout(() => {
       livePreviewTimerRef.current = 0;
+      if (editorClosingRef.current) return;
       livePreviewLastSentRef.current = Date.now();
       emitLivePreviewFrame();
     }, delay);
@@ -2634,11 +2355,18 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath, annotationsByPath, canvasSize.height, canvasSize.width, draft, emitLivePreviewFrame]);
 
   useEffect(() => () => {
+    editorClosingRef.current = true;
     if (livePreviewTimerRef.current) {
       window.clearTimeout(livePreviewTimerRef.current);
+      livePreviewTimerRef.current = 0;
+    }
+    if (autosaveTimerRef.current) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = 0;
     }
   }, []);
   const persistAnnotatedImage = useCallback(async () => {
+    if (editorClosingRef.current) return;
     if (!imageRef.current || !activePath) return;
     if (!(annotationsByPath[activePath] || []).length) return;
     setStatus("Saving…");
@@ -2646,6 +2374,7 @@ export function SnippingAnnotationEditorWindow() {
       const imageDataUrl = exportActiveDataUrl();
       if (!imageDataUrl) return;
       const sourcePath = autosaveTargetsRef.current[activePath] || activePath;
+      if (editorClosingRef.current) return;
       const result = await invoke("snipping_save_edited_untracked_asset", {
         request: {
           imageDataUrl,
@@ -2653,6 +2382,7 @@ export function SnippingAnnotationEditorWindow() {
         },
       });
       const savedPath = text(result?.local_path || result?.localPath || result?.path);
+      if (editorClosingRef.current) return;
       if (savedPath) {
         autosaveTargetsRef.current[activePath] = savedPath;
       }
@@ -2663,9 +2393,11 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath, annotationsByPath, exportActiveDataUrl]);
 
   useEffect(() => {
+    if (editorClosingRef.current) return undefined;
     if (!(annotationsByPath[activePath] || []).length) return undefined;
     window.clearTimeout(autosaveTimerRef.current);
     autosaveTimerRef.current = window.setTimeout(() => {
+      if (editorClosingRef.current) return;
       void persistAnnotatedImage();
     }, 900);
     return () => window.clearTimeout(autosaveTimerRef.current);
@@ -2719,8 +2451,17 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath, annotationsByPath, exportActiveDataUrl, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
 
   const closeEditor = useCallback(() => {
-    getCurrentWindow().close().catch(() => {});
-  }, []);
+    beginEditorDispose();
+    const current = getCurrentWindow();
+    const label = text(current.label);
+    if (!label.startsWith(SNIPPING_EDITOR_WINDOW_PREFIX)) {
+      current.close().catch(() => {});
+      return;
+    }
+    invoke("snipping_close_annotation_editor", { label }).catch(() => {
+      current.close().catch(() => {});
+    });
+  }, [beginEditorDispose]);
 
   const savedState = status === "Saved" ? "saved" : status === "Saving…" ? "saving" : "idle";
 
@@ -2728,7 +2469,7 @@ export function SnippingAnnotationEditorWindow() {
     <>
       <SnipFloatingGlobalStyle />
       <EditorViewport>
-        <EditorWindowRoot>
+        <EditorWindowRoot data-closing={editorClosing ? "true" : "false"}>
           <EditorTitleBar data-tauri-drag-region>
             <EditorTitleMeta data-tauri-drag-region>
               <strong data-tauri-drag-region>{name}</strong>
@@ -3862,8 +3603,10 @@ const EditorStage = styled.section`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  /* Bottom padding clears the floating options bar. */
-  padding: 12px 12px 56px 52px;
+  /* The padding reserves the chrome bands so the artwork can never slide
+     under floating controls: top clears the zoom/undo action cluster, bottom
+     clears the options pill, left clears the tool rail. */
+  padding: 52px 12px 56px 52px;
   background:
     radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
     #05070b;
@@ -3928,15 +3671,16 @@ const EditorZoomReadout = styled.button`
   }
 `;
 
-/* The rail spans the stage's full height (it ends above the bottom options
-   pill's band so the two never overlap), with the tool groups centered via
-   auto margins instead of justify-content — overflow-safe, so a short window
-   can still scroll to the first and last tool. */
+/* The rail spans the stage's full height, top edge to bottom edge (the
+   options pill keeps clear of it via its own max-width), with the tool
+   groups centered via auto margins instead of justify-content —
+   overflow-safe, so a short window can still scroll to the first and last
+   tool. */
 const EditorFloatingRail = styled.nav`
   position: absolute;
   left: 8px;
   top: 8px;
-  bottom: 52px;
+  bottom: 8px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -3998,7 +3742,9 @@ const EditorOptionsBar = styled.nav`
   display: flex;
   align-items: center;
   gap: 9px;
-  max-width: calc(100% - 80px);
+  /* Wide enough clearance that the centered pill can never reach the
+     full-height tool rail hugging the left edge. */
+  max-width: calc(100% - 128px);
   overflow-x: auto;
   overflow-y: hidden;
   padding: 6px 12px;
