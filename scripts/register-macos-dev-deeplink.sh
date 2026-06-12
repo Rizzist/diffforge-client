@@ -16,19 +16,56 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+# Adds the dev keychain (code-signing identity only) to the user search list.
+#
+# This function must stay paranoid: an earlier version stripped quotes but
+# not the 4-space indent `security list-keychains` prints, so the "already
+# registered" check never matched and every run re-registered whitespace-
+# prefixed paths. `security` resolved those relative to ~/Library/Keychains/,
+# compounding nested garbage entries until login.keychain-db fell OUT of the
+# search list entirely — system-wide breakage (Chrome loses its Safe Storage
+# key and logs the user out of everything). Rules now enforced on every run:
+#   1. trim whitespace AND quotes from every parsed entry,
+#   2. drop entries whose files do not exist (self-heals old corruption),
+#   3. login.keychain-db is always present and stays FIRST,
+#   4. the dev keychain is appended LAST, never prepended,
+#   5. rewrite only when something actually needs to change.
 register_dev_keychain() {
-  keychains=()
-  keychain_registered=false
-  while IFS= read -r keychain; do
-    keychain="${keychain//\"/}"
+  local login_keychain="$HOME/Library/Keychains/login.keychain-db"
+  local keychains=()
+  local line keychain
+  local keychain_registered=false
+  local list_dirty=false
+  local login_present=false
+
+  while IFS= read -r line; do
+    keychain="${line//\"/}"
+    keychain="${keychain#"${keychain%%[![:space:]]*}"}"
+    keychain="${keychain%"${keychain##*[![:space:]]}"}"
     [[ -z "$keychain" ]] && continue
-    [[ "$keychain" == "$dev_keychain" ]] && keychain_registered=true && continue
+    if [[ ! -f "$keychain" ]]; then
+      # Malformed or stale entry: drop it and rewrite the cleaned list.
+      list_dirty=true
+      continue
+    fi
+    if [[ "$keychain" == "$dev_keychain" ]]; then
+      keychain_registered=true
+      continue
+    fi
+    [[ "$keychain" == "$login_keychain" ]] && login_present=true
     keychains+=("$keychain")
   done < <(security list-keychains -d user)
 
-  if [[ "$keychain_registered" != true ]]; then
-    security list-keychains -d user -s "$dev_keychain" "${keychains[@]}"
+  if [[ "$login_present" != true && -f "$login_keychain" ]]; then
+    keychains=("$login_keychain" ${keychains[@]+"${keychains[@]}"})
+    list_dirty=true
   fi
+
+  if [[ "$keychain_registered" == true && "$list_dirty" != true ]]; then
+    return
+  fi
+
+  security list-keychains -d user -s ${keychains[@]+"${keychains[@]}"} "$dev_keychain"
 }
 
 unlock_dev_keychain() {

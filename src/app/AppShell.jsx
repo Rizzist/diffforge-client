@@ -539,6 +539,7 @@ import {
   WorkspaceCreateFooter,
   VIEW_TRANSITION_MS
 } from "./appStyles";
+import { PlanFlame } from "./PlanFlame.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
@@ -3021,10 +3022,12 @@ function AuthSquareBackdrop({ tone = "default" } = {}) {
   );
 }
 
-function WorkspaceIdleState({ detail = "No workspace selected.", viewMotion }) {
+function WorkspaceIdleState({ detail = "No workspace selected.", plan = "", viewMotion }) {
   return (
     <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
       <AuthSquareBackdrop tone="quiet" />
+      {/* The signed-in plan rendered as its pricing-page flame tier. */}
+      <PlanFlame plan={plan} />
       <WorkspaceIdlePanel>
         <WorkspaceIdleLogo src="/logo.webp" alt="" />
         <WorkspaceIdleTitle>{BRAND_NAME}</WorkspaceIdleTitle>
@@ -18469,26 +18472,33 @@ export default function App() {
     });
     const closeRemoteControlTerminal = async (workspaceId, terminal, target = {}) => {
       const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
-      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]);
-      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]);
+      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"])
+        ?? (Number.isInteger(target.targetTerminalIndex) ? target.targetTerminalIndex : null);
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"])
+        || String(target.targetThreadId || "").trim();
       const instanceId = remoteControlTerminalText(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
-      if (!paneId) {
+      if (!paneId && !Number.isInteger(terminalIndex)) {
         return {
           closed: false,
           reason: "missing_pane_id",
           terminal: remoteControlTerminalSummary(terminal, target),
         };
       }
-      await invoke("terminal_close", {
-        paneId,
-        instanceId: instanceId || undefined,
-        waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP || undefined,
-      });
       if (Number.isInteger(terminalIndex)) {
+        // Same path as the pane's own close button: removing the workspace
+        // terminal slot tears the pane down for good. Killing only the PTY
+        // left the slot configured, so the runtime relaunched the terminal
+        // and the remote close looked like a no-op.
         closeWorkspaceTerminal({
           threadId,
           terminalIndex,
           workspaceId,
+        });
+      } else {
+        await invoke("terminal_close", {
+          paneId,
+          instanceId: instanceId || undefined,
+          waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP || undefined,
         });
       }
       terminalStatusEventEmitterRef.current?.({
@@ -24145,7 +24155,11 @@ export default function App() {
                       aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                     >
-                      <WorkspaceIdleState detail={defaultWorkspaceIdleDetail} viewMotion={viewMotion} />
+                      <WorkspaceIdleState
+                        detail={defaultWorkspaceIdleDetail}
+                        plan={billingPlanNameFromStatus(billingStatus, user)}
+                        viewMotion={viewMotion}
+                      />
                     </WorkspaceRuntimeLayer>
                   )}
                   <WorkspaceCreateLayer

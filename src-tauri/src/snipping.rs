@@ -1987,7 +1987,17 @@ fn snipping_macos_sck_capture_display(
             }
         },
     );
-    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&content_block) };
+    // The plain getShareableContent variant can omit desktop-level windows
+    // (wallpaper, Finder's icon layer) from the enumeration depending on the
+    // macOS version — then the icon exclusion above matches nothing and the
+    // icons stay baked into the capture. Ask for desktop windows explicitly.
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            false,
+            false,
+            &content_block,
+        )
+    };
 
     receiver
         .recv_timeout(Duration::from_millis(6000))
@@ -3625,37 +3635,22 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
     });
 }
 
-fn snipping_area_escape_shortcut() -> Shortcut {
-    Shortcut::new(None, Code::Escape)
-}
 
 /// While area-snip mode is active, Escape is grabbed globally so it always
 /// exits the mode — even when the overlay webview does not hold keyboard
 /// focus (e.g. right after swiping to a full-screen Space). The grab exists
 /// only for the lifetime of the mode; outside it, Escape reaches apps
 /// normally.
+// Escape ownership goes through the shared broker in handsfree_audio.rs: the
+// dictation widget scopes the same bare key, and independent register/
+// unregister calls used to steal it from each other (whichever feature
+// finished first unregistered the survivor's live registration).
 fn snipping_register_escape_cancel(app: &AppHandle) {
-    let _ = app
-        .global_shortcut()
-        .unregister(snipping_area_escape_shortcut());
-    let _ = app.global_shortcut().on_shortcut(
-        snipping_area_escape_shortcut(),
-        |app, _shortcut, event| {
-            if event.state != ShortcutState::Pressed {
-                return;
-            }
-            let app = app.clone();
-            thread::spawn(move || {
-                let _ = snipping_cancel_area_snip_for(&app);
-            });
-        },
-    );
+    escape_scope_set_snipping(app, true);
 }
 
 fn snipping_unregister_escape_cancel(app: &AppHandle) {
-    let _ = app
-        .global_shortcut()
-        .unregister(snipping_area_escape_shortcut());
+    escape_scope_set_snipping(app, false);
 }
 
 fn snipping_cancel_area_snip_for(app: &AppHandle) -> Result<Value, String> {
@@ -4567,18 +4562,20 @@ fn snipping_open_preview_paths(app: &AppHandle) -> HashSet<String> {
 /// event wiring; shared by direct opens and the warm pool.
 /// Cross-Space style for floating previews, re-asserted on every show: the
 /// CanJoinAllSpaces bit tao maintains does not join other apps' fullscreen
-/// Spaces — that needs FullScreenAuxiliary — and the old build-time assert
-/// ran inline on whatever thread the opening command happened to be on,
-/// where AppKit silently ignores NSWindow mutations (pool windows, built on
-/// the main thread, worked; direct builds intermittently did not). Same
-/// main-thread + every-show recipe as the strip and monitor overlays.
+/// Spaces — that needs CanJoinAllApplications + FullScreenAuxiliary — and
+/// the old build-time assert ran inline on whatever thread the opening
+/// command happened to be on, where AppKit silently ignores NSWindow
+/// mutations (pool windows, built on the main thread, worked; direct builds
+/// intermittently did not). Same main-thread + every-show recipe as the strip
+/// and monitor overlays.
 /// Collection behavior alone is not enough on a fullscreen Space: tao's
 /// always-on-top floating level (3) renders BEHIND the Space's raised
 /// fullscreen window, so previews join the Space but stay invisible there.
-/// They run at status-bar level like the strip; the strip drag-out level
-/// juggling restores to this same level.
+/// They run at screen-saver level like the area overlay; the strip drag-out
+/// level juggling restores to this same level.
 #[cfg(target_os = "macos")]
 fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
+    snipping_convert_overlay_window_to_panel(window);
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
         let Ok(ns_window) = window_for_main.ns_window() else {
@@ -4590,10 +4587,11 @@ fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
         let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
         ns_window.setCollectionBehavior(
             objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
                 | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
                 | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
         );
-        ns_window.setLevel(objc2_app_kit::NSStatusWindowLevel);
+        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
         // Hover must work without the window ever having been clicked: a
         // non-key NSWindow drops mouse-moved events by default, which left
         // the preview's hover chrome unreachable until a focusing click
@@ -4975,6 +4973,7 @@ const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
 const SNIPPING_STRIP_RECENT_LIMIT: usize = 16;
 const SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS: u64 = 350;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
+const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
 static SNIPPING_STRIP_LAST_BLUR_HIDE_MS: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_STRIP_DISMISS_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -5094,7 +5093,10 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         });
     }
     #[cfg(target_os = "macos")]
-    snipping_strip_apply_macos_overlay_style(&window);
+    {
+        snipping_convert_overlay_window_to_panel(&window);
+        snipping_strip_apply_macos_overlay_style(&window);
+    }
     let blur_window = window.clone();
     let blur_app = app.clone();
     window.on_window_event(move |event| {
@@ -5111,11 +5113,12 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 
 /// Menu-bar-level overlay style, the same recipe the background monitor uses
 /// to appear over OTHER apps' fullscreen Spaces: CanJoinAllSpaces alone does
-/// not join fullscreen Spaces — the bar also needs FullScreenAuxiliary — and
-/// tao's always-on-top floating level is not reliably above a fullscreen
-/// Space's window, so the bar runs at status-bar level. Re-asserted on every
-/// show since both values are plain NSWindow state that other window calls
-/// may rewrite.
+/// not join fullscreen Spaces — the bar also needs CanJoinAllApplications +
+/// FullScreenAuxiliary — and tao's always-on-top floating level is not
+/// reliably above a fullscreen Space's window, and status-bar level can still
+/// lose to another app's fullscreen Space, so the bar uses the same
+/// screen-saver level as the area overlay. Re-asserted on every show since
+/// both values are plain NSWindow state that other window calls may rewrite.
 #[cfg(target_os = "macos")]
 fn snipping_strip_apply_macos_overlay_style(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
@@ -5129,11 +5132,12 @@ fn snipping_strip_apply_macos_overlay_style(window: &tauri::WebviewWindow) {
         let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
         ns_window.setCollectionBehavior(
             objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
                 | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
                 | objc2_app_kit::NSWindowCollectionBehavior::Stationary
                 | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
         );
-        ns_window.setLevel(objc2_app_kit::NSStatusWindowLevel);
+        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
         ns_window.setAcceptsMouseMovedEvents(true);
     });
 }
@@ -5200,6 +5204,27 @@ fn snipping_strip_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) 
     let _ = app.emit_to(SNIPPING_STRIP_WINDOW_LABEL, SNIPPING_STRIP_ANIM_EVENT, payload);
 }
 
+fn snipping_strip_emit_open_reassert(app: &AppHandle, origin: &'static str) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(SNIPPING_STRIP_REASSERT_SHOW_MS)).await;
+        let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+            return;
+        };
+        if !window.is_visible().unwrap_or(false) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            snipping_convert_overlay_window_to_panel(&window);
+            snipping_strip_apply_macos_overlay_style(&window);
+            snipping_strip_order_front_regardless(&window);
+            snipping_make_overlay_key(&window);
+        }
+        snipping_strip_emit_anim(&app, "open", Some(origin));
+    });
+}
+
 fn snipping_strip_hide_animated(
     app: &AppHandle,
     window: tauri::WebviewWindow,
@@ -5227,34 +5252,26 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     };
     let origin = snipping_strip_position(app, &window);
     #[cfg(target_os = "macos")]
+    snipping_convert_overlay_window_to_panel(&window);
+    #[cfg(target_os = "macos")]
     snipping_strip_apply_macos_overlay_style(&window);
     let _ = window.show();
     #[cfg(target_os = "macos")]
     snipping_strip_order_front_regardless(&window);
-    // Focus only while Diff Forge is already the active app: tao's set_focus
-    // activates the app (activateIgnoringOtherApps), and activating a
-    // Regular-policy app from another app's fullscreen Space makes macOS
-    // paint a black menu bar instead of surfacing the bar — the same failure
-    // the background monitor solved with the Accessory policy, which is not
-    // available here because the main window is up. Unfocused, the bar is
-    // still on screen via orderFrontRegardless; dismissal then falls to the
-    // global click-outside monitor instead of the focus-loss handler.
+    #[cfg(target_os = "macos")]
+    snipping_make_overlay_key(&window);
+    // The strip is a non-activating panel on macOS, so makeKeyAndOrderFront
+    // gives the webview key status without activating Diff Forge or switching
+    // away from the fullscreen Space that invoked it. Click-outside dismissal
+    // still needs the global monitor because the app may remain inactive.
     #[cfg(target_os = "macos")]
     {
-        let window_for_focus = window.clone();
-        let _ = window.run_on_main_thread(move || {
-            let Some(mtm) = objc2::MainThreadMarker::new() else {
-                return;
-            };
-            if objc2_app_kit::NSApplication::sharedApplication(mtm).isActive() {
-                let _ = window_for_focus.set_focus();
-            }
-        });
         snipping_strip_install_dismiss_monitor(app);
     }
     #[cfg(not(target_os = "macos"))]
     let _ = window.set_focus();
     snipping_strip_emit_anim(app, "open", Some(origin));
+    snipping_strip_emit_open_reassert(app, origin);
 }
 
 /// App-lifetime global mouse-down monitor that dismisses the strip on a
@@ -5454,13 +5471,13 @@ fn snipping_strip_drag_out_track_cursor(app: &AppHandle, window: &tauri::Webview
 }
 
 /// Window level juggling for strip drag-outs: the strip and the previews both
-/// run at status-bar level (so they can overlay fullscreen Spaces), and
-/// same-level stacking depends on ordering calls — a preview dragged out of
-/// the bar could ride invisibly behind it until the cursor left the strip
-/// band. Raising the held preview one notch above the strip keeps it visible
-/// from the first drag pixel; release restores the previews' shared
-/// status-level base (NOT floating level — that tier renders behind a
-/// fullscreen Space's window and would undo the cross-Space fix).
+/// run at screen-saver level (so they can overlay other apps' fullscreen
+/// Spaces), and same-level stacking depends on ordering calls — a preview
+/// dragged out of the bar could ride invisibly behind it until the cursor
+/// left the strip band. Raising the held preview one notch above the strip
+/// keeps it visible from the first drag pixel; release restores the previews'
+/// shared fullscreen-safe base (NOT floating level — that tier renders
+/// behind a fullscreen Space's window and would undo the cross-Space fix).
 #[cfg(target_os = "macos")]
 fn snipping_strip_drag_out_set_level(window: &tauri::WebviewWindow, raised: bool) {
     let window_for_main = window.clone();
@@ -5473,9 +5490,9 @@ fn snipping_strip_drag_out_set_level(window: &tauri::WebviewWindow, raised: bool
         }
         let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
         ns_window.setLevel(if raised {
-            objc2_app_kit::NSStatusWindowLevel + 1
+            objc2_app_kit::NSScreenSaverWindowLevel + 1
         } else {
-            objc2_app_kit::NSStatusWindowLevel
+            objc2_app_kit::NSScreenSaverWindowLevel
         });
     });
 }

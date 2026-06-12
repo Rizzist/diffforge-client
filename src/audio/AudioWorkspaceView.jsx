@@ -4911,6 +4911,13 @@ export function AudioWidgetWindow() {
 
     listen(AUDIO_CANCEL_EVENT, () => {
       if (!disposed) {
+        // Parity with the focused-widget Escape path: the consumed key still
+        // clears the partially-dictated text from the target terminal's
+        // composer before the take is cancelled.
+        forwardEscapeToActiveTerminal({
+          action: "cancel_audio_and_forward_terminal",
+          source: "global_cancel_shortcut",
+        });
         cancelRecording();
       }
     })
@@ -4928,7 +4935,7 @@ export function AudioWidgetWindow() {
       disposed = true;
       unlisten();
     };
-  }, [cancelRecording]);
+  }, [cancelRecording, forwardEscapeToActiveTerminal]);
 
   // Bare-key cancel shortcuts (plain Escape by default) are only registered
   // globally while a take is active: tell Rust when the widget enters and

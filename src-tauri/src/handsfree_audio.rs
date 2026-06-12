@@ -530,6 +530,209 @@ fn audio_cancel_shortcut_defers_global_registration(shortcut: &str) -> bool {
     !audio_shortcut_has_explicit_modifier(shortcut)
 }
 
+fn audio_shortcut_is_bare_escape(shortcut: &str) -> bool {
+    matches!(
+        shortcut.trim().replace([' ', '-', '_'], "").to_ascii_uppercase().as_str(),
+        "ESC" | "ESCAPE"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Shared bare-Escape scope broker.
+//
+// Two features scope-register plain Escape globally: dictation cancel (while
+// a take is active) and area-snip cancel (while selection overlays are up).
+// They used to register and unregister the same accelerator independently,
+// so whichever activated second silently stole the key, and whichever
+// finished first unregistered it out from under the other — leaving Escape
+// dead for the survivor until restart. The broker is the single owner: each
+// feature toggles its scope bit, exactly one plugin registration lives while
+// any bit is set, and a press routes by priority (visible snip overlays
+// first, then the active dictation take).
+// ---------------------------------------------------------------------------
+
+static ESCAPE_SCOPE_AUDIO_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ESCAPE_SCOPE_SNIPPING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ESCAPE_SCOPE_REGISTERED: AtomicBool = AtomicBool::new(false);
+static ESCAPE_SCOPE_LAST_TRIGGER_MS: AtomicU64 = AtomicU64::new(0);
+
+fn escape_scope_shortcut() -> Shortcut {
+    Shortcut::new(None, Code::Escape)
+}
+
+fn escape_scope_any_active() -> bool {
+    ESCAPE_SCOPE_AUDIO_ACTIVE.load(Ordering::Acquire)
+        || ESCAPE_SCOPE_SNIPPING_ACTIVE.load(Ordering::Acquire)
+}
+
+/// One press, one cancel: the hotkey callback and the macOS key-monitor
+/// fallback can both observe the same keystroke.
+fn escape_scope_trigger_debounced(app: &AppHandle, source: &str) {
+    let now = current_time_ms();
+    let last = ESCAPE_SCOPE_LAST_TRIGGER_MS.swap(now, Ordering::AcqRel);
+    if now.saturating_sub(last) < 250 {
+        return;
+    }
+    log_audio_diagnostic_event(
+        "audio.escape_scope.trigger",
+        json!({
+            "source": source,
+            "audio_active": ESCAPE_SCOPE_AUDIO_ACTIVE.load(Ordering::Acquire),
+            "snipping_active": ESCAPE_SCOPE_SNIPPING_ACTIVE.load(Ordering::Acquire),
+        }),
+    );
+    if ESCAPE_SCOPE_SNIPPING_ACTIVE.load(Ordering::Acquire) {
+        let app = app.clone();
+        thread::spawn(move || {
+            let _ = snipping_cancel_area_snip_for(&app);
+        });
+        return;
+    }
+    if ESCAPE_SCOPE_AUDIO_ACTIVE.load(Ordering::Acquire) {
+        handle_audio_cancel_shortcut_state(
+            app.clone(),
+            ShortcutState::Pressed,
+            "Escape".to_string(),
+        );
+    }
+}
+
+fn escape_scope_sync_registration(app: &AppHandle) {
+    if escape_scope_any_active() {
+        if ESCAPE_SCOPE_REGISTERED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Defensive re-take: clears any stale handle (crashed scope, older
+        // build) so this registration can never fail on "already registered".
+        let _ = app.global_shortcut().unregister(escape_scope_shortcut());
+        let registered = app.global_shortcut().on_shortcut(
+            escape_scope_shortcut(),
+            |app, _shortcut, event| {
+                if event.state != ShortcutState::Pressed {
+                    return;
+                }
+                escape_scope_trigger_debounced(app, "global_hotkey");
+            },
+        );
+        if let Err(error) = registered {
+            ESCAPE_SCOPE_REGISTERED.store(false, Ordering::Release);
+            log_audio_diagnostic_event(
+                "audio.escape_scope.register_error",
+                json!({ "error": clean_whisper_local_audio_log_text(&error.to_string()) }),
+            );
+        } else {
+            log_audio_diagnostic_event("audio.escape_scope.registered", json!({}));
+        }
+        // The macOS key monitors back up the hotkey regardless of whether it
+        // registered: RegisterEventHotKey can also fail silently there.
+        #[cfg(target_os = "macos")]
+        escape_scope_install_macos_key_monitors(app);
+    } else if ESCAPE_SCOPE_REGISTERED.swap(false, Ordering::AcqRel) {
+        let _ = app.global_shortcut().unregister(escape_scope_shortcut());
+        log_audio_diagnostic_event("audio.escape_scope.unregistered", json!({}));
+    }
+}
+
+pub(crate) fn escape_scope_set_audio(app: &AppHandle, active: bool) {
+    ESCAPE_SCOPE_AUDIO_ACTIVE.store(active, Ordering::Release);
+    escape_scope_sync_registration(app);
+}
+
+pub(crate) fn escape_scope_set_snipping(app: &AppHandle, active: bool) {
+    ESCAPE_SCOPE_SNIPPING_ACTIVE.store(active, Ordering::Release);
+    escape_scope_sync_registration(app);
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_ESCAPE_KEY_CODE: u16 = 53;
+
+#[cfg(target_os = "macos")]
+static ESCAPE_SCOPE_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static ESCAPE_SCOPE_MONITOR_APP: OnceLock<StdMutex<Option<AppHandle>>> = OnceLock::new();
+
+/// Returns true when the event is a bare-Escape press this broker consumed.
+/// Modifier combos (cmd+esc, ...) always pass through untouched.
+#[cfg(target_os = "macos")]
+fn escape_scope_handle_monitor_event(event: &objc2_app_kit::NSEvent) -> bool {
+    if !escape_scope_any_active() {
+        return false;
+    }
+    if event.r#type() != objc2_app_kit::NSEventType::KeyDown {
+        return false;
+    }
+    if event.keyCode() != MACOS_ESCAPE_KEY_CODE {
+        return false;
+    }
+    let flags = event.modifierFlags();
+    if flags.intersects(
+        objc2_app_kit::NSEventModifierFlags::Command
+            | objc2_app_kit::NSEventModifierFlags::Option
+            | objc2_app_kit::NSEventModifierFlags::Control
+            | objc2_app_kit::NSEventModifierFlags::Shift,
+    ) {
+        return false;
+    }
+    let Some(app) = ESCAPE_SCOPE_MONITOR_APP
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
+    else {
+        return false;
+    };
+    escape_scope_trigger_debounced(&app, "macos_key_monitor");
+    true
+}
+
+/// macOS belt-and-suspenders: RegisterEventHotKey has silently stopped
+/// delivering some registrations on macOS 15 (this codebase already works
+/// around Option-only and Fn bindings with NSEvent monitors). The same
+/// fallback covers scoped Escape: app-lifetime global+local key monitors
+/// fire the broker while a scope is active — the local monitor swallows the
+/// key inside Diff Forge windows; system-wide consumption still comes from
+/// the hotkey whenever it is healthy.
+#[cfg(target_os = "macos")]
+fn escape_scope_install_macos_key_monitors(app: &AppHandle) {
+    let app_slot = ESCAPE_SCOPE_MONITOR_APP.get_or_init(|| StdMutex::new(None));
+    if let Ok(mut slot) = app_slot.lock() {
+        *slot = Some(app.clone());
+    }
+    if ESCAPE_SCOPE_MONITORS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.run_on_main_thread(move || {
+        use objc2_app_kit::{NSEvent, NSEventMask};
+
+        let mask = NSEventMask::KeyDown;
+
+        let global_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                let _ = escape_scope_handle_monitor_event(unsafe { event.as_ref() });
+            },
+        );
+        if let Some(token) =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
+        {
+            std::mem::forget(token);
+        }
+
+        let local_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
+                if escape_scope_handle_monitor_event(unsafe { event.as_ref() }) {
+                    return std::ptr::null_mut();
+                }
+                event.as_ptr()
+            },
+        );
+        if let Some(token) =
+            unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block) }
+        {
+            std::mem::forget(token);
+        }
+
+        log_audio_diagnostic_event("audio.escape_scope.monitors_installed", json!({}));
+    });
+}
+
 /// Tracks whether a deferred bare-key cancel shortcut (typically plain
 /// Escape) is currently scope-registered as a global shortcut.
 static AUDIO_CANCEL_SCOPE_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -547,6 +750,12 @@ fn audio_cancel_shortcut_scope(app: AppHandle, active: bool) -> Result<(), Strin
     let shortcut = cancel.shortcut;
     if !audio_cancel_shortcut_defers_global_registration(&shortcut) {
         // Modifier shortcuts are globally registered at startup already.
+        return Ok(());
+    }
+    if audio_shortcut_is_bare_escape(&shortcut) {
+        // Plain Escape is shared with the snipping overlay: the broker owns
+        // the single registration and routes presses by scope priority.
+        escape_scope_set_audio(&app, active);
         return Ok(());
     }
     if active {

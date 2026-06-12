@@ -3190,6 +3190,61 @@ const OrchestratorHistoryEngineChip = styled.span`
   }
 `;
 
+const OrchestratorHistoryToolList = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+`;
+
+const OrchestratorHistoryToolChip = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.92);
+  background: rgba(148, 163, 184, 0.08);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  text-align: left;
+
+  em {
+    font-style: normal;
+    font-weight: 600;
+    color: rgba(148, 163, 184, 0.85);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover,
+  &[data-expanded="true"] {
+    border-color: rgba(96, 165, 250, 0.45);
+    color: rgba(219, 234, 254, 0.96);
+  }
+`;
+
+const OrchestratorHistoryToolDetail = styled.pre`
+  margin: 2px 0 0;
+  padding: 7px 9px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  color: rgba(203, 213, 225, 0.88);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+`;
+
 const OrchestratorHistoryTurnStatusChip = styled.span`
   flex: none;
   margin-left: auto;
@@ -7766,6 +7821,20 @@ function getVoiceHistoryTurnLabel(item) {
   return `Voice turn ${turnIndex + 1}`;
 }
 
+function normalizeVoiceHistoryToolCalls(value) {
+  return (Array.isArray(value) ? value : [])
+    .filter((call) => call && typeof call === "object")
+    .map((call) => ({
+      atMs: Number(call.atMs) || Date.now(),
+      detail: String(call.detail || "").slice(0, 1600),
+      id: String(call.id || "").trim(),
+      name: String(call.name || "").trim().slice(0, 48),
+      summary: normalizeVoiceHistoryText(call.summary, 220),
+    }))
+    .filter((call) => call.name)
+    .slice(-12);
+}
+
 function normalizeOrchestratorVoiceHistoryItem(item) {
   if (!item || typeof item !== "object") {
     return null;
@@ -7777,7 +7846,8 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
   const llmError = normalizeVoiceHistoryText(item.llmError, 1600);
   const queuedText = normalizeVoiceHistoryText(item.queuedText, 600);
   const plan = normalizeVoicePlanSnapshot(item.plan);
-  if (!id || (!transcript && !llmFeedback && !llmError && !queuedText && !plan)) {
+  const toolCalls = normalizeVoiceHistoryToolCalls(item.toolCalls);
+  if (!id || (!transcript && !llmFeedback && !llmError && !queuedText && !plan && !toolCalls.length)) {
     return null;
   }
 
@@ -7797,6 +7867,7 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
     queuedText,
     source: String(item.source || "").trim().slice(0, 32),
     engine: String(item.engine || "").trim().slice(0, 24),
+    toolCalls,
     transcript,
     transcriptFinal: Boolean(item.transcriptFinal),
     turnIndex: Number.isFinite(turnIndex) ? turnIndex : 0,
@@ -11808,6 +11879,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [orchestratorChatDraft, setOrchestratorChatDraft] = useState("");
   const [orchestratorChatSubmitting, setOrchestratorChatSubmitting] = useState(false);
   const [orchestratorHistoryCopiedKey, setOrchestratorHistoryCopiedKey] = useState("");
+  const [orchestratorHistoryExpandedToolKey, setOrchestratorHistoryExpandedToolKey] = useState("");
   const [reorderingItemId, setReorderingItemId] = useState("");
   const orchestratorVoiceEventsActiveRef = useRef(false);
   const orchestratorVoiceInputFinishRequestedRef = useRef(false);
@@ -11876,6 +11948,66 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       return nextItems.slice(-ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS);
     });
   }, []);
+
+  // GPT-Realtime can start streaming an assistant response while the user's
+  // input transcription is still pending; when the transcription completes,
+  // turn_index advances mid-stream and the same response would split across
+  // two turn cards (the stale one stuck "Pending"). Response streams carry a
+  // stable turn_id, so later frames of the same stream migrate the
+  // accumulated turn item to the new key instead of forking it.
+  const voiceFeedbackStreamKeysRef = useRef(new Map());
+  const migrateVoiceHistoryTurn = useCallback((fromKey, toKey) => {
+    const safeFromKey = String(fromKey || "").trim();
+    const safeToKey = String(toKey || "").trim();
+    if (!safeFromKey || !safeToKey || safeFromKey === safeToKey) {
+      return;
+    }
+    setOrchestratorVoiceHistoryItems((currentItems) => {
+      const fromIndex = currentItems.findIndex((item) => item.id === safeFromKey);
+      if (fromIndex < 0) {
+        return currentItems;
+      }
+      const fromItem = currentItems[fromIndex];
+      const toIndex = currentItems.findIndex((item) => item.id === safeToKey);
+      const toItem = toIndex >= 0 ? currentItems[toIndex] : null;
+      const merged = normalizeOrchestratorVoiceHistoryItem({
+        ...fromItem,
+        ...(toItem || {}),
+        id: safeToKey,
+        llmFeedback: toItem?.llmFeedback || fromItem.llmFeedback || "",
+        llmFinal: Boolean(toItem?.llmFinal || fromItem.llmFinal),
+        llmStatus: toItem?.llmStatus || fromItem.llmStatus || "",
+        toolCalls: [...(fromItem.toolCalls || []), ...(toItem?.toolCalls || [])],
+        transcript: toItem?.transcript || fromItem.transcript || "",
+        transcriptFinal: Boolean(toItem?.transcriptFinal || fromItem.transcriptFinal),
+        turnIndex: Number(safeToKey.split(":").pop() || 0) || toItem?.turnIndex || fromItem.turnIndex || 0,
+        updatedAtMs: Date.now(),
+      });
+      const withoutFrom = currentItems.filter((_, index) => index !== fromIndex);
+      if (!merged) {
+        return withoutFrom;
+      }
+      const replaceIndex = withoutFrom.findIndex((item) => item.id === safeToKey);
+      return replaceIndex >= 0
+        ? withoutFrom.map((item, index) => (index === replaceIndex ? merged : item))
+        : withoutFrom.concat([merged]);
+    });
+  }, []);
+  const bindVoiceHistoryStreamKey = useCallback((event, turnKey) => {
+    const turnId = String(event?.turn_id || event?.turnId || event?.id || "").trim();
+    if (!turnId) {
+      return;
+    }
+    const previousKey = voiceFeedbackStreamKeysRef.current.get(turnId);
+    if (previousKey && previousKey !== turnKey) {
+      migrateVoiceHistoryTurn(previousKey, turnKey);
+    }
+    voiceFeedbackStreamKeysRef.current.set(turnId, turnKey);
+    if (voiceFeedbackStreamKeysRef.current.size > 64) {
+      const oldestKey = voiceFeedbackStreamKeysRef.current.keys().next().value;
+      voiceFeedbackStreamKeysRef.current.delete(oldestKey);
+    }
+  }, [migrateVoiceHistoryTurn]);
 
   useEffect(() => {
     orchestratorVoiceHistoryItemsRef.current = orchestratorVoiceHistoryItems;
@@ -12258,18 +12390,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       turnKey,
       workspaceId: orchestratorPanelWorkspaceId,
     });
-    updateVoiceHistoryTurn(turnKey, {
+    bindVoiceHistoryStreamKey(event, turnKey);
+    updateVoiceHistoryTurn(turnKey, (currentItem) => ({
+      engine: event?.provider === "openai_realtime" ? "gpt_realtime" : currentItem.engine || "pipeline",
       llmFeedback: feedback,
       llmFinal: Boolean(event?.final),
       llmStatus: String(event?.status || "").trim(),
       turnIndex: getVoiceHistoryTurnIndex(event),
-    });
+    }));
     if (event?.final) {
       clearVoiceHistoryTurnTimeout(turnKey);
     } else {
       scheduleVoiceHistoryTurnTimeout(turnKey);
     }
-  }, [clearVoiceHistoryTurnTimeout, orchestratorPanelWorkspaceId, scheduleVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
+  }, [bindVoiceHistoryStreamKey, clearVoiceHistoryTurnTimeout, orchestratorPanelWorkspaceId, scheduleVoiceHistoryTurnTimeout, updateVoiceHistoryTurn]);
 
   const recordVoiceHistoryToolCall = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
@@ -12297,11 +12431,35 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       patch.llmFeedback = planSummary ? `Creating plan: ${planSummary}` : "Creating plan...";
       patch.llmFinal = false;
     }
+    const rawArgs = event?.arguments && typeof event.arguments === "object"
+      ? event.arguments
+      : event?.args && typeof event.args === "object" ? event.args : {};
+    let toolDetail = "";
+    try {
+      toolDetail = JSON.stringify(rawArgs, null, 2).slice(0, 1600);
+    } catch {
+      toolDetail = "";
+    }
+    const toolCallEntry = {
+      atMs: Date.now(),
+      detail: toolDetail,
+      id: String(event?.call_id || event?.callId || `${toolName}-${Date.now()}`),
+      name: toolName,
+      summary: normalizeVoiceHistoryText(
+        toolName === "open_coding_agents"
+          ? openAgentsSummary
+          : toolName === "create_plan"
+            ? planSummary
+            : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
+        220,
+      ),
+    };
     updateVoiceHistoryTurn(turnKey, (currentItem) => ({
       ...patch,
       llmFeedback: currentItem.llmFeedback || patch.llmFeedback || "",
       llmFinal: currentItem.llmFeedback ? currentItem.llmFinal : Boolean(patch.llmFinal),
       llmStatus: currentItem.llmStatus || patch.llmStatus || "",
+      toolCalls: [...(currentItem.toolCalls || []), toolCallEntry].slice(-12),
     }));
     if (toolName === "create_plan") {
       scheduleVoiceHistoryTurnTimeout(turnKey);
@@ -13379,6 +13537,38 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
+      if (kind === "voice_agent_device_control") {
+        if (!orchestratorVoiceEventsActiveRef.current) {
+          return;
+        }
+        const action = String(event?.action || "").trim();
+        const controlStatus = String(event?.status || "").trim();
+        if (!action) {
+          return;
+        }
+        const sessionId = orchestratorVoiceSessionRef.current;
+        const turnKey = getVoiceHistoryTurnKey(event, sessionId);
+        let controlDetail = "";
+        try {
+          controlDetail = JSON.stringify(event, null, 2).slice(0, 1600);
+        } catch {
+          controlDetail = "";
+        }
+        updateVoiceHistoryTurn(turnKey, (currentItem) => ({
+          toolCalls: [...(currentItem.toolCalls || []), {
+            atMs: Date.now(),
+            detail: controlDetail,
+            id: String(event?.command_id || event?.commandId || `device-control-${Date.now()}`),
+            name: `device_control: ${action}`,
+            summary: controlStatus
+              ? `${controlStatus}${event?.error ? ` (${String(event.error).slice(0, 120)})` : ""}`
+              : "",
+          }].slice(-12),
+          turnIndex: getVoiceHistoryTurnIndex(event),
+        }));
+        return;
+      }
+
       if (kind === "voice_agent_tool_call") {
         if (!orchestratorVoiceEventsActiveRef.current) {
           logTerminalStatus("frontend.voice_agent.tool_call_ignored", {
@@ -13444,6 +13634,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     completeOrchestratorVoiceSession,
     stopOrchestratorVoiceMonitor,
     orchestratorPanelWorkspaceId,
+    updateVoiceHistoryTurn,
   ]);
 
   useEffect(() => {
@@ -14535,6 +14726,35 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   </OrchestratorHistoryPlanSteps>
                                 )}
                               </OrchestratorHistoryPlan>
+                            )}
+                            {Array.isArray(item.toolCalls) && item.toolCalls.length > 0 && (
+                              <OrchestratorHistoryToolList aria-label="Tool calls in this turn">
+                                {item.toolCalls.map((call, callIndex) => {
+                                  const toolKey = `${item.id}:tool:${call.id || callIndex}`;
+                                  const toolExpanded = orchestratorHistoryExpandedToolKey === toolKey;
+                                  return (
+                                    <Fragment key={toolKey}>
+                                      <OrchestratorHistoryToolChip
+                                        aria-expanded={toolExpanded}
+                                        data-expanded={toolExpanded ? "true" : undefined}
+                                        onClick={(clickEvent) => {
+                                          clickEvent.preventDefault();
+                                          clickEvent.stopPropagation();
+                                          setOrchestratorHistoryExpandedToolKey(toolExpanded ? "" : toolKey);
+                                        }}
+                                        title={call.summary || call.name}
+                                        type="button"
+                                      >
+                                        <span>{`\u2692 ${call.name}`}</span>
+                                        {call.summary ? <em>{call.summary}</em> : null}
+                                      </OrchestratorHistoryToolChip>
+                                      {toolExpanded && call.detail ? (
+                                        <OrchestratorHistoryToolDetail>{call.detail}</OrchestratorHistoryToolDetail>
+                                      ) : null}
+                                    </Fragment>
+                                  );
+                                })}
+                              </OrchestratorHistoryToolList>
                             )}
                           </OrchestratorHistoryTurn>
                         );

@@ -300,6 +300,62 @@ function assetPreviewUrl(asset) {
   }
 }
 
+function versionedAssetPreviewUrl(localPath, imageVersion = 0) {
+  const url = assetPreviewUrl({ localPath });
+  if (!url || !imageVersion) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
+}
+
+function useStripTilePreviewUrl(localPath, imageVersion = 0) {
+  const assetUrl = useMemo(
+    () => versionedAssetPreviewUrl(localPath, imageVersion),
+    [imageVersion, localPath],
+  );
+  const [dataUrl, setDataUrl] = useState("");
+  const [assetUrlFailed, setAssetUrlFailed] = useState(false);
+  const requestRef = useRef(0);
+
+  useEffect(() => {
+    const path = text(localPath);
+    setDataUrl("");
+    setAssetUrlFailed(false);
+    if (!path) return undefined;
+
+    let cancelled = false;
+    const requestId = requestRef.current + 1;
+    requestRef.current = requestId;
+    invoke("snipping_read_asset_data_url", { path })
+      .then((nextDataUrl) => {
+        if (cancelled || requestRef.current !== requestId) return;
+        const normalized = text(nextDataUrl);
+        if (normalized) {
+          setDataUrl(normalized);
+        }
+      })
+      .catch(() => {
+        // Keep the asset:-URL fallback below; the file may still paint fine.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [imageVersion, localPath]);
+
+  const onImageError = useCallback(() => {
+    if (dataUrl) {
+      setDataUrl("");
+      setAssetUrlFailed(false);
+    } else {
+      setAssetUrlFailed(true);
+    }
+  }, [dataUrl]);
+
+  return {
+    previewUrl: dataUrl || (assetUrlFailed ? "" : assetUrl),
+    onImageError,
+  };
+}
+
 function decodePathToken(value) {
   const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
@@ -532,6 +588,22 @@ function SnipUploadButtonBody({ uploadState, urlCopied }) {
       <CloudUpload aria-hidden="true" />
       <span>Upload</span>
     </>
+  );
+}
+
+function SnipStatusPill({ status }) {
+  const label = text(status);
+  if (!label) return null;
+  const copied = /copied/iu.test(label);
+  return (
+    <FloatStatusPill
+      aria-label={copied ? "Copied to clipboard" : label}
+      aria-live="polite"
+      data-tone={copied ? "success" : "info"}
+    >
+      {copied ? <Check aria-hidden="true" /> : null}
+      <span>{copied ? "Copied" : label}</span>
+    </FloatStatusPill>
   );
 }
 
@@ -898,7 +970,7 @@ export function SnippingFloatWindow() {
             <Delete aria-hidden="true" />
           </FloatActionButton>
         </FloatActionBar>
-        {status ? <FloatStatusPill aria-live="polite">{status}</FloatStatusPill> : null}
+        <SnipStatusPill status={status} />
       </FloatWindowRoot>
     </>
   );
@@ -1206,22 +1278,51 @@ const FloatStatusPill = styled.span`
   position: absolute;
   top: 8px;
   left: 50%;
+  display: inline-flex;
+  min-height: 25px;
   max-width: calc(100% - 132px);
+  align-items: center;
+  gap: 6px;
   overflow: hidden;
-  padding: 4px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.28);
+  padding: 5px 10px 5px 8px;
+  border: 1px solid rgba(125, 176, 255, 0.32);
   border-radius: 999px;
   color: #dceaff;
-  background: rgba(7, 10, 16, 0.92);
-  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
-  font-size: 10px;
-  font-weight: 740;
-  line-height: 1.2;
+  background: linear-gradient(180deg, rgba(10, 14, 22, 0.95), rgba(5, 8, 13, 0.9));
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1;
   pointer-events: none;
   text-overflow: ellipsis;
   transform: translateX(-50%);
   white-space: nowrap;
   z-index: 4;
+
+  svg {
+    flex: 0 0 auto;
+    width: 13px;
+    height: 13px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &[data-tone="success"] {
+    border-color: rgba(94, 222, 153, 0.48);
+    color: #e9fff3;
+    background: linear-gradient(180deg, rgba(12, 30, 22, 0.96), rgba(6, 17, 13, 0.92));
+  }
+
+  &[data-tone="success"] svg {
+    color: #68f0a8;
+  }
 `;
 
 /**
@@ -1236,26 +1337,10 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
   const localPath = text(snip?.path);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [imageVersion, setImageVersion] = useState(0);
-  // asset:-protocol load failures fall back to backend-read data URLs so a
-  // tile can never sit blank while its file is perfectly readable.
-  const [fallbackUrl, setFallbackUrl] = useState("");
-  const fallbackRequestedRef = useRef(false);
-  const previewUrl = useMemo(() => {
-    if (fallbackUrl) return fallbackUrl;
-    const url = assetPreviewUrl({ localPath });
-    if (!url || !imageVersion) return url;
-    return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
-  }, [fallbackUrl, imageVersion, localPath]);
-
-  const onImageError = useCallback(() => {
-    if (fallbackRequestedRef.current || !localPath) return;
-    fallbackRequestedRef.current = true;
-    invoke("snipping_read_asset_data_url", { path: localPath })
-      .then((dataUrl) => {
-        if (text(dataUrl)) setFallbackUrl(dataUrl);
-      })
-      .catch(() => {});
-  }, [localPath]);
+  // The strip lives in a transparent macOS auxiliary webview. Use the backend
+  // data URL as the steady-state paint source so WebKit's local asset protocol
+  // cannot silently leave the tile blank while drag-out still works.
+  const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const statusTimerRef = useRef(0);
@@ -1277,9 +1362,6 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
       const edited = text(payload.editedPath || payload.edited_path || payload.path);
       const current = localPathRef.current;
       if (current !== original && current !== edited) return;
-      // Fresh pixels: retry the asset URL before re-falling back.
-      fallbackRequestedRef.current = false;
-      setFallbackUrl("");
       setImageVersion((version) => version + 1);
     })
       .then((nextUnlisten) => {
@@ -1430,7 +1512,7 @@ function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
           <Delete aria-hidden="true" />
         </FloatActionButton>
       </FloatActionBar>
-      {status ? <FloatStatusPill aria-live="polite">{status}</FloatStatusPill> : null}
+      <SnipStatusPill status={status} />
     </StripTileRoot>
   );
 }
@@ -1597,10 +1679,10 @@ export function SnippingRecentStrip() {
  * placement, sizing, and the open/close animation cues).
  */
 export function SnippingStripWindow() {
-  const [animPhase, setAnimPhase] = useState("closed");
+  const [animPhase, setAnimPhase] = useState("open");
   const [animOrigin, setAnimOrigin] = useState("top");
   const [openNonce, setOpenNonce] = useState(0);
-  const animPhaseRef = useRef("closed");
+  const animPhaseRef = useRef("open");
   // Epoch-ms of the last close cue: the watchdog must not fight the hide
   // animation, but a window still visible long after a close cue (or with no
   // cue at all) has missed its open cue and must force itself visible.
@@ -1640,6 +1722,11 @@ export function SnippingStripWindow() {
       setAnimOrigin(origin);
       if (phase === "open") {
         lastCloseCueMsRef.current = 0;
+        if (animPhaseRef.current === "open") {
+          setOpenNonce((nonce) => nonce + 1);
+          setAnimPhase("open");
+          return;
+        }
         playOpen();
       } else {
         lastCloseCueMsRef.current = Date.now();
@@ -1763,6 +1850,7 @@ const StripEmpty = styled.span`
 
 const StripTileRoot = styled.div`
   position: relative;
+  isolation: isolate;
   display: flex;
   flex: 0 0 auto;
   align-items: center;
@@ -1774,17 +1862,23 @@ const StripTileRoot = styled.div`
   border-radius: 12px;
   background: rgba(9, 12, 18, 0.85);
   cursor: pointer;
+  transform: translateZ(0);
   user-select: none;
   -webkit-user-select: none;
 
   img {
     position: absolute;
     inset: 0;
+    z-index: 1;
+    display: block;
     width: 100%;
     height: 100%;
+    min-width: 0;
+    min-height: 0;
     object-fit: contain;
     object-position: center;
     pointer-events: none;
+    transform: translateZ(0);
     user-select: none;
     -webkit-user-select: none;
     -webkit-user-drag: none;
@@ -1800,6 +1894,7 @@ const StripTileRoot = styled.div`
      strip window is focused while visible, so CSS :hover is reliable here. */
   > button,
   > div {
+    z-index: 2;
     opacity: 0;
     pointer-events: none;
     transition: opacity 140ms ease;

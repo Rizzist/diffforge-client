@@ -14,6 +14,7 @@ import {
   ButtonRefreshIcon,
   ButtonSplitHorizontalIcon,
   ButtonSplitVerticalIcon,
+  GlobalStyle,
   TerminalAgentDot,
   TerminalAgentLabel,
   TerminalCloseButton,
@@ -474,6 +475,11 @@ export default function TerminalWindowHost() {
 
   return (
     <HostShell>
+      {/* This window's root returns before the main app mounts GlobalStyle;
+          without it box-sizing stays content-box and the header pill
+          (width: 100% + padding) overflows, clipping the right-edge close
+          button. */}
+      <GlobalStyle />
       <TerminalRestartPill data-tauri-drag-region data-terminal-control="true">
         <TerminalRailIdentity data-tauri-drag-region>
           {/* Drag handle lives at the far left of the rail, away from the
