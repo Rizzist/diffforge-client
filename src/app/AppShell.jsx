@@ -16341,6 +16341,12 @@ export default function App() {
         const workspaceId = String(workspace?.id || "").trim();
         if (!workspaceId) return null;
         const entry = workspaceThreads?.[workspaceId] || {};
+        const presenceWorkspace = terminalPresenceWorkspaces.find((candidate) => (
+          String(candidate?.workspaceId || "").trim() === workspaceId
+        ));
+        const presenceTerminals = Array.isArray(presenceWorkspace?.terminals)
+          ? presenceWorkspace.terminals
+          : [];
         const threads = Object.entries(entry.threads || {})
           .map(([threadId, thread]) => {
             if (!thread || thread.archivedAt) return null;
@@ -16354,7 +16360,21 @@ export default function App() {
                 || "",
             ).trim();
             if (!label) return null;
-            return { threadId, label };
+            const presence = presenceTerminals.find((terminal) => (
+              String(terminal?.threadId || terminal?.thread_id || "").trim() === threadId
+            ));
+            const terminalIndex = Number(
+              thread.terminalIndex
+                ?? thread.terminalBinding?.terminalIndex
+                ?? presence?.terminalIndex
+                ?? presence?.terminal_index,
+            );
+            return {
+              color: String(presence?.color || "").trim(),
+              label,
+              terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
+              threadId,
+            };
           })
           .filter(Boolean)
           .slice(0, 24);
@@ -16366,7 +16386,7 @@ export default function App() {
       })
       .filter(Boolean);
     invoke("snipping_set_dispatch_targets", { targets }).catch(() => {});
-  }, [workspaceThreads, workspaces]);
+  }, [terminalPresenceWorkspaces, workspaceThreads, workspaces]);
   useEffect(() => {
     let disposed = false;
     let unlistenAnnotationTodo = null;

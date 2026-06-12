@@ -23,10 +23,14 @@ const CLOUD_DICTATION_WARM_CLAIM_TIMEOUT_MS: u64 = 800;
 const CLOUD_DICTATION_WARM_RETRY_MIN_MS: u64 = 1_000;
 const CLOUD_DICTATION_WARM_RETRY_MAX_MS: u64 = 30_000;
 // Raw-first finalization: the cloud sends `voice_dictation_final` with the
-// raw transcript as soon as Deepgram flushes, then a `voice_dictation_cleaned`
-// follow-up frame once the LLM pass lands. The client waits at most this long
-// for the cleaned frame (server cleanup budget is 4s) before returning raw.
+// raw transcript as soon as Deepgram flushes, then streams
+// `voice_dictation_cleanup_delta` partials while the LLM pass generates, then
+// a `voice_dictation_cleaned` follow-up frame. The client waits this long for
+// the cleaned frame before returning raw; each streamed partial proves the
+// cleanup is alive and extends the deadline up to the hard cap.
 const CLOUD_DICTATION_CLEANED_WAIT_SECS: u64 = 6;
+const CLOUD_DICTATION_CLEANED_PROGRESS_EXTEND_SECS: u64 = 3;
+const CLOUD_DICTATION_CLEANED_WAIT_CAP_SECS: u64 = 15;
 // Cold-connect route cache, keyed by websocket path: every successful voice
 // route resolve (mostly the dictation warm keeper's) is remembered briefly so
 // a cold press-to-talk skips the serial auth + heartbeat + balancer round
@@ -5720,10 +5724,13 @@ async fn run_forge_dictation_stream(
                                         // cleaned follow-up frame a bounded
                                         // window, then return raw as-is.
                                         let cleaned_wait_started = Instant::now();
-                                        let deadline = tokio::time::Instant::now()
+                                        let wait_cap = tokio::time::Instant::now()
+                                            + Duration::from_secs(CLOUD_DICTATION_CLEANED_WAIT_CAP_SECS);
+                                        let mut deadline = tokio::time::Instant::now()
                                             + Duration::from_secs(CLOUD_DICTATION_CLEANED_WAIT_SECS);
                                         loop {
                                             let remaining = deadline
+                                                .min(wait_cap)
                                                 .saturating_duration_since(tokio::time::Instant::now());
                                             if remaining.is_zero() {
                                                 break;
@@ -5735,11 +5742,37 @@ async fn run_forge_dictation_stream(
                                                     else {
                                                         continue;
                                                     };
-                                                    if frame
+                                                    let frame_kind = frame
                                                         .get("kind")
                                                         .and_then(Value::as_str)
-                                                        != Some("voice_dictation_cleaned")
-                                                    {
+                                                        .unwrap_or_default();
+                                                    if frame_kind == "voice_dictation_cleanup_delta" {
+                                                        // Streamed partial cleanup: surface it in
+                                                        // the live overlay and keep waiting — the
+                                                        // stream is alive, so extend the window.
+                                                        let partial = frame
+                                                            .get("text")
+                                                            .and_then(Value::as_str)
+                                                            .unwrap_or_default()
+                                                            .trim()
+                                                            .to_string();
+                                                        if !partial.is_empty() {
+                                                            let _ = app.emit(
+                                                                AUDIO_REALTIME_TRANSCRIPT_EVENT,
+                                                                DeepgramRealtimeTranscriptEvent {
+                                                                    text: partial,
+                                                                    is_final: false,
+                                                                    speech_final: false,
+                                                                },
+                                                            );
+                                                        }
+                                                        deadline = tokio::time::Instant::now()
+                                                            + Duration::from_secs(
+                                                                CLOUD_DICTATION_CLEANED_PROGRESS_EXTEND_SECS,
+                                                            );
+                                                        continue;
+                                                    }
+                                                    if frame_kind != "voice_dictation_cleaned" {
                                                         continue;
                                                     }
                                                     let cleaned_text = frame

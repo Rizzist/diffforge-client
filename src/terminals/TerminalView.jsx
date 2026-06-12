@@ -11772,6 +11772,18 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     warmWorkspaceTools(coordinationTargets, rootDirectory);
   }, [coordinationTargets, rootDirectory]);
 
+  const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
+  const [editingItemId, setEditingItemId] = useState("");
+  const [editingDraft, setEditingDraft] = useState("");
+  const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
+  const [orchestratorVoiceFeedback, setOrchestratorVoiceFeedback] = useState("");
+  const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState([]);
+  const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
+  const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
+  // Mic arbitration: true while dictation has borrowed the microphone from a
+  // live voice agent session (Rust pauses/resumes the agent's audio feed).
+  const [orchestratorVoiceMicBorrowed, setOrchestratorVoiceMicBorrowed] = useState(false);
+
   // Mic arbitration events from Rust: dictation borrows the voice agent's
   // microphone and hands it back when it finishes.
   useEffect(() => {
@@ -11798,17 +11810,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       setOrchestratorVoiceMicBorrowed(false);
     }
   }, [orchestratorVoiceState]);
-  const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
-  const [editingItemId, setEditingItemId] = useState("");
-  const [editingDraft, setEditingDraft] = useState("");
-  const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
-  const [orchestratorVoiceFeedback, setOrchestratorVoiceFeedback] = useState("");
-  const [orchestratorVoiceHistoryItems, setOrchestratorVoiceHistoryItems] = useState([]);
-  const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
-  const [orchestratorVoiceState, setOrchestratorVoiceState] = useState("idle");
-  // Mic arbitration: true while dictation has borrowed the microphone from a
-  // live voice agent session (Rust pauses/resumes the agent's audio feed).
-  const [orchestratorVoiceMicBorrowed, setOrchestratorVoiceMicBorrowed] = useState(false);
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
   const [orchestratorChatDraft, setOrchestratorChatDraft] = useState("");
   const [orchestratorChatSubmitting, setOrchestratorChatSubmitting] = useState(false);

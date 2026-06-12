@@ -8298,8 +8298,21 @@ fn emit_terminal_prompt_submitted(
         && todo_dispatch_id.is_none()
         && todo_command_id.is_none()
         && !todo_resume_requested;
+    // Typed prompts ride with the webview's synthetic terminal-direct refs,
+    // which used to suppress this capture and leave running-status visibility
+    // entirely to the webview's materializer chain (lifecycle event → source
+    // gates → React state → debounced sync). When any link missed, the store
+    // never held a running row until settlement, so the activity overlay
+    // showed nothing while the agent worked. Capture synthetic-ref
+    // submissions here too, converging on the exact item id the webview
+    // minted so both writers land on one row.
+    let synthetic_direct_todo_id = if !direct_capture_candidate && !todo_resume_requested {
+        terminal_prompt_synthetic_direct_todo_id(todo_id, todo_dispatch_id, todo_command_id)
+    } else {
+        None
+    };
     let mut direct_todo_item_id: Option<String> = None;
-    if direct_capture_candidate {
+    if direct_capture_candidate || synthetic_direct_todo_id.is_some() {
         if terminal_direct_prompt_should_capture(&metadata.pane_id, prompt) {
             direct_todo_item_id = todo_dispatch_capture_direct_prompt_todo(
                 app,
@@ -8314,6 +8327,7 @@ fn emit_terminal_prompt_submitted(
                 &metadata.agent_kind,
                 prompt,
                 prompt_event_id,
+                synthetic_direct_todo_id.as_deref(),
             );
         }
     } else {
@@ -9258,6 +9272,41 @@ fn terminal_direct_prompt_mark_seen(pane_id: &str, prompt: &str) {
 /// Returns true exactly once per (pane, prompt) inside the dedupe window.
 fn terminal_direct_prompt_should_capture(pane_id: &str, prompt: &str) -> bool {
     !terminal_direct_prompt_registry_apply(pane_id, prompt, true)
+}
+
+/// The webview mints synthetic `terminal-direct-*` todo refs for prompts the
+/// user types straight into a coding-agent terminal, so its queue tracking
+/// has ids before any store row exists. Returns that synthetic item id when
+/// every attached ref belongs to the family. A real queue dispatch — even a
+/// requeued terminal-direct todo, whose dispatch/command ids come from the
+/// queue machinery — keeps returning None.
+fn terminal_prompt_synthetic_direct_todo_id(
+    todo_id: Option<&str>,
+    todo_dispatch_id: Option<&str>,
+    todo_command_id: Option<&str>,
+) -> Option<String> {
+    let todo_id = todo_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if !todo_id.starts_with("terminal-direct-")
+        || todo_id.starts_with("terminal-direct-dispatch-")
+        || todo_id.starts_with("terminal-direct-command-")
+    {
+        return None;
+    }
+    let ref_in_family = |value: Option<&str>, prefix: &str| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.starts_with(prefix))
+            .unwrap_or(true)
+    };
+    if !ref_in_family(todo_dispatch_id, "terminal-direct-dispatch-")
+        || !ref_in_family(todo_command_id, "terminal-direct-command-")
+    {
+        return None;
+    }
+    Some(todo_id.to_string())
 }
 
 /// Hook-driven prompt registration: the provider's own UserPromptSubmit hook
@@ -13180,6 +13229,58 @@ mod terminal_tests {
                 true
             ))
         );
+    }
+
+    #[test]
+    fn synthetic_direct_todo_refs_are_recognized() {
+        // The typed-prompt bridge: all three refs from the webview's
+        // terminal-direct family resolve to the synthetic item id.
+        assert_eq!(
+            terminal_prompt_synthetic_direct_todo_id(
+                Some("terminal-direct-terminal-prompt-abc123"),
+                Some("terminal-direct-dispatch-terminal-prompt-abc123"),
+                Some("terminal-direct-command-terminal-prompt-abc123"),
+            ),
+            Some("terminal-direct-terminal-prompt-abc123".to_string())
+        );
+        // Dispatch/command refs are optional but must stay in the family.
+        assert_eq!(
+            terminal_prompt_synthetic_direct_todo_id(
+                Some("terminal-direct-terminal-prompt-abc123"),
+                None,
+                None,
+            ),
+            Some("terminal-direct-terminal-prompt-abc123".to_string())
+        );
+        // A real queue dispatch keeps suppressing the capture.
+        assert_eq!(
+            terminal_prompt_synthetic_direct_todo_id(Some("todo-42"), None, None),
+            None
+        );
+        // A requeued terminal-direct todo dispatched through the queue
+        // carries queue-family dispatch ids — not a synthetic submission.
+        assert_eq!(
+            terminal_prompt_synthetic_direct_todo_id(
+                Some("terminal-direct-terminal-prompt-abc123"),
+                Some("dispatch-9f3a"),
+                None,
+            ),
+            None
+        );
+        // Dispatch/command ids passed in the todo id slot never match.
+        assert_eq!(
+            terminal_prompt_synthetic_direct_todo_id(
+                Some("terminal-direct-dispatch-terminal-prompt-abc123"),
+                None,
+                None,
+            ),
+            None
+        );
+        assert_eq!(terminal_prompt_synthetic_direct_todo_id(None, None, None), None);
+    }
+
+    #[test]
+    fn activity_hook_kind_mappings_cover_tools_and_subagents() {
         assert_eq!(terminal_activity_hook_lifecycle_kind("SubagentStop"), None);
         assert_eq!(
             terminal_activity_hook_activity_kind("PreToolUse", &json!({})),

@@ -1661,6 +1661,7 @@ const OverlayCard = styled.main`
   -webkit-backdrop-filter: blur(24px) saturate(1.2);
   clip-path: inset(0 round 18px);
   contain: paint;
+  container-type: inline-size;
   cursor: grab;
   user-select: none;
   -webkit-user-select: none;
@@ -1678,6 +1679,10 @@ const OverlayCard = styled.main`
     -webkit-app-region: no-drag;
     max-width: 100%;
     max-height: 100%;
+  }
+
+  @media (max-width: 280px) {
+    padding: 10px 10px 8px;
   }
 
   &[data-tone="danger"] {
@@ -1882,6 +1887,10 @@ const RowLine = styled.div`
   display: flex;
   align-items: baseline;
   gap: 8px;
+
+  @container (max-width: 280px) {
+    gap: 6px;
+  }
 `;
 
 const RowTitle = styled.span`
@@ -1906,16 +1915,25 @@ const RowDetail = styled.span`
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  @container (max-width: 260px) {
+    display: none;
+  }
 `;
 
 const RowStatus = styled.span`
   flex: 0 0 auto;
   margin-left: auto;
+  /* Transfer meta ("1.2 MB / 4.0 MB") can outgrow a narrow panel; truncate
+     instead of clipping past the card edge. */
+  max-width: 55%;
+  overflow: hidden;
   color: rgba(130, 173, 255, 0.85);
   font-size: 9.5px;
   font-weight: 620;
   font-variant-numeric: tabular-nums;
   line-height: 1;
+  text-overflow: ellipsis;
   text-transform: lowercase;
   white-space: nowrap;
 
@@ -2002,10 +2020,13 @@ const EmptyTitle = styled.span`
 `;
 
 const EmptyHint = styled.span`
+  max-width: 100%;
+  padding: 0 8px;
   color: rgba(122, 132, 147, 0.6);
   font-size: 9.5px;
   font-weight: 500;
-  line-height: 1;
+  line-height: 1.45;
+  text-align: center;
 `;
 
 const OverlayFooter = styled.footer`
@@ -2024,6 +2045,16 @@ const OverlayFooter = styled.footer`
   line-height: 1;
   text-transform: lowercase;
   -webkit-app-region: drag;
+
+  /* :first-child/:last-child skip the flexible FooterSpacer between them. */
+  & > span:first-child,
+  & > span:last-child {
+    min-width: 0;
+    flex: 0 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   &:active {
     cursor: grabbing;

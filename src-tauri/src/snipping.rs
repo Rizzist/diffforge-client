@@ -18,6 +18,13 @@ const SNIPPING_AREA_OVERLAY_WINDOW_PREFIX: &str = "snipping-overlay";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
 const SNIPPING_DISMISSED_TOASTS_FILE: &str = "snipping-dismissed-toasts.json";
+/// Restore recipe written while this app has the user's desktop icons hidden
+/// for a capture; replayed on startup if a crash skipped the normal restore.
+const SNIPPING_DESKTOP_ICONS_MARKER_FILE: &str = "snipping-desktop-icons-hidden.json";
+
+/// True only between a hide this process performed and its matching restore,
+/// so captures never double-hide and never touch a user's own icons-off setup.
+static SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP: AtomicBool = AtomicBool::new(false);
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
@@ -241,6 +248,7 @@ impl SnippingShortcutManager {
 #[derive(Clone)]
 struct SnippingShortcutManagerState {
     enabled: bool,
+    hide_desktop_icons: bool,
     full_screenshot: SnippingShortcutRegistration,
     area_snip: SnippingShortcutRegistration,
 }
@@ -249,6 +257,7 @@ impl SnippingShortcutManagerState {
     fn from_settings(settings: &SnippingSettings) -> Self {
         Self {
             enabled: settings.enabled,
+            hide_desktop_icons: settings.hide_desktop_icons,
             full_screenshot: SnippingShortcutRegistration::new(settings.full_screenshot.clone()),
             area_snip: SnippingShortcutRegistration::new(settings.area_snip.clone()),
         }
@@ -257,6 +266,7 @@ impl SnippingShortcutManagerState {
     fn settings(&self) -> SnippingSettings {
         SnippingSettings {
             enabled: self.enabled,
+            hide_desktop_icons: self.hide_desktop_icons,
             full_screenshot: self.full_screenshot.shortcut.clone(),
             area_snip: self.area_snip.shortcut.clone(),
         }
@@ -380,6 +390,7 @@ struct SnippingPermissionStatus {
 #[serde(rename_all = "camelCase")]
 struct SnippingSettingsStatus {
     enabled: bool,
+    hide_desktop_icons: bool,
     full_screenshot: SnippingShortcutRegistrationStatus,
     area_snip: SnippingShortcutRegistrationStatus,
     permissions: SnippingPermissionStatus,
@@ -390,11 +401,17 @@ fn default_snipping_enabled() -> bool {
     true
 }
 
+fn default_snipping_hide_desktop_icons() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SnippingSettings {
     #[serde(default = "default_snipping_enabled")]
     enabled: bool,
+    #[serde(default = "default_snipping_hide_desktop_icons")]
+    hide_desktop_icons: bool,
     #[serde(default)]
     full_screenshot: String,
     #[serde(default)]
@@ -410,6 +427,12 @@ struct SnippingDismissedToasts {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnippingEnabledUpdateRequest {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingHideDesktopIconsRequest {
     enabled: bool,
 }
 
@@ -493,6 +516,7 @@ struct SnippingAreaMonitor {
 fn default_snipping_settings() -> SnippingSettings {
     SnippingSettings {
         enabled: true,
+        hide_desktop_icons: true,
         full_screenshot: SnippingShortcutAction::FullScreenshot.default_shortcut(),
         area_snip: SnippingShortcutAction::AreaSnip.default_shortcut(),
     }
@@ -591,6 +615,7 @@ fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
 
     SnippingSettings {
         enabled: settings.enabled,
+        hide_desktop_icons: settings.hide_desktop_icons,
         full_screenshot,
         area_snip,
     }
@@ -630,6 +655,322 @@ fn write_snipping_settings(
             path.display()
         )
     })
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SnippingDesktopIconsRestoreEntry {
+    kind: String,
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    value: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SnippingDesktopIconsMarker {
+    entries: Vec<SnippingDesktopIconsRestoreEntry>,
+}
+
+fn snipping_desktop_icons_marker_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
+
+    Ok(app_data_dir.join(SNIPPING_DESKTOP_ICONS_MARKER_FILE))
+}
+
+// Only the Windows/Linux screen-side hides leave state worth a crash marker;
+// macOS hides capture-side and changes nothing on the system.
+#[cfg(any(windows, target_os = "linux"))]
+fn snipping_write_desktop_icons_marker(
+    app: &AppHandle,
+    marker: &SnippingDesktopIconsMarker,
+) {
+    let Ok(path) = snipping_desktop_icons_marker_path(app) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(contents) = serde_json::to_string(marker) {
+        let _ = fs::write(path, contents);
+    }
+}
+
+fn snipping_take_desktop_icons_marker(app: &AppHandle) -> Option<SnippingDesktopIconsMarker> {
+    let path = snipping_desktop_icons_marker_path(app).ok()?;
+    let contents = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    serde_json::from_str::<SnippingDesktopIconsMarker>(&contents).ok()
+}
+
+/// Undoes the Finder CreateDesktop toggle an older build's crash marker may
+/// have left behind. Live macOS captures never touch Finder anymore: the
+/// desktop icon windows are excluded from the ScreenCaptureKit capture, so
+/// nothing on screen changes and nothing needs restoring.
+#[cfg(target_os = "macos")]
+fn snipping_macos_restore_finder_desktop_icons() {
+    let wrote = Command::new("defaults")
+        .args(["write", "com.apple.finder", "CreateDesktop", "-bool", "true"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if wrote {
+        // Finder only re-evaluates CreateDesktop on relaunch.
+        let _ = Command::new("killall").arg("Finder").status();
+    }
+}
+
+#[cfg(windows)]
+fn snipping_windows_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The desktop icon ListView lives in a SHELLDLL_DefView under Progman, or
+/// under a WorkerW when wallpaper slideshow mode has reparented it.
+#[cfg(windows)]
+fn snipping_windows_desktop_icons_view() -> *mut std::ffi::c_void {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW};
+
+    let progman_class = snipping_windows_wide("Progman");
+    let defview_class = snipping_windows_wide("SHELLDLL_DefView");
+    let worker_class = snipping_windows_wide("WorkerW");
+    unsafe {
+        let progman = FindWindowW(progman_class.as_ptr(), std::ptr::null());
+        if !progman.is_null() {
+            let defview = FindWindowExW(
+                progman,
+                std::ptr::null_mut(),
+                defview_class.as_ptr(),
+                std::ptr::null(),
+            );
+            if !defview.is_null() {
+                return defview;
+            }
+        }
+        let mut worker = FindWindowExW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            worker_class.as_ptr(),
+            std::ptr::null(),
+        );
+        while !worker.is_null() {
+            let defview = FindWindowExW(
+                worker,
+                std::ptr::null_mut(),
+                defview_class.as_ptr(),
+                std::ptr::null(),
+            );
+            if !defview.is_null() {
+                return defview;
+            }
+            worker = FindWindowExW(
+                std::ptr::null_mut(),
+                worker,
+                worker_class.as_ptr(),
+                std::ptr::null(),
+            );
+        }
+        std::ptr::null_mut()
+    }
+}
+
+#[cfg(windows)]
+fn snipping_windows_show_desktop_icons_view(visible: bool) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW,
+    };
+
+    let defview = snipping_windows_desktop_icons_view();
+    if defview.is_null() {
+        return false;
+    }
+    unsafe {
+        if !visible && IsWindowVisible(defview) == 0 {
+            // Icons are already hidden (by the user or another tool).
+            return false;
+        }
+        let _ = ShowWindow(defview, if visible { SW_SHOW } else { SW_HIDE });
+    }
+    true
+}
+
+#[cfg(windows)]
+fn snipping_desktop_icons_hide_platform(app: &AppHandle) -> bool {
+    if !snipping_windows_show_desktop_icons_view(false) {
+        return false;
+    }
+    snipping_write_desktop_icons_marker(
+        app,
+        &SnippingDesktopIconsMarker {
+            entries: vec![SnippingDesktopIconsRestoreEntry {
+                kind: "windows-defview".to_string(),
+                schema: String::new(),
+                key: String::new(),
+                value: String::new(),
+            }],
+        },
+    );
+    true
+}
+
+/// Desktop-icon toggles per Linux desktop environment that draws icons.
+/// GNOME Shell itself has none; Cinnamon (nemo), MATE, and legacy GNOME
+/// expose gsettings booleans, XFCE an xfconf icon-style integer.
+#[cfg(target_os = "linux")]
+const SNIPPING_LINUX_DESKTOP_ICON_GSETTINGS: &[(&str, &str)] = &[
+    ("org.nemo.desktop", "show-desktop-icons"),
+    ("org.mate.background", "show-desktop-icons"),
+    ("org.gnome.desktop.background", "show-desktop-icons"),
+];
+
+#[cfg(target_os = "linux")]
+fn snipping_linux_command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn snipping_desktop_icons_hide_platform(app: &AppHandle) -> bool {
+    let mut entries = Vec::new();
+
+    for (schema, key) in SNIPPING_LINUX_DESKTOP_ICON_GSETTINGS {
+        let Some(value) = snipping_linux_command_stdout("gsettings", &["get", schema, key]) else {
+            continue;
+        };
+        if value != "true" {
+            continue;
+        }
+        let set = Command::new("gsettings")
+            .args(["set", schema, key, "false"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if set {
+            entries.push(SnippingDesktopIconsRestoreEntry {
+                kind: "gsettings".to_string(),
+                schema: (*schema).to_string(),
+                key: (*key).to_string(),
+                value: "true".to_string(),
+            });
+        }
+    }
+
+    if let Some(style) = snipping_linux_command_stdout(
+        "xfconf-query",
+        &["-c", "xfce4-desktop", "-p", "/desktop-icons/style"],
+    ) {
+        if style.parse::<i64>().map(|value| value > 0).unwrap_or(false) {
+            let set = Command::new("xfconf-query")
+                .args(["-c", "xfce4-desktop", "-p", "/desktop-icons/style", "-s", "0"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if set {
+                entries.push(SnippingDesktopIconsRestoreEntry {
+                    kind: "xfconf".to_string(),
+                    schema: "xfce4-desktop".to_string(),
+                    key: "/desktop-icons/style".to_string(),
+                    value: style,
+                });
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return false;
+    }
+    snipping_write_desktop_icons_marker(app, &SnippingDesktopIconsMarker { entries });
+    true
+}
+
+// macOS hides icons capture-side (ScreenCaptureKit window exclusion), so it
+// shares the no-op screen-side hide with unsupported platforms.
+#[cfg(not(any(windows, target_os = "linux")))]
+fn snipping_desktop_icons_hide_platform(_app: &AppHandle) -> bool {
+    false
+}
+
+fn snipping_desktop_icons_restore_entries(entries: &[SnippingDesktopIconsRestoreEntry]) {
+    for entry in entries {
+        match entry.kind.as_str() {
+            #[cfg(target_os = "macos")]
+            "macos-finder" => {
+                snipping_macos_restore_finder_desktop_icons();
+            }
+            #[cfg(windows)]
+            "windows-defview" => {
+                let _ = snipping_windows_show_desktop_icons_view(true);
+            }
+            #[cfg(target_os = "linux")]
+            "gsettings" => {
+                let _ = Command::new("gsettings")
+                    .args(["set", &entry.schema, &entry.key, &entry.value])
+                    .status();
+            }
+            #[cfg(target_os = "linux")]
+            "xfconf" => {
+                let _ = Command::new("xfconf-query")
+                    .args(["-c", &entry.schema, "-p", &entry.key, "-s", &entry.value])
+                    .status();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn snipping_desktop_icons_restore_platform(app: &AppHandle) {
+    if let Some(marker) = snipping_take_desktop_icons_marker(app) {
+        snipping_desktop_icons_restore_entries(&marker.entries);
+    }
+}
+
+fn snipping_should_hide_desktop_icons(app: &AppHandle) -> bool {
+    app.state::<SnippingState>()
+        .shortcut_manager
+        .snapshot()
+        .hide_desktop_icons
+}
+
+/// Hides desktop icon clutter ahead of a capture when the setting is on.
+/// Screen-side hiding only exists on Windows/Linux; macOS filters the icon
+/// windows out of the capture itself, so this no-ops there. No-ops when
+/// icons are already hidden (by the user or an in-flight snip).
+fn snipping_hide_desktop_icons_for_capture(app: &AppHandle) {
+    if !snipping_should_hide_desktop_icons(app) {
+        return;
+    }
+    if SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !snipping_desktop_icons_hide_platform(app) {
+        SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP.store(false, Ordering::Release);
+    }
+}
+
+/// Brings the desktop icons back after a capture this process hid them for.
+fn snipping_restore_desktop_icons_after_capture(app: &AppHandle) {
+    if !SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    snipping_desktop_icons_restore_platform(app);
+}
+
+/// A crash between hide and restore leaves the user's desktop iconless; the
+/// persisted marker lets the next launch undo exactly what was changed.
+fn snipping_restore_desktop_icons_from_marker_on_startup(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(move || {
+        snipping_desktop_icons_restore_platform(&app);
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -710,6 +1051,7 @@ fn snipping_status_from_state(
     let root = diffforge_prepare_untracked_asset_root()?;
     Ok(SnippingSettingsStatus {
         enabled: state.enabled,
+        hide_desktop_icons: state.hide_desktop_icons,
         full_screenshot: snipping_shortcut_registration_status(
             SnippingShortcutAction::FullScreenshot,
             state.full_screenshot,
@@ -982,6 +1324,7 @@ fn register_snipping_shortcut_registration(
 fn register_snipping_shortcuts(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     register_snipping_space_change_observer(app);
+    snipping_restore_desktop_icons_from_marker_on_startup(app);
     let settings = read_snipping_settings(app);
     let mut state = SnippingShortcutManagerState::from_settings(&settings);
 
@@ -1018,6 +1361,7 @@ fn set_snipping_enabled_for(
 
     let settings = SnippingSettings {
         enabled: request.enabled,
+        hide_desktop_icons: state.hide_desktop_icons,
         full_screenshot: state.full_screenshot.shortcut.clone(),
         area_snip: state.area_snip.shortcut.clone(),
     };
@@ -1044,6 +1388,25 @@ fn set_snipping_enabled_for(
     }
 
     manager.replace(next_state);
+    emit_snipping_shortcuts_changed(app);
+    snipping_status_for(app)
+}
+
+fn set_snipping_hide_desktop_icons_for(
+    app: &AppHandle,
+    request: SnippingHideDesktopIconsRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    let manager = app.state::<SnippingState>().shortcut_manager.clone();
+    let mut state = manager.snapshot();
+    state.hide_desktop_icons = request.enabled;
+
+    write_snipping_settings(app, &state.settings())?;
+    manager.replace(state);
+    if !request.enabled {
+        // Never leave icons hidden when the user turns the feature off
+        // mid-capture.
+        snipping_restore_desktop_icons_after_capture(app);
+    }
     emit_snipping_shortcuts_changed(app);
     snipping_status_for(app)
 }
@@ -1110,6 +1473,7 @@ fn reset_snipping_shortcuts_for(app: &AppHandle) -> Result<SnippingSettingsStatu
 
     let settings = SnippingSettings {
         enabled: state.enabled,
+        hide_desktop_icons: state.hide_desktop_icons,
         ..default_snipping_settings()
     };
     write_snipping_settings(app, &settings)?;
@@ -1473,6 +1837,7 @@ fn snipping_macos_capture_region_below_window(
 fn snipping_macos_sck_capture_display(
     display_id: u32,
     exclude_window_numbers: &[u32],
+    exclude_desktop_icons: bool,
     width: u32,
     height: u32,
 ) -> Result<xcap::image::RgbaImage, String> {
@@ -1510,7 +1875,25 @@ fn snipping_macos_sck_capture_display(
                 let excluded: Vec<_> = windows
                     .iter()
                     .filter(|window| {
-                        exclude_window_numbers.contains(&(unsafe { window.windowID() }))
+                        if exclude_window_numbers.contains(&(unsafe { window.windowID() })) {
+                            return true;
+                        }
+                        if !exclude_desktop_icons {
+                            return false;
+                        }
+                        // Finder draws the desktop icon clutter in windows
+                        // below the normal level; excluding those captures an
+                        // icon-free desktop instantly, with nothing on the
+                        // real screen ever changing.
+                        if unsafe { window.windowLayer() } >= 0 {
+                            return false;
+                        }
+                        unsafe { window.owningApplication() }
+                            .map(|owner| {
+                                unsafe { owner.bundleIdentifier() }.to_string()
+                                    == "com.apple.finder"
+                            })
+                            .unwrap_or(false)
                     })
                     .collect();
                 let excluded_array = objc2_foundation::NSArray::from_retained_slice(&excluded);
@@ -1569,6 +1952,7 @@ fn snipping_macos_sck_capture_display(
 fn snipping_macos_sck_capture_monitor(
     monitor: &XcapMonitor,
     exclude_window_numbers: &[u32],
+    exclude_desktop_icons: bool,
 ) -> Result<xcap::image::RgbaImage, String> {
     let display_id = monitor
         .id()
@@ -1576,20 +1960,42 @@ fn snipping_macos_sck_capture_monitor(
     let scale = f64::from(monitor.scale_factor().unwrap_or(1.0)).max(0.1);
     let width = (f64::from(monitor.width().unwrap_or(1)) * scale).round().max(1.0) as u32;
     let height = (f64::from(monitor.height().unwrap_or(1)) * scale).round().max(1.0) as u32;
-    snipping_macos_sck_capture_display(display_id, exclude_window_numbers, width, height)
+    snipping_macos_sck_capture_display(
+        display_id,
+        exclude_window_numbers,
+        exclude_desktop_icons,
+        width,
+        height,
+    )
 }
 
 /// Full-monitor capture for snips: xcap (CGWindowListCreateImage) first, and
 /// when macOS removes that legacy path, ScreenCaptureKit as the fallback.
+/// With `exclude_desktop_icons`, macOS goes straight to ScreenCaptureKit so
+/// Finder's icon windows can be filtered out of the captured frame.
 fn snipping_capture_monitor_full_image(
     monitor: &XcapMonitor,
+    exclude_desktop_icons: bool,
 ) -> Result<xcap::image::RgbaImage, String> {
+    #[cfg(target_os = "macos")]
+    if exclude_desktop_icons {
+        if let Ok(image) = snipping_macos_sck_capture_monitor(monitor, &[], true) {
+            return Ok(image);
+        }
+        // SCK refused (permissions, old macOS): fall through and still
+        // deliver a screenshot, just with the icons visible.
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = exclude_desktop_icons;
+
     match monitor.capture_image() {
         Ok(image) => Ok(image),
         Err(error) => {
             #[cfg(target_os = "macos")]
             {
-                if let Ok(image) = snipping_macos_sck_capture_monitor(monitor, &[]) {
+                if let Ok(image) =
+                    snipping_macos_sck_capture_monitor(monitor, &[], exclude_desktop_icons)
+                {
                     return Ok(image);
                 }
             }
@@ -1649,25 +2055,34 @@ fn snipping_capture_monitor_image_keeping_session(
 ) -> Result<xcap::image::RgbaImage, String> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(window_number) = app
-            .get_webview_window(overlay_label)
-            .as_ref()
-            .and_then(snipping_macos_window_number)
-        {
-            if let Ok(image) = snipping_macos_capture_region_below_window(
-                monitor,
-                0,
-                0,
-                width,
-                height,
-                window_number,
-            ) {
-                return Ok(image);
+        let exclude_desktop_icons = snipping_should_hide_desktop_icons(app);
+        // Below-window capture cannot filter the desktop icon windows, so an
+        // icons-hidden re-freeze must go straight to ScreenCaptureKit.
+        if !exclude_desktop_icons {
+            if let Some(window_number) = app
+                .get_webview_window(overlay_label)
+                .as_ref()
+                .and_then(snipping_macos_window_number)
+            {
+                if let Ok(image) = snipping_macos_capture_region_below_window(
+                    monitor,
+                    0,
+                    0,
+                    width,
+                    height,
+                    window_number,
+                ) {
+                    return Ok(image);
+                }
             }
         }
 
         let overlay_window_numbers = snipping_macos_overlay_window_numbers(app);
-        if let Ok(image) = snipping_macos_sck_capture_monitor(monitor, &overlay_window_numbers) {
+        if let Ok(image) = snipping_macos_sck_capture_monitor(
+            monitor,
+            &overlay_window_numbers,
+            exclude_desktop_icons,
+        ) {
             return Ok(image);
         }
     }
@@ -2432,10 +2847,14 @@ fn snipping_capture_full_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
-    let monitor = xcap_monitor_for_full(app)?;
-    let image = snipping_capture_monitor_full_image(&monitor)
-        .map_err(|error| format!("Unable to capture screenshot: {error}"))?;
-    snipping_save_image(app, image, "full", reason, shortcut)
+    let exclude_desktop_icons = snipping_should_hide_desktop_icons(app);
+    snipping_hide_desktop_icons_for_capture(app);
+    let image_result = xcap_monitor_for_full(app).and_then(|monitor| {
+        snipping_capture_monitor_full_image(&monitor, exclude_desktop_icons)
+            .map_err(|error| format!("Unable to capture screenshot: {error}"))
+    });
+    snipping_restore_desktop_icons_after_capture(app);
+    snipping_save_image(app, image_result?, "full", reason, shortcut)
 }
 
 fn size_snipping_overlay_window(
@@ -2875,12 +3294,15 @@ fn snipping_begin_area_snip_for(
     // Freeze every display in parallel BEFORE any overlay shows, so no
     // overlay (hint pill, dimming) contaminates a frozen frame. Total
     // latency is the slowest single display, same as one display before.
+    let exclude_desktop_icons = snipping_should_hide_desktop_icons(app);
+    snipping_hide_desktop_icons_for_capture(app);
     let mut capture_handles = Vec::new();
     for (index, monitor) in monitors.into_iter().enumerate() {
         capture_handles.push(thread::spawn(
             move || -> (usize, SnippingAreaMonitor, Result<xcap::image::RgbaImage, String>) {
-                let result = xcap_monitor_for_area(&monitor)
-                    .and_then(|xcap_monitor| snipping_capture_monitor_full_image(&xcap_monitor));
+                let result = xcap_monitor_for_area(&monitor).and_then(|xcap_monitor| {
+                    snipping_capture_monitor_full_image(&xcap_monitor, exclude_desktop_icons)
+                });
                 (index, monitor, result)
             },
         ));
@@ -2921,6 +3343,7 @@ fn snipping_begin_area_snip_for(
     }
 
     if ordered.is_empty() {
+        snipping_restore_desktop_icons_after_capture(app);
         return Err(first_error
             .unwrap_or_else(|| "Unable to capture screen for area snip.".to_string()));
     }
@@ -3210,6 +3633,9 @@ fn snipping_hide_area_overlay(app: &AppHandle) {
     for (_, window) in snipping_overlay_windows(app) {
         let _ = window.hide();
     }
+    // Windows/Linux hide the real desktop icons for the whole area session;
+    // teardown (finish, cancel, Escape) is where they come back.
+    snipping_restore_desktop_icons_after_capture(app);
 }
 
 fn snipping_close_area_overlay(app: &AppHandle) {
@@ -3340,6 +3766,14 @@ fn set_snipping_enabled(
     request: SnippingEnabledUpdateRequest,
 ) -> Result<SnippingSettingsStatus, String> {
     set_snipping_enabled_for(&app, request)
+}
+
+#[tauri::command]
+fn set_snipping_hide_desktop_icons(
+    app: AppHandle,
+    request: SnippingHideDesktopIconsRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    set_snipping_hide_desktop_icons_for(&app, request)
 }
 
 #[tauri::command]
@@ -3944,12 +4378,69 @@ fn snipping_emit_preview_drag_over(app: &AppHandle, label: &str) {
 }
 
 const SNIPPING_FLOAT_ASSIGN_EVENT: &str = "forge-snip-float-assign";
+// Fired whenever the set of open floating previews changes (open, close,
+// destroy): the recent-snips strip hides snips that are already on screen as
+// draggable previews, so it re-lists on this signal.
+const SNIPPING_FLOATS_CHANGED_EVENT: &str = "forge-snip-floats-changed";
 // One parked window is enough: refilling starts the moment a capture adopts
 // it, long before the user can finish the next selection.
 const SNIPPING_FLOAT_POOL_TARGET: usize = 1;
 
+fn snipping_emit_floats_changed(app: &AppHandle) {
+    let _ = app.emit(
+        SNIPPING_FLOATS_CHANGED_EVENT,
+        json!({ "kind": "snip_floats_changed" }),
+    );
+}
+
+/// Paths currently shown as floating snip previews (windows still alive).
+fn snipping_open_preview_paths(app: &AppHandle) -> HashSet<String> {
+    app.state::<SnippingState>()
+        .preview_paths
+        .lock()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter(|(label, _)| app.get_webview_window(label.as_str()).is_some())
+                .map(|(_, path)| path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Builds a snip preview window (hidden) with all of its chrome and window
 /// event wiring; shared by direct opens and the warm pool.
+/// Cross-Space style for floating previews, re-asserted on every show: the
+/// CanJoinAllSpaces bit tao maintains does not join other apps' fullscreen
+/// Spaces — that needs FullScreenAuxiliary — and the old build-time assert
+/// ran inline on whatever thread the opening command happened to be on,
+/// where AppKit silently ignores NSWindow mutations (pool windows, built on
+/// the main thread, worked; direct builds intermittently did not). Same
+/// main-thread + every-show recipe as the strip and monitor overlays.
+#[cfg(target_os = "macos")]
+fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setCollectionBehavior(
+            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+        );
+        // Hover must work without the window ever having been clicked: a
+        // non-key NSWindow drops mouse-moved events by default, which left
+        // the preview's hover chrome unreachable until a focusing click
+        // (and made every button cost two clicks).
+        ns_window.setAcceptsMouseMovedEvents(true);
+    });
+}
+
 fn snipping_build_preview_window(
     app: &AppHandle,
     label: &str,
@@ -3977,21 +4468,7 @@ fn snipping_build_preview_window(
     .build()
     .map_err(|error| format!("Unable to create snip preview window: {error}"))?;
     #[cfg(target_os = "macos")]
-    if let Ok(ns_window) = window.ns_window() {
-        if !ns_window.is_null() {
-            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
-            );
-            // Hover must work without the window ever having been clicked: a
-            // non-key NSWindow drops mouse-moved events by default, which left
-            // the preview's hover chrome unreachable until a focusing click
-            // (and made every button cost two clicks).
-            ns_window.setAcceptsMouseMovedEvents(true);
-        }
-    }
+    snipping_preview_apply_macos_space_style(&window);
     // Dragging a preview out of the bottom-left column (or closing one) frees
     // its slot and the stack re-packs; dropping one back over the column
     // re-adopts it. Reflow is debounced until the window stops moving. While
@@ -4021,6 +4498,7 @@ fn snipping_build_preview_window(
                         pool.retain(|pooled| pooled != &label_for_events);
                     }
                     schedule_snipping_preview_stack_reflow(&app_for_events);
+                    snipping_emit_floats_changed(&app_for_events);
                 }
                 _ => {}
             }
@@ -4152,6 +4630,8 @@ fn snipping_open_snip_preview_window_for(
     };
     if let Some(existing_label) = existing_label {
         if let Some(existing) = app.get_webview_window(&existing_label) {
+            #[cfg(target_os = "macos")]
+            snipping_preview_apply_macos_space_style(&existing);
             let _ = existing.show();
             if focused {
                 let _ = existing.set_focus();
@@ -4184,12 +4664,15 @@ fn snipping_open_snip_preview_window_for(
                 "path": path_string,
             }),
         );
+        #[cfg(target_os = "macos")]
+        snipping_preview_apply_macos_space_style(&window);
         let _ = window.show();
         if focused {
             let _ = window.set_focus();
         }
         snipping_start_float_hover_watcher(app);
         snipping_warm_preview_pool(app);
+        snipping_emit_floats_changed(app);
         return Ok(json!({
             "kind": "snip_float_opened",
             "label": pooled_label,
@@ -4206,10 +4689,13 @@ fn snipping_open_snip_preview_window_for(
     if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
         paths.insert(label.clone(), path_string.clone());
     }
+    #[cfg(target_os = "macos")]
+    snipping_preview_apply_macos_space_style(&window);
     let _ = window.show();
     snipping_start_float_hover_watcher(app);
     // Park a warm window so the next capture takes the fast path.
     snipping_warm_preview_pool(app);
+    snipping_emit_floats_changed(app);
 
     Ok(json!({
         "kind": "snip_float_opened",
@@ -4283,26 +4769,38 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
 
 // === Recent-snips strip: a CleanShot-style bar of the latest captures. ===
 // Toggled from the always-present tray icon while the main window is up, and
-// embedded as the Snippets tab of the background monitor popover. Tiles reuse
-// the floating-preview look and actions (no close button — that belongs to
-// the queue surface only).
+// launched from the background monitor's Snippets button (which dismisses the
+// popover first — the strip is never embedded inside the dropdown). The bar
+// spans the full width of the monitor the cursor is on and joins fullscreen
+// Spaces, so a tray click surfaces it from any Space. Tiles reuse the
+// floating-preview look and actions, with a pin button where the preview's
+// close button sits (pin = open as a draggable preview in the bottom-left
+// queue). Snips already on screen as floating previews are excluded from the
+// list, and a tile can be physically dragged out of the bar to become a
+// preview at the drop point.
 
 const SNIPPING_STRIP_WINDOW_LABEL: &str = "snipping-strip";
 const SNIPPING_STRIP_ANIM_EVENT: &str = "forge-snip-strip-anim";
 const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 196.0;
-const SNIPPING_STRIP_LOGICAL_MAX_WIDTH: f64 = 1080.0;
+// Pre-show placeholder only: every show resizes the bar to the full logical
+// width of the monitor under the cursor.
+const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
 const SNIPPING_STRIP_RECENT_LIMIT: usize = 16;
 const SNIPPING_STRIP_BLUR_TOGGLE_GRACE_MS: u64 = 350;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 static SNIPPING_STRIP_LAST_BLUR_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+static SNIPPING_STRIP_DISMISS_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Newest-first listing of saved snip files. The on-disk `snips` directory is
-/// the durable history (the in-memory toast list only ever holds six).
-fn snipping_recent_snip_items(limit: usize) -> Result<Vec<Value>, String> {
+/// the durable history (the in-memory toast list only ever holds six). Snips
+/// currently shown as floating previews are excluded — they are already on
+/// screen, and the strip re-lists them when their preview closes.
+fn snipping_recent_snip_items(app: &AppHandle, limit: usize) -> Result<Vec<Value>, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
     let Ok(entries) = fs::read_dir(root.join("snips")) else {
         return Ok(Vec::new());
     };
+    let floating = snipping_open_preview_paths(app);
     let mut snips: Vec<(u128, Value)> = entries
         .flatten()
         .filter_map(|entry| {
@@ -4326,10 +4824,14 @@ fn snipping_recent_snip_items(limit: usize) -> Result<Vec<Value>, String> {
                 .map(|elapsed| elapsed.as_millis())
                 .unwrap_or_default();
             let name = path.file_name()?.to_string_lossy().to_string();
+            let path_string = path.display().to_string();
+            if floating.contains(&path_string) {
+                return None;
+            }
             Some((
                 modified_ms,
                 json!({
-                    "path": path.display().to_string(),
+                    "path": path_string,
                     "name": name,
                     "modifiedMs": modified_ms as u64,
                 }),
@@ -4345,13 +4847,13 @@ fn snipping_recent_snip_items(limit: usize) -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-fn snipping_recent_snips(limit: Option<usize>) -> Result<Value, String> {
+fn snipping_recent_snips(app: AppHandle, limit: Option<usize>) -> Result<Value, String> {
     let limit = limit
         .unwrap_or(SNIPPING_STRIP_RECENT_LIMIT)
         .clamp(1, SNIPPING_STRIP_RECENT_LIMIT);
     Ok(json!({
         "kind": "snipping_recent_snips",
-        "items": snipping_recent_snip_items(limit)?,
+        "items": snipping_recent_snip_items(&app, limit)?,
     }))
 }
 
@@ -4365,7 +4867,7 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         WebviewUrl::App("index.html#/snipping-strip".into()),
     )
     .title("Recent Snips")
-    .inner_size(SNIPPING_STRIP_LOGICAL_MAX_WIDTH, SNIPPING_STRIP_LOGICAL_HEIGHT)
+    .inner_size(SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH, SNIPPING_STRIP_LOGICAL_HEIGHT)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -4379,18 +4881,33 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     .visible(false)
     .build()
     .ok()?;
-    #[cfg(target_os = "macos")]
-    if let Ok(ns_window) = window.ns_window() {
-        if !ns_window.is_null() {
-            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+    // A transparent window still paints the webview's default backdrop until
+    // the background color is cleared (the same faint full-size square the
+    // monitor popover had).
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+    // Native glass behind the translucent webview chrome: CSS backdrop-filter
+    // can only blur the webview's own content, never the desktop behind a
+    // transparent window, so the frosted look needs the OS compositor.
+    // HudWindow is dark glass on both system themes.
+    {
+        let vibrancy_window = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            #[cfg(target_os = "macos")]
+            let _ = window_vibrancy::apply_vibrancy(
+                &vibrancy_window,
+                window_vibrancy::NSVisualEffectMaterial::HudWindow,
+                Some(window_vibrancy::NSVisualEffectState::Active),
+                Some(14.0),
             );
-            ns_window.setAcceptsMouseMovedEvents(true);
-        }
+            #[cfg(target_os = "windows")]
+            let _ = window_vibrancy::apply_acrylic(&vibrancy_window, Some((10, 14, 22, 150)))
+                .or_else(|_| window_vibrancy::apply_blur(&vibrancy_window, Some((10, 14, 22, 150))));
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let _ = &vibrancy_window;
+        });
     }
+    #[cfg(target_os = "macos")]
+    snipping_strip_apply_macos_overlay_style(&window);
     let blur_window = window.clone();
     let blur_app = app.clone();
     window.on_window_event(move |event| {
@@ -4405,42 +4922,87 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     Some(window)
 }
 
-/// Top-center bar on macOS (just under the menu bar, CleanShot-style);
-/// bottom-center above the taskbar elsewhere. Sized to the monitor the
-/// cursor is on. Returns the animation origin edge.
+/// Menu-bar-level overlay style, the same recipe the background monitor uses
+/// to appear over OTHER apps' fullscreen Spaces: CanJoinAllSpaces alone does
+/// not join fullscreen Spaces — the bar also needs FullScreenAuxiliary — and
+/// tao's always-on-top floating level is not reliably above a fullscreen
+/// Space's window, so the bar runs at status-bar level. Re-asserted on every
+/// show since both values are plain NSWindow state that other window calls
+/// may rewrite.
+#[cfg(target_os = "macos")]
+fn snipping_strip_apply_macos_overlay_style(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setCollectionBehavior(
+            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        ns_window.setLevel(objc2_app_kit::NSStatusWindowLevel);
+        ns_window.setAcceptsMouseMovedEvents(true);
+    });
+}
+
+/// Surfaces the bar even while Diff Forge is NOT the active app (tray clicks
+/// from another app's fullscreen Space): makeKeyAndOrderFront does nothing
+/// visible there, orderFrontRegardless is the documented way.
+#[cfg(target_os = "macos")]
+fn snipping_strip_order_front_regardless(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.orderFrontRegardless();
+    });
+}
+
+/// Full-width bar on the monitor the cursor is on, flush against the work
+/// area's edge: stuck to the very top (right under the macOS menu bar — the
+/// whole monitor in a fullscreen Space) or to the very bottom above the
+/// taskbar elsewhere. Returns the animation origin edge.
 fn snipping_strip_position(app: &AppHandle, window: &tauri::WebviewWindow) -> &'static str {
+    #[cfg(target_os = "macos")]
+    const SNIPPING_STRIP_ORIGIN: &str = "top";
+    #[cfg(not(target_os = "macos"))]
+    const SNIPPING_STRIP_ORIGIN: &str = "bottom";
     let monitor = app
         .cursor_position()
         .ok()
         .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
         .or_else(|| app.primary_monitor().ok().flatten());
-    let (position, size, scale) = monitor
-        .map(|monitor| (*monitor.position(), *monitor.size(), monitor.scale_factor()))
-        .unwrap_or((
-            tauri::PhysicalPosition::new(0, 0),
-            tauri::PhysicalSize::new(1920, 1080),
-            1.0,
-        ));
-    let width_logical =
-        (size.width as f64 / scale - 48.0).clamp(360.0, SNIPPING_STRIP_LOGICAL_MAX_WIDTH);
+    let Some(monitor) = monitor else {
+        return SNIPPING_STRIP_ORIGIN;
+    };
+    let area = *monitor.work_area();
+    let scale = monitor.scale_factor().max(0.1);
+    let width_logical = (area.size.width as f64 / scale).max(360.0);
     let _ = window.set_size(tauri::LogicalSize::new(
         width_logical,
         SNIPPING_STRIP_LOGICAL_HEIGHT,
     ));
-    let width = (width_logical * scale).round() as i32;
-    let x = position.x + ((size.width as i32 - width) / 2).max(0);
+    let x = area.position.x;
     #[cfg(target_os = "macos")]
-    let (y, origin) = (position.y + (44.0 * scale).round() as i32, "top");
+    let y = area.position.y;
     #[cfg(not(target_os = "macos"))]
-    let (y, origin) = {
+    let y = {
         let height = (SNIPPING_STRIP_LOGICAL_HEIGHT * scale).round() as i32;
-        (
-            position.y + size.height as i32 - height - (56.0 * scale).round() as i32,
-            "bottom",
-        )
+        area.position.y + area.size.height as i32 - height
     };
     let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
-    origin
+    SNIPPING_STRIP_ORIGIN
 }
 
 fn snipping_strip_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) {
@@ -4469,6 +5031,87 @@ fn snipping_strip_hide_animated(
     });
 }
 
+/// Unconditional show (the monitor popover's Snippets button): re-anchors to
+/// the cursor's monitor, re-asserts the overlay style, and surfaces the bar
+/// even while another app's fullscreen Space is frontmost.
+pub(crate) fn snipping_strip_show(app: &AppHandle) {
+    let Some(window) = snipping_strip_window(app) else {
+        return;
+    };
+    let origin = snipping_strip_position(app, &window);
+    #[cfg(target_os = "macos")]
+    snipping_strip_apply_macos_overlay_style(&window);
+    let _ = window.show();
+    #[cfg(target_os = "macos")]
+    snipping_strip_order_front_regardless(&window);
+    // Focus only while Diff Forge is already the active app: tao's set_focus
+    // activates the app (activateIgnoringOtherApps), and activating a
+    // Regular-policy app from another app's fullscreen Space makes macOS
+    // paint a black menu bar instead of surfacing the bar — the same failure
+    // the background monitor solved with the Accessory policy, which is not
+    // available here because the main window is up. Unfocused, the bar is
+    // still on screen via orderFrontRegardless; dismissal then falls to the
+    // global click-outside monitor instead of the focus-loss handler.
+    #[cfg(target_os = "macos")]
+    {
+        let window_for_focus = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            let Some(mtm) = objc2::MainThreadMarker::new() else {
+                return;
+            };
+            if objc2_app_kit::NSApplication::sharedApplication(mtm).isActive() {
+                let _ = window_for_focus.set_focus();
+            }
+        });
+        snipping_strip_install_dismiss_monitor(app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = window.set_focus();
+    snipping_strip_emit_anim(app, "open", Some(origin));
+}
+
+/// App-lifetime global mouse-down monitor that dismisses the strip on a
+/// click outside it. The focus-loss handler only covers dismissal when the
+/// strip actually became key — showing it from another app's fullscreen
+/// Space deliberately skips focus (see snipping_strip_show), and global
+/// monitors only observe OTHER apps' events, which is exactly that case.
+#[cfg(target_os = "macos")]
+fn snipping_strip_install_dismiss_monitor(app: &AppHandle) {
+    if SNIPPING_STRIP_DISMISS_MONITOR_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app_for_monitor = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        use objc2_app_kit::{NSEvent, NSEventMask};
+        let mask = NSEventMask::LeftMouseDown
+            | NSEventMask::RightMouseDown
+            | NSEventMask::OtherMouseDown;
+        let block = block2::RcBlock::new(
+            move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                let Some(strip) =
+                    app_for_monitor.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)
+                else {
+                    return;
+                };
+                if !strip.is_visible().unwrap_or(false) {
+                    return;
+                }
+                if snipping_strip_contains_cursor(&app_for_monitor) {
+                    return;
+                }
+                // Same grace stamp as the focus-loss path so the click that
+                // dismissed the bar cannot instantly re-toggle it open.
+                SNIPPING_STRIP_LAST_BLUR_HIDE_MS.store(cloud_mcp_now_ms(), Ordering::Release);
+                snipping_strip_hide_animated(&app_for_monitor, strip, false);
+            },
+        );
+        if let Some(token) = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block) {
+            // Lives for the app's lifetime; it early-returns while hidden.
+            std::mem::forget(token);
+        }
+    });
+}
+
 /// Tray-click toggle for the recent-snips bar, mirroring the background
 /// monitor's blur-grace dance (clicking the tray blurs the bar first; without
 /// the grace window it would hide and instantly reopen).
@@ -4486,10 +5129,7 @@ pub(crate) fn snipping_strip_toggle(app: &AppHandle) {
     {
         return;
     }
-    let origin = snipping_strip_position(app, &window);
-    let _ = window.show();
-    let _ = window.set_focus();
-    snipping_strip_emit_anim(app, "open", Some(origin));
+    snipping_strip_show(app);
 }
 
 #[tauri::command]
@@ -4504,12 +5144,214 @@ fn snipping_open_snip_float(
     path: String,
     x: Option<f64>,
     y: Option<f64>,
+    focused: Option<bool>,
 ) -> Result<Value, String> {
     let explicit_position = match (x, y) {
         (Some(x), Some(y)) => Some((x, y)),
         _ => None,
     };
-    snipping_open_snip_preview_window_for(&app, &path, explicit_position, true)
+    // `focused: false` is the strip's pin path: stealing focus would blur-hide
+    // the strip the moment a snip is pinned.
+    snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))
+}
+
+/// Every preview window label currently showing this snip: the token label
+/// (direct opens) plus any adopted pool windows from the path registry.
+fn snipping_float_labels_for_path(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
+    let file = diffforge_local_asset_file(path)?;
+    let path_string = file.display().to_string();
+    let mut labels = vec![format!(
+        "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+        snipping_window_token(&file)
+    )];
+    if let Ok(paths) = app.state::<SnippingState>().preview_paths.lock() {
+        for (label, open_path) in paths.iter() {
+            if open_path == &path_string && !labels.contains(label) {
+                labels.push(label.clone());
+            }
+        }
+    }
+    Ok(labels)
+}
+
+/// Whether a floating preview is currently open for this snip — drives the
+/// annotation editor's pin/close toggle.
+#[tauri::command]
+fn snipping_snip_float_open(app: AppHandle, path: String) -> Result<Value, String> {
+    let open = snipping_float_labels_for_path(&app, &path)?
+        .iter()
+        .any(|label| app.get_webview_window(label).is_some());
+    Ok(json!({ "kind": "snip_float_open", "open": open }))
+}
+
+/// Closes the floating preview showing this snip, if one is open. The window
+/// Destroyed handler cleans the registries and emits floats-changed.
+#[tauri::command]
+fn snipping_close_snip_float_for_path(app: AppHandle, path: String) -> Result<Value, String> {
+    let mut closed = false;
+    for label in snipping_float_labels_for_path(&app, &path)? {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+            closed = true;
+        }
+    }
+    Ok(json!({ "ok": true, "closed": closed }))
+}
+
+// A strip drag-out session: one at a time, owned by whichever strip tile the
+// user is currently holding. The strip webview drives it (pointer events keep
+// flowing to the window that received the press), while Rust follows the
+// global cursor so coordinates stay correct across monitors and scales.
+static SNIPPING_STRIP_DRAG_OUT_LABEL: StdMutex<Option<String>> = StdMutex::new(None);
+
+/// Centers a preview window on the global cursor in physical pixels.
+fn snipping_strip_drag_out_track_cursor(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let Ok(cursor) = app.cursor_position() else {
+        return;
+    };
+    let size = window.outer_size().unwrap_or(tauri::PhysicalSize {
+        width: SNIPPING_FLOAT_LOGICAL_WIDTH as u32,
+        height: SNIPPING_FLOAT_LOGICAL_HEIGHT as u32,
+    });
+    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+        cursor.x as i32 - size.width as i32 / 2,
+        cursor.y as i32 - size.height as i32 / 2,
+    )));
+}
+
+/// Window level juggling for strip drag-outs: the strip runs at status-bar
+/// level (so it can overlay fullscreen Spaces), which is ABOVE the previews'
+/// normal floating tier — a preview dragged out of the bar would ride
+/// invisibly behind it until the cursor left the strip band. Raising the held
+/// preview one notch above the strip keeps it visible from the first drag
+/// pixel; the level is restored on release so previews never outrank
+/// menu-bar UI afterwards.
+#[cfg(target_os = "macos")]
+fn snipping_strip_drag_out_set_level(window: &tauri::WebviewWindow, raised: bool) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setLevel(if raised {
+            objc2_app_kit::NSStatusWindowLevel + 1
+        } else {
+            objc2_app_kit::NSFloatingWindowLevel
+        });
+    });
+}
+
+/// True while the global cursor is inside the recent-snips strip window.
+fn snipping_strip_contains_cursor(app: &AppHandle) -> bool {
+    let Some(strip) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+        return false;
+    };
+    if !strip.is_visible().unwrap_or(false) {
+        return false;
+    }
+    let (Ok(cursor), Ok(position), Ok(size)) =
+        (app.cursor_position(), strip.outer_position(), strip.outer_size())
+    else {
+        return false;
+    };
+    cursor.x >= position.x as f64
+        && cursor.x <= (position.x + size.width as i32) as f64
+        && cursor.y >= position.y as f64
+        && cursor.y <= (position.y + size.height as i32) as f64
+}
+
+/// Starts dragging a snip out of the strip: opens its floating preview
+/// (unfocused — focus would blur-hide the strip mid-drag) centered under the
+/// cursor. The strip re-lists immediately, so the tile visibly leaves the bar.
+#[tauri::command]
+fn snipping_strip_drag_out_begin(app: AppHandle, path: String) -> Result<Value, String> {
+    let cursor = app
+        .cursor_position()
+        .map_err(|error| format!("Unable to read cursor position: {error}"))?;
+    let scale = app
+        .monitor_from_point(cursor.x, cursor.y)
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0)
+        .max(0.1);
+    let opened = snipping_open_snip_preview_window_for(
+        &app,
+        &path,
+        Some((
+            cursor.x / scale - SNIPPING_FLOAT_LOGICAL_WIDTH / 2.0,
+            cursor.y / scale - SNIPPING_FLOAT_LOGICAL_HEIGHT / 2.0,
+        )),
+        false,
+    )?;
+    let label = opened
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(window) = app.get_webview_window(&label) {
+        // Re-anchor in pure physical math: the logical open position above is
+        // best-effort on mixed-scale monitor layouts.
+        snipping_strip_drag_out_track_cursor(&app, &window);
+        #[cfg(target_os = "macos")]
+        snipping_strip_drag_out_set_level(&window, true);
+    }
+    if let Ok(mut guard) = SNIPPING_STRIP_DRAG_OUT_LABEL.lock() {
+        *guard = (!label.is_empty()).then(|| label.clone());
+    }
+    Ok(opened)
+}
+
+/// Follows the cursor while a strip drag-out is in flight (the strip webview
+/// streams pointer moves; the actual position comes from the global cursor).
+#[tauri::command]
+fn snipping_strip_drag_out_move(app: AppHandle) -> Result<(), String> {
+    let label = SNIPPING_STRIP_DRAG_OUT_LABEL
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let Some(label) = label else {
+        return Ok(());
+    };
+    if let Some(window) = app.get_webview_window(&label) {
+        snipping_strip_drag_out_track_cursor(&app, &window);
+    }
+    Ok(())
+}
+
+/// Ends a strip drag-out. Releasing back over the strip cancels (the preview
+/// closes and the tile returns to the list); anywhere else the preview stays
+/// where it was dropped — including adoption into the bottom-left queue when
+/// dropped over that column.
+#[tauri::command]
+fn snipping_strip_drag_out_end(app: AppHandle) -> Result<Value, String> {
+    let label = SNIPPING_STRIP_DRAG_OUT_LABEL
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    let Some(label) = label else {
+        return Ok(json!({ "ok": true, "dropped": false }));
+    };
+    let Some(window) = app.get_webview_window(&label) else {
+        return Ok(json!({ "ok": true, "dropped": false }));
+    };
+    snipping_strip_drag_out_track_cursor(&app, &window);
+    #[cfg(target_os = "macos")]
+    snipping_strip_drag_out_set_level(&window, false);
+    #[cfg(target_os = "macos")]
+    snipping_preview_apply_macos_space_style(&window);
+    if snipping_strip_contains_cursor(&app) {
+        let _ = window.close();
+        return Ok(json!({ "ok": true, "dropped": false }));
+    }
+    // Dropped over the bottom-left column? The normal settle pass adopts it.
+    schedule_snipping_preview_stack_reflow(&app);
+    Ok(json!({ "ok": true, "dropped": true, "label": label }))
 }
 
 /// Called by a preview window's webview right before it starts the native

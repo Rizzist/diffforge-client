@@ -8317,7 +8317,7 @@ export const AudioBarNoticeProgress = styled.span`
    (the window is anchored to the monitor work area, so it sits just above
    the macOS Dock / Windows taskbar, or near the bare edge when there is
    none). Hovering the dock zone reveals one round record button with its
-   shortcut hinted in orange at the button's top right. */
+   shortcut hinted in orange centered above it. */
 export const AudioBarIdleShell = styled.div`
   position: fixed;
   inset: 0;
@@ -8392,8 +8392,15 @@ export const AudioBarRecordButton = styled.button`
 
 export const AudioBarShortcutHint = styled.span`
   position: absolute;
-  left: calc(100% + 7px);
-  top: -5px;
+  /* Centered above the button: the idle widget window is only 200px wide
+     with the button in the middle, so anything anchored off the button's
+     right edge runs past the native window bounds and gets cut off. */
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 2px 7px;
   border: 1px solid color-mix(in srgb, var(--forge-orange, #ff9f43) 38%, transparent);
   border-radius: 999px;

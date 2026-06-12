@@ -65,6 +65,8 @@ import { Postgresql } from "@styled-icons/simple-icons/Postgresql";
 import { Redis } from "@styled-icons/simple-icons/Redis";
 import { Stripe } from "@styled-icons/simple-icons/Stripe";
 import { Supabase } from "@styled-icons/simple-icons/Supabase";
+import Select from "react-select";
+import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -9285,21 +9287,159 @@ function todoHistoryGroupId(item) {
   return "listed";
 }
 
-function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }) {
+function todoTargetSelectPortal() {
+  return typeof document === "undefined" ? undefined : document.body;
+}
+
+function todoTargetColorAlpha(hex, alpha) {
+  const value = String(hex || "").trim();
+  if (!/^#[0-9a-fA-F]{6}$/.test(value)) {
+    return `rgba(148, 163, 184, ${alpha})`;
+  }
+  const r = Number.parseInt(value.slice(1, 3), 16);
+  const g = Number.parseInt(value.slice(3, 5), 16);
+  const b = Number.parseInt(value.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+const TODO_TARGET_SELECT_STYLES = {
+  container: (base) => ({ ...base, flex: "0 1 auto", minWidth: 126, maxWidth: 188 }),
+  control: (base, state) => {
+    const accent = state.getValue()?.[0]?.color || "";
+    return {
+      ...base,
+      minHeight: 26,
+      height: 26,
+      borderRadius: 7,
+      borderColor: accent
+        ? todoTargetColorAlpha(accent, state.isFocused ? 0.68 : 0.4)
+        : state.isFocused
+          ? "rgba(147, 197, 253, 0.44)"
+          : "rgba(148, 163, 184, 0.24)",
+      backgroundColor: "rgba(2, 6, 23, 0.85)",
+      boxShadow: state.isFocused ? `0 0 0 3px ${todoTargetColorAlpha(accent, 0.14)}` : "none",
+      cursor: "pointer",
+      transition: "border-color 140ms ease, box-shadow 140ms ease",
+    };
+  },
+  valueContainer: (base) => ({ ...base, padding: "0 2px 0 8px", flexWrap: "nowrap" }),
+  singleValue: (base) => ({
+    ...base,
+    display: "flex",
+    minWidth: 0,
+    margin: 0,
+    color: "rgba(226, 232, 240, 0.95)",
+    fontSize: 10.5,
+    fontWeight: 760,
+  }),
+  input: (base) => ({ ...base, margin: 0, padding: 0, color: "transparent" }),
+  indicatorSeparator: () => ({ display: "none" }),
+  dropdownIndicator: (base, state) => ({
+    ...base,
+    padding: "0 6px 0 2px",
+    color: state.isFocused ? "rgba(226, 232, 240, 0.9)" : "rgba(148, 163, 184, 0.8)",
+    transform: state.selectProps.menuIsOpen ? "rotate(180deg)" : "none",
+    transition: "transform 160ms ease",
+    svg: { width: 14, height: 14 },
+  }),
+  menuPortal: (base) => ({ ...base, zIndex: 9999 }),
+  menu: (base) => ({
+    ...base,
+    minWidth: 172,
+    overflow: "hidden",
+    border: "1px solid rgba(148, 163, 184, 0.22)",
+    borderRadius: 9,
+    backgroundColor: "rgba(10, 14, 24, 0.98)",
+    boxShadow: "0 16px 36px rgba(0, 0, 0, 0.45)",
+  }),
+  menuList: (base) => ({ ...base, padding: 4 }),
+  option: (base, state) => ({
+    ...base,
+    display: "flex",
+    alignItems: "center",
+    borderRadius: 6,
+    padding: "6px 8px",
+    color: state.isSelected ? "rgba(240, 244, 255, 0.98)" : "rgba(203, 213, 225, 0.92)",
+    backgroundColor: state.isSelected
+      ? todoTargetColorAlpha(state.data?.color, 0.2)
+      : state.isFocused
+        ? "rgba(148, 163, 184, 0.12)"
+        : "transparent",
+    fontSize: 11,
+    fontWeight: 760,
+    cursor: "pointer",
+  }),
+};
+
+const TodoTargetOptionLabel = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+
+  i {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--todo-target-dot, rgba(148, 163, 184, 0.5));
+  }
+
+  &[data-any="true"] i {
+    background: transparent;
+    border: 1.5px solid rgba(148, 163, 184, 0.55);
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const TodoTargetSelectShell = styled.span`
+  display: inline-flex;
+  min-width: 0;
+`;
+
+function todoTargetOptionLabelRenderer(option) {
   return (
-    <TodoActionSelect
-      aria-label="Todo target terminal"
-      onChange={(event) => onSelect(item, event.target.value)}
-      onClick={(event) => event.stopPropagation()}
-      value={value}
+    <TodoTargetOptionLabel
+      data-any={option.value === "" ? "true" : "false"}
+      style={option.color ? { "--todo-target-dot": option.color } : undefined}
     >
-      <option value="">Any terminal</option>
-      {terminalOptions.map((terminal) => (
-        <option key={`${terminal.terminalIndex}-${terminal.paneId}`} value={String(terminal.terminalIndex)}>
-          {terminal.label}
-        </option>
-      ))}
-    </TodoActionSelect>
+      <i aria-hidden="true" />
+      <span>{option.label}</span>
+    </TodoTargetOptionLabel>
+  );
+}
+
+function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }) {
+  const options = useMemo(() => [
+    { color: "", label: "Any terminal", value: "" },
+    ...terminalOptions.map((terminal) => ({
+      color: sanitizeTerminalColor(terminal.color, terminal.terminalIndex),
+      label: terminal.label,
+      value: String(terminal.terminalIndex),
+    })),
+  ], [terminalOptions]);
+  const selected = options.find((option) => option.value === String(value ?? "")) || options[0];
+  return (
+    <TodoTargetSelectShell
+      onClick={(event) => event.stopPropagation()}
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      <Select
+        aria-label="Todo target terminal"
+        formatOptionLabel={todoTargetOptionLabelRenderer}
+        isSearchable={false}
+        menuPortalTarget={todoTargetSelectPortal()}
+        onChange={(option) => onSelect(item, option?.value ?? "")}
+        options={options}
+        styles={TODO_TARGET_SELECT_STYLES}
+        value={selected}
+      />
+    </TodoTargetSelectShell>
   );
 }
 
@@ -13568,18 +13708,6 @@ const TodoActionButton = styled.button`
   &[data-danger="true"]:hover {
     background: rgba(127, 29, 29, 0.24);
   }
-`;
-
-const TodoActionSelect = styled.select`
-  max-width: 130px;
-  padding: 3px 6px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 6px;
-  color: rgba(226, 232, 240, 0.95);
-  background: rgba(2, 6, 23, 0.85);
-  font-size: 10px;
-  font-weight: 700;
-  cursor: pointer;
 `;
 
 const TodoHistoryNotice = styled.p`

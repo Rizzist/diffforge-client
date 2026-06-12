@@ -2806,6 +2806,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
     agent_kind: &str,
     prompt: &str,
     prompt_event_id: Option<&str>,
+    item_id_override: Option<&str>,
 ) -> Option<String> {
     let workspace_id = workspace_id.trim();
     let prompt = prompt.trim();
@@ -2821,7 +2822,13 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         return None;
     }
     let now_iso = chrono_like_now_iso();
-    let item_id = todo_dispatch_direct_prompt_item_id(prompt_event_id);
+    // Typed prompts arrive with the item id the webview already minted for
+    // this submission; converging on it keeps webview/store/cloud at ONE row.
+    let item_id = item_id_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| todo_dispatch_direct_prompt_item_id(prompt_event_id));
     if todo_store_tombstone_ids(workspace_id).contains(&item_id) {
         // The user already deleted this exact prompt's todo: never re-create.
         return None;

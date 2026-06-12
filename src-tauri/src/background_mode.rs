@@ -1,7 +1,8 @@
 // Background mode: the app keeps running with the main window hidden, with a
-// small monitor window (activity + tokenomics + snippets) as the visible
-// surface. The cross-platform tray icon lives for the whole app lifetime —
-// while the main window is up its click toggles the recent-snips strip.
+// small monitor window (activity + tokenomics tabs, plus a Snippets button
+// that dismisses the popover and launches the full-width recent-snips strip)
+// as the visible surface. The cross-platform tray icon lives for the whole
+// app lifetime — while the main window is up its click toggles that strip.
 // Entering/leaving background never tears anything down — terminals, sync,
 // hotkeys, and the todo ledger are process-scoped.
 
@@ -347,6 +348,20 @@ fn app_background_mode_state() -> Result<Value, String> {
     Ok(json!({ "background": app_is_in_background_mode() }))
 }
 
+/// The monitor popover's Snippets button: the strip is its own full-width
+/// surface, never embedded inside the dropdown — dismiss the popover and
+/// surface the bar in its place.
+#[tauri::command]
+fn background_monitor_open_snip_strip(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(BACKGROUND_MONITOR_WINDOW_LABEL) {
+        if window.is_visible().unwrap_or(false) {
+            background_monitor_hide_animated(&app, window, false);
+        }
+    }
+    snipping_strip_show(&app);
+    Ok(())
+}
+
 /// Cross-platform tray icon, present for the whole app lifetime. Left click
 /// is mode-aware: with the main window up it toggles the recent-snips strip
 /// (CleanShot-style bar); in background mode it toggles the monitor popover.
@@ -433,5 +448,9 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
             json!({ "error": error.to_string() }),
         );
     }
+    // Pre-create the hidden strip so its webview is booted before the first
+    // tray click: an open-anim event emitted into a still-loading webview is
+    // lost, which showed as an invisible-but-clickable bar.
+    let _ = snipping_strip_window(app);
 }
 

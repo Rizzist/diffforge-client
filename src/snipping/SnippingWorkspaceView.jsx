@@ -101,6 +101,7 @@ function fallbackSnippingStatus() {
 
   return {
     enabled: true,
+    hideDesktopIcons: true,
     fullScreenshot: {
       shortcut: full,
       defaultShortcut: full,
@@ -263,6 +264,7 @@ export default function SnippingWorkspaceView({
   const [lastCapture, setLastCapture] = useState(null);
 
   const snippingEnabled = Boolean(status?.enabled);
+  const hideDesktopIcons = status?.hideDesktopIcons !== false;
   const permissions = status?.permissions || fallbackPermissions();
   const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
   const areaShortcut = status?.areaSnip?.shortcut || defaultAreaShortcut();
@@ -283,6 +285,7 @@ export default function SnippingWorkspaceView({
     && Boolean(status?.areaSnip?.registered);
   const savingShortcut = actionState === "saving";
   const togglingSnipping = actionState === "toggling";
+  const togglingDesktopIcons = actionState === "toggling-desktop-icons";
   const capturingFull = actionState === "capturing-full";
   const capturingArea = actionState === "capturing-area";
   const openingPermissions = actionState === "opening-permissions";
@@ -316,6 +319,21 @@ export default function SnippingWorkspaceView({
       setCapturingShortcut("");
     } catch (toggleError) {
       setError(getErrorMessage(toggleError, "Unable to update snipping switch."));
+    } finally {
+      setActionState("idle");
+    }
+  }, []);
+
+  const setHideDesktopIcons = useCallback(async (enabled) => {
+    setActionState("toggling-desktop-icons");
+    setError("");
+    try {
+      const nextStatus = await invoke("set_snipping_hide_desktop_icons", {
+        request: { enabled },
+      });
+      setStatus(nextStatus || fallbackSnippingStatus());
+    } catch (toggleError) {
+      setError(getErrorMessage(toggleError, "Unable to update the desktop icons setting."));
     } finally {
       setActionState("idle");
     }
@@ -521,6 +539,20 @@ export default function SnippingWorkspaceView({
             <SettingsHint>
               Saves to {status?.untrackedRoot ? `${status.untrackedRoot}/snips` : "the untracked snips folder"}.
             </SettingsHint>
+            <AudioRecorderOptionRow>
+              <SettingsHint>
+                Hide desktop icon clutter while capturing, then bring it back.
+              </SettingsHint>
+              <McpSwitchButton
+                aria-pressed={hideDesktopIcons ? "true" : "false"}
+                disabled={togglingDesktopIcons}
+                onClick={() => setHideDesktopIcons(!hideDesktopIcons)}
+                type="button"
+              >
+                <span aria-hidden="true" />
+                {togglingDesktopIcons ? "Switching" : hideDesktopIcons ? "On" : "Off"}
+              </McpSwitchButton>
+            </AudioRecorderOptionRow>
             {lastCapture?.localPath && (
               <AudioInputMeta>Last snip: {lastCapture.localPath}</AudioInputMeta>
             )}

@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-native-roots"] }
 uuid = { version = "1", features = ["v4"] }
+window-vibrancy = "0.6"
 xcap = "0.9.6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

@@ -24,9 +24,11 @@ import { Texture } from "@styled-icons/material-rounded/Texture";
 import { Undo } from "@styled-icons/material-rounded/Undo";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
+import { Folder } from "@styled-icons/material-rounded/Folder";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import styled, { createGlobalStyle } from "styled-components";
+import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
@@ -46,6 +48,7 @@ export const SNIPPING_STRIP_HASH = "#/snipping-strip";
 
 const SNIPPING_STRIP_ANIM_EVENT = "forge-snip-strip-anim";
 const SNIPPING_STRIP_RECENT_LIMIT = 16;
+const SNIPPING_FLOATS_CHANGED_EVENT = "forge-snip-floats-changed";
 
 
 // Quick-access tools. Closed shapes (rect/oval) are one abstract "shape" tool
@@ -112,23 +115,47 @@ const COLOR_OPTIONS = ["#f8fafc", "#ef4444", "#f59e0b", "#22c55e", "#38bdf8", "#
 
 // react-select theme for the composer's workspace/terminal pickers: compact
 // dark pills with an upward menu (the composer sits on the bottom edge).
+function targetColorAlpha(hex, alpha) {
+  const value = String(hex || "").trim();
+  if (!/^#[0-9a-fA-F]{6}$/.test(value)) {
+    return `rgba(147, 197, 253, ${alpha})`;
+  }
+  const r = Number.parseInt(value.slice(1, 3), 16);
+  const g = Number.parseInt(value.slice(3, 5), 16);
+  const b = Number.parseInt(value.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 const TARGET_SELECT_STYLES = {
   container: (base) => ({ ...base, flex: "0 1 auto", minWidth: 110, maxWidth: 172 }),
-  control: (base, state) => ({
-    ...base,
-    minHeight: 32,
-    height: 32,
-    borderRadius: 999,
-    backgroundColor: state.isFocused ? "rgba(230, 236, 245, 0.09)" : "rgba(230, 236, 245, 0.06)",
-    borderColor: state.isFocused ? "rgba(147, 197, 253, 0.45)" : "rgba(230, 236, 245, 0.12)",
-    boxShadow: "none",
-    cursor: "pointer",
-    transition: "border-color 120ms ease, background-color 120ms ease",
-    ":hover": { borderColor: "rgba(147, 197, 253, 0.4)" },
-  }),
-  valueContainer: (base) => ({ ...base, padding: "0 2px 0 13px", flexWrap: "nowrap" }),
+  control: (base, state) => {
+    // Terminal options carry the terminal's color; tint the pill with it so
+    // the chosen target reads at a glance. Workspace options have no color
+    // and keep the neutral blue focus accent.
+    const accent = state.getValue()?.[0]?.color || "";
+    return {
+      ...base,
+      minHeight: 32,
+      height: 32,
+      borderRadius: 999,
+      backgroundColor: state.isFocused ? "rgba(230, 236, 245, 0.09)" : "rgba(230, 236, 245, 0.06)",
+      borderColor: accent
+        ? targetColorAlpha(accent, state.isFocused ? 0.66 : 0.38)
+        : state.isFocused
+          ? "rgba(147, 197, 253, 0.45)"
+          : "rgba(230, 236, 245, 0.12)",
+      boxShadow: state.isFocused && accent ? `0 0 0 3px ${targetColorAlpha(accent, 0.13)}` : "none",
+      cursor: "pointer",
+      transition: "border-color 120ms ease, background-color 120ms ease, box-shadow 140ms ease",
+      ":hover": { borderColor: accent ? targetColorAlpha(accent, 0.6) : "rgba(147, 197, 253, 0.4)" },
+    };
+  },
+  valueContainer: (base) => ({ ...base, padding: "0 2px 0 11px", flexWrap: "nowrap" }),
   singleValue: (base) => ({
     ...base,
+    display: "flex",
+    minWidth: 0,
+    margin: 0,
     color: "rgba(248, 250, 252, 0.9)",
     fontSize: 12,
     fontWeight: 700,
@@ -160,21 +187,26 @@ const TARGET_SELECT_STYLES = {
     marginBottom: 8,
   }),
   menuList: (base) => ({ ...base, padding: 5, maxHeight: 240 }),
-  option: (base, state) => ({
-    ...base,
-    borderRadius: 8,
-    padding: "7px 10px",
-    fontSize: 12,
-    fontWeight: 650,
-    color: state.isSelected ? "#ffffff" : "rgba(248, 250, 252, 0.85)",
-    backgroundColor: state.isSelected
-      ? "rgba(59, 130, 246, 0.45)"
-      : state.isFocused
-        ? "rgba(230, 236, 245, 0.09)"
-        : "transparent",
-    cursor: "pointer",
-    ":active": { backgroundColor: "rgba(59, 130, 246, 0.32)" },
-  }),
+  option: (base, state) => {
+    const accent = state.data?.color || "";
+    return {
+      ...base,
+      display: "flex",
+      alignItems: "center",
+      borderRadius: 8,
+      padding: "7px 10px",
+      fontSize: 12,
+      fontWeight: 650,
+      color: state.isSelected ? "#ffffff" : "rgba(248, 250, 252, 0.85)",
+      backgroundColor: state.isSelected
+        ? (accent ? targetColorAlpha(accent, 0.26) : "rgba(59, 130, 246, 0.45)")
+        : state.isFocused
+          ? "rgba(230, 236, 245, 0.09)"
+          : "transparent",
+      cursor: "pointer",
+      ":active": { backgroundColor: accent ? targetColorAlpha(accent, 0.2) : "rgba(59, 130, 246, 0.32)" },
+    };
+  },
   noOptionsMessage: (base) => ({
     ...base,
     color: "rgba(248, 250, 252, 0.5)",
@@ -182,6 +214,60 @@ const TARGET_SELECT_STYLES = {
     fontWeight: 650,
   }),
 };
+
+const TargetOptionLabel = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+
+  i {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--target-option-dot, rgba(148, 163, 184, 0.5));
+  }
+
+  &[data-any="true"] i {
+    background: transparent;
+    border: 1.5px solid rgba(148, 163, 184, 0.55);
+  }
+
+  svg {
+    flex: none;
+    width: 13px;
+    height: 13px;
+    color: rgba(148, 163, 184, 0.85);
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+function workspaceOptionLabelRenderer(option) {
+  return (
+    <TargetOptionLabel>
+      <Folder aria-hidden="true" />
+      <span>{option.label}</span>
+    </TargetOptionLabel>
+  );
+}
+
+function terminalOptionLabelRenderer(option) {
+  return (
+    <TargetOptionLabel
+      data-any={option.value === "" ? "true" : "false"}
+      style={option.color ? { "--target-option-dot": option.color } : undefined}
+    >
+      <i aria-hidden="true" />
+      <span>{option.label}</span>
+    </TargetOptionLabel>
+  );
+}
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -742,6 +828,39 @@ const FloatCloseButton = styled.button`
   }
 `;
 
+/* The strip tile's stand-in for the preview's close button: same slot, same
+   shape, but it pins (opens the draggable preview) instead of dismissing. */
+const FloatPinButton = styled.button`
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #f8fafc;
+  background: rgba(7, 10, 16, 0.85);
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.55);
+    background: rgba(23, 37, 62, 0.92);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+`;
+
 const FloatUploadButton = styled.button`
   position: absolute;
   top: 6px;
@@ -843,10 +962,13 @@ const FloatStatusPill = styled.span`
 
 /**
  * One recent-snip tile: the floating preview's exact look and hover actions
- * (upload, copy, annotate, delete) minus the close button — dismissal belongs
- * to the queue surface only. Click opens the standalone draggable preview.
+ * (upload, copy, annotate, delete), with a pin button where the preview's
+ * close button sits — pinning opens the snip as a draggable preview in the
+ * bottom-left queue. Click opens the annotation editor directly, and holding
+ * and dragging hands the tile off to a floating preview under the cursor
+ * (the drag engine lives in the strip, which never unmounts mid-drag).
  */
-function SnipStripTile({ snip, onRemoved }) {
+function SnipStripTile({ snip, onRemoved, onDragOutStart }) {
   const localPath = text(snip?.path);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [imageVersion, setImageVersion] = useState(0);
@@ -916,6 +1038,10 @@ function SnipStripTile({ snip, onRemoved }) {
       if (action === "delete") {
         await invoke("diffforge_delete_untracked_asset", { path: localPath });
         if (onRemoved) onRemoved(localPath);
+      } else if (action === "pin") {
+        // Unfocused open: stealing focus would blur-hide the strip. The
+        // floats-changed event then drops this tile from the list.
+        await invoke("snipping_open_snip_float", { path: localPath, focused: false });
       } else if (action === "copy") {
         const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
         showStatus(copyStatus);
@@ -939,23 +1065,40 @@ function SnipStripTile({ snip, onRemoved }) {
     }
   }, [busy, localPath, name, onRemoved, previewUrl, showStatus]);
 
-  const openFloat = useCallback((event) => {
+  const openEditor = useCallback((event) => {
     if (event.target.closest("button")) return;
-    invoke("snipping_open_snip_float", { path: localPath }).catch(() => {});
-  }, [localPath]);
+    runAction("edit");
+  }, [runAction]);
+
+  const onPointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    if (event.target.closest("button")) return;
+    if (onDragOutStart) onDragOutStart(localPath, event);
+  }, [localPath, onDragOutStart]);
 
   return (
     <StripTileRoot
       data-busy={busy ? "true" : "false"}
-      onClick={openFloat}
-      onDoubleClick={() => runAction("edit")}
-      title={`${name} — click for a draggable preview, double-click to annotate`}
+      onClick={openEditor}
+      onPointerDown={onPointerDown}
+      title={`${name} — click to annotate, drag out for a pinned preview`}
     >
       {previewUrl ? (
         <img alt={name} draggable={false} src={previewUrl} />
       ) : (
         <span data-empty="true">Preview unavailable</span>
       )}
+      <FloatPinButton
+        aria-label={`Pin ${name} to the screen`}
+        disabled={busy}
+        onClick={() => runAction("pin")}
+        title="Pin as draggable preview"
+        type="button"
+      >
+        <svg aria-hidden="true" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z" />
+        </svg>
+      </FloatPinButton>
       <FloatUploadButton
         aria-label={`Upload ${name}`}
         disabled={busy}
@@ -1001,14 +1144,25 @@ function SnipStripTile({ snip, onRemoved }) {
   );
 }
 
+// Pointer travel before a press becomes a drag-out instead of a click.
+const STRIP_DRAG_OUT_THRESHOLD_PX = 8;
+
 /**
  * The last 16 snips as a horizontally scrollable row (wheel, trackpad, and
- * drag-scroll all work). Shared by the CleanShot-style strip window and the
- * background monitor's Snippets tab.
+ * drag-scroll all work), hosted by the CleanShot-style strip window. Snips
+ * already pinned on screen as floating previews are excluded (Rust filters
+ * them and signals re-lists via the floats-changed event). Tiles can be
+ * dragged out of the bar: past a small threshold the snip opens as a floating
+ * preview that follows the cursor until release.
  */
-export function SnippingRecentStrip({ embedded = false }) {
+export function SnippingRecentStrip() {
   const [snips, setSnips] = useState([]);
   const scrollRef = useRef(null);
+  // The drag engine lives here, on window-level listeners: the dragged tile
+  // unmounts the moment its float opens (it leaves the list), which would
+  // kill any listener or pointer capture owned by the tile itself.
+  const dragRef = useRef(null);
+  const suppressClickRef = useRef(false);
 
   const refresh = useCallback(() => {
     invoke("snipping_recent_snips", { limit: SNIPPING_STRIP_RECENT_LIMIT })
@@ -1040,6 +1194,7 @@ export function SnippingRecentStrip({ embedded = false }) {
     };
     addListener(SNIPPING_CAPTURE_SAVED_EVENT);
     addListener(SNIPPING_SOURCE_UPDATED_EVENT);
+    addListener(SNIPPING_FLOATS_CHANGED_EVENT);
     return () => {
       cancelled = true;
       unlisteners.forEach((unlisten) => {
@@ -1051,6 +1206,66 @@ export function SnippingRecentStrip({ embedded = false }) {
       });
     };
   }, [refresh]);
+
+  const onDragOutStart = useCallback((path, event) => {
+    dragRef.current = {
+      path,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      moveQueued: false,
+    };
+  }, []);
+
+  useEffect(() => {
+    const onPointerMove = (event) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      if (!drag.active) {
+        const travel = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+        if (travel < STRIP_DRAG_OUT_THRESHOLD_PX) return;
+        drag.active = true;
+        suppressClickRef.current = true;
+        invoke("snipping_strip_drag_out_begin", { path: drag.path }).catch(() => {
+          dragRef.current = null;
+        });
+        return;
+      }
+      // Rust reads the global cursor itself; the pointer stream just paces
+      // the follow calls, throttled to one per frame.
+      if (drag.moveQueued) return;
+      drag.moveQueued = true;
+      window.requestAnimationFrame(() => {
+        drag.moveQueued = false;
+        if (dragRef.current === drag && drag.active) {
+          invoke("snipping_strip_drag_out_move").catch(() => {});
+        }
+      });
+    };
+    const onPointerEnd = () => {
+      const drag = dragRef.current;
+      dragRef.current = null;
+      if (!drag?.active) return;
+      invoke("snipping_strip_drag_out_end").catch(() => {});
+    };
+    window.addEventListener("pointermove", onPointerMove, true);
+    window.addEventListener("pointerup", onPointerEnd, true);
+    window.addEventListener("pointercancel", onPointerEnd, true);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("pointerup", onPointerEnd, true);
+      window.removeEventListener("pointercancel", onPointerEnd, true);
+    };
+  }, []);
+
+  // A release that finished a drag-out must not fall through as a tile click
+  // (which would open the annotation editor).
+  const onClickCapture = useCallback((event) => {
+    if (!suppressClickRef.current) return;
+    suppressClickRef.current = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, []);
 
   const onWheel = useCallback((event) => {
     const node = scrollRef.current;
@@ -1068,12 +1283,17 @@ export function SnippingRecentStrip({ embedded = false }) {
   }, [refresh]);
 
   return (
-    <StripScroller data-embedded={embedded ? "true" : "false"} onWheel={onWheel} ref={scrollRef}>
+    <StripScroller onClickCapture={onClickCapture} onWheel={onWheel} ref={scrollRef}>
       {snips.length === 0 ? (
         <StripEmpty>No snips yet — capture one with the snipping shortcut.</StripEmpty>
       ) : (
         snips.map((snip) => (
-          <SnipStripTile key={text(snip?.path)} onRemoved={handleRemoved} snip={snip} />
+          <SnipStripTile
+            key={text(snip?.path)}
+            onDragOutStart={onDragOutStart}
+            onRemoved={handleRemoved}
+            snip={snip}
+          />
         ))
       )}
     </StripScroller>
@@ -1081,8 +1301,9 @@ export function SnippingRecentStrip({ embedded = false }) {
 }
 
 /**
- * The tray-toggled recent-snips bar: top-center on macOS, bottom-center on
- * Windows/Linux (Rust owns placement and the open/close animation cues).
+ * The tray-toggled recent-snips bar, spanning the full monitor width: pinned
+ * under the menu bar on macOS, above the taskbar on Windows/Linux (Rust owns
+ * placement, sizing, and the open/close animation cues).
  */
 export function SnippingStripWindow() {
   const [animPhase, setAnimPhase] = useState("closed");
@@ -1094,20 +1315,25 @@ export function SnippingStripWindow() {
   useEffect(() => {
     let cancelled = false;
     let unlistenAnim = null;
+    let receivedAnim = false;
+    const playOpen = () => {
+      // Re-mount the strip on every open so it always shows fresh snips,
+      // and two-frame the transition so the closed state paints first.
+      setOpenNonce((nonce) => nonce + 1);
+      setAnimPhase("closed");
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => setAnimPhase("open"));
+      });
+    };
     listen(SNIPPING_STRIP_ANIM_EVENT, (event) => {
       if (cancelled) return;
+      receivedAnim = true;
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const phase = text(payload.phase) === "open" ? "open" : "closed";
       const origin = text(payload.origin) === "bottom" ? "bottom" : "top";
       setAnimOrigin(origin);
       if (phase === "open") {
-        // Re-mount the strip on every open so it always shows fresh snips,
-        // and two-frame the transition so the closed state paints first.
-        setOpenNonce((nonce) => nonce + 1);
-        setAnimPhase("closed");
-        window.requestAnimationFrame(() => {
-          window.requestAnimationFrame(() => setAnimPhase("open"));
-        });
+        playOpen();
       } else {
         setAnimPhase("closed");
       }
@@ -1118,6 +1344,18 @@ export function SnippingStripWindow() {
           return;
         }
         unlistenAnim = unlisten;
+        // First-show race: when the bar is shown while this webview is still
+        // booting, the open cue is emitted into a page with no listener yet
+        // and the shell stays at opacity 0 — an invisible but clickable bar.
+        // The listener is live now, so a visible window with no cue received
+        // means exactly that race: play the open ourselves.
+        getCurrentWindow()
+          .isVisible()
+          .then((visible) => {
+            if (cancelled || receivedAnim || !visible) return;
+            playOpen();
+          })
+          .catch(() => {});
       })
       .catch(() => {});
     return () => {
@@ -1147,11 +1385,14 @@ export function SnippingStripWindow() {
   );
 }
 
+/* Flush, full-bleed sheet: the window itself is pinned to the work-area edge
+   and the native vibrancy layer (Rust applies it with a matching 14px corner
+   radius) provides the glass — the webview only tints it. */
 const StripWindowShell = styled.main`
   box-sizing: border-box;
   display: grid;
   height: 100vh;
-  padding: 10px;
+  padding: 0;
   overflow: hidden;
   background: transparent;
   opacity: 0;
@@ -1179,13 +1420,14 @@ const StripScroller = styled.div`
   align-items: center;
   gap: 10px;
   box-sizing: border-box;
-  padding: 12px;
+  padding: 14px;
   overflow-x: auto;
   overflow-y: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 16px;
-  background: rgba(7, 10, 15, 0.96);
-  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  /* Light tint only — the frosted glass is the OS vibrancy layer behind the
+     transparent window, identical on light and dark themes. */
+  background: rgba(10, 14, 22, 0.38);
   scrollbar-width: thin;
 
   &::-webkit-scrollbar {
@@ -1195,13 +1437,6 @@ const StripScroller = styled.div`
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
     background: rgba(148, 163, 184, 0.35);
-  }
-
-  &[data-embedded="true"] {
-    border: 0;
-    border-radius: 0;
-    background: transparent;
-    box-shadow: none;
   }
 `;
 
@@ -1308,8 +1543,61 @@ export function SnippingAnnotationEditorWindow() {
   const [dispatchTargets, setDispatchTargets] = useState([]);
   const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
   const [targetThreadId, setTargetThreadId] = useState("");
+  // Whether the edited snip is currently pinned on screen as a floating
+  // preview: the action cluster shows a pin button when it is not, and a
+  // close button when it is.
+  const [floatOpen, setFloatOpen] = useState(false);
   const annotations = annotationsByPath[activePath] || [];
   const hasCrop = annotations.some((annotation) => annotation.type === "crop");
+
+  useEffect(() => {
+    if (!activePath) {
+      setFloatOpen(false);
+      return undefined;
+    }
+    let cancelled = false;
+    const refreshFloatState = () => {
+      invoke("snipping_snip_float_open", { path: activePath })
+        .then((result) => {
+          if (!cancelled) setFloatOpen(Boolean(result?.open));
+        })
+        .catch(() => {});
+    };
+    refreshFloatState();
+    // Manually closing (or pinning) the preview elsewhere flips the button.
+    let unlisten = () => {};
+    listen(SNIPPING_FLOATS_CHANGED_EVENT, refreshFloatState)
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten();
+    };
+  }, [activePath]);
+
+  const toggleFloatPin = useCallback(async () => {
+    if (!activePath) return;
+    try {
+      if (floatOpen) {
+        await invoke("snipping_close_snip_float_for_path", { path: activePath });
+        setFloatOpen(false);
+        setStatus("Pinned preview closed");
+      } else {
+        // Unfocused so the editor keeps focus (and keyboard shortcuts).
+        await invoke("snipping_open_snip_float", { path: activePath, focused: false });
+        setFloatOpen(true);
+        setStatus("Pinned to screen");
+      }
+    } catch (error) {
+      setStatus(error?.message || String(error || "Pin failed"));
+    }
+  }, [activePath, floatOpen]);
 
   useEffect(() => {
     let disposed = false;
@@ -1339,8 +1627,12 @@ export function SnippingAnnotationEditorWindow() {
   })), [dispatchTargets]);
 
   const threadOptions = useMemo(() => [
-    { label: "Any terminal", value: "" },
-    ...(targetWorkspace?.threads || []).map((thread) => ({
+    { color: "", label: "Any terminal", value: "" },
+    ...(targetWorkspace?.threads || []).map((thread, index) => ({
+      color: sanitizeTerminalColor(
+        thread.color,
+        Number.isInteger(thread.terminalIndex) ? thread.terminalIndex : index,
+      ),
       label: text(thread.label, thread.threadId),
       value: thread.threadId,
     })),
@@ -2108,6 +2400,20 @@ export function SnippingAnnotationEditorWindow() {
               <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
                 <ContentCopy aria-hidden="true" />
               </EditorToolButton>
+              <EditorToolButton
+                aria-label={floatOpen ? "Close pinned preview" : "Pin as draggable preview"}
+                onClick={toggleFloatPin}
+                title={floatOpen ? "Close pinned preview" : "Pin as draggable preview"}
+                type="button"
+              >
+                {floatOpen ? (
+                  <Close aria-hidden="true" />
+                ) : (
+                  <svg aria-hidden="true" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z" />
+                  </svg>
+                )}
+              </EditorToolButton>
             </EditorActionCluster>
             <EditorFloatingRail aria-label="Annotation tools">
               {TOOL_GROUPS.map((group, groupIndex) => (
@@ -2272,6 +2578,7 @@ export function SnippingAnnotationEditorWindow() {
             <EditorComposerInner>
               <Select
                 aria-label="Target workspace"
+                formatOptionLabel={workspaceOptionLabelRenderer}
                 isDisabled={!dispatchTargets.length}
                 isSearchable={false}
                 menuPlacement="top"
@@ -2283,6 +2590,7 @@ export function SnippingAnnotationEditorWindow() {
               />
               <Select
                 aria-label="Target terminal"
+                formatOptionLabel={terminalOptionLabelRenderer}
                 isDisabled={!(targetWorkspace?.threads || []).length}
                 isSearchable={false}
                 menuPlacement="top"

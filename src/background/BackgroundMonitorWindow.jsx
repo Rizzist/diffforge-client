@@ -5,7 +5,6 @@ import styled, { createGlobalStyle } from "styled-components";
 
 import { ActivityOverlayPanel } from "../activity/ActivityOverlay.jsx";
 import { useAuthSnapshot } from "../authStore";
-import { SnippingRecentStrip } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 const LAST_TAB_STORAGE_KEY = "diffforge.backgroundMonitor.lastTab.v1";
@@ -19,7 +18,7 @@ function text(value, fallback = "") {
 function readLastTab() {
   try {
     const stored = text(window.localStorage.getItem(LAST_TAB_STORAGE_KEY));
-    return stored === "activity" || stored === "snippets" ? stored : "tokenomics";
+    return stored === "activity" ? stored : "tokenomics";
   } catch {
     return "tokenomics";
   }
@@ -78,6 +77,12 @@ export default function BackgroundMonitorWindow() {
     void invoke("app_exit_background").catch(() => {});
   }, []);
 
+  // Snippets is a launcher, not a tab: the strip is its own full-width bar,
+  // so the popover dismisses itself and Rust surfaces the strip instead.
+  const openSnipStrip = useCallback(() => {
+    void invoke("background_monitor_open_snip_strip").catch(() => {});
+  }, []);
+
   return (
     <MonitorViewport>
       <MonitorGlobalStyle />
@@ -109,9 +114,9 @@ export default function BackgroundMonitorWindow() {
             Activity
           </MonitorTabButton>
           <MonitorTabButton
-            data-active={tab === "snippets" ? "true" : "false"}
-            onClick={() => setTab("snippets")}
-            role="tab"
+            data-active="false"
+            onClick={openSnipStrip}
+            title="Close this popover and show the recent-snips bar"
             type="button"
           >
             Snippets
@@ -121,10 +126,6 @@ export default function BackgroundMonitorWindow() {
         <MonitorFill>
           {tab === "tokenomics" ? (
             <AccountTokenomicsView accountKey={user?.id || user?.email || ""} />
-          ) : tab === "snippets" ? (
-            <MonitorSnipsHost>
-              <SnippingRecentStrip embedded />
-            </MonitorSnipsHost>
           ) : (
             <MonitorActivityHost>
               <ActivityOverlayPanel embedded />
@@ -203,41 +204,49 @@ const MonitorActivityHost = styled.div`
   background: linear-gradient(180deg, rgba(13, 16, 22, 0.65), rgba(7, 10, 15, 0.2));
 `;
 
-const MonitorSnipsHost = styled.div`
-  display: grid;
-  min-width: 0;
-  min-height: 0;
-  align-content: center;
-  overflow: hidden;
-  padding: 8px 2px;
-  background: linear-gradient(180deg, rgba(13, 16, 22, 0.65), rgba(7, 10, 15, 0.2));
-`;
-
 const MonitorHeader = styled.header`
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  min-width: 0;
   padding: 12px 14px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
 
   div {
     display: grid;
     gap: 1px;
+    min-width: 0;
   }
 
   strong {
+    overflow: hidden;
     font-size: 14px;
     font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   span {
+    overflow: hidden;
     color: #7a8493;
     font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 280px) {
+    gap: 8px;
+    padding: 10px 10px;
+
+    span {
+      display: none;
+    }
   }
 `;
 
 const ReturnButton = styled.button`
+  flex: 0 0 auto;
   padding: 7px 13px;
   border: 1px solid rgba(125, 176, 255, 0.36);
   border-radius: 8px;
@@ -245,20 +254,34 @@ const ReturnButton = styled.button`
   background: rgba(59, 130, 246, 0.18);
   font-size: 12px;
   font-weight: 750;
+  white-space: nowrap;
   cursor: pointer;
 
   &:hover {
     background: rgba(59, 130, 246, 0.3);
+  }
+
+  @media (max-width: 280px) {
+    padding: 6px 9px;
+    font-size: 11px;
   }
 `;
 
 const MonitorTabs = styled.nav`
   display: flex;
   gap: 2px;
+  min-width: 0;
   padding: 8px 14px 0;
+
+  @media (max-width: 280px) {
+    padding: 8px 10px 0;
+  }
 `;
 
 const MonitorTabButton = styled.button`
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   padding: 7px 14px;
   border: 1px solid transparent;
   border-radius: 8px 8px 0 0;
@@ -266,6 +289,8 @@ const MonitorTabButton = styled.button`
   background: transparent;
   font-size: 12px;
   font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   cursor: pointer;
 
   &[data-active="true"] {
@@ -273,5 +298,10 @@ const MonitorTabButton = styled.button`
     border-color: rgba(230, 236, 245, 0.1);
     border-bottom-color: transparent;
     background: rgba(13, 17, 23, 0.7);
+  }
+
+  @media (max-width: 280px) {
+    padding: 7px 8px;
+    font-size: 11px;
   }
 `;
