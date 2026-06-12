@@ -10,9 +10,12 @@ export const PLAN_FLAME_OPTIONS = [
 
 const PLAN_FLAME_KEYS = new Set(PLAN_FLAME_OPTIONS.map((option) => option.key));
 
+// quality.ratio caps the render pixel ratio, quality.octaves the noise depth,
+// and quality.detail gates the ridged-lick pass and second ember layer, so
+// lower tiers stay cheap on weak GPUs while pro/ultra keep full fidelity.
 const PLAN_FLAME_PRESETS = {
   free: {
-    height: 178,
+    height: 150,
     core: [1, 0.93, 0.72],
     mid: [1, 0.42, 0.12],
     outer: [0.45, 0.03, 0.01],
@@ -20,16 +23,17 @@ const PLAN_FLAME_PRESETS = {
     accent2: [0.92, 0.1, 0.04],
     glow: "rgba(255, 73, 63, 0.42)",
     heat: "#ff493f",
-    intensity: 0.82,
+    intensity: 0.76,
     speed: 1.32,
-    top: 0.6,
-    volatility: 1.04,
-    flash: 0.92,
-    sparks: 0.7,
+    top: 0.5,
+    volatility: 1,
+    flash: 0.88,
+    sparks: 0.6,
     accentMix: 0.32,
+    quality: { ratio: 1, octaves: 3, detail: false },
   },
   plus: {
-    height: 220,
+    height: 215,
     core: [1, 0.99, 0.84],
     mid: [1, 0.74, 0.22],
     outer: [0.58, 0.16, 0.02],
@@ -37,16 +41,17 @@ const PLAN_FLAME_PRESETS = {
     accent2: [0.96, 0.2, 0.06],
     glow: "rgba(255, 194, 71, 0.46)",
     heat: "#ffc247",
-    intensity: 0.9,
+    intensity: 0.88,
     speed: 1.22,
-    top: 0.66,
-    volatility: 1.14,
-    flash: 1.02,
-    sparks: 0.95,
+    top: 0.62,
+    volatility: 1.12,
+    flash: 1,
+    sparks: 0.9,
     accentMix: 0.6,
+    quality: { ratio: 1.25, octaves: 3, detail: false },
   },
   pro: {
-    height: 258,
+    height: 295,
     core: [1, 1, 1],
     mid: [0.74, 0.87, 1],
     outer: [0.1, 0.3, 0.74],
@@ -56,14 +61,15 @@ const PLAN_FLAME_PRESETS = {
     heat: "#f4fbff",
     intensity: 0.96,
     speed: 1.12,
-    top: 0.71,
+    top: 0.74,
     volatility: 1.22,
     flash: 1.08,
     sparks: 1.15,
     accentMix: 0.85,
+    quality: { ratio: 1.5, octaves: 4, detail: true },
   },
   ultra: {
-    height: 310,
+    height: 385,
     core: [0.95, 0.97, 1],
     mid: [0.5, 0.45, 1],
     outer: [0.26, 0.06, 0.56],
@@ -73,11 +79,12 @@ const PLAN_FLAME_PRESETS = {
     heat: "#8d6bff",
     intensity: 1,
     speed: 1.02,
-    top: 0.78,
+    top: 0.85,
     volatility: 1.34,
     flash: 1.18,
     sparks: 1.4,
     accentMix: 1,
+    quality: { ratio: 1.5, octaves: 4, detail: true },
   },
 };
 
@@ -91,8 +98,11 @@ const VERTEX_SHADER_SOURCE = `
   }
 `;
 
-const FRAGMENT_SHADER_SOURCE = `
+const buildFlameFragmentSource = (quality) => `
   precision highp float;
+
+  #define OCTAVES ${quality.octaves}
+  ${quality.detail ? "#define DETAIL" : ""}
 
   uniform vec2 u_resolution;
   uniform float u_time;
@@ -133,7 +143,7 @@ const FRAGMENT_SHADER_SOURCE = `
     float amplitude = 0.5;
     mat2 warp = mat2(1.62, 1.18, -1.18, 1.62);
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < OCTAVES; i++) {
       value += amplitude * noise(p);
       p = warp * p + 17.71;
       amplitude *= 0.52;
@@ -142,6 +152,7 @@ const FRAGMENT_SHADER_SOURCE = `
     return value;
   }
 
+  #ifdef DETAIL
   float ridge(vec2 p) {
     float value = 0.0;
     float amplitude = 0.55;
@@ -155,6 +166,7 @@ const FRAGMENT_SHADER_SOURCE = `
 
     return value;
   }
+  #endif
 
   float emberLayer(vec2 p, float t, float seed, float speed, float scale) {
     vec2 g = vec2(p.x * scale + seed, (p.y - t * speed) * scale);
@@ -188,7 +200,11 @@ const FRAGMENT_SHADER_SOURCE = `
       fbm(p * 1.8 + vec2(5.2, -t * 1.45))
     );
     float turb = fbm(p * 2.6 + (q - 0.5) * 2.3 + vec2(0.0, -t * 1.9));
+    #ifdef DETAIL
     float licks = ridge(p * vec2(3.4, 2.2) + (q - 0.5) * 1.7 + vec2(0.0, -t * 2.6));
+    #else
+    float licks = 0.0;
+    #endif
 
     float tongueField = fbm(vec2(p.x * 1.45 + t * 0.16, t * 0.75));
     float tongues = pow(tongueField, 1.6) * 1.9;
@@ -196,7 +212,11 @@ const FRAGMENT_SHADER_SOURCE = `
     float flareField = fbm(vec2(p.x * 0.55 - t * 0.09, t * 0.5));
     float flare = pow(smoothstep(0.52, 0.8, flareField), 2.0) * u_flash;
 
-    float ceiling = u_top * (0.34 + tongues * u_volatility) + flare * 0.85 * u_top;
+    float ceilingRaw = u_top * (0.34 + tongues * u_volatility) + flare * 0.85 * u_top;
+    // Soft-knee compression: tall tongues and flares squash toward 0.88
+    // instead of clipping, so flame tips always taper inside the canvas.
+    float knee = max(ceilingRaw - 0.6, 0.0);
+    float ceiling = min(ceilingRaw, 0.6) + 0.28 * (1.0 - exp(-knee / 0.28));
     ceiling = max(ceiling, 0.07);
 
     float h = uv.y / ceiling;
@@ -222,8 +242,10 @@ const FRAGMENT_SHADER_SOURCE = `
     color = mix(color, u_core, smoothstep(0.55, 0.92, heat));
     color = mix(color, vec3(1.0), smoothstep(0.9, 1.25, heat + (0.1 - uv.y) * 1.6) * 0.8);
 
-    float ember = emberLayer(p, t, 0.0, 0.5, 15.0)
-      + emberLayer(p, t, 13.0, 0.85, 23.0) * 0.8;
+    float ember = emberLayer(p, t, 0.0, 0.5, 15.0);
+    #ifdef DETAIL
+    ember += emberLayer(p, t, 13.0, 0.85, 23.0) * 0.8;
+    #endif
     float emberMask = smoothstep(0.03, 0.15, uv.y) * (1.0 - smoothstep(0.7, 1.0, uv.y));
     ember *= emberMask * u_sparks * (0.35 + 0.65 * flare + 0.4 * pulse);
     color += (mix(u_accent, u_core, 0.5) + 0.35) * ember;
@@ -233,7 +255,9 @@ const FRAGMENT_SHADER_SOURCE = `
 
     float alpha = fire * (0.8 + 0.35 * turb) + glow + ember;
     alpha *= u_intensity * pulse;
-    alpha *= 1.0 - smoothstep(0.86, 1.0, uv.y);
+    // The ceiling compressor keeps fire below 0.88, so this fade only grazes
+    // embers and glow instead of flattening flame tips.
+    alpha *= 1.0 - smoothstep(0.9, 1.0, uv.y);
     gl_FragColor = vec4(color, clamp(alpha, 0.0, 1.0));
   }
 `;
@@ -256,9 +280,9 @@ function compileShader(gl, type, source) {
   return shader;
 }
 
-function createProgram(gl) {
+function createProgram(gl, fragmentSource) {
   const vertexShader = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SOURCE);
-  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
   const program = gl.createProgram();
 
   if (!program) {
@@ -319,7 +343,7 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
     }
 
     try {
-      const program = createProgram(gl);
+      const program = createProgram(gl, buildFlameFragmentSource(preset.quality));
       const positionLocation = gl.getAttribLocation(program, "a_position");
       const uniforms = {
         accent: gl.getUniformLocation(program, "u_accent"),
@@ -365,11 +389,28 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-      function resize() {
+      let pendingWidth = 0;
+      let pendingHeight = 0;
+      let needsResize = false;
+
+      // Layout reads happen only on actual size changes; the render loop
+      // consumes the cached size so it never forces synchronous layout.
+      function measure() {
         const rect = canvas.getBoundingClientRect();
-        const ratio = Math.min(window.devicePixelRatio || 1, 2);
-        const width = Math.max(1, Math.floor(rect.width * ratio));
-        const height = Math.max(1, Math.floor(rect.height * ratio));
+        pendingWidth = rect.width;
+        pendingHeight = rect.height;
+        needsResize = true;
+      }
+
+      function applyResize() {
+        if (!needsResize) {
+          return;
+        }
+        needsResize = false;
+
+        const ratio = Math.min(window.devicePixelRatio || 1, preset.quality.ratio);
+        const width = Math.max(1, Math.floor(pendingWidth * ratio));
+        const height = Math.max(1, Math.floor(pendingHeight * ratio));
 
         if (canvas.width !== width || canvas.height !== height) {
           canvas.width = width;
@@ -379,7 +420,7 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       }
 
       function render(now) {
-        resize();
+        applyResize();
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
         gl.useProgram(program);
@@ -408,11 +449,19 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       }
 
       if (typeof ResizeObserver !== "undefined") {
-        resizeObserver = new ResizeObserver(resize);
+        resizeObserver = new ResizeObserver((entries) => {
+          const rect = entries[entries.length - 1]?.contentRect;
+          if (rect) {
+            pendingWidth = rect.width;
+            pendingHeight = rect.height;
+            needsResize = true;
+          }
+        });
         resizeObserver.observe(canvas);
       } else {
-        window.addEventListener("resize", resize);
+        window.addEventListener("resize", measure);
       }
+      measure();
 
       render(startTime);
 
@@ -423,7 +472,7 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
         if (resizeObserver) {
           resizeObserver.disconnect();
         } else {
-          window.removeEventListener("resize", resize);
+          window.removeEventListener("resize", measure);
         }
         if (buffer) {
           gl.deleteBuffer(buffer);
@@ -510,8 +559,8 @@ const FlameStage = styled.div`
   bottom: 0;
   left: 0;
   z-index: 0;
-  height: min(38vh, var(--flame-h));
-  min-height: min(26vh, var(--flame-h));
+  height: min(48vh, var(--flame-h));
+  min-height: min(30vh, var(--flame-h));
   pointer-events: none;
   isolation: isolate;
 

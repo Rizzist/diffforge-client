@@ -20,6 +20,7 @@ import { Link } from "@styled-icons/material-rounded/Link";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { Numbers } from "@styled-icons/material-rounded/Numbers";
 import { Public } from "@styled-icons/material-rounded/Public";
+import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
 import { Rectangle } from "@styled-icons/material-rounded/Rectangle";
 import { Send } from "@styled-icons/material-rounded/Send";
@@ -38,6 +39,7 @@ const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
 const SNIPPING_LIVE_PREVIEW_EVENT = "forge-snip-live-preview";
 const SNIPPING_FLOAT_ASSIGN_EVENT = "forge-snip-float-assign";
+const SNIPPING_FLOAT_DOCK_STATE_EVENT = "forge-snip-float-dock-state";
 const SNIPPING_FLOAT_DISPOSE_EVENT = "forge-snip-float-dispose";
 const SNIPPING_EDITOR_DISPOSE_EVENT = "forge-snip-editor-dispose";
 // ~22fps: frames are tiny (max edge capped below), so the encode+emit cost
@@ -630,6 +632,64 @@ function useFloatingWindowBody(kind) {
   }, [kind]);
 }
 
+function wheelDeltaPixels(event) {
+  const unit = event.deltaMode === 1
+    ? 32
+    : event.deltaMode === 2
+      ? Math.max(window.innerWidth || 0, window.innerHeight || 0, 1)
+      : 1;
+  return {
+    x: event.deltaX * unit,
+    y: event.deltaY * unit,
+  };
+}
+
+function useSnippingStripWheelScroll(enabled) {
+  const pendingRef = useRef({ x: 0, y: 0 });
+  const frameRef = useRef(0);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+
+    const flush = () => {
+      frameRef.current = 0;
+      const { x, y } = pendingRef.current;
+      pendingRef.current = { x: 0, y: 0 };
+      if (Math.abs(x) < 0.5 && Math.abs(y) < 0.5) return;
+      invoke("snipping_scroll_snip_strip", {
+        request: {
+          deltaX: x,
+          deltaY: y,
+        },
+      }).catch(() => {});
+    };
+
+    const onWheel = (event) => {
+      const delta = wheelDeltaPixels(event);
+      if (Math.abs(delta.x) < 0.5 && Math.abs(delta.y) < 0.5) return;
+      event.preventDefault();
+      event.stopPropagation();
+      pendingRef.current = {
+        x: pendingRef.current.x + delta.x,
+        y: pendingRef.current.y + delta.y,
+      };
+      if (!frameRef.current) {
+        frameRef.current = window.requestAnimationFrame(flush);
+      }
+    };
+
+    window.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      window.removeEventListener("wheel", onWheel, { passive: false });
+      if (frameRef.current) {
+        window.cancelAnimationFrame(frameRef.current);
+        frameRef.current = 0;
+      }
+      pendingRef.current = { x: 0, y: 0 };
+    };
+  }, [enabled]);
+}
+
 // Legacy dock route: snip previews are standalone draggable windows
 // (#/snipping-float) from the moment they are captured, so a leftover dock
 // window from an older session simply closes itself.
@@ -676,6 +736,7 @@ export function SnippingFloatWindow() {
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  const [docked, setDocked] = useState(false);
   const busyRef = useRef(false);
   // Rust watches the global cursor and arms the hover chrome — CSS :hover
   // alone never fires while this window is unfocused, which used to hide the
@@ -684,6 +745,7 @@ export function SnippingFloatWindow() {
   const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
+  useSnippingStripWheelScroll(docked && !closing);
 
   useEffect(() => {
     busyRef.current = busy;
@@ -735,12 +797,13 @@ export function SnippingFloatWindow() {
     let disposed = false;
     let unlisten = () => {};
     const ownLabel = getCurrentWindow().label;
-    const adopt = (path) => {
+    const adopt = (path, nextDocked = false) => {
       if (disposed || !path) return;
       closingRef.current = false;
       setClosing(false);
       setBusy(false);
       setStatus("");
+      setDocked(nextDocked === true);
       setHoverArmed(false);
       localPathRef.current = path;
       setLocalPath(path);
@@ -751,7 +814,7 @@ export function SnippingFloatWindow() {
     listen(SNIPPING_FLOAT_ASSIGN_EVENT, (event) => {
       const payload = event?.payload || {};
       if (text(payload.label) !== ownLabel) return;
-      adopt(text(payload.path));
+      adopt(text(payload.path), payload.docked === true);
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -764,7 +827,7 @@ export function SnippingFloatWindow() {
 
     if (!initialPath) {
       invoke("snipping_float_assigned_path")
-        .then((result) => adopt(text(result?.path)))
+        .then((result) => adopt(text(result?.path), result?.docked === true))
         .catch(() => {});
     }
 
@@ -773,6 +836,38 @@ export function SnippingFloatWindow() {
       unlisten();
     };
   }, [initialPath]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    const ownLabel = getCurrentWindow().label;
+
+    listen(SNIPPING_FLOAT_DOCK_STATE_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      if (text(payload.label) !== ownLabel) return;
+      setDocked(payload.docked === true);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    invoke("snipping_float_dock_state")
+      .then((result) => {
+        if (!disposed) setDocked(result?.docked === true);
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -913,6 +1008,20 @@ export function SnippingFloatWindow() {
     closeFloat();
   }, [closeFloat, localPath]);
 
+  const pinDockedFloat = useCallback(() => {
+    if (closingRef.current) return;
+    setBusy(true);
+    invoke("snipping_pin_snip_float", { label: getCurrentWindow().label })
+      .then(() => {
+        setDocked(false);
+        setBusy(false);
+      })
+      .catch((error) => {
+        setBusy(false);
+        showStatus(error?.message || String(error || "Unable to pin snip preview."));
+      });
+  }, [showStatus]);
+
   const runAction = useCallback(async (action) => {
     if (!localPath || busyRef.current || closingRef.current) return;
     const actionPath = localPath;
@@ -994,6 +1103,7 @@ export function SnippingFloatWindow() {
       <FloatWindowRoot
         data-busy={busy ? "true" : "false"}
         data-closing={closing ? "true" : "false"}
+        data-docked={docked ? "true" : "false"}
         data-hovered={hoverArmed ? "true" : "false"}
         onDoubleClick={() => runAction("edit")}
         onMouseDown={beginDrag}
@@ -1004,15 +1114,27 @@ export function SnippingFloatWindow() {
         ) : (
           <span data-empty="true">Preview unavailable</span>
         )}
-        <FloatCloseButton
-          aria-label={`Dismiss ${name}`}
-          disabled={closing}
-          onClick={dismissFloat}
-          title="Dismiss"
-          type="button"
-        >
-          <Close aria-hidden="true" />
-        </FloatCloseButton>
+        {docked ? (
+          <FloatPinButton
+            aria-label={`Pin ${name} on screen`}
+            disabled={busy || closing}
+            onClick={pinDockedFloat}
+            title="Pin on screen"
+            type="button"
+          >
+            <PushPin aria-hidden="true" />
+          </FloatPinButton>
+        ) : (
+          <FloatCloseButton
+            aria-label={`Dismiss ${name}`}
+            disabled={closing}
+            onClick={dismissFloat}
+            title="Dismiss"
+            type="button"
+          >
+            <Close aria-hidden="true" />
+          </FloatCloseButton>
+        )}
         <FloatUploadButton
           aria-label={snipUploadButtonTitle(uploadState, name)}
           data-state={uploadState}
@@ -1125,6 +1247,25 @@ const FloatWindowRoot = styled.main`
     opacity: 1;
     pointer-events: auto;
   }
+
+  &[data-docked="true"] {
+    border-radius: 9px;
+    clip-path: inset(0 round 9px);
+  }
+
+  &[data-docked="true"] > button {
+    transform: scale(0.84);
+    transform-origin: top left;
+  }
+
+  &[data-docked="true"] > button:nth-of-type(2) {
+    transform-origin: top right;
+  }
+
+  &[data-docked="true"] > div {
+    transform: translateX(-50%) scale(0.78);
+    transform-origin: bottom center;
+  }
 `;
 
 const FloatCloseButton = styled.button`
@@ -1153,8 +1294,7 @@ const FloatCloseButton = styled.button`
   }
 `;
 
-/* The strip tile's stand-in for the preview's close button: same slot, same
-   shape, but it pins (opens the draggable preview) instead of dismissing. */
+/* Docked previews use the close-button slot for an explicit pin action. */
 const FloatPinButton = styled.button`
   position: absolute;
   top: 6px;
@@ -1438,6 +1578,7 @@ export function SnippingStripWindow() {
   const lastCloseCueMsRef = useRef(0);
 
   useFloatingWindowBody("strip");
+  useSnippingStripWheelScroll(true);
 
   useEffect(() => {
     animPhaseRef.current = animPhase;
@@ -1532,7 +1673,7 @@ export function SnippingStripWindow() {
     <>
       <SnipFloatingGlobalStyle />
       <StripWindowShell data-anim={animPhase} data-origin={animOrigin}>
-        <StripCloseButton aria-label="Undock strip" onClick={closeStrip} title="Undock" type="button">
+        <StripCloseButton aria-label="Close dock" onClick={closeStrip} title="Close dock" type="button">
           <Close aria-hidden="true" />
         </StripCloseButton>
         <SnippingRecentStrip key={openNonce} />
@@ -2558,6 +2699,7 @@ export function SnippingAnnotationEditorWindow() {
             </EditorBatchStrip>
           )}
 
+          <EditorBody>
           <EditorStage ref={stageRef}>
             <EditorCanvasViewport ref={viewportRef}>
               <EditorCanvasSizer>
@@ -2648,27 +2790,6 @@ export function SnippingAnnotationEditorWindow() {
                 )}
               </EditorToolButton>
             </EditorActionCluster>
-            <EditorFloatingRail aria-label="Annotation tools">
-              {TOOL_GROUPS.map((group, groupIndex) => (
-                <Fragment key={group[0].id}>
-                  {groupIndex > 0 && <EditorRailDivider aria-hidden="true" />}
-                  <EditorToolGroup>
-                    {group.map((option) => (
-                      <EditorToolButton
-                        aria-label={option.label}
-                        data-active={isToolOptionActive(option)}
-                        key={option.id}
-                        onClick={() => selectTool(option)}
-                        title={option.label}
-                        type="button"
-                      >
-                        <option.Icon aria-hidden="true" />
-                      </EditorToolButton>
-                    ))}
-                  </EditorToolGroup>
-                </Fragment>
-              ))}
-            </EditorFloatingRail>
             {/* Style + contextual options live in one bottom pill: colors and
                 stroke size are always one click away, and the active tool
                 appends its own controls (shape kind/fill, blur strategy and
@@ -2807,6 +2928,32 @@ export function SnippingAnnotationEditorWindow() {
             </EditorOptionsBar>
           </EditorStage>
 
+          {/* The rail lives beside both the stage and the composer (the body
+              is its positioning context), so it can use the editor's full
+              height; auto margins inside center the tool stack when there is
+              extra room. */}
+          <EditorFloatingRail aria-label="Annotation tools">
+            {TOOL_GROUPS.map((group, groupIndex) => (
+              <Fragment key={group[0].id}>
+                {groupIndex > 0 && <EditorRailDivider aria-hidden="true" />}
+                <EditorToolGroup>
+                  {group.map((option) => (
+                    <EditorToolButton
+                      aria-label={option.label}
+                      data-active={isToolOptionActive(option)}
+                      key={option.id}
+                      onClick={() => selectTool(option)}
+                      title={option.label}
+                      type="button"
+                    >
+                      <option.Icon aria-hidden="true" />
+                    </EditorToolButton>
+                  ))}
+                </EditorToolGroup>
+              </Fragment>
+            ))}
+          </EditorFloatingRail>
+
           <EditorComposer onSubmit={queueTodo}>
             <EditorComposerInner>
               <input
@@ -2846,6 +2993,7 @@ export function SnippingAnnotationEditorWindow() {
               </EditorComposerControls>
             </EditorComposerInner>
           </EditorComposer>
+          </EditorBody>
         </EditorWindowRoot>
       </EditorViewport>
     </>
@@ -3635,6 +3783,18 @@ const EditorThumbButton = styled.button`
 // The canvas owns the whole stage; the tools float over it as a glass pill
 // hugging the artwork's left edge — annotation controls live "around the
 // thing", not in app chrome.
+/* Positioning context for the floating tool rail: spans the stage AND the
+   composer band, so the rail can run the editor's full height regardless of
+   how tall the title bar or batch strip above happen to be. */
+const EditorBody = styled.div`
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+`;
+
 const EditorStage = styled.section`
   position: relative;
   /* Flex centering, not grid: the canvas's max-width/max-height percentages
@@ -3718,9 +3878,9 @@ const EditorZoomReadout = styled.button`
   }
 `;
 
-/* The rail spans the stage's full height, top edge to bottom edge (the
-   options pill keeps clear of it via its own max-width), with the tool
-   groups centered via auto margins instead of justify-content —
+/* The rail spans the editor body's full height — stage plus composer band
+   (the centered composer leaves the bottom-left corner free) — with the
+   tool groups centered via auto margins instead of justify-content:
    overflow-safe, so a short window can still scroll to the first and last
    tool. */
 const EditorFloatingRail = styled.nav`
@@ -3728,6 +3888,7 @@ const EditorFloatingRail = styled.nav`
   left: 8px;
   top: 8px;
   bottom: 8px;
+  z-index: 6;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -4070,16 +4231,18 @@ const EditorComposer = styled.form`
   }
 `;
 
-/* One composer card, centered with a capped width (ChatGPT-style) so it
-   doesn't stretch edge to edge on wide editor windows: the prompt line sits
-   on top and the dispatch controls (workspace and terminal pickers
-   bottom-left, send bottom-right) dock inside the card's bottom edge. */
+/* One composer card, centered at ~72% of the editor width (ChatGPT-style)
+   so it never stretches edge to edge: the prompt line sits on top and the
+   dispatch controls (workspace and terminal pickers bottom-left, send
+   bottom-right) dock inside the card's bottom edge. The min-width keeps it
+   usable on small windows; the side gutters leave room for the full-height
+   tool rail on the left. */
 const EditorComposerInner = styled.div`
   display: flex;
   flex-direction: column;
   gap: 7px;
-  width: 100%;
-  max-width: 780px;
+  width: min(72%, 780px);
+  min-width: min(100%, 360px);
   margin: 0 auto;
   padding: 8px 9px 9px;
   border: 1px solid rgba(230, 236, 245, 0.12);

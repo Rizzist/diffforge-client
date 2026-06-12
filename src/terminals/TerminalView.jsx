@@ -7080,6 +7080,141 @@ function normalizeTodoQueueLifecycleStatus(value) {
   return "";
 }
 
+function getTodoQueueLifecycleProgressRank(status) {
+  const normalized = normalizeTodoQueueLifecycleStatus(status);
+  if (["completed", "cancelled", "deleted", "failed", "interrupted", "timed_out"].includes(normalized)) {
+    return 3;
+  }
+  if (["paused", "running"].includes(normalized)) {
+    return 2;
+  }
+  if (normalized === "queued") {
+    return 1;
+  }
+  return 0;
+}
+
+function todoQueueLifecycleStatusIsSettled(status) {
+  return ["completed", "cancelled", "deleted", "failed", "interrupted", "timed_out"]
+    .includes(normalizeTodoQueueLifecycleStatus(status));
+}
+
+function getTodoQueueExplicitLifecycleStatus(item) {
+  return normalizeTodoQueueLifecycleStatus(
+    item?.todoStatus
+      || item?.todo_status
+      || item?.cloudStatus
+      || item?.cloud_status
+      || item?.status,
+  );
+}
+
+function getTodoQueueLifecycleStatusUpdatedAt(item) {
+  return String(
+    item?.todoStatusUpdatedAt
+      || item?.todo_status_updated_at
+      || item?.statusUpdatedAt
+      || item?.status_updated_at
+      || "",
+  ).trim();
+}
+
+function todoQueueParsedTimeMs(value) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getTodoQueueLifecycleStatusUpdatedMs(item) {
+  return todoQueueParsedTimeMs(getTodoQueueLifecycleStatusUpdatedAt(item))
+    || todoQueueParsedTimeMs(item?.updatedAt || item?.updated_at);
+}
+
+function getTodoQueueSettledStatusEvidence(item) {
+  const candidates = [
+    {
+      status: "completed",
+      at: item?.todoCompletedAt || item?.todo_completed_at || item?.completedAt || item?.completed_at,
+    },
+    {
+      status: "cancelled",
+      at: item?.todoCancelledAt || item?.todo_cancelled_at || item?.cancelledAt || item?.cancelled_at || item?.canceledAt || item?.canceled_at,
+    },
+    {
+      status: "failed",
+      at: item?.todoFailedAt || item?.todo_failed_at || item?.failedAt || item?.failed_at,
+    },
+    {
+      status: "interrupted",
+      at: item?.todoInterruptedAt || item?.todo_interrupted_at || item?.interruptedAt || item?.interrupted_at,
+    },
+    {
+      status: "timed_out",
+      at: item?.todoTimedOutAt || item?.todo_timed_out_at || item?.timedOutAt || item?.timed_out_at || item?.timeoutAt || item?.timeout_at,
+    },
+    {
+      status: "deleted",
+      at: item?.todoDeletedAt || item?.todo_deleted_at || item?.deletedAt || item?.deleted_at,
+    },
+  ];
+  return candidates.reduce((best, candidate) => {
+    const at = String(candidate.at || "").trim();
+    if (!at) {
+      return best;
+    }
+    const atMs = todoQueueParsedTimeMs(at);
+    if (!best) {
+      return { status: candidate.status, at, atMs };
+    }
+    if (atMs > 0 && best.atMs > 0) {
+      return atMs > best.atMs ? { status: candidate.status, at, atMs } : best;
+    }
+    if (atMs > 0 && !best.atMs) {
+      return { status: candidate.status, at, atMs };
+    }
+    if (!atMs && !best.atMs && at > best.at) {
+      return { status: candidate.status, at, atMs };
+    }
+    return best;
+  }, null);
+}
+
+function todoQueueSettledEvidenceWins(item, explicitStatus, evidence) {
+  if (!evidence?.status) {
+    return false;
+  }
+  const settledRank = getTodoQueueLifecycleProgressRank(evidence.status);
+  const explicitRank = getTodoQueueLifecycleProgressRank(explicitStatus);
+  if (!settledRank || settledRank <= explicitRank) {
+    return false;
+  }
+  if (!normalizeTodoQueueLifecycleStatus(explicitStatus)) {
+    return true;
+  }
+  const statusMs = getTodoQueueLifecycleStatusUpdatedMs(item);
+  return !statusMs || !evidence.atMs || evidence.atMs >= statusMs;
+}
+
+function getTodoQueueCanonicalLifecycle(item, fallback = "") {
+  const explicitStatus = getTodoQueueExplicitLifecycleStatus(item);
+  const evidence = getTodoQueueSettledStatusEvidence(item);
+  if (todoQueueSettledEvidenceWins(item, explicitStatus, evidence)) {
+    return {
+      evidence,
+      status: evidence.status,
+      statusUpdatedAt: evidence.at,
+    };
+  }
+  return {
+    evidence: null,
+    status: explicitStatus || normalizeTodoQueueLifecycleStatus(fallback),
+    statusUpdatedAt: getTodoQueueLifecycleStatusUpdatedAt(item),
+  };
+}
+
+function getTodoQueueCanonicalLifecycleStatus(item, fallback = "") {
+  return getTodoQueueCanonicalLifecycle(item, fallback).status;
+}
+
 function normalizeTodoQueueDispatchAction(value) {
   const action = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
   if (["resume", "manual_resume", "resume_unfinished", "resume_unfinished_plan_tasks"].includes(action)) {
@@ -7182,14 +7317,7 @@ function getTodoQueueDispatchAction(item, source = "", fields = {}) {
   if (reasonText.includes("resume") && !reasonText.includes("retry") && !reasonText.includes("requeue")) {
     return "resume";
   }
-  const status = normalizeTodoQueueLifecycleStatus(
-    item?.todoStatus
-      || item?.todo_status
-      || item?.status
-      || item?.cloudStatus
-      || item?.cloud_status
-      || "",
-  );
+  const status = getTodoQueueCanonicalLifecycleStatus(item);
   if (status === "paused") {
     return "resume";
   }
@@ -7200,15 +7328,13 @@ function getTodoQueueDispatchAction(item, source = "", fields = {}) {
 }
 
 function getTodoQueueItemCloudStatus(item, pendingItem = null) {
+  const explicitStatus = getTodoQueueCanonicalLifecycleStatus(item);
+  if (todoQueueLifecycleStatusIsSettled(explicitStatus)) {
+    return explicitStatus;
+  }
   if (pendingItem) {
     return getTodoQueuePendingPhase(pendingItem) === "queued" ? "queued" : "running";
   }
-  const explicitStatus = normalizeTodoQueueLifecycleStatus(
-    item?.todoStatus
-      || item?.todo_status
-      || item?.cloudStatus
-      || item?.cloud_status,
-  );
   if (explicitStatus) {
     return explicitStatus;
   }
@@ -7225,18 +7351,27 @@ function getTodoQueueItemWithCloudStatus(item, status, fields = {}) {
   }
   const nextStatus = normalizeTodoQueueLifecycleStatus(status) || "listed";
   const updatedAt = String(fields.updatedAt || new Date().toISOString());
+  const completedAt = String(fields.completedAt || updatedAt);
+  const cancelledAt = String(fields.cancelledAt || fields.canceledAt || updatedAt);
+  const pausedAt = String(fields.pausedAt || fields.parkedAt || updatedAt);
+  const interruptedAt = String(fields.interruptedAt || updatedAt);
+  const timedOutAt = String(fields.timedOutAt || fields.timeoutAt || updatedAt);
+  const failedAt = String(fields.failedAt || updatedAt);
+  const deletedAt = String(fields.deletedAt || updatedAt);
   return {
     ...item,
+    status: nextStatus,
     todoStatus: nextStatus,
+    updatedAt,
     todoStatusUpdatedAt: updatedAt,
-    ...(nextStatus === "completed" ? { todoCompletedAt: String(fields.completedAt || updatedAt) } : {}),
-    ...(nextStatus === "cancelled" ? { todoCancelledAt: String(fields.cancelledAt || fields.canceledAt || updatedAt) } : {}),
-    ...(nextStatus === "paused" ? { todoPausedAt: String(fields.pausedAt || fields.parkedAt || updatedAt) } : {}),
-    ...(nextStatus === "interrupted" ? { todoInterruptedAt: String(fields.interruptedAt || updatedAt) } : {}),
-    ...(nextStatus === "timed_out" ? { todoTimedOutAt: String(fields.timedOutAt || fields.timeoutAt || updatedAt) } : {}),
-    ...(nextStatus === "failed" ? { todoFailedAt: String(fields.failedAt || updatedAt) } : {}),
-    ...(nextStatus === "deleted" ? { todoDeletedAt: String(fields.deletedAt || updatedAt) } : {}),
-    ...(fields.reason ? { todoStatusReason: String(fields.reason) } : {}),
+    ...(nextStatus === "completed" ? { completedAt, todoCompletedAt: completedAt } : {}),
+    ...(nextStatus === "cancelled" ? { cancelledAt, todoCancelledAt: cancelledAt } : {}),
+    ...(nextStatus === "paused" ? { pausedAt, todoPausedAt: pausedAt } : {}),
+    ...(nextStatus === "interrupted" ? { interruptedAt, todoInterruptedAt: interruptedAt } : {}),
+    ...(nextStatus === "timed_out" ? { timedOutAt, todoTimedOutAt: timedOutAt } : {}),
+    ...(nextStatus === "failed" ? { failedAt, todoFailedAt: failedAt } : {}),
+    ...(nextStatus === "deleted" ? { deletedAt, todoDeletedAt: deletedAt } : {}),
+    ...(fields.reason ? { statusReason: String(fields.reason), todoStatusReason: String(fields.reason) } : {}),
   };
 }
 
@@ -8079,13 +8214,7 @@ function getVoicePlanTaskLocalQueueState(planTask, items = [], pendingItems = {}
 }
 
 function getVoicePlanStatusFromWorkspaceTodo(todo) {
-  const status = normalizeTodoQueueLifecycleStatus(
-    todo?.todoStatus
-      || todo?.todo_status
-      || todo?.cloudStatus
-      || todo?.cloud_status
-      || todo?.status,
-  );
+  const status = getTodoQueueCanonicalLifecycleStatus(todo);
   if (status === "completed") return "done";
   if (status === "queued") return "queued";
   if (status === "running") return "running";
@@ -9862,13 +9991,7 @@ function getTodoQueueItemStorageIdentity(item) {
 }
 
 function getTodoQueueItemStorageStatus(item) {
-  const status = normalizeTodoQueueLifecycleStatus(
-    item?.todoStatus
-      || item?.todo_status
-      || item?.cloudStatus
-      || item?.cloud_status
-      || item?.status,
-  );
+  const status = getTodoQueueCanonicalLifecycleStatus(item);
   if (status) {
     return status;
   }
@@ -10353,8 +10476,9 @@ function createTodoQueueItem(text, options = {}) {
     ? { ...options.remoteCommand }
     : null;
   const queueState = normalizeTodoQueuePersistedQueueState(options);
-  const todoStatus = normalizeTodoQueueLifecycleStatus(options.todoStatus || options.todo_status || options.cloudStatus || options.cloud_status);
-  const todoStatusUpdatedAt = String(options.todoStatusUpdatedAt || options.todo_status_updated_at || "").trim();
+  const canonicalLifecycle = getTodoQueueCanonicalLifecycle(options);
+  const todoStatus = canonicalLifecycle.status;
+  const todoStatusUpdatedAt = String(canonicalLifecycle.statusUpdatedAt || "").trim();
   const todoCompletedAt = String(options.todoCompletedAt || options.todo_completed_at || options.completedAt || options.completed_at || "").trim();
   const todoCancelledAt = String(options.todoCancelledAt || options.todo_cancelled_at || options.cancelledAt || options.cancelled_at || options.canceledAt || options.canceled_at || "").trim();
   const todoPausedAt = String(options.todoPausedAt || options.todo_paused_at || options.pausedAt || options.paused_at || options.parkedAt || options.parked_at || "").trim();
@@ -10362,7 +10486,11 @@ function createTodoQueueItem(text, options = {}) {
   const todoTimedOutAt = String(options.todoTimedOutAt || options.todo_timed_out_at || options.timedOutAt || options.timed_out_at || options.timeoutAt || options.timeout_at || "").trim();
   const todoFailedAt = String(options.todoFailedAt || options.todo_failed_at || options.failedAt || options.failed_at || "").trim();
   const todoDeletedAt = String(options.todoDeletedAt || options.todo_deleted_at || options.deletedAt || options.deleted_at || "").trim();
-  const todoStatusReason = String(options.todoStatusReason || options.todo_status_reason || options.statusReason || options.status_reason || options.reason || "").trim();
+  const todoStatusReason = String(
+    canonicalLifecycle.evidence
+      ? options.reason || options.todoStatusReason || options.todo_status_reason || options.statusReason || options.status_reason || ""
+      : options.todoStatusReason || options.todo_status_reason || options.statusReason || options.status_reason || options.reason || "",
+  ).trim();
 
   return {
     createdAt,
@@ -10375,7 +10503,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(source ? { source } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
-    ...(todoStatus && todoStatus !== "listed" ? { todoStatus } : {}),
+    ...(todoStatus && todoStatus !== "listed" ? { status: todoStatus, todoStatus } : {}),
     ...(todoStatusUpdatedAt ? { todoStatusUpdatedAt } : {}),
     ...(todoCompletedAt ? { todoCompletedAt } : {}),
     ...(todoCancelledAt ? { todoCancelledAt } : {}),
@@ -10436,8 +10564,9 @@ function normalizeTodoQueueItem(item) {
       ? { ...item.remote_command }
       : null;
   const queueState = normalizeTodoQueuePersistedQueueState(item);
-  const todoStatus = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status || item.cloudStatus || item.cloud_status);
-  const todoStatusUpdatedAt = String(item.todoStatusUpdatedAt || item.todo_status_updated_at || "").trim();
+  const canonicalLifecycle = getTodoQueueCanonicalLifecycle(item);
+  const todoStatus = canonicalLifecycle.status;
+  const todoStatusUpdatedAt = String(canonicalLifecycle.statusUpdatedAt || "").trim();
   const todoCompletedAt = String(item.todoCompletedAt || item.todo_completed_at || item.completedAt || item.completed_at || "").trim();
   const todoCancelledAt = String(item.todoCancelledAt || item.todo_cancelled_at || item.cancelledAt || item.cancelled_at || item.canceledAt || item.canceled_at || "").trim();
   const todoPausedAt = String(item.todoPausedAt || item.todo_paused_at || item.pausedAt || item.paused_at || item.parkedAt || item.parked_at || "").trim();
@@ -10445,7 +10574,11 @@ function normalizeTodoQueueItem(item) {
   const todoTimedOutAt = String(item.todoTimedOutAt || item.todo_timed_out_at || item.timedOutAt || item.timed_out_at || item.timeoutAt || item.timeout_at || "").trim();
   const todoFailedAt = String(item.todoFailedAt || item.todo_failed_at || item.failedAt || item.failed_at || "").trim();
   const todoDeletedAt = String(item.todoDeletedAt || item.todo_deleted_at || item.deletedAt || item.deleted_at || "").trim();
-  const todoStatusReason = String(item.todoStatusReason || item.todo_status_reason || item.statusReason || item.status_reason || item.reason || "").trim();
+  const todoStatusReason = String(
+    canonicalLifecycle.evidence
+      ? item.reason || item.todoStatusReason || item.todo_status_reason || item.statusReason || item.status_reason || ""
+      : item.todoStatusReason || item.todo_status_reason || item.statusReason || item.status_reason || item.reason || "",
+  ).trim();
   if (!text && !images.length && !note) {
     return null;
   }
@@ -10463,7 +10596,7 @@ function normalizeTodoQueueItem(item) {
     ...(source ? { source } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
-    ...(todoStatus && todoStatus !== "listed" ? { todoStatus } : {}),
+    ...(todoStatus && todoStatus !== "listed" ? { status: todoStatus, todoStatus } : {}),
     ...(todoStatusUpdatedAt ? { todoStatusUpdatedAt } : {}),
     ...(todoCompletedAt ? { todoCompletedAt } : {}),
     ...(todoCancelledAt ? { todoCancelledAt } : {}),
@@ -11523,7 +11656,7 @@ function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId, de
         return null;
       }
       seen.add(key);
-      const status = normalizeWorkspaceTodoPeerStatus(item.todoStatus || item.todo_status || item.status);
+      const status = normalizeWorkspaceTodoPeerStatus(getTodoQueueCanonicalLifecycleStatus(item) || item.status);
       const text = normalizeTodoQueueMultilineText(
         item.todoText || item.todo_text || item.text || item.title || "Untitled todo",
         900,
@@ -15049,7 +15182,7 @@ function TerminalView({
       // that independent of pending-state attachment timing — direct-typed
       // prompts used to flash as a card in the race between the Rust capture
       // adoption and the prompt-submitted handler attaching pending state.
-      const lifecycleStatus = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status);
+      const lifecycleStatus = getTodoQueueCanonicalLifecycleStatus(item);
       if (lifecycleStatus === "running" || lifecycleStatus === "sending" || lifecycleStatus === "completed") {
         return false;
       }
@@ -21709,7 +21842,7 @@ function TerminalView({
         if (String(item?.id || "").trim() !== safeItemId) {
           return item;
         }
-        if (normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) === "running") {
+        if (getTodoQueueCanonicalLifecycleStatus(item) === "running") {
           return item;
         }
         changed = true;
@@ -22461,6 +22594,7 @@ function TerminalView({
             const attemptSubmittedAt = isRetry ? new Date().toISOString() : submittedAt;
             const submitTransactionData = terminalSubmitSequence;
             const submittedWaiter = await createTerminalPromptSubmittedWaiter({
+              allowObservedInputGateForHookManaged: true,
               agentId: targetRole,
               expectedPrompt: terminalText,
               instanceId: targetBinding?.instanceId,
@@ -23216,7 +23350,7 @@ function TerminalView({
       if (explicitItemIds.has(itemId)) {
         return true;
       }
-      const status = normalizeTodoQueueLifecycleStatus(item?.todoStatus || item?.todo_status);
+      const status = getTodoQueueCanonicalLifecycleStatus(item);
       if (status !== "queued" && status !== "listed") {
         return false;
       }
@@ -23244,7 +23378,7 @@ function TerminalView({
         if (!matchedIdSet.has(String(item?.id || "").trim())) {
           return item;
         }
-        const wasQueued = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) === "queued";
+        const wasQueued = getTodoQueueCanonicalLifecycleStatus(item) === "queued";
         const {
           queueState: _droppedQueueState,
           queue_state: _droppedQueueStateSnake,
@@ -23705,12 +23839,8 @@ function TerminalView({
             }
             const storeItem = storeById.get(itemId);
             if (storeItem) {
-              const storeStatus = normalizeTodoQueueLifecycleStatus(
-                storeItem.todoStatus || storeItem.todo_status,
-              );
-              const localStatus = normalizeTodoQueueLifecycleStatus(
-                item.todoStatus || item.todo_status,
-              );
+              const storeStatus = getTodoQueueCanonicalLifecycleStatus(storeItem);
+              const localStatus = getTodoQueueCanonicalLifecycleStatus(item);
               // Adopt settled flips from the store (sweep/cancel corrections);
               // live lifecycle (queued/sending/running) stays webview-owned.
               if (settledStatuses.has(storeStatus) && storeStatus !== localStatus) {
@@ -23761,9 +23891,7 @@ function TerminalView({
             }
             // The store retains settled rows as todo history; those belong to
             // the Todos History view, never to the live queue list.
-            const storeStatus = normalizeTodoQueueLifecycleStatus(
-              storeItem.todoStatus || storeItem.todo_status,
-            );
+            const storeStatus = getTodoQueueCanonicalLifecycleStatus(storeItem);
             if (settledStatuses.has(storeStatus)) {
               return;
             }
@@ -23889,7 +24017,7 @@ function TerminalView({
           if (String(item?.todoStatusReason || item?.todo_status_reason || "").trim() !== "todo_queue_backend_submit") {
             return item;
           }
-          if (normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) !== "running") {
+          if (getTodoQueueCanonicalLifecycleStatus(item) !== "running") {
             return item;
           }
           const commandId = String(
@@ -24093,7 +24221,7 @@ function TerminalView({
         if (!itemId) {
           return;
         }
-        const status = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status);
+        const status = getTodoQueueCanonicalLifecycleStatus(item);
         const hasInFlight = Array.from(todoQueueTerminalInFlightPromptsRef.current.values())
           .some((prompt) => String(prompt?.itemId || "").trim() === itemId);
         const pendingItem = todoQueuePendingItemsRef.current[itemId] || null;

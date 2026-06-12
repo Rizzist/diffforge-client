@@ -5365,6 +5365,9 @@ async fn cloud_mcp_start_remote_command_listener(
             cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
+            if cloud_mcp_remote_command_is_rust_owned(&event) {
+                continue;
+            }
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
             let (status, message) = if emit_result.is_ok() {
                 ("received", "Remote command received by desktop.")
@@ -6155,15 +6158,43 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
 /// window hidden in background/tray mode included. macOS uses the bundled
 /// app icon automatically; Windows/Linux get the Diff Forge logo from the
 /// bundled resource when present.
-fn cloud_mcp_show_native_notification(app: &AppHandle, title: &str, body: &str) -> bool {
-    let mut builder = app.notification().builder().title(title).body(body);
+fn cloud_mcp_show_native_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    match app.notification().permission_state() {
+        Ok(tauri::plugin::PermissionState::Denied) => {
+            return Err("Native notification permission is denied for Diff Forge AI.".to_string());
+        }
+        Ok(tauri::plugin::PermissionState::Prompt)
+        | Ok(tauri::plugin::PermissionState::PromptWithRationale) => {
+            if matches!(
+                app.notification().request_permission(),
+                Ok(tauri::plugin::PermissionState::Denied)
+            ) {
+                return Err(
+                    "Native notification permission was not granted for Diff Forge AI."
+                        .to_string(),
+                );
+            }
+        }
+        Ok(tauri::plugin::PermissionState::Granted) => {}
+        Err(error) => {
+            return Err(format!("Unable to read native notification permission: {error}"));
+        }
+    }
+    let builder = app.notification().builder().title(title).body(body);
     #[cfg(not(target_os = "macos"))]
     {
+        let mut builder = builder;
         if let Some(icon) = cloud_mcp_notification_icon_path(app) {
             builder = builder.icon(icon);
         }
+        return builder
+            .show()
+            .map_err(|error| format!("Unable to show native notification: {error}"));
     }
-    builder.show().is_ok()
+    #[cfg(target_os = "macos")]
+    builder
+        .show()
+        .map_err(|error| format!("Unable to show native notification: {error}"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -6238,6 +6269,8 @@ fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, e
             "notify" => {
                 let message = cloud_mcp_payload_text(&event, &["message", "text", "body"])
                     .or_else(|| cloud_mcp_payload_text(&event, &["payload", "message"]))
+                    .or_else(|| cloud_mcp_payload_text(&event, &["payload", "text"]))
+                    .or_else(|| cloud_mcp_payload_text(&event, &["payload", "body"]))
                     .unwrap_or_default();
                 if message.is_empty() {
                     let _ = cloud_mcp_send_remote_command_status_event(
@@ -6258,16 +6291,38 @@ fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, e
                         .or_else(|| {
                             cloud_mcp_payload_text(&event, &["payload", "notificationTitle"])
                         })
+                        .or_else(|| cloud_mcp_payload_text(&event, &["title"]))
+                        .or_else(|| cloud_mcp_payload_text(&event, &["payload", "title"]))
                         .unwrap_or_else(|| "Diff Forge AI".to_string());
-                let shown = cloud_mcp_show_native_notification(&app, &title, &message);
-                let (status, reply) = if shown {
-                    ("completed", "Notification shown on this desktop.")
-                } else {
-                    ("failed", "Notification could not be shown on this desktop.")
+                let notify_result = cloud_mcp_show_native_notification(&app, &title, &message);
+                let (status, reply, error) = match notify_result {
+                    Ok(()) => (
+                        "completed",
+                        "Notification shown on this desktop.",
+                        String::new(),
+                    ),
+                    Err(error) => (
+                        "failed",
+                        "Notification could not be shown on this desktop.",
+                        error,
+                    ),
                 };
-                let _ =
-                    cloud_mcp_send_remote_command_status_event(&state, &event, status, reply, None)
-                        .await;
+                let details = json!({
+                    "native_notification": status == "completed",
+                    "nativeNotification": status == "completed",
+                    "notification_title": title,
+                    "notificationTitle": title,
+                    "notification_error": error,
+                    "notificationError": error,
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    status,
+                    reply,
+                    Some(&details),
+                )
+                .await;
             }
             "account_switch" => {
                 let provider = cloud_mcp_payload_text(
@@ -6321,6 +6376,44 @@ fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, e
             _ => {}
         }
     });
+}
+
+fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
+    let command_kind =
+        cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .replace(['.', ' ', '-'], "_");
+    matches!(
+        command_kind.as_str(),
+        "agent_uninstall"
+            | "uninstall_agent"
+            | "cli_uninstall"
+            | "app_show_window"
+            | "show_window"
+            | "open_app_window"
+            | "app_open_window"
+            | "app_hide_window"
+            | "hide_window"
+            | "app_background"
+            | "hide_app_window"
+            | "device_notify"
+            | "notify_device"
+            | "device_notification"
+            | "send_notification"
+            | "agent_account_switch"
+            | "switch_agent_account"
+            | "agent_profile_switch"
+            | "account_switch"
+            | "terminal_output_status"
+            | "terminal_status"
+            | "terminal_output"
+            | "terminal_activity_status"
+            | "plan_release_stage"
+            | "release_plan_stage"
+            | "plan_release"
+            | "release_stage"
+    )
 }
 
 /// Answers `terminal_output_status`: resolves the target terminal from the
@@ -14232,6 +14325,26 @@ async fn cloud_mcp_sync_terminal_presence(
                     .or_else(|| terminal.get("inputReady"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                let pane_id = cloud_mcp_payload_text(
+                    terminal,
+                    &[
+                        "pane_id",
+                        "paneId",
+                        "target_terminal_id",
+                        "targetTerminalId",
+                    ],
+                );
+                let terminal_id = cloud_mcp_payload_text(
+                    terminal,
+                    &[
+                        "terminal_id",
+                        "terminalId",
+                        "target_terminal_id",
+                        "targetTerminalId",
+                        "pane_id",
+                        "paneId",
+                    ],
+                );
                 json!({
                     "device": device_profile.clone(),
                     "device_id": device_profile["device_id"].clone(),
@@ -14273,8 +14386,9 @@ async fn cloud_mcp_sync_terminal_presence(
                             "parkedTitle",
                         ],
                     ),
-                    "pane_id": cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]),
-                    "terminal_id": cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId", "pane_id", "paneId"]),
+                    "pane_id": pane_id,
+                    "terminal_id": terminal_id.clone(),
+                    "target_terminal_id": terminal_id,
                     "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
                     "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
                     "color_slot": cloud_mcp_payload_text(terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
@@ -14381,11 +14495,15 @@ async fn cloud_mcp_sync_terminal_presence(
         reason_for_ack.clone(),
     )
     .await;
+    let live_result =
+        cloud_mcp_send_device_workspace_snapshot_event(state.inner(), &reason_for_ack).await;
     Ok(cloud_mcp_background_sync_ack(
         "terminal_presence_snapshot",
         &sync_key,
         &reason_for_ack,
         json!({
+            "sent": live_result.is_ok(),
+            "send_error": live_result.err(),
             "stored": {
                 "stored_count": terminal_count,
                 "terminal_count": terminal_count,
@@ -14903,10 +15021,26 @@ async fn cloud_mcp_sync_terminal_status_event(
     .unwrap_or_else(|| "terminal.status".to_string());
     let command_phase = cloud_mcp_payload_text(&terminal, &["command_phase", "commandPhase"]);
     let execution_phase = cloud_mcp_payload_text(&terminal, &["execution_phase", "executionPhase"]);
-    let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]);
-    let terminal_id = cloud_mcp_payload_text(&terminal, &["terminal_id", "terminalId"])
-        .or_else(|| pane_id.clone())
-        .unwrap_or_else(|| "terminal".to_string());
+    let pane_id = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "pane_id",
+            "paneId",
+            "target_terminal_id",
+            "targetTerminalId",
+        ],
+    );
+    let terminal_id = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+        ],
+    )
+    .or_else(|| pane_id.clone())
+    .unwrap_or_else(|| "terminal".to_string());
     let terminal_instance_id = cloud_mcp_payload_u64(
         &terminal,
         &[
@@ -14982,7 +15116,8 @@ async fn cloud_mcp_sync_terminal_status_event(
         "workspace_runtime_epoch": workspace_runtime_epoch,
         "workspaceRuntimeEpoch": workspace_runtime_epoch,
         "display_name": terminal_nickname.clone(),
-        "terminal_id": terminal_id,
+        "terminal_id": terminal_id.clone(),
+        "target_terminal_id": terminal_id,
         "pane_id": pane_id,
         "terminal_instance_id": terminal_instance_id,
         "terminal_index": terminal_index,
@@ -18070,17 +18205,22 @@ async fn cloud_mcp_upload_workspace_asset(
             }
         }
     }
-    let prepared =
-        match cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/prepare-upload", &payload).await {
-            Ok(response) => {
-                cloud_mcp_asset_finish_process_reset(attached_process_reset, true);
-                response
-            }
-            Err(error) => {
-                cloud_mcp_asset_finish_process_reset(attached_process_reset, false);
-                return Err(error);
-            }
-        };
+    let prepared = match cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/workspace/assets/prepare-upload",
+        &payload,
+    )
+    .await
+    {
+        Ok(response) => {
+            cloud_mcp_asset_finish_process_reset(attached_process_reset, true);
+            response
+        }
+        Err(error) => {
+            cloud_mcp_asset_finish_process_reset(attached_process_reset, false);
+            return Err(error);
+        }
+    };
     let data = prepared.get("data").cloned().unwrap_or(prepared.clone());
     let upload_required = data
         .get("upload_required")
@@ -19396,9 +19536,7 @@ fn cloud_mcp_asset_process_reset_before() -> &'static str {
         .as_str()
 }
 
-fn cloud_mcp_asset_attach_process_reset_flag(
-    object: &mut serde_json::Map<String, Value>,
-) -> bool {
+fn cloud_mcp_asset_attach_process_reset_flag(object: &mut serde_json::Map<String, Value>) -> bool {
     if CLOUD_MCP_ASSET_REMOTE_PROCESS_RESET_STATE
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -19431,14 +19569,11 @@ fn cloud_mcp_asset_finish_process_reset(attached: bool, success: bool) {
     if !attached {
         return;
     }
-    CLOUD_MCP_ASSET_REMOTE_PROCESS_RESET_STATE.store(if success { 2 } else { 0 }, Ordering::Release);
+    CLOUD_MCP_ASSET_REMOTE_PROCESS_RESET_STATE
+        .store(if success { 2 } else { 0 }, Ordering::Release);
 }
 
-fn cloud_mcp_asset_transfer_row_interrupted(
-    row_json: &str,
-    now: &str,
-    reason: &str,
-) -> String {
+fn cloud_mcp_asset_transfer_row_interrupted(row_json: &str, now: &str, reason: &str) -> String {
     let mut row = serde_json::from_str::<Value>(row_json).unwrap_or_else(|_| json!({}));
     if let Some(object) = row.as_object_mut() {
         object.insert("status".to_string(), json!("interrupted"));
@@ -19726,8 +19861,10 @@ fn cloud_mcp_asset_local_copy_available(row: &Value) -> bool {
     {
         return explicit && !local_path.is_empty();
     }
-    let local_status =
-        cloud_mcp_asset_normalized_status(&cloud_mcp_asset_row_text(row, &["local_status", "localStatus"]));
+    let local_status = cloud_mcp_asset_normalized_status(&cloud_mcp_asset_row_text(
+        row,
+        &["local_status", "localStatus"],
+    ));
     if matches!(
         local_status.as_str(),
         "deleted" | "local-deleted" | "missing" | "not-found" | "unavailable"
@@ -19794,7 +19931,8 @@ fn cloud_mcp_asset_cloud_copy_available(row: &Value) -> bool {
 }
 
 fn cloud_mcp_asset_transfer_active_for_visibility(transfer: &Value) -> bool {
-    let status = cloud_mcp_asset_normalized_status(&cloud_mcp_asset_row_text(transfer, &["status"]));
+    let status =
+        cloud_mcp_asset_normalized_status(&cloud_mcp_asset_row_text(transfer, &["status"]));
     matches!(
         status.as_str(),
         "queued"

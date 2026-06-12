@@ -540,6 +540,26 @@ function todoWorkspaceLabel(item) {
 
 function todoUpdatedAt(item) {
   return recentTimestamp(
+    item?.todoCompletedAt,
+    item?.todo_completed_at,
+    item?.completedAt,
+    item?.completed_at,
+    item?.todoCancelledAt,
+    item?.todo_cancelled_at,
+    item?.cancelledAt,
+    item?.cancelled_at,
+    item?.todoFailedAt,
+    item?.todo_failed_at,
+    item?.failedAt,
+    item?.failed_at,
+    item?.todoInterruptedAt,
+    item?.todo_interrupted_at,
+    item?.interruptedAt,
+    item?.interrupted_at,
+    item?.todoTimedOutAt,
+    item?.todo_timed_out_at,
+    item?.timedOutAt,
+    item?.timed_out_at,
     item?.updatedAt,
     item?.updated_at,
     item?.queuedAt,
@@ -551,8 +571,8 @@ function todoUpdatedAt(item) {
   );
 }
 
-function todoDisplayStatus(item, fallback = "listed") {
-  const status = statusKey(
+function todoRawStatusText(item) {
+  return text(
     item?.dispatchStatus
       || item?.dispatch_status
       || item?.todoStatus
@@ -561,8 +581,70 @@ function todoDisplayStatus(item, fallback = "listed") {
       || item?.cloud_status
       || item?.status
       || item?.state,
-    fallback,
   );
+}
+
+function todoLifecycleRank(status) {
+  const key = statusKey(status, "");
+  if (["done", "failed", "stopped"].includes(key)) {
+    return 3;
+  }
+  if (["active", "paused"].includes(key)) {
+    return 2;
+  }
+  if (key === "queued") {
+    return 1;
+  }
+  return 0;
+}
+
+function todoStatusUpdatedAt(item) {
+  return recentTimestamp(
+    item?.todoStatusUpdatedAt,
+    item?.todo_status_updated_at,
+    item?.statusUpdatedAt,
+    item?.status_updated_at,
+  ) || recentTimestamp(
+    item?.updatedAt,
+    item?.updated_at,
+  );
+}
+
+function todoSettledEvidence(item) {
+  const candidates = [
+    { status: "done", at: firstText(item?.todoCompletedAt, item?.todo_completed_at, item?.completedAt, item?.completed_at) },
+    { status: "stopped", at: firstText(item?.todoCancelledAt, item?.todo_cancelled_at, item?.cancelledAt, item?.cancelled_at, item?.canceledAt, item?.canceled_at) },
+    { status: "failed", at: firstText(item?.todoFailedAt, item?.todo_failed_at, item?.failedAt, item?.failed_at) },
+    { status: "stopped", at: firstText(item?.todoInterruptedAt, item?.todo_interrupted_at, item?.interruptedAt, item?.interrupted_at) },
+    { status: "stopped", at: firstText(item?.todoTimedOutAt, item?.todo_timed_out_at, item?.timedOutAt, item?.timed_out_at, item?.timeoutAt, item?.timeout_at) },
+  ];
+  return candidates
+    .map((candidate) => ({ ...candidate, atMs: timestampMs(candidate.at) }))
+    .filter((candidate) => candidate.at)
+    .sort((left, right) => (right.atMs || 0) - (left.atMs || 0))[0] || null;
+}
+
+function todoLifecycleStatus(item, fallback = "listed") {
+  const rawText = todoRawStatusText(item);
+  const status = statusKey(rawText || fallback, fallback);
+  const evidence = todoSettledEvidence(item);
+  if (!evidence) {
+    return status;
+  }
+  const evidenceRank = todoLifecycleRank(evidence.status);
+  const statusRank = rawText ? todoLifecycleRank(status) : 0;
+  if (!evidenceRank || evidenceRank <= statusRank) {
+    return status;
+  }
+  const statusAt = todoStatusUpdatedAt(item);
+  if (!rawText || !statusAt || !evidence.atMs || evidence.atMs >= statusAt) {
+    return evidence.status;
+  }
+  return status;
+}
+
+function todoDisplayStatus(item, fallback = "listed") {
+  const status = todoLifecycleStatus(item, fallback);
   if (status === "queued") {
     return "queued";
   }
@@ -706,6 +788,28 @@ function normalizeOverviewTodoCards(overview) {
   return uniqueCards(cards);
 }
 
+function collectOverviewTodoIdentities(overview) {
+  const identities = new Set();
+  jsonArray(overview?.workspaces).forEach((workspace) => {
+    jsonArray(workspace?.items).forEach((item, index) => {
+      const object = jsonObject(item) || {};
+      [
+        todoIdentity(object, index),
+        object.commandId,
+        object.command_id,
+        object.dispatchId,
+        object.dispatch_id,
+        object.todoDispatchId,
+        object.todo_dispatch_id,
+      ]
+        .map(text)
+        .filter(Boolean)
+        .forEach((identity) => identities.add(identity));
+    });
+  });
+  return identities;
+}
+
 function normalizeTodoCards(status, workspaceId = "") {
   const workspaceTodos = workspaceTodosFromStatus(status);
   const listedCards = workspaceTodoCollection(
@@ -750,17 +854,7 @@ function normalizeTodoCards(status, workspaceId = "") {
 }
 
 function todoTerminalStatus(item) {
-  const status = statusKey(
-    item?.dispatchStatus
-      || item?.dispatch_status
-      || item?.todoStatus
-      || item?.todo_status
-      || item?.cloudStatus
-      || item?.cloud_status
-      || item?.status
-      || item?.state,
-    "",
-  );
+  const status = todoLifecycleStatus(item, "");
   if (["done", "failed", "stopped"].includes(status)) {
     return status;
   }
@@ -1383,6 +1477,10 @@ function RowGlyph({ celebrate = false, kind, status, tone }) {
     );
   } else if (state === "done") {
     shape = <path d="M2.8 6.3l2.2 2.3 4.2-4.7" />;
+  } else if (state === "listed") {
+    // Plain backlog todo: the same solid blue dot the orchestrator tab's
+    // todo list uses.
+    shape = <circle cx="6" cy="6" r="3" fill="currentColor" stroke="none" />;
   } else if (kind === "upload") {
     shape = (
       <>
@@ -1446,12 +1544,14 @@ export function ActivityOverlayPanel({ embedded = false }) {
   const todoCards = useMemo(() => {
     // Rust queue stores lead (running/queued/listed, headless truth); the
     // cloud mirror only adds peer-device rows behind them. Mirror cards for
-    // a todo the store already covers drop by todo identity, whichever lane
-    // prefix ("todo-" item rows vs "todo-dispatch-" dispatch rows) they use.
+    // a todo the store already knows drop by todo identity, even after the
+    // store's completed card ages out of the short finished window.
     const overviewCards = normalizeOverviewTodoCards(data.todoOverview);
-    const storeIdentities = new Set(
-      overviewCards.map((card) => String(card.id).replace(/^todo-/, "")),
-    );
+    const storeIdentities = collectOverviewTodoIdentities(data.todoOverview);
+    overviewCards
+      .map((card) => String(card.id).replace(/^todo-/, ""))
+      .filter(Boolean)
+      .forEach((identity) => storeIdentities.add(identity));
     const mirrorCards = normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, "")
       .filter((card) => !storeIdentities.has(
         String(card.id).replace(/^todo-dispatch-/, "").replace(/^todo-/, ""),
@@ -1704,9 +1804,12 @@ export function ActivityOverlayPanel({ embedded = false }) {
   const renderRow = useCallback((card, exit = null) => {
     const kind = hudCardKind(card);
     const state = exit ? exit.exitState : statusKey(card.status);
+    const isListedTodo = !exit && kind === "todo" && state === "listed";
     const tone = exit
       ? exit.exitState === "done" ? "good" : exit.exitState === "failed" ? "danger" : "muted"
-      : card.tone || statusTone(card.status);
+      : isListedTodo
+        ? "dot"
+        : card.tone || statusTone(card.status);
     const isTransfer = card.lane === "transfers";
     const progress = clampPercent(card.progress ?? statusProgress(card.status));
     const detail = isTransfer ? "" : text(card.detail);
@@ -1732,7 +1835,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
           <RowLine>
             <RowTitle>{card.title}</RowTitle>
             {detail ? <RowDetail>{detail}</RowDetail> : null}
-            <RowStatus data-tone={tone}>{statusLabel}</RowStatus>
+            {!isListedTodo && <RowStatus data-tone={tone}>{statusLabel}</RowStatus>}
           </RowLine>
           {!exit && isTransfer && !isTerminalTransferStatus(state) ? (
             <RowTrack aria-hidden="true">
@@ -2145,6 +2248,11 @@ const GlyphBadge = styled.span`
 
   &[data-tone="muted"] {
     color: rgba(107, 116, 128, 0.9);
+  }
+
+  /* Listed todos reuse the orchestrator todo list's solid blue dot color. */
+  &[data-tone="dot"] {
+    color: #8bb8ff;
   }
 
   &[data-spin="true"] > svg {

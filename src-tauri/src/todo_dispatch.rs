@@ -576,6 +576,10 @@ fn todo_dispatch_attention_should_notify(key: String) -> bool {
     true
 }
 
+fn todo_dispatch_normalize_activity_hook_event_type(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['_', ' '], "-")
+}
+
 /// Observe terminal activity hook lifecycle payloads at their Rust emit site.
 /// Handles: attention notifications (approval / user input required) and
 /// settlement of submitted receipts on provider turn completion.
@@ -584,7 +588,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     payload: &TerminalActivityHookPayload,
 ) {
     todo_dispatch_update_terminal_runtime(payload);
-    let event_type = payload.event_type.trim().to_ascii_lowercase();
+    let event_type = todo_dispatch_normalize_activity_hook_event_type(&payload.event_type);
 
     let needs_attention = payload.manual_approval_required
         || payload.terminal_is_prompting_user
@@ -746,6 +750,7 @@ fn todo_dispatch_queue_write(workspace_id: &str, items: &[Value]) {
     let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
         return;
     };
+    let items = todo_store_canonicalize_settled_items(items.iter().cloned().collect());
     let snapshot = json!({
         "workspaceId": workspace_id,
         "items": items,
@@ -1012,7 +1017,205 @@ fn todo_store_filter_tombstoned(
 }
 
 fn todo_store_item_status(item: &Value) -> String {
+    let explicit = todo_store_item_explicit_status(item);
+    if let Some((settled_status, settled_at)) = todo_store_item_settled_status_evidence(item) {
+        if todo_store_settled_evidence_wins(item, &explicit, &settled_status, &settled_at) {
+            return settled_status;
+        }
+    }
+    explicit
+}
+
+fn todo_store_item_explicit_status(item: &Value) -> String {
     todo_dispatch_text(item, &["todoStatus", "todo_status", "status"]).to_ascii_lowercase()
+}
+
+fn todo_store_item_status_stamp_ms(item: &Value) -> u64 {
+    let stamp = todo_dispatch_text(
+        item,
+        &[
+            "todoStatusUpdatedAt",
+            "todo_status_updated_at",
+            "statusUpdatedAt",
+            "status_updated_at",
+            "updatedAt",
+            "updated_at",
+        ],
+    );
+    todo_dispatch_parse_iso_ms(&stamp).unwrap_or(0)
+}
+
+fn todo_store_item_settled_status_evidence(item: &Value) -> Option<(String, String)> {
+    let evidence_fields: [(&str, &[&str]); 6] = [
+        (
+            "completed",
+            &[
+                "todoCompletedAt",
+                "todo_completed_at",
+                "completedAt",
+                "completed_at",
+            ],
+        ),
+        (
+            "cancelled",
+            &[
+                "todoCancelledAt",
+                "todo_cancelled_at",
+                "cancelledAt",
+                "cancelled_at",
+                "canceledAt",
+                "canceled_at",
+            ],
+        ),
+        (
+            "failed",
+            &["todoFailedAt", "todo_failed_at", "failedAt", "failed_at"],
+        ),
+        (
+            "interrupted",
+            &[
+                "todoInterruptedAt",
+                "todo_interrupted_at",
+                "interruptedAt",
+                "interrupted_at",
+            ],
+        ),
+        (
+            "timed_out",
+            &[
+                "todoTimedOutAt",
+                "todo_timed_out_at",
+                "timedOutAt",
+                "timed_out_at",
+                "timeoutAt",
+                "timeout_at",
+            ],
+        ),
+        (
+            "deleted",
+            &[
+                "todoDeletedAt",
+                "todo_deleted_at",
+                "deletedAt",
+                "deleted_at",
+            ],
+        ),
+    ];
+    let mut best: Option<(String, String, u64)> = None;
+    for (status, keys) in evidence_fields {
+        let at = todo_dispatch_text(item, keys);
+        if at.is_empty() {
+            continue;
+        }
+        let at_ms = todo_dispatch_parse_iso_ms(&at).unwrap_or(0);
+        let replace = match &best {
+            None => true,
+            Some((_, best_at, best_ms)) if at_ms > 0 && *best_ms > 0 => at_ms > *best_ms,
+            Some((_, _, best_ms)) if at_ms > 0 => *best_ms == 0,
+            Some((_, best_at, best_ms)) => *best_ms == 0 && at > *best_at,
+        };
+        if replace {
+            best = Some((status.to_string(), at, at_ms));
+        }
+    }
+    best.map(|(status, at, _)| (status, at))
+}
+
+fn todo_store_settled_evidence_wins(
+    item: &Value,
+    explicit_status: &str,
+    settled_status: &str,
+    settled_at: &str,
+) -> bool {
+    if settled_status.is_empty() {
+        return false;
+    }
+    let settled_rank = todo_store_status_rank(settled_status);
+    let explicit_rank = todo_store_status_rank(explicit_status);
+    if settled_rank == 0 || settled_rank <= explicit_rank {
+        return false;
+    }
+    if explicit_status.trim().is_empty() {
+        return true;
+    }
+    let status_ms = todo_store_item_status_stamp_ms(item);
+    let settled_ms = todo_dispatch_parse_iso_ms(settled_at).unwrap_or(0);
+    status_ms == 0 || settled_ms == 0 || settled_ms >= status_ms
+}
+
+fn todo_store_canonicalize_settled_evidence(item: &mut Value) -> bool {
+    let explicit_status = todo_store_item_explicit_status(item);
+    let Some((settled_status, settled_at)) = todo_store_item_settled_status_evidence(item) else {
+        return false;
+    };
+    if !todo_store_settled_evidence_wins(item, &explicit_status, &settled_status, &settled_at) {
+        return false;
+    }
+    let reason = todo_dispatch_text(
+        item,
+        &[
+            "reason",
+            "todoStatusReason",
+            "todo_status_reason",
+            "statusReason",
+            "status_reason",
+        ],
+    );
+    let reason = if reason.is_empty() {
+        "todo_store_settled_evidence".to_string()
+    } else {
+        reason
+    };
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    object.insert("todoStatus".to_string(), json!(settled_status.clone()));
+    object.insert("status".to_string(), json!(settled_status.clone()));
+    object.insert("todoStatusReason".to_string(), json!(reason.clone()));
+    object.insert("statusReason".to_string(), json!(reason));
+    object.insert("todoStatusUpdatedAt".to_string(), json!(settled_at.clone()));
+    object.insert("updatedAt".to_string(), json!(settled_at.clone()));
+    match settled_status.as_str() {
+        "completed" => {
+            object.insert("todoCompletedAt".to_string(), json!(settled_at.clone()));
+            object.insert("completedAt".to_string(), json!(settled_at.clone()));
+        }
+        "cancelled" => {
+            object.insert("todoCancelledAt".to_string(), json!(settled_at.clone()));
+            object.insert("cancelledAt".to_string(), json!(settled_at.clone()));
+        }
+        "failed" => {
+            object.insert("todoFailedAt".to_string(), json!(settled_at.clone()));
+            object.insert("failedAt".to_string(), json!(settled_at.clone()));
+        }
+        "interrupted" => {
+            object.insert("todoInterruptedAt".to_string(), json!(settled_at.clone()));
+            object.insert("interruptedAt".to_string(), json!(settled_at.clone()));
+        }
+        "timed_out" => {
+            object.insert("todoTimedOutAt".to_string(), json!(settled_at.clone()));
+            object.insert("timedOutAt".to_string(), json!(settled_at.clone()));
+        }
+        "deleted" => {
+            object.insert("todoDeletedAt".to_string(), json!(settled_at.clone()));
+            object.insert("deletedAt".to_string(), json!(settled_at.clone()));
+        }
+        _ => {}
+    }
+    if let Some(settled_ms) = todo_dispatch_parse_iso_ms(&settled_at) {
+        object.insert("updatedAtMs".to_string(), json!(settled_ms));
+    }
+    true
+}
+
+fn todo_store_canonicalize_settled_items(items: Vec<Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            todo_store_canonicalize_settled_evidence(&mut item);
+            item
+        })
+        .collect()
 }
 
 fn todo_store_item_pane_id(item: &Value) -> String {
@@ -1199,6 +1402,7 @@ async fn todo_store_snapshot(workspace_id: String) -> Result<Value, String> {
             .cloned()
             .unwrap_or_default();
         let (items, _) = todo_store_filter_tombstoned(items, &tombstoned);
+        let items = todo_store_canonicalize_settled_items(items);
         Ok(json!({
             "workspaceId": workspace_id,
             "items": items,
@@ -1969,7 +2173,9 @@ fn todo_store_status_rank(status: &str) -> u8 {
     match status {
         "queued" => 1,
         "sending" | "dispatching" | "running" => 2,
-        "completed" | "cancelled" | "failed" | "interrupted" | "timed_out" | "done" => 3,
+        "completed" | "cancelled" | "failed" | "interrupted" | "timed_out" | "deleted" | "done" => {
+            3
+        }
         _ => 0,
     }
 }
@@ -1999,11 +2205,13 @@ fn todo_store_apply_newer_store_status_core(
             else {
                 return item;
             };
-            let stored_status = todo_store_item_status(stored);
+            let mut stored = stored.clone();
+            todo_store_canonicalize_settled_evidence(&mut stored);
+            let stored_status = todo_store_item_status(&stored);
             if stored_status.is_empty() {
                 return item;
             }
-            let stored_at = todo_dispatch_text(stored, &["todoStatusUpdatedAt"]);
+            let stored_at = todo_dispatch_text(&stored, &["todoStatusUpdatedAt"]);
             let incoming_at = todo_dispatch_text(&item, &["todoStatusUpdatedAt"]);
             // Both sides stamp identical 24-char ISO; lexicographic compare
             // is chronological. The store only wins when strictly newer.
@@ -2017,7 +2225,7 @@ fn todo_store_apply_newer_store_status_core(
             // these rows only happen through the Rust doors
             // (todo_store_set_status / settlement), which write the store
             // directly with a fresh stamp.
-            let store_wins_by_rank = todo_store_item_is_rust_owned(stored)
+            let store_wins_by_rank = todo_store_item_is_rust_owned(&stored)
                 && todo_store_status_rank(&todo_store_item_status(&item))
                     < todo_store_status_rank(&stored_status);
             if !store_wins_by_stamp && !store_wins_by_rank {
@@ -2030,6 +2238,20 @@ fn todo_store_apply_newer_store_status_core(
                     "todoStatusReason",
                     "statusReason",
                     "todoStatusUpdatedAt",
+                    "updatedAt",
+                    "updatedAtMs",
+                    "todoCompletedAt",
+                    "completedAt",
+                    "todoCancelledAt",
+                    "cancelledAt",
+                    "todoFailedAt",
+                    "failedAt",
+                    "todoInterruptedAt",
+                    "interruptedAt",
+                    "todoTimedOutAt",
+                    "timedOutAt",
+                    "todoDeletedAt",
+                    "deletedAt",
                 ] {
                     if let Some(value) = stored.get(key) {
                         object.insert(key.to_string(), value.clone());
@@ -2277,6 +2499,7 @@ fn todo_dispatch_queue_mark_settled(
     };
     let mut changed = false;
     let mut completed_item_id = String::new();
+    let mut settled_items = Vec::new();
     let now_iso = chrono_like_now_iso();
     let next_items = items
         .into_iter()
@@ -2296,12 +2519,19 @@ fn todo_dispatch_queue_mark_settled(
                     object.insert("completedAt".to_string(), json!(now_iso.clone()));
                 }
             }
+            settled_items.push(item.clone());
             item
         })
         .collect::<Vec<_>>();
     if changed {
         todo_dispatch_queue_write(workspace_id, &next_items);
         if let Some(app) = app {
+            todo_store_push_corrections(
+                app,
+                workspace_id,
+                settled_items,
+                "todo_queue_backend_settled",
+            );
             todo_store_emit_changed(app, workspace_id, "todo_queue_backend_settled", "store");
         }
     }
@@ -2382,6 +2612,18 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn activity_hook_event_type_normalizes_provider_variants() {
+        assert_eq!(
+            todo_dispatch_normalize_activity_hook_event_type("provider_turn_completed"),
+            "provider-turn-completed"
+        );
+        assert_eq!(
+            todo_dispatch_normalize_activity_hook_event_type(" Provider Turn Error "),
+            "provider-turn-error"
+        );
+    }
+
+    #[test]
     fn tombstone_filter_passes_everything_when_no_tombstones() {
         let items = vec![json!({ "id": "a" }), json!({ "id": "b" })];
         let (kept, rejected) = todo_store_filter_tombstoned(items, &HashSet::new());
@@ -2415,6 +2657,72 @@ mod todo_store_tests {
         assert_eq!(item["statusReason"], "todo_history_cancel");
         assert!(item["updatedAtMs"].as_u64().unwrap() > 0);
         assert!(item["updatedAt"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn settled_evidence_overrides_stale_running_status_fields() {
+        let mut item = json!({
+            "id": "terminal-direct-1",
+            "todoStatus": "running",
+            "status": "running",
+            "todoStatusReason": "todo_queue_backend_submit",
+            "todoStatusUpdatedAt": "2026-06-12T18:52:33.543Z",
+            "completedAt": "2026-06-12T18:53:48.276Z",
+            "reason": "todo_queue_backend_settled",
+        });
+        assert_eq!(todo_store_item_status(&item), "completed");
+        assert!(todo_store_canonicalize_settled_evidence(&mut item));
+        assert_eq!(item["todoStatus"], "completed");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["todoStatusReason"], "todo_queue_backend_settled");
+        assert_eq!(item["statusReason"], "todo_queue_backend_settled");
+        assert_eq!(item["todoStatusUpdatedAt"], "2026-06-12T18:53:48.276Z");
+        assert_eq!(item["todoCompletedAt"], "2026-06-12T18:53:48.276Z");
+        assert_eq!(item["completedAt"], "2026-06-12T18:53:48.276Z");
+    }
+
+    #[test]
+    fn settled_evidence_does_not_override_fresh_requeue_status() {
+        let mut item = json!({
+            "id": "terminal-direct-1",
+            "todoStatus": "queued",
+            "status": "queued",
+            "todoStatusReason": "todo_history_queue",
+            "todoStatusUpdatedAt": "2026-06-12T18:55:00.000Z",
+            "completedAt": "2026-06-12T18:53:48.276Z",
+        });
+        assert_eq!(todo_store_item_status(&item), "queued");
+        assert!(!todo_store_canonicalize_settled_evidence(&mut item));
+        assert_eq!(item["todoStatus"], "queued");
+        assert_eq!(item["status"], "queued");
+        assert_eq!(item["todoStatusUpdatedAt"], "2026-06-12T18:55:00.000Z");
+    }
+
+    #[test]
+    fn newer_store_status_merge_copies_canonical_settled_fields() {
+        let stored = vec![json!({
+            "id": "terminal-direct-1",
+            "source": "terminal_direct",
+            "todoStatus": "running",
+            "status": "running",
+            "todoStatusReason": "todo_queue_backend_submit",
+            "todoStatusUpdatedAt": "2026-06-12T18:52:33.543Z",
+            "completedAt": "2026-06-12T18:53:48.276Z",
+        })];
+        let incoming = vec![json!({
+            "id": "terminal-direct-1",
+            "text": "hi",
+            "todoStatus": "running",
+            "status": "running",
+            "todoStatusUpdatedAt": "2026-06-12T18:52:33.543Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(todo_store_item_status(&merged[0]), "completed");
+        assert_eq!(merged[0]["todoStatus"], "completed");
+        assert_eq!(merged[0]["status"], "completed");
+        assert_eq!(merged[0]["completedAt"], "2026-06-12T18:53:48.276Z");
+        assert_eq!(merged[0]["todoCompletedAt"], "2026-06-12T18:53:48.276Z");
     }
 
     #[test]
@@ -3115,6 +3423,7 @@ async fn todo_dispatch_queue_sync(
             .filter(|item| item.is_object())
             .collect::<Vec<_>>();
         let (items, rejected_ids) = todo_store_filter_tombstoned(items, &tombstoned);
+        let items = todo_store_canonicalize_settled_items(items);
         let stored_items = todo_dispatch_data_path("queues", &workspace_id)
             .map(|path| {
                 todo_dispatch_queue_read(&path)
@@ -3124,6 +3433,7 @@ async fn todo_dispatch_queue_sync(
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        let stored_items = todo_store_canonicalize_settled_items(stored_items);
         let items = todo_store_keep_settled_sweep_flips_core(stored_items.clone(), items);
         // Status LWW: deliberate flips made through the store (history
         // Queue/Unqueue/retarget) outrank stale webview claims by stamp.
@@ -3200,9 +3510,16 @@ async fn todo_dispatch_queue_get(workspace_id: String) -> Result<Value, String> 
         let snapshot = todo_dispatch_data_path("queues", &workspace_id)
             .map(|path| todo_dispatch_queue_read(&path))
             .unwrap_or_else(|| json!({}));
+        let items = todo_store_canonicalize_settled_items(
+            snapshot
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
         Ok(json!({
             "workspaceId": workspace_id,
-            "items": snapshot.get("items").cloned().unwrap_or_else(|| json!([])),
+            "items": items,
             "updatedAtMs": snapshot.get("updatedAtMs").cloned().unwrap_or(json!(0)),
         }))
     })
@@ -3256,15 +3573,13 @@ async fn todo_dispatch_overview() -> Result<Value, String> {
                     .unwrap_or_default(),
                 &tombstoned,
             );
-            let items = kept_items
+            let items = todo_store_canonicalize_settled_items(kept_items)
                 .into_iter()
                 .map(|item| {
-                    let status = item
-                        .get("todoStatus")
-                        .or_else(|| item.get("status"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("listed")
-                        .to_string();
+                    let status = match todo_store_item_status(&item).as_str() {
+                        "" => "listed".to_string(),
+                        value => value.to_string(),
+                    };
                     let bucket = match status.as_str() {
                         "running" | "sending" | "submitted" | "paused" => "running",
                         "queued" => "queued",

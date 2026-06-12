@@ -1473,7 +1473,6 @@ function AssetsPanel({
             const transferFailed = transferStatus === "failed";
             const transferPercent = transfer ? assetTransferPercent(transfer) : 0;
             const transferLabel = transfer ? assetTransferDirectionLabel(transfer) : "";
-            const transferError = text(transfer?.error);
             const syncedDeviceNames = assetSyncedDeviceNames(asset);
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
             const localPath = assetLocalPath(asset);
@@ -1516,6 +1515,7 @@ function AssetsPanel({
 
             return (
               <AssetCard data-selected={selected ? "true" : "false"} data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
+                <AssetCardMedia>
                 <AssetCardPreview
                   aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
@@ -1711,6 +1711,7 @@ function AssetsPanel({
                     </AssetIconButton>
                   )}
                 </AssetCardActions>
+                </AssetCardMedia>
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
                   {localPath ? (
@@ -1726,11 +1727,6 @@ function AssetsPanel({
                   {isPublic && (
                     <AssetCardMetaLine title={publicUrl}>
                       Public link
-                    </AssetCardMetaLine>
-                  )}
-                  {transferFailed && !transferActive && (
-                    <AssetCardMetaLine data-failed="true" title={transferError || "Transfer failed."}>
-                      {`${transferLabel || "Transfer"} failed — retry available`}
                     </AssetCardMetaLine>
                   )}
                 </AssetCardCaption>
@@ -2225,6 +2221,7 @@ function UntrackedAssetsPanel({
 
             return (
               <AssetCard data-selected={selected ? "true" : "false"} data-status="parked" key={id} title={localPath || name}>
+                <AssetCardMedia>
                 <AssetCardPreview
                   aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
@@ -2341,6 +2338,7 @@ function UntrackedAssetsPanel({
                     <Delete aria-hidden="true" />
                   </AssetIconButton>
                 </AssetCardActions>
+                </AssetCardMedia>
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
                   {localPath ? (
@@ -3068,7 +3066,8 @@ const AssetGrid = styled.div`
 
 const AssetCard = styled.article`
   position: relative;
-  aspect-ratio: 1;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   overflow: hidden;
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -3131,6 +3130,16 @@ const AssetCard = styled.article`
   }
 `;
 
+/* Golden-ratio media stage, the same proportions as the floating snip
+   preview window; all hover chrome (status chip, select, action pill)
+   anchors to it, and the caption below makes the card a little taller. */
+const AssetCardMedia = styled.div`
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1.618;
+  overflow: hidden;
+`;
+
 const AssetCardPreview = styled.button`
   position: absolute;
   inset: 0;
@@ -3161,14 +3170,14 @@ const AssetDocumentPreview = styled.div`
   width: 100%;
   height: 100%;
   min-width: 0;
-  padding: 16px 14px 42px;
+  padding: 12px 14px;
   color: rgba(203, 213, 225, 0.78);
 `;
 
 const AssetDocumentGlyph = styled.div`
   position: relative;
-  width: 62px;
-  height: 72px;
+  width: 52px;
+  height: 60px;
 
   svg {
     width: 100%;
@@ -3178,7 +3187,7 @@ const AssetDocumentGlyph = styled.div`
 
   span {
     position: absolute;
-    top: 32px;
+    top: 27px;
     left: 50%;
     width: 36px;
     overflow: hidden;
@@ -3198,7 +3207,7 @@ const AssetPreviewImage = styled.img`
   inset: 0;
   width: 100%;
   height: 100%;
-  padding: 7px 7px 45px;
+  padding: 6px;
   object-fit: contain;
   object-position: center;
   background: rgba(2, 6, 23, 0.7);
@@ -3389,7 +3398,7 @@ const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
 const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   position: absolute;
   right: auto;
-  bottom: 34px;
+  bottom: 6px;
   left: 50%;
   z-index: 4;
   display: flex;
@@ -3452,15 +3461,12 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
 `;
 
 const AssetCardCaption = styled.div`
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 2;
+  flex: 1 0 auto;
   min-width: 0;
-  padding: 18px 8px 7px;
-  background: linear-gradient(180deg, transparent, rgba(2, 6, 23, 0.94) 42%);
-  pointer-events: none;
+  min-height: 34px;
+  padding: 6px 9px 7px;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+  background: rgba(2, 6, 23, 0.55);
 `;
 
 const AssetCardName = styled.strong`
@@ -3486,10 +3492,6 @@ const AssetCardMetaLine = styled.span`
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
-
-  &[data-failed="true"] {
-    color: rgba(254, 205, 211, 0.9);
-  }
 `;
 
 const AssetTransferOverlay = styled.div`

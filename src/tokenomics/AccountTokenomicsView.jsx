@@ -1081,6 +1081,32 @@ function hasKnownLimitPercent(limit = {}) {
   ) != null;
 }
 
+function limitDisplayPercentKind(limit = {}, fallbackWindowKind = "") {
+  const explicit = String(
+    limit.display_percent_kind
+      ?? limit.displayPercentKind
+      ?? limit.limit_display_percent_kind
+      ?? limit.limitDisplayPercentKind
+      ?? "",
+  ).toLowerCase();
+  if (explicit === "remaining" || explicit === "used") return explicit;
+  const windowKind = String(
+    fallbackWindowKind
+      || limit.window_kind
+      || limit.windowKind
+      || limit.limit_kind
+      || limit.limitKind
+      || "",
+  );
+  return windowKind === "weekly" ? "remaining" : "used";
+}
+
+function limitDisplayPercent(limit = {}, usedPercent = null, remainingPercent = null, fallbackWindowKind = "") {
+  const displayKind = limitDisplayPercentKind(limit, fallbackWindowKind);
+  const percent = displayKind === "remaining" ? remainingPercent : usedPercent;
+  return percent == null ? null : Math.max(0, Math.min(100, Math.round(percent)));
+}
+
 function isProviderResetEstimate(limit = {}) {
   if (!(limit?.client_estimated || limit?.clientEstimated)) return false;
   const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
@@ -1099,17 +1125,24 @@ function clientProjectedLimit(limit = {}) {
       resetAfterSeconds: secondsUntilReset,
     };
   }
+  const resetWindowKind = String(limit.window_kind || limit.windowKind || limit.limit_kind || limit.limitKind || "");
+  const resetDisplayKind = limitDisplayPercentKind(limit, resetWindowKind);
+  const resetDisplayPercent = resetDisplayKind === "remaining" ? 100 : 0;
   return {
     ...limit,
     used: 0,
     allowance: 100,
     remaining: 100,
-    used_percent: 100,
-    usedPercent: 100,
-    limit_used_percent: 100,
-    limitUsedPercent: 100,
+    used_percent: 0,
+    usedPercent: 0,
+    limit_used_percent: 0,
+    limitUsedPercent: 0,
     remaining_percent: 100,
     remainingPercent: 100,
+    display_percent: resetDisplayPercent,
+    displayPercent: resetDisplayPercent,
+    display_percent_kind: resetDisplayKind,
+    displayPercentKind: resetDisplayKind,
     reset_after_seconds: 0,
     resetAfterSeconds: 0,
     status_label: "Available",
@@ -1134,6 +1167,8 @@ function mergeLimits(limits, windowKind) {
       confidence: "unknown",
       remainingPercent: null,
       usedPercent: null,
+      displayPercent: null,
+      displayPercentKind: limitDisplayPercentKind({}, windowKind),
       paceDelta: 0,
       paceStatus: "unknown",
       overPace: false,
@@ -1147,11 +1182,15 @@ function mergeLimits(limits, windowKind) {
   const allowanceValues = rows.map((row) => numeric(row?.allowance)).filter((value) => value > 0);
   const allowance = allowanceValues.length ? allowanceValues.reduce((sum, value) => sum + value, 0) : null;
   const usedPercent = resetEstimated
-    ? 100
+    ? 0
     : allowance
       ? Math.max(0, Math.min(100, Math.round((used / allowance) * 100)))
       : null;
   const remainingPercent = resetEstimated ? 100 : (usedPercent == null ? null : Math.max(0, 100 - usedPercent));
+  const displayPercentKind = limitDisplayPercentKind(rows[0], windowKind);
+  const displayPercent = resetEstimated
+    ? (displayPercentKind === "remaining" ? 100 : 0)
+    : limitDisplayPercent(rows[0], usedPercent, remainingPercent, windowKind);
   const paceDelta = resetEstimated
     ? 0
     : Math.round(rows.reduce((sum, row) => sum + numeric(row?.pace_delta_percent, row?.paceDeltaPercent), 0) / rows.length);
@@ -1173,6 +1212,8 @@ function mergeLimits(limits, windowKind) {
     providerKeys,
     remainingPercent,
     usedPercent,
+    displayPercent,
+    displayPercentKind,
     paceDelta,
     paceStatus,
     overPace,
@@ -1404,10 +1445,15 @@ function statusTone(remainingPercent, paceDelta = 0, paceStatus = "unknown") {
   return "good";
 }
 
-function limitPercentTone(percent) {
+function limitPercentTone(percent, displayPercentKind = "used") {
   if (percent == null) return "unknown";
   const value = Number(percent);
   if (!Number.isFinite(value)) return "unknown";
+  if (displayPercentKind === "remaining") {
+    if (value <= 15) return "danger";
+    if (value <= 38) return "warn";
+    return "good";
+  }
   if (value >= 82) return "danger";
   if (value >= 62) return "warn";
   return "good";
@@ -2034,6 +2080,9 @@ function CostCell({ value }) {
 }
 
 function LimitMetricCard({ icon: Icon, limit, title }) {
+  const displayPercent = limit.displayPercent;
+  const displayKind = limit.displayPercentKind || "used";
+  const progressLabel = displayKind === "remaining" ? `${title} remaining` : `${title} used`;
   return (
     <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta, limit.paceStatus)}>
       <MetricHeading>
@@ -2042,12 +2091,15 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
           <span>{title}</span>
         </MetricName>
         <MetricScore>
-          <strong>{limit.usedPercent == null ? "—" : `${limit.usedPercent}%`}</strong>
+          <strong>{displayPercent == null ? "—" : `${displayPercent}%`}</strong>
           <span>{limit.paceDelta > 0 ? "▲" : "▼"}{Math.abs(limit.paceDelta)}%</span>
         </MetricScore>
       </MetricHeading>
-      <ProgressTrack aria-label={`${title} used`}>
-        <ProgressFill $tone={limitPercentTone(limit.usedPercent)} style={{ width: `${limit.usedPercent ?? 0}%` }} />
+      <ProgressTrack aria-label={progressLabel}>
+        <ProgressFill
+          $tone={limitPercentTone(displayPercent, displayKind)}
+          style={{ width: `${displayPercent ?? 0}%` }}
+        />
       </ProgressTrack>
       <MetricFoot>
         <span>{limit.resetLabel}</span>

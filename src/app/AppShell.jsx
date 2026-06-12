@@ -12340,7 +12340,7 @@ export default function App() {
     setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
   }, []);
 
-  const changeWorkspaceTerminalRole = useCallback(({ role, terminalIndex, threadId, workspaceId, startNewSession = false }) => {
+  const changeWorkspaceTerminalRole = useCallback(({ role, restart = false, terminalIndex, threadId, workspaceId, startNewSession = false }) => {
     if (!workspaceId) {
       return;
     }
@@ -12419,7 +12419,7 @@ export default function App() {
         targetTerminalIndex,
       );
 
-    if (previousRole === nextRole && (!roleThread?.id || roleThread.currentAgent === nextRole)) {
+    if (!restart && previousRole === nextRole && (!roleThread?.id || roleThread.currentAgent === nextRole)) {
       return;
     }
 
@@ -12463,7 +12463,7 @@ export default function App() {
         agentId: getWorkspaceTerminalPaneAgentId(previousRole),
         nextTerminalCount,
         previousTerminalCount: terminalCount,
-        reason: "terminal_role_switch",
+        reason: restart ? "terminal_restart" : "terminal_role_switch",
         terminalIndex: targetTerminalIndex,
         workspaceId,
       });
@@ -14610,12 +14610,17 @@ export default function App() {
               colorSlot,
               inputReady: Boolean(terminalLifecycle === "open" && readiness === "ready"),
               ...nativeRailFields,
+              pane_id: paneId,
               paneId,
               readiness,
               sessionState: terminalLifecycle === "open" ? "session_attached" : "no_session",
               status,
               statusSeq,
+              targetTerminalId: paneId,
+              target_terminal_id: paneId,
               terminalEpoch: `${paneId}:${terminalInstanceId || "0"}`,
+              terminalId: paneId,
+              terminal_id: paneId,
               terminalIndex,
               terminalInstanceId,
               terminalLifecycle,
@@ -18044,6 +18049,18 @@ export default function App() {
       }
       return "";
     };
+    const remoteCommandBooleanField = (event, keys) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      for (const key of keys) {
+        const value = event?.[key] ?? payload?.[key];
+        if (typeof value === "boolean") return value;
+        if (typeof value === "number") return value !== 0;
+        const text = String(value || "").trim().toLowerCase();
+        if (["1", "true", "yes", "on"].includes(text)) return true;
+        if (["0", "false", "no", "off"].includes(text)) return false;
+      }
+      return false;
+    };
     const remoteCommandObjectField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       for (const key of keys) {
@@ -18230,6 +18247,29 @@ export default function App() {
         ...(details && typeof details === "object" ? { details } : {}),
       }).catch(() => {})
     );
+    const remoteControlWorkspaceLifecycleDetails = (workspaceId, active, phase, details = {}) => ({
+      ...details,
+      lifecyclePhase: phase,
+      lifecycle_phase: phase,
+      workspaceActive: Boolean(active),
+      workspace_active: Boolean(active),
+      workspaceEffectiveActive: Boolean(active),
+      workspace_effective_active: Boolean(active),
+      workspaceId,
+      workspace_id: workspaceId,
+      workspaceStatus: active ? "active" : "deactivated",
+      workspace_status: active ? "active" : "deactivated",
+    });
+    const completeRemoteControlStateSync = (event, reason, lifecycleOverride, message, details = {}) => {
+      void (async () => {
+        await syncRemoteControlState(reason, lifecycleOverride);
+        await recordRemoteCommandStatus(event, "completed", message, {
+          ...details,
+          lifecyclePhase: "sync_complete",
+          lifecycle_phase: "sync_complete",
+        });
+      })();
+    };
     const remoteControlWorkspaceCatalogTargets = (lifecycleOverride = null) => {
       const overrideWorkspaceId = String(lifecycleOverride?.workspaceId || "").trim();
       const activeWorkspaceIds = new Set(normalizeEnabledWorkspaceIds([
@@ -18664,15 +18704,27 @@ export default function App() {
           });
           return;
         }
-        await syncRemoteControlState("remote_workspace_activate", {
+        const lifecycleOverride = {
           active: true,
           workspaceId,
-        });
-        await recordRemoteCommandStatus(event, "completed", "Workspace activated from the web dashboard.", {
+        };
+        const lifecycleDetails = remoteControlWorkspaceLifecycleDetails(workspaceId, true, "state_changed", {
           commandId,
           commandKind,
-          workspaceId,
         });
+        await recordRemoteCommandStatus(
+          event,
+          "state_changed",
+          "Workspace activated on this desktop; syncing live state.",
+          lifecycleDetails,
+        );
+        completeRemoteControlStateSync(
+          event,
+          "remote_workspace_activate",
+          lifecycleOverride,
+          "Workspace activation synced from this desktop.",
+          lifecycleDetails,
+        );
         return;
       }
       if (normalizedKind === "terminal_close_idle" || normalizedKind === "close_idle_terminal") {
@@ -18908,6 +18960,12 @@ export default function App() {
       }
       if (normalizedKind === "workspace_close_idle_terminals" || normalizedKind === "close_idle_terminals") {
         const { terminals } = findRemoteControlTerminal(workspaceId, target);
+        await recordRemoteCommandStatus(event, "running", "Closing idle terminals on this desktop.", {
+          commandId,
+          commandKind,
+          terminalCount: terminals.length,
+          workspaceId,
+        });
         const closeResults = [];
         const skipped = [];
         for (const terminal of terminals) {
@@ -18920,15 +18978,25 @@ export default function App() {
           }
           closeResults.push(await closeRemoteControlTerminal(workspaceId, terminal, target));
         }
-        await syncRemoteControlState("remote_workspace_close_idle_terminals");
-        await recordRemoteCommandStatus(event, "completed", `Closed ${closeResults.filter((item) => item.closed).length} idle terminal(s).`, {
+        const closedCount = closeResults.filter((item) => item.closed).length;
+        const lifecycleDetails = {
           closed: closeResults,
-          closedCount: closeResults.filter((item) => item.closed).length,
+          closedCount,
           commandId,
           commandKind,
+          lifecyclePhase: "state_changed",
+          lifecycle_phase: "state_changed",
           skipped,
           workspaceId,
-        });
+        };
+        await recordRemoteCommandStatus(event, "state_changed", `Closed ${closedCount} idle terminal(s); syncing live state.`, lifecycleDetails);
+        completeRemoteControlStateSync(
+          event,
+          "remote_workspace_close_idle_terminals",
+          null,
+          `Closed ${closedCount} idle terminal(s).`,
+          lifecycleDetails,
+        );
         return;
       }
       if (normalizedKind === "workspace_deactivate_if_idle" || normalizedKind === "deactivate_workspace_if_idle") {
@@ -18943,17 +19011,39 @@ export default function App() {
           });
           return;
         }
+        await recordRemoteCommandStatus(
+          event,
+          "running",
+          "Workspace is deactivating on this desktop.",
+          remoteControlWorkspaceLifecycleDetails(workspaceId, false, "deactivating", {
+            commandId,
+            commandKind,
+            terminalCount: terminals.length,
+          }),
+        );
         await deactivateWorkspace(workspaceId, "remote_control");
-        await syncRemoteControlState("remote_workspace_deactivate_if_idle", {
+        const lifecycleOverride = {
           active: false,
           workspaceId,
-        });
-        await recordRemoteCommandStatus(event, "completed", "Workspace deactivated from the web dashboard.", {
+        };
+        const lifecycleDetails = remoteControlWorkspaceLifecycleDetails(workspaceId, false, "state_changed", {
           commandId,
           commandKind,
           terminalCount: terminals.length,
-          workspaceId,
         });
+        await recordRemoteCommandStatus(
+          event,
+          "state_changed",
+          "Workspace deactivated on this desktop; syncing live state.",
+          lifecycleDetails,
+        );
+        completeRemoteControlStateSync(
+          event,
+          "remote_workspace_deactivate_if_idle",
+          lifecycleOverride,
+          "Workspace deactivation synced from this desktop.",
+          lifecycleDetails,
+        );
         return;
       }
       if ([
@@ -18961,9 +19051,23 @@ export default function App() {
         "relaunch_terminal_agent",
         "relaunch_terminal",
         "terminal_relaunch",
+        "terminal_restart",
+        "terminal_restart_agent",
+        "restart_terminal",
+        "restart_terminal_agent",
         "terminal_switch_agent",
         "switch_terminal_agent",
       ].includes(normalizedKind)) {
+        const restartRequested = [
+          "terminal_restart",
+          "terminal_restart_agent",
+          "restart_terminal",
+          "restart_terminal_agent",
+        ].includes(normalizedKind) || remoteCommandBooleanField(event, [
+          "restart",
+          "terminal_restart",
+          "terminalRestart",
+        ]);
         const nextAgentId = normalizeManagedAgentProviderId(
           agentId
             || remoteCommandStringField(event, [
@@ -19009,7 +19113,7 @@ export default function App() {
         }
         const previousAgentId = remoteControlTerminalText(terminal, ["agentId", "agent_id", "agentKind", "agent_kind"]);
         const terminalLooksOpen = Boolean(terminal) && !remoteControlTerminalLooksClosed(terminal);
-        if (previousAgentId && previousAgentId === nextAgentId && terminalLooksOpen) {
+        if (!restartRequested && previousAgentId && previousAgentId === nextAgentId && terminalLooksOpen) {
           await recordRemoteCommandStatus(event, "completed", `Terminal is already running ${getManagedAgentLabel(nextAgentId)}.`, {
             agentId: nextAgentId,
             commandId,
@@ -19020,7 +19124,9 @@ export default function App() {
           return;
         }
         const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]) || targetThreadId;
-        await recordRemoteCommandStatus(event, "running", `Relaunching terminal as ${getManagedAgentLabel(nextAgentId)}.`, {
+        await recordRemoteCommandStatus(event, "running", restartRequested
+          ? `Restarting terminal as ${getManagedAgentLabel(nextAgentId)}.`
+          : `Relaunching terminal as ${getManagedAgentLabel(nextAgentId)}.`, {
           agentId: nextAgentId,
           commandId,
           commandKind,
@@ -19031,6 +19137,7 @@ export default function App() {
         // Same path as the desktop's own agent switcher: the role change
         // closes the pane and the runtime relaunches it with the new CLI.
         changeWorkspaceTerminalRole({
+          restart: restartRequested,
           role: nextAgentId,
           source: "remote_control_relaunch",
           terminalIndex,
@@ -19038,7 +19145,9 @@ export default function App() {
           workspaceId,
         });
         await syncRemoteControlState("remote_terminal_relaunch_agent");
-        await recordRemoteCommandStatus(event, "completed", `Terminal relaunched as ${getManagedAgentLabel(nextAgentId)} from the web dashboard.`, {
+        await recordRemoteCommandStatus(event, "completed", restartRequested
+          ? `Terminal restarted as ${getManagedAgentLabel(nextAgentId)} from the web dashboard.`
+          : `Terminal relaunched as ${getManagedAgentLabel(nextAgentId)} from the web dashboard.`, {
           agentId: nextAgentId,
           commandId,
           commandKind,

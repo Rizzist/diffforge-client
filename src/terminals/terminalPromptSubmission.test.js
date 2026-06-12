@@ -35,6 +35,34 @@ test("frontend prompt metadata cannot prove submission by itself", () => {
   }), false);
 });
 
+test("backend prompt metadata submit is authoritative after an enter write", () => {
+  assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
+    expectedPrompt: "what else is there",
+    prompt: "what else is there",
+    promptMatch: true,
+    promptSource: "prompt_event_submit_metadata",
+  }), true);
+
+  assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
+    expectedPrompt: "what else is there",
+    prompt: "",
+    promptMatch: true,
+    promptSource: "prompt_event_submit_metadata",
+  }), true);
+
+  assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
+    promptMatch: true,
+    promptSource: "prompt_event_submit_metadata",
+  }), false);
+
+  assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
+    expectedPrompt: "what else is there",
+    prompt: "different prompt",
+    promptMatch: false,
+    promptSource: "prompt_event_submit_metadata",
+  }), false);
+});
+
 test("parked resume backend submit remains authoritative", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
     expectedPrompt: "continue",

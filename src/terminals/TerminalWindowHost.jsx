@@ -28,6 +28,7 @@ import {
   TerminalStateDebugBadge,
 } from "../app/appStyles.js";
 import { measureTerminalGrid } from "./terminalResizeController";
+import { guardXtermDuringPushToTalk } from "./xtermPushToTalkGuard.js";
 import {
   TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
   TERMINAL_WINDOW_CONTROL_EVENT,
@@ -248,6 +249,7 @@ export default function TerminalWindowHost() {
     let resizeTimer = 0;
     let reattachTimer = 0;
     let detachResize = () => {};
+    let detachPushToTalkGuard = () => {};
 
     const fitTerminal = () => {
       if (disposed || !term) {
@@ -384,6 +386,10 @@ export default function TerminalWindowHost() {
       const isLightTheme = document.documentElement.dataset.forgeTheme === "light";
       term = new XTerm({
         allowProposedApi: false,
+        // Alt+click must never synthesize arrow keys: agent CLIs treat Up as
+        // history recall, so a stray Option+click would paste the previous
+        // prompt into the composer.
+        altClickMovesCursor: false,
         convertEol: false,
         cursorBlink: true,
         cursorStyle: "block",
@@ -399,6 +405,7 @@ export default function TerminalWindowHost() {
         theme: isLightTheme ? TERMINAL_LIGHT_THEME : TERMINAL_DARK_THEME,
       });
       term.open(container);
+      detachPushToTalkGuard = guardXtermDuringPushToTalk(term);
 
       term.onData((data) => {
         invoke("terminal_write", { paneId, data }).catch(() => {});
@@ -426,6 +433,7 @@ export default function TerminalWindowHost() {
         window.clearTimeout(reattachTimer);
       }
       detachResize();
+      detachPushToTalkGuard();
       try {
         socket?.close();
       } catch {

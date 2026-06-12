@@ -6176,6 +6176,22 @@ fn tokenomics_limit_effective_window_seconds(window_kind: &str, seconds: Option<
         .unwrap_or_else(|| tokenomics_limit_default_window_seconds(window_kind))
 }
 
+fn tokenomics_limit_display_percent_kind(window_kind: &str) -> &'static str {
+    if window_kind == "weekly" {
+        "remaining"
+    } else {
+        "used"
+    }
+}
+
+fn tokenomics_limit_display_percent(window_kind: &str, used_percent: i64, remaining_percent: i64) -> i64 {
+    if tokenomics_limit_display_percent_kind(window_kind) == "remaining" {
+        remaining_percent
+    } else {
+        used_percent
+    }
+}
+
 fn tokenomics_limit_pace_snapshot(
     used_percent: i64,
     limit_window_seconds: i64,
@@ -6308,6 +6324,9 @@ fn tokenomics_codex_window_snapshot(
         .unwrap_or(0)
         .clamp(0, 100);
     let remaining_percent = (100 - used_percent).clamp(0, 100);
+    let display_percent_kind = tokenomics_limit_display_percent_kind(window_kind);
+    let display_percent =
+        tokenomics_limit_display_percent(window_kind, used_percent, remaining_percent);
     let reset_after_seconds_value =
         tokenomics_value_i64(window, &["reset_after_seconds", "resetAfterSeconds"]);
     let reset_after_seconds = reset_after_seconds_value.unwrap_or(0);
@@ -6351,6 +6370,14 @@ fn tokenomics_codex_window_snapshot(
         "remaining": remaining_percent,
         "used_percent": used_percent,
         "remaining_percent": remaining_percent,
+        "display_percent": display_percent,
+        "displayPercent": display_percent,
+        "limit_display_percent": display_percent,
+        "limitDisplayPercent": display_percent,
+        "display_percent_kind": display_percent_kind,
+        "displayPercentKind": display_percent_kind,
+        "limit_display_percent_kind": display_percent_kind,
+        "limitDisplayPercentKind": display_percent_kind,
         "status_label": tokenomics_codex_status_label(remaining_percent, limit_reached, allowed),
         "reset_label": tokenomics_reset_label(reset_at, reset_after_seconds),
         "reset_after_seconds": reset_after_seconds,
@@ -6583,6 +6610,9 @@ fn tokenomics_claude_window_snapshot(
     .clamp(0, 100);
     let used_percent = provider_reported_percent;
     let remaining_percent = (100 - used_percent).clamp(0, 100);
+    let display_percent_kind = tokenomics_limit_display_percent_kind(window_kind);
+    let display_percent =
+        tokenomics_limit_display_percent(window_kind, used_percent, remaining_percent);
     let reset_at = tokenomics_value_string(
         window,
         &[
@@ -6634,6 +6664,14 @@ fn tokenomics_claude_window_snapshot(
         "remaining": remaining_percent,
         "used_percent": used_percent,
         "remaining_percent": remaining_percent,
+        "display_percent": display_percent,
+        "displayPercent": display_percent,
+        "limit_display_percent": display_percent,
+        "limitDisplayPercent": display_percent,
+        "display_percent_kind": display_percent_kind,
+        "displayPercentKind": display_percent_kind,
+        "limit_display_percent_kind": display_percent_kind,
+        "limitDisplayPercentKind": display_percent_kind,
         "provider_reported_percent": provider_reported_percent,
         "provider_reported_direction": "used",
         "status_label": tokenomics_claude_status_label(remaining_percent),
@@ -6708,6 +6746,14 @@ fn tokenomics_unknown_limit_snapshot(
         "remaining": Value::Null,
         "used_percent": Value::Null,
         "remaining_percent": Value::Null,
+        "display_percent": Value::Null,
+        "displayPercent": Value::Null,
+        "limit_display_percent": Value::Null,
+        "limitDisplayPercent": Value::Null,
+        "display_percent_kind": tokenomics_limit_display_percent_kind(window_kind),
+        "displayPercentKind": tokenomics_limit_display_percent_kind(window_kind),
+        "limit_display_percent_kind": tokenomics_limit_display_percent_kind(window_kind),
+        "limitDisplayPercentKind": tokenomics_limit_display_percent_kind(window_kind),
         "status_label": status_label,
         "reset_label": reset_label,
         "rate_points": [],
@@ -8321,6 +8367,8 @@ mod tokenomics_tests {
 
         assert_eq!(snapshot["used_percent"], json!(95));
         assert_eq!(snapshot["remaining_percent"], json!(5));
+        assert_eq!(snapshot["display_percent"], json!(95));
+        assert_eq!(snapshot["display_percent_kind"], json!("used"));
         assert_eq!(snapshot["provider_reported_percent"], json!(95));
         assert_eq!(snapshot["provider_reported_direction"], json!("used"));
         assert_eq!(snapshot["pace_status"], json!("over_pace"));
@@ -8359,12 +8407,16 @@ mod tokenomics_tests {
         assert_eq!(limits[0]["limit_source"], json!("claude_oauth_usage_api"));
         assert_eq!(limits[0]["used_percent"], json!(95));
         assert_eq!(limits[0]["remaining_percent"], json!(5));
+        assert_eq!(limits[0]["display_percent"], json!(95));
+        assert_eq!(limits[0]["display_percent_kind"], json!("used"));
         assert_eq!(limits[0]["provider_reported_percent"], json!(95));
         assert_eq!(limits[0]["provider_reported_direction"], json!("used"));
         assert_eq!(limits[0]["reset_after_seconds"], json!(3600));
         assert_eq!(limits[1]["window_kind"], json!("weekly"));
         assert_eq!(limits[1]["used_percent"], json!(20));
         assert_eq!(limits[1]["remaining_percent"], json!(80));
+        assert_eq!(limits[1]["display_percent"], json!(80));
+        assert_eq!(limits[1]["display_percent_kind"], json!("remaining"));
     }
 
     #[test]
@@ -8522,7 +8574,40 @@ mod tokenomics_tests {
         );
 
         assert_eq!(snapshot["remaining_percent"], json!(2));
+        assert_eq!(snapshot["display_percent"], json!(98));
+        assert_eq!(snapshot["display_percent_kind"], json!("used"));
         assert_eq!(snapshot["updated_at"], json!("unix:2010"));
         assert_eq!(snapshot["last_known_at"], json!("unix:2010"));
+    }
+
+    #[test]
+    fn tokenomics_codex_weekly_limit_snapshot_displays_remaining_percent() {
+        let account = TokenomicsProviderAccount {
+            key: "openai:codex:test".to_string(),
+            label: "Codex account test".to_string(),
+        };
+        let snapshot = tokenomics_codex_window_snapshot(
+            "weekly",
+            "Weekly Limit",
+            "ChatGPT Pro",
+            "codex_usage_api",
+            &json!({
+                "used_percent": 62,
+                "reset_after_seconds": 99 * 60 * 60,
+            }),
+            &json!({
+                "allowed": true,
+                "limit_reached": false,
+            }),
+            &json!({}),
+            "unix:2010",
+            &account,
+        );
+
+        assert_eq!(snapshot["used_percent"], json!(62));
+        assert_eq!(snapshot["remaining_percent"], json!(38));
+        assert_eq!(snapshot["display_percent"], json!(38));
+        assert_eq!(snapshot["display_percent_kind"], json!("remaining"));
+        assert_eq!(snapshot["pace_status"], json!("over_pace"));
     }
 }

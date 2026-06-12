@@ -9754,6 +9754,7 @@ fn terminal_prompt_submitted_source_is_authoritative(
         "observed_input_gate" => observed_prompt
             .map(str::trim)
             .is_some_and(|value| !value.is_empty()),
+        "prompt_event_submit_metadata" => true,
         "parked_resume_backend_submit"
         | "crash_todo_resume_backend_submit"
         | "todo_queue_backend_submit" => true,
@@ -10932,6 +10933,61 @@ async fn terminal_write_inner(
                         "original_data": original_data_diagnostic.clone(),
                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
                         "prompt_prefix": clean_terminal_diagnostic_log_text(event_prompt.split_whitespace().next().unwrap_or_default()),
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    },
+                }));
+                return Ok(());
+            }
+            if data.contains('\r') || data.contains('\n') {
+                emit_terminal_prompt_submitted(
+                    &app,
+                    &instance,
+                    &event_prompt,
+                    prompt_event_id.as_deref(),
+                    prompt_event_revision,
+                    prompt_event_source.as_deref(),
+                    prompt_event_submitted_at.as_deref(),
+                    todo_id.as_deref(),
+                    todo_dispatch_id.as_deref(),
+                    todo_command_id.as_deref(),
+                    todo_action.as_deref(),
+                    todo_resume_requested.unwrap_or(false),
+                    Some(&event_prompt),
+                    None,
+                    true,
+                    "prompt_event_submit_metadata",
+                    thread_id.as_deref(),
+                );
+                log_terminal_status_event(
+                    "backend.terminal_write.prompt_event_submit_metadata",
+                    json!({
+                        "data_len": data.len(),
+                        "instance_id": instance.id,
+                        "observer_reason": observer_reason,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                        "prompt_text_len": event_prompt.len(),
+                        "status_truth": "processing_request_submitted",
+                        "thread_id": thread_id.as_deref().unwrap_or_default(),
+                    }),
+                );
+                write_thread_bridge_diagnostic_log_entry(json!({
+                    "ts_ms": current_time_ms(),
+                    "phase": "backend.bridge.prompt_event_submit_metadata",
+                    "source": "backend",
+                    "app_pid": std::process::id(),
+                    "thread": terminal_diagnostic_thread_label(),
+                    "fields": {
+                        "data_len": data.len(),
+                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                        "has_prompt_event_text": true,
+                        "instance_id": instance.id,
+                        "observer_reason": observer_reason,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                        "prompt_text_len": event_prompt.len(),
                         "thread_id": thread_id.as_deref().unwrap_or_default(),
                     },
                 }));
@@ -13143,6 +13199,11 @@ mod terminal_tests {
         ));
         assert!(terminal_prompt_submitted_source_is_authoritative(
             "crash_todo_resume_backend_submit",
+            true,
+            None,
+        ));
+        assert!(terminal_prompt_submitted_source_is_authoritative(
+            "prompt_event_submit_metadata",
             true,
             None,
         ));

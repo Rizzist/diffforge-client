@@ -28,6 +28,7 @@ import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { Mic } from "@styled-icons/material-rounded/Mic";
+import { MicOff } from "@styled-icons/material-rounded/MicOff";
 import { Remove } from "@styled-icons/material-rounded/Remove";
 import { OpenInBrowser } from "@styled-icons/material-rounded/OpenInBrowser";
 import { Pending } from "@styled-icons/material-rounded/Pending";
@@ -7014,11 +7015,13 @@ export const AudioInputMicButton = styled.button`
     opacity: 0.6;
   }
 
+  /* Live keeps the same mic logo, just a brighter blue — the red X swap
+     read as alarming rather than active. */
   &[data-live="true"] {
-    border-color: rgba(239, 107, 107, 0.5);
-    color: #ffb1b1;
+    border-color: rgba(95, 156, 255, 0.66);
+    color: #dceaff;
     background:
-      linear-gradient(180deg, rgba(239, 107, 107, 0.26), rgba(239, 107, 107, 0.1)),
+      linear-gradient(180deg, rgba(59, 130, 246, 0.36), rgba(59, 130, 246, 0.16)),
       rgba(21, 27, 35, 0.8);
   }
 
@@ -7029,9 +7032,65 @@ export const AudioInputMicButton = styled.button`
   }
 
   html[data-forge-theme="light"] &[data-live="true"] {
-    border-color: rgba(214, 69, 69, 0.4);
-    color: #c93b3b;
-    background: rgba(214, 69, 69, 0.08);
+    border-color: rgba(0, 102, 204, 0.46);
+    background: rgba(0, 102, 204, 0.16);
+  }
+`;
+
+export const AudioInputHeaderControls = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+`;
+
+/* Mute/enable toggle docked left of the input status badge: blue in both
+   states, mic-off glyph while monitoring (press to mute), mic glyph while
+   idle (press to enable). */
+export const AudioInputMuteButton = styled.button`
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(95, 156, 255, 0.36);
+  border-radius: 8px;
+  color: #8bb9ff;
+  background: rgba(59, 130, 246, 0.12);
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+
+  > svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(95, 156, 255, 0.55);
+    background: rgba(59, 130, 246, 0.2);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(95, 156, 255, 0.62);
+    color: #dceaff;
+    background: rgba(59, 130, 246, 0.28);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.3);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.46);
+    background: rgba(0, 102, 204, 0.16);
   }
 `;
 
@@ -7346,19 +7405,308 @@ export const AudioTabPanel = styled.div`
 export const AudioDictionaryPanel = styled.section`
   display: grid;
   align-content: start;
-  gap: 12px;
+  gap: 10px;
   min-height: 260px;
   min-width: 0;
-  padding: 12px;
-  border: 1px solid rgba(125, 160, 205, 0.2);
+  padding: 0;
+`;
+
+export const AudioDictionarySummaryBar = styled.div`
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioDictionaryStat = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid rgba(125, 160, 205, 0.16);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.32);
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 20px;
+    font-weight: 780;
+    line-height: 1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 720;
+    letter-spacing: 0;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+`;
+
+export const AudioDictionaryComposer = styled.form`
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(125, 160, 205, 0.18);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.01)),
-    rgba(13, 17, 23, 0.58);
+    linear-gradient(180deg, rgba(244, 247, 250, 0.024), rgba(244, 247, 250, 0.008)),
+    rgba(13, 17, 23, 0.5);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+`;
+
+export const AudioDictionaryComposerTopline = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+
+  > div {
+    display: grid;
+    min-width: min(100%, 190px);
+    gap: 2px;
+  }
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 13px;
+    font-weight: 780;
+    letter-spacing: 0;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 12px;
+    font-weight: 640;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    min-height: 34px;
+    padding: 0 12px;
+  }
+`;
+
+export const AudioDictionaryComposerGrid = styled.div`
+  display: grid;
+  grid-template-columns: minmax(160px, 0.38fr) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 700px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioDictionaryTextarea = styled.textarea`
+  min-width: 0;
+  min-height: 56px;
+  padding: 9px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(21, 27, 35, 0.72);
+  font-size: 12px;
+  font-weight: 650;
+  font-family: inherit;
+  line-height: 1.45;
+  letter-spacing: 0;
+  resize: vertical;
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.44);
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
+  }
+`;
+
+export const AudioDictionaryListHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0;
+  line-height: 1.3;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const AudioDictionaryList = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+`;
+
+export const AudioDictionaryCard = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.34);
+
+  &[data-disabled="true"] {
+    opacity: 0.64;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.035);
+  }
+`;
+
+export const AudioDictionaryCardTopline = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  input {
+    flex: 1 1 160px;
+  }
+`;
+
+export const AudioDictionaryTitleInput = styled.input`
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 2px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--forge-text);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 760;
+  letter-spacing: 0;
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.28);
+    outline: none;
+    background: rgba(21, 27, 35, 0.42);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(0, 102, 204, 0.18);
+    background: var(--forge-surface-control);
+  }
+`;
+
+export const AudioDictionaryMetaPill = styled.span`
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  border: 1px solid rgba(125, 160, 205, 0.16);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: rgba(125, 160, 205, 0.08);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1;
+  white-space: nowrap;
+
+  &[data-active="true"] {
+    border-color: rgba(75, 212, 170, 0.24);
+    color: var(--forge-green);
+    background: rgba(75, 212, 170, 0.1);
+  }
+
+  &[data-active="false"] {
+    opacity: 0.78;
+  }
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
     background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(26, 127, 55, 0.16);
+    color: #1a7f37;
+    background: rgba(26, 127, 55, 0.08);
+  }
+`;
+
+export const AudioDictionaryEmpty = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 108px;
+  place-items: center;
+  gap: 4px;
+  padding: 18px;
+  border: 1px dashed rgba(125, 160, 205, 0.22);
+  border-radius: 8px;
+  color: var(--forge-text-muted);
+  background: rgba(7, 9, 13, 0.22);
+  text-align: center;
+
+  strong {
+    color: var(--forge-text);
+    font-size: 13px;
+    font-weight: 780;
+    letter-spacing: 0;
+  }
+
+  span {
+    max-width: 36ch;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
   }
 `;
 
@@ -13529,6 +13877,10 @@ export const ButtonLightModeIcon = styled(LightMode)`
 `;
 
 export const ButtonMicIcon = styled(Mic)`
+  ${buttonIconSize}
+`;
+
+export const ButtonMicOffIcon = styled(MicOff)`
   ${buttonIconSize}
 `;
 

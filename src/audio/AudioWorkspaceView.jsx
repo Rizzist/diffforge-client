@@ -237,9 +237,11 @@ import {
   AudioDeviceSelect,
   AudioCloudField,
   AudioCloudInput,
+  AudioInputHeaderControls,
   AudioInputMeter,
   AudioInputMeta,
   AudioInputMicButton,
+  AudioInputMuteButton,
   AudioInputPill,
   AudioInputPillIconButton,
   AudioInputPillSelect,
@@ -252,6 +254,19 @@ import {
   AudioTabButton,
   AudioTabPanel,
   AudioDictionaryPanel,
+  AudioDictionarySummaryBar,
+  AudioDictionaryStat,
+  AudioDictionaryComposer,
+  AudioDictionaryComposerTopline,
+  AudioDictionaryComposerGrid,
+  AudioDictionaryTextarea,
+  AudioDictionaryListHeader,
+  AudioDictionaryList,
+  AudioDictionaryCard,
+  AudioDictionaryCardTopline,
+  AudioDictionaryTitleInput,
+  AudioDictionaryMetaPill,
+  AudioDictionaryEmpty,
   AudioRulesTabs,
   AudioRulesTab,
   AudioRulesHint,
@@ -438,6 +453,7 @@ import {
   ButtonTerminalIcon,
   ButtonKeyIcon,
   ButtonMicIcon,
+  ButtonMicOffIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
   FileChevronIcon,
@@ -1220,6 +1236,8 @@ export default function AudioWorkspaceView({
   const [voiceRulesTab, setVoiceRulesTab] = useState("dictionary");
   const [voiceRulesPreviewInput, setVoiceRulesPreviewInput] = useState("");
   const [voiceRulesError, setVoiceRulesError] = useState("");
+  const [dictionaryDraftName, setDictionaryDraftName] = useState("");
+  const [dictionaryDraftTermsText, setDictionaryDraftTermsText] = useState("");
   const voiceRulesSaveTimerRef = useRef(0);
   const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
   const [audioShortcutError, setAudioShortcutError] = useState("");
@@ -1332,9 +1350,18 @@ export default function AudioWorkspaceView({
       ? applyVoiceTextPipeline(voiceRulesPreviewInput, voiceRules)
       : null
   ), [voiceRulesPreviewInput, voiceRules]);
+  const dictionaryLists = useMemo(() => (
+    Array.isArray(voiceRules.dictionary) ? voiceRules.dictionary : []
+  ), [voiceRules.dictionary]);
+  const selectedDictionaryListCount = useMemo(() => (
+    dictionaryLists.filter((list) => list?.selected !== false).length
+  ), [dictionaryLists]);
+  const dictionaryDraftTerms = useMemo(() => (
+    parseDictionaryTerms(dictionaryDraftTermsText)
+  ), [dictionaryDraftTermsText]);
   const activeDictionaryTermCount = useMemo(() => {
     const seen = new Set();
-    for (const list of voiceRules.dictionary || []) {
+    for (const list of dictionaryLists) {
       if (list?.selected === false) {
         continue;
       }
@@ -1346,7 +1373,7 @@ export default function AudioWorkspaceView({
       }
     }
     return seen.size;
-  }, [voiceRules]);
+  }, [dictionaryLists]);
   const toggleAudioHistoryExpanded = useCallback((entryKey) => {
     setExpandedAudioHistoryIds((current) => {
       const next = new Set(current);
@@ -1576,6 +1603,31 @@ export default function AudioWorkspaceView({
       return [...entries, blankEntry];
     });
   }, [updateVoiceRulesList]);
+
+  const createDictionaryList = useCallback((event) => {
+    event?.preventDefault?.();
+
+    const name = String(dictionaryDraftName || "").trim();
+    const termsText = String(dictionaryDraftTermsText || "").trim();
+
+    if (!name && !dictionaryDraftTerms.length) {
+      return;
+    }
+
+    const id = `dictionary-${Date.now()}`;
+    updateVoiceRulesList("dictionary", (entries) => [
+      ...entries,
+      {
+        id,
+        name: name || `List ${entries.length + 1}`,
+        terms: dictionaryDraftTerms,
+        termsText,
+        selected: true,
+      },
+    ]);
+    setDictionaryDraftName("");
+    setDictionaryDraftTermsText("");
+  }, [dictionaryDraftName, dictionaryDraftTerms, dictionaryDraftTermsText, updateVoiceRulesList]);
 
   const updateOrchestratorRealtimeEnabled = useCallback((enabled) => {
     setOrchestratorRealtimeEnabled(Boolean(enabled));
@@ -2295,9 +2347,26 @@ export default function AudioWorkspaceView({
               <SettingsLabel>Input source</SettingsLabel>
               <SettingsHint>{audioInputMessage}</SettingsHint>
             </div>
-            <AudioStatePill data-installed={audioInputState === "previewing"}>
-              {audioInputStatusLabel}
-            </AudioStatePill>
+            <AudioInputHeaderControls>
+              <AudioInputMuteButton
+                aria-label={audioInputState === "previewing" ? "Mute input monitor" : "Enable input monitor"}
+                aria-pressed={audioInputState === "previewing"}
+                data-active={audioInputState === "previewing" ? "true" : "false"}
+                disabled={audioInputState === "checking" || audioInputState === "starting"}
+                onClick={toggleAudioInputPreview}
+                title={audioInputState === "previewing" ? "Mute (stop monitoring)" : "Enable input"}
+                type="button"
+              >
+                {audioInputState === "previewing" ? (
+                  <ButtonMicOffIcon aria-hidden="true" />
+                ) : (
+                  <ButtonMicIcon aria-hidden="true" />
+                )}
+              </AudioInputMuteButton>
+              <AudioStatePill data-installed={audioInputState === "previewing"}>
+                {audioInputStatusLabel}
+              </AudioStatePill>
+            </AudioInputHeaderControls>
           </AudioDeviceHeader>
 
           <AudioInputPill data-live={audioInputState === "previewing" ? "true" : "false"}>
@@ -2309,11 +2378,7 @@ export default function AudioWorkspaceView({
               title={audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
               type="button"
             >
-              {audioInputState === "previewing" ? (
-                <ButtonCloseIcon aria-hidden="true" />
-              ) : (
-                <ButtonMicIcon aria-hidden="true" />
-              )}
+              <ButtonMicIcon aria-hidden="true" />
             </AudioInputMicButton>
             <AudioInputPillSelect
               aria-label="Microphone input source"
@@ -2587,187 +2652,235 @@ export default function AudioWorkspaceView({
               ))}
             </AudioRulesTabs>
 
-            <AudioRulesHint>
-              {voiceRulesTab === "dictionary"
-                ? "Word lists of expected terms. Paste 20–150 words per list, then select the lists to use: their words become Deepgram keyterms (your key or Diff Forge Cloud) and the local Whisper glossary prompt."
-                : voiceRulesTab === "snippets"
-                  ? "Say a trigger word and it expands into the full text, like saying “gstack” to insert an entire prompt."
-                  : "Find-and-replace rules applied last, in order. Use them for spoken commands like “new line” or regex cleanups."}
-            </AudioRulesHint>
+            {voiceRulesTab === "dictionary" ? (
+              <>
+                <AudioDictionarySummaryBar>
+                  <AudioDictionaryStat>
+                    <strong>{dictionaryLists.length}</strong>
+                    <span>{dictionaryLists.length === 1 ? "list" : "lists"}</span>
+                  </AudioDictionaryStat>
+                  <AudioDictionaryStat>
+                    <strong>{selectedDictionaryListCount}</strong>
+                    <span>active</span>
+                  </AudioDictionaryStat>
+                  <AudioDictionaryStat>
+                    <strong>{activeDictionaryTermCount}</strong>
+                    <span>{activeDictionaryTermCount === 1 ? "word" : "words"}</span>
+                  </AudioDictionaryStat>
+                </AudioDictionarySummaryBar>
 
-            <AudioRulesList>
-              {voiceRulesTab === "dictionary" && (voiceRules.dictionary || []).map((list) => (
-                <AudioRuleRow data-disabled={list.selected === false ? "true" : undefined} key={list.id}>
-                  <AudioRuleToggle
-                    aria-label={list.selected === false ? "Include word list in dictation" : "Exclude word list from dictation"}
-                    aria-pressed={list.selected !== false}
-                    onClick={() => updateVoiceRuleEntry("dictionary", list.id, { selected: list.selected === false })}
-                    type="button"
-                  />
-                  <AudioRuleFields>
-                    <AudioRuleFieldRow data-single="true">
-                      <AudioCloudInput
-                        aria-label="Word list name"
-                        onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, { name: event.target.value })}
-                        placeholder="List name, e.g. Project jargon"
-                        value={list.name || ""}
-                      />
-                    </AudioRuleFieldRow>
-                    <AudioRuleFieldRow data-single="true">
-                      <AudioRuleTextarea
-                        aria-label="Word list terms"
-                        onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, {
-                          termsText: event.target.value,
-                          terms: parseDictionaryTerms(event.target.value),
-                        })}
-                        placeholder="Paste the words you expect to say, separated by commas or new lines"
-                        value={list.termsText ?? (list.terms || []).join(", ")}
-                      />
-                    </AudioRuleFieldRow>
-                    <SettingsHint>
-                      {(list.terms || []).length} {(list.terms || []).length === 1 ? "word" : "words"}
-                      {list.selected === false ? " · not sent to dictation" : ""}
-                    </SettingsHint>
-                  </AudioRuleFields>
-                  <AudioRuleIconButton
-                    aria-label="Delete word list"
-                    onClick={() => removeVoiceRuleEntry("dictionary", list.id)}
-                    type="button"
-                  >
-                    <ButtonDeleteIcon aria-hidden="true" />
-                  </AudioRuleIconButton>
-                </AudioRuleRow>
-              ))}
+                <AudioDictionaryComposer onSubmit={createDictionaryList}>
+                  <AudioDictionaryComposerTopline>
+                    <div>
+                      <strong>Create list</strong>
+                      <span>
+                        {dictionaryDraftTerms.length
+                          ? `${dictionaryDraftTerms.length} ${dictionaryDraftTerms.length === 1 ? "word" : "words"} ready`
+                          : "Names, APIs, people, commands"}
+                      </span>
+                    </div>
+                    <PrimaryButton
+                      disabled={!dictionaryDraftName.trim() && !dictionaryDraftTerms.length}
+                      type="submit"
+                    >
+                      <ButtonAddIcon aria-hidden="true" />
+                      <span>Create list</span>
+                    </PrimaryButton>
+                  </AudioDictionaryComposerTopline>
+                  <AudioDictionaryComposerGrid>
+                    <AudioCloudInput
+                      aria-label="New word list name"
+                      onChange={(event) => setDictionaryDraftName(event.target.value)}
+                      placeholder="List name"
+                      value={dictionaryDraftName}
+                    />
+                    <AudioDictionaryTextarea
+                      aria-label="New word list terms"
+                      onChange={(event) => setDictionaryDraftTermsText(event.target.value)}
+                      placeholder="Tauri, Deepgram, AppKit"
+                      value={dictionaryDraftTermsText}
+                    />
+                  </AudioDictionaryComposerGrid>
+                </AudioDictionaryComposer>
 
-              {voiceRulesTab === "snippets" && (voiceRules.snippets || []).map((entry) => (
-                <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
-                  <AudioRuleToggle
-                    aria-label={entry.enabled === false ? "Enable snippet" : "Disable snippet"}
-                    aria-pressed={entry.enabled !== false}
-                    onClick={() => updateVoiceRuleEntry("snippets", entry.id, { enabled: entry.enabled === false })}
-                    type="button"
-                  />
-                  <AudioRuleFields>
-                    <AudioRuleFieldRow data-single="true">
-                      <AudioCloudInput
-                        aria-label="Trigger"
-                        onChange={(event) => updateVoiceRuleEntry("snippets", entry.id, { trigger: event.target.value })}
-                        placeholder="Trigger, e.g. gstack"
-                        value={entry.trigger || ""}
-                      />
-                    </AudioRuleFieldRow>
-                    <AudioRuleFieldRow data-single="true">
-                      <AudioRuleTextarea
-                        aria-label="Expansion"
-                        onChange={(event) => updateVoiceRuleEntry("snippets", entry.id, { expansion: event.target.value })}
-                        placeholder="Expands into this full text..."
-                        value={entry.expansion || ""}
-                      />
-                    </AudioRuleFieldRow>
-                  </AudioRuleFields>
-                  <AudioRuleIconButton
-                    aria-label="Delete snippet"
-                    onClick={() => removeVoiceRuleEntry("snippets", entry.id)}
-                    type="button"
-                  >
-                    <ButtonDeleteIcon aria-hidden="true" />
-                  </AudioRuleIconButton>
-                </AudioRuleRow>
-              ))}
+                <AudioDictionaryListHeader>
+                  <span>Lists</span>
+                  <span>Saves automatically</span>
+                </AudioDictionaryListHeader>
 
-              {voiceRulesTab === "transforms" && (voiceRules.transforms || []).map((entry) => (
-                <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
-                  <AudioRuleToggle
-                    aria-label={entry.enabled === false ? "Enable transform" : "Disable transform"}
-                    aria-pressed={entry.enabled !== false}
-                    onClick={() => updateVoiceRuleEntry("transforms", entry.id, { enabled: entry.enabled === false })}
-                    type="button"
-                  />
-                  <AudioRuleFields>
-                    <AudioRuleFieldRow>
-                      <AudioCloudInput
-                        aria-label="Match"
-                        onChange={(event) => updateVoiceRuleEntry("transforms", entry.id, { match: event.target.value })}
-                        placeholder={entry.isRegex ? "Pattern, e.g. bug (\\d+)" : "Match, e.g. new line"}
-                        value={entry.match || ""}
+                {dictionaryLists.length ? (
+                  <AudioDictionaryList>
+                    {dictionaryLists.map((list) => (
+                      <AudioDictionaryCard data-disabled={list.selected === false ? "true" : undefined} key={list.id}>
+                        <AudioDictionaryCardTopline>
+                          <AudioRuleToggle
+                            aria-label={list.selected === false ? "Include word list in dictation" : "Exclude word list from dictation"}
+                            aria-pressed={list.selected !== false}
+                            onClick={() => updateVoiceRuleEntry("dictionary", list.id, { selected: list.selected === false })}
+                            type="button"
+                          />
+                          <AudioDictionaryTitleInput
+                            aria-label="Word list name"
+                            onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, { name: event.target.value })}
+                            placeholder="Untitled list"
+                            value={list.name || ""}
+                          />
+                          <AudioDictionaryMetaPill data-active={list.selected !== false ? "true" : "false"}>
+                            {list.selected === false ? "Paused" : "Active"}
+                          </AudioDictionaryMetaPill>
+                          <AudioDictionaryMetaPill>
+                            {(list.terms || []).length} {(list.terms || []).length === 1 ? "word" : "words"}
+                          </AudioDictionaryMetaPill>
+                          <AudioRuleIconButton
+                            aria-label="Delete word list"
+                            onClick={() => removeVoiceRuleEntry("dictionary", list.id)}
+                            type="button"
+                          >
+                            <ButtonDeleteIcon aria-hidden="true" />
+                          </AudioRuleIconButton>
+                        </AudioDictionaryCardTopline>
+                        <AudioDictionaryTextarea
+                          aria-label="Word list terms"
+                          onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, {
+                            termsText: event.target.value,
+                            terms: parseDictionaryTerms(event.target.value),
+                          })}
+                          placeholder="Add words separated by commas or new lines"
+                          value={list.termsText ?? (list.terms || []).join(", ")}
+                        />
+                      </AudioDictionaryCard>
+                    ))}
+                  </AudioDictionaryList>
+                ) : (
+                  <AudioDictionaryEmpty>
+                    <strong>No lists yet</strong>
+                    <span>Add names, APIs, commands, or people you say often.</span>
+                  </AudioDictionaryEmpty>
+                )}
+              </>
+            ) : (
+              <>
+                <AudioRulesHint>
+                  {voiceRulesTab === "snippets"
+                    ? "Say a trigger word and it expands into the full text, like saying gstack to insert an entire prompt."
+                    : "Find-and-replace rules applied last, in order. Use them for spoken commands or regex cleanups."}
+                </AudioRulesHint>
+
+                <AudioRulesList>
+                  {voiceRulesTab === "snippets" && (voiceRules.snippets || []).map((entry) => (
+                    <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
+                      <AudioRuleToggle
+                        aria-label={entry.enabled === false ? "Enable snippet" : "Disable snippet"}
+                        aria-pressed={entry.enabled !== false}
+                        onClick={() => updateVoiceRuleEntry("snippets", entry.id, { enabled: entry.enabled === false })}
+                        type="button"
                       />
-                      <AudioRuleTextarea
-                        aria-label="Replacement"
-                        onChange={(event) => updateVoiceRuleEntry("transforms", entry.id, { replacement: event.target.value })}
-                        placeholder={entry.isRegex ? "Replacement, e.g. BUG-$1" : "Replacement (newlines allowed)"}
-                        style={{ minHeight: 36 }}
-                        value={entry.replacement || ""}
-                      />
-                    </AudioRuleFieldRow>
-                    <AudioRulesActionsRow>
-                      <SecondaryButton
-                        aria-pressed={entry.isRegex === true}
-                        onClick={() => updateVoiceRuleEntry("transforms", entry.id, { isRegex: entry.isRegex !== true })}
+                      <AudioRuleFields>
+                        <AudioRuleFieldRow data-single="true">
+                          <AudioCloudInput
+                            aria-label="Trigger"
+                            onChange={(event) => updateVoiceRuleEntry("snippets", entry.id, { trigger: event.target.value })}
+                            placeholder="Trigger, e.g. gstack"
+                            value={entry.trigger || ""}
+                          />
+                        </AudioRuleFieldRow>
+                        <AudioRuleFieldRow data-single="true">
+                          <AudioRuleTextarea
+                            aria-label="Expansion"
+                            onChange={(event) => updateVoiceRuleEntry("snippets", entry.id, { expansion: event.target.value })}
+                            placeholder="Expands into this full text..."
+                            value={entry.expansion || ""}
+                          />
+                        </AudioRuleFieldRow>
+                      </AudioRuleFields>
+                      <AudioRuleIconButton
+                        aria-label="Delete snippet"
+                        onClick={() => removeVoiceRuleEntry("snippets", entry.id)}
                         type="button"
                       >
-                        <ButtonKeyIcon aria-hidden="true" />
-                        <span>{entry.isRegex ? "Regex: on" : "Regex: off"}</span>
-                      </SecondaryButton>
-                    </AudioRulesActionsRow>
-                  </AudioRuleFields>
-                  <AudioRuleIconButton
-                    aria-label="Delete transform"
-                    onClick={() => removeVoiceRuleEntry("transforms", entry.id)}
-                    type="button"
-                  >
-                    <ButtonDeleteIcon aria-hidden="true" />
-                  </AudioRuleIconButton>
-                </AudioRuleRow>
-              ))}
+                        <ButtonDeleteIcon aria-hidden="true" />
+                      </AudioRuleIconButton>
+                    </AudioRuleRow>
+                  ))}
 
-              {!(voiceRules[voiceRulesTab] || []).length && (
-                <AudioRulesHint>
-                  {voiceRulesTab === "dictionary"
-                    ? "No word lists yet. Create one and paste the product names, APIs, and people you expect to say."
-                    : voiceRulesTab === "snippets"
-                      ? "No snippets yet. Map a short spoken trigger to a long prompt."
-                      : "No transforms yet. Try “new line” → a line break."}
-                </AudioRulesHint>
-              )}
-            </AudioRulesList>
+                  {voiceRulesTab === "transforms" && (voiceRules.transforms || []).map((entry) => (
+                    <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
+                      <AudioRuleToggle
+                        aria-label={entry.enabled === false ? "Enable transform" : "Disable transform"}
+                        aria-pressed={entry.enabled !== false}
+                        onClick={() => updateVoiceRuleEntry("transforms", entry.id, { enabled: entry.enabled === false })}
+                        type="button"
+                      />
+                      <AudioRuleFields>
+                        <AudioRuleFieldRow>
+                          <AudioCloudInput
+                            aria-label="Match"
+                            onChange={(event) => updateVoiceRuleEntry("transforms", entry.id, { match: event.target.value })}
+                            placeholder={entry.isRegex ? "Pattern, e.g. bug (\\d+)" : "Match, e.g. new line"}
+                            value={entry.match || ""}
+                          />
+                          <AudioRuleTextarea
+                            aria-label="Replacement"
+                            onChange={(event) => updateVoiceRuleEntry("transforms", entry.id, { replacement: event.target.value })}
+                            placeholder={entry.isRegex ? "Replacement, e.g. BUG-$1" : "Replacement (newlines allowed)"}
+                            style={{ minHeight: 36 }}
+                            value={entry.replacement || ""}
+                          />
+                        </AudioRuleFieldRow>
+                        <AudioRulesActionsRow>
+                          <SecondaryButton
+                            aria-pressed={entry.isRegex === true}
+                            onClick={() => updateVoiceRuleEntry("transforms", entry.id, { isRegex: entry.isRegex !== true })}
+                            type="button"
+                          >
+                            <ButtonKeyIcon aria-hidden="true" />
+                            <span>{entry.isRegex ? "Regex: on" : "Regex: off"}</span>
+                          </SecondaryButton>
+                        </AudioRulesActionsRow>
+                      </AudioRuleFields>
+                      <AudioRuleIconButton
+                        aria-label="Delete transform"
+                        onClick={() => removeVoiceRuleEntry("transforms", entry.id)}
+                        type="button"
+                      >
+                        <ButtonDeleteIcon aria-hidden="true" />
+                      </AudioRuleIconButton>
+                    </AudioRuleRow>
+                  ))}
 
-            {voiceRulesTab === "dictionary" && (voiceRules.dictionary || []).length > 0 && (
-              <AudioRulesHint>
-                {activeDictionaryTermCount === 1
-                  ? "1 unique word from selected lists rides"
-                  : `${activeDictionaryTermCount} unique words from selected lists ride`}
-                {" every dictation start; the first 100 become Deepgram keyterms and the local Whisper glossary."}
-              </AudioRulesHint>
+                  {!(voiceRules[voiceRulesTab] || []).length && (
+                    <AudioRulesHint>
+                      {voiceRulesTab === "snippets"
+                        ? "No snippets yet."
+                        : "No transforms yet."}
+                    </AudioRulesHint>
+                  )}
+                </AudioRulesList>
+
+                <AudioRulesActionsRow>
+                  <SecondaryButton onClick={() => addVoiceRuleEntry(voiceRulesTab)} type="button">
+                    <ButtonMicIcon aria-hidden="true" />
+                    <span>{voiceRulesTab === "snippets" ? "Add snippet" : "Add transform"}</span>
+                  </SecondaryButton>
+                  <SettingsHint>Synced to dictation instantly. Saves automatically.</SettingsHint>
+                </AudioRulesActionsRow>
+
+                <AudioRulesPreview>
+                  <strong>Try it</strong>
+                  <AudioCloudInput
+                    aria-label="Preview input"
+                    onChange={(event) => setVoiceRulesPreviewInput(event.target.value)}
+                    placeholder="Type what you'd say, e.g. run gstack with tauri new line done"
+                    value={voiceRulesPreviewInput}
+                  />
+                  {voiceRulesPreview && (
+                    <AudioRulesPreviewResult>{voiceRulesPreview.text}</AudioRulesPreviewResult>
+                  )}
+                </AudioRulesPreview>
+              </>
             )}
 
-            <AudioRulesActionsRow>
-              <SecondaryButton onClick={() => addVoiceRuleEntry(voiceRulesTab)} type="button">
-                <ButtonMicIcon aria-hidden="true" />
-                <span>
-                  {voiceRulesTab === "dictionary"
-                    ? "New word list"
-                    : voiceRulesTab === "snippets"
-                      ? "Add snippet"
-                      : "Add transform"}
-                </span>
-              </SecondaryButton>
-              <SettingsHint>Synced to dictation instantly. Saves automatically.</SettingsHint>
-            </AudioRulesActionsRow>
-
             {voiceRulesError && <FormMessage $state="error">{voiceRulesError}</FormMessage>}
-
-            <AudioRulesPreview>
-              <strong>Try it</strong>
-              <AudioCloudInput
-                aria-label="Preview input"
-                onChange={(event) => setVoiceRulesPreviewInput(event.target.value)}
-                placeholder="Type what you'd say, e.g. run gstack with tauri new line done"
-                value={voiceRulesPreviewInput}
-              />
-              {voiceRulesPreview && (
-                <AudioRulesPreviewResult>{voiceRulesPreview.text}</AudioRulesPreviewResult>
-              )}
-            </AudioRulesPreview>
           </AudioDictionaryPanel>
         )}
 

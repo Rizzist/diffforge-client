@@ -25,6 +25,7 @@ import {
   TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
 } from "../todoQueueSources.js";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
+import { guardXtermDuringPushToTalk } from "../xtermPushToTalkGuard.js";
 import {
   GlobalStyle,
   AppFrame,
@@ -5116,6 +5117,10 @@ function WorkspaceTerminal({
     let terminalScrollableElement = null;
     const terminal = new XTerm({
       allowProposedApi: false,
+      // Alt+click must never synthesize arrow keys: agent CLIs treat Up as
+      // history recall, so a stray Option+click would paste the previous
+      // prompt into the composer.
+      altClickMovesCursor: false,
       convertEol: false,
       cursorBlink: terminalActiveRef.current && !parkedPromptRef.current,
       cursorStyle: "block",
@@ -5141,6 +5146,7 @@ function WorkspaceTerminal({
       theme: getTerminalThemeForForgeTheme(),
     });
     xtermRef.current = terminal;
+    const detachPushToTalkGuard = guardXtermDuringPushToTalk(terminal);
 
     let providerSessionCaptureBuffer = "";
     let providerSessionErrorBuffer = "";
@@ -11091,10 +11097,10 @@ function WorkspaceTerminal({
                 // Manually typed prompts carry synthetic terminal-direct todo
                 // refs, so the Rust write observer marks them seen and the
                 // UserPromptSubmit hook never re-emits a prompt-submitted
-                // event. The observed input gate is the only confirmation
-                // that can arrive for hook-managed agents here; without it
-                // this waiter times out and the typed prompt never reaches
-                // todo history.
+                // event. The terminal write confirmation is the only
+                // immediate signal that can arrive for hook-managed agents
+                // here; without it this waiter times out and the typed prompt
+                // never reaches todo history.
                 allowObservedInputGateForHookManaged: true,
                 agentId: terminalAgentKind,
                 expectedPrompt: promptTextAtSubmit,
@@ -12162,6 +12168,7 @@ function WorkspaceTerminal({
       });
       clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceId);
       setTerminalAudioInputTarget(false, terminalInstanceId, "terminal_cleanup");
+      detachPushToTalkGuard();
       const preserveCoordinationSession = preserveCoordinationOnNextCleanupRef.current && !isGenericTerminal;
       preserveCoordinationOnNextCleanupRef.current = false;
       logTerminalStatus("frontend.terminal_lifecycle.cleanup_close", {
@@ -12482,6 +12489,7 @@ function WorkspaceTerminal({
             workspaceId: workspace?.id || thread?.workspaceId || "",
           });
           const waiter = await createTerminalPromptSubmittedWaiter({
+            allowObservedInputGateForHookManaged: true,
             agentId: terminalAgentKind,
             expectedPrompt: promptText,
             instanceId: currentInstanceId,
@@ -13029,6 +13037,7 @@ function WorkspaceTerminal({
     try {
       submittedWaiter = submitSequence
         ? await createTerminalPromptSubmittedWaiter({
+          allowObservedInputGateForHookManaged: true,
           agentId: terminalAgentKind,
           expectedPrompt: prompt,
           instanceId: terminalInstanceIdRef.current || undefined,
