@@ -34,9 +34,9 @@ use super::schema::{
     WORKSPACE_MCP_SECRETS_MIGRATION_NAME, WORKSPACE_MCP_SECRETS_MIGRATION_VERSION,
     WORKSPACE_MCP_SECRETS_SCHEMA_SQL, WORKSPACE_MCP_SECRETS_STATE_MIGRATION_NAME,
     WORKSPACE_MCP_SECRETS_STATE_MIGRATION_VERSION, WORKSPACE_MCP_SECRETS_STATE_SCHEMA_SQL,
-    WORKSPACE_MCP_SEED_STATE_MIGRATION_NAME,
-    WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION, WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL,
-    WORKTREE_TASK_BINDING_MIGRATION_NAME, WORKTREE_TASK_BINDING_MIGRATION_VERSION,
+    WORKSPACE_MCP_SEED_STATE_MIGRATION_NAME, WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION,
+    WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL, WORKTREE_TASK_BINDING_MIGRATION_NAME,
+    WORKTREE_TASK_BINDING_MIGRATION_VERSION,
 };
 
 pub const REPO_ID: &str = "local";
@@ -689,9 +689,10 @@ fn apply_workspace_mcp_seed_state_migration(
         ));
     }
 
-    with_sqlite_lock_retry("Unable to initialize workspace MCP seed state schema", || {
-        connection.execute_batch(WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL)
-    })?;
+    with_sqlite_lock_retry(
+        "Unable to initialize workspace MCP seed state schema",
+        || connection.execute_batch(WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL),
+    )?;
     let mut migration = record_migration_if_missing(
         connection,
         WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION,

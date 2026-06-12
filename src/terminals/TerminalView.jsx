@@ -64,6 +64,7 @@ import {
   createCloudVoiceAgentTtsPlayer,
   finishCloudVoiceAgentInput,
   sendCloudVoiceAgentTextMessage,
+  setCloudVoiceAgentInputEnabled,
   startCloudVoiceAgentStream,
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
@@ -1675,6 +1676,8 @@ const TerminalBreakoutActivityNodeGlyph = styled.span`
     box-shadow: none;
   }
 
+  /* Pixel-cluster glyph tinted per agent via --terminal-activity-glyph
+     (stable hash of the agent name, set inline by the row). */
   &[data-kind="subagent"]::before {
     content: "";
     position: absolute;
@@ -1682,27 +1685,21 @@ const TerminalBreakoutActivityNodeGlyph = styled.span`
     left: calc(1px * var(--terminal-slot-inverse-scale, 1));
     width: calc(4px * var(--terminal-slot-inverse-scale, 1));
     height: calc(4px * var(--terminal-slot-inverse-scale, 1));
-    background: #facc15;
+    background: var(--terminal-activity-glyph, #facc15);
     box-shadow:
-      calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 0 #facc15,
-      0 calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 #facc15,
-      calc(5px * var(--terminal-slot-inverse-scale, 1)) calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 #facc15,
-      calc(10px * var(--terminal-slot-inverse-scale, 1)) calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 #facc15,
-      calc(5px * var(--terminal-slot-inverse-scale, 1)) calc(10px * var(--terminal-slot-inverse-scale, 1)) 0 #facc15;
+      calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 0 var(--terminal-activity-glyph, #facc15),
+      0 calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 var(--terminal-activity-glyph, #facc15),
+      calc(5px * var(--terminal-slot-inverse-scale, 1)) calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 var(--terminal-activity-glyph, #facc15),
+      calc(10px * var(--terminal-slot-inverse-scale, 1)) calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 var(--terminal-activity-glyph, #facc15),
+      calc(5px * var(--terminal-slot-inverse-scale, 1)) calc(10px * var(--terminal-slot-inverse-scale, 1)) 0 var(--terminal-activity-glyph, #facc15);
   }
 
-  &[data-status="awaiting"]::before {
-    background: #facc15;
+  &[data-kind="subagent"][data-status="awaiting"] {
+    opacity: 0.62;
   }
 
-  &[data-kind="subagent"][data-status="failed"]::before {
-    background: #fb7185;
-    box-shadow:
-      calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 0 #fb7185,
-      0 calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 #fb7185,
-      calc(5px * var(--terminal-slot-inverse-scale, 1)) calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 #fb7185,
-      calc(10px * var(--terminal-slot-inverse-scale, 1)) calc(5px * var(--terminal-slot-inverse-scale, 1)) 0 #fb7185,
-      calc(5px * var(--terminal-slot-inverse-scale, 1)) calc(10px * var(--terminal-slot-inverse-scale, 1)) 0 #fb7185;
+  &[data-kind="subagent"][data-status="failed"] {
+    --terminal-activity-glyph: #fb7185;
   }
 
   &[data-status="done"] {
@@ -1719,6 +1716,8 @@ const TerminalBreakoutActivityRowMain = styled.div`
   min-width: 0;
 `;
 
+/* One line per node, like the reference monitor row: bold agent/process
+   name, dimmed "is working"-style status after it. */
 const TerminalBreakoutActivityRowTitle = styled.div`
   min-width: 0;
   color: inherit;
@@ -1727,38 +1726,15 @@ const TerminalBreakoutActivityRowTitle = styled.div`
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-`;
 
-const TerminalBreakoutActivityRowMeta = styled.div`
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  gap: calc(4px * var(--terminal-slot-inverse-scale, 1));
-  margin-top: calc(2px * var(--terminal-slot-inverse-scale, 1));
-  color: rgba(148, 163, 184, 0.82);
-  font-size: calc(8px * var(--terminal-slot-inverse-scale, 1));
-  font-weight: 760;
-`;
-
-const TerminalBreakoutActivityPill = styled.span`
-  display: inline-flex;
-  align-items: center;
-  min-height: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  color: rgba(153, 246, 228, 0.82);
-  background: transparent;
-  font-size: inherit;
-  font-weight: 760;
-  white-space: nowrap;
-
-  &[data-tone="blue"] {
-    color: rgba(191, 219, 254, 0.84);
+  strong {
+    color: rgba(248, 250, 252, 0.97);
+    font-weight: 800;
   }
 
-  &[data-tone="yellow"] {
-    color: rgba(253, 224, 71, 0.9);
+  span {
+    color: rgba(148, 163, 184, 0.85);
+    font-weight: 620;
   }
 `;
 
@@ -6086,21 +6062,30 @@ function terminalActivityProcessLabel(process) {
   return process?.pid ? `process ${process.pid}` : "process";
 }
 
-function terminalActivityProcessMeta(process) {
-  return [
-    terminalActivityPortLabel(process),
-    formatTerminalActivityCpu(process?.cpuPercent),
-    formatTerminalActivityBytes(process?.memoryBytes),
-    formatTerminalActivityDuration(process?.runTimeSeconds),
-  ].filter(Boolean);
+function terminalActivitySubagentName(subagent) {
+  return cleanTerminalBreakoutPlanText(subagent?.label || subagent?.agentType || subagent?.agentId)
+    || "Subagent";
 }
 
-function terminalActivitySubagentMeta(subagent) {
-  return [
-    subagent?.provider || "",
-    subagent?.status || "",
-    subagent?.confidence === "named" ? "named" : "",
-  ].filter(Boolean);
+// Per-agent glyph hue, stable across snapshots: hash the display name into a
+// small palette so "Ampere" stays purple and "Ohm" stays orange the whole
+// session, like the reference monitor UI.
+const TERMINAL_ACTIVITY_GLYPH_COLORS = [
+  "#a78bfa",
+  "#fb923c",
+  "#facc15",
+  "#34d399",
+  "#60a5fa",
+  "#f472b6",
+];
+
+function terminalActivityGlyphColor(name) {
+  const text = String(name || "");
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash * 31) + text.charCodeAt(index)) >>> 0;
+  }
+  return TERMINAL_ACTIVITY_GLYPH_COLORS[hash % TERMINAL_ACTIVITY_GLYPH_COLORS.length];
 }
 
 function terminalActivityStatusKey(value) {
@@ -6153,9 +6138,7 @@ function terminalBreakoutActivityDetailPairs(pairs) {
 }
 
 function terminalActivitySubagentTitle(subagent) {
-  const label = cleanTerminalBreakoutPlanText(subagent?.label || subagent?.agentType || subagent?.agentId)
-    || "Subagent";
-  return `${label} is ${terminalBreakoutActivityStatusLabel(subagent?.status)}`;
+  return `${terminalActivitySubagentName(subagent)} is ${terminalBreakoutActivityStatusLabel(subagent?.status)}`;
 }
 
 function terminalActivitySubagentDetails(subagent) {
@@ -6169,10 +6152,6 @@ function terminalActivitySubagentDetails(subagent) {
     ["Last", subagent?.lastMessage],
     ["Transcript", subagent?.agentTranscriptPath || subagent?.transcriptPath],
   ]);
-}
-
-function terminalActivityProcessTitle(process) {
-  return `${terminalActivityProcessLabel(process)} is running`;
 }
 
 function terminalActivityProcessDetails(process) {
@@ -11783,6 +11762,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   // Mic arbitration: true while dictation has borrowed the microphone from a
   // live voice agent session (Rust pauses/resumes the agent's audio feed).
   const [orchestratorVoiceMicBorrowed, setOrchestratorVoiceMicBorrowed] = useState(false);
+  const [orchestratorVoiceInputEnabled, setOrchestratorVoiceInputEnabled] = useState(false);
+  const [orchestratorVoiceRealtimeSession, setOrchestratorVoiceRealtimeSession] = useState(false);
 
   // Mic arbitration events from Rust: dictation borrows the voice agent's
   // microphone and hands it back when it finishes.
@@ -11791,7 +11772,18 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     let unlisten = null;
     void listen("forge-voice-agent-mic", (event) => {
       if (disposed) return;
-      setOrchestratorVoiceMicBorrowed(String(event?.payload?.state || "") === "paused");
+      const micState = String(event?.payload?.state || "");
+      const reason = String(event?.payload?.reason || "");
+      const borrowed = micState === "paused" && (
+        reason === "dictation_started"
+        || reason === "dictation_active"
+      );
+      setOrchestratorVoiceMicBorrowed(borrowed);
+      if (micState === "resumed") {
+        setOrchestratorVoiceInputEnabled(true);
+      } else if (micState === "paused" && !borrowed) {
+        setOrchestratorVoiceInputEnabled(false);
+      }
     }).then((dispose) => {
       if (disposed) {
         dispose();
@@ -11808,6 +11800,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   useEffect(() => {
     if (orchestratorVoiceState === "idle") {
       setOrchestratorVoiceMicBorrowed(false);
+      setOrchestratorVoiceInputEnabled(false);
+      setOrchestratorVoiceRealtimeSession(false);
     }
   }, [orchestratorVoiceState]);
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
@@ -12512,6 +12506,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorVoiceInputEnabled(false);
+    setOrchestratorVoiceRealtimeSession(false);
     setOrchestratorChatSubmitting(false);
     await ttsPlayer?.close?.().catch(() => {});
     await stopCloudVoiceAgentStream().catch(() => {});
@@ -12527,6 +12523,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceState("processing");
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
+    setOrchestratorVoiceInputEnabled(false);
     await finishCloudVoiceAgentInput().catch((error) => {
       logBigViewSyncDiagnosticEvent("tui.voice_agent.finish_input_error", {
         message: getAudioInputErrorMessage(error, "Unable to finish voice input."),
@@ -12560,6 +12557,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorVoiceInputEnabled(false);
+    setOrchestratorVoiceRealtimeSession(false);
     setOrchestratorChatSubmitting(false);
     await ttsPlayer?.close?.().catch(() => {});
     await stopCloudVoiceAgentStream().catch(() => {});
@@ -12578,6 +12577,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorVoiceInputEnabled(false);
+    setOrchestratorVoiceRealtimeSession(false);
     setOrchestratorChatSubmitting(false);
     await stopCloudVoiceAgentStream().catch(() => {});
     await monitor?.finishCapture?.().catch(() => null);
@@ -12588,6 +12589,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const startOrchestratorVoiceMonitor = useCallback(async () => {
     const runId = orchestratorVoiceRunRef.current + 1;
     const submissionMode = readOrchestratorVoiceSubmissionMode();
+    const realtimeMode = readOrchestratorRealtimeEnabled();
     orchestratorVoiceRunRef.current = runId;
     clearAllVoiceHistoryTurnTimeouts();
     resetOrchestratorFastResponseGate();
@@ -12611,6 +12613,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorVoiceInputEnabled(true);
+    setOrchestratorVoiceRealtimeSession(realtimeMode);
 
     let monitor = null;
     let captureStarted = false;
@@ -12657,9 +12661,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       await startCloudVoiceAgentStream({
         ...getCloudVoiceAgentRequestContext(),
         submissionMode,
-        realtime: readOrchestratorRealtimeEnabled(),
+        realtime: realtimeMode,
       });
       cloudStarted = true;
+      setOrchestratorVoiceInputEnabled(true);
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
         await cleanupStartedMonitor();
@@ -12673,6 +12678,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         }
         setOrchestratorVoiceState("processing");
         setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+        setOrchestratorVoiceInputEnabled(false);
         await finishCloudVoiceAgentInput().catch(() => {});
         await ownedMonitor?.finishCapture?.().catch(() => null);
         await ownedMonitor?.close?.().catch(() => {});
@@ -12690,6 +12696,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
       setOrchestratorVoiceState("error");
       setOrchestratorVoiceFeedback("");
+      setOrchestratorVoiceInputEnabled(false);
+      setOrchestratorVoiceRealtimeSession(false);
       await cleanupStartedMonitor();
       orchestratorVoiceEventsActiveRef.current = false;
       setOrchestratorVoiceError(getAudioInputErrorMessage(
@@ -12728,6 +12736,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
+    setOrchestratorVoiceInputEnabled(false);
+    setOrchestratorVoiceRealtimeSession(false);
     const previousTtsPlayer = orchestratorVoiceTtsPlayerRef.current;
     orchestratorVoiceTtsPlayerRef.current = null;
     await previousTtsPlayer?.close?.().catch(() => {});
@@ -12785,7 +12795,49 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     void handleOrchestratorChatSubmit(event);
   }, [handleOrchestratorChatSubmit]);
 
+  const toggleOrchestratorRealtimeInput = useCallback(async () => {
+    if (orchestratorVoiceState !== "listening" && orchestratorVoiceState !== "processing") {
+      return;
+    }
+    const nextEnabled = !orchestratorVoiceInputEnabled;
+    setOrchestratorVoiceInputEnabled(nextEnabled);
+    setOrchestratorVoiceError("");
+    try {
+      const result = await setCloudVoiceAgentInputEnabled(nextEnabled);
+      if (result && Object.prototype.hasOwnProperty.call(result, "enabled")) {
+        setOrchestratorVoiceInputEnabled(Boolean(result.enabled));
+      }
+    } catch (error) {
+      setOrchestratorVoiceInputEnabled(!nextEnabled);
+      const message = getAudioInputErrorMessage(
+        error,
+        nextEnabled
+          ? "Unable to resume voice agent audio."
+          : "Unable to pause voice agent audio.",
+      );
+      setOrchestratorVoiceError(message);
+      logBigViewSyncDiagnosticEvent("tui.voice_agent.input_toggle_error", {
+        enabled: nextEnabled,
+        message,
+        surface: "tui_voice_agent",
+        workspaceId: orchestratorPanelWorkspaceId,
+      });
+    }
+  }, [orchestratorPanelWorkspaceId, orchestratorVoiceInputEnabled, orchestratorVoiceState]);
+
   const toggleOrchestratorVoiceMonitor = useCallback(() => {
+    if (
+      orchestratorVoiceRealtimeSession
+      && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing")
+    ) {
+      void toggleOrchestratorRealtimeInput();
+      return;
+    }
+
+    if (orchestratorVoiceRealtimeSession && orchestratorVoiceState === "starting") {
+      return;
+    }
+
     if (orchestratorVoiceState === "starting" || orchestratorVoiceState === "listening") {
       void finishOrchestratorVoiceInput();
       return;
@@ -12796,7 +12848,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     }
 
     void startOrchestratorVoiceMonitor();
-  }, [finishOrchestratorVoiceInput, orchestratorVoiceState, startOrchestratorVoiceMonitor]);
+  }, [
+    finishOrchestratorVoiceInput,
+    orchestratorVoiceRealtimeSession,
+    orchestratorVoiceState,
+    startOrchestratorVoiceMonitor,
+    toggleOrchestratorRealtimeInput,
+  ]);
 
   const handleDraftKeyDown = useCallback((event) => {
     if (event.key !== "Enter" || event.shiftKey) {
@@ -13489,32 +13547,49 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
   const orchestratorVoiceLevel = getOrchestratorVoiceLevel(orchestratorVoiceStats);
   const paneFullscreen = paneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const orchestratorVoiceRealtimeMode = orchestratorVoiceRealtimeSession;
   const orchestratorVoiceInputActive = orchestratorVoiceState === "starting"
     || orchestratorVoiceState === "listening";
+  const orchestratorVoiceSessionActive = orchestratorVoiceInputActive
+    || orchestratorVoiceState === "processing";
+  const orchestratorVoiceCanToggleInput = orchestratorVoiceRealtimeMode
+    && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing");
+  const orchestratorVoiceInputSending = orchestratorVoiceState === "starting"
+    || (
+      (orchestratorVoiceState === "listening"
+        || (orchestratorVoiceRealtimeMode && orchestratorVoiceState === "processing"))
+      && orchestratorVoiceInputEnabled
+      && !orchestratorVoiceMicBorrowed
+    );
   const orchestratorVoiceManualMode = orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL;
-  const orchestratorVoiceHasSignal = orchestratorVoiceInputActive && orchestratorVoiceLevel >= 6;
+  const orchestratorVoiceHasSignal = orchestratorVoiceInputSending && orchestratorVoiceLevel >= 6;
   const orchestratorVoiceButtonLabel = orchestratorVoiceState === "starting"
     ? "Starting voice agent monitor"
-    : orchestratorVoiceState === "listening"
-      ? orchestratorVoiceManualMode
+    : orchestratorVoiceCanToggleInput
+      ? orchestratorVoiceInputEnabled
+        ? "Pause voice agent audio"
+        : "Resume voice agent audio"
+      : orchestratorVoiceState === "listening"
+        ? orchestratorVoiceManualMode
         ? "Submit voice agent input"
         : "Finish voice agent input"
-      : orchestratorVoiceState === "processing"
-        ? "Voice agent response in progress"
-        : orchestratorVoiceError
-          ? "Restart voice agent monitor"
-          : "Start voice agent monitor";
+        : orchestratorVoiceState === "processing"
+          ? "Voice agent response in progress"
+          : orchestratorVoiceError
+            ? "Restart voice agent monitor"
+            : "Start voice agent monitor";
   const orchestratorVoiceButtonTitle = orchestratorVoiceError
     || orchestratorVoiceFeedback
     || (orchestratorVoiceState === "starting"
       ? "Starting input"
-      : orchestratorVoiceState === "listening"
-        ? orchestratorVoiceManualMode ? "Submit input" : "Stop sending audio"
+      : orchestratorVoiceCanToggleInput
+        ? orchestratorVoiceInputEnabled ? "Pause audio to realtime agent" : "Resume audio to realtime agent"
+        : orchestratorVoiceState === "listening"
+          ? orchestratorVoiceManualMode ? "Submit input" : "Stop sending audio"
         : orchestratorVoiceState === "processing"
           ? "Waiting for the voice response"
           : "Start listening");
-  const orchestratorVoiceCanCancel = orchestratorVoiceInputActive
-    || orchestratorVoiceState === "processing"
+  const orchestratorVoiceCanCancel = orchestratorVoiceSessionActive
     || orchestratorChatSubmitting;
   const orchestratorChatBusy = orchestratorChatSubmitting
     || orchestratorVoiceState === "starting"
@@ -13716,14 +13791,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               <OrchestratorVoiceButton
                 aria-label={orchestratorVoiceButtonLabel}
                 data-error={orchestratorVoiceError ? "true" : undefined}
-                data-monitoring={orchestratorVoiceInputActive ? "true" : undefined}
+                data-monitoring={orchestratorVoiceInputSending ? "true" : undefined}
                 data-starting={orchestratorVoiceState === "starting" ? "true" : undefined}
                 onClick={toggleOrchestratorVoiceMonitor}
                 title={orchestratorVoiceButtonTitle}
                 type="button"
               >
                 <OrchestratorVoiceCanvasRing
-                  active={orchestratorVoiceInputActive}
+                  active={orchestratorVoiceInputSending}
                   hasSignal={orchestratorVoiceHasSignal}
                   level={orchestratorVoiceLevel}
                   stats={orchestratorVoiceStats}
@@ -27034,11 +27109,16 @@ function TerminalView({
                   </TerminalBreakoutActivityHeader>
                   <TerminalBreakoutActivityList>
                     {terminalBreakoutSubagents.map((subagent) => {
-                      const meta = terminalActivitySubagentMeta(subagent);
+                      const subagentName = terminalActivitySubagentName(subagent);
+                      // Identity must be stable across activity polls:
+                      // keying on updatedAtMs regenerated the row key every
+                      // snapshot, which dropped the expanded state and made
+                      // the dropdown look unclickable.
+                      const subagentIdentity = subagent.id || subagent.agentId || subagentName;
                       const rowKey = terminalBreakoutActivityRowKey(
                         terminalPaneId,
                         "subagent",
-                        subagent.id || `${subagent.label}-${subagent.updatedAtMs}`,
+                        subagentIdentity,
                       );
                       const expanded = Boolean(terminalBreakoutActivityExpandedRows[rowKey]);
                       const statusKind = terminalBreakoutActivityStatusKind(subagent.status);
@@ -27048,7 +27128,7 @@ function TerminalView({
                         <TerminalBreakoutActivityItem
                           data-kind="subagent"
                           data-open={expanded ? "true" : "false"}
-                          key={subagent.id || `${subagent.label}-${subagent.updatedAtMs}`}
+                          key={subagentIdentity}
                         >
                           <TerminalBreakoutActivityRow
                             aria-expanded={expanded}
@@ -27063,23 +27143,13 @@ function TerminalView({
                               aria-hidden="true"
                               data-kind="subagent"
                               data-status={statusKind}
+                              style={{ "--terminal-activity-glyph": terminalActivityGlyphColor(subagentName) }}
                             />
                             <TerminalBreakoutActivityRowMain>
                               <TerminalBreakoutActivityRowTitle title={subagent.description || title}>
-                                {title}
+                                <strong>{subagentName}</strong>
+                                <span>{` is ${terminalBreakoutActivityStatusLabel(subagent.status)}`}</span>
                               </TerminalBreakoutActivityRowTitle>
-                              {meta.length > 0 && (
-                                <TerminalBreakoutActivityRowMeta>
-                                  {meta.map((item) => (
-                                    <TerminalBreakoutActivityPill
-                                      data-tone={statusKind === "awaiting" ? "yellow" : "blue"}
-                                      key={item}
-                                    >
-                                      {item}
-                                    </TerminalBreakoutActivityPill>
-                                  ))}
-                                </TerminalBreakoutActivityRowMeta>
-                              )}
                             </TerminalBreakoutActivityRowMain>
                             <span aria-hidden="true" />
                             <TerminalBreakoutActivityChevron aria-hidden="true" data-open={expanded ? "true" : "false"} />
@@ -27101,8 +27171,8 @@ function TerminalView({
                       const stopKey = `${terminalPaneId}:${process.pid}`;
                       const stopState = terminalBreakoutActivityStopState[stopKey] || "";
                       const stopping = stopState === "stopping";
-                      const meta = terminalActivityProcessMeta(process);
                       const label = terminalActivityProcessLabel(process);
+                      const portLabel = terminalActivityPortLabel(process);
                       const rowKey = terminalBreakoutActivityRowKey(terminalPaneId, "process", process.pid);
                       const expanded = Boolean(terminalBreakoutActivityExpandedRows[rowKey]);
                       const details = terminalActivityProcessDetails(process);
@@ -27124,17 +27194,9 @@ function TerminalView({
                             <TerminalBreakoutActivityNodeGlyph aria-hidden="true" data-kind="process" />
                             <TerminalBreakoutActivityRowMain>
                               <TerminalBreakoutActivityRowTitle title={process.command || process.executable || label}>
-                                {terminalActivityProcessTitle(process)}
+                                <strong>{label}</strong>
+                                <span>{` is running${portLabel ? ` · ${portLabel}` : ""}`}</span>
                               </TerminalBreakoutActivityRowTitle>
-                              {meta.length > 0 && (
-                                <TerminalBreakoutActivityRowMeta>
-                                  {meta.map((item) => (
-                                    <TerminalBreakoutActivityPill key={item}>
-                                      {item}
-                                    </TerminalBreakoutActivityPill>
-                                  ))}
-                                </TerminalBreakoutActivityRowMeta>
-                              )}
                             </TerminalBreakoutActivityRowMain>
                             {process.killable ? (
                               <TerminalBreakoutActivityStopButton

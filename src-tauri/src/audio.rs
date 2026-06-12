@@ -131,6 +131,16 @@ async fn forge_dictation_release_mic(app: &AppHandle, audio_state: &AudioState) 
     if !borrowed {
         return;
     }
+    if !audio_state
+        .cloud_voice_agent_input_enabled
+        .load(Ordering::SeqCst)
+    {
+        log_audio_diagnostic_event(
+            "audio.cloud_voice.mic.resume_skipped",
+            json!({ "reason": "input_disabled" }),
+        );
+        return;
+    }
     let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
     let Some(session) = session_guard.as_mut() else {
         return;
@@ -140,6 +150,9 @@ async fn forge_dictation_release_mic(app: &AppHandle, audio_state: &AudioState) 
     match session.finished_rx.try_recv() {
         Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
             *session_guard = None;
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(false, Ordering::SeqCst);
             return;
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
@@ -394,13 +407,26 @@ impl NativeAudioShared {
     }
 }
 
+/// Keeps the platform capture stream alive for the session's lifetime.
+/// macOS prefers the VoiceProcessingIO audio unit: the OS echo canceller
+/// subtracts everything the system plays (including the webview's TTS) from
+/// the mic signal, so the voice agent can never hear itself.
+enum NativeAudioStreamHandle {
+    // Held only so Drop tears the capture stream down with the session.
+    #[allow(dead_code)]
+    Cpal(cpal::Stream),
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    VoiceProcessing(MacosVoiceProcessingCapture),
+}
+
 struct NativeAudioSession {
     device_id: String,
     label: String,
     owners: HashSet<String>,
     sample_rate: u32,
     shared: Arc<StdMutex<NativeAudioShared>>,
-    _stream: cpal::Stream,
+    _stream: NativeAudioStreamHandle,
 }
 
 enum NativeAudioCommand {
@@ -1002,6 +1028,133 @@ fn log_native_audio_stream_error(device_id: &str, error: cpal::StreamError) {
     eprintln!("Diff Forge audio input stream error for {device_id}: {error}");
 }
 
+/// Client-side sample rate requested from the VoiceProcessingIO unit; the
+/// unit converts from the device clock, downstream consumers resample again
+/// (Whisper to 16 kHz, the cloud agents from the advertised session rate).
+#[cfg(target_os = "macos")]
+const MACOS_VOICE_PROCESSING_SAMPLE_RATE: u32 = 48_000;
+
+#[cfg(target_os = "macos")]
+struct MacosVoiceProcessingCapture {
+    unit: coreaudio::audio_unit::AudioUnit,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosVoiceProcessingCapture {
+    fn drop(&mut self) {
+        // AudioUnit's own Drop uninitializes and disposes; stopping first
+        // keeps CoreAudio from rendering into a half-torn-down unit.
+        let _ = self.unit.stop();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_voice_processing_core_device(
+    device_id: &str,
+    label: &str,
+) -> Result<coreaudio::sys::AudioDeviceID, String> {
+    use coreaudio::audio_unit::macos_helpers::{get_default_device_id, get_device_id_from_name};
+
+    if device_id.is_empty() || device_id == "default" {
+        return get_default_device_id(true).ok_or_else(|| {
+            "No default input device is available for voice processing.".to_string()
+        });
+    }
+    get_device_id_from_name(label, true).ok_or_else(|| {
+        format!("Input device {label} was not found for voice processing capture.")
+    })
+}
+
+/// Builds a mic capture stream through macOS's VoiceProcessingIO audio unit,
+/// which applies the system echo canceller (plus noise suppression and AGC)
+/// before we ever see the samples. The same unit/config Safari and Chrome
+/// use for getUserMedia echo cancellation.
+#[cfg(target_os = "macos")]
+fn build_macos_voice_processing_capture(
+    app: AppHandle,
+    device_id: String,
+    label: &str,
+) -> Result<(MacosVoiceProcessingCapture, Arc<StdMutex<NativeAudioShared>>, u32), String> {
+    use coreaudio::audio_unit::audio_format::LinearPcmFlags;
+    use coreaudio::audio_unit::render_callback::{self, data};
+    use coreaudio::audio_unit::{AudioUnit, Element, IOType, SampleFormat, Scope, StreamFormat};
+    use coreaudio::sys::{
+        kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
+        kAudioUnitProperty_StreamFormat,
+    };
+
+    let describe = |stage: &str, error: coreaudio::Error| {
+        format!("Voice processing capture failed at {stage}: {error}")
+    };
+
+    let core_device = macos_voice_processing_core_device(&device_id, label)?;
+    let mut unit = AudioUnit::new(IOType::VoiceProcessingIO)
+        .map_err(|error| describe("create", error))?;
+    // EnableIO and formats only apply to an uninitialized unit.
+    unit.uninitialize().map_err(|error| describe("uninitialize", error))?;
+    let enable_input: u32 = 1;
+    unit.set_property(
+        kAudioOutputUnitProperty_EnableIO,
+        Scope::Input,
+        Element::Input,
+        Some(&enable_input),
+    )
+    .map_err(|error| describe("enable input", error))?;
+    let disable_output: u32 = 0;
+    unit.set_property(
+        kAudioOutputUnitProperty_EnableIO,
+        Scope::Output,
+        Element::Output,
+        Some(&disable_output),
+    )
+    .map_err(|error| describe("disable output", error))?;
+    unit.set_property(
+        kAudioOutputUnitProperty_CurrentDevice,
+        Scope::Global,
+        Element::Output,
+        Some(&core_device),
+    )
+    .map_err(|error| describe("select device", error))?;
+    let stream_format = StreamFormat {
+        sample_rate: f64::from(MACOS_VOICE_PROCESSING_SAMPLE_RATE),
+        sample_format: SampleFormat::F32,
+        flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
+        channels: 1,
+    };
+    unit.set_property(
+        kAudioUnitProperty_StreamFormat,
+        Scope::Output,
+        Element::Input,
+        Some(&stream_format.to_asbd()),
+    )
+    .map_err(|error| describe("set format", error))?;
+
+    let shared = Arc::new(StdMutex::new(NativeAudioShared::new(
+        MACOS_VOICE_PROCESSING_SAMPLE_RATE,
+    )));
+    let callback_shared = shared.clone();
+    let callback_device_id = device_id;
+    type VoiceProcessingArgs = render_callback::Args<data::Interleaved<f32>>;
+    unit.set_input_callback(move |args: VoiceProcessingArgs| {
+        process_native_audio_samples(
+            &app,
+            &callback_device_id,
+            &callback_shared,
+            args.data.buffer.to_vec(),
+        );
+        Ok(())
+    })
+    .map_err(|error| describe("install callback", error))?;
+    unit.initialize().map_err(|error| describe("initialize", error))?;
+    unit.start().map_err(|error| describe("start", error))?;
+
+    Ok((
+        MacosVoiceProcessingCapture { unit },
+        shared,
+        MACOS_VOICE_PROCESSING_SAMPLE_RATE,
+    ))
+}
+
 fn build_native_audio_stream(
     app: AppHandle,
     device_id: String,
@@ -1414,6 +1567,52 @@ fn start_native_audio_session(
 
     *session = None;
     let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
+
+    // macOS: capture through the system voice-processing unit so the OS
+    // echo canceller strips played-back agent speech from the mic signal.
+    // Any failure (virtual devices, odd aggregates) falls back to cpal.
+    #[cfg(target_os = "macos")]
+    match build_macos_voice_processing_capture(app.clone(), device_id.clone(), &label) {
+        Ok((capture, shared, sample_rate)) => {
+            let mut owners = HashSet::new();
+            owners.insert(owner.clone());
+            let next_session = NativeAudioSession {
+                device_id,
+                label,
+                owners,
+                sample_rate,
+                shared,
+                _stream: NativeAudioStreamHandle::VoiceProcessing(capture),
+            };
+            let status = native_audio_status(&next_session);
+            *session = Some(next_session);
+            log_whisper_local_audio_event(
+                "audio.monitor.start.done",
+                Some(started_at.elapsed()),
+                json!({
+                    "owner": owner,
+                    "device_id": &status.device_id,
+                    "label": &status.label,
+                    "sample_rate": status.sample_rate,
+                    "engine": "voice_processing_io",
+                    "owner_count": status.owner_count,
+                }),
+            );
+            return Ok(status);
+        }
+        Err(error) => {
+            log_whisper_local_audio_event(
+                "audio.monitor.start.voice_processing_fallback",
+                None,
+                json!({
+                    "owner": owner,
+                    "device_id": &device_id,
+                    "error": error,
+                }),
+            );
+        }
+    }
+
     let supported_config = device
         .default_input_config()
         .map_err(|error| native_audio_error_message(error))?;
@@ -1441,7 +1640,7 @@ fn start_native_audio_session(
         owners,
         sample_rate,
         shared,
-        _stream: stream,
+        _stream: NativeAudioStreamHandle::Cpal(stream),
     };
     let status = native_audio_status(&next_session);
     *session = Some(next_session);
@@ -3479,7 +3678,7 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
             "browser_search",
             "file_search"
         ],
-        "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks"],
+        "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control"],
         "tool_choice": "auto",
         "response_contract": {
             "immediate_feedback_required": true,
@@ -3603,6 +3802,7 @@ fn is_expected_cloud_voice_agent_close_error(error: &str) -> bool {
         || error.contains("already closed")
         || error.contains("closed by peer")
         || error.contains("reset by peer")
+        || error.contains("sending after closing")
         || error.contains("websocket protocol error: connection reset")
 }
 
@@ -3886,7 +4086,23 @@ async fn run_cloud_voice_agent_stream(
     finished_tx: oneshot::Sender<Result<(), String>>,
 ) {
     let mut ready_tx = Some(ready_tx);
-    let mut opened_target = ws_target.clone();
+    let opened_target = ws_target.clone();
+    let realtime_engine = start_request
+        .get("realtime")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            start_request
+                .get("voice_engine")
+                .or_else(|| start_request.get("voiceEngine"))
+                .and_then(Value::as_str)
+                .map(|engine| {
+                    matches!(
+                        engine.trim().to_ascii_lowercase().as_str(),
+                        "gpt_realtime" | "gpt-realtime" | "realtime"
+                    )
+                })
+                .unwrap_or(false)
+        });
     let request = match cloud_voice_agent_ws_request(
         &opened_target,
         auth_bearer.as_deref(),
@@ -4029,6 +4245,7 @@ async fn run_cloud_voice_agent_stream(
     let mut stream_error: Option<String> = None;
     let mut client_stop_requested = false;
     let mut input_finished_sent = false;
+    let mut peer_closed = false;
     let mut result_received = false;
     let mut tts_suppression_until: Option<Instant> = None;
     let mut pending_binary_audio: Option<Value> = None;
@@ -4039,7 +4256,7 @@ async fn run_cloud_voice_agent_stream(
             maybe_control = control_rx.recv() => {
                 match maybe_control {
                     Some(CloudVoiceAgentControl::FinishInput) => {
-                        if !input_finished_sent {
+                        if !input_finished_sent && !peer_closed {
                             let finish_message = json!({
                                 "kind": "finish_input",
                                 "voice_protocol": "diffforge.voice.realtime.v2",
@@ -4050,9 +4267,14 @@ async fn run_cloud_voice_agent_stream(
                                 .send(Message::Text(finish_message.to_string().into()))
                                 .await
                             {
-                                stream_error = Some(format!(
-                                    "Unable to finish cloud voice agent input: {error}"
-                                ));
+                                let error_text = error.to_string();
+                                if is_expected_cloud_voice_agent_close_error(&error_text) {
+                                    peer_closed = true;
+                                } else {
+                                    stream_error = Some(format!(
+                                        "Unable to finish cloud voice agent input: {error_text}"
+                                    ));
+                                }
                             } else {
                                 input_finished_sent = true;
                                 log_audio_diagnostic_event(
@@ -4083,7 +4305,7 @@ async fn run_cloud_voice_agent_stream(
                         Ok(CloudVoiceAgentControl::FinishInput)
                         | Err(mpsc::error::TryRecvError::Empty) => {}
                     }
-                    if !input_finished_sent {
+                    if !input_finished_sent && !peer_closed {
                         let finish_message = json!({
                             "kind": "finish_input",
                             "voice_protocol": "diffforge.voice.realtime.v2",
@@ -4094,9 +4316,14 @@ async fn run_cloud_voice_agent_stream(
                             .send(Message::Text(finish_message.to_string().into()))
                             .await
                         {
-                            stream_error = Some(format!(
-                                "Unable to finish cloud voice agent input after audio closed: {error}"
-                            ));
+                            let error_text = error.to_string();
+                            if is_expected_cloud_voice_agent_close_error(&error_text) {
+                                peer_closed = true;
+                            } else {
+                                stream_error = Some(format!(
+                                    "Unable to finish cloud voice agent input after audio closed: {error_text}"
+                                ));
+                            }
                         } else {
                             input_finished_sent = true;
                             log_audio_diagnostic_event(
@@ -4112,7 +4339,9 @@ async fn run_cloud_voice_agent_stream(
                     break;
                 };
                 if !audio_bytes.is_empty() {
-                    if cloud_voice_agent_tts_suppression_active(tts_suppression_until) {
+                    if !realtime_engine
+                        && cloud_voice_agent_tts_suppression_active(tts_suppression_until)
+                    {
                         suppressed_audio_chunks += 1;
                         suppressed_audio_bytes += audio_bytes.len() as u64;
                         continue;
@@ -4173,14 +4402,23 @@ async fn run_cloud_voice_agent_stream(
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if let Err(error) = write.send(Message::Pong(payload)).await {
-                            stream_error = Some(format!("Unable to answer cloud voice agent ping: {error}"));
+                            let error_text = error.to_string();
+                            if is_expected_cloud_voice_agent_close_error(&error_text) {
+                                peer_closed = true;
+                            } else {
+                                stream_error = Some(format!("Unable to answer cloud voice agent ping: {error_text}"));
+                            }
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        peer_closed = true;
+                        break;
+                    }
                     Some(Err(error)) => {
                         let error_text = error.to_string();
-                        if client_stop_requested && is_expected_cloud_voice_agent_close_error(&error_text) {
+                        if is_expected_cloud_voice_agent_close_error(&error_text) {
+                            peer_closed = true;
                             break;
                         }
                         stream_error = Some(format!("Cloud voice agent stream failed: {error_text}"));
@@ -4192,7 +4430,13 @@ async fn run_cloud_voice_agent_stream(
         }
     }
 
-    if stream_error.is_none() && !client_stop_requested && !result_received {
+    if peer_closed && stream_error.is_none() && !client_stop_requested && !result_received {
+        stream_error = Some(
+            "Cloud voice agent connection closed before final response, plan, or error.".to_string(),
+        );
+    }
+
+    if stream_error.is_none() && !client_stop_requested && !result_received && !peer_closed {
         if !input_finished_sent {
             let finish_message = json!({
                 "kind": "finish_input",
@@ -4204,9 +4448,18 @@ async fn run_cloud_voice_agent_stream(
                 .send(Message::Text(finish_message.to_string().into()))
                 .await
             {
-                stream_error = Some(format!(
-                    "Unable to finish cloud voice agent input before waiting for result: {error}"
-                ));
+                let error_text = error.to_string();
+                if is_expected_cloud_voice_agent_close_error(&error_text) {
+                    peer_closed = true;
+                    stream_error = Some(
+                        "Cloud voice agent connection closed before result wait could start."
+                            .to_string(),
+                    );
+                } else {
+                    stream_error = Some(format!(
+                        "Unable to finish cloud voice agent input before waiting for result: {error_text}"
+                    ));
+                }
             } else {
                 log_audio_diagnostic_event(
                     "audio.cloud_voice.finish_input.sent",
@@ -4220,7 +4473,7 @@ async fn run_cloud_voice_agent_stream(
         }
     }
 
-    if stream_error.is_none() && !client_stop_requested && !result_received {
+    if stream_error.is_none() && !client_stop_requested && !result_received && !peer_closed {
         log_audio_diagnostic_event(
             "audio.cloud_voice.result_wait.start",
             json!({
@@ -4235,7 +4488,6 @@ async fn run_cloud_voice_agent_stream(
             tokio::select! {
                 maybe_control = control_rx.recv() => {
                     if matches!(maybe_control, Some(CloudVoiceAgentControl::Stop) | None) {
-                        client_stop_requested = true;
                         break;
                     }
                 }
@@ -4267,12 +4519,22 @@ async fn run_cloud_voice_agent_stream(
                         }
                         Some(Ok(Message::Ping(payload))) => {
                             if let Err(error) = write.send(Message::Pong(payload)).await {
-                                stream_error =
-                                    Some(format!("Unable to answer cloud voice agent ping: {error}"));
+                                let error_text = error.to_string();
+                                if is_expected_cloud_voice_agent_close_error(&error_text) {
+                                    peer_closed = true;
+                                    stream_error = Some(
+                                        "Cloud voice agent connection closed while waiting for result."
+                                            .to_string(),
+                                    );
+                                } else {
+                                    stream_error =
+                                        Some(format!("Unable to answer cloud voice agent ping: {error_text}"));
+                                }
                                 break;
                             }
                         }
                         Some(Ok(Message::Close(_))) | None => {
+                            peer_closed = true;
                             stream_error = Some(
                                 "Cloud voice agent connection closed before final response, plan, or error."
                                     .to_string(),
@@ -4281,9 +4543,17 @@ async fn run_cloud_voice_agent_stream(
                         }
                         Some(Err(error)) => {
                             let error_text = error.to_string();
-                            stream_error = Some(format!(
-                                "Cloud voice agent stream failed: {error_text}"
-                            ));
+                            if is_expected_cloud_voice_agent_close_error(&error_text) {
+                                peer_closed = true;
+                                stream_error = Some(
+                                    "Cloud voice agent connection closed while waiting for result."
+                                        .to_string(),
+                                );
+                            } else {
+                                stream_error = Some(format!(
+                                    "Cloud voice agent stream failed: {error_text}"
+                                ));
+                            }
                             break;
                         }
                         _ => {}
@@ -4308,27 +4578,29 @@ async fn run_cloud_voice_agent_stream(
         );
     }
 
-    let stop_message = json!({
-        "kind": "stop",
-        "voice_protocol": "diffforge.voice.realtime.v2",
-        "lane": "control",
-        "contract": "diffforge.voice_agent.v1",
-    });
-    if let Err(error) = write
-        .send(Message::Text(stop_message.to_string().into()))
-        .await
-    {
-        let error_text = error.to_string();
-        if stream_error.is_none()
-            && !(client_stop_requested && is_expected_cloud_voice_agent_close_error(&error_text))
+    if !peer_closed {
+        let stop_message = json!({
+            "kind": "stop",
+            "voice_protocol": "diffforge.voice.realtime.v2",
+            "lane": "control",
+            "contract": "diffforge.voice_agent.v1",
+        });
+        if let Err(error) = write
+            .send(Message::Text(stop_message.to_string().into()))
+            .await
         {
-            stream_error = Some(format!(
-                "Unable to stop cloud voice agent stream: {error_text}"
-            ));
+            let error_text = error.to_string();
+            if is_expected_cloud_voice_agent_close_error(&error_text) {
+                peer_closed = true;
+            } else if stream_error.is_none() {
+                stream_error = Some(format!(
+                    "Unable to stop cloud voice agent stream: {error_text}"
+                ));
+            }
         }
     }
 
-    if stream_error.is_none() {
+    if stream_error.is_none() && !peer_closed {
         loop {
             match timeout(
                 Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS),
@@ -4356,17 +4628,20 @@ async fn run_cloud_voice_agent_stream(
                 }
                 Ok(Some(Ok(Message::Ping(payload)))) => {
                     if let Err(error) = write.send(Message::Pong(payload)).await {
-                        stream_error =
-                            Some(format!("Unable to answer cloud voice agent ping: {error}"));
+                        let error_text = error.to_string();
+                        if !is_expected_cloud_voice_agent_close_error(&error_text) {
+                            stream_error =
+                                Some(format!("Unable to answer cloud voice agent ping: {error_text}"));
+                        }
                         break;
                     }
                 }
-                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => {
+                    break;
+                }
                 Ok(Some(Err(error))) => {
                     let error_text = error.to_string();
-                    if client_stop_requested
-                        && is_expected_cloud_voice_agent_close_error(&error_text)
-                    {
+                    if is_expected_cloud_voice_agent_close_error(&error_text) {
                         break;
                     }
                     stream_error = Some(format!("Cloud voice agent stream failed: {error_text}"));
@@ -4404,7 +4679,7 @@ async fn run_cloud_voice_agent_text_message(
     repo_id: String,
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
-    let mut opened_target = ws_target.clone();
+    let opened_target = ws_target.clone();
     let request = match cloud_voice_agent_ws_request(
         &opened_target,
         auth_bearer.as_deref(),
@@ -4715,6 +4990,9 @@ async fn start_cloud_voice_agent_stream(
             match session.finished_rx.try_recv() {
                 Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     *session_guard = None;
+                    audio_state
+                        .cloud_voice_agent_input_enabled
+                        .store(false, Ordering::SeqCst);
                     let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
@@ -4754,6 +5032,9 @@ async fn start_cloud_voice_agent_stream(
             }
         };
         realtime_mic_holder_set(&audio_state, RealtimeMicHolder::VoiceAgent);
+        audio_state
+            .cloud_voice_agent_input_enabled
+            .store(true, Ordering::SeqCst);
         spawn_cloud_voice_agent_desktop_log(
             cloud_mcp_state.inner(),
             "audio_input_attached",
@@ -4821,7 +5102,7 @@ async fn start_cloud_voice_agent_stream(
                     "browser_search",
                     "file_search"
                 ],
-                "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks"],
+            "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control"],
                 "tool_choice": "auto",
                 "response_contract": {
                     "immediate_feedback_required": true,
@@ -4888,6 +5169,9 @@ async fn start_cloud_voice_agent_stream(
             let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
             let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
             *session_guard = None;
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(false, Ordering::SeqCst);
             let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
         }
         spawn_cloud_voice_agent_desktop_log(
@@ -4922,6 +5206,131 @@ async fn start_cloud_voice_agent_stream(
         sample_rate: status.sample_rate,
         workspace_id,
     })
+}
+
+#[tauri::command]
+async fn set_cloud_voice_agent_input_enabled(
+    app: AppHandle,
+    audio_state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<Value, String> {
+    log_audio_diagnostic_event(
+        "audio.cloud_voice.input_enabled.command",
+        json!({ "enabled": enabled }),
+    );
+    let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
+
+    if !enabled {
+        audio_state
+            .cloud_voice_agent_input_enabled
+            .store(false, Ordering::SeqCst);
+        realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent)?;
+        let active = audio_state.cloud_voice_agent_stream.lock().await.is_some();
+        emit_voice_agent_mic_event(&app, "paused", "user_toggle");
+        log_audio_diagnostic_event(
+            "audio.cloud_voice.input_enabled.paused",
+            json!({ "active": active }),
+        );
+        return Ok(json!({
+            "active": active,
+            "enabled": false,
+            "mic_attached": false,
+        }));
+    }
+
+    let audio_tx = {
+        let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
+        let Some(session) = session_guard.as_mut() else {
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(false, Ordering::SeqCst);
+            log_audio_diagnostic_event("audio.cloud_voice.input_enabled.inactive", json!({}));
+            return Err("Cloud voice agent stream is not active.".to_string());
+        };
+        match session.finished_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                *session_guard = None;
+                audio_state
+                    .cloud_voice_agent_input_enabled
+                    .store(false, Ordering::SeqCst);
+                let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
+                log_audio_diagnostic_event("audio.cloud_voice.input_enabled.finished", json!({}));
+                return Err("Cloud voice agent stream has already finished.".to_string());
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => session.audio_tx.clone(),
+        }
+    };
+
+    match realtime_mic_holder_get(&audio_state) {
+        RealtimeMicHolder::VoiceAgent => {
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(true, Ordering::SeqCst);
+            emit_voice_agent_mic_event(&app, "resumed", "user_toggle");
+            log_audio_diagnostic_event(
+                "audio.cloud_voice.input_enabled.already_attached",
+                json!({}),
+            );
+            Ok(json!({
+                "active": true,
+                "enabled": true,
+                "mic_attached": true,
+            }))
+        }
+        RealtimeMicHolder::Dictation => {
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(true, Ordering::SeqCst);
+            emit_voice_agent_mic_event(&app, "paused", "dictation_active");
+            log_audio_diagnostic_event(
+                "audio.cloud_voice.input_enabled.waiting_for_dictation",
+                json!({}),
+            );
+            Ok(json!({
+                "active": true,
+                "enabled": true,
+                "mic_attached": false,
+                "reason": "dictation_active",
+            }))
+        }
+        RealtimeMicHolder::Deepgram => {
+            log_audio_diagnostic_event(
+                "audio.cloud_voice.input_enabled.blocked",
+                json!({ "holder": "deepgram" }),
+            );
+            Err("Deepgram realtime transcription is using the microphone.".to_string())
+        }
+        RealtimeMicHolder::None => {
+            match audio_state.input_worker.attach_realtime_stream_silent(audio_tx) {
+                Ok(_) => {
+                    realtime_mic_holder_set(&audio_state, RealtimeMicHolder::VoiceAgent);
+                    audio_state
+                        .cloud_voice_agent_input_enabled
+                        .store(true, Ordering::SeqCst);
+                    emit_voice_agent_mic_event(&app, "resumed", "user_toggle");
+                    log_audio_diagnostic_event(
+                        "audio.cloud_voice.input_enabled.resumed",
+                        json!({}),
+                    );
+                    Ok(json!({
+                        "active": true,
+                        "enabled": true,
+                        "mic_attached": true,
+                    }))
+                }
+                Err(error) => {
+                    audio_state
+                        .cloud_voice_agent_input_enabled
+                        .store(false, Ordering::SeqCst);
+                    log_audio_diagnostic_event(
+                        "audio.cloud_voice.input_enabled.resume_failed",
+                        json!({ "error": error }),
+                    );
+                    Err(error)
+                }
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -5119,10 +5528,16 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
         session_guard.take()
     };
     let Some(session) = session else {
+        audio_state
+            .cloud_voice_agent_input_enabled
+            .store(false, Ordering::SeqCst);
         log_audio_diagnostic_event("audio.cloud_voice.stop.inactive", json!({}));
         return Ok(());
     };
 
+    audio_state
+        .cloud_voice_agent_input_enabled
+        .store(false, Ordering::SeqCst);
     let _ = session.control_tx.send(CloudVoiceAgentControl::Stop);
     // Guarded detach: when dictation borrowed the mic, the agent no longer
     // owns it and must leave dictation's feed untouched.
@@ -5146,12 +5561,18 @@ async fn finish_cloud_voice_agent_input(audio_state: State<'_, AudioState>) -> R
     let control_tx = {
         let session_guard = audio_state.cloud_voice_agent_stream.lock().await;
         let Some(session) = session_guard.as_ref() else {
+            audio_state
+                .cloud_voice_agent_input_enabled
+                .store(false, Ordering::SeqCst);
             log_audio_diagnostic_event("audio.cloud_voice.finish_input.inactive", json!({}));
             return Ok(());
         };
         session.control_tx.clone()
     };
 
+    audio_state
+        .cloud_voice_agent_input_enabled
+        .store(false, Ordering::SeqCst);
     let _ = control_tx.send(CloudVoiceAgentControl::FinishInput);
     realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent)?;
     log_audio_diagnostic_event("audio.cloud_voice.finish_input.done", json!({}));
@@ -5628,7 +6049,7 @@ async fn run_forge_dictation_stream(
     let mut started = false;
     let start_deadline = sleep(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS));
     tokio::pin!(start_deadline);
-    let result: Result<ForgeDictationResult, String> = loop {
+    let result: Result<ForgeDictationResult, String> = 'stream: loop {
         tokio::select! {
             _ = &mut start_deadline, if !started => {
                 break Err("Cloud dictation timed out while starting the audio stream.".to_string());
@@ -5644,6 +6065,38 @@ async fn run_forge_dictation_stream(
                 };
                 cancel_requested = cancel_requested || cancel;
                 if !finish_sent {
+                    // Forward the captured tail before declaring the turn
+                    // over: select! races this branch against the audio one,
+                    // and the stop command detaches the mic before sending
+                    // Finish, so frames still queued here are the end of the
+                    // utterance — dropping them clipped trailing words.
+                    if !cancel_requested {
+                        let mut tail_frames: u64 = 0;
+                        loop {
+                            match audio_rx.try_recv() {
+                                Ok(audio_bytes) => {
+                                    if audio_bytes.is_empty() {
+                                        continue;
+                                    }
+                                    tail_frames += 1;
+                                    if let Err(error) = write.send(Message::Binary(audio_bytes.into())).await {
+                                        break 'stream Err(format!("Unable to stream audio to Diff Forge Cloud: {error}"));
+                                    }
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    audio_open = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if tail_frames > 0 {
+                            log_audio_diagnostic_event(
+                                "audio.forge_dictation.tail_flushed",
+                                json!({ "frames": tail_frames }),
+                            );
+                        }
+                    }
                     finish_sent = true;
                     let frame = json!({
                         "kind": control_kind,
@@ -6281,14 +6734,20 @@ async fn stop_forge_dictation_transcription(
         });
     };
 
+    // Detach the mic BEFORE sending the finish control: detaching stops the
+    // capture thread and flushes its last frames into the audio channel, so
+    // when the stream task processes Finish, everything still queued IS the
+    // complete tail of the utterance. The other order raced the capture
+    // thread and clipped trailing words ("hey there can you hear me" losing
+    // everything after "can"). Release also hands the mic back to a voice
+    // agent session that lent it (mic arbitration); plain dictation just
+    // detaches.
+    forge_dictation_release_mic(&app, &audio_state).await;
     let _ = session.control_tx.send(if cancel {
         ForgeDictationControl::Cancel
     } else {
         ForgeDictationControl::Finish
     });
-    // Hands the mic back to a voice agent session that lent it (mic
-    // arbitration); plain dictation just detaches.
-    forge_dictation_release_mic(&app, &audio_state).await;
 
     let result = timeout(
         Duration::from_secs(CLOUD_DICTATION_RESULT_TIMEOUT_SECS),

@@ -729,6 +729,57 @@ fn tokenomics_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Account keys whose per-profile sources are suppressed because the
+/// captured profile duplicates the Default login. Rows recorded under these
+/// keys before the dedupe (limit gauges above all) made one login render as
+/// two usage accounts; they are filtered from every limits payload, purged
+/// from the local sample store, and published as retractions so the cloud
+/// deletes its copies too.
+fn tokenomics_retired_provider_account_keys() -> Vec<String> {
+    let mut keys = Vec::new();
+    for profile_id in agent_accounts_duplicate_profile_ids("claude") {
+        keys.push(format!("anthropic:claude:profile:{profile_id}"));
+    }
+    for profile_id in agent_accounts_duplicate_profile_ids("codex") {
+        keys.push(format!("openai:codex:profile:{profile_id}"));
+    }
+    keys
+}
+
+fn tokenomics_value_account_key(value: &Value) -> String {
+    value
+        .get("provider_account_key")
+        .or_else(|| value.get("providerAccountKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn tokenomics_retain_active_account_rows(rows: &mut Vec<Value>, retired_keys: &[String]) {
+    if retired_keys.is_empty() {
+        return;
+    }
+    rows.retain(|row| {
+        let key = tokenomics_value_account_key(row);
+        key.is_empty() || !retired_keys.iter().any(|retired| retired == &key)
+    });
+}
+
+fn tokenomics_purge_retired_limit_samples(
+    conn: &rusqlite::Connection,
+    retired_keys: &[String],
+) -> Result<(), String> {
+    for key in retired_keys {
+        conn.execute(
+            "DELETE FROM tokenomics_provider_limit_samples WHERE provider_account_key=?1",
+            rusqlite::params![key],
+        )
+        .map_err(|error| format!("Unable to purge retired limit samples: {error}"))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct TokenomicsProviderAccount {
     key: String,
@@ -4085,8 +4136,10 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
 	    )?;
     let mut limits = tokenomics_provider_limits(conn, include_cloud, include_cloud)?;
     tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
-    let limit_samples =
+    let retired_account_keys = tokenomics_retired_provider_account_keys();
+    let mut limit_samples =
         tokenomics_provider_limit_sample_rows(conn, None, scope_filter, include_cloud)?;
+    tokenomics_retain_active_account_rows(&mut limit_samples, &retired_account_keys);
     let sync_hourly = if include_rollups {
         tokenomics_account_hourly_sync_rollups(conn, None, scope_filter)?
     } else {
@@ -4118,6 +4171,8 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
         {"provider": "opencode", "agent_kind": "opencode", "label": "OpenCode"}
 	    ],
 	    "limits": limits,
+	    "retired_account_keys": retired_account_keys.clone(),
+	    "retiredAccountKeys": retired_account_keys,
 	    "device_identities": device_identities.clone(),
 	    "deviceIdentities": device_identities,
 	    }))
@@ -5555,6 +5610,15 @@ fn tokenomics_provider_limits(
 
     if include_cloud_last_known {
         limits = tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, limits);
+    }
+
+    // Suppressed duplicate-of-default profile accounts: drop their rows from
+    // every limits payload (cloud last-known included) and from the local
+    // sample store, so the same login never renders as two account chips.
+    let retired_keys = tokenomics_retired_provider_account_keys();
+    if !retired_keys.is_empty() {
+        tokenomics_retain_active_account_rows(&mut limits, &retired_keys);
+        tokenomics_purge_retired_limit_samples(conn, &retired_keys)?;
     }
 
     Ok(limits)

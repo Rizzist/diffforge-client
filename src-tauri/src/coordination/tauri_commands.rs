@@ -74,7 +74,9 @@ fn coordination_input_root(repo_path: Option<String>) -> Result<PathBuf, String>
     // cache folders) target user workspaces, not this store — without the
     // exemption the Global defaults scope can never load its registry.
     if let Some(defaults_root) = super::kernel::global_mcp_defaults_root_dir() {
-        let canonical_input = repo_path.canonicalize().unwrap_or_else(|_| repo_path.clone());
+        let canonical_input = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.clone());
         let canonical_defaults = defaults_root
             .canonicalize()
             .unwrap_or_else(|_| defaults_root.clone());

@@ -780,6 +780,9 @@ struct AudioState {
     cloud_voice_agent_stream: Arc<Mutex<Option<CloudVoiceAgentSession>>>,
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
     forge_dictation_stream: Arc<Mutex<Option<ForgeDictationSession>>>,
+    // User intent for the cloud voice agent mic feed. The websocket/session
+    // can stay alive while this is false; dictation release respects it.
+    cloud_voice_agent_input_enabled: Arc<AtomicBool>,
     // True while an active dictation session has borrowed the microphone from
     // a live cloud voice agent session; dictation teardown hands it back.
     forge_dictation_mic_borrowed: Arc<AtomicBool>,
@@ -2872,6 +2875,10 @@ fn schedule_app_exit_after_terminal_shutdown(
     thread::Builder::new()
         .name("diffforge-app-close".to_string())
         .spawn(move || {
+            // Tell the cloud we are leaving BEFORE teardown: a deliberate ws
+            // close flips dashboard presence to offline instantly instead of
+            // racing process exit against the cloud's silence timeout.
+            cloud_mcp_send_shutdown_goodbye_blocking();
             thread::sleep(Duration::from_millis(APP_CLOSE_EXIT_REQUEST_DELAY_MS));
             let _ = close_workspace_webviews(&app_for_exit);
             cleanup_windows_headless_console_hosts();
@@ -2907,6 +2914,7 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
             thread::sleep(Duration::from_millis(
                 APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS,
             ));
+            cloud_mcp_send_shutdown_goodbye_blocking();
             let _ = close_workspace_webviews(&app_for_exit);
             advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
             cleanup_windows_headless_console_hosts();
@@ -3485,7 +3493,10 @@ fn local_workspace_store_path(app: &AppHandle, scope_key: &str) -> Result<PathBu
         .join("workspace-catalog");
     fs::create_dir_all(&store_dir)
         .map_err(|error| format!("Unable to create workspace catalog directory: {error}"))?;
-    Ok(store_dir.join(format!("{}.json", local_workspace_scope_file_key(scope_key))))
+    Ok(store_dir.join(format!(
+        "{}.json",
+        local_workspace_scope_file_key(scope_key)
+    )))
 }
 
 /// Workspaces are local-first: the UI commits to this store instantly and the
@@ -3596,8 +3607,7 @@ pub(crate) fn local_workspace_catalog_apply_upsert(
             .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
     let workspace_name =
         local_workspace_catalog_text(workspace, &["workspace_name", "workspaceName", "name"]);
-    let created_at =
-        local_workspace_catalog_text(workspace, &["created_at", "createdAt"]);
+    let created_at = local_workspace_catalog_text(workspace, &["created_at", "createdAt"]);
     let updated_at = local_workspace_catalog_text(workspace, &["updated_at", "updatedAt"])
         .unwrap_or_else(cloud_mcp_rfc3339_now);
     let mut items = local_workspace_catalog_read_items(app, scope_key)?;
@@ -3655,18 +3665,20 @@ pub(crate) fn local_workspace_catalog_apply_delete(
 
 fn local_workspace_catalog_normalize_cloud_entry(entry: &Value) -> Option<Value> {
     let id = local_workspace_catalog_text(entry, &["workspace_id", "workspaceId", "id"])?;
-    let name = local_workspace_catalog_text(
-        entry,
-        &["workspace_name", "workspaceName", "name"],
-    )
-    .unwrap_or_else(|| "Workspace".to_string());
+    let name = local_workspace_catalog_text(entry, &["workspace_name", "workspaceName", "name"])
+        .unwrap_or_else(|| "Workspace".to_string());
     let created_at =
         local_workspace_catalog_text(entry, &["created_at", "createdAt"]).unwrap_or_default();
     let updated_at =
         local_workspace_catalog_text(entry, &["updated_at", "updatedAt"]).unwrap_or_default();
     let origin_device_id = local_workspace_catalog_text(
         entry,
-        &["origin_device_id", "originDeviceId", "device_id", "deviceId"],
+        &[
+            "origin_device_id",
+            "originDeviceId",
+            "device_id",
+            "deviceId",
+        ],
     )
     .unwrap_or_default();
     Some(json!({
@@ -3698,8 +3710,7 @@ pub(crate) fn local_workspace_catalog_apply_cloud_merge(
     let local_items = local_workspace_catalog_read_items(app, scope_key)?;
     let mut next_items = Vec::new();
     for item in local_items {
-        let Some(id) =
-            local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
+        let Some(id) = local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
         else {
             continue;
         };
@@ -3763,7 +3774,11 @@ pub(crate) fn app_local_state_read(app: &AppHandle, key: &str) -> Value {
         .unwrap_or(json!(null))
 }
 
-pub(crate) fn app_local_state_write(app: &AppHandle, key: &str, value: &Value) -> Result<(), String> {
+pub(crate) fn app_local_state_write(
+    app: &AppHandle,
+    key: &str,
+    value: &Value,
+) -> Result<(), String> {
     let path = app_local_state_path(app, key)?;
     let serialized = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("Unable to serialize app state: {error}"))?;
@@ -4183,6 +4198,7 @@ pub fn run() {
             cloud_voice_agent_stream: Arc::new(Mutex::new(None)),
             deepgram_stream: Arc::new(Mutex::new(None)),
             forge_dictation_stream: Arc::new(Mutex::new(None)),
+            cloud_voice_agent_input_enabled: Arc::new(AtomicBool::new(false)),
             forge_dictation_mic_borrowed: Arc::new(AtomicBool::new(false)),
             forge_dictation_warm: Arc::new(Mutex::new(None)),
             forge_dictation_warm_desired: Arc::new(AtomicBool::new(false)),
@@ -4210,11 +4226,9 @@ pub fn run() {
                 // Restore the persisted desktop session before the first
                 // connect so cloud auth comes up without waiting for the
                 // webview (background-capable startup).
-                let _ = cloud_mcp_restore_persisted_desktop_session(
-                    &cloud_mcp_app,
-                    &cloud_mcp_state,
-                )
-                .await;
+                let _ =
+                    cloud_mcp_restore_persisted_desktop_session(&cloud_mcp_app, &cloud_mcp_state)
+                        .await;
                 let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
             });
             cloud_mcp_start_tokenomics_scheduler(
@@ -4363,6 +4377,7 @@ pub fn run() {
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
             start_cloud_voice_agent_stream,
+            set_cloud_voice_agent_input_enabled,
             finish_cloud_voice_agent_input,
             stop_cloud_voice_agent_stream,
             send_cloud_voice_agent_text_message,
@@ -4483,6 +4498,8 @@ pub fn run() {
             cloud_mcp_download_workspace_asset,
             cloud_mcp_cancel_asset_transfer,
             cloud_mcp_delete_cloud_workspace_asset,
+            cloud_mcp_publish_workspace_asset,
+            cloud_mcp_unpublish_workspace_asset,
             cloud_mcp_delete_local_workspace_asset,
             cloud_mcp_get_workspace_asset_status,
             diffforge_start_untracked_assets_watcher,

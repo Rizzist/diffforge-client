@@ -355,7 +355,7 @@ async function copySnipToClipboard(snip) {
     await invoke("diffforge_copy_asset_to_clipboard", {
       path: snip.localPath,
     });
-    return "Copied image";
+    return "Copied to clipboard";
   } catch {
     // Fall through to web clipboard fallback.
   }
@@ -374,12 +374,12 @@ async function copySnipToClipboard(snip) {
         [mimeType]: blob,
       }),
     ]);
-    return "Copied image";
+    return "Copied to clipboard";
   }
 
   if (navigator?.clipboard?.writeText) {
     await navigator.clipboard.writeText(snip.localPath);
-    return "Copied path";
+    return "Copied to clipboard";
   }
 
   throw new Error("Clipboard is not available in this webview.");
@@ -944,20 +944,24 @@ const FloatActionButton = styled.button`
 
 const FloatStatusPill = styled.span`
   position: absolute;
-  top: 7px;
+  top: 8px;
   left: 50%;
   max-width: calc(100% - 132px);
   overflow: hidden;
-  padding: 3px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  padding: 4px 10px;
+  border: 1px solid rgba(125, 176, 255, 0.28);
   border-radius: 999px;
-  color: rgba(248, 250, 252, 0.92);
-  background: rgba(7, 10, 16, 0.88);
+  color: #dceaff;
+  background: rgba(7, 10, 16, 0.92);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
   font-size: 10px;
   font-weight: 740;
+  line-height: 1.2;
+  pointer-events: none;
   text-overflow: ellipsis;
   transform: translateX(-50%);
   white-space: nowrap;
+  z-index: 4;
 `;
 
 /**

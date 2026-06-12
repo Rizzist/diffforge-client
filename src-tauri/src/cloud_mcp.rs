@@ -3661,6 +3661,36 @@ async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
     });
 }
 
+// Manual-quit goodbye: the cloud flips presence to offline the instant the
+// app ws closes, so a graceful exit should close it deliberately instead of
+// relying on the OS FIN racing process teardown (which left the dashboard
+// showing "online" until the silence timeout).
+static CLOUD_MCP_SHUTDOWN_GOODBYE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static CLOUD_MCP_SHUTDOWN_GOODBYE_SENT: AtomicBool = AtomicBool::new(false);
+static CLOUD_MCP_GLOBAL_WS_LIVE: AtomicBool = AtomicBool::new(false);
+
+fn cloud_mcp_shutdown_goodbye_notify() -> &'static tokio::sync::Notify {
+    CLOUD_MCP_SHUTDOWN_GOODBYE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Called from the app-close thread right before exit: asks the live app ws
+/// to send a goodbye + Close frame and waits briefly (≤400ms) for the flush.
+/// No-op when live sync is not connected.
+pub(crate) fn cloud_mcp_send_shutdown_goodbye_blocking() {
+    if !CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
+        return;
+    }
+    cloud_mcp_shutdown_goodbye_notify().notify_waiters();
+    for _ in 0..20 {
+        if CLOUD_MCP_SHUTDOWN_GOODBYE_SENT.load(Ordering::Acquire)
+            || !CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
     cloud_mcp_log_voice_shared_ws(
         "voice_agent.shared_ws.manager_started",
@@ -3673,6 +3703,17 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
     loop {
         loop_iteration += 1;
         let iteration_started = Instant::now();
+        if app_shutdown_requested() {
+            // Quitting: the goodbye path just closed the ws deliberately so
+            // the cloud flips presence to offline instantly — reconnecting
+            // here would flicker the device back online mid-exit.
+            state.global_ws_started.store(false, Ordering::SeqCst);
+            log_cloud_sync_event(
+                "ws.loop_exit",
+                json!({ "iteration": loop_iteration, "reason": "app_shutdown" }),
+            );
+            return;
+        }
         if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
             state.global_ws_started.store(false, Ordering::SeqCst);
             log_cloud_sync_event(
@@ -4099,11 +4140,31 @@ async fn cloud_mcp_open_global_ws(
     // accidental health check where any single request timeout tore the
     // shared connection down (which caused reconnect storms).
     let mut last_inbound_at = Instant::now();
-    let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+    // 15s ping / 45s silence (was 30s/90s): a half-dead socket parked
+    // inbound remote commands for the whole zombie window — the web-visible
+    // "115 seconds to activate a workspace" failure. Three missed ping/pong
+    // exchanges still have to elapse before declaring death, so transient
+    // hiccups don't cause reconnect storms.
+    let mut keepalive = tokio::time::interval(Duration::from_secs(15));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    CLOUD_MCP_GLOBAL_WS_LIVE.store(true, Ordering::Release);
     let result: Result<(), String> = loop {
         tokio::select! {
             biased;
+            _ = cloud_mcp_shutdown_goodbye_notify().notified() => {
+                // Manual quit: close deliberately so the cloud broadcasts
+                // the offline devices_state immediately.
+                let goodbye = json!({
+                    "kind": "desktop_goodbye",
+                    "contract": "diffforge.app_ws.v1",
+                    "reason": "app_quit",
+                });
+                let _ = write.send(Message::Text(goodbye.to_string().into())).await;
+                let _ = write.send(Message::Close(None)).await;
+                let _ = write.flush().await;
+                CLOUD_MCP_SHUTDOWN_GOODBYE_SENT.store(true, Ordering::Release);
+                break Err("App websocket closed for shutdown goodbye.".to_string());
+            }
             _ = &mut ready_timeout, if !ready_seen => {
                 break Err(format!(
                     "Cloud MCP app websocket did not send a ready frame within {} seconds.",
@@ -4111,9 +4172,9 @@ async fn cloud_mcp_open_global_ws(
                 ));
             }
             _ = keepalive.tick() => {
-                if last_inbound_at.elapsed() >= Duration::from_secs(90) {
+                if last_inbound_at.elapsed() >= Duration::from_secs(45) {
                     break Err(
-                        "Cloud MCP app websocket went silent (no frames for 90 seconds)."
+                        "Cloud MCP app websocket went silent (no frames for 45 seconds)."
                             .to_string(),
                     );
                 }
@@ -4305,6 +4366,7 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
 }
 
 async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &str) {
+    CLOUD_MCP_GLOBAL_WS_LIVE.store(false, Ordering::Release);
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         return;
     }
@@ -6023,6 +6085,34 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
     });
 }
 
+/// Shows an OS-native notification (Notification Center on macOS, toast on
+/// Windows) from the Rust side, so it works identically headless — main
+/// window hidden in background/tray mode included. macOS uses the bundled
+/// app icon automatically; Windows/Linux get the Diff Forge logo from the
+/// bundled resource when present.
+fn cloud_mcp_show_native_notification(app: &AppHandle, title: &str, body: &str) -> bool {
+    let mut builder = app.notification().builder().title(title).body(body);
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(icon) = cloud_mcp_notification_icon_path(app) {
+            builder = builder.icon(icon);
+        }
+    }
+    builder.show().is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cloud_mcp_notification_icon_path(app: &AppHandle) -> Option<String> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    for candidate in ["icons/128x128.png", "icons/32x32.png", "icons/icon.ico"] {
+        let path = resource_dir.join(candidate);
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 /// Device-level levers Rust always owns, with or without the webview: window
 /// visibility, native notifications, agent account switching, and terminal
 /// output status (served from the native PTY tail buffer). The webview
@@ -6095,13 +6185,14 @@ fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, e
                     .await;
                     return;
                 }
-                let shown = app
-                    .notification()
-                    .builder()
-                    .title("Diff Forge")
-                    .body(&message)
-                    .show()
-                    .is_ok();
+                let title = cloud_mcp_payload_text(
+                    &event,
+                    &["notification_title", "notificationTitle"],
+                )
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "notification_title"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "notificationTitle"]))
+                .unwrap_or_else(|| "Diff Forge AI".to_string());
+                let shown = cloud_mcp_show_native_notification(&app, &title, &message);
                 let (status, reply) = if shown {
                     ("completed", "Notification shown on this desktop.")
                 } else {
@@ -9806,6 +9897,8 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/workspace/assets/complete-upload" => Some("workspace_asset_complete_upload"),
         "/v1/workspace/assets/prepare-download" => Some("workspace_asset_prepare_download"),
         "/v1/workspace/assets/delete-cloud" => Some("workspace_asset_delete_cloud"),
+        "/v1/workspace/assets/publish-public" => Some("workspace_asset_publish_public"),
+        "/v1/workspace/assets/unpublish-public" => Some("workspace_asset_unpublish_public"),
         "/v1/workspace/assets/status" => Some("workspace_asset_status"),
         "/v1/workspace/assets/report-transfer-progress" => {
             Some("workspace_asset_report_transfer_progress")
@@ -10026,6 +10119,8 @@ fn cloud_mcp_post_log_context(
         "/v1/workspace/assets/complete-upload" => "cloud_complete_asset_upload",
         "/v1/workspace/assets/prepare-download" => "cloud_prepare_asset_download",
         "/v1/workspace/assets/delete-cloud" => "cloud_delete_cloud_asset",
+        "/v1/workspace/assets/publish-public" => "cloud_publish_public_asset",
+        "/v1/workspace/assets/unpublish-public" => "cloud_unpublish_public_asset",
         "/v1/workspace/assets/status" => "cloud_get_asset_status",
         "/v1/workspace/assets/report-transfer-progress" => "cloud_report_asset_transfer_progress",
         "/v1/events" => payload
@@ -18035,6 +18130,89 @@ async fn cloud_mcp_delete_cloud_workspace_asset(
     cloud_mcp_update_asset_library_from_response(
         "asset_delete_cloud",
         Some("/v1/workspace/assets/delete-cloud"),
+        &payload,
+        &data,
+    );
+    Ok(data)
+}
+
+#[tauri::command]
+async fn cloud_mcp_publish_workspace_asset(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    asset_id: String,
+    cloud_id: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path,
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = cloud_mcp_asset_payload_base(
+        &req,
+        &workspace_id,
+        workspace_name.as_deref(),
+        "asset_publish_public",
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("asset_id".to_string(), json!(asset_id));
+        object.insert("assetId".to_string(), json!(asset_id));
+        if let Some(cloud_id) = cloud_id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            object.insert("cloud_id".to_string(), json!(cloud_id));
+            object.insert("cloudId".to_string(), json!(cloud_id));
+        }
+    }
+    let response = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/workspace/assets/publish-public",
+        &payload,
+    )
+    .await?;
+    let data = response.get("data").cloned().unwrap_or(response);
+    cloud_mcp_update_asset_library_from_response(
+        "asset_publish_public",
+        Some("/v1/workspace/assets/publish-public"),
+        &payload,
+        &data,
+    );
+    Ok(data)
+}
+
+#[tauri::command]
+async fn cloud_mcp_unpublish_workspace_asset(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    asset_id: String,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path,
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = cloud_mcp_asset_payload_base(
+        &req,
+        &workspace_id,
+        workspace_name.as_deref(),
+        "asset_unpublish_public",
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("asset_id".to_string(), json!(asset_id));
+        object.insert("assetId".to_string(), json!(asset_id));
+    }
+    let response = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/workspace/assets/unpublish-public",
+        &payload,
+    )
+    .await?;
+    let data = response.get("data").cloned().unwrap_or(response);
+    cloud_mcp_update_asset_library_from_response(
+        "asset_unpublish_public",
+        Some("/v1/workspace/assets/unpublish-public"),
         &payload,
         &data,
     );

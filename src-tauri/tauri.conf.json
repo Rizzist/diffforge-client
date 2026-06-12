@@ -29,15 +29,22 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/**", "$TEMP/**"]
+        "scope": [
+          "$HOME/**",
+          "$TEMP/**"
+        ]
       },
       "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:* https://diffforge.ai; img-src 'self' asset: http://asset.localhost data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'",
-      "dangerousDisableAssetCspModification": ["style-src"]
+      "dangerousDisableAssetCspModification": [
+        "style-src"
+      ]
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -58,12 +65,17 @@
     },
     "macOS": {
       "entitlements": "Entitlements.plist"
-    }
+    },
+    "resources": [
+      "icons/128x128.png"
+    ]
   },
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["diffforge"]
+        "schemes": [
+          "diffforge"
+        ]
       }
     }
   }

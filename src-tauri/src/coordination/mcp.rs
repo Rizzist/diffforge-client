@@ -1064,9 +1064,7 @@ pub(crate) fn workspace_gateway_dispatch_tool(
 fn workspace_gateway_secrets_enabled(context: &McpContext) -> bool {
     workspace_gateway_kernel(context)
         .ok()
-        .and_then(|(kernel, workspace_id)| {
-            kernel.workspace_mcp_secrets_enabled(&workspace_id).ok()
-        })
+        .and_then(|(kernel, workspace_id)| kernel.workspace_mcp_secrets_enabled(&workspace_id).ok())
         .unwrap_or(false)
 }
 

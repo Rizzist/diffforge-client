@@ -84,6 +84,26 @@ export function finishCloudVoiceAgentInput() {
     });
 }
 
+export function setCloudVoiceAgentInputEnabled(enabled) {
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.input_enabled.invoke", {
+    enabled: Boolean(enabled),
+  });
+  return invoke("set_cloud_voice_agent_input_enabled", { enabled: Boolean(enabled) })
+    .then((result) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.input_enabled.ok", {
+        enabled: Boolean(result?.enabled),
+        micAttached: Boolean(result?.micAttached || result?.mic_attached),
+      });
+      return result;
+    })
+    .catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.input_enabled.error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
+      throw error;
+    });
+}
+
 export function sendCloudVoiceAgentTextMessage(request = {}) {
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.text_message.invoke", {
     repoId: request?.repoId || request?.repo_id || "",

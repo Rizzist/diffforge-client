@@ -5113,7 +5113,11 @@ impl CoordinationKernel {
                                 .as_deref()
                                 .unwrap_or("queued"),
                         );
-                        Some((title, status, terminal_todo_plan_step_detail_from_value(step)))
+                        Some((
+                            title,
+                            status,
+                            terminal_todo_plan_step_detail_from_value(step),
+                        ))
                     })
                     .take(120)
                     .collect::<Vec<_>>()
@@ -5123,8 +5127,14 @@ impl CoordinationKernel {
             return Ok(None);
         }
 
-        let normalized_title_key =
-            |value: &str| value.trim().to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized_title_key = |value: &str| {
+            value
+                .trim()
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let new_title_keys = steps
             .iter()
             .map(|(title, _, _)| normalized_title_key(title))
@@ -5142,14 +5152,16 @@ impl CoordinationKernel {
         let current_step_index = steps
             .iter()
             .position(|(_, status, _)| status == "in_progress")
-            .or_else(|| steps.iter().position(|(_, status, _)| status != "completed"))
+            .or_else(|| {
+                steps
+                    .iter()
+                    .position(|(_, status, _)| status != "completed")
+            })
             .unwrap_or(steps.len().saturating_sub(1)) as i64;
         let new_plan_title = string_from_value_keys(update, &["title", "explanation"])
             .map(|value| compact_terminal_todo_plan_text(&value, 160))
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| {
-                compact_terminal_todo_plan_text(&steps[0].0, 160)
-            });
+            .unwrap_or_else(|| compact_terminal_todo_plan_text(&steps[0].0, 160));
         let now = now_rfc3339();
         let actor_id = agent_id.unwrap_or(REPO_ID);
 
@@ -5181,10 +5193,7 @@ impl CoordinationKernel {
                     .filter_map(|row| row["title"].as_str())
                     .map(normalized_title_key)
                     .collect::<HashSet<_>>();
-                let overlaps = existing_keys
-                    .intersection(&new_title_keys)
-                    .next()
-                    .is_some();
+                let overlaps = existing_keys.intersection(&new_title_keys).next().is_some();
                 if overlaps || existing_keys.len() == new_title_keys.len() {
                     Some(plan_id)
                 } else {
@@ -8542,9 +8551,8 @@ impl CoordinationKernel {
         let text = |row: &Value, key: &str| -> String {
             row[key].as_str().unwrap_or_default().to_string()
         };
-        let optional_text = |row: &Value, key: &str| -> Option<String> {
-            row[key].as_str().map(str::to_string)
-        };
+        let optional_text =
+            |row: &Value, key: &str| -> Option<String> { row[key].as_str().map(str::to_string) };
         let flag = |row: &Value, key: &str, fallback: i64| -> i64 {
             row[key]
                 .as_i64()
@@ -9929,8 +9937,7 @@ impl CoordinationKernel {
                 .as_bool()
                 .or_else(|| input["workspace_enabled"].as_i64().map(|value| value != 0))
                 .ok_or_else(|| {
-                    "The Secrets MCP only supports enabling or disabling agent access."
-                        .to_string()
+                    "The Secrets MCP only supports enabling or disabling agent access.".to_string()
                 })?;
             self.set_workspace_mcp_secrets_enabled(workspace_id, enabled)?;
             self.emit_event(

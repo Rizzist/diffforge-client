@@ -15,9 +15,12 @@ import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFile
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
+import { Link } from "@styled-icons/material-rounded/Link";
+import { LinkOff } from "@styled-icons/material-rounded/LinkOff";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
+import { Public } from "@styled-icons/material-rounded/Public";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import MediaTranscriptChip from "./MediaTranscriptChip.jsx";
@@ -414,6 +417,31 @@ function assetSha(asset) {
   return text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
 }
 
+function assetPublicLink(asset) {
+  return jsonObject(asset?.publicLink || asset?.public_link) || null;
+}
+
+function assetPublicUrl(asset) {
+  const link = assetPublicLink(asset);
+  return text(
+    asset?.publicUrl
+      || asset?.public_url
+      || link?.publicUrl
+      || link?.public_url
+      || link?.url,
+  );
+}
+
+async function copyTextToClipboard(value) {
+  const normalized = text(value);
+  if (!normalized) return false;
+  if (typeof navigator !== "undefined" && navigator?.clipboard?.writeText) {
+    await navigator.clipboard.writeText(normalized);
+    return true;
+  }
+  return false;
+}
+
 export default function AccountAssetsView({
   assetWorkspaces = [],
   defaultWorkingDirectory = "",
@@ -607,6 +635,8 @@ function AssetsPanel({
   const [selectedWorkspaceFilterKeys, setSelectedWorkspaceFilterKeys] = useState([]);
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
+  const [actionNotice, setActionNotice] = useState("");
+  const actionNoticeTimerRef = useRef(0);
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
   const selectedCloud = useMemo(() => (
@@ -616,6 +646,23 @@ function AssetsPanel({
   ), [clouds, defaultCloudId, selectedCloudId]);
   const selectedCloudLabel = text(selectedCloud?.label || selectedCloud?.name, "Cloud");
   const effectiveCloudId = text(selectedCloud?.cloudId || selectedCloud?.cloud_id || selectedCloudId, DEFAULT_ASSET_CLOUD_ID);
+
+  const showActionNotice = useCallback((nextNotice) => {
+    setActionNotice(nextNotice);
+    if (actionNoticeTimerRef.current) {
+      window.clearTimeout(actionNoticeTimerRef.current);
+    }
+    actionNoticeTimerRef.current = window.setTimeout(() => {
+      actionNoticeTimerRef.current = 0;
+      setActionNotice("");
+    }, 2600);
+  }, []);
+
+  useEffect(() => () => {
+    if (actionNoticeTimerRef.current) {
+      window.clearTimeout(actionNoticeTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     if (!clouds.length) return;
@@ -863,6 +910,27 @@ function AssetsPanel({
     const localPath = assetLocalPath(asset);
     const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
+    setActionNotice("");
+    if (action === "copyPublic") {
+      const publicUrl = assetPublicUrl(asset);
+      if (!publicUrl) return;
+      const key = `${action}:${id || publicUrl}`;
+      setBusyKey(key);
+      setActionError("");
+      try {
+        const copied = await copyTextToClipboard(publicUrl);
+        if (copied) {
+          showActionNotice("Public URL copied to clipboard.");
+        } else {
+          setActionError("Public URL is ready, but clipboard access is unavailable.");
+        }
+      } catch (nextError) {
+        setActionError(nextError?.message || String(nextError || "Unable to copy public URL."));
+      } finally {
+        setBusyKey((current) => (current === key ? "" : current));
+      }
+      return;
+    }
     if (action === "open") {
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
@@ -955,6 +1023,35 @@ function AssetsPanel({
             );
           }
         }
+      } else if (action === "publish") {
+        const response = await invoke("cloud_mcp_publish_workspace_asset", {
+          assetId: id,
+          cloudId: effectiveCloudId,
+          repoPath: actionRepoPath,
+          workspaceId: actionWorkspaceId,
+          workspaceName: actionWorkspaceName,
+        });
+        const publicUrl = text(
+          response?.publicUrl
+            || response?.public_url
+            || response?.publicLink?.publicUrl
+            || response?.public_link?.public_url,
+        );
+        if (publicUrl) {
+          const copied = await copyTextToClipboard(publicUrl);
+          if (copied) {
+            showActionNotice("Public URL copied to clipboard.");
+          } else {
+            setActionError("Public URL created, but clipboard access is unavailable.");
+          }
+        }
+      } else if (action === "unpublish") {
+        await invoke("cloud_mcp_unpublish_workspace_asset", {
+          assetId: id,
+          repoPath: actionRepoPath,
+          workspaceId: actionWorkspaceId,
+          workspaceName: actionWorkspaceName,
+        });
       } else {
         const command = action === "upload"
           ? "cloud_mcp_upload_workspace_asset"
@@ -978,7 +1075,7 @@ function AssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [effectiveCloudId, onOpenHyperframeAsset, refresh, repoPath, selectedCloudLabel, workspaceOptionForAsset]);
+  }, [effectiveCloudId, onOpenHyperframeAsset, refresh, repoPath, selectedCloudLabel, showActionNotice, workspaceOptionForAsset]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
     const id = assetId(asset);
@@ -1191,6 +1288,7 @@ function AssetsPanel({
         onDelete={() => runSelectedAssetAction("delete")}
       />
       {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
+      {actionNotice && <AssetNotice aria-live="polite">{actionNotice}</AssetNotice>}
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
       ) : (
@@ -1210,6 +1308,8 @@ function AssetsPanel({
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
             const localPath = assetLocalPath(asset);
             const previewUrl = assetPreviewUrl(asset);
+            const publicUrl = assetPublicUrl(asset);
+            const isPublic = Boolean(publicUrl);
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
             const shouldOpenHyperframeEditor = !shouldShowImagePreview && assetCanContainHyperframe(asset) && Boolean(localPath);
@@ -1224,17 +1324,24 @@ function AssetsPanel({
             const deleteCloudBusy = busyKey === `deleteCloud:${id}`;
             const viewBusy = busyKey === `view:${id}`;
             const copyBusy = busyKey === `copy:${id}`;
+            const copyPublicBusy = busyKey === `copyPublic:${id}`;
+            const publishBusy = busyKey === `publish:${id}`;
+            const unpublishBusy = busyKey === `unpublish:${id}`;
             const pinBusy = busyKey === `pin:${id}`;
             const untrackBusy = busyKey === `untrack:${id}`;
             const canUpload = canRunAssetAction && !transferActive && availability.hasLocal && !availability.hasCloud && Boolean(localPath);
             const canDownload = canRunAssetAction && !transferActive && availability.hasCloud && !availability.hasLocal;
             const canDeleteCloud = canRunAssetAction && !transferActive && availability.hasCloud;
             const canDeleteLocal = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
+            const canPublish = canRunAssetAction && !transferActive && availability.hasCloud && !isPublic;
+            const canCopyPublic = isPublic;
+            const canUnpublish = canRunAssetAction && !transferActive && isPublic;
             const canView = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canUntrack = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
             const showUpload = availability.hasLocal;
             const showDownload = availability.hasCloud;
+            const showPublish = availability.hasCloud;
             const showDeleteCloud = availability.hasCloud;
             const showDeleteLocal = availability.hasLocal;
             const selected = selectedAssetIds.has(id);
@@ -1376,6 +1483,41 @@ function AssetsPanel({
                       <FileDownload aria-hidden="true" />
                     </AssetIconButton>
                   )}
+                  {showPublish && !isPublic && (
+                    <AssetIconButton
+                      aria-label={`Make ${name} public`}
+                      data-primary="true"
+                      disabled={!canPublish || publishBusy || Boolean(busyKey && !publishBusy)}
+                      onClick={() => runAssetAction("publish", asset)}
+                      title="Make public and copy URL"
+                      type="button"
+                    >
+                      <Public aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
+                  {isPublic && (
+                    <AssetIconButton
+                      aria-label={`Copy public URL for ${name}`}
+                      disabled={!canCopyPublic || copyPublicBusy || Boolean(busyKey && !copyPublicBusy)}
+                      onClick={() => runAssetAction("copyPublic", asset)}
+                      title="Copy public URL"
+                      type="button"
+                    >
+                      <Link aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
+                  {isPublic && (
+                    <AssetIconButton
+                      aria-label={`Make ${name} private`}
+                      data-warning="true"
+                      disabled={!canUnpublish || unpublishBusy || Boolean(busyKey && !unpublishBusy)}
+                      onClick={() => runAssetAction("unpublish", asset)}
+                      title="Make private"
+                      type="button"
+                    >
+                      <LinkOff aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
                   {showDeleteCloud && (
                     <AssetIconButton
                       aria-label={`Delete Cloud copy of ${name}`}
@@ -1411,6 +1553,11 @@ function AssetsPanel({
                       {syncedDeviceNames.length === 1
                         ? `On ${syncedDeviceNames[0]}`
                         : `On ${syncedDeviceNames.length} devices`}
+                    </AssetCardMetaLine>
+                  )}
+                  {isPublic && (
+                    <AssetCardMetaLine title={publicUrl}>
+                      Public link
                     </AssetCardMetaLine>
                   )}
                   {transferFailed && !transferActive && (
@@ -3179,6 +3326,18 @@ const AssetError = styled.div`
   border-radius: 8px;
   color: rgba(254, 202, 202, 0.92);
   background: rgba(127, 29, 29, 0.12);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+`;
+
+const AssetNotice = styled.div`
+  padding: 8px 10px;
+  border: 1px solid rgba(74, 222, 128, 0.22);
+  border-radius: 8px;
+  color: rgba(187, 247, 208, 0.94);
+  background: rgba(20, 83, 45, 0.14);
   font-size: 10px;
   font-weight: 760;
   line-height: 1.35;

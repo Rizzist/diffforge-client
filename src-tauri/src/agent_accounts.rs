@@ -255,6 +255,39 @@ fn agent_accounts_profile_is_duplicate_of_default(
     agent_accounts_profile_email(kind, profile) == default_email
 }
 
+fn agent_accounts_default_email(kind: &str) -> String {
+    agent_accounts_profile_identity(kind, None)
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default()
+}
+
+/// Ids of captured profiles currently suppressed as duplicates of the
+/// Default login. Tokenomics retracts the per-profile account keys it may
+/// have published for these before the dedupe existed, so one login stops
+/// rendering as two usage accounts (desktop Tokenomics tab and the cloud
+/// dashboard alike).
+pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
+    let registry = agent_accounts_registry_read();
+    let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let default_email = agent_accounts_default_email(kind);
+    profiles
+        .iter()
+        .filter(|profile| {
+            agent_accounts_profile_is_duplicate_of_default(kind, profile, &active_id, &default_email)
+        })
+        .filter_map(|profile| {
+            profile
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
     let (active_id, profiles) = agent_accounts_kind_entry(registry, kind);
     let default_identity = agent_accounts_profile_identity(kind, None);
@@ -329,10 +362,23 @@ pub(crate) fn agent_accounts_profiles_for_tokenomics(
     kind: &str,
 ) -> Vec<(String, String, PathBuf)> {
     let registry = agent_accounts_registry_read();
-    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let default_email = agent_accounts_default_email(kind);
     profiles
         .iter()
         .filter_map(|profile| {
+            // Same rule as the switcher pills: a captured pin that mirrors
+            // the Default home's current login must not feed a second
+            // tokenomics account (transcript roots, limit probes) for the
+            // same human account.
+            if agent_accounts_profile_is_duplicate_of_default(
+                kind,
+                profile,
+                &active_id,
+                &default_email,
+            ) {
+                return None;
+            }
             let id = profile
                 .get("id")
                 .and_then(Value::as_str)

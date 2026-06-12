@@ -7502,8 +7502,8 @@ export const AudioHistoryRow = styled.div`
   display: grid;
   min-width: 0;
   align-content: start;
-  gap: 6px;
-  padding: 10px 12px;
+  gap: 4px;
+  padding: 7px 12px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.5);
@@ -7516,6 +7516,8 @@ export const AudioHistoryRow = styled.div`
       inset 0 1px 0 rgba(255, 255, 255, 0.92);
   }
 
+  /* One line per card keeps the virtualized rows thin; the title tooltip and
+     the Copy button still carry the full transcript. */
   > strong {
     display: -webkit-box;
     min-width: 0;
@@ -7524,7 +7526,7 @@ export const AudioHistoryRow = styled.div`
     font-size: 13px;
     font-weight: 720;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
+    -webkit-line-clamp: 1;
     line-height: 1.35;
     text-overflow: ellipsis;
     white-space: normal;

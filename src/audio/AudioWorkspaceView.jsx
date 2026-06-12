@@ -527,7 +527,7 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
     label: "Bottom bar",
   },
 ];
-const AUDIO_HISTORY_ROW_HEIGHT = 124;
+const AUDIO_HISTORY_ROW_HEIGHT = 88;
 const AUDIO_HISTORY_VIEWPORT_HEIGHT = 420;
 const AUDIO_HISTORY_OVERSCAN = 5;
 
@@ -3095,6 +3095,7 @@ export function AudioWidgetWindow() {
         await resetForgeVoiceTtsPlayer();
         forgeVoiceEventsActiveRef.current = true;
         await startCloudVoiceAgentStream({
+          realtime: readOrchestratorRealtimeEnabled(),
           submissionMode: readOrchestratorVoiceSubmissionMode(),
         });
       }
