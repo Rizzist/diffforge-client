@@ -61,6 +61,7 @@ import {
   cloudVoiceAgentEventKind,
   createCloudVoiceAgentTtsPlayer,
   finishCloudVoiceAgentInput,
+  prewarmCloudVoiceAgentStream,
   startCloudVoiceAgentStream,
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
@@ -1728,7 +1729,10 @@ export default function AudioWorkspaceView({
     invoke("prewarm_forge_dictation_transcription", {
       request: { enabled: isForgeMode },
     }).catch(() => {});
-  }, [isForgeMode]);
+    if (isForgeAgentMode) {
+      prewarmCloudVoiceAgentStream().catch(() => {});
+    }
+  }, [isForgeAgentMode, isForgeMode]);
 
   const toggleForgeLlmCleanup = useCallback(() => {
     setForgeLlmCleanup((currentValue) => {
@@ -3365,6 +3369,26 @@ export function AudioWidgetWindow() {
           await audioBuffer.close().catch(() => {});
         }
         return;
+      }
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        setMessage("Preparing Forge voice");
+        await prewarmCloudVoiceAgentStream({
+          requireBilling: true,
+          onStatus: ({ message }) => {
+            if (recordingRunRef.current === recordingRunId && message) {
+              setMessage(message);
+            }
+          },
+        });
+        if (recordingRunRef.current !== recordingRunId) {
+          if (audioBufferRef.current === audioBuffer) {
+            await closeWarmBuffer();
+          } else {
+            await audioBuffer.close().catch(() => {});
+          }
+          return;
+        }
+        setMessage("Opening Forge voice");
       }
       await audioBuffer.beginCapture();
       captureBegan = true;

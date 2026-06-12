@@ -161,6 +161,11 @@ function assetTransferStatusKind(transfer) {
   return assetStatusKind(transfer?.status || transfer?.transferStatus || transfer?.transfer_status);
 }
 
+function assetTransferStatusLabel(transfer) {
+  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, "failed");
+  return status.replace(/[_-]+/gu, " ");
+}
+
 function assetTransferAssetId(transfer) {
   return text(transfer?.assetId || transfer?.asset_id);
 }
@@ -213,6 +218,13 @@ function assetTransferCloudId(transfer) {
   return text(transfer?.cloudId || transfer?.cloud_id || transfer?.assetCloudId || transfer?.asset_cloud_id, DEFAULT_ASSET_CLOUD_ID);
 }
 
+function assetTransferDirection(transfer) {
+  const direction = text(transfer?.direction || transfer?.transferDirection || transfer?.transfer_direction).toLowerCase();
+  if (direction.includes("download")) return "download";
+  if (direction.includes("upload")) return "upload";
+  return "";
+}
+
 function assetTransferCacheKey(assetIdValue, cloudId = DEFAULT_ASSET_CLOUD_ID, direction = "upload") {
   const id = text(assetIdValue);
   if (!id) return "";
@@ -222,9 +234,10 @@ function assetTransferCacheKey(assetIdValue, cloudId = DEFAULT_ASSET_CLOUD_ID, d
 function assetTransferShadowedByAsset(transfer, asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
   if (!["failed", "interrupted"].includes(status)) return false;
-  const direction = text(transfer?.direction).toLowerCase();
-  if (direction && !direction.includes("upload")) return false;
-  return assetCloudAvailable(asset, cloudId);
+  const direction = assetTransferDirection(transfer);
+  if (direction === "upload") return assetCloudAvailable(asset, cloudId);
+  if (direction === "download") return assetLocalAvailable(asset);
+  return false;
 }
 
 function assetTransferClearedOnRestart(transfer) {
@@ -258,11 +271,46 @@ function assetTransferPercent(transfer) {
   return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
 }
 
+function formatAssetBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const precision = unitIndex === 0 || size >= 10 ? 0 : 1;
+  return `${size.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function assetTransferBytesSummary(transfer) {
+  const total = Number(transfer?.bytesTotal ?? transfer?.bytes_total ?? 0) || 0;
+  const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
+  if (total <= 0 && done <= 0) return "";
+  if (total > 0) {
+    return `${formatAssetBytes(done)} of ${formatAssetBytes(total)} (${assetTransferPercent(transfer)}%)`;
+  }
+  return formatAssetBytes(done);
+}
+
 function assetTransferDirectionLabel(transfer) {
-  const direction = text(transfer?.direction).toLowerCase();
-  if (direction.includes("upload")) return "Uploading";
-  if (direction.includes("download")) return "Downloading";
+  const direction = assetTransferDirection(transfer);
+  if (direction === "upload") return "Uploading";
+  if (direction === "download") return "Downloading";
   return "Syncing";
+}
+
+function assetTransferFailureError(transfer) {
+  return text(
+    transfer?.error
+      || transfer?.errorMessage
+      || transfer?.error_message
+      || transfer?.message
+      || transfer?.detail
+      || transfer?.reason,
+  );
 }
 
 function assetSyncedDeviceNames(asset) {
@@ -457,6 +505,90 @@ function assetPublicUrl(asset) {
       || link?.public_url
       || link?.url,
   );
+}
+
+function assetTransferFailureDetails({
+  asset,
+  assetIdValue,
+  cloudId,
+  cloudLabel,
+  direction,
+  transfer,
+}) {
+  const details = [];
+  const cloudName = text(cloudLabel, cloudId || "Cloud");
+  if (cloudName) details.push(`Cloud: ${cloudName}`);
+  const bytes = transfer ? assetTransferBytesSummary(transfer) : "";
+  if (bytes) details.push(`Progress: ${bytes}`);
+  const transferId = transfer ? assetTransferId(transfer) : "";
+  if (transferId) details.push(`Transfer: ${shortLabel(transferId, 22)}`);
+  const id = text(assetIdValue || assetId(asset));
+  if (id) details.push(`Asset ID: ${shortLabel(id, 22)}`);
+  const localPath = assetLocalPath(asset);
+  if (direction === "upload" && localPath) details.push(`Local path: ${localPath}`);
+  return details;
+}
+
+function assetTransferFailureFromTransfer(transfer, asset, cloudLabel, cloudId) {
+  const direction = assetTransferDirection(transfer);
+  if (!["upload", "download"].includes(direction)) return null;
+  const operation = direction === "download" ? "Download" : "Upload";
+  const assetIdValue = assetTransferAssetId(transfer);
+  const name = assetName(asset, assetIdValue ? shortLabel(assetIdValue, 20) : "asset");
+  const errorMessage = assetTransferFailureError(transfer)
+    || `${operation} ${assetTransferStatusLabel(transfer)} without an error message.`;
+  const actualCloudId = assetTransferCloudId(transfer) || cloudId;
+  return {
+    assetId: assetIdValue,
+    cloudId: actualCloudId,
+    details: assetTransferFailureDetails({
+      asset,
+      assetIdValue,
+      cloudId: actualCloudId,
+      cloudLabel,
+      direction,
+      transfer,
+    }),
+    direction,
+    key: `transfer:${direction}:${actualCloudId}:${assetIdValue}:${assetTransferId(transfer) || assetTransferUpdatedAt(transfer)}`,
+    message: errorMessage,
+    title: `${operation} failed for ${name}`,
+    updatedAt: assetTransferUpdatedAt(transfer),
+  };
+}
+
+function assetTransferFailureFromAction(action, asset, cloudLabel, cloudId, error) {
+  const direction = action === "download" ? "download" : action === "upload" ? "upload" : "";
+  if (!direction) return null;
+  const operation = direction === "download" ? "Download" : "Upload";
+  const id = assetId(asset);
+  const errorMessage = error?.message || String(error || `${operation} failed.`);
+  return {
+    assetId: id,
+    cloudId,
+    details: assetTransferFailureDetails({
+      asset,
+      assetIdValue: id,
+      cloudId,
+      cloudLabel,
+      direction,
+      transfer: null,
+    }),
+    direction,
+    key: `action:${direction}:${cloudId}:${id}:${Date.now()}`,
+    message: errorMessage,
+    title: `${operation} failed for ${assetName(asset, "asset")}`,
+    updatedAt: Date.now(),
+  };
+}
+
+function assetTransferFailureDedupeKey(failure) {
+  return [
+    failure?.direction,
+    failure?.cloudId,
+    failure?.assetId,
+    failure?.message,
+  ].map((value) => text(value).toLowerCase()).join(":");
 }
 
 async function copyTextToClipboard(value) {
@@ -706,6 +838,7 @@ function AssetsPanel({
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
   const [uploadPublic, setUploadPublic] = useState(readAssetUploadPublicPreference);
   const [optimisticTransfers, setOptimisticTransfers] = useState({});
+  const [transferActionFailure, setTransferActionFailure] = useState(null);
 
   const toggleUploadPublic = useCallback(() => {
     setUploadPublic((current) => {
@@ -813,6 +946,48 @@ function AssetsPanel({
         : rows
     ).filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId);
   }, [effectiveCloudId, optimisticTransferRows, selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
+  const assetById = useMemo(() => {
+    const byId = new Map();
+    filteredItems.forEach((asset) => {
+      const id = assetId(asset);
+      if (id) byId.set(id, asset);
+    });
+    return byId;
+  }, [filteredItems]);
+  const failedTransferFailures = useMemo(() => {
+    const seen = new Set();
+    return visibleTransfers
+      .filter((transfer) => assetTransferStatusKind(transfer) === "failed")
+      .filter((transfer) => ["upload", "download"].includes(assetTransferDirection(transfer)))
+      .filter((transfer) => !assetTransferClearedOnRestart(transfer))
+      .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left))
+      .map((transfer) => {
+        const transferAsset = assetById.get(assetTransferAssetId(transfer)) || null;
+        if (assetTransferShadowedByAsset(transfer, transferAsset, effectiveCloudId)) return null;
+        return assetTransferFailureFromTransfer(transfer, transferAsset, selectedCloudLabel, effectiveCloudId);
+      })
+      .filter(Boolean)
+      .filter((failure) => {
+        const key = assetTransferFailureDedupeKey(failure);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 4);
+  }, [assetById, effectiveCloudId, selectedCloudLabel, visibleTransfers]);
+  const transferFailures = useMemo(() => {
+    const failures = [];
+    const seen = new Set();
+    [transferActionFailure, ...failedTransferFailures].forEach((failure) => {
+      if (!failure) return;
+      const key = assetTransferFailureDedupeKey(failure);
+      if (seen.has(key)) return;
+      seen.add(key);
+      failures.push(failure);
+    });
+    return failures.slice(0, 4);
+  }, [failedTransferFailures, transferActionFailure]);
+  const inlineError = error || (!transferActionFailure ? actionError : "");
   const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
   const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
   const activeTransfers = selectedWorkspaceFilterOptions.length
@@ -1033,6 +1208,7 @@ function AssetsPanel({
     const localPath = assetLocalPath(asset);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
     setActionNotice("");
+    setTransferActionFailure(null);
     if (action === "copyPublic") {
       const publicUrl = assetPublicUrl(asset);
       if (!publicUrl) return;
@@ -1218,6 +1394,15 @@ function AssetsPanel({
           error: nextError?.message || String(nextError || "Upload failed."),
         });
       }
+      if (["upload", "download"].includes(action)) {
+        setTransferActionFailure(assetTransferFailureFromAction(
+          action,
+          asset,
+          selectedCloudLabel,
+          effectiveCloudId,
+          nextError,
+        ));
+      }
       setActionError(nextError?.message || String(nextError || `Unable to ${action} asset.`));
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
@@ -1331,6 +1516,7 @@ function AssetsPanel({
 
   return (
     <AssetsPane>
+      <AssetTransferFailureBanner failures={transferFailures} />
       <AssetsHeader>
         <div>
           <AssetsKicker>Library</AssetsKicker>
@@ -1457,7 +1643,7 @@ function AssetsPanel({
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedAssetAction("delete")}
       />
-      {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
+      {inlineError && <AssetError>{inlineError}</AssetError>}
       {actionNotice && <AssetNotice aria-live="polite">{actionNotice}</AssetNotice>}
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
@@ -1736,6 +1922,33 @@ function AssetsPanel({
         </AssetGrid>
       )}
     </AssetsPane>
+  );
+}
+
+function AssetTransferFailureBanner({ failures = [] }) {
+  if (!failures.length) return null;
+  return (
+    <AssetTransferFailurePanel aria-live="assertive" role="alert">
+      <AssetTransferFailureHeader>
+        <strong>{failures.length === 1 ? "Asset transfer failed" : `${failures.length} asset transfers failed`}</strong>
+        <span>Upload/download error details</span>
+      </AssetTransferFailureHeader>
+      <AssetTransferFailureList>
+        {failures.map((failure) => (
+          <AssetTransferFailureItem key={failure.key}>
+            <AssetTransferFailureTitle>{failure.title}</AssetTransferFailureTitle>
+            <AssetTransferFailureMessage>{failure.message}</AssetTransferFailureMessage>
+            {failure.details?.length ? (
+              <AssetTransferFailureMeta>
+                {failure.details.map((detail) => (
+                  <span key={detail}>{detail}</span>
+                ))}
+              </AssetTransferFailureMeta>
+            ) : null}
+          </AssetTransferFailureItem>
+        ))}
+      </AssetTransferFailureList>
+    </AssetTransferFailurePanel>
   );
 }
 
@@ -3569,6 +3782,107 @@ const AssetTransferCancel = styled.button`
   &:disabled {
     cursor: default;
     opacity: 0.55;
+  }
+`;
+
+const AssetTransferFailurePanel = styled.div`
+  display: grid;
+  flex: 0 0 auto;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(248, 113, 113, 0.28);
+  border-radius: 8px;
+  color: rgba(254, 226, 226, 0.96);
+  background: rgba(127, 29, 29, 0.16);
+  box-shadow: 0 12px 28px rgba(2, 6, 23, 0.18);
+`;
+
+const AssetTransferFailureHeader = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+
+  strong {
+    min-width: 0;
+    color: rgba(254, 242, 242, 0.98);
+    font-size: 11px;
+    font-weight: 900;
+    line-height: 1.2;
+    text-transform: uppercase;
+  }
+
+  span {
+    flex: 0 0 auto;
+    color: rgba(254, 202, 202, 0.76);
+    font-size: 9px;
+    font-weight: 820;
+    line-height: 1.2;
+    text-transform: uppercase;
+  }
+
+  @media (max-width: 620px) {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+`;
+
+const AssetTransferFailureList = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const AssetTransferFailureItem = styled.div`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(248, 113, 113, 0.16);
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.28);
+`;
+
+const AssetTransferFailureTitle = styled.strong`
+  min-width: 0;
+  color: rgba(254, 242, 242, 0.96);
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+`;
+
+const AssetTransferFailureMessage = styled.div`
+  min-width: 0;
+  color: rgba(254, 226, 226, 0.94);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+`;
+
+const AssetTransferFailureMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+
+  span {
+    max-width: 100%;
+    padding: 3px 5px;
+    overflow: hidden;
+    border: 1px solid rgba(254, 202, 202, 0.14);
+    border-radius: 5px;
+    color: rgba(254, 202, 202, 0.84);
+    background: rgba(15, 23, 42, 0.3);
+    font-size: 8px;
+    font-weight: 820;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 `;
 

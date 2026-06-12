@@ -47,6 +47,12 @@ const CLOUD_MCP_TODO_MIRROR_ROWS_TABLE: &str = "workspace_todo_mirror_rows";
 const CLOUD_MCP_TODO_HISTORY_ROWS_TABLE: &str = "workspace_todo_history_rows";
 const CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS: usize = 2048;
 const CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS: usize = 500;
+const CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT: usize = 25;
+const CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE: usize = 10;
+const CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT: usize = 50;
+const CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT: usize = 3;
+const CLOUD_MCP_AGENT_SESSION_TODO_ROW_LIMIT: usize = 1000;
+const CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION: u64 = 1;
 const CLOUD_MCP_CREDIT_LEDGER_DB_FILE: &str = "diffforge-credit-ledger.sqlite";
 const CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT: i64 = 1_000_000;
 const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
@@ -14865,7 +14871,17 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     } else {
         CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
     };
+    let agent_session_observed = {
+        let base_url = {
+            let runtime = state.inner.lock().await;
+            runtime.base_url.clone()
+        };
+        cloud_mcp_agent_session_upsert_lifecycle_delta(&base_url, &delta)
+    };
     cloud_mcp_enqueue_terminal_lifecycle_delta(state, delta, terminal_id, reason, priority).await;
+    if let Some(agent_session_payload) = agent_session_observed {
+        cloud_mcp_enqueue_agent_session_observed(state, agent_session_payload, reason, priority).await;
+    }
     if let (Some(refs), Some(status)) = (
         direct_prompt_refs.as_ref(),
         cloud_mcp_direct_prompt_dispatch_status_for_turn(turn_status),
@@ -18876,6 +18892,12 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
         workspace_name.clone(),
     );
     let device_profile = cloud_mcp_desktop_device_profile();
+    let sync_reason = reason.unwrap_or_else(|| "todo_queue_sync".to_string());
+    let workspace_name_value = workspace_name.clone().unwrap_or_default();
+    let base_url = {
+        let runtime = state.inner.lock().await;
+        runtime.base_url.clone()
+    };
     let mut payload = match todos {
         Value::Object(object) => Value::Object(object),
         Value::Array(items) => json!({ "todos": items }),
@@ -18888,18 +18910,15 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
         object.insert("source".to_string(), json!("rust-diffforge-todo-queue"));
         object.insert(
             "reason".to_string(),
-            json!(reason.unwrap_or_else(|| "todo_queue_sync".to_string())),
+            json!(sync_reason.clone()),
         );
         object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
         object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
         object.insert(
             "workspace_name".to_string(),
-            json!(workspace_name.clone().unwrap_or_default()),
+            json!(workspace_name_value.clone()),
         );
-        object.insert(
-            "workspaceName".to_string(),
-            json!(workspace_name.unwrap_or_default()),
-        );
+        object.insert("workspaceName".to_string(), json!(workspace_name_value.clone()));
         object.insert("device".to_string(), device_profile.clone());
         object.insert("device_id".to_string(), device_profile["device_id"].clone());
         object.insert("deviceId".to_string(), device_profile["device_id"].clone());
@@ -18921,6 +18940,61 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
         object.insert("prune_missing".to_string(), json!(false));
         object.insert("pruneMissing".to_string(), json!(false));
         object.insert("ts_ms".to_string(), json!(cloud_mcp_now_ms()));
+    }
+    let agent_session_context = cloud_mcp_agent_session_observe_todo_snapshot(
+        &base_url,
+        &req.repo_id,
+        &workspace_id,
+        &workspace_name_value,
+        &mut payload,
+    );
+    let agent_session_summary_jobs =
+        cloud_mcp_agent_session_summary_jobs_from_context(&agent_session_context);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "agent_session_context".to_string(),
+            agent_session_context.clone(),
+        );
+        object.insert(
+            "agentSessionContext".to_string(),
+            agent_session_context.clone(),
+        );
+        object.insert(
+            "agent_session_summaries".to_string(),
+            json!(agent_session_context["sessions"].clone()),
+        );
+        object.insert(
+            "agentSessionSummaries".to_string(),
+            json!(agent_session_context["sessions"].clone()),
+        );
+        object.insert(
+            "agent_session_summary_jobs".to_string(),
+            json!(agent_session_summary_jobs.clone()),
+        );
+        object.insert(
+            "agentSessionSummaryJobs".to_string(),
+            json!(agent_session_summary_jobs),
+        );
+        object.insert(
+            "agent_session_summary_policy".to_string(),
+            json!({
+                "mode": "todos_with_cloud_llm_compression",
+                "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+                "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+                "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+                "recent_session_limit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+            }),
+        );
+        object.insert(
+            "agentSessionSummaryPolicy".to_string(),
+            json!({
+                "mode": "todos_with_cloud_llm_compression",
+                "chunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+                "summaryItemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+                "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+                "recentSessionLimit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+            }),
+        );
     }
 
     log_terminal_status_event(
@@ -20777,6 +20851,42 @@ fn cloud_mcp_todo_mirror_init_conn(conn: &rusqlite::Connection) -> rusqlite::Res
             updated_at_ms INTEGER NOT NULL DEFAULT 0,
             metadata_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS workspace_agent_sessions(
+            key TEXT PRIMARY KEY,
+            base_url TEXT NOT NULL DEFAULT '',
+            repo_id TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            workspace_name TEXT NOT NULL DEFAULT '',
+            agent_kind TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '',
+            provider_session_id TEXT NOT NULL DEFAULT '',
+            native_session_id TEXT NOT NULL DEFAULT '',
+            local_session_id TEXT NOT NULL DEFAULT '',
+            terminal_id TEXT NOT NULL DEFAULT '',
+            terminal_instance_id TEXT NOT NULL DEFAULT '',
+            terminal_index INTEGER,
+            thread_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            first_seen_at_ms INTEGER NOT NULL DEFAULT 0,
+            last_active_at_ms INTEGER NOT NULL DEFAULT 0,
+            todo_count INTEGER NOT NULL DEFAULT 0,
+            summary_chunk_count INTEGER NOT NULL DEFAULT 0,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            row_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_agent_session_todos(
+            key TEXT PRIMARY KEY,
+            session_key TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            todo_id TEXT NOT NULL DEFAULT '',
+            ordinal INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            text TEXT NOT NULL DEFAULT '',
+            row_json TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_todo_mirror_workspace
             ON workspace_todo_mirror_rows(workspace_id, updated_at);
         CREATE INDEX IF NOT EXISTS idx_todo_mirror_batch
@@ -20823,6 +20933,18 @@ fn cloud_mcp_todo_mirror_init_conn(conn: &rusqlite::Connection) -> rusqlite::Res
             ON workspace_todo_history_rows(last_seen_ms);
         CREATE INDEX IF NOT EXISTS idx_todo_mirror_snapshots_updated
             ON workspace_todo_mirror_snapshots(updated_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_workspace_recent
+            ON workspace_agent_sessions(workspace_id, last_active_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_provider_session
+            ON workspace_agent_sessions(provider_session_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_terminal
+            ON workspace_agent_sessions(workspace_id, terminal_id, terminal_instance_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_thread
+            ON workspace_agent_sessions(workspace_id, thread_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_session_todos_session
+            ON workspace_agent_session_todos(session_key, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_agent_session_todos_workspace_todo
+            ON workspace_agent_session_todos(workspace_id, todo_id);
         ",
     )
 }
@@ -20841,6 +20963,1241 @@ fn cloud_mcp_open_todo_mirror_conn() -> Result<rusqlite::Connection, String> {
     cloud_mcp_todo_mirror_init_conn(&conn)
         .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
     Ok(conn)
+}
+
+fn cloud_mcp_agent_session_clean_text(value: &str, max_chars: usize) -> String {
+    value
+        .replace(|character: char| character.is_control(), " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn cloud_mcp_agent_session_text(value: &Value, keys: &[&str]) -> String {
+    cloud_mcp_payload_text(value, keys)
+        .map(|value| cloud_mcp_agent_session_clean_text(&value, 512))
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_agent_session_key_from_fields(
+    workspace_id: &str,
+    agent_kind: &str,
+    provider_session_id: &str,
+    native_session_id: &str,
+    terminal_id: &str,
+    terminal_instance_id: &str,
+    thread_id: &str,
+) -> Option<String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return None;
+    }
+    let agent_kind = agent_kind.trim().to_ascii_lowercase();
+    let agent_kind = if agent_kind.is_empty() {
+        "coding_agent"
+    } else {
+        agent_kind.as_str()
+    };
+    let terminal_id = terminal_id.trim();
+    let terminal_instance_id = terminal_instance_id.trim();
+    let provider_session_id = provider_session_id.trim();
+    let native_session_id = native_session_id.trim();
+    let thread_id = thread_id.trim();
+    let identity = if !terminal_id.is_empty() && !terminal_instance_id.is_empty() {
+        format!("terminal:{terminal_id}:{terminal_instance_id}")
+    } else if !provider_session_id.is_empty() {
+        format!("provider:{provider_session_id}")
+    } else if !native_session_id.is_empty() {
+        format!("native:{native_session_id}")
+    } else if !thread_id.is_empty() {
+        format!("thread:{thread_id}")
+    } else {
+        return None;
+    };
+    Some(format!(
+        "agent-session-{}",
+        cloud_mcp_short_hash(&format!("{workspace_id}::{agent_kind}::{identity}"))
+    ))
+}
+
+fn cloud_mcp_agent_session_key_from_value(
+    value: &Value,
+    workspace_fallback: &str,
+) -> Option<String> {
+    if let Some(key) = cloud_mcp_payload_text(value, &["agent_session_id", "agentSessionId"]) {
+        return Some(key);
+    }
+    let workspace_id = cloud_mcp_payload_text(value, &["workspace_id", "workspaceId"])
+        .unwrap_or_else(|| workspace_fallback.to_string());
+    let agent_kind = cloud_mcp_payload_text(
+        value,
+        &[
+            "agent_kind",
+            "agentKind",
+            "agent_type",
+            "agentType",
+            "target_agent_id",
+            "targetAgentId",
+        ],
+    )
+    .unwrap_or_default();
+    let provider_session_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "provider_session_id",
+            "providerSessionId",
+            "terminal_session_id",
+            "terminalSessionId",
+            "session_id",
+            "sessionId",
+        ],
+    )
+    .unwrap_or_default();
+    let native_session_id = cloud_mcp_payload_text(
+        value,
+        &["native_session_id", "nativeSessionId", "terminal_session_id", "terminalSessionId"],
+    )
+    .unwrap_or_default();
+    let terminal_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+            "pane_id",
+            "paneId",
+        ],
+    )
+    .unwrap_or_default();
+    let terminal_instance_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "terminal_instance_id",
+            "terminalInstanceId",
+            "target_terminal_instance_id",
+            "targetTerminalInstanceId",
+            "instance_id",
+            "instanceId",
+        ],
+    )
+    .unwrap_or_default();
+    let thread_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "thread_id",
+            "threadId",
+            "target_thread_id",
+            "targetThreadId",
+        ],
+    )
+    .unwrap_or_default();
+    cloud_mcp_agent_session_key_from_fields(
+        &workspace_id,
+        &agent_kind,
+        &provider_session_id,
+        &native_session_id,
+        &terminal_id,
+        &terminal_instance_id,
+        &thread_id,
+    )
+}
+
+fn cloud_mcp_agent_session_match_score(session: &Value, todo: &Value) -> u8 {
+    let session_provider = cloud_mcp_agent_session_text(
+        session,
+        &["provider_session_id", "providerSessionId", "native_session_id", "nativeSessionId"],
+    );
+    let todo_provider = cloud_mcp_agent_session_text(
+        todo,
+        &[
+            "provider_session_id",
+            "providerSessionId",
+            "native_session_id",
+            "nativeSessionId",
+            "terminal_session_id",
+            "terminalSessionId",
+            "session_id",
+            "sessionId",
+        ],
+    );
+    if !session_provider.is_empty() && session_provider == todo_provider {
+        return 100;
+    }
+
+    let session_terminal = cloud_mcp_agent_session_text(session, &["terminal_id", "terminalId"]);
+    let todo_terminal = cloud_mcp_agent_session_text(
+        todo,
+        &[
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+            "pane_id",
+            "paneId",
+        ],
+    );
+    let session_instance =
+        cloud_mcp_agent_session_text(session, &["terminal_instance_id", "terminalInstanceId"]);
+    let todo_instance = cloud_mcp_agent_session_text(
+        todo,
+        &[
+            "terminal_instance_id",
+            "terminalInstanceId",
+            "target_terminal_instance_id",
+            "targetTerminalInstanceId",
+            "instance_id",
+            "instanceId",
+        ],
+    );
+    if !session_terminal.is_empty()
+        && session_terminal == todo_terminal
+        && (todo_instance.is_empty()
+            || session_instance.is_empty()
+            || session_instance == todo_instance)
+    {
+        return 90;
+    }
+
+    let session_thread = cloud_mcp_agent_session_text(session, &["thread_id", "threadId"]);
+    let todo_thread = cloud_mcp_agent_session_text(
+        todo,
+        &[
+            "thread_id",
+            "threadId",
+            "target_thread_id",
+            "targetThreadId",
+        ],
+    );
+    if !session_thread.is_empty() && session_thread == todo_thread {
+        return 80;
+    }
+
+    let session_index = cloud_mcp_payload_i64(session, &["terminal_index", "terminalIndex"]);
+    let todo_index = cloud_mcp_payload_i64(
+        todo,
+        &[
+            "terminal_index",
+            "terminalIndex",
+            "target_terminal_index",
+            "targetTerminalIndex",
+        ],
+    );
+    let session_agent = cloud_mcp_agent_session_text(session, &["agent_kind", "agentKind"]);
+    let todo_agent = cloud_mcp_agent_session_text(
+        todo,
+        &[
+            "agent_kind",
+            "agentKind",
+            "agent_type",
+            "agentType",
+            "target_agent_id",
+            "targetAgentId",
+        ],
+    );
+    if session_index.is_some()
+        && session_index == todo_index
+        && (todo_agent.is_empty() || session_agent.is_empty() || session_agent == todo_agent)
+    {
+        return 70;
+    }
+    0
+}
+
+fn cloud_mcp_agent_session_recent_rows_from_conn(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+    limit: usize,
+) -> Vec<Value> {
+    let limit = limit.max(1).min(100) as i64;
+    let rows = if workspace_id.trim().is_empty() {
+        conn.prepare(
+            "SELECT row_json, summary_json, todo_count, summary_chunk_count
+             FROM workspace_agent_sessions
+             ORDER BY last_active_at_ms DESC LIMIT ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(rusqlite::params![limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+    } else {
+        conn.prepare(
+            "SELECT row_json, summary_json, todo_count, summary_chunk_count
+             FROM workspace_agent_sessions
+             WHERE workspace_id=?1
+             ORDER BY last_active_at_ms DESC LIMIT ?2",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(rusqlite::params![workspace_id, limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+    };
+
+    rows.into_iter()
+        .filter_map(|(row_json, summary_json, todo_count, chunk_count)| {
+            let mut row = serde_json::from_str::<Value>(&row_json).ok()?;
+            let summary = serde_json::from_str::<Value>(&summary_json).unwrap_or_else(|_| json!({}));
+            if let Some(object) = row.as_object_mut() {
+                object.insert("summary".to_string(), summary.clone());
+                object.insert("sessionSummary".to_string(), summary);
+                object.insert("todoCount".to_string(), json!(todo_count.max(0)));
+                object.insert("todo_count".to_string(), json!(todo_count.max(0)));
+                object.insert("summaryChunkCount".to_string(), json!(chunk_count.max(0)));
+                object.insert("summary_chunk_count".to_string(), json!(chunk_count.max(0)));
+            }
+            Some(row)
+        })
+        .collect()
+}
+
+fn cloud_mcp_agent_session_best_match(sessions: &[Value], todo: &Value) -> Option<Value> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let score = cloud_mcp_agent_session_match_score(session, todo);
+            (score > 0).then(|| (score, session.clone()))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, session)| session)
+}
+
+fn cloud_mcp_agent_session_insert_if_present(
+    object: &mut serde_json::Map<String, Value>,
+    camel_key: &str,
+    snake_key: &str,
+    value: String,
+) {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    if !object
+        .get(camel_key)
+        .and_then(Value::as_str)
+        .is_some_and(|existing| !existing.trim().is_empty())
+    {
+        object.insert(camel_key.to_string(), json!(value.clone()));
+    }
+    if !object
+        .get(snake_key)
+        .and_then(Value::as_str)
+        .is_some_and(|existing| !existing.trim().is_empty())
+    {
+        object.insert(snake_key.to_string(), json!(value));
+    }
+}
+
+fn cloud_mcp_agent_session_attach_to_todo(todo: &mut Value, session: &Value) {
+    let Some(object) = todo.as_object_mut() else {
+        return;
+    };
+    let session_key = cloud_mcp_agent_session_text(session, &["agent_session_id", "agentSessionId", "key"]);
+    cloud_mcp_agent_session_insert_if_present(object, "agentSessionId", "agent_session_id", session_key);
+    let provider_session_id =
+        cloud_mcp_agent_session_text(session, &["provider_session_id", "providerSessionId"]);
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "providerSessionId",
+        "provider_session_id",
+        provider_session_id.clone(),
+    );
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "terminalSessionId",
+        "terminal_session_id",
+        provider_session_id.clone(),
+    );
+    let native_session_id =
+        cloud_mcp_agent_session_text(session, &["native_session_id", "nativeSessionId"]);
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "nativeSessionId",
+        "native_session_id",
+        native_session_id,
+    );
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "terminalId",
+        "terminal_id",
+        cloud_mcp_agent_session_text(session, &["terminal_id", "terminalId"]),
+    );
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "terminalInstanceId",
+        "terminal_instance_id",
+        cloud_mcp_agent_session_text(session, &["terminal_instance_id", "terminalInstanceId"]),
+    );
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "threadId",
+        "thread_id",
+        cloud_mcp_agent_session_text(session, &["thread_id", "threadId"]),
+    );
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "agentKind",
+        "agent_kind",
+        cloud_mcp_agent_session_text(session, &["agent_kind", "agentKind"]),
+    );
+    cloud_mcp_agent_session_insert_if_present(
+        object,
+        "provider",
+        "provider",
+        cloud_mcp_agent_session_text(session, &["provider"]),
+    );
+    if let Some(index) = cloud_mcp_payload_i64(session, &["terminal_index", "terminalIndex"]) {
+        object
+            .entry("terminalIndex".to_string())
+            .or_insert_with(|| json!(index));
+        object
+            .entry("terminal_index".to_string())
+            .or_insert_with(|| json!(index));
+    }
+}
+
+fn cloud_mcp_agent_session_title_from_todos(rows: &[Value], fallback: &str) -> String {
+    rows.iter()
+        .rev()
+        .find_map(|row| {
+            let text = cloud_mcp_agent_session_text(row, &["text", "todoText", "todo_text"]);
+            (!text.is_empty()).then(|| text.chars().take(96).collect::<String>())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn cloud_mcp_agent_session_todo_rows_from_conn(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+) -> Vec<Value> {
+    conn.prepare(
+        "SELECT row_json FROM (
+             SELECT row_json, ordinal, updated_at_ms, todo_id
+             FROM workspace_agent_session_todos
+             WHERE session_key=?1
+             ORDER BY ordinal DESC, updated_at_ms DESC, todo_id DESC
+             LIMIT ?2
+         )
+         ORDER BY ordinal ASC, updated_at_ms ASC, todo_id ASC",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_map(
+                rusqlite::params![session_key, CLOUD_MCP_AGENT_SESSION_TODO_ROW_LIMIT as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|rows| rows.flatten().collect::<Vec<_>>())
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|row_json| serde_json::from_str::<Value>(&row_json).ok())
+    .collect()
+}
+
+fn cloud_mcp_agent_session_summary_text(rows: &[Value]) -> String {
+    let snippets = rows
+        .iter()
+        .map(|row| {
+            let status = cloud_mcp_agent_session_text(row, &["status", "todoStatus", "todo_status"]);
+            let text = cloud_mcp_agent_session_text(row, &["text", "todoText", "todo_text"]);
+            if text.is_empty() {
+                status
+            } else if status.is_empty() {
+                text
+            } else {
+                format!("{status}: {text}")
+            }
+        })
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    cloud_mcp_agent_session_clean_text(&snippets.join("; "), 1200)
+}
+
+fn cloud_mcp_agent_session_row_ordinal(row: &Value, fallback: usize) -> usize {
+    cloud_mcp_payload_u64(row, &["ordinal"])
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
+fn cloud_mcp_agent_session_summary_chunk(
+    session_key: &str,
+    provider_session_id: &str,
+    chunk_index: usize,
+    chunk: &[Value],
+    ordinal_start: usize,
+    ordinal_end: usize,
+) -> Value {
+    let todo_ids = chunk
+        .iter()
+        .filter_map(|row| cloud_mcp_payload_text(row, &["todo_id", "todoId", "id"]))
+        .collect::<Vec<_>>();
+    let fallback_summary = cloud_mcp_agent_session_summary_text(chunk);
+    let compression_job = json!({
+        "kind": "agent_session_summary_compression_job",
+        "schemaVersion": CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION,
+        "agentSessionId": session_key,
+        "agent_session_id": session_key,
+        "providerSessionId": provider_session_id,
+        "provider_session_id": provider_session_id,
+        "chunkIndex": chunk_index,
+        "chunk_index": chunk_index,
+        "chunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+        "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+        "todoIds": todo_ids,
+        "todo_ids": todo_ids,
+        "inputTodos": chunk,
+        "input_todos": chunk,
+    });
+    json!({
+        "kind": "agent_session_summary_chunk",
+        "itemKind": "compressed_todo_chunk",
+        "item_kind": "compressed_todo_chunk",
+        "chunkIndex": chunk_index,
+        "chunk_index": chunk_index,
+        "todoCount": chunk.len(),
+        "todo_count": chunk.len(),
+        "ordinalStart": ordinal_start,
+        "ordinal_start": ordinal_start,
+        "ordinalEnd": ordinal_end,
+        "ordinal_end": ordinal_end,
+        "summary": fallback_summary,
+        "fallbackSummary": fallback_summary,
+        "fallback_summary": fallback_summary,
+        "compressionStatus": "pending_cloud_llm",
+        "compression_status": "pending_cloud_llm",
+        "llmCompressionRequired": true,
+        "llm_compression_required": true,
+        "compressionJob": compression_job,
+        "compression_job": compression_job,
+    })
+}
+
+fn cloud_mcp_agent_session_summary_raw_item(row: &Value, fallback_ordinal: usize) -> Value {
+    let ordinal = cloud_mcp_agent_session_row_ordinal(row, fallback_ordinal);
+    let todo_id = cloud_mcp_agent_session_text(row, &["todoId", "todo_id", "id"]);
+    let status = cloud_mcp_agent_session_text(row, &["status", "todoStatus", "todo_status"]);
+    let text = cloud_mcp_agent_session_text(row, &["text", "todoText", "todo_text"]);
+    json!({
+        "kind": "agent_session_summary_todo",
+        "itemKind": "raw_todo",
+        "item_kind": "raw_todo",
+        "todoId": todo_id,
+        "todo_id": todo_id,
+        "ordinal": ordinal,
+        "status": status,
+        "text": text,
+        "todo": row,
+        "compressionStatus": "not_compressed",
+        "compression_status": "not_compressed",
+        "llmCompressionRequired": false,
+        "llm_compression_required": false,
+    })
+}
+
+fn cloud_mcp_agent_session_summary_items_from_rows(
+    session_key: &str,
+    provider_session_id: &str,
+    rows: &[Value],
+) -> Vec<Value> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let protected_raw_start = rows
+        .len()
+        .saturating_sub(CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT);
+    let compressed_len = (protected_raw_start / CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE)
+        * CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE;
+    let mut items = Vec::new();
+    for (chunk_index, chunk) in rows[..compressed_len]
+        .chunks(CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE)
+        .enumerate()
+    {
+        let ordinal_start = chunk
+            .first()
+            .map(|row| cloud_mcp_agent_session_row_ordinal(row, chunk_index * CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE))
+            .unwrap_or(chunk_index * CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE);
+        let ordinal_end = chunk
+            .last()
+            .map(|row| {
+                cloud_mcp_agent_session_row_ordinal(
+                    row,
+                    chunk_index * CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE + chunk.len().saturating_sub(1),
+                )
+            })
+            .unwrap_or(ordinal_start);
+        items.push(cloud_mcp_agent_session_summary_chunk(
+            session_key,
+            provider_session_id,
+            chunk_index,
+            chunk,
+            ordinal_start,
+            ordinal_end,
+        ));
+    }
+    for (index, row) in rows[compressed_len..].iter().enumerate() {
+        let fallback_ordinal = compressed_len + index;
+        items.push(cloud_mcp_agent_session_summary_raw_item(row, fallback_ordinal));
+    }
+
+    if items.len() > CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT {
+        items.split_off(items.len() - CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT)
+    } else {
+        items
+    }
+}
+
+fn cloud_mcp_agent_session_summary_from_rows(
+    session: &Value,
+    rows: &[Value],
+    updated_at_ms: u64,
+) -> Value {
+    let session_key = cloud_mcp_agent_session_text(session, &["agent_session_id", "agentSessionId", "key"]);
+    let provider_session_id =
+        cloud_mcp_agent_session_text(session, &["provider_session_id", "providerSessionId"]);
+    let agent_kind = cloud_mcp_agent_session_text(session, &["agent_kind", "agentKind"]);
+    let provider = cloud_mcp_agent_session_text(session, &["provider"]);
+    let summary_items =
+        cloud_mcp_agent_session_summary_items_from_rows(&session_key, &provider_session_id, rows);
+    let chunks = summary_items
+        .iter()
+        .filter(|item| {
+            cloud_mcp_agent_session_text(item, &["itemKind", "item_kind"])
+                == "compressed_todo_chunk"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let jobs = chunks
+        .iter()
+        .filter_map(|chunk| chunk.get("compressionJob").or_else(|| chunk.get("compression_job")).cloned())
+        .collect::<Vec<_>>();
+    let raw_todos = summary_items
+        .iter()
+        .filter(|item| {
+            cloud_mcp_agent_session_text(item, &["itemKind", "item_kind"]) == "raw_todo"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_chunks = !chunks.is_empty();
+    let title = cloud_mcp_agent_session_title_from_todos(rows, "Coding agent session");
+    let summary_text = cloud_mcp_agent_session_summary_text(rows);
+    json!({
+        "kind": "agent_session_summary",
+        "schemaVersion": CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION,
+        "schema_version": CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION,
+        "agentSessionId": session_key,
+        "agent_session_id": session_key,
+        "providerSessionId": provider_session_id,
+        "provider_session_id": provider_session_id,
+        "agentKind": agent_kind,
+        "agent_kind": agent_kind,
+        "provider": provider,
+        "title": title,
+        "summary": summary_text,
+        "summaryText": summary_text,
+        "summary_text": summary_text,
+        "todoCount": rows.len(),
+        "todo_count": rows.len(),
+        "chunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+        "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+        "summaryItemCount": summary_items.len(),
+        "summary_item_count": summary_items.len(),
+        "summaryItemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+        "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+        "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+        "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+        "chunkCount": chunks.len(),
+        "chunk_count": chunks.len(),
+        "chunks": chunks,
+        "summaryItems": summary_items.clone(),
+        "summary_items": summary_items,
+        "rawTodos": raw_todos.clone(),
+        "raw_todos": raw_todos.clone(),
+        "rawRecentTodos": raw_todos.clone(),
+        "raw_recent_todos": raw_todos,
+        "compressionJobs": jobs.clone(),
+        "compression_jobs": jobs,
+        "compression": {
+            "mode": "cloud_llm",
+            "chunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+            "itemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+            "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+            "status": if rows.is_empty() {
+                "empty"
+            } else if !has_chunks {
+                "raw_recent_only"
+            } else {
+                "pending_cloud_llm"
+            },
+        },
+        "updatedAtMs": updated_at_ms,
+        "updated_at_ms": updated_at_ms,
+    })
+}
+
+fn cloud_mcp_agent_session_update_summary_conn(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+) -> Result<Option<Value>, String> {
+    let row_json = conn
+        .query_row(
+            "SELECT row_json FROM workspace_agent_sessions WHERE key=?1",
+            rusqlite::params![session_key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let Some(row_json) = row_json else {
+        return Ok(None);
+    };
+    let mut session = serde_json::from_str::<Value>(&row_json).unwrap_or_else(|_| json!({}));
+    let rows = cloud_mcp_agent_session_todo_rows_from_conn(conn, session_key);
+    let now_ms = cloud_mcp_now_ms();
+    let summary = cloud_mcp_agent_session_summary_from_rows(&session, &rows, now_ms);
+    let title = summary
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Coding agent session")
+        .to_string();
+    if let Some(object) = session.as_object_mut() {
+        object.insert("title".to_string(), json!(title.clone()));
+        object.insert("todoCount".to_string(), json!(rows.len()));
+        object.insert("todo_count".to_string(), json!(rows.len()));
+        object.insert("summaryChunkCount".to_string(), json!(summary["chunkCount"].clone()));
+        object.insert("summary_chunk_count".to_string(), json!(summary["chunk_count"].clone()));
+    }
+    let summary_json = serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_string());
+    let row_json = serde_json::to_string(&session).unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        "UPDATE workspace_agent_sessions
+         SET title=?2, todo_count=?3, summary_chunk_count=?4, summary_json=?5, row_json=?6,
+             last_active_at_ms=MAX(last_active_at_ms, ?7)
+         WHERE key=?1",
+        rusqlite::params![
+            session_key,
+            title,
+            rows.len() as i64,
+            summary
+                .get("chunkCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as i64,
+            summary_json,
+            row_json,
+            now_ms as i64,
+        ],
+    )
+    .map_err(|error| format!("Unable to update agent session summary: {error}"))?;
+    Ok(Some(summary))
+}
+
+fn cloud_mcp_agent_session_row_from_value(
+    value: &Value,
+    base_url: &str,
+    repo_id: &str,
+    workspace_id: &str,
+    workspace_name: &str,
+    now_ms: u64,
+) -> Option<(String, Value)> {
+    let workspace_id = cloud_mcp_payload_text(value, &["workspace_id", "workspaceId"])
+        .unwrap_or_else(|| workspace_id.to_string());
+    let agent_kind = cloud_mcp_agent_session_text(
+        value,
+        &[
+            "agent_kind",
+            "agentKind",
+            "agent_type",
+            "agentType",
+            "target_agent_id",
+            "targetAgentId",
+        ],
+    );
+    let provider_session_id = cloud_mcp_agent_session_text(
+        value,
+        &[
+            "provider_session_id",
+            "providerSessionId",
+            "terminal_session_id",
+            "terminalSessionId",
+            "session_id",
+            "sessionId",
+        ],
+    );
+    let native_session_id = cloud_mcp_agent_session_text(
+        value,
+        &["native_session_id", "nativeSessionId", "terminal_session_id", "terminalSessionId"],
+    );
+    let terminal_id = cloud_mcp_agent_session_text(
+        value,
+        &[
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+            "pane_id",
+            "paneId",
+        ],
+    );
+    let terminal_instance_id = cloud_mcp_agent_session_text(
+        value,
+        &[
+            "terminal_instance_id",
+            "terminalInstanceId",
+            "target_terminal_instance_id",
+            "targetTerminalInstanceId",
+            "instance_id",
+            "instanceId",
+        ],
+    );
+    let thread_id = cloud_mcp_agent_session_text(
+        value,
+        &[
+            "thread_id",
+            "threadId",
+            "target_thread_id",
+            "targetThreadId",
+        ],
+    );
+    let key = cloud_mcp_agent_session_key_from_value(value, &workspace_id).or_else(|| {
+        cloud_mcp_agent_session_key_from_fields(
+            &workspace_id,
+            &agent_kind,
+            &provider_session_id,
+            &native_session_id,
+            &terminal_id,
+            &terminal_instance_id,
+            &thread_id,
+        )
+    })?;
+    let local_session_id = if !terminal_id.is_empty() && !terminal_instance_id.is_empty() {
+        format!("{terminal_id}:{terminal_instance_id}")
+    } else {
+        String::new()
+    };
+    let terminal_index = cloud_mcp_payload_i64(
+        value,
+        &[
+            "terminal_index",
+            "terminalIndex",
+            "target_terminal_index",
+            "targetTerminalIndex",
+        ],
+    );
+    let status = cloud_mcp_agent_session_text(
+        value,
+        &["status", "activity_status", "activityStatus", "todoStatus", "todo_status"],
+    );
+    let provider = cloud_mcp_agent_session_text(value, &["provider"]);
+    let mut row = json!({
+        "agentSessionId": key,
+        "agent_session_id": key,
+        "key": key,
+        "baseUrl": base_url,
+        "base_url": base_url,
+        "repoId": repo_id,
+        "repo_id": repo_id,
+        "workspaceId": workspace_id,
+        "workspace_id": workspace_id,
+        "workspaceName": workspace_name,
+        "workspace_name": workspace_name,
+        "agentKind": agent_kind,
+        "agent_kind": agent_kind,
+        "provider": provider,
+        "providerSessionId": provider_session_id,
+        "provider_session_id": provider_session_id,
+        "nativeSessionId": native_session_id,
+        "native_session_id": native_session_id,
+        "localSessionId": local_session_id,
+        "local_session_id": local_session_id,
+        "terminalId": terminal_id,
+        "terminal_id": terminal_id,
+        "terminalInstanceId": terminal_instance_id,
+        "terminal_instance_id": terminal_instance_id,
+        "threadId": thread_id,
+        "thread_id": thread_id,
+        "status": if status.is_empty() { "observed" } else { status.as_str() },
+        "firstSeenAtMs": now_ms,
+        "first_seen_at_ms": now_ms,
+        "lastActiveAtMs": now_ms,
+        "last_active_at_ms": now_ms,
+    });
+    if let Some(index) = terminal_index {
+        row["terminalIndex"] = json!(index);
+        row["terminal_index"] = json!(index);
+    }
+    Some((key, row))
+}
+
+fn cloud_mcp_agent_session_upsert_row_conn(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+    row: &Value,
+    now_ms: u64,
+) -> Result<(), String> {
+    let base_url = cloud_mcp_agent_session_text(row, &["base_url", "baseUrl"]);
+    let repo_id = cloud_mcp_agent_session_text(row, &["repo_id", "repoId"]);
+    let workspace_id = cloud_mcp_agent_session_text(row, &["workspace_id", "workspaceId"]);
+    let workspace_name = cloud_mcp_agent_session_text(row, &["workspace_name", "workspaceName"]);
+    let agent_kind = cloud_mcp_agent_session_text(row, &["agent_kind", "agentKind"]);
+    let provider = cloud_mcp_agent_session_text(row, &["provider"]);
+    let provider_session_id =
+        cloud_mcp_agent_session_text(row, &["provider_session_id", "providerSessionId"]);
+    let native_session_id =
+        cloud_mcp_agent_session_text(row, &["native_session_id", "nativeSessionId"]);
+    let local_session_id =
+        cloud_mcp_agent_session_text(row, &["local_session_id", "localSessionId"]);
+    let terminal_id = cloud_mcp_agent_session_text(row, &["terminal_id", "terminalId"]);
+    let terminal_instance_id =
+        cloud_mcp_agent_session_text(row, &["terminal_instance_id", "terminalInstanceId"]);
+    let terminal_index = cloud_mcp_payload_i64(row, &["terminal_index", "terminalIndex"]);
+    let thread_id = cloud_mcp_agent_session_text(row, &["thread_id", "threadId"]);
+    let status = cloud_mcp_agent_session_text(row, &["status"]);
+    let row_json = serde_json::to_string(row).unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        "INSERT INTO workspace_agent_sessions(
+            key, base_url, repo_id, workspace_id, workspace_name, agent_kind, provider,
+            provider_session_id, native_session_id, local_session_id, terminal_id,
+            terminal_instance_id, terminal_index, thread_id, status, title,
+            first_seen_at_ms, last_active_at_ms, todo_count, summary_chunk_count,
+            summary_json, row_json
+         ) VALUES(
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, '',
+            ?16, ?16, 0, 0,
+            '{}', ?17
+         )
+         ON CONFLICT(key) DO UPDATE SET
+            base_url=excluded.base_url,
+            repo_id=CASE WHEN excluded.repo_id<>'' THEN excluded.repo_id ELSE workspace_agent_sessions.repo_id END,
+            workspace_id=excluded.workspace_id,
+            workspace_name=CASE WHEN excluded.workspace_name<>'' THEN excluded.workspace_name ELSE workspace_agent_sessions.workspace_name END,
+            agent_kind=CASE WHEN excluded.agent_kind<>'' THEN excluded.agent_kind ELSE workspace_agent_sessions.agent_kind END,
+            provider=CASE WHEN excluded.provider<>'' THEN excluded.provider ELSE workspace_agent_sessions.provider END,
+            provider_session_id=CASE WHEN excluded.provider_session_id<>'' THEN excluded.provider_session_id ELSE workspace_agent_sessions.provider_session_id END,
+            native_session_id=CASE WHEN excluded.native_session_id<>'' THEN excluded.native_session_id ELSE workspace_agent_sessions.native_session_id END,
+            local_session_id=CASE WHEN excluded.local_session_id<>'' THEN excluded.local_session_id ELSE workspace_agent_sessions.local_session_id END,
+            terminal_id=CASE WHEN excluded.terminal_id<>'' THEN excluded.terminal_id ELSE workspace_agent_sessions.terminal_id END,
+            terminal_instance_id=CASE WHEN excluded.terminal_instance_id<>'' THEN excluded.terminal_instance_id ELSE workspace_agent_sessions.terminal_instance_id END,
+            terminal_index=COALESCE(excluded.terminal_index, workspace_agent_sessions.terminal_index),
+            thread_id=CASE WHEN excluded.thread_id<>'' THEN excluded.thread_id ELSE workspace_agent_sessions.thread_id END,
+            status=CASE WHEN excluded.status<>'' THEN excluded.status ELSE workspace_agent_sessions.status END,
+            last_active_at_ms=MAX(workspace_agent_sessions.last_active_at_ms, excluded.last_active_at_ms),
+            row_json=excluded.row_json",
+        rusqlite::params![
+            session_key,
+            base_url,
+            repo_id,
+            workspace_id,
+            workspace_name,
+            agent_kind,
+            provider,
+            provider_session_id,
+            native_session_id,
+            local_session_id,
+            terminal_id,
+            terminal_instance_id,
+            terminal_index,
+            thread_id,
+            status,
+            now_ms as i64,
+            row_json,
+        ],
+    )
+    .map_err(|error| format!("Unable to upsert agent session: {error}"))?;
+    Ok(())
+}
+
+fn cloud_mcp_agent_session_upsert_todo_conn(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+    workspace_id: &str,
+    todo: &Value,
+    ordinal: usize,
+    now_ms: u64,
+) -> Result<(), String> {
+    let todo_id = cloud_mcp_agent_session_text(todo, &["todo_id", "todoId", "id"]);
+    if todo_id.is_empty() {
+        return Ok(());
+    }
+    let status = cloud_mcp_agent_session_text(todo, &["todoStatus", "todo_status", "status"]);
+    let updated_at = cloud_mcp_agent_session_text(
+        todo,
+        &["updatedAt", "updated_at", "completedAt", "completed_at", "createdAt", "created_at"],
+    );
+    let updated_at_ms = cloud_mcp_payload_u64(todo, &["updatedAtMs", "updated_at_ms"])
+        .unwrap_or(now_ms);
+    let text = cloud_mcp_agent_session_text(
+        todo,
+        &["text", "todoText", "todo_text", "todoBodyPreview", "todo_body_preview"],
+    );
+    let mut row = todo.clone();
+    if let Some(object) = row.as_object_mut() {
+        object.insert("agentSessionId".to_string(), json!(session_key));
+        object.insert("agent_session_id".to_string(), json!(session_key));
+        object.insert("todoId".to_string(), json!(todo_id.clone()));
+        object.insert("todo_id".to_string(), json!(todo_id.clone()));
+        object.insert("ordinal".to_string(), json!(ordinal));
+        if !text.is_empty() {
+            object.insert("text".to_string(), json!(text.clone()));
+        }
+    }
+    let row_json = serde_json::to_string(&row).unwrap_or_else(|_| "{}".to_string());
+    let key = format!(
+        "{}::todo::{}",
+        session_key,
+        cloud_mcp_short_hash(&todo_id)
+    );
+    conn.execute(
+        "INSERT INTO workspace_agent_session_todos(
+            key, session_key, workspace_id, todo_id, ordinal, status,
+            updated_at, updated_at_ms, text, row_json
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(key) DO UPDATE SET
+            session_key=excluded.session_key,
+            workspace_id=excluded.workspace_id,
+            todo_id=excluded.todo_id,
+            ordinal=excluded.ordinal,
+            status=excluded.status,
+            updated_at=excluded.updated_at,
+            updated_at_ms=excluded.updated_at_ms,
+            text=excluded.text,
+            row_json=excluded.row_json",
+        rusqlite::params![
+            key,
+            session_key,
+            workspace_id,
+            todo_id,
+            ordinal as i64,
+            status,
+            updated_at,
+            updated_at_ms as i64,
+            text,
+            row_json,
+        ],
+    )
+    .map_err(|error| format!("Unable to upsert agent session todo: {error}"))?;
+    Ok(())
+}
+
+fn cloud_mcp_agent_session_summary_jobs_from_context(context: &Value) -> Vec<Value> {
+    context
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|session| {
+            session
+                .get("summary")
+                .or_else(|| session.get("sessionSummary"))
+                .and_then(|summary| {
+                    summary
+                        .get("compressionJobs")
+                        .or_else(|| summary.get("compression_jobs"))
+                })
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn cloud_mcp_agent_session_context_from_conn(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+    limit: usize,
+) -> Value {
+    let sessions = cloud_mcp_agent_session_recent_rows_from_conn(conn, workspace_id, limit);
+    let context = json!({
+        "kind": "agent_session_context",
+        "schemaVersion": CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION,
+        "schema_version": CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION,
+        "recentSessionLimit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+        "recent_session_limit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+        "todoChunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+        "todo_chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+        "summaryItemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+        "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+        "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+        "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+        "sessions": sessions,
+        "summaryPolicy": {
+            "mode": "todos_with_cloud_llm_compression",
+            "chunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+            "summaryItemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+            "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+            "compression": "cloud_llm",
+        },
+        "summary_policy": {
+            "mode": "todos_with_cloud_llm_compression",
+            "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+            "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+            "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+            "compression": "cloud_llm",
+        },
+    });
+    let jobs = cloud_mcp_agent_session_summary_jobs_from_context(&context);
+    let mut context = context;
+    if let Some(object) = context.as_object_mut() {
+        object.insert("summaryJobs".to_string(), json!(jobs.clone()));
+        object.insert("summary_jobs".to_string(), json!(jobs));
+    }
+    context
+}
+
+pub(crate) fn cloud_mcp_agent_session_context_for_voice(workspace_id: &str) -> Value {
+    match cloud_mcp_open_todo_mirror_conn() {
+        Ok(conn) => cloud_mcp_agent_session_context_from_conn(
+            &conn,
+            workspace_id,
+            CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+        ),
+        Err(error) => json!({
+            "kind": "agent_session_context",
+            "schemaVersion": CLOUD_MCP_AGENT_SESSION_SUMMARY_SCHEMA_VERSION,
+            "sessions": [],
+            "summaryJobs": [],
+            "recentSessionLimit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+            "recent_session_limit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+            "todoChunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+            "todo_chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+            "summaryItemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+            "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+            "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+            "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+            "localError": clean_terminal_telemetry_text(&error),
+        }),
+    }
+}
+
+fn cloud_mcp_agent_session_observe_todo_snapshot(
+    base_url: &str,
+    repo_id: &str,
+    workspace_id: &str,
+    workspace_name: &str,
+    payload: &mut Value,
+) -> Value {
+    let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
+        return cloud_mcp_agent_session_context_for_voice(workspace_id);
+    };
+    let now_ms = cloud_mcp_now_ms();
+    let mut sessions = cloud_mcp_agent_session_recent_rows_from_conn(
+        &conn,
+        workspace_id,
+        CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+    );
+    let mut touched = HashSet::<String>::new();
+    if let Some(items) = payload.get_mut("todos").and_then(Value::as_array_mut) {
+        for (ordinal, item) in items.iter_mut().enumerate() {
+            if !item.is_object() {
+                continue;
+            }
+            let matched_session = cloud_mcp_agent_session_best_match(&sessions, item);
+            if let Some(session) = matched_session.as_ref() {
+                cloud_mcp_agent_session_attach_to_todo(item, session);
+            }
+            let Some((session_key, session_row)) = cloud_mcp_agent_session_row_from_value(
+                item,
+                base_url,
+                repo_id,
+                workspace_id,
+                workspace_name,
+                now_ms,
+            ) else {
+                continue;
+            };
+            let _ = cloud_mcp_agent_session_upsert_row_conn(&conn, &session_key, &session_row, now_ms);
+            cloud_mcp_agent_session_attach_to_todo(item, &session_row);
+            let _ = cloud_mcp_agent_session_upsert_todo_conn(
+                &conn,
+                &session_key,
+                workspace_id,
+                item,
+                ordinal,
+                now_ms,
+            );
+            touched.insert(session_key);
+            sessions.push(session_row);
+        }
+    }
+    for session_key in touched {
+        let _ = cloud_mcp_agent_session_update_summary_conn(&conn, &session_key);
+    }
+    cloud_mcp_agent_session_context_from_conn(
+        &conn,
+        workspace_id,
+        CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+    )
+}
+
+fn cloud_mcp_agent_session_upsert_lifecycle_delta(
+    base_url: &str,
+    delta: &Value,
+) -> Option<Value> {
+    let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
+    let now_ms = cloud_mcp_now_ms();
+    let workspace_id =
+        cloud_mcp_payload_text(delta, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let workspace_name =
+        cloud_mcp_payload_text(delta, &["workspace_name", "workspaceName"]).unwrap_or_default();
+    let repo_id = cloud_mcp_payload_text(delta, &["repo_id", "repoId"]).unwrap_or_default();
+    let (session_key, mut row) = cloud_mcp_agent_session_row_from_value(
+        delta,
+        base_url,
+        &repo_id,
+        &workspace_id,
+        &workspace_name,
+        now_ms,
+    )?;
+    if let Some(object) = row.as_object_mut() {
+        object.insert("eventKind".to_string(), json!("agent_session_observed"));
+        object.insert("event_kind".to_string(), json!("agent_session_observed"));
+        object.insert("source".to_string(), json!("rust-diffforge-activity-hook"));
+    }
+    cloud_mcp_agent_session_upsert_row_conn(&conn, &session_key, &row, now_ms).ok()?;
+    let _ = cloud_mcp_agent_session_update_summary_conn(&conn, &session_key);
+    Some(row)
+}
+
+async fn cloud_mcp_enqueue_agent_session_observed(
+    state: &CloudMcpState,
+    payload: Value,
+    reason: &str,
+    priority: u8,
+) {
+    let workspace_id = cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
+        .unwrap_or_else(|| "workspace".to_string());
+    let session_key = cloud_mcp_payload_text(&payload, &["agent_session_id", "agentSessionId", "key"])
+        .unwrap_or_else(|| "session".to_string());
+    let sync_key = format!("agent_session:{workspace_id}:{session_key}");
+    cloud_mcp_enqueue_background_sync(
+        state,
+        sync_key,
+        "agent_session_observed",
+        payload,
+        priority,
+        reason.to_string(),
+    )
+    .await;
 }
 
 /// Builds a minimal correction-item payload from the newest mirror row for a
@@ -24800,6 +26157,173 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn agent_session_summary_keeps_latest_three_todos_raw() {
+        let session = json!({
+            "agentSessionId": "agent-session-1",
+            "providerSessionId": "provider-session-1",
+            "agentKind": "codex",
+            "provider": "codex",
+        });
+        let rows = (0..23)
+            .map(|index| {
+                json!({
+                    "todoId": format!("todo-{index}"),
+                    "status": if index % 2 == 0 { "completed" } else { "running" },
+                    "text": format!("Task number {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let summary = cloud_mcp_agent_session_summary_from_rows(&session, &rows, 1234);
+
+        assert_eq!(summary["todoCount"].as_u64(), Some(23));
+        assert_eq!(summary["summaryItemCount"].as_u64(), Some(5));
+        assert_eq!(summary["chunkCount"].as_u64(), Some(2));
+        let chunks = summary["chunks"].as_array().unwrap();
+        assert_eq!(chunks[0]["todoCount"].as_u64(), Some(10));
+        assert_eq!(chunks[1]["todoCount"].as_u64(), Some(10));
+        assert_eq!(
+            summary["compressionJobs"].as_array().map(Vec::len),
+            Some(2)
+        );
+        let items = summary["summaryItems"].as_array().unwrap();
+        assert_eq!(items[2]["itemKind"].as_str(), Some("raw_todo"));
+        assert_eq!(items[2]["todoId"].as_str(), Some("todo-20"));
+        assert_eq!(items[4]["todoId"].as_str(), Some("todo-22"));
+        assert_eq!(
+            chunks[0]["compressionStatus"].as_str(),
+            Some("pending_cloud_llm")
+        );
+    }
+
+    #[test]
+    fn agent_session_summary_waits_until_thirteen_todos_to_compress() {
+        let session = json!({
+            "agentSessionId": "agent-session-1",
+            "providerSessionId": "provider-session-1",
+        });
+        let rows = (0..12)
+            .map(|index| json!({ "todoId": format!("todo-{index}"), "text": format!("Task {index}") }))
+            .collect::<Vec<_>>();
+
+        let twelve = cloud_mcp_agent_session_summary_from_rows(&session, &rows, 1234);
+        assert_eq!(twelve["chunkCount"].as_u64(), Some(0));
+        assert_eq!(twelve["summaryItemCount"].as_u64(), Some(12));
+
+        let mut thirteen_rows = rows;
+        thirteen_rows.push(json!({ "todoId": "todo-12", "text": "Task 12" }));
+        let thirteen = cloud_mcp_agent_session_summary_from_rows(&session, &thirteen_rows, 1234);
+        assert_eq!(thirteen["chunkCount"].as_u64(), Some(1));
+        assert_eq!(thirteen["summaryItemCount"].as_u64(), Some(4));
+        assert_eq!(
+            thirteen["summaryItems"].as_array().unwrap()[1]["todoId"].as_str(),
+            Some("todo-10")
+        );
+        assert_eq!(
+            thirteen["summaryItems"].as_array().unwrap()[3]["todoId"].as_str(),
+            Some("todo-12")
+        );
+    }
+
+    #[test]
+    fn agent_session_summary_limits_to_latest_fifty_items() {
+        let session = json!({
+            "agentSessionId": "agent-session-1",
+            "providerSessionId": "provider-session-1",
+        });
+        let rows = (0..603)
+            .map(|index| {
+                json!({
+                    "todoId": format!("todo-{index}"),
+                    "ordinal": index,
+                    "text": format!("Task number {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let summary = cloud_mcp_agent_session_summary_from_rows(&session, &rows, 1234);
+
+        assert_eq!(summary["summaryItemCount"].as_u64(), Some(50));
+        assert_eq!(summary["chunkCount"].as_u64(), Some(47));
+        assert_eq!(
+            summary["compressionJobs"].as_array().map(Vec::len),
+            Some(47)
+        );
+        let items = summary["summaryItems"].as_array().unwrap();
+        assert_eq!(items.len(), CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT);
+        assert_eq!(items[0]["itemKind"].as_str(), Some("compressed_todo_chunk"));
+        assert_eq!(items[0]["ordinalStart"].as_u64(), Some(130));
+        assert_eq!(items[49]["itemKind"].as_str(), Some("raw_todo"));
+        assert_eq!(items[49]["todoId"].as_str(), Some("todo-602"));
+    }
+
+    #[test]
+    fn agent_session_backfills_todo_provider_session_from_terminal_lifecycle() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let now_ms = 1234;
+        let lifecycle = json!({
+            "workspaceId": "workspace-a",
+            "workspaceName": "Workspace A",
+            "repoId": "repo-a",
+            "agentKind": "codex",
+            "provider": "codex",
+            "providerSessionId": "provider-session-a",
+            "nativeSessionId": "provider-session-a",
+            "terminalId": "pane-a",
+            "terminalInstanceId": "42",
+            "terminalIndex": 0,
+            "threadId": "thread-a",
+            "status": "idle",
+        });
+        let (session_key, session_row) = cloud_mcp_agent_session_row_from_value(
+            &lifecycle,
+            "https://cloud.example",
+            "repo-a",
+            "workspace-a",
+            "Workspace A",
+            now_ms,
+        )
+        .unwrap();
+        cloud_mcp_agent_session_upsert_row_conn(&conn, &session_key, &session_row, now_ms)
+            .unwrap();
+
+        let mut todo = json!({
+            "id": "todo-a",
+            "todoId": "todo-a",
+            "workspaceId": "workspace-a",
+            "targetAgentId": "codex",
+            "targetTerminalId": "pane-a",
+            "targetTerminalIndex": 0,
+            "text": "Finish the feature",
+            "status": "running",
+        });
+        let sessions =
+            cloud_mcp_agent_session_recent_rows_from_conn(&conn, "workspace-a", 25);
+        let matched = cloud_mcp_agent_session_best_match(&sessions, &todo).unwrap();
+        cloud_mcp_agent_session_attach_to_todo(&mut todo, &matched);
+
+        assert_eq!(
+            todo["providerSessionId"].as_str(),
+            Some("provider-session-a")
+        );
+        assert_eq!(todo["agentSessionId"].as_str(), Some(session_key.as_str()));
+        cloud_mcp_agent_session_upsert_todo_conn(
+            &conn,
+            &session_key,
+            "workspace-a",
+            &todo,
+            0,
+            now_ms,
+        )
+        .unwrap();
+        let summary = cloud_mcp_agent_session_update_summary_conn(&conn, &session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["todoCount"].as_u64(), Some(1));
+    }
+
+    #[test]
     fn diffforge_credit_ledger_dedupes_entities_and_meters_transfer_bytes() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -27615,14 +29139,28 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     let fail_asset_id = asset_id.clone();
     let fail_transfer_id = transfer_id.clone();
     let fail_cloud_id = cloud_id.clone();
-    let length = fs::metadata(local_path)
-        .map_err(|error| {
-            format!(
+    let length = match fs::metadata(local_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let message = format!(
                 "Unable to inspect asset file {}: {error}",
                 local_path.display()
-            )
-        })?
-        .len();
+            );
+            let _ = cloud_mcp_asset_store_local_transfer_progress(
+                &fail_repo_id,
+                &fail_workspace_id,
+                &fail_asset_id,
+                &fail_transfer_id,
+                &fail_cloud_id,
+                "upload",
+                "failed",
+                bytes_total,
+                0,
+                Some(&message),
+            );
+            return Err(message);
+        }
+    };
     if let Some(max_allowed_bytes) = cloud_mcp_asset_upload_exceeds_size_limit(length, bytes_total)
     {
         let error = format!(
@@ -27647,12 +29185,28 @@ fn cloud_mcp_upload_asset_streaming_blocking(
         );
         return Err(error);
     }
-    let file = fs::File::open(local_path).map_err(|error| {
-        format!(
-            "Unable to open asset file {}: {error}",
-            local_path.display()
-        )
-    })?;
+    let file = match fs::File::open(local_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let message = format!(
+                "Unable to open asset file {}: {error}",
+                local_path.display()
+            );
+            let _ = cloud_mcp_asset_store_local_transfer_progress(
+                &fail_repo_id,
+                &fail_workspace_id,
+                &fail_asset_id,
+                &fail_transfer_id,
+                &fail_cloud_id,
+                "upload",
+                "failed",
+                bytes_total,
+                0,
+                Some(&message),
+            );
+            return Err(message);
+        }
+    };
     let mut progress = CloudMcpAssetTransferProgress::new(
         repo_id,
         workspace_id,
@@ -27705,6 +29259,20 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     let upload_result = serde_json::from_str::<Value>(&response_text)
         .unwrap_or_else(|_| json!({"raw_response": response_text}));
     if !status.is_success() {
+        let detail = upload_result
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| upload_result.get("error").and_then(Value::as_str))
+            .or_else(|| upload_result.get("raw_response").and_then(Value::as_str))
+            .map(|value| value.trim().chars().take(300).collect::<String>())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "upload failed".to_string());
+        let message = format!(
+            "Asset upload returned {}: {}",
+            status.as_u16(),
+            detail
+        );
         let _ = cloud_mcp_asset_store_local_transfer_progress(
             &fail_repo_id,
             &fail_workspace_id,
@@ -27715,22 +29283,9 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             "failed",
             bytes_total,
             0,
-            Some("Asset upload returned an error response."),
+            Some(&message),
         );
-        let detail = upload_result
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .or_else(|| upload_result.get("error").and_then(Value::as_str))
-            .or_else(|| upload_result.get("raw_response").and_then(Value::as_str))
-            .map(|value| value.trim().chars().take(300).collect::<String>())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "upload failed".to_string());
-        return Err(format!(
-            "Asset upload returned {}: {}",
-            status.as_u16(),
-            detail
-        ));
+        return Err(message);
     }
     let completed_bytes = bytes_total.max(i64::try_from(length).unwrap_or(i64::MAX));
     let _ = cloud_mcp_asset_store_local_transfer_progress(
@@ -27846,6 +29401,25 @@ fn cloud_mcp_download_asset_streaming_blocking(
     };
     let status = response.status();
     if !status.is_success() {
+        let response_text = response
+            .text()
+            .unwrap_or_else(|error| format!("Unable to read asset download error response: {error}"));
+        let download_result = serde_json::from_str::<Value>(&response_text)
+            .unwrap_or_else(|_| json!({"raw_response": response_text}));
+        let detail = download_result
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| download_result.get("error").and_then(Value::as_str))
+            .or_else(|| download_result.get("raw_response").and_then(Value::as_str))
+            .map(|value| value.trim().chars().take(300).collect::<String>())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "download failed".to_string());
+        let message = format!(
+            "Asset download returned {}: {}",
+            status.as_u16(),
+            detail
+        );
         let _ = cloud_mcp_asset_store_local_transfer_progress(
             &fail_repo_id,
             &fail_workspace_id,
@@ -27856,7 +29430,7 @@ fn cloud_mcp_download_asset_streaming_blocking(
             "failed",
             expected_size,
             0,
-            Some("Asset download returned an error response."),
+            Some(&message),
         );
         if let Some(reporter) = failure_reporter.as_ref() {
             let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
@@ -27869,10 +29443,10 @@ fn cloud_mcp_download_asset_streaming_blocking(
                 "failed",
                 expected_size,
                 0,
-                Some("Asset download returned an error response."),
+                Some(&message),
             ));
         }
-        return Err(format!("Asset download returned {}", status.as_u16()));
+        return Err(message);
     }
     cloud_mcp_write_download_response_to_file(
         response,
@@ -27901,28 +29475,28 @@ fn cloud_mcp_write_download_response_to_file(
 ) -> Result<(), String> {
     if let Some(parent) = target_path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
+            let message = format!("Unable to create asset download directory: {error}");
             progress.report(
                 "failed",
                 progress.bytes_done,
                 true,
-                Some("Unable to create asset download directory."),
+                Some(&message),
             );
-            return Err(format!(
-                "Unable to create asset download directory: {error}"
-            ));
+            return Err(message);
         }
     }
     let staging = target_path.with_extension(format!("download-{}.tmp", uuid::Uuid::new_v4()));
     let mut file = match fs::File::create(&staging) {
         Ok(file) => file,
         Err(error) => {
+            let message = format!("Unable to create downloaded asset: {error}");
             progress.report(
                 "failed",
                 progress.bytes_done,
                 true,
-                Some("Unable to create downloaded asset."),
+                Some(&message),
             );
-            return Err(format!("Unable to create downloaded asset: {error}"));
+            return Err(message);
         }
     };
     let mut hasher = Sha256::new();
@@ -27945,13 +29519,14 @@ fn cloud_mcp_write_download_response_to_file(
             Ok(read) => read,
             Err(error) => {
                 let _ = fs::remove_file(&staging);
+                let message = format!("Unable to read asset download bytes: {error}");
                 progress.report(
                     "failed",
                     bytes_done,
                     true,
-                    Some("Unable to read asset download bytes."),
+                    Some(&message),
                 );
-                return Err(format!("Unable to read asset download bytes: {error}"));
+                return Err(message);
             }
         };
         if read == 0 {
@@ -27959,13 +29534,14 @@ fn cloud_mcp_write_download_response_to_file(
         }
         if let Err(error) = file.write_all(&buffer[..read]) {
             let _ = fs::remove_file(&staging);
+            let message = format!("Unable to write downloaded asset: {error}");
             progress.report(
                 "failed",
                 bytes_done,
                 true,
-                Some("Unable to write downloaded asset."),
+                Some(&message),
             );
-            return Err(format!("Unable to write downloaded asset: {error}"));
+            return Err(message);
         }
         hasher.update(&buffer[..read]);
         bytes_done = bytes_done.saturating_add(read as i64);
@@ -27973,50 +29549,54 @@ fn cloud_mcp_write_download_response_to_file(
     }
     if let Err(error) = file.flush() {
         let _ = fs::remove_file(&staging);
+        let message = format!("Unable to flush downloaded asset: {error}");
         progress.report(
             "failed",
             bytes_done,
             true,
-            Some("Unable to flush downloaded asset."),
+            Some(&message),
         );
-        return Err(format!("Unable to flush downloaded asset: {error}"));
+        return Err(message);
     }
     if expected_size >= 0 && expected_size != bytes_done {
         let _ = fs::remove_file(&staging);
+        let message = format!(
+            "Downloaded asset size mismatch: expected {expected_size}, got {bytes_done}"
+        );
         progress.report(
             "failed",
             bytes_done,
             true,
-            Some("Downloaded asset size mismatch."),
+            Some(&message),
         );
-        return Err(format!(
-            "Downloaded asset size mismatch: expected {expected_size}, got {bytes_done}"
-        ));
+        return Err(message);
     }
     if !expected_hash.is_empty() {
         let actual_hash = format!("{:x}", hasher.finalize());
         if actual_hash != expected_hash {
             let _ = fs::remove_file(&staging);
+            let message = format!(
+                "Downloaded asset hash mismatch: expected {expected_hash}, got {actual_hash}"
+            );
             progress.report(
                 "failed",
                 bytes_done,
                 true,
-                Some("Downloaded asset hash mismatch."),
+                Some(&message),
             );
-            return Err(format!(
-                "Downloaded asset hash mismatch: expected {expected_hash}, got {actual_hash}"
-            ));
+            return Err(message);
         }
     }
     if let Err(error) = fs::rename(&staging, target_path) {
         let _ = fs::remove_file(&staging);
+        let message = format!("Unable to finalize downloaded asset: {error}");
         progress.report(
             "failed",
             bytes_done,
             true,
-            Some("Unable to finalize downloaded asset."),
+            Some(&message),
         );
-        return Err(format!("Unable to finalize downloaded asset: {error}"));
+        return Err(message);
     }
     progress.report("completed", bytes_done, true, None);
     Ok(())

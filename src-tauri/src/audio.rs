@@ -3853,7 +3853,7 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
             "browser_search",
             "file_search"
         ],
-        "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control"],
+        "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control", "highlight_terminal"],
         "tool_choice": "auto",
         "response_contract": {
             "immediate_feedback_required": true,
@@ -3862,6 +3862,7 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
             "regular_response_kind": "voice_agent_llm_feedback",
             "plan_tool_name": "create_plan",
             "agent_open_tool_name": "open_coding_agents",
+            "terminal_highlight_tool_name": "highlight_terminal",
             "remote_dispatch_tool_name": "dispatch_remote_tasks",
             "plan_snapshot_kind": "voice_agent_plan_snapshot"
         }
@@ -4247,6 +4248,46 @@ fn spawn_cloud_voice_agent_desktop_log(
     );
 }
 
+#[tauri::command]
+async fn prewarm_cloud_voice_agent_stream(
+    cloud_mcp_state: State<'_, CloudMcpState>,
+) -> Result<bool, String> {
+    log_audio_diagnostic_event("audio.cloud_voice.prewarm.command", json!({}));
+    ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state.inner()).await?;
+    let _ = cloud_mcp_ws_request_with_timeout(
+        cloud_mcp_state.inner(),
+        "voice_agent_prewarm",
+        &json!({ "kind": "voice_agent_prewarm" }),
+        Duration::from_secs(CLOUD_VOICE_AGENT_TEXT_CONNECT_TIMEOUT_SECS),
+    )
+    .await?;
+    if forge_voice_route_cache_fresh(CLOUD_VOICE_AGENT_WS_PATH).is_some() {
+        log_audio_diagnostic_event(
+            "audio.cloud_voice.prewarm.cached",
+            json!({ "ws_path": CLOUD_VOICE_AGENT_WS_PATH }),
+        );
+        return Ok(true);
+    }
+    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
+    let ws_target = cloud_mcp_resolve_ws_target(
+        cloud_mcp_state.inner(),
+        &cloud_mcp_base_url(),
+        CLOUD_VOICE_AGENT_WS_PATH,
+    )
+    .await
+    .map_err(|error| format!("Cloud voice route unavailable: {error}"))?;
+    forge_voice_route_cache_store(CLOUD_VOICE_AGENT_WS_PATH, &ws_target, &auth_bearer);
+    log_audio_diagnostic_event(
+        "audio.cloud_voice.prewarm.done",
+        json!({
+            "direct": ws_target.route_token.is_some(),
+            "transport": ws_target.transport,
+            "ws_path": CLOUD_VOICE_AGENT_WS_PATH,
+        }),
+    );
+    Ok(true)
+}
+
 async fn run_cloud_voice_agent_stream(
     app: AppHandle,
     ws_target: CloudMcpWsTarget,
@@ -4349,10 +4390,15 @@ async fn run_cloud_voice_agent_stream(
                                 let _ = finished_tx.send(Err(message));
                                 return;
                             }
-                            if matches!(
-                                kind.as_str(),
-                                "voice_agent_start_accepted" | "voice_agent_stream_started"
-                            ) {
+                            let started = if realtime_engine {
+                                kind == "voice_agent_stream_started"
+                            } else {
+                                matches!(
+                                    kind.as_str(),
+                                    "voice_agent_start_accepted" | "voice_agent_stream_started"
+                                )
+                            };
+                            if started {
                                 if let Some(ready_tx) = ready_tx.take() {
                                     let _ = ready_tx.send(Ok(()));
                                 }
@@ -5223,6 +5269,7 @@ async fn start_cloud_voice_agent_stream(
             }),
         );
         let device_profile = cloud_mcp_desktop_device_profile();
+        let agent_session_context = cloud_mcp_agent_session_context_for_voice(&workspace_id);
         let start_request = json!({
             "kind": "start",
             "contract": CLOUD_VOICE_AGENT_CONTRACT,
@@ -5240,6 +5287,10 @@ async fn start_cloud_voice_agent_stream(
             "workspace_name": workspace_name.clone(),
             "workspace_root": workspace_root.clone(),
             "repo_id": repo_id.clone(),
+            "agent_session_context": agent_session_context.clone(),
+            "agentSessionContext": agent_session_context.clone(),
+            "recent_agent_sessions": agent_session_context["sessions"].clone(),
+            "recentAgentSessions": agent_session_context["sessions"].clone(),
             "submission_mode": submission_mode.clone(),
             "input_mode": submission_mode.clone(),
             "turn_policy": {
@@ -5277,7 +5328,18 @@ async fn start_cloud_voice_agent_stream(
                     "browser_search",
                     "file_search"
                 ],
-            "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control"],
+                "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control", "highlight_terminal"],
+                "context_sources": ["recent_agent_sessions"],
+                "recent_agent_session_limit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
+                "agent_session_summary_policy": {
+                    "mode": "todos_with_cloud_llm_compression",
+                    "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
+                    "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
+                    "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
+                    "compression": "cloud_llm",
+                    "open_coding_agents_accepts_context": true,
+                    "highlight_terminal_accepts_context": true,
+                },
                 "tool_choice": "auto",
                 "response_contract": {
                     "immediate_feedback_required": true,
@@ -5286,6 +5348,7 @@ async fn start_cloud_voice_agent_stream(
                     "regular_response_kind": "voice_agent_llm_feedback",
                     "plan_tool_name": "create_plan",
                     "agent_open_tool_name": "open_coding_agents",
+                    "terminal_highlight_tool_name": "highlight_terminal",
                     "remote_dispatch_tool_name": "dispatch_remote_tasks",
                     "plan_snapshot_kind": "voice_agent_plan_snapshot"
                 }

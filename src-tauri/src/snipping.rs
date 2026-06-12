@@ -5787,6 +5787,7 @@ const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
 const SNIPPING_STRIP_RECENT_LIMIT: usize = 16;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
+const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
 
 /// Newest-first listing of saved snip files. The on-disk `snips` directory is
 /// the durable history (the in-memory toast list only ever holds six). The strip
@@ -6030,25 +6031,47 @@ fn snipping_strip_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) 
     );
 }
 
+fn snipping_strip_reassert_open_state(
+    app: &AppHandle,
+    origin: &'static str,
+    emit_anim: bool,
+) -> bool {
+    let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+        return false;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        snipping_convert_overlay_window_to_panel(&window);
+        snipping_strip_apply_macos_overlay_style(&window);
+        snipping_strip_order_front_regardless(&window);
+        snipping_make_overlay_key(&window);
+    }
+    if emit_anim {
+        snipping_strip_emit_anim(app, "open", Some(origin));
+    }
+    // The immediate show path can race the first native size/position commit
+    // for a newly created strip window. Repopulating during the settle pass
+    // parks the preview windows against the real strip geometry.
+    snipping_strip_populate_row(app);
+    snipping_strip_reassert_docked_previews(app);
+    true
+}
+
 fn snipping_strip_emit_open_reassert(app: &AppHandle, origin: &'static str) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(SNIPPING_STRIP_REASSERT_SHOW_MS)).await;
-        let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
-            return;
-        };
-        if !window.is_visible().unwrap_or(false) {
+        if !snipping_strip_reassert_open_state(&app, origin, true) {
             return;
         }
-        #[cfg(target_os = "macos")]
-        {
-            snipping_convert_overlay_window_to_panel(&window);
-            snipping_strip_apply_macos_overlay_style(&window);
-            snipping_strip_order_front_regardless(&window);
-            snipping_make_overlay_key(&window);
-        }
-        snipping_strip_emit_anim(&app, "open", Some(origin));
-        snipping_strip_reassert_docked_previews(&app);
+        sleep(Duration::from_millis(
+            SNIPPING_STRIP_COLD_BOOT_REASSERT_MS.saturating_sub(SNIPPING_STRIP_REASSERT_SHOW_MS),
+        ))
+        .await;
+        let _ = snipping_strip_reassert_open_state(&app, origin, false);
     });
 }
 

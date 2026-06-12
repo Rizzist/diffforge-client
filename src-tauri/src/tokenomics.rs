@@ -6176,16 +6176,28 @@ fn tokenomics_limit_effective_window_seconds(window_kind: &str, seconds: Option<
         .unwrap_or_else(|| tokenomics_limit_default_window_seconds(window_kind))
 }
 
-fn tokenomics_limit_display_percent_kind(window_kind: &str) -> &'static str {
-    if window_kind == "weekly" {
+fn tokenomics_limit_display_percent_kind(
+    provider: &str,
+    agent_kind: &str,
+    window_kind: &str,
+) -> &'static str {
+    if provider == "openai" && agent_kind == "codex" {
+        "remaining"
+    } else if window_kind == "weekly" {
         "remaining"
     } else {
         "used"
     }
 }
 
-fn tokenomics_limit_display_percent(window_kind: &str, used_percent: i64, remaining_percent: i64) -> i64 {
-    if tokenomics_limit_display_percent_kind(window_kind) == "remaining" {
+fn tokenomics_limit_display_percent(
+    provider: &str,
+    agent_kind: &str,
+    window_kind: &str,
+    used_percent: i64,
+    remaining_percent: i64,
+) -> i64 {
+    if tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind) == "remaining" {
         remaining_percent
     } else {
         used_percent
@@ -6324,9 +6336,15 @@ fn tokenomics_codex_window_snapshot(
         .unwrap_or(0)
         .clamp(0, 100);
     let remaining_percent = (100 - used_percent).clamp(0, 100);
-    let display_percent_kind = tokenomics_limit_display_percent_kind(window_kind);
-    let display_percent =
-        tokenomics_limit_display_percent(window_kind, used_percent, remaining_percent);
+    let display_percent_kind =
+        tokenomics_limit_display_percent_kind("openai", "codex", window_kind);
+    let display_percent = tokenomics_limit_display_percent(
+        "openai",
+        "codex",
+        window_kind,
+        used_percent,
+        remaining_percent,
+    );
     let reset_after_seconds_value =
         tokenomics_value_i64(window, &["reset_after_seconds", "resetAfterSeconds"]);
     let reset_after_seconds = reset_after_seconds_value.unwrap_or(0);
@@ -6610,9 +6628,15 @@ fn tokenomics_claude_window_snapshot(
     .clamp(0, 100);
     let used_percent = provider_reported_percent;
     let remaining_percent = (100 - used_percent).clamp(0, 100);
-    let display_percent_kind = tokenomics_limit_display_percent_kind(window_kind);
-    let display_percent =
-        tokenomics_limit_display_percent(window_kind, used_percent, remaining_percent);
+    let display_percent_kind =
+        tokenomics_limit_display_percent_kind("anthropic", "claude", window_kind);
+    let display_percent = tokenomics_limit_display_percent(
+        "anthropic",
+        "claude",
+        window_kind,
+        used_percent,
+        remaining_percent,
+    );
     let reset_at = tokenomics_value_string(
         window,
         &[
@@ -6750,10 +6774,10 @@ fn tokenomics_unknown_limit_snapshot(
         "displayPercent": Value::Null,
         "limit_display_percent": Value::Null,
         "limitDisplayPercent": Value::Null,
-        "display_percent_kind": tokenomics_limit_display_percent_kind(window_kind),
-        "displayPercentKind": tokenomics_limit_display_percent_kind(window_kind),
-        "limit_display_percent_kind": tokenomics_limit_display_percent_kind(window_kind),
-        "limitDisplayPercentKind": tokenomics_limit_display_percent_kind(window_kind),
+        "display_percent_kind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
+        "displayPercentKind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
+        "limit_display_percent_kind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
+        "limitDisplayPercentKind": tokenomics_limit_display_percent_kind(provider, agent_kind, window_kind),
         "status_label": status_label,
         "reset_label": reset_label,
         "rate_points": [],
@@ -8574,8 +8598,8 @@ mod tokenomics_tests {
         );
 
         assert_eq!(snapshot["remaining_percent"], json!(2));
-        assert_eq!(snapshot["display_percent"], json!(98));
-        assert_eq!(snapshot["display_percent_kind"], json!("used"));
+        assert_eq!(snapshot["display_percent"], json!(2));
+        assert_eq!(snapshot["display_percent_kind"], json!("remaining"));
         assert_eq!(snapshot["updated_at"], json!("unix:2010"));
         assert_eq!(snapshot["last_known_at"], json!("unix:2010"));
     }

@@ -4380,6 +4380,7 @@ pub fn run() {
             cancel_whisper_transcription,
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
+            prewarm_cloud_voice_agent_stream,
             start_cloud_voice_agent_stream,
             set_cloud_voice_agent_input_enabled,
             finish_cloud_voice_agent_input,

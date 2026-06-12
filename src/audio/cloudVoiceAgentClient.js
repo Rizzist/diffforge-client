@@ -54,6 +54,41 @@ export function startCloudVoiceAgentStream(request = {}) {
     });
 }
 
+export async function prewarmCloudVoiceAgentStream(options = {}) {
+  const requireBilling = Boolean(options?.requireBilling);
+  const onStatus = typeof options?.onStatus === "function" ? options.onStatus : null;
+  const emitStatus = (phase, message) => {
+    try {
+      onStatus?.({ phase, message });
+    } catch (_error) {
+      // Status callbacks are UI sugar; prewarm should not fail because of one.
+    }
+  };
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.invoke");
+  emitStatus("credits_billing", "Checking Diff Forge Credits");
+  await invoke("cloud_mcp_get_billing_status").catch((error) => {
+    logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.billing_error", {
+      message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+    });
+    if (requireBilling) {
+      throw error;
+    }
+  });
+  emitStatus("credits_wallet", "Loading voice credits");
+  return invoke("prewarm_cloud_voice_agent_stream")
+    .then((result) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.ok");
+      emitStatus("credits_ready", "Voice credits ready");
+      return result;
+    })
+    .catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
+      throw error;
+    });
+}
+
 export function stopCloudVoiceAgentStream() {
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.stop_stream.invoke");
   return invoke("stop_cloud_voice_agent_stream")

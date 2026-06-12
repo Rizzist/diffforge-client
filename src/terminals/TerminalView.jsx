@@ -63,6 +63,7 @@ import {
   cloudVoiceAgentEventKind,
   createCloudVoiceAgentTtsPlayer,
   finishCloudVoiceAgentInput,
+  prewarmCloudVoiceAgentStream,
   sendCloudVoiceAgentTextMessage,
   setCloudVoiceAgentInputEnabled,
   startCloudVoiceAgentStream,
@@ -254,6 +255,7 @@ const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
 const VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT = "diffforge:voice-agent-open-coding-agents-result";
+const VOICE_AGENT_HIGHLIGHT_TERMINAL_RESULT_EVENT = "diffforge:voice-agent-highlight-terminal-result";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
 const ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS = 60000;
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
@@ -1132,6 +1134,7 @@ const TODO_COMPOSER_MEDIA_DROP_EVENT = "diffforge:todo-composer-media-drop";
 const TODO_DROP_IMAGE_PATH_PATTERN = /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/i;
 
 const TODO_COMPLETION_FLASH_MS = 2000;
+const TERMINAL_HIGHLIGHT_FLASH_MS = 4200;
 
 const todoCompletionFlashPulse = keyframes`
   0% { opacity: 0; }
@@ -1161,6 +1164,29 @@ const TerminalTodoCompletionFlash = styled.div`
       0 0 14px 3px rgba(22, 163, 74, 0.42),
       0 0 30px 8px rgba(22, 163, 74, 0.22),
       inset 0 0 16px rgba(22, 163, 74, 0.16);
+  }
+`;
+
+const TerminalVoiceHighlightFlash = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 201;
+  pointer-events: none;
+  border-radius: inherit;
+  border: 2px solid rgba(250, 204, 21, 0.98);
+  box-shadow:
+    0 0 15px 4px rgba(250, 204, 21, 0.62),
+    0 0 38px 10px rgba(250, 204, 21, 0.34),
+    inset 0 0 20px rgba(250, 204, 21, 0.26);
+  opacity: 0;
+  animation: ${todoCompletionFlashPulse} 2s ease-in-out infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(202, 138, 4, 0.92);
+    box-shadow:
+      0 0 15px 4px rgba(202, 138, 4, 0.42),
+      0 0 34px 9px rgba(202, 138, 4, 0.24),
+      inset 0 0 18px rgba(202, 138, 4, 0.16);
   }
 `;
 
@@ -2713,6 +2739,23 @@ const OrchestratorVoiceMicChip = styled.span`
   @keyframes orchestratorMicChipPulse {
     0%, 100% { opacity: 0.45; }
     50% { opacity: 1; }
+  }
+`;
+
+const OrchestratorVoiceStatus = styled.div`
+  max-width: min(240px, calc(100% - 24px));
+  min-height: 15px;
+  color: rgba(212, 222, 238, 0.74);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(35, 45, 62, 0.7);
   }
 `;
 
@@ -7572,6 +7615,137 @@ function getVoiceAgentOpenCodingAgentsRequestSummary(args = {}) {
   return `Open ${count} more ${agentLabel} terminal${count === 1 ? "" : "s"}.`;
 }
 
+function getVoiceAgentHighlightStringValues(...values) {
+  const result = [];
+  const append = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    if (value == null) {
+      return;
+    }
+    if (typeof value === "object") {
+      append(
+        value.id
+          || value.terminal_id
+          || value.terminalId
+          || value.pane_id
+          || value.paneId
+          || value.name
+          || "",
+      );
+      return;
+    }
+    String(value)
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .forEach((entry) => result.push(entry));
+  };
+  values.forEach(append);
+  return Array.from(new Set(result));
+}
+
+function getVoiceAgentHighlightIntegerValues(...values) {
+  return getVoiceAgentHighlightStringValues(...values)
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isInteger(value) && value >= 0);
+}
+
+function getVoiceAgentHighlightQuery(args = {}) {
+  return normalizeTodoQueueText(
+    args.query
+      || args.topic
+      || args.todo_query
+      || args.todoQuery
+      || args.session_query
+      || args.sessionQuery
+      || args.todo_text
+      || args.todoText
+      || args.text
+      || "",
+  );
+}
+
+function voiceAgentHighlightScopeIsAll(args = {}) {
+  const scope = String(
+    args.scope
+      || args.target_scope
+      || args.targetScope
+      || args.selection
+      || args.target
+      || "",
+  ).trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return Boolean(args.all)
+    || scope === "all"
+    || scope === "every"
+    || scope === "all_terminals"
+    || scope === "matching_terminals";
+}
+
+function voiceAgentHighlightScopeIsCurrent(args = {}) {
+  const scope = String(
+    args.scope
+      || args.target_scope
+      || args.targetScope
+      || args.selection
+      || args.target
+      || "",
+  ).trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return Boolean(args.current)
+    || Boolean(args.active)
+    || scope === "current"
+    || scope === "active"
+    || scope === "this_terminal";
+}
+
+function getVoiceAgentHighlightTerminalRequestSummary(args = {}) {
+  const agentType = normalizeVoiceAgentManagementAgent(
+    args.agent_type
+      || args.agentType
+      || args.agent_kind
+      || args.agentKind
+      || args.target_agent_id
+      || args.targetAgentId,
+  );
+  const agentLabel = agentType && agentType !== "any" ? `${agentType} ` : "";
+  const query = normalizeVoiceHistoryText(getVoiceAgentHighlightQuery(args), 120);
+  const terminalIds = getVoiceAgentHighlightStringValues(
+    args.terminal_id,
+    args.terminalId,
+    args.terminal_ids,
+    args.terminalIds,
+    args.target_terminal_id,
+    args.targetTerminalId,
+    args.pane_id,
+    args.paneId,
+  );
+  const terminalIndexes = getVoiceAgentHighlightIntegerValues(
+    args.terminal_index,
+    args.terminalIndex,
+    args.terminal_indexes,
+    args.terminalIndexes,
+    args.target_terminal_index,
+    args.targetTerminalIndex,
+  );
+  const explicitCount = terminalIds.length + terminalIndexes.length;
+
+  if (voiceAgentHighlightScopeIsAll(args)) {
+    return `Highlight all ${agentLabel}terminals.`;
+  }
+  if (query) {
+    return `Highlight ${agentLabel}terminal(s) matching "${query}".`;
+  }
+  if (explicitCount > 0) {
+    return `Highlight ${explicitCount} ${agentLabel}terminal${explicitCount === 1 ? "" : "s"}.`;
+  }
+  if (voiceAgentHighlightScopeIsCurrent(args)) {
+    return "Highlight the current terminal.";
+  }
+  return `Highlight ${agentLabel}terminal(s).`;
+}
+
 function getVoiceAgentToolCallSignature(toolCall) {
   const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
   const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.toolName || "").trim();
@@ -10416,6 +10590,56 @@ function isTodoQueueBusyError(error) {
   );
 }
 
+function getTodoQueueAgentSessionMetadata(item = {}) {
+  const metadata = {};
+  const textField = (camelKey, snakeKey, ...aliases) => {
+    const value = String(
+      item?.[camelKey]
+        || item?.[snakeKey]
+        || aliases.map((alias) => item?.[alias]).find((candidate) => String(candidate || "").trim())
+        || "",
+    ).trim();
+    if (value) {
+      metadata[camelKey] = value;
+    }
+  };
+  textField("agentSessionId", "agent_session_id");
+  textField("providerSessionId", "provider_session_id", "sessionId", "session_id");
+  textField("nativeSessionId", "native_session_id");
+  textField("terminalSessionId", "terminal_session_id", "sessionId", "session_id", "providerSessionId", "provider_session_id");
+  textField("terminalId", "terminal_id", "targetTerminalId", "target_terminal_id", "paneId", "pane_id");
+  textField("terminalInstanceId", "terminal_instance_id", "targetTerminalInstanceId", "target_terminal_instance_id", "instanceId", "instance_id");
+  textField("threadId", "thread_id", "targetThreadId", "target_thread_id");
+  textField("agentKind", "agent_kind", "agentType", "agent_type", "targetAgentId", "target_agent_id");
+  textField("provider", "provider");
+  const terminalIndex = Number(
+    item?.terminalIndex
+      ?? item?.terminal_index
+      ?? item?.targetTerminalIndex
+      ?? item?.target_terminal_index,
+  );
+  if (Number.isInteger(terminalIndex)) {
+    metadata.terminalIndex = terminalIndex;
+  }
+  return metadata;
+}
+
+function getTodoQueueAgentSessionCloudFields(item = {}) {
+  const metadata = getTodoQueueAgentSessionMetadata(item);
+  return {
+    ...(metadata.agentSessionId ? { agentSessionId: metadata.agentSessionId, agent_session_id: metadata.agentSessionId } : {}),
+    ...(metadata.providerSessionId ? { providerSessionId: metadata.providerSessionId, provider_session_id: metadata.providerSessionId } : {}),
+    ...(metadata.nativeSessionId ? { nativeSessionId: metadata.nativeSessionId, native_session_id: metadata.nativeSessionId } : {}),
+    ...(metadata.terminalSessionId ? { terminalSessionId: metadata.terminalSessionId, terminal_session_id: metadata.terminalSessionId } : {}),
+    ...(metadata.terminalId ? { terminalId: metadata.terminalId, terminal_id: metadata.terminalId } : {}),
+    ...(metadata.terminalInstanceId ? { terminalInstanceId: metadata.terminalInstanceId, terminal_instance_id: metadata.terminalInstanceId } : {}),
+    ...(Number.isInteger(metadata.terminalIndex) ? { terminalIndex: metadata.terminalIndex, terminal_index: metadata.terminalIndex } : {}),
+    ...(metadata.threadId ? { threadId: metadata.threadId, thread_id: metadata.threadId } : {}),
+    ...(metadata.agentKind ? { agentKind: metadata.agentKind, agent_kind: metadata.agentKind } : {}),
+    ...(metadata.provider ? { provider: metadata.provider } : {}),
+  };
+}
+
 function getTodoQueuePendingPhase(pendingItem) {
   const phase = String(pendingItem?.phase || pendingItem?.state || "sending").trim().toLowerCase();
   return phase === "queued" ? "queued" : "sending";
@@ -10476,6 +10700,7 @@ function createTodoQueueItem(text, options = {}) {
     ? { ...options.remoteCommand }
     : null;
   const queueState = normalizeTodoQueuePersistedQueueState(options);
+  const agentSessionMetadata = getTodoQueueAgentSessionMetadata(options);
   const canonicalLifecycle = getTodoQueueCanonicalLifecycle(options);
   const todoStatus = canonicalLifecycle.status;
   const todoStatusUpdatedAt = String(canonicalLifecycle.statusUpdatedAt || "").trim();
@@ -10503,6 +10728,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(source ? { source } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
+    ...agentSessionMetadata,
     ...(todoStatus && todoStatus !== "listed" ? { status: todoStatus, todoStatus } : {}),
     ...(todoStatusUpdatedAt ? { todoStatusUpdatedAt } : {}),
     ...(todoCompletedAt ? { todoCompletedAt } : {}),
@@ -10564,6 +10790,7 @@ function normalizeTodoQueueItem(item) {
       ? { ...item.remote_command }
       : null;
   const queueState = normalizeTodoQueuePersistedQueueState(item);
+  const agentSessionMetadata = getTodoQueueAgentSessionMetadata(item);
   const canonicalLifecycle = getTodoQueueCanonicalLifecycle(item);
   const todoStatus = canonicalLifecycle.status;
   const todoStatusUpdatedAt = String(canonicalLifecycle.statusUpdatedAt || "").trim();
@@ -10596,6 +10823,7 @@ function normalizeTodoQueueItem(item) {
     ...(source ? { source } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
+    ...agentSessionMetadata,
     ...(todoStatus && todoStatus !== "listed" ? { status: todoStatus, todoStatus } : {}),
     ...(todoStatusUpdatedAt ? { todoStatusUpdatedAt } : {}),
     ...(todoCompletedAt ? { todoCompletedAt } : {}),
@@ -10726,6 +10954,7 @@ function buildTodoQueueCloudSyncItem(item, {
   const image = images[0] || null;
   const note = getTodoQueueItemNote(normalizedItem);
   const queueState = normalizeTodoQueuePersistedQueueState(normalizedItem);
+  const agentSessionFields = getTodoQueueAgentSessionCloudFields(normalizedItem);
   const cloudStatus = normalizeTodoQueueLifecycleStatus(status)
     || getTodoQueueItemCloudStatus(normalizedItem);
   return {
@@ -10771,6 +11000,7 @@ function buildTodoQueueCloudSyncItem(item, {
     ...(normalizedItem.planTask ? { planTask: normalizedItem.planTask } : {}),
     ...(normalizedItem.remoteCommand ? { remoteCommand: normalizedItem.remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
+    ...agentSessionFields,
     ...(getTodoQueueRemoteCommandDispatchId(normalizedItem) ? { lastDispatchId: getTodoQueueRemoteCommandDispatchId(normalizedItem) } : {}),
     ...(normalizedItem.targetAgentId ? { targetAgentId: normalizedItem.targetAgentId } : {}),
     ...(normalizedItem.targetTerminalId ? { targetTerminalId: normalizedItem.targetTerminalId } : {}),
@@ -11466,6 +11696,7 @@ function createTodoQueueItemFromWorkspaceTodo(item, workspaceId, hydratedText = 
     createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
     id: todoId,
     kind: "todo",
+    ...getTodoQueueAgentSessionMetadata(item),
     source: item?.sourceKind || item?.source_kind || item?.source || "cloud-remote-listed-todo",
     text,
     todoStatus: "listed",
@@ -11554,6 +11785,7 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
     createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
     id: commandId,
     kind: "todo",
+    ...getTodoQueueAgentSessionMetadata(item),
     remoteCommand: {
       commandId,
       dispatchSource,
@@ -11947,6 +12179,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   useEffect(() => {
     warmWorkspaceTools(coordinationTargets, rootDirectory);
   }, [coordinationTargets, rootDirectory]);
+
+  useEffect(() => {
+    prewarmCloudVoiceAgentStream().catch(() => {});
+  }, [orchestratorPanelWorkspaceId]);
 
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
   const [editingItemId, setEditingItemId] = useState("");
@@ -12537,21 +12773,27 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
     const args = normalizeVoiceAgentQueueArguments(event?.arguments || event?.args);
     const openAgentsSummary = getVoiceAgentOpenCodingAgentsRequestSummary(args);
+    const highlightTerminalSummary = getVoiceAgentHighlightTerminalRequestSummary(args);
     const planSummary = normalizeVoiceHistoryText(args.title || args.goal || args.objective || args.text || "", 220);
     const patch = {
       queued: toolName === "queue",
       queuedText: normalizeVoiceHistoryText(
         toolName === "open_coding_agents"
           ? openAgentsSummary
-          : toolName === "create_plan"
-            ? planSummary
-          : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
+          : toolName === "highlight_terminal"
+            ? highlightTerminalSummary
+            : toolName === "create_plan"
+              ? planSummary
+              : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
         600,
       ),
       turnIndex: getVoiceHistoryTurnIndex(event),
     };
     if (toolName === "open_coding_agents") {
       patch.llmFeedback = `Opening agents: ${openAgentsSummary}`;
+      patch.llmFinal = false;
+    } else if (toolName === "highlight_terminal") {
+      patch.llmFeedback = highlightTerminalSummary;
       patch.llmFinal = false;
     } else if (toolName === "create_plan") {
       patch.llmFeedback = planSummary ? `Creating plan: ${planSummary}` : "Creating plan...";
@@ -12574,9 +12816,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       summary: normalizeVoiceHistoryText(
         toolName === "open_coding_agents"
           ? openAgentsSummary
-          : toolName === "create_plan"
-            ? planSummary
-            : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
+          : toolName === "highlight_terminal"
+            ? highlightTerminalSummary
+            : toolName === "create_plan"
+              ? planSummary
+              : cleanPublicVoiceAgentText(args.text || args.todo || args.task || ""),
         220,
       ),
     };
@@ -12789,7 +13033,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceState("idle");
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
-    setOrchestratorVoiceFeedback("");
+    setOrchestratorVoiceFeedback("Checking Diff Forge Credits");
     setOrchestratorVoiceInputEnabled(false);
     setOrchestratorVoiceRealtimeSession(false);
     setOrchestratorChatSubmitting(false);
@@ -12915,6 +13159,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     };
 
     try {
+      await prewarmCloudVoiceAgentStream({
+        requireBilling: true,
+        onStatus: ({ message }) => {
+          if (orchestratorVoiceRunRef.current === runId && message) {
+            setOrchestratorVoiceFeedback(message);
+          }
+        },
+      });
+      if (orchestratorVoiceRunRef.current !== runId) {
+        await cleanupStartedMonitor();
+        return;
+      }
+      setOrchestratorVoiceFeedback("Opening voice session");
+
       monitor = await startLowPowerAudioBuffer({
         deviceId: readSelectedAudioInputDeviceId(),
         owner: ORCHESTRATOR_VOICE_OWNER,
@@ -12970,6 +13228,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
 
       setOrchestratorVoiceState("listening");
+      setOrchestratorVoiceFeedback("");
     } catch (error) {
       if (orchestratorVoiceRunRef.current !== runId) {
         await cleanupStartedMonitor();
@@ -13707,7 +13966,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         }
         cancelOrchestratorFastResponseGate("tool_call");
         const toolName = String(event?.name || event?.tool_name || event?.toolName || "").trim();
-        if (toolName === "queue" || toolName === "open_coding_agents" || toolName === "create_plan") {
+        if (toolName === "queue" || toolName === "open_coding_agents" || toolName === "highlight_terminal" || toolName === "create_plan") {
           logTerminalStatus("frontend.voice_agent.tool_call_arrived", {
             toolName,
             workspaceId: orchestratorPanelWorkspaceId,
@@ -13718,9 +13977,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           setOrchestratorVoiceFeedback(
             toolName === "open_coding_agents"
               ? "Opening coding agents..."
-              : toolName === "create_plan"
-                ? "Creating plan..."
-                : "Queued voice todo.",
+              : toolName === "highlight_terminal"
+                ? "Highlighting terminal..."
+                : toolName === "create_plan"
+                  ? "Creating plan..."
+                  : "Queued voice todo.",
           );
         }
         return;
@@ -13798,8 +14059,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     };
 
     window.addEventListener(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, handleVoiceAgentOpenCodingAgentsResult);
+    window.addEventListener(VOICE_AGENT_HIGHLIGHT_TERMINAL_RESULT_EVENT, handleVoiceAgentOpenCodingAgentsResult);
     return () => {
       window.removeEventListener(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, handleVoiceAgentOpenCodingAgentsResult);
+      window.removeEventListener(VOICE_AGENT_HIGHLIGHT_TERMINAL_RESULT_EVENT, handleVoiceAgentOpenCodingAgentsResult);
     };
   }, [recordVoiceHistoryOpenCodingAgentsResult, workspaceId]);
 
@@ -14123,6 +14386,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 <OrchestratorVoiceLogo />
               </OrchestratorVoiceButton>
             </OrchestratorVoiceControls>
+            {orchestratorVoiceState === "starting" && (
+              <OrchestratorVoiceStatus aria-live="polite" role="status">
+                {orchestratorVoiceFeedback || "Preparing voice agent"}
+              </OrchestratorVoiceStatus>
+            )}
           </OrchestratorVoiceArea>
           <OrchestratorSectionTabs aria-label="Orchestrator section">
             <OrchestratorSectionButton
@@ -15256,16 +15524,106 @@ function TerminalView({
     setTodoQueuePendingItems(normalizedPendingItems);
   }, []);
 
+  const getTodoQueueItemAgentSessionMetadataForSync = useCallback((item, pendingItem = null) => {
+    const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item) ?? getTodoQueueTargetTerminalIndex(pendingItem);
+    const liveTerminal = Number.isInteger(targetTerminalIndex)
+      ? todoQueueLiveTerminalsRef.current.get(targetTerminalIndex) || null
+      : null;
+    const liveProviderSessionId = String(
+      liveTerminal?.providerSessionId
+        || liveTerminal?.provider_session_id
+        || liveTerminal?.nativeSessionId
+        || liveTerminal?.native_session_id
+        || liveTerminal?.sessionId
+        || liveTerminal?.session_id
+        || "",
+    ).trim();
+    const liveMetadata = liveTerminal ? getTodoQueueAgentSessionMetadata({
+      agentKind: liveTerminal.agentId || liveTerminal.agent_id || liveTerminal.agentType || liveTerminal.agent_type || "",
+      nativeSessionId: liveTerminal.nativeSessionId || liveTerminal.native_session_id || liveProviderSessionId,
+      provider: liveTerminal.provider || "",
+      providerSessionId: liveProviderSessionId,
+      terminalId: liveTerminal.paneId || liveTerminal.pane_id || liveTerminal.terminalId || liveTerminal.terminal_id || "",
+      terminalIndex: targetTerminalIndex,
+      terminalInstanceId: liveTerminal.instanceId || liveTerminal.instance_id || "",
+      terminalSessionId: liveProviderSessionId,
+      threadId: liveTerminal.threadId || liveTerminal.thread_id || "",
+    }) : {};
+    const pendingProviderSessionId = String(
+      pendingItem?.providerSessionId
+        || pendingItem?.provider_session_id
+        || pendingItem?.nativeSessionId
+        || pendingItem?.native_session_id
+        || pendingItem?.sessionId
+        || pendingItem?.session_id
+        || "",
+    ).trim();
+    const pendingMetadata = getTodoQueueAgentSessionMetadata({
+      ...(pendingItem || {}),
+      ...(pendingProviderSessionId ? {
+        nativeSessionId: pendingProviderSessionId,
+        providerSessionId: pendingProviderSessionId,
+        terminalSessionId: pendingProviderSessionId,
+      } : {}),
+    });
+    const itemMetadata = getTodoQueueAgentSessionMetadata(item);
+    const metadata = {
+      ...liveMetadata,
+      ...pendingMetadata,
+      ...itemMetadata,
+    };
+    if (!metadata.terminalId) {
+      const terminalId = getTodoQueueTargetTerminalId(item) || getTodoQueueTargetTerminalId(pendingItem);
+      if (terminalId) metadata.terminalId = terminalId;
+    }
+    if (!Number.isInteger(metadata.terminalIndex) && Number.isInteger(targetTerminalIndex)) {
+      metadata.terminalIndex = targetTerminalIndex;
+    }
+    if (!metadata.threadId) {
+      const threadId = getTodoQueueTargetThreadId(item) || getTodoQueueTargetThreadId(pendingItem);
+      if (threadId) metadata.threadId = threadId;
+    }
+    if (!metadata.agentKind) {
+      const agentKind = normalizeTodoTerminalAgentId(
+        item?.targetAgentId
+          || item?.target_agent_id
+          || pendingItem?.targetAgentId
+          || pendingItem?.target_agent_id
+          || liveTerminal?.agentId
+          || liveTerminal?.agent_id
+          || "",
+      );
+      if (agentKind) metadata.agentKind = agentKind;
+    }
+    if (!metadata.providerSessionId && metadata.terminalSessionId) {
+      metadata.providerSessionId = metadata.terminalSessionId;
+    }
+    if (!metadata.terminalSessionId && metadata.providerSessionId) {
+      metadata.terminalSessionId = metadata.providerSessionId;
+    }
+    if (!metadata.nativeSessionId && metadata.providerSessionId) {
+      metadata.nativeSessionId = metadata.providerSessionId;
+    }
+    return metadata;
+  }, []);
+
   const buildTodoQueueCloudSyncPayload = useCallback((items, options = {}) => {
     const pendingItems = options.pendingItems || todoQueuePendingItemsRef.current || {};
     const workspaceId = terminalWorkspace?.id || "";
     const normalizedItems = normalizeTodoQueueItemsForWorkspace(items, workspaceId, cloudDesktopDeviceId);
     const cloudItems = normalizedItems
-      .map((item) => buildTodoQueueCloudSyncItem(item, {
-        deviceId: cloudDesktopDeviceId,
-        status: getTodoQueueItemCloudStatus(item, pendingItems[item.id] || null),
-        workspaceId,
-      }))
+      .map((item) => {
+        const pendingItem = pendingItems[item.id] || null;
+        const agentSessionMetadata = getTodoQueueItemAgentSessionMetadataForSync(item, pendingItem);
+        return buildTodoQueueCloudSyncItem({
+          ...item,
+          ...agentSessionMetadata,
+        }, {
+          deviceId: cloudDesktopDeviceId,
+          status: getTodoQueueItemCloudStatus(item, pendingItem),
+          workspaceId,
+        });
+      })
       .filter(Boolean);
     const removedTodoIds = Array.isArray(options.removedTodoIds)
       ? options.removedTodoIds
@@ -15281,6 +15639,7 @@ function TerminalView({
     };
   }, [
     cloudDesktopDeviceId,
+    getTodoQueueItemAgentSessionMetadataForSync,
     terminalWorkspace?.id,
   ]);
 
@@ -15297,9 +15656,16 @@ function TerminalView({
     const signature = JSON.stringify({
       removedTodoIds: payload.removedTodoIds,
       todos: payload.todos.map((item) => ({
+        agentKind: item.agentKind || item.agent_kind || "",
+        agentSessionId: item.agentSessionId || item.agent_session_id || "",
         id: item.id,
+        nativeSessionId: item.nativeSessionId || item.native_session_id || "",
+        provider: item.provider || "",
+        providerSessionId: item.providerSessionId || item.provider_session_id || "",
         reason: item.reason || item.todoStatusReason || item.statusReason || "",
         status: item.todoStatus || item.status || "",
+        terminalInstanceId: item.terminalInstanceId || item.terminal_instance_id || "",
+        terminalSessionId: item.terminalSessionId || item.terminal_session_id || "",
         targetTerminalColor: item.targetTerminalColor || item.target_terminal_color || "",
         targetTerminalId: item.targetTerminalId || item.target_terminal_id || "",
         targetTerminalIndex: item.targetTerminalIndex ?? item.target_terminal_index ?? "",
@@ -15984,6 +16350,54 @@ function TerminalView({
       window.clearTimeout(timer);
     });
     todoCompletionFlashTimersRef.current.clear();
+  }, []);
+  const [terminalHighlightFlashes, setTerminalHighlightFlashes] = useState({});
+  const terminalHighlightFlashTimersRef = useRef(new Map());
+  const triggerTerminalHighlightFlash = useCallback((paneIds, options = {}) => {
+    const uniquePaneIds = Array.from(new Set(
+      (Array.isArray(paneIds) ? paneIds : [paneIds])
+        .map((paneId) => String(paneId || "").trim())
+        .filter(Boolean),
+    ));
+    if (!uniquePaneIds.length) {
+      return;
+    }
+    const durationMs = Math.max(
+      TODO_COMPLETION_FLASH_MS,
+      Math.min(12000, Number(options.durationMs || options.duration_ms || TERMINAL_HIGHLIGHT_FLASH_MS) || TERMINAL_HIGHLIGHT_FLASH_MS),
+    );
+    const flashId = Date.now();
+    setTerminalHighlightFlashes((current) => {
+      const next = { ...current };
+      uniquePaneIds.forEach((paneId) => {
+        next[paneId] = flashId;
+      });
+      return next;
+    });
+    uniquePaneIds.forEach((paneId) => {
+      const existingTimer = terminalHighlightFlashTimersRef.current.get(paneId);
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+      }
+      const timer = window.setTimeout(() => {
+        terminalHighlightFlashTimersRef.current.delete(paneId);
+        setTerminalHighlightFlashes((current) => {
+          if (current[paneId] !== flashId) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[paneId];
+          return next;
+        });
+      }, durationMs);
+      terminalHighlightFlashTimersRef.current.set(paneId, timer);
+    });
+  }, []);
+  useEffect(() => () => {
+    terminalHighlightFlashTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    terminalHighlightFlashTimersRef.current.clear();
   }, []);
   const workspaceThreadEntry = terminalWorkspace
     ? workspaceThreads?.[terminalWorkspace.id] || null
@@ -16999,6 +17413,7 @@ function TerminalView({
       updatedAt: nowIso,
       workspaceId: eventWorkspaceId || terminalWorkspace?.id || "",
     };
+    const sessionIdChanged = String(existing.sessionId || existing.session_id || "") !== String(nextTerminal.sessionId || "");
     const changed = existing.inputReady !== nextTerminal.inputReady
       || String(existing.activityStatus || existing.activity_status || "") !== String(nextTerminal.activityStatus || "")
       || String(existing.agentDisplayName || existing.agent_display_name || "") !== String(nextTerminal.agentDisplayName || "")
@@ -17006,7 +17421,7 @@ function TerminalView({
       || String(existing.instanceId || "") !== String(nextTerminal.instanceId || "")
       || String(existing.paneId || "") !== String(nextTerminal.paneId || "")
       || String(existing.promptEventId || existing.pendingPromptId || "") !== String(nextTerminal.promptEventId || nextTerminal.pendingPromptId || "")
-      || String(existing.sessionId || existing.session_id || "") !== String(nextTerminal.sessionId || "")
+      || sessionIdChanged
       || String(existing.provider || "") !== String(nextTerminal.provider || "")
       || String(existing.status || "") !== String(nextTerminal.status || "")
       || String(existing.taskId || existing.task_id || "") !== String(nextTerminal.taskId || "")
@@ -17014,6 +17429,12 @@ function TerminalView({
     todoQueueLiveTerminalsRef.current.set(terminalIndex, nextTerminal);
     if (changed || marksReady || marksBusy || eventType === "opened") {
       setTodoQueueDispatchRevision((revision) => revision + 1);
+    }
+    if (sessionIdChanged && nextTerminal.sessionId) {
+      syncTodoQueueItemsToCloud(todoQueueItemsRef.current, {
+        force: true,
+        reason: "agent_session_id_observed",
+      });
     }
     logTerminalStatus("frontend.todo_queue.live_terminal_lifecycle", {
       eventType,
@@ -17035,6 +17456,7 @@ function TerminalView({
     getTerminalRole,
     getTerminalThread,
     logicalTerminalIndexes,
+    syncTodoQueueItemsToCloud,
     terminalWorkspace?.id,
   ]);
   const getLiveTerminalPaneIdForThread = useCallback((threadId) => {
@@ -24559,17 +24981,369 @@ function TerminalView({
     return true;
   }, []);
 
+  const getVoiceAgentHighlightTerminalCandidates = useCallback(() => {
+    const workspaceTerminals = Object.values(workspaceThreadEntry?.terminals || {});
+    return logicalTerminalIndexes.map((terminalIndex) => {
+      const paneId = String(getTerminalPaneId(terminalIndex) || "").trim();
+      if (!paneId) {
+        return null;
+      }
+      const thread = getTerminalThread(terminalIndex) || null;
+      const workspaceLiveTerminal = workspaceTerminals.find((candidate) => {
+        const candidateIndex = normalizeTodoTerminalIndex(candidate?.terminalIndex ?? candidate?.terminal_index);
+        return Number.isInteger(candidateIndex)
+          ? candidateIndex === terminalIndex
+          : normalizeTodoTerminalIdentity(candidate?.paneId || candidate?.pane_id || candidate?.terminalId || candidate?.terminal_id) === paneId;
+      }) || null;
+      const runtimeTerminal = todoQueueLiveTerminalsRef.current.get(terminalIndex) || null;
+      const liveTerminal = runtimeTerminal || workspaceLiveTerminal || {};
+      const agentType = normalizeTodoTerminalAgentId(
+        liveTerminal?.agentId
+          || liveTerminal?.agent_id
+          || liveTerminal?.agentType
+          || liveTerminal?.agent_type
+          || liveTerminal?.agentKind
+          || liveTerminal?.agent_kind
+          || getTerminalRole(terminalIndex),
+      );
+      const terminalIds = new Set(getVoiceAgentHighlightStringValues(
+        paneId,
+        liveTerminal?.paneId,
+        liveTerminal?.pane_id,
+        liveTerminal?.terminalId,
+        liveTerminal?.terminal_id,
+        liveTerminal?.targetTerminalId,
+        liveTerminal?.target_terminal_id,
+        workspaceLiveTerminal?.paneId,
+        workspaceLiveTerminal?.pane_id,
+        workspaceLiveTerminal?.terminalId,
+        workspaceLiveTerminal?.terminal_id,
+      ));
+      const threadIds = new Set(getVoiceAgentHighlightStringValues(
+        thread?.id,
+        liveTerminal?.threadId,
+        liveTerminal?.thread_id,
+        liveTerminal?.targetThreadId,
+        liveTerminal?.target_thread_id,
+        workspaceLiveTerminal?.threadId,
+        workspaceLiveTerminal?.thread_id,
+      ));
+      const sessionIds = new Set(getVoiceAgentHighlightStringValues(
+        liveTerminal?.agentSessionId,
+        liveTerminal?.agent_session_id,
+        liveTerminal?.providerSessionId,
+        liveTerminal?.provider_session_id,
+        liveTerminal?.nativeSessionId,
+        liveTerminal?.native_session_id,
+        liveTerminal?.terminalSessionId,
+        liveTerminal?.terminal_session_id,
+        liveTerminal?.sessionId,
+        liveTerminal?.session_id,
+        workspaceLiveTerminal?.agentSessionId,
+        workspaceLiveTerminal?.agent_session_id,
+        workspaceLiveTerminal?.providerSessionId,
+        workspaceLiveTerminal?.provider_session_id,
+        workspaceLiveTerminal?.nativeSessionId,
+        workspaceLiveTerminal?.native_session_id,
+        workspaceLiveTerminal?.terminalSessionId,
+        workspaceLiveTerminal?.terminal_session_id,
+        workspaceLiveTerminal?.sessionId,
+        workspaceLiveTerminal?.session_id,
+        thread?.transcriptSessionId,
+        thread?.transcript_session_id,
+      ));
+      const terminalNames = new Set(getVoiceAgentHighlightStringValues(
+        liveTerminal?.name,
+        liveTerminal?.label,
+        liveTerminal?.title,
+        liveTerminal?.targetTerminalName,
+        liveTerminal?.target_terminal_name,
+        workspaceLiveTerminal?.name,
+        workspaceLiveTerminal?.label,
+        workspaceLiveTerminal?.title,
+        getTerminalTabAgentMeta(getTerminalRole(terminalIndex))?.label,
+      ).map((value) => value.toLowerCase()));
+      return {
+        agentType,
+        paneId,
+        sessionIds,
+        terminalIds,
+        terminalIndex,
+        terminalNames,
+        threadIds,
+      };
+    }).filter(Boolean);
+  }, [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    logicalTerminalIndexes,
+    workspaceThreadEntry,
+  ]);
+
+  const resolveVoiceAgentHighlightTerminals = useCallback((toolCall) => {
+    const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
+    const candidates = getVoiceAgentHighlightTerminalCandidates();
+    const selected = new Map();
+    const requestedAgentType = normalizeVoiceAgentManagementAgent(
+      args.agent_type
+        || args.agentType
+        || args.agent_kind
+        || args.agentKind
+        || args.target_agent_id
+        || args.targetAgentId,
+    );
+    const agentMatches = (candidate) => (
+      !requestedAgentType
+        || requestedAgentType === "any"
+        || candidate.agentType === normalizeTodoTerminalAgentId(requestedAgentType)
+    );
+    const addCandidate = (candidate, reason) => {
+      if (!candidate || !agentMatches(candidate)) {
+        return;
+      }
+      if (!selected.has(candidate.paneId)) {
+        selected.set(candidate.paneId, { ...candidate, reason });
+      }
+    };
+    const stringSet = (...values) => new Set(getVoiceAgentHighlightStringValues(...values));
+    const integerSet = (...values) => new Set(getVoiceAgentHighlightIntegerValues(...values));
+    const terminalIds = stringSet(
+      args.terminal_id,
+      args.terminalId,
+      args.terminal_ids,
+      args.terminalIds,
+      args.target_terminal_id,
+      args.targetTerminalId,
+      args.target_terminal_ids,
+      args.targetTerminalIds,
+      args.pane_id,
+      args.paneId,
+      args.pane_ids,
+      args.paneIds,
+    );
+    const terminalNames = new Set(getVoiceAgentHighlightStringValues(
+      args.terminal_name,
+      args.terminalName,
+      args.terminal_names,
+      args.terminalNames,
+      args.target_terminal_name,
+      args.targetTerminalName,
+      args.target_terminal_names,
+      args.targetTerminalNames,
+      args.name,
+      args.names,
+    ).map((value) => value.toLowerCase()));
+    const terminalIndexes = integerSet(
+      args.terminal_index,
+      args.terminalIndex,
+      args.terminal_indexes,
+      args.terminalIndexes,
+      args.target_terminal_index,
+      args.targetTerminalIndex,
+      args.target_terminal_indexes,
+      args.targetTerminalIndexes,
+    );
+    const terminalNumbers = getVoiceAgentHighlightIntegerValues(
+      args.terminal_number,
+      args.terminalNumber,
+      args.terminal_numbers,
+      args.terminalNumbers,
+    );
+    terminalNumbers.forEach((terminalNumber) => {
+      if (terminalNumber > 0) {
+        terminalIndexes.add(terminalNumber - 1);
+      }
+    });
+    const threadIds = stringSet(
+      args.thread_id,
+      args.threadId,
+      args.thread_ids,
+      args.threadIds,
+      args.target_thread_id,
+      args.targetThreadId,
+      args.target_thread_ids,
+      args.targetThreadIds,
+    );
+    const sessionIds = stringSet(
+      args.agent_session_id,
+      args.agentSessionId,
+      args.agent_session_ids,
+      args.agentSessionIds,
+      args.provider_session_id,
+      args.providerSessionId,
+      args.provider_session_ids,
+      args.providerSessionIds,
+      args.native_session_id,
+      args.nativeSessionId,
+      args.terminal_session_id,
+      args.terminalSessionId,
+      args.session_id,
+      args.sessionId,
+      args.session_ids,
+      args.sessionIds,
+    );
+    const hasExplicitTarget = terminalIds.size > 0
+      || terminalNames.size > 0
+      || terminalIndexes.size > 0
+      || threadIds.size > 0
+      || sessionIds.size > 0;
+
+    if (voiceAgentHighlightScopeIsAll(args)) {
+      candidates.forEach((candidate) => addCandidate(candidate, "all"));
+    } else if (voiceAgentHighlightScopeIsCurrent(args)) {
+      candidates.forEach((candidate) => {
+        if (candidate.paneId === activePaneId) {
+          addCandidate(candidate, "current");
+        }
+      });
+    }
+
+    if (hasExplicitTarget) {
+      candidates.forEach((candidate) => {
+        const matchesTerminalId = [...terminalIds].some((terminalId) => candidate.terminalIds.has(terminalId));
+        const matchesTerminalName = [...terminalNames].some((terminalName) => candidate.terminalNames.has(terminalName));
+        const matchesTerminalIndex = terminalIndexes.has(candidate.terminalIndex);
+        const matchesThreadId = [...threadIds].some((threadId) => candidate.threadIds.has(threadId));
+        const matchesSessionId = [...sessionIds].some((sessionId) => candidate.sessionIds.has(sessionId));
+        if (
+          matchesTerminalId
+          || matchesTerminalName
+          || matchesTerminalIndex
+          || matchesThreadId
+          || matchesSessionId
+        ) {
+          addCandidate(candidate, "explicit_target");
+        }
+      });
+    }
+
+    const query = getVoiceAgentHighlightQuery(args).toLowerCase();
+    if (query) {
+      const pendingItems = todoQueuePendingItemsRef.current || {};
+      const localItems = todoQueueItemsRef.current || [];
+      const cloudItems = workspaceTodoItemsForWorkspace(workspaceTodos, terminalWorkspace?.id || "");
+      [...localItems, ...cloudItems].forEach((item) => {
+        const text = normalizeTodoQueueText(
+          getTodoQueueItemTerminalText(item)
+            || item?.todoText
+            || item?.todo_text
+            || item?.body
+            || item?.todoBodyPreview
+            || item?.todo_body_preview
+            || item?.textPreview
+            || item?.text_preview
+            || "",
+        ).toLowerCase();
+        const title = normalizeTodoQueueText(
+          item?.title
+            || item?.todoTitle
+            || item?.todo_title
+            || item?.llmTitle
+            || item?.llm_title
+            || "",
+        ).toLowerCase();
+        if (!text.includes(query) && !title.includes(query)) {
+          return;
+        }
+        const pendingItem = pendingItems[String(item?.id || item?.todoId || item?.todo_id || "").trim()] || null;
+        const metadata = {
+          ...getTodoQueueItemAgentSessionMetadataForSync(item, pendingItem),
+          ...getTodoQueueAgentSessionMetadata(item),
+        };
+        const itemTerminalId = getTodoQueueTargetTerminalId(item) || metadata.terminalId || "";
+        const itemTerminalIndex = getTodoQueueTargetTerminalIndex(item) ?? metadata.terminalIndex;
+        const itemThreadId = getTodoQueueTargetThreadId(item) || metadata.threadId || "";
+        const itemSessionIds = getVoiceAgentHighlightStringValues(
+          metadata.agentSessionId,
+          metadata.providerSessionId,
+          metadata.nativeSessionId,
+          metadata.terminalSessionId,
+          item?.agentSessionId,
+          item?.agent_session_id,
+          item?.providerSessionId,
+          item?.provider_session_id,
+          item?.nativeSessionId,
+          item?.native_session_id,
+          item?.terminalSessionId,
+          item?.terminal_session_id,
+          item?.sessionId,
+          item?.session_id,
+        );
+        candidates.forEach((candidate) => {
+          const matchesTodoTarget = Boolean(
+            (itemTerminalId && candidate.terminalIds.has(itemTerminalId))
+              || (Number.isInteger(itemTerminalIndex) && candidate.terminalIndex === itemTerminalIndex)
+              || (itemThreadId && candidate.threadIds.has(itemThreadId))
+              || itemSessionIds.some((sessionId) => candidate.sessionIds.has(sessionId)),
+          );
+          if (matchesTodoTarget) {
+            addCandidate(candidate, "todo_query");
+          }
+        });
+      });
+    }
+
+    if (!selected.size && requestedAgentType && requestedAgentType !== "any") {
+      candidates.forEach((candidate) => addCandidate(candidate, "agent_type"));
+    }
+
+    return {
+      args,
+      candidates,
+      matches: Array.from(selected.values()),
+      query,
+      summary: getVoiceAgentHighlightTerminalRequestSummary(args),
+    };
+  }, [
+    activePaneId,
+    getTodoQueueItemAgentSessionMetadataForSync,
+    getVoiceAgentHighlightTerminalCandidates,
+    terminalWorkspace?.id,
+    workspaceTodos,
+  ]);
+
   const executeVoiceAgentOpenCodingAgentsToolCall = useCallback(async (toolCall) => {
     const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
     const action = normalizeVoiceAgentOpenCodingAgentsAction(args.action);
     const agentType = normalizeVoiceAgentManagementAgent(args.agent_type);
     const count = Math.max(1, Math.min(12, Number.parseInt(args.count, 10) || 1));
+    const sessionContext = args.session_context && typeof args.session_context === "object"
+      ? args.session_context
+      : args.sessionContext && typeof args.sessionContext === "object"
+        ? args.sessionContext
+        : null;
+    const sessionMetadata = getTodoQueueAgentSessionMetadata({
+      agentSessionId: args.agent_session_id || args.agentSessionId || sessionContext?.agentSessionId || sessionContext?.agent_session_id || "",
+      agentKind: args.agent_kind || args.agentKind || args.agent_type || args.agentType || sessionContext?.agentKind || sessionContext?.agent_kind || "",
+      nativeSessionId: args.native_session_id || args.nativeSessionId || sessionContext?.nativeSessionId || sessionContext?.native_session_id || "",
+      provider: args.provider || sessionContext?.provider || "",
+      providerSessionId: args.provider_session_id || args.providerSessionId || args.session_id || args.sessionId || sessionContext?.providerSessionId || sessionContext?.provider_session_id || "",
+      terminalId: args.terminal_id || args.terminalId || args.target_terminal_id || args.targetTerminalId || sessionContext?.terminalId || sessionContext?.terminal_id || "",
+      terminalIndex: args.terminal_index ?? args.terminalIndex ?? sessionContext?.terminalIndex ?? sessionContext?.terminal_index,
+      terminalInstanceId: args.terminal_instance_id || args.terminalInstanceId || sessionContext?.terminalInstanceId || sessionContext?.terminal_instance_id || "",
+      terminalSessionId: args.terminal_session_id || args.terminalSessionId || args.session_id || args.sessionId || sessionContext?.terminalSessionId || sessionContext?.terminal_session_id || "",
+      threadId: args.thread_id || args.threadId || sessionContext?.threadId || sessionContext?.thread_id || "",
+    });
+    const contextPrompt = normalizeTodoQueueText(
+      args.context_prompt
+        || args.contextPrompt
+        || args.session_prompt
+        || args.sessionPrompt
+        || sessionContext?.contextPrompt
+        || sessionContext?.context_prompt
+        || sessionContext?.summary
+        || "",
+    );
 
     try {
       const result = await manageWorkspaceAgents?.({
         action,
         agentType,
         count,
+        contextPrompt,
+        sessionContext,
+        ...sessionMetadata,
         source: "voice-agent-open-coding-agents",
         workspaceId: terminalWorkspace?.id || "",
       });
@@ -24586,6 +25360,7 @@ function TerminalView({
         action,
         agentType,
         count,
+        providerSessionPresent: Boolean(sessionMetadata.providerSessionId || sessionMetadata.nativeSessionId),
         result,
         surface: "tui_orchestrator_voice",
         workspaceId: terminalWorkspace?.id || "",
@@ -24616,6 +25391,58 @@ function TerminalView({
     terminalWorkspace?.id,
   ]);
 
+  const executeVoiceAgentHighlightTerminalToolCall = useCallback((toolCall) => {
+    const resolution = resolveVoiceAgentHighlightTerminals(toolCall);
+    const paneIds = resolution.matches.map((match) => match.paneId);
+    const durationMs = Number(
+      resolution.args.duration_ms
+        || resolution.args.durationMs
+        || resolution.args.highlight_duration_ms
+        || resolution.args.highlightDurationMs
+        || 0,
+    );
+    const message = paneIds.length
+      ? `Highlighted ${paneIds.length} terminal${paneIds.length === 1 ? "" : "s"}.`
+      : "I couldn't find a matching visible terminal to highlight.";
+    if (paneIds.length) {
+      triggerTerminalHighlightFlash(paneIds, {
+        durationMs,
+      });
+    }
+    window.dispatchEvent(new CustomEvent(VOICE_AGENT_HIGHLIGHT_TERMINAL_RESULT_EVENT, {
+      detail: {
+        highlightedCount: paneIds.length,
+        matches: resolution.matches.map((match) => ({
+          agentType: match.agentType,
+          paneId: match.paneId,
+          reason: match.reason,
+          terminalIndex: match.terminalIndex,
+        })),
+        message,
+        status: paneIds.length ? "ready" : "error",
+        toolCall,
+        workspaceId: terminalWorkspace?.id || "",
+      },
+    }));
+    logBigViewSyncDiagnosticEvent("tui.voice_agent.highlight_terminal", {
+      highlightedCount: paneIds.length,
+      query: resolution.query,
+      summary: resolution.summary,
+      surface: "tui_orchestrator_voice",
+      targetPaneIds: paneIds,
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    return {
+      highlightedCount: paneIds.length,
+      matches: resolution.matches,
+      ok: paneIds.length > 0,
+    };
+  }, [
+    resolveVoiceAgentHighlightTerminals,
+    terminalWorkspace?.id,
+    triggerTerminalHighlightFlash,
+  ]);
+
   const handleVoiceAgentToolCall = useCallback((toolCall) => {
     const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.toolName || "").trim();
     logTerminalStatus("frontend.voice_agent.tool_call_handle", {
@@ -24634,6 +25461,17 @@ function TerminalView({
       }
       void executeVoiceAgentOpenCodingAgentsToolCall(toolCall);
       return null;
+    }
+    if (toolName === "highlight_terminal") {
+      if (!claimVoiceAgentToolCall(toolCall)) {
+        logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+          reason: "duplicate_highlight_terminal",
+          toolName,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        return null;
+      }
+      return executeVoiceAgentHighlightTerminalToolCall(toolCall);
     }
     if (toolName === "create_plan") {
       if (!claimVoiceAgentToolCall(toolCall)) {
@@ -24749,6 +25587,7 @@ function TerminalView({
   }, [
     claimVoiceAgentToolCall,
     executeVoiceAgentOpenCodingAgentsToolCall,
+    executeVoiceAgentHighlightTerminalToolCall,
     handleVoicePlanServerResult,
     queueReleasedVoicePlanTasks,
     recordVoicePlanTaskStatus,
@@ -27291,6 +28130,12 @@ function TerminalView({
                 <TerminalTodoCompletionFlash
                   aria-hidden="true"
                   key={`todo-flash-${todoCompletionFlashes[terminalPaneId]}`}
+                />
+              ) : null}
+              {terminalHighlightFlashes[terminalPaneId] ? (
+                <TerminalVoiceHighlightFlash
+                  aria-hidden="true"
+                  key={`terminal-highlight-${terminalHighlightFlashes[terminalPaneId]}`}
                 />
               ) : null}
               {terminalBreakoutLayoutActive && !fullscreenThisTerminal && (
