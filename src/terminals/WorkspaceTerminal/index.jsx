@@ -1106,6 +1106,9 @@ const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const TERMINAL_CONTROL_UI_SUPPRESSION_EVENT = "diffforge:terminal-control-ui-suppression";
 const TERMINAL_CONTROL_UI_SUPPRESSION_DEFAULT_MS = 10000;
 const TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS = 15000;
+const TERMINAL_CODING_AGENT_READY_RECONCILE_QUIET_MS = 850;
+const TERMINAL_CODING_AGENT_READY_RECONCILE_RETRY_MS = 350;
+const TERMINAL_CODING_AGENT_READY_RECONCILE_MAX_MS = 12000;
 const TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS = 250;
 const TERMINAL_THREAD_PROMPT_READY_EARLY_MIN_MS = 120;
 const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
@@ -5216,24 +5219,97 @@ function WorkspaceTerminal({
       return true;
     };
     let codingAgentInputReadyEmitted = false;
-    const emitCodingAgentInputReady = (source = "timer") => {
-      if (codingAgentInputReadyEmitted) {
+    let codingAgentInputReadyEmissionKey = "";
+    const emitCodingAgentInputReady = (source = "timer", options = {}) => {
+      const submittedPromptForReady = terminalThreadSubmittedPromptRef.current;
+      const readinessKey = String(
+        options.readinessKey
+          || submittedPromptForReady?.promptEventId
+          || submittedPromptForReady?.promptEpoch
+          || "startup",
+      ).trim();
+      const allowRepeated = options.allowRepeated === true && readinessKey !== "startup";
+      if (allowRepeated && codingAgentInputReadyEmissionKey === readinessKey) {
+        return false;
+      }
+      if (!allowRepeated && codingAgentInputReadyEmitted) {
         return false;
       }
 
+      const readinessEvidence = String(
+        options.readinessEvidence
+          || options.completionEvidence
+          || "",
+      ).trim();
+      if (!readinessEvidence) {
+        codingAgentInputReadyEmitted = true;
+        logThreadBridgeDiagnostic("frontend.thread_terminal_input_ready_timer_disabled", {
+          agentId: terminalAgentKind,
+          instanceId: terminalInstanceId,
+          nativeSessionIdPresent: Boolean(capturedProviderSessionId),
+          paneId,
+          reason: "missing_positive_readiness_evidence",
+          source,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+        return false;
+      }
+
+      const inputReadyAt = new Date().toISOString();
       codingAgentInputReadyEmitted = true;
-      logThreadBridgeDiagnostic("frontend.thread_terminal_input_ready_timer_disabled", {
+      codingAgentInputReadyEmissionKey = readinessKey;
+      markTerminalThreadActivityStatus("idle", {
+        reason: source,
+      });
+      terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
+      if (options.clearSubmittedPrompt !== false) {
+        terminalThreadSubmittedPromptRef.current = null;
+      }
+      logThreadBridgeDiagnostic("frontend.thread_terminal_input_ready", {
         agentId: terminalAgentKind,
+        inputReadyAt,
         instanceId: terminalInstanceId,
         nativeSessionIdPresent: Boolean(capturedProviderSessionId),
         paneId,
-        reason: "provider_hooks_own_readiness",
+        promptEventId: submittedPromptForReady?.promptEventId || "",
+        readinessKey,
         source,
         terminalIndex,
         threadId: terminalThreadIdRef.current || "",
         workspaceId: workspace?.id || "",
       });
-      return false;
+      onThreadTerminalLifecycle?.({
+        activityStatus: "idle",
+        agentId: terminalAgentKind,
+        commandPhase: "completed",
+        completionEvidence: options.completionEvidence || source,
+        completionInferred: options.completionInferred === true,
+        completionSource: options.completionSource || source,
+        inputReady: true,
+        inputReadyAt,
+        inputReadyConfidence: options.inputReadyConfidence || options.completionEvidence || source,
+        instanceId: terminalInstanceId,
+        ...getTerminalNativeRailStateFields("idle"),
+        paneId,
+        pendingPromptId: submittedPromptForReady?.promptEventId || "",
+        promptEpoch: submittedPromptForReady?.promptEpoch || 0,
+        prompt_epoch: submittedPromptForReady?.promptEpoch || 0,
+        promptEventId: submittedPromptForReady?.promptEventId || "",
+        promptEventSubmittedAt: submittedPromptForReady?.submittedAt || "",
+        promptReadyAt: inputReadyAt,
+        submittedAt: submittedPromptForReady?.submittedAt || "",
+        terminalPrompt: submittedPromptForReady?.promptText || "",
+        source,
+        status: "active",
+        terminalIndex,
+        terminalWorkState: "complete",
+        threadId: terminalThreadIdRef.current || "",
+        type: "terminal-input-ready",
+        workspaceId: workspace?.id || "",
+      });
+      return true;
     };
     const scheduleCodingAgentInputReady = (
       reason,
@@ -9258,6 +9334,160 @@ function WorkspaceTerminal({
         const outputTextDecoder = outputSessionInspectionEnabled
           ? new TextDecoder("utf-8", { fatal: false })
           : null;
+        let terminalSubmittedInputHasText = false;
+        let terminalSubmittedInputText = "";
+        let terminalSubmittedComposerState = createTerminalComposerState();
+        let terminalReadyReconcileTimer = 0;
+        let terminalReadyReconcileStartedAt = 0;
+        let terminalReadyReconcileSequence = 0;
+        const clearTerminalReadyReconcileTimer = () => {
+          if (terminalReadyReconcileTimer) {
+            window.clearTimeout(terminalReadyReconcileTimer);
+            terminalReadyReconcileTimer = 0;
+          }
+        };
+        disposables.push(clearTerminalReadyReconcileTimer);
+        const normalizeTerminalReadyPromptText = (value) => String(value || "")
+          .toLowerCase()
+          .replace(/\s+/g, "");
+        const getTerminalReadyPromptEvidence = () => {
+          const activeBuffer = terminal?.buffer?.active;
+          if (!activeBuffer) {
+            return null;
+          }
+
+          const lineCount = Number(activeBuffer.length || 0);
+          if (!lineCount) {
+            return null;
+          }
+
+          const cursorLine = Math.min(
+            lineCount - 1,
+            Math.max(0, Number(activeBuffer.baseY || 0) + Number(activeBuffer.cursorY || 0)),
+          );
+          let startLine = cursorLine;
+          while (startLine > 0 && activeBuffer.getLine(startLine)?.isWrapped) {
+            startLine -= 1;
+          }
+          let endLine = cursorLine;
+          while (endLine + 1 < lineCount && activeBuffer.getLine(endLine + 1)?.isWrapped) {
+            endLine += 1;
+          }
+
+          const rowTexts = [];
+          for (let lineIndex = startLine; lineIndex <= endLine; lineIndex += 1) {
+            const line = activeBuffer.getLine(lineIndex);
+            rowTexts.push(line ? line.translateToString(lineIndex === endLine).replace(/\u00a0/g, " ") : "");
+          }
+          const rawText = rowTexts.join("").replace(/[ \t]+$/g, "");
+          const prefixMatch = rawText.match(/^([ \t]*(?:[\u203a\u276f\u2771>]\s*)+)/u);
+          if (!prefixMatch) {
+            return null;
+          }
+
+          const prefix = prefixMatch[1] || "";
+          const hasSemanticPromptGlyph = /[\u203a\u276f\u2771]/u.test(prefix);
+          const promptText = rawText.slice(prefix.length).trim();
+          const currentComposerText = String(terminalSubmittedInputText || "").trim();
+          if (!hasSemanticPromptGlyph && promptText) {
+            const promptCompare = normalizeTerminalReadyPromptText(promptText);
+            const composerCompare = normalizeTerminalReadyPromptText(currentComposerText);
+            if (!composerCompare || !promptCompare.includes(composerCompare)) {
+              return null;
+            }
+          }
+          if (isTerminalModelPickerUiPrompt(promptText)) {
+            return null;
+          }
+
+          const cursorX = Number(activeBuffer.cursorX || 0);
+          if (Number.isFinite(cursorX) && cursorX < prefix.length) {
+            return null;
+          }
+
+          return {
+            cursorLine,
+            cursorX,
+            endLine,
+            hasSemanticPromptGlyph,
+            promptText,
+            rawText,
+            startLine,
+          };
+        };
+        const shouldAttemptTerminalReadyReconcile = () => Boolean(
+          terminalUsesActivityHooks
+            && !isGenericTerminal
+            && !isDisposed
+            && hasOpenPty
+            && !parkedPromptRef.current
+            && (
+              terminalThreadSubmittedPromptRef.current
+              || String(terminalThreadActivityStatusRef.current || "").trim().toLowerCase() === "thinking"
+            )
+        );
+        const runTerminalReadyReconcile = (reason, sequence) => {
+          if (sequence !== terminalReadyReconcileSequence || !shouldAttemptTerminalReadyReconcile()) {
+            return;
+          }
+
+          const evidence = getTerminalReadyPromptEvidence();
+          if (evidence) {
+            clearTerminalReadyReconcileTimer();
+            const submittedPrompt = terminalThreadSubmittedPromptRef.current;
+            const readinessKey = String(
+              submittedPrompt?.promptEventId
+                || submittedPrompt?.promptEpoch
+                || `${terminalThreadIdRef.current || "thread"}:${terminalThreadLastWorkStartedAtRef.current || "ready"}`,
+            );
+            logThreadBridgeDiagnostic("frontend.thread_terminal_input_ready_reconcile", {
+              agentId: terminalAgentKind,
+              cursorLine: evidence.cursorLine,
+              hasSemanticPromptGlyph: evidence.hasSemanticPromptGlyph,
+              instanceId: terminalInstanceId,
+              paneId,
+              promptEventId: submittedPrompt?.promptEventId || "",
+              promptText: getBigViewTextDiagnosticFields(evidence.promptText),
+              reason,
+              readinessKey,
+              source: "terminal_prompt_ready_after_output_quiet",
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              workspaceId: workspace?.id || "",
+            });
+            emitCodingAgentInputReady("terminal_prompt_ready_after_output_quiet", {
+              allowRepeated: true,
+              completionEvidence: "terminal_prompt_ready_after_output_quiet",
+              completionInferred: true,
+              completionSource: "terminal-readiness-reconcile",
+              inputReadyConfidence: "terminal_prompt_ready_after_output_quiet",
+              readinessEvidence: "terminal_prompt_line",
+              readinessKey,
+            });
+            return;
+          }
+
+          if (performance.now() - terminalReadyReconcileStartedAt < TERMINAL_CODING_AGENT_READY_RECONCILE_MAX_MS) {
+            terminalReadyReconcileTimer = window.setTimeout(() => {
+              terminalReadyReconcileTimer = 0;
+              runTerminalReadyReconcile(`${reason}:retry`, sequence);
+            }, TERMINAL_CODING_AGENT_READY_RECONCILE_RETRY_MS);
+          }
+        };
+        const scheduleTerminalReadyReconcile = (reason) => {
+          if (!shouldAttemptTerminalReadyReconcile()) {
+            return;
+          }
+
+          clearTerminalReadyReconcileTimer();
+          terminalReadyReconcileStartedAt = performance.now();
+          terminalReadyReconcileSequence += 1;
+          const sequence = terminalReadyReconcileSequence;
+          terminalReadyReconcileTimer = window.setTimeout(() => {
+            terminalReadyReconcileTimer = 0;
+            runTerminalReadyReconcile(reason, sequence);
+          }, TERMINAL_CODING_AGENT_READY_RECONCILE_QUIET_MS);
+        };
         const processPreparedTerminalOutput = (payload = {}) => {
           if (isDisposed) {
             return;
@@ -9456,6 +9686,9 @@ function WorkspaceTerminal({
             outputDebug,
             rawCodexResizeGateData: payload.rawCodexResizeGateData === true,
           });
+          if (hasVisibleOutput) {
+            scheduleTerminalReadyReconcile("visible_output_quiet");
+          }
         };
 
         const processTerminalOutputInline = (data, chunkStartedAt = performance.now()) => {
@@ -9685,9 +9918,6 @@ function WorkspaceTerminal({
         let terminalComposerDraftSyncTimer = 0;
         let terminalComposerDraftSyncPending = false;
         let terminalComposerDraftSyncValue = "";
-        let terminalSubmittedInputHasText = false;
-        let terminalSubmittedInputText = "";
-        let terminalSubmittedComposerState = createTerminalComposerState();
         let terminalLastSelectionAt = 0;
         let terminalLastSelectionText = "";
         let terminalControlUiSuppressionUntilMs = 0;

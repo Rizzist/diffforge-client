@@ -6181,7 +6181,9 @@ fn tokenomics_limit_display_percent_kind(
     agent_kind: &str,
     window_kind: &str,
 ) -> &'static str {
-    if provider == "openai" && agent_kind == "codex" {
+    if (provider == "openai" && agent_kind == "codex")
+        || (provider == "anthropic" && agent_kind == "claude")
+    {
         "remaining"
     } else if window_kind == "weekly" {
         "remaining"
@@ -8391,8 +8393,8 @@ mod tokenomics_tests {
 
         assert_eq!(snapshot["used_percent"], json!(95));
         assert_eq!(snapshot["remaining_percent"], json!(5));
-        assert_eq!(snapshot["display_percent"], json!(95));
-        assert_eq!(snapshot["display_percent_kind"], json!("used"));
+        assert_eq!(snapshot["display_percent"], json!(5));
+        assert_eq!(snapshot["display_percent_kind"], json!("remaining"));
         assert_eq!(snapshot["provider_reported_percent"], json!(95));
         assert_eq!(snapshot["provider_reported_direction"], json!("used"));
         assert_eq!(snapshot["pace_status"], json!("over_pace"));
@@ -8431,8 +8433,8 @@ mod tokenomics_tests {
         assert_eq!(limits[0]["limit_source"], json!("claude_oauth_usage_api"));
         assert_eq!(limits[0]["used_percent"], json!(95));
         assert_eq!(limits[0]["remaining_percent"], json!(5));
-        assert_eq!(limits[0]["display_percent"], json!(95));
-        assert_eq!(limits[0]["display_percent_kind"], json!("used"));
+        assert_eq!(limits[0]["display_percent"], json!(5));
+        assert_eq!(limits[0]["display_percent_kind"], json!("remaining"));
         assert_eq!(limits[0]["provider_reported_percent"], json!(95));
         assert_eq!(limits[0]["provider_reported_direction"], json!("used"));
         assert_eq!(limits[0]["reset_after_seconds"], json!(3600));

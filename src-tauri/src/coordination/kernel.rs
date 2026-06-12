@@ -1346,6 +1346,167 @@ fn global_mcp_env_pairs(env_schema: &Value, config_values: &Value) -> Vec<String
         .collect()
 }
 
+fn global_mcp_env_map(server: &Value) -> Map<String, Value> {
+    let mut env = Map::new();
+    if let Some(values) = server["config_values_json"].as_object() {
+        for (key, value) in values {
+            if key.trim().is_empty() {
+                continue;
+            }
+            if let Some(text) = value.as_str() {
+                if !text.trim().is_empty() {
+                    env.insert(key.clone(), json!(text));
+                }
+            } else if let Some(text) = value
+                .as_object()
+                .and_then(|object| object.get("value"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                env.insert(key.clone(), json!(text));
+            }
+        }
+    }
+    for item in server["env_schema_json"].as_array().into_iter().flatten() {
+        let Some(key) = item["key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if env.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = global_mcp_config_value(&server["config_values_json"], key)
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert(key.to_string(), json!(value));
+        }
+    }
+    env
+}
+
+fn global_mcp_server_args(server: &Value) -> Vec<String> {
+    server["args_json"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect()
+}
+
+fn inherited_global_mcp_server_config(server: &Value) -> Option<Value> {
+    let server_key = server["server_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if matches!(server_key, "coordination-kernel" | "workspace-mcp-gateway") {
+        return None;
+    }
+    if !missing_required_config(&server["env_schema_json"], &server["config_values_json"])
+        .is_empty()
+    {
+        return None;
+    }
+
+    let transport = server["transport"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("stdio");
+    let mut config = Map::new();
+    if matches!(transport, "http" | "streamable-http" | "sse") {
+        let url = server["url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        config.insert("url".to_string(), json!(url));
+        config.insert("transport".to_string(), json!(transport));
+    } else {
+        let command = server["command"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        config.insert("command".to_string(), json!(command));
+        config.insert("args".to_string(), json!(global_mcp_server_args(server)));
+    }
+
+    let env = global_mcp_env_map(server);
+    if !env.is_empty() {
+        config.insert("env".to_string(), Value::Object(env));
+    }
+    config.insert(
+        "diffforge".to_string(),
+        json!({
+            "scope": "global_inherited",
+            "authority": "global_mcp_inherited",
+            "shadowedBy": "workspace_mcp_server_key",
+            "serverKey": server_key,
+            "sourceKind": server["source_kind"],
+            "sourceLabel": server["source_label"],
+        }),
+    );
+    Some(Value::Object(config))
+}
+
+fn global_mcp_server_provider_supports_codex(server: &Value) -> bool {
+    let source_kind = server["source_kind"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    source_kind.is_empty()
+        || source_kind.contains("codex")
+        || matches!(
+            source_kind.as_str(),
+            "manual" | "global" | "marketplace" | "mcp_registry"
+        )
+}
+
+fn global_mcp_server_provider_supports_claude(server: &Value) -> bool {
+    let source_kind = server["source_kind"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    source_kind.is_empty()
+        || source_kind.contains("claude")
+        || matches!(
+            source_kind.as_str(),
+            "manual" | "global" | "marketplace" | "mcp_registry"
+        )
+}
+
+fn filter_inherited_global_mcp_servers(
+    servers: Vec<Value>,
+    shadowed: &HashSet<String>,
+) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut inherited = Vec::new();
+    for server in servers {
+        let Some(server_key) = server["server_key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(workspace_mcp_key)
+        else {
+            continue;
+        };
+        if matches!(
+            server_key.as_str(),
+            "coordination-kernel" | "workspace-mcp-gateway"
+        ) || shadowed.contains(&server_key)
+            || !seen.insert(server_key)
+        {
+            continue;
+        }
+        if inherited_global_mcp_server_config(&server).is_some() {
+            inherited.push(server);
+        }
+    }
+    inherited.sort_by_key(global_mcp_server_sort_key);
+    inherited
+}
+
 fn install_native_global_mcp_server(
     source_kind: &str,
     server_key: &str,
@@ -6502,6 +6663,7 @@ impl CoordinationKernel {
                             worktree_path,
                             context_run_id.or_else(|| existing["context_run_id"].as_str()),
                             context_role.or_else(|| existing["context_role"].as_str()),
+                            None,
                         )?;
                         return Ok(self.session_response(&existing, slot, &mcp_config, Vec::new()));
                     }
@@ -6594,6 +6756,7 @@ impl CoordinationKernel {
                         .and_then(|_| existing["write_root"].as_str()),
                     context_run_id.or_else(|| existing["context_run_id"].as_str()),
                     context_role.or_else(|| existing["context_role"].as_str()),
+                    None,
                 )?;
                 self.emit_event(
                     "agent_session_reused",
@@ -6876,6 +7039,7 @@ impl CoordinationKernel {
             },
             context_run_id,
             context_role,
+            None,
         )?;
 
         self.emit_event(
@@ -6976,18 +7140,48 @@ impl CoordinationKernel {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mcp_config_path = session["mcpConfigPath"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let codex_mcp_config_path = session["codexMcpConfigPath"]
-            .as_str()
-            .unwrap_or(mcp_config_path.as_str())
-            .to_string();
-        let claude_mcp_config_path = session["claudeMcpConfigPath"]
-            .as_str()
-            .unwrap_or(mcp_config_path.as_str())
-            .to_string();
+        let scoped_mcp_config = if let Some(agent_slot_id) = agent_slot_id.as_deref() {
+            Some(self.write_or_update_slot_mcp_config(
+                agent_slot_id,
+                &session_id,
+                pty_id,
+                task_id,
+                worktree_id.as_deref(),
+                worktree_path.as_deref(),
+                context_run_id,
+                context_role,
+                workspace_id,
+            )?)
+        } else {
+            None
+        };
+        let mcp_config_path = scoped_mcp_config
+            .as_ref()
+            .map(|config| config.generic_path.clone())
+            .unwrap_or_else(|| {
+                session["mcpConfigPath"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            });
+        let codex_mcp_config_path = scoped_mcp_config
+            .as_ref()
+            .map(|config| config.codex_path.clone())
+            .unwrap_or_else(|| {
+                session["codexMcpConfigPath"]
+                    .as_str()
+                    .unwrap_or(mcp_config_path.as_str())
+                    .to_string()
+            });
+        let claude_mcp_config_path = scoped_mcp_config
+            .as_ref()
+            .map(|config| config.claude_path.clone())
+            .unwrap_or_else(|| {
+                session["claudeMcpConfigPath"]
+                    .as_str()
+                    .unwrap_or(mcp_config_path.as_str())
+                    .to_string()
+            });
 
         let (mcp_command, _) = self.coordination_mcp_command_spec();
         let workspace_mcp_allowed_tools =
@@ -7001,6 +7195,7 @@ impl CoordinationKernel {
             &write_root,
             &enforcement_mode,
             &mcp_command,
+            &self.inherited_global_mcp_servers_for_workspace(workspace_id),
         )?;
 
         Ok(TerminalCoordinationContext {
@@ -7118,18 +7313,48 @@ impl CoordinationKernel {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mcp_config_path = session["mcpConfigPath"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let codex_mcp_config_path = session["codexMcpConfigPath"]
-            .as_str()
-            .unwrap_or(mcp_config_path.as_str())
-            .to_string();
-        let claude_mcp_config_path = session["claudeMcpConfigPath"]
-            .as_str()
-            .unwrap_or(mcp_config_path.as_str())
-            .to_string();
+        let scoped_mcp_config = if let Some(agent_slot_id) = agent_slot_id.as_deref() {
+            Some(self.write_or_update_slot_mcp_config(
+                agent_slot_id,
+                &session_id,
+                session["ptyId"].as_str(),
+                task_id,
+                worktree_id.as_deref(),
+                worktree_path.as_deref(),
+                context_run_id,
+                context_role,
+                workspace_id,
+            )?)
+        } else {
+            None
+        };
+        let mcp_config_path = scoped_mcp_config
+            .as_ref()
+            .map(|config| config.generic_path.clone())
+            .unwrap_or_else(|| {
+                session["mcpConfigPath"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            });
+        let codex_mcp_config_path = scoped_mcp_config
+            .as_ref()
+            .map(|config| config.codex_path.clone())
+            .unwrap_or_else(|| {
+                session["codexMcpConfigPath"]
+                    .as_str()
+                    .unwrap_or(mcp_config_path.as_str())
+                    .to_string()
+            });
+        let claude_mcp_config_path = scoped_mcp_config
+            .as_ref()
+            .map(|config| config.claude_path.clone())
+            .unwrap_or_else(|| {
+                session["claudeMcpConfigPath"]
+                    .as_str()
+                    .unwrap_or(mcp_config_path.as_str())
+                    .to_string()
+            });
 
         let (mcp_command, _) = self.coordination_mcp_command_spec();
         let workspace_mcp_allowed_tools =
@@ -7143,6 +7368,7 @@ impl CoordinationKernel {
             &write_root,
             &enforcement_mode,
             &mcp_command,
+            &self.inherited_global_mcp_servers_for_workspace(workspace_id),
         )?;
 
         Ok(TerminalCoordinationContext {
@@ -8194,54 +8420,64 @@ impl CoordinationKernel {
             args.extend(["--workspace-id".to_string(), value.to_string()]);
         }
         let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(workspace_id);
+        let inherited_global_mcp_servers =
+            self.inherited_global_mcp_servers_for_workspace(workspace_id);
         let (gateway_command, gateway_args) =
             self.workspace_gateway_mcp_command_spec(workspace_id, Some(&objective_key));
-        let generic_config = json!({
-            "mcpServers": {
-                "coordination-kernel": {
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "env": {
-                        "COORDINATION_ENABLED": "1",
-                        "COORDINATION_WORKSPACE_ID": workspace_id,
-                        "COORDINATION_OBJECTIVE_KEY": objective_key,
-                        "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
-                        "COORDINATION_MCP_ALWAYS_ON": "1"
-                    },
-                    "diffforge": {
-                        "scope": "workspace",
-                        "workspaceId": workspace_id,
-                        "workspaceName": workspace_name,
-                        "objectiveKey": objective_key,
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "authority": "local_coordination_kernel"
-                    }
-                },
-                "workspace-mcp-gateway": {
-                    "command": gateway_command.clone(),
-                    "args": gateway_args.clone(),
-                    "env": {
-                        "COORDINATION_ENABLED": "1",
-                        "COORDINATION_WORKSPACE_ID": workspace_id,
-                        "COORDINATION_OBJECTIVE_KEY": objective_key,
-                        "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
-                        "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
-                        "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
-                    },
-                    "diffforge": {
-                        "scope": "workspace",
-                        "workspaceId": workspace_id,
-                        "workspaceName": workspace_name,
-                        "objectiveKey": objective_key,
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "authority": "workspace_mcp_gateway"
-                    }
-                }
+        let coordination_server = json!({
+            "command": command.clone(),
+            "args": args.clone(),
+            "env": {
+                "COORDINATION_ENABLED": "1",
+                "COORDINATION_WORKSPACE_ID": workspace_id,
+                "COORDINATION_OBJECTIVE_KEY": objective_key,
+                "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
+                "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
+                "COORDINATION_MCP_ALWAYS_ON": "1"
+            },
+            "diffforge": {
+                "scope": "workspace",
+                "workspaceId": workspace_id,
+                "workspaceName": workspace_name,
+                "objectiveKey": objective_key,
+                "alwaysOn": true,
+                "toggleable": false,
+                "authority": "local_coordination_kernel"
             }
         });
+        let gateway_server = json!({
+            "command": gateway_command.clone(),
+            "args": gateway_args.clone(),
+            "env": {
+                "COORDINATION_ENABLED": "1",
+                "COORDINATION_WORKSPACE_ID": workspace_id,
+                "COORDINATION_OBJECTIVE_KEY": objective_key,
+                "COORDINATION_REPO_PATH": process_path_text(&self.paths.repo_path),
+                "COORDINATION_DB_PATH": process_path_text(&self.paths.db_path),
+                "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
+            },
+            "diffforge": {
+                "scope": "workspace",
+                "workspaceId": workspace_id,
+                "workspaceName": workspace_name,
+                "objectiveKey": objective_key,
+                "alwaysOn": true,
+                "toggleable": false,
+                "authority": "workspace_mcp_gateway"
+            }
+        });
+        let generic_config = mcp_config_json_with_inherited_global_servers(
+            coordination_server.clone(),
+            gateway_server.clone(),
+            &inherited_global_mcp_servers,
+            |_| true,
+        );
+        let claude_config = mcp_config_json_with_inherited_global_servers(
+            coordination_server,
+            gateway_server,
+            &inherited_global_mcp_servers,
+            global_mcp_server_provider_supports_claude,
+        );
         let config_bytes = serde_json::to_vec(&generic_config).map_err(|error| {
             format!("Unable to serialize workspace MCP config for hashing: {error}")
         })?;
@@ -8275,9 +8511,14 @@ impl CoordinationKernel {
         write_json_file_atomic(&generic_path, &generic_config)?;
         write_text_file_atomic(
             &codex_path,
-            &codex_config_toml_with_gateway_tools(&command, &args, &gateway_approved_tools),
+            &codex_config_toml_with_gateway_tools_and_global_servers(
+                &command,
+                &args,
+                &gateway_approved_tools,
+                &inherited_global_mcp_servers,
+            ),
         )?;
-        write_json_file_atomic(&claude_path, &generic_config)?;
+        write_json_file_atomic(&claude_path, &claude_config)?;
         let shared_repo_cleanup = self.cleanup_repo_root_coordination_activation_files()?;
 
         let response = json!({
@@ -9155,6 +9396,37 @@ impl CoordinationKernel {
         }
         names.sort();
         names
+    }
+
+    fn workspace_mcp_shadowed_server_keys(&self, workspace_id: Option<&str>) -> HashSet<String> {
+        let Some(workspace_id) = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return HashSet::new();
+        };
+        self.query_json(
+            "SELECT server_key FROM workspace_mcp_servers
+             WHERE workspace_id=?1
+               AND COALESCE(install_state, 'installed') != 'uninstalled'",
+            &[&workspace_id],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            row["server_key"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(workspace_mcp_key)
+        })
+        .collect()
+    }
+
+    fn inherited_global_mcp_servers_for_workspace(&self, workspace_id: Option<&str>) -> Vec<Value> {
+        let shadowed = self.workspace_mcp_shadowed_server_keys(workspace_id);
+        let registry = global_mcp_load_registry().unwrap_or_else(|_| global_mcp_empty_registry());
+        filter_inherited_global_mcp_servers(global_mcp_array(&registry, "servers"), &shadowed)
     }
 
     fn global_mcp_marketplaces(&self) -> Result<Vec<Value>, String> {
@@ -10438,6 +10710,7 @@ impl CoordinationKernel {
         worktree_path: Option<&str>,
         _context_run_id: Option<&str>,
         _context_role: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<SessionMcpConfigPaths, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
         let slot_agent_id = required_string(&slot, "agent_id")?;
@@ -10463,53 +10736,76 @@ impl CoordinationKernel {
         if let Some(value) = worktree_path {
             args.extend(["--worktree-path".to_string(), value.to_string()]);
         }
-        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(None);
+        if let Some(value) = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.extend(["--workspace-id".to_string(), value.to_string()]);
+            args.extend([
+                "--objective-key".to_string(),
+                require_workspace_objective_key(workspace_id)?,
+            ]);
+        }
+        let gateway_approved_tools = self.workspace_mcp_gateway_approved_tool_names(workspace_id);
+        let inherited_global_mcp_servers =
+            self.inherited_global_mcp_servers_for_workspace(workspace_id);
         let gateway_args = workspace_gateway_args_from_coordination_args(&args);
-        let generic_config = json!({
-            "mcpServers": {
-                "coordination-kernel": {
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "env": {
-                        "COORDINATION_ENABLED": "1",
-                        "COORDINATION_AGENT_ID": agent_id,
-                        "COORDINATION_AGENT_SLOT_ID": agent_slot_id,
-                        "COORDINATION_SLOT_KEY": slot_key,
-                        "COORDINATION_MCP_ALWAYS_ON": "1"
-                    },
-                    "diffforge": {
-                        "scope": "workspace",
-                        "slotKey": slot_key,
-                        "agentSlotId": agent_slot_id,
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "identitySource": "active_session_for_slot",
-                        "authority": "local_coordination_kernel"
-                    }
-                },
-                "workspace-mcp-gateway": {
-                    "command": command.clone(),
-                    "args": gateway_args,
-                    "env": {
-                        "COORDINATION_ENABLED": "1",
-                        "COORDINATION_AGENT_ID": agent_id,
-                        "COORDINATION_AGENT_SLOT_ID": agent_slot_id,
-                        "COORDINATION_SLOT_KEY": slot_key,
-                        "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
-                    },
-                    "diffforge": {
-                        "scope": "workspace",
-                        "slotKey": slot_key,
-                        "agentSlotId": agent_slot_id,
-                        "alwaysOn": true,
-                        "toggleable": false,
-                        "identitySource": "active_session_for_slot",
-                        "authority": "workspace_mcp_gateway"
-                    }
-                }
+        let coordination_server = json!({
+            "command": command.clone(),
+            "args": args.clone(),
+            "env": {
+                "COORDINATION_ENABLED": "1",
+                "COORDINATION_AGENT_ID": agent_id,
+                "COORDINATION_AGENT_SLOT_ID": agent_slot_id,
+                "COORDINATION_SLOT_KEY": slot_key,
+                "COORDINATION_WORKSPACE_ID": workspace_id,
+                "COORDINATION_MCP_ALWAYS_ON": "1"
+            },
+            "diffforge": {
+                "scope": "workspace",
+                "slotKey": slot_key,
+                "agentSlotId": agent_slot_id,
+                "workspaceId": workspace_id,
+                "alwaysOn": true,
+                "toggleable": false,
+                "identitySource": "active_session_for_slot",
+                "authority": "local_coordination_kernel"
             }
         });
-        let claude_config = generic_config.clone();
+        let gateway_server = json!({
+            "command": command.clone(),
+            "args": gateway_args,
+            "env": {
+                "COORDINATION_ENABLED": "1",
+                "COORDINATION_AGENT_ID": agent_id,
+                "COORDINATION_AGENT_SLOT_ID": agent_slot_id,
+                "COORDINATION_SLOT_KEY": slot_key,
+                "COORDINATION_WORKSPACE_ID": workspace_id,
+                "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
+            },
+            "diffforge": {
+                "scope": "workspace",
+                "slotKey": slot_key,
+                "agentSlotId": agent_slot_id,
+                "workspaceId": workspace_id,
+                "alwaysOn": true,
+                "toggleable": false,
+                "identitySource": "active_session_for_slot",
+                "authority": "workspace_mcp_gateway"
+            }
+        });
+        let generic_config = mcp_config_json_with_inherited_global_servers(
+            coordination_server.clone(),
+            gateway_server.clone(),
+            &inherited_global_mcp_servers,
+            |_| true,
+        );
+        let claude_config = mcp_config_json_with_inherited_global_servers(
+            coordination_server,
+            gateway_server,
+            &inherited_global_mcp_servers,
+            global_mcp_server_provider_supports_claude,
+        );
         let generic_path = self
             .paths
             .mcp_root
@@ -10546,6 +10842,7 @@ impl CoordinationKernel {
             &command,
             &args,
             &gateway_approved_tools,
+            &inherited_global_mcp_servers,
             worktree_path,
         );
         let files_reused = existing_config
@@ -10559,7 +10856,12 @@ impl CoordinationKernel {
             write_json_file_atomic(&generic_path, &generic_config)?;
             write_text_file_atomic(
                 &codex_path,
-                &codex_config_toml_with_gateway_tools(&command, &args, &gateway_approved_tools),
+                &codex_config_toml_with_gateway_tools_and_global_servers(
+                    &command,
+                    &args,
+                    &gateway_approved_tools,
+                    &inherited_global_mcp_servers,
+                ),
             )?;
             write_json_file_atomic(&claude_path, &claude_config)?;
             self.cleanup_repo_root_coordination_activation_files()?;
@@ -10575,6 +10877,7 @@ impl CoordinationKernel {
                     &command,
                     &args,
                     &gateway_approved_tools,
+                    &inherited_global_mcp_servers,
                 )?;
             }
         }
@@ -10696,12 +10999,18 @@ impl CoordinationKernel {
         command: &str,
         args: &[String],
         gateway_approved_tools: &[String],
+        inherited_global_mcp_servers: &[Value],
         worktree_path: Option<&str>,
     ) -> bool {
         if !json_file_matches(generic_path, generic_config)
             || !text_file_matches(
                 codex_path,
-                &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
+                &codex_config_toml_with_gateway_tools_and_global_servers(
+                    command,
+                    args,
+                    gateway_approved_tools,
+                    inherited_global_mcp_servers,
+                ),
             )
             || !json_file_matches(claude_path, claude_config)
         {
@@ -10717,11 +11026,20 @@ impl CoordinationKernel {
         json_file_matches(&worktree.join(".mcp.json"), generic_config)
             && json_file_matches(
                 &worktree.join("opencode.json"),
-                &opencode_config_json(command, args),
+                &opencode_config_json_with_inherited_global_servers(
+                    command,
+                    args,
+                    inherited_global_mcp_servers,
+                ),
             )
             && text_file_matches(
                 &worktree.join(".codex").join("config.toml"),
-                &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
+                &codex_config_toml_with_gateway_tools_and_global_servers(
+                    command,
+                    args,
+                    gateway_approved_tools,
+                    inherited_global_mcp_servers,
+                ),
             )
             && claude_settings_file_has_required_policy_with_gateway_tools(
                 &claude_settings_path(&worktree),
@@ -10736,6 +11054,7 @@ impl CoordinationKernel {
         command: &str,
         args: &[String],
         gateway_approved_tools: &[String],
+        inherited_global_mcp_servers: &[Value],
     ) -> Result<(), String> {
         let worktree = PathBuf::from(worktree_path);
         if !worktree.exists() {
@@ -10754,14 +11073,23 @@ impl CoordinationKernel {
         write_json_file_atomic(&worktree.join(".mcp.json"), generic_config)?;
         write_json_file_atomic(
             &worktree.join("opencode.json"),
-            &opencode_config_json(command, args),
+            &opencode_config_json_with_inherited_global_servers(
+                command,
+                args,
+                inherited_global_mcp_servers,
+            ),
         )?;
         let codex_dir = worktree.join(".codex");
         fs::create_dir_all(&codex_dir)
             .map_err(|error| format!("Unable to create {}: {error}", codex_dir.display()))?;
         write_text_file_atomic(
             &codex_dir.join("config.toml"),
-            &codex_config_toml_with_gateway_tools(command, args, gateway_approved_tools),
+            &codex_config_toml_with_gateway_tools_and_global_servers(
+                command,
+                args,
+                gateway_approved_tools,
+                inherited_global_mcp_servers,
+            ),
         )?;
         write_claude_settings_file_with_gateway_tools(&worktree, gateway_approved_tools)?;
         self.write_agent_contract_files(&worktree)?;
@@ -25084,6 +25412,7 @@ fn prepare_managed_codex_profile_for_terminal(
     write_root: &str,
     enforcement_mode: &str,
     mcp_command: &str,
+    inherited_global_mcp_servers: &[Value],
 ) -> Result<ManagedCodexProfileLaunch, String> {
     if !agent_kind.to_ascii_lowercase().contains("codex") {
         return Ok(ManagedCodexProfileLaunch {
@@ -25119,6 +25448,7 @@ fn prepare_managed_codex_profile_for_terminal(
         &slot_segment,
         Path::new(write_root),
         enforcement_mode,
+        inherited_global_mcp_servers,
     )?;
     let profile_path = profile_home.join(format!("{profile}.config.toml"));
     let hooks_json = codex_managed_hooks_config_json(
@@ -25178,6 +25508,7 @@ fn codex_profile_home_for_launch(
     slot_segment: &str,
     write_root: &Path,
     enforcement_mode: &str,
+    inherited_global_mcp_servers: &[Value],
 ) -> Result<PathBuf, String> {
     let home = crate::coordination::db::coordination_repo_state_root(&paths.repo_path)
         .join("codex-home")
@@ -25189,7 +25520,13 @@ fn codex_profile_home_for_launch(
             home.display()
         )
     })?;
-    codex_prepare_private_home(&home, &paths.repo_path, write_root, enforcement_mode)?;
+    codex_prepare_private_home(
+        &home,
+        &paths.repo_path,
+        write_root,
+        enforcement_mode,
+        inherited_global_mcp_servers,
+    )?;
     Ok(home)
 }
 
@@ -25198,10 +25535,16 @@ fn codex_prepare_private_home(
     repo_path: &Path,
     write_root: &Path,
     enforcement_mode: &str,
+    inherited_global_mcp_servers: &[Value],
 ) -> Result<(), String> {
     let trust_sources = codex_private_home_project_trust_source_paths(home);
-    let config =
-        codex_private_home_base_config(&trust_sources, repo_path, write_root, enforcement_mode);
+    let config = codex_private_home_base_config(
+        &trust_sources,
+        repo_path,
+        write_root,
+        enforcement_mode,
+        inherited_global_mcp_servers,
+    );
     write_text_file_atomic(&home.join("config.toml"), &config)?;
 
     let Some(source_home) = codex_user_home_for_auth_bridge() else {
@@ -25218,8 +25561,9 @@ fn codex_private_home_base_config(
     repo_path: &Path,
     write_root: &Path,
     enforcement_mode: &str,
+    inherited_global_mcp_servers: &[Value],
 ) -> String {
-    let mut config = "# Diff Forge managed Codex home. Workspace terminals inherit trusted project entries, but not global plugins, apps, or MCP servers.\n".to_string();
+    let mut config = "# Diff Forge managed Codex home. Workspace terminals inherit trusted project entries and unshadowed global MCP servers, but not global plugins or apps.\n".to_string();
     let mut seen = HashSet::new();
     for path in trust_source_paths {
         let Ok(body) = fs::read_to_string(path) else {
@@ -25237,6 +25581,7 @@ fn codex_private_home_base_config(
     if !config.ends_with('\n') {
         config.push('\n');
     }
+    append_codex_inherited_global_mcp_servers(&mut config, inherited_global_mcp_servers);
     config
 }
 
@@ -26271,22 +26616,15 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn codex_config_toml_with_gateway_tools(
+fn codex_config_toml_with_gateway_tools_and_global_servers(
     command: &str,
     args: &[String],
     gateway_approved_tools: &[String],
+    inherited_global_mcp_servers: &[Value],
 ) -> String {
-    let coordination_args = args
-        .iter()
-        .map(|arg| format!("\"{}\"", toml_escape(arg)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let coordination_args = toml_string_array(args);
     let gateway_args = workspace_gateway_args_from_coordination_args(args);
-    let gateway_args = gateway_args
-        .iter()
-        .map(|arg| format!("\"{}\"", toml_escape(arg)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let gateway_args = toml_string_array(&gateway_args);
 
     let mut config = format!(
         "[mcp_servers.coordination-kernel]\ncommand = \"{}\"\nargs = [{}]\ndefault_tools_approval_mode = \"prompt\"\n\n\
@@ -26316,7 +26654,106 @@ fn codex_config_toml_with_gateway_tools(
         ));
     }
 
+    append_codex_inherited_global_mcp_servers(&mut config, inherited_global_mcp_servers);
     config
+}
+
+fn append_codex_inherited_global_mcp_servers(
+    config: &mut String,
+    inherited_global_servers: &[Value],
+) {
+    let mut seen = HashSet::new();
+    for server in inherited_global_servers {
+        if !global_mcp_server_provider_supports_codex(server) {
+            continue;
+        }
+        let Some(server_key) = server["server_key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(server_key.to_string()) {
+            continue;
+        }
+        if let Some(server_config) = inherited_global_mcp_server_config(server) {
+            append_codex_mcp_server_config(config, server_key, &server_config);
+        }
+    }
+}
+
+fn append_codex_mcp_server_config(config: &mut String, server_key: &str, server_config: &Value) {
+    let server_segment = toml_key_segment(server_key);
+    config.push_str(&format!("\n[mcp_servers.{server_segment}]\n"));
+    config.push_str("default_tools_approval_mode = \"prompt\"\n");
+    if let Some(command) = server_config["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.push_str(&format!("command = \"{}\"\n", toml_escape(command)));
+        let args = server_config["args"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        config.push_str(&format!("args = [{}]\n", toml_string_array(&args)));
+    } else if let Some(url) = server_config["url"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.push_str(&format!("url = \"{}\"\n", toml_escape(url)));
+        if let Some(transport) = server_config["transport"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "http")
+        {
+            config.push_str(&format!("transport = \"{}\"\n", toml_escape(transport)));
+        }
+    } else {
+        return;
+    }
+
+    let Some(env) = server_config["env"]
+        .as_object()
+        .filter(|env| !env.is_empty())
+    else {
+        return;
+    };
+    config.push_str(&format!("\n[mcp_servers.{server_segment}.env]\n"));
+    let mut env_keys = env.keys().collect::<Vec<_>>();
+    env_keys.sort();
+    for key in env_keys {
+        if let Some(value) = toml_string_from_json_value(&env[key]) {
+            config.push_str(&format!(
+                "{} = \"{}\"\n",
+                toml_key_segment(key),
+                toml_escape(&value)
+            ));
+        }
+    }
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", toml_escape(value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn toml_string_from_json_value(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if value.is_null() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn coordination_arg_value(args: &[String], key: &str) -> Option<String> {
@@ -26346,6 +26783,39 @@ fn workspace_gateway_args_from_coordination_args(args: &[String]) -> Vec<String>
         }
     }
     gateway_args
+}
+
+fn mcp_config_json_with_inherited_global_servers<F>(
+    coordination_server: Value,
+    gateway_server: Value,
+    inherited_global_servers: &[Value],
+    include_server: F,
+) -> Value
+where
+    F: Fn(&Value) -> bool,
+{
+    let mut servers = Map::new();
+    servers.insert("coordination-kernel".to_string(), coordination_server);
+    servers.insert("workspace-mcp-gateway".to_string(), gateway_server);
+    for server in inherited_global_servers {
+        if !include_server(server) {
+            continue;
+        }
+        let Some(server_key) = server["server_key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if servers.contains_key(server_key) {
+            continue;
+        }
+        if let Some(config) = inherited_global_mcp_server_config(server) {
+            servers.insert(server_key.to_string(), config);
+        }
+    }
+    json!({ "mcpServers": Value::Object(servers) })
 }
 
 fn claude_settings_path(root: &Path) -> PathBuf {
@@ -26538,7 +27008,11 @@ fn write_claude_settings_file_with_gateway_tools(
     Ok(path)
 }
 
-fn opencode_config_json(command: &str, args: &[String]) -> Value {
+fn opencode_config_json_with_inherited_global_servers(
+    command: &str,
+    args: &[String],
+    inherited_global_mcp_servers: &[Value],
+) -> Value {
     let mut command_args = Vec::with_capacity(args.len() + 1);
     command_args.push(json!(command));
     command_args.extend(args.iter().map(|arg| json!(arg)));
@@ -26547,10 +27021,10 @@ fn opencode_config_json(command: &str, args: &[String]) -> Value {
     gateway_command_args.push(json!(command));
     gateway_command_args.extend(gateway_args.iter().map(|arg| json!(arg)));
 
-    json!({
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": {
-            "coordination-kernel": {
+    let mut mcp = Map::new();
+    mcp.insert(
+        "coordination-kernel".to_string(),
+        json!({
                 "type": "local",
                 "command": command_args,
                 "enabled": true,
@@ -26558,8 +27032,11 @@ fn opencode_config_json(command: &str, args: &[String]) -> Value {
                     "COORDINATION_ENABLED": "1",
                     "COORDINATION_MCP_ALWAYS_ON": "1"
                 }
-            },
-            "workspace-mcp-gateway": {
+        }),
+    );
+    mcp.insert(
+        "workspace-mcp-gateway".to_string(),
+        json!({
                 "type": "local",
                 "command": gateway_command_args,
                 "enabled": true,
@@ -26567,8 +27044,60 @@ fn opencode_config_json(command: &str, args: &[String]) -> Value {
                     "COORDINATION_ENABLED": "1",
                     "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
                 }
-            }
+        }),
+    );
+
+    for server in inherited_global_mcp_servers {
+        let Some(server_key) = server["server_key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if mcp.contains_key(server_key) {
+            continue;
         }
+        let Some(config) = inherited_global_mcp_server_config(server) else {
+            continue;
+        };
+        let mut entry = Map::new();
+        entry.insert("enabled".to_string(), json!(true));
+        if let Some(command) = config["command"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let mut command_args = vec![json!(command)];
+            command_args.extend(
+                config["args"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| json!(value)),
+            );
+            entry.insert("type".to_string(), json!("local"));
+            entry.insert("command".to_string(), Value::Array(command_args));
+        } else if let Some(url) = config["url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            entry.insert("type".to_string(), json!("remote"));
+            entry.insert("url".to_string(), json!(url));
+        } else {
+            continue;
+        }
+        if let Some(env) = config["env"].as_object().filter(|env| !env.is_empty()) {
+            entry.insert("environment".to_string(), Value::Object(env.clone()));
+        }
+        mcp.insert(server_key.to_string(), Value::Object(entry));
+    }
+
+    json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": Value::Object(mcp)
     })
 }
 
@@ -26923,6 +27452,18 @@ fn ensure_git_info_exclude_entries(root: &Path, additions: &[&str]) -> Result<()
 
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn toml_key_segment(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", toml_escape(value))
+    }
 }
 
 fn short_id(value: &str) -> String {
@@ -27429,6 +27970,23 @@ mod tests {
             ],
         );
         repo
+    }
+
+    fn test_global_mcp_server(server_key: &str, source_kind: &str) -> Value {
+        json!({
+            "server_key": server_key,
+            "name": server_key,
+            "source_kind": source_kind,
+            "source_label": source_kind,
+            "transport": "stdio",
+            "command": "uvx",
+            "args_json": ["mcp-server-test"],
+            "env_schema_json": [],
+            "config_values_json": {
+                "TEST_TOKEN": "secret"
+            },
+            "tools_json": [],
+        })
     }
 
     fn enable_agent_worktrees(kernel: &CoordinationKernel) {
@@ -29103,6 +29661,66 @@ mod tests {
     }
 
     #[test]
+    fn inherited_global_mcp_servers_skip_workspace_shadowed_keys() {
+        let mut shadowed = HashSet::new();
+        shadowed.insert("appwrite-api".to_string());
+        let inherited = filter_inherited_global_mcp_servers(
+            vec![
+                test_global_mcp_server("appwrite-api", "codex_global_mcp"),
+                test_global_mcp_server("github", "manual"),
+                test_global_mcp_server("coordination-kernel", "manual"),
+            ],
+            &shadowed,
+        );
+
+        let keys = inherited
+            .iter()
+            .filter_map(|server| server["server_key"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["github"]);
+    }
+
+    #[test]
+    fn codex_mcp_config_inherits_unshadowed_global_servers_prompt_gated() {
+        let inherited = vec![
+            test_global_mcp_server("appwrite.api", "codex_global_mcp"),
+            test_global_mcp_server("claude-only", "claude_user_mcp"),
+        ];
+        let config = codex_config_toml_with_gateway_tools_and_global_servers(
+            "diffforge",
+            &["--coordination-mcp".to_string()],
+            &[],
+            &inherited,
+        );
+
+        assert!(config.contains("[mcp_servers.\"appwrite.api\"]"));
+        assert!(config.contains("command = \"uvx\""));
+        assert!(config.contains("default_tools_approval_mode = \"prompt\""));
+        assert!(config.contains("[mcp_servers.\"appwrite.api\".env]"));
+        assert!(config.contains("TEST_TOKEN = \"secret\""));
+        assert!(!config.contains("[mcp_servers.claude-only]"));
+    }
+
+    #[test]
+    fn managed_codex_private_home_config_inherits_scoped_global_mcp_servers() {
+        let repo = init_git_repo("managed_codex_private_home_global_mcp");
+        let worktree = repo.join(".agents").join("worktrees").join("3");
+        fs::create_dir_all(&worktree).unwrap();
+        let config = codex_private_home_base_config(
+            &[],
+            &repo,
+            &worktree,
+            "worktree_required",
+            &[test_global_mcp_server("github", "manual")],
+        );
+
+        assert!(config.contains("[mcp_servers.github]"));
+        assert!(config.contains("default_tools_approval_mode = \"prompt\""));
+        assert!(config.contains("[mcp_servers.github.env]"));
+        assert!(config.contains("TEST_TOKEN = \"secret\""));
+    }
+
+    #[test]
     fn codex_global_mcp_server_approval_policy_updates_existing_server() {
         let config = r#"[model]
 name = "gpt-5.5"
@@ -29232,8 +29850,13 @@ enabled = true
         )
         .unwrap();
 
-        let config =
-            codex_private_home_base_config(&[source_config], &repo, &worktree, "worktree_required");
+        let config = codex_private_home_base_config(
+            &[source_config],
+            &repo,
+            &worktree,
+            "worktree_required",
+            &[],
+        );
 
         assert!(config.contains(&format!(
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",

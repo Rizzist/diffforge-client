@@ -1142,7 +1142,7 @@ function limitDisplayPercentKind(limit = {}, fallbackWindowKind = "") {
       ?? "",
   ).toLowerCase();
   if (explicit === "remaining" || explicit === "used") return explicit;
-  if (providerKey(limit) === "codex") return "remaining";
+  if (providerKey(limit) === "codex" || providerKey(limit) === "claude") return "remaining";
   const windowKind = String(
     fallbackWindowKind
       || limit.window_kind

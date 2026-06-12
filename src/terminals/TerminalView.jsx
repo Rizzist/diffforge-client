@@ -1137,6 +1137,7 @@ const TODO_DROP_IMAGE_PATH_PATTERN = /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/
 
 const TODO_COMPLETION_FLASH_MS = 2000;
 const TERMINAL_HIGHLIGHT_FLASH_MS = 4200;
+const NOTIFICATION_ATTENTION_FLASH_MS = 6000;
 
 const todoCompletionFlashPulse = keyframes`
   0% { opacity: 0; }
@@ -1189,6 +1190,61 @@ const TerminalVoiceHighlightFlash = styled.div`
       0 0 15px 4px rgba(202, 138, 4, 0.42),
       0 0 34px 9px rgba(202, 138, 4, 0.24),
       inset 0 0 18px rgba(202, 138, 4, 0.16);
+  }
+`;
+
+/* Switch-back attention: the orange matches the workspace notification badge
+   so the pane ring reads as "this terminal is where that badge came from"
+   (todo flash is green, voice highlight is yellow). */
+const TerminalNotificationAttentionFlash = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 202;
+  pointer-events: none;
+  border-radius: inherit;
+  border: 2px solid rgba(251, 146, 60, 0.95);
+  box-shadow:
+    0 0 15px 4px rgba(251, 146, 60, 0.55),
+    0 0 38px 10px rgba(251, 146, 60, 0.3),
+    inset 0 0 20px rgba(251, 146, 60, 0.22);
+  opacity: 0;
+  animation: ${todoCompletionFlashPulse} 2s ease-in-out infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(194, 65, 12, 0.9);
+    box-shadow:
+      0 0 15px 4px rgba(194, 65, 12, 0.4),
+      0 0 34px 9px rgba(194, 65, 12, 0.22),
+      inset 0 0 18px rgba(194, 65, 12, 0.14);
+  }
+`;
+
+const TerminalNotificationAttentionChip = styled.div`
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  z-index: 203;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 24px);
+  padding: 4px 11px;
+  border: 1px solid rgba(247, 181, 83, 0.45);
+  border-radius: 999px;
+  color: #fff8ea;
+  background: rgba(184, 93, 25, 0.94);
+  box-shadow: 0 6px 14px rgba(184, 93, 25, 0.32);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  pointer-events: none;
+  transform: translateX(-50%);
+  white-space: nowrap;
+
+  > span:last-child {
+    overflow: hidden;
+    min-width: 0;
+    text-overflow: ellipsis;
   }
 `;
 
@@ -15253,6 +15309,7 @@ function TerminalView({
   workspaceAgentLaunchEpoch,
   workspaceError,
   workspaceName,
+  workspaceNotificationAttention = null,
   workspaceSyncState,
   workspaceThreadRestoreReady = true,
   workspaceTerminalAgentLaunchReady,
@@ -16400,6 +16457,86 @@ function TerminalView({
       window.clearTimeout(timer);
     });
     terminalHighlightFlashTimersRef.current.clear();
+  }, []);
+  // Switch-back notification attention: AppShell hands down which panes
+  // produced the unread notifications it just marked seen; flash those panes
+  // with an orange ring + a chip naming the latest notification so the badge
+  // count the user clicked through has a visible source.
+  const [notificationAttentionFlashes, setNotificationAttentionFlashes] = useState({});
+  const notificationAttentionTimersRef = useRef(new Map());
+  const notificationAttentionSeenIdRef = useRef(0);
+  useEffect(() => {
+    const attention = workspaceNotificationAttention;
+    if (!attention || !Array.isArray(attention.panes) || !attention.panes.length) {
+      return;
+    }
+    if (notificationAttentionSeenIdRef.current === attention.id) {
+      return;
+    }
+    notificationAttentionSeenIdRef.current = attention.id;
+    const visiblePaneIds = new Set(
+      logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
+    );
+    const resolved = new Map();
+    attention.panes.forEach((pane) => {
+      // Pane ids in notifications can outlive a relaunch; fall back to the
+      // terminal index so the attention still lands on the right slot.
+      let paneId = String(pane?.paneId || "").trim();
+      if (!paneId || !visiblePaneIds.has(paneId)) {
+        const index = Number(pane?.terminalIndex);
+        paneId = Number.isInteger(index) && logicalTerminalIndexes.includes(index)
+          ? getTerminalPaneId(index)
+          : "";
+      }
+      if (!paneId || !visiblePaneIds.has(paneId)) {
+        return;
+      }
+      const count = Math.max(1, Number(pane?.count) || 1);
+      const existing = resolved.get(paneId);
+      if (existing) {
+        existing.count += count;
+        return;
+      }
+      resolved.set(paneId, {
+        count,
+        id: attention.id,
+        title: String(pane?.title || "").trim() || "Notification",
+      });
+    });
+    if (!resolved.size) {
+      return;
+    }
+    setNotificationAttentionFlashes((current) => {
+      const next = { ...current };
+      resolved.forEach((entry, paneId) => {
+        next[paneId] = entry;
+      });
+      return next;
+    });
+    resolved.forEach((entry, paneId) => {
+      const existingTimer = notificationAttentionTimersRef.current.get(paneId);
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+      }
+      const timer = window.setTimeout(() => {
+        notificationAttentionTimersRef.current.delete(paneId);
+        setNotificationAttentionFlashes((current) => {
+          if (current[paneId]?.id !== entry.id) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[paneId];
+          return next;
+        });
+      }, NOTIFICATION_ATTENTION_FLASH_MS);
+      notificationAttentionTimersRef.current.set(paneId, timer);
+    });
+  }, [getTerminalPaneId, logicalTerminalIndexes, workspaceNotificationAttention]);
+  useEffect(() => () => {
+    notificationAttentionTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    notificationAttentionTimersRef.current.clear();
   }, []);
   const workspaceThreadEntry = terminalWorkspace
     ? workspaceThreads?.[terminalWorkspace.id] || null
@@ -28139,6 +28276,23 @@ function TerminalView({
                   aria-hidden="true"
                   key={`terminal-highlight-${terminalHighlightFlashes[terminalPaneId]}`}
                 />
+              ) : null}
+              {notificationAttentionFlashes[terminalPaneId] ? (
+                <>
+                  <TerminalNotificationAttentionFlash
+                    aria-hidden="true"
+                    key={`notification-attention-${notificationAttentionFlashes[terminalPaneId].id}`}
+                  />
+                  <TerminalNotificationAttentionChip role="status">
+                    <span aria-hidden="true">🔔</span>
+                    <span>
+                      {notificationAttentionFlashes[terminalPaneId].title}
+                      {notificationAttentionFlashes[terminalPaneId].count > 1
+                        ? ` ×${notificationAttentionFlashes[terminalPaneId].count}`
+                        : ""}
+                    </span>
+                  </TerminalNotificationAttentionChip>
+                </>
               ) : null}
               {terminalBreakoutLayoutActive && !fullscreenThisTerminal && (
                 <TerminalTabStrip data-breakout="true" data-terminal-control="true">

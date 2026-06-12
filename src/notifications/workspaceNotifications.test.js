@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  collectWorkspaceNotificationAttentionPanes,
   getWorkspaceNotificationSummary,
   reduceThreadLifecycleNotificationEvent,
   reduceTodoCompletedNotificationEvent,
@@ -289,4 +290,69 @@ test("queue drain while watching the causing workspace stays silent", () => {
     drained.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-4"].status,
     "read",
   );
+});
+
+test("attention panes attribute unread notifications to their terminals", () => {
+  const state = {
+    workspaces: {
+      "workspace-1": {
+        notifications: {
+          "n-newest": {
+            createdAt: "2026-06-12T10:00:02.000Z",
+            id: "n-newest",
+            kind: "approval.required",
+            paneId: "pane-a",
+            status: "unread",
+            title: "Approval required",
+          },
+          "n-older": {
+            createdAt: "2026-06-12T10:00:01.000Z",
+            id: "n-older",
+            kind: "user.input.required",
+            paneId: "pane-a",
+            status: "unread",
+            title: "User input needed",
+          },
+          "n-index-only": {
+            createdAt: "2026-06-12T10:00:00.000Z",
+            id: "n-index-only",
+            kind: "all.done",
+            status: "unread",
+            terminalIndex: 2,
+            title: "Agents finished",
+          },
+          "n-read": {
+            createdAt: "2026-06-12T09:00:00.000Z",
+            id: "n-read",
+            kind: "all.done",
+            paneId: "pane-b",
+            status: "read",
+            title: "Agents finished",
+          },
+          "n-no-pane": {
+            createdAt: "2026-06-12T08:00:00.000Z",
+            id: "n-no-pane",
+            kind: "todo.completed",
+            status: "unread",
+            title: "Todo completed",
+          },
+        },
+      },
+    },
+  };
+
+  const panes = collectWorkspaceNotificationAttentionPanes(state, "workspace-1");
+  assert.equal(panes.length, 2);
+
+  const paneA = panes.find((pane) => pane.paneId === "pane-a");
+  assert.equal(paneA.count, 2);
+  // Notifications normalize newest-first, so the chip title is the latest one.
+  assert.equal(paneA.title, "Approval required");
+
+  const indexPane = panes.find((pane) => pane.terminalIndex === 2);
+  assert.equal(indexPane.count, 1);
+  assert.equal(indexPane.paneId, "");
+
+  assert.equal(collectWorkspaceNotificationAttentionPanes(state, "missing").length, 0);
+  assert.equal(collectWorkspaceNotificationAttentionPanes(state, "").length, 0);
 });

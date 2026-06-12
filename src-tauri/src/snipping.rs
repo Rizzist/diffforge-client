@@ -163,11 +163,6 @@ struct SnippingState {
     /// bottom-left queue, but the queue must not pull them into an auto slot
     /// after release.
     preview_detached_labels: Arc<StdMutex<HashSet<String>>>,
-    /// Preview labels currently owned by the top strip row. These are real
-    /// preview windows, but the strip owns their lifecycle while docked.
-    preview_docked_labels: Arc<StdMutex<HashSet<String>>>,
-    /// Horizontal scroll offset, in logical pixels, for the top dock row.
-    strip_row_scroll_logical: Arc<StdMutex<f64>>,
     /// Preview labels whose webviews have been told to dispose and whose native
     /// windows are waiting for the close grace/release gate.
     preview_closing: Arc<StdMutex<HashSet<String>>>,
@@ -175,9 +170,6 @@ struct SnippingState {
     /// Bumped whenever a new stack animation starts; in-flight tween threads
     /// compare their ticket and stop, so re-targeted reflows never fight.
     preview_animation_generation: Arc<AtomicU64>,
-    /// Separate size tween ticket so expanding a dragged-out dock item does
-    /// not cancel the row/column position reflow.
-    preview_resize_generation: Arc<AtomicU64>,
     preview_live_reflow_last_ms: Arc<AtomicU64>,
     /// Labels of hidden, fully booted preview windows parked for instant
     /// adoption by the next capture (webview creation + page boot paid ahead
@@ -203,12 +195,9 @@ impl SnippingState {
             preview_paths: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
             preview_detached_labels: Arc::new(StdMutex::new(HashSet::new())),
-            preview_docked_labels: Arc::new(StdMutex::new(HashSet::new())),
-            strip_row_scroll_logical: Arc::new(StdMutex::new(0.0)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
             preview_animation_generation: Arc::new(AtomicU64::new(0)),
-            preview_resize_generation: Arc::new(AtomicU64::new(0)),
             preview_live_reflow_last_ms: Arc::new(AtomicU64::new(0)),
             preview_pool: Arc::new(StdMutex::new(Vec::new())),
             preview_pool_spawning: Arc::new(AtomicBool::new(false)),
@@ -2446,7 +2435,6 @@ fn snipping_emit_untracked_image_saved_with_toast(
                 &preview_path,
                 None,
                 false,
-                false,
             );
         });
     }
@@ -4311,8 +4299,6 @@ const SNIPPING_FLOAT_GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
 // cropped) instead of sizing the window.
 const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 =
     SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
-const SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH * 0.5;
-const SNIPPING_DOCKED_FLOAT_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_HEIGHT * 0.5;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
 // Fallback settle deadline pushed forward by every Moved event. On platforms
@@ -4341,17 +4327,6 @@ const SNIPPING_FLOAT_DISPOSE_EVENT: &str = "forge-snip-float-dispose";
 // image src before the native WebKit window starts teardown.
 const SNIPPING_FLOAT_CLOSE_GRACE_MS: u64 = 45;
 const SNIPPING_FLOAT_CLOSE_RELEASE_WAIT_MS: u64 = 1200;
-
-fn snipping_preview_logical_size(docked: bool) -> (f64, f64) {
-    if docked {
-        (
-            SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH,
-            SNIPPING_DOCKED_FLOAT_LOGICAL_HEIGHT,
-        )
-    } else {
-        (SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT)
-    }
-}
 
 fn snipping_preview_closing_labels(app: &AppHandle) -> HashSet<String> {
     app.state::<SnippingState>()
@@ -4393,37 +4368,8 @@ fn snipping_preview_detached_labels(app: &AppHandle) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn snipping_preview_docked_labels(app: &AppHandle) -> HashSet<String> {
-    app.state::<SnippingState>()
-        .preview_docked_labels
-        .lock()
-        .map(|labels| labels.clone())
-        .unwrap_or_default()
-}
-
-fn snipping_preview_is_docked(app: &AppHandle, label: &str) -> bool {
-    app.state::<SnippingState>()
-        .preview_docked_labels
-        .lock()
-        .map(|labels| labels.contains(label))
-        .unwrap_or(false)
-}
-
-fn snipping_emit_preview_dock_state(app: &AppHandle, label: &str, docked: bool) {
-    let _ = app.emit_to(
-        label,
-        SNIPPING_FLOAT_DOCK_STATE_EVENT,
-        json!({
-            "kind": "snip_float_dock_state",
-            "label": label,
-            "docked": docked,
-        }),
-    );
-}
-
 fn snipping_path_has_visible_free_preview(app: &AppHandle, path_string: &str) -> bool {
     let closing = snipping_preview_closing_labels(app);
-    let docked = snipping_preview_docked_labels(app);
     app.state::<SnippingState>()
         .preview_paths
         .lock()
@@ -4431,33 +4377,12 @@ fn snipping_path_has_visible_free_preview(app: &AppHandle, path_string: &str) ->
             paths.iter().any(|(label, open_path)| {
                 open_path == path_string
                     && !closing.contains(label)
-                    && !docked.contains(label)
                     && app
                         .get_webview_window(label.as_str())
                         .is_some_and(|window| window.is_visible().unwrap_or(false))
             })
         })
         .unwrap_or(false)
-}
-
-fn snipping_mark_preview_docked(app: &AppHandle, label: &str, docked: bool) {
-    let state = app.state::<SnippingState>();
-    let mut changed = false;
-    if let Ok(mut docked_labels) = state.preview_docked_labels.lock() {
-        changed = if docked {
-            docked_labels.insert(label.to_string())
-        } else {
-            docked_labels.remove(label)
-        };
-    }
-    if docked {
-        if let Ok(mut detached) = state.preview_detached_labels.lock() {
-            detached.remove(label);
-        }
-    }
-    if changed {
-        snipping_emit_preview_dock_state(app, label, docked);
-    }
 }
 
 fn snipping_begin_preview_drag_session(
@@ -4492,9 +4417,6 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     if let Ok(mut detached) = state.preview_detached_labels.lock() {
         detached.remove(label);
     }
-    if let Ok(mut docked) = state.preview_docked_labels.lock() {
-        docked.remove(label);
-    }
     if let Ok(mut pool) = state.preview_pool.lock() {
         pool.retain(|pooled| pooled != label);
     };
@@ -4518,9 +4440,6 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     }
     if let Ok(mut detached) = state.preview_detached_labels.lock() {
         detached.remove(label);
-    }
-    if let Ok(mut docked) = state.preview_docked_labels.lock() {
-        docked.remove(label);
     }
     if let Ok(mut pool) = state.preview_pool.lock() {
         pool.retain(|pooled| pooled != label);
@@ -4546,9 +4465,6 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     }
     if let Ok(mut detached) = state.preview_detached_labels.lock() {
         detached.remove(label);
-    }
-    if let Ok(mut docked) = state.preview_docked_labels.lock() {
-        docked.remove(label);
     }
     if let Ok(mut pool) = state.preview_pool.lock() {
         if !pool.iter().any(|pooled| pooled == label) {
@@ -4694,16 +4610,8 @@ fn snipping_preview_stack_position(
             continue;
         };
         // Only stack against previews still parked in the left column; ones
-        // the user dragged away stop reserving a slot, and ones parked on the
-        // strip's horizontal row belong to that queue.
+        // the user dragged away stop reserving a slot.
         if !snipping_preview_in_stack_column(position.x, width_physical, x) {
-            continue;
-        }
-        let height = window
-            .outer_size()
-            .map(|size| size.height.max(1) as i32)
-            .unwrap_or(height_physical);
-        if snipping_preview_in_strip_row(app, position.y, height) {
             continue;
         }
         highest_top = Some(highest_top.map_or(position.y, |current| current.min(position.y)));
@@ -4737,59 +4645,33 @@ fn snipping_tween_eased(progress: f64, easing: SnippingTweenEasing) -> f64 {
     }
 }
 
-fn snipping_set_preview_logical_size(window: &tauri::WebviewWindow, docked: bool) {
-    let (width, height) = snipping_preview_logical_size(docked);
-    let _ = window.set_size(tauri::LogicalSize::new(width, height));
-}
-
-fn snipping_animate_preview_logical_size(
+fn snipping_animate_preview_logical_size_to_full(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
-    docked: bool,
+    from_width: f64,
+    from_height: f64,
     duration_ms: f64,
 ) {
-    let Ok(current_size) = window.inner_size() else {
-        snipping_set_preview_logical_size(window, docked);
-        return;
-    };
-    let scale = window.scale_factor().unwrap_or(1.0).max(0.1);
-    let from_width = current_size.width as f64 / scale;
-    let from_height = current_size.height as f64 / scale;
-    let (to_width, to_height) = snipping_preview_logical_size(docked);
-    if (from_width - to_width).abs() < 0.5 && (from_height - to_height).abs() < 0.5 {
-        snipping_set_preview_logical_size(window, docked);
-        return;
-    }
-
-    let duration_ms = duration_ms.max(1.0);
-    let generation = app.state::<SnippingState>().preview_resize_generation.clone();
-    let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = window.set_size(tauri::LogicalSize::new(from_width, from_height));
     let app = app.clone();
     let window = window.clone();
     let label = window.label().to_string();
+    let duration_ms = duration_ms.max(1.0);
     thread::spawn(move || {
         let started = Instant::now();
         loop {
-            if generation.load(Ordering::SeqCst) != ticket {
-                return;
-            }
             let progress = (started.elapsed().as_millis() as f64 / duration_ms).min(1.0);
             let eased = snipping_tween_eased(progress, SnippingTweenEasing::Track);
-            let width = from_width + (to_width - from_width) * eased;
-            let height = from_height + (to_height - from_height) * eased;
-            let frame_generation = generation.clone();
+            let width = from_width + (SNIPPING_FLOAT_LOGICAL_WIDTH - from_width) * eased;
+            let height = from_height + (SNIPPING_FLOAT_LOGICAL_HEIGHT - from_height) * eased;
             let app_for_frame = app.clone();
             let window_for_frame = window.clone();
             let label_for_frame = label.clone();
             let _ = app.run_on_main_thread(move || {
-                if frame_generation.load(Ordering::SeqCst) != ticket {
-                    return;
-                }
                 if app_for_frame
                     .get_webview_window(label_for_frame.as_str())
                     .is_none()
                     || snipping_preview_is_closing(&app_for_frame, &label_for_frame)
-                    || snipping_preview_is_dragging(&app_for_frame, &label_for_frame)
                 {
                     return;
                 }
@@ -4863,7 +4745,6 @@ fn snipping_animate_previews(
                     }
                     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
                 }
-                snipping_strip_update_docked_preview_visibility(&app_for_frame);
             });
             if progress >= 1.0 {
                 return;
@@ -4882,8 +4763,6 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         .get_webview_window("main")
         .and_then(|main_window| main_window.current_monitor().ok().flatten())
     else {
-        let moves = snipping_strip_row_reflow_moves(app);
-        snipping_animate_previews(app, moves, animate_ms, easing);
         return;
     };
     let work_area = monitor.work_area();
@@ -4897,10 +4776,9 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
 
     let dragging_labels = snipping_preview_dragging_labels(app);
     let detached_labels = snipping_preview_detached_labels(app);
-    let docked_labels = snipping_preview_docked_labels(app);
     let closing_labels = snipping_preview_closing_labels(app);
 
-    let mut docked: Vec<(
+    let mut previews: Vec<(
         tauri::PhysicalPosition<i32>,
         i32,
         tauri::WebviewWindow,
@@ -4914,9 +4792,6 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         if closing_labels.contains(&label) {
             continue;
         }
-        if docked_labels.contains(&label) {
-            continue;
-        }
         if !window.is_visible().unwrap_or(false) {
             continue;
         }
@@ -4927,16 +4802,12 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
             .outer_size()
             .map(|size| (size.width as i32, size.height as i32))
             .unwrap_or((width_physical, height_physical));
-        // Same queue-ownership test as snipping_preview_stack_position; the
-        // strip's horizontal row owns anything parked on the visible bar.
+        // Same queue-ownership test as snipping_preview_stack_position.
         if !snipping_preview_in_stack_column(position.x, width, x) {
             continue;
         }
-        if snipping_preview_in_strip_row(app, position.y, height.max(1)) {
-            continue;
-        }
         let height = height.max(1);
-        docked.push((
+        previews.push((
             position,
             height,
             window,
@@ -4946,11 +4817,11 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
     }
 
     // The lowest window keeps the bottom slot; on-screen order is preserved.
-    docked.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
+    previews.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
     // A held window is an obstacle at its REAL on-screen band, not at a
     // canonical packed slot. Detached windows use the same treatment after
     // release, preventing the old left-side auto-align from grabbing them.
-    let mut obstacle_bands: Vec<(i32, i32)> = docked
+    let mut obstacle_bands: Vec<(i32, i32)> = previews
         .iter()
         .filter(|(_, _, _, dragging, detached)| *dragging || *detached)
         .map(|(position, height, _, _, _)| (position.y, position.y + height))
@@ -4958,7 +4829,7 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
     obstacle_bands.sort_by(|a, b| b.1.cmp(&a.1));
     let mut bottom_edge = work_area.position.y + work_area.size.height as i32 - margin;
     let mut moves = Vec::new();
-    for (position, height, window, dragging, detached) in docked {
+    for (position, height, window, dragging, detached) in previews {
         if dragging || detached {
             // The OS drag owns a held window's position; a detached window is
             // user-positioned. Their bands above already block slots.
@@ -4980,9 +4851,6 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         }
         bottom_edge = y - gap;
     }
-    // One tween generation drives both queues: animating the column and the
-    // strip row separately would cancel each other's in-flight frames.
-    moves.extend(snipping_strip_row_reflow_moves(app));
     snipping_animate_previews(app, moves, animate_ms, easing);
 }
 
@@ -5156,51 +5024,30 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
         {
             continue;
         }
-        // A drop inside either queue band adopts the preview (the reflow then
-        // packs it); anywhere else detaches it at the user's position.
-        let (in_row, adopted_by_queue) = {
-            let (width, height) = window
+        // A drop inside the bottom-left queue column adopts the preview (the
+        // reflow then packs it); anywhere else detaches it at the user's
+        // position. The top strip is rendered in its own webview now, so native
+        // preview windows are never dock-owned.
+        let adopted_by_queue = {
+            let width = window
                 .outer_size()
-                .map(|size| (size.width.max(1) as i32, size.height.max(1) as i32))
-                .unwrap_or((1, 1));
-            let in_row = snipping_preview_in_strip_row(app, position.y, height);
-            let in_column = !in_row
-                && app
-                    .get_webview_window("main")
-                    .and_then(|main_window| main_window.current_monitor().ok().flatten())
-                    .map(|monitor| {
-                        let column_x = monitor.work_area().position.x
-                            + (SNIPPING_FLOAT_STACK_MARGIN * monitor.scale_factor().max(0.1))
-                                .round() as i32;
-                        snipping_preview_in_stack_column(position.x, width, column_x)
-                    })
-                    .unwrap_or(false);
-            (in_row, in_row || in_column)
+                .map(|size| size.width.max(1) as i32)
+                .unwrap_or(1);
+            app.get_webview_window("main")
+                .and_then(|main_window| main_window.current_monitor().ok().flatten())
+                .map(|monitor| {
+                    let column_x = monitor.work_area().position.x
+                        + (SNIPPING_FLOAT_STACK_MARGIN * monitor.scale_factor().max(0.1)).round()
+                            as i32;
+                    snipping_preview_in_stack_column(position.x, width, column_x)
+                })
+                .unwrap_or(false)
         };
         if let Ok(mut detached) = state.preview_detached_labels.lock() {
             if adopted_by_queue {
                 detached.remove(&label);
             } else {
                 detached.insert(label.clone());
-            }
-        }
-        let was_docked = snipping_preview_is_docked(app, &label);
-        let next_docked = adopted_by_queue && in_row;
-        snipping_mark_preview_docked(app, &label, next_docked);
-        if let Some(window) = app.get_webview_window(&label) {
-            #[cfg(target_os = "macos")]
-            snipping_preview_set_strip_docked_level(&window, next_docked);
-            if next_docked {
-                snipping_set_preview_logical_size(&window, true);
-            } else if was_docked {
-                snipping_animate_preview_logical_size(
-                    app,
-                    &window,
-                    false,
-                    SNIPPING_FLOAT_ANIMATE_MS * 0.62,
-                );
-            } else {
-                snipping_set_preview_logical_size(&window, false);
             }
         }
         let Some((client_x, client_y)) = snipping_preview_point_in_main(app, &window) else {
@@ -5268,7 +5115,6 @@ fn snipping_emit_preview_drag_over(app: &AppHandle, label: &str) {
 }
 
 const SNIPPING_FLOAT_ASSIGN_EVENT: &str = "forge-snip-float-assign";
-const SNIPPING_FLOAT_DOCK_STATE_EVENT: &str = "forge-snip-float-dock-state";
 // Fired whenever the set of open floating previews changes (open, close,
 // destroy), so any quick-access UI watching preview state can refresh.
 const SNIPPING_FLOATS_CHANGED_EVENT: &str = "forge-snip-floats-changed";
@@ -5347,50 +5193,6 @@ fn snipping_preview_order_front_regardless(window: &tauri::WebviewWindow) {
             ns_window.orderFrontRegardless();
         });
     });
-}
-
-#[cfg(target_os = "macos")]
-fn snipping_preview_set_strip_docked_level(window: &tauri::WebviewWindow, docked: bool) {
-    let window_for_main = window.clone();
-    let _ = window.run_on_main_thread(move || {
-        snipping_catch_objc("preview_set_strip_docked_level", || {
-            let Ok(ns_window) = window_for_main.ns_window() else {
-                return;
-            };
-            if ns_window.is_null() {
-                return;
-            }
-            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setLevel(if docked {
-                objc2_app_kit::NSScreenSaverWindowLevel + 1
-            } else {
-                objc2_app_kit::NSScreenSaverWindowLevel
-            });
-        });
-    });
-}
-
-fn snipping_strip_reassert_docked_previews(app: &AppHandle) {
-    let docked_labels = snipping_preview_docked_labels(app);
-    if docked_labels.is_empty() {
-        return;
-    }
-    let dragging_labels = snipping_preview_dragging_labels(app);
-    for label in docked_labels {
-        if dragging_labels.contains(&label) || snipping_preview_is_closing(app, &label) {
-            continue;
-        }
-        let Some(window) = app.get_webview_window(&label) else {
-            continue;
-        };
-        snipping_set_preview_logical_size(&window, true);
-        #[cfg(target_os = "macos")]
-        {
-            snipping_preview_apply_macos_space_style(&window);
-            snipping_preview_set_strip_docked_level(&window, true);
-        }
-    }
-    snipping_strip_update_docked_preview_visibility(app);
 }
 
 fn snipping_build_preview_window(
@@ -5551,20 +5353,6 @@ fn snipping_float_assigned_path(
         "kind": "snip_float_assigned_path",
         "label": label,
         "path": path,
-        "docked": snipping_preview_is_docked(&app, &label),
-    }))
-}
-
-#[tauri::command]
-fn snipping_float_dock_state(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-) -> Result<Value, String> {
-    let label = window.label().to_string();
-    Ok(json!({
-        "kind": "snip_float_dock_state",
-        "label": label,
-        "docked": snipping_preview_is_docked(&app, &label),
     }))
 }
 
@@ -5578,10 +5366,10 @@ fn snipping_open_snip_preview_window_for(
     path: &str,
     explicit_position: Option<(f64, f64)>,
     focused: bool,
-    docked_open: bool,
 ) -> Result<Value, String> {
     let file = diffforge_local_asset_file(path)?;
-    let (width, height) = snipping_preview_logical_size(docked_open);
+    let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
+    let height = SNIPPING_FLOAT_LOGICAL_HEIGHT;
     let path_string = file.display().to_string();
     let label = format!(
         "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
@@ -5608,8 +5396,7 @@ fn snipping_open_snip_preview_window_for(
     if let Some(existing_label) = existing_label {
         if let Some(existing) = app.get_webview_window(&existing_label) {
             let was_visible = existing.is_visible().unwrap_or(false);
-            snipping_mark_preview_docked(app, &existing_label, docked_open);
-            snipping_set_preview_logical_size(&existing, docked_open);
+            let _ = existing.set_size(tauri::LogicalSize::new(width, height));
             if explicit_position.is_some() || !was_visible {
                 snipping_position_preview_window(app, &existing, explicit_position);
             }
@@ -5638,8 +5425,7 @@ fn snipping_open_snip_preview_window_for(
     // running, so the preview appears the moment the capture file lands.
     if let Some(window) = snipping_take_pooled_preview_window(app) {
         let pooled_label = window.label().to_string();
-        snipping_mark_preview_docked(app, &pooled_label, docked_open);
-        snipping_set_preview_logical_size(&window, docked_open);
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
         snipping_position_preview_window(app, &window, explicit_position);
         if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
             paths.insert(pooled_label.clone(), path_string.clone());
@@ -5651,7 +5437,6 @@ fn snipping_open_snip_preview_window_for(
                 "kind": "snip_float_assign",
                 "label": pooled_label,
                 "path": path_string,
-                "docked": docked_open,
             }),
         );
         #[cfg(target_os = "macos")]
@@ -5677,8 +5462,7 @@ fn snipping_open_snip_preview_window_for(
 
     let encoded_path = snipping_url_token(&path_string);
     let window = snipping_build_preview_window(app, &label, &encoded_path, focused)?;
-    snipping_mark_preview_docked(app, &label, docked_open);
-    snipping_set_preview_logical_size(&window, docked_open);
+    let _ = window.set_size(tauri::LogicalSize::new(width, height));
     snipping_position_preview_window(app, &window, explicit_position);
     if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
         paths.insert(label.clone(), path_string.clone());
@@ -5778,9 +5562,7 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
 
 const SNIPPING_STRIP_WINDOW_LABEL: &str = "snipping-strip";
 const SNIPPING_STRIP_ANIM_EVENT: &str = "forge-snip-strip-anim";
-const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 =
-    SNIPPING_DOCKED_FLOAT_LOGICAL_HEIGHT + SNIPPING_FLOAT_STACK_MARGIN * 2.0;
-const SNIPPING_STRIP_CONTROL_LOGICAL_WIDTH: f64 = 56.0;
+const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 88.0;
 // Pre-show placeholder only: every show resizes the bar to the full logical
 // width of the monitor under the cursor.
 const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
@@ -5791,8 +5573,8 @@ const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
 
 /// Newest-first listing of saved snip files. The on-disk `snips` directory is
 /// the durable history (the in-memory toast list only ever holds six). The strip
-/// excludes visible free previews so opening the dock never steals what is
-/// already on screen; hidden/docked previews are still eligible and get reused.
+/// can exclude visible previews so opening the dock never duplicates what is
+/// already on screen.
 fn snipping_recent_snip_items(
     app: &AppHandle,
     limit: usize,
@@ -5854,13 +5636,21 @@ fn snipping_recent_snip_items(
 }
 
 #[tauri::command]
-fn snipping_recent_snips(app: AppHandle, limit: Option<usize>) -> Result<Value, String> {
+fn snipping_recent_snips(
+    app: AppHandle,
+    limit: Option<usize>,
+    exclude_visible_free_previews: Option<bool>,
+) -> Result<Value, String> {
     let limit = limit
         .unwrap_or(SNIPPING_STRIP_RECENT_LIMIT)
         .clamp(1, SNIPPING_STRIP_RECENT_LIMIT);
     Ok(json!({
         "kind": "snipping_recent_snips",
-        "items": snipping_recent_snip_items(&app, limit, false)?,
+        "items": snipping_recent_snip_items(
+            &app,
+            limit,
+            exclude_visible_free_previews.unwrap_or(false),
+        )?,
     }))
 }
 
@@ -6052,11 +5842,6 @@ fn snipping_strip_reassert_open_state(
     if emit_anim {
         snipping_strip_emit_anim(app, "open", Some(origin));
     }
-    // The immediate show path can race the first native size/position commit
-    // for a newly created strip window. Repopulating during the settle pass
-    // parks the preview windows against the real strip geometry.
-    snipping_strip_populate_row(app);
-    snipping_strip_reassert_docked_previews(app);
     true
 }
 
@@ -6084,15 +5869,10 @@ fn snipping_strip_hide_animated(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(SNIPPING_STRIP_CLOSE_ANIM_MS)).await;
-        let app_for_close = app.clone();
         let _ = app.run_on_main_thread(move || {
             if only_if_unfocused && window.is_focused().unwrap_or(false) {
                 return;
             }
-            // Explicit strip dismissal keeps dock-owned previews docked but
-            // hidden. Only a drag-out or pin action changes them to free
-            // on-screen previews.
-            snipping_strip_hide_docked_previews(&app_for_close);
             snipping_hide_window_now(&window, "strip_hide_animated");
         });
     });
@@ -6119,8 +5899,6 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     snipping_focus_window_now(&window, "strip_focus");
     snipping_strip_emit_anim(app, "open", Some(origin));
     snipping_strip_emit_open_reassert(app, origin);
-    // The bar's tiles are real preview windows parked on a horizontal queue.
-    snipping_strip_populate_row(app);
 }
 
 /// Tray-click toggle for the recent-snips bar. The strip is persistent now:
@@ -6142,44 +5920,6 @@ fn snipping_toggle_snip_strip(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct SnippingStripScrollRequest {
-    #[serde(default)]
-    delta_x: f64,
-    #[serde(default)]
-    delta_y: f64,
-}
-
-#[tauri::command]
-fn snipping_scroll_snip_strip(
-    app: AppHandle,
-    request: SnippingStripScrollRequest,
-) -> Result<Value, String> {
-    let delta = if request.delta_x.abs() >= request.delta_y.abs() {
-        request.delta_x
-    } else {
-        request.delta_y
-    };
-    let max_scroll = snipping_strip_row_max_scroll_logical(&app);
-    let offset = {
-        let state = app.state::<SnippingState>();
-        let mut offset = state
-            .strip_row_scroll_logical
-            .lock()
-            .map_err(|_| "Unable to lock snip strip scroll offset.".to_string())?;
-        *offset = (*offset + delta).clamp(0.0, max_scroll);
-        *offset
-    };
-    snipping_reflow_preview_stack(&app, 120.0, SnippingTweenEasing::Track);
-    snipping_strip_update_docked_preview_visibility(&app);
-    Ok(json!({
-        "kind": "snipping_strip_scroll",
-        "offset": offset,
-        "max": max_scroll,
-    }))
-}
-
 #[tauri::command]
 fn snipping_open_snip_float(
     app: AppHandle,
@@ -6194,55 +5934,41 @@ fn snipping_open_snip_float(
     };
     // `focused: false` keeps quick-access opens from stealing focus away from
     // the strip/background workflow.
-    snipping_open_snip_preview_window_for(
-        &app,
-        &path,
-        explicit_position,
-        focused.unwrap_or(true),
-        false,
-    )
+    snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))
 }
 
 #[tauri::command]
-fn snipping_pin_snip_float(app: AppHandle, label: String) -> Result<Value, String> {
-    let label = label.trim().to_string();
-    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
-        return Err("Not a snip preview window.".to_string());
-    }
-    if snipping_preview_is_closing(&app, &label) {
-        return Err("Snip preview window is closing.".to_string());
-    }
-    let Some(window) = app.get_webview_window(&label) else {
-        snipping_mark_preview_docked(&app, &label, false);
-        return Err("Snip preview window is not open.".to_string());
-    };
-
-    snipping_mark_preview_docked(&app, &label, false);
-    if let Ok(mut detached) = app
-        .state::<SnippingState>()
-        .preview_detached_labels
-        .lock()
-    {
-        detached.remove(&label);
-    }
-    snipping_position_preview_window(&app, &window, None);
-    snipping_animate_preview_logical_size(
+fn snipping_open_snip_float_for_drag(
+    app: AppHandle,
+    path: String,
+    x: f64,
+    y: f64,
+) -> Result<Value, String> {
+    let opened = snipping_open_snip_preview_window_for(&app, &path, Some((x, y)), false)?;
+    let label = opened
+        .get("label")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Snip preview opened without a window label.".to_string())?
+        .to_string();
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| "Snip preview window is not open.".to_string())?;
+    snipping_animate_preview_logical_size_to_full(
         &app,
         &window,
-        false,
-        SNIPPING_FLOAT_ANIMATE_MS * 0.62,
+        SNIPPING_FLOAT_LOGICAL_WIDTH * 0.5,
+        SNIPPING_FLOAT_LOGICAL_HEIGHT * 0.5,
+        SNIPPING_FLOAT_ANIMATE_MS * 0.5,
     );
-    #[cfg(target_os = "macos")]
-    {
-        snipping_preview_set_strip_docked_level(&window, false);
-        snipping_preview_order_front_regardless(&window);
-    }
-    snipping_show_window_now(&window, "pin_snip_float_show");
-    snipping_start_float_hover_watcher(&app);
-    snipping_reflow_preview_stack(&app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
-    snipping_emit_floats_changed(&app);
-
-    Ok(json!({ "ok": true, "label": label, "docked": false }))
+    let position = window
+        .outer_position()
+        .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
+    snipping_begin_preview_drag_session(&app, &label, position);
+    schedule_snipping_preview_stack_reflow(&app);
+    let drag_started = window.start_dragging().is_ok();
+    let mut opened = opened;
+    opened["dragStarted"] = json!(drag_started);
+    Ok(opened)
 }
 
 /// Every preview window label currently showing this snip. The path registry is
@@ -6270,7 +5996,6 @@ fn snipping_snip_float_open(app: AppHandle, path: String) -> Result<Value, Strin
         .iter()
         .any(|label| {
             !snipping_preview_is_closing(&app, label)
-                && !snipping_preview_is_docked(&app, label)
                 && app
                     .get_webview_window(label)
                     .is_some_and(|window| window.is_visible().unwrap_or(false))
@@ -6293,9 +6018,6 @@ fn snipping_close_snip_float(app: AppHandle, label: String) -> Result<Value, Str
 fn snipping_close_snip_float_for_path(app: AppHandle, path: String) -> Result<Value, String> {
     let mut closed = false;
     for label in snipping_float_labels_for_path(&app, &path)? {
-        if snipping_preview_is_docked(&app, &label) {
-            continue;
-        }
         if app
             .get_webview_window(&label)
             .is_some_and(|window| window.is_visible().unwrap_or(false))
@@ -6368,331 +6090,6 @@ fn snipping_handle_untracked_asset_deleted(app: &AppHandle, deleted_path: &str) 
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct SnippingStripRowBand {
-    band_top: i32,
-    band_bottom: i32,
-    row_left_x: i32,
-    row_width: i32,
-    gap: i32,
-    scale: f64,
-}
-
-/// Geometry of the strip's horizontal queue while the bar is visible. None
-/// while the bar is hidden — the row then owns nothing and the bottom-left
-/// column is the only queue.
-fn snipping_strip_row_band(app: &AppHandle) -> Option<SnippingStripRowBand> {
-    let strip = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)?;
-    if !strip.is_visible().unwrap_or(false) {
-        return None;
-    }
-    let position = strip.outer_position().ok()?;
-    let size = strip.outer_size().ok()?;
-    let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
-    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
-    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
-    let control_width = (SNIPPING_STRIP_CONTROL_LOGICAL_WIDTH * scale).round() as i32;
-    Some(SnippingStripRowBand {
-        band_top: position.y,
-        band_bottom: position.y + size.height as i32,
-        row_left_x: position.x + margin,
-        row_width: (size.width as i32 - margin * 2 - control_width).max(0),
-        gap,
-        scale,
-    })
-}
-
-/// Vertical ownership for the strip's horizontal queue: a preview whose
-/// center sits inside the visible bar belongs to the row, never to the
-/// bottom-left column (the first row slot shares the column's x).
-fn snipping_preview_in_strip_row(app: &AppHandle, position_y: i32, height: i32) -> bool {
-    let Some(band) = snipping_strip_row_band(app) else {
-        return false;
-    };
-    let center = position_y + height.max(1) / 2;
-    center >= band.band_top && center < band.band_bottom
-}
-
-fn snipping_strip_row_scroll_offset_logical(app: &AppHandle) -> f64 {
-    app.state::<SnippingState>()
-        .strip_row_scroll_logical
-        .lock()
-        .map(|offset| (*offset).max(0.0))
-        .unwrap_or(0.0)
-}
-
-fn snipping_strip_row_docked_count(app: &AppHandle) -> usize {
-    let Some(band) = snipping_strip_row_band(app) else {
-        return 0;
-    };
-    let closing_labels = snipping_preview_closing_labels(app);
-    snipping_preview_docked_labels(app)
-        .into_iter()
-        .filter(|label| {
-            if closing_labels.contains(label) {
-                return false;
-            }
-            let Some(window) = app.get_webview_window(label.as_str()) else {
-                return false;
-            };
-            let Ok(position) = window.outer_position() else {
-                return false;
-            };
-            let height = window
-                .outer_size()
-                .map(|size| size.height.max(1) as i32)
-                .unwrap_or_else(|_| (SNIPPING_DOCKED_FLOAT_LOGICAL_HEIGHT * band.scale) as i32);
-            let center = position.y + height / 2;
-            center >= band.band_top && center < band.band_bottom
-        })
-        .count()
-}
-
-fn snipping_strip_row_max_scroll_logical(app: &AppHandle) -> f64 {
-    let Some(band) = snipping_strip_row_band(app) else {
-        return 0.0;
-    };
-    let count = snipping_strip_row_docked_count(app);
-    if count <= 1 {
-        return 0.0;
-    }
-    let content_width = count as f64 * SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH
-        + count.saturating_sub(1) as f64 * SNIPPING_FLOAT_STACK_GAP;
-    let viewport_width = band.row_width as f64 / band.scale;
-    (content_width - viewport_width).max(0.0)
-}
-
-fn snipping_clamp_strip_row_scroll(app: &AppHandle) -> f64 {
-    let max_scroll = snipping_strip_row_max_scroll_logical(app);
-    let state = app.state::<SnippingState>();
-    let Ok(mut offset) = state.strip_row_scroll_logical.lock() else {
-        return 0.0;
-    };
-    *offset = (*offset).clamp(0.0, max_scroll);
-    *offset
-}
-
-fn snipping_strip_update_docked_preview_visibility(app: &AppHandle) {
-    let Some(band) = snipping_strip_row_band(app) else {
-        return;
-    };
-    let viewport_left = band.row_left_x;
-    let viewport_right = band.row_left_x + band.row_width;
-    let dragging_labels = snipping_preview_dragging_labels(app);
-    let docked_labels = snipping_preview_docked_labels(app);
-    let closing_labels = snipping_preview_closing_labels(app);
-    for label in docked_labels {
-        if dragging_labels.contains(&label) || closing_labels.contains(&label) {
-            continue;
-        }
-        let Some(window) = app.get_webview_window(&label) else {
-            continue;
-        };
-        let Ok(position) = window.outer_position() else {
-            continue;
-        };
-        let Ok(size) = window.outer_size() else {
-            continue;
-        };
-        let center_y = position.y + size.height.max(1) as i32 / 2;
-        let fully_inside_viewport = center_y >= band.band_top
-            && center_y < band.band_bottom
-            && position.x >= viewport_left
-            && position.x + size.width as i32 <= viewport_right;
-        if fully_inside_viewport {
-            snipping_set_preview_logical_size(&window, true);
-            if !window.is_visible().unwrap_or(false) {
-                snipping_show_window_now(&window, "strip_show_visible_docked_preview");
-            }
-            #[cfg(target_os = "macos")]
-            {
-                snipping_preview_set_strip_docked_level(&window, true);
-                snipping_preview_order_front_regardless(&window);
-            }
-        } else if window.is_visible().unwrap_or(false) {
-            snipping_hide_window_now(&window, "strip_hide_scrolled_docked_preview");
-        }
-    }
-}
-
-/// Pending moves that re-pack every preview parked on the visible bar into a
-/// tight left-to-right row — the horizontal twin of the bottom-left column.
-/// Held and detached windows are obstacles at their real bands, exactly like
-/// the column, so the row parts around a drag and collapses behind it.
-fn snipping_strip_row_reflow_moves(
-    app: &AppHandle,
-) -> Vec<(
-    tauri::WebviewWindow,
-    tauri::PhysicalPosition<i32>,
-    tauri::PhysicalPosition<i32>,
-)> {
-    let Some(band) = snipping_strip_row_band(app) else {
-        return Vec::new();
-    };
-    let row_scroll = snipping_clamp_strip_row_scroll(app);
-    let scroll_physical = (row_scroll * band.scale).round() as i32;
-    let docked_width = (SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH * band.scale).round() as i32;
-    let docked_height = (SNIPPING_DOCKED_FLOAT_LOGICAL_HEIGHT * band.scale).round() as i32;
-    let dragging_labels = snipping_preview_dragging_labels(app);
-    let detached_labels = snipping_preview_detached_labels(app);
-    let docked_labels = snipping_preview_docked_labels(app);
-    let closing_labels = snipping_preview_closing_labels(app);
-
-    let mut docked: Vec<(
-        tauri::PhysicalPosition<i32>,
-        i32,
-        i32,
-        tauri::WebviewWindow,
-        bool,
-    )> = Vec::new();
-    for (label, window) in app.webview_windows() {
-        if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) || closing_labels.contains(&label) {
-            continue;
-        }
-        let is_docked = docked_labels.contains(&label);
-        let dragging = dragging_labels.contains(&label);
-        if !is_docked && !dragging {
-            continue;
-        }
-        if !is_docked && !window.is_visible().unwrap_or(false) {
-            continue;
-        }
-        let Ok(position) = window.outer_position() else {
-            continue;
-        };
-        let (width, height) = if is_docked && !dragging {
-            (docked_width.max(1), docked_height.max(1))
-        } else {
-            window
-                .outer_size()
-                .map(|size| (size.width.max(1) as i32, size.height.max(1) as i32))
-                .unwrap_or((docked_width.max(1), docked_height.max(1)))
-        };
-        let center = position.y + height / 2;
-        if center < band.band_top || center >= band.band_bottom {
-            continue;
-        }
-        let held = dragging || detached_labels.contains(&label);
-        docked.push((position, width, height, window, held));
-    }
-
-    // The left-most window keeps the first slot; on-screen order is preserved.
-    docked.sort_by(|a, b| a.0.x.cmp(&b.0.x));
-    let mut obstacle_bands: Vec<(i32, i32)> = docked
-        .iter()
-        .filter(|(_, _, _, _, held)| *held)
-        .map(|(position, width, _, _, _)| (position.x, position.x + width))
-        .collect();
-    obstacle_bands.sort_by(|a, b| a.0.cmp(&b.0));
-    let band_center = band.band_top + (band.band_bottom - band.band_top) / 2;
-    let mut left_edge = band.row_left_x - scroll_physical;
-    let mut moves = Vec::new();
-    for (position, width, height, window, held) in docked {
-        if held {
-            continue;
-        }
-        let mut x = left_edge;
-        for (obstacle_left, obstacle_right) in &obstacle_bands {
-            let intersects =
-                x < obstacle_right + band.gap && x + width > obstacle_left - band.gap;
-            if intersects {
-                x = obstacle_right + band.gap;
-            }
-        }
-        let y = band_center - height / 2;
-        if position.x != x || position.y != y {
-            moves.push((window, position, tauri::PhysicalPosition::new(x, y)));
-        }
-        left_edge = x + width + band.gap;
-    }
-    moves
-}
-
-/// Fills the freshly shown bar with real preview float windows for the most
-/// recent snips: the strip's tiles ARE snip previews now — same window, same
-/// actions, same drag — so the open bar is a horizontal queue unified with
-/// the bottom-left column. The row docks the recent limit and scrolls them
-/// horizontally; if a snip already has a preview, that same object is moved
-/// into dock mode.
-fn snipping_strip_populate_row(app: &AppHandle) {
-    let Some(strip) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
-        return;
-    };
-    let (Ok(position), Ok(size)) = (strip.outer_position(), strip.outer_size()) else {
-        return;
-    };
-    let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
-    let usable = (size.width as f64 / scale
-        - SNIPPING_FLOAT_STACK_MARGIN * 2.0
-        - SNIPPING_STRIP_CONTROL_LOGICAL_WIDTH)
-        .max(0.0);
-    if usable < SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH {
-        return;
-    }
-    let per_tile = SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH + SNIPPING_FLOAT_STACK_GAP;
-    let items = snipping_recent_snip_items(app, SNIPPING_STRIP_RECENT_LIMIT, true)
-        .unwrap_or_default();
-    if items.is_empty() {
-        return;
-    }
-    let viewport_left = position.x as f64 / scale + SNIPPING_FLOAT_STACK_MARGIN;
-    let viewport_right = viewport_left + usable;
-    let origin_x = viewport_left - snipping_strip_row_scroll_offset_logical(app);
-    let origin_y = position.y as f64 / scale
-        + (size.height as f64 / scale - SNIPPING_DOCKED_FLOAT_LOGICAL_HEIGHT).max(0.0) / 2.0;
-    let mut docked_index = 0usize;
-    for item in items.iter() {
-        let Some(path) = item.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        if snipping_path_has_visible_free_preview(app, path) {
-            continue;
-        }
-        let x = origin_x + docked_index as f64 * per_tile;
-        if let Ok(opened) =
-            snipping_open_snip_preview_window_for(app, path, Some((x, origin_y)), false, true)
-        {
-            if let Some(label) = opened.get("label").and_then(Value::as_str) {
-                snipping_mark_preview_docked(app, label, true);
-                if let Some(window) = app.get_webview_window(label) {
-                    snipping_set_preview_logical_size(&window, true);
-                    if x >= viewport_left && x + SNIPPING_DOCKED_FLOAT_LOGICAL_WIDTH <= viewport_right {
-                        #[cfg(target_os = "macos")]
-                        {
-                            snipping_preview_set_strip_docked_level(&window, true);
-                            snipping_preview_order_front_regardless(&window);
-                        }
-                    } else {
-                        snipping_hide_window_now(&window, "strip_hide_initial_scrolled_preview");
-                    }
-                }
-                docked_index += 1;
-            }
-        }
-    }
-    snipping_clamp_strip_row_scroll(app);
-    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
-    snipping_strip_reassert_docked_previews(app);
-}
-
-/// Hides every docked preview when the strip is explicitly toggled off. Docked
-/// previews stay registered and docked, so the next strip open reuses the same
-/// objects instead of pinning them or recreating duplicates.
-fn snipping_strip_hide_docked_previews(app: &AppHandle) {
-    let dragging_labels = snipping_preview_dragging_labels(app);
-    let docked_labels = snipping_preview_docked_labels(app);
-    for label in docked_labels {
-        if dragging_labels.contains(&label) || snipping_preview_is_closing(app, &label) {
-            continue;
-        }
-        let Some(window) = app.get_webview_window(&label) else {
-            continue;
-        };
-        snipping_hide_window_now(&window, "strip_hide_docked_preview");
-    }
-    snipping_emit_floats_changed(app);
 }
 
 /// Called by a preview window's webview right before it starts the native

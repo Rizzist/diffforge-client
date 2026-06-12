@@ -86,6 +86,7 @@ import {
 } from "../notifications/notificationSfx";
 import { sendNativeNotification } from "../notifications/nativeNotifications";
 import {
+  collectWorkspaceNotificationAttentionPanes,
   formatWorkspaceNotificationBadgeCount,
   getWorkspaceNotificationSummaries,
   markWorkspaceNotificationsSeen,
@@ -6305,6 +6306,10 @@ export default function App() {
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
+  // workspaceId -> { id, panes: [{ paneId, terminalIndex, count, title, kind }] }
+  // captured at the switch-back moment so the terminal grid can show WHICH
+  // terminals produced the badge/SFX that pulled the user back.
+  const [workspaceTerminalNotificationAttention, setWorkspaceTerminalNotificationAttention] = useState({});
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
@@ -6325,6 +6330,7 @@ export default function App() {
   const [authInitialized, setAuthInitialized] = useState(false);
   const [isLaunchScreenVisible, setLaunchScreenVisible] = useState(true);
   const [workspaceState, setWorkspaceState] = useState("idle");
+  const [hasEnteredWorkspaceShell, setHasEnteredWorkspaceShell] = useState(false);
   const [workspaceAgentLaunchEpoch, setWorkspaceAgentLaunchEpoch] = useState(0);
   const [preparedTerminalVersion, setPreparedTerminalVersion] = useState(0);
   const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
@@ -6409,6 +6415,8 @@ export default function App() {
   const workspaceThreadsRef = useRef(workspaceThreads);
   const workspaceNotificationCueIdsRef = useRef(new Set());
   const workspaceNotificationHighlightTimersRef = useRef(new Map());
+  const workspaceNotificationsStateRef = useRef(null);
+  const workspaceTerminalNotificationAttentionTimersRef = useRef(new Map());
   const workspaceNotificationSfxRef = useRef(null);
   const workspaceNotificationSnapshotKeyRef = useRef("");
   const workspaceThreadsHydratedKeyRef = useRef("");
@@ -8408,6 +8416,7 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    workspaceNotificationsStateRef.current = workspaceNotifications;
     persistWorkspaceNotifications(workspaceNotifications);
   }, [workspaceNotifications]);
 
@@ -8478,6 +8487,10 @@ export default function App() {
       window.clearTimeout(timer);
     });
     workspaceNotificationHighlightTimersRef.current.clear();
+    workspaceTerminalNotificationAttentionTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    workspaceTerminalNotificationAttentionTimersRef.current.clear();
   }, []);
 
   useEffect(() => {
@@ -8512,6 +8525,39 @@ export default function App() {
       || !mainWindowFocused
     ) {
       return;
+    }
+
+    // Capture which terminals produced the unread notifications BEFORE the
+    // mark-seen below wipes the unread flags; the workspace's terminal grid
+    // renders this as a per-pane attention flash so the badge count has a
+    // visible source when the user switches back.
+    const attentionPanes = collectWorkspaceNotificationAttentionPanes(
+      workspaceNotificationsStateRef.current,
+      selectedWorkspaceId,
+    );
+    if (attentionPanes.length) {
+      const attentionWorkspaceId = selectedWorkspaceId;
+      const attentionId = Date.now();
+      setWorkspaceTerminalNotificationAttention((current) => ({
+        ...current,
+        [attentionWorkspaceId]: { id: attentionId, panes: attentionPanes },
+      }));
+      const existingTimer = workspaceTerminalNotificationAttentionTimersRef.current.get(attentionWorkspaceId);
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+      }
+      const timer = window.setTimeout(() => {
+        workspaceTerminalNotificationAttentionTimersRef.current.delete(attentionWorkspaceId);
+        setWorkspaceTerminalNotificationAttention((current) => {
+          if (current[attentionWorkspaceId]?.id !== attentionId) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[attentionWorkspaceId];
+          return next;
+        });
+      }, 9000);
+      workspaceTerminalNotificationAttentionTimersRef.current.set(attentionWorkspaceId, timer);
     }
 
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
@@ -13802,6 +13848,17 @@ export default function App() {
     workspaceListHydrated,
     workspaceState,
   ]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      setHasEnteredWorkspaceShell(false);
+      return;
+    }
+
+    if (workspaceState === "ready" && isPaidUser(user)) {
+      setHasEnteredWorkspaceShell(true);
+    }
+  }, [authState, user, workspaceState]);
 
   useEffect(() => {
     if (
@@ -21554,6 +21611,16 @@ export default function App() {
     );
     const lifecycleEventTerminal = {
       ...(lifecycleLiveTerminalForGroundTruth || {}),
+      activityStatus: lifecycleEvent.activityStatus
+        || lifecycleEvent.activity_status
+        || lifecycleLiveTerminalForGroundTruth?.activityStatus
+        || lifecycleLiveTerminalForGroundTruth?.activity_status
+        || "",
+      activity_status: lifecycleEvent.activityStatus
+        || lifecycleEvent.activity_status
+        || lifecycleLiveTerminalForGroundTruth?.activity_status
+        || lifecycleLiveTerminalForGroundTruth?.activityStatus
+        || "",
       inputReady: lifecycleEvent.inputReady === true
         ? true
         : lifecycleEvent.inputReady === false
@@ -21684,18 +21751,121 @@ export default function App() {
         || lifecycleEvent.type === "terminal-input-ready"
     );
     if (lifecycleReadinessEvent) {
-      logTerminalStatus("frontend.terminal_cli.readiness_lifecycle_disabled", {
+      const latestTurnState = String(
+        lifecycleThreadForGroundTruth?.latestTurn?.state
+          || lifecycleThreadForGroundTruth?.latestTurn?.status
+          || "",
+      ).trim().toLowerCase();
+      const threadActivityStatus = String(lifecycleThreadForGroundTruth?.activityStatus || "")
+        .trim()
+        .toLowerCase();
+      const providerActivityStatus = String(
+        lifecycleProviderBindingForGroundTruth?.activityStatus
+          || lifecycleProviderBindingForGroundTruth?.activity_status
+          || "",
+      ).trim().toLowerCase();
+      const readinessEventStatus = String(lifecycleEvent.status || "")
+        .trim()
+        .toLowerCase();
+      const readinessBlocked = Boolean(
+        !lifecycleUsesActivityHooks
+          || !lifecycleThreadId
+          || !lifecycleWorkspaceId
+          || lifecycleGroundTruth.hasPendingPrompt
+          || lifecycleThreadForGroundTruth?.pendingPrompt
+          || lifecycleGroundTruth.terminalIsParked
+          || lifecycleGroundTruth.terminalIsPromptingUser
+          || terminalActivityStatusIsPaused(lifecycleEvent.activityStatus)
+          || ["closed", "closing", "exited", "offline", "stopped"].includes(readinessEventStatus)
+      );
+      const readinessThreadLooksBusy = Boolean(
+        latestTurnState === "running"
+          || terminalActivityStatusIsBusy(threadActivityStatus)
+          || terminalActivityStatusIsBusy(providerActivityStatus)
+          || terminalActivityStatusIsBusy(lifecycleGroundTruth.activityStatus)
+      );
+      const readinessInputReady = lifecycleEvent.inputReady === true
+        || lifecycleEvent.type === "terminal-prompt-ready"
+        || lifecycleEvent.type === "terminal-input-ready";
+      if (readinessBlocked || !readinessThreadLooksBusy || !readinessInputReady) {
+        logTerminalStatus("frontend.terminal_cli.readiness_lifecycle_ignored", {
+          agentId: lifecycleAgentId,
+          hasPendingPrompt: Boolean(lifecycleGroundTruth.hasPendingPrompt || lifecycleThreadForGroundTruth?.pendingPrompt),
+          inputReadyAt: lifecycleEvent.inputReadyAt || "",
+          latestTurnState,
+          paneId: lifecycleEvent.paneId || "",
+          reason: readinessBlocked
+            ? "readiness_blocked"
+            : !readinessThreadLooksBusy
+              ? "thread_not_busy"
+              : "input_not_ready",
+          source: lifecycleEvent.source || "",
+          terminalIndex: lifecycleEvent.terminalIndex ?? "",
+          terminalIsParked: Boolean(lifecycleGroundTruth.terminalIsParked),
+          terminalIsPromptingUser: Boolean(lifecycleGroundTruth.terminalIsPromptingUser),
+          threadActivityStatus,
+          threadId: lifecycleThreadId,
+          type: lifecycleEvent.type || "",
+          workspaceId: lifecycleWorkspaceId,
+        });
+        return;
+      }
+
+      const readinessInputReadyAt = String(
+        lifecycleEvent.inputReadyAt
+          || lifecycleEvent.promptReadyAt
+          || lifecycleEvent.completedAt
+          || new Date().toISOString(),
+      ).trim();
+      const readinessPromptEventId = lifecyclePromptEventId
+        || getPromptEventIdFromRunningThread(lifecycleThreadForGroundTruth);
+      if (readinessPromptEventId && !lifecyclePromptEventId) {
+        lifecyclePromptEventId = readinessPromptEventId;
+      }
+      const readinessHasErrorEvidence = Boolean(
+        lifecycleEvent.error
+          || lifecycleEvent.terminalError
+          || lifecycleEvent.authError
+          || lifecycleEvent.providerError
+      );
+      const readinessLifecycleType = readinessHasErrorEvidence
+        ? "provider-turn-error"
+        : "provider-turn-completed";
+      lifecycleEvent = {
+        ...lifecycleEvent,
+        activityStatus: readinessHasErrorEvidence ? "error" : "idle",
+        commandPhase: readinessHasErrorEvidence ? "failed" : "completed",
+        completedAt: lifecycleEvent.completedAt || readinessInputReadyAt,
+        completionEvidence: lifecycleEvent.completionEvidence
+          || "terminal_prompt_ready_after_output_quiet",
+        completionInferred: true,
+        completionSource: lifecycleEvent.completionSource || "terminal-readiness-reconcile",
+        inputReady: true,
+        inputReadyAt: readinessInputReadyAt,
+        inputReadyConfidence: lifecycleEvent.inputReadyConfidence
+          || lifecycleEvent.completionEvidence
+          || "terminal_prompt_ready_after_output_quiet",
+        pendingPromptId: lifecycleEvent.pendingPromptId || readinessPromptEventId,
+        promptEventId: lifecycleEvent.promptEventId || readinessPromptEventId,
+        source: "terminal-readiness-reconcile",
+        status: readinessHasErrorEvidence ? "error" : (lifecycleEvent.status || "active"),
+        terminalWorkState: readinessHasErrorEvidence ? "error" : "complete",
+        type: readinessLifecycleType,
+      };
+      logTerminalStatus("frontend.terminal_cli.readiness_lifecycle_reconciled", {
         agentId: lifecycleAgentId,
-        inputReadyAt: lifecycleEvent.inputReadyAt || "",
+        completionEvidence: lifecycleEvent.completionEvidence || "",
+        inputReadyAt: readinessInputReadyAt,
+        latestTurnState,
+        lifecycleType: readinessLifecycleType,
         paneId: lifecycleEvent.paneId || "",
-        reason: "provider_hooks_own_readiness",
+        promptEventId: readinessPromptEventId || "",
         source: lifecycleEvent.source || "",
         terminalIndex: lifecycleEvent.terminalIndex ?? "",
+        threadActivityStatus,
         threadId: lifecycleThreadId,
-        type: lifecycleEvent.type || "",
         workspaceId: lifecycleWorkspaceId,
       });
-      return;
     }
     logTerminalStatus("frontend.terminal_status.lifecycle_received", {
       activityStatus: lifecycleEvent.activityStatus || "",
@@ -23510,6 +23680,7 @@ export default function App() {
 
   const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
   const isPaidPlanUser = isPaidUser(user) || billingStatus?.planStatus === "paid";
+  const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
   const cloudSyncPillState = authState !== "authenticated"
     ? null
     : !isPaidPlanUser
@@ -23534,7 +23705,12 @@ export default function App() {
       : "Syncing queued changes to the cloud.",
     upgrade: "Upgrade to unlock live cloud sync across your devices.",
   }[cloudSyncPillState] || "";
-  const shouldShowLaunchScreen = isLaunchScreenVisible || isConnectivityBlocked;
+  const shouldShowStartupPhases = !hasEnteredWorkspaceShell;
+  const shouldShowLaunchScreen = shouldShowStartupPhases && (
+    isLaunchScreenVisible
+    || isConnectivityBlocked
+    || shouldHoldWorkspaceShellForStartup
+  );
   const launchState = isConnectivityBlocked && apiState === "offline"
     ? "offline"
     : isConnectivityBlocked && apiState === "checking"
@@ -23608,7 +23784,7 @@ export default function App() {
     ? Math.min(100, Math.round((workspaceDeactivateClosed / workspaceDeactivateTotal) * 100))
     : 0;
   const workspaceDeactivateTerminalLabel = workspaceDeactivateTotal === 1 ? "terminal" : "terminals";
-  const isWorkspaceStartupOverlayVisible = workspaceState !== "ready";
+  const isWorkspaceStartupOverlayVisible = shouldShowStartupPhases && workspaceState !== "ready";
 
   return (
     <>
@@ -23798,11 +23974,11 @@ export default function App() {
                   <PlanPrice>
                     $40<span>/mo</span>
                   </PlanPrice>
-                  <PlanDescription>Paid status unlocks the native dashboard shell with 5,000 monthly credits.</PlanDescription>
+                  <PlanDescription>Paid status unlocks the native dashboard shell with 10,000 monthly credits.</PlanDescription>
                   <PlanFeatureList>
                     <li>Desktop workspace dashboard</li>
                     <li>Cloud workspace sync</li>
-                    <li>5,000 included credits</li>
+                    <li>10,000 included credits</li>
                   </PlanFeatureList>
                 </PricingPlanCard>
 
@@ -24226,6 +24402,7 @@ export default function App() {
                             workspaceName={runtimeWorkspace.name || workspaceName}
                             workspaceSyncState={workspaceSyncState}
                             workspaceThreadRestoreReady={workspaceThreadsHydrated}
+                            workspaceNotificationAttention={workspaceTerminalNotificationAttention[runtimeWorkspace.id] || null}
                             workspaceTerminalAgentLaunchReady={runtimeAgentLaunchReady}
                             workspaceTerminalRenderAgent={runtimeDescriptor.renderAgent}
                             workspaceThreads={workspaceThreads}

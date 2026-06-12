@@ -39,7 +39,6 @@ const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
 const SNIPPING_LIVE_PREVIEW_EVENT = "forge-snip-live-preview";
 const SNIPPING_FLOAT_ASSIGN_EVENT = "forge-snip-float-assign";
-const SNIPPING_FLOAT_DOCK_STATE_EVENT = "forge-snip-float-dock-state";
 const SNIPPING_FLOAT_DISPOSE_EVENT = "forge-snip-float-dispose";
 const SNIPPING_EDITOR_DISPOSE_EVENT = "forge-snip-editor-dispose";
 // ~22fps: frames are tiny (max edge capped below), so the encode+emit cost
@@ -632,64 +631,6 @@ function useFloatingWindowBody(kind) {
   }, [kind]);
 }
 
-function wheelDeltaPixels(event) {
-  const unit = event.deltaMode === 1
-    ? 32
-    : event.deltaMode === 2
-      ? Math.max(window.innerWidth || 0, window.innerHeight || 0, 1)
-      : 1;
-  return {
-    x: event.deltaX * unit,
-    y: event.deltaY * unit,
-  };
-}
-
-function useSnippingStripWheelScroll(enabled) {
-  const pendingRef = useRef({ x: 0, y: 0 });
-  const frameRef = useRef(0);
-
-  useEffect(() => {
-    if (!enabled) return undefined;
-
-    const flush = () => {
-      frameRef.current = 0;
-      const { x, y } = pendingRef.current;
-      pendingRef.current = { x: 0, y: 0 };
-      if (Math.abs(x) < 0.5 && Math.abs(y) < 0.5) return;
-      invoke("snipping_scroll_snip_strip", {
-        request: {
-          deltaX: x,
-          deltaY: y,
-        },
-      }).catch(() => {});
-    };
-
-    const onWheel = (event) => {
-      const delta = wheelDeltaPixels(event);
-      if (Math.abs(delta.x) < 0.5 && Math.abs(delta.y) < 0.5) return;
-      event.preventDefault();
-      event.stopPropagation();
-      pendingRef.current = {
-        x: pendingRef.current.x + delta.x,
-        y: pendingRef.current.y + delta.y,
-      };
-      if (!frameRef.current) {
-        frameRef.current = window.requestAnimationFrame(flush);
-      }
-    };
-
-    window.addEventListener("wheel", onWheel, { passive: false });
-    return () => {
-      window.removeEventListener("wheel", onWheel, { passive: false });
-      if (frameRef.current) {
-        window.cancelAnimationFrame(frameRef.current);
-        frameRef.current = 0;
-      }
-      pendingRef.current = { x: 0, y: 0 };
-    };
-  }, [enabled]);
-}
-
 // Legacy dock route: snip previews are standalone draggable windows
 // (#/snipping-float) from the moment they are captured, so a leftover dock
 // window from an older session simply closes itself.
@@ -736,7 +677,6 @@ export function SnippingFloatWindow() {
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
-  const [docked, setDocked] = useState(false);
   const busyRef = useRef(false);
   // Rust watches the global cursor and arms the hover chrome — CSS :hover
   // alone never fires while this window is unfocused, which used to hide the
@@ -745,7 +685,6 @@ export function SnippingFloatWindow() {
   const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
-  useSnippingStripWheelScroll(docked && !closing);
 
   useEffect(() => {
     busyRef.current = busy;
@@ -797,13 +736,12 @@ export function SnippingFloatWindow() {
     let disposed = false;
     let unlisten = () => {};
     const ownLabel = getCurrentWindow().label;
-    const adopt = (path, nextDocked = false) => {
+    const adopt = (path) => {
       if (disposed || !path) return;
       closingRef.current = false;
       setClosing(false);
       setBusy(false);
       setStatus("");
-      setDocked(nextDocked === true);
       setHoverArmed(false);
       localPathRef.current = path;
       setLocalPath(path);
@@ -814,7 +752,7 @@ export function SnippingFloatWindow() {
     listen(SNIPPING_FLOAT_ASSIGN_EVENT, (event) => {
       const payload = event?.payload || {};
       if (text(payload.label) !== ownLabel) return;
-      adopt(text(payload.path), payload.docked === true);
+      adopt(text(payload.path));
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -827,7 +765,7 @@ export function SnippingFloatWindow() {
 
     if (!initialPath) {
       invoke("snipping_float_assigned_path")
-        .then((result) => adopt(text(result?.path), result?.docked === true))
+        .then((result) => adopt(text(result?.path)))
         .catch(() => {});
     }
 
@@ -836,38 +774,6 @@ export function SnippingFloatWindow() {
       unlisten();
     };
   }, [initialPath]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten = () => {};
-    const ownLabel = getCurrentWindow().label;
-
-    listen(SNIPPING_FLOAT_DOCK_STATE_EVENT, (event) => {
-      if (disposed) return;
-      const payload = event?.payload || {};
-      if (text(payload.label) !== ownLabel) return;
-      setDocked(payload.docked === true);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-
-    invoke("snipping_float_dock_state")
-      .then((result) => {
-        if (!disposed) setDocked(result?.docked === true);
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      unlisten();
-    };
-  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -1008,20 +914,6 @@ export function SnippingFloatWindow() {
     closeFloat();
   }, [closeFloat, localPath]);
 
-  const pinDockedFloat = useCallback(() => {
-    if (closingRef.current) return;
-    setBusy(true);
-    invoke("snipping_pin_snip_float", { label: getCurrentWindow().label })
-      .then(() => {
-        setDocked(false);
-        setBusy(false);
-      })
-      .catch((error) => {
-        setBusy(false);
-        showStatus(error?.message || String(error || "Unable to pin snip preview."));
-      });
-  }, [showStatus]);
-
   const runAction = useCallback(async (action) => {
     if (!localPath || busyRef.current || closingRef.current) return;
     const actionPath = localPath;
@@ -1103,7 +995,6 @@ export function SnippingFloatWindow() {
       <FloatWindowRoot
         data-busy={busy ? "true" : "false"}
         data-closing={closing ? "true" : "false"}
-        data-docked={docked ? "true" : "false"}
         data-hovered={hoverArmed ? "true" : "false"}
         onDoubleClick={() => runAction("edit")}
         onMouseDown={beginDrag}
@@ -1114,27 +1005,15 @@ export function SnippingFloatWindow() {
         ) : (
           <span data-empty="true">Preview unavailable</span>
         )}
-        {docked ? (
-          <FloatPinButton
-            aria-label={`Pin ${name} on screen`}
-            disabled={busy || closing}
-            onClick={pinDockedFloat}
-            title="Pin on screen"
-            type="button"
-          >
-            <PushPin aria-hidden="true" />
-          </FloatPinButton>
-        ) : (
-          <FloatCloseButton
-            aria-label={`Dismiss ${name}`}
-            disabled={closing}
-            onClick={dismissFloat}
-            title="Dismiss"
-            type="button"
-          >
-            <Close aria-hidden="true" />
-          </FloatCloseButton>
-        )}
+        <FloatCloseButton
+          aria-label={`Dismiss ${name}`}
+          disabled={closing}
+          onClick={dismissFloat}
+          title="Dismiss"
+          type="button"
+        >
+          <Close aria-hidden="true" />
+        </FloatCloseButton>
         <FloatUploadButton
           aria-label={snipUploadButtonTitle(uploadState, name)}
           data-state={uploadState}
@@ -1248,24 +1127,6 @@ const FloatWindowRoot = styled.main`
     pointer-events: auto;
   }
 
-  &[data-docked="true"] {
-    border-radius: 9px;
-    clip-path: inset(0 round 9px);
-  }
-
-  &[data-docked="true"] > button {
-    transform: scale(0.84);
-    transform-origin: top left;
-  }
-
-  &[data-docked="true"] > button:nth-of-type(2) {
-    transform-origin: top right;
-  }
-
-  &[data-docked="true"] > div {
-    transform: translateX(-50%) scale(0.78);
-    transform-origin: bottom center;
-  }
 `;
 
 const FloatCloseButton = styled.button`
@@ -1291,38 +1152,6 @@ const FloatCloseButton = styled.button`
   &:hover {
     border-color: rgba(239, 107, 107, 0.5);
     background: rgba(76, 22, 26, 0.9);
-  }
-`;
-
-/* Docked previews use the close-button slot for an explicit pin action. */
-const FloatPinButton = styled.button`
-  position: absolute;
-  top: 6px;
-  left: 6px;
-  display: grid;
-  width: 22px;
-  height: 22px;
-  place-items: center;
-  padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 999px;
-  color: #f8fafc;
-  background: rgba(7, 10, 16, 0.85);
-  cursor: pointer;
-
-  svg {
-    width: 13px;
-    height: 13px;
-  }
-
-  &:hover:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.55);
-    background: rgba(23, 37, 62, 0.92);
-  }
-
-  &:disabled {
-    opacity: 0.5;
-    cursor: default;
   }
 `;
 
@@ -1551,15 +1380,266 @@ const FloatStatusPill = styled.span`
   }
 `;
 
-/**
- * Backdrop content for the strip bar. Every tile on the bar is a real snip
- * preview window now — Rust parks them on a horizontal queue over this band
- * (one unified queue system with the bottom-left column), so the webview
- * renders no tiles, no drag ghost, and no drag-out bridge: dragging a tile
- * out of (or into) the bar is just dragging the preview window itself.
- */
+function StripSnipTile({ item, onChanged, onOpened }) {
+  const localPath = assetLocalPath(item);
+  const name = useMemo(() => assetName(item), [item]);
+  const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const [launching, setLaunching] = useState(false);
+  const statusTimerRef = useRef(0);
+  const dragRef = useRef(null);
+  const mountedRef = useRef(true);
+
+  const showStatus = useCallback((nextStatus) => {
+    setStatus(nextStatus);
+    if (statusTimerRef.current) {
+      window.clearTimeout(statusTimerRef.current);
+    }
+    statusTimerRef.current = window.setTimeout(() => {
+      statusTimerRef.current = 0;
+      setStatus("");
+    }, 1800);
+  }, []);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    if (statusTimerRef.current) {
+      window.clearTimeout(statusTimerRef.current);
+    }
+  }, []);
+
+  const openFloat = useCallback(async () => {
+    if (!localPath || busy) return;
+    setBusy(true);
+    setLaunching(true);
+    try {
+      await invoke("snipping_open_snip_float", { path: localPath, focused: false });
+      onOpened(localPath);
+    } catch (error) {
+      if (mountedRef.current) setLaunching(false);
+      showStatus(error?.message || String(error || "Unable to pin snip preview."));
+    } finally {
+      if (mountedRef.current) setBusy(false);
+    }
+  }, [busy, localPath, onOpened, showStatus]);
+
+  const runAction = useCallback(async (action) => {
+    if (!localPath || busy) return;
+    setBusy(true);
+    try {
+      if (action === "copy") {
+        const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
+        showStatus(copyStatus);
+      } else if (action === "edit") {
+        await invoke("snipping_open_annotation_editor", { path: localPath });
+        showStatus("Editor opened");
+      } else if (action === "delete") {
+        await invoke("diffforge_delete_untracked_asset", { path: localPath });
+        onChanged(localPath);
+      }
+    } catch (error) {
+      showStatus(error?.message || String(error || "Action failed"));
+    } finally {
+      if (mountedRef.current) setBusy(false);
+    }
+  }, [busy, localPath, name, onChanged, previewUrl, showStatus]);
+
+  const clearDrag = useCallback(() => {
+    dragRef.current = null;
+  }, []);
+
+  const startDrag = useCallback((event) => {
+    if (!localPath || busy || event.button !== 0 || event.target.closest("button")) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      started: false,
+    };
+  }, [busy, localPath]);
+
+  const continueDrag = useCallback((event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId || drag.started || busy) return;
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+    if (distance < 7) return;
+    drag.started = true;
+    setBusy(true);
+    setLaunching(true);
+    invoke("snipping_open_snip_float_for_drag", {
+      path: localPath,
+      x: event.screenX - 60,
+      y: event.screenY - 37,
+    })
+      .then(() => {
+        onOpened(localPath);
+      })
+      .catch((error) => {
+        if (mountedRef.current) setLaunching(false);
+        showStatus(error?.message || String(error || "Unable to drag snip preview."));
+      })
+      .finally(() => {
+        dragRef.current = null;
+        if (mountedRef.current) setBusy(false);
+      });
+  }, [busy, localPath, onOpened, showStatus]);
+
+  if (!localPath) return null;
+
+  return (
+    <StripTile
+      aria-label={name}
+      data-busy={busy ? "true" : "false"}
+      data-launching={launching ? "true" : "false"}
+      onPointerCancel={clearDrag}
+      onPointerDown={startDrag}
+      onPointerMove={continueDrag}
+      onPointerUp={clearDrag}
+      title={name}
+    >
+      {previewUrl ? (
+        <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
+      ) : (
+        <span data-empty="true">Preview unavailable</span>
+      )}
+      <StripTilePinButton
+        aria-label={`Pin ${name} on screen`}
+        disabled={busy}
+        onClick={openFloat}
+        title="Pin on screen"
+        type="button"
+      >
+        <PushPin aria-hidden="true" />
+      </StripTilePinButton>
+      <StripTileActions>
+        <StripTileActionButton
+          aria-label={`Copy ${name}`}
+          disabled={busy}
+          onClick={() => runAction("copy")}
+          title="Copy image"
+          type="button"
+        >
+          <ContentCopy aria-hidden="true" />
+        </StripTileActionButton>
+        <StripTileActionButton
+          aria-label={`Annotate ${name}`}
+          disabled={busy}
+          onClick={() => runAction("edit")}
+          title="Annotate copy"
+          type="button"
+        >
+          <ModeEdit aria-hidden="true" />
+        </StripTileActionButton>
+        <StripTileActionButton
+          aria-label={`Delete ${name}`}
+          data-danger="true"
+          disabled={busy}
+          onClick={() => runAction("delete")}
+          title="Delete file"
+          type="button"
+        >
+          <Delete aria-hidden="true" />
+        </StripTileActionButton>
+      </StripTileActions>
+      <SnipStatusPill status={status} />
+    </StripTile>
+  );
+}
+
+function wheelUnit(event) {
+  if (event.deltaMode === 1) return 32;
+  if (event.deltaMode === 2) return Math.max(window.innerWidth || 0, window.innerHeight || 0, 1);
+  return 1;
+}
+
 export function SnippingRecentStrip() {
-  return null;
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const railRef = useRef(null);
+
+  const refresh = useCallback((showLoading = false) => {
+    if (showLoading) setLoading(true);
+    invoke("snipping_recent_snips", {
+      limit: SNIPPING_STRIP_RECENT_LIMIT,
+      excludeVisibleFreePreviews: true,
+    })
+      .then((result) => {
+        setItems(Array.isArray(result?.items) ? result.items : []);
+        setError("");
+      })
+      .catch((nextError) => {
+        setError(nextError?.message || String(nextError || "Unable to load snips."));
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    refresh(true);
+  }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners = [];
+    const listenRefresh = (eventName) => {
+      listen(eventName, () => {
+        if (!cancelled) refresh(false);
+      })
+        .then((unlisten) => {
+          if (cancelled) {
+            unlisten();
+          } else {
+            unlisteners.push(unlisten);
+          }
+        })
+        .catch(() => {});
+    };
+    listenRefresh(SNIPPING_CAPTURE_SAVED_EVENT);
+    listenRefresh(SNIPPING_SOURCE_UPDATED_EVENT);
+    listenRefresh(SNIPPING_FLOATS_CHANGED_EVENT);
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [refresh]);
+
+  const onWheel = useCallback((event) => {
+    const rail = railRef.current;
+    if (!rail) return;
+    const unit = wheelUnit(event);
+    const deltaX = event.deltaX * unit;
+    const deltaY = event.deltaY * unit;
+    if (Math.abs(deltaY) <= Math.abs(deltaX)) return;
+    event.preventDefault();
+    rail.scrollLeft += deltaY;
+  }, []);
+
+  const removePath = useCallback((path) => {
+    setItems((current) => current.filter((item) => assetLocalPath(item) !== path));
+  }, []);
+
+  return (
+    <StripRail aria-label="Recent snips" onWheel={onWheel} ref={railRef}>
+      {items.map((item) => (
+        <StripSnipTile
+          item={item}
+          key={assetLocalPath(item)}
+          onChanged={removePath}
+          onOpened={removePath}
+        />
+      ))}
+      {!items.length ? (
+        <StripRailStatus>
+          {loading ? "Loading..." : error || "No snips yet"}
+        </StripRailStatus>
+      ) : null}
+    </StripRail>
+  );
 }
 
 /**
@@ -1578,7 +1658,6 @@ export function SnippingStripWindow() {
   const lastCloseCueMsRef = useRef(0);
 
   useFloatingWindowBody("strip");
-  useSnippingStripWheelScroll(true);
 
   useEffect(() => {
     animPhaseRef.current = animPhase;
@@ -1750,6 +1829,221 @@ const StripCloseButton = styled.button`
   &:active {
     transform: translateY(-50%) scale(0.97);
   }
+`;
+
+const StripRail = styled.div`
+  position: absolute;
+  inset: 0 56px 0 0;
+  z-index: 2;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 7px 14px 9px;
+  overscroll-behavior-x: contain;
+  scrollbar-color: rgba(148, 163, 184, 0.5) rgba(15, 23, 42, 0.22);
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+
+  &::-webkit-scrollbar {
+    height: 7px;
+  }
+
+  &::-webkit-scrollbar-track {
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.22);
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border: 2px solid rgba(15, 23, 42, 0.15);
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.56);
+  }
+`;
+
+const StripTile = styled.div`
+  position: relative;
+  flex: 0 0 120px;
+  width: 120px;
+  height: 74px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(8, 12, 18, 0.78);
+  box-shadow:
+    0 14px 30px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  cursor: grab;
+  transform-origin: center;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    opacity 120ms ease,
+    transform 160ms cubic-bezier(0.2, 0.9, 0.3, 1.1);
+  user-select: none;
+  -webkit-user-select: none;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.48);
+    box-shadow:
+      0 16px 32px rgba(0, 0, 0, 0.28),
+      0 0 0 1px rgba(125, 176, 255, 0.16),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  &:active {
+    cursor: grabbing;
+  }
+
+  &[data-launching="true"] {
+    opacity: 0.55;
+    transform: scale(1.08);
+  }
+
+  img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    object-position: center;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  > span[data-empty="true"] {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 8px;
+    color: rgba(248, 250, 252, 0.58);
+    font-size: 10px;
+    font-weight: 700;
+    text-align: center;
+  }
+
+  ${FloatStatusPill} {
+    top: 6px;
+    min-height: 21px;
+    max-width: calc(100% - 28px);
+    padding: 4px 8px 4px 6px;
+    font-size: 10px;
+    z-index: 5;
+  }
+`;
+
+const StripTilePinButton = styled.button`
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  z-index: 3;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #eef6ff;
+  background: rgba(6, 10, 16, 0.74);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.58);
+    background: rgba(24, 39, 65, 0.94);
+    transform: scale(1.05);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+`;
+
+const StripTileActions = styled.div`
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  background: rgba(5, 8, 13, 0.78);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+
+  ${StripTile}:hover &,
+  ${StripTile}:focus-within & {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+`;
+
+const StripTileActionButton = styled.button`
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.82);
+  background: transparent;
+  cursor: pointer;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover:not(:disabled) {
+    color: #fff;
+    background: rgba(125, 176, 255, 0.24);
+  }
+
+  &[data-danger="true"]:hover:not(:disabled) {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.86);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+`;
+
+const StripRailStatus = styled.div`
+  flex: 1 0 auto;
+  display: grid;
+  min-width: min(280px, calc(100vw - 96px));
+  height: 74px;
+  place-items: center;
+  color: rgba(248, 250, 252, 0.62);
+  font-size: 12px;
+  font-weight: 720;
 `;
 
 export function SnippingAnnotationEditorWindow() {

@@ -1588,6 +1588,41 @@ export function markWorkspaceNotificationsSeen(state, workspaceId) {
   });
 }
 
+/* Pane attribution for the "switch back" moment: which terminals produced the
+   still-unread notifications behind the workspace badge/SFX. Must be captured
+   BEFORE markWorkspaceNotificationsSeen wipes the unread flags; the terminal
+   grid then flashes exactly those panes. */
+export function collectWorkspaceNotificationAttentionPanes(state, workspaceId) {
+  const safeWorkspaceId = cleanText(workspaceId);
+  if (!safeWorkspaceId) return [];
+  const { bucket } = getWorkspaceBucket(state, safeWorkspaceId);
+  const panes = new Map();
+  // Bucket notifications are normalized newest-first, so the first notification
+  // kept per pane carries the latest title.
+  Object.values(bucket.notifications || {}).forEach((notification) => {
+    if (notification.status !== "unread") return;
+    const paneId = cleanText(notification.paneId);
+    const terminalIndex = notification.terminalIndex == null
+      ? null
+      : (Number.isInteger(Number(notification.terminalIndex)) ? Number(notification.terminalIndex) : null);
+    if (!paneId && terminalIndex === null) return;
+    const key = paneId || `terminal-index:${terminalIndex}`;
+    const existing = panes.get(key);
+    if (existing) {
+      existing.count += 1;
+      return;
+    }
+    panes.set(key, {
+      count: 1,
+      kind: notification.kind,
+      paneId,
+      terminalIndex,
+      title: notification.title,
+    });
+  });
+  return Array.from(panes.values());
+}
+
 function threadIsActive(thread) {
   if (!thread || typeof thread !== "object") return false;
   if (thread.latestTurn?.state === "running") return true;

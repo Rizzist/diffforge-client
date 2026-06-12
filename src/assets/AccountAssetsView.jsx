@@ -591,6 +591,21 @@ function assetTransferFailureDedupeKey(failure) {
   ].map((value) => text(value).toLowerCase()).join(":");
 }
 
+function assetTransferFailureCopyText(failure) {
+  return [
+    failure?.title,
+    failure?.message,
+    ...jsonArray(failure?.details),
+  ].map((value) => text(value)).filter(Boolean).join("\n");
+}
+
+function assetTransferFailuresCopyText(failures) {
+  return jsonArray(failures)
+    .map(assetTransferFailureCopyText)
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 async function copyTextToClipboard(value) {
   const normalized = text(value);
   if (!normalized) return false;
@@ -1516,125 +1531,129 @@ function AssetsPanel({
 
   return (
     <AssetsPane>
-      <AssetTransferFailureBanner failures={transferFailures} />
-      <AssetsHeader>
-        <div>
-          <AssetsKicker>Library</AssetsKicker>
-          <AssetModeTabs
-            assetMode={assetMode}
-            onAssetModeChange={onAssetModeChange}
-            trackedCount={trackedCount}
-            untrackedCount={untrackedCount}
-          />
-          <AssetHeadingLine>
-            <AssetsTitle>{repoLabel}</AssetsTitle>
-            {(syncing || (!loading && !error)) && (
-              <AssetSyncPill aria-live="polite" data-state={syncing ? "syncing" : "synced"}>
-                {syncing && <AssetSyncSpinner aria-hidden="true" />}
-                {syncing ? "Syncing" : "Synced"}
-              </AssetSyncPill>
-            )}
-          </AssetHeadingLine>
-        </div>
-        <AssetHeaderActions>
-          <AssetsSummary>
-            {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} {shortLabel(selectedCloudLabel, 14)}
-            {activeTransfers ? ` · ${activeTransfers} active` : ""}
-            {activeTransferSummary ? ` · ${activeTransferSummary}` : ""}
-          </AssetsSummary>
-          <AssetIconButton
-            aria-label="Refresh assets"
-            disabled={loading || syncing}
-            onClick={() => refresh({ silent: false })}
-            title="Refresh assets"
-            type="button"
-          >
-            <Cached aria-hidden="true" />
-          </AssetIconButton>
-          <AssetIconButton
-            aria-label="Asset cloud settings"
-            data-active={cloudSettingsOpen ? "true" : "false"}
-            onClick={() => setCloudSettingsOpen((open) => !open)}
-            title="Asset cloud settings"
-            type="button"
-          >
-            <Settings aria-hidden="true" />
-          </AssetIconButton>
-        </AssetHeaderActions>
-      </AssetsHeader>
-      <AssetCloudControls aria-label="Asset cloud">
-        {clouds.map((cloud) => {
-          const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
-          const active = cloudId === effectiveCloudId;
-          return (
-            <AssetCloudButton
-              aria-pressed={active}
-              data-active={active}
-              key={cloudId}
-              onClick={() => setSelectedCloudId(cloudId)}
-              title={text(cloud.endpoint || cloud.bucket || cloud.providerKind || cloud.provider_kind, cloud.label)}
+      <AssetControlsRegion>
+        <AssetTransferFailureBanner failures={transferFailures} />
+        <AssetsHeader>
+          <div>
+            <AssetsKicker>Library</AssetsKicker>
+            <AssetModeTabs
+              assetMode={assetMode}
+              onAssetModeChange={onAssetModeChange}
+              trackedCount={trackedCount}
+              untrackedCount={untrackedCount}
+            />
+            <AssetHeadingLine>
+              <AssetsTitle>{repoLabel}</AssetsTitle>
+              {(syncing || (!loading && !error)) && (
+                <AssetSyncPill aria-live="polite" data-state={syncing ? "syncing" : "synced"}>
+                  {syncing && <AssetSyncSpinner aria-hidden="true" />}
+                  {syncing ? "Syncing" : "Synced"}
+                </AssetSyncPill>
+              )}
+            </AssetHeadingLine>
+          </div>
+          <AssetHeaderActions>
+            <AssetsSummary>
+              {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} {shortLabel(selectedCloudLabel, 14)}
+              {activeTransfers ? ` · ${activeTransfers} active` : ""}
+              {activeTransferSummary ? ` · ${activeTransferSummary}` : ""}
+            </AssetsSummary>
+            <AssetIconButton
+              aria-label="Refresh assets"
+              disabled={loading || syncing}
+              onClick={() => refresh({ silent: false })}
+              title="Refresh assets"
               type="button"
             >
-              <Cloud aria-hidden="true" />
-              <span>{shortLabel(cloud.label, 22)}</span>
-            </AssetCloudButton>
-          );
-        })}
-        <AssetCloudButton
-          aria-pressed={uploadPublic}
-          data-active={uploadPublic}
-          onClick={toggleUploadPublic}
-          title={uploadPublic
-            ? "New uploads publish a public link immediately. Click to keep uploads private."
-            : "New uploads stay private. Click to also publish a public link on upload."}
-          type="button"
-        >
-          <Public aria-hidden="true" />
-          <span>{uploadPublic ? "Public on upload" : "Private on upload"}</span>
-        </AssetCloudButton>
-      </AssetCloudControls>
-      {cloudSettingsOpen && (
-        <AssetCloudSettingsPanel
-          busyKey={cloudSettingsBusy}
-          clouds={clouds}
-          error={cloudSettingsError}
-          onAction={runCloudSettingsAction}
-          onClose={() => setCloudSettingsOpen(false)}
-          selectedCloudId={effectiveCloudId}
-        />
-      )}
-      {workspaceFilterOptions.length > 0 && (
-        <AssetWorkspaceFilters aria-label="Asset workspace filters">
-          <AssetFilterButton
-            aria-pressed={!hasWorkspaceFilters}
-            data-active={!hasWorkspaceFilters}
-            onClick={() => setSelectedWorkspaceFilterKeys([])}
-            title="Show all assets"
-            type="button"
-          >
-            All
-          </AssetFilterButton>
-          {workspaceFilterOptions.map((option) => {
-            const selected = selectedWorkspaceFilterKeys.includes(option.key);
+              <Cached aria-hidden="true" />
+            </AssetIconButton>
+            <AssetIconButton
+              aria-label="Asset cloud settings"
+              data-active={cloudSettingsOpen ? "true" : "false"}
+              onClick={() => setCloudSettingsOpen((open) => !open)}
+              title="Asset cloud settings"
+              type="button"
+            >
+              <Settings aria-hidden="true" />
+            </AssetIconButton>
+          </AssetHeaderActions>
+        </AssetsHeader>
+        <AssetCloudControls aria-label="Asset cloud">
+          {clouds.map((cloud) => {
+            const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
+            const active = cloudId === effectiveCloudId;
             return (
-              <AssetFilterButton
-                aria-pressed={selected}
-                data-active={selected}
-                key={option.key}
-                onClick={() => setSelectedWorkspaceFilterKeys((current) => (
-                  current.includes(option.key)
-                    ? current.filter((item) => item !== option.key)
-                    : [...current, option.key]
-                ))}
-                title={option.name}
+              <AssetCloudButton
+                aria-pressed={active}
+                data-active={active}
+                key={cloudId}
+                onClick={() => setSelectedCloudId(cloudId)}
+                title={text(cloud.endpoint || cloud.bucket || cloud.providerKind || cloud.provider_kind, cloud.label)}
                 type="button"
               >
-                {option.name}
-              </AssetFilterButton>
+                <Cloud aria-hidden="true" />
+                <span>{shortLabel(cloud.label, 22)}</span>
+              </AssetCloudButton>
             );
           })}
-        </AssetWorkspaceFilters>
-      )}
+          <AssetCloudButton
+            aria-pressed={uploadPublic}
+            data-active={uploadPublic}
+            onClick={toggleUploadPublic}
+            title={uploadPublic
+              ? "New uploads publish a public link immediately. Click to keep uploads private."
+              : "New uploads stay private. Click to also publish a public link on upload."}
+            type="button"
+          >
+            <Public aria-hidden="true" />
+            <span>{uploadPublic ? "Public on upload" : "Private on upload"}</span>
+          </AssetCloudButton>
+        </AssetCloudControls>
+        {cloudSettingsOpen && (
+          <AssetCloudSettingsPanel
+            busyKey={cloudSettingsBusy}
+            clouds={clouds}
+            error={cloudSettingsError}
+            onAction={runCloudSettingsAction}
+            onClose={() => setCloudSettingsOpen(false)}
+            selectedCloudId={effectiveCloudId}
+          />
+        )}
+        {workspaceFilterOptions.length > 0 && (
+          <AssetWorkspaceFilters aria-label="Asset workspace filters">
+            <AssetFilterButton
+              aria-pressed={!hasWorkspaceFilters}
+              data-active={!hasWorkspaceFilters}
+              onClick={() => setSelectedWorkspaceFilterKeys([])}
+              title="Show all assets"
+              type="button"
+            >
+              All
+            </AssetFilterButton>
+            {workspaceFilterOptions.map((option) => {
+              const selected = selectedWorkspaceFilterKeys.includes(option.key);
+              return (
+                <AssetFilterButton
+                  aria-pressed={selected}
+                  data-active={selected}
+                  key={option.key}
+                  onClick={() => setSelectedWorkspaceFilterKeys((current) => (
+                    current.includes(option.key)
+                      ? current.filter((item) => item !== option.key)
+                      : [...current, option.key]
+                  ))}
+                  title={option.name}
+                  type="button"
+                >
+                  {option.name}
+                </AssetFilterButton>
+              );
+            })}
+          </AssetWorkspaceFilters>
+        )}
+        {inlineError && <AssetError>{inlineError}</AssetError>}
+        {actionNotice && <AssetNotice aria-live="polite">{actionNotice}</AssetNotice>}
+      </AssetControlsRegion>
       <AssetSelectionDock
         busy={Boolean(busyKey)}
         count={selectedAssets.length}
@@ -1643,8 +1662,6 @@ function AssetsPanel({
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedAssetAction("delete")}
       />
-      {inlineError && <AssetError>{inlineError}</AssetError>}
-      {actionNotice && <AssetNotice aria-live="polite">{actionNotice}</AssetNotice>}
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
       ) : (
@@ -1926,17 +1943,63 @@ function AssetsPanel({
 }
 
 function AssetTransferFailureBanner({ failures = [] }) {
+  const [copiedKey, setCopiedKey] = useState("");
+  const copiedTimerRef = useRef(0);
+  const allFailureText = useMemo(() => assetTransferFailuresCopyText(failures), [failures]);
+  const copyFailureText = useCallback(async (key, value) => {
+    const copied = await copyTextToClipboard(value);
+    if (!copied) return;
+    setCopiedKey(key);
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = 0;
+      setCopiedKey("");
+    }, 1600);
+  }, []);
+
+  useEffect(() => () => {
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+  }, []);
+
   if (!failures.length) return null;
   return (
     <AssetTransferFailurePanel aria-live="assertive" role="alert">
       <AssetTransferFailureHeader>
         <strong>{failures.length === 1 ? "Asset transfer failed" : `${failures.length} asset transfers failed`}</strong>
-        <span>Upload/download error details</span>
+        <AssetTransferFailureHeaderActions>
+          <span>Upload/download error details</span>
+          <AssetFailureCopyButton
+            aria-label="Copy all asset transfer errors"
+            data-copied={copiedKey === "all"}
+            disabled={!allFailureText}
+            onClick={() => void copyFailureText("all", allFailureText)}
+            title="Copy all errors"
+            type="button"
+          >
+            <ContentCopy aria-hidden="true" />
+            <span>{copiedKey === "all" ? "Copied" : "Copy all"}</span>
+          </AssetFailureCopyButton>
+        </AssetTransferFailureHeaderActions>
       </AssetTransferFailureHeader>
       <AssetTransferFailureList>
         {failures.map((failure) => (
           <AssetTransferFailureItem key={failure.key}>
-            <AssetTransferFailureTitle>{failure.title}</AssetTransferFailureTitle>
+            <AssetTransferFailureItemHeader>
+              <AssetTransferFailureTitle>{failure.title}</AssetTransferFailureTitle>
+              <AssetFailureIconButton
+                aria-label={`Copy error for ${failure.title}`}
+                data-copied={copiedKey === failure.key}
+                onClick={() => void copyFailureText(failure.key, assetTransferFailureCopyText(failure))}
+                title="Copy this error"
+                type="button"
+              >
+                <ContentCopy aria-hidden="true" />
+              </AssetFailureIconButton>
+            </AssetTransferFailureItemHeader>
             <AssetTransferFailureMessage>{failure.message}</AssetTransferFailureMessage>
             {failure.details?.length ? (
               <AssetTransferFailureMeta>
@@ -2366,38 +2429,41 @@ function UntrackedAssetsPanel({
 
   return (
     <AssetsPane>
-      <AssetsHeader>
-        <div>
-          <AssetsKicker>Scratch</AssetsKicker>
-          <AssetModeTabs
-            assetMode={assetMode}
-            onAssetModeChange={onAssetModeChange}
-            trackedCount={trackedCount}
-            untrackedCount={untrackedCount}
-          />
-          <AssetHeadingLine>
-            <AssetsTitle>Untracked Assets</AssetsTitle>
-            <AssetSyncPill aria-live="polite" data-state={syncing ? "syncing" : "local"}>
-              {syncing && <AssetSyncSpinner aria-hidden="true" />}
-              {syncing ? "Scanning" : "Local Scratch"}
-            </AssetSyncPill>
-          </AssetHeadingLine>
-        </div>
-        <AssetHeaderActions>
-          <AssetsSummary>
-            {items.length} scratch file{items.length === 1 ? "" : "s"} · local only · not synced
-          </AssetsSummary>
-          <AssetIconButton
-            aria-label="Refresh untracked assets"
-            disabled={loading || syncing}
-            onClick={() => refresh({ silent: false, force: true })}
-            title="Refresh untracked assets"
-            type="button"
-          >
-            <Cached aria-hidden="true" />
-          </AssetIconButton>
-        </AssetHeaderActions>
-      </AssetsHeader>
+      <AssetControlsRegion>
+        <AssetsHeader>
+          <div>
+            <AssetsKicker>Scratch</AssetsKicker>
+            <AssetModeTabs
+              assetMode={assetMode}
+              onAssetModeChange={onAssetModeChange}
+              trackedCount={trackedCount}
+              untrackedCount={untrackedCount}
+            />
+            <AssetHeadingLine>
+              <AssetsTitle>Untracked Assets</AssetsTitle>
+              <AssetSyncPill aria-live="polite" data-state={syncing ? "syncing" : "local"}>
+                {syncing && <AssetSyncSpinner aria-hidden="true" />}
+                {syncing ? "Scanning" : "Local Scratch"}
+              </AssetSyncPill>
+            </AssetHeadingLine>
+          </div>
+          <AssetHeaderActions>
+            <AssetsSummary>
+              {items.length} scratch file{items.length === 1 ? "" : "s"} · local only · not synced
+            </AssetsSummary>
+            <AssetIconButton
+              aria-label="Refresh untracked assets"
+              disabled={loading || syncing}
+              onClick={() => refresh({ silent: false, force: true })}
+              title="Refresh untracked assets"
+              type="button"
+            >
+              <Cached aria-hidden="true" />
+            </AssetIconButton>
+          </AssetHeaderActions>
+        </AssetsHeader>
+        {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
+      </AssetControlsRegion>
       <AssetSelectionDock
         busy={Boolean(busyKey)}
         count={selectedAssets.length}
@@ -2406,7 +2472,6 @@ function UntrackedAssetsPanel({
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedUntrackedAction("delete")}
       />
-      {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
       {!items.length ? (
         <AssetEmptyState>
           {loading ? "Loading untracked assets..." : "No untracked scratch files yet. Snips and edits will appear here before you track them."}
@@ -2588,6 +2653,26 @@ const AssetsPane = styled.div`
   height: 100%;
   overflow: hidden;
   padding: 16px;
+`;
+
+const AssetControlsRegion = styled.div`
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  max-height: min(46%, 420px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+
+  @media (max-height: 680px) {
+    max-height: min(54%, 360px);
+  }
 `;
 
 const AssetsHeader = styled.header`
@@ -3261,16 +3346,19 @@ const AssetBatchButton = styled.button`
 
 const AssetGrid = styled.div`
   display: grid;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   grid-template-columns: repeat(auto-fill, minmax(148px, 176px));
   grid-auto-rows: max-content;
   gap: 10px;
   align-content: start;
   min-width: 0;
-  min-height: 0;
+  min-height: 120px;
   overflow: auto;
-  padding: 12px 2px 2px;
+  padding: 12px 2px 72px;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
 
   @media (max-width: 520px) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3790,6 +3878,7 @@ const AssetTransferFailurePanel = styled.div`
   flex: 0 0 auto;
   gap: 8px;
   min-width: 0;
+  overflow: hidden;
   padding: 10px;
   border: 1px solid rgba(248, 113, 113, 0.28);
   border-radius: 8px;
@@ -3814,7 +3903,22 @@ const AssetTransferFailureHeader = styled.div`
     text-transform: uppercase;
   }
 
-  span {
+  @media (max-width: 620px) {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+`;
+
+const AssetTransferFailureHeaderActions = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+
+  > span {
     flex: 0 0 auto;
     color: rgba(254, 202, 202, 0.76);
     font-size: 9px;
@@ -3824,9 +3928,8 @@ const AssetTransferFailureHeader = styled.div`
   }
 
   @media (max-width: 620px) {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 3px;
+    width: 100%;
+    justify-content: space-between;
   }
 `;
 
@@ -3834,16 +3937,34 @@ const AssetTransferFailureList = styled.div`
   display: grid;
   gap: 6px;
   min-width: 0;
+  max-height: clamp(92px, 13vh, 126px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
+  overscroll-behavior: contain;
+  scroll-snap-type: y proximity;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
 `;
 
 const AssetTransferFailureItem = styled.div`
   display: grid;
   gap: 4px;
   min-width: 0;
+  min-height: 88px;
   padding: 7px 8px;
   border: 1px solid rgba(248, 113, 113, 0.16);
   border-radius: 7px;
   background: rgba(2, 6, 23, 0.28);
+  scroll-snap-align: start;
+`;
+
+const AssetTransferFailureItemHeader = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  align-items: start;
+  gap: 6px;
+  min-width: 0;
 `;
 
 const AssetTransferFailureTitle = styled.strong`
@@ -3883,6 +4004,71 @@ const AssetTransferFailureMeta = styled.div`
     line-height: 1.2;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+`;
+
+const AssetFailureCopyButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(254, 202, 202, 0.18);
+  border-radius: 6px;
+  color: rgba(254, 226, 226, 0.88);
+  background: rgba(15, 23, 42, 0.34);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1;
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  span {
+    white-space: nowrap;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible,
+  &[data-copied="true"] {
+    border-color: rgba(45, 212, 191, 0.32);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.16);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+`;
+
+const AssetFailureIconButton = styled.button`
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(254, 202, 202, 0.14);
+  border-radius: 6px;
+  color: rgba(254, 226, 226, 0.8);
+  background: rgba(15, 23, 42, 0.3);
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover,
+  &:focus-visible,
+  &[data-copied="true"] {
+    border-color: rgba(45, 212, 191, 0.3);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.16);
   }
 `;
 
@@ -3979,9 +4165,10 @@ const AssetNotice = styled.div`
 
 const AssetEmptyState = styled.div`
   display: grid;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   place-items: center;
-  min-height: 0;
+  min-height: 120px;
+  overflow: auto;
   padding: 20px;
   border: 1px dashed rgba(148, 163, 184, 0.22);
   border-radius: 8px;

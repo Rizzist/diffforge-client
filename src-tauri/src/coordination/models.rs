@@ -253,6 +253,23 @@ impl TerminalCoordinationContext {
                 self.mcp_command.clone(),
             ),
             (
+                "COORDINATION_MCP_CONFIG_PATH".to_string(),
+                self.mcp_config_path.clone(),
+            ),
+            ("MCP_CONFIG_PATH".to_string(), self.mcp_config_path.clone()),
+            (
+                "CODEX_MCP_CONFIG_PATH".to_string(),
+                self.codex_mcp_config_path.clone(),
+            ),
+            (
+                "CLAUDE_MCP_CONFIG".to_string(),
+                self.claude_mcp_config_path.clone(),
+            ),
+            (
+                "CLAUDE_CODE_MCP_CONFIG".to_string(),
+                self.claude_mcp_config_path.clone(),
+            ),
+            (
                 "COORDINATION_OBJECTIVE_KEY".to_string(),
                 self.objective_key.clone(),
             ),
