@@ -252,6 +252,7 @@ import {
   AudioShortcutKey,
   AudioShortcutActions,
   AudioTabBar,
+  AudioTabList,
   AudioTabButton,
   AudioTabPanel,
   AudioDictionaryPanel,
@@ -278,6 +279,8 @@ import {
   AudioRuleStatusLine,
   AudioHistoryStatusBadge,
   AudioHistoryPanel,
+  AudioHistoryStats,
+  AudioHistoryStatChip,
   AudioHistoryVirtualList,
   AudioHistoryList,
   AudioHistoryRow,
@@ -288,6 +291,15 @@ import {
   AudioHistoryProvider,
   AudioHistoryCopyButton,
   AudioHistoryMeta,
+  AudioInsightCard,
+  AudioInsightCardTopline,
+  AudioInsightLabel,
+  AudioInsightSubValue,
+  AudioInsightValue,
+  AudioWpmGauge,
+  AudioHeatmapGrid,
+  AudioHeatmapColumn,
+  AudioHeatmapCell,
   AudioRuntimeHint,
   AudioProgressPanel,
   AudioProgressTopline,
@@ -1551,6 +1563,7 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
+  const audioHistoryInsights = useMemo(() => buildAudioHistoryInsights(audioHistory), [audioHistory]);
   const audioHistoryRows = useMemo(() => buildAudioHistoryRows(audioHistory), [audioHistory]);
   const audioHistoryVirtualWindow = useMemo(() => (
     buildAudioHistoryVirtualWindow(
@@ -2510,24 +2523,7 @@ export default function AudioWorkspaceView({
 
   return (
     <AudioWorkspaceSurface aria-label="Workspace audio">
-      <AudioTabBar onKeyDown={handleAudioTabKeyDown} role="tablist" aria-label="Audio settings sections">
-        {AUDIO_SETTINGS_TABS.map((tab) => (
-          <AudioTabButton
-            aria-controls={`audio-tabpanel-${tab.id}`}
-            aria-selected={activeAudioTab === tab.id}
-            id={`audio-tab-${tab.id}`}
-            key={tab.id}
-            onClick={() => selectAudioTab(tab.id)}
-            role="tab"
-            tabIndex={activeAudioTab === tab.id ? 0 : -1}
-            type="button"
-          >
-            {tab.label}
-          </AudioTabButton>
-        ))}
-      </AudioTabBar>
-
-      <AudioSetupPanel>
+      <AudioTabBar aria-label="Audio settings">
         <AudioHeroRow>
           <VaultPlaceholderIcon aria-hidden="true">
             <ButtonMicIcon />
@@ -2548,6 +2544,25 @@ export default function AudioWorkspaceView({
           </AudioStatePill>
         </AudioHeroRow>
 
+        <AudioTabList onKeyDown={handleAudioTabKeyDown} role="tablist" aria-label="Audio settings sections">
+          {AUDIO_SETTINGS_TABS.map((tab) => (
+            <AudioTabButton
+              aria-controls={`audio-tabpanel-${tab.id}`}
+              aria-selected={activeAudioTab === tab.id}
+              id={`audio-tab-${tab.id}`}
+              key={tab.id}
+              onClick={() => selectAudioTab(tab.id)}
+              role="tab"
+              tabIndex={activeAudioTab === tab.id ? 0 : -1}
+              type="button"
+            >
+              {tab.label}
+            </AudioTabButton>
+          ))}
+        </AudioTabList>
+      </AudioTabBar>
+
+      <AudioSetupPanel>
         {activeAudioTab === "general" && (
           <AudioTabPanel
             aria-labelledby="audio-tab-general"
@@ -3403,6 +3418,80 @@ export default function AudioWorkspaceView({
             id="audio-tabpanel-history"
             role="tabpanel"
           >
+            <AudioHistoryStats aria-label="Speech to text statistics">
+              <AudioInsightCard
+                aria-label={`Average words per minute${
+                  audioWpmPercentileLabel(audioHistoryInsights.averageWpm)
+                    ? `, ${audioWpmPercentileLabel(audioHistoryInsights.averageWpm)} of speakers`
+                    : ""
+                }`}
+              >
+                <AudioInsightValue>
+                  {audioHistoryInsights.averageWpm > 0
+                    ? formatInteger(audioHistoryInsights.averageWpm)
+                    : "0"}
+                </AudioInsightValue>
+                <AudioInsightLabel>Words per minute</AudioInsightLabel>
+                <AudioWpmGauge aria-hidden="true" viewBox="0 0 100 56">
+                  <path
+                    className="track"
+                    d="M 8 50 A 42 42 0 0 1 92 50"
+                  />
+                  <path
+                    className="fill"
+                    d="M 8 50 A 42 42 0 0 1 92 50"
+                    style={{
+                      strokeDasharray: 131.95,
+                      strokeDashoffset: 131.95 * (1 - Math.min(
+                        Math.max(audioHistoryInsights.averageWpm, 0) / AUDIO_WPM_GAUGE_MAX,
+                        1,
+                      )),
+                    }}
+                  />
+                  {audioWpmPercentileLabel(audioHistoryInsights.averageWpm) && (
+                    <text className="tier" textAnchor="middle" x="50" y="49">
+                      {audioWpmPercentileLabel(audioHistoryInsights.averageWpm).toUpperCase()}
+                    </text>
+                  )}
+                </AudioWpmGauge>
+              </AudioInsightCard>
+              <AudioInsightCard aria-label="Words spoken per day">
+                <AudioInsightCardTopline>
+                  <AudioInsightLabel>Daily speaking</AudioInsightLabel>
+                  <AudioInsightSubValue>
+                    {formatInteger(audioHistoryInsights.totalWords)} words
+                  </AudioInsightSubValue>
+                </AudioInsightCardTopline>
+                <AudioHeatmapGrid role="img" aria-label="Words spoken per day, recent weeks">
+                  {audioHistoryInsights.weeks.map((week, weekIndex) => (
+                    <AudioHeatmapColumn key={`week-${weekIndex}`}>
+                      {week.map((cell, dayIndex) => (
+                        cell ? (
+                          <AudioHeatmapCell
+                            data-level={cell.level}
+                            key={cell.key}
+                            title={cell.label}
+                          />
+                        ) : (
+                          <AudioHeatmapCell data-empty="true" key={`pad-${weekIndex}-${dayIndex}`} />
+                        )
+                      ))}
+                    </AudioHeatmapColumn>
+                  ))}
+                </AudioHeatmapGrid>
+              </AudioInsightCard>
+              <AudioInsightCard data-kind="totals">
+                <AudioHistoryStatChip>
+                  <span>Dictations</span>
+                  <strong>{formatInteger(audioHistoryInsights.totalDictations)}</strong>
+                </AudioHistoryStatChip>
+                <AudioHistoryStatChip>
+                  <span>Audio time</span>
+                  <strong>{formatAudioHistoryTotalDuration(audioHistoryInsights.audioMs)}</strong>
+                </AudioHistoryStatChip>
+              </AudioInsightCard>
+            </AudioHistoryStats>
+
             {audioHistory.length ? (
               <AudioHistoryVirtualList
                 aria-label="Speech to text history"

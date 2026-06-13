@@ -1432,7 +1432,24 @@ fn tokenomics_generic_device_label(device_id: &str) -> String {
     } else if lower.contains("linux") {
         "Linux device".to_string()
     } else {
-        "Other device".to_string()
+        let char_count = device_id.chars().count();
+        let suffix = if char_count > 10 {
+            let prefix = device_id.chars().take(6).collect::<String>();
+            let tail = device_id
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>();
+            format!("{prefix}...{tail}")
+        } else if device_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            device_id.to_string()
+        };
+        format!("Device {suffix}")
     }
 }
 

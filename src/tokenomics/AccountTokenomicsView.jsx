@@ -779,6 +779,8 @@ function tokenomicsDeviceIdentityRows(summary = {}) {
     ...(Array.isArray(value.device_identities) ? value.device_identities : []),
     ...(Array.isArray(value.deviceIdentities) ? value.deviceIdentities : []),
     ...(Array.isArray(value.devices) ? value.devices : []),
+    ...(Array.isArray(value.device_aliases) ? value.device_aliases : []),
+    ...(Array.isArray(value.deviceAliases) ? value.deviceAliases : []),
   ];
 }
 
@@ -812,6 +814,65 @@ function tokenomicsDeviceIdentityIds(identity = {}) {
   ].map((value) => String(value || "").trim()).filter(Boolean);
 }
 
+function tokenomicsIdentityLooksNative(identity = {}) {
+  if (!identity || typeof identity !== "object") return false;
+  if (identity.current === true || identity.current === "true") return true;
+  const clientKind = [
+    identity.client_kind,
+    identity.clientKind,
+    identity.source,
+    identity.agent_id,
+    identity.agentId,
+  ].map((value) => String(value || "").trim()).join(" ").toLowerCase();
+  const platformAndForm = [
+    identity.platform,
+    identity.os,
+    identity.form_factor,
+    identity.formFactor,
+    identity.device_type,
+    identity.deviceType,
+  ].map((value) => String(value || "").trim()).join(" ").toLowerCase();
+  const nativeRuntime = ["native", "desktop", "tauri", "rust"].some((token) => clientKind.includes(token));
+  const webOnly = clientKind.includes("web") && !nativeRuntime;
+  const mobileOnly = !nativeRuntime
+    && ["mobile", "phone", "tablet", "android", "ios"].some((token) => platformAndForm.includes(token));
+  return nativeRuntime && !webOnly && !mobileOnly;
+}
+
+function mappedNativeDeviceIds(summary = {}) {
+  const ids = new Set();
+  const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
+  if (currentDeviceId) ids.add(currentDeviceId);
+  tokenomicsDeviceIdentityRows(summary).forEach((identity) => {
+    if (!tokenomicsIdentityLooksNative(identity)) return;
+    tokenomicsDeviceIdentityIds(identity).forEach((id) => ids.add(id));
+  });
+  return ids;
+}
+
+function rowsForMappedNativeDevices(rows = [], nativeDeviceIds = new Set()) {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row) => {
+    const id = rowDeviceId(row);
+    return !id || nativeDeviceIds.has(id);
+  });
+}
+
+function summaryForMappedNativeDevices(summary = {}) {
+  if (!summary || typeof summary !== "object") return summary;
+  const nativeDeviceIds = mappedNativeDeviceIds(summary);
+  return {
+    ...summary,
+    by_device: rowsForMappedNativeDevices(summary.by_device, nativeDeviceIds),
+    by_device_provider: rowsForMappedNativeDevices(summary.by_device_provider, nativeDeviceIds),
+    by_device_account: rowsForMappedNativeDevices(summary.by_device_account, nativeDeviceIds),
+    by_device_model: rowsForMappedNativeDevices(summary.by_device_model, nativeDeviceIds),
+    daily_by_device_provider: rowsForMappedNativeDevices(summary.daily_by_device_provider, nativeDeviceIds),
+    hourly: rowsForMappedNativeDevices(summary.hourly, nativeDeviceIds),
+    monthly_by_device_provider: rowsForMappedNativeDevices(summary.monthly_by_device_provider, nativeDeviceIds),
+  };
+}
+
 function tokenomicsDeviceIdentityMap(summary = {}) {
   const byId = new Map();
   tokenomicsDeviceIdentityRows(summary).forEach((identity) => {
@@ -834,7 +895,9 @@ function genericDeviceLabel(deviceId) {
   if (lower.includes("windows") || lower.startsWith("win")) return "Windows PC";
   if (lower.includes("macos") || lower.includes("macbook") || lower.startsWith("mac")) return "Mac device";
   if (lower.includes("linux")) return "Linux device";
-  return "Other device";
+  const clean = String(deviceId || "").trim();
+  const suffix = clean.length > 10 ? `${clean.slice(0, 6)}...${clean.slice(-4)}` : clean || "unknown";
+  return `Device ${suffix}`;
 }
 
 function dedupeDeviceLabels(devices) {
@@ -1644,6 +1707,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
 function deviceOptions(summary, selectedScopeKey = "all") {
   const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
   const identityMap = tokenomicsDeviceIdentityMap(summary);
+  const nativeDeviceIds = mappedNativeDeviceIds(summary);
   const rows = [
     ...(Array.isArray(summary?.by_device) ? summary.by_device : []),
     ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
@@ -1651,16 +1715,13 @@ function deviceOptions(summary, selectedScopeKey = "all") {
     ...(Array.isArray(summary?.by_device_model) ? summary.by_device_model : []),
     ...(Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : []),
     ...(Array.isArray(summary?.hourly) ? summary.hourly : []),
-    ...(Array.isArray(summary?.limits) ? summary.limits : []),
-    ...(Array.isArray(summary?.limit_samples) ? summary.limit_samples : []),
-    ...(Array.isArray(summary?.limitSamples) ? summary.limitSamples : []),
-    ...tokenomicsDeviceIdentityRows(summary),
   ];
   const byDevice = new Map();
   for (const row of rows) {
     if (selectedScopeKey !== "all" && rowScopeKey(row) !== selectedScopeKey) continue;
     const id = rowDeviceId(row);
     if (!id) continue;
+    if (!nativeDeviceIds.has(id)) continue;
     const current = byDevice.get(id) || {
       key: id,
       current: currentDeviceId === id,
@@ -2294,15 +2355,16 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     };
   }, []);
 
-  const providers = Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : [];
+  const visibleSummary = useMemo(() => summaryForMappedNativeDevices(summary), [summary]);
+  const providers = Array.isArray(visibleSummary?.by_device_provider) ? visibleSummary.by_device_provider : [];
   const deviceFiltered = selectedDeviceId !== "all";
-  const modelRows = Array.isArray(summary?.by_device_model) ? summary.by_device_model : [];
+  const modelRows = Array.isArray(visibleSummary?.by_device_model) ? visibleSummary.by_device_model : [];
   const providerRows = providers;
-  const scopes = useMemo(() => scopeOptions(summary), [summary]);
-  const devices = useMemo(() => deviceOptions(summary, selectedScopeKey), [summary, selectedScopeKey]);
+  const scopes = useMemo(() => scopeOptions(visibleSummary), [visibleSummary]);
+  const devices = useMemo(() => deviceOptions(visibleSummary, selectedScopeKey), [visibleSummary, selectedScopeKey]);
   const accountOptions = useMemo(
-    () => providerAccountOptions(summary, selectedProvider, selectedDeviceId, selectedScopeKey),
-    [summary, selectedDeviceId, selectedProvider, selectedScopeKey],
+    () => providerAccountOptions(visibleSummary, selectedProvider, selectedDeviceId, selectedScopeKey),
+    [visibleSummary, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   useEffect(() => {
     if (
@@ -2334,14 +2396,14 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
       updateTokenomicsStore({ selectedAccountKey: "all" });
     }
   }, [accountOptions, selectedAccountKey, selectedProvider]);
-  const dailyRaw = Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : [];
-  const hourlyRaw = Array.isArray(summary?.hourly) ? summary.hourly : [];
-  const limitSamplesRaw = Array.isArray(summary?.limit_samples)
-    ? summary.limit_samples
-    : (Array.isArray(summary?.limitSamples) ? summary.limitSamples : []);
+  const dailyRaw = Array.isArray(visibleSummary?.daily_by_device_provider) ? visibleSummary.daily_by_device_provider : [];
+  const hourlyRaw = Array.isArray(visibleSummary?.hourly) ? visibleSummary.hourly : [];
+  const limitSamplesRaw = Array.isArray(visibleSummary?.limit_samples)
+    ? visibleSummary.limit_samples
+    : (Array.isArray(visibleSummary?.limitSamples) ? visibleSummary.limitSamples : []);
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, limitSamplesRaw, summary?.limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
-    [dailyRaw, dailyWindowDays, limitSamplesRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, summary?.limits],
+    () => buildDailyRows(dailyRaw, limitSamplesRaw, visibleSummary?.limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, limitSamplesRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, visibleSummary?.limits],
   );
   const today = useMemo(
     () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
@@ -2351,7 +2413,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
     [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
-  const deviceAccountRows = Array.isArray(summary?.by_device_account) ? summary.by_device_account : [];
+  const deviceAccountRows = Array.isArray(visibleSummary?.by_device_account) ? visibleSummary.by_device_account : [];
   const totalRows = deviceFiltered
     ? (selectedAccountKey === "all" ? providerRows : deviceAccountRows)
     : selectedAccountKey === "all" ? providerRows : deviceAccountRows;
@@ -2360,8 +2422,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, totalRows],
   );
   const limits = useMemo(
-    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
-    [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, summary?.limits],
+    () => filterLimits(visibleSummary?.limits, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
+    [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, visibleSummary?.limits],
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
@@ -2381,20 +2443,20 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     () => modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
     [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
-  const credits = billingStatus?.credits || summary?.credits || {};
+  const credits = billingStatus?.credits || visibleSummary?.credits || {};
   const providerLimitGroups = useMemo(() => (
     ["codex", "claude"].map((providerId) => {
-      const providerLimits = filterLimits(summary?.limits, providerId, "all", selectedScopeKey, selectedDeviceId);
+      const providerLimits = filterLimits(visibleSummary?.limits, providerId, "all", selectedScopeKey, selectedDeviceId);
       return {
         providerId,
         fiveHour: mergeLimits(providerLimits, "5_hour"),
         weekly: mergeLimits(providerLimits, "weekly"),
       };
     })
-  ), [selectedDeviceId, selectedScopeKey, summary?.limits]);
+  ), [selectedDeviceId, selectedScopeKey, visibleSummary?.limits]);
   const storage = useMemo(
-    () => storageUsageModel(billingStatus, summary, storageUsage),
-    [billingStatus, storageUsage, summary],
+    () => storageUsageModel(billingStatus, visibleSummary, storageUsage),
+    [billingStatus, storageUsage, visibleSummary],
   );
 
   return (

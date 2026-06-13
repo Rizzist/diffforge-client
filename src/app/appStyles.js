@@ -7356,18 +7356,39 @@ export const AudioTabBar = styled.div`
   display: grid;
   width: min(1080px, 100%);
   justify-self: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.03), rgba(244, 247, 250, 0.008)),
+    rgba(7, 9, 13, 0.72);
+
+  ${AudioHeroRow} {
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--forge-border);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+`;
+
+export const AudioTabList = styled.div`
+  display: grid;
+  width: 100%;
   grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
   gap: 6px;
   min-width: 0;
   padding: 5px;
-  border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.006)),
-    rgba(7, 9, 13, 0.66);
+    rgba(17, 22, 29, 0.58);
 
   html[data-forge-theme="light"] & {
-    background: var(--forge-surface);
+    background: rgba(0, 102, 204, 0.035);
   }
 
   @media (max-width: 520px) {
