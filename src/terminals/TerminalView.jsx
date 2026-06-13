@@ -13091,7 +13091,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceState("idle");
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
-    setOrchestratorVoiceFeedback("Checking Diff Forge Credits");
+    setOrchestratorVoiceFeedback("");
     setOrchestratorVoiceInputEnabled(false);
     setOrchestratorVoiceRealtimeSession(false);
     setOrchestratorChatSubmitting(false);
@@ -13229,7 +13229,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         await cleanupStartedMonitor();
         return;
       }
-      setOrchestratorVoiceFeedback("Opening voice session");
+      setOrchestratorVoiceFeedback("Working..");
 
       monitor = await startLowPowerAudioBuffer({
         deviceId: readSelectedAudioInputDeviceId(),

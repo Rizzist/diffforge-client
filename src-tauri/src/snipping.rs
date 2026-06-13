@@ -167,6 +167,9 @@ struct SnippingState {
     /// native post-release movement (edge snap/constrain) to go quiet before
     /// the app decides queue vs detached from the final position.
     preview_post_release_settling_labels: Arc<StdMutex<HashSet<String>>>,
+    /// Preview labels currently hovering over the recent strip during a native
+    /// drag. While present, their native window stays strip-tile sized.
+    preview_strip_hover_labels: Arc<StdMutex<HashSet<String>>>,
     /// Set by the watcher as soon as it sees mouse-up for a native preview
     /// drag, before the main-thread settle pass can decide whether the
     /// left-column quiet gate applies. This prevents a post-release Moved
@@ -176,6 +179,9 @@ struct SnippingState {
     /// windows are waiting for the close grace/release gate.
     preview_closing: Arc<StdMutex<HashSet<String>>>,
     preview_drag_over_last_emit_ms: Arc<AtomicU64>,
+    /// Bumped whenever a preview size tween is superseded by a newer
+    /// strip-hover shrink/expand target.
+    preview_size_animation_generation: Arc<AtomicU64>,
     /// Bumped whenever a new stack animation starts; in-flight tween threads
     /// compare their ticket and stop, so re-targeted reflows never fight.
     preview_animation_generation: Arc<AtomicU64>,
@@ -205,9 +211,11 @@ impl SnippingState {
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
             preview_detached_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_post_release_settling_labels: Arc::new(StdMutex::new(HashSet::new())),
+            preview_strip_hover_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_post_release_check_pending: Arc::new(AtomicBool::new(false)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
+            preview_size_animation_generation: Arc::new(AtomicU64::new(0)),
             preview_animation_generation: Arc::new(AtomicU64::new(0)),
             preview_live_reflow_last_ms: Arc::new(AtomicU64::new(0)),
             preview_pool: Arc::new(StdMutex::new(Vec::new())),
@@ -4310,6 +4318,8 @@ const SNIPPING_FLOAT_GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
 // cropped) instead of sizing the window.
 const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 =
     SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
+const SNIPPING_STRIP_TILE_LOGICAL_WIDTH: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH * 0.5;
+const SNIPPING_STRIP_TILE_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_HEIGHT * 0.5;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
 // Fallback settle deadline pushed forward by every Moved event. On platforms
@@ -4331,6 +4341,7 @@ const SNIPPING_FLOAT_SETTLE_POLL_MS: u64 = 15;
 // pane, ...) and consumes the preview when one accepts.
 const SNIPPING_PREVIEW_DROP_EVENT: &str = "forge-snip-preview-drop";
 const SNIPPING_PREVIEW_DRAG_OVER_EVENT: &str = "forge-snip-preview-drag-over";
+const SNIPPING_STRIP_DRAG_EVENT: &str = "forge-snip-strip-drag";
 // One drag-over point per display frame keeps target highlights glued to the
 // cursor; the old 50ms cadence visibly trailed it.
 const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 16;
@@ -4411,6 +4422,9 @@ fn snipping_begin_preview_drag_session(
     if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
         settling.remove(label);
     }
+    if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
+        strip_hover.remove(label);
+    }
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -4439,6 +4453,9 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     }
     if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
         settling.remove(label);
+    }
+    if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
+        strip_hover.remove(label);
     }
     state
         .preview_post_release_check_pending
@@ -4470,6 +4487,9 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
         settling.remove(label);
     }
+    if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
+        strip_hover.remove(label);
+    }
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -4500,6 +4520,9 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     }
     if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
         settling.remove(label);
+    }
+    if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
+        strip_hover.remove(label);
     }
     state
         .preview_post_release_check_pending
@@ -4701,13 +4724,32 @@ fn snipping_tween_eased(progress: f64, easing: SnippingTweenEasing) -> f64 {
     }
 }
 
-fn snipping_animate_preview_logical_size_to_full(
+fn snipping_set_preview_logical_size_now(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    width: f64,
+    height: f64,
+) {
+    app.state::<SnippingState>()
+        .preview_size_animation_generation
+        .fetch_add(1, Ordering::SeqCst);
+    let _ = window.set_size(tauri::LogicalSize::new(width, height));
+}
+
+fn snipping_animate_preview_logical_size(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
     from_width: f64,
     from_height: f64,
+    to_width: f64,
+    to_height: f64,
     duration_ms: f64,
 ) {
+    let generation = app
+        .state::<SnippingState>()
+        .preview_size_animation_generation
+        .clone();
+    let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = window.set_size(tauri::LogicalSize::new(from_width, from_height));
     let app = app.clone();
     let window = window.clone();
@@ -4716,14 +4758,21 @@ fn snipping_animate_preview_logical_size_to_full(
     thread::spawn(move || {
         let started = Instant::now();
         loop {
+            if generation.load(Ordering::SeqCst) != ticket {
+                return;
+            }
             let progress = (started.elapsed().as_millis() as f64 / duration_ms).min(1.0);
             let eased = snipping_tween_eased(progress, SnippingTweenEasing::Track);
-            let width = from_width + (SNIPPING_FLOAT_LOGICAL_WIDTH - from_width) * eased;
-            let height = from_height + (SNIPPING_FLOAT_LOGICAL_HEIGHT - from_height) * eased;
+            let width = from_width + (to_width - from_width) * eased;
+            let height = from_height + (to_height - from_height) * eased;
             let app_for_frame = app.clone();
             let window_for_frame = window.clone();
             let label_for_frame = label.clone();
+            let generation_for_frame = generation.clone();
             let _ = app.run_on_main_thread(move || {
+                if generation_for_frame.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
                 if app_for_frame
                     .get_webview_window(label_for_frame.as_str())
                     .is_none()
@@ -4739,6 +4788,24 @@ fn snipping_animate_preview_logical_size_to_full(
             thread::sleep(Duration::from_millis(SNIPPING_FLOAT_ANIMATE_FRAME_MS));
         }
     });
+}
+
+fn snipping_animate_preview_logical_size_to_full(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    from_width: f64,
+    from_height: f64,
+    duration_ms: f64,
+) {
+    snipping_animate_preview_logical_size(
+        app,
+        window,
+        from_width,
+        from_height,
+        SNIPPING_FLOAT_LOGICAL_WIDTH,
+        SNIPPING_FLOAT_LOGICAL_HEIGHT,
+        duration_ms,
+    );
 }
 
 /// Tweens preview windows to their stack slots instead of snapping them. A
@@ -5197,6 +5264,140 @@ fn snipping_preview_overlaps_strip(app: &AppHandle, preview: &tauri::WebviewWind
     overlap_x >= min_overlap_x && overlap_y >= min_overlap_y
 }
 
+fn snipping_preview_strip_client_x(
+    app: &AppHandle,
+    preview: &tauri::WebviewWindow,
+) -> Option<f64> {
+    let strip = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)?;
+    let preview_position = preview.outer_position().ok()?;
+    let preview_size = preview.outer_size().ok()?;
+    let strip_position = strip.outer_position().ok()?;
+    let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
+    let center_x = preview_position.x + preview_size.width as i32 / 2;
+    Some(f64::from(center_x - strip_position.x) / scale)
+}
+
+fn snipping_emit_strip_drag_event(
+    app: &AppHandle,
+    label: &str,
+    window: Option<&tauri::WebviewWindow>,
+    over: bool,
+    done: bool,
+    docked: bool,
+) {
+    let path = app
+        .state::<SnippingState>()
+        .preview_paths
+        .lock()
+        .ok()
+        .and_then(|paths| paths.get(label).cloned())
+        .unwrap_or_default();
+    let mut payload = json!({
+        "kind": "snip_strip_drag",
+        "label": label,
+        "path": path,
+        "over": over,
+        "done": done,
+        "docked": docked,
+    });
+    if let Some(client_x) = window.and_then(|preview| snipping_preview_strip_client_x(app, preview))
+    {
+        payload["clientX"] = json!(client_x);
+    }
+    let _ = app.emit_to(SNIPPING_STRIP_WINDOW_LABEL, SNIPPING_STRIP_DRAG_EVENT, payload);
+}
+
+fn snipping_update_preview_strip_drag_state(
+    app: &AppHandle,
+    label: &str,
+    force_full_when_not_over: bool,
+) {
+    let is_dragging = app
+        .state::<SnippingState>()
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(label))
+        .unwrap_or(false);
+    if !is_dragging {
+        return;
+    }
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    let over_strip = snipping_preview_overlaps_strip(app, &window);
+    let changed = app
+        .state::<SnippingState>()
+        .preview_strip_hover_labels
+        .lock()
+        .map(|mut hovered| {
+            if over_strip {
+                hovered.insert(label.to_string())
+            } else {
+                hovered.remove(label)
+            }
+        })
+        .unwrap_or(false);
+    if over_strip {
+        if changed {
+            snipping_set_preview_logical_size_now(
+                app,
+                &window,
+                SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+                SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+            );
+            let _ = snipping_position_preview_under_cursor(
+                app,
+                &window,
+                SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+                SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+            );
+        }
+        snipping_emit_strip_drag_event(app, label, Some(&window), true, false, false);
+    } else {
+        if changed || force_full_when_not_over {
+            snipping_animate_preview_logical_size_to_full(
+                app,
+                &window,
+                SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+                SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+                SNIPPING_FLOAT_ANIMATE_MS * 0.45,
+            );
+        }
+        if changed {
+            snipping_emit_strip_drag_event(app, label, Some(&window), false, false, false);
+        }
+    }
+}
+
+fn snipping_clear_preview_strip_drag_state(
+    app: &AppHandle,
+    label: &str,
+    window: Option<&tauri::WebviewWindow>,
+    expand_to_full: bool,
+    docked: bool,
+) {
+    let changed = app
+        .state::<SnippingState>()
+        .preview_strip_hover_labels
+        .lock()
+        .map(|mut hovered| hovered.remove(label))
+        .unwrap_or(false);
+    if expand_to_full && changed {
+        if let Some(window) = window {
+            snipping_animate_preview_logical_size_to_full(
+                app,
+                window,
+                SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+                SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+                SNIPPING_FLOAT_ANIMATE_MS * 0.45,
+            );
+        }
+    }
+    if changed || docked {
+        snipping_emit_strip_drag_event(app, label, window, false, true, docked);
+    }
+}
+
 /// Offers every settled user drag to the main webview as a drop candidate.
 /// The webview decides whether something accepts it (and then calls
 /// snipping_consume_snip_preview); Rust only reports where it landed.
@@ -5225,6 +5426,7 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
         if (position.x - start_x).abs() < SNIPPING_PREVIEW_DRAG_MIN_DISTANCE
             && (position.y - start_y).abs() < SNIPPING_PREVIEW_DRAG_MIN_DISTANCE
         {
+            snipping_clear_preview_strip_drag_state(app, &label, Some(&window), true, false);
             continue;
         }
         let path = state
@@ -5234,15 +5436,18 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
             .and_then(|paths| paths.get(&label).cloned())
             .unwrap_or_default();
         if path.is_empty() {
+            snipping_clear_preview_strip_drag_state(app, &label, Some(&window), true, false);
             continue;
         }
         if snipping_preview_overlaps_strip(app, &window) {
             if let Ok(mut detached) = state.preview_detached_labels.lock() {
                 detached.remove(&label);
             }
+            snipping_clear_preview_strip_drag_state(app, &label, Some(&window), false, true);
             snipping_close_preview_window(app, &label, "strip-returned");
             continue;
         }
+        snipping_clear_preview_strip_drag_state(app, &label, Some(&window), true, false);
         // A drop inside the bottom-left queue column adopts the preview (the
         // reflow then packs it); a drop back onto the strip was handled above.
         // Anywhere else detaches it at the user's position.
@@ -5429,6 +5634,11 @@ fn snipping_build_preview_window(
         window.on_window_event(move |event| {
             match event {
                 WindowEvent::Moved(_) => {
+                    snipping_update_preview_strip_drag_state(
+                        &app_for_events,
+                        &label_for_events,
+                        false,
+                    );
                     snipping_emit_preview_drag_over(&app_for_events, &label_for_events);
                     // While the user holds this preview, the rest of the stack
                     // re-packs around it live (throttled, animated).
@@ -5478,6 +5688,48 @@ fn snipping_position_preview_window(
             }
         }
     }
+}
+
+fn snipping_cursor_logical_origin_for_preview(
+    app: &AppHandle,
+    width: f64,
+    height: f64,
+) -> Option<(f64, f64)> {
+    let cursor = app.cursor_position().ok()?;
+    let scale = app
+        .monitor_from_point(cursor.x, cursor.y)
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .map(|monitor| monitor.scale_factor().max(0.1))
+        .unwrap_or(1.0);
+    Some((cursor.x / scale - width * 0.5, cursor.y / scale - height * 0.5))
+}
+
+fn snipping_position_preview_under_cursor(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    width: f64,
+    height: f64,
+) -> bool {
+    let Ok(cursor) = app.cursor_position() else {
+        return false;
+    };
+    let scale = app
+        .monitor_from_point(cursor.x, cursor.y)
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .map(|monitor| monitor.scale_factor().max(0.1))
+        .unwrap_or(1.0);
+    let width_physical = (width * scale).round() as i32;
+    let height_physical = (height * scale).round() as i32;
+    let x = cursor.x.round() as i32 - width_physical / 2;
+    let y = cursor.y.round() as i32 - height_physical / 2;
+    window
+        .set_position(tauri::PhysicalPosition::new(x, y))
+        .is_ok()
 }
 
 /// Keeps hidden, fully booted preview windows parked so the next capture or
@@ -5563,9 +5815,19 @@ fn snipping_open_snip_preview_window_for(
     explicit_position: Option<(f64, f64)>,
     focused: bool,
 ) -> Result<Value, String> {
+    snipping_open_snip_preview_window_for_with_size(app, path, explicit_position, focused, None)
+}
+
+fn snipping_open_snip_preview_window_for_with_size(
+    app: &AppHandle,
+    path: &str,
+    explicit_position: Option<(f64, f64)>,
+    focused: bool,
+    initial_size: Option<(f64, f64)>,
+) -> Result<Value, String> {
     let file = diffforge_local_asset_file(path)?;
-    let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
-    let height = SNIPPING_FLOAT_LOGICAL_HEIGHT;
+    let (width, height) =
+        initial_size.unwrap_or((SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT));
     let path_string = file.display().to_string();
     let label = format!(
         "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
@@ -5767,22 +6029,22 @@ const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
 const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
 
-/// Newest-first listing of saved snip files. The on-disk `snips` directory is
-/// the durable history (the in-memory toast list only ever holds six). The strip
-/// can exclude visible previews so opening the dock never duplicates what is
-/// already on screen.
+/// Newest-first listing of saved snip files and their edited copies. The
+/// on-disk `snips` and `edits` directories are the durable history (the
+/// in-memory toast list only ever holds six). The strip can exclude visible
+/// previews so opening the dock never duplicates what is already on screen.
 fn snipping_recent_snip_items(
     app: &AppHandle,
     limit: usize,
     exclude_visible_free_previews: bool,
 ) -> Result<Vec<Value>, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
-    let Ok(entries) = fs::read_dir(root.join("snips")) else {
-        return Ok(Vec::new());
-    };
-    let mut snips: Vec<(u128, Value)> = entries
-        .flatten()
-        .filter_map(|entry| {
+    let mut snips: Vec<(u128, Value)> = Vec::new();
+    for (directory_name, source_kind) in [("snips", "snip"), ("edits", "edit")] {
+        let Ok(entries) = fs::read_dir(root.join(directory_name)) else {
+            continue;
+        };
+        snips.extend(entries.flatten().filter_map(|entry| {
             let path = entry.path();
             if !path
                 .extension()
@@ -5819,10 +6081,12 @@ fn snipping_recent_snip_items(
                     "path": path_string,
                     "name": name,
                     "modifiedMs": modified_ms as u64,
+                    "sourceKind": source_kind,
+                    "source_kind": source_kind,
                 }),
             ))
-        })
-        .collect();
+        }));
+    }
     snips.sort_by(|a, b| b.0.cmp(&a.0));
     Ok(snips
         .into_iter()
@@ -6141,7 +6405,20 @@ fn snipping_open_snip_float_for_drag(
     x: f64,
     y: f64,
 ) -> Result<Value, String> {
-    let opened = snipping_open_snip_preview_window_for(&app, &path, Some((x, y)), false)?;
+    let drag_size = (
+        SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+        SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+    );
+    let initial_position =
+        snipping_cursor_logical_origin_for_preview(&app, drag_size.0, drag_size.1)
+            .or(Some((x, y)));
+    let opened = snipping_open_snip_preview_window_for_with_size(
+        &app,
+        &path,
+        initial_position,
+        false,
+        Some(drag_size),
+    )?;
     let label = opened
         .get("label")
         .and_then(Value::as_str)
@@ -6150,18 +6427,15 @@ fn snipping_open_snip_float_for_drag(
     let window = app
         .get_webview_window(&label)
         .ok_or_else(|| "Snip preview window is not open.".to_string())?;
-    snipping_animate_preview_logical_size_to_full(
-        &app,
-        &window,
-        SNIPPING_FLOAT_LOGICAL_WIDTH * 0.5,
-        SNIPPING_FLOAT_LOGICAL_HEIGHT * 0.5,
-        SNIPPING_FLOAT_ANIMATE_MS * 0.5,
-    );
+    snipping_set_preview_logical_size_now(&app, &window, drag_size.0, drag_size.1);
+    let _ = snipping_position_preview_under_cursor(&app, &window, drag_size.0, drag_size.1);
     let position = window
         .outer_position()
         .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
     snipping_begin_preview_drag_session(&app, &label, position);
+    snipping_update_preview_strip_drag_state(&app, &label, true);
     schedule_snipping_preview_stack_reflow(&app);
+    let _ = snipping_position_preview_under_cursor(&app, &window, drag_size.0, drag_size.1);
     let drag_started = window.start_dragging().is_ok();
     let mut opened = opened;
     opened["dragStarted"] = json!(drag_started);
@@ -6308,6 +6582,7 @@ fn snipping_preview_drag_started(app: AppHandle, label: String) -> Result<Value,
         .outer_position()
         .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
     snipping_begin_preview_drag_session(&app, &label, position);
+    snipping_update_preview_strip_drag_state(&app, &label, false);
     // A plain click never emits Moved events, so make sure the session still
     // gets settled (and cleared) shortly after.
     schedule_snipping_preview_stack_reflow(&app);

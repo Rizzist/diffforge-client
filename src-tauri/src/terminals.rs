@@ -3438,6 +3438,8 @@ fn spawn_terminal_reader(
         let mut forensics_bytes: u64 = 0;
         let mut forensics_total_chunks: u64 = 0;
         let mut forensics_total_bytes: u64 = 0;
+        let mut auth_failure_scan_tail = String::new();
+        let mut auth_failure_marked = false;
         let exit_reason = loop {
             if output_channel_closed.load(Ordering::SeqCst) {
                 break "output_channel_closed";
@@ -3460,6 +3462,16 @@ fn spawn_terminal_reader(
                     let chunk = &buffer[..bytes_read];
                     if let Ok(mut headless_output) = headless_output.lock() {
                         headless_output.append(chunk);
+                    }
+                    if !auth_failure_marked
+                        && agent_accounts_observe_terminal_auth_output(
+                            &app,
+                            &reader_pane_id,
+                            &mut auth_failure_scan_tail,
+                            chunk,
+                        )
+                    {
+                        auth_failure_marked = true;
                     }
 
                     forensics_chunks += 1;

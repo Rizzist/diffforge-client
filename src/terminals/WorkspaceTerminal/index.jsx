@@ -1415,7 +1415,7 @@ const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
    its agent kind changes, the pane keeps working on its old account — this
    chip just says so, and that a restart adopts the new one. Never forced. */
 function TerminalAccountStaleChip({ paneId, agentKind }) {
-  const [stale, setStale] = useState(null);
+  const [status, setStatus] = useState(null);
 
   useEffect(() => {
     const kind = String(agentKind || "").toLowerCase().includes("claude")
@@ -1423,7 +1423,7 @@ function TerminalAccountStaleChip({ paneId, agentKind }) {
       : String(agentKind || "").toLowerCase().includes("codex") ? "codex" : "";
     const safePaneId = String(paneId || "").trim();
     if (!kind || !safePaneId) {
-      setStale(null);
+      setStatus(null);
       return undefined;
     }
     let cancelled = false;
@@ -1436,17 +1436,29 @@ function TerminalAccountStaleChip({ paneId, agentKind }) {
         const stamp = state?.panes?.[safePaneId];
         const active = state?.active?.[kind];
         if (!stamp || !active?.profileId) {
-          setStale(null);
+          setStatus(null);
+          return;
+        }
+        const auth = state?.auth?.[kind]?.[stamp.profileId];
+        if (auth?.needsLogin) {
+          setStatus({
+            kind,
+            mode: "needs-login",
+            profileId: String(stamp.profileId || ""),
+            label: String(stamp.profileLabel || "account"),
+            message: String(auth.message || "Sign in again for this account"),
+          });
           return;
         }
         if (String(stamp.profileId || "") !== String(active.profileId)) {
-          setStale({ label: String(active.profileLabel || "new account") });
+          setStatus({ mode: "stale", label: String(active.profileLabel || "new account") });
         } else {
-          setStale(null);
+          setStatus(null);
         }
       }).catch(() => {});
     };
     check();
+    const interval = window.setInterval(check, 6000);
     listen(AGENT_ACCOUNTS_CHANGED_EVENT, check).then((next) => {
       if (cancelled) {
         next();
@@ -1456,36 +1468,65 @@ function TerminalAccountStaleChip({ paneId, agentKind }) {
     }).catch(() => {});
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
       if (unlisten) {
         unlisten();
       }
     };
   }, [agentKind, paneId]);
 
-  if (!stale) {
+  if (!status) {
     return null;
+  }
+
+  const sharedStyle = {
+    alignItems: "center",
+    borderRadius: 999,
+    display: "inline-flex",
+    flex: "0 0 auto",
+    fontSize: 10,
+    fontWeight: 750,
+    gap: 4,
+    lineHeight: 1,
+    padding: "3px 8px",
+    whiteSpace: "nowrap",
+  };
+
+  if (status.mode === "needs-login") {
+    return (
+      <button
+        onClick={() => {
+          invoke("agent_accounts_start_profile_login", {
+            agentKind: status.kind,
+            profileId: status.profileId,
+          }).catch(() => {});
+        }}
+        style={{
+          ...sharedStyle,
+          background: "rgba(251, 146, 60, 0.16)",
+          border: "1px solid rgba(251, 146, 60, 0.52)",
+          color: "rgba(254, 215, 170, 0.95)",
+          cursor: "pointer",
+        }}
+        title={status.message}
+        type="button"
+      >
+        {`↻ login ${status.label}`}
+      </button>
+    );
   }
 
   return (
     <span
       style={{
-        alignItems: "center",
+        ...sharedStyle,
         background: "rgba(251, 146, 60, 0.14)",
         border: "1px solid rgba(251, 146, 60, 0.45)",
-        borderRadius: 999,
         color: "rgba(254, 215, 170, 0.95)",
-        display: "inline-flex",
-        flex: "0 0 auto",
-        fontSize: 10,
-        fontWeight: 750,
-        gap: 4,
-        lineHeight: 1,
-        padding: "3px 8px",
-        whiteSpace: "nowrap",
       }}
-      title={`Account switched to “${stale.label}”. This terminal still uses the account it started with — close and relaunch it to use the new one.`}
+      title={`Account switched to “${status.label}”. This terminal still uses the account it started with — close and relaunch it to use the new one.`}
     >
-      {`↻ ${stale.label}`}
+      {`↻ ${status.label}`}
     </span>
   );
 }

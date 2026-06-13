@@ -488,7 +488,7 @@ const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
 const FORGE_RELEASE_POST_BUFFER_MS = 350;
 // Last successful billing snapshot, module-wide: provider switches and
 // remounts render the known state instantly (stale-while-revalidate) instead
-// of flashing "Checking credits" while the network refresh runs.
+// of flashing startup text while the network refresh runs.
 let lastKnownForgeBilling = null;
 const AUDIO_WIDGET_PREROLL_READY_MS = 500;
 // Matches the 18-column track inside the input-source capsule meter.
@@ -1246,8 +1246,6 @@ export default function AudioWorkspaceView({
   const [capturingAudioShortcut, setCapturingAudioShortcut] = useState("");
   const audioInputPreviewRef = useRef(null);
   const audioInputRunRef = useRef(0);
-  const audioInputAutoWarmAttemptedRef = useRef(false);
-  const audioInputAutoWarmSuppressedRef = useRef(false);
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
   const copiedAudioHistoryTimerRef = useRef(0);
@@ -1305,7 +1303,7 @@ export default function AudioWorkspaceView({
           : "Forge ready")
     : isForgeAgentMode
       ? (forgeBilling.state === "loading"
-        ? "Checking credits"
+        ? "Starting.."
         : forgeBilling.state === "error"
           ? "Sign in needed"
           : forgeCreditsExhausted
@@ -1529,7 +1527,6 @@ export default function AudioWorkspaceView({
 
   const toggleAudioInputPreview = useCallback(() => {
     if (audioInputStateRef.current === "previewing") {
-      audioInputAutoWarmSuppressedRef.current = true;
       stopAudioInputPreview();
       audioInputStateRef.current = "ready";
       setAudioInputState("ready");
@@ -1538,8 +1535,6 @@ export default function AudioWorkspaceView({
       return;
     }
 
-    audioInputAutoWarmSuppressedRef.current = false;
-    audioInputAutoWarmAttemptedRef.current = true;
     startAudioInputPreview();
   }, [startAudioInputPreview, stopAudioInputPreview]);
 
@@ -1687,7 +1682,7 @@ export default function AudioWorkspaceView({
 
   const refreshForgeBilling = useCallback(async () => {
     // Stale-while-revalidate: keep showing the last known billing state while
-    // the refresh runs; "Checking credits" only appears on the first load.
+    // the refresh runs; startup text only appears on the first load.
     setForgeBilling((current) => (
       current.state === "ready"
         ? current
@@ -1928,24 +1923,6 @@ export default function AudioWorkspaceView({
   }, [loadAudioInputDevices]);
 
   useEffect(() => {
-    const inputSetupReady = hasAudioInputSetup();
-    const needsManualMacInputEnable = isMacPlatform() && !inputSetupReady;
-
-    if (
-      audioInputAutoWarmAttemptedRef.current
-      || audioInputAutoWarmSuppressedRef.current
-      || needsManualMacInputEnable
-      || audioInputState !== "ready"
-      || audioInputDevices.length === 0
-    ) {
-      return;
-    }
-
-    audioInputAutoWarmAttemptedRef.current = true;
-    startAudioInputPreview();
-  }, [audioInputDevices.length, audioInputState, startAudioInputPreview]);
-
-  useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
 
@@ -2156,7 +2133,7 @@ export default function AudioWorkspaceView({
                 <AudioRecorderOptionRow>
                   <SettingsHint>
                     {forgeBilling.state === "loading"
-                      ? "Checking Diff Forge AI credits..."
+                      ? (isForgeAgentMode ? "Working.." : "Checking Diff Forge AI credits...")
                       : forgeBilling.state === "error"
                         ? forgeBilling.error
                         : forgeCreditsExhausted
@@ -2165,10 +2142,12 @@ export default function AudioWorkspaceView({
                             ? "Streams mic audio to Diff Forge Cloud, runs the voice agent, and plays the response back here."
                             : "Realtime Nova-3 in Diff Forge Cloud. Billed from your credits: audio input, LLM cleanup, and transfer per MB."}
                   </SettingsHint>
-                  <SecondaryButton onClick={refreshForgeBilling} type="button">
-                    <ButtonRefreshIcon aria-hidden="true" />
-                    <span>{forgeBilling.state === "loading" ? "Checking..." : "Recheck credits"}</span>
-                  </SecondaryButton>
+                  {isForgeAgentMode && (
+                    <SecondaryButton onClick={refreshForgeBilling} type="button">
+                      <ButtonRefreshIcon aria-hidden="true" />
+                      <span>{forgeBilling.state === "loading" ? "Working.." : "Recheck credits"}</span>
+                    </SecondaryButton>
+                  )}
                 </AudioRecorderOptionRow>
                 {isForgeMode && (
                   <AudioRecorderOptionRow>
@@ -3351,7 +3330,7 @@ export function AudioWidgetWindow() {
     recordingRunRef.current = recordingRunId;
     setError("");
     setFinishPending(false);
-    setMessage("Arming buffer");
+    setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT ? "Starting.." : "Arming buffer");
     setRealtimeTranscript("");
     setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
     widgetStateRef.current = "arming";
@@ -3371,7 +3350,7 @@ export function AudioWidgetWindow() {
         return;
       }
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
-        setMessage("Preparing Forge voice");
+        setMessage("Starting..");
         await prewarmCloudVoiceAgentStream({
           requireBilling: true,
           onStatus: ({ message }) => {
@@ -3388,7 +3367,7 @@ export function AudioWidgetWindow() {
           }
           return;
         }
-        setMessage("Opening Forge voice");
+        setMessage("Working..");
       }
       await audioBuffer.beginCapture();
       captureBegan = true;
@@ -3416,7 +3395,7 @@ export function AudioWidgetWindow() {
         : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
           ? "Connecting Diff Forge Cloud"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
-            ? "Connecting Forge voice"
+            ? "Starting.."
             : "Recording");
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
         setMessage("Opening Deepgram stream");
@@ -4633,40 +4612,6 @@ export function AudioWidgetWindow() {
       closeWarmBuffer();
     };
   }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus]);
-
-  useEffect(() => {
-    if (widgetState !== "ready" || !hasAudioInputSetup()) {
-      return undefined;
-    }
-
-    const providerReady = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-      ? Boolean(deepgramApiKey.trim())
-      : transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
-        ? true
-      : transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-        ? true
-        : Boolean(modelStatus?.installed);
-
-    if (!providerReady) {
-      return undefined;
-    }
-
-    let disposed = false;
-
-    startWarmBuffer().catch((bufferError) => {
-      if (disposed || widgetStateRef.current !== "ready") {
-        return;
-      }
-
-      widgetStateRef.current = "error";
-      setWidgetState("error");
-      setError(getAudioInputErrorMessage(bufferError, "Unable to keep microphone input ready."));
-    });
-
-    return () => {
-      disposed = true;
-    };
-  }, [deepgramApiKey, modelStatus?.installed, startWarmBuffer, transcriptionProvider, widgetState]);
 
   useEffect(() => {
     if (widgetState === "setup" || widgetState === "missing" || widgetState === "error") {

@@ -58,6 +58,7 @@ const SNIPPING_FLOAT_WINDOW_PREFIX = "snip-float";
 const SNIPPING_STRIP_ANIM_EVENT = "forge-snip-strip-anim";
 const SNIPPING_STRIP_RECENT_LIMIT = 16;
 const SNIPPING_FLOATS_CHANGED_EVENT = "forge-snip-floats-changed";
+const SNIPPING_STRIP_DRAG_EVENT = "forge-snip-strip-drag";
 
 
 // Quick-access tools. Closed shapes (rect/oval) are one abstract "shape" tool
@@ -1383,8 +1384,65 @@ const FloatStatusPill = styled.span`
 const STRIP_TILE_DRAG_INTENT_PX = 7;
 const STRIP_TILE_DRAG_OUT_INTENT_PX = 12;
 const STRIP_TILE_DRAG_OUT_EDGE_PX = 8;
+const STRIP_TILE_WIDTH_PX = 120;
+const STRIP_TILE_GAP_PX = 10;
+const STRIP_RAIL_PADDING_LEFT_PX = 14;
 
-function StripSnipTile({ item, onChanged, onOpened, railRef }) {
+function clampIndex(index, min, max) {
+  return Math.max(min, Math.min(max, index));
+}
+
+function stripIndexForClientX(rail, clientX, itemCount) {
+  if (!rail) return 0;
+  const rect = rail.getBoundingClientRect();
+  const x = clientX - rect.left + rail.scrollLeft - STRIP_RAIL_PADDING_LEFT_PX;
+  const index = Math.round(x / (STRIP_TILE_WIDTH_PX + STRIP_TILE_GAP_PX));
+  return clampIndex(index, 0, Math.max(0, itemCount));
+}
+
+function nudgeStripRailForClientX(rail, clientX) {
+  if (!rail) return;
+  const rect = rail.getBoundingClientRect();
+  const edge = Math.min(96, Math.max(48, rect.width * 0.16));
+  if (clientX < rect.left + edge) {
+    rail.scrollLeft -= 26;
+  } else if (clientX > rect.right - edge) {
+    rail.scrollLeft += 26;
+  }
+}
+
+function moveStripItemToIndex(items, path, targetIndex) {
+  const fromIndex = items.findIndex((item) => assetLocalPath(item) === path);
+  if (fromIndex < 0) return items;
+  const next = items.slice();
+  const [item] = next.splice(fromIndex, 1);
+  next.splice(clampIndex(targetIndex, 0, next.length), 0, item);
+  return next;
+}
+
+function orderPathsForItems(items) {
+  return items.map((item) => assetLocalPath(item)).filter(Boolean);
+}
+
+function applyStripOrder(items, order) {
+  if (!order.length) return items;
+  const byPath = new Map(items.map((item) => [assetLocalPath(item), item]));
+  const used = new Set();
+  const ordered = [];
+  order.forEach((path) => {
+    const item = byPath.get(path);
+    if (!item || used.has(path)) return;
+    ordered.push(item);
+    used.add(path);
+  });
+  items.forEach((item) => {
+    const path = assetLocalPath(item);
+    if (!used.has(path)) ordered.push(item);
+  });
+  return ordered;
+}
+
+function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove, onReorderStart, railRef }) {
   const localPath = assetLocalPath(item);
   const name = useMemo(() => assetName(item), [item]);
   const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath);
@@ -1452,6 +1510,9 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
 
   const clearDrag = useCallback((event) => {
     const drag = dragRef.current;
+    if (drag?.mode === "reorder") {
+      onReorderEnd?.(localPath);
+    }
     if (drag && event?.currentTarget) {
       try {
         event.currentTarget.releasePointerCapture?.(drag.pointerId);
@@ -1461,7 +1522,7 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
     }
     dragRef.current = null;
     if (mountedRef.current) setPanning(false);
-  }, []);
+  }, [localPath, onReorderEnd]);
 
   const startDrag = useCallback((event) => {
     if (!localPath || busy || event.button !== 0 || event.target.closest("button")) return;
@@ -1473,7 +1534,6 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      startScrollLeft: rail?.scrollLeft || 0,
       railBottom: railRect?.bottom ?? 0,
       railTop: railRect?.top ?? 0,
       mode: "pending",
@@ -1489,13 +1549,6 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
     const absX = Math.abs(dx);
     const absY = Math.abs(dy);
     const distance = Math.hypot(dx, dy);
-    if (drag.mode === "scroll") {
-      if (rail) rail.scrollLeft = drag.startScrollLeft - dx;
-      event.preventDefault();
-      return;
-    }
-    if (distance < STRIP_TILE_DRAG_INTENT_PX) return;
-
     const railRect = rail?.getBoundingClientRect();
     const railTop = railRect?.top ?? drag.railTop;
     const railBottom = railRect?.bottom ?? drag.railBottom;
@@ -1503,13 +1556,31 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
       ? event.clientY < railTop - STRIP_TILE_DRAG_OUT_EDGE_PX
         || event.clientY > railBottom + STRIP_TILE_DRAG_OUT_EDGE_PX
       : false;
+    if (drag.mode === "reorder") {
+      if (outsideRailY && absY >= STRIP_TILE_DRAG_OUT_INTENT_PX) {
+        onReorderEnd?.(localPath);
+      } else {
+        nudgeStripRailForClientX(rail, event.clientX);
+        onReorderMove?.(localPath, event.clientX);
+        event.preventDefault();
+        return;
+      }
+    }
+    if (drag.mode === "reorder" && !outsideRailY) {
+      event.preventDefault();
+      return;
+    }
+    if (distance < STRIP_TILE_DRAG_INTENT_PX) return;
+
     const horizontalIntent = absX > absY * 1.15;
     const verticalIntent =
       absY >= STRIP_TILE_DRAG_OUT_INTENT_PX && (outsideRailY || absY > absX * 0.85);
 
     if (horizontalIntent && !outsideRailY) {
-      drag.mode = "scroll";
-      if (rail) rail.scrollLeft = drag.startScrollLeft - dx;
+      drag.mode = "reorder";
+      onReorderStart?.(localPath);
+      nudgeStripRailForClientX(rail, event.clientX);
+      onReorderMove?.(localPath, event.clientX);
       setPanning(true);
       event.preventDefault();
       return;
@@ -1517,6 +1588,7 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
     if (!verticalIntent && !outsideRailY) return;
 
     drag.mode = "drag-out";
+    onReorderEnd?.(localPath);
     setPanning(false);
     setBusy(true);
     setLaunching(true);
@@ -1537,7 +1609,7 @@ function StripSnipTile({ item, onChanged, onOpened, railRef }) {
         if (mountedRef.current) setPanning(false);
         if (mountedRef.current) setBusy(false);
       });
-  }, [busy, localPath, onOpened, railRef, showStatus]);
+  }, [busy, localPath, onOpened, onReorderEnd, onReorderMove, onReorderStart, railRef, showStatus]);
 
   if (!localPath) return null;
 
@@ -1612,7 +1684,26 @@ export function SnippingRecentStrip() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [nativeDrag, setNativeDrag] = useState(null);
   const railRef = useRef(null);
+  const orderRef = useRef([]);
+  const pendingDockRef = useRef(null);
+
+  const updateItemsFromServer = useCallback((incomingItems) => {
+    let nextItems = applyStripOrder(incomingItems, orderRef.current);
+    const pendingDock = pendingDockRef.current;
+    let dockApplied = false;
+    if (pendingDock?.path && nextItems.some((item) => assetLocalPath(item) === pendingDock.path)) {
+      nextItems = moveStripItemToIndex(nextItems, pendingDock.path, pendingDock.index);
+      orderRef.current = orderPathsForItems(nextItems);
+      pendingDockRef.current = null;
+      dockApplied = true;
+    }
+    setItems(nextItems);
+    if (dockApplied) {
+      setNativeDrag(null);
+    }
+  }, []);
 
   const refresh = useCallback((showLoading = false) => {
     if (showLoading) setLoading(true);
@@ -1621,7 +1712,7 @@ export function SnippingRecentStrip() {
       excludeVisibleFreePreviews: true,
     })
       .then((result) => {
-        setItems(Array.isArray(result?.items) ? result.items : []);
+        updateItemsFromServer(Array.isArray(result?.items) ? result.items : []);
         setError("");
       })
       .catch((nextError) => {
@@ -1630,7 +1721,7 @@ export function SnippingRecentStrip() {
       .finally(() => {
         setLoading(false);
       });
-  }, []);
+  }, [updateItemsFromServer]);
 
   useEffect(() => {
     refresh(true);
@@ -1661,6 +1752,55 @@ export function SnippingRecentStrip() {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten = () => {};
+    listen(SNIPPING_STRIP_DRAG_EVENT, (event) => {
+      if (cancelled) return;
+      const payload = event?.payload || {};
+      const path = text(payload.path);
+      if (!path) {
+        setNativeDrag(null);
+        return;
+      }
+      const rail = railRef.current;
+      const clientX = Number(payload.clientX);
+      const index = Number.isFinite(clientX)
+        ? stripIndexForClientX(rail, clientX, items.length)
+        : items.length;
+      if (Number.isFinite(clientX)) {
+        nudgeStripRailForClientX(rail, clientX);
+      }
+      if (payload.docked === true) {
+        pendingDockRef.current = { path, index };
+        orderRef.current = [
+          ...orderRef.current.filter((orderedPath) => orderedPath !== path).slice(0, index),
+          path,
+          ...orderRef.current.filter((orderedPath) => orderedPath !== path).slice(index),
+        ];
+        setNativeDrag({ docking: true, index, path });
+        return;
+      }
+      if (payload.done === true || payload.over === false) {
+        setNativeDrag(null);
+        return;
+      }
+      setNativeDrag({ index, path });
+    })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten();
+    };
+  }, [items.length]);
+
   const onWheel = useCallback((event) => {
     const rail = railRef.current;
     if (!rail) return;
@@ -1673,21 +1813,61 @@ export function SnippingRecentStrip() {
   }, []);
 
   const removePath = useCallback((path) => {
+    orderRef.current = orderRef.current.filter((orderedPath) => orderedPath !== path);
     setItems((current) => current.filter((item) => assetLocalPath(item) !== path));
   }, []);
 
+  const reorderPath = useCallback((path, clientX) => {
+    const rail = railRef.current;
+    nudgeStripRailForClientX(rail, clientX);
+    setItems((current) => {
+      const targetIndex = stripIndexForClientX(rail, clientX, current.length);
+      const next = moveStripItemToIndex(current, path, targetIndex);
+      orderRef.current = orderPathsForItems(next);
+      return next;
+    });
+  }, []);
+
+  const endReorder = useCallback(() => {
+    setItems((current) => {
+      orderRef.current = orderPathsForItems(current);
+      return current;
+    });
+  }, []);
+
+  const renderEntries = useMemo(() => {
+    const entries = items
+      .filter((item) => assetLocalPath(item) !== nativeDrag?.path)
+      .map((item) => ({ item, key: assetLocalPath(item), type: "item" }));
+    if (nativeDrag?.path) {
+      entries.splice(clampIndex(nativeDrag.index, 0, entries.length), 0, {
+        key: `native-slot:${nativeDrag.path}`,
+        path: nativeDrag.path,
+        type: "slot",
+      });
+    }
+    return entries;
+  }, [items, nativeDrag]);
+
   return (
     <StripRail aria-label="Recent snips" onWheel={onWheel} ref={railRef}>
-      {items.map((item) => (
-        <StripSnipTile
-          item={item}
-          key={assetLocalPath(item)}
-          onChanged={removePath}
-          onOpened={removePath}
-          railRef={railRef}
-        />
+      {renderEntries.map((entry) => (
+        entry.type === "slot" ? (
+          <StripDropSlot data-docking={nativeDrag?.docking ? "true" : "false"} key={entry.key} />
+        ) : (
+          <StripSnipTile
+            item={entry.item}
+            key={entry.key}
+            onChanged={removePath}
+            onOpened={removePath}
+            onReorderEnd={endReorder}
+            onReorderMove={reorderPath}
+            onReorderStart={() => {}}
+            railRef={railRef}
+          />
+        )
       ))}
-      {!items.length ? (
+      {!items.length && !nativeDrag ? (
         <StripRailStatus>
           {loading ? "Loading..." : error || "No snips yet"}
         </StripRailStatus>
@@ -1994,6 +2174,33 @@ const StripTile = styled.div`
     padding: 4px 8px 4px 6px;
     font-size: 10px;
     z-index: 5;
+  }
+`;
+
+const StripDropSlot = styled.div`
+  position: relative;
+  flex: 0 0 120px;
+  width: 120px;
+  height: 74px;
+  border: 1px dashed rgba(125, 176, 255, 0.62);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(28, 48, 78, 0.42), rgba(8, 14, 24, 0.28)),
+    rgba(10, 16, 25, 0.35);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 12px 26px rgba(0, 0, 0, 0.18);
+  opacity: 0.95;
+  transition:
+    border-color 120ms ease,
+    opacity 120ms ease,
+    transform 160ms cubic-bezier(0.2, 0.9, 0.3, 1.1);
+
+  &[data-docking="true"] {
+    border-style: solid;
+    border-color: rgba(94, 222, 153, 0.62);
+    opacity: 0.8;
+    transform: scale(0.985);
   }
 `;
 

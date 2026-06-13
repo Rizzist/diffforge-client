@@ -5477,17 +5477,39 @@ fn cleanup_login_terminal_children() -> usize {
 }
 
 #[cfg(windows)]
-fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), String> {
+fn quote_cmd_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(windows)]
+fn run_login_terminal_with_env(
+    title: &str,
+    binary: &str,
+    args: &[&str],
+    env_vars: &[(String, String)],
+) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
     let mut command = Command::new("cmd");
-    command
-        .arg("/K")
-        .arg(binary)
-        .args(args)
-        .creation_flags(CREATE_NEW_CONSOLE);
+    command.arg("/K").creation_flags(CREATE_NEW_CONSOLE);
+    if env_vars.is_empty() {
+        command.arg(binary).args(args);
+    } else {
+        let mut command_line = env_vars
+            .iter()
+            .map(|(key, value)| format!("set \"{key}={value}\""))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        command_line.push_str(" && ");
+        command_line.push_str(&quote_cmd_arg(binary));
+        for arg in args {
+            command_line.push(' ');
+            command_line.push_str(&quote_cmd_arg(arg));
+        }
+        command.arg(command_line);
+    }
 
     let child = command
         .spawn()
@@ -5496,6 +5518,11 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
     track_login_terminal_child(child);
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), String> {
+    run_login_terminal_with_env(title, binary, args, &[])
 }
 
 #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
@@ -5511,12 +5538,27 @@ fn quote_shell_arg(value: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), String> {
-    let shell_command = std::iter::once(binary)
+fn run_login_terminal_with_env(
+    title: &str,
+    binary: &str,
+    args: &[&str],
+    env_vars: &[(String, String)],
+) -> Result<(), String> {
+    let env_prefix = env_vars
+        .iter()
+        .map(|(key, value)| format!("{key}={}", quote_shell_arg(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let invocation = std::iter::once(binary)
         .chain(args.iter().copied())
         .map(quote_shell_arg)
         .collect::<Vec<_>>()
         .join(" ");
+    let shell_command = if env_prefix.is_empty() {
+        invocation
+    } else {
+        format!("{env_prefix} {invocation}")
+    };
     let escaped = shell_command.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("tell application \"Terminal\" to do script \"{escaped}\"");
 
@@ -5530,8 +5572,18 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
         .map_err(|error| format!("Unable to open {title} login terminal: {error}"))
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "macos")]
 fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), String> {
+    run_login_terminal_with_env(title, binary, args, &[])
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_login_terminal_with_env(
+    title: &str,
+    binary: &str,
+    args: &[&str],
+    env_vars: &[(String, String)],
+) -> Result<(), String> {
     let command_line = std::iter::once(binary)
         .chain(args.iter().copied())
         .map(quote_shell_arg)
@@ -5552,6 +5604,9 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
     for (terminal, prefix_args) in terminal_attempts {
         let mut command = Command::new(terminal);
         apply_desktop_command_environment(&mut command);
+        for (key, value) in env_vars {
+            command.env(key, value);
+        }
 
         if matches!(terminal, "xfce4-terminal" | "mate-terminal") {
             command.args(prefix_args);
@@ -5569,6 +5624,11 @@ fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), St
         "Unable to open a terminal for {title}. Run {} manually.",
         binary
     ))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_login_terminal(title: &str, binary: &str, args: &[&str]) -> Result<(), String> {
+    run_login_terminal_with_env(title, binary, args, &[])
 }
 
 fn normalize_forge_model(model: Option<String>) -> Result<Option<String>, String> {

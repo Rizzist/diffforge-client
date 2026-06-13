@@ -165,6 +165,39 @@ function numberValue(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function normalizeDictationHistoryEntry(entry, index = 0) {
+  const object = jsonObject(entry);
+  const entryText = text(object?.text);
+  if (!entryText) {
+    return null;
+  }
+  const createdAt = timestampMs(object?.createdAt || object?.created_at);
+  return {
+    createdAt,
+    id: text(object?.id, `dictation-${createdAt || index}`),
+    status: text(object?.status, "inserted"),
+    text: entryText,
+  };
+}
+
+function mergeDictationHistoryEntries(...entryLists) {
+  const seen = new Set();
+  return entryLists
+    .flatMap((entries) => jsonArray(entries))
+    .map(normalizeDictationHistoryEntry)
+    .filter(Boolean)
+    .filter((entry) => {
+      const key = entry.id || `${entry.createdAt}:${entry.text}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => right.createdAt - left.createdAt)
+    .slice(0, DICTATION_CARD_LIMIT);
+}
+
 function readDictationHistoryEntries() {
   if (typeof window === "undefined") {
     return [];
@@ -175,24 +208,7 @@ function readDictationHistoryEntries() {
   } catch {
     return [];
   }
-  return jsonArray(raw)
-    .map((entry, index) => {
-      const object = jsonObject(entry);
-      const entryText = text(object?.text);
-      if (!entryText) {
-        return null;
-      }
-      const createdAt = timestampMs(object?.createdAt);
-      return {
-        createdAt,
-        id: text(object?.id, `dictation-${createdAt || index}`),
-        status: text(object?.status, "inserted"),
-        text: entryText,
-      };
-    })
-    .filter(Boolean)
-    .sort((left, right) => right.createdAt - left.createdAt)
-    .slice(0, DICTATION_CARD_LIMIT);
+  return mergeDictationHistoryEntries(raw);
 }
 
 function dictationClockLabel(createdAt) {
@@ -1632,11 +1648,24 @@ export function ActivityOverlayPanel({ embedded = false }) {
   useEffect(() => {
     let cancelled = false;
     let unlistenResult = null;
-    listen(AUDIO_TRANSCRIPTION_RESULT_EVENT, () => {
+    let reconcileTimer = 0;
+    const reconcileDictationHistory = () => {
       if (cancelled) return;
-      // The publisher writes localStorage before emitting, so a fresh read
-      // here always sees the new entry.
-      setDictationEntries(readDictationHistoryEntries());
+      setDictationEntries((current) => mergeDictationHistoryEntries(readDictationHistoryEntries(), current));
+    };
+    const scheduleDictationHistoryReconcile = () => {
+      if (reconcileTimer) {
+        window.clearTimeout(reconcileTimer);
+      }
+      reconcileTimer = window.setTimeout(() => {
+        reconcileTimer = 0;
+        reconcileDictationHistory();
+      }, 80);
+    };
+    listen(AUDIO_TRANSCRIPTION_RESULT_EVENT, (event) => {
+      if (cancelled) return;
+      setDictationEntries((current) => mergeDictationHistoryEntries([event?.payload], current));
+      scheduleDictationHistoryReconcile();
     })
       .then((unlisten) => {
         if (cancelled) {
@@ -1646,8 +1675,18 @@ export function ActivityOverlayPanel({ embedded = false }) {
         unlistenResult = unlisten;
       })
       .catch(() => {});
+    const handleStorage = (event) => {
+      if (event.key === AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY) {
+        reconcileDictationHistory();
+      }
+    };
+    window.addEventListener("storage", handleStorage);
     return () => {
       cancelled = true;
+      if (reconcileTimer) {
+        window.clearTimeout(reconcileTimer);
+      }
+      window.removeEventListener("storage", handleStorage);
       if (unlistenResult) unlistenResult();
     };
   }, []);

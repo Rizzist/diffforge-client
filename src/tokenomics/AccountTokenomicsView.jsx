@@ -408,6 +408,18 @@ function AgentAccountsManager() {
     }).catch((error) => setActionError(String(error?.message || error || "Unable to open the login terminal.")));
   }, []);
 
+  const beginProfileLogin = useCallback((kind, profileId) => {
+    setActionError("");
+    invoke("agent_accounts_start_profile_login", { agentKind: kind, profileId }).then(() => {
+      setLoginPendingKind(kind);
+      if (loginPendingTimerRef.current) {
+        window.clearTimeout(loginPendingTimerRef.current);
+      }
+      loginPendingTimerRef.current = window.setTimeout(() => setLoginPendingKind(""), 30000);
+      refresh();
+    }).catch((error) => setActionError(String(error?.message || error || "Unable to open the account login terminal.")));
+  }, [refresh]);
+
   const requestDelete = useCallback((kind, profileId) => {
     const key = `${kind}:${profileId}`;
     if (confirmDeleteKey !== key) {
@@ -481,32 +493,52 @@ function AgentAccountsManager() {
                   ? (profile.label || "Default")
                   : (alias || profile.label || "Account");
                 const detail = profile.isDefault ? (alias || email) : (alias ? "" : email);
+                const authStatus = profile.authStatus || {};
+                const needsLogin = Boolean(authStatus.needsLogin || (!profile.identity?.authReady && !profile.isDefault));
                 const canEdit = Boolean(email);
                 const canDelete = !profile.isDefault && !profile.isActive;
                 const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
                 return (
                   <AgentAccountPill
-                    data-active={profile.isActive ? "true" : "false"}
+                    data-active={profile.isActive && !needsLogin ? "true" : "false"}
                     key={profile.id}
                     onClick={() => {
+                      if (needsLogin) {
+                        beginProfileLogin(kind, profile.id);
+                        return;
+                      }
                       if (!profile.isActive) {
                         setActive(kind, profile.id);
                       }
                     }}
-                    title={profile.isActive
+                    title={needsLogin
+                      ? (authStatus.message || "Sign in again for this account")
+                      : profile.isActive
                       ? `Active: new ${kind} terminals use this account`
                       : `Use this account for new ${kind} terminals`}
                     type="button"
                   >
                     <i
                       aria-hidden="true"
-                      data-state={profile.isActive
-                        ? "active"
-                        : profile.identity?.authReady ? "none" : "needs-login"}
+                      data-state={needsLogin ? "needs-login" : profile.isActive ? "active" : "none"}
                     />
                     <span>{name}</span>
                     {detail ? <em>{detail}</em> : null}
-                    {!profile.identity?.authReady && !profile.isDefault ? <em>needs login</em> : null}
+                    {needsLogin ? <em>needs login</em> : null}
+                    {needsLogin && (
+                      <AgentAccountIconButton
+                        aria-label={`Sign in again for ${name}`}
+                        as="span"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          beginProfileLogin(kind, profile.id);
+                        }}
+                        role="button"
+                        title={authStatus.message || "Sign in again for this account"}
+                      >
+                        ↻
+                      </AgentAccountIconButton>
+                    )}
                     {canEdit && (
                       <AgentAccountIconButton
                         aria-label={`Edit ${name}`}

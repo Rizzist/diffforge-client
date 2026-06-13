@@ -4328,6 +4328,7 @@ pub fn run() {
             agent_statuses,
             start_agent_login,
             start_agent_account_login,
+            agent_accounts_start_profile_login,
             disconnect_agent,
             install_agent,
             update_agent,

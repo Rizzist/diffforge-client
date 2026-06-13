@@ -21,6 +21,9 @@ const AGENT_ACCOUNTS_CHANGED_EVENT: &str = "agent-accounts-changed";
 const AGENT_ACCOUNTS_FILE: &str = "agent-accounts.json";
 const AGENT_ACCOUNTS_PROFILE_DIR: &str = "agent-profiles";
 const AGENT_ACCOUNTS_DEFAULT_PROFILE_ID: &str = "default";
+const AGENT_ACCOUNTS_AUTH_ISSUE_KEY: &str = "authIssue";
+const AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY: &str = "defaultAuthIssue";
+const AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS: usize = 4096;
 
 static AGENT_ACCOUNTS_PANE_PROFILES: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 
@@ -194,6 +197,13 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
         .unwrap_or_default()
         .to_string();
     let identity = agent_accounts_profile_identity(kind, Some(Path::new(&dir)));
+    let auth_status = agent_accounts_auth_status(
+        kind,
+        &id,
+        Some(profile),
+        &identity,
+        profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY),
+    );
     json!({
         "id": id,
         "label": profile.get("label").and_then(Value::as_str).unwrap_or_default(),
@@ -204,6 +214,7 @@ fn agent_accounts_profile_view(kind: &str, profile: &Value, active_id: &str) -> 
         "dir": dir,
         "createdAtMs": profile.get("createdAtMs").and_then(Value::as_u64).unwrap_or(0),
         "identity": identity,
+        "authStatus": auth_status,
         "isDefault": false,
         "isActive": id == active_id,
         "loginCommand": agent_accounts_login_command(kind, &dir),
@@ -310,6 +321,17 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         .and_then(|entry| entry.get("defaultAlias"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let default_issue = registry
+        .get("agents")
+        .and_then(|agents| agents.get(kind))
+        .and_then(|entry| entry.get(AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY));
+    let default_auth_status = agent_accounts_auth_status(
+        kind,
+        AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+        None,
+        &default_identity,
+        default_issue,
+    );
     let mut views = vec![json!({
         "id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
         "label": "Default",
@@ -319,6 +341,7 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
             .unwrap_or_default(),
         "createdAtMs": 0,
         "identity": default_identity,
+        "authStatus": default_auth_status,
         "isDefault": true,
         "isActive": active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
         "loginCommand": "",
@@ -331,6 +354,54 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         views.push(agent_accounts_profile_view(kind, profile, &active_id));
     }
     json!({ "activeProfileId": active_id, "profiles": views })
+}
+
+fn agent_accounts_kind_auth_statuses(registry: &Value, kind: &str) -> Value {
+    let mut statuses = serde_json::Map::new();
+    let default_identity = agent_accounts_profile_identity(kind, None);
+    let default_issue = registry
+        .get("agents")
+        .and_then(|agents| agents.get(kind))
+        .and_then(|entry| entry.get(AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY));
+    statuses.insert(
+        AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string(),
+        agent_accounts_auth_status(
+            kind,
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            None,
+            &default_identity,
+            default_issue,
+        ),
+    );
+
+    let (_, profiles) = agent_accounts_kind_entry(registry, kind);
+    for profile in profiles {
+        let Some(id) = agent_accounts_profile_id(&profile) else {
+            continue;
+        };
+        let dir = profile
+            .get("dir")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
+        let identity = dir
+            .as_deref()
+            .map(|dir| agent_accounts_profile_identity(kind, Some(dir)))
+            .unwrap_or_else(|| json!({ "email": "", "authReady": false }));
+        statuses.insert(
+            id.clone(),
+            agent_accounts_auth_status(
+                kind,
+                &id,
+                Some(&profile),
+                &identity,
+                profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY),
+            ),
+        );
+    }
+
+    Value::Object(statuses)
 }
 
 fn agent_accounts_active_profile_dir(kind: &str) -> Option<String> {
@@ -361,6 +432,168 @@ fn agent_accounts_auth_file_name(kind: &str) -> &'static str {
         "claude" => ".credentials.json",
         _ => "auth.json",
     }
+}
+
+fn agent_accounts_auth_file_signature(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let bytes = fs::read(path).ok()?;
+    let digest = cloud_mcp_short_hash(&String::from_utf8_lossy(&bytes));
+    Some(format!("{modified_ms}:{}:{digest}", metadata.len()))
+}
+
+fn agent_accounts_auth_file_path(
+    kind: &str,
+    profile_id: &str,
+    profile: Option<&Value>,
+) -> Option<PathBuf> {
+    if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        return agent_accounts_default_home(kind).map(|home| home.join(agent_accounts_auth_file_name(kind)));
+    }
+    profile
+        .and_then(agent_accounts_profile_dir)
+        .map(|dir| dir.join(agent_accounts_auth_file_name(kind)))
+}
+
+fn agent_accounts_auth_signature_for_profile(
+    kind: &str,
+    profile_id: &str,
+    profile: Option<&Value>,
+) -> Option<String> {
+    agent_accounts_auth_file_path(kind, profile_id, profile)
+        .and_then(|path| agent_accounts_auth_file_signature(&path))
+}
+
+fn agent_accounts_auth_issue_is_current(
+    kind: &str,
+    profile_id: &str,
+    profile: Option<&Value>,
+    issue: Option<&Value>,
+) -> bool {
+    let Some(issue) = issue else {
+        return false;
+    };
+    if !issue
+        .get("needsLogin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let marked_signature = issue
+        .get("authFileSignature")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_signature = agent_accounts_auth_signature_for_profile(kind, profile_id, profile);
+    match marked_signature {
+        Some(marked_signature) => match current_signature {
+            Some(current_signature) => current_signature == marked_signature,
+            None => true,
+        },
+        None => current_signature.is_none(),
+    }
+}
+
+fn agent_accounts_auth_status(
+    kind: &str,
+    profile_id: &str,
+    profile: Option<&Value>,
+    identity: &Value,
+    issue: Option<&Value>,
+) -> Value {
+    let file_ready = identity
+        .get("authReady")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let issue_current = agent_accounts_auth_issue_is_current(kind, profile_id, profile, issue);
+    let needs_login = !file_ready || issue_current;
+    let reason = if issue_current {
+        issue
+            .and_then(|issue| issue.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("refresh_failed")
+    } else if !file_ready {
+        "missing_auth"
+    } else {
+        ""
+    };
+    let message = if issue_current {
+        issue
+            .and_then(|issue| issue.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Sign in again for this saved account.")
+    } else if !file_ready {
+        "Sign in to finish this saved account."
+    } else {
+        ""
+    };
+    json!({
+        "authReady": file_ready && !issue_current,
+        "fileReady": file_ready,
+        "needsLogin": needs_login,
+        "reason": reason,
+        "message": message,
+        "detectedAtMs": issue.and_then(|issue| issue.get("detectedAtMs")).and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+fn agent_accounts_clear_resolved_auth_issues_for_kind(registry: &mut Value, kind: &str) -> bool {
+    let mut changed = false;
+    if let Some(entry) = registry
+        .get_mut("agents")
+        .and_then(|agents| agents.get_mut(kind))
+    {
+        let default_issue = entry.get(AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY).cloned();
+        if default_issue.is_some()
+            && !agent_accounts_auth_issue_is_current(
+                kind,
+                AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                None,
+                default_issue.as_ref(),
+            )
+        {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove(AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY);
+                changed = true;
+            }
+        }
+
+        if let Some(profiles) = entry.get_mut("profiles").and_then(Value::as_array_mut) {
+            for profile in profiles {
+                let id = agent_accounts_profile_id(profile).unwrap_or_default();
+                if id.is_empty() {
+                    continue;
+                }
+                let issue = profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY).cloned();
+                if issue.is_some()
+                    && !agent_accounts_auth_issue_is_current(kind, &id, Some(profile), issue.as_ref())
+                {
+                    if let Some(object) = profile.as_object_mut() {
+                        object.remove(AGENT_ACCOUNTS_AUTH_ISSUE_KEY);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn agent_accounts_registry_read_resolved() -> Value {
+    let mut registry = agent_accounts_registry_read();
+    let claude_changed = agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "claude");
+    let codex_changed = agent_accounts_clear_resolved_auth_issues_for_kind(&mut registry, "codex");
+    let changed = claude_changed || codex_changed;
+    if changed {
+        agent_accounts_registry_write(&registry);
+    }
+    registry
 }
 
 fn agent_accounts_profile_id(profile: &Value) -> Option<String> {
@@ -827,10 +1060,255 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
         });
 }
 
+fn agent_accounts_codex_auth_failure_reason(text: &str) -> Option<(&'static str, &'static str)> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("your access token could not be refreshed because you have since logged out")
+        || lower.contains("signed in to another account. please sign in again")
+    {
+        return Some((
+            "account_mismatch",
+            "Codex could not refresh this account because another account was signed in. Sign in again for this saved account.",
+        ));
+    }
+    if lower.contains("refresh token has expired") {
+        return Some((
+            "refresh_expired",
+            "Codex refresh expired for this saved account. Sign in again for this account.",
+        ));
+    }
+    if lower.contains("refresh token was already used")
+        || lower.contains("refresh token has already been used")
+    {
+        return Some((
+            "refresh_reused",
+            "Codex refresh was already consumed elsewhere. Sign in again for this saved account.",
+        ));
+    }
+    if lower.contains("refresh token was revoked")
+        || lower.contains("refresh_token_invalidated")
+    {
+        return Some((
+            "refresh_revoked",
+            "Codex refresh was revoked for this saved account. Sign in again for this account.",
+        ));
+    }
+    if lower.contains("failed to refresh token")
+        && (lower.contains("401") || lower.contains("unauthorized"))
+    {
+        return Some((
+            "refresh_failed",
+            "Codex could not refresh this saved account. Sign in again for this account.",
+        ));
+    }
+    None
+}
+
+pub(crate) fn agent_accounts_observe_terminal_auth_output(
+    app: &AppHandle,
+    pane_id: &str,
+    scan_tail: &mut String,
+    chunk: &[u8],
+) -> bool {
+    if chunk.is_empty() {
+        return false;
+    }
+    scan_tail.push_str(&String::from_utf8_lossy(chunk));
+    if scan_tail.len() > AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS {
+        let drain_to = scan_tail.len().saturating_sub(AGENT_ACCOUNTS_AUTH_SCAN_MAX_CHARS);
+        if scan_tail.is_char_boundary(drain_to) {
+            scan_tail.drain(..drain_to);
+        } else {
+            scan_tail.clear();
+            scan_tail.push_str(&String::from_utf8_lossy(chunk));
+        }
+    }
+    let Some((reason, message)) = agent_accounts_codex_auth_failure_reason(scan_tail) else {
+        return false;
+    };
+    agent_accounts_mark_pane_auth_issue(app, pane_id, reason, message)
+}
+
+fn agent_accounts_mark_pane_auth_issue(
+    app: &AppHandle,
+    pane_id: &str,
+    reason: &str,
+    message: &str,
+) -> bool {
+    let stamp = AGENT_ACCOUNTS_PANE_PROFILES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|map| map.get(pane_id).cloned());
+    let Some(stamp) = stamp else {
+        return false;
+    };
+    let Some(kind) = stamp
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(agent_accounts_supported_kind)
+    else {
+        return false;
+    };
+    if kind != "codex" {
+        return false;
+    }
+    let profile_id = stamp
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(AGENT_ACCOUNTS_DEFAULT_PROFILE_ID)
+        .to_string();
+
+    let mut registry = agent_accounts_registry_read();
+    agent_accounts_ensure_kind_entry(&mut registry, kind);
+    let mut profile_for_signature = None;
+    if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        profile_for_signature = registry
+            .get("agents")
+            .and_then(|agents| agents.get(kind))
+            .and_then(|entry| entry.get("profiles"))
+            .and_then(Value::as_array)
+            .and_then(|profiles| {
+                profiles.iter().find(|profile| {
+                    profile
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        == profile_id
+                })
+            })
+            .cloned();
+        if profile_for_signature.is_none() {
+            return false;
+        }
+    }
+    let auth_file_signature =
+        agent_accounts_auth_signature_for_profile(kind, &profile_id, profile_for_signature.as_ref())
+            .unwrap_or_default();
+    let issue = json!({
+        "needsLogin": true,
+        "reason": reason,
+        "message": message,
+        "detectedAtMs": todo_dispatch_now_ms(),
+        "authFileSignature": auth_file_signature,
+    });
+
+    let mut changed = false;
+    if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        let current = registry["agents"][kind]
+            .get(AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY)
+            .cloned();
+        if current.as_ref() != Some(&issue) {
+            registry["agents"][kind][AGENT_ACCOUNTS_DEFAULT_AUTH_ISSUE_KEY] = issue;
+            changed = true;
+        }
+    } else if let Some(profile) = registry
+        .get_mut("agents")
+        .and_then(|agents| agents.get_mut(kind))
+        .and_then(|entry| entry.get_mut("profiles"))
+        .and_then(Value::as_array_mut)
+        .and_then(|profiles| {
+            profiles.iter_mut().find(|profile| {
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == profile_id
+            })
+        })
+    {
+        let current = profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY).cloned();
+        if current.as_ref() != Some(&issue) {
+            profile[AGENT_ACCOUNTS_AUTH_ISSUE_KEY] = issue;
+            changed = true;
+        }
+    }
+
+    if changed {
+        agent_accounts_registry_write(&registry);
+        let _ = app.emit(
+            AGENT_ACCOUNTS_CHANGED_EVENT,
+            json!({
+                "kind": kind,
+                "profileId": profile_id,
+                "authIssue": true,
+                "reason": reason,
+            }),
+        );
+    }
+    changed
+}
+
+fn agent_accounts_profile_login_target(
+    kind: &'static str,
+    profile_id: &str,
+) -> Result<(PathBuf, bool), String> {
+    if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        let dir = agent_accounts_default_home(kind)
+            .ok_or_else(|| format!("Unable to resolve default {kind} account home."))?;
+        return Ok((dir, true));
+    }
+    let registry = agent_accounts_registry_read();
+    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let profile = profiles
+        .iter()
+        .find(|profile| {
+            profile
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                == profile_id
+        })
+        .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
+    let dir = agent_accounts_profile_dir(profile)
+        .ok_or_else(|| format!("{kind} account profile has no directory: {profile_id}"))?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Unable to prepare {kind} account profile dir: {error}"))?;
+    Ok((dir, false))
+}
+
+fn agent_accounts_launch_profile_login_terminal(
+    kind: &'static str,
+    profile_id: &str,
+) -> Result<(), String> {
+    let (dir, is_default) = agent_accounts_profile_login_target(kind, profile_id)?;
+    if is_default {
+        let provider = if kind == "claude" {
+            AgentProvider::Claude
+        } else {
+            AgentProvider::Codex
+        };
+        return launch_account_login_terminal(provider);
+    }
+
+    let provider = if kind == "claude" {
+        AgentProvider::Claude
+    } else {
+        AgentProvider::Codex
+    };
+    let definition = agent_definition(provider);
+    let binary = npm_global_executable_path(definition)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| definition.binary.to_string());
+    let dir_text = dir.to_string_lossy().to_string();
+    let (args, env_vars): (Vec<&str>, Vec<(String, String)>) = match kind {
+        "claude" => (
+            vec!["/login"],
+            vec![("CLAUDE_CONFIG_DIR".to_string(), dir_text)],
+        ),
+        _ => (
+            vec!["login"],
+            vec![("CODEX_HOME".to_string(), dir_text)],
+        ),
+    };
+    run_login_terminal_with_env(definition.label, &binary, &args, &env_vars)
+}
+
 #[tauri::command]
 async fn agent_accounts_state() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let registry = agent_accounts_registry_read();
+        let registry = agent_accounts_registry_read_resolved();
         Ok(json!({
             "agents": {
                 "claude": agent_accounts_kind_state(&registry, "claude"),
@@ -840,6 +1318,30 @@ async fn agent_accounts_state() -> Result<Value, String> {
     })
     .await
     .map_err(|error| format!("Agent accounts state worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn agent_accounts_start_profile_login(
+    app: AppHandle,
+    agent_kind: String,
+    profile_id: String,
+) -> Result<Value, String> {
+    let kind = agent_accounts_supported_kind(&agent_kind)
+        .ok_or_else(|| format!("Unsupported agent kind for accounts: {agent_kind}"))?;
+    let profile_id = profile_id.trim().to_string();
+    if profile_id.is_empty() {
+        return Err("A profile id is required.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_accounts_launch_profile_login_terminal(kind, &profile_id)?;
+        let _ = app.emit(
+            AGENT_ACCOUNTS_CHANGED_EVENT,
+            json!({ "kind": kind, "profileId": profile_id, "loginStarted": true }),
+        );
+        Ok(json!({ "ok": true, "kind": kind, "profileId": profile_id }))
+    })
+    .await
+    .map_err(|error| format!("Agent account login worker failed: {error}"))?
 }
 
 /// Alias + display preferences for one account pill. The pill shows the alias
@@ -1056,6 +1558,7 @@ async fn agent_accounts_remove(
 /// login change can still mark older panes stale.
 #[tauri::command]
 async fn agent_accounts_pane_profiles() -> Result<Value, String> {
+    let registry = agent_accounts_registry_read_resolved();
     let panes = AGENT_ACCOUNTS_PANE_PROFILES
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
@@ -1067,12 +1570,17 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
         .unwrap_or_default();
     let (claude_active, claude_label) = agent_accounts_launch_profile_label("claude");
     let (codex_active, codex_label) = agent_accounts_launch_profile_label("codex");
+    let auth = json!({
+        "claude": agent_accounts_kind_auth_statuses(&registry, "claude"),
+        "codex": agent_accounts_kind_auth_statuses(&registry, "codex"),
+    });
     Ok(json!({
         "panes": panes,
         "active": {
             "claude": { "profileId": claude_active, "profileLabel": claude_label },
             "codex": { "profileId": codex_active, "profileLabel": codex_label },
-        }
+        },
+        "auth": auth,
     }))
 }
 
@@ -1224,6 +1732,136 @@ mod agent_accounts_tests {
     }
 
     #[test]
+    fn codex_refresh_failure_text_is_detected() {
+        let (reason, message) = agent_accounts_codex_auth_failure_reason(
+            "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.",
+        )
+        .unwrap();
+        assert_eq!(reason, "account_mismatch");
+        assert!(message.contains("Sign in again"));
+
+        let (reason, _) =
+            agent_accounts_codex_auth_failure_reason("Failed to refresh token: 401 Unauthorized")
+                .unwrap();
+        assert_eq!(reason, "refresh_failed");
+        assert!(agent_accounts_codex_auth_failure_reason("ordinary output").is_none());
+    }
+
+    #[test]
+    fn auth_issue_clears_after_profile_auth_file_changes() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_auth_issue_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profile_dir = root.join("profile");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("auth.json"),
+            test_codex_auth_for_email("dev@example.com"),
+        )
+        .unwrap();
+        let mut profile = json!({
+            "id": "cap-dev",
+            "email": "dev@example.com",
+            "source": "captured",
+            "dir": profile_dir.to_string_lossy().to_string(),
+        });
+        let signature =
+            agent_accounts_auth_signature_for_profile("codex", "cap-dev", Some(&profile)).unwrap();
+        profile[AGENT_ACCOUNTS_AUTH_ISSUE_KEY] = json!({
+            "needsLogin": true,
+            "reason": "refresh_expired",
+            "message": "Sign in again.",
+            "detectedAtMs": 1,
+            "authFileSignature": signature,
+        });
+        let identity = agent_accounts_profile_identity("codex", Some(&profile_dir));
+        let status = agent_accounts_auth_status(
+            "codex",
+            "cap-dev",
+            Some(&profile),
+            &identity,
+            profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY),
+        );
+        assert_eq!(status["needsLogin"].as_bool(), Some(true));
+
+        fs::write(
+            profile_dir.join("auth.json"),
+            test_codex_auth_for_email("dev@example.com")
+                .replace("h.", "h.changed-",)
+                .replace(".s", ".changed-s"),
+        )
+        .unwrap();
+        let mut registry = json!({
+            "agents": {
+                "codex": {
+                    "activeProfileId": "cap-dev",
+                    "profiles": [profile],
+                }
+            }
+        });
+        assert!(agent_accounts_clear_resolved_auth_issues_for_kind(
+            &mut registry,
+            "codex"
+        ));
+        assert!(registry["agents"]["codex"]["profiles"][0]
+            .get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY)
+            .is_none());
+    }
+
+    #[test]
+    fn auth_issue_without_signature_clears_after_auth_file_appears() {
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_missing_auth_issue_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profile_dir = root.join("profile");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let mut profile = json!({
+            "id": "cap-dev",
+            "email": "dev@example.com",
+            "source": "captured",
+            "dir": profile_dir.to_string_lossy().to_string(),
+        });
+        profile[AGENT_ACCOUNTS_AUTH_ISSUE_KEY] = json!({
+            "needsLogin": true,
+            "reason": "refresh_failed",
+            "message": "Sign in again.",
+            "detectedAtMs": 1,
+        });
+        let identity = agent_accounts_profile_identity("codex", Some(&profile_dir));
+        let status = agent_accounts_auth_status(
+            "codex",
+            "cap-dev",
+            Some(&profile),
+            &identity,
+            profile.get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY),
+        );
+        assert_eq!(status["needsLogin"].as_bool(), Some(true));
+
+        fs::write(
+            profile_dir.join("auth.json"),
+            test_codex_auth_for_email("dev@example.com"),
+        )
+        .unwrap();
+        let mut registry = json!({
+            "agents": {
+                "codex": {
+                    "activeProfileId": "cap-dev",
+                    "profiles": [profile],
+                }
+            }
+        });
+        assert!(agent_accounts_clear_resolved_auth_issues_for_kind(
+            &mut registry,
+            "codex"
+        ));
+        assert!(registry["agents"]["codex"]["profiles"][0]
+            .get(AGENT_ACCOUNTS_AUTH_ISSUE_KEY)
+            .is_none());
+    }
+
+    #[test]
     fn codex_launch_home_pins_default_account_to_captured_snapshot() {
         let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -1320,6 +1958,10 @@ mod agent_accounts_tests {
 
     #[test]
     fn codex_managed_home_is_not_clobbered() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Even if an active codex profile existed, a coordination-managed
         // CODEX_HOME must win; this asserts the guard path compiles and the
         // managed entry survives untouched.

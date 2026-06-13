@@ -65,7 +65,7 @@ export async function prewarmCloudVoiceAgentStream(options = {}) {
     }
   };
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.invoke");
-  emitStatus("credits_billing", "Checking Diff Forge Credits");
+  emitStatus("credits_billing", "Starting..");
   await invoke("cloud_mcp_get_billing_status").catch((error) => {
     logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.billing_error", {
       message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
@@ -74,11 +74,11 @@ export async function prewarmCloudVoiceAgentStream(options = {}) {
       throw error;
     }
   });
-  emitStatus("credits_wallet", "Loading voice credits");
+  emitStatus("credits_wallet", "Working..");
   return invoke("prewarm_cloud_voice_agent_stream")
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.ok");
-      emitStatus("credits_ready", "Voice credits ready");
+      emitStatus("credits_ready", "Voice ready");
       return result;
     })
     .catch((error) => {
