@@ -200,9 +200,10 @@ struct CloudMcpProcessAuthCache {
 #[derive(Clone, Default)]
 struct CloudMcpRuntimeSnapshots {
     workspace_catalog: Option<Value>,
-    terminal_presence: Option<Value>,
-    workspace_mcps: Option<Value>,
+    workspace_terminals: Option<Value>,
+    workspace_servers: Option<Value>,
     agent_installations: Option<Value>,
+    cli_states: Option<Value>,
     tokenomics: Option<Value>,
 }
 
@@ -1439,6 +1440,8 @@ fn cloud_mcp_outbox_idempotency_key(
     if matches!(
         normalized_kind.as_str(),
         "workspace_todo_dispatch_status" | "todo_dispatch_status" | "todo_dispatch_update"
+            | "workspace_sync"
+            | "workspace_registration"
     ) {
         if let Some(status) =
             cloud_mcp_payload_text(payload, &["status", "dispatch_status", "dispatchStatus"])
@@ -3562,18 +3565,6 @@ fn cloud_mcp_git_repo_identity_for_path_uncached(path: &Path) -> Value {
     })
 }
 
-fn cloud_mcp_git_identity_from_workspace_or_path(workspace: &Value, root_path: &str) -> Value {
-    workspace
-        .get("git_repo_identity")
-        .or_else(|| workspace.get("gitRepoIdentity"))
-        .filter(|identity| {
-            cloud_mcp_payload_text(identity, &["git_repo_identity_id", "gitRepoIdentityId"])
-                .is_some()
-        })
-        .cloned()
-        .unwrap_or_else(|| cloud_mcp_git_repo_identity_for_path(Path::new(root_path)))
-}
-
 fn cloud_mcp_apply_git_identity_to_value(value: &mut Value, identity: &Value) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -3773,6 +3764,10 @@ async fn require_cloud_mcp_connected_state(
 }
 
 async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
+    cloud_mcp_spawn_global_ws(state);
+}
+
+fn cloud_mcp_spawn_global_ws(state: &CloudMcpState) {
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         return;
     }
@@ -3785,15 +3780,31 @@ async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
         let result = std::panic::AssertUnwindSafe(cloud_mcp_global_ws_loop(loop_state))
             .catch_unwind()
             .await;
-        if result.is_err() {
+        if let Err(panic) = result {
+            let panic_message = cloud_mcp_panic_message(panic.as_ref());
+            let error = format!(
+                "Cloud MCP app websocket loop crashed: {panic_message}. Restarting now."
+            );
             state.global_ws_started.store(false, Ordering::SeqCst);
-            cloud_mcp_mark_global_ws_disconnected(
-                &state,
-                "Cloud MCP app websocket loop crashed and will be restarted.",
-            )
-            .await;
+            cloud_mcp_mark_global_ws_disconnected(&state, &error).await;
+            if !app_shutdown_requested()
+                && !state.global_ws_registration_blocked.load(Ordering::SeqCst)
+            {
+                sleep(Duration::from_millis(750)).await;
+                cloud_mcp_spawn_global_ws(&state);
+            }
         }
     });
+}
+
+fn cloud_mcp_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return clean_terminal_telemetry_text(message);
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return clean_terminal_telemetry_text(message);
+    }
+    "unknown panic".to_string()
 }
 
 // Manual-quit goodbye: the cloud flips presence to offline the instant the
@@ -6113,7 +6124,7 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         }
         let snapshot = {
             let snapshots = state.runtime_snapshots.lock().await;
-            snapshots.terminal_presence.clone()
+            snapshots.workspace_terminals.clone()
         };
         let workspace_terminals = snapshot
             .as_ref()
@@ -6695,7 +6706,7 @@ async fn cloud_mcp_report_terminal_output_status(
     }
     let snapshot = {
         let snapshots = state.runtime_snapshots.lock().await;
-        snapshots.terminal_presence.clone()
+        snapshots.workspace_terminals.clone()
     };
     let terminal = snapshot
         .as_ref()
@@ -6957,93 +6968,9 @@ async fn cloud_mcp_sync_device_live_state_snapshot(
     }))
 }
 
-fn cloud_mcp_workspace_catalog_repo_id(
-    workspace_id: &str,
-    repo_path: &str,
-    workspace: &Value,
-) -> String {
-    cloud_mcp_payload_text(workspace, &["repo_id", "repoId"])
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if repo_path.trim().is_empty() {
-                format!("workspace-catalog-{}", cloud_mcp_short_hash(workspace_id))
-            } else {
-                cloud_mcp_repo_id_for_root(Path::new(repo_path))
-            }
-        })
-}
-
-const CLOUD_MCP_WORKSPACE_CATALOG_GIT_REPO_LIMIT: usize = 32;
-
-/// Precomputes the git identity and mounted git repo list for every workspace
-/// root in a catalog snapshot. Each repo identity costs several git
-/// subprocesses, so callers run this on a blocking thread instead of inside
-/// the async command itself.
-fn cloud_mcp_workspace_catalog_git_context(
-    workspaces: &Value,
-) -> HashMap<String, (Value, Vec<Value>)> {
-    let mut by_root = HashMap::new();
-    let Some(items) = workspaces.as_array() else {
-        return by_root;
-    };
-    for workspace in items.iter().take(64) {
-        let Some(repo_path) = cloud_mcp_payload_text(
-            workspace,
-            &[
-                "repo_path",
-                "repoPath",
-                "workspace_root",
-                "workspaceRoot",
-                "workspace_root_directory",
-                "workspaceRootDirectory",
-                "workingDirectory",
-                "rootDirectory",
-            ],
-        )
-        .filter(|value| !value.trim().is_empty()) else {
-            continue;
-        };
-        let root = Path::new(&repo_path);
-        let key = normalized_path_key(root);
-        if by_root.contains_key(&key) {
-            continue;
-        }
-        let identity = cloud_mcp_git_repo_identity_for_path(root);
-        let git_repos = cloud_mcp_workspace_catalog_git_repos(root);
-        by_root.insert(key, (identity, git_repos));
-    }
-    by_root
-}
-
-fn cloud_mcp_workspace_catalog_git_repos(workspace_root: &Path) -> Vec<Value> {
-    cloud_mcp_container_project_mounts(workspace_root)
-        .into_iter()
-        .filter(|mount| mount.has_git)
-        .take(CLOUD_MCP_WORKSPACE_CATALOG_GIT_REPO_LIMIT)
-        .map(|mount| {
-            let mut entry = json!({
-                "repo_id": cloud_mcp_repo_id_for_root(&mount.root_path),
-                "repoId": cloud_mcp_repo_id_for_root(&mount.root_path),
-                "repo_path": workspace_path_display(&mount.root_path),
-                "repoPath": workspace_path_display(&mount.root_path),
-                "workspace_relative_path": mount.workspace_relative_path.clone(),
-                "workspaceRelativePath": mount.workspace_relative_path,
-                "project_name": mount.project_name.clone(),
-                "projectName": mount.project_name,
-                "has_agents": mount.has_agents,
-                "hasAgents": mount.has_agents,
-            });
-            let identity = cloud_mcp_git_repo_identity_for_path(&mount.root_path);
-            cloud_mcp_apply_git_identity_to_value(&mut entry, &identity);
-            entry
-        })
-        .collect()
-}
-
 fn cloud_mcp_normalize_workspace_catalog_items(
     state: &CloudMcpState,
     workspaces: &Value,
-    git_context: &HashMap<String, (Value, Vec<Value>)>,
 ) -> Result<Vec<Value>, String> {
     let workspace_items = workspaces
         .as_array()
@@ -7066,20 +6993,6 @@ fn cloud_mcp_normalize_workspace_catalog_items(
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
                 .unwrap_or_else(|| workspace_id.clone());
-        let repo_path = cloud_mcp_payload_text(
-            workspace,
-            &[
-                "repo_path",
-                "repoPath",
-                "workspace_root",
-                "workspaceRoot",
-                "workspace_root_directory",
-                "workspaceRootDirectory",
-                "workingDirectory",
-                "rootDirectory",
-            ],
-        )
-        .unwrap_or_default();
         let workspace_active = workspace
             .get("workspace_active")
             .or_else(|| workspace.get("workspaceActive"))
@@ -7097,21 +7010,6 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                 "deactivated".to_string()
             }
         });
-        let repo_id = cloud_mcp_workspace_catalog_repo_id(&workspace_id, &repo_path, workspace);
-        let terminal_count = workspace
-            .get("terminal_count")
-            .or_else(|| workspace.get("terminalCount"))
-            .or_else(|| workspace.get("logical_terminal_count"))
-            .or_else(|| workspace.get("logicalTerminalCount"))
-            .cloned()
-            .unwrap_or_else(|| json!(0));
-        let mcp_server_count = workspace
-            .get("mcp_server_count")
-            .or_else(|| workspace.get("mcpServerCount"))
-            .or_else(|| workspace.get("server_count"))
-            .or_else(|| workspace.get("serverCount"))
-            .cloned()
-            .unwrap_or_else(|| json!(0));
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state, workspace);
         let workspace_order = cloud_mcp_payload_u64(
@@ -7127,9 +7025,6 @@ fn cloud_mcp_normalize_workspace_catalog_items(
             ],
         )
         .unwrap_or(workspace_index as u64);
-        // Last-known terminal identity (names/colors/agents) rides with the
-        // catalog so every device and the web dashboard can render terminals
-        // even while this device is offline.
         let last_known_terminals = workspace
             .get("terminals")
             .or_else(|| workspace.get("terminal_identities"))
@@ -7167,64 +7062,20 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mut workspace_value = json!({
-            "device": device_profile.clone(),
+        let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
-            "device_name": device_profile["device_name"].clone(),
-            "machine_id": device_profile["device_id"].clone(),
-            "machine_name": device_profile["machine_name"].clone(),
-            "platform": device_profile["platform"].clone(),
-            "form_factor": device_profile["form_factor"].clone(),
-            "client_kind": device_profile["client_kind"].clone(),
-            "repo_id": repo_id,
             "workspace_id": workspace_id,
             "workspace_name": workspace_name,
-            "workspace_root": repo_path.clone(),
-            "dashboard_workspace": true,
             "workspace_role": "desktop_workspace",
             "display_surface": "dashboard_workspace",
             "workspace_active": workspace_active,
-            "workspace_reported_active": workspace_active,
             "workspace_status": workspace_status,
             "workspace_runtime_seq": workspace_runtime_seq,
-            "workspaceRuntimeSeq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
-            "workspaceRuntimeEpoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
-            "workspaceOrder": workspace_order,
-            "workspace_index": workspace_order,
-            "workspaceIndex": workspace_order,
-            "terminal_count": terminal_count,
-            "mcp_server_count": mcp_server_count,
             "terminals": last_known_terminals.clone(),
-            "last_known_terminals": last_known_terminals,
+            "updated_at_ms": cloud_mcp_now_ms(),
         });
-        if !repo_path.trim().is_empty() {
-            let root = Path::new(&repo_path);
-            let (git_identity, git_repos) = git_context
-                .get(&normalized_path_key(root))
-                .cloned()
-                .unwrap_or_else(|| {
-                    (
-                        cloud_mcp_git_repo_identity_for_path(root),
-                        cloud_mcp_workspace_catalog_git_repos(root),
-                    )
-                });
-            cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
-            if let Some(object) = workspace_value.as_object_mut() {
-                object.insert(
-                    "workspace_location_fingerprint".to_string(),
-                    json!(cloud_mcp_workspace_location_fingerprint(root)),
-                );
-                // Catalog every git repo mounted in this workspace, not just the
-                // root, so the cloud can map repo state to workspace membership
-                // and detect repos no workspace references anymore.
-                object.insert("git_repo_count".to_string(), json!(git_repos.len()));
-                object.insert("gitRepoCount".to_string(), json!(git_repos.len()));
-                object.insert("git_repos".to_string(), json!(git_repos.clone()));
-                object.insert("gitRepos".to_string(), json!(git_repos));
-            }
-        }
         normalized_workspaces.push(workspace_value);
     }
 
@@ -7241,16 +7092,8 @@ async fn cloud_mcp_sync_device_live_workspaces(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "device_live_state_snapshot".to_string());
-    let git_context = {
-        let workspaces = workspaces.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            cloud_mcp_workspace_catalog_git_context(&workspaces)
-        })
-        .await
-        .unwrap_or_default()
-    };
     let normalized_workspaces =
-        cloud_mcp_normalize_workspace_catalog_items(state.inner(), &workspaces, &git_context)?;
+        cloud_mcp_normalize_workspace_catalog_items(state.inner(), &workspaces)?;
     let workspace_count = normalized_workspaces.len();
     let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
@@ -7258,7 +7101,6 @@ async fn cloud_mcp_sync_device_live_workspaces(
         "event_kind": "device_live_state_snapshot",
         "reason": reason.clone(),
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
@@ -7269,7 +7111,6 @@ async fn cloud_mcp_sync_device_live_workspaces(
         "snapshot_id": format!("device-workspace-catalog-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
         "snapshot_full": true,
         "authoritative": true,
-        "workspace_count": workspace_count,
         "workspaces": normalized_workspaces,
         "summary": "Desktop workspace catalog synced.",
         "ts_ms": cloud_mcp_now_ms(),
@@ -7861,8 +7702,8 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
     {
         let snapshots = state.runtime_snapshots.lock().await;
         for snapshot in [
-            snapshots.terminal_presence.as_ref(),
-            snapshots.workspace_mcps.as_ref(),
+            snapshots.workspace_terminals.as_ref(),
+            snapshots.workspace_servers.as_ref(),
             snapshots.workspace_catalog.as_ref(),
         ]
         .into_iter()
@@ -7875,57 +7716,21 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                 let workspace_id =
                     cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
                         .unwrap_or_default();
-                let repo_id =
-                    cloud_mcp_payload_text(workspace, &["repo_id", "repoId"]).unwrap_or_default();
                 if workspace_id.is_empty() || !seen.insert(workspace_id.clone()) {
                     continue;
                 }
-                let root_display = cloud_mcp_payload_text(
-                    workspace,
-                    &["workspace_root", "workspaceRoot", "repo_path", "repoPath"],
-                )
-                .unwrap_or_default();
-                let git_identity =
-                    cloud_mcp_git_identity_from_workspace_or_path(workspace, &root_display);
                 let mut workspace_value = json!({
                     "workspace_id": workspace_id,
-                    "repo_id": repo_id,
                     "workspace_name": cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]),
-                    "workspace_root": root_display,
-                    "dashboard_workspace": true,
                     "workspace_role": "desktop_workspace",
                     "display_surface": "dashboard_workspace",
-                    "workspace_location_fingerprint": cloud_mcp_payload_text(
-                        workspace,
-                        &[
-                            "workspace_location_fingerprint",
-                            "workspaceLocationFingerprint",
-                            "root_fingerprint",
-                            "rootFingerprint",
-                        ],
-                    ),
                     "workspace_status": cloud_mcp_payload_text(workspace, &["workspace_status", "workspaceStatus", "status"]),
-                    "terminal_count": workspace.get("terminal_count")
-                        .or_else(|| workspace.get("terminalCount"))
-                        .cloned()
-                        .unwrap_or_else(|| json!(0)),
-                    "mcp_server_count": workspace.get("mcp_server_count")
-                        .or_else(|| workspace.get("mcpServerCount"))
-                        .or_else(|| workspace.get("server_count"))
-                        .or_else(|| workspace.get("serverCount"))
-                        .cloned()
-                        .unwrap_or_else(|| json!(0)),
                     "workspace_active": workspace.get("workspace_active")
-                        .or_else(|| workspace.get("workspaceActive"))
-                        .cloned()
-                        .unwrap_or_else(|| json!(false)),
-                    "workspace_reported_active": workspace.get("workspace_active")
                         .or_else(|| workspace.get("workspaceActive"))
                         .cloned()
                         .unwrap_or_else(|| json!(false)),
                 });
                 cloud_mcp_copy_workspace_runtime_ordering(&mut workspace_value, workspace);
-                cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
                 workspaces.push(workspace_value);
             }
         }
@@ -7933,27 +7738,17 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
 
     let runtime = state.inner.lock().await;
     for workspace in runtime.registered_workspaces.values() {
-        let repo_id = cloud_mcp_repo_id_for_root(Path::new(&workspace.root));
         if !seen.insert(workspace.workspace_id.clone()) {
             continue;
         }
-        let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&workspace.root));
-        let mut workspace_value = json!({
+        let workspace_value = json!({
             "workspace_id": workspace.workspace_id,
-            "repo_id": repo_id,
             "workspace_name": workspace.workspace_name,
-            "workspace_root": workspace.root,
-            "dashboard_workspace": true,
             "workspace_role": "desktop_workspace",
             "display_surface": "dashboard_workspace",
-            "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(Path::new(&workspace.root)),
             "workspace_active": false,
-            "workspace_reported_active": false,
             "workspace_status": "registered",
-            "terminal_count": 0,
-            "mcp_server_count": 0,
         });
-        cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
         workspaces.push(workspace_value);
     }
 
@@ -8028,6 +7823,107 @@ fn cloud_mcp_live_state_workspace_from_snapshot(
     (workspace_key, value)
 }
 
+fn cloud_mcp_live_contract_deprecated_key(key: &str) -> bool {
+    key.starts_with("git")
+        || matches!(
+            key,
+            "repo_id"
+                | "repoId"
+                | "repo_ids"
+                | "repoIds"
+                | "repo_path"
+                | "repoPath"
+                | "repositories"
+                | "repository"
+                | "workspace_root"
+                | "workspaceRoot"
+                | "workspace_location_fingerprint"
+                | "workspaceLocationFingerprint"
+                | "root_fingerprint"
+                | "rootFingerprint"
+                | "project_mounts"
+                | "projectMounts"
+                | "device"
+                | "device_info"
+                | "deviceInfo"
+                | "assets"
+                | "workspace_count"
+                | "workspaceCount"
+                | "workspaceId"
+                | "workspaceName"
+                | "workspaceActive"
+                | "workspaceStatus"
+                | "workspaceRuntimeSeq"
+                | "workspaceRuntimeEpoch"
+                | "workspaceOrder"
+                | "workspaceIndex"
+                | "terminal_count"
+                | "terminalCount"
+                | "terminalId"
+                | "paneId"
+                | "targetTerminalId"
+                | "presenceAgentId"
+                | "agentKind"
+                | "agentLabel"
+                | "displayName"
+                | "sessionState"
+                | "terminalName"
+                | "terminalNickname"
+                | "terminalEpoch"
+                | "terminalInstanceId"
+                | "terminalLifecycle"
+                | "nativeRailState"
+                | "nativeRailLabel"
+                | "turnId"
+                | "turnStatus"
+                | "statusSeq"
+                | "inputReady"
+                | "parkedPromptTitle"
+                | "threadId"
+                | "colorSlot"
+                | "waitingOn"
+                | "server_count"
+                | "serverKey"
+                | "workspaceEnabled"
+                | "toolCount"
+                | "agent_count"
+                | "codingAgents"
+                | "installed_agents"
+                | "installedAgents"
+                | "agents"
+                | "cliStates"
+                | "deviceAliases"
+                | "limitSamples"
+                | "deviceId"
+                | "deviceName"
+                | "machineId"
+                | "machineName"
+                | "formFactor"
+                | "clientKind"
+                | "eventKind"
+                | "tsMs"
+                | "updatedAt"
+                | "updatedAtMs"
+        )
+}
+
+fn cloud_mcp_sanitize_live_contract_in_place(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, _| !cloud_mcp_live_contract_deprecated_key(key));
+            for child in object.values_mut() {
+                cloud_mcp_sanitize_live_contract_in_place(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                cloud_mcp_sanitize_live_contract_in_place(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn cloud_mcp_device_live_state_snapshot_payload(
     state: &CloudMcpState,
     reason: &str,
@@ -8036,11 +7932,12 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop".to_string());
     let mut workspaces = serde_json::Map::new();
-    let mut installed_agents = Vec::<Value>::new();
+    let mut coding_agents = Vec::<Value>::new();
     let mut cli_states = serde_json::Map::new();
     let mut tokenomics = Value::Null;
     let mut has_workspace_state = false;
     let mut has_agent_inventory = false;
+    let mut has_cli_state = false;
     let mut has_tokenomics = false;
 
     let lifecycle_workspaces = cloud_mcp_lifecycle_workspaces(state).await;
@@ -8058,7 +7955,7 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         let snapshots = state.runtime_snapshots.lock().await;
         for snapshot in [
             snapshots.workspace_catalog.as_ref(),
-            snapshots.terminal_presence.as_ref(),
+            snapshots.workspace_terminals.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -8079,7 +7976,7 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
                 cloud_mcp_live_state_merge_object(existing, workspace_value);
             }
         }
-        if let Some(snapshot) = snapshots.workspace_mcps.as_ref() {
+        if let Some(snapshot) = snapshots.workspace_servers.as_ref() {
             if snapshot.get("workspaces").is_some() {
                 has_workspace_state = true;
             }
@@ -8117,15 +8014,34 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         }
         if let Some(snapshot) = snapshots.agent_installations.as_ref() {
             has_agent_inventory = true;
-            installed_agents = snapshot
-                .get("agents")
+            has_cli_state = true;
+            coding_agents = snapshot
+                .get("coding_agents")
+                .or_else(|| snapshot.get("agents"))
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            for (index, agent) in installed_agents.iter().enumerate() {
+            for (index, agent) in coding_agents.iter().enumerate() {
                 let key = cloud_mcp_payload_text(agent, &["id", "agent_id", "agentId"])
                     .unwrap_or_else(|| format!("agent-{index}"));
                 cli_states.insert(key, agent.clone());
+            }
+        }
+        if let Some(snapshot) = snapshots.cli_states.as_ref() {
+            has_cli_state = true;
+            for (index, cli) in snapshot
+                .get("clis")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let key = cloud_mcp_payload_text(
+                    cli,
+                    &["id", "cli_id", "cliId", "agent_id", "agentId", "binary", "name"],
+                )
+                .unwrap_or_else(|| format!("cli-{index}"));
+                cli_states.insert(key, cli.clone());
             }
         }
         if let Some(snapshot) = snapshots.tokenomics.as_ref() {
@@ -8134,37 +8050,39 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         }
     }
 
-    let workspace_count = workspaces.len();
     let mut payload = json!({
         "source": "rust-diffforge-device-live-state",
         "event_kind": "device_live_state_snapshot",
         "contract": "diffforge.device_live_state.v1",
         "reason": reason,
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "device": device_profile.clone(),
         "device_id": device_id.clone(),
+        "device_name": device_profile["device_name"].clone(),
         "machine_id": device_id,
-        "device_info": device_profile,
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
         "status": "connected",
         "connected": true,
-        "assets": json!({ "known": false, "transfers": [] }),
         "snapshot_id": format!("device-live-state-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
         "ts_ms": cloud_mcp_now_ms(),
     });
     if let Some(object) = payload.as_object_mut() {
         if has_workspace_state {
             object.insert("workspaces".to_string(), Value::Object(workspaces));
-            object.insert("workspace_count".to_string(), json!(workspace_count));
-            object.insert("workspaceCount".to_string(), json!(workspace_count));
         }
         if has_agent_inventory {
-            object.insert("installed_agents".to_string(), Value::Array(installed_agents));
+            object.insert("coding_agents".to_string(), Value::Array(coding_agents));
+        }
+        if has_cli_state {
             object.insert("cli_states".to_string(), Value::Object(cli_states));
         }
         if has_tokenomics {
             object.insert("tokenomics".to_string(), tokenomics);
         }
     }
+    cloud_mcp_sanitize_live_contract_in_place(&mut payload);
     payload
 }
 
@@ -8855,6 +8773,22 @@ async fn cloud_mcp_local_cloud_health_reachable_async(ws_url: &str) -> bool {
 }
 
 fn cloud_mcp_local_cloud_health_reachable_blocking(ws_url: &str) -> bool {
+    // reqwest::blocking owns a Tokio runtime internally. Creating and dropping
+    // it on one of Tauri/Tokio's async worker threads panics, so callers that
+    // accidentally reach this sync probe from async code get bounced to a
+    // plain OS thread.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let ws_url = ws_url.to_string();
+        return std::thread::spawn(move || {
+            cloud_mcp_local_cloud_health_reachable_blocking_inner(&ws_url)
+        })
+        .join()
+        .unwrap_or(false);
+    }
+    cloud_mcp_local_cloud_health_reachable_blocking_inner(ws_url)
+}
+
+fn cloud_mcp_local_cloud_health_reachable_blocking_inner(ws_url: &str) -> bool {
     let Some(health_url) = cloud_mcp_local_cloud_health_url_from_ws_url(ws_url) else {
         return false;
     };
@@ -10374,21 +10308,6 @@ fn cloud_mcp_payload_bool(payload: &Value, path: &[&str], fallback: bool) -> boo
     fallback
 }
 
-fn cloud_mcp_payload_usize(payload: &Value, keys: &[&str]) -> Option<usize> {
-    keys.iter().find_map(|key| {
-        payload.get(*key).and_then(|value| {
-            value
-                .as_u64()
-                .and_then(|number| usize::try_from(number).ok())
-                .or_else(|| {
-                    value
-                        .as_str()
-                        .and_then(|text| text.trim().parse::<usize>().ok())
-                })
-        })
-    })
-}
-
 fn cloud_mcp_payload_items(payload: &Value, keys: &[&str], limit: usize) -> Vec<Value> {
     for key in keys {
         let Some(value) = payload.get(*key) else {
@@ -10408,109 +10327,17 @@ fn cloud_mcp_payload_items(payload: &Value, keys: &[&str], limit: usize) -> Vec<
 }
 
 fn cloud_mcp_workspace_terminal_items(workspace: &Value) -> Vec<Value> {
-    let items = cloud_mcp_payload_items(
+    cloud_mcp_payload_items(
         workspace,
-        &[
-            "terminals",
-            "terminal_statuses",
-            "terminalStatuses",
-            "terminal_agents",
-            "terminalAgents",
-            "terminal_presence",
-            "terminalPresence",
-            "terminal_panes",
-            "terminalPanes",
-            "panes",
-            "agents",
-        ],
+        &["terminals"],
         64,
-    );
-    if !items.is_empty() {
-        return items;
-    }
-
-    let indexes = workspace
-        .get("logicalTerminalIndexes")
-        .or_else(|| workspace.get("logical_terminal_indexes"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_i64)
-                .take(64)
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| {
-            let count = cloud_mcp_payload_usize(
-                workspace,
-                &[
-                    "logicalTerminalCount",
-                    "logical_terminal_count",
-                    "terminalCount",
-                    "terminal_count",
-                    "activeTerminalCount",
-                    "active_terminal_count",
-                ],
-            )
-            .unwrap_or(0)
-            .min(64);
-            (0..count).map(|index| index as i64).collect::<Vec<_>>()
-        });
-    if indexes.is_empty() {
-        return Vec::new();
-    }
-
-    let roles = workspace
-        .get("terminalRolesByIndex")
-        .or_else(|| workspace.get("terminal_roles_by_index"))
-        .and_then(Value::as_object);
-    let agents = workspace
-        .get("terminalAgentsByIndex")
-        .or_else(|| workspace.get("terminal_agents_by_index"))
-        .and_then(Value::as_object);
-
-    indexes
-        .into_iter()
-        .map(|index| {
-            let key = index.to_string();
-            let role = roles
-                .and_then(|roles| roles.get(&key))
-                .and_then(Value::as_str)
-                .unwrap_or("terminal");
-            let agent = agents.and_then(|agents| agents.get(&key));
-            json!({
-                "agent_kind": agent
-                    .and_then(|agent| cloud_mcp_payload_text(agent, &["agent_kind", "agentKind", "id", "agent_id", "agentId"]))
-                    .unwrap_or_else(|| role.to_string()),
-                "agent_label": agent
-                    .and_then(|agent| cloud_mcp_payload_text(agent, &["agent_label", "agentLabel", "label", "name"]))
-                    .unwrap_or_else(|| role.to_string()),
-                "status": "no_session",
-                "session_state": "no_session",
-                "terminal_index": index,
-            })
-        })
-        .collect()
+    )
 }
 
 fn cloud_mcp_workspace_server_items(workspace: &Value) -> Vec<Value> {
     let direct = cloud_mcp_payload_items(
         workspace,
-        &[
-            "servers",
-            "mcp_servers",
-            "mcpServers",
-            "workspace_servers",
-            "workspaceServers",
-            "installed_servers",
-            "installedServers",
-            "registry_servers",
-            "registryServers",
-            "items",
-            "entries",
-            "mcps",
-        ],
+        &["mcps", "servers"],
         128,
     );
     if !direct.is_empty() {
@@ -10562,8 +10389,6 @@ async fn cloud_mcp_register_prepared_workspace(
     reason: &str,
 ) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
     let now_ms = cloud_mcp_now_ms();
-    let repo_id = cloud_mcp_repo_id_for_root(&prepared.root);
-    let git_identity = cloud_mcp_git_repo_identity_for_path(&prepared.root);
     let policy_graph_detected = prepared.policy_graph.is_some();
     let workspace_status = CloudMcpWorkspaceStatus {
         root: prepared.root_display.clone(),
@@ -10582,9 +10407,8 @@ async fn cloud_mcp_register_prepared_workspace(
         policy_graph_detected,
         policy_graph_path: prepared.policy_graph_path.clone(),
     };
-    let mut payload = json!({
+    let payload = json!({
         "source": "rust-diffforge",
-        "repo_id": repo_id.clone(),
         "agent_id": "rust-diffforge",
         "event_kind": reason,
         "summary": format!("Workspace {} synced into the Cloud MCP context ledger.", prepared.workspace_name),
@@ -10592,21 +10416,15 @@ async fn cloud_mcp_register_prepared_workspace(
             "reason": reason,
             "workspace_id": prepared.workspace_id.clone(),
             "workspace_name": prepared.workspace_name.clone(),
-            "workspace_root": prepared.root_display.clone(),
             "workspace_kind": prepared.workspace_kind.clone(),
             "dashboard_workspace": true,
             "workspace_role": "desktop_workspace",
             "display_surface": "dashboard_workspace",
-            "project_mounts": prepared.project_mounts.clone(),
             "policy_graph_detected": policy_graph_detected,
             "policy_graph_path": workspace_status.policy_graph_path,
             "context_pack_model": true,
         }
     });
-    cloud_mcp_apply_git_identity_to_value(&mut payload, &git_identity);
-    if let Some(inner_payload) = payload.get_mut("payload") {
-        cloud_mcp_apply_git_identity_to_value(inner_payload, &git_identity);
-    }
     let event_response = cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
     if reason == "workspace_registration" {
         cloud_mcp_publish_device_live_state_snapshot(state, "workspace_registration").await;
@@ -10617,9 +10435,7 @@ async fn cloud_mcp_register_prepared_workspace(
         &workspace_status.workspace_id,
         &workspace_status.workspace_name,
         json!({
-            "repo_id": repo_id,
             "workspace_kind": prepared.workspace_kind.clone(),
-            "project_mount_count": prepared.project_mounts.len(),
             "policy_graph_detected": policy_graph_detected,
             "synced": true,
         }),
@@ -10640,8 +10456,7 @@ async fn cloud_mcp_register_prepared_workspace(
         }
         runtime.last_connected_ms = Some(now_ms);
     }
-    let registration_response =
-        cloud_mcp_ws_send_workspace_registration(state, &repo_id, &workspace_status).await?;
+    let registration_response = cloud_mcp_ws_send_workspace_registration(state, &workspace_status).await?;
     cloud_mcp_publish_device_live_state_snapshot(state, "workspace_registered").await;
     let status = cloud_mcp_status_snapshot(state).await;
     Ok(CloudMcpWorkspaceRegistrationResult {
@@ -10682,23 +10497,16 @@ async fn cloud_mcp_register_prepared_workspace_bundle(
 
 async fn cloud_mcp_ws_send_workspace_registration(
     state: &CloudMcpState,
-    repo_id: &str,
     workspace: &CloudMcpWorkspaceStatus,
 ) -> Result<Value, String> {
-    let root = Path::new(&workspace.root);
-    let git_identity = cloud_mcp_git_repo_identity_for_path(root);
-    let mut payload = json!({
-        "repo_id": repo_id,
+    let payload = json!({
         "workspace_id": workspace.workspace_id,
         "workspace_name": workspace.workspace_name,
         "dashboard_workspace": workspace.dashboard_workspace,
         "workspace_role": workspace.workspace_role,
         "display_surface": workspace.display_surface,
-        "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(root),
-        "workspace_root": workspace.root,
         "schema_version": 1,
     });
-    cloud_mcp_apply_git_identity_to_value(&mut payload, &git_identity);
     cloud_mcp_ws_request(state, "workspace_register", &payload).await
 }
 
@@ -11725,7 +11533,7 @@ async fn cloud_mcp_mark_device_live_terminal_closed(
     reason: &str,
 ) {
     let mut snapshots = state.runtime_snapshots.lock().await;
-    let Some(snapshot) = snapshots.terminal_presence.as_mut() else {
+    let Some(snapshot) = snapshots.workspace_terminals.as_mut() else {
         return;
     };
     let Some(workspaces) = snapshot.get_mut("workspaces").and_then(Value::as_array_mut) else {
@@ -13346,17 +13154,36 @@ async fn cloud_mcp_workspace_catalog_upsert(
             workspace.insert("origin_device_id".to_string(), json!(device_id));
         }
     }
-    let workspace = Value::Object(workspace);
-    let workspace_id = cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])
+    let local_workspace = Value::Object(workspace.clone());
+    let workspace_id = cloud_mcp_payload_text(&local_workspace, &["workspace_id", "workspaceId", "id"])
         .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
     if let Some(scope_key) = scope_key
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        local_workspace_catalog_apply_upsert(&app, &scope_key, &workspace)?;
+        local_workspace_catalog_apply_upsert(&app, &scope_key, &local_workspace)?;
     }
+    let cloud_workspace = json!({
+        "workspace_id": workspace_id.clone(),
+        "workspace_name": cloud_mcp_payload_text(&local_workspace, &["workspace_name", "workspaceName", "name"]),
+        "workspace_active": local_workspace
+            .get("workspace_active")
+            .or_else(|| local_workspace.get("workspaceActive"))
+            .or_else(|| local_workspace.get("active"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "workspace_status": cloud_mcp_payload_text(&local_workspace, &["workspace_status", "workspaceStatus", "status", "state"]),
+        "workspace_order": local_workspace
+            .get("workspace_order")
+            .or_else(|| local_workspace.get("workspaceOrder"))
+            .or_else(|| local_workspace.get("workspace_index"))
+            .or_else(|| local_workspace.get("workspaceIndex"))
+            .or_else(|| local_workspace.get("order"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    });
     let payload = json!({
-        "workspace": workspace,
+        "workspace": cloud_workspace,
         "workspace_id": workspace_id,
     });
     cloud_mcp_post_event_endpoint(state.inner(), "workspace_catalog_upsert", &payload).await
@@ -13389,7 +13216,25 @@ async fn cloud_mcp_workspace_catalog_delete(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "workspace_deleted".to_string()),
     });
-    cloud_mcp_post_event_endpoint(state.inner(), "workspace_catalog_delete", &payload).await
+    let removed_catalog_snapshots = {
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        cloud_mcp_filter_deleted_workspace_snapshot(
+            &mut snapshots.workspace_catalog,
+            &workspace_id,
+            "catalog",
+        )
+    };
+    cloud_mcp_publish_device_live_state_snapshot(state.inner(), "workspace_catalog_delete").await;
+
+    let mut response =
+        cloud_mcp_post_event_endpoint(state.inner(), "workspace_catalog_delete", &payload).await?;
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "removedCatalogSnapshots".to_string(),
+            json!(removed_catalog_snapshots),
+        );
+    }
+    Ok(response)
 }
 
 // Workspace ids with a catalog delete still queued in the outbox: stale cloud
@@ -13493,7 +13338,7 @@ async fn cloud_mcp_sync_agent_installations(
 /// can converge the cloud without a tauri command context.
 pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
     state: &CloudMcpState,
-    repo_path: String,
+    _repo_path: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     agent_statuses: Value,
@@ -13513,18 +13358,6 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
         uuid::Uuid::new_v4()
     );
     let device_profile = cloud_mcp_desktop_device_profile();
-    let req = if repo_path.trim().is_empty() {
-        let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-            .unwrap_or_else(|| "desktop".to_string());
-        CloudMcpRepoRequest {
-            root_display: "device-agent-inventory".to_string(),
-            repo_id: format!("repo-device-agents-{}", cloud_mcp_short_hash(&device_id)),
-            workspace_id: workspace_id.clone(),
-            workspace_name: workspace_name.clone(),
-        }
-    } else {
-        cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone())
-    };
     let agent_items = agent_statuses
         .as_array()
         .ok_or_else(|| "Agent installation sync requires an agentStatuses array.".to_string())?;
@@ -13537,7 +13370,6 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
     let payload = json!({
         "source": "rust-diffforge-device-live-agent-inventory",
         "event_kind": "device_live_state_snapshot",
-        "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
@@ -13545,9 +13377,6 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
         "platform": device_profile["platform"].clone(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
-        "repo_id": req.repo_id,
-        "repo_path": req.root_display,
-        "workspace_root": req.root_display,
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
         "agent_id": "rust-diffforge",
@@ -13555,7 +13384,7 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
         "reason": reason,
         "snapshot_id": snapshot_id,
         "agent_count": agent_count,
-        "agents": coding_agents,
+        "coding_agents": coding_agents,
         "summary": "Desktop coding agent capabilities synced.",
         "ts_ms": cloud_mcp_now_ms(),
     });
@@ -13714,34 +13543,20 @@ async fn cloud_mcp_sync_device_live_terminals(
     let reason = clean_option(reason).unwrap_or_else(|| "device_live_state_snapshot".to_string());
     let workspace_items = workspaces
         .as_array()
-        .ok_or_else(|| "Terminal presence sync requires a workspaces array.".to_string())?;
+        .ok_or_else(|| "Workspace terminals sync requires a workspaces array.".to_string())?;
     let mut normalized_workspaces = Vec::new();
     let device_profile = cloud_mcp_desktop_device_profile();
 
     for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
-        let repo_path = cloud_mcp_payload_text(
-            workspace,
-            &[
-                "repo_path",
-                "repoPath",
-                "workspace_root",
-                "workspaceRoot",
-                "workspace_root_directory",
-                "workspaceRootDirectory",
-                "workingDirectory",
-                "rootDirectory",
-                "terminalWorkspaceWorkingDirectory",
-            ],
-        )
-        .unwrap_or_default();
-        if repo_path.trim().is_empty() {
+        let Some(workspace_id) =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                .filter(|value| !value.trim().is_empty())
+        else {
             continue;
-        }
-
-        let workspace_id =
-            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
+        };
         let workspace_name =
-            cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
+            cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
+                .unwrap_or_else(|| workspace_id.clone());
         let workspace_active = workspace
             .get("workspace_active")
             .or_else(|| workspace.get("workspaceActive"))
@@ -13759,8 +13574,6 @@ async fn cloud_mcp_sync_device_live_terminals(
                 "deactivated".to_string()
             }
         });
-        let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
-        let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
         let terminal_items = cloud_mcp_workspace_terminal_items(workspace);
         let terminals = terminal_items
             .iter()
@@ -13841,9 +13654,6 @@ async fn cloud_mcp_sync_device_live_terminals(
                     ],
                 );
                 json!({
-                    "device": device_profile.clone(),
-                    "device_id": device_profile["device_id"].clone(),
-                    "machine_id": device_profile["device_id"].clone(),
                     "presence_agent_id": cloud_mcp_payload_text(
                         terminal,
                         &["presence_agent_id", "presenceAgentId", "id"],
@@ -13896,7 +13706,6 @@ async fn cloud_mcp_sync_device_live_terminals(
             })
             .collect::<Vec<_>>();
 
-        let terminal_count = terminals.len();
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
         let workspace_order = cloud_mcp_payload_u64(
@@ -13912,33 +13721,17 @@ async fn cloud_mcp_sync_device_live_terminals(
             ],
         )
         .unwrap_or(workspace_index as u64);
-        let mut workspace_value = json!({
-            "device": device_profile.clone(),
+        let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
-            "device_name": device_profile["device_name"].clone(),
-            "machine_id": device_profile["device_id"].clone(),
-            "machine_name": device_profile["machine_name"].clone(),
-            "platform": device_profile["platform"].clone(),
-            "form_factor": device_profile["form_factor"].clone(),
-            "client_kind": device_profile["client_kind"].clone(),
-            "repo_id": req.repo_id,
-            "workspace_root": req.root_display,
             "workspace_active": workspace_active,
-            "workspace_id": req.workspace_id,
-            "workspace_name": req.workspace_name,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
             "workspace_status": workspace_status,
             "workspace_runtime_seq": workspace_runtime_seq,
-            "workspaceRuntimeSeq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
-            "workspaceRuntimeEpoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
-            "workspaceOrder": workspace_order,
-            "workspace_index": workspace_order,
-            "workspaceIndex": workspace_order,
-            "terminal_count": terminal_count,
             "terminals": terminals,
         });
-        cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
         normalized_workspaces.push(workspace_value);
     }
     let terminal_count = normalized_workspaces
@@ -13957,7 +13750,6 @@ async fn cloud_mcp_sync_device_live_terminals(
     let payload = json!({
         "source": "rust-diffforge-device-live-terminals",
         "event_kind": "device_live_state_snapshot",
-        "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
@@ -13977,7 +13769,7 @@ async fn cloud_mcp_sync_device_live_terminals(
 
     {
         let mut snapshots = state.inner().runtime_snapshots.lock().await;
-        snapshots.terminal_presence = Some(payload.clone());
+        snapshots.workspace_terminals = Some(payload.clone());
     }
     cloud_mcp_publish_device_live_state_snapshot(state.inner(), &reason_for_ack).await;
 
@@ -14260,8 +14052,8 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
     let device_profile = cloud_mcp_desktop_device_profile();
 
     let mut snapshots = state.runtime_snapshots.lock().await;
-    if snapshots.terminal_presence.is_none() {
-        snapshots.terminal_presence = Some(json!({
+    if snapshots.workspace_terminals.is_none() {
+        snapshots.workspace_terminals = Some(json!({
             "source": "rust-diffforge-device-live-terminals",
             "event_kind": "device_live_state_snapshot",
             "device": device_profile.clone(),
@@ -14278,11 +14070,11 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
             "workspace_count": 0,
             "terminal_count": 0,
             "workspaces": [],
-            "summary": "Desktop terminal presence synced.",
+            "summary": "Desktop workspace terminals synced.",
             "ts_ms": observed_at_ms,
         }));
     }
-    let Some(snapshot) = snapshots.terminal_presence.as_mut() else {
+    let Some(snapshot) = snapshots.workspace_terminals.as_mut() else {
         return;
     };
     if !snapshot
@@ -14845,7 +14637,7 @@ async fn cloud_mcp_sync_terminal_status_event(
 }
 
 #[tauri::command]
-async fn cloud_mcp_sync_device_live_workspace_mcps(
+async fn cloud_mcp_sync_device_live_workspace_servers(
     state: State<'_, CloudMcpState>,
     workspaces: Value,
     reason: Option<String>,
@@ -14863,29 +14655,15 @@ async fn cloud_mcp_sync_device_live_workspace_mcps(
     let device_profile = cloud_mcp_desktop_device_profile();
 
     for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
-        let repo_path = cloud_mcp_payload_text(
-            workspace,
-            &[
-                "repo_path",
-                "repoPath",
-                "workspace_root",
-                "workspaceRoot",
-                "workspace_root_directory",
-                "workspaceRootDirectory",
-                "workingDirectory",
-                "rootDirectory",
-                "terminalWorkspaceWorkingDirectory",
-            ],
-        )
-        .unwrap_or_default();
-        if repo_path.trim().is_empty() {
+        let Some(workspace_id) =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                .filter(|value| !value.trim().is_empty())
+        else {
             continue;
-        }
-
-        let workspace_id =
-            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
+        };
         let workspace_name =
-            cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
+            cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
+                .unwrap_or_else(|| workspace_id.clone());
         let workspace_active = workspace
             .get("workspace_active")
             .or_else(|| workspace.get("workspaceActive"))
@@ -14903,7 +14681,6 @@ async fn cloud_mcp_sync_device_live_workspace_mcps(
                 "deactivated".to_string()
             }
         });
-        let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
         let server_items = cloud_mcp_workspace_server_items(workspace);
         let servers = server_items
             .iter()
@@ -14952,7 +14729,6 @@ async fn cloud_mcp_sync_device_live_workspace_mcps(
             })
             .collect::<Vec<_>>();
 
-        let server_count = servers.len();
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
         let workspace_order = cloud_mcp_payload_u64(
@@ -14970,28 +14746,20 @@ async fn cloud_mcp_sync_device_live_workspace_mcps(
         .unwrap_or(workspace_index as u64);
         let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
-            "machine_id": device_profile["device_id"].clone(),
-            "repo_id": req.repo_id,
-            "workspace_id": req.workspace_id,
+            "workspace_id": workspace_id,
             "workspace_active": workspace_active,
-            "workspace_name": req.workspace_name,
+            "workspace_name": workspace_name,
             "workspace_status": workspace_status,
             "workspace_runtime_seq": workspace_runtime_seq,
-            "workspaceRuntimeSeq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
-            "workspaceRuntimeEpoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
-            "workspaceOrder": workspace_order,
-            "workspace_index": workspace_order,
-            "workspaceIndex": workspace_order,
-            "server_count": server_count,
             "servers": servers,
         });
         normalized_workspaces.push(workspace_value);
     }
 
     let snapshot_id = format!(
-        "workspace-mcps-{}-{}",
+        "workspace-mcp-servers-{}-{}",
         cloud_mcp_now_ms(),
         uuid::Uuid::new_v4()
     );
@@ -15008,10 +14776,9 @@ async fn cloud_mcp_sync_device_live_workspace_mcps(
     let workspace_count = normalized_workspaces.len();
     let reason_for_ack = reason.clone();
     let payload = json!({
-        "source": "rust-diffforge-device-live-workspace-mcps",
+        "source": "rust-diffforge-device-live-workspace-mcp-servers",
         "event_kind": "device_live_state_snapshot",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
@@ -15032,7 +14799,7 @@ async fn cloud_mcp_sync_device_live_workspace_mcps(
 
     {
         let mut snapshots = state.inner().runtime_snapshots.lock().await;
-        snapshots.workspace_mcps = Some(payload.clone());
+        snapshots.workspace_servers = Some(payload.clone());
     }
     cloud_mcp_publish_device_live_state_snapshot(state.inner(), &reason_for_ack).await;
 
@@ -15059,6 +14826,137 @@ fn cloud_mcp_workspace_payload_matches_delete(value: &Value, workspace_id: &str)
         .as_deref()
         .map(|value| value == workspace_id)
         .unwrap_or(false)
+}
+
+fn cloud_mcp_mark_workspace_inactive_in_snapshot(
+    snapshot: &mut Option<Value>,
+    workspace_id: &str,
+    reason: &str,
+    observed_at_ms: u64,
+) -> bool {
+    let Some(snapshot_value) = snapshot.as_mut() else {
+        return false;
+    };
+    let Some(object) = snapshot_value.as_object_mut() else {
+        return false;
+    };
+    let Some(workspaces) = object.get_mut("workspaces").and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for workspace in workspaces {
+        if !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id) {
+            continue;
+        }
+        changed = true;
+        if let Some(workspace_object) = workspace.as_object_mut() {
+            workspace_object.insert("workspace_active".to_string(), json!(false));
+            workspace_object.insert("workspaceActive".to_string(), json!(false));
+            workspace_object.insert("workspace_status".to_string(), json!("deactivated"));
+            workspace_object.insert("workspaceStatus".to_string(), json!("deactivated"));
+            workspace_object.insert("status".to_string(), json!("deactivated"));
+            workspace_object.insert("reason".to_string(), json!(reason));
+            workspace_object.insert("ts_ms".to_string(), json!(observed_at_ms));
+            workspace_object.insert("updated_at_ms".to_string(), json!(observed_at_ms));
+            workspace_object.insert("updatedAtMs".to_string(), json!(observed_at_ms));
+        }
+    }
+    if changed {
+        object.insert("reason".to_string(), json!(reason));
+        object.insert("ts_ms".to_string(), json!(observed_at_ms));
+        object.insert("updated_at_ms".to_string(), json!(observed_at_ms));
+        object.insert("updatedAtMs".to_string(), json!(observed_at_ms));
+    }
+    changed
+}
+
+fn cloud_mcp_deactivated_workspace_snapshot(workspace_id: &str, reason: &str, observed_at_ms: u64) -> Value {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    json!({
+        "source": "rust-diffforge-workspace-runtime",
+        "event_kind": "device_live_state_snapshot",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "reason": reason,
+        "workspace_count": 1,
+        "workspaces": [{
+            "workspace_id": workspace_id,
+            "workspace_active": false,
+            "workspaceActive": false,
+            "workspace_status": "deactivated",
+            "workspaceStatus": "deactivated",
+            "status": "deactivated",
+            "terminals": [],
+            "terminal_count": 0,
+            "terminalCount": 0,
+            "active_count": 0,
+            "activeCount": 0,
+            "reason": reason,
+            "ts_ms": observed_at_ms,
+            "updated_at_ms": observed_at_ms,
+            "updatedAtMs": observed_at_ms,
+        }],
+        "ts_ms": observed_at_ms,
+        "updated_at_ms": observed_at_ms,
+        "updatedAtMs": observed_at_ms,
+    })
+}
+
+pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
+    state: &CloudMcpState,
+    workspace_id: &str,
+    reason: &str,
+) {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return;
+    }
+    let reason = {
+        let trimmed = reason.trim();
+        if trimmed.is_empty() {
+            "workspace_deactivate".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let observed_at_ms = cloud_mcp_now_ms();
+    let mut changed = false;
+    {
+        let mut snapshots = state.runtime_snapshots.lock().await;
+        changed |= cloud_mcp_mark_workspace_inactive_in_snapshot(
+            &mut snapshots.workspace_catalog,
+            workspace_id,
+            &reason,
+            observed_at_ms,
+        );
+        changed |= cloud_mcp_mark_workspace_inactive_in_snapshot(
+            &mut snapshots.workspace_terminals,
+            workspace_id,
+            &reason,
+            observed_at_ms,
+        );
+        changed |= cloud_mcp_mark_workspace_inactive_in_snapshot(
+            &mut snapshots.workspace_servers,
+            workspace_id,
+            &reason,
+            observed_at_ms,
+        );
+        if !changed {
+            snapshots.workspace_catalog = Some(cloud_mcp_deactivated_workspace_snapshot(
+                workspace_id,
+                &reason,
+                observed_at_ms,
+            ));
+        }
+    }
+    cloud_mcp_publish_device_live_state_snapshot(state, &reason).await;
 }
 
 fn cloud_mcp_filter_deleted_workspace_snapshot(
@@ -15164,19 +15062,24 @@ async fn cloud_mcp_delete_workspace(
         cloud_delete_repo_ids.dedup();
     }
 
-    let (removed_terminal_snapshots, removed_mcp_snapshots) = {
+    let (removed_catalog_snapshots, removed_terminal_snapshots, removed_mcp_snapshots) = {
         let mut snapshots = state.runtime_snapshots.lock().await;
+        let catalog_removed = cloud_mcp_filter_deleted_workspace_snapshot(
+            &mut snapshots.workspace_catalog,
+            &workspace_id,
+            "catalog",
+        );
         let terminal_removed = cloud_mcp_filter_deleted_workspace_snapshot(
-            &mut snapshots.terminal_presence,
+            &mut snapshots.workspace_terminals,
             &workspace_id,
             "terminals",
         );
         let mcp_removed = cloud_mcp_filter_deleted_workspace_snapshot(
-            &mut snapshots.workspace_mcps,
+            &mut snapshots.workspace_servers,
             &workspace_id,
             "mcps",
         );
-        (terminal_removed, mcp_removed)
+        (catalog_removed, terminal_removed, mcp_removed)
     };
     {
         let mut runtime = state.inner.lock().await;
@@ -15237,6 +15140,7 @@ async fn cloud_mcp_delete_workspace(
         "includeChildProjects": include_child_projects,
         "removedTerminalSnapshots": removed_terminal_snapshots,
         "removedMcpSnapshots": removed_mcp_snapshots,
+        "removedCatalogSnapshots": removed_catalog_snapshots,
         "workspaceUnregister": workspace_unregister_response,
         "serverResponse": response,
     }))
@@ -15713,8 +15617,8 @@ async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<
                     "revision": Value::Null,
                 },
                 "clis": [],
-                "workspace_mcps": [],
-                "workspaceMcps": [],
+                "mcps": [],
+                "servers": [],
             }))
         }
     }
@@ -15750,6 +15654,11 @@ async fn cloud_mcp_report_cli_snapshot(
     if let Some(object) = payload.as_object_mut() {
         object.insert("clis".to_string(), clis);
     }
+    {
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        snapshots.cli_states = Some(payload.clone());
+    }
+    cloud_mcp_publish_device_live_state_snapshot(state.inner(), "cli_snapshot").await;
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/tools/cli-snapshot", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
@@ -26749,6 +26658,28 @@ mod cloud_mcp_tests {
         assert_ne!(queued_key, cancelled_key);
         assert!(queued_key.contains("hash-queued"));
         assert!(cancelled_key.contains("hash-cancelled"));
+    }
+
+    #[test]
+    fn workspace_sync_idempotency_key_changes_with_payload() {
+        let initial = json!({
+            "repo_id": "repo-a",
+            "workspace_id": "workspace-a",
+            "workspace_name": "Workspace A",
+        });
+        let updated = json!({
+            "repo_id": "repo-a",
+            "workspace_id": "workspace-a",
+            "workspace_name": "Workspace A renamed",
+        });
+        let initial_key =
+            cloud_mcp_outbox_idempotency_key("workspace_sync", &initial, "hash-initial", None);
+        let updated_key =
+            cloud_mcp_outbox_idempotency_key("workspace_sync", &updated, "hash-updated", None);
+
+        assert_ne!(initial_key, updated_key);
+        assert!(initial_key.contains("hash-initial"));
+        assert!(updated_key.contains("hash-updated"));
     }
 
     #[test]

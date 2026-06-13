@@ -8,7 +8,7 @@ import {
   terminalAgentUsesActivityHooks,
   terminalExecutionPhaseFromState,
   shouldSuppressThreadPropThinking,
-  terminalPresenceStatusFromActivityStatus,
+  workspaceTerminalStatusFromActivityStatus,
   terminalRailStateFromActivityStatus,
   terminalRailStateFromExecutionPhase,
   terminalReadinessFromPresenceStatus,
@@ -56,7 +56,7 @@ test("fresh submitted prompts are allowed to move a terminal into thinking", () 
 
 test("visible terminal presence follows activity status instead of running turn state", () => {
   assert.equal(terminalRailStateFromActivityStatus("idle"), "idle");
-  assert.equal(terminalPresenceStatusFromActivityStatus("idle", {
+  assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
     fallbackStatus: "thinking",
     terminalLifecycle: "open",
   }), "idle");
@@ -68,7 +68,7 @@ test("visible terminal rail preserves exact activity status", () => {
   assert.equal(terminalRailStateFromActivityStatus("running"), "running");
   assert.equal(terminalActivityStatusIsBusy("running"), true);
   assert.equal(terminalActivityStatusIsSendable("running"), false);
-  assert.equal(terminalPresenceStatusFromActivityStatus("thinking", {
+  assert.equal(workspaceTerminalStatusFromActivityStatus("thinking", {
     terminalLifecycle: "open",
   }), "thinking");
   assert.equal(terminalReadinessFromPresenceStatus("thinking"), "busy");
@@ -88,7 +88,7 @@ test("queue sendability is driven by idle activity status only", () => {
 });
 
 test("closed lifecycle wins over idle activity for terminal presence", () => {
-  assert.equal(terminalPresenceStatusFromActivityStatus("idle", {
+  assert.equal(workspaceTerminalStatusFromActivityStatus("idle", {
     terminalLifecycle: "closed",
   }), "closed");
   assert.equal(terminalReadinessFromPresenceStatus("closed"), "closed");

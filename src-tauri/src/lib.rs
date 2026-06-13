@@ -3155,6 +3155,16 @@ async fn deactivate_workspace_runtime(
         }),
     );
 
+    if let Some(workspace_id) = workspace_id.as_deref() {
+        let cloud_mcp_state = app.state::<CloudMcpState>();
+        cloud_mcp_publish_workspace_deactivated_snapshot(
+            cloud_mcp_state.inner(),
+            workspace_id,
+            &reason,
+        )
+        .await;
+    }
+
     let errors = [terminal_error, mcp_error]
         .into_iter()
         .flatten()
@@ -4470,7 +4480,7 @@ pub fn run() {
             cloud_mcp_sync_agent_installations,
             cloud_mcp_sync_device_live_terminals,
             cloud_mcp_sync_terminal_status_event,
-            cloud_mcp_sync_device_live_workspace_mcps,
+            cloud_mcp_sync_device_live_workspace_servers,
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
             cloud_mcp_schedule_tokenomics_sync,

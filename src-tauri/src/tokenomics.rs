@@ -5410,7 +5410,7 @@ fn tokenomics_store_cloud_provider_limit_samples(
 
 fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
     if let Some(account_state) = tokenomics_account_device_live_state_payload(event) {
-        if let Some(summary) = tokenomics_flatten_account_device_tokenomics(account_state) {
+        if let Some(summary) = tokenomics_flatten_account_devices_usage(account_state) {
             return summary;
         }
     }
@@ -5441,25 +5441,25 @@ fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value>
             })
         })
         .unwrap_or(event);
-    let has_device_tokenomics = candidate.get("device_tokenomics").is_some()
-        || candidate.get("deviceTokenomics").is_some()
-        || candidate.get("tokenomics_by_device").is_some()
-        || candidate.get("tokenomicsByDevice").is_some();
-    if event_kind == "account_device_live_state_snapshot" || has_device_tokenomics {
+    let has_device_usage = tokenomics_account_device_usage_entries(candidate)
+        .into_iter()
+        .next()
+        .is_some();
+    if event_kind == "account_device_live_state_snapshot" || has_device_usage {
         Some(candidate)
     } else {
         None
     }
 }
 
-fn tokenomics_flatten_account_device_tokenomics(account_state: &Value) -> Option<Value> {
+fn tokenomics_flatten_account_devices_usage(account_state: &Value) -> Option<Value> {
     let local_device_id = tokenomics_local_device_id();
     let mut hourly = Vec::new();
     let mut limits = Vec::new();
     let mut limit_samples = Vec::new();
     let mut device_identities = Vec::new();
     let mut device_count = 0usize;
-    for (device_id, tokenomics) in tokenomics_account_device_tokenomics_entries(account_state) {
+    for (device_id, tokenomics) in tokenomics_account_device_usage_entries(account_state) {
         if device_id == local_device_id {
             continue;
         }
@@ -5506,29 +5506,29 @@ fn tokenomics_flatten_account_device_tokenomics(account_state: &Value) -> Option
     }))
 }
 
-fn tokenomics_account_device_tokenomics_entries(account_state: &Value) -> Vec<(String, Value)> {
+fn tokenomics_account_device_usage_entries(account_state: &Value) -> Vec<(String, Value)> {
     let mut entries = Vec::new();
-    let Some(value) = account_state
-        .get("device_tokenomics")
-        .or_else(|| account_state.get("deviceTokenomics"))
-        .or_else(|| account_state.get("tokenomics_by_device"))
-        .or_else(|| account_state.get("tokenomicsByDevice"))
-    else {
+    let Some(value) = account_state.get("devices") else {
         return entries;
     };
     match value {
-        Value::Object(items) => {
-            for (device_id, tokenomics) in items {
+        Value::Object(devices) => {
+            for (device_id, device) in devices {
                 let clean_device_id = tokenomics_clean_device_id(device_id)
-                    .or_else(|| tokenomics_device_id_from_tokenomics_payload(tokenomics));
-                if let Some(device_id) = clean_device_id {
+                    .or_else(|| tokenomics_device_id_from_tokenomics_payload(device));
+                if let (Some(device_id), Some(tokenomics)) =
+                    (clean_device_id, device.get("tokenomics"))
+                {
                     entries.push((device_id, tokenomics.clone()));
                 }
             }
         }
-        Value::Array(items) => {
-            for tokenomics in items {
-                if let Some(device_id) = tokenomics_device_id_from_tokenomics_payload(tokenomics) {
+        Value::Array(devices) => {
+            for device in devices {
+                if let (Some(device_id), Some(tokenomics)) = (
+                    tokenomics_device_id_from_tokenomics_payload(device),
+                    device.get("tokenomics"),
+                ) {
                     entries.push((device_id, tokenomics.clone()));
                 }
             }

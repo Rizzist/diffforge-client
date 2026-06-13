@@ -116,7 +116,7 @@ export function terminalActivityStatusIsSendable(activityStatus) {
   return TERMINAL_ACTIVITY_IDLE_STATES.has(normalizeActivityText(activityStatus, ""));
 }
 
-export function terminalPresenceStatusFromActivityStatus(activityStatus, options = {}) {
+export function workspaceTerminalStatusFromActivityStatus(activityStatus, options = {}) {
   const terminalLifecycle = normalizeActivityText(options.terminalLifecycle, "");
   const liveStatus = normalizeActivityText(options.liveStatus, "");
   if (terminalLifecycle === "closed" || liveStatus === "closed") return "closed";

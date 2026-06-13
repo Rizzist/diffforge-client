@@ -3520,6 +3520,7 @@ export function AudioWidgetWindow() {
   const [cancelNoticePaused, setCancelNoticePaused] = useState(false);
   const [widgetHistory, setWidgetHistory] = useState(readAudioTranscriptionHistory);
   const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
+  const [widgetDragging, setWidgetDragging] = useState(false);
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
@@ -3546,6 +3547,9 @@ export function AudioWidgetWindow() {
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
   const bubbleHistoryTrayActiveRef = useRef(false);
+  const widgetDraggingRef = useRef(false);
+  const widgetDragSettleTimerRef = useRef(0);
+  const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceTtsPlayerRef = useRef(null);
@@ -3564,6 +3568,10 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     widgetStyleRef.current = widgetStyle;
   }, [widgetStyle]);
+
+  useEffect(() => {
+    widgetDraggingRef.current = widgetDragging;
+  }, [widgetDragging]);
 
   useEffect(() => {
     applyAudioWidgetThemePreference(audioWidgetTheme);
@@ -4007,6 +4015,29 @@ export function AudioWidgetWindow() {
     }
   }, []);
 
+  const scheduleWidgetDragFinish = useCallback((delayMs = 240) => {
+    if (widgetDragSettleTimerRef.current) {
+      window.clearTimeout(widgetDragSettleTimerRef.current);
+    }
+
+    widgetDragSettleTimerRef.current = window.setTimeout(() => {
+      widgetDragSettleTimerRef.current = 0;
+      const closeHistoryTray = historyTrayCloseAfterDragRef.current;
+      historyTrayCloseAfterDragRef.current = false;
+      widgetDraggingRef.current = false;
+      setWidgetDragging(false);
+      if (closeHistoryTray) {
+        setHistoryTrayOpen(false);
+        runWidgetWindowAction((windowHandle) => (
+          windowHandle.setSize(new LogicalSize(
+            AUDIO_WIDGET_COMPACT_SIZE.width,
+            AUDIO_WIDGET_COMPACT_SIZE.height,
+          ))
+        ));
+      }
+    }, delayMs);
+  }, [runWidgetWindowAction]);
+
   const widgetTargetMode = isFocusedAudioWidgetState(widgetState) ? "focus" : "compact";
   const widgetActive = widgetState === "arming"
     || widgetState === "recording"
@@ -4025,6 +4056,7 @@ export function AudioWidgetWindow() {
     && !widgetActive
     && !cancelNoticeActive;
   const bubbleHistoryTrayActive = canUseBubbleHistoryTray && historyTrayOpen;
+  const bubbleHistoryTrayVisible = bubbleHistoryTrayActive && !widgetDragging;
   const bubbleCancelNoticeActiveRef = useRef(bubbleCancelNoticeActive);
   bubbleCancelNoticeActiveRef.current = bubbleCancelNoticeActive;
   bubbleHistoryTrayActiveRef.current = bubbleHistoryTrayActive;
@@ -4064,7 +4096,7 @@ export function AudioWidgetWindow() {
   }, []);
 
   const openBubbleHistoryTray = useCallback(() => {
-    if (!canUseBubbleHistoryTray) {
+    if (!canUseBubbleHistoryTray || widgetDraggingRef.current) {
       return;
     }
 
@@ -4079,6 +4111,14 @@ export function AudioWidgetWindow() {
   const closeBubbleHistoryTray = useCallback(() => {
     if (historyTrayCloseTimerRef.current) {
       window.clearTimeout(historyTrayCloseTimerRef.current);
+    }
+
+    if (widgetDraggingRef.current) {
+      historyTrayCloseTimerRef.current = 0;
+      if (bubbleHistoryTrayActiveRef.current) {
+        historyTrayCloseAfterDragRef.current = true;
+      }
+      return;
     }
 
     historyTrayCloseTimerRef.current = window.setTimeout(() => {
@@ -4165,11 +4205,61 @@ export function AudioWidgetWindow() {
       historyTrayCloseTimerRef.current = 0;
     }
 
+    if (widgetDragSettleTimerRef.current) {
+      window.clearTimeout(widgetDragSettleTimerRef.current);
+      widgetDragSettleTimerRef.current = 0;
+    }
+    historyTrayCloseAfterDragRef.current = false;
+
     if (copiedWidgetHistoryTimerRef.current) {
       window.clearTimeout(copiedWidgetHistoryTimerRef.current);
       copiedWidgetHistoryTimerRef.current = 0;
     }
   }, []);
+
+  useEffect(() => {
+    const finishAfterRelease = () => {
+      if (widgetDraggingRef.current) {
+        scheduleWidgetDragFinish(60);
+      }
+    };
+
+    let disposed = false;
+    let unlistenMoved = () => {};
+
+    window.addEventListener("mouseup", finishAfterRelease, true);
+    window.addEventListener("pointerup", finishAfterRelease, true);
+    window.addEventListener("pointercancel", finishAfterRelease, true);
+    window.addEventListener("blur", finishAfterRelease);
+
+    try {
+      getCurrentWindow().onMoved(() => {
+        if (widgetDraggingRef.current) {
+          scheduleWidgetDragFinish(700);
+        }
+      })
+        .then((nextUnlisten) => {
+          if (disposed) {
+            nextUnlisten();
+            return;
+          }
+
+          unlistenMoved = nextUnlisten;
+        })
+        .catch(() => {});
+    } catch {
+      // In non-Tauri web previews the native move listener is unavailable.
+    }
+
+    return () => {
+      disposed = true;
+      unlistenMoved();
+      window.removeEventListener("mouseup", finishAfterRelease, true);
+      window.removeEventListener("pointerup", finishAfterRelease, true);
+      window.removeEventListener("pointercancel", finishAfterRelease, true);
+      window.removeEventListener("blur", finishAfterRelease);
+    };
+  }, [scheduleWidgetDragFinish]);
 
   // The bar style docks the window bottom-center of the active monitor; the
   // user's bubble placement is restored on exit. The monitor work area keeps
@@ -4227,18 +4317,28 @@ export function AudioWidgetWindow() {
   // bubble's screen position alone. No tray open/close path should setPosition,
   // otherwise hover close can undo a native drag that happened while expanded.
   useEffect(() => {
-    if (!bubbleHistoryTrayActive) {
+    if (!bubbleHistoryTrayActive || widgetDragging) {
       return undefined;
     }
 
-    runWidgetWindowAction((windowHandle) => (
-      windowHandle.setSize(new LogicalSize(
+    let disposed = false;
+    runWidgetWindowAction((windowHandle) => {
+      if (disposed || widgetDraggingRef.current) {
+        return undefined;
+      }
+
+      return windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_HISTORY_TRAY_SIZE.width,
         AUDIO_WIDGET_HISTORY_TRAY_SIZE.height,
-      ))
-    ));
+      ));
+    });
 
     return () => {
+      disposed = true;
+      if (widgetDraggingRef.current && bubbleHistoryTrayActiveRef.current) {
+        return;
+      }
+
       runWidgetWindowAction((windowHandle) => (
         windowHandle.setSize(new LogicalSize(
           AUDIO_WIDGET_COMPACT_SIZE.width,
@@ -4246,7 +4346,7 @@ export function AudioWidgetWindow() {
         ))
       ));
     };
-  }, [bubbleHistoryTrayActive, runWidgetWindowAction]);
+  }, [bubbleHistoryTrayActive, runWidgetWindowAction, widgetDragging]);
 
   // Bubble-style errors get a small card above the widget: the window grows
   // upward by the card height while the error shows, and the pill stays at
@@ -4433,24 +4533,32 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    if (bubbleHistoryTrayActiveRef.current) {
-      if (historyTrayCloseTimerRef.current) {
-        window.clearTimeout(historyTrayCloseTimerRef.current);
-        historyTrayCloseTimerRef.current = 0;
-      }
-      setHistoryTrayOpen(false);
-      runWidgetWindowAction(async (windowHandle) => {
-        await windowHandle.setSize(new LogicalSize(
-          AUDIO_WIDGET_COMPACT_SIZE.width,
-          AUDIO_WIDGET_COMPACT_SIZE.height,
-        ));
-        await windowHandle.startDragging();
-      });
+    if (event.target?.closest?.("button, a, input, textarea, select, [data-audio-widget-no-drag='true']")) {
       return;
     }
 
-    runWidgetWindowAction((windowHandle) => windowHandle.startDragging());
-  }, [runWidgetWindowAction]);
+    event.preventDefault();
+    event.stopPropagation();
+
+    const trayWasActive = bubbleHistoryTrayActiveRef.current;
+
+    if (historyTrayCloseTimerRef.current) {
+      window.clearTimeout(historyTrayCloseTimerRef.current);
+      historyTrayCloseTimerRef.current = 0;
+    }
+
+    historyTrayCloseAfterDragRef.current = trayWasActive;
+    widgetDraggingRef.current = true;
+    setWidgetDragging(true);
+    if (!trayWasActive) {
+      setHistoryTrayOpen(false);
+    }
+    scheduleWidgetDragFinish(5000);
+
+    runWidgetWindowAction(async (windowHandle) => {
+      await windowHandle.startDragging();
+    });
+  }, [runWidgetWindowAction, scheduleWidgetDragFinish]);
 
   const minimizeWidget = useCallback(() => {
     runWidgetWindowAction((windowHandle) => windowHandle.minimize());
@@ -5247,6 +5355,23 @@ export function AudioWidgetWindow() {
   }, [closeWarmBuffer, widgetState]);
 
   useEffect(() => {
+    if (widgetState !== "ready" || !hasAudioInputSetup()) {
+      return undefined;
+    }
+
+    let disposed = false;
+    startWarmBuffer().catch(() => {
+      if (!disposed && widgetStateRef.current === "ready") {
+        setMessage("Audio input standby");
+      }
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [startWarmBuffer, widgetState]);
+
+  useEffect(() => {
     if (
       transcriptionProvider !== AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
       || widgetState !== "ready"
@@ -5794,6 +5919,9 @@ export function AudioWidgetWindow() {
         onMouseDown={(event) => {
           event.stopPropagation();
         }}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+        }}
         tabIndex={available && focusable ? 0 : -1}
         title={available ? label : (slot === "latest" ? "No transcript yet" : "No previous transcript")}
         type="button"
@@ -5980,9 +6108,9 @@ export function AudioWidgetWindow() {
       )}
       <AudioWidgetShell
         aria-label={widgetLabel}
-        data-tauri-drag-region
         data-closing={isClosingFocus ? "true" : undefined}
         data-concealed={widgetStyle === AUDIO_WIDGET_STYLE_HIDDEN && !widgetActive ? "true" : undefined}
+        data-dragging={widgetDragging ? "true" : undefined}
         data-error-frame={errorFrameActive ? "true" : undefined}
         data-focus={isFocusedWidget ? "true" : undefined}
         data-handoff={isCompactHandoff ? "true" : undefined}
@@ -5990,13 +6118,12 @@ export function AudioWidgetWindow() {
         data-state={widgetState}
         data-theme={audioWidgetTheme}
         data-history-tray={bubbleHistoryTrayActive ? "true" : undefined}
-        onMouseDown={dragWidget}
         onMouseEnter={openBubbleHistoryTray}
         onMouseLeave={closeBubbleHistoryTray}
+        onPointerDown={dragWidget}
       >
         <AudioWidgetFocusStage
           aria-label={widgetLabel}
-          data-tauri-drag-region
           data-mode={widgetVisualMode}
           role="status"
         >
@@ -6040,6 +6167,9 @@ export function AudioWidgetWindow() {
             onMouseDown={(event) => {
               event.stopPropagation();
             }}
+            onPointerDown={(event) => {
+              event.stopPropagation();
+            }}
             title="Cancel (transcript is saved to history)"
             type="button"
           >
@@ -6047,11 +6177,11 @@ export function AudioWidgetWindow() {
           </AudioWidgetCancelButton>
         )}
         <AudioWidgetHistoryTray
-          aria-hidden={!bubbleHistoryTrayActive}
+          aria-hidden={!bubbleHistoryTrayVisible}
           aria-label="Dictation copy shortcuts"
         >
-          {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText), bubbleHistoryTrayActive)}
-          {renderHistoryQuickButton("previous", "Copy previous transcription", Boolean(previousHistoryText), bubbleHistoryTrayActive)}
+          {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText), bubbleHistoryTrayVisible)}
+          {renderHistoryQuickButton("previous", "Copy previous transcription", Boolean(previousHistoryText), bubbleHistoryTrayVisible)}
         </AudioWidgetHistoryTray>
       </AudioWidgetShell>
     </>

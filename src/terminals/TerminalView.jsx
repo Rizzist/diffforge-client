@@ -15249,7 +15249,7 @@ function TerminalView({
   knownDevices = [],
   storageUsage = null,
   terminalWorkspace,
-  terminalAgentsByIndex = {},
+  terminalRenderAgentsByIndex = {},
   terminalRolesByIndex = {},
   terminalThreadsByIndex = {},
   terminalWorkspaceCoordinationTargets = [],
@@ -16079,10 +16079,10 @@ function TerminalView({
     setWorkspaceFileDragState(nextState || null);
   }, []);
   const getTerminalAgent = useCallback((terminalIndex) => (
-    Object.prototype.hasOwnProperty.call(terminalAgentsByIndex, terminalIndex)
-      ? terminalAgentsByIndex[terminalIndex]
+    Object.prototype.hasOwnProperty.call(terminalRenderAgentsByIndex, terminalIndex)
+      ? terminalRenderAgentsByIndex[terminalIndex]
       : workspaceTerminalRenderAgent
-  ), [terminalAgentsByIndex, workspaceTerminalRenderAgent]);
+  ), [terminalRenderAgentsByIndex, workspaceTerminalRenderAgent]);
   const getTerminalRole = useCallback((terminalIndex) => (
     terminalRolesByIndex[terminalIndex] || getTerminalAgent(terminalIndex)?.id || ""
   ), [getTerminalAgent, terminalRolesByIndex]);

@@ -8895,11 +8895,19 @@ export const AudioWidgetShell = styled.main`
     box-shadow 160ms ease,
     opacity 180ms ease;
   contain: paint;
-  -webkit-app-region: drag;
+  cursor: grab;
 
   &[data-concealed="true"] {
     opacity: 0;
     pointer-events: none;
+  }
+
+  &[data-dragging="true"] {
+    cursor: grabbing;
+  }
+
+  &[data-history-tray="true"] {
+    place-items: start center;
   }
 
   /* Error frame: the window grew upward to fit the error card, so the pill
@@ -9735,7 +9743,6 @@ export const AudioWidgetFocusStage = styled.div`
   transition:
     opacity 160ms ease,
     transform 190ms cubic-bezier(0.3, 0, 0.2, 1);
-  -webkit-app-region: drag;
 
   &[data-mode="closing"] {
     opacity: 1;
@@ -9792,6 +9799,13 @@ export const AudioWidgetHistoryTray = styled.div`
     opacity: 1;
     pointer-events: auto;
     transform: translateX(-50%) translateY(0) scale(1);
+  }
+
+  ${AudioWidgetShell}[data-dragging="true"] & {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-50%) translateY(-5px) scale(0.96);
+    transition: none;
   }
 
   html[data-audio-widget-theme="light"] & {

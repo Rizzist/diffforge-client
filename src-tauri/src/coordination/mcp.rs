@@ -5749,10 +5749,7 @@ mod tests {
             view["account_data"]["account_sync"]["connected_device_count"].as_u64(),
             Some(2)
         );
-        assert_eq!(
-            view["todo_compression"]["chunk_count"].as_u64(),
-            Some(1)
-        );
+        assert_eq!(view["todo_compression"]["chunk_count"].as_u64(), Some(1));
         assert_eq!(view["task_history"]["task_count"].as_u64(), Some(2));
         assert_eq!(view["spec_activity"]["recorded"].as_bool(), Some(true));
         assert!(view.get("event").is_none());
