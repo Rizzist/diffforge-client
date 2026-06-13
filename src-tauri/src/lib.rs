@@ -1004,6 +1004,7 @@ struct TerminalCloudMcpCloseContext {
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
     session_mode: TerminalSessionMode,
+    metadata: TerminalInstanceMetadata,
 }
 
 impl TerminalCloudMcpCloseContext {
@@ -1013,6 +1014,7 @@ impl TerminalCloudMcpCloseContext {
             active_task: Arc::clone(&instance.active_task),
             coordination: instance.coordination.clone(),
             session_mode: instance.session_mode,
+            metadata: instance.metadata.clone(),
         }
     }
 }

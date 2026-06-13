@@ -170,6 +170,10 @@ struct SnippingState {
     /// Preview labels currently hovering over the recent strip during a native
     /// drag. While present, their native window stays strip-tile sized.
     preview_strip_hover_labels: Arc<StdMutex<HashSet<String>>>,
+    /// Preview labels freshly pulled from the strip whose native window drag is
+    /// still being adopted by the OS. During this short phase, synthetic
+    /// position/size moves must not trigger left-column queue reflow.
+    preview_drag_handoff_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
     /// Set by the watcher as soon as it sees mouse-up for a native preview
     /// drag, before the main-thread settle pass can decide whether the
     /// left-column quiet gate applies. This prevents a post-release Moved
@@ -212,6 +216,7 @@ impl SnippingState {
             preview_detached_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_post_release_settling_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_strip_hover_labels: Arc::new(StdMutex::new(HashSet::new())),
+            preview_drag_handoff_until_ms: Arc::new(StdMutex::new(HashMap::new())),
             preview_post_release_check_pending: Arc::new(AtomicBool::new(false)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
@@ -4333,6 +4338,12 @@ const SNIPPING_FLOAT_RESTACK_SETTLE_FALLBACK_MS: u64 = 420;
 // After a left-column release, wait for native edge snap/constrain movement
 // to go quiet, then decide queue vs detached from the final window position.
 const SNIPPING_FLOAT_POST_RELEASE_SETTLE_MS: u64 = 170;
+// Fresh strip drag-outs create/reuse a native window, position it, resize it,
+// and then hand it to the OS drag manager. Those first synthetic/native-takeover
+// moves must not wake the left queue, or the preview visually snaps between
+// OS-owned and queue-owned positions.
+const SNIPPING_FLOAT_DRAG_HANDOFF_GRACE_MS: u64 = 260;
+const SNIPPING_FLOAT_DRAG_HANDOFF_EXPAND_DELAY_MS: u64 = 90;
 // How often the settle watcher polls the button state / deadline while a
 // drag or pending reflow is in flight.
 const SNIPPING_FLOAT_SETTLE_POLL_MS: u64 = 15;
@@ -4425,6 +4436,9 @@ fn snipping_begin_preview_drag_session(
     if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
         strip_hover.remove(label);
     }
+    if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
+        handoffs.remove(label);
+    }
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -4456,6 +4470,9 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     }
     if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
         strip_hover.remove(label);
+    }
+    if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
+        handoffs.remove(label);
     }
     state
         .preview_post_release_check_pending
@@ -4490,6 +4507,9 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
         strip_hover.remove(label);
     }
+    if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
+        handoffs.remove(label);
+    }
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -4523,6 +4543,9 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     }
     if let Ok(mut strip_hover) = state.preview_strip_hover_labels.lock() {
         strip_hover.remove(label);
+    }
+    if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
+        handoffs.remove(label);
     }
     state
         .preview_post_release_check_pending
@@ -4635,20 +4658,127 @@ fn snipping_preview_in_stack_column(position_x: i32, preview_width: i32, stack_x
     preview_right >= stack_left && preview_left <= stack_right
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SnippingPreviewStackMonitorKey {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_micros: i64,
+}
+
+#[derive(Clone, Copy)]
+struct SnippingPreviewStackMetrics {
+    key: SnippingPreviewStackMonitorKey,
+    x: i32,
+    top_limit: i32,
+    bottom_edge: i32,
+    gap: i32,
+    width_physical: i32,
+    height_physical: i32,
+}
+
+fn snipping_preview_stack_metrics_for_monitor(
+    monitor: &tauri::Monitor,
+    width: f64,
+    height: f64,
+) -> SnippingPreviewStackMetrics {
+    let work_area = *monitor.work_area();
+    let scale = monitor.scale_factor().max(0.1);
+    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
+    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
+    let width_physical = (width * scale).round().max(1.0) as i32;
+    let height_physical = (height * scale).round().max(1.0) as i32;
+    SnippingPreviewStackMetrics {
+        key: SnippingPreviewStackMonitorKey {
+            x: work_area.position.x,
+            y: work_area.position.y,
+            width: work_area.size.width,
+            height: work_area.size.height,
+            scale_micros: (scale * 1_000_000.0).round() as i64,
+        },
+        x: work_area.position.x + margin,
+        top_limit: work_area.position.y + margin,
+        bottom_edge: work_area.position.y + work_area.size.height as i32 - margin,
+        gap,
+        width_physical,
+        height_physical,
+    }
+}
+
+fn snipping_monitor_overlap_area(
+    position: tauri::PhysicalPosition<i32>,
+    width: i32,
+    height: i32,
+    monitor: &tauri::Monitor,
+) -> i64 {
+    let area = *monitor.work_area();
+    let left = position.x.max(area.position.x);
+    let top = position.y.max(area.position.y);
+    let right = (position.x + width.max(1)).min(area.position.x + area.size.width as i32);
+    let bottom = (position.y + height.max(1)).min(area.position.y + area.size.height as i32);
+    i64::from((right - left).max(0)) * i64::from((bottom - top).max(0))
+}
+
+fn snipping_preview_stack_monitor_for_rect(
+    app: &AppHandle,
+    position: tauri::PhysicalPosition<i32>,
+    width: i32,
+    height: i32,
+) -> Option<tauri::Monitor> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let center_x = f64::from(position.x) + f64::from(width) * 0.5;
+    let center_y = f64::from(position.y) + f64::from(height) * 0.5;
+    app.monitor_from_point(center_x, center_y)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            app.available_monitors().ok().and_then(|monitors| {
+                let mut best: Option<(tauri::Monitor, i64)> = None;
+                for monitor in monitors {
+                    let area = snipping_monitor_overlap_area(position, width, height, &monitor);
+                    if area > best.as_ref().map(|(_, best_area)| *best_area).unwrap_or(0) {
+                        best = Some((monitor, area));
+                    }
+                }
+                best.map(|(monitor, _)| monitor)
+            })
+        })
+        .or_else(|| {
+            app.get_webview_window("main")
+                .and_then(|main_window| main_window.current_monitor().ok().flatten())
+        })
+        .or_else(|| app.primary_monitor().ok().flatten())
+}
+
+fn snipping_preview_stack_active_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
+    app.cursor_position()
+        .ok()
+        .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
+        .or_else(|| {
+            app.get_webview_window("main")
+                .and_then(|main_window| main_window.current_monitor().ok().flatten())
+        })
+        .or_else(|| app.primary_monitor().ok().flatten())
+}
+
 fn snipping_preview_window_in_stack_column(app: &AppHandle, window: &tauri::WebviewWindow) -> bool {
     let Ok(position) = window.outer_position() else {
         return false;
     };
-    let width = window
+    let (width, height) = window
         .outer_size()
-        .map(|size| size.width.max(1) as i32)
-        .unwrap_or(1);
-    app.get_webview_window("main")
-        .and_then(|main_window| main_window.current_monitor().ok().flatten())
+        .map(|size| (size.width.max(1) as i32, size.height.max(1) as i32))
+        .unwrap_or((1, 1));
+    snipping_preview_stack_monitor_for_rect(app, position, width, height)
         .map(|monitor| {
-            let column_x = monitor.work_area().position.x
-                + (SNIPPING_FLOAT_STACK_MARGIN * monitor.scale_factor().max(0.1)).round() as i32;
-            snipping_preview_in_stack_column(position.x, width, column_x)
+            let metrics = snipping_preview_stack_metrics_for_monitor(
+                &monitor,
+                SNIPPING_FLOAT_LOGICAL_WIDTH,
+                SNIPPING_FLOAT_LOGICAL_HEIGHT,
+            );
+            snipping_preview_in_stack_column(position.x, width, metrics.x)
         })
         .unwrap_or(false)
 }
@@ -4661,17 +4791,9 @@ fn snipping_preview_stack_position(
     width: f64,
     height: f64,
 ) -> Option<tauri::PhysicalPosition<i32>> {
-    let monitor = app
-        .get_webview_window("main")
-        .and_then(|main_window| main_window.current_monitor().ok().flatten())?;
-    let work_area = monitor.work_area();
-    let scale = monitor.scale_factor().max(0.1);
-    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
-    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
-    let width_physical = (width * scale).round() as i32;
-    let height_physical = (height * scale).round() as i32;
-    let x = work_area.position.x + margin;
-    let bottom_y = work_area.position.y + work_area.size.height as i32 - height_physical - margin;
+    let monitor = snipping_preview_stack_active_monitor(app)?;
+    let metrics = snipping_preview_stack_metrics_for_monitor(&monitor, width, height);
+    let bottom_y = metrics.bottom_edge - metrics.height_physical;
 
     let mut highest_top: Option<i32> = None;
     let closing_labels = snipping_preview_closing_labels(app);
@@ -4688,19 +4810,33 @@ fn snipping_preview_stack_position(
         let Ok(position) = window.outer_position() else {
             continue;
         };
+        let (window_width, window_height) = window
+            .outer_size()
+            .map(|size| (size.width.max(1) as i32, size.height.max(1) as i32))
+            .unwrap_or((metrics.width_physical, metrics.height_physical));
+        let Some(window_monitor) =
+            snipping_preview_stack_monitor_for_rect(app, position, window_width, window_height)
+        else {
+            continue;
+        };
+        if snipping_preview_stack_metrics_for_monitor(&window_monitor, width, height).key
+            != metrics.key
+        {
+            continue;
+        }
         // Only stack against previews still parked in the left column; ones
         // the user dragged away stop reserving a slot.
-        if !snipping_preview_in_stack_column(position.x, width_physical, x) {
+        if !snipping_preview_in_stack_column(position.x, window_width, metrics.x) {
             continue;
         }
         highest_top = Some(highest_top.map_or(position.y, |current| current.min(position.y)));
     }
 
     let y = match highest_top {
-        Some(top) => (top - gap - height_physical).max(work_area.position.y + margin),
+        Some(top) => (top - metrics.gap - metrics.height_physical).max(metrics.top_limit),
         None => bottom_y,
     };
-    Some(tauri::PhysicalPosition::new(x, y))
+    Some(tauri::PhysicalPosition::new(metrics.x, y))
 }
 
 // One snappy tween profile for both mid-drag re-packs and release settles:
@@ -4744,6 +4880,7 @@ fn snipping_animate_preview_logical_size(
     to_width: f64,
     to_height: f64,
     duration_ms: f64,
+    center_on_cursor: bool,
 ) {
     let generation = app
         .state::<SnippingState>()
@@ -4781,6 +4918,16 @@ fn snipping_animate_preview_logical_size(
                     return;
                 }
                 let _ = window_for_frame.set_size(tauri::LogicalSize::new(width, height));
+                if center_on_cursor
+                    && snipping_preview_is_dragging(&app_for_frame, &label_for_frame)
+                {
+                    let _ = snipping_position_preview_under_cursor(
+                        &app_for_frame,
+                        &window_for_frame,
+                        width,
+                        height,
+                    );
+                }
             });
             if progress >= 1.0 {
                 return;
@@ -4805,6 +4952,26 @@ fn snipping_animate_preview_logical_size_to_full(
         SNIPPING_FLOAT_LOGICAL_WIDTH,
         SNIPPING_FLOAT_LOGICAL_HEIGHT,
         duration_ms,
+        false,
+    );
+}
+
+fn snipping_animate_preview_logical_size_to_full_under_cursor(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    from_width: f64,
+    from_height: f64,
+    duration_ms: f64,
+) {
+    snipping_animate_preview_logical_size(
+        app,
+        window,
+        from_width,
+        from_height,
+        SNIPPING_FLOAT_LOGICAL_WIDTH,
+        SNIPPING_FLOAT_LOGICAL_HEIGHT,
+        duration_ms,
+        true,
     );
 }
 
@@ -4882,32 +5049,21 @@ fn snipping_animate_previews(
 /// release: it can still block the column, but the queue no longer pulls it
 /// into an auto slot.
 fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: SnippingTweenEasing) {
-    let Some(monitor) = app
-        .get_webview_window("main")
-        .and_then(|main_window| main_window.current_monitor().ok().flatten())
-    else {
-        return;
-    };
-    let work_area = monitor.work_area();
-    let scale = monitor.scale_factor().max(0.1);
-    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
-    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
-    let width_physical = (SNIPPING_FLOAT_LOGICAL_WIDTH * scale).round() as i32;
-    let height_physical = (SNIPPING_FLOAT_LOGICAL_HEIGHT * scale).round() as i32;
-    let x = work_area.position.x + margin;
-    let top_limit = work_area.position.y + margin;
-
     let dragging_labels = snipping_preview_dragging_labels(app);
     let detached_labels = snipping_preview_detached_labels(app);
     let closing_labels = snipping_preview_closing_labels(app);
 
-    let mut previews: Vec<(
+    type StackPreviewEntry = (
         tauri::PhysicalPosition<i32>,
         i32,
         tauri::WebviewWindow,
         bool,
         bool,
-    )> = Vec::new();
+    );
+    let mut groups: HashMap<
+        SnippingPreviewStackMonitorKey,
+        (SnippingPreviewStackMetrics, Vec<StackPreviewEntry>),
+    > = HashMap::new();
     for (label, window) in app.webview_windows() {
         if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
             continue;
@@ -4924,13 +5080,25 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         let (width, height) = window
             .outer_size()
             .map(|size| (size.width as i32, size.height as i32))
-            .unwrap_or((width_physical, height_physical));
+            .unwrap_or((1, 1));
+        let Some(monitor) = snipping_preview_stack_monitor_for_rect(app, position, width, height)
+        else {
+            continue;
+        };
+        let metrics = snipping_preview_stack_metrics_for_monitor(
+            &monitor,
+            SNIPPING_FLOAT_LOGICAL_WIDTH,
+            SNIPPING_FLOAT_LOGICAL_HEIGHT,
+        );
         // Same queue-ownership test as snipping_preview_stack_position.
-        if !snipping_preview_in_stack_column(position.x, width, x) {
+        if !snipping_preview_in_stack_column(position.x, width, metrics.x) {
             continue;
         }
         let height = height.max(1);
-        previews.push((
+        let entry = groups
+            .entry(metrics.key)
+            .or_insert_with(|| (metrics, Vec::new()));
+        entry.1.push((
             position,
             height,
             window,
@@ -4939,40 +5107,43 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64, easing: Snipp
         ));
     }
 
-    // The lowest window keeps the bottom slot; on-screen order is preserved.
-    previews.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
-    // A held window is an obstacle at its REAL on-screen band, not at a
-    // canonical packed slot. Detached windows use the same treatment after
-    // release, preventing the old left-side auto-align from grabbing them.
-    let mut obstacle_bands: Vec<(i32, i32)> = previews
-        .iter()
-        .filter(|(_, _, _, dragging, detached)| *dragging || *detached)
-        .map(|(position, height, _, _, _)| (position.y, position.y + height))
-        .collect();
-    obstacle_bands.sort_by(|a, b| b.1.cmp(&a.1));
-    let mut bottom_edge = work_area.position.y + work_area.size.height as i32 - margin;
     let mut moves = Vec::new();
-    for (position, height, window, dragging, detached) in previews {
-        if dragging || detached {
-            // The OS drag owns a held window's position; a detached window is
-            // user-positioned. Their bands above already block slots.
-            continue;
-        }
-        let mut y = bottom_edge - height;
-        for (band_top, band_bottom) in &obstacle_bands {
-            let intersects = y < band_bottom + gap && y + height > band_top - gap;
-            if intersects {
-                // The lowest free slot would collide with the held preview:
-                // hop fully above it (bands are visited lowest-first, so a
-                // hop can cascade past stacked obstacles).
-                y = band_top - gap - height;
+    for (_, (metrics, mut previews)) in groups {
+        // The lowest window keeps the bottom slot; on-screen order is preserved.
+        previews.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
+        // A held window is an obstacle at its REAL on-screen band, not at a
+        // canonical packed slot. Detached windows use the same treatment after
+        // release, preventing the old left-side auto-align from grabbing them.
+        let mut obstacle_bands: Vec<(i32, i32)> = previews
+            .iter()
+            .filter(|(_, _, _, dragging, detached)| *dragging || *detached)
+            .map(|(position, height, _, _, _)| (position.y, position.y + height))
+            .collect();
+        obstacle_bands.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut bottom_edge = metrics.bottom_edge;
+        for (position, height, window, dragging, detached) in previews {
+            if dragging || detached {
+                // The OS drag owns a held window's position; a detached window is
+                // user-positioned. Their bands above already block slots.
+                continue;
             }
+            let mut y = bottom_edge - height;
+            for (band_top, band_bottom) in &obstacle_bands {
+                let intersects =
+                    y < band_bottom + metrics.gap && y + height > band_top - metrics.gap;
+                if intersects {
+                    // The lowest free slot would collide with the held preview:
+                    // hop fully above it (bands are visited lowest-first, so a
+                    // hop can cascade past stacked obstacles).
+                    y = band_top - metrics.gap - height;
+                }
+            }
+            let y = y.max(metrics.top_limit);
+            if position.x != metrics.x || position.y != y {
+                moves.push((window, position, tauri::PhysicalPosition::new(metrics.x, y)));
+            }
+            bottom_edge = y - metrics.gap;
         }
-        let y = y.max(top_limit);
-        if position.x != x || position.y != y {
-            moves.push((window, position, tauri::PhysicalPosition::new(x, y)));
-        }
-        bottom_edge = y - gap;
     }
     snipping_animate_previews(app, moves, animate_ms, easing);
 }
@@ -4987,6 +5158,9 @@ fn snipping_live_reflow_on_drag(app: &AppHandle, label: &str) {
         .map(|sessions| sessions.contains_key(label))
         .unwrap_or(false);
     if !is_dragging {
+        return;
+    }
+    if snipping_preview_drag_handoff_active(app, label) {
         return;
     }
     let now_ms = SystemTime::now()
@@ -5008,6 +5182,96 @@ fn snipping_now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn snipping_preview_drag_handoff_active(app: &AppHandle, label: &str) -> bool {
+    let now_ms = snipping_now_epoch_ms();
+    app.state::<SnippingState>()
+        .preview_drag_handoff_until_ms
+        .lock()
+        .map(|handoffs| handoffs.get(label).is_some_and(|until_ms| now_ms < *until_ms))
+        .unwrap_or(false)
+}
+
+fn snipping_any_preview_drag_handoff_active(app: &AppHandle) -> bool {
+    let now_ms = snipping_now_epoch_ms();
+    app.state::<SnippingState>()
+        .preview_drag_handoff_until_ms
+        .lock()
+        .map(|handoffs| handoffs.values().any(|until_ms| now_ms < *until_ms))
+        .unwrap_or(false)
+}
+
+fn snipping_finish_preview_drag_handoff(app: &AppHandle, label: &str) -> bool {
+    let now_ms = snipping_now_epoch_ms();
+    app.state::<SnippingState>()
+        .preview_drag_handoff_until_ms
+        .lock()
+        .map(|mut handoffs| match handoffs.get(label).copied() {
+            Some(until_ms) if now_ms >= until_ms => {
+                handoffs.remove(label);
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+fn snipping_begin_preview_drag_handoff(app: &AppHandle, label: &str) {
+    let until_ms = snipping_now_epoch_ms() + SNIPPING_FLOAT_DRAG_HANDOFF_GRACE_MS;
+    let state = app.state::<SnippingState>();
+    if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
+        handoffs.insert(label.to_string(), until_ms);
+    }
+
+    let app_for_expand = app.clone();
+    let label_for_expand = label.to_string();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(
+            SNIPPING_FLOAT_DRAG_HANDOFF_EXPAND_DELAY_MS,
+        ));
+        let app_for_main = app_for_expand.clone();
+        let label_for_main = label_for_expand.clone();
+        let _ = app_for_expand.run_on_main_thread(move || {
+            if !snipping_preview_drag_handoff_active(&app_for_main, &label_for_main)
+                || !snipping_preview_is_dragging(&app_for_main, &label_for_main)
+            {
+                return;
+            }
+            let Some(window) = app_for_main.get_webview_window(&label_for_main) else {
+                return;
+            };
+            if snipping_preview_overlaps_strip(&app_for_main, &window) {
+                snipping_update_preview_strip_drag_state(&app_for_main, &label_for_main, false);
+                return;
+            }
+            snipping_animate_preview_logical_size_to_full_under_cursor(
+                &app_for_main,
+                &window,
+                SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+                SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+                (SNIPPING_FLOAT_DRAG_HANDOFF_GRACE_MS
+                    .saturating_sub(SNIPPING_FLOAT_DRAG_HANDOFF_EXPAND_DELAY_MS))
+                    as f64,
+            );
+        });
+
+        thread::sleep(Duration::from_millis(
+            SNIPPING_FLOAT_DRAG_HANDOFF_GRACE_MS
+                .saturating_sub(SNIPPING_FLOAT_DRAG_HANDOFF_EXPAND_DELAY_MS),
+        ));
+        let app_for_main = app_for_expand.clone();
+        let label_for_main = label_for_expand.clone();
+        let _ = app_for_expand.run_on_main_thread(move || {
+            if !snipping_finish_preview_drag_handoff(&app_for_main, &label_for_main) {
+                return;
+            }
+            if snipping_preview_is_dragging(&app_for_main, &label_for_main) {
+                snipping_update_preview_strip_drag_state(&app_for_main, &label_for_main, false);
+                schedule_snipping_preview_stack_reflow(&app_for_main);
+            }
+        });
+    });
 }
 
 /// Settle deadline for the current platform: short where the watcher has a
@@ -5138,6 +5402,10 @@ fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
 /// any user-dragged preview to the main webview as a drop, then re-packs the
 /// bottom-left stack.
 fn snipping_settle_preview_windows(app: &AppHandle) {
+    if snipping_any_preview_drag_handoff_active(app) {
+        schedule_snipping_preview_stack_reflow(app);
+        return;
+    }
     if snipping_left_mouse_button_pressed() {
         // Rare watcher race (a drag re-grabbed between release and settle):
         // never resolve a drop while the button is held; watch again.
@@ -5634,6 +5902,21 @@ fn snipping_build_preview_window(
         window.on_window_event(move |event| {
             match event {
                 WindowEvent::Moved(_) => {
+                    if snipping_preview_drag_handoff_active(&app_for_events, &label_for_events) {
+                        if app_for_events
+                            .get_webview_window(&label_for_events)
+                            .is_some_and(|window| {
+                                snipping_preview_overlaps_strip(&app_for_events, &window)
+                            })
+                        {
+                            snipping_update_preview_strip_drag_state(
+                                &app_for_events,
+                                &label_for_events,
+                                false,
+                            );
+                        }
+                        return;
+                    }
                     snipping_update_preview_strip_drag_state(
                         &app_for_events,
                         &label_for_events,
@@ -6433,8 +6716,7 @@ fn snipping_open_snip_float_for_drag(
         .outer_position()
         .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
     snipping_begin_preview_drag_session(&app, &label, position);
-    snipping_update_preview_strip_drag_state(&app, &label, true);
-    schedule_snipping_preview_stack_reflow(&app);
+    snipping_begin_preview_drag_handoff(&app, &label);
     let _ = snipping_position_preview_under_cursor(&app, &window, drag_size.0, drag_size.1);
     let drag_started = window.start_dragging().is_ok();
     let mut opened = opened;

@@ -3,6 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 
 export const CLOUD_VOICE_AGENT_EVENT = "forge-cloud-voice-agent-event";
 export const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED = false;
+const CLOUD_VOICE_AGENT_PREWARM_FRESH_MS = 15_000;
+
+let cloudVoiceAgentPrewarmPromise = null;
+let cloudVoiceAgentPrewarmReadyAt = 0;
 
 export function cloudVoiceAgentEventKind(event) {
   return String(event?.kind || event?.event_kind || event?.eventKind || event?.type || "").trim();
@@ -65,19 +69,34 @@ export async function prewarmCloudVoiceAgentStream(options = {}) {
     }
   };
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.invoke");
-  emitStatus("credits_billing", "Starting..");
-  await invoke("cloud_mcp_get_billing_status").catch((error) => {
-    logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.billing_error", {
-      message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
-    });
-    if (requireBilling) {
+  if (requireBilling) {
+    emitStatus("credits_billing", "Starting..");
+    await invoke("cloud_mcp_get_billing_status").catch((error) => {
+      logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.billing_error", {
+        message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
+      });
       throw error;
+    });
+  }
+  if (!requireBilling && cloudVoiceAgentPrewarmReadyAt > 0) {
+    const ageMs = Date.now() - cloudVoiceAgentPrewarmReadyAt;
+    if (ageMs >= 0 && ageMs < CLOUD_VOICE_AGENT_PREWARM_FRESH_MS) {
+      emitStatus("credits_ready", "Voice ready");
+      return true;
     }
-  });
+  }
   emitStatus("credits_wallet", "Working..");
-  return invoke("prewarm_cloud_voice_agent_stream")
+  const prewarmPromise = cloudVoiceAgentPrewarmPromise || invoke("prewarm_cloud_voice_agent_stream");
+  if (!requireBilling && !cloudVoiceAgentPrewarmPromise) {
+    cloudVoiceAgentPrewarmPromise = prewarmPromise;
+  }
+
+  return prewarmPromise
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.prewarm.ok");
+      if (!requireBilling) {
+        cloudVoiceAgentPrewarmReadyAt = Date.now();
+      }
       emitStatus("credits_ready", "Voice ready");
       return result;
     })
@@ -86,6 +105,11 @@ export async function prewarmCloudVoiceAgentStream(options = {}) {
         message: cleanVoiceOrchestratorDiagnosticText(error?.message || error),
       });
       throw error;
+    })
+    .finally(() => {
+      if (!requireBilling && cloudVoiceAgentPrewarmPromise === prewarmPromise) {
+        cloudVoiceAgentPrewarmPromise = null;
+      }
     });
 }
 

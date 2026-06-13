@@ -4577,6 +4577,17 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
         }),
     );
+    cloud_mcp_mark_terminal_opened(
+        cloud_mcp_state.inner(),
+        &pane_id,
+        instance_id,
+        &process_working_directory,
+        terminal_coordination.as_ref(),
+        effective_session_mode,
+        &terminal_metadata_for_log,
+        "terminal_open",
+    )
+    .await;
     if let Some(displaced_instance) = displaced_instance {
         cleanup_terminal_instance_async(
             displaced_instance,

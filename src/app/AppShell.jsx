@@ -14567,16 +14567,14 @@ export default function App() {
             });
             const colorSlot = getTerminalAgentColorSlot(terminalIndex);
             const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
-            const hasSession = Boolean(
-              thread?.transcriptSessionId
-                || providerBinding?.nativeSessionId
-                || providerBinding?.nativeSessionTitle,
-            );
             const latestTurn = thread?.latestTurn && typeof thread.latestTurn === "object"
               ? thread.latestTurn
               : {};
             const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
-            const terminalLifecycle = liveTerminal || hasSession ? "open" : "closed";
+            const liveTerminalOpen = Boolean(
+              liveTerminal && !["closed", "closing", "exited", "offline"].includes(liveStatus),
+            );
+            const terminalLifecycle = liveTerminalOpen ? "open" : "closed";
             const liveRailActivity = String(
               liveTerminal?.activityStatus
                 || liveTerminal?.activity_status
@@ -15759,13 +15757,13 @@ export default function App() {
         terminalPresenceSyncPendingRef.current = null;
         return;
       }
-      const hotDelayMs = getTerminalInputHotDelayMs(1200);
+      const hotDelayMs = getTerminalInputHotDelayMs(120);
       if (hotDelayMs > 0) {
         terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, hotDelayMs);
         return;
       }
       if (terminalPresenceSyncInFlightRef.current) {
-        terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 1000);
+        terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 120);
         return;
       }
 
@@ -15782,7 +15780,7 @@ export default function App() {
           && !disposed
           && !terminalPresenceSyncTimerRef.current
         ) {
-          terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 1000);
+          terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 120);
         }
       };
       window.setTimeout(releasePresenceSyncGate, 0);
@@ -15842,7 +15840,7 @@ export default function App() {
     if (terminalPresenceSyncTimerRef.current) {
       window.clearTimeout(terminalPresenceSyncTimerRef.current);
     }
-    terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 900);
+    terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 120);
 
     return () => {
       disposed = true;

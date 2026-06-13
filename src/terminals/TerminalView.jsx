@@ -13217,20 +13217,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     };
 
     try {
-      await prewarmCloudVoiceAgentStream({
-        requireBilling: true,
-        onStatus: ({ message }) => {
-          if (orchestratorVoiceRunRef.current === runId && message) {
-            setOrchestratorVoiceFeedback(message);
-          }
-        },
-      });
-      if (orchestratorVoiceRunRef.current !== runId) {
-        await cleanupStartedMonitor();
-        return;
-      }
-      setOrchestratorVoiceFeedback("Working..");
-
+      setOrchestratorVoiceFeedback("Starting..");
       monitor = await startLowPowerAudioBuffer({
         deviceId: readSelectedAudioInputDeviceId(),
         owner: ORCHESTRATOR_VOICE_OWNER,
@@ -13252,6 +13239,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       orchestratorVoiceMonitorRef.current = monitor;
       await monitor.beginCapture();
       captureStarted = true;
+      setOrchestratorVoiceState("listening");
+      setOrchestratorVoiceFeedback("");
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
         await cleanupStartedMonitor();

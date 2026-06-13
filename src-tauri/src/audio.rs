@@ -1080,6 +1080,23 @@ static MACOS_VOICE_PLAYBACK_QUEUE: OnceLock<Arc<StdMutex<VecDeque<f32>>>> = Once
 #[cfg(target_os = "macos")]
 const MACOS_VOICE_PLAYBACK_MAX_SAMPLES: usize =
     (MACOS_VOICE_PROCESSING_SAMPLE_RATE as usize) * 30;
+/// AUVoiceIO ducking controls are not exposed by coreaudio-rs, but they are
+/// documented in AudioToolbox/AudioUnitProperties.h. If these cannot be set,
+/// we fall back to raw cpal capture rather than letting macOS attenuate other
+/// apps while Diff Forge is listening.
+#[cfg(target_os = "macos")]
+const MACOS_AU_VOICE_IO_PROPERTY_DUCK_NON_VOICE_AUDIO: u32 = 2102;
+#[cfg(target_os = "macos")]
+const MACOS_AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION: u32 = 2108;
+#[cfg(target_os = "macos")]
+const MACOS_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN: u32 = 10;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacosVoiceIoOtherAudioDuckingConfiguration {
+    enable_advanced_ducking: u8,
+    ducking_level: u32,
+}
 
 #[cfg(target_os = "macos")]
 fn macos_voice_playback_queue() -> &'static Arc<StdMutex<VecDeque<f32>>> {
@@ -1126,6 +1143,49 @@ fn macos_voice_playback_enqueue_linear16(bytes: &[u8], source_rate: u32) {
     if let Ok(mut queue) = macos_voice_playback_queue().lock() {
         let room = MACOS_VOICE_PLAYBACK_MAX_SAMPLES.saturating_sub(queue.len());
         queue.extend(resampled.into_iter().take(room));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_voice_processing_no_ducking(
+    unit: &mut coreaudio::audio_unit::AudioUnit,
+) -> Result<(), String> {
+    use coreaudio::audio_unit::{Element, Scope};
+
+    let ducking_config = MacosVoiceIoOtherAudioDuckingConfiguration {
+        enable_advanced_ducking: 0,
+        ducking_level: MACOS_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN,
+    };
+    let advanced_result = unit.set_property(
+        MACOS_AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION,
+        Scope::Global,
+        Element::Output,
+        Some(&ducking_config),
+    );
+    let legacy_disabled: u32 = 0;
+    let legacy_result = unit.set_property(
+        MACOS_AU_VOICE_IO_PROPERTY_DUCK_NON_VOICE_AUDIO,
+        Scope::Global,
+        Element::Output,
+        Some(&legacy_disabled),
+    );
+
+    let advanced_error = advanced_result.as_ref().err().map(ToString::to_string);
+    let legacy_error = legacy_result.as_ref().err().map(ToString::to_string);
+    log_audio_diagnostic_event(
+        "audio.voice_processing.ducking_config",
+        json!({
+            "advanced_ducking": if advanced_result.is_ok() { "ok" } else { "error" },
+            "advanced_error": advanced_error,
+            "legacy_ducking": if legacy_result.is_ok() { "ok" } else { "error" },
+            "legacy_error": legacy_error,
+        }),
+    );
+
+    if advanced_result.is_ok() || legacy_result.is_ok() {
+        Ok(())
+    } else {
+        Err("macOS voice processing ducking could not be disabled.".to_string())
     }
 }
 
@@ -1189,6 +1249,7 @@ fn build_macos_voice_processing_capture(
         .map_err(|error| describe("create", error))?;
     // EnableIO and formats only apply to an uninitialized unit.
     unit.uninitialize().map_err(|error| describe("uninitialize", error))?;
+    configure_macos_voice_processing_no_ducking(&mut unit)?;
     let enable: u32 = 1;
     unit.set_property(
         kAudioOutputUnitProperty_EnableIO,
@@ -4372,94 +4433,8 @@ async fn run_cloud_voice_agent_stream(
         return;
     }
 
-    let start_deadline = sleep(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS));
-    tokio::pin!(start_deadline);
-    loop {
-        tokio::select! {
-            maybe_message = read.next() => {
-                match maybe_message {
-                    Some(Ok(Message::Ping(payload))) => {
-                        if let Err(error) = write.send(Message::Pong(payload)).await {
-                            let message = format!("Unable to answer cloud voice agent ping before stream start: {error}");
-                            if let Some(ready_tx) = ready_tx.take() {
-                                let _ = ready_tx.send(Err(message.clone()));
-                            }
-                            let _ = finished_tx.send(Err(message));
-                            return;
-                        }
-                    }
-                    Some(Ok(message)) => {
-                        if let Some(payload) = cloud_voice_agent_payload_from_ws_message(&message) {
-                            let kind = cloud_voice_agent_event_kind(&payload).to_string();
-                            emit_cloud_voice_agent_event(&app, payload.clone());
-                            if let Some(error) = cloud_voice_agent_error_message(&payload) {
-                                let message = format!("Cloud voice agent could not start audio stream: {error}");
-                                if let Some(ready_tx) = ready_tx.take() {
-                                    let _ = ready_tx.send(Err(message.clone()));
-                                }
-                                let _ = finished_tx.send(Err(message));
-                                return;
-                            }
-                            let started = if realtime_engine {
-                                kind == "voice_agent_stream_started"
-                            } else {
-                                matches!(
-                                    kind.as_str(),
-                                    "voice_agent_start_accepted" | "voice_agent_stream_started"
-                                )
-                            };
-                            if started {
-                                if let Some(ready_tx) = ready_tx.take() {
-                                    let _ = ready_tx.send(Ok(()));
-                                }
-                                break;
-                            }
-                        } else if matches!(message, Message::Close(_)) {
-                            let message = "Cloud voice agent closed before the audio stream started.".to_string();
-                            if let Some(ready_tx) = ready_tx.take() {
-                                let _ = ready_tx.send(Err(message.clone()));
-                            }
-                            let _ = finished_tx.send(Err(message));
-                            return;
-                        }
-                    }
-                    Some(Err(error)) => {
-                        let message = format!("Cloud voice agent stream failed before it started: {error}");
-                        if let Some(ready_tx) = ready_tx.take() {
-                            let _ = ready_tx.send(Err(message.clone()));
-                        }
-                        let _ = finished_tx.send(Err(message));
-                        return;
-                    }
-                    None => {
-                        let message = "Cloud voice agent websocket closed before the audio stream started.".to_string();
-                        if let Some(ready_tx) = ready_tx.take() {
-                            let _ = ready_tx.send(Err(message.clone()));
-                        }
-                        let _ = finished_tx.send(Err(message));
-                        return;
-                    }
-                }
-            }
-            maybe_control = control_rx.recv() => {
-                if matches!(maybe_control, Some(CloudVoiceAgentControl::Stop) | None) {
-                    let message = "Cloud voice agent stream was stopped before it started.".to_string();
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Err(message.clone()));
-                    }
-                    let _ = finished_tx.send(Ok(()));
-                    return;
-                }
-            }
-            _ = &mut start_deadline => {
-                let message = "Cloud voice agent timed out while starting the audio stream.".to_string();
-                if let Some(ready_tx) = ready_tx.take() {
-                    let _ = ready_tx.send(Err(message.clone()));
-                }
-                let _ = finished_tx.send(Err(message));
-                return;
-            }
-        }
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(Ok(()));
     }
 
     log_audio_diagnostic_event(
