@@ -2,8 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-const ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
+const ASSETS_UPDATED_EVENT = "cloud-mcp-account-assets-updated";
 const DEFAULT_ASSET_LIBRARY_LIMIT = 500;
+const ACCOUNT_ASSET_LIBRARY_KEY = "account";
 
 function createAssetsLibraryState() {
   return {
@@ -19,7 +20,6 @@ const assetsLibraryStore = {
   listenerPromise: null,
   loadCachedPromise: null,
   refreshPromise: null,
-  repoPath: "",
   state: createAssetsLibraryState(),
   subscribers: new Set(),
   unlisten: null,
@@ -163,30 +163,10 @@ function normalizeAssetsLibrary(library) {
   };
 }
 
-function normalizeRepoPath(repoPath) {
-  return String(repoPath || "").trim();
-}
-
-function resetAssetsLibraryStore(repoPath) {
-  const nextRepoPath = normalizeRepoPath(repoPath);
-  if (assetsLibraryStore.repoPath === nextRepoPath) {
-    return;
-  }
-
-  assetsLibraryStore.repoPath = nextRepoPath;
-  assetsLibraryStore.loadCachedPromise = null;
-  assetsLibraryStore.refreshPromise = null;
-  assetsLibraryStore.initializedKeys.clear();
-  assetsLibraryStore.state = createAssetsLibraryState();
-  assetsLibraryStore.subscribers.forEach((subscriber) => subscriber(assetsLibraryStore.state));
-}
-
-function assetLibraryRequestOptions(repoPath, { localOnly = false } = {}) {
+function assetLibraryRequestOptions({ localOnly = false } = {}) {
   return {
-    includeAllWorkspaces: true,
     limit: DEFAULT_ASSET_LIBRARY_LIMIT,
     localOnly,
-    repoPath,
   };
 }
 
@@ -195,22 +175,19 @@ function loadCachedAssetsLibrary() {
     return assetsLibraryStore.loadCachedPromise;
   }
 
-  const requestRepoPath = assetsLibraryStore.repoPath;
   assetsLibraryStore.loadCachedPromise = invoke(
-    "cloud_mcp_list_workspace_assets",
-    assetLibraryRequestOptions(requestRepoPath, { localOnly: true }),
+    "cloud_mcp_list_account_assets",
+    assetLibraryRequestOptions({ localOnly: true }),
   )
     .then((library) => {
-      if (library && assetsLibraryStore.repoPath === requestRepoPath) {
+      if (library) {
         updateAssetsLibraryStore({ library: normalizeAssetsLibrary(library) });
       }
       return library;
     })
     .catch(() => null)
     .finally(() => {
-      if (assetsLibraryStore.repoPath === requestRepoPath) {
-        assetsLibraryStore.loadCachedPromise = null;
-      }
+      assetsLibraryStore.loadCachedPromise = null;
     });
 
   return assetsLibraryStore.loadCachedPromise;
@@ -221,41 +198,34 @@ function refreshAssetsLibrary({ silent = false, force = false } = {}) {
     return assetsLibraryStore.refreshPromise;
   }
 
-  const requestRepoPath = assetsLibraryStore.repoPath;
   if (!silent) {
     updateAssetsLibraryStore({ loading: true });
   }
   updateAssetsLibraryStore({ error: "", syncing: true });
 
   assetsLibraryStore.refreshPromise = invoke(
-    "cloud_mcp_list_workspace_assets",
-    assetLibraryRequestOptions(requestRepoPath),
+    "cloud_mcp_list_account_assets",
+    assetLibraryRequestOptions(),
   )
     .then((library) => {
-      if (assetsLibraryStore.repoPath === requestRepoPath) {
-        updateAssetsLibraryStore({
-          error: "",
-          library: normalizeAssetsLibrary(library),
-          loading: false,
-        });
-      }
+      updateAssetsLibraryStore({
+        error: "",
+        library: normalizeAssetsLibrary(library),
+        loading: false,
+      });
       return library;
     })
     .catch((error) => {
-      if (assetsLibraryStore.repoPath === requestRepoPath) {
-        updateAssetsLibraryStore((previous) => ({
-          error: assetLibraryErrorMessage(error),
-          loading: false,
-          library: previous.library,
-        }));
-      }
+      updateAssetsLibraryStore((previous) => ({
+        error: assetLibraryErrorMessage(error),
+        loading: false,
+        library: previous.library,
+      }));
       return null;
     })
     .finally(() => {
-      if (assetsLibraryStore.repoPath === requestRepoPath) {
-        assetsLibraryStore.refreshPromise = null;
-        updateAssetsLibraryStore({ syncing: false });
-      }
+      assetsLibraryStore.refreshPromise = null;
+      updateAssetsLibraryStore({ syncing: false });
     });
 
   return assetsLibraryStore.refreshPromise;
@@ -278,12 +248,10 @@ function ensureAssetsLibraryListener() {
     });
 }
 
-function startAssetsLibrarySync(repoPath) {
-  resetAssetsLibraryStore(repoPath);
+function startAssetsLibrarySync() {
   ensureAssetsLibraryListener();
 
-  const requestRepoPath = assetsLibraryStore.repoPath;
-  const key = assetsLibraryStore.repoPath || "account";
+  const key = ACCOUNT_ASSET_LIBRARY_KEY;
   if (assetsLibraryStore.initializedKeys.has(key)) {
     return Promise.resolve(assetsLibraryStore.state.library);
   }
@@ -291,22 +259,19 @@ function startAssetsLibrarySync(repoPath) {
 
   return loadCachedAssetsLibrary()
     .finally(() => {
-      if (assetsLibraryStore.repoPath !== requestRepoPath) {
-        return;
-      }
       updateAssetsLibraryStore({ loading: false });
       void refreshAssetsLibrary({ silent: true });
     });
 }
 
-export function useAccountAssetsLibrary({ repoPath = "" } = {}) {
+export function useAccountAssetsLibrary() {
   const [state, setState] = useState(() => assetsLibraryStore.state);
 
   useEffect(() => subscribeAssetsLibraryStore(setState), []);
 
   useEffect(() => {
-    void startAssetsLibrarySync(repoPath);
-  }, [repoPath]);
+    void startAssetsLibrarySync();
+  }, []);
 
   const loadCached = useCallback(() => loadCachedAssetsLibrary(), []);
   const refresh = useCallback((options = {}) => refreshAssetsLibrary(options), []);

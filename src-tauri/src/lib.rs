@@ -246,7 +246,7 @@ const DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS: u64 = 90;
 const DEEPGRAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEEPGRAM_CLOSE_TIMEOUT_SECS: u64 = 8;
 const CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS: u64 = 45;
-const CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS: u64 = 55;
+const CLOUD_VOICE_AGENT_RESULT_TIMEOUT_SECS: u64 = 95;
 const DEEPGRAM_MAX_API_KEY_LENGTH: usize = 512;
 const DEEPGRAM_MAX_LANGUAGE_LENGTH: usize = 24;
 const AUDIO_REALTIME_TRANSCRIPT_EVENT: &str = "forge-audio-realtime-transcript";
@@ -4434,7 +4434,6 @@ pub fn run() {
             snipping_finish_area_snip,
             snipping_recent_capture_toasts,
             snipping_dismiss_capture_toast,
-            snipping_set_asset_target,
             snipping_upload_untracked_asset,
             snipping_upload_untracked_asset_to_cloud,
             snipping_publish_uploaded_asset,
@@ -4515,21 +4514,21 @@ pub fn run() {
             cloud_mcp_architecture_hub_catalog,
             cloud_mcp_sync_workspace_architecture,
             cloud_mcp_hydrate_workspace_architecture,
-            cloud_mcp_list_workspace_assets,
+            cloud_mcp_list_account_assets,
             cloud_mcp_list_asset_clouds,
             cloud_mcp_save_asset_cloud,
             cloud_mcp_validate_asset_cloud,
             cloud_mcp_set_default_asset_cloud,
             cloud_mcp_delete_asset_cloud,
-            cloud_mcp_register_workspace_asset,
-            cloud_mcp_upload_workspace_asset,
-            cloud_mcp_download_workspace_asset,
+            cloud_mcp_register_account_asset,
+            cloud_mcp_upload_account_asset,
+            cloud_mcp_download_account_asset,
             cloud_mcp_cancel_asset_transfer,
-            cloud_mcp_delete_cloud_workspace_asset,
-            cloud_mcp_publish_workspace_asset,
-            cloud_mcp_unpublish_workspace_asset,
-            cloud_mcp_delete_local_workspace_asset,
-            cloud_mcp_get_workspace_asset_status,
+            cloud_mcp_delete_cloud_account_asset,
+            cloud_mcp_publish_account_asset,
+            cloud_mcp_unpublish_account_asset,
+            cloud_mcp_delete_local_account_asset,
+            cloud_mcp_get_account_asset_status,
             diffforge_start_untracked_assets_watcher,
             diffforge_list_untracked_assets,
             diffforge_delete_untracked_asset,
@@ -4566,7 +4565,7 @@ pub fn run() {
             hyperframe_media_transcript_status,
             diffforge_copy_asset_to_clipboard,
             diffforge_copy_image_data_url_to_clipboard,
-            diffforge_untrack_workspace_asset,
+            diffforge_untrack_account_asset,
             diffforge_promote_untracked_asset,
             cloud_mcp_sync_workspace_todos,
             cloud_mcp_archive_workspace_todos,

@@ -38,8 +38,11 @@ import { Settings } from "@styled-icons/material-rounded/Settings";
 import { ContentCut } from "@styled-icons/material-rounded/ContentCut";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
+import { TerminalFill as AgentTerminalGlyph } from "@styled-icons/bootstrap/TerminalFill";
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
 import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
+import CodexBrandGlyph from "@likec4/icons/tech/openai-icon";
+import ClaudeBrandGlyph from "@likec4/icons/tech/claude-icon";
 
 export const TITLE_BAR_HEIGHT = "34px";
 export const VIEW_TRANSITION_MS = 170;
@@ -14536,12 +14539,23 @@ export const WorkspaceCreateCdInput = styled.input`
 `;
 
 export const WorkspaceCreateDirGrid = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 6px;
-  max-height: min(220px, 30vh);
-  overflow: auto;
-  padding: 2px 3px 2px 0;
+  display: flex;
+  min-width: 0;
+  min-height: 44px;
+  align-items: center;
+  gap: 7px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 1px 7px;
+  scrollbar-gutter: stable;
+  overscroll-behavior-inline: contain;
+  scroll-snap-type: x proximity;
+  -webkit-overflow-scrolling: touch;
+
+  &:focus-visible {
+    outline: 2px solid rgba(138, 216, 255, 0.38);
+    outline-offset: 2px;
+  }
 `;
 
 export const WorkspaceCreateDirChip = styled.button`
@@ -14549,11 +14563,14 @@ export const WorkspaceCreateDirChip = styled.button`
   align-items: center;
   justify-content: flex-start;
   gap: 6px;
-  width: 100%;
+  flex: 0 0 auto;
+  max-width: min(190px, 42vw);
   min-width: 0;
-  padding: 6px 10px;
+  min-height: 36px;
+  scroll-snap-align: start;
+  padding: 7px 11px;
   border: 1px solid var(--forge-border);
-  border-radius: 8px;
+  border-radius: 9px;
   color: var(--forge-text);
   background: var(--forge-surface-raised);
   cursor: pointer;
@@ -14592,16 +14609,17 @@ export const WorkspaceCreateDirChip = styled.button`
 
 export const WorkspaceCreateAgentGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(176px, 1fr));
   gap: 9px;
 `;
 
 export const WorkspaceCreateAgentCard = styled.div`
-  display: flex;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
-  gap: 9px;
-  padding: 10px 12px;
+  gap: 11px;
+  min-height: 88px;
+  padding: 11px 12px;
   border: 1px solid ${({ $active }) => ($active ? "rgba(138, 216, 255, 0.34)" : "var(--forge-border)")};
   border-radius: 10px;
   background: ${({ $active }) => ($active ? "var(--forge-surface-selected)" : "var(--forge-surface-raised)")};
@@ -14612,18 +14630,83 @@ export const WorkspaceCreateAgentCard = styled.div`
   }
 `;
 
+export const WorkspaceCreateAgentIcon = styled.span`
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--forge-border);
+  border-radius: 9px;
+  color: var(--forge-text);
+  background: var(--forge-bg-deep);
+
+  &[data-agent="codex"] {
+    color: #f5f7fa;
+    background: linear-gradient(145deg, #11161d, #030405);
+  }
+
+  &[data-agent="claude"] {
+    background: rgba(217, 119, 87, 0.11);
+    border-color: rgba(217, 119, 87, 0.28);
+  }
+
+  &[data-agent="generic"] {
+    color: #a9d6ff;
+    background: rgba(79, 163, 255, 0.09);
+    border-color: rgba(79, 163, 255, 0.24);
+  }
+
+  &[data-agent="opencode"] {
+    background: rgba(241, 236, 236, 0.07);
+    border-color: rgba(241, 236, 236, 0.2);
+  }
+
+  > svg {
+    display: block;
+    max-width: 26px;
+    max-height: 26px;
+  }
+`;
+
+export const WorkspaceCreateAgentCodexIcon = styled(CodexBrandGlyph)`
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+`;
+
+export const WorkspaceCreateAgentClaudeIcon = styled(ClaudeBrandGlyph)`
+  width: 24px;
+  height: 24px;
+`;
+
+export const WorkspaceCreateAgentTerminalIcon = styled(AgentTerminalGlyph)`
+  width: 22px;
+  height: 22px;
+`;
+
+export const WorkspaceCreateAgentOpenCodeIcon = styled.svg`
+  width: 22px;
+  height: 28px;
+`;
+
+export const WorkspaceCreateAgentBody = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+`;
+
 export const WorkspaceCreateAgentLabel = styled.div`
   display: grid;
   min-width: 0;
   gap: 2px;
 
   > strong {
-    overflow: hidden;
     color: var(--forge-text);
     font-size: 12.5px;
     font-weight: 800;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    line-height: 1.12;
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   > span {
@@ -14640,6 +14723,7 @@ export const WorkspaceCreateAgentStepper = styled.div`
   flex: 0 0 auto;
   align-items: center;
   gap: 2px;
+  justify-self: start;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   background: var(--forge-bg-deep);

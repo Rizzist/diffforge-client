@@ -531,6 +531,12 @@ import {
   WorkspaceCreateDirChip,
   WorkspaceCreateAgentGrid,
   WorkspaceCreateAgentCard,
+  WorkspaceCreateAgentIcon,
+  WorkspaceCreateAgentCodexIcon,
+  WorkspaceCreateAgentClaudeIcon,
+  WorkspaceCreateAgentTerminalIcon,
+  WorkspaceCreateAgentOpenCodeIcon,
+  WorkspaceCreateAgentBody,
   WorkspaceCreateAgentLabel,
   WorkspaceCreateAgentStepper,
   WorkspaceCreateAgentStepButton,
@@ -3052,11 +3058,67 @@ function WorkspaceIdleState({
 
 const WORKSPACE_CREATE_AGENT_ROLE_CAP = 8;
 
+function getWorkspaceCreateAgentState(option, agent) {
+  if (option?.id === WORKSPACE_TERMINAL_ROLE_GENERIC) {
+    return {
+      available: true,
+      statusLabel: "shell",
+    };
+  }
+
+  const operation = String(agent?.operation || agent?.packageOperation || "").trim().toLowerCase();
+  const installing = operation === "installing" || Boolean(agent?.installing);
+  const installed = Boolean(agent?.installed);
+
+  if (installing) {
+    return {
+      available: false,
+      statusLabel: "installing",
+    };
+  }
+
+  if (!installed) {
+    return {
+      available: false,
+      statusLabel: "uninstalled",
+    };
+  }
+
+  return {
+    available: true,
+    statusLabel: agent?.authenticated ? "ready" : "installed",
+  };
+}
+
 function expandWorkspaceCreateAgentCounts(roleOptions, agentCounts) {
   return roleOptions.flatMap((option) => (
     Array.from({ length: Math.max(0, Number(agentCounts[option.id]) || 0) }, () => option.id)
   ));
 }
+
+function WorkspaceCreateAgentGlyph({ roleId }) {
+  if (roleId === "codex") {
+    return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
+  }
+  if (roleId === "claude") {
+    return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
+  }
+  if (roleId === "opencode") {
+    return (
+      <WorkspaceCreateAgentOpenCodeIcon
+        aria-hidden="true"
+        fill="none"
+        viewBox="0 0 24 30"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <path d="M18 24H6V12H18V24Z" fill="#4B4646" />
+        <path d="M18 6H6V24H18V6ZM24 30H0V0H24V30Z" fill="#F1ECEC" />
+      </WorkspaceCreateAgentOpenCodeIcon>
+    );
+  }
+  return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
+}
+
 
 /**
  * Inline create-workspace panel rendered in the main area right of the
@@ -3155,10 +3217,67 @@ function WorkspaceCreatePanel({
     });
   }, [browseTo, cdDraft, defaultWorkingDirectory, rootDraft]);
 
+  const handleDirectoryStripWheel = useCallback((event) => {
+    const strip = event.currentTarget;
+    if (!strip || strip.scrollWidth <= strip.clientWidth) {
+      return;
+    }
+
+    const rawDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      ? event.deltaX
+      : event.deltaY;
+    if (!rawDelta) {
+      return;
+    }
+
+    const scale = event.deltaMode === 1
+      ? 18
+      : event.deltaMode === 2
+        ? strip.clientWidth
+        : 1;
+    const previousLeft = strip.scrollLeft;
+    strip.scrollLeft += rawDelta * scale;
+    if (strip.scrollLeft !== previousLeft) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }, []);
+
+  const installedAgentById = useMemo(() => {
+    const byId = new Map();
+    (Array.isArray(agentStatuses) ? agentStatuses : []).forEach((agent) => {
+      if (agent?.id) {
+        byId.set(agent.id, agent);
+      }
+    });
+    return byId;
+  }, [agentStatuses]);
+
   const adjustAgentCount = useCallback((roleId, delta) => {
     setAgentCounts((current) => {
+      const option = roleOptions.find((candidate) => candidate.id === roleId);
+      const agent = option?.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+        ? GENERIC_TERMINAL_AGENT
+        : installedAgentById.get(roleId);
+      const agentState = getWorkspaceCreateAgentState(option, agent);
+      if (!agentState.available && delta > 0) {
+        return current;
+      }
+
       const totalOther = roleOptions.reduce((sum, option) => (
-        option.id === roleId ? sum : sum + Math.max(0, Number(current[option.id]) || 0)
+        option.id === roleId
+          ? sum
+          : sum + Math.max(
+            0,
+            getWorkspaceCreateAgentState(
+              option,
+              option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+                ? GENERIC_TERMINAL_AGENT
+                : installedAgentById.get(option.id),
+            ).available
+              ? Number(current[option.id]) || 0
+              : 0,
+          )
       ), 0);
       const currentValue = Math.max(0, Number(current[roleId]) || 0);
       const maxForRole = Math.min(
@@ -3171,26 +3290,50 @@ function WorkspaceCreatePanel({
       }
       return { ...current, [roleId]: nextValue };
     });
-  }, [roleOptions]);
+  }, [installedAgentById, roleOptions]);
 
-  const terminalRoles = useMemo(
-    () => expandWorkspaceCreateAgentCounts(roleOptions, agentCounts),
-    [agentCounts, roleOptions],
-  );
-  const installedAgentById = useMemo(() => {
-    const byId = new Map();
-    (Array.isArray(agentStatuses) ? agentStatuses : []).forEach((agent) => {
-      if (agent?.id) {
-        byId.set(agent.id, agent);
-      }
+  const availableAgentCounts = useMemo(() => {
+    const counts = {};
+    roleOptions.forEach((option) => {
+      const agent = option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+        ? GENERIC_TERMINAL_AGENT
+        : installedAgentById.get(option.id);
+      const agentState = getWorkspaceCreateAgentState(option, agent);
+      counts[option.id] = agentState.available
+        ? Math.max(0, Number(agentCounts[option.id]) || 0)
+        : 0;
     });
-    return byId;
-  }, [agentStatuses]);
+    return counts;
+  }, [agentCounts, installedAgentById, roleOptions]);
+  const terminalRoles = useMemo(
+    () => expandWorkspaceCreateAgentCounts(roleOptions, availableAgentCounts),
+    [availableAgentCounts, roleOptions],
+  );
   const roleLabelById = useMemo(() => {
     const byId = new Map();
     roleOptions.forEach((option) => byId.set(option.id, option));
     return byId;
   }, [roleOptions]);
+
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+    setAgentCounts((current) => {
+      let changed = false;
+      const next = { ...current };
+      roleOptions.forEach((option) => {
+        const agent = option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+          ? GENERIC_TERMINAL_AGENT
+          : installedAgentById.get(option.id);
+        if (!getWorkspaceCreateAgentState(option, agent).available && Number(next[option.id]) > 0) {
+          next[option.id] = 0;
+          changed = true;
+        }
+      });
+      return changed ? next : current;
+    });
+  }, [installedAgentById, roleOptions, visible]);
 
   const currentDirectory = browse?.workingDirectory || rootDraft || defaultWorkingDirectory || "";
   const rootEligible = browse ? browse.rootEligible !== false : true;
@@ -3278,7 +3421,11 @@ function WorkspaceCreatePanel({
               value={cdDraft}
             />
           </WorkspaceCreateCdForm>
-          <WorkspaceCreateDirGrid aria-label="Subdirectories">
+          <WorkspaceCreateDirGrid
+            aria-label="Subdirectories"
+            onWheel={handleDirectoryStripWheel}
+            tabIndex={0}
+          >
             {browse?.parentDirectory && (
               <WorkspaceCreateDirChip
                 data-up="true"
@@ -3339,46 +3486,50 @@ function WorkspaceCreatePanel({
           </SettingsHint>
           <WorkspaceCreateAgentGrid>
             {roleOptions.map((option) => {
-              const count = Math.max(0, Number(agentCounts[option.id]) || 0);
-              const agent = installedAgentById.get(option.id);
-              const unavailable = option.id !== WORKSPACE_TERMINAL_ROLE_GENERIC
-                && agent
-                && !agent.installed;
+              const agent = option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+                ? GENERIC_TERMINAL_AGENT
+                : installedAgentById.get(option.id);
+              const agentState = getWorkspaceCreateAgentState(option, agent);
+              const count = Math.max(0, Number(availableAgentCounts[option.id]) || 0);
+              const unavailable = !agentState.available;
+              const canAddAgent = !creating
+                && agentState.available
+                && count < WORKSPACE_CREATE_AGENT_ROLE_CAP
+                && terminalRoles.length < MAX_WORKSPACE_TERMINAL_COUNT;
               return (
                 <WorkspaceCreateAgentCard
                   $active={count > 0}
                   data-unavailable={unavailable ? "true" : undefined}
                   key={option.id}
                 >
-                  <WorkspaceCreateAgentLabel>
-                    <strong>{option.label}</strong>
-                    <span>
-                      {option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
-                        ? "shell"
-                        : agent?.installed
-                          ? agent?.authenticated ? "ready" : "installed"
-                          : "agent"}
-                    </span>
-                  </WorkspaceCreateAgentLabel>
-                  <WorkspaceCreateAgentStepper>
-                    <WorkspaceCreateAgentStepButton
-                      aria-label={`Remove one ${option.label} terminal`}
-                      disabled={creating || count === 0}
-                      onClick={() => adjustAgentCount(option.id, -1)}
-                      type="button"
-                    >
-                      -
-                    </WorkspaceCreateAgentStepButton>
-                    <strong>{count}</strong>
-                    <WorkspaceCreateAgentStepButton
-                      aria-label={`Add one ${option.label} terminal`}
-                      disabled={creating}
-                      onClick={() => adjustAgentCount(option.id, 1)}
-                      type="button"
-                    >
-                      +
-                    </WorkspaceCreateAgentStepButton>
-                  </WorkspaceCreateAgentStepper>
+                  <WorkspaceCreateAgentIcon data-agent={option.id}>
+                    <WorkspaceCreateAgentGlyph roleId={option.id} />
+                  </WorkspaceCreateAgentIcon>
+                  <WorkspaceCreateAgentBody>
+                    <WorkspaceCreateAgentLabel>
+                      <strong>{option.label}</strong>
+                      <span>{agentState.statusLabel}</span>
+                    </WorkspaceCreateAgentLabel>
+                    <WorkspaceCreateAgentStepper>
+                      <WorkspaceCreateAgentStepButton
+                        aria-label={`Remove one ${option.label} terminal`}
+                        disabled={creating || count === 0}
+                        onClick={() => adjustAgentCount(option.id, -1)}
+                        type="button"
+                      >
+                        -
+                      </WorkspaceCreateAgentStepButton>
+                      <strong>{count}</strong>
+                      <WorkspaceCreateAgentStepButton
+                        aria-label={`Add one ${option.label} terminal`}
+                        disabled={!canAddAgent}
+                        onClick={() => adjustAgentCount(option.id, 1)}
+                        type="button"
+                      >
+                        +
+                      </WorkspaceCreateAgentStepButton>
+                    </WorkspaceCreateAgentStepper>
+                  </WorkspaceCreateAgentBody>
                 </WorkspaceCreateAgentCard>
               );
             })}
@@ -13570,6 +13721,36 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("diffforge:cloud-device-live-initial-sync", {
         detail: { epoch: nextEpoch },
       }));
+      const terminalWorkspaces = Array.isArray(workspaceTerminalsWorkspacesRef.current)
+        ? workspaceTerminalsWorkspacesRef.current
+        : [];
+      if (authState === "authenticated" && isPaidUser(user) && terminalWorkspaces.length > 0) {
+        const terminalCount = terminalWorkspaces.reduce(
+          (sum, workspace) => sum + (Array.isArray(workspace?.terminals) ? workspace.terminals.length : 0),
+          0,
+        );
+        void invoke("cloud_mcp_sync_device_live_terminals", {
+          workspaces: terminalWorkspaces,
+          reason: "cloud_reconnect_initial_terminal_snapshot",
+        }).catch((error) => {
+          logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_terminals_reconnect_sync.failed", {
+            message: getErrorMessage(error, "Unable to sync workspace terminals after reconnect."),
+            terminalCount,
+            workspaceCount: terminalWorkspaces.length,
+          });
+          void recordCloudConnectionDiagnostic(authStore.getToken(), {
+            channel: "rust-client-sync",
+            step: "rust.sync.workspace_terminals.reconnect",
+            status: "error",
+            message: getErrorMessage(error, "Unable to sync workspace terminals after reconnect."),
+            details: {
+              reason: "cloud_reconnect_initial_terminal_snapshot",
+              terminalCount,
+              workspaceCount: terminalWorkspaces.length,
+            },
+          });
+        });
+      }
       tokenomicsForceResyncRef.current?.();
     }
     if (connection !== "connected" || previous === "connected" || !previous) {
@@ -14833,7 +15014,7 @@ export default function App() {
       }
       terminalStatusEventSyncInFlightRef.current.delete(syncKey);
       if (terminalStatusEventSyncQueueRef.current.has(syncKey)) {
-        scheduleTerminalStatusEventSyncFlush(syncKey, 1000);
+        scheduleTerminalStatusEventSyncFlush(syncKey, 0);
       }
     };
     void invoke("cloud_mcp_sync_terminal_status_event", {
@@ -15334,18 +15515,7 @@ export default function App() {
       workspacePayload,
       workspaceId,
     };
-    const statusSyncDelayMs = (() => {
-      if (["closed", "closing", "exited", "provider-turn-error"].includes(eventType)) {
-        return 250;
-      }
-      if (eventType === "message-submitted") {
-        return 900;
-      }
-      if (eventType === "agent-output") {
-        return 1400;
-      }
-      return 1100;
-    })();
+    const statusSyncDelayMs = 0;
     terminalStatusEventSyncQueueRef.current.set(statusSyncKey, terminalStatusSyncItem);
     scheduleTerminalStatusEventSyncFlush(statusSyncKey, statusSyncDelayMs);
     logTerminalStatus("frontend.terminal_status.event_sync.coalesced", {
@@ -15477,7 +15647,6 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !workspaceHydrationReady
-      || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
@@ -15731,7 +15900,6 @@ export default function App() {
     workspaceTerminalsWorkspaces,
     user,
     workspaceHydrationReady,
-    workspaceActivationDeferred,
     cloudLiveSyncEpoch,
     workspaceSyncState,
   ]);
@@ -16270,25 +16438,6 @@ export default function App() {
     workspaceSettings,
     workspaces,
   ]);
-  const snippingAssetTarget = useMemo(() => ({
-    repoPath: selectedWorkspaceRootDirectory || defaultWorkingDirectory || "",
-    workspaceId: selectedWorkspace?.id || "",
-    workspaceName: selectedWorkspace?.name || "",
-  }), [
-    defaultWorkingDirectory,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspaceRootDirectory,
-  ]);
-  useEffect(() => {
-    invoke("snipping_set_asset_target", {
-      request: snippingAssetTarget,
-    }).catch(() => {});
-  }, [
-    snippingAssetTarget.repoPath,
-    snippingAssetTarget.workspaceId,
-    snippingAssetTarget.workspaceName,
-  ]);
   useEffect(() => {
     // Publish workspace + terminal targets so the annotation editor window
     // can queue todos at a chosen workspace/terminal.
@@ -16355,7 +16504,7 @@ export default function App() {
       const workspaceId = String(
         payload.workspaceId
           || payload.workspace_id
-          || snippingAssetTarget.workspaceId
+          || selectedWorkspace?.id
           || "",
       ).trim();
       if (!workspaceId) {
@@ -16425,7 +16574,7 @@ export default function App() {
           },
           source: "snipping-annotation",
           workspaceId,
-          workspaceName: String(payload.workspaceName || payload.workspace_name || snippingAssetTarget.workspaceName || "").trim(),
+          workspaceName: String(payload.workspaceName || payload.workspace_name || selectedWorkspace?.name || "").trim(),
         },
       }));
     })
@@ -16445,12 +16594,10 @@ export default function App() {
       }
     };
   }, [
-    snippingAssetTarget.workspaceId,
-    snippingAssetTarget.workspaceName,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
   ]);
-  const accountAssetsLibrary = useAccountAssetsLibrary({
-    repoPath: defaultWorkingDirectory,
-  });
+  const accountAssetsLibrary = useAccountAssetsLibrary();
   const untrackedAssetsLibrary = useUntrackedAssetsLibrary();
   const processKnownRoots = useMemo(() => {
     const roots = [];
@@ -24293,7 +24440,7 @@ export default function App() {
                         fallbackRole={workspaceTerminalFallbackRole}
                         onClose={closeCreateWorkspaceModal}
                         onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
-                        roleOptions={workspaceTerminalRoleOptions}
+                        roleOptions={WORKSPACE_TERMINAL_ROLE_OPTIONS}
                         rootDraft={newWorkspaceRootDraft}
                         setRootDraft={setNewWorkspaceRootDraft}
                         setWorkspaceName={setWorkspaceName}

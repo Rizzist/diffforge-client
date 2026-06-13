@@ -65,7 +65,6 @@ import {
   finishCloudVoiceAgentInput,
   prewarmCloudVoiceAgentStream,
   sendCloudVoiceAgentTextMessage,
-  setCloudVoiceAgentInputEnabled,
   startCloudVoiceAgentStream,
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
@@ -2817,6 +2816,12 @@ const OrchestratorVoiceStatus = styled.div`
   }
 `;
 
+const orchestratorVoiceButtonSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
 const OrchestratorVoiceButton = styled.button`
   display: grid;
   position: relative;
@@ -2886,6 +2891,27 @@ const OrchestratorVoiceButton = styled.button`
   }
 
   &[data-starting="true"] {
+    cursor: progress;
+  }
+
+  &[data-starting="true"]::after {
+    position: absolute;
+    z-index: 6;
+    width: 24px;
+    height: 24px;
+    border: 2px solid rgba(244, 247, 250, 0.28);
+    border-top-color: rgba(244, 247, 250, 0.96);
+    border-radius: 999px;
+    content: "";
+    animation: ${orchestratorVoiceButtonSpin} 760ms linear infinite;
+    pointer-events: none;
+  }
+
+  &[data-starting="true"] img {
+    opacity: 0.42;
+  }
+
+  &:disabled {
     cursor: progress;
   }
 
@@ -2995,6 +3021,7 @@ const OrchestratorVoiceLogo = styled.img.attrs({
   z-index: 2;
   user-select: none;
   -webkit-user-drag: none;
+  transition: opacity 140ms ease;
 `;
 
 const OrchestratorSectionTabs = styled.div`
@@ -13199,7 +13226,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceFeedback("");
-    setOrchestratorVoiceInputEnabled(true);
+    setOrchestratorVoiceInputEnabled(false);
     setOrchestratorVoiceRealtimeSession(realtimeMode);
 
     let monitor = null;
@@ -13237,23 +13264,23 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       }
 
       orchestratorVoiceMonitorRef.current = monitor;
-      await monitor.beginCapture();
-      captureStarted = true;
-      setOrchestratorVoiceState("listening");
-      setOrchestratorVoiceFeedback("");
-      if (orchestratorVoiceRunRef.current !== runId) {
-        orchestratorVoiceMonitorRef.current = null;
-        await cleanupStartedMonitor();
-        return;
-      }
-
       await startCloudVoiceAgentStream({
         ...getCloudVoiceAgentRequestContext(),
         submissionMode,
         realtime: realtimeMode,
       });
       cloudStarted = true;
+      if (orchestratorVoiceRunRef.current !== runId) {
+        orchestratorVoiceMonitorRef.current = null;
+        await cleanupStartedMonitor();
+        return;
+      }
+
+      await monitor.beginCapture();
+      captureStarted = true;
       setOrchestratorVoiceInputEnabled(true);
+      setOrchestratorVoiceState("listening");
+      setOrchestratorVoiceFeedback("");
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
         await cleanupStartedMonitor();
@@ -13385,46 +13412,16 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     void handleOrchestratorChatSubmit(event);
   }, [handleOrchestratorChatSubmit]);
 
-  const toggleOrchestratorRealtimeInput = useCallback(async () => {
-    if (orchestratorVoiceState !== "listening" && orchestratorVoiceState !== "processing") {
+  const toggleOrchestratorVoiceMonitor = useCallback(() => {
+    if (orchestratorVoiceRealtimeSession && orchestratorVoiceState === "starting") {
       return;
     }
-    const nextEnabled = !orchestratorVoiceInputEnabled;
-    setOrchestratorVoiceInputEnabled(nextEnabled);
-    setOrchestratorVoiceError("");
-    try {
-      const result = await setCloudVoiceAgentInputEnabled(nextEnabled);
-      if (result && Object.prototype.hasOwnProperty.call(result, "enabled")) {
-        setOrchestratorVoiceInputEnabled(Boolean(result.enabled));
-      }
-    } catch (error) {
-      setOrchestratorVoiceInputEnabled(!nextEnabled);
-      const message = getAudioInputErrorMessage(
-        error,
-        nextEnabled
-          ? "Unable to resume voice agent audio."
-          : "Unable to pause voice agent audio.",
-      );
-      setOrchestratorVoiceError(message);
-      logBigViewSyncDiagnosticEvent("tui.voice_agent.input_toggle_error", {
-        enabled: nextEnabled,
-        message,
-        surface: "tui_voice_agent",
-        workspaceId: orchestratorPanelWorkspaceId,
-      });
-    }
-  }, [orchestratorPanelWorkspaceId, orchestratorVoiceInputEnabled, orchestratorVoiceState]);
 
-  const toggleOrchestratorVoiceMonitor = useCallback(() => {
     if (
       orchestratorVoiceRealtimeSession
       && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing")
     ) {
-      void toggleOrchestratorRealtimeInput();
-      return;
-    }
-
-    if (orchestratorVoiceRealtimeSession && orchestratorVoiceState === "starting") {
+      void stopOrchestratorVoiceMonitor();
       return;
     }
 
@@ -13443,7 +13440,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     orchestratorVoiceRealtimeSession,
     orchestratorVoiceState,
     startOrchestratorVoiceMonitor,
-    toggleOrchestratorRealtimeInput,
+    stopOrchestratorVoiceMonitor,
   ]);
 
   const handleDraftKeyDown = useCallback((event) => {
@@ -14179,27 +14176,21 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     || orchestratorVoiceState === "listening";
   const orchestratorVoiceSessionActive = orchestratorVoiceInputActive
     || orchestratorVoiceState === "processing";
-  const orchestratorVoiceCanToggleInput = orchestratorVoiceRealtimeMode
-    && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing");
-  const orchestratorVoiceInputSending = orchestratorVoiceState === "starting"
-    || (
-      (orchestratorVoiceState === "listening"
-        || (orchestratorVoiceRealtimeMode && orchestratorVoiceState === "processing"))
-      && orchestratorVoiceInputEnabled
-      && !orchestratorVoiceMicBorrowed
-    );
+  const orchestratorVoiceInputSending = (
+    orchestratorVoiceState === "listening"
+      || (orchestratorVoiceRealtimeMode && orchestratorVoiceState === "processing")
+  ) && orchestratorVoiceInputEnabled && !orchestratorVoiceMicBorrowed;
   const orchestratorVoiceManualMode = orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL;
   const orchestratorVoiceHasSignal = orchestratorVoiceInputSending && orchestratorVoiceLevel >= 6;
   const orchestratorVoiceButtonLabel = orchestratorVoiceState === "starting"
     ? "Starting voice agent monitor"
-    : orchestratorVoiceCanToggleInput
-      ? orchestratorVoiceInputEnabled
-        ? "Pause voice agent audio"
-        : "Resume voice agent audio"
+    : orchestratorVoiceRealtimeMode
+      && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing")
+      ? "Stop voice agent monitor"
       : orchestratorVoiceState === "listening"
         ? orchestratorVoiceManualMode
-        ? "Submit voice agent input"
-        : "Finish voice agent input"
+          ? "Submit voice agent input"
+          : "Finish voice agent input"
         : orchestratorVoiceState === "processing"
           ? "Voice agent response in progress"
           : orchestratorVoiceError
@@ -14208,9 +14199,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const orchestratorVoiceButtonTitle = orchestratorVoiceError
     || orchestratorVoiceFeedback
     || (orchestratorVoiceState === "starting"
-      ? "Starting input"
-      : orchestratorVoiceCanToggleInput
-        ? orchestratorVoiceInputEnabled ? "Pause audio to realtime agent" : "Resume audio to realtime agent"
+      ? "Connecting to the realtime voice agent"
+      : orchestratorVoiceRealtimeMode
+        && (orchestratorVoiceState === "listening" || orchestratorVoiceState === "processing")
+        ? "Stop the realtime voice session"
         : orchestratorVoiceState === "listening"
           ? orchestratorVoiceManualMode ? "Submit input" : "Stop sending audio"
         : orchestratorVoiceState === "processing"
@@ -14420,6 +14412,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 data-error={orchestratorVoiceError ? "true" : undefined}
                 data-monitoring={orchestratorVoiceInputSending ? "true" : undefined}
                 data-starting={orchestratorVoiceState === "starting" ? "true" : undefined}
+                disabled={orchestratorVoiceState === "starting"}
                 onClick={toggleOrchestratorVoiceMonitor}
                 title={orchestratorVoiceButtonTitle}
                 type="button"

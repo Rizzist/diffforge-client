@@ -875,7 +875,7 @@ fn promote_result_generated_image_artifacts(
 
 fn promoted_generated_asset_event(
     result: &CodexThreadTranscriptResult,
-    workspace_id: Option<&str>,
+    _workspace_id: Option<&str>,
     reason: &str,
 ) -> Option<Value> {
     let mut seen = HashSet::new();
@@ -907,15 +907,11 @@ fn promoted_generated_asset_event(
     }
 
     Some(json!({
-        "event_kind": "workspace_assets_updated",
-        "eventKind": "workspace_assets_updated",
-        "kind": "workspace_assets_updated",
+        "event_kind": "account_assets_updated",
+        "eventKind": "account_assets_updated",
+        "kind": "account_assets_updated",
         "reason": reason,
-        "repo_path": result.cwd,
-        "repoPath": result.cwd,
         "source": "codex_imagegen_autocopy",
-        "workspace_id": workspace_id.unwrap_or_default(),
-        "workspaceId": workspace_id.unwrap_or_default(),
         "assets": assets,
     }))
 }
@@ -929,7 +925,7 @@ fn emit_promoted_generated_asset_event(
     let Some(event) = promoted_generated_asset_event(result, workspace_id, reason) else {
         return;
     };
-    let _ = app.emit(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, event);
+    let _ = app.emit(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, event);
 }
 
 fn codex_path_has_generated_images(path: &Path) -> bool {

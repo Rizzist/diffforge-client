@@ -20,7 +20,6 @@ import { Link } from "@styled-icons/material-rounded/Link";
 import { LinkOff } from "@styled-icons/material-rounded/LinkOff";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
-import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
 import { Public } from "@styled-icons/material-rounded/Public";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Settings } from "@styled-icons/material-rounded/Settings";
@@ -68,10 +67,6 @@ function shortLabel(value, maxLength = 30) {
   if (raw.length <= maxLength) return raw;
   if (maxLength <= 3) return raw.slice(0, maxLength);
   return `${raw.slice(0, maxLength - 3)}...`;
-}
-
-function repoPathKey(value) {
-  return text(value).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 function assetLibraryItems(value) {
@@ -439,55 +434,6 @@ function assetFileTypeLabel(asset) {
   return kind === "asset" ? "FILE" : shortLabel(kind.toUpperCase(), 8);
 }
 
-function assetWorkspaceId(asset) {
-  return text(asset?.workspaceId || asset?.workspace_id || asset?.workspace?.id);
-}
-
-function assetWorkspaceName(asset) {
-  return text(asset?.workspaceName || asset?.workspace_name || asset?.workspace?.name);
-}
-
-function assetRepoPath(asset) {
-  return text(asset?.repoPath || asset?.repo_path || asset?.workspaceRoot || asset?.workspace_root || asset?.rootPath || asset?.root_path);
-}
-
-function assetWorkspaceOptionKey(option) {
-  const id = text(option?.id || option?.workspaceId || option?.workspace_id);
-  if (id) return `id:${id}`;
-  const name = text(option?.name || option?.workspaceName || option?.workspace_name);
-  if (name) return `name:${name.toLowerCase()}`;
-  const rootDirectory = text(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path);
-  if (rootDirectory) return `root:${repoPathKey(rootDirectory)}`;
-  return "";
-}
-
-function assetWorkspaceOptionLabel(option) {
-  return text(
-    option?.name
-      || option?.workspaceName
-      || option?.workspace_name
-      || option?.id
-      || option?.workspaceId
-      || option?.workspace_id,
-    "Workspace",
-  );
-}
-
-function assetMatchesWorkspaceOption(asset, option) {
-  const optionId = text(option?.id || option?.workspaceId || option?.workspace_id);
-  const optionName = text(option?.name || option?.workspaceName || option?.workspace_name);
-  const optionRoot = text(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path);
-  const workspaceId = assetWorkspaceId(asset);
-  const workspaceName = assetWorkspaceName(asset);
-  const repoPath = assetRepoPath(asset);
-
-  return Boolean(
-    (optionId && workspaceId && optionId === workspaceId)
-      || (optionName && workspaceName && optionName === workspaceName)
-      || (optionRoot && repoPath && repoPathKey(optionRoot) === repoPathKey(repoPath)),
-  );
-}
-
 function assetSha(asset) {
   return text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
 }
@@ -656,7 +602,8 @@ export default function AccountAssetsView({
   onUntrackedRefresh = null,
   onUntrackedRename = null,
 }) {
-  const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  void rootDirectory;
+  void defaultWorkingDirectory;
   const [assetMode, setAssetMode] = useState("tracked");
   const [hyperframeEditor, setHyperframeEditor] = useState(null);
   const trackedItems = useMemo(() => assetLibraryItems(library), [library]);
@@ -740,7 +687,6 @@ export default function AccountAssetsView({
           onRefresh={onUntrackedRefresh}
           onRename={onUntrackedRename}
           onTrackedRefresh={onRefresh}
-          repoPath={repoPath}
           syncing={untrackedSyncing}
           trackedCount={trackedCount}
           untrackedCount={untrackedCount}
@@ -748,7 +694,6 @@ export default function AccountAssetsView({
       ) : (
         <AssetsPanel
           assetMode={assetMode}
-          assetWorkspaces={assetWorkspaces}
           error={error}
           library={library}
           loading={loading}
@@ -757,7 +702,6 @@ export default function AccountAssetsView({
           onOpenHyperframeAsset={openHyperframeAsset}
           onRefresh={onRefresh}
           repoLabel="Assets"
-          repoPath={repoPath}
           syncing={syncing}
           trackedCount={trackedCount}
           untrackedCount={untrackedCount}
@@ -800,7 +744,6 @@ function AssetModeTabs({
 
 function AssetsPanel({
   assetMode = "tracked",
-  assetWorkspaces = [],
   error = "",
   library = null,
   loading = false,
@@ -809,7 +752,6 @@ function AssetsPanel({
   onOpenHyperframeAsset,
   onRefresh,
   repoLabel,
-  repoPath,
   syncing = false,
   trackedCount = 0,
   untrackedCount = 0,
@@ -844,7 +786,6 @@ function AssetsPanel({
   const [cloudSettingsOpen, setCloudSettingsOpen] = useState(false);
   const [cloudSettingsError, setCloudSettingsError] = useState("");
   const [cloudSettingsBusy, setCloudSettingsBusy] = useState("");
-  const [selectedWorkspaceFilterKeys, setSelectedWorkspaceFilterKeys] = useState([]);
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
   const [actionNotice, setActionNotice] = useState("");
@@ -895,59 +836,7 @@ function AssetsPanel({
     }
   }, [clouds, defaultCloudId, selectedCloudId]);
 
-  const workspaceFilterOptions = useMemo(() => {
-    const options = [];
-    const seen = new Set();
-    const seenNames = new Set();
-    const seenRoots = new Set();
-    const addOption = (option, fallbackOnly = false) => {
-      const key = assetWorkspaceOptionKey(option);
-      const nameKey = text(option?.name || option?.workspaceName || option?.workspace_name).toLowerCase();
-      const rootKey = repoPathKey(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path);
-      if (!key || seen.has(key)) return;
-      if (fallbackOnly && ((nameKey && seenNames.has(nameKey)) || (rootKey && seenRoots.has(rootKey)))) return;
-      seen.add(key);
-      if (nameKey) seenNames.add(nameKey);
-      if (rootKey) seenRoots.add(rootKey);
-      options.push({
-        id: text(option?.id || option?.workspaceId || option?.workspace_id),
-        key,
-        name: assetWorkspaceOptionLabel(option),
-        rootDirectory: text(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path),
-      });
-    };
-
-    assetWorkspaces.forEach((option) => addOption(option));
-    items.forEach((asset) => {
-      addOption({
-        id: assetWorkspaceId(asset),
-        name: assetWorkspaceName(asset),
-        rootDirectory: assetRepoPath(asset),
-      }, true);
-    });
-
-    return options;
-  }, [assetWorkspaces, items]);
-  const workspaceFilterOptionKeys = useMemo(
-    () => new Set(workspaceFilterOptions.map((option) => option.key)),
-    [workspaceFilterOptions],
-  );
-
-  useEffect(() => {
-    setSelectedWorkspaceFilterKeys((current) => current.filter((key) => workspaceFilterOptionKeys.has(key)));
-  }, [workspaceFilterOptionKeys]);
-
-  const selectedWorkspaceFilterOptions = useMemo(() => (
-    selectedWorkspaceFilterKeys
-      .map((key) => workspaceFilterOptions.find((option) => option.key === key))
-      .filter(Boolean)
-  ), [selectedWorkspaceFilterKeys, workspaceFilterOptions]);
-  const filteredItems = useMemo(() => {
-    if (!selectedWorkspaceFilterOptions.length) return items;
-    return items.filter((asset) => (
-      selectedWorkspaceFilterOptions.some((option) => assetMatchesWorkspaceOption(asset, option))
-    ));
-  }, [items, selectedWorkspaceFilterOptions]);
+  const filteredItems = items;
   const visibleAssetIds = useMemo(
     () => new Set(filteredItems.map((asset) => assetId(asset)).filter(Boolean)),
     [filteredItems],
@@ -955,12 +844,10 @@ function AssetsPanel({
   const optimisticTransferRows = useMemo(() => Object.values(optimisticTransfers), [optimisticTransfers]);
   const visibleTransfers = useMemo(() => {
     const rows = [...transfers, ...optimisticTransferRows];
-    return (
-      selectedWorkspaceFilterOptions.length
-        ? rows.filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
-        : rows
-    ).filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId);
-  }, [effectiveCloudId, optimisticTransferRows, selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
+    return rows
+      .filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
+      .filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId);
+  }, [effectiveCloudId, optimisticTransferRows, transfers, visibleAssetIds]);
   const assetById = useMemo(() => {
     const byId = new Map();
     filteredItems.forEach((asset) => {
@@ -1005,16 +892,13 @@ function AssetsPanel({
   const inlineError = error || (!transferActionFailure ? actionError : "");
   const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
   const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
-  const activeTransfers = selectedWorkspaceFilterOptions.length
-    ? visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length
-    : numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
-      || visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
+  const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
+    || visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
   const activeTransferSummary = useMemo(
     () => assetTransferDeviceSummary(visibleTransfers),
     [visibleTransfers],
   );
-  const hasWorkspaceFilters = selectedWorkspaceFilterKeys.length > 0;
-  const assetCountPluralBase = hasWorkspaceFilters ? items.length : filteredItems.length;
+  const assetCountPluralBase = filteredItems.length;
   const selectedAssets = useMemo(() => (
     filteredItems.filter((asset) => selectedAssetIds.has(assetId(asset)))
   ), [filteredItems, selectedAssetIds]);
@@ -1036,15 +920,11 @@ function AssetsPanel({
 
   const refreshClouds = useCallback(async () => {
     setCloudSettingsError("");
-    const response = await invoke("cloud_mcp_list_asset_clouds", {
-      repoPath,
-      workspaceId: null,
-      workspaceName: null,
-    });
+    const response = await invoke("cloud_mcp_list_asset_clouds");
     const nextClouds = assetLibraryClouds(response);
     setCloudsOverride(nextClouds);
     return nextClouds;
-  }, [repoPath]);
+  }, []);
 
   useEffect(() => {
     if (!cloudSettingsOpen) return;
@@ -1077,9 +957,6 @@ function AssetsPanel({
       let response = null;
       if (action === "save") {
         response = await invoke("cloud_mcp_save_asset_cloud", {
-          repoPath,
-          workspaceId: null,
-          workspaceName: null,
           cloud: payload,
         });
         const savedCloud = jsonObject(response?.cloud) || {};
@@ -1090,9 +967,6 @@ function AssetsPanel({
           setSelectedCloudId(savedCloudId);
           try {
             await invoke("cloud_mcp_validate_asset_cloud", {
-              repoPath,
-              workspaceId: null,
-              workspaceName: null,
               cloudId: savedCloudId,
             });
           } catch (validationError) {
@@ -1104,24 +978,15 @@ function AssetsPanel({
         }
       } else if (action === "validate") {
         response = await invoke("cloud_mcp_validate_asset_cloud", {
-          repoPath,
-          workspaceId: null,
-          workspaceName: null,
           cloudId,
         });
       } else if (action === "default") {
         response = await invoke("cloud_mcp_set_default_asset_cloud", {
-          repoPath,
-          workspaceId: null,
-          workspaceName: null,
           cloudId,
         });
         if (cloudId) setSelectedCloudId(cloudId);
       } else if (action === "delete") {
         response = await invoke("cloud_mcp_delete_asset_cloud", {
-          repoPath,
-          workspaceId: null,
-          workspaceName: null,
           cloudId,
         });
         if (cloudId === effectiveCloudId) setSelectedCloudId(DEFAULT_ASSET_CLOUD_ID);
@@ -1138,7 +1003,7 @@ function AssetsPanel({
     } finally {
       setCloudSettingsBusy((current) => (current === key ? "" : current));
     }
-  }, [effectiveCloudId, refresh, refreshClouds, repoPath]);
+  }, [effectiveCloudId, refresh, refreshClouds]);
 
   useEffect(() => {
     if (!busyKey && !activeTransfers) return undefined;
@@ -1149,10 +1014,6 @@ function AssetsPanel({
     const interval = window.setInterval(loadCached, 250);
     return () => window.clearInterval(interval);
   }, [activeTransfers, busyKey, onLoadCached]);
-
-  const workspaceOptionForAsset = useCallback((asset) => (
-    workspaceFilterOptions.find((option) => assetMatchesWorkspaceOption(asset, option)) || null
-  ), [workspaceFilterOptions]);
 
   const toggleAssetSelected = useCallback((asset) => {
     const id = assetId(asset);
@@ -1303,12 +1164,6 @@ function AssetsPanel({
       }
       return;
     }
-    // Assets are account-level: workspace/repo are descriptive metadata, so
-    // actions run with whatever context is known instead of requiring one.
-    const actionWorkspace = workspaceOptionForAsset(asset);
-    const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath || "";
-    const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id || "";
-    const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
     if (!id) return;
     const key = `${action}:${id}`;
     setBusyKey(key);
@@ -1321,18 +1176,15 @@ function AssetsPanel({
         // Untracking only moves the local copy back to scratch; cloud private
         // and public copies stay until their own delete/unpublish buttons.
         if (!localPath) return;
-        await invoke("diffforge_untrack_workspace_asset", {
+        await invoke("diffforge_untrack_account_asset", {
           assetId: id,
           name,
           path: localPath,
         });
       } else if (action === "publish") {
-        const response = await invoke("cloud_mcp_publish_workspace_asset", {
+        const response = await invoke("cloud_mcp_publish_account_asset", {
           assetId: id,
           cloudId: effectiveCloudId,
-          repoPath: actionRepoPath,
-          workspaceId: actionWorkspaceId,
-          workspaceName: actionWorkspaceName,
         });
         const publicUrl = text(
           response?.publicUrl
@@ -1349,28 +1201,22 @@ function AssetsPanel({
           }
         }
       } else if (action === "unpublish") {
-        await invoke("cloud_mcp_unpublish_workspace_asset", {
+        await invoke("cloud_mcp_unpublish_account_asset", {
           assetId: id,
           cloudId: effectiveCloudId,
-          repoPath: actionRepoPath,
-          workspaceId: actionWorkspaceId,
-          workspaceName: actionWorkspaceName,
         });
       } else {
         const command = action === "upload"
-          ? "cloud_mcp_upload_workspace_asset"
+          ? "cloud_mcp_upload_account_asset"
           : action === "download"
-            ? "cloud_mcp_download_workspace_asset"
+            ? "cloud_mcp_download_account_asset"
             : action === "deleteLocal"
-              ? "cloud_mcp_delete_local_workspace_asset"
-              : "cloud_mcp_delete_cloud_workspace_asset";
+              ? "cloud_mcp_delete_local_account_asset"
+              : "cloud_mcp_delete_cloud_account_asset";
         await invoke(command, {
           assetId: id,
           cloudId: ["upload", "download", "deleteCloud"].includes(action) ? effectiveCloudId : undefined,
           deleteFile: action === "deleteLocal" ? true : undefined,
-          repoPath: actionRepoPath,
-          workspaceId: actionWorkspaceId,
-          workspaceName: actionWorkspaceName,
         });
         if (action === "upload") {
           setOptimisticUploadTransfer(asset, effectiveCloudId, "completed");
@@ -1381,12 +1227,9 @@ function AssetsPanel({
             return;
           }
           try {
-            await invoke("cloud_mcp_publish_workspace_asset", {
+            await invoke("cloud_mcp_publish_account_asset", {
               assetId: id,
               cloudId: effectiveCloudId,
-              repoPath: actionRepoPath,
-              workspaceId: actionWorkspaceId,
-              workspaceName: actionWorkspaceName,
             });
             await refresh({ silent: true, force: true });
             showActionNotice("Uploaded and published with a public link.");
@@ -1427,12 +1270,10 @@ function AssetsPanel({
     effectiveCloudId,
     onOpenHyperframeAsset,
     refresh,
-    repoPath,
     selectedCloudLabel,
     setOptimisticUploadTransfer,
     showActionNotice,
     uploadPublic,
-    workspaceOptionForAsset,
   ]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
@@ -1477,31 +1318,21 @@ function AssetsPanel({
         let deletedCount = 0;
         for (const asset of selectedAssets) {
           const id = assetId(asset);
-          const actionWorkspace = workspaceOptionForAsset(asset);
-          const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath || "";
-          const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id || "";
-          const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
           const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
           if (!id) {
             continue;
           }
           if (availability.hasLocal) {
-            await invoke("cloud_mcp_delete_local_workspace_asset", {
+            await invoke("cloud_mcp_delete_local_account_asset", {
               assetId: id,
               deleteFile: true,
-              repoPath: actionRepoPath,
-              workspaceId: actionWorkspaceId,
-              workspaceName: actionWorkspaceName,
             });
             deletedCount += 1;
           }
           if (availability.hasCloud) {
-            await invoke("cloud_mcp_delete_cloud_workspace_asset", {
+            await invoke("cloud_mcp_delete_cloud_account_asset", {
               assetId: id,
               cloudId: effectiveCloudId,
-              repoPath: actionRepoPath,
-              workspaceId: actionWorkspaceId,
-              workspaceName: actionWorkspaceName,
             });
             deletedCount += 1;
           }
@@ -1521,12 +1352,10 @@ function AssetsPanel({
   }, [
     clearSelectedAssets,
     refresh,
-    repoPath,
     selectedAssets,
     selectedImageAssets,
     effectiveCloudId,
     selectedCloudLabel,
-    workspaceOptionForAsset,
   ]);
 
   return (
@@ -1554,7 +1383,7 @@ function AssetsPanel({
           </div>
           <AssetHeaderActions>
             <AssetsSummary>
-              {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} {shortLabel(selectedCloudLabel, 14)}
+              {filteredItems.length} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} {shortLabel(selectedCloudLabel, 14)}
               {activeTransfers ? ` · ${activeTransfers} active` : ""}
               {activeTransferSummary ? ` · ${activeTransferSummary}` : ""}
             </AssetsSummary>
@@ -1619,38 +1448,6 @@ function AssetsPanel({
             selectedCloudId={effectiveCloudId}
           />
         )}
-        {workspaceFilterOptions.length > 0 && (
-          <AssetWorkspaceFilters aria-label="Asset workspace filters">
-            <AssetFilterButton
-              aria-pressed={!hasWorkspaceFilters}
-              data-active={!hasWorkspaceFilters}
-              onClick={() => setSelectedWorkspaceFilterKeys([])}
-              title="Show all assets"
-              type="button"
-            >
-              All
-            </AssetFilterButton>
-            {workspaceFilterOptions.map((option) => {
-              const selected = selectedWorkspaceFilterKeys.includes(option.key);
-              return (
-                <AssetFilterButton
-                  aria-pressed={selected}
-                  data-active={selected}
-                  key={option.key}
-                  onClick={() => setSelectedWorkspaceFilterKeys((current) => (
-                    current.includes(option.key)
-                      ? current.filter((item) => item !== option.key)
-                      : [...current, option.key]
-                  ))}
-                  title={option.name}
-                  type="button"
-                >
-                  {option.name}
-                </AssetFilterButton>
-              );
-            })}
-          </AssetWorkspaceFilters>
-        )}
         {inlineError && <AssetError>{inlineError}</AssetError>}
         {actionNotice && <AssetNotice aria-live="polite">{actionNotice}</AssetNotice>}
       </AssetControlsRegion>
@@ -1663,7 +1460,7 @@ function AssetsPanel({
         onDelete={() => runSelectedAssetAction("delete")}
       />
       {!filteredItems.length ? (
-        <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
+        <AssetEmptyState>{loading ? "Loading assets..." : "No assets registered yet."}</AssetEmptyState>
       ) : (
         <AssetGrid aria-label="Asset library grid">
           {filteredItems.map((asset, index) => {
@@ -1713,7 +1510,10 @@ function AssetsPanel({
             const showDownload = availability.hasCloud;
             const showPublish = availability.hasCloud;
             const showDeleteCloud = availability.hasCloud;
-            const showDeleteLocal = availability.hasLocal;
+            const bottomDeleteAction = canDeleteLocal ? "deleteLocal" : canDeleteCloud ? "deleteCloud" : "";
+            const bottomDeleteBusy = canDeleteLocal ? deleteLocalBusy : deleteCloudBusy;
+            const canBottomDelete = Boolean(bottomDeleteAction);
+            const bottomDeleteTitle = canDeleteLocal ? "Delete local copy" : canDeleteCloud ? "Delete Cloud copy" : "Delete asset";
             const selected = selectedAssetIds.has(id);
 
             return (
@@ -1754,6 +1554,18 @@ function AssetsPanel({
                 <AssetCardStatus data-status={availability.statusKind} title={`${selectedCloudLabel}: ${availability.label}`}>
                   {availability.label}
                 </AssetCardStatus>
+                {showUpload && (
+                  <AssetTopActionButton
+                    aria-label={`Upload ${name}`}
+                    data-busy={uploadBusy ? "true" : "false"}
+                    disabled={!canUpload || uploadBusy || Boolean(busyKey && !uploadBusy)}
+                    onClick={() => runAssetAction("upload", asset)}
+                    title={availability.hasCloud ? "Already in Cloud" : "Upload to Cloud"}
+                    type="button"
+                  >
+                    <CloudUpload aria-hidden="true" />
+                  </AssetTopActionButton>
+                )}
                 {transferActive && (
                   <AssetTransferOverlay>
                     <AssetTransferInfo>
@@ -1786,42 +1598,21 @@ function AssetsPanel({
                 >
                   {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
                 </AssetSelectButton>
-                <AssetCardActions>
-                  {canView && (
-                    <AssetIconButton
-                      aria-label={`Open big view for ${name}`}
-                      disabled={!canView || viewBusy || Boolean(busyKey && !viewBusy)}
-                      onClick={() => runAssetAction("view", asset)}
-                      title="Open big view and annotate"
-                      type="button"
-                    >
-                      <OpenInFull aria-hidden="true" />
-                    </AssetIconButton>
-                  )}
+                <AssetUtilityStrip>
                   {canCopy && (
-                    <AssetIconButton
-                      aria-label={`Copy ${name} to clipboard`}
-                      disabled={!canCopy || copyBusy || Boolean(busyKey && !copyBusy)}
-                      onClick={() => runAssetAction("copy", asset)}
-                      title="Copy image to clipboard"
-                      type="button"
-                    >
-                      <ContentCopy aria-hidden="true" />
-                    </AssetIconButton>
-                  )}
-                  {canCopy && (
-                    <AssetIconButton
+                    <AssetUtilityButton
                       aria-label={`Pin ${name} as a floating snip preview`}
+                      data-asset-pin="true"
                       disabled={pinBusy || Boolean(busyKey && !pinBusy)}
                       onClick={() => runAssetAction("pin", asset)}
                       title="Pin as floating snip preview"
                       type="button"
                     >
                       <PushPin aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
                   {canUntrack && (
-                    <AssetIconButton
+                    <AssetUtilityButton
                       aria-label={`Untrack ${name}`}
                       data-warning="true"
                       disabled={!canUntrack || untrackBusy || Boolean(busyKey && !untrackBusy)}
@@ -1830,21 +1621,10 @@ function AssetsPanel({
                       type="button"
                     >
                       <MoveToInbox aria-hidden="true" />
-                    </AssetIconButton>
-                  )}
-                  {showUpload && (
-                    <AssetIconButton
-                      aria-label={`Upload ${name}`}
-                      disabled={!canUpload || uploadBusy || Boolean(busyKey && !uploadBusy)}
-                      onClick={() => runAssetAction("upload", asset)}
-                      title={availability.hasCloud ? "Already in Cloud" : "Upload to Cloud"}
-                      type="button"
-                    >
-                      <CloudUpload aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
                   {showDownload && (
-                    <AssetIconButton
+                    <AssetUtilityButton
                       aria-label={`Download ${name}`}
                       disabled={!canDownload || downloadBusy || Boolean(busyKey && !downloadBusy)}
                       onClick={() => runAssetAction("download", asset)}
@@ -1852,10 +1632,10 @@ function AssetsPanel({
                       type="button"
                     >
                       <FileDownload aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
                   {showPublish && !isPublic && (
-                    <AssetIconButton
+                    <AssetUtilityButton
                       aria-label={`Make ${name} public`}
                       data-primary="true"
                       disabled={!canPublish || publishBusy || Boolean(busyKey && !publishBusy)}
@@ -1864,10 +1644,10 @@ function AssetsPanel({
                       type="button"
                     >
                       <Public aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
                   {isPublic && (
-                    <AssetIconButton
+                    <AssetUtilityButton
                       aria-label={`Copy public URL for ${name}`}
                       disabled={!canCopyPublic || copyPublicBusy || Boolean(busyKey && !copyPublicBusy)}
                       onClick={() => runAssetAction("copyPublic", asset)}
@@ -1875,10 +1655,10 @@ function AssetsPanel({
                       type="button"
                     >
                       <Link aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
                   {isPublic && (
-                    <AssetIconButton
+                    <AssetUtilityButton
                       aria-label={`Make ${name} private`}
                       data-warning="true"
                       disabled={!canUnpublish || unpublishBusy || Boolean(busyKey && !unpublishBusy)}
@@ -1887,10 +1667,10 @@ function AssetsPanel({
                       type="button"
                     >
                       <LinkOff aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
-                  {showDeleteCloud && (
-                    <AssetIconButton
+                  {showDeleteCloud && bottomDeleteAction !== "deleteCloud" && (
+                    <AssetUtilityButton
                       aria-label={`Delete Cloud copy of ${name}`}
                       data-danger="true"
                       disabled={!canDeleteCloud || deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
@@ -1899,20 +1679,38 @@ function AssetsPanel({
                       type="button"
                     >
                       <Cloud aria-hidden="true" />
-                    </AssetIconButton>
+                    </AssetUtilityButton>
                   )}
-                  {showDeleteLocal && (
-                    <AssetIconButton
-                      aria-label={`Delete local copy of ${name}`}
-                      data-danger="true"
-                      disabled={!canDeleteLocal || deleteLocalBusy || Boolean(busyKey && !deleteLocalBusy)}
-                      onClick={() => runAssetAction("deleteLocal", asset)}
-                      title="Delete local copy"
-                      type="button"
-                    >
-                      <Delete aria-hidden="true" />
-                    </AssetIconButton>
-                  )}
+                </AssetUtilityStrip>
+                <AssetCardActions>
+                  <AssetIconButton
+                    aria-label={`Copy ${name} to clipboard`}
+                    disabled={!canCopy || copyBusy || Boolean(busyKey && !copyBusy)}
+                    onClick={() => runAssetAction("copy", asset)}
+                    title="Copy image to clipboard"
+                    type="button"
+                  >
+                    <ContentCopy aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Annotate ${name}`}
+                    disabled={!canView || viewBusy || Boolean(busyKey && !viewBusy)}
+                    onClick={() => runAssetAction("view", asset)}
+                    title="Annotate copy"
+                    type="button"
+                  >
+                    <ModeEdit aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Delete ${name}`}
+                    data-danger="true"
+                    disabled={!canBottomDelete || bottomDeleteBusy || Boolean(busyKey && !bottomDeleteBusy)}
+                    onClick={() => bottomDeleteAction && runAssetAction(bottomDeleteAction, asset)}
+                    title={bottomDeleteTitle}
+                    type="button"
+                  >
+                    <Delete aria-hidden="true" />
+                  </AssetIconButton>
                 </AssetCardActions>
                 </AssetCardMedia>
                 <AssetCardCaption>
@@ -2278,7 +2076,6 @@ function UntrackedAssetsPanel({
   onRefresh,
   onRename,
   onTrackedRefresh,
-  repoPath = "",
   syncing = false,
   trackedCount = 0,
   untrackedCount = 0,
@@ -2374,7 +2171,6 @@ function UntrackedAssetsPanel({
           deleteSource: true,
           name,
           path: localPath,
-          repoPath: "",
         });
         await trackedRefresh({ silent: true, force: true });
       }
@@ -2546,48 +2342,25 @@ function UntrackedAssetsPanel({
                 >
                   {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
                 </AssetSelectButton>
-                {canCopy && (
-                  <UntrackedPinButton
-                    disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
-                    localPath={localPath}
-                    name={name}
-                    onToggle={() => runUntrackedAction("pin", asset)}
-                  />
-                )}
-                <AssetTrackButton
-                  aria-label={`Track ${name}`}
-                  disabled={!localPath || !onPromote || trackBusy || Boolean(busyKey && !trackBusy)}
-                  onClick={() => runUntrackedAction("track", asset)}
-                  title="Move from untracked scratch into tracked assets"
-                  type="button"
-                >
-                  <AddToPhotos aria-hidden="true" />
-                  <span>Track</span>
-                </AssetTrackButton>
-                <AssetCardActions>
+                <AssetUtilityStrip>
                   {canCopy && (
-                    <AssetIconButton
-                      aria-label={`Copy ${name} to clipboard`}
-                      disabled={!localPath || copyBusy || Boolean(busyKey && !copyBusy)}
-                      onClick={() => runUntrackedAction("copy", asset)}
-                      title="Copy image to clipboard"
-                      type="button"
-                    >
-                      <ContentCopy aria-hidden="true" />
-                    </AssetIconButton>
+                    <UntrackedPinButton
+                      disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
+                      localPath={localPath}
+                      name={name}
+                      onToggle={() => runUntrackedAction("pin", asset)}
+                    />
                   )}
-                  {canView && (
-                    <AssetIconButton
-                      aria-label={`Annotate ${name}`}
-                      disabled={!localPath || viewBusy || Boolean(busyKey && !viewBusy)}
-                      onClick={() => runUntrackedAction("view", asset)}
-                      title="Annotate (big view)"
-                      type="button"
-                    >
-                      <ModeEdit aria-hidden="true" />
-                    </AssetIconButton>
-                  )}
-                  <AssetIconButton
+                  <AssetTrackButton
+                    aria-label={`Track ${name}`}
+                    disabled={!localPath || !onPromote || trackBusy || Boolean(busyKey && !trackBusy)}
+                    onClick={() => runUntrackedAction("track", asset)}
+                    title="Move from untracked scratch into tracked assets"
+                    type="button"
+                  >
+                    <AddToPhotos aria-hidden="true" />
+                  </AssetTrackButton>
+                  <AssetUtilityButton
                     aria-label={`Open ${name}`}
                     disabled={!localPath || openBusy || Boolean(busyKey && !openBusy)}
                     onClick={() => runUntrackedAction("open", asset)}
@@ -2595,8 +2368,8 @@ function UntrackedAssetsPanel({
                     type="button"
                   >
                     <FileOpen aria-hidden="true" />
-                  </AssetIconButton>
-                  <AssetIconButton
+                  </AssetUtilityButton>
+                  <AssetUtilityButton
                     aria-label={`Rename ${name}`}
                     disabled={!localPath || !onRename || renameBusy || Boolean(busyKey && !renameBusy)}
                     onClick={() => runUntrackedAction("rename", asset)}
@@ -2604,6 +2377,26 @@ function UntrackedAssetsPanel({
                     type="button"
                   >
                     <DriveFileRenameOutline aria-hidden="true" />
+                  </AssetUtilityButton>
+                </AssetUtilityStrip>
+                <AssetCardActions>
+                  <AssetIconButton
+                    aria-label={`Copy ${name} to clipboard`}
+                    disabled={!canCopy || copyBusy || Boolean(busyKey && !copyBusy)}
+                    onClick={() => runUntrackedAction("copy", asset)}
+                    title="Copy image to clipboard"
+                    type="button"
+                  >
+                    <ContentCopy aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Annotate ${name}`}
+                    disabled={!canView || viewBusy || Boolean(busyKey && !viewBusy)}
+                    onClick={() => runUntrackedAction("view", asset)}
+                    title="Annotate copy"
+                    type="button"
+                  >
+                    <ModeEdit aria-hidden="true" />
                   </AssetIconButton>
                   <AssetIconButton
                     aria-label={`Delete ${name}`}
@@ -3153,55 +2946,6 @@ const AssetCloudError = styled.div`
   overflow-wrap: anywhere;
 `;
 
-const AssetWorkspaceFilters = styled.div`
-  display: flex;
-  flex: 0 0 auto;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-width: 0;
-  max-height: 112px;
-  overflow: auto;
-  padding-bottom: 10px;
-  padding-right: 2px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-  scrollbar-width: thin;
-`;
-
-const AssetFilterButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 44px;
-  max-width: 180px;
-  min-height: 30px;
-  padding: 0 10px;
-  overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.15);
-  border-radius: 7px;
-  color: rgba(203, 213, 225, 0.78);
-  background: rgba(15, 23, 42, 0.38);
-  font: inherit;
-  font-size: 10px;
-  font-weight: 850;
-  line-height: 1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
-
-  &:hover,
-  &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    color: rgba(224, 242, 254, 0.94);
-    background: rgba(14, 165, 233, 0.14);
-  }
-
-  &[data-active="true"] {
-    border-color: rgba(45, 212, 191, 0.34);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.2);
-  }
-`;
-
 /* The selection bar floats over the bottom of the grid instead of sitting in
    flow — an in-flow bar shoves every card down the moment the first asset is
    selected. Always mounted: visibility is animated (slide + fade) so it can
@@ -3391,20 +3135,29 @@ const AssetCard = styled.article`
     }
 
     [data-asset-select="true"],
-    [data-asset-pin="true"],
-    [data-asset-track="true"] {
+    [data-asset-upload="true"] {
       opacity: 1;
       pointer-events: auto;
       transform: translateY(0);
+    }
+
+    [data-asset-utilities="true"] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+  }
+
+  &:has([data-pinned="true"]) {
+    [data-asset-utilities="true"] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
     }
   }
 
   &[data-status="active"] {
     border-color: rgba(96, 165, 250, 0.3);
-  }
-
-  &[data-status="failed"] {
-    border-color: rgba(251, 113, 133, 0.28);
   }
 
   &[data-selected="true"] {
@@ -3422,11 +3175,16 @@ const AssetCard = styled.article`
     }
 
     [data-asset-select="true"],
-    [data-asset-pin="true"],
-    [data-asset-track="true"] {
+    [data-asset-upload="true"] {
       opacity: 1;
       pointer-events: auto;
       transform: translateY(0);
+    }
+
+    [data-asset-utilities="true"] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
     }
   }
 `;
@@ -3521,7 +3279,7 @@ const AssetCardStatus = styled.span`
   z-index: 3;
   display: inline-flex;
   align-items: center;
-  max-width: calc(100% - 50px);
+  max-width: calc(100% - 84px);
   overflow: hidden;
   padding: 3px 6px;
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -3558,48 +3316,77 @@ const AssetCardStatus = styled.span`
   }
 `;
 
-/* Pin toggle in the snip-preview style: circular, top-left under the status
-   chip, revealed on hover — and held visible while the file is pinned, the
-   same way the select checkbox stays visible while selected. */
-const AssetFloatPinButton = styled.button.attrs({ "data-asset-pin": "true" })`
+const AssetUtilityStrip = styled.div.attrs({ "data-asset-utilities": "true" })`
   position: absolute;
-  top: 32px;
+  top: 31px;
   left: 7px;
   z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: calc(100% - 37px);
+  overflow: auto;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-4px);
+  transition: opacity 130ms ease, transform 150ms ease;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+`;
+
+const AssetUtilityButton = styled.button`
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
   place-items: center;
   padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
   color: #f8fafc;
   background: rgba(7, 10, 16, 0.85);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-3px);
+  font: inherit;
   cursor: pointer;
-  transition: opacity 130ms ease, transform 130ms ease, background 120ms ease, border-color 120ms ease;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
   backdrop-filter: blur(8px);
 
   svg {
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
   }
 
   &:hover:not(:disabled),
   &:focus-visible {
     border-color: rgba(125, 176, 255, 0.55);
     background: rgba(23, 37, 62, 0.92);
+    transform: scale(1.05);
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.28);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.18);
+  }
+
+  &[data-warning="true"] {
+    border-color: rgba(251, 191, 36, 0.22);
+    color: rgba(254, 240, 138, 0.9);
+    background: rgba(113, 63, 18, 0.18);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.22);
+    color: rgba(254, 205, 211, 0.9);
+    background: rgba(127, 29, 29, 0.18);
   }
 
   &[data-pinned="true"] {
     border-color: rgba(125, 176, 255, 0.5);
     color: #cfe3ff;
     background: rgba(37, 64, 110, 0.9);
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateY(0);
   }
 
   &:disabled {
@@ -3608,34 +3395,16 @@ const AssetFloatPinButton = styled.button.attrs({ "data-asset-pin": "true" })`
   }
 `;
 
-/* Untracked → tracked, styled like the snip preview's Upload pill. */
-const AssetTrackButton = styled.button.attrs({ "data-asset-track": "true" })`
+const AssetTopActionButton = styled(AssetUtilityButton).attrs({ "data-asset-upload": "true" })`
   position: absolute;
   top: 8px;
-  right: 40px;
+  right: 42px;
   z-index: 5;
-  display: inline-flex;
-  min-height: 26px;
-  align-items: center;
-  gap: 4px;
-  padding: 0 9px;
-  border: 1px solid rgba(125, 176, 255, 0.34);
-  border-radius: 999px;
+  border-color: rgba(125, 176, 255, 0.34);
   color: #cfe3ff;
-  background: rgba(7, 10, 16, 0.85);
-  font-size: 10px;
-  font-weight: 760;
   opacity: 0;
   pointer-events: none;
   transform: translateY(-3px);
-  cursor: pointer;
-  transition: opacity 130ms ease, transform 130ms ease, background 120ms ease, color 120ms ease;
-  backdrop-filter: blur(8px);
-
-  svg {
-    width: 12px;
-    height: 12px;
-  }
 
   &:hover:not(:disabled),
   &:focus-visible {
@@ -3644,10 +3413,18 @@ const AssetTrackButton = styled.button.attrs({ "data-asset-track": "true" })`
     border-color: transparent;
   }
 
-  &:disabled {
-    cursor: default;
-    opacity: 0.5;
+  &[data-busy="true"] {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
   }
+`;
+
+const AssetFloatPinButton = styled(AssetUtilityButton).attrs({ "data-asset-pin": "true" })``;
+
+const AssetTrackButton = styled(AssetUtilityButton).attrs({ "data-asset-track": "true" })`
+  border-color: rgba(125, 176, 255, 0.34);
+  color: #cfe3ff;
 `;
 
 const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
@@ -3693,9 +3470,8 @@ const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
   }
 `;
 
-/* Same glass-pill chrome as the floating snip previews (FloatActionBar in
-   SnippingQuickAccess): one dark rounded pill, borderless round icon buttons
-   that tint on hover instead of carrying their own boxes. */
+/* Same bottom action chrome as the floating snip preview: exactly three
+   borderless icon buttons inside one compact dark pill. */
 const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   position: absolute;
   right: auto;
@@ -3703,10 +3479,10 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   left: 50%;
   z-index: 4;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  align-items: center;
   justify-content: center;
-  gap: 3px;
-  max-width: calc(100% - 14px);
+  gap: 5px;
   padding: 4px 6px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 999px;
@@ -3719,8 +3495,11 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   backdrop-filter: blur(12px);
 
   button {
-    width: 26px;
-    height: 26px;
+    display: grid;
+    width: 24px;
+    height: 24px;
+    place-items: center;
+    padding: 0;
     border: 0;
     border-radius: 999px;
     color: rgba(248, 250, 252, 0.82);

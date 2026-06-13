@@ -421,12 +421,12 @@ fn diffforge_copy_image_data_url_to_clipboard_for(image_data_url: &str) -> Resul
 fn diffforge_delete_tracked_asset_cache_row(asset_id: &str) -> Result<(), String> {
     let conn = cloud_mcp_open_asset_library_conn()?;
     conn.execute(
-        "DELETE FROM workspace_asset_transfers WHERE asset_id=?1",
+        "DELETE FROM account_asset_transfers WHERE asset_id=?1",
         rusqlite::params![asset_id],
     )
     .map_err(|error| format!("Unable to remove tracked asset transfers from cache: {error}"))?;
     conn.execute(
-        "DELETE FROM workspace_asset_items WHERE asset_id=?1",
+        "DELETE FROM account_asset_items WHERE asset_id=?1",
         rusqlite::params![asset_id],
     )
     .map_err(|error| format!("Unable to remove tracked asset from cache: {error}"))?;
@@ -747,7 +747,7 @@ fn diffforge_copy_image_data_url_to_clipboard(image_data_url: String) -> Result<
 }
 
 #[tauri::command]
-fn diffforge_untrack_workspace_asset(
+fn diffforge_untrack_account_asset(
     app: AppHandle,
     asset_id: String,
     path: Option<String>,
@@ -821,11 +821,11 @@ fn diffforge_untrack_workspace_asset(
     diffforge_delete_tracked_asset_cache_row(&asset_id)?;
     diffforge_emit_untracked_assets_updated(&app, "untracked", item.clone());
     let _ = app.emit(
-        CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT,
+        CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT,
         json!({
-            "kind": "workspace_asset_untracked",
-            "event_kind": "workspace_asset_untracked",
-            "eventKind": "workspace_asset_untracked",
+            "kind": "asset_library_untracked",
+            "event_kind": "asset_library_untracked",
+            "eventKind": "asset_library_untracked",
             "asset_id": asset_id.clone(),
             "assetId": asset_id.clone(),
             "local_path": local_path,
@@ -838,7 +838,7 @@ fn diffforge_untrack_workspace_asset(
     );
 
     Ok(json!({
-        "kind": "workspace_asset_untracked",
+        "kind": "asset_library_untracked",
         "asset_id": asset_id,
         "assetId": asset_id,
         "path": target.display().to_string(),
@@ -854,9 +854,6 @@ fn diffforge_untrack_workspace_asset(
 #[tauri::command]
 fn diffforge_promote_untracked_asset(
     app: AppHandle,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
     path: String,
     name: Option<String>,
     group: Option<String>,
@@ -865,13 +862,14 @@ fn diffforge_promote_untracked_asset(
     let source = diffforge_untracked_asset_file(&path)?;
     let untracked_root = diffforge_prepare_untracked_asset_root()?;
     let (sha256, size_bytes) = cloud_mcp_file_sha256_and_size(&source)?;
-    let workspace_id_text = workspace_id.as_deref().unwrap_or_default();
-    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_asset_scope_request();
     let asset_id = format!(
         "asset-snip-{}",
         cloud_mcp_short_hash(&format!(
-            "{}:{}:{}:{}",
-            req.repo_id, workspace_id_text, sha256, size_bytes
+            "{}:{}:{}",
+            source.display(),
+            sha256,
+            size_bytes
         ))
     );
     let group = group
@@ -947,8 +945,8 @@ fn diffforge_promote_untracked_asset(
     });
     let row = cloud_mcp_asset_local_row_with_input(
         &req,
-        workspace_id_text,
-        workspace_name.as_deref().or(req.workspace_name.as_deref()),
+        "",
+        None,
         &target_path,
         &input,
     )?;
@@ -967,15 +965,15 @@ fn diffforge_promote_untracked_asset(
     };
     diffforge_emit_untracked_assets_updated(&app, "promoted", None);
     let _ = app.emit(
-        CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT,
+        CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT,
         json!({
-            "kind": "workspace_asset_local_registered",
-            "event_kind": "workspace_asset_local_registered",
-            "eventKind": "workspace_asset_local_registered",
+            "kind": "asset_library_local_registered",
+            "event_kind": "asset_library_local_registered",
+            "eventKind": "asset_library_local_registered",
             "asset_id": asset_id.clone(),
             "assetId": asset_id.clone(),
             "payload": {
-                "kind": "workspace_asset_local_registered",
+                "kind": "asset_library_local_registered",
                 "asset": row.clone(),
                 "assets": [row.clone()],
             }

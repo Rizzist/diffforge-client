@@ -144,7 +144,6 @@ struct SnippingState {
     shortcut_manager: SnippingShortcutManager,
     active_area_sessions: Arc<StdMutex<HashMap<String, SnippingAreaSession>>>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
-    asset_target: Arc<StdMutex<SnippingAssetTarget>>,
     dispatch_targets: Arc<StdMutex<Value>>,
     /// Settle deadline (epoch ms) pushed forward by every preview Moved
     /// event; one watcher thread (gated by the flag below) polls it together
@@ -207,7 +206,6 @@ impl SnippingState {
             shortcut_manager: SnippingShortcutManager::new(),
             active_area_sessions: Arc::new(StdMutex::new(HashMap::new())),
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
-            asset_target: Arc::new(StdMutex::new(SnippingAssetTarget::default())),
             dispatch_targets: Arc::new(StdMutex::new(Value::Array(Vec::new()))),
             preview_restack_deadline_ms: Arc::new(AtomicU64::new(0)),
             preview_restack_watcher_active: Arc::new(AtomicBool::new(false)),
@@ -228,13 +226,6 @@ impl SnippingState {
             editor_paths: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
-}
-
-#[derive(Clone, Default)]
-struct SnippingAssetTarget {
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -511,14 +502,6 @@ struct SnippingAreaSelectionRequest {
     width: f64,
     height: f64,
     scale_factor: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SnippingAssetTargetRequest {
-    repo_path: Option<String>,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2800,48 +2783,13 @@ fn snipping_open_annotation_editor_for_paths(
     }))
 }
 
-fn snipping_set_asset_target_for(
-    app: &AppHandle,
-    request: SnippingAssetTargetRequest,
-) -> Result<Value, String> {
-    let repo_path = request.repo_path.unwrap_or_default().trim().to_string();
-    let workspace_id = request
-        .workspace_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let workspace_name = request
-        .workspace_name
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let state = app.state::<SnippingState>();
-    let mut guard = state
-        .asset_target
-        .lock()
-        .map_err(|_| "Unable to lock snipping asset target.".to_string())?;
-    *guard = SnippingAssetTarget {
-        repo_path,
-        workspace_id,
-        workspace_name,
-    };
-    Ok(json!({
-        "kind": "snipping_asset_target_set",
-        "repoPath": guard.repo_path.clone(),
-        "workspaceId": guard.workspace_id.clone(),
-        "workspaceName": guard.workspace_name.clone(),
-    }))
-}
-
 fn snipping_upload_untracked_asset_for(
     app: &AppHandle,
     request: SnippingUploadAssetRequest,
 ) -> Result<Value, String> {
-    // Snips are account-level assets: no workspace target is required, and
-    // the empty repo path resolves to the fixed account scope.
+    // Snips are account-level assets: no workspace target is required.
     diffforge_promote_untracked_asset(
         app.clone(),
-        String::new(),
-        None,
-        None,
         request.path,
         request.name,
         request.group.or_else(|| Some("snips".to_string())),
@@ -4185,14 +4133,6 @@ fn snipping_dismiss_capture_toast(
 }
 
 #[tauri::command]
-fn snipping_set_asset_target(
-    app: AppHandle,
-    request: SnippingAssetTargetRequest,
-) -> Result<Value, String> {
-    snipping_set_asset_target_for(&app, request)
-}
-
-#[tauri::command]
 fn snipping_upload_untracked_asset(
     app: AppHandle,
     request: SnippingUploadAssetRequest,
@@ -4227,11 +4167,8 @@ async fn snipping_publish_uploaded_asset_to_cloud(
     app: &AppHandle,
     asset_id: String,
 ) -> Result<String, String> {
-    let published = cloud_mcp_publish_workspace_asset(
+    let published = cloud_mcp_publish_account_asset(
         app.state::<CloudMcpState>(),
-        String::new(),
-        String::new(),
-        None,
         asset_id,
         None,
     )
@@ -4277,11 +4214,8 @@ async fn snipping_upload_untracked_asset_to_cloud(
     let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId"])
         .ok_or_else(|| "Snip was tracked, but no asset id was returned.".to_string())?;
 
-    cloud_mcp_upload_workspace_asset(
+    cloud_mcp_upload_account_asset(
         app.state::<CloudMcpState>(),
-        String::new(),
-        String::new(),
-        None,
         asset_id.clone(),
         None,
     )

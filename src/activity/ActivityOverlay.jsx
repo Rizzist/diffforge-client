@@ -1320,11 +1320,9 @@ function useActivityOverlayData(context) {
     try {
       const [cloudStatusResult, libraryResult, todoOverviewResult] = await Promise.allSettled([
         invoke("cloud_mcp_get_status"),
-        invoke("cloud_mcp_list_workspace_assets", {
-          includeAllWorkspaces: true,
+        invoke("cloud_mcp_list_account_assets", {
           limit: 120,
           localOnly,
-          repoPath: "",
         }),
         // The Rust queue stores are the headless todo truth: running, queued,
         // and listed todos render from here with no cloud round trip.

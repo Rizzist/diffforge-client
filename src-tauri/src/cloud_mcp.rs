@@ -31,7 +31,7 @@ const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT: &str = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT: &str =
     "cloud-mcp-workspace-architectures-updated";
-const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-workspace-assets-updated";
+const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-account-assets-updated";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 const CLOUD_MCP_DEVICE_KEY_FILE: &str = "device-key";
@@ -4678,13 +4678,13 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             cloud_mcp_update_asset_library_from_response(
                 "global_ws_ready_assets",
                 Some("/v1/events"),
-                &json!({"include_all_workspaces": true, "includeAllWorkspaces": true}),
+                &json!({"asset_scope": "account", "assetScope": "account"}),
                 &initial_asset_transfer_snapshot,
             );
             let _ = state.global_ws_events.send(json!({
-                "kind": "workspace_assets_snapshot",
-                "event_kind": "workspace_assets_snapshot",
-                "eventKind": "workspace_assets_snapshot",
+                "kind": "account_assets_snapshot",
+                "event_kind": "account_assets_snapshot",
+                "eventKind": "account_assets_snapshot",
                 "payload": initial_asset_transfer_snapshot,
             }));
         }
@@ -4860,9 +4860,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 &event,
             )
             .await;
-        } else if cloud_mcp_is_workspace_asset_wake_event(&event_kind, &event) {
+        } else if cloud_mcp_is_account_asset_wake_event(&event_kind, &event) {
             cloud_mcp_update_asset_library_from_response(
-                "workspace_asset_event",
+                "asset_library_event",
                 Some("/v1/events"),
                 &event,
                 &event,
@@ -5465,8 +5465,8 @@ async fn cloud_mcp_start_remote_command_listener(
                 }
                 continue;
             }
-            if cloud_mcp_is_workspace_asset_wake_event(&event_kind, &event) {
-                let _ = app.emit(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, event.clone());
+            if cloud_mcp_is_account_asset_wake_event(&event_kind, &event) {
+                let _ = app.emit(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, event.clone());
                 continue;
             }
             if cloud_mcp_is_voice_plan_result_event(&event_kind) {
@@ -6335,25 +6335,14 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
             .to_ascii_lowercase()
             .replace(['.', ' ', '-'], "_");
     let action = match command_kind.as_str() {
-        "upload_asset" | "asset_upload" | "workspace_asset_upload" => "upload",
-        "download_asset" | "asset_download" | "workspace_asset_download" => "download",
+        "upload_asset" | "asset_upload" => "upload",
+        "download_asset" | "asset_download" => "download",
         _ => return,
     };
     let asset_id = cloud_mcp_payload_text(event, &["asset_id", "assetId", "id"])
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "asset_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "assetId"]))
         .unwrap_or_default();
-    let repo_path = cloud_mcp_payload_text(
-        event,
-        &["workspace_root", "workspaceRoot", "repo_path", "repoPath"],
-    )
-    .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_root"]))
-    .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceRoot"]))
-    .or_else(|| cloud_mcp_payload_text(event, &["payload", "repo_path"]))
-    .or_else(|| cloud_mcp_payload_text(event, &["payload", "repoPath"]));
-    let workspace_id = cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"])
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"]));
     let base_url = cloud_mcp_payload_text(event, &["base_url", "baseUrl"])
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "base_url"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "baseUrl"]));
@@ -6386,23 +6375,21 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
         )
         .await;
 
-        let repo_path = cloud_mcp_clean_optional_text(&repo_path);
-        let workspace_id = cloud_mcp_clean_optional_text(&workspace_id);
         let base_url = cloud_mcp_clean_optional_text(&base_url);
         let input = event.clone();
         let action_for_worker = action.clone();
         let transfer_result = tokio::task::spawn_blocking(move || {
             if action_for_worker == "upload" {
                 cloud_mcp_forward_agent_upload_asset(
-                    repo_path.as_deref(),
-                    workspace_id.as_deref(),
+                    None,
+                    None,
                     base_url.as_deref(),
                     &input,
                 )
             } else {
                 cloud_mcp_forward_agent_download_asset(
-                    repo_path.as_deref(),
-                    workspace_id.as_deref(),
+                    None,
+                    None,
                     base_url.as_deref(),
                     &input,
                 )
@@ -6419,7 +6406,7 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
                 } else {
                     "Asset download completed on this desktop."
                 };
-                let _ = app.emit(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, result.clone());
+                let _ = app.emit(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, result.clone());
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
                     &event,
@@ -6651,10 +6638,8 @@ fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
             | "terminal_activity_status"
             | "upload_asset"
             | "asset_upload"
-            | "workspace_asset_upload"
             | "download_asset"
             | "asset_download"
-            | "workspace_asset_download"
             | "plan_release_stage"
             | "release_plan_stage"
             | "plan_release"
@@ -6900,19 +6885,19 @@ fn cloud_mcp_is_workspace_architecture_wake_event(event_kind: &str, _event: &Val
     false
 }
 
-fn cloud_mcp_is_workspace_asset_wake_event(event_kind: &str, _event: &Value) -> bool {
+fn cloud_mcp_is_account_asset_wake_event(event_kind: &str, _event: &Value) -> bool {
     if matches!(
         event_kind,
-        "workspace_asset_registered"
-            | "workspace_asset_updated"
-            | "workspace_assets_snapshot"
-            | "workspace_asset_upload_prepared"
-            | "workspace_asset_upload_completed"
-            | "workspace_asset_download_prepared"
-            | "workspace_asset_cache_available"
-            | "workspace_asset_cloud_deleted"
-            | "workspace_asset_transfer_progress"
-            | "workspace_asset_transfer_failed"
+        "asset_library_registered"
+            | "asset_library_updated"
+            | "account_assets_snapshot"
+            | "asset_library_upload_prepared"
+            | "asset_library_upload_completed"
+            | "asset_library_download_prepared"
+            | "asset_library_cache_available"
+            | "asset_library_cloud_deleted"
+            | "asset_library_transfer_progress"
+            | "asset_library_transfer_failed"
     ) {
         return true;
     }
@@ -9844,7 +9829,7 @@ async fn cloud_mcp_post_json_endpoint(
             )
             .await;
             cloud_mcp_update_asset_library_from_response(
-                if endpoint == "/v1/workspace/assets/list" {
+                if endpoint == "/v1/assets/list" {
                     "asset_library_list_snapshot"
                 } else {
                     "app_websocket_response"
@@ -9896,23 +9881,21 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/workspace/todos/history" => Some("workspace_todo_history"),
         "/v1/workspace/architectures/list" => Some("workspace_architectures_list"),
         "/v1/workspace/architectures/hydrate" => Some("workspace_architecture_hydrate"),
-        "/v1/workspace/assets/list" => Some("workspace_assets_list"),
-        "/v1/workspace/assets/clouds/list" => Some("workspace_asset_clouds_list"),
-        "/v1/workspace/assets/clouds/save" => Some("workspace_asset_cloud_save"),
-        "/v1/workspace/assets/clouds/validate" => Some("workspace_asset_cloud_validate"),
-        "/v1/workspace/assets/clouds/default" => Some("workspace_asset_cloud_set_default"),
-        "/v1/workspace/assets/clouds/delete" => Some("workspace_asset_cloud_delete"),
-        "/v1/workspace/assets/register" => Some("workspace_asset_register"),
-        "/v1/workspace/assets/prepare-upload" => Some("workspace_asset_prepare_upload"),
-        "/v1/workspace/assets/complete-upload" => Some("workspace_asset_complete_upload"),
-        "/v1/workspace/assets/prepare-download" => Some("workspace_asset_prepare_download"),
-        "/v1/workspace/assets/delete-cloud" => Some("workspace_asset_delete_cloud"),
-        "/v1/workspace/assets/publish-public" => Some("workspace_asset_publish_public"),
-        "/v1/workspace/assets/unpublish-public" => Some("workspace_asset_unpublish_public"),
-        "/v1/workspace/assets/status" => Some("workspace_asset_status"),
-        "/v1/workspace/assets/report-transfer-progress" => {
-            Some("workspace_asset_report_transfer_progress")
-        }
+        "/v1/assets/list" => Some("asset_library_list"),
+        "/v1/assets/clouds/list" => Some("asset_library_clouds_list"),
+        "/v1/assets/clouds/save" => Some("asset_library_cloud_save"),
+        "/v1/assets/clouds/validate" => Some("asset_library_cloud_validate"),
+        "/v1/assets/clouds/default" => Some("asset_library_cloud_set_default"),
+        "/v1/assets/clouds/delete" => Some("asset_library_cloud_delete"),
+        "/v1/assets/register" => Some("asset_library_register"),
+        "/v1/assets/prepare-upload" => Some("asset_library_prepare_upload"),
+        "/v1/assets/complete-upload" => Some("asset_library_complete_upload"),
+        "/v1/assets/prepare-download" => Some("asset_library_prepare_download"),
+        "/v1/assets/delete-cloud" => Some("asset_library_delete_cloud"),
+        "/v1/assets/publish-public" => Some("asset_library_publish_public"),
+        "/v1/assets/unpublish-public" => Some("asset_library_unpublish_public"),
+        "/v1/assets/status" => Some("asset_library_status"),
+        "/v1/assets/report-transfer-progress" => Some("asset_library_report_transfer_progress"),
         "/v1/tokenomics/reset-device" => Some("tokenomics_reset_device_cloud"),
         "/v1/cloud/server-reset" => Some("server_reset_cloud_state"),
         "/v1/cloud/repo-catalog" => Some("account_repo_catalog"),
@@ -10118,21 +10101,21 @@ fn cloud_mcp_post_log_context(
         "/v1/workspace/todos/history" => "cloud_workspace_todo_history",
         "/v1/workspace/architectures/list" => "cloud_get_workspace_architectures",
         "/v1/workspace/architectures/hydrate" => "cloud_hydrate_workspace_architecture",
-        "/v1/workspace/assets/list" => "cloud_list_workspace_assets",
-        "/v1/workspace/assets/clouds/list" => "cloud_list_asset_clouds",
-        "/v1/workspace/assets/clouds/save" => "cloud_save_asset_cloud",
-        "/v1/workspace/assets/clouds/validate" => "cloud_validate_asset_cloud",
-        "/v1/workspace/assets/clouds/default" => "cloud_set_default_asset_cloud",
-        "/v1/workspace/assets/clouds/delete" => "cloud_delete_asset_cloud",
-        "/v1/workspace/assets/register" => "cloud_register_workspace_asset",
-        "/v1/workspace/assets/prepare-upload" => "cloud_prepare_asset_upload",
-        "/v1/workspace/assets/complete-upload" => "cloud_complete_asset_upload",
-        "/v1/workspace/assets/prepare-download" => "cloud_prepare_asset_download",
-        "/v1/workspace/assets/delete-cloud" => "cloud_delete_cloud_asset",
-        "/v1/workspace/assets/publish-public" => "cloud_publish_public_asset",
-        "/v1/workspace/assets/unpublish-public" => "cloud_unpublish_public_asset",
-        "/v1/workspace/assets/status" => "cloud_get_asset_status",
-        "/v1/workspace/assets/report-transfer-progress" => "cloud_report_asset_transfer_progress",
+        "/v1/assets/list" => "cloud_list_account_assets",
+        "/v1/assets/clouds/list" => "cloud_list_asset_clouds",
+        "/v1/assets/clouds/save" => "cloud_save_asset_cloud",
+        "/v1/assets/clouds/validate" => "cloud_validate_asset_cloud",
+        "/v1/assets/clouds/default" => "cloud_set_default_asset_cloud",
+        "/v1/assets/clouds/delete" => "cloud_delete_asset_cloud",
+        "/v1/assets/register" => "cloud_register_account_asset",
+        "/v1/assets/prepare-upload" => "cloud_prepare_asset_upload",
+        "/v1/assets/complete-upload" => "cloud_complete_asset_upload",
+        "/v1/assets/prepare-download" => "cloud_prepare_asset_download",
+        "/v1/assets/delete-cloud" => "cloud_delete_cloud_asset",
+        "/v1/assets/publish-public" => "cloud_publish_public_asset",
+        "/v1/assets/unpublish-public" => "cloud_unpublish_public_asset",
+        "/v1/assets/status" => "cloud_get_asset_status",
+        "/v1/assets/report-transfer-progress" => "cloud_report_asset_transfer_progress",
         "/v1/events" => payload
             .get("event_kind")
             .and_then(Value::as_str)
@@ -16538,31 +16521,15 @@ async fn cloud_mcp_architecture_hub_catalog(
     }))
 }
 
-fn cloud_mcp_asset_payload_base(
-    req: &CloudMcpRepoRequest,
-    workspace_id: &str,
-    workspace_name: Option<&str>,
-    reason: &str,
-) -> Value {
+fn cloud_mcp_asset_payload_base(reason: &str) -> Value {
     let device_profile = cloud_mcp_desktop_device_profile();
-    let workspace_id = if workspace_id.trim().is_empty() {
-        req.workspace_id.as_deref().unwrap_or_default()
-    } else {
-        workspace_id.trim()
-    };
     json!({
         "source": "rust-diffforge-assets",
         "reason": reason,
-        "repo_id": req.repo_id,
-        "repoId": req.repo_id,
-        "repo_path": req.root_display,
-        "repoPath": req.root_display,
-        "workspace_root": req.root_display,
-        "workspaceRoot": req.root_display,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
-        "workspace_name": workspace_name.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
+        "asset_scope": "account",
+        "assetScope": "account",
+        "library_scope": "account",
+        "libraryScope": "account",
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "deviceId": device_profile["device_id"].clone(),
@@ -16572,6 +16539,32 @@ fn cloud_mcp_asset_payload_base(
         "machine_name": device_profile["machine_name"].clone(),
         "ts_ms": cloud_mcp_now_ms(),
     })
+}
+
+fn cloud_mcp_strip_asset_workspace_identity(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "repo_id",
+        "repoId",
+        "repo_path",
+        "repoPath",
+        "workspace_id",
+        "workspaceId",
+        "workspace_name",
+        "workspaceName",
+        "workspace_root",
+        "workspaceRoot",
+        "root_path",
+        "rootPath",
+    ] {
+        object.remove(key);
+    }
+    object.insert("asset_scope".to_string(), json!("account"));
+    object.insert("assetScope".to_string(), json!("account"));
+    object.insert("library_scope".to_string(), json!("account"));
+    object.insert("libraryScope".to_string(), json!("account"));
 }
 
 fn cloud_mcp_file_sha256_and_size(path: &Path) -> Result<(String, u64), String> {
@@ -16814,8 +16807,8 @@ fn cloud_mcp_available_asset_download_path(target_dir: &Path, filename: &str) ->
 }
 
 fn cloud_mcp_promote_generated_asset_to_library(
-    repo_path: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _workspace_id: Option<&str>,
     source_path: &Path,
     name_hint: Option<&str>,
     prompt: Option<&str>,
@@ -16839,17 +16832,14 @@ fn cloud_mcp_promote_generated_asset_to_library(
     }
 
     let (source_sha256, source_size_bytes) = cloud_mcp_file_sha256_and_size(&source_path)?;
-    let req = cloud_mcp_repo_request(
-        repo_path.unwrap_or_default().to_string(),
-        workspace_id.map(str::to_string),
-        None,
-    );
-    let workspace_id_text = workspace_id.unwrap_or_default();
+    let req = cloud_mcp_asset_scope_request();
     let asset_id = format!(
         "asset-imagegen-{}",
         cloud_mcp_short_hash(&format!(
-            "{}:{}:{}:{}",
-            req.repo_id, workspace_id_text, source_sha256, source_size_bytes
+            "{}:{}:{}",
+            source_path.display(),
+            source_sha256,
+            source_size_bytes
         ))
     );
 
@@ -16938,7 +16928,7 @@ fn cloud_mcp_promote_generated_asset_to_library(
     });
     let row = cloud_mcp_asset_local_row_with_input(
         &req,
-        workspace_id_text,
+        "",
         req.workspace_name.as_deref(),
         &target_path,
         &input,
@@ -16964,6 +16954,7 @@ fn cloud_mcp_asset_local_row(
     path: &Path,
     metadata: Option<Value>,
 ) -> Result<Value, String> {
+    let _ = (req, workspace_id, workspace_name);
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let (sha256, size_bytes) = cloud_mcp_file_sha256_and_size(&canonical)?;
     let mime_type = cloud_mcp_asset_mime_for_path(&canonical);
@@ -16975,8 +16966,7 @@ fn cloud_mcp_asset_local_row(
     let asset_id = format!(
         "asset-{}",
         cloud_mcp_short_hash(&format!(
-            "{}:{}:{}:{}",
-            workspace_id,
+            "{}:{}:{}",
             canonical.display(),
             sha256,
             size_bytes
@@ -16986,12 +16976,10 @@ fn cloud_mcp_asset_local_row(
         "id": asset_id,
         "asset_id": asset_id,
         "assetId": asset_id,
-        "repo_id": req.repo_id,
-        "repoId": req.repo_id,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
-        "workspace_name": workspace_name.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
+        "asset_scope": "account",
+        "assetScope": "account",
+        "library_scope": "account",
+        "libraryScope": "account",
         "name": name,
         "filename": name,
         "kind": cloud_mcp_asset_kind_for_mime(&mime_type),
@@ -17077,8 +17065,8 @@ fn cloud_mcp_asset_store_local_row(row: &Value) -> Result<(), String> {
         &conn,
         "local_asset_registration",
         Some(cloud_mcp_base_url().as_str()),
-        cloud_mcp_payload_text(row, &["repo_id", "repoId"]).as_deref(),
-        cloud_mcp_payload_text(row, &["workspace_id", "workspaceId"]).as_deref(),
+        None,
+        None,
         &json!({"items": [row.clone()]}),
     )
 }
@@ -17120,7 +17108,7 @@ fn cloud_mcp_asset_row_from_file(asset_id: &str) -> Result<Value, String> {
         .map_err(|error| format!("Unable to initialize asset cache: {error}"))?;
     let (text, local_path, local_status): (String, String, String) = conn
         .query_row(
-            "SELECT row_json, local_path, local_status FROM workspace_asset_items WHERE asset_id=?1",
+            "SELECT row_json, local_path, local_status FROM account_asset_items WHERE asset_id=?1",
             rusqlite::params![asset_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -17128,6 +17116,7 @@ fn cloud_mcp_asset_row_from_file(asset_id: &str) -> Result<Value, String> {
     let mut row = serde_json::from_str::<Value>(&text)
         .map_err(|error| format!("Local asset row for {asset_id} is invalid: {error}"))?;
     cloud_mcp_asset_overlay_local_columns(&mut row, &local_path, &local_status);
+    cloud_mcp_strip_asset_workspace_identity(&mut row);
     Ok(row)
 }
 
@@ -17216,7 +17205,7 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
         .map_err(|error| format!("Unable to initialize asset cache: {error}"))?;
     let updated = conn
         .execute(
-            "UPDATE workspace_asset_items
+            "UPDATE account_asset_items
              SET repo_id=?1,
                  workspace_id=?2,
                  workspace_name=?3,
@@ -17235,10 +17224,13 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
                  mirror_updated_at_ms=?16,
                  row_json=?17
              WHERE asset_id=?18",
-            rusqlite::params![
-                cloud_mcp_asset_row_text(row, &["repo_id", "repoId"]),
-                cloud_mcp_asset_row_text(row, &["workspace_id", "workspaceId"]),
-                cloud_mcp_asset_row_text(row, &["workspace_name", "workspaceName"]),
+            {
+                let mut stored_row = row.clone();
+                cloud_mcp_strip_asset_workspace_identity(&mut stored_row);
+                rusqlite::params![
+                "",
+                "",
+                "",
                 cloud_mcp_asset_row_text(row, &["name", "filename", "file_name", "fileName"]),
                 cloud_mcp_asset_row_text(row, &["kind", "asset_kind", "assetKind"]),
                 cloud_mcp_asset_row_text(row, &["mime_type", "mimeType"]),
@@ -17260,9 +17252,10 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
                 ),
                 cloud_mcp_asset_row_text(row, &["updated_at", "updatedAt"]),
                 cloud_mcp_now_ms() as i64,
-                row.to_string(),
+                stored_row.to_string(),
                 asset_id,
-            ],
+                ]
+            },
         )
         .map_err(|error| format!("Unable to update local asset row {asset_id}: {error}"))?;
     if updated == 0 {
@@ -17328,7 +17321,7 @@ fn cloud_mcp_delete_local_asset_copy(asset_id: &str, delete_file: bool) -> Resul
     }
     cloud_mcp_asset_replace_local_row(asset_id, &row)?;
     Ok(json!({
-        "kind": "workspace_asset_local_deleted",
+        "kind": "asset_library_local_deleted",
         "source": "local_asset_library",
         "asset_id": asset_id,
         "assetId": asset_id,
@@ -17343,8 +17336,6 @@ fn cloud_mcp_delete_local_asset_copy(asset_id: &str, delete_file: bool) -> Resul
 
 fn cloud_mcp_asset_http_headers(
     token: Option<&str>,
-    repo_id: &str,
-    workspace_id: &str,
     route_token: Option<&str>,
 ) -> Result<reqwest::header::HeaderMap, String> {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -17364,16 +17355,6 @@ fn cloud_mcp_asset_http_headers(
     headers.insert(
         "x-diffforge-actor",
         reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
-    );
-    headers.insert(
-        "x-diffforge-repo-id",
-        reqwest::header::HeaderValue::from_str(repo_id)
-            .map_err(|error| format!("Invalid asset transfer repo header: {error}"))?,
-    );
-    headers.insert(
-        "x-diffforge-workspace-id",
-        reqwest::header::HeaderValue::from_str(workspace_id)
-            .map_err(|error| format!("Invalid asset transfer workspace header: {error}"))?,
     );
     let device_profile = cloud_mcp_desktop_device_profile();
     if let Some(device_id) = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]) {
@@ -17407,60 +17388,25 @@ fn cloud_mcp_asset_http_headers(
 }
 
 #[tauri::command]
-async fn cloud_mcp_list_workspace_assets(
+async fn cloud_mcp_list_account_assets(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
     limit: Option<u64>,
-    include_all_workspaces: Option<bool>,
     local_only: Option<bool>,
 ) -> Result<Value, String> {
-    let req =
-        cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
-    // Assets are account-global; per-workspace filtering is opt-in.
-    let include_all_workspaces = include_all_workspaces.unwrap_or(true);
     let effective_limit = limit
         .unwrap_or(100)
         .clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS as u64);
-    let local_repo_id = if include_all_workspaces {
-        None
-    } else {
-        Some(req.repo_id.as_str())
-    };
-    let local_workspace_id = if include_all_workspaces {
-        None
-    } else {
-        workspace_id.as_deref()
-    };
-    let local = cloud_mcp_asset_library_from_file(
-        local_repo_id,
-        local_workspace_id,
-        effective_limit as usize,
-    );
+    let local = cloud_mcp_asset_library_from_file(effective_limit as usize);
     if local_only.unwrap_or(false) {
         return Ok(local);
     }
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        workspace_id.as_deref().unwrap_or_default(),
-        workspace_name.as_deref(),
-        "asset_library_list",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("asset_library_list");
     let mut attached_process_reset = false;
     if let Some(object) = payload.as_object_mut() {
         attached_process_reset = cloud_mcp_asset_attach_process_reset_flag(object);
-        object.insert(
-            "include_all_workspaces".to_string(),
-            json!(include_all_workspaces),
-        );
-        object.insert(
-            "includeAllWorkspaces".to_string(),
-            json!(include_all_workspaces),
-        );
         object.insert("limit".to_string(), json!(effective_limit));
     }
-    match cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/list", &payload).await {
+    match cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/list", &payload).await {
         Ok(response) => {
             cloud_mcp_asset_finish_process_reset(attached_process_reset, true);
             let remote = response.get("data").cloned().unwrap_or(response);
@@ -17476,37 +17422,16 @@ async fn cloud_mcp_list_workspace_assets(
 #[tauri::command]
 async fn cloud_mcp_list_asset_clouds(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
 ) -> Result<Value, String> {
-    let req =
-        cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
-    let payload = cloud_mcp_asset_payload_base(
-        &req,
-        workspace_id.as_deref().unwrap_or_default(),
-        workspace_name.as_deref(),
-        "asset_clouds_list",
-    );
+    let payload = cloud_mcp_asset_payload_base("asset_clouds_list");
     let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/clouds/list", &payload)
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/list", &payload)
             .await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
 
-fn cloud_mcp_asset_cloud_payload(
-    req: &CloudMcpRepoRequest,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-    reason: &str,
-    cloud: Option<Value>,
-) -> Value {
-    let mut payload = cloud_mcp_asset_payload_base(
-        req,
-        workspace_id.unwrap_or_default(),
-        workspace_name,
-        reason,
-    );
+fn cloud_mcp_asset_cloud_payload(reason: &str, cloud: Option<Value>) -> Value {
+    let mut payload = cloud_mcp_asset_payload_base(reason);
     if let (Some(object), Some(cloud)) = (payload.as_object_mut(), cloud) {
         if let Some(cloud_object) = cloud.as_object() {
             for (key, value) in cloud_object {
@@ -17520,22 +17445,11 @@ fn cloud_mcp_asset_cloud_payload(
 #[tauri::command]
 async fn cloud_mcp_save_asset_cloud(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
     cloud: Value,
 ) -> Result<Value, String> {
-    let req =
-        cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
-    let payload = cloud_mcp_asset_cloud_payload(
-        &req,
-        workspace_id.as_deref(),
-        workspace_name.as_deref(),
-        "asset_cloud_save",
-        Some(cloud),
-    );
+    let payload = cloud_mcp_asset_cloud_payload("asset_cloud_save", Some(cloud));
     let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/clouds/save", &payload)
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/save", &payload)
             .await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
@@ -17543,17 +17457,9 @@ async fn cloud_mcp_save_asset_cloud(
 #[tauri::command]
 async fn cloud_mcp_validate_asset_cloud(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
     cloud_id: String,
 ) -> Result<Value, String> {
-    let req =
-        cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
-        &req,
-        workspace_id.as_deref(),
-        workspace_name.as_deref(),
         "asset_cloud_validate",
         Some(json!({
             "cloud_id": cloud_id,
@@ -17562,7 +17468,7 @@ async fn cloud_mcp_validate_asset_cloud(
     );
     let response = cloud_mcp_post_json_endpoint(
         state.inner(),
-        "/v1/workspace/assets/clouds/validate",
+        "/v1/assets/clouds/validate",
         &payload,
     )
     .await?;
@@ -17572,17 +17478,9 @@ async fn cloud_mcp_validate_asset_cloud(
 #[tauri::command]
 async fn cloud_mcp_set_default_asset_cloud(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
     cloud_id: String,
 ) -> Result<Value, String> {
-    let req =
-        cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
-        &req,
-        workspace_id.as_deref(),
-        workspace_name.as_deref(),
         "asset_cloud_set_default",
         Some(json!({
             "cloud_id": cloud_id,
@@ -17591,7 +17489,7 @@ async fn cloud_mcp_set_default_asset_cloud(
     );
     let response = cloud_mcp_post_json_endpoint(
         state.inner(),
-        "/v1/workspace/assets/clouds/default",
+        "/v1/assets/clouds/default",
         &payload,
     )
     .await?;
@@ -17601,17 +17499,9 @@ async fn cloud_mcp_set_default_asset_cloud(
 #[tauri::command]
 async fn cloud_mcp_delete_asset_cloud(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
     cloud_id: String,
 ) -> Result<Value, String> {
-    let req =
-        cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let payload = cloud_mcp_asset_cloud_payload(
-        &req,
-        workspace_id.as_deref(),
-        workspace_name.as_deref(),
         "asset_cloud_delete",
         Some(json!({
             "cloud_id": cloud_id,
@@ -17620,7 +17510,7 @@ async fn cloud_mcp_delete_asset_cloud(
     );
     let response = cloud_mcp_post_json_endpoint(
         state.inner(),
-        "/v1/workspace/assets/clouds/delete",
+        "/v1/assets/clouds/delete",
         &payload,
     )
     .await?;
@@ -17628,11 +17518,8 @@ async fn cloud_mcp_delete_asset_cloud(
 }
 
 #[tauri::command]
-async fn cloud_mcp_register_workspace_asset(
+async fn cloud_mcp_register_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     path: String,
     metadata: Option<Value>,
     upload: Option<bool>,
@@ -17641,29 +17528,16 @@ async fn cloud_mcp_register_workspace_asset(
         Path::new(&path),
         "register a tracked asset",
     )?;
-    let req = cloud_mcp_asset_scope_request(
-        repo_path.clone(),
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let row = cloud_mcp_asset_local_row(
-        &req,
-        &workspace_id,
-        workspace_name.as_deref(),
-        Path::new(&path),
-        metadata,
-    )?;
+    let req = cloud_mcp_asset_scope_request();
+    let row = cloud_mcp_asset_local_row(&req, "", None, Path::new(&path), metadata)?;
     cloud_mcp_asset_store_local_row(&row)?;
     let payload = cloud_mcp_asset_registration_payload_from_row(
-        &req,
-        &workspace_id,
-        workspace_name.as_deref(),
         "asset_register",
         &row,
     );
     let cloud = match cloud_mcp_post_json_endpoint(
         state.inner(),
-        "/v1/workspace/assets/register",
+        "/v1/assets/register",
         &payload,
     )
     .await
@@ -17675,18 +17549,10 @@ async fn cloud_mcp_register_workspace_asset(
     };
     if upload.unwrap_or(false) {
         let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
-        return cloud_mcp_upload_workspace_asset(
-            state,
-            repo_path,
-            workspace_id,
-            workspace_name,
-            asset_id,
-            None,
-        )
-        .await;
+        return cloud_mcp_upload_account_asset(state, asset_id, None).await;
     }
     Ok(json!({
-        "kind": "workspace_asset_registered",
+        "kind": "asset_library_registered",
         "source": "local_asset_library",
         "asset": row,
         "assets": [row],
@@ -17695,23 +17561,40 @@ async fn cloud_mcp_register_workspace_asset(
 }
 
 #[tauri::command]
-async fn cloud_mcp_upload_workspace_asset(
+async fn cloud_mcp_upload_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_asset_scope_request(
-        repo_path,
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let scope_workspace_id = req
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| workspace_id.trim().to_string());
+    let mut stale_prepare_error = None;
+    for attempt in 0..2 {
+        match cloud_mcp_upload_account_asset_once(
+            state.inner(),
+            asset_id.clone(),
+            cloud_id.clone(),
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if attempt == 0
+                    && cloud_mcp_asset_transfer_error_requires_reprepare(&error, "upload") =>
+            {
+                stale_prepare_error = Some(error);
+                cloud_mcp_delete_local_asset_transfer_rows(&asset_id, cloud_id.as_deref(), "upload");
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(stale_prepare_error.unwrap_or_else(|| "Asset upload did not start.".to_string()))
+}
+
+async fn cloud_mcp_upload_account_asset_once(
+    state: &CloudMcpState,
+    asset_id: String,
+    cloud_id: Option<String>,
+) -> Result<Value, String> {
     // A cancel from a previous attempt must not kill this retry.
     cloud_mcp_clear_asset_transfer_cancel(&[&asset_id]);
     let row = cloud_mcp_asset_row_with_local_copy(&asset_id)?;
@@ -17721,12 +17604,7 @@ async fn cloud_mcp_upload_workspace_asset(
         Path::new(&local_path),
         "upload a tracked asset",
     )?;
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        &scope_workspace_id,
-        workspace_name.as_deref(),
-        "asset_upload",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("asset_upload");
     let mut attached_process_reset = false;
     if let Some(object) = payload.as_object_mut() {
         attached_process_reset = cloud_mcp_asset_attach_process_reset_flag(object);
@@ -17759,8 +17637,8 @@ async fn cloud_mcp_upload_workspace_asset(
         }
     }
     let prepared = match cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/workspace/assets/prepare-upload",
+        state,
+        "/v1/assets/prepare-upload",
         &payload,
     )
     .await
@@ -17783,7 +17661,7 @@ async fn cloud_mcp_upload_workspace_asset(
     if !upload_required {
         cloud_mcp_update_asset_library_from_response(
             "asset_upload_deduped",
-            Some("/v1/workspace/assets/prepare-upload"),
+            Some("/v1/assets/prepare-upload"),
             &payload,
             &data,
         );
@@ -17805,7 +17683,7 @@ async fn cloud_mcp_upload_workspace_asset(
             route_token: None,
         }
     } else {
-        cloud_mcp_asset_http_target_async(state.inner(), &upload_path).await?
+        cloud_mcp_asset_http_target_async(state, &upload_path).await?
     };
     // Asset bytes go to the assigned cloud-diffforge route. The balancer only
     // mints the route token; it never proxies upload bytes.
@@ -17813,13 +17691,11 @@ async fn cloud_mcp_upload_workspace_asset(
     if direct_transfer {
         attempts.push((http_target.url.clone(), reqwest::header::HeaderMap::new()));
     } else {
-        let token = cloud_mcp_authorization_bearer(state.inner()).await?;
+        let token = cloud_mcp_authorization_bearer(state).await?;
         attempts.push((
             http_target.url.clone(),
             cloud_mcp_asset_http_headers(
                 token.as_deref(),
-                &req.repo_id,
-                &scope_workspace_id,
                 http_target.route_token.as_deref(),
             )?,
         ));
@@ -17834,12 +17710,12 @@ async fn cloud_mcp_upload_workspace_asset(
         .unwrap_or_default();
     let mut upload_reporter = if direct_transfer {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<Value>();
-        let progress_state = state.inner().clone();
+        let progress_state = state.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let _ = cloud_mcp_post_json_endpoint(
                     &progress_state,
-                    "/v1/workspace/assets/report-transfer-progress",
+                    "/v1/assets/report-transfer-progress",
                     &progress,
                 )
                 .await;
@@ -17853,8 +17729,6 @@ async fn cloud_mcp_upload_workspace_asset(
     let mut upload_result: Result<Value, String> = Err("Asset upload did not start.".to_string());
     for (attempt_index, (attempt_url, attempt_headers)) in attempts.into_iter().enumerate() {
         let local_path_buf = PathBuf::from(local_path.clone());
-        let repo_id_for_upload = req.repo_id.clone();
-        let workspace_id_for_upload = scope_workspace_id.clone();
         let asset_id_for_upload = asset_id.clone();
         let transfer_id_for_upload = transfer_id.clone();
         let cloud_id_for_upload = transfer_cloud_id.clone();
@@ -17864,8 +17738,6 @@ async fn cloud_mcp_upload_workspace_asset(
                 attempt_url,
                 attempt_headers,
                 &local_path_buf,
-                repo_id_for_upload,
-                workspace_id_for_upload,
                 asset_id_for_upload,
                 transfer_id_for_upload,
                 cloud_id_for_upload,
@@ -17901,8 +17773,6 @@ async fn cloud_mcp_upload_workspace_asset(
                 "failed"
             };
             let failure_report = cloud_mcp_asset_transfer_progress_row(
-                &req.repo_id,
-                &scope_workspace_id,
                 &asset_id,
                 &transfer_id,
                 &transfer_cloud_id,
@@ -17913,8 +17783,8 @@ async fn cloud_mcp_upload_workspace_asset(
                 Some(&error),
             );
             let _ = cloud_mcp_post_json_endpoint(
-                state.inner(),
-                "/v1/workspace/assets/report-transfer-progress",
+                state,
+                "/v1/assets/report-transfer-progress",
                 &failure_report,
             )
             .await;
@@ -17928,12 +17798,7 @@ async fn cloud_mcp_upload_workspace_asset(
         &upload_result,
     );
     if direct_transfer {
-        let mut complete_payload = cloud_mcp_asset_payload_base(
-            &req,
-            &scope_workspace_id,
-            workspace_name.as_deref(),
-            "asset_upload_complete",
-        );
+        let mut complete_payload = cloud_mcp_asset_payload_base("asset_upload_complete");
         if let Some(object) = complete_payload.as_object_mut() {
             object.insert("asset_id".to_string(), json!(asset_id));
             object.insert("assetId".to_string(), json!(asset_id));
@@ -17943,15 +17808,15 @@ async fn cloud_mcp_upload_workspace_asset(
             object.insert("cloudId".to_string(), json!(transfer_cloud_id));
         }
         let completed = cloud_mcp_post_json_endpoint(
-            state.inner(),
-            "/v1/workspace/assets/complete-upload",
+            state,
+            "/v1/assets/complete-upload",
             &complete_payload,
         )
         .await?;
         let completed_data = completed.get("data").cloned().unwrap_or(completed);
         cloud_mcp_update_asset_library_from_response(
             "asset_upload_direct_completed",
-            Some("/v1/workspace/assets/complete-upload"),
+            Some("/v1/assets/complete-upload"),
             &complete_payload,
             &completed_data,
         );
@@ -17961,33 +17826,47 @@ async fn cloud_mcp_upload_workspace_asset(
 }
 
 #[tauri::command]
-async fn cloud_mcp_download_workspace_asset(
+async fn cloud_mcp_download_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     asset_id: String,
     target_directory: Option<String>,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_asset_scope_request(
-        repo_path.clone(),
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let scope_workspace_id = req
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| workspace_id.trim().to_string());
+    let mut stale_prepare_error = None;
+    for attempt in 0..2 {
+        match cloud_mcp_download_account_asset_once(
+            state.inner(),
+            asset_id.clone(),
+            target_directory.clone(),
+            cloud_id.clone(),
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if attempt == 0
+                    && cloud_mcp_asset_transfer_error_requires_reprepare(&error, "download") =>
+            {
+                stale_prepare_error = Some(error);
+                cloud_mcp_delete_local_asset_transfer_rows(&asset_id, cloud_id.as_deref(), "download");
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(stale_prepare_error.unwrap_or_else(|| "Asset download did not start.".to_string()))
+}
+
+async fn cloud_mcp_download_account_asset_once(
+    state: &CloudMcpState,
+    asset_id: String,
+    target_directory: Option<String>,
+    cloud_id: Option<String>,
+) -> Result<Value, String> {
     // A cancel from a previous attempt must not kill this retry.
     cloud_mcp_clear_asset_transfer_cancel(&[&asset_id]);
     let payload = {
-        let mut payload = cloud_mcp_asset_payload_base(
-            &req,
-            &scope_workspace_id,
-            workspace_name.as_deref(),
-            "asset_download",
-        );
+        let mut payload = cloud_mcp_asset_payload_base("asset_download");
         if let Some(object) = payload.as_object_mut() {
             object.insert("asset_id".to_string(), json!(asset_id));
             object.insert("assetId".to_string(), json!(asset_id));
@@ -18003,8 +17882,8 @@ async fn cloud_mcp_download_workspace_asset(
         payload
     };
     let prepared = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/workspace/assets/prepare-download",
+        state,
+        "/v1/assets/prepare-download",
         &payload,
     )
     .await?;
@@ -18025,7 +17904,7 @@ async fn cloud_mcp_download_workspace_asset(
             route_token: None,
         }
     } else {
-        cloud_mcp_asset_http_target_async(state.inner(), &download_path).await?
+        cloud_mcp_asset_http_target_async(state, &download_path).await?
     };
     // Same policy as upload: download bytes use the assigned cloud route, with
     // the balancer only minting the route token.
@@ -18033,13 +17912,11 @@ async fn cloud_mcp_download_workspace_asset(
     if direct_transfer {
         attempts.push((http_target.url.clone(), reqwest::header::HeaderMap::new()));
     } else {
-        let token = cloud_mcp_authorization_bearer(state.inner()).await?;
+        let token = cloud_mcp_authorization_bearer(state).await?;
         attempts.push((
             http_target.url.clone(),
             cloud_mcp_asset_http_headers(
                 token.as_deref(),
-                &req.repo_id,
-                &scope_workspace_id,
                 http_target.route_token.as_deref(),
             )?,
         ));
@@ -18060,26 +17937,19 @@ async fn cloud_mcp_download_workspace_asset(
     let name = cloud_mcp_sanitize_asset_filename(&raw_name, &format!("{asset_id}.asset"));
     let target_dir = match target_directory.map(PathBuf::from) {
         Some(dir) => dir,
-        // Account-scope assets have no workspace root; land pulls in the
-        // managed library so the row's local copy stays rediscoverable.
-        None if req.root_display.trim().is_empty() => cloud_mcp_managed_asset_root()?
-            .join("downloads")
-            .join(&asset_id),
-        None => PathBuf::from(&req.root_display)
-            .join(".diffforge")
-            .join("assets"),
+        None => cloud_mcp_managed_asset_root()?.join("downloads").join(&asset_id),
     };
     diffforge_reject_untracked_asset_path_for_tracking(&target_dir, "download a tracked asset")?;
     fs::create_dir_all(&target_dir)
         .map_err(|error| format!("Unable to create asset download directory: {error}"))?;
     let target_path = cloud_mcp_available_asset_download_path(&target_dir, &name);
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<Value>();
-    let progress_state = state.inner().clone();
+    let progress_state = state.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(progress) = progress_rx.recv().await {
             let _ = cloud_mcp_post_json_endpoint(
                 &progress_state,
-                "/v1/workspace/assets/report-transfer-progress",
+                "/v1/assets/report-transfer-progress",
                 &progress,
             )
             .await;
@@ -18089,8 +17959,6 @@ async fn cloud_mcp_download_workspace_asset(
     let mut download_result: Result<(), String> = Err("Asset download did not start.".to_string());
     for (attempt_index, (attempt_url, attempt_headers)) in attempts.into_iter().enumerate() {
         let target_path_for_download = target_path.clone();
-        let repo_id_for_download = req.repo_id.clone();
-        let workspace_id_for_download = scope_workspace_id.clone();
         let asset_id_for_download = asset_id.clone();
         let cloud_id_for_download = transfer_cloud_id.clone();
         let transfer_id_for_download = transfer_id.clone();
@@ -18103,8 +17971,6 @@ async fn cloud_mcp_download_workspace_asset(
                 &target_path_for_download,
                 &expected_hash_for_download,
                 expected_size,
-                repo_id_for_download,
-                workspace_id_for_download,
                 asset_id_for_download,
                 cloud_id_for_download,
                 transfer_id_for_download,
@@ -18144,7 +18010,7 @@ async fn cloud_mcp_download_workspace_asset(
     }
     cloud_mcp_asset_store_local_row(&local_asset)?;
     Ok(json!({
-        "kind": "workspace_asset_downloaded",
+        "kind": "asset_library_downloaded",
         "asset": local_asset,
         "asset_id": asset_id,
         "assetId": asset_id,
@@ -18175,25 +18041,12 @@ async fn cloud_mcp_cancel_asset_transfer(
 }
 
 #[tauri::command]
-async fn cloud_mcp_delete_cloud_workspace_asset(
+async fn cloud_mcp_delete_cloud_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_asset_scope_request(
-        repo_path,
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        &workspace_id,
-        workspace_name.as_deref(),
-        "asset_delete_cloud",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("asset_delete_cloud");
     if let Some(object) = payload.as_object_mut() {
         object.insert("asset_id".to_string(), json!(asset_id));
         object.insert("assetId".to_string(), json!(asset_id));
@@ -18207,12 +18060,12 @@ async fn cloud_mcp_delete_cloud_workspace_asset(
         }
     }
     let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/delete-cloud", &payload)
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/delete-cloud", &payload)
             .await?;
     let data = response.get("data").cloned().unwrap_or(response);
     cloud_mcp_update_asset_library_from_response(
         "asset_delete_cloud",
-        Some("/v1/workspace/assets/delete-cloud"),
+        Some("/v1/assets/delete-cloud"),
         &payload,
         &data,
     );
@@ -18220,25 +18073,12 @@ async fn cloud_mcp_delete_cloud_workspace_asset(
 }
 
 #[tauri::command]
-async fn cloud_mcp_publish_workspace_asset(
+async fn cloud_mcp_publish_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_asset_scope_request(
-        repo_path,
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        &workspace_id,
-        workspace_name.as_deref(),
-        "asset_publish_public",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("asset_publish_public");
     if let Some(object) = payload.as_object_mut() {
         object.insert("asset_id".to_string(), json!(asset_id));
         object.insert("assetId".to_string(), json!(asset_id));
@@ -18253,14 +18093,14 @@ async fn cloud_mcp_publish_workspace_asset(
     }
     let response = cloud_mcp_post_json_endpoint(
         state.inner(),
-        "/v1/workspace/assets/publish-public",
+        "/v1/assets/publish-public",
         &payload,
     )
     .await?;
     let data = response.get("data").cloned().unwrap_or(response);
     cloud_mcp_update_asset_library_from_response(
         "asset_publish_public",
-        Some("/v1/workspace/assets/publish-public"),
+        Some("/v1/assets/publish-public"),
         &payload,
         &data,
     );
@@ -18268,25 +18108,12 @@ async fn cloud_mcp_publish_workspace_asset(
 }
 
 #[tauri::command]
-async fn cloud_mcp_unpublish_workspace_asset(
+async fn cloud_mcp_unpublish_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     asset_id: String,
     cloud_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_asset_scope_request(
-        repo_path,
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        &workspace_id,
-        workspace_name.as_deref(),
-        "asset_unpublish_public",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("asset_unpublish_public");
     if let Some(object) = payload.as_object_mut() {
         object.insert("asset_id".to_string(), json!(asset_id));
         object.insert("assetId".to_string(), json!(asset_id));
@@ -18301,14 +18128,14 @@ async fn cloud_mcp_unpublish_workspace_asset(
     }
     let response = cloud_mcp_post_json_endpoint(
         state.inner(),
-        "/v1/workspace/assets/unpublish-public",
+        "/v1/assets/unpublish-public",
         &payload,
     )
     .await?;
     let data = response.get("data").cloned().unwrap_or(response);
     cloud_mcp_update_asset_library_from_response(
         "asset_unpublish_public",
-        Some("/v1/workspace/assets/unpublish-public"),
+        Some("/v1/assets/unpublish-public"),
         &payload,
         &data,
     );
@@ -18316,11 +18143,8 @@ async fn cloud_mcp_unpublish_workspace_asset(
 }
 
 #[tauri::command]
-async fn cloud_mcp_delete_local_workspace_asset(
+async fn cloud_mcp_delete_local_account_asset(
     state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
     asset_id: String,
     delete_file: Option<bool>,
 ) -> Result<Value, String> {
@@ -18330,15 +18154,7 @@ async fn cloud_mcp_delete_local_workspace_asset(
     // sync metadata stays accurate everywhere. Best-effort: a failure here
     // never blocks the local delete.
     if let Some(row) = row {
-        let req = cloud_mcp_asset_scope_request(
-            repo_path,
-            Some(workspace_id.clone()),
-            workspace_name.clone(),
-        );
         let mut payload = cloud_mcp_asset_registration_payload_from_row(
-            &req,
-            &workspace_id,
-            workspace_name.as_deref(),
             "asset_local_deleted",
             &row,
         );
@@ -18347,45 +18163,30 @@ async fn cloud_mcp_delete_local_workspace_asset(
             object.insert("localStatus".to_string(), json!("local_deleted"));
         }
         let _ =
-            cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/register", &payload)
+            cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/register", &payload)
                 .await;
     }
     Ok(result)
 }
 
 #[tauri::command]
-async fn cloud_mcp_get_workspace_asset_status(
-    repo_path: String,
-    workspace_id: Option<String>,
+async fn cloud_mcp_get_account_asset_status(
     asset_id: Option<String>,
     transfer_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_asset_scope_request(repo_path, workspace_id.clone(), None);
     let conn = cloud_mcp_open_asset_library_conn()?;
     let assets = if let Some(asset_id) = asset_id.as_deref() {
         vec![cloud_mcp_asset_row_from_file(asset_id)?]
     } else {
-        cloud_mcp_asset_library_rows_from_conn(
-            &conn,
-            Some(&req.repo_id),
-            workspace_id.as_deref(),
-            CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS,
-        )?
+        cloud_mcp_asset_library_rows_from_conn(&conn, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS)?
     };
     let transfers = cloud_mcp_asset_library_transfers_from_conn(
         &conn,
         asset_id.as_deref(),
         transfer_id.as_deref(),
-        workspace_id.as_deref(),
         CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS,
     )?;
-    Ok(cloud_mcp_asset_library_response_from_rows(
-        Some(&req.repo_id),
-        workspace_id.as_deref(),
-        assets,
-        transfers,
-        None,
-    ))
+    Ok(cloud_mcp_asset_library_response_from_rows(assets, transfers, None))
 }
 
 #[tauri::command]
@@ -19039,12 +18840,9 @@ fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::R
         "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
-        CREATE TABLE IF NOT EXISTS workspace_asset_items(
+        CREATE TABLE IF NOT EXISTS account_asset_items(
             asset_id TEXT PRIMARY KEY,
             base_url TEXT NOT NULL DEFAULT '',
-            repo_id TEXT NOT NULL DEFAULT '',
-            workspace_id TEXT NOT NULL DEFAULT '',
-            workspace_name TEXT NOT NULL DEFAULT '',
             name TEXT NOT NULL DEFAULT '',
             kind TEXT NOT NULL DEFAULT 'file',
             mime_type TEXT NOT NULL DEFAULT '',
@@ -19060,14 +18858,12 @@ fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::R
             mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0,
             row_json TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS workspace_asset_transfers(
+        CREATE TABLE IF NOT EXISTS account_asset_transfers(
             transfer_id TEXT PRIMARY KEY,
             asset_id TEXT NOT NULL DEFAULT '',
             cloud_id TEXT NOT NULL DEFAULT '',
             provider_kind TEXT NOT NULL DEFAULT '',
             base_url TEXT NOT NULL DEFAULT '',
-            repo_id TEXT NOT NULL DEFAULT '',
-            workspace_id TEXT NOT NULL DEFAULT '',
             direction TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT '',
             bytes_total INTEGER NOT NULL DEFAULT 0,
@@ -19076,49 +18872,25 @@ fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::R
             mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0,
             row_json TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS workspace_asset_snapshots(
-            entry_key TEXT PRIMARY KEY,
-            base_url TEXT NOT NULL DEFAULT '',
-            repo_id TEXT NOT NULL DEFAULT '',
-            workspace_id TEXT NOT NULL DEFAULT '',
-            updated_at_ms INTEGER NOT NULL DEFAULT 0,
-            metadata_json TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_asset_items_workspace
-            ON workspace_asset_items(workspace_id, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_asset_items_repo
-            ON workspace_asset_items(repo_id, updated_at);
         CREATE INDEX IF NOT EXISTS idx_asset_items_blob
-            ON workspace_asset_items(blob_id, updated_at);
+            ON account_asset_items(blob_id, updated_at);
         CREATE INDEX IF NOT EXISTS idx_asset_items_status
-            ON workspace_asset_items(cloud_status, updated_at);
+            ON account_asset_items(cloud_status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_asset_items_hash
-            ON workspace_asset_items(sha256, size_bytes);
+            ON account_asset_items(sha256, size_bytes);
         CREATE INDEX IF NOT EXISTS idx_asset_transfers_asset
-            ON workspace_asset_transfers(asset_id, updated_at);
+            ON account_asset_transfers(asset_id, updated_at);
         CREATE INDEX IF NOT EXISTS idx_asset_transfers_cloud
-            ON workspace_asset_transfers(cloud_id, status, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_asset_transfers_workspace
-            ON workspace_asset_transfers(workspace_id, updated_at);
+            ON account_asset_transfers(cloud_id, status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_asset_transfers_status
-            ON workspace_asset_transfers(status, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_asset_snapshots_updated
-            ON workspace_asset_snapshots(updated_at_ms);
+            ON account_asset_transfers(status, updated_at);
         ",
     )?;
-    let _ = conn.execute(
-        "ALTER TABLE workspace_asset_transfers ADD COLUMN cloud_id TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE workspace_asset_transfers ADD COLUMN provider_kind TEXT NOT NULL DEFAULT ''",
-        [],
-    );
     // Clouds-list responses were once mirrored as asset rows (the response
     // aliases its clouds as `items`), leaving id-keyed ghosts with no name,
     // hash, blob, or path: purge anything matching that junk shape.
     let _ = conn.execute(
-        "DELETE FROM workspace_asset_items
+        "DELETE FROM account_asset_items
          WHERE TRIM(name)='' AND TRIM(sha256)='' AND TRIM(blob_id)='' AND TRIM(local_path)=''",
         [],
     );
@@ -19211,7 +18983,7 @@ fn cloud_mcp_asset_library_interrupt_active_transfers(
     let rows = if let Some(before_mirror_ms) = before_mirror_ms {
         let mut statement = conn.prepare(
             "SELECT transfer_id, row_json
-             FROM workspace_asset_transfers
+             FROM account_asset_transfers
              WHERE status IN ('queued', 'preparing', 'prepared', 'uploading',
                               'downloading', 'verifying', 'committing', 'warming_cache')
                AND mirror_updated_at_ms > 0
@@ -19224,7 +18996,7 @@ fn cloud_mcp_asset_library_interrupt_active_transfers(
     } else {
         let mut statement = conn.prepare(
             "SELECT transfer_id, row_json
-             FROM workspace_asset_transfers
+             FROM account_asset_transfers
              WHERE status IN ('queued', 'preparing', 'prepared', 'uploading',
                               'downloading', 'verifying', 'committing', 'warming_cache')",
         )?;
@@ -19237,7 +19009,7 @@ fn cloud_mcp_asset_library_interrupt_active_transfers(
     for (transfer_id, row_json) in rows {
         let interrupted_row = cloud_mcp_asset_transfer_row_interrupted(&row_json, &now, reason);
         changed += conn.execute(
-            "UPDATE workspace_asset_transfers
+            "UPDATE account_asset_transfers
              SET status='interrupted',
                  updated_at=?2,
                  mirror_updated_at_ms=?3,
@@ -19269,15 +19041,15 @@ fn cloud_mcp_asset_library_prune_transfers(conn: &rusqlite::Connection) -> rusql
         )?;
     }
     conn.execute(
-        "DELETE FROM workspace_asset_transfers
+        "DELETE FROM account_asset_transfers
          WHERE status IN ('completed', 'failed', 'interrupted', 'cancelled')
            AND mirror_updated_at_ms < ?1",
         rusqlite::params![now_ms - CLOUD_MCP_ASSET_TRANSFER_TERMINAL_RETENTION_MS],
     )?;
     conn.execute(
-        "DELETE FROM workspace_asset_transfers
+        "DELETE FROM account_asset_transfers
          WHERE transfer_id IN (
-           SELECT transfer_id FROM workspace_asset_transfers
+           SELECT transfer_id FROM account_asset_transfers
            ORDER BY mirror_updated_at_ms DESC
            LIMIT -1 OFFSET ?1
          )",
@@ -19336,22 +19108,6 @@ fn cloud_mcp_open_asset_library_conn() -> Result<rusqlite::Connection, String> {
     Ok(conn)
 }
 
-fn cloud_mcp_extract_workspace_assets(value: &Value) -> Option<Value> {
-    if let Some(assets) = value
-        .get("workspace_assets")
-        .or_else(|| value.get("workspaceAssets"))
-        .filter(|item| item.is_object())
-    {
-        return Some(assets.clone());
-    }
-    for key in ["data", "payload", "result", "stored"] {
-        if let Some(found) = value.get(key).and_then(cloud_mcp_extract_workspace_assets) {
-            return Some(found);
-        }
-    }
-    None
-}
-
 /// Only objects carrying a real asset id are asset rows. Responses reuse
 /// generic container keys for other entities too (the clouds list aliases its
 /// clouds as `items`), and ingesting those by their bare `id` plants ghost
@@ -19385,8 +19141,8 @@ fn cloud_mcp_asset_items_from_response(value: &Value) -> Vec<Value> {
         "payload",
         "result",
         "stored",
-        "workspace_assets",
-        "workspaceAssets",
+        "account_assets",
+        "accountAssets",
     ] {
         if let Some(child) = value.get(key) {
             items.extend(cloud_mcp_asset_items_from_response(child));
@@ -19408,8 +19164,8 @@ fn cloud_mcp_asset_transfers_from_response(value: &Value) -> Vec<Value> {
         "payload",
         "result",
         "stored",
-        "workspace_assets",
-        "workspaceAssets",
+        "account_assets",
+        "accountAssets",
     ] {
         if let Some(child) = value.get(key) {
             transfers.extend(cloud_mcp_asset_transfers_from_response(child));
@@ -19585,12 +19341,6 @@ fn cloud_mcp_asset_merge_local_overlay_row(remote: &mut Value, local: &Value) {
         "path",
         "local_status",
         "localStatus",
-        "workspace_name",
-        "workspaceName",
-        "workspace_id",
-        "workspaceId",
-        "repo_id",
-        "repoId",
     ] {
         if let Some(value) = local
             .get(key)
@@ -19655,8 +19405,8 @@ fn cloud_mcp_asset_response_bool(value: &Value, keys: &[&str]) -> bool {
         "payload",
         "result",
         "stored",
-        "workspace_assets",
-        "workspaceAssets",
+        "account_assets",
+        "accountAssets",
     ] {
         if let Some(child) = value.get(key) {
             if cloud_mcp_asset_response_bool(child, keys) {
@@ -19671,30 +19421,28 @@ fn cloud_mcp_update_asset_library_conn(
     conn: &rusqlite::Connection,
     source: &str,
     base_url: Option<&str>,
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_id: Option<&str>,
+    _workspace_id: Option<&str>,
     response: &Value,
 ) -> Result<(), String> {
     cloud_mcp_asset_library_init_conn(conn)
         .map_err(|error| format!("Unable to initialize asset cache: {error}"))?;
-    conn.execute_batch("SAVEPOINT workspace_asset_cache_update")
+    conn.execute_batch("SAVEPOINT account_asset_cache_update")
         .map_err(|error| format!("Unable to start asset cache update: {error}"))?;
     let result = cloud_mcp_update_asset_library_conn_inner(
         conn,
         source,
         base_url,
-        repo_id,
-        workspace_id,
         response,
     );
     match result {
         Ok(()) => conn
-            .execute_batch("RELEASE SAVEPOINT workspace_asset_cache_update")
+            .execute_batch("RELEASE SAVEPOINT account_asset_cache_update")
             .map_err(|error| format!("Unable to commit asset cache update: {error}")),
         Err(error) => {
             let _ = conn.execute_batch(
-                "ROLLBACK TO SAVEPOINT workspace_asset_cache_update;
-                 RELEASE SAVEPOINT workspace_asset_cache_update;",
+                "ROLLBACK TO SAVEPOINT account_asset_cache_update;
+                 RELEASE SAVEPOINT account_asset_cache_update;",
             );
             Err(error)
         }
@@ -19705,46 +19453,15 @@ fn cloud_mcp_update_asset_library_conn_inner(
     conn: &rusqlite::Connection,
     source: &str,
     base_url: Option<&str>,
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
     response: &Value,
 ) -> Result<(), String> {
     let now_ms = cloud_mcp_now_ms() as i64;
     let asset_items = cloud_mcp_asset_items_from_response(response);
     let transfers = cloud_mcp_asset_transfers_from_response(response);
-    let workspace_assets = cloud_mcp_extract_workspace_assets(response);
     let authoritative_full_snapshot = source == "asset_library_list_snapshot"
         && cloud_mcp_asset_response_bool(response, &["snapshot_full", "snapshotFull"]);
-    if asset_items.is_empty()
-        && transfers.is_empty()
-        && workspace_assets.is_none()
-        && !authoritative_full_snapshot
-    {
+    if asset_items.is_empty() && transfers.is_empty() && !authoritative_full_snapshot {
         return Ok(());
-    }
-    if let Some(workspace_assets) = workspace_assets {
-        let entry_key = cloud_mcp_todo_mirror_entry_key(base_url, repo_id, workspace_id);
-        conn.execute(
-            "INSERT INTO workspace_asset_snapshots(
-                entry_key, base_url, repo_id, workspace_id, updated_at_ms, metadata_json
-             )
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(entry_key) DO UPDATE SET
-                base_url=excluded.base_url,
-                repo_id=excluded.repo_id,
-                workspace_id=excluded.workspace_id,
-                updated_at_ms=excluded.updated_at_ms,
-                metadata_json=excluded.metadata_json",
-            rusqlite::params![
-                entry_key,
-                base_url.unwrap_or_default(),
-                repo_id.unwrap_or_default(),
-                workspace_id.unwrap_or_default(),
-                now_ms,
-                workspace_assets.to_string(),
-            ],
-        )
-        .map_err(|error| format!("Unable to update asset snapshot cache: {error}"))?;
     }
     let authoritative_asset_ids = asset_items
         .iter()
@@ -19752,12 +19469,13 @@ fn cloud_mcp_update_asset_library_conn_inner(
         .filter(|asset_id| !asset_id.is_empty())
         .collect::<HashSet<_>>();
     for mut item in asset_items {
+        cloud_mcp_strip_asset_workspace_identity(&mut item);
         let asset_id = cloud_mcp_asset_row_text(&item, &["asset_id", "assetId", "id"]);
         if asset_id.is_empty() {
             continue;
         }
         if let Ok(existing_json) = conn.query_row(
-            "SELECT row_json FROM workspace_asset_items WHERE asset_id=?1 LIMIT 1",
+            "SELECT row_json FROM account_asset_items WHERE asset_id=?1 LIMIT 1",
             [&asset_id],
             |row| row.get::<_, String>(0),
         ) {
@@ -19765,20 +19483,15 @@ fn cloud_mcp_update_asset_library_conn_inner(
                 cloud_mcp_asset_merge_local_overlay_row(&mut item, &existing);
             }
         }
-        let row_repo_id = cloud_mcp_asset_row_text(&item, &["repo_id", "repoId"]);
-        let row_workspace_id = cloud_mcp_asset_row_text(&item, &["workspace_id", "workspaceId"]);
         conn.execute(
-            "INSERT INTO workspace_asset_items(
-                asset_id, base_url, repo_id, workspace_id, workspace_name, name, kind,
-                mime_type, size_bytes, sha256, blob_id, cloud_status, local_status,
-                local_path, object_key, origin_device_id, updated_at, mirror_updated_at_ms, row_json
+            "INSERT INTO account_asset_items(
+                asset_id, base_url, name, kind, mime_type, size_bytes, sha256,
+                blob_id, cloud_status, local_status, local_path, object_key,
+                origin_device_id, updated_at, mirror_updated_at_ms, row_json
              )
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(asset_id) DO UPDATE SET
                 base_url=excluded.base_url,
-                repo_id=excluded.repo_id,
-                workspace_id=excluded.workspace_id,
-                workspace_name=excluded.workspace_name,
                 name=excluded.name,
                 kind=excluded.kind,
                 mime_type=excluded.mime_type,
@@ -19787,11 +19500,11 @@ fn cloud_mcp_update_asset_library_conn_inner(
                 blob_id=excluded.blob_id,
                 cloud_status=excluded.cloud_status,
                 local_status=CASE
-                    WHEN excluded.local_status='' OR excluded.local_status='unknown' THEN workspace_asset_items.local_status
+                    WHEN excluded.local_status='' OR excluded.local_status='unknown' THEN account_asset_items.local_status
                     ELSE excluded.local_status
                 END,
                 local_path=CASE
-                    WHEN excluded.local_path='' THEN workspace_asset_items.local_path
+                    WHEN excluded.local_path='' THEN account_asset_items.local_path
                     ELSE excluded.local_path
                 END,
                 object_key=excluded.object_key,
@@ -19802,9 +19515,6 @@ fn cloud_mcp_update_asset_library_conn_inner(
             rusqlite::params![
                 asset_id,
                 base_url.unwrap_or_default(),
-                if row_repo_id.is_empty() { repo_id.unwrap_or_default() } else { row_repo_id.as_str() },
-                if row_workspace_id.is_empty() { workspace_id.unwrap_or_default() } else { row_workspace_id.as_str() },
-                cloud_mcp_asset_row_text(&item, &["workspace_name", "workspaceName"]),
                 cloud_mcp_asset_row_text(&item, &["name", "filename", "file_name", "fileName"]),
                 cloud_mcp_asset_row_text(&item, &["kind", "asset_kind", "assetKind"]),
                 cloud_mcp_asset_row_text(&item, &["mime_type", "mimeType"]),
@@ -19824,12 +19534,13 @@ fn cloud_mcp_update_asset_library_conn_inner(
         .map_err(|error| format!("Unable to update asset item cache from {source}: {error}"))?;
     }
     for mut transfer in transfers {
+        cloud_mcp_strip_asset_workspace_identity(&mut transfer);
         let transfer_id = cloud_mcp_asset_row_text(&transfer, &["transfer_id", "transferId", "id"]);
         if transfer_id.is_empty() {
             continue;
         }
         if let Ok(existing_json) = conn.query_row(
-            "SELECT row_json FROM workspace_asset_transfers WHERE transfer_id=?1 LIMIT 1",
+            "SELECT row_json FROM account_asset_transfers WHERE transfer_id=?1 LIMIT 1",
             [&transfer_id],
             |row| row.get::<_, String>(0),
         ) {
@@ -19838,18 +19549,16 @@ fn cloud_mcp_update_asset_library_conn_inner(
             }
         }
         conn.execute(
-            "INSERT INTO workspace_asset_transfers(
-                transfer_id, asset_id, cloud_id, provider_kind, base_url, repo_id, workspace_id, direction, status,
-                bytes_total, bytes_done, updated_at, mirror_updated_at_ms, row_json
+            "INSERT INTO account_asset_transfers(
+                transfer_id, asset_id, cloud_id, provider_kind, base_url, direction,
+                status, bytes_total, bytes_done, updated_at, mirror_updated_at_ms, row_json
              )
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(transfer_id) DO UPDATE SET
                 asset_id=excluded.asset_id,
                 cloud_id=excluded.cloud_id,
                 provider_kind=excluded.provider_kind,
                 base_url=excluded.base_url,
-                repo_id=excluded.repo_id,
-                workspace_id=excluded.workspace_id,
                 direction=excluded.direction,
                 status=excluded.status,
                 bytes_total=excluded.bytes_total,
@@ -19863,8 +19572,6 @@ fn cloud_mcp_update_asset_library_conn_inner(
                 cloud_mcp_asset_row_text(&transfer, &["cloud_id", "cloudId"]),
                 cloud_mcp_asset_row_text(&transfer, &["provider_kind", "providerKind", "provider"]),
                 base_url.unwrap_or_default(),
-                cloud_mcp_asset_row_text(&transfer, &["repo_id", "repoId"]),
-                cloud_mcp_asset_row_text(&transfer, &["workspace_id", "workspaceId"]),
                 cloud_mcp_asset_row_text(&transfer, &["direction"]),
                 cloud_mcp_asset_row_text(&transfer, &["status"]),
                 cloud_mcp_asset_row_i64(&transfer, &["bytes_total", "bytesTotal"]),
@@ -19877,25 +19584,14 @@ fn cloud_mcp_update_asset_library_conn_inner(
         .map_err(|error| format!("Unable to update asset transfer cache from {source}: {error}"))?;
         let transfer_status = cloud_mcp_asset_row_text(&transfer, &["status"]);
         if cloud_mcp_asset_transfer_status_is_billable(&transfer_status) {
-            let row_repo_id = cloud_mcp_asset_row_text(&transfer, &["repo_id", "repoId"]);
-            let row_workspace_id =
-                cloud_mcp_asset_row_text(&transfer, &["workspace_id", "workspaceId"]);
             let transfer_bytes =
                 cloud_mcp_asset_row_i64(&transfer, &["bytes_done", "bytesDone"]).max(
                     cloud_mcp_asset_row_i64(&transfer, &["bytes_total", "bytesTotal"]),
                 );
             let _ = cloud_mcp_record_diffforge_asset_transfer_credit(
                 source,
-                Some(if row_repo_id.is_empty() {
-                    repo_id.unwrap_or_default()
-                } else {
-                    row_repo_id.as_str()
-                }),
-                Some(if row_workspace_id.is_empty() {
-                    workspace_id.unwrap_or_default()
-                } else {
-                    row_workspace_id.as_str()
-                }),
+                None,
+                None,
                 &cloud_mcp_asset_row_text(&transfer, &["asset_id", "assetId"]),
                 &transfer_id,
                 &cloud_mcp_asset_row_text(&transfer, &["cloud_id", "cloudId"]),
@@ -19905,26 +19601,13 @@ fn cloud_mcp_update_asset_library_conn_inner(
         }
     }
     if authoritative_full_snapshot {
-        let mut sql = "SELECT asset_id, local_path, row_json FROM workspace_asset_items WHERE 1=1"
-            .to_string();
-        let mut scope_params = Vec::<String>::new();
-        if let Some(repo_id) = repo_id.filter(|value| !value.trim().is_empty()) {
-            sql.push_str(" AND repo_id=?");
-            scope_params.push(repo_id.to_string());
-        }
-        if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
-            sql.push_str(" AND workspace_id=?");
-            scope_params.push(workspace_id.to_string());
-        }
-        let dyn_params = scope_params
-            .iter()
-            .map(|value| value as &dyn rusqlite::ToSql)
-            .collect::<Vec<_>>();
+        let sql =
+            "SELECT asset_id, local_path, row_json FROM account_asset_items WHERE 1=1";
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare(sql)
             .map_err(|error| format!("Unable to prepare stale asset reconciliation: {error}"))?;
         let mapped = stmt
-            .query_map(rusqlite::params_from_iter(dyn_params), |row| {
+            .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -19940,7 +19623,7 @@ fn cloud_mcp_update_asset_library_conn_inner(
             }
             if local_path.trim().is_empty() {
                 conn.execute(
-                    "DELETE FROM workspace_asset_items WHERE asset_id=?1",
+                    "DELETE FROM account_asset_items WHERE asset_id=?1",
                     [&asset_id],
                 )
                 .map_err(|error| format!("Unable to prune stale cloud asset: {error}"))?;
@@ -19955,8 +19638,9 @@ fn cloud_mcp_update_asset_library_conn_inner(
                 object.insert("object_key".to_string(), json!(""));
                 object.insert("objectKey".to_string(), json!(""));
             }
+            cloud_mcp_strip_asset_workspace_identity(&mut row);
             conn.execute(
-                "UPDATE workspace_asset_items
+                "UPDATE account_asset_items
                  SET cloud_status='local_only', blob_id='', object_key='', row_json=?1,
                      mirror_updated_at_ms=?2
                  WHERE asset_id=?3",
@@ -19974,26 +19658,10 @@ fn cloud_mcp_update_asset_library_from_response(
     request: &Value,
     response: &Value,
 ) {
+    let _ = request;
     let base_url = Some(cloud_mcp_base_url());
-    let include_all_workspaces = cloud_mcp_payload_bool(
-        request,
-        &["include_all_workspaces", "includeAllWorkspaces"],
-        false,
-    );
-    let repo_id = (!include_all_workspaces)
-        .then(|| {
-            cloud_mcp_payload_text(response, &["repo_id", "repoId"])
-                .or_else(|| cloud_mcp_payload_text(request, &["repo_id", "repoId"]))
-        })
-        .flatten();
-    let workspace_id = (!include_all_workspaces)
-        .then(|| {
-            cloud_mcp_payload_text(response, &["workspace_id", "workspaceId"])
-                .or_else(|| cloud_mcp_payload_text(request, &["workspace_id", "workspaceId"]))
-        })
-        .flatten();
     if !endpoint.unwrap_or_default().contains("/assets")
-        && !cloud_mcp_is_workspace_asset_wake_event(
+        && !cloud_mcp_is_account_asset_wake_event(
             cloud_mcp_payload_text(response, &["event_kind", "eventKind", "kind"])
                 .as_deref()
                 .unwrap_or_default(),
@@ -20009,8 +19677,8 @@ fn cloud_mcp_update_asset_library_from_response(
             &conn,
             source,
             base_url.as_deref(),
-            repo_id.as_deref(),
-            workspace_id.as_deref(),
+            None,
+            None,
             response,
         );
     }
@@ -20018,35 +19686,19 @@ fn cloud_mcp_update_asset_library_from_response(
 
 fn cloud_mcp_asset_library_rows_from_conn(
     conn: &rusqlite::Connection,
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
     cloud_mcp_asset_library_init_conn(conn)
         .map_err(|error| format!("Unable to initialize asset library cache: {error}"))?;
-    let mut sql = "SELECT row_json, local_path, local_status FROM workspace_asset_items WHERE 1=1"
+    let mut sql = "SELECT row_json, local_path, local_status FROM account_asset_items WHERE 1=1"
         .to_string();
-    let mut params = Vec::<String>::new();
-    if let Some(repo_id) = repo_id.filter(|value| !value.trim().is_empty()) {
-        sql.push_str(" AND repo_id=?");
-        params.push(repo_id.to_string());
-    }
-    if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
-        sql.push_str(" AND workspace_id=?");
-        params.push(workspace_id.to_string());
-    }
     sql.push_str(" ORDER BY updated_at DESC, mirror_updated_at_ms DESC LIMIT ?");
     let limit = limit.clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS) as i64;
-    let mut dyn_params: Vec<&dyn rusqlite::ToSql> = params
-        .iter()
-        .map(|value| value as &dyn rusqlite::ToSql)
-        .collect();
-    dyn_params.push(&limit);
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|error| format!("Unable to query asset library cache: {error}"))?;
     let mapped = stmt
-        .query_map(rusqlite::params_from_iter(dyn_params), |row| {
+        .query_map(rusqlite::params![limit], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -20059,6 +19711,7 @@ fn cloud_mcp_asset_library_rows_from_conn(
         if let Ok((text, local_path, local_status)) = row {
             if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
                 cloud_mcp_asset_overlay_local_columns(&mut value, &local_path, &local_status);
+                cloud_mcp_strip_asset_workspace_identity(&mut value);
                 rows.push(value);
             }
         }
@@ -20070,12 +19723,11 @@ fn cloud_mcp_asset_library_transfers_from_conn(
     conn: &rusqlite::Connection,
     asset_id: Option<&str>,
     transfer_id: Option<&str>,
-    workspace_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
     cloud_mcp_asset_library_init_conn(conn)
         .map_err(|error| format!("Unable to initialize asset library cache: {error}"))?;
-    let mut sql = "SELECT row_json FROM workspace_asset_transfers WHERE 1=1".to_string();
+    let mut sql = "SELECT row_json FROM account_asset_transfers WHERE 1=1".to_string();
     let mut params = Vec::<String>::new();
     if let Some(asset_id) = asset_id.filter(|value| !value.trim().is_empty()) {
         sql.push_str(" AND asset_id=?");
@@ -20084,10 +19736,6 @@ fn cloud_mcp_asset_library_transfers_from_conn(
     if let Some(transfer_id) = transfer_id.filter(|value| !value.trim().is_empty()) {
         sql.push_str(" AND transfer_id=?");
         params.push(transfer_id.to_string());
-    }
-    if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
-        sql.push_str(" AND workspace_id=?");
-        params.push(workspace_id.to_string());
     }
     sql.push_str(" ORDER BY updated_at DESC, mirror_updated_at_ms DESC LIMIT ?");
     let limit = limit.clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS) as i64;
@@ -20107,7 +19755,8 @@ fn cloud_mcp_asset_library_transfers_from_conn(
     let mut rows = Vec::new();
     for row in mapped {
         if let Ok(text) = row {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+                cloud_mcp_strip_asset_workspace_identity(&mut value);
                 rows.push(value);
             }
         }
@@ -20116,12 +19765,15 @@ fn cloud_mcp_asset_library_transfers_from_conn(
 }
 
 fn cloud_mcp_asset_library_response_from_rows(
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
     mut rows: Vec<Value>,
     mut transfers: Vec<Value>,
     error: Option<String>,
 ) -> Value {
+    rows.iter_mut()
+        .for_each(cloud_mcp_strip_asset_workspace_identity);
+    transfers
+        .iter_mut()
+        .for_each(cloud_mcp_strip_asset_workspace_identity);
     cloud_mcp_filter_unavailable_asset_rows(&mut rows, &mut transfers);
     let asset_count = rows.len();
     let transfer_count = transfers.len();
@@ -20148,13 +19800,9 @@ fn cloud_mcp_asset_library_response_from_rows(
         .filter(|transfer| transfer.get("status").and_then(Value::as_str) == Some("failed"))
         .count();
     json!({
-        "kind": "workspace_assets",
+        "kind": "account_assets",
         "version": 1,
         "source": "local_asset_library",
-        "repo_id": repo_id.unwrap_or_default(),
-        "repoId": repo_id.unwrap_or_default(),
-        "workspace_id": workspace_id.unwrap_or_default(),
-        "workspaceId": workspace_id.unwrap_or_default(),
         "items": rows.clone(),
         "assets": rows,
         "transfers": transfers.clone(),
@@ -20198,12 +19846,6 @@ fn cloud_mcp_asset_library_merge_local(mut remote: Value, local: Value) -> Value
                     "path",
                     "local_status",
                     "localStatus",
-                    "workspace_name",
-                    "workspaceName",
-                    "workspace_id",
-                    "workspaceId",
-                    "repo_id",
-                    "repoId",
                 ] {
                     if let Some(value) = local_object
                         .get(key)
@@ -20277,32 +19919,22 @@ fn cloud_mcp_asset_library_merge_local(mut remote: Value, local: Value) -> Value
     remote
 }
 
-fn cloud_mcp_asset_library_from_file(
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
-    limit: usize,
-) -> Value {
+fn cloud_mcp_asset_library_from_file(limit: usize) -> Value {
     match cloud_mcp_open_asset_library_conn() {
         Ok(conn) => {
-            let rows = cloud_mcp_asset_library_rows_from_conn(&conn, repo_id, workspace_id, limit)
-                .unwrap_or_default();
+            let rows = cloud_mcp_asset_library_rows_from_conn(&conn, limit).unwrap_or_default();
             let transfers = cloud_mcp_asset_library_transfers_from_conn(
                 &conn,
                 None,
                 None,
-                workspace_id,
                 CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS,
             )
             .unwrap_or_default();
-            cloud_mcp_asset_library_response_from_rows(repo_id, workspace_id, rows, transfers, None)
+            cloud_mcp_asset_library_response_from_rows(rows, transfers, None)
         }
-        Err(error) => cloud_mcp_asset_library_response_from_rows(
-            repo_id,
-            workspace_id,
-            Vec::new(),
-            Vec::new(),
-            Some(error),
-        ),
+        Err(error) => {
+            cloud_mcp_asset_library_response_from_rows(Vec::new(), Vec::new(), Some(error))
+        }
     }
 }
 
@@ -25329,31 +24961,13 @@ fn cloud_mcp_repo_request(
     }
 }
 
-/// Fixed scope marker for account-level assets: the cloud keys asset rows by
-/// account_id + asset_id and treats workspace/repo columns as descriptive
-/// metadata, so asset commands never need a real repo behind them.
-const CLOUD_MCP_ACCOUNT_ASSET_REPO_ID: &str = "account-assets";
-const CLOUD_MCP_ACCOUNT_ASSET_WORKSPACE_ID: &str = "default";
-
-/// Asset commands are account-level: an empty repo path resolves to the fixed
-/// account scope instead of deriving a repo id from the filesystem, so snips
-/// and other workspace-less assets upload, publish, and delete globally.
-fn cloud_mcp_asset_scope_request(
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-) -> CloudMcpRepoRequest {
-    if repo_path.trim().is_empty() {
-        return CloudMcpRepoRequest {
-            root_display: String::new(),
-            repo_id: CLOUD_MCP_ACCOUNT_ASSET_REPO_ID.to_string(),
-            workspace_id: workspace_id
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| Some(CLOUD_MCP_ACCOUNT_ASSET_WORKSPACE_ID.to_string())),
-            workspace_name: workspace_name.filter(|value| !value.trim().is_empty()),
-        };
+pub(crate) fn cloud_mcp_asset_scope_request() -> CloudMcpRepoRequest {
+    CloudMcpRepoRequest {
+        root_display: String::new(),
+        repo_id: String::new(),
+        workspace_id: None,
+        workspace_name: None,
     }
-    cloud_mcp_repo_request(repo_path, workspace_id, workspace_name)
 }
 
 fn cloud_mcp_task_history_cache_key(req: &CloudMcpRepoRequest) -> String {
@@ -26092,9 +25706,11 @@ mod cloud_mcp_tests {
         assert!(local_path_buf.starts_with(expected_asset_root));
         assert_eq!(fs::read(&local_path_buf).unwrap(), b"fake png payload");
         assert_eq!(
-            promoted["asset"]["workspaceId"].as_str(),
-            Some("workspace-a")
+            promoted["asset"]["assetScope"].as_str(),
+            Some("account")
         );
+        assert!(promoted["asset"]["workspaceId"].is_null());
+        assert!(promoted["asset"]["repoId"].is_null());
         assert_eq!(promoted["asset"]["sourceKind"].as_str(), Some("imagegen"));
         assert_eq!(
             promoted["asset"]["metadata"]["originalPath"].as_str(),
@@ -26143,7 +25759,7 @@ mod cloud_mcp_tests {
     #[test]
     fn asset_items_extraction_skips_non_asset_objects() {
         let clouds_list = json!({
-            "kind": "workspace_asset_clouds",
+            "kind": "asset_library_clouds",
             "items": [
                 { "id": "diffforge-ai-cloud", "label": "Diff Forge AI Cloud", "provider_kind": "diffforge" }
             ],
@@ -26740,7 +26356,7 @@ mod cloud_mcp_tests {
         )
         .unwrap();
 
-        let rows = cloud_mcp_asset_library_rows_from_conn(&conn, None, None, 10).unwrap();
+        let rows = cloud_mcp_asset_library_rows_from_conn(&conn, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["local_path"].as_str(), Some("/tmp/image.png"));
         assert_eq!(rows[0]["size_bytes"].as_i64(), Some(42));
@@ -26759,7 +26375,7 @@ mod cloud_mcp_tests {
         )
         .unwrap();
 
-        let rows = cloud_mcp_asset_library_rows_from_conn(&conn, None, None, 10).unwrap();
+        let rows = cloud_mcp_asset_library_rows_from_conn(&conn, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["local_path"].as_str(), Some("/tmp/image.png"));
         assert_eq!(rows[0]["cloud_status"].as_str(), Some("local_only"));
@@ -27444,28 +27060,18 @@ pub(crate) fn cloud_mcp_forward_agent_list_todo_targets(
 }
 
 pub(crate) fn cloud_mcp_forward_agent_list_assets(
-    repo_path: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _workspace_id: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
-    let repo_path_text = repo_path.unwrap_or_default().trim().to_string();
-    let repo_id = (!repo_path_text.is_empty())
-        .then(|| format!("repo-{}", cloud_mcp_short_hash(&repo_path_text)));
     let limit = cloud_mcp_payload_i64(input, &["limit"])
         .unwrap_or(100)
         .max(1) as usize;
-    let library = cloud_mcp_asset_library_from_file(repo_id.as_deref(), workspace_id, limit);
-    Ok(cloud_mcp_filter_asset_library_for_agent(
-        repo_id.as_deref(),
-        workspace_id,
-        input,
-        library,
-    ))
+    let library = cloud_mcp_asset_library_from_file(limit);
+    Ok(cloud_mcp_filter_asset_library_for_agent(input, library))
 }
 
 fn cloud_mcp_filter_asset_library_for_agent(
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
     input: &Value,
     library: Value,
 ) -> Value {
@@ -27601,7 +27207,7 @@ fn cloud_mcp_filter_asset_library_for_agent(
         }
         true
     });
-    cloud_mcp_asset_library_response_from_rows(repo_id, workspace_id, rows, transfers, None)
+    cloud_mcp_asset_library_response_from_rows(rows, transfers, None)
 }
 
 fn cloud_mcp_asset_transfer_status_is_active(status: &str) -> bool {
@@ -27619,16 +27225,10 @@ fn cloud_mcp_asset_transfer_status_is_active(status: &str) -> bool {
 }
 
 pub(crate) fn cloud_mcp_forward_agent_get_asset_root(
-    repo_path: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _workspace_id: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
-    let repo_path_text = repo_path.unwrap_or_default().trim().to_string();
-    let req = cloud_mcp_repo_request(
-        repo_path_text,
-        workspace_id.map(str::to_string),
-        cloud_mcp_payload_text(input, &["workspace_name", "workspaceName"]),
-    );
     let asset_id = cloud_mcp_payload_text(input, &["asset_id", "assetId", "id"])
         .map(|value| cloud_mcp_sanitize_asset_id(&value))
         .unwrap_or_else(|| format!("asset-{}", uuid::Uuid::new_v4()));
@@ -27647,8 +27247,6 @@ pub(crate) fn cloud_mcp_forward_agent_get_asset_root(
     fs::create_dir_all(&asset_dir)
         .map_err(|error| format!("Unable to create managed asset directory: {error}"))?;
     let local_path = cloud_mcp_available_asset_download_path(&asset_dir, &filename);
-    let workspace_name_text = req.workspace_name.clone().unwrap_or_default();
-    let repo_id = req.repo_id.clone();
     Ok(json!({
         "kind": "asset_root",
         "source": "managed_asset_library",
@@ -27661,24 +27259,15 @@ pub(crate) fn cloud_mcp_forward_agent_get_asset_root(
         "path": local_path.display().to_string(),
         "relative_path": local_path.strip_prefix(&asset_root).ok().map(|path| path.display().to_string()).unwrap_or_default(),
         "relativePath": local_path.strip_prefix(&asset_root).ok().map(|path| path.display().to_string()).unwrap_or_default(),
-        "workspace_id": workspace_id.unwrap_or_default(),
-        "workspaceId": workspace_id.unwrap_or_default(),
-        "workspace_name": workspace_name_text.clone(),
-        "workspaceName": workspace_name_text,
-        "repo_id": repo_id.clone(),
-        "repoId": repo_id,
         "instruction": "Write generated or reusable media under assetRoot, then call upload_asset with the written path.",
     }))
 }
 
 fn cloud_mcp_asset_registration_payload_from_row(
-    req: &CloudMcpRepoRequest,
-    workspace_id: &str,
-    workspace_name: Option<&str>,
     reason: &str,
     row: &Value,
 ) -> Value {
-    let mut payload = cloud_mcp_asset_payload_base(req, workspace_id, workspace_name, reason);
+    let mut payload = cloud_mcp_asset_payload_base(reason);
     if let Some(object) = payload.as_object_mut() {
         for key in [
             "asset_id",
@@ -27727,7 +27316,7 @@ fn cloud_mcp_forward_agent_asset_transfer_status(
     let limit = cloud_mcp_payload_i64(input, &["limit"])
         .unwrap_or(100)
         .clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS as i64) as usize;
-    let library = cloud_mcp_asset_library_from_file(None, None, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS);
+    let library = cloud_mcp_asset_library_from_file(CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS);
     Ok(cloud_mcp_asset_transfer_status_from_local(
         input, direction, reason, library, limit,
     ))
@@ -27818,10 +27407,9 @@ fn cloud_mcp_asset_transfer_status_from_local(
         (!asset_ids.is_empty() && asset_ids.contains(&asset_id))
             || transfer_asset_ids.contains(&asset_id)
     });
-    let mut response =
-        cloud_mcp_asset_library_response_from_rows(None, None, assets, transfers, None);
+    let mut response = cloud_mcp_asset_library_response_from_rows(assets, transfers, None);
     if let Some(object) = response.as_object_mut() {
-        object.insert("kind".to_string(), json!("workspace_asset_status"));
+        object.insert("kind".to_string(), json!("asset_library_status"));
         object.insert("source".to_string(), json!("local_asset_library"));
         object.insert("status_source".to_string(), json!("local_rust_mirror"));
         object.insert("statusSource".to_string(), json!("local_rust_mirror"));
@@ -27864,8 +27452,8 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset_status(
 }
 
 pub(crate) fn cloud_mcp_forward_agent_upload_asset(
-    repo_path: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _workspace_id: Option<&str>,
     base_url_override: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
@@ -27909,13 +27497,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
         }
     };
     diffforge_reject_untracked_asset_path_for_tracking(Path::new(&path), "upload a tracked asset")?;
-    let repo_path = repo_path.unwrap_or_default().trim().to_string();
-    let req = cloud_mcp_repo_request(
-        repo_path,
-        workspace_id.map(str::to_string),
-        cloud_mcp_payload_text(&input, &["workspace_name", "workspaceName"]),
-    );
-    let workspace_id_text = workspace_id.unwrap_or_default();
+    let req = cloud_mcp_asset_scope_request();
     let base_url = base_url_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -27923,8 +27505,8 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
         .unwrap_or_else(cloud_mcp_base_url);
     let row = cloud_mcp_asset_local_row_with_input(
         &req,
-        workspace_id_text,
-        req.workspace_name.as_deref(),
+        "",
+        None,
         Path::new(&path),
         &input,
     )?;
@@ -27932,13 +27514,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
     let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
     let local_path = cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"])
         .ok_or_else(|| "upload_asset could not resolve a local path.".to_string())?;
-    let mut payload = cloud_mcp_asset_registration_payload_from_row(
-        &req,
-        workspace_id_text,
-        req.workspace_name.as_deref(),
-        "agent_asset_upload",
-        &row,
-    );
+    let mut payload = cloud_mcp_asset_registration_payload_from_row("agent_asset_upload", &row);
     let mut attached_process_reset = false;
     if let Some(object) = payload.as_object_mut() {
         attached_process_reset = cloud_mcp_asset_attach_process_reset_flag(object);
@@ -27949,7 +27525,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
     }
     let response = match cloud_mcp_proxy_post_json_endpoint(
         &base_url,
-        "/v1/workspace/assets/prepare-upload",
+        "/v1/assets/prepare-upload",
         &payload.to_string(),
     ) {
         Ok(response) => {
@@ -27966,7 +27542,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
     let prepare = parsed.get("data").cloned().unwrap_or(parsed);
     cloud_mcp_update_asset_library_from_response(
         "agent_asset_prepare_upload",
-        Some("/v1/workspace/assets/prepare-upload"),
+        Some("/v1/assets/prepare-upload"),
         &payload,
         &prepare,
     );
@@ -28003,8 +27579,6 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                 http_target.url.clone(),
                 cloud_mcp_asset_http_headers(
                     token.as_deref(),
-                    &req.repo_id,
-                    workspace_id_text,
                     http_target.route_token.as_deref(),
                 )?,
             ));
@@ -28023,7 +27597,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                 while let Some(progress) = progress_rx.blocking_recv() {
                     let _ = cloud_mcp_proxy_post_json_endpoint(
                         &progress_base_url,
-                        "/v1/workspace/assets/report-transfer-progress",
+                        "/v1/assets/report-transfer-progress",
                         &progress.to_string(),
                     );
                 }
@@ -28040,8 +27614,6 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                 attempt_url,
                 attempt_headers,
                 Path::new(&local_path),
-                req.repo_id.clone(),
-                workspace_id_text.to_string(),
                 asset_id.clone(),
                 transfer_id.clone(),
                 transfer_cloud_id.clone(),
@@ -28071,12 +27643,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
             &upload,
         );
         if direct_transfer {
-            let mut complete_payload = cloud_mcp_asset_payload_base(
-                &req,
-                workspace_id_text,
-                req.workspace_name.as_deref(),
-                "agent_asset_upload_complete",
-            );
+            let mut complete_payload = cloud_mcp_asset_payload_base("agent_asset_upload_complete");
             if let Some(object) = complete_payload.as_object_mut() {
                 object.insert("asset_id".to_string(), json!(asset_id));
                 object.insert("assetId".to_string(), json!(asset_id));
@@ -28087,7 +27654,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
             }
             let response = cloud_mcp_proxy_post_json_endpoint(
                 &base_url,
-                "/v1/workspace/assets/complete-upload",
+                "/v1/assets/complete-upload",
                 &complete_payload.to_string(),
             )?;
             let parsed = serde_json::from_str::<Value>(&response)
@@ -28095,7 +27662,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
             let completed = parsed.get("data").cloned().unwrap_or(parsed);
             cloud_mcp_update_asset_library_from_response(
                 "agent_asset_upload_direct_completed",
-                Some("/v1/workspace/assets/complete-upload"),
+                Some("/v1/assets/complete-upload"),
                 &complete_payload,
                 &completed,
             );
@@ -28120,25 +27687,14 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
 }
 
 pub(crate) fn cloud_mcp_forward_agent_delete_cloud_asset(
-    repo_path: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _workspace_id: Option<&str>,
     base_url_override: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
     let asset_id = cloud_mcp_payload_text(input, &["asset_id", "assetId"])
         .ok_or_else(|| "delete_cloud_asset requires asset_id.".to_string())?;
-    let repo_path = repo_path.unwrap_or_default().trim().to_string();
-    let req = cloud_mcp_repo_request(
-        repo_path,
-        workspace_id.map(str::to_string),
-        cloud_mcp_payload_text(input, &["workspace_name", "workspaceName"]),
-    );
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        workspace_id.unwrap_or_default(),
-        req.workspace_name.as_deref(),
-        "agent_asset_delete_cloud",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("agent_asset_delete_cloud");
     if let Some(object) = payload.as_object_mut() {
         object.insert("asset_id".to_string(), json!(asset_id));
         object.insert("assetId".to_string(), json!(asset_id));
@@ -28154,7 +27710,7 @@ pub(crate) fn cloud_mcp_forward_agent_delete_cloud_asset(
         .unwrap_or_else(cloud_mcp_base_url);
     let response = cloud_mcp_proxy_post_json_endpoint(
         &base_url,
-        "/v1/workspace/assets/delete-cloud",
+        "/v1/assets/delete-cloud",
         &payload.to_string(),
     )?;
     let parsed = serde_json::from_str::<Value>(&response)
@@ -28162,7 +27718,7 @@ pub(crate) fn cloud_mcp_forward_agent_delete_cloud_asset(
     let data = parsed.get("data").cloned().unwrap_or(parsed);
     cloud_mcp_update_asset_library_from_response(
         "agent_asset_delete_cloud",
-        Some("/v1/workspace/assets/delete-cloud"),
+        Some("/v1/assets/delete-cloud"),
         &payload,
         &data,
     );
@@ -28182,19 +27738,13 @@ pub(crate) fn cloud_mcp_forward_agent_delete_local_asset(
 }
 
 pub(crate) fn cloud_mcp_forward_agent_download_asset(
-    repo_path: Option<&str>,
-    workspace_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _workspace_id: Option<&str>,
     base_url_override: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
     let asset_id = cloud_mcp_payload_text(input, &["asset_id", "assetId", "id"])
         .ok_or_else(|| "download_asset requires asset_id.".to_string())?;
-    let repo_path = repo_path.unwrap_or_default().trim().to_string();
-    let req = cloud_mcp_repo_request(
-        repo_path.clone(),
-        workspace_id.map(str::to_string),
-        cloud_mcp_payload_text(input, &["workspace_name", "workspaceName"]),
-    );
     let base_url = base_url_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -28204,19 +27754,14 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             cloud_mcp_managed_asset_root()
-                .unwrap_or_else(|_| PathBuf::from(&repo_path).join(".diffforge").join("assets"))
+                .unwrap_or_else(|_| PathBuf::from(".diffforge").join("assets"))
                 .join("cloud")
                 .join(&asset_id)
         });
     diffforge_reject_untracked_asset_path_for_tracking(&target_dir, "download a tracked asset")?;
     fs::create_dir_all(&target_dir)
         .map_err(|error| format!("Unable to create asset target directory: {error}"))?;
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        workspace_id.unwrap_or_default(),
-        req.workspace_name.as_deref(),
-        "agent_asset_download",
-    );
+    let mut payload = cloud_mcp_asset_payload_base("agent_asset_download");
     if let Some(object) = payload.as_object_mut() {
         object.insert("asset_id".to_string(), json!(asset_id));
         object.insert("assetId".to_string(), json!(asset_id));
@@ -28227,7 +27772,7 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
     }
     let response = cloud_mcp_proxy_post_json_endpoint(
         &base_url,
-        "/v1/workspace/assets/prepare-download",
+        "/v1/assets/prepare-download",
         &payload.to_string(),
     )?;
     let parsed = serde_json::from_str::<Value>(&response)
@@ -28235,7 +27780,7 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
     let prepare = parsed.get("data").cloned().unwrap_or(parsed);
     cloud_mcp_update_asset_library_from_response(
         "agent_asset_prepare_download",
-        Some("/v1/workspace/assets/prepare-download"),
+        Some("/v1/assets/prepare-download"),
         &payload,
         &prepare,
     );
@@ -28266,8 +27811,6 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
             http_target.url.clone(),
             cloud_mcp_asset_http_headers(
                 token.as_deref(),
-                &req.repo_id,
-                workspace_id.unwrap_or_default(),
                 http_target.route_token.as_deref(),
             )?,
         ));
@@ -28292,7 +27835,7 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
         while let Some(progress) = progress_rx.blocking_recv() {
             let _ = cloud_mcp_proxy_post_json_endpoint(
                 &progress_base_url,
-                "/v1/workspace/assets/report-transfer-progress",
+                "/v1/assets/report-transfer-progress",
                 &progress.to_string(),
             );
         }
@@ -28306,8 +27849,6 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
             &target_path,
             &expected_hash,
             expected_size,
-            req.repo_id.clone(),
-            workspace_id.unwrap_or_default().to_string(),
             asset_id.clone(),
             transfer_cloud_id.clone(),
             transfer_id.clone(),
@@ -28355,8 +27896,6 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
 }
 
 fn cloud_mcp_asset_store_local_transfer_progress(
-    repo_id: &str,
-    workspace_id: &str,
     asset_id: &str,
     transfer_id: &str,
     cloud_id: &str,
@@ -28368,8 +27907,6 @@ fn cloud_mcp_asset_store_local_transfer_progress(
 ) -> Result<(), String> {
     let conn = cloud_mcp_open_asset_library_conn()?;
     let row = cloud_mcp_asset_transfer_progress_row(
-        repo_id,
-        workspace_id,
         asset_id,
         transfer_id,
         cloud_id,
@@ -28383,16 +27920,16 @@ fn cloud_mcp_asset_store_local_transfer_progress(
         &conn,
         "local_asset_transfer_progress",
         Some(cloud_mcp_base_url().as_str()),
-        Some(repo_id),
-        Some(workspace_id),
+        None,
+        None,
         &json!({"transfers": [row.clone()]}),
     );
     if update.is_ok() {
         if let Some(sender) = CLOUD_MCP_ASSET_LOCAL_EVENT_SENDER.get() {
             let event_kind = if matches!(status, "failed" | "interrupted") {
-                "workspace_asset_transfer_failed"
+                "asset_library_transfer_failed"
             } else {
-                "workspace_asset_transfer_progress"
+                "asset_library_transfer_progress"
             };
             let _ = sender.send(json!({
                 "kind": event_kind,
@@ -28415,8 +27952,6 @@ fn cloud_mcp_asset_store_local_transfer_progress(
 }
 
 fn cloud_mcp_asset_transfer_progress_row(
-    repo_id: &str,
-    workspace_id: &str,
     asset_id: &str,
     transfer_id: &str,
     cloud_id: &str,
@@ -28434,10 +27969,10 @@ fn cloud_mcp_asset_transfer_progress_row(
         "assetId": asset_id,
         "cloud_id": cloud_id,
         "cloudId": cloud_id,
-        "repo_id": repo_id,
-        "repoId": repo_id,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
+        "asset_scope": "account",
+        "assetScope": "account",
+        "library_scope": "account",
+        "libraryScope": "account",
         "direction": direction,
         "status": status,
         "bytes_total": bytes_total,
@@ -28451,8 +27986,6 @@ fn cloud_mcp_asset_transfer_progress_row(
 }
 
 struct CloudMcpAssetTransferProgress {
-    repo_id: String,
-    workspace_id: String,
     asset_id: String,
     transfer_id: String,
     cloud_id: String,
@@ -28466,8 +27999,6 @@ struct CloudMcpAssetTransferProgress {
 
 impl CloudMcpAssetTransferProgress {
     fn new(
-        repo_id: String,
-        workspace_id: String,
         asset_id: String,
         transfer_id: String,
         cloud_id: String,
@@ -28476,8 +28007,6 @@ impl CloudMcpAssetTransferProgress {
         reporter: Option<mpsc::UnboundedSender<Value>>,
     ) -> Self {
         Self {
-            repo_id,
-            workspace_id,
             asset_id,
             transfer_id,
             cloud_id,
@@ -28498,8 +28027,6 @@ impl CloudMcpAssetTransferProgress {
             return;
         }
         let _ = cloud_mcp_asset_store_local_transfer_progress(
-            &self.repo_id,
-            &self.workspace_id,
             &self.asset_id,
             &self.transfer_id,
             &self.cloud_id,
@@ -28511,8 +28038,6 @@ impl CloudMcpAssetTransferProgress {
         );
         if let Some(reporter) = self.reporter.as_ref() {
             let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
-                &self.repo_id,
-                &self.workspace_id,
                 &self.asset_id,
                 &self.transfer_id,
                 &self.cloud_id,
@@ -28594,6 +28119,48 @@ fn cloud_mcp_asset_transfer_error_is_retryable(error: &str) -> bool {
     error.starts_with("Asset upload failed:") || error.starts_with("Asset download failed:")
 }
 
+fn cloud_mcp_asset_transfer_error_requires_reprepare(error: &str, direction: &str) -> bool {
+    if error.contains("cancelled by user") {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    let returned_404 = lower.contains(&format!("asset {direction} returned 404"));
+    returned_404
+        || lower.contains("asset transfer was not found")
+        || lower.contains("asset_transfer_not_found")
+        || lower.contains("unknown transfer")
+        || lower.contains("prepared transfer")
+}
+
+fn cloud_mcp_delete_local_asset_transfer_rows(asset_id: &str, cloud_id: Option<&str>, direction: &str) {
+    let asset_id = asset_id.trim();
+    if asset_id.is_empty() {
+        return;
+    }
+    let Ok(conn) = cloud_mcp_open_asset_library_conn() else {
+        return;
+    };
+    let cloud_id = cloud_id.unwrap_or_default().trim();
+    let direction = direction.trim();
+    if cloud_id.is_empty() {
+        let _ = conn.execute(
+            "DELETE FROM account_asset_transfers
+             WHERE asset_id=?1 AND direction=?2
+               AND status IN ('queued', 'preparing', 'prepared', 'uploading', 'downloading',
+                              'verifying', 'committing', 'warming_cache', 'failed', 'interrupted')",
+            rusqlite::params![asset_id, direction],
+        );
+    } else {
+        let _ = conn.execute(
+            "DELETE FROM account_asset_transfers
+             WHERE asset_id=?1 AND cloud_id=?2 AND direction=?3
+               AND status IN ('queued', 'preparing', 'prepared', 'uploading', 'downloading',
+                              'verifying', 'committing', 'warming_cache', 'failed', 'interrupted')",
+            rusqlite::params![asset_id, cloud_id, direction],
+        );
+    }
+}
+
 struct CloudMcpAssetProgressReader {
     file: fs::File,
     progress: CloudMcpAssetTransferProgress,
@@ -28623,16 +28190,12 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     url: String,
     headers: reqwest::header::HeaderMap,
     local_path: &Path,
-    repo_id: String,
-    workspace_id: String,
     asset_id: String,
     transfer_id: String,
     cloud_id: String,
     bytes_total: i64,
     reporter: Option<mpsc::UnboundedSender<Value>>,
 ) -> Result<Value, String> {
-    let fail_repo_id = repo_id.clone();
-    let fail_workspace_id = workspace_id.clone();
     let fail_asset_id = asset_id.clone();
     let fail_transfer_id = transfer_id.clone();
     let fail_cloud_id = cloud_id.clone();
@@ -28644,8 +28207,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
                 local_path.display()
             );
             let _ = cloud_mcp_asset_store_local_transfer_progress(
-                &fail_repo_id,
-                &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28669,8 +28230,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             max_allowed_bytes
         );
         let _ = cloud_mcp_asset_store_local_transfer_progress(
-            &fail_repo_id,
-            &fail_workspace_id,
             &fail_asset_id,
             &fail_transfer_id,
             &fail_cloud_id,
@@ -28690,8 +28249,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
                 local_path.display()
             );
             let _ = cloud_mcp_asset_store_local_transfer_progress(
-                &fail_repo_id,
-                &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28705,8 +28262,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
         }
     };
     let mut progress = CloudMcpAssetTransferProgress::new(
-        repo_id,
-        workspace_id,
         asset_id,
         transfer_id,
         cloud_id,
@@ -28735,8 +28290,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
                 ("failed", format!("Asset upload failed: {error}"))
             };
             let _ = cloud_mcp_asset_store_local_transfer_progress(
-                &fail_repo_id,
-                &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28767,8 +28320,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             .unwrap_or_else(|| "upload failed".to_string());
         let message = format!("Asset upload returned {}: {}", status.as_u16(), detail);
         let _ = cloud_mcp_asset_store_local_transfer_progress(
-            &fail_repo_id,
-            &fail_workspace_id,
             &fail_asset_id,
             &fail_transfer_id,
             &fail_cloud_id,
@@ -28782,8 +28333,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     }
     let completed_bytes = bytes_total.max(i64::try_from(length).unwrap_or(i64::MAX));
     let _ = cloud_mcp_asset_store_local_transfer_progress(
-        &fail_repo_id,
-        &fail_workspace_id,
         &fail_asset_id,
         &fail_transfer_id,
         &fail_cloud_id,
@@ -28812,15 +28361,11 @@ fn cloud_mcp_download_asset_streaming_blocking(
     target_path: &Path,
     expected_hash: &str,
     expected_size: i64,
-    repo_id: String,
-    workspace_id: String,
     asset_id: String,
     cloud_id: String,
     transfer_id: String,
     reporter: Option<mpsc::UnboundedSender<Value>>,
 ) -> Result<(), String> {
-    let fail_repo_id = repo_id.clone();
-    let fail_workspace_id = workspace_id.clone();
     let fail_asset_id = asset_id.clone();
     let fail_transfer_id = transfer_id.clone();
     let fail_cloud_id = cloud_id.clone();
@@ -28831,9 +28376,8 @@ fn cloud_mcp_download_asset_streaming_blocking(
     {
         Ok(client) => client,
         Err(error) => {
+            let message = format!("Unable to create asset download client: {error}");
             let _ = cloud_mcp_asset_store_local_transfer_progress(
-                &fail_repo_id,
-                &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28841,12 +28385,10 @@ fn cloud_mcp_download_asset_streaming_blocking(
                 "failed",
                 expected_size,
                 0,
-                Some(&format!("Unable to create asset download client: {error}")),
+                Some(&message),
             );
             if let Some(reporter) = failure_reporter.as_ref() {
                 let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
-                    &fail_repo_id,
-                    &fail_workspace_id,
                     &fail_asset_id,
                     &fail_transfer_id,
                     &fail_cloud_id,
@@ -28854,18 +28396,17 @@ fn cloud_mcp_download_asset_streaming_blocking(
                     "failed",
                     expected_size,
                     0,
-                    Some(&format!("Unable to create asset download client: {error}")),
+                    Some(&message),
                 ));
             }
-            return Err(format!("Unable to create asset download client: {error}"));
+            return Err(message);
         }
     };
     let response = match client.get(url).headers(headers).send() {
         Ok(response) => response,
         Err(error) => {
+            let message = format!("Asset download failed: {error}");
             let _ = cloud_mcp_asset_store_local_transfer_progress(
-                &fail_repo_id,
-                &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28873,12 +28414,10 @@ fn cloud_mcp_download_asset_streaming_blocking(
                 "failed",
                 expected_size,
                 0,
-                Some(&format!("Asset download failed: {error}")),
+                Some(&message),
             );
             if let Some(reporter) = failure_reporter.as_ref() {
                 let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
-                    &fail_repo_id,
-                    &fail_workspace_id,
                     &fail_asset_id,
                     &fail_transfer_id,
                     &fail_cloud_id,
@@ -28886,10 +28425,10 @@ fn cloud_mcp_download_asset_streaming_blocking(
                     "failed",
                     expected_size,
                     0,
-                    Some(&format!("Asset download failed: {error}")),
+                    Some(&message),
                 ));
             }
-            return Err(format!("Asset download failed: {error}"));
+            return Err(message);
         }
     };
     let status = response.status();
@@ -28910,8 +28449,6 @@ fn cloud_mcp_download_asset_streaming_blocking(
             .unwrap_or_else(|| "download failed".to_string());
         let message = format!("Asset download returned {}: {}", status.as_u16(), detail);
         let _ = cloud_mcp_asset_store_local_transfer_progress(
-            &fail_repo_id,
-            &fail_workspace_id,
             &fail_asset_id,
             &fail_transfer_id,
             &fail_cloud_id,
@@ -28923,8 +28460,6 @@ fn cloud_mcp_download_asset_streaming_blocking(
         );
         if let Some(reporter) = failure_reporter.as_ref() {
             let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
-                &fail_repo_id,
-                &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28943,8 +28478,6 @@ fn cloud_mcp_download_asset_streaming_blocking(
         expected_hash,
         expected_size,
         CloudMcpAssetTransferProgress::new(
-            repo_id,
-            workspace_id,
             asset_id,
             transfer_id,
             cloud_id,
