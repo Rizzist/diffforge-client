@@ -56,7 +56,7 @@ export const SNIPPING_STRIP_HASH = "#/snipping-strip";
 const SNIPPING_EDITOR_WINDOW_PREFIX = "snipping-editor";
 const SNIPPING_FLOAT_WINDOW_PREFIX = "snip-float";
 const SNIPPING_STRIP_ANIM_EVENT = "forge-snip-strip-anim";
-const SNIPPING_STRIP_RECENT_LIMIT = 16;
+const SNIPPING_STRIP_PAGE_SIZE = 64;
 const SNIPPING_FLOATS_CHANGED_EVENT = "forge-snip-floats-changed";
 const SNIPPING_STRIP_DRAG_EVENT = "forge-snip-strip-drag";
 
@@ -1385,8 +1385,12 @@ const STRIP_TILE_DRAG_INTENT_PX = 7;
 const STRIP_TILE_DRAG_OUT_INTENT_PX = 12;
 const STRIP_TILE_DRAG_OUT_EDGE_PX = 8;
 const STRIP_TILE_WIDTH_PX = 120;
+const STRIP_TILE_HEIGHT_PX = 74;
 const STRIP_TILE_GAP_PX = 10;
+const STRIP_TILE_STEP_PX = STRIP_TILE_WIDTH_PX + STRIP_TILE_GAP_PX;
 const STRIP_RAIL_PADDING_LEFT_PX = 14;
+const STRIP_VIRTUAL_OVERSCAN = 4;
+const STRIP_PAGE_PREFETCH_PX = 420;
 
 function clampIndex(index, min, max) {
   return Math.max(min, Math.min(max, index));
@@ -1396,7 +1400,7 @@ function stripIndexForClientX(rail, clientX, itemCount) {
   if (!rail) return 0;
   const rect = rail.getBoundingClientRect();
   const x = clientX - rect.left + rail.scrollLeft - STRIP_RAIL_PADDING_LEFT_PX;
-  const index = Math.round(x / (STRIP_TILE_WIDTH_PX + STRIP_TILE_GAP_PX));
+  const index = Math.round(x / STRIP_TILE_STEP_PX);
   return clampIndex(index, 0, Math.max(0, itemCount));
 }
 
@@ -1723,49 +1727,161 @@ function wheelUnit(event) {
 export function SnippingRecentStrip() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
+  const [hasMore, setHasMore] = useState(true);
+  const [totalCount, setTotalCount] = useState(0);
   const [nativeDrag, setNativeDrag] = useState(null);
+  const [viewport, setViewport] = useState({ scrollLeft: 0, width: 0 });
   const railRef = useRef(null);
   const orderRef = useRef([]);
   const pendingDockRef = useRef(null);
+  const cursorRef = useRef(null);
+  const hasMoreRef = useRef(true);
+  const loadingPageRef = useRef(false);
+  const pageRequestRef = useRef(0);
+  const initialPageLoadedRef = useRef(false);
 
-  const updateItemsFromServer = useCallback((incomingItems) => {
-    let nextItems = applyStripOrder(incomingItems, orderRef.current);
-    const pendingDock = pendingDockRef.current;
-    let dockApplied = false;
-    if (pendingDock?.path && nextItems.some((item) => assetLocalPath(item) === pendingDock.path)) {
-      nextItems = moveStripItemToIndex(nextItems, pendingDock.path, pendingDock.index);
-      orderRef.current = orderPathsForItems(nextItems);
-      pendingDockRef.current = null;
-      dockApplied = true;
-    }
-    setItems(nextItems);
-    if (dockApplied) {
-      setNativeDrag(null);
-    }
+  const updateItemsFromServer = useCallback((incomingItems, { reset = false } = {}) => {
+    setItems((current) => {
+      const incoming = Array.isArray(incomingItems) ? incomingItems : [];
+      const base = reset ? [] : current;
+      const seen = new Set(base.map((item) => assetLocalPath(item)).filter(Boolean));
+      const merged = reset
+        ? incoming
+        : [
+            ...base,
+            ...incoming.filter((item) => {
+              const path = assetLocalPath(item);
+              if (!path || seen.has(path)) return false;
+              seen.add(path);
+              return true;
+            }),
+          ];
+      let nextItems = applyStripOrder(merged, orderRef.current);
+      const pendingDock = pendingDockRef.current;
+      if (pendingDock?.path && nextItems.some((item) => assetLocalPath(item) === pendingDock.path)) {
+        nextItems = moveStripItemToIndex(nextItems, pendingDock.path, pendingDock.index);
+        orderRef.current = orderPathsForItems(nextItems);
+      }
+      return nextItems;
+    });
   }, []);
 
-  const refresh = useCallback((showLoading = false) => {
+  const updateViewport = useCallback(() => {
+    const rail = railRef.current;
+    if (!rail) return;
+    const nextViewport = {
+      scrollLeft: rail.scrollLeft,
+      width: rail.clientWidth,
+    };
+    setViewport((current) => (
+      current.scrollLeft === nextViewport.scrollLeft && current.width === nextViewport.width
+        ? current
+        : nextViewport
+    ));
+  }, []);
+
+  const loadPage = useCallback(({ reset = false, showLoading = false } = {}) => {
+    if (loadingPageRef.current && !reset) return;
+    if (!reset && !hasMoreRef.current) return;
+
+    const requestId = pageRequestRef.current + 1;
+    pageRequestRef.current = requestId;
+    loadingPageRef.current = true;
+    const cursor = reset ? null : cursorRef.current;
+    if (reset) {
+      initialPageLoadedRef.current = false;
+      cursorRef.current = null;
+      hasMoreRef.current = true;
+      setHasMore(true);
+    }
     if (showLoading) setLoading(true);
+    if (!reset) setLoadingMore(true);
+
     invoke("snipping_recent_snips", {
-      limit: SNIPPING_STRIP_RECENT_LIMIT,
+      limit: SNIPPING_STRIP_PAGE_SIZE,
+      cursorModifiedMs: cursor?.modifiedMs ?? null,
+      cursorPath: cursor?.path || "",
       excludeVisibleFreePreviews: true,
     })
       .then((result) => {
-        updateItemsFromServer(Array.isArray(result?.items) ? result.items : []);
+        if (pageRequestRef.current !== requestId) return;
+        const nextItems = Array.isArray(result?.items) ? result.items : [];
+        updateItemsFromServer(nextItems, { reset });
+        const nextHasMore = result?.hasMore === true || result?.has_more === true;
+        const nextCursor = result?.nextCursor || result?.next_cursor || {};
+        const nextModifiedMs = Number(nextCursor?.modifiedMs || nextCursor?.modified_ms || 0) || 0;
+        const nextPath = text(nextCursor?.path);
+        cursorRef.current = nextHasMore && nextModifiedMs && nextPath
+          ? { modifiedMs: nextModifiedMs, path: nextPath }
+          : null;
+        hasMoreRef.current = nextHasMore;
+        setHasMore(nextHasMore);
+        setTotalCount(Number(result?.totalCount || result?.total_count || 0) || 0);
         setError("");
       })
       .catch((nextError) => {
+        if (pageRequestRef.current !== requestId) return;
         setError(nextError?.message || String(nextError || "Unable to load snips."));
       })
       .finally(() => {
+        if (pageRequestRef.current !== requestId) return;
+        loadingPageRef.current = false;
+        if (reset) {
+          initialPageLoadedRef.current = true;
+        }
         setLoading(false);
+        setLoadingMore(false);
       });
   }, [updateItemsFromServer]);
+
+  const refresh = useCallback((showLoading = false) => {
+    loadPage({ reset: true, showLoading });
+  }, [loadPage]);
+
+  const loadMoreIfNeeded = useCallback(() => {
+    const rail = railRef.current;
+    if (!rail || !initialPageLoadedRef.current || !hasMoreRef.current || loadingPageRef.current) return;
+    const remaining = rail.scrollWidth - rail.clientWidth - rail.scrollLeft;
+    if (remaining < STRIP_PAGE_PREFETCH_PX) {
+      loadPage({ reset: false });
+    }
+  }, [loadPage]);
 
   useEffect(() => {
     refresh(true);
   }, [refresh]);
+
+  useLayoutEffect(() => {
+    updateViewport();
+    loadMoreIfNeeded();
+    const rail = railRef.current;
+    if (!rail) return undefined;
+    const onResize = () => {
+      updateViewport();
+      loadMoreIfNeeded();
+    };
+    let observer = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(onResize);
+      observer.observe(rail);
+    }
+    window.addEventListener("resize", onResize);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", onResize);
+    };
+  }, [items.length, loadMoreIfNeeded, updateViewport]);
+
+  useEffect(() => {
+    const pendingDock = pendingDockRef.current;
+    if (!pendingDock?.path) return;
+    if (items.some((item) => assetLocalPath(item) === pendingDock.path)) {
+      pendingDockRef.current = null;
+      setNativeDrag(null);
+    }
+  }, [items]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1850,7 +1966,16 @@ export function SnippingRecentStrip() {
     if (Math.abs(deltaY) <= Math.abs(deltaX)) return;
     event.preventDefault();
     rail.scrollLeft += deltaY;
-  }, []);
+    window.requestAnimationFrame(() => {
+      updateViewport();
+      loadMoreIfNeeded();
+    });
+  }, [loadMoreIfNeeded, updateViewport]);
+
+  const onScroll = useCallback(() => {
+    updateViewport();
+    loadMoreIfNeeded();
+  }, [loadMoreIfNeeded, updateViewport]);
 
   const removePath = useCallback((path) => {
     orderRef.current = orderRef.current.filter((orderedPath) => orderedPath !== path);
@@ -1889,27 +2014,79 @@ export function SnippingRecentStrip() {
     return entries;
   }, [items, nativeDrag]);
 
+  const virtualEntries = useMemo(() => {
+    const total = renderEntries.length;
+    if (!total) {
+      return { entries: [], startIndex: 0, width: 0 };
+    }
+    const viewportWidth = viewport.width
+      || (typeof window !== "undefined" ? window.innerWidth : 0)
+      || STRIP_TILE_STEP_PX * 8;
+    const startIndex = clampIndex(
+      Math.floor(viewport.scrollLeft / STRIP_TILE_STEP_PX) - STRIP_VIRTUAL_OVERSCAN,
+      0,
+      total,
+    );
+    const endIndex = clampIndex(
+      Math.ceil((viewport.scrollLeft + viewportWidth) / STRIP_TILE_STEP_PX)
+        + STRIP_VIRTUAL_OVERSCAN
+        + 1,
+      startIndex,
+      total,
+    );
+    return {
+      entries: renderEntries.slice(startIndex, endIndex),
+      startIndex,
+      width: (total * STRIP_TILE_WIDTH_PX) + Math.max(0, total - 1) * STRIP_TILE_GAP_PX,
+    };
+  }, [renderEntries, viewport]);
+
   return (
-    <StripRail aria-label="Recent snips" onWheel={onWheel} ref={railRef}>
-      {renderEntries.map((entry) => (
-        entry.type === "slot" ? (
-          <StripDropSlot data-docking={nativeDrag?.docking ? "true" : "false"} key={entry.key} />
-        ) : (
-          <StripSnipTile
-            item={entry.item}
-            key={entry.key}
-            onChanged={removePath}
-            onOpened={removePath}
-            onReorderEnd={endReorder}
-            onReorderMove={reorderPath}
-            onReorderStart={() => {}}
-            railRef={railRef}
-          />
-        )
-      ))}
+    <StripRail aria-label="Recent snips" onScroll={onScroll} onWheel={onWheel} ref={railRef}>
+      {renderEntries.length ? (
+        <StripVirtualCanvas
+          style={{
+            width: `${virtualEntries.width}px`,
+          }}
+        >
+          {virtualEntries.entries.map((entry, offset) => {
+            const index = virtualEntries.startIndex + offset;
+            return (
+              <StripVirtualItem
+                key={entry.key}
+                style={{
+                  transform: `translateX(${index * STRIP_TILE_STEP_PX}px)`,
+                }}
+              >
+                {entry.type === "slot" ? (
+                  <StripDropSlot data-docking={nativeDrag?.docking ? "true" : "false"} />
+                ) : (
+                  <StripSnipTile
+                    item={entry.item}
+                    onChanged={removePath}
+                    onOpened={removePath}
+                    onReorderEnd={endReorder}
+                    onReorderMove={reorderPath}
+                    onReorderStart={() => {}}
+                    railRef={railRef}
+                  />
+                )}
+              </StripVirtualItem>
+            );
+          })}
+        </StripVirtualCanvas>
+      ) : null}
       {!items.length && !nativeDrag ? (
         <StripRailStatus>
           {loading ? "Loading..." : error || "No snips yet"}
+        </StripRailStatus>
+      ) : null}
+      {items.length && error ? (
+        <StripRailStatus data-floating="true">{error}</StripRailStatus>
+      ) : null}
+      {items.length && loadingMore && hasMore ? (
+        <StripRailStatus data-floating="true">
+          {totalCount > items.length ? `Loading ${Math.max(0, totalCount - items.length)} more...` : "Loading more..."}
         </StripRailStatus>
       ) : null}
     </StripRail>
@@ -2110,9 +2287,7 @@ const StripRail = styled.div`
   inset: 0 56px 0 0;
   z-index: 2;
   box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  display: block;
   overflow-x: auto;
   overflow-y: hidden;
   padding: 7px 14px 9px;
@@ -2120,6 +2295,7 @@ const StripRail = styled.div`
   scrollbar-color: rgba(148, 163, 184, 0.5) rgba(15, 23, 42, 0.22);
   scrollbar-width: thin;
   -webkit-overflow-scrolling: touch;
+  contain: layout paint;
 
   &::-webkit-scrollbar {
     height: 7px;
@@ -2135,6 +2311,21 @@ const StripRail = styled.div`
     border-radius: 999px;
     background: rgba(148, 163, 184, 0.56);
   }
+`;
+
+const StripVirtualCanvas = styled.div`
+  position: relative;
+  height: ${STRIP_TILE_HEIGHT_PX}px;
+  min-width: 100%;
+`;
+
+const StripVirtualItem = styled.div`
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: ${STRIP_TILE_WIDTH_PX}px;
+  height: ${STRIP_TILE_HEIGHT_PX}px;
+  will-change: transform;
 `;
 
 const StripTile = styled.div`
@@ -2438,11 +2629,30 @@ const StripRailStatus = styled.div`
   flex: 1 0 auto;
   display: grid;
   min-width: min(280px, calc(100vw - 96px));
-  height: 74px;
+  height: ${STRIP_TILE_HEIGHT_PX}px;
   place-items: center;
   color: rgba(248, 250, 252, 0.62);
   font-size: 12px;
   font-weight: 720;
+
+  &[data-floating="true"] {
+    position: sticky;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 6;
+    width: max-content;
+    min-width: 0;
+    height: 24px;
+    margin: -30px auto 0;
+    padding: 0 10px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 999px;
+    background: rgba(5, 8, 13, 0.72);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.24);
+    font-size: 10px;
+    pointer-events: none;
+  }
 `;
 
 export function SnippingAnnotationEditorWindow() {

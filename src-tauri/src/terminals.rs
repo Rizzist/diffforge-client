@@ -10399,7 +10399,6 @@ async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
         Some(&parked.task_id),
         Some(&parked.title),
         status,
-        "terminal-agent",
         body,
     )
     .await;
@@ -11585,7 +11584,6 @@ async fn mark_terminal_active_task_interrupted(
         Some(&active_task.task_id),
         Some(&active_task.title),
         "interrupted",
-        "terminal-agent",
         lifecycle_message,
     )
     .await;
@@ -11649,7 +11647,6 @@ async fn interrupt_terminal_parked_prompts(
             Some(&parked.task_id),
             Some(&parked.title),
             "interrupted",
-            "terminal-agent",
             "Interrupted by Escape while parked; the task was not marked cancelled.",
         )
         .await;

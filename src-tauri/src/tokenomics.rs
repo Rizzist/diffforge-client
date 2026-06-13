@@ -272,7 +272,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_tokenomics_source_offsets_provider ON tokenomics_source_offsets(provider, agent_kind, updated_at);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_limit_samples_updated ON tokenomics_provider_limit_samples(updated_at);
-         CREATE INDEX IF NOT EXISTS idx_tokenomics_limit_samples_match ON tokenomics_provider_limit_samples(billing_scope_type, billing_team_id, provider, agent_kind, provider_account_key, window_kind, sample_bucket_unix);",
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_limit_samples_match ON tokenomics_provider_limit_samples(billing_scope_type, billing_team_id, provider, agent_kind, provider_account_key, window_kind, sample_bucket_unix);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_limit_samples_device_match ON tokenomics_provider_limit_samples(device_id, billing_scope_type, billing_team_id, provider, agent_kind, provider_account_key, window_kind, sample_bucket_unix);",
     )
     .map_err(|error| format!("Unable to prepare Tokenomics database: {error}"))?;
     for table in [
@@ -4311,6 +4312,7 @@ fn tokenomics_provider_limit_sample_bucket_unix(sample_at_unix: u64) -> u64 {
 }
 
 fn tokenomics_provider_limit_sample_id(
+    device_id: &str,
     provider: &str,
     agent_kind: &str,
     provider_account_key: &str,
@@ -4319,7 +4321,8 @@ fn tokenomics_provider_limit_sample_id(
     sample_bucket_unix: u64,
 ) -> String {
     let raw = format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        device_id,
         billing_scope.scope_type,
         billing_scope.team_id.as_deref().unwrap_or_default(),
         provider,
@@ -4475,6 +4478,7 @@ fn tokenomics_upsert_provider_limit_sample(
     let device_id = tokenomics_value_string(value, &["device_id", "deviceId", "machine_id", "machineId"])
         .unwrap_or_else(|| fallback_device_id.to_string());
     let id = tokenomics_provider_limit_sample_id(
+        &device_id,
         &provider,
         &agent_kind,
         &provider_account_key,
@@ -4713,6 +4717,11 @@ fn tokenomics_recent_provider_limit_samples_for_limit(
         &["window_kind", "windowKind", "limit_kind", "limitKind"],
     )
     .unwrap_or_else(|| "5_hour".to_string());
+    let device_id = tokenomics_value_string(
+        limit,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    )
+    .unwrap_or_default();
     let now_unix = tokenomics_unix_now();
     let retention = if window_kind == "weekly" {
         TOKENOMICS_PROVIDER_LIMIT_SAMPLE_WEEKLY_RETENTION_SECS
@@ -4754,7 +4763,8 @@ fn tokenomics_recent_provider_limit_samples_for_limit(
                AND agent_kind=?4
                AND provider_account_key=?5
                AND window_kind=?6
-               AND sample_at_unix >= ?7
+               AND (?7 = '' OR device_id=?7)
+               AND sample_at_unix >= ?8
              ORDER BY sample_at_unix ASC
              LIMIT 384",
         )
@@ -4773,6 +4783,7 @@ fn tokenomics_recent_provider_limit_samples_for_limit(
                 agent_kind,
                 provider_account_key,
                 window_kind,
+                device_id,
                 cutoff as i64,
             ],
             |row| {
@@ -5137,15 +5148,19 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
     let inherited_billing_scope =
         tokenomics_billing_scope_from_value(event, &tokenomics_unknown_billing_scope());
     let summary = tokenomics_cloud_summary_payload(event);
-    let stored_limit_count =
-        tokenomics_store_cloud_provider_limits(&conn, summary, &inherited_billing_scope)?;
-    let stored_limit_sample_count = tokenomics_store_cloud_provider_limit_samples(
+    let stored_limit_count = tokenomics_store_cloud_provider_limits(
         &conn,
-        summary,
+        &summary,
         &inherited_billing_scope,
         inherited_device_id.as_deref().unwrap_or("cloud"),
     )?;
-    let stored_device_identity_count = tokenomics_store_cloud_device_identities(&conn, summary)?;
+    let stored_limit_sample_count = tokenomics_store_cloud_provider_limit_samples(
+        &conn,
+        &summary,
+        &inherited_billing_scope,
+        inherited_device_id.as_deref().unwrap_or("cloud"),
+    )?;
+    let stored_device_identity_count = tokenomics_store_cloud_device_identities(&conn, &summary)?;
     let hourly = summary
         .get("hourly")
         .and_then(Value::as_array)
@@ -5300,6 +5315,7 @@ fn tokenomics_store_cloud_provider_limits(
     conn: &rusqlite::Connection,
     summary: &Value,
     inherited_billing_scope: &TokenomicsBillingScope,
+    fallback_device_id: &str,
 ) -> Result<usize, String> {
     let incoming = summary
         .get("limits")
@@ -5333,6 +5349,14 @@ fn tokenomics_store_cloud_provider_limits(
             object
                 .entry("limit_source_kind".to_string())
                 .or_insert_with(|| json!("cloud_last_known"));
+            if !fallback_device_id.trim().is_empty() {
+                object
+                    .entry("device_id".to_string())
+                    .or_insert_with(|| json!(fallback_device_id));
+                object
+                    .entry("deviceId".to_string())
+                    .or_insert_with(|| json!(fallback_device_id));
+            }
         }
         hydrated.push(limit);
     }
@@ -5384,7 +5408,12 @@ fn tokenomics_store_cloud_provider_limit_samples(
     Ok(stored_count)
 }
 
-fn tokenomics_cloud_summary_payload(event: &Value) -> &Value {
+fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
+    if let Some(account_state) = tokenomics_account_device_live_state_payload(event) {
+        if let Some(summary) = tokenomics_flatten_account_device_tokenomics(account_state) {
+            return summary;
+        }
+    }
     event
         .get("summary")
         .or_else(|| {
@@ -5392,7 +5421,255 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> &Value {
                 .get("payload")
                 .and_then(|payload| payload.get("summary"))
         })
-        .unwrap_or(event)
+        .cloned()
+        .unwrap_or_else(|| event.clone())
+}
+
+fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value> {
+    let event_kind = tokenomics_text_field(event, &["event_kind", "eventKind", "kind"])
+        .unwrap_or_default();
+    let candidate = event
+        .get("data")
+        .or_else(|| event.get("account_live_state"))
+        .or_else(|| event.get("accountLiveState"))
+        .or_else(|| {
+            event.get("payload").and_then(|payload| {
+                payload
+                    .get("data")
+                    .or_else(|| payload.get("account_live_state"))
+                    .or_else(|| payload.get("accountLiveState"))
+            })
+        })
+        .unwrap_or(event);
+    let has_device_tokenomics = candidate.get("device_tokenomics").is_some()
+        || candidate.get("deviceTokenomics").is_some()
+        || candidate.get("tokenomics_by_device").is_some()
+        || candidate.get("tokenomicsByDevice").is_some();
+    if event_kind == "account_device_live_state_snapshot" || has_device_tokenomics {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn tokenomics_flatten_account_device_tokenomics(account_state: &Value) -> Option<Value> {
+    let local_device_id = tokenomics_local_device_id();
+    let mut hourly = Vec::new();
+    let mut limits = Vec::new();
+    let mut limit_samples = Vec::new();
+    let mut device_identities = Vec::new();
+    let mut device_count = 0usize;
+    for (device_id, tokenomics) in tokenomics_account_device_tokenomics_entries(account_state) {
+        if device_id == local_device_id {
+            continue;
+        }
+        device_count += 1;
+        if let Some(identity) =
+            tokenomics_account_device_identity(account_state, &device_id, &tokenomics)
+        {
+            device_identities.push(identity);
+        }
+        let summary = tokenomics
+            .get("summary")
+            .filter(|value| value.is_object())
+            .unwrap_or(&tokenomics);
+        tokenomics_extend_device_rows(&mut hourly, summary.get("hourly"), &device_id);
+        tokenomics_extend_device_rows(&mut limits, summary.get("limits"), &device_id);
+        if let Some(value) = summary.get("limit_samples").or_else(|| summary.get("limitSamples")) {
+            tokenomics_extend_device_rows(&mut limit_samples, Some(value), &device_id);
+        }
+        tokenomics_extend_device_rows(
+            &mut device_identities,
+            summary.get("device_identities"),
+            &device_id,
+        );
+        tokenomics_extend_device_rows(
+            &mut device_identities,
+            summary.get("deviceIdentities"),
+            &device_id,
+        );
+    }
+    if device_count == 0 && hourly.is_empty() && limits.is_empty() && limit_samples.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "known": true,
+        "source": "account_device_live_state_snapshot",
+        "updated_at": tokenomics_now_iso_like(),
+        "remote_device_count": device_count,
+        "hourly": hourly,
+        "limits": limits,
+        "limit_samples": limit_samples.clone(),
+        "limitSamples": limit_samples,
+        "device_identities": device_identities.clone(),
+        "deviceIdentities": device_identities,
+    }))
+}
+
+fn tokenomics_account_device_tokenomics_entries(account_state: &Value) -> Vec<(String, Value)> {
+    let mut entries = Vec::new();
+    let Some(value) = account_state
+        .get("device_tokenomics")
+        .or_else(|| account_state.get("deviceTokenomics"))
+        .or_else(|| account_state.get("tokenomics_by_device"))
+        .or_else(|| account_state.get("tokenomicsByDevice"))
+    else {
+        return entries;
+    };
+    match value {
+        Value::Object(items) => {
+            for (device_id, tokenomics) in items {
+                let clean_device_id = tokenomics_clean_device_id(device_id)
+                    .or_else(|| tokenomics_device_id_from_tokenomics_payload(tokenomics));
+                if let Some(device_id) = clean_device_id {
+                    entries.push((device_id, tokenomics.clone()));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for tokenomics in items {
+                if let Some(device_id) = tokenomics_device_id_from_tokenomics_payload(tokenomics) {
+                    entries.push((device_id, tokenomics.clone()));
+                }
+            }
+        }
+        _ => {}
+    }
+    entries
+}
+
+fn tokenomics_device_id_from_tokenomics_payload(value: &Value) -> Option<String> {
+    tokenomics_text_field(value, &["device_id", "deviceId", "machine_id", "machineId"])
+        .or_else(|| {
+            value.get("device").and_then(|device| {
+                tokenomics_text_field(device, &["device_id", "deviceId", "machine_id", "machineId"])
+            })
+        })
+        .or_else(|| {
+            value.get("summary").and_then(|summary| {
+                tokenomics_text_field(
+                    summary,
+                    &["current_device_id", "currentDeviceId", "device_id", "deviceId"],
+                )
+            })
+        })
+        .and_then(|device_id| tokenomics_clean_device_id(&device_id))
+}
+
+fn tokenomics_account_device_identity(
+    account_state: &Value,
+    device_id: &str,
+    tokenomics: &Value,
+) -> Option<Value> {
+    let mut object = serde_json::Map::new();
+    object.insert("device_id".to_string(), json!(device_id));
+    object.insert("machine_id".to_string(), json!(device_id));
+    if let Some(device) = tokenomics.get("device").filter(|value| value.is_object()) {
+        if let Some(device_object) = device.as_object() {
+            for (key, value) in device_object {
+                object.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    if let Some(device) = tokenomics_account_state_device(account_state, device_id) {
+        if let Some(device_object) = device.as_object() {
+            for (key, value) in device_object {
+                object.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    let summary = tokenomics
+        .get("summary")
+        .filter(|value| value.is_object())
+        .unwrap_or(tokenomics);
+    for key in [
+        "current_device_name",
+        "currentDeviceName",
+        "device_name",
+        "deviceName",
+        "machine_name",
+        "machineName",
+        "platform",
+        "form_factor",
+        "formFactor",
+    ] {
+        if let Some(value) = summary.get(key) {
+            object.entry(key.to_string()).or_insert_with(|| value.clone());
+        }
+    }
+    let display_name = tokenomics_device_identity_label(&Value::Object(object.clone()))
+        .unwrap_or_else(|| tokenomics_generic_device_label(device_id));
+    object
+        .entry("display_name".to_string())
+        .or_insert_with(|| Value::String(display_name.clone()));
+    let device_name = object
+        .get("display_name")
+        .cloned()
+        .unwrap_or_else(|| Value::String(display_name));
+    object
+        .entry("device_name".to_string())
+        .or_insert(device_name);
+    object
+        .entry("source".to_string())
+        .or_insert_with(|| json!("account_device_live_state"));
+    object
+        .entry("updated_at".to_string())
+        .or_insert_with(tokenomics_now_iso_like_value);
+    Some(Value::Object(object))
+}
+
+fn tokenomics_account_state_device<'a>(
+    account_state: &'a Value,
+    device_id: &str,
+) -> Option<&'a Value> {
+    let devices = account_state.get("devices")?;
+    match devices {
+        Value::Object(items) => items.get(device_id),
+        Value::Array(items) => items.iter().find(|device| {
+            tokenomics_device_id_from_tokenomics_payload(device)
+                .as_deref()
+                == Some(device_id)
+        }),
+        _ => None,
+    }
+}
+
+fn tokenomics_now_iso_like_value() -> Value {
+    Value::String(tokenomics_now_iso_like())
+}
+
+fn tokenomics_extend_device_rows(rows: &mut Vec<Value>, value: Option<&Value>, device_id: &str) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(row) = tokenomics_hydrate_device_row(item, device_id) {
+                    rows.push(row);
+                }
+            }
+        }
+        Value::Object(items) => {
+            for item in items.values() {
+                if let Some(row) = tokenomics_hydrate_device_row(item, device_id) {
+                    rows.push(row);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tokenomics_hydrate_device_row(row: &Value, device_id: &str) -> Option<Value> {
+    let mut object = row.as_object().cloned()?;
+    object
+        .entry("device_id".to_string())
+        .or_insert_with(|| json!(device_id));
+    object
+        .entry("deviceId".to_string())
+        .or_insert_with(|| json!(device_id));
+    Some(Value::Object(object))
 }
 
 fn tokenomics_cloud_rollup_id(
@@ -5608,6 +5885,9 @@ fn tokenomics_provider_limits(
         }
     }
 
+    let local_device_id = tokenomics_local_device_id();
+    tokenomics_tag_provider_limit_devices(&mut limits, &local_device_id);
+
     if include_cloud_last_known {
         limits = tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, limits);
     }
@@ -5622,6 +5902,23 @@ fn tokenomics_provider_limits(
     }
 
     Ok(limits)
+}
+
+fn tokenomics_tag_provider_limit_devices(limits: &mut [Value], device_id: &str) {
+    let device_id = device_id.trim();
+    if device_id.is_empty() {
+        return;
+    }
+    for limit in limits {
+        if let Some(object) = limit.as_object_mut() {
+            object
+                .entry("device_id".to_string())
+                .or_insert_with(|| json!(device_id));
+            object
+                .entry("deviceId".to_string())
+                .or_insert_with(|| json!(device_id));
+        }
+    }
 }
 
 fn tokenomics_cloud_provider_limits(conn: &rusqlite::Connection) -> Result<Vec<Value>, String> {
@@ -5670,6 +5967,11 @@ fn tokenomics_should_replace_provider_limit(existing: &Value, incoming: &Value) 
 }
 
 fn tokenomics_provider_limit_key(limit: &Value) -> String {
+    let device_id = tokenomics_value_string(
+        limit,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    )
+    .unwrap_or_else(|| "unknown-device".to_string());
     let provider = tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
     let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
         .unwrap_or_else(|| provider.clone());
@@ -5703,7 +6005,7 @@ fn tokenomics_provider_limit_key(limit: &Value) -> String {
         &["window_kind", "windowKind", "limit_kind", "limitKind"],
     )
     .unwrap_or_else(|| "provider_limit".to_string());
-    format!("{scope_type}\u{1f}{team_id}\u{1f}{provider}\u{1f}{agent_kind}\u{1f}{account_key}\u{1f}{window_kind}")
+    format!("{scope_type}\u{1f}{team_id}\u{1f}{device_id}\u{1f}{provider}\u{1f}{agent_kind}\u{1f}{account_key}\u{1f}{window_kind}")
 }
 
 fn tokenomics_provider_limit_is_unknown(limit: &Value) -> bool {

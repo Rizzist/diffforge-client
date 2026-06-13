@@ -144,7 +144,10 @@ pub struct RememberedKernelStorage {
 
 impl StoragePaths {
     pub fn new(repo_path: PathBuf, db_path: Option<PathBuf>) -> Self {
-        let agents_root = repo_path.join(".agents");
+        let agents_root = db_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| coordination_workspace_state_root(&repo_path));
         let worktrees_root = agents_root.join("worktrees");
         Self {
             db_path: db_path.unwrap_or_else(|| agents_root.join("kernel.sqlite")),
@@ -161,46 +164,35 @@ impl StoragePaths {
     pub fn ensure(&self) -> Result<StorageEnsureDiagnostics, String> {
         let mut diagnostics = StorageEnsureDiagnostics::default();
         diagnostics.migrated_private_state_paths = migrate_legacy_private_state(self)?;
-        for path in [
-            &self.agents_root,
-            &self.artifacts_root,
-            &self.artifacts_root.join("db-change-requests"),
-            &self.artifacts_root.join("migrations"),
-            &self.artifacts_root.join("cloud"),
-            &self.artifacts_root.join("repo-sketches"),
-            &self.memory_root,
-            &self.memory_root.join("decisions"),
-            &self.memory_root.join("contracts"),
-            &self.memory_root.join("handoffs"),
-            &self.memory_root.join("bugs"),
-            &self.memory_root.join("migrations"),
-            &self.memory_root.join("qa"),
-            &self.memory_root.join("runs"),
-            &self.worktrees_root,
-            &self.mcp_root,
-            &self.mcp_root.join("agents"),
-            &self.cloud_root,
-            &self.cloud_root.join("mock-plans"),
-            &self.cloud_root.join("context-exports"),
-            &self.cloud_root.join("received-plans"),
-            &self.cloud_root.join("sync"),
-            &self.agents_root.join("db").join("sandboxes"),
-            &self.agents_root.join("db").join("schema-fingerprints"),
-        ] {
+
+        // Keep startup storage minimal. Feature-owned directories such as
+        // artifacts, memory, MCP configs, and worktrees are created lazily when
+        // their owning operation writes into them.
+        let mut startup_directories = Vec::new();
+        if let Some(parent) = self.db_path.parent() {
+            startup_directories.push(parent.to_path_buf());
+        }
+        if startup_directories.is_empty() {
+            startup_directories.push(self.agents_root.clone());
+        }
+
+        for path in startup_directories {
             let existed = path.exists();
-            fs::create_dir_all(path)
+            fs::create_dir_all(&path)
                 .map_err(|error| format!("Unable to create {}: {error}", path.display()))?;
             diagnostics
                 .ensured_directories
-                .push(process_path_text(path));
+                .push(process_path_text(&path));
             if !existed {
                 diagnostics
                     .created_directories
-                    .push(process_path_text(path));
+                    .push(process_path_text(&path));
             }
         }
 
-        crate::ensure_workspace_agents_gitignore(&self.repo_path)?;
+        if coordination_state_root_is_visible(&self.repo_path, &self.agents_root) {
+            crate::ensure_workspace_agents_gitignore(&self.repo_path)?;
+        }
         diagnostics.removed_mcp_temp_files = clean_stale_mcp_temp_files(&self.mcp_root)?;
 
         Ok(diagnostics)
@@ -327,8 +319,20 @@ pub fn coordination_repo_state_root(repo_path: &Path) -> PathBuf {
         .join(coordination_repo_state_id(repo_path))
 }
 
+pub fn coordination_visible_state_root(repo_path: &Path) -> PathBuf {
+    repo_path.join(".agents")
+}
+
+pub fn coordination_workspace_state_root(repo_path: &Path) -> PathBuf {
+    coordination_visible_state_root(repo_path)
+}
+
+pub fn coordination_state_root_is_visible(repo_path: &Path, state_root: &Path) -> bool {
+    process_path_text(state_root) == process_path_text(&coordination_visible_state_root(repo_path))
+}
+
 pub fn coordination_daemon_info_path(repo_path: &Path) -> PathBuf {
-    coordination_repo_state_root(repo_path)
+    coordination_workspace_state_root(repo_path)
         .join("mcp")
         .join("coordination.daemon.json")
 }
@@ -1642,11 +1646,66 @@ mod tests {
         root
     }
 
+    fn fake_git_root(root: &Path) {
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn canonical_repo_path_rejects_filesystem_root() {
         let error = canonical_repo_path("/").unwrap_err();
         assert!(error.contains("filesystem root"));
+    }
+
+    #[test]
+    fn storage_paths_for_plain_folder_use_visible_agents_state() {
+        let repo = temp_repo("plain_visible_state");
+        let paths = StoragePaths::new(repo.clone(), None);
+
+        assert_eq!(
+            process_path_text(&paths.agents_root),
+            process_path_text(&repo.join(".agents"))
+        );
+        assert!(coordination_state_root_is_visible(
+            &repo,
+            &paths.agents_root
+        ));
+
+        let (connection, existed, _) = open_connection(&paths).unwrap();
+        drop(connection);
+
+        assert!(!existed);
+        assert!(paths.db_path.exists());
+        assert!(repo.join(".agents").is_dir());
+        assert!(repo.join(".gitignore").is_file());
+
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn storage_paths_for_git_root_use_visible_agents_state() {
+        let repo = temp_repo("git_visible_state");
+        fake_git_root(&repo);
+        let paths = StoragePaths::new(repo.clone(), None);
+
+        assert_eq!(
+            process_path_text(&paths.agents_root),
+            process_path_text(&repo.join(".agents"))
+        );
+        assert!(coordination_state_root_is_visible(
+            &repo,
+            &paths.agents_root
+        ));
+
+        let (connection, existed, _) = open_connection(&paths).unwrap();
+        drop(connection);
+
+        assert!(!existed);
+        assert!(repo.join(".agents").is_dir());
+        assert!(repo.join(".gitignore").is_file());
+
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[test]
@@ -1665,6 +1724,31 @@ mod tests {
         assert!(root_temp.exists());
         assert!(agent_temp.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_storage_only_creates_sqlite_parent_directory() {
+        let repo = temp_repo("minimal_startup_storage");
+        let paths = StoragePaths::new(repo.clone(), None);
+
+        let (connection, _existed, diagnostics) = open_connection(&paths).unwrap();
+
+        assert!(paths.agents_root.is_dir());
+        assert!(paths.db_path.exists());
+        assert_eq!(
+            diagnostics.path_diagnostics.ensured_directories,
+            vec![process_path_text(&paths.agents_root)]
+        );
+        for name in ["artifacts", "cloud", "db", "mcp", "memory", "worktrees"] {
+            assert!(
+                !paths.agents_root.join(name).exists(),
+                "unexpected eager .agents/{name} directory"
+            );
+        }
+
+        drop(connection);
+        let _ = fs::remove_dir_all(paths.agents_root);
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[test]

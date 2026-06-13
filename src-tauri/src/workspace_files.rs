@@ -373,7 +373,7 @@ fn workspace_git_top_level(root: &Path) -> Option<PathBuf> {
     path.canonicalize().ok().or(Some(path))
 }
 
-fn workspace_is_exact_git_root(root: &Path) -> bool {
+pub(crate) fn workspace_is_exact_git_root(root: &Path) -> bool {
     let marker = root.join(".git");
     match fs::metadata(&marker) {
         // A directory holding a valid `.git` directory is by definition the top

@@ -265,19 +265,26 @@ fn todo_dispatch_receipts_payload(workspace_id: &str, receipts: &Value, reason: 
     })
 }
 
-fn todo_dispatch_main_window_focused(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
-        .and_then(|window| window.is_focused().ok())
-        .unwrap_or(false)
-}
-
 /// Send a native notification unless the main window is focused (matching the
 /// webview's `suppressWhenFocused` behavior).
 fn todo_dispatch_native_notify(app: &AppHandle, title: &str, body: &str) {
-    if todo_dispatch_main_window_focused(app) {
-        return;
-    }
-    let _ = app.notification().builder().title(title).body(body).show();
+    let _ = diffforge_native_notify(
+        app,
+        title,
+        body,
+        NativeNotificationUrgency::Normal,
+        true,
+    );
+}
+
+fn todo_dispatch_native_attention_notify(app: &AppHandle, title: &str, body: &str) {
+    let _ = diffforge_native_notify(
+        app,
+        title,
+        body,
+        NativeNotificationUrgency::Attention,
+        false,
+    );
 }
 
 fn todo_dispatch_maybe_notify_drained(
@@ -616,7 +623,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             } else {
                 format!("A coding agent in {workspace_name} is waiting on a tool approval.")
             };
-            todo_dispatch_native_notify(app, title, &body);
+            todo_dispatch_native_attention_notify(app, title, &body);
         }
     }
 

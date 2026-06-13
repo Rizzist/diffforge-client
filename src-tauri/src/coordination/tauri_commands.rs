@@ -1785,6 +1785,11 @@ mod tests {
         fs::write(path.join("package.json"), "{}\n").unwrap();
     }
 
+    fn fake_git_root(path: &Path) {
+        fs::create_dir_all(path.join(".git")).unwrap();
+        fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
     fn data(value: &Value) -> &Value {
         value.get("data").unwrap_or(value)
     }
@@ -1910,6 +1915,8 @@ mod tests {
         assert_eq!(project_snapshots[0]["mountId"].as_str(), Some("frontend"));
         assert_eq!(skipped_projects[0]["mountId"].as_str(), Some("backend"));
         assert!(!root.join(".agents").exists());
+        assert!(!frontend.join(".agents").exists());
+        assert!(!frontend.join(".gitignore").exists());
         assert!(!backend.join(".agents").exists());
 
         let _ = fs::remove_dir_all(root);
@@ -1949,6 +1956,27 @@ mod tests {
                 .unwrap_or_default(),
         );
         assert!(registry_db_path.exists());
+        assert!(!frontend.join(".agents").exists());
+        assert!(!frontend.join(".gitignore").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plain_child_inside_git_repo_uses_private_kernel_state() {
+        let root = test_root("plain-child-inside-git");
+        fake_git_root(&root);
+        let public = root.join("public");
+        create_package_project(&public);
+
+        let init = coordination_init(Some(public.display().to_string()), None).unwrap();
+        let init_data = data(&init);
+        let init_db_path = PathBuf::from(init_data["db_path"].as_str().unwrap_or_default());
+
+        assert!(init_db_path.exists());
+        assert!(!public.join(".agents").exists());
+        assert!(!public.join(".gitignore").exists());
+        assert!(!root.join(".agents").exists());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -659,31 +659,83 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
     .map_err(|error| format!("Unable to validate workspace root directory: {error}"))?
 }
 
+fn workspace_browse_is_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+fn expand_workspace_browse_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") {
+        let home =
+            user_home_dir().ok_or_else(|| "Unable to resolve the home directory.".to_string())?;
+        if trimmed == "~" {
+            Ok(home)
+        } else {
+            Ok(home.join(trimmed.trim_start_matches("~/")))
+        }
+    } else if trimmed.is_empty() {
+        default_working_directory()
+    } else {
+        Ok(PathBuf::from(trimmed))
+    }
+}
+
+fn resolve_workspace_browse_target(
+    path: Option<String>,
+    command: Option<String>,
+    base_path: Option<String>,
+) -> Result<PathBuf, String> {
+    if let Some(raw_command) = command {
+        let trimmed = raw_command.trim();
+        if trimmed.is_empty() {
+            return Err("Enter a cd command.".to_string());
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let verb = parts.next().unwrap_or_default();
+        if !verb.eq_ignore_ascii_case("cd") {
+            return Err("Only cd commands can change the project root.".to_string());
+        }
+
+        let destination = parts.next().unwrap_or_default().trim();
+        let destination = if destination.is_empty() {
+            "~"
+        } else {
+            destination
+        };
+        if destination == "~"
+            || destination.starts_with("~/")
+            || PathBuf::from(destination).is_absolute()
+            || workspace_browse_is_windows_absolute(destination)
+        {
+            return expand_workspace_browse_path(destination);
+        }
+
+        let base = expand_workspace_browse_path(base_path.as_deref().unwrap_or_default())?;
+        return Ok(base.join(destination));
+    }
+
+    expand_workspace_browse_path(path.as_deref().unwrap_or_default())
+}
+
 /// Directory navigation for the inline create-workspace panel: unlike
 /// `validate_workspace_root_directory`, browsing may pass through directories
 /// (home, system folders) that are not eligible workspace roots — eligibility
 /// is reported separately so the UI can disable Create instead of blocking
-/// navigation.
+/// navigation. The optional command path is intentionally cd-only; shell muscle
+/// memory such as ls/dir should never be interpreted as a folder path.
 #[tauri::command]
 async fn browse_workspace_root_directory(
+    base_path: Option<String>,
+    command: Option<String>,
     path: Option<String>,
 ) -> Result<WorkspaceRootBrowse, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let raw = path.unwrap_or_default();
-        let trimmed = raw.trim();
-        let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
-            let home = user_home_dir()
-                .ok_or_else(|| "Unable to resolve the home directory.".to_string())?;
-            if trimmed == "~" {
-                home
-            } else {
-                home.join(trimmed.trim_start_matches("~/"))
-            }
-        } else if trimmed.is_empty() {
-            default_working_directory()?
-        } else {
-            PathBuf::from(trimmed)
-        };
+        let expanded = resolve_workspace_browse_target(path, command, base_path)?;
         if expanded
             .to_string_lossy()
             .bytes()

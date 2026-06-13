@@ -21,6 +21,8 @@ import {
 } from "./tokenomicsFormat.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
+const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
+const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = 7;
@@ -949,21 +951,22 @@ function weeklyLimitRowResetKey(row = {}) {
 }
 
 function weeklyLimitSeriesKey(row = {}) {
-  return [rowScopeKey(row), providerKey(row), rowProviderAccountKey(row)].join("::");
+  return [rowScopeKey(row), rowDeviceId(row) || "unknown-device", providerKey(row), rowProviderAccountKey(row)].join("::");
 }
 
-function matchingWeeklyLimitRows(rows, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+function matchingWeeklyLimitRows(rows, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
   return (Array.isArray(rows) ? rows : []).filter((row) => (
     String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "") === "weekly"
       && (selectedProvider === "all" || providerKey(row) === selectedProvider)
       && (selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey)
+      && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
 }
 
-function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
   const bySeries = new Map();
-  for (const row of matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey)) {
+  for (const row of matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey)) {
     const used = weeklyLimitUsedPercent(row);
     const time = weeklyLimitRowTime(row);
     if (used == null || !time) continue;
@@ -996,10 +999,10 @@ function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selected
   return byDay;
 }
 
-function latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
+function latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
   const candidates = [
-    ...matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey),
-    ...matchingWeeklyLimitRows(limits, selectedProvider, selectedAccountKey, selectedScopeKey),
+    ...matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
+    ...matchingWeeklyLimitRows(limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
   ]
     .map((row) => ({
       time: weeklyLimitRowTime(row)?.getTime() || 0,
@@ -1016,8 +1019,8 @@ function latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, se
   );
 }
 
-function withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey = "all") {
-  const directPercents = directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedScopeKey);
+function withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
+  const directPercents = directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
   let knownTokenTotal = 0;
   let knownPercentTotal = 0;
   const seeded = rows.map((row) => {
@@ -1033,7 +1036,7 @@ function withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvid
   const tokenPercentRatio = knownTokenTotal > 0 && knownPercentTotal > 0
     ? knownPercentTotal / knownTokenTotal
     : null;
-  const latestUsedPercent = latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey);
+  const latestUsedPercent = latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
   const visibleTokenTotal = seeded.reduce((sum, row) => sum + dailyUsageValue(row), 0);
 
   return seeded.map((row) => {
@@ -1083,7 +1086,7 @@ function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selec
     label: compactDayLabel(row.key),
     titleLabel: fullDayLabel(row.key, todayKey),
   }));
-  return withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedScopeKey);
+  return withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
 }
 
 function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
@@ -1105,11 +1108,12 @@ function todayAggregate(dailyRows, selectedProvider, selectedAccountKey, selecte
   return aggregateRows(rows);
 }
 
-function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all") {
+function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all", selectedDeviceId = "all") {
   if (!Array.isArray(limits)) return [];
   return limits.filter((limit) => (
     (selectedProvider === "all" || providerKey(limit) === selectedProvider)
       && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
+      && (selectedDeviceId === "all" || !rowDeviceId(limit) || rowDeviceId(limit) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(limit) === selectedScopeKey)
   ));
 }
@@ -1614,9 +1618,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
     ...limitRows,
   ].filter((row) => (
     provider.match(row)
-      && ((row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind)
-        || selectedDeviceId === "all"
-        || rowDeviceId(row) === selectedDeviceId)
+      && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
   const byKey = new Map();
@@ -1649,6 +1651,10 @@ function deviceOptions(summary, selectedScopeKey = "all") {
     ...(Array.isArray(summary?.by_device_model) ? summary.by_device_model : []),
     ...(Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : []),
     ...(Array.isArray(summary?.hourly) ? summary.hourly : []),
+    ...(Array.isArray(summary?.limits) ? summary.limits : []),
+    ...(Array.isArray(summary?.limit_samples) ? summary.limit_samples : []),
+    ...(Array.isArray(summary?.limitSamples) ? summary.limitSamples : []),
+    ...tokenomicsDeviceIdentityRows(summary),
   ];
   const byDevice = new Map();
   for (const row of rows) {
@@ -1718,6 +1724,7 @@ function lastUpdatedText(value) {
 function providerLimitKey(row = {}) {
   return [
     rowScopeKey(row),
+    rowDeviceId(row) || "unknown-device",
     providerKey(row),
     rowProviderAccountKey(row),
     String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
@@ -1727,6 +1734,7 @@ function providerLimitKey(row = {}) {
 function providerLimitSampleKey(row = {}) {
   return [
     rowScopeKey(row),
+    rowDeviceId(row) || "unknown-device",
     providerKey(row),
     rowProviderAccountKey(row),
     String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
@@ -1873,6 +1881,8 @@ const tokenomicsStore = {
   limitPercentSignature: "",
   limitSyncInFlight: false,
   limitSyncPending: false,
+  cloudListenerPromise: null,
+  cloudUnlistens: [],
   progressListenerPromise: null,
   progressUnlisten: null,
   subscribers: new Set(),
@@ -2025,6 +2035,30 @@ function ensureTokenomicsProgressListener() {
     });
 }
 
+function ensureTokenomicsCloudListener() {
+  if (tokenomicsStore.cloudUnlistens.length || tokenomicsStore.cloudListenerPromise) {
+    return;
+  }
+
+  const refreshFromCloud = () => {
+    void loadTokenomicsStore({ force: true }).finally(() => {
+      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+    });
+  };
+
+  tokenomicsStore.cloudListenerPromise = Promise.all([
+    listen(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, refreshFromCloud),
+    listen(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, refreshFromCloud),
+  ])
+    .then((handlers) => {
+      tokenomicsStore.cloudUnlistens = handlers;
+    })
+    .catch(() => {})
+    .finally(() => {
+      tokenomicsStore.cloudListenerPromise = null;
+    });
+}
+
 function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
   const requestEpoch = tokenomicsStore.requestEpoch;
   if (tokenomicsStore.liveLimitsPromise) {
@@ -2108,11 +2142,13 @@ function loadTokenomicsStore({ scan = false, force = false } = {}) {
 export function startAccountTokenomicsStartupScan(accountKey = "") {
   resetTokenomicsStoreForAccount(accountKey);
   ensureTokenomicsProgressListener();
+  ensureTokenomicsCloudListener();
   return loadTokenomicsStore({ scan: true, force: true });
 }
 
 function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
+  ensureTokenomicsCloudListener();
   tokenomicsStore.pollSubscriberCount += 1;
   void loadTokenomicsStore().finally(() => {
     void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
@@ -2324,8 +2360,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, totalRows],
   );
   const limits = useMemo(
-    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey, selectedScopeKey),
-    [selectedAccountKey, selectedProvider, selectedScopeKey, summary?.limits],
+    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
+    [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, summary?.limits],
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
@@ -2348,14 +2384,14 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const credits = billingStatus?.credits || summary?.credits || {};
   const providerLimitGroups = useMemo(() => (
     ["codex", "claude"].map((providerId) => {
-      const providerLimits = filterLimits(summary?.limits, providerId, "all", selectedScopeKey);
+      const providerLimits = filterLimits(summary?.limits, providerId, "all", selectedScopeKey, selectedDeviceId);
       return {
         providerId,
         fiveHour: mergeLimits(providerLimits, "5_hour"),
         weekly: mergeLimits(providerLimits, "weekly"),
       };
     })
-  ), [selectedScopeKey, summary?.limits]);
+  ), [selectedDeviceId, selectedScopeKey, summary?.limits]);
   const storage = useMemo(
     () => storageUsageModel(billingStatus, summary, storageUsage),
     [billingStatus, storageUsage, summary],
@@ -2412,7 +2448,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             ))}
           </AccountTabs>
         ) : null}
-        {devices.length > 2 ? (
+        {devices.length > 1 ? (
           <AccountTabs role="tablist" aria-label="Tokenomics device filter">
             {devices.map((device) => (
               <AccountTab

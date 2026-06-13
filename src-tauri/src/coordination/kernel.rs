@@ -2303,7 +2303,6 @@ fn submit_job_public_value(job: &Value) -> Value {
         "phase": job["phase"],
         "phase_message": job["phase_message"],
         "summary": job["summary"],
-        "lane": job["lane"],
         "patch_id": job["patch_id"],
         "validation_id": job["validation_id"],
         "diff_artifact_id": job["diff_artifact_id"],
@@ -8583,7 +8582,7 @@ impl CoordinationKernel {
         workspace_id: Option<&str>,
         workspace_name: Option<&str>,
     ) -> Result<Value, String> {
-        let mut status = self.workspace_mcp_status_snapshot(workspace_id, workspace_name)?;
+        let mut status = self.workspace_mcp_status_view(workspace_id, workspace_name)?;
         let health = self.workspace_mcp_health_cached(&status);
         if let Some(object) = status.as_object_mut() {
             object.insert("health".to_string(), health);
@@ -8591,7 +8590,7 @@ impl CoordinationKernel {
         Ok(status)
     }
 
-    fn workspace_mcp_status_snapshot(
+    fn workspace_mcp_status_view(
         &self,
         workspace_id: Option<&str>,
         workspace_name: Option<&str>,
@@ -9156,7 +9155,7 @@ impl CoordinationKernel {
         workspace_name: Option<&str>,
     ) {
         let needs_ensure = self
-            .workspace_mcp_status_snapshot(Some(workspace_id), workspace_name)
+            .workspace_mcp_status_view(Some(workspace_id), workspace_name)
             .map(|status| {
                 let health = self.workspace_mcp_health_cached(&status);
                 health["config_generated"].as_bool() != Some(true)
@@ -13492,13 +13491,9 @@ impl CoordinationKernel {
         session_id: &str,
         worktree_id: Option<&str>,
         summary: Option<&str>,
-        lane: Option<&str>,
         client_request_id: Option<&str>,
     ) -> Result<Value, String> {
         let worktree_id = worktree_id
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
-        let lane = lane
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string);
         let client_request_id = client_request_id
@@ -13533,9 +13528,9 @@ impl CoordinationKernel {
             .execute(
                 "INSERT INTO submit_jobs(
                     id, task_id, agent_id, session_id, worktree_id, status, phase,
-                    phase_message, summary, lane, client_request_id, idempotency_key,
+                    phase_message, summary, client_request_id, idempotency_key,
                     warnings_json, phase_timings_json, created_at, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, 'queued', 'queued', ?6, ?7, ?8, ?9, ?10, '[]', '{}', ?11, ?11)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 'queued', 'queued', ?6, ?7, ?8, ?9, '[]', '{}', ?10, ?10)",
                 params![
                     id,
                     task_id,
@@ -13544,7 +13539,6 @@ impl CoordinationKernel {
                     worktree_id,
                     "submit_patch accepted; background validation will start shortly.",
                     summary,
-                    lane,
                     client_request_id,
                     idempotency_key,
                     now
@@ -17152,7 +17146,6 @@ impl CoordinationKernel {
                 "agent_id": "$CLOUD_MCP_AGENT_ID",
                 "self_agent_id": "$CLOUD_MCP_AGENT_ID",
                 "repo_id": "$CLOUD_MCP_REPO_ID",
-                "lane": format!("merge-resolution:{patch_id}"),
                 "prompt": format!("Resolve merge for patch {patch_id}"),
                 "patch_id": patch_id,
                 "merge_job_id": merge_job_id.clone(),
@@ -20824,7 +20817,7 @@ impl CoordinationKernel {
                 "cloud_mcp": {
                     "mode": "automatic_rust_lifecycle",
                     "agent_action_required": "use_cloud_returned_start_task_id_for_lease_checkpoint_submit_or_complete",
-                    "note": "Diff Forge publishes context packs, task lifecycle, checkpoint summaries, and lane state through the app/kernel cloud sync path."
+                    "note": "Diff Forge publishes context packs, task lifecycle, checkpoint summaries, and merge context through the app/kernel cloud sync path."
                 }
             }
         })))
@@ -27194,7 +27187,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 8. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Cloud MCP is automatic\n\n\
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
-- Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, lane claims, and merge context through the Rust cloud event path.\n\
+- Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, and merge context through the Rust cloud event path.\n\
 - Use the local coordination kernel for leases, completion, patch submission when enabled, and merge safety.\n\
 - For Git-managed files, obey the active file authority: direct sessions edit the visible repo root after leases; isolated sessions edit only through the assigned agent worktree/branch root.\n\
 - Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and finish through the reported completion mode.\n\
@@ -30678,7 +30671,6 @@ Appwrite > Session Store: create session
                 session_id,
                 Some("worktree-1"),
                 Some("submit it"),
-                Some("terminal-agent"),
                 Some("client-request-1"),
             )
             .unwrap();
@@ -30693,7 +30685,6 @@ Appwrite > Session Store: create session
                 session_id,
                 Some("worktree-1"),
                 Some("submit it"),
-                Some("terminal-agent"),
                 Some("client-request-1"),
             )
             .unwrap();

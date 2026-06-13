@@ -6307,7 +6307,8 @@ const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 88.0;
 // Pre-show placeholder only: every show resizes the bar to the full logical
 // width of the monitor under the cursor.
 const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
-const SNIPPING_STRIP_RECENT_LIMIT: usize = 16;
+const SNIPPING_STRIP_RECENT_PAGE_LIMIT: usize = 64;
+const SNIPPING_STRIP_RECENT_PAGE_LIMIT_MAX: usize = 200;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
 const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
@@ -6319,10 +6320,15 @@ const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
 fn snipping_recent_snip_items(
     app: &AppHandle,
     limit: usize,
+    cursor_modified_ms: Option<u64>,
+    cursor_path: Option<&str>,
     exclude_visible_free_previews: bool,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, usize, bool, Option<u64>, Option<String>), String> {
     let root = diffforge_prepare_untracked_asset_root()?;
-    let mut snips: Vec<(u128, Value)> = Vec::new();
+    let mut snips: Vec<(u128, String, Value)> = Vec::new();
+    let mut total_count = 0usize;
+    let cursor_modified_ms = cursor_modified_ms.map(u128::from);
+    let cursor_path = cursor_path.unwrap_or("");
     for (directory_name, source_kind) in [("snips", "snip"), ("edits", "edit")] {
         let Ok(entries) = fs::read_dir(root.join(directory_name)) else {
             continue;
@@ -6358,8 +6364,17 @@ fn snipping_recent_snip_items(
             {
                 return None;
             }
+            total_count += 1;
+            if let Some(cursor_modified_ms) = cursor_modified_ms {
+                let after_cursor = modified_ms < cursor_modified_ms
+                    || (modified_ms == cursor_modified_ms && path_string.as_str() > cursor_path);
+                if !after_cursor {
+                    return None;
+                }
+            }
             Some((
                 modified_ms,
+                path_string.clone(),
                 json!({
                     "path": path_string,
                     "name": name,
@@ -6370,30 +6385,64 @@ fn snipping_recent_snip_items(
             ))
         }));
     }
-    snips.sort_by(|a, b| b.0.cmp(&a.0));
-    Ok(snips
+    snips.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let has_more = snips.len() > limit;
+    let mut next_cursor_modified_ms = None;
+    let mut next_cursor_path = None;
+    let items = snips
         .into_iter()
         .take(limit)
-        .map(|(_, item)| item)
-        .collect())
+        .map(|(modified_ms, path, item)| {
+            next_cursor_modified_ms = Some(modified_ms as u64);
+            next_cursor_path = Some(path);
+            item
+        })
+        .collect();
+    Ok((
+        items,
+        total_count,
+        has_more,
+        next_cursor_modified_ms,
+        next_cursor_path,
+    ))
 }
 
 #[tauri::command]
 fn snipping_recent_snips(
     app: AppHandle,
     limit: Option<usize>,
+    cursor_modified_ms: Option<u64>,
+    cursor_path: Option<String>,
     exclude_visible_free_previews: Option<bool>,
 ) -> Result<Value, String> {
     let limit = limit
-        .unwrap_or(SNIPPING_STRIP_RECENT_LIMIT)
-        .clamp(1, SNIPPING_STRIP_RECENT_LIMIT);
-    Ok(json!({
-        "kind": "snipping_recent_snips",
-        "items": snipping_recent_snip_items(
+        .unwrap_or(SNIPPING_STRIP_RECENT_PAGE_LIMIT)
+        .clamp(1, SNIPPING_STRIP_RECENT_PAGE_LIMIT_MAX);
+    let (items, total_count, has_more, next_cursor_modified_ms, next_cursor_path) =
+        snipping_recent_snip_items(
             &app,
             limit,
+            cursor_modified_ms,
+            cursor_path.as_deref(),
             exclude_visible_free_previews.unwrap_or(false),
-        )?,
+        )?;
+    Ok(json!({
+        "kind": "snipping_recent_snips",
+        "items": items,
+        "totalCount": total_count,
+        "total_count": total_count,
+        "hasMore": has_more,
+        "has_more": has_more,
+        "nextCursor": {
+            "modifiedMs": next_cursor_modified_ms,
+            "modified_ms": next_cursor_modified_ms,
+            "path": next_cursor_path,
+        },
+        "next_cursor": {
+            "modifiedMs": next_cursor_modified_ms,
+            "modified_ms": next_cursor_modified_ms,
+            "path": next_cursor_path,
+        },
     }))
 }
 

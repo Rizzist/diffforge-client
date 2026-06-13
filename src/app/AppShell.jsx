@@ -526,7 +526,6 @@ import {
   WorkspaceCreatePathText,
   WorkspaceCreatePathBadge,
   WorkspaceCreateCdForm,
-  WorkspaceCreateCdPrompt,
   WorkspaceCreateCdInput,
   WorkspaceCreateDirGrid,
   WorkspaceCreateDirChip,
@@ -3022,7 +3021,14 @@ function AuthSquareBackdrop({ tone = "default" } = {}) {
   );
 }
 
-function WorkspaceIdleState({ detail = "No workspace selected.", plan = "", viewMotion }) {
+function WorkspaceIdleState({
+  actionLabel = "",
+  detail = "No workspace selected.",
+  onAction = null,
+  plan = "",
+  title = BRAND_NAME,
+  viewMotion,
+}) {
   return (
     <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
       <AuthSquareBackdrop tone="quiet" />
@@ -3030,8 +3036,14 @@ function WorkspaceIdleState({ detail = "No workspace selected.", plan = "", view
       <PlanFlame plan={plan} showControls={Boolean(plan)} />
       <WorkspaceIdlePanel>
         <WorkspaceIdleLogo src="/logo.webp" alt="" />
-        <WorkspaceIdleTitle>{BRAND_NAME}</WorkspaceIdleTitle>
+        <WorkspaceIdleTitle>{title}</WorkspaceIdleTitle>
         <WorkspaceIdleDetail>{detail}</WorkspaceIdleDetail>
+        {actionLabel && typeof onAction === "function" && (
+          <PrimaryButton onClick={onAction} type="button">
+            <ButtonAddIcon aria-hidden="true" />
+            <span>{actionLabel}</span>
+          </PrimaryButton>
+        )}
       </WorkspaceIdlePanel>
     </WorkspaceIdleSurface>
   );
@@ -3076,27 +3088,32 @@ function WorkspaceCreatePanel({
   const browseRef = useRef(null);
   const creating = workspaceSyncState === "creating";
 
-  const browseTo = useCallback(async (path) => {
+  const browseTo = useCallback(async (path, options = {}) => {
     const seq = browseSeqRef.current + 1;
     browseSeqRef.current = seq;
     setBrowseError("");
+    const command = String(options.command || "").trim();
     try {
       const result = await invoke("browse_workspace_root_directory", {
-        path: String(path || "").trim() || null,
+        basePath: command ? String(options.basePath || "").trim() || null : null,
+        command: command || null,
+        path: command ? null : String(path || "").trim() || null,
       });
       if (browseSeqRef.current !== seq) {
-        return;
+        return false;
       }
       browseRef.current = result;
       setBrowse(result);
       if (result?.workingDirectory) {
         setRootDraft(result.workingDirectory);
       }
+      return true;
     } catch (error) {
       if (browseSeqRef.current !== seq) {
-        return;
+        return false;
       }
       setBrowseError(getErrorMessage(error, "Unable to open that directory."));
+      return false;
     }
   }, [setRootDraft]);
 
@@ -3127,18 +3144,15 @@ function WorkspaceCreatePanel({
     if (!raw) {
       return;
     }
-    const command = raw.replace(/^cd\s+/i, "").trim() || "~";
     const currentDirectory = browseRef.current?.workingDirectory
       || rootDraft
       || defaultWorkingDirectory
       || "";
-    const isAbsolute = command === "~"
-      || command.startsWith("~/")
-      || command.startsWith("/")
-      || /^[A-Za-z]:[\\/]/.test(command);
-    const target = isAbsolute ? command : `${currentDirectory}/${command}`;
-    setCdDraft("");
-    void browseTo(target);
+    void browseTo("", { basePath: currentDirectory, command: raw }).then((ok) => {
+      if (ok) {
+        setCdDraft("");
+      }
+    });
   }, [browseTo, cdDraft, defaultWorkingDirectory, rootDraft]);
 
   const adjustAgentCount = useCallback((roleId, delta) => {
@@ -3203,7 +3217,7 @@ function WorkspaceCreatePanel({
       >
         <WorkspaceCreateHeader>
           <div>
-            <PanelKicker>{onClose ? "New workspace" : "First workspace"}</PanelKicker>
+            <PanelKicker>New workspace</PanelKicker>
             <PanelHeading>Create workspace</PanelHeading>
           </div>
           {onClose && (
@@ -3248,9 +3262,8 @@ function WorkspaceCreatePanel({
             )}
           </WorkspaceCreatePathBar>
           <WorkspaceCreateCdForm>
-            <WorkspaceCreateCdPrompt aria-hidden="true">cd</WorkspaceCreateCdPrompt>
             <WorkspaceCreateCdInput
-              aria-label="Change directory"
+              aria-label="Directory command"
               disabled={creating}
               maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
               onChange={(event) => setCdDraft(event.target.value)}
@@ -3260,7 +3273,7 @@ function WorkspaceCreatePanel({
                   submitCd();
                 }
               }}
-              placeholder="../sibling, ~/projects/app, or a subfolder below"
+              placeholder="cd ../sibling, cd ~/projects/app, or cd subfolder below"
               spellCheck={false}
               value={cdDraft}
             />
@@ -6381,7 +6394,9 @@ export default function App() {
   // the quiet re-validation that runs when the cloud connection returns.
   const offlineSessionGraceRef = useRef(false);
   const [cloudSyncStatus, setCloudSyncStatus] = useState(null);
+  const [cloudLiveSyncEpoch, setCloudLiveSyncEpoch] = useState(0);
   const cloudSyncConnectionRef = useRef("");
+  const cloudLiveSyncEpochRef = useRef(0);
   const launchStartedAtRef = useRef(Date.now());
   const dashboardShellRef = useRef(null);
   const workspaceRailRef = useRef(null);
@@ -6390,6 +6405,7 @@ export default function App() {
   const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
   const agentStatusCacheHitRef = useRef(agentStatuses.some((agent) => agent.cached));
+  const agentStatusesRef = useRef(agentStatuses);
   const agentInitialStatusUserRef = useRef("");
   const previousAccountScopeKeyRef = useRef("");
   const startupAgentFlowIdRef = useRef(0);
@@ -6494,6 +6510,9 @@ export default function App() {
   const workspaceCoordinationTargetsCacheRef = useRef(readWorkspaceCoordinationTargetsCache());
   const workspaceCoordinationTargetsStateKeyRef = useRef("");
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
+  useEffect(() => {
+    agentStatusesRef.current = agentStatuses;
+  }, [agentStatuses]);
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -10573,6 +10592,7 @@ export default function App() {
 
     const syncKey = JSON.stringify({
       scope: "connected-device-agent-installations",
+      cloudLiveSyncEpoch: cloudLiveSyncEpochRef.current,
       agents: codingAgents,
     });
     if (agentInstallationSyncKeyRef.current === syncKey) {
@@ -10598,6 +10618,27 @@ export default function App() {
     });
   }, [resolveAgentInstallationSyncTarget]);
 
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !cloudLiveSyncEpoch
+    ) {
+      return;
+    }
+
+    syncAgentInstallationsToCloud(
+      agentStatuses,
+      "cloud_connection_initial_state",
+    );
+  }, [
+    agentStatuses,
+    authState,
+    cloudLiveSyncEpoch,
+    syncAgentInstallationsToCloud,
+    user,
+  ]);
+
   const refreshAgentStatuses = useCallback(async () => {
     const agentStatusStartedAt = performance.now();
     setAgentStatusState("checking");
@@ -10612,6 +10653,7 @@ export default function App() {
         ...(statusMap.get(provider.id) || {}),
       }));
       persistAgentStatusCache(nextStatuses);
+      agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);
       syncAgentInstallationsToCloud(nextStatuses, "agent_status_refresh");
       setAgentStatusState("idle");
@@ -10645,6 +10687,7 @@ export default function App() {
         ...(statusMap.get(provider.id) || {}),
       }));
       persistAgentStatusCache(nextStatuses);
+      agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);
     }).then((dispose) => {
       if (disposed) {
@@ -10815,6 +10858,7 @@ export default function App() {
           }
           : agent
       ));
+      agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);
       persistAgentStatusCache(nextStatuses);
       syncAgentInstallationsToCloud(nextStatuses, "agent_disconnect");
@@ -10833,7 +10877,7 @@ export default function App() {
 
   const installAgentWithNpm = useCallback(async (provider) => {
     setAgentInstallState((state) => ({ ...state, [provider]: "installing" }));
-    syncAgentInstallationsToCloud(agentStatuses, "agent_install_start", { [provider]: "installing" });
+    syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "agent_install_start", { [provider]: "installing" });
     setAgentStatusError("");
     setAgentInstallResults((results) => {
       const nextResults = { ...results };
@@ -10841,12 +10885,13 @@ export default function App() {
       return nextResults;
     });
 
+    let refreshedStatuses = null;
     try {
       const result = await invoke("install_agent", { provider });
       setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm" } }));
 
       if (result?.installed) {
-        await refreshAgentStatuses();
+        refreshedStatuses = await refreshAgentStatuses();
       }
     } catch (error) {
       setAgentInstallResults((results) => ({
@@ -10860,13 +10905,13 @@ export default function App() {
       }));
     } finally {
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-      syncAgentInstallationsToCloud(agentStatuses, "agent_install_idle", { [provider]: "idle" });
+      syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, "agent_install_idle", { [provider]: "idle" });
     }
   }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
 
   const updateAgentWithNpm = useCallback(async (provider) => {
     setAgentInstallState((state) => ({ ...state, [provider]: "updating" }));
-    syncAgentInstallationsToCloud(agentStatuses, "agent_update_start", { [provider]: "updating" });
+    syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "agent_update_start", { [provider]: "updating" });
     setAgentStatusError("");
     setAgentInstallResults((results) => {
       const nextResults = { ...results };
@@ -10874,12 +10919,13 @@ export default function App() {
       return nextResults;
     });
 
+    let refreshedStatuses = null;
     try {
       const result = await invoke("update_agent", { provider });
       setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm-update" } }));
 
       if (result?.installed) {
-        await refreshAgentStatuses();
+        refreshedStatuses = await refreshAgentStatuses();
       }
     } catch (error) {
       setAgentInstallResults((results) => ({
@@ -10893,7 +10939,7 @@ export default function App() {
       }));
     } finally {
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-      syncAgentInstallationsToCloud(agentStatuses, "agent_update_idle", { [provider]: "idle" });
+      syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, "agent_update_idle", { [provider]: "idle" });
     }
   }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
 
@@ -10926,7 +10972,7 @@ export default function App() {
     for (const agent of updates) {
       setStartupAgentUpdateMessage(`Updating ${agent.label}...`);
       setAgentInstallState((state) => ({ ...state, [agent.id]: "updating" }));
-      syncAgentInstallationsToCloud(agentStatuses, "startup_agent_update_start", { [agent.id]: "updating" });
+      syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "startup_agent_update_start", { [agent.id]: "updating" });
       setAgentInstallResults((results) => {
         const nextResults = { ...results };
         delete nextResults[agent.id];
@@ -10948,7 +10994,7 @@ export default function App() {
         }));
       } finally {
         setAgentInstallState((state) => ({ ...state, [agent.id]: "idle" }));
-        syncAgentInstallationsToCloud(agentStatuses, "startup_agent_update_idle", { [agent.id]: "idle" });
+        syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "startup_agent_update_idle", { [agent.id]: "idle" });
       }
     }
 
@@ -13533,6 +13579,20 @@ export default function App() {
     const connection = cloudSyncStatus?.connection || "";
     const previous = cloudSyncConnectionRef.current;
     cloudSyncConnectionRef.current = connection;
+    if (connection === "connected" && previous !== "connected") {
+      const nextEpoch = Number(cloudSyncStatus?.updatedAtMs || 0) || Date.now();
+      cloudLiveSyncEpochRef.current = nextEpoch;
+      setCloudLiveSyncEpoch(nextEpoch);
+      agentInstallationSyncKeyRef.current = "";
+      terminalPresenceSyncKeyRef.current = "";
+      workspaceMcpSyncKeyRef.current = "";
+      workspaceCatalogSyncKeyRef.current = "";
+      workspaceCloudSyncKeyRef.current = "";
+      window.dispatchEvent(new CustomEvent("diffforge:cloud-device-live-initial-sync", {
+        detail: { epoch: nextEpoch },
+      }));
+      tokenomicsForceResyncRef.current?.();
+    }
     if (connection !== "connected" || previous === "connected" || !previous) {
       return;
     }
@@ -15454,6 +15514,7 @@ export default function App() {
     const accountKey = user?.id || user?.email || "paid-user";
     const syncKey = JSON.stringify({
       accountKey,
+      cloudLiveSyncEpoch,
       targets: targets.map((target) => ({
         active: Boolean(target.workspaceActive),
         repoPath: getWorkspaceRootIdentity(target.repoPath || ""),
@@ -15485,7 +15546,7 @@ export default function App() {
       });
 
       try {
-        await invoke("cloud_mcp_sync_device_workspace_catalog", {
+        await invoke("cloud_mcp_sync_device_live_workspaces", {
           reason: "desktop_workspace_catalog",
           workspaces: targets,
         });
@@ -15538,6 +15599,7 @@ export default function App() {
     user,
     workspaceCatalogSyncKey,
     workspaceCatalogSyncTargets,
+    cloudLiveSyncEpoch,
     workspaceHydrationReady,
     workspaceActivationDeferred,
     workspaceSyncState,
@@ -15568,6 +15630,7 @@ export default function App() {
     const accountKey = user?.id || user?.email || "paid-user";
     const syncKey = JSON.stringify({
       accountKey,
+      cloudLiveSyncEpoch,
       targets: targets.map((target) => ({
         repoPath: getWorkspaceRootIdentity(target.repoPath),
         workspaceId: target.workspaceId,
@@ -15665,6 +15728,7 @@ export default function App() {
     user,
     workspaceHydrationReady,
     workspaceActivationDeferred,
+    cloudLiveSyncEpoch,
     workspaceMcpSyncTargetKey,
     workspaceMcpSyncTargets,
     workspaceSyncState,
@@ -15684,8 +15748,8 @@ export default function App() {
     }
 
     let disposed = false;
-    const reason = "terminal_presence_snapshot";
-    const syncKey = `${terminalPresenceSyncKey}:${reason}`;
+    const reason = "device_live_state_snapshot";
+    const syncKey = `${terminalPresenceSyncKey}:${reason}:${cloudLiveSyncEpoch}`;
     if (terminalPresenceSyncKeyRef.current === syncKey) {
       return undefined;
     }
@@ -15734,7 +15798,7 @@ export default function App() {
         }
       };
       window.setTimeout(releasePresenceSyncGate, 0);
-      invoke("cloud_mcp_sync_terminal_presence", {
+      invoke("cloud_mcp_sync_device_live_terminals", {
         workspaces: pending.workspaces,
         reason: pending.reason,
       })
@@ -15807,6 +15871,7 @@ export default function App() {
     user,
     workspaceHydrationReady,
     workspaceActivationDeferred,
+    cloudLiveSyncEpoch,
     workspaceSyncState,
   ]);
 
@@ -15841,8 +15906,8 @@ export default function App() {
       if (disposed) {
         return;
       }
-      const syncKey = `${workspaceMcpSyncTargetKey}:${reason}`;
-      if (reason === "workspace_mcp_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
+      const syncKey = `${workspaceMcpSyncTargetKey}:${reason}:${cloudLiveSyncEpoch}`;
+      if (reason === "device_live_state_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
         return;
       }
       const diagnosticToken = authStore.getToken();
@@ -15867,7 +15932,7 @@ export default function App() {
             return sanitizeWorkspaceMcpRegistryForCloud(response, target);
           }),
         );
-        const syncResponse = await invoke("cloud_mcp_sync_workspace_mcp_snapshot", {
+        const syncResponse = await invoke("cloud_mcp_sync_device_live_workspace_mcps", {
           workspaces: workspacesForCloud,
           reason,
         });
@@ -15924,7 +15989,7 @@ export default function App() {
       }
     };
 
-    scheduleWorkspaceMcpSync("workspace_mcp_snapshot", 0);
+    scheduleWorkspaceMcpSync("device_live_state_snapshot", 0);
     const handleWorkspaceMcpRegistryUpdated = () => {
       scheduleWorkspaceMcpSync("workspace_mcp_registry_updated", 0);
     };
@@ -15956,6 +16021,7 @@ export default function App() {
     workspaceMcpSyncTargets,
     workspaceHydrationReady,
     workspaceActivationDeferred,
+    cloudLiveSyncEpoch,
     workspaceSyncState,
   ]);
 
@@ -18350,20 +18416,20 @@ export default function App() {
         : [];
       const catalogTargets = remoteControlWorkspaceCatalogTargets(lifecycleOverride);
       if (catalogTargets.length > 0) {
-        await invoke("cloud_mcp_sync_device_workspace_catalog", {
+        await invoke("cloud_mcp_sync_device_live_workspaces", {
           reason,
           workspaces: catalogTargets,
         }).catch(() => {});
       }
       const adjustedWorkspaces = applyRemoteControlWorkspaceOverride(workspacesSnapshot, lifecycleOverride);
       if (adjustedWorkspaces.length > 0) {
-        await invoke("cloud_mcp_sync_terminal_presence", {
+        await invoke("cloud_mcp_sync_device_live_terminals", {
           reason,
           workspaces: adjustedWorkspaces,
         }).catch(() => {});
       }
       if (!lifecycleOverride) {
-        await invoke("cloud_mcp_sync_device_workspace_snapshot", {
+        await invoke("cloud_mcp_sync_device_live_state_snapshot", {
           reason,
         }).catch(() => {});
       }
@@ -18592,7 +18658,7 @@ export default function App() {
       }
 
       setAgentInstallState((state) => ({ ...state, [provider]: updating ? "updating" : "installing" }));
-      syncAgentInstallationsToCloud(agentStatuses, updating ? "remote_agent_update_start" : "remote_agent_install_start", {
+      syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, updating ? "remote_agent_update_start" : "remote_agent_install_start", {
         [provider]: updating ? "updating" : "installing",
       });
       setAgentInstallResults((results) => {
@@ -18609,10 +18675,12 @@ export default function App() {
         source,
       });
 
+      let refreshedStatuses = null;
       try {
         const result = await invoke(updating ? "update_agent" : "install_agent", { provider });
         setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source, remote: true } }));
         const nextStatuses = await refreshAgentStatuses();
+        refreshedStatuses = nextStatuses;
         const completed = Boolean(result?.installed);
         await recordRemoteCommandStatus(
           event,
@@ -18650,7 +18718,7 @@ export default function App() {
         });
       } finally {
         setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-        syncAgentInstallationsToCloud(agentStatuses, updating ? "remote_agent_update_idle" : "remote_agent_install_idle", {
+        syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, updating ? "remote_agent_update_idle" : "remote_agent_install_idle", {
           [provider]: "idle",
         });
       }
@@ -24219,21 +24287,13 @@ export default function App() {
                       aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                     >
-                      <WorkspaceCreatePanel
-                        agentStatuses={agentStatuses}
-                        chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
-                        defaultWorkingDirectory={defaultWorkingDirectory}
-                        fallbackRole={workspaceTerminalFallbackRole}
-                        onClose={null}
-                        onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
-                        roleOptions={workspaceTerminalRoleOptions}
-                        rootDraft={newWorkspaceRootDraft}
-                        setRootDraft={setNewWorkspaceRootDraft}
-                        setWorkspaceName={setWorkspaceName}
-                        visible={visibleView === DEFAULT_WORKSPACE_VIEW}
-                        workspaceError={workspaceError}
-                        workspaceName={workspaceName}
-                        workspaceSyncState={workspaceSyncState}
+                      <WorkspaceIdleState
+                        actionLabel="Create First Workspace"
+                        detail="Create a workspace to start opening agents, files, and project history."
+                        onAction={openCreateWorkspaceModal}
+                        plan={billingPlanNameFromStatus(billingStatus, user)}
+                        title="No Workspaces Selected"
+                        viewMotion={viewMotion}
                       />
                     </WorkspaceRuntimeLayer>
                   ) : shouldKeepWorkspaceTerminalMounted && (
@@ -25335,21 +25395,13 @@ export default function App() {
               ) : visibleView === "files" ? (
                 <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
                   {shouldShowWorkspaceSetup ? (
-                    <WorkspaceCreatePanel
-                      agentStatuses={agentStatuses}
-                      chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
-                      defaultWorkingDirectory={defaultWorkingDirectory}
-                      fallbackRole={workspaceTerminalFallbackRole}
-                      onClose={null}
-                      onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
-                      roleOptions={workspaceTerminalRoleOptions}
-                      rootDraft={newWorkspaceRootDraft}
-                      setRootDraft={setNewWorkspaceRootDraft}
-                      setWorkspaceName={setWorkspaceName}
-                      visible={visibleView === "files"}
-                      workspaceError={workspaceError}
-                      workspaceName={workspaceName}
-                      workspaceSyncState={workspaceSyncState}
+                    <WorkspaceIdleState
+                      actionLabel="Create First Workspace"
+                      detail="Create a workspace before browsing project files."
+                      onAction={openCreateWorkspaceModal}
+                      plan={billingPlanNameFromStatus(billingStatus, user)}
+                      title="No Workspaces Selected"
+                      viewMotion={viewMotion}
                     />
                   ) : selectedWorkspace ? (
                     <FilesWorkspaceView

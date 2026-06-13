@@ -3951,10 +3951,12 @@ fn voice_history_safe_workspace_id(value: &str) -> String {
 
 fn voice_history_path(root_directory: Option<&str>, workspace_id: &str) -> Result<PathBuf, String> {
     let root = resolve_workspace_root_directory(root_directory)?;
-    let agents_dir = root.join(".agents");
+    let agents_dir = coordination::db::coordination_workspace_state_root(&root);
     fs::create_dir_all(&agents_dir)
-        .map_err(|error| format!("Unable to create workspace .agents directory: {error}"))?;
-    let _ = ensure_workspace_agents_gitignore(&root);
+        .map_err(|error| format!("Unable to create workspace state directory: {error}"))?;
+    if coordination::db::coordination_state_root_is_visible(&root, &agents_dir) {
+        let _ = ensure_workspace_agents_gitignore(&root);
+    }
     let history_dir = agents_dir.join("voice-history");
     fs::create_dir_all(&history_dir)
         .map_err(|error| format!("Unable to create voice history directory: {error}"))?;
@@ -4466,7 +4468,6 @@ async fn run_cloud_voice_agent_stream(
                             let finish_message = json!({
                                 "kind": "finish_input",
                                 "voice_protocol": "diffforge.voice.realtime.v2",
-                                "lane": "control",
                                 "contract": "diffforge.voice_agent.v1",
                             });
                             if let Err(error) = write
@@ -4515,7 +4516,6 @@ async fn run_cloud_voice_agent_stream(
                         let finish_message = json!({
                             "kind": "finish_input",
                             "voice_protocol": "diffforge.voice.realtime.v2",
-                            "lane": "control",
                             "contract": "diffforge.voice_agent.v1",
                         });
                         if let Err(error) = write
@@ -4647,7 +4647,6 @@ async fn run_cloud_voice_agent_stream(
             let finish_message = json!({
                 "kind": "finish_input",
                 "voice_protocol": "diffforge.voice.realtime.v2",
-                "lane": "control",
                 "contract": "diffforge.voice_agent.v1",
             });
             if let Err(error) = write
@@ -4788,7 +4787,6 @@ async fn run_cloud_voice_agent_stream(
         let stop_message = json!({
             "kind": "stop",
             "voice_protocol": "diffforge.voice.realtime.v2",
-            "lane": "control",
             "contract": "diffforge.voice_agent.v1",
         });
         if let Err(error) = write
@@ -5003,7 +5001,6 @@ async fn run_cloud_voice_agent_text_message(
         let stop_message = json!({
             "kind": "stop",
             "voice_protocol": "diffforge.voice.realtime.v2",
-            "lane": "control",
             "contract": "diffforge.voice_agent.v1",
         });
         let _ = write
@@ -5259,7 +5256,6 @@ async fn start_cloud_voice_agent_stream(
             "kind": "start",
             "contract": CLOUD_VOICE_AGENT_CONTRACT,
             "voice_protocol": "diffforge.voice.realtime.v2",
-            "lane": "control",
             // GPT-Realtime engine opt-in (cloud falls back to the pipeline
             // when its env kill switch is set).
             "realtime": realtime_engine,
@@ -5712,7 +5708,6 @@ async fn send_cloud_voice_agent_text_message(
         "kind": "text_message",
         "contract": CLOUD_VOICE_AGENT_CONTRACT,
         "voice_protocol": "diffforge.voice.realtime.v2",
-        "lane": "control",
         "voice_session_id": voice_session_id,
         "device_id": device_profile["device_id"].clone(),
         "machine_id": device_profile["device_id"].clone(),

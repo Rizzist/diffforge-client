@@ -30,6 +30,7 @@ use tauri::{
     AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -2196,6 +2197,7 @@ include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("terminal_cli.rs");
 include!("tokenomics.rs");
+include!("native_notifications.rs");
 include!("cloud_mcp.rs");
 include!("assets.rs");
 include!("agent_sessions.rs");
@@ -4466,9 +4468,9 @@ pub fn run() {
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
             cloud_mcp_sync_agent_installations,
-            cloud_mcp_sync_terminal_presence,
+            cloud_mcp_sync_device_live_terminals,
             cloud_mcp_sync_terminal_status_event,
-            cloud_mcp_sync_workspace_mcp_snapshot,
+            cloud_mcp_sync_device_live_workspace_mcps,
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
             cloud_mcp_schedule_tokenomics_sync,
@@ -4490,11 +4492,11 @@ pub fn run() {
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
-            cloud_mcp_sync_device_workspace_catalog,
+            cloud_mcp_sync_device_live_workspaces,
             cloud_mcp_workspace_catalog_upsert,
             cloud_mcp_workspace_catalog_delete,
             cloud_mcp_workspace_catalog_list,
-            cloud_mcp_sync_device_workspace_snapshot,
+            cloud_mcp_sync_device_live_state_snapshot,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_update_voice_plan_steps,
             cloud_mcp_get_workspace_architectures,

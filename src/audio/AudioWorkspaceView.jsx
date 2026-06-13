@@ -485,7 +485,7 @@ const AUDIO_INPUT_METER_BARS = 18;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
-const AUDIO_WIDGET_HISTORY_TRAY_SIZE = { width: 132, height: 112 };
+const AUDIO_WIDGET_HISTORY_TRAY_SIZE = { width: 64, height: 98 };
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
@@ -3545,6 +3545,7 @@ export function AudioWidgetWindow() {
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
+  const bubbleHistoryTrayActiveRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceTtsPlayerRef = useRef(null);
@@ -4026,6 +4027,7 @@ export function AudioWidgetWindow() {
   const bubbleHistoryTrayActive = canUseBubbleHistoryTray && historyTrayOpen;
   const bubbleCancelNoticeActiveRef = useRef(bubbleCancelNoticeActive);
   bubbleCancelNoticeActiveRef.current = bubbleCancelNoticeActive;
+  bubbleHistoryTrayActiveRef.current = bubbleHistoryTrayActive;
 
   const refreshWidgetHistory = useCallback(() => {
     setWidgetHistory(readAudioTranscriptionHistory());
@@ -4220,62 +4222,29 @@ export function AudioWidgetWindow() {
     });
   }, [barVisible, cancelNoticeActive, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
 
-  // Bubble history controls live below the compact bubble, leaving the error
-  // popover's upward resize path untouched. The window grows down and widens
-  // around the bubble center, then restores the original placement.
+  // Bubble history controls use the same stable-anchor idea as the error
+  // popover: resize the native frame in one direction while leaving the
+  // bubble's screen position alone. No tray open/close path should setPosition,
+  // otherwise hover close can undo a native drag that happened while expanded.
   useEffect(() => {
     if (!bubbleHistoryTrayActive) {
       return undefined;
     }
 
-    let disposed = false;
-    let savedPosition = null;
-
-    runWidgetWindowAction(async (windowHandle) => {
-      const scale = (await windowHandle.scaleFactor().catch(() => 1)) || 1;
-      const originalPosition = await windowHandle.outerPosition();
-
-      if (disposed) {
-        return;
-      }
-
-      savedPosition = originalPosition;
-      await windowHandle.setSize(new LogicalSize(
+    runWidgetWindowAction((windowHandle) => (
+      windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_HISTORY_TRAY_SIZE.width,
         AUDIO_WIDGET_HISTORY_TRAY_SIZE.height,
-      ));
-
-      const monitor = await currentMonitor().catch(() => null);
-      const centeredX = originalPosition.x
-        - Math.round(((AUDIO_WIDGET_HISTORY_TRAY_SIZE.width - AUDIO_WIDGET_COMPACT_SIZE.width) * scale) / 2);
-      let nextX = centeredX;
-
-      if (monitor) {
-        const area = monitor.workArea?.size?.width
-          ? monitor.workArea
-          : { position: monitor.position, size: monitor.size };
-        const maxX = area.position.x
-          + area.size.width
-          - Math.round(AUDIO_WIDGET_HISTORY_TRAY_SIZE.width * scale);
-        nextX = Math.max(area.position.x, Math.min(centeredX, maxX));
-      }
-
-      if (!disposed) {
-        await windowHandle.setPosition(new PhysicalPosition(nextX, originalPosition.y));
-      }
-    });
+      ))
+    ));
 
     return () => {
-      disposed = true;
-      runWidgetWindowAction(async (windowHandle) => {
-        await windowHandle.setSize(new LogicalSize(
+      runWidgetWindowAction((windowHandle) => (
+        windowHandle.setSize(new LogicalSize(
           AUDIO_WIDGET_COMPACT_SIZE.width,
           AUDIO_WIDGET_COMPACT_SIZE.height,
-        ));
-        if (savedPosition) {
-          await windowHandle.setPosition(savedPosition);
-        }
-      });
+        ))
+      ));
     };
   }, [bubbleHistoryTrayActive, runWidgetWindowAction]);
 
@@ -4461,6 +4430,22 @@ export function AudioWidgetWindow() {
     }
 
     if (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+      return;
+    }
+
+    if (bubbleHistoryTrayActiveRef.current) {
+      if (historyTrayCloseTimerRef.current) {
+        window.clearTimeout(historyTrayCloseTimerRef.current);
+        historyTrayCloseTimerRef.current = 0;
+      }
+      setHistoryTrayOpen(false);
+      runWidgetWindowAction(async (windowHandle) => {
+        await windowHandle.setSize(new LogicalSize(
+          AUDIO_WIDGET_COMPACT_SIZE.width,
+          AUDIO_WIDGET_COMPACT_SIZE.height,
+        ));
+        await windowHandle.startDragging();
+      });
       return;
     }
 

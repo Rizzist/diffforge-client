@@ -101,10 +101,12 @@ fn workspace_threads_clean_thread_id(value: &str) -> Option<String> {
 }
 
 fn workspace_threads_store_db_path(root: &Path) -> Result<PathBuf, String> {
-    let agents_dir = root.join(".agents");
+    let agents_dir = coordination::db::coordination_workspace_state_root(root);
     fs::create_dir_all(&agents_dir)
-        .map_err(|error| format!("Unable to create workspace .agents directory: {error}"))?;
-    let _ = ensure_workspace_agents_gitignore(root);
+        .map_err(|error| format!("Unable to create workspace state directory: {error}"))?;
+    if coordination::db::coordination_state_root_is_visible(root, &agents_dir) {
+        let _ = ensure_workspace_agents_gitignore(root);
+    }
     Ok(agents_dir.join("diffforge_threads.sqlite3"))
 }
 
@@ -123,7 +125,7 @@ fn workspace_threads_open_store(
     let db_path = if create {
         workspace_threads_store_db_path(&root)?
     } else {
-        root.join(".agents").join("diffforge_threads.sqlite3")
+        coordination::db::coordination_workspace_state_root(&root).join("diffforge_threads.sqlite3")
     };
     let connection = rusqlite::Connection::open(&db_path)
         .map_err(|error| format!("Unable to open workspace threads SQLite store: {error}"))?;

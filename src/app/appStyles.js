@@ -9751,13 +9751,16 @@ export const AudioWidgetFocusStage = styled.div`
 
 export const AudioWidgetHistoryTray = styled.div`
   position: absolute;
-  top: 70px;
+  top: 58px;
   left: 50%;
   z-index: 6;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 6px;
+  justify-content: center;
+  width: 64px;
+  box-sizing: border-box;
+  gap: 3px;
+  padding: 3px;
   border: 1px solid rgba(230, 236, 245, 0.12);
   border-radius: 999px;
   background:
@@ -9774,6 +9777,16 @@ export const AudioWidgetHistoryTray = styled.div`
     opacity 150ms ease,
     transform 180ms cubic-bezier(0.3, 0, 0.2, 1);
   -webkit-app-region: no-drag;
+
+  ${AudioHistoryQuickButton} {
+    width: 27px;
+    height: 27px;
+  }
+
+  ${AudioHistoryQuickButton} svg {
+    width: 13px;
+    height: 13px;
+  }
 
   ${AudioWidgetShell}[data-history-tray="true"] & {
     opacity: 1;
@@ -14493,15 +14506,6 @@ export const WorkspaceCreateCdForm = styled.div`
   }
 `;
 
-export const WorkspaceCreateCdPrompt = styled.span`
-  flex: 0 0 auto;
-  color: #7bdc9d;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12.5px;
-  font-weight: 700;
-  user-select: none;
-`;
-
 export const WorkspaceCreateCdInput = styled.input`
   flex: 1;
   min-width: 0;
@@ -14518,19 +14522,21 @@ export const WorkspaceCreateCdInput = styled.input`
 `;
 
 export const WorkspaceCreateDirGrid = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-  max-height: 168px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  max-height: min(220px, 30vh);
   overflow: auto;
-  padding: 2px;
+  padding: 2px 3px 2px 0;
 `;
 
 export const WorkspaceCreateDirChip = styled.button`
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 6px;
-  max-width: 220px;
+  width: 100%;
+  min-width: 0;
   padding: 6px 10px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
