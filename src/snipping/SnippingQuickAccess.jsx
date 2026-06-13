@@ -1380,13 +1380,18 @@ const FloatStatusPill = styled.span`
   }
 `;
 
-function StripSnipTile({ item, onChanged, onOpened }) {
+const STRIP_TILE_DRAG_INTENT_PX = 7;
+const STRIP_TILE_DRAG_OUT_INTENT_PX = 12;
+const STRIP_TILE_DRAG_OUT_EDGE_PX = 8;
+
+function StripSnipTile({ item, onChanged, onOpened, railRef }) {
   const localPath = assetLocalPath(item);
   const name = useMemo(() => assetName(item), [item]);
   const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [launching, setLaunching] = useState(false);
+  const [panning, setPanning] = useState(false);
   const statusTimerRef = useRef(0);
   const dragRef = useRef(null);
   const mountedRef = useRef(true);
@@ -1445,28 +1450,74 @@ function StripSnipTile({ item, onChanged, onOpened }) {
     }
   }, [busy, localPath, name, onChanged, previewUrl, showStatus]);
 
-  const clearDrag = useCallback(() => {
+  const clearDrag = useCallback((event) => {
+    const drag = dragRef.current;
+    if (drag && event?.currentTarget) {
+      try {
+        event.currentTarget.releasePointerCapture?.(drag.pointerId);
+      } catch (_) {
+        // Pointer capture may already have been released by the native drag.
+      }
+    }
     dragRef.current = null;
+    if (mountedRef.current) setPanning(false);
   }, []);
 
   const startDrag = useCallback((event) => {
     if (!localPath || busy || event.button !== 0 || event.target.closest("button")) return;
+    const rail = railRef?.current;
+    const railRect = rail?.getBoundingClientRect();
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     dragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      started: false,
+      startScrollLeft: rail?.scrollLeft || 0,
+      railBottom: railRect?.bottom ?? 0,
+      railTop: railRect?.top ?? 0,
+      mode: "pending",
     };
-  }, [busy, localPath]);
+  }, [busy, localPath, railRef]);
 
   const continueDrag = useCallback((event) => {
     const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId || drag.started || busy) return;
-    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-    if (distance < 7) return;
-    drag.started = true;
+    if (!drag || drag.pointerId !== event.pointerId || drag.mode === "drag-out" || busy) return;
+    const rail = railRef?.current;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    const absX = Math.abs(dx);
+    const absY = Math.abs(dy);
+    const distance = Math.hypot(dx, dy);
+    if (drag.mode === "scroll") {
+      if (rail) rail.scrollLeft = drag.startScrollLeft - dx;
+      event.preventDefault();
+      return;
+    }
+    if (distance < STRIP_TILE_DRAG_INTENT_PX) return;
+
+    const railRect = rail?.getBoundingClientRect();
+    const railTop = railRect?.top ?? drag.railTop;
+    const railBottom = railRect?.bottom ?? drag.railBottom;
+    const outsideRailY = railRect
+      ? event.clientY < railTop - STRIP_TILE_DRAG_OUT_EDGE_PX
+        || event.clientY > railBottom + STRIP_TILE_DRAG_OUT_EDGE_PX
+      : false;
+    const horizontalIntent = absX > absY * 1.15;
+    const verticalIntent =
+      absY >= STRIP_TILE_DRAG_OUT_INTENT_PX && (outsideRailY || absY > absX * 0.85);
+
+    if (horizontalIntent && !outsideRailY) {
+      drag.mode = "scroll";
+      if (rail) rail.scrollLeft = drag.startScrollLeft - dx;
+      setPanning(true);
+      event.preventDefault();
+      return;
+    }
+    if (!verticalIntent && !outsideRailY) return;
+
+    drag.mode = "drag-out";
+    setPanning(false);
     setBusy(true);
     setLaunching(true);
     invoke("snipping_open_snip_float_for_drag", {
@@ -1483,9 +1534,10 @@ function StripSnipTile({ item, onChanged, onOpened }) {
       })
       .finally(() => {
         dragRef.current = null;
+        if (mountedRef.current) setPanning(false);
         if (mountedRef.current) setBusy(false);
       });
-  }, [busy, localPath, onOpened, showStatus]);
+  }, [busy, localPath, onOpened, railRef, showStatus]);
 
   if (!localPath) return null;
 
@@ -1494,6 +1546,7 @@ function StripSnipTile({ item, onChanged, onOpened }) {
       aria-label={name}
       data-busy={busy ? "true" : "false"}
       data-launching={launching ? "true" : "false"}
+      data-panning={panning ? "true" : "false"}
       onPointerCancel={clearDrag}
       onPointerDown={startDrag}
       onPointerMove={continueDrag}
@@ -1631,6 +1684,7 @@ export function SnippingRecentStrip() {
           key={assetLocalPath(item)}
           onChanged={removePath}
           onOpened={removePath}
+          railRef={railRef}
         />
       ))}
       {!items.length ? (
@@ -1884,6 +1938,7 @@ const StripTile = styled.div`
     transform 160ms cubic-bezier(0.2, 0.9, 0.3, 1.1);
   user-select: none;
   -webkit-user-select: none;
+  touch-action: none;
 
   &:hover {
     border-color: rgba(125, 176, 255, 0.48);
@@ -1900,6 +1955,11 @@ const StripTile = styled.div`
   &[data-launching="true"] {
     opacity: 0.55;
     transform: scale(1.08);
+  }
+
+  &[data-panning="true"] {
+    cursor: grabbing;
+    transform: scale(0.985);
   }
 
   img {

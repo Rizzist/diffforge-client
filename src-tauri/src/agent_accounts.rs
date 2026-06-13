@@ -248,7 +248,10 @@ fn agent_accounts_profile_is_duplicate_of_default(
     if profile.get("source").and_then(Value::as_str) != Some("captured") {
         return false;
     }
-    let id = profile.get("id").and_then(Value::as_str).unwrap_or_default();
+    let id = profile
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if id == active_id {
         return false;
     }
@@ -275,7 +278,12 @@ pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
     profiles
         .iter()
         .filter(|profile| {
-            agent_accounts_profile_is_duplicate_of_default(kind, profile, &active_id, &default_email)
+            agent_accounts_profile_is_duplicate_of_default(
+                kind,
+                profile,
+                &active_id,
+                &default_email,
+            )
         })
         .filter_map(|profile| {
             profile
@@ -332,7 +340,10 @@ fn agent_accounts_active_profile_dir(kind: &str) -> Option<String> {
         return None;
     }
     profiles.iter().find_map(|profile| {
-        let id = profile.get("id").and_then(Value::as_str).unwrap_or_default();
+        let id = profile
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if id != active_id {
             return None;
         }
@@ -345,6 +356,73 @@ fn agent_accounts_active_profile_dir(kind: &str) -> Option<String> {
     })
 }
 
+fn agent_accounts_auth_file_name(kind: &str) -> &'static str {
+    match kind {
+        "claude" => ".credentials.json",
+        _ => "auth.json",
+    }
+}
+
+fn agent_accounts_profile_id(profile: &Value) -> Option<String> {
+    profile
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn agent_accounts_profile_dir(profile: &Value) -> Option<PathBuf> {
+    profile
+        .get("dir")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+fn agent_accounts_default_profile_for_launch(kind: &'static str) -> Option<Value> {
+    let identity = agent_accounts_profile_identity(kind, None);
+    let email = identity
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
+    let auth_ready = identity
+        .get("authReady")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if email.is_empty() || !auth_ready {
+        return None;
+    }
+
+    let _ = agent_accounts_capture_kind(kind);
+    let registry = agent_accounts_registry_read();
+    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let auth_file = agent_accounts_auth_file_name(kind);
+    profiles.into_iter().find_map(|profile| {
+        if agent_accounts_profile_email(kind, &profile) != email {
+            return None;
+        }
+        agent_accounts_profile_dir(&profile)
+            .filter(|path| path.join(auth_file).is_file())
+            .map(|_| profile)
+    })
+}
+
+fn agent_accounts_default_profile_home_for_launch(kind: &'static str) -> Option<PathBuf> {
+    agent_accounts_default_profile_for_launch(kind).and_then(|profile| {
+        let auth_file = agent_accounts_auth_file_name(kind);
+        agent_accounts_profile_dir(&profile).filter(|path| path.join(auth_file).is_file())
+    })
+}
+
+fn agent_accounts_profile_home_for_launch(kind: &'static str) -> Option<PathBuf> {
+    agent_accounts_active_profile_dir(kind)
+        .map(PathBuf::from)
+        .or_else(|| agent_accounts_default_profile_home_for_launch(kind))
+}
+
 fn agent_accounts_active_profile_label(kind: &str) -> (String, String) {
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
@@ -354,20 +432,35 @@ fn agent_accounts_active_profile_label(kind: &str) -> (String, String) {
     let label = profiles
         .iter()
         .find(|profile| {
-            profile.get("id").and_then(Value::as_str).unwrap_or_default() == active_id
+            profile
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                == active_id
         })
         .map(agent_accounts_profile_display_label)
         .unwrap_or_else(|| "Account".to_string());
     (active_id, label)
 }
 
+fn agent_accounts_launch_profile_label(kind: &'static str) -> (String, String) {
+    let (active_id, active_label) = agent_accounts_active_profile_label(kind);
+    if active_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        return (active_id, active_label);
+    }
+    agent_accounts_default_profile_for_launch(kind)
+        .and_then(|profile| {
+            agent_accounts_profile_id(&profile)
+                .map(|id| (id, agent_accounts_profile_display_label(&profile)))
+        })
+        .unwrap_or((active_id, active_label))
+}
+
 /// All registered profiles of one kind with existing dirs, for tokenomics:
 /// Claude profiles contribute transcript scan roots (`<dir>/projects`), Codex
 /// profiles contribute per-account auth for the live usage endpoint — each
 /// attributed to its own account key.
-pub(crate) fn agent_accounts_profiles_for_tokenomics(
-    kind: &str,
-) -> Vec<(String, String, PathBuf)> {
+pub(crate) fn agent_accounts_profiles_for_tokenomics(kind: &str) -> Vec<(String, String, PathBuf)> {
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
     let default_email = agent_accounts_default_email(kind);
@@ -414,6 +507,17 @@ pub(crate) fn agent_accounts_active_codex_home() -> Option<PathBuf> {
         .filter(|path| path.join("auth.json").is_file())
 }
 
+/// Stable Codex auth home for a managed launch. A selected captured profile is
+/// already isolated; the Default profile is first pinned to its captured
+/// per-account snapshot so later `~/.codex/auth.json` changes do not mutate
+/// running managed panes.
+pub(crate) fn agent_accounts_codex_home_for_launch() -> Option<PathBuf> {
+    if let Some(profile_home) = agent_accounts_active_codex_home() {
+        return Some(profile_home);
+    }
+    agent_accounts_default_profile_home_for_launch("codex")
+}
+
 /// Spawn-time account binding: stamps the pane with the active profile and
 /// injects the CLI home override for non-default profiles. Called from
 /// `extend_terminal_activity_env_vars`, which every agent spawn/relaunch
@@ -427,7 +531,7 @@ pub(crate) fn agent_accounts_apply_spawn_env(
     let Some(kind) = agent_accounts_supported_kind(provider_id) else {
         return;
     };
-    let (active_id, active_label) = agent_accounts_active_profile_label(kind);
+    let (active_id, active_label) = agent_accounts_launch_profile_label(kind);
     {
         let registry = AGENT_ACCOUNTS_PANE_PROFILES.get_or_init(|| StdMutex::new(HashMap::new()));
         if let Ok(mut map) = registry.lock() {
@@ -445,15 +549,21 @@ pub(crate) fn agent_accounts_apply_spawn_env(
             );
         }
     }
-    let Some(dir) = agent_accounts_active_profile_dir(kind) else {
-        return;
-    };
     match kind {
         "claude" => {
+            let Some(dir) = agent_accounts_profile_home_for_launch(kind) else {
+                return;
+            };
             env_vars.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
-            env_vars.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
+            env_vars.push((
+                "CLAUDE_CONFIG_DIR".to_string(),
+                dir.to_string_lossy().to_string(),
+            ));
         }
         _ => {
+            let Some(dir) = agent_accounts_active_profile_dir(kind) else {
+                return;
+            };
             // Coordinated Codex panes already run a Diff Forge managed
             // CODEX_HOME (hook profiles live there); their auth re-links from
             // the active profile via the kernel's auth bridge instead.
@@ -531,11 +641,17 @@ fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
     if !source.is_file() {
         return false;
     }
+    let destination_empty = destination
+        .metadata()
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(false);
     let newer = match (
         source.metadata().and_then(|meta| meta.modified()),
         destination.metadata().and_then(|meta| meta.modified()),
     ) {
-        (Ok(source_time), Ok(destination_time)) => source_time > destination_time,
+        (Ok(source_time), Ok(destination_time)) => {
+            destination_empty || source_time > destination_time
+        }
         (Ok(_), Err(_)) => true,
         _ => false,
     };
@@ -773,7 +889,11 @@ async fn agent_accounts_update_display(
             .and_then(Value::as_array_mut)
             .and_then(|profiles| {
                 profiles.iter_mut().find(|profile| {
-                    profile.get("id").and_then(Value::as_str).unwrap_or_default() == profile_id
+                    profile
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        == profile_id
                 })
             })
             .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
@@ -817,7 +937,11 @@ async fn agent_accounts_set_active(
         let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
         let known = profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
             || profiles.iter().any(|profile| {
-                profile.get("id").and_then(Value::as_str).unwrap_or_default() == profile_id
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == profile_id
             });
         if !known {
             return Err(format!("Unknown {kind} account profile: {profile_id}"));
@@ -864,7 +988,11 @@ async fn agent_accounts_remove(
         let removed = profiles
             .iter()
             .find(|profile| {
-                profile.get("id").and_then(Value::as_str).unwrap_or_default() == profile_id
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == profile_id
             })
             .cloned()
             .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?;
@@ -875,7 +1003,11 @@ async fn agent_accounts_remove(
             .and_then(Value::as_array_mut)
         {
             entries.retain(|profile| {
-                profile.get("id").and_then(Value::as_str).unwrap_or_default() != profile_id
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    != profile_id
             });
         }
         // Deleting an account that is still signed into the default home must
@@ -918,8 +1050,10 @@ async fn agent_accounts_remove(
     .map_err(|error| format!("Agent accounts remove worker failed: {error}"))?
 }
 
-/// Pane → profile stamps plus the current active ids, for the webview's
-/// stale-terminal chips ("account switched — restart to use X").
+/// Pane → launch-profile stamps plus the current launch ids, for the webview's
+/// stale-terminal chips ("account switched — restart to use X"). Default
+/// accounts resolve to captured snapshots when possible, so a later default
+/// login change can still mark older panes stale.
 #[tauri::command]
 async fn agent_accounts_pane_profiles() -> Result<Value, String> {
     let panes = AGENT_ACCOUNTS_PANE_PROFILES
@@ -931,8 +1065,8 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
                 .collect::<serde_json::Map<String, Value>>()
         })
         .unwrap_or_default();
-    let (claude_active, claude_label) = agent_accounts_active_profile_label("claude");
-    let (codex_active, codex_label) = agent_accounts_active_profile_label("codex");
+    let (claude_active, claude_label) = agent_accounts_launch_profile_label("claude");
+    let (codex_active, codex_label) = agent_accounts_launch_profile_label("codex");
     Ok(json!({
         "panes": panes,
         "active": {
@@ -946,6 +1080,42 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
 mod agent_accounts_tests {
     use super::*;
 
+    static AGENT_ACCOUNTS_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    struct ScopedAgentAccountsEnv {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedAgentAccountsEnv {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedAgentAccountsEnv {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn test_codex_auth_for_email(email: &str) -> String {
+        let claims = general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&json!({ "email": email })).unwrap());
+        serde_json::to_string(&json!({ "tokens": { "id_token": format!("h.{claims}.s") } }))
+            .unwrap()
+    }
+
+    fn test_claude_state_for_email(email: &str) -> String {
+        serde_json::to_string(&json!({ "oauthAccount": { "emailAddress": email } })).unwrap()
+    }
+
     #[test]
     fn supported_kind_normalizes_provider_ids() {
         assert_eq!(agent_accounts_supported_kind("claude"), Some("claude"));
@@ -958,17 +1128,25 @@ mod agent_accounts_tests {
 
     #[test]
     fn codex_email_reads_id_token_payload() {
-        let claims = general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&json!({ "email": "dev@example.com" })).unwrap());
-        let auth = json!({ "tokens": { "id_token": format!("h.{claims}.s") } });
-        assert_eq!(agent_accounts_codex_email_from_auth(&auth), "dev@example.com");
+        let auth =
+            serde_json::from_str::<Value>(&test_codex_auth_for_email("dev@example.com")).unwrap();
+        assert_eq!(
+            agent_accounts_codex_email_from_auth(&auth),
+            "dev@example.com"
+        );
         assert_eq!(agent_accounts_codex_email_from_auth(&json!({})), "");
     }
 
     #[test]
     fn email_key_and_slug_normalize() {
-        assert_eq!(agent_accounts_email_key(" Dev@Example.COM "), "dev@example.com");
-        assert_eq!(agent_accounts_email_slug("dev.person+x@example.com"), "dev-person-x");
+        assert_eq!(
+            agent_accounts_email_key(" Dev@Example.COM "),
+            "dev@example.com"
+        );
+        assert_eq!(
+            agent_accounts_email_slug("dev.person+x@example.com"),
+            "dev-person-x"
+        );
         assert_eq!(agent_accounts_email_slug("@nowhere"), "account");
     }
 
@@ -1043,6 +1221,94 @@ mod agent_accounts_tests {
             vec!["a@b.com".to_string()]
         );
         assert!(agent_accounts_suppressed_emails(&json!({}), "claude").is_empty());
+    }
+
+    #[test]
+    fn codex_launch_home_pins_default_account_to_captured_snapshot() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!("agent_accounts_launch_{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_codex_home = home.join(".codex");
+        fs::create_dir_all(&default_codex_home).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            default_codex_home.join("auth.json"),
+            test_codex_auth_for_email("dev@example.com"),
+        )
+        .unwrap();
+        fs::write(default_codex_home.join("config.toml"), "# default config\n").unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+
+        let launch_home = agent_accounts_codex_home_for_launch().unwrap();
+
+        assert_ne!(launch_home, default_codex_home);
+        assert!(launch_home.starts_with(data.join(AGENT_ACCOUNTS_PROFILE_DIR)));
+        assert_eq!(
+            fs::read_to_string(launch_home.join("auth.json")).unwrap(),
+            test_codex_auth_for_email("dev@example.com")
+        );
+    }
+
+    #[test]
+    fn claude_spawn_env_pins_default_account_to_captured_config_dir() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_claude_launch_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_claude_home = home.join(".claude");
+        fs::create_dir_all(&default_claude_home).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            default_claude_home.join(".credentials.json"),
+            "{\"accessToken\":\"account-a\"}",
+        )
+        .unwrap();
+        fs::write(default_claude_home.join("settings.json"), "{}").unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            test_claude_state_for_email("dev@example.com"),
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+
+        let mut env_vars = Vec::new();
+        agent_accounts_apply_spawn_env(&mut env_vars, "pane-test-claude", "claude");
+        let launch_dir = env_vars
+            .iter()
+            .find_map(|(key, value)| (key == "CLAUDE_CONFIG_DIR").then(|| PathBuf::from(value)))
+            .unwrap();
+
+        assert_ne!(launch_dir, default_claude_home);
+        assert!(launch_dir.starts_with(data.join(AGENT_ACCOUNTS_PROFILE_DIR).join("claude")));
+        assert_eq!(
+            fs::read_to_string(launch_dir.join(".credentials.json")).unwrap(),
+            "{\"accessToken\":\"account-a\"}"
+        );
+        assert_eq!(
+            fs::read_to_string(launch_dir.join(".claude.json")).unwrap(),
+            test_claude_state_for_email("dev@example.com")
+        );
+        let expected_profile_id = launch_dir.file_name().and_then(|value| value.to_str());
+        let panes = AGENT_ACCOUNTS_PANE_PROFILES
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        assert_eq!(
+            panes["pane-test-claude"]["profileId"].as_str(),
+            expected_profile_id
+        );
     }
 
     #[test]

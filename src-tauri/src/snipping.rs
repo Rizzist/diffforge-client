@@ -163,6 +163,15 @@ struct SnippingState {
     /// bottom-left queue, but the queue must not pull them into an auto slot
     /// after release.
     preview_detached_labels: Arc<StdMutex<HashSet<String>>>,
+    /// Preview labels released near the queue column that are waiting for
+    /// native post-release movement (edge snap/constrain) to go quiet before
+    /// the app decides queue vs detached from the final position.
+    preview_post_release_settling_labels: Arc<StdMutex<HashSet<String>>>,
+    /// Set by the watcher as soon as it sees mouse-up for a native preview
+    /// drag, before the main-thread settle pass can decide whether the
+    /// left-column quiet gate applies. This prevents a post-release Moved
+    /// event from spawning a second watcher that resolves too early.
+    preview_post_release_check_pending: Arc<AtomicBool>,
     /// Preview labels whose webviews have been told to dispose and whose native
     /// windows are waiting for the close grace/release gate.
     preview_closing: Arc<StdMutex<HashSet<String>>>,
@@ -195,6 +204,8 @@ impl SnippingState {
             preview_paths: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
             preview_detached_labels: Arc::new(StdMutex::new(HashSet::new())),
+            preview_post_release_settling_labels: Arc::new(StdMutex::new(HashSet::new())),
+            preview_post_release_check_pending: Arc::new(AtomicBool::new(false)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
             preview_animation_generation: Arc::new(AtomicU64::new(0)),
@@ -4302,13 +4313,16 @@ const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 =
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
 // Fallback settle deadline pushed forward by every Moved event. On platforms
-// with a live mouse-button probe the watcher resolves the drop the moment
-// the button releases and this deadline only covers programmatic restack
-// animations; on platforms without one (Linux) it is the release signal.
+// with a live mouse-button probe the watcher usually resolves the drop the
+// moment the button releases, except for left-column post-release settling.
+// On platforms without one (Linux) it is the release signal.
 const SNIPPING_FLOAT_RESTACK_SETTLE_MS: u64 = 160;
 // Without a button probe a mid-drag pause is indistinguishable from a
 // release; keep the old longer stillness window there.
 const SNIPPING_FLOAT_RESTACK_SETTLE_FALLBACK_MS: u64 = 420;
+// After a left-column release, wait for native edge snap/constrain movement
+// to go quiet, then decide queue vs detached from the final window position.
+const SNIPPING_FLOAT_POST_RELEASE_SETTLE_MS: u64 = 170;
 // How often the settle watcher polls the button state / deadline while a
 // drag or pending reflow is in flight.
 const SNIPPING_FLOAT_SETTLE_POLL_MS: u64 = 15;
@@ -4394,6 +4408,12 @@ fn snipping_begin_preview_drag_session(
     if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
         sessions.insert(label.to_string(), (position.x, position.y));
     }
+    if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
+        settling.remove(label);
+    }
+    state
+        .preview_post_release_check_pending
+        .store(false, Ordering::SeqCst);
     // A pack animation may have captured this preview as movable just before
     // the press. Kill it immediately so left-side queue alignment wins over any
     // stale side/center tug.
@@ -4417,6 +4437,12 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     if let Ok(mut detached) = state.preview_detached_labels.lock() {
         detached.remove(label);
     }
+    if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
+        settling.remove(label);
+    }
+    state
+        .preview_post_release_check_pending
+        .store(false, Ordering::SeqCst);
     if let Ok(mut pool) = state.preview_pool.lock() {
         pool.retain(|pooled| pooled != label);
     };
@@ -4441,6 +4467,12 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     if let Ok(mut detached) = state.preview_detached_labels.lock() {
         detached.remove(label);
     }
+    if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
+        settling.remove(label);
+    }
+    state
+        .preview_post_release_check_pending
+        .store(false, Ordering::SeqCst);
     if let Ok(mut pool) = state.preview_pool.lock() {
         pool.retain(|pooled| pooled != label);
     }
@@ -4466,6 +4498,12 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     if let Ok(mut detached) = state.preview_detached_labels.lock() {
         detached.remove(label);
     }
+    if let Ok(mut settling) = state.preview_post_release_settling_labels.lock() {
+        settling.remove(label);
+    }
+    state
+        .preview_post_release_check_pending
+        .store(false, Ordering::SeqCst);
     if let Ok(mut pool) = state.preview_pool.lock() {
         if !pool.iter().any(|pooled| pooled == label) {
             pool.push(label.to_string());
@@ -4572,6 +4610,24 @@ fn snipping_preview_in_stack_column(position_x: i32, preview_width: i32, stack_x
     let stack_left = stack_x;
     let stack_right = stack_x + width;
     preview_right >= stack_left && preview_left <= stack_right
+}
+
+fn snipping_preview_window_in_stack_column(app: &AppHandle, window: &tauri::WebviewWindow) -> bool {
+    let Ok(position) = window.outer_position() else {
+        return false;
+    };
+    let width = window
+        .outer_size()
+        .map(|size| size.width.max(1) as i32)
+        .unwrap_or(1);
+    app.get_webview_window("main")
+        .and_then(|main_window| main_window.current_monitor().ok().flatten())
+        .map(|monitor| {
+            let column_x = monitor.work_area().position.x
+                + (SNIPPING_FLOAT_STACK_MARGIN * monitor.scale_factor().max(0.1)).round() as i32;
+            snipping_preview_in_stack_column(position.x, width, column_x)
+        })
+        .unwrap_or(false)
 }
 
 /// Bottom-left stacking slot for a new preview window: directly above the
@@ -4899,12 +4955,55 @@ fn snipping_restack_settle_ms() -> u64 {
     }
 }
 
+fn snipping_begin_left_column_post_release_settle(app: &AppHandle) -> bool {
+    // Platforms without a reliable button probe already wait for Moved-event
+    // stillness before resolving, so they do not need a second release gate.
+    if !snipping_mouse_button_state_supported() {
+        return false;
+    }
+    let state = app.state::<SnippingState>();
+    let labels = state
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if labels.is_empty() {
+        return false;
+    }
+
+    let left_column_labels = labels
+        .into_iter()
+        .filter(|label| {
+            app.get_webview_window(label).is_some_and(|window| {
+                !snipping_preview_overlaps_strip(app, &window)
+                    && snipping_preview_window_in_stack_column(app, &window)
+            })
+        })
+        .collect::<Vec<_>>();
+    if left_column_labels.is_empty() {
+        return false;
+    }
+
+    let marked = state
+        .preview_post_release_settling_labels
+        .lock()
+        .map(|mut settling| {
+            let mut inserted = false;
+            for label in left_column_labels {
+                inserted |= settling.insert(label);
+            }
+            inserted
+        })
+        .unwrap_or(false);
+    marked
+}
+
 /// Settle trigger fed by preview Moved/Destroyed window events and drag
 /// starts. Pushes the shared deadline forward and ensures the single watcher
-/// thread is running: the watcher resolves a user drag the instant the mouse
-/// button releases (where the platform can report it) and otherwise settles
-/// once the deadline passes with no further Moved events. One thread total,
-/// instead of one spawned per Moved event.
+/// thread is running: the watcher resolves most user drags the instant the
+/// mouse button releases, but waits for Moved-event stillness when a preview
+/// was released over the left queue column. One thread total, instead of one
+/// spawned per Moved event.
 fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
     let state = app.state::<SnippingState>();
     state.preview_restack_deadline_ms.store(
@@ -4920,6 +5019,8 @@ fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
     let deadline = state.preview_restack_deadline_ms.clone();
     let watcher_active = state.preview_restack_watcher_active.clone();
     let drag_sessions = state.preview_drag_sessions.clone();
+    let post_release_settling = state.preview_post_release_settling_labels.clone();
+    let post_release_check_pending = state.preview_post_release_check_pending.clone();
     let app = app.clone();
     thread::spawn(move || {
         let button_probe = snipping_mouse_button_state_supported();
@@ -4929,14 +5030,30 @@ fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
                 .lock()
                 .map(|sessions| !sessions.is_empty())
                 .unwrap_or(false);
-            if dragging && button_probe {
-                if !snipping_left_mouse_button_pressed() {
-                    // Released: resolve the drop right now.
+            let settling_after_release = post_release_settling
+                .lock()
+                .map(|settling| !settling.is_empty())
+                .unwrap_or(false);
+            let release_check_pending = post_release_check_pending.load(Ordering::SeqCst);
+            if button_probe {
+                let button_down = snipping_left_mouse_button_pressed();
+                if dragging && button_down {
+                    // Still holding: never settle mid-drag, however long the
+                    // pause — keep watching for the release.
+                    continue;
+                }
+                if settling_after_release || release_check_pending {
+                    if snipping_now_epoch_ms() >= deadline.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+                if dragging {
+                    // Released; the main-thread settle pass will decide
+                    // whether the left-column native quiet gate applies.
+                    post_release_check_pending.store(true, Ordering::SeqCst);
                     break;
                 }
-                // Still holding: never settle mid-drag, however long the
-                // pause — keep watching for the release.
-                continue;
             }
             if snipping_now_epoch_ms() >= deadline.load(Ordering::SeqCst) {
                 break;
@@ -4959,6 +5076,54 @@ fn snipping_settle_preview_windows(app: &AppHandle) {
         // never resolve a drop while the button is held; watch again.
         schedule_snipping_preview_stack_reflow(app);
         return;
+    }
+    let settling_after_release = {
+        let state = app.state::<SnippingState>();
+        state
+            .preview_post_release_settling_labels
+            .lock()
+            .map(|settling| !settling.is_empty())
+            .unwrap_or(false)
+    };
+    if !settling_after_release && snipping_begin_left_column_post_release_settle(app) {
+        app.state::<SnippingState>()
+            .preview_post_release_check_pending
+            .store(false, Ordering::SeqCst);
+        schedule_snipping_preview_stack_reflow(app);
+        app.state::<SnippingState>()
+            .preview_restack_deadline_ms
+            .store(
+                snipping_now_epoch_ms() + SNIPPING_FLOAT_POST_RELEASE_SETTLE_MS,
+                Ordering::SeqCst,
+            );
+        return;
+    }
+    app.state::<SnippingState>()
+        .preview_post_release_check_pending
+        .store(false, Ordering::SeqCst);
+    if settling_after_release {
+        if snipping_now_epoch_ms()
+            < app
+                .state::<SnippingState>()
+                .preview_restack_deadline_ms
+                .load(Ordering::SeqCst)
+        {
+            schedule_snipping_preview_stack_reflow(app);
+            app.state::<SnippingState>()
+                .preview_restack_deadline_ms
+                .store(
+                    snipping_now_epoch_ms() + SNIPPING_FLOAT_POST_RELEASE_SETTLE_MS,
+                    Ordering::SeqCst,
+                );
+            return;
+        }
+        if let Ok(mut settling) = app
+            .state::<SnippingState>()
+            .preview_post_release_settling_labels
+            .lock()
+        {
+            settling.clear();
+        }
     }
     snipping_resolve_preview_drop_candidates(app);
     snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS, SnippingTweenEasing::Track);
@@ -4994,6 +5159,44 @@ fn snipping_preview_point_in_main(
     ))
 }
 
+/// True when a native preview substantially overlaps the recent-snips strip.
+/// This is the drag-back bridge between the native preview window and the
+/// high-throughput DOM rail that renders docked items.
+fn snipping_preview_overlaps_strip(app: &AppHandle, preview: &tauri::WebviewWindow) -> bool {
+    let Some(strip) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+        return false;
+    };
+    if !strip.is_visible().unwrap_or(false) || strip.is_minimized().unwrap_or(false) {
+        return false;
+    }
+    let Ok(preview_position) = preview.outer_position() else {
+        return false;
+    };
+    let Ok(preview_size) = preview.outer_size() else {
+        return false;
+    };
+    let Ok(strip_position) = strip.outer_position() else {
+        return false;
+    };
+    let Ok(strip_size) = strip.outer_size() else {
+        return false;
+    };
+    let preview_left = preview_position.x;
+    let preview_top = preview_position.y;
+    let preview_right = preview_left + preview_size.width as i32;
+    let preview_bottom = preview_top + preview_size.height as i32;
+    let strip_left = strip_position.x;
+    let strip_top = strip_position.y;
+    let strip_right = strip_left + strip_size.width as i32;
+    let strip_bottom = strip_top + strip_size.height as i32;
+    let overlap_x = preview_right.min(strip_right) - preview_left.max(strip_left);
+    let overlap_y = preview_bottom.min(strip_bottom) - preview_top.max(strip_top);
+    let scale = strip.scale_factor().unwrap_or(1.0).max(0.1);
+    let min_overlap_x = (24.0 * scale).round().max(1.0) as i32;
+    let min_overlap_y = (14.0 * scale).round().max(1.0) as i32;
+    overlap_x >= min_overlap_x && overlap_y >= min_overlap_y
+}
+
 /// Offers every settled user drag to the main webview as a drop candidate.
 /// The webview decides whether something accepts it (and then calls
 /// snipping_consume_snip_preview); Rust only reports where it landed.
@@ -5024,25 +5227,26 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
         {
             continue;
         }
+        let path = state
+            .preview_paths
+            .lock()
+            .ok()
+            .and_then(|paths| paths.get(&label).cloned())
+            .unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        if snipping_preview_overlaps_strip(app, &window) {
+            if let Ok(mut detached) = state.preview_detached_labels.lock() {
+                detached.remove(&label);
+            }
+            snipping_close_preview_window(app, &label, "strip-returned");
+            continue;
+        }
         // A drop inside the bottom-left queue column adopts the preview (the
-        // reflow then packs it); anywhere else detaches it at the user's
-        // position. The top strip is rendered in its own webview now, so native
-        // preview windows are never dock-owned.
-        let adopted_by_queue = {
-            let width = window
-                .outer_size()
-                .map(|size| size.width.max(1) as i32)
-                .unwrap_or(1);
-            app.get_webview_window("main")
-                .and_then(|main_window| main_window.current_monitor().ok().flatten())
-                .map(|monitor| {
-                    let column_x = monitor.work_area().position.x
-                        + (SNIPPING_FLOAT_STACK_MARGIN * monitor.scale_factor().max(0.1)).round()
-                            as i32;
-                    snipping_preview_in_stack_column(position.x, width, column_x)
-                })
-                .unwrap_or(false)
-        };
+        // reflow then packs it); a drop back onto the strip was handled above.
+        // Anywhere else detaches it at the user's position.
+        let adopted_by_queue = snipping_preview_window_in_stack_column(app, &window);
         if let Ok(mut detached) = state.preview_detached_labels.lock() {
             if adopted_by_queue {
                 detached.remove(&label);
@@ -5053,15 +5257,6 @@ fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
         let Some((client_x, client_y)) = snipping_preview_point_in_main(app, &window) else {
             continue;
         };
-        let path = state
-            .preview_paths
-            .lock()
-            .ok()
-            .and_then(|paths| paths.get(&label).cloned())
-            .unwrap_or_default();
-        if path.is_empty() {
-            continue;
-        }
         let _ = app.emit_to(
             "main",
             SNIPPING_PREVIEW_DROP_EVENT,
@@ -5118,9 +5313,9 @@ const SNIPPING_FLOAT_ASSIGN_EVENT: &str = "forge-snip-float-assign";
 // Fired whenever the set of open floating previews changes (open, close,
 // destroy), so any quick-access UI watching preview state can refresh.
 const SNIPPING_FLOATS_CHANGED_EVENT: &str = "forge-snip-floats-changed";
-// One parked window is enough: refilling starts the moment a capture adopts
-// it, long before the user can finish the next selection.
-const SNIPPING_FLOAT_POOL_TARGET: usize = 1;
+// Keep two parked preview windows booted: one for the immediate drag/capture
+// handoff and one spare while the consumed window is being refilled.
+const SNIPPING_FLOAT_POOL_TARGET: usize = 2;
 
 fn snipping_emit_floats_changed(app: &AppHandle) {
     let _ = app.emit(
@@ -5285,10 +5480,10 @@ fn snipping_position_preview_window(
     }
 }
 
-/// Keeps one hidden, fully booted preview window parked so the next capture
-/// shows its preview instantly: webview creation and page boot — the slow
-/// part of opening a preview on every platform — happen ahead of time, off
-/// the capture hot path.
+/// Keeps hidden, fully booted preview windows parked so the next capture or
+/// strip drag-out shows its preview instantly: webview creation and page boot
+/// — the slow part of opening a preview on every platform — happen ahead of
+/// time, off the interaction hot path.
 fn snipping_warm_preview_pool(app: &AppHandle) {
     let state = app.state::<SnippingState>();
     let parked = state
@@ -5315,6 +5510,7 @@ fn snipping_warm_preview_pool(app: &AppHandle) {
             if let Ok(mut pool) = state.preview_pool.lock() {
                 pool.push(label);
             }
+            snipping_warm_preview_pool(&app_for_spawn);
         }
     });
     if queued.is_err() {
@@ -5882,6 +6078,7 @@ fn snipping_strip_hide_animated(
 /// the cursor's monitor, re-asserts the overlay style, and surfaces the bar
 /// even while another app's fullscreen Space is frontmost.
 pub(crate) fn snipping_strip_show(app: &AppHandle) {
+    snipping_warm_preview_pool(app);
     let Some(window) = snipping_strip_window(app) else {
         return;
     };

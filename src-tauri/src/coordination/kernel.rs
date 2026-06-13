@@ -25551,7 +25551,12 @@ fn codex_prepare_private_home(
         return Ok(());
     };
     for file_name in ["auth.json", "installation_id", "version.json"] {
-        codex_bridge_private_home_file(&source_home, home, file_name)?;
+        codex_bridge_private_home_file(
+            &source_home.home,
+            home,
+            file_name,
+            source_home.copy_auth_json && file_name == "auth.json",
+        )?;
     }
     Ok(())
 }
@@ -25591,7 +25596,7 @@ fn codex_private_home_project_trust_source_paths(home: &Path) -> Vec<PathBuf> {
     push_unique_codex_config_path(&mut paths, &mut seen, home.join("config.toml"));
 
     if let Some(source_home) = codex_user_home_for_auth_bridge() {
-        push_unique_codex_config_path(&mut paths, &mut seen, source_home.join("config.toml"));
+        push_unique_codex_config_path(&mut paths, &mut seen, source_home.home.join("config.toml"));
     }
 
     if let Some(parent) = home.parent() {
@@ -25695,24 +25700,38 @@ fn codex_project_trust_line_is_trusted(line: &str) -> bool {
     value == "trusted"
 }
 
-fn codex_user_home_for_auth_bridge() -> Option<PathBuf> {
-    // The active agent-account profile wins: managed per-slot homes re-link
-    // auth.json from it, so coordinated Codex panes adopt the account the
-    // user selected (the bridge replaces stale links when the source moves).
-    if let Some(profile_home) = crate::agent_accounts_active_codex_home() {
-        return Some(profile_home);
+#[derive(Debug, Clone)]
+struct CodexAuthBridgeSource {
+    home: PathBuf,
+    copy_auth_json: bool,
+}
+
+fn codex_user_home_for_auth_bridge() -> Option<CodexAuthBridgeSource> {
+    // Prefer a stable agent-account snapshot. Falling back to the mutable
+    // default home is allowed, but auth.json is copied so later account logins
+    // do not rewrite already launched managed Codex homes through a symlink.
+    if let Some(profile_home) = crate::agent_accounts_codex_home_for_launch() {
+        return Some(CodexAuthBridgeSource {
+            home: profile_home,
+            copy_auth_json: false,
+        });
     }
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
         .filter(|path| path.exists())
+        .map(|home| CodexAuthBridgeSource {
+            home,
+            copy_auth_json: true,
+        })
 }
 
 fn codex_bridge_private_home_file(
     source_home: &Path,
     private_home: &Path,
     file_name: &str,
+    copy_file: bool,
 ) -> Result<(), String> {
     let source = source_home.join(file_name);
     if !source.is_file() {
@@ -25724,7 +25743,7 @@ fn codex_bridge_private_home_file(
         let destination_key = destination
             .canonicalize()
             .unwrap_or_else(|_| destination.clone());
-        if source_key == destination_key {
+        if !copy_file && source_key == destination_key {
             return Ok(());
         }
         fs::remove_file(&destination).map_err(|error| {
@@ -25733,6 +25752,18 @@ fn codex_bridge_private_home_file(
                 destination.display()
             )
         })?;
+    }
+    if copy_file {
+        fs::copy(&source, &destination)
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "Unable to copy Codex file {} into managed home {}: {error}",
+                    source.display(),
+                    private_home.display()
+                )
+            })?;
+        return Ok(());
     }
     codex_link_or_copy_private_home_file(&source, &destination).map_err(|error| {
         format!(
@@ -29718,6 +29749,26 @@ mod tests {
         assert!(config.contains("default_tools_approval_mode = \"prompt\""));
         assert!(config.contains("[mcp_servers.github.env]"));
         assert!(config.contains("TEST_TOKEN = \"secret\""));
+    }
+
+    #[test]
+    fn managed_codex_auth_copy_replaces_mutable_default_symlink() {
+        let source = temp_repo("codex_auth_bridge_source");
+        let managed = temp_repo("codex_auth_bridge_managed");
+        fs::write(source.join("auth.json"), "account-a").unwrap();
+
+        codex_bridge_private_home_file(&source, &managed, "auth.json", false).unwrap();
+        codex_bridge_private_home_file(&source, &managed, "auth.json", true).unwrap();
+        fs::write(source.join("auth.json"), "account-b").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(managed.join("auth.json")).unwrap(),
+            "account-a"
+        );
+        assert!(!fs::symlink_metadata(managed.join("auth.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

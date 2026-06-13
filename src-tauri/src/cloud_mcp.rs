@@ -17,8 +17,6 @@ const CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS: u64 = 3600;
 const CLOUD_MCP_APPWRITE_JWT_REFRESH_MARGIN_MS: u64 = 60_000;
 const CLOUD_MCP_DEVICE_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 const CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH: usize = 8192;
-const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
-const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
@@ -240,12 +238,7 @@ struct CloudMcpTerminalContextState {
     todo_dispatch_id: Option<String>,
     todo_command_id: Option<String>,
     created_ms: u64,
-    last_changed_hash: String,
-    last_checkpoint_ms: u64,
     local_task_id: Option<String>,
-    reported_change: bool,
-    stable_review_reported: bool,
-    stable_change_cycles: u8,
     saw_agent_activity: bool,
     work_brief: String,
     work_brief_reported: bool,
@@ -329,20 +322,8 @@ struct CloudMcpWorkspaceStatus {
     last_registered_ms: Option<u64>,
     last_synced_ms: Option<u64>,
     last_error: String,
-    file_count: usize,
     policy_graph_detected: bool,
     policy_graph_path: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct CloudMcpFileEntry {
-    relative_path: String,
-    kind: String,
-    size: Option<u64>,
-    modified_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    references: Vec<String>,
 }
 
 struct CloudMcpPreparedWorkspace {
@@ -352,8 +333,6 @@ struct CloudMcpPreparedWorkspace {
     project_mounts: Vec<WorkspaceProjectMount>,
     workspace_id: String,
     workspace_name: String,
-    filetree: Vec<CloudMcpFileEntry>,
-    filetree_truncated: bool,
     policy_graph_path: String,
     policy_graph: Option<Value>,
 }
@@ -1367,34 +1346,6 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
         }
         return Some(format!("event:{normalized_kind}:{dispatch_id}:{status}"));
     }
-    // Heartbeat / lane lifecycle events are latest-wins per identity. They
-    // previously derived a STABLE idempotency key from identity parts while
-    // the payload kept changing (timestamps, task ids), which the server
-    // permanently rejects as "idempotency key reused with a different
-    // payload" — and each new heartbeat resurrected the rejected row through
-    // the enqueue upsert, so the outbox never drained and the sync pill
-    // looped Syncing/Connecting forever. A coalesce key here makes the
-    // idempotency key hash-suffixed (unique per payload, so the server never
-    // sees a key reuse) and supersedes older queued rows locally.
-    if matches!(
-        normalized_kind.as_str(),
-        "agent_heartbeat" | "lane_claim" | "lane_claimed" | "lane_release" | "lane_released"
-    ) {
-        let mut parts = Vec::new();
-        for keys in [
-            &["lane", "lane_id", "laneId"][..],
-            &["agent_id", "agentId", "self_agent_id", "selfAgentId"][..],
-            &["task_id", "taskId"][..],
-            &["session_id", "sessionId"][..],
-            &["workspace_id", "workspaceId"][..],
-            &["repo_id", "repoId"][..],
-        ] {
-            if let Some(value) = cloud_mcp_payload_text(payload, keys) {
-                parts.push(value);
-            }
-        }
-        return Some(format!("event:{normalized_kind}:{}", parts.join(":")));
-    }
     let is_snapshot = matches!(
         normalized_kind.as_str(),
         "agent_installation_snapshot"
@@ -1980,13 +1931,8 @@ fn cloud_mcp_outbox_priority_for_event(event_kind: &str) -> u8 {
         | "remote_command_ack"
         | "remote_command_result"
         | "workspace_catalog_upsert"
-        | "workspace_catalog_delete"
-        | "lane_claim"
-        | "lane_claimed"
-        | "lane_release"
-        | "lane_released" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        | "workspace_catalog_delete" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
         "terminal_presence_snapshot"
-        | "terminal_status_event"
         | "terminal_lifecycle_delta"
         | "checkpoint"
         | "checkpoint_recorded"
@@ -5092,6 +5038,22 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["todoId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_id"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "todoId"])),
+        "asset_id": cloud_mcp_payload_text(event, &["asset_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["assetId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "asset_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "assetId"])),
+        "assetId": cloud_mcp_payload_text(event, &["asset_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["assetId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "asset_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "assetId"])),
+        "cloud_id": cloud_mcp_payload_text(event, &["cloud_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["cloudId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "cloud_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "cloudId"])),
+        "cloudId": cloud_mcp_payload_text(event, &["cloud_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["cloudId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "cloud_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "cloudId"])),
         "todo_workspace_id": cloud_mcp_payload_text(event, &["todo_workspace_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["todoWorkspaceId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_workspace_id"]))
@@ -5370,6 +5332,7 @@ async fn cloud_mcp_start_remote_command_listener(
             cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
+            cloud_mcp_apply_remote_asset_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
             if cloud_mcp_remote_command_is_rust_owned(&event) {
                 continue;
@@ -6215,6 +6178,131 @@ fn cloud_mcp_notification_icon_path(app: &AppHandle) -> Option<String> {
     None
 }
 
+/// Asset transfer commands are Rust-owned because local file presence and
+/// managed asset paths live on the target device. Cloud/voice sends only ids and
+/// metadata; this function resolves the local library row and performs the
+/// upload/download through the existing asset endpoints.
+fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+    let command_kind =
+        cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .replace(['.', ' ', '-'], "_");
+    let action = match command_kind.as_str() {
+        "upload_asset" | "asset_upload" | "workspace_asset_upload" => "upload",
+        "download_asset" | "asset_download" | "workspace_asset_download" => "download",
+        _ => return,
+    };
+    let asset_id = cloud_mcp_payload_text(event, &["asset_id", "assetId", "id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "asset_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "assetId"]))
+        .unwrap_or_default();
+    let repo_path = cloud_mcp_payload_text(
+        event,
+        &["workspace_root", "workspaceRoot", "repo_path", "repoPath"],
+    )
+    .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_root"]))
+    .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceRoot"]))
+    .or_else(|| cloud_mcp_payload_text(event, &["payload", "repo_path"]))
+    .or_else(|| cloud_mcp_payload_text(event, &["payload", "repoPath"]));
+    let workspace_id = cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"]));
+    let base_url = cloud_mcp_payload_text(event, &["base_url", "baseUrl"])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "base_url"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "baseUrl"]));
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    let action = action.to_string();
+    tauri::async_runtime::spawn(async move {
+        if asset_id.trim().is_empty() {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "Asset transfer command did not include an asset id.",
+                None,
+            )
+            .await;
+            return;
+        }
+        let _ = cloud_mcp_send_remote_command_status_event(
+            &state,
+            &event,
+            "running",
+            if action == "upload" {
+                "Uploading tracked asset from this desktop."
+            } else {
+                "Downloading cloud asset to this desktop."
+            },
+            None,
+        )
+        .await;
+
+        let repo_path = cloud_mcp_clean_optional_text(&repo_path);
+        let workspace_id = cloud_mcp_clean_optional_text(&workspace_id);
+        let base_url = cloud_mcp_clean_optional_text(&base_url);
+        let input = event.clone();
+        let action_for_worker = action.clone();
+        let transfer_result = tokio::task::spawn_blocking(move || {
+            if action_for_worker == "upload" {
+                cloud_mcp_forward_agent_upload_asset(
+                    repo_path.as_deref(),
+                    workspace_id.as_deref(),
+                    base_url.as_deref(),
+                    &input,
+                )
+            } else {
+                cloud_mcp_forward_agent_download_asset(
+                    repo_path.as_deref(),
+                    workspace_id.as_deref(),
+                    base_url.as_deref(),
+                    &input,
+                )
+            }
+        })
+        .await
+        .map_err(|error| format!("Asset transfer worker failed: {error}"))
+        .and_then(|result| result);
+
+        match transfer_result {
+            Ok(result) => {
+                let message = if action == "upload" {
+                    "Asset upload completed from this desktop."
+                } else {
+                    "Asset download completed on this desktop."
+                };
+                let _ = app.emit(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, result.clone());
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "completed",
+                    message,
+                    Some(&result),
+                )
+                .await;
+            }
+            Err(error) => {
+                let details = json!({
+                    "asset_id": asset_id,
+                    "assetId": asset_id,
+                    "action": action,
+                    "error": error,
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Asset transfer failed on this desktop.",
+                    Some(&details),
+                )
+                .await;
+            }
+        }
+    });
+}
+
 /// Device-level levers Rust always owns, with or without the webview: window
 /// visibility, native notifications, agent account switching, and terminal
 /// output status (served from the native PTY tail buffer). The webview
@@ -6415,6 +6503,12 @@ fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
             | "terminal_status"
             | "terminal_output"
             | "terminal_activity_status"
+            | "upload_asset"
+            | "asset_upload"
+            | "workspace_asset_upload"
+            | "download_asset"
+            | "asset_download"
+            | "workspace_asset_download"
             | "plan_release_stage"
             | "release_plan_stage"
             | "plan_release"
@@ -9262,501 +9356,6 @@ fn cloud_mcp_workspace_log(
     Ok(path)
 }
 
-fn cloud_mcp_skip_filetree_name(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | ".next"
-            | ".turbo"
-            | ".cache"
-            | ".agents"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | "__pycache__"
-    )
-}
-
-fn cloud_mcp_modified_ms(metadata: &fs::Metadata) -> Option<u64> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-}
-
-fn cloud_mcp_normalized_git_path(value: &[u8]) -> Option<String> {
-    let path = String::from_utf8_lossy(value)
-        .replace('\\', "/")
-        .trim()
-        .trim_matches('/')
-        .to_string();
-    if path.is_empty()
-        || path == ".git"
-        || path == ".agents"
-        || matches!(
-            path.as_str(),
-            ".gitignore" | ".gitattributes" | ".gitmodules"
-        )
-        || path.starts_with(".git/")
-        || path.starts_with(".agents/")
-        || path.ends_with("/.gitignore")
-        || path.ends_with("/.gitattributes")
-        || path.ends_with("/.gitmodules")
-        || path.starts_with("../")
-        || path.contains("/../")
-    {
-        return None;
-    }
-    Some(path)
-}
-
-fn cloud_mcp_parent_folders_for_relative_path(path: &str) -> Vec<String> {
-    let parts = path
-        .split('/')
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>();
-    if parts.len() < 2 {
-        return Vec::new();
-    }
-    (1..parts.len()).map(|end| parts[..end].join("/")).collect()
-}
-
-#[derive(Clone, Debug)]
-struct CloudMcpIgnoreRule {
-    base_path: String,
-    pattern: String,
-    negated: bool,
-    directory_only: bool,
-    anchored: bool,
-    has_slash: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CloudMcpIgnoreMatcher {
-    rules: Vec<CloudMcpIgnoreRule>,
-}
-
-impl CloudMcpIgnoreMatcher {
-    fn from_root(root: &Path) -> Self {
-        let mut rules = Vec::new();
-        let mut queue = VecDeque::new();
-        queue.push_back((root.to_path_buf(), 0usize));
-
-        while let Some((directory, depth)) = queue.pop_front() {
-            if depth > CLOUD_MCP_FILETREE_MAX_DEPTH {
-                continue;
-            }
-
-            let ignore_path = directory.join(".gitignore");
-            if let Ok(contents) = fs::read_to_string(&ignore_path) {
-                let base_path = directory
-                    .strip_prefix(root)
-                    .ok()
-                    .map(workspace_path_display)
-                    .map(|path| path.replace('\\', "/").trim_matches('/').to_string())
-                    .unwrap_or_default();
-                rules.extend(cloud_mcp_parse_gitignore_rules(&base_path, &contents));
-            }
-
-            let Ok(read_dir) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if cloud_mcp_skip_filetree_name(&name) {
-                    continue;
-                }
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_dir() && !file_type.is_symlink() {
-                    queue.push_back((entry.path(), depth + 1));
-                }
-            }
-        }
-
-        if let Ok(contents) = fs::read_to_string(root.join(".git").join("info").join("exclude")) {
-            rules.extend(cloud_mcp_parse_gitignore_rules("", &contents));
-        }
-
-        Self { rules }
-    }
-
-    fn ignores(&self, relative_path: &str, is_dir: bool) -> bool {
-        let normalized = relative_path.replace('\\', "/");
-        let normalized = normalized.trim().trim_matches('/');
-        if normalized.is_empty() {
-            return false;
-        }
-
-        let mut ignored = false;
-        for rule in &self.rules {
-            if rule.matches(normalized, is_dir) {
-                ignored = !rule.negated;
-            }
-        }
-        ignored
-    }
-}
-
-impl CloudMcpIgnoreRule {
-    fn matches(&self, relative_path: &str, is_dir: bool) -> bool {
-        let path_in_base = if self.base_path.is_empty() {
-            relative_path
-        } else if let Some(rest) = relative_path.strip_prefix(&format!("{}/", self.base_path)) {
-            rest
-        } else {
-            return false;
-        };
-        if path_in_base.is_empty() {
-            return false;
-        }
-
-        if self.directory_only {
-            if is_dir && self.matches_relative(path_in_base) {
-                return true;
-            }
-            return cloud_mcp_parent_folders_for_relative_path(path_in_base)
-                .iter()
-                .any(|parent| self.matches_relative(parent));
-        }
-
-        self.matches_relative(path_in_base)
-    }
-
-    fn matches_relative(&self, path: &str) -> bool {
-        if self.has_slash || self.anchored {
-            return cloud_mcp_gitignore_glob_matches(&self.pattern, path);
-        }
-        path.split('/')
-            .any(|component| cloud_mcp_gitignore_glob_matches(&self.pattern, component))
-    }
-}
-
-fn cloud_mcp_parse_gitignore_rules(base_path: &str, contents: &str) -> Vec<CloudMcpIgnoreRule> {
-    contents
-        .lines()
-        .filter_map(|line| cloud_mcp_parse_gitignore_rule(base_path, line))
-        .collect()
-}
-
-fn cloud_mcp_parse_gitignore_rule(base_path: &str, line: &str) -> Option<CloudMcpIgnoreRule> {
-    let mut pattern = line.trim();
-    if pattern.is_empty() || pattern.starts_with('#') {
-        return None;
-    }
-
-    let mut negated = false;
-    if let Some(rest) = pattern.strip_prefix('!') {
-        negated = true;
-        pattern = rest.trim_start();
-    }
-    if pattern.is_empty() {
-        return None;
-    }
-
-    let anchored = pattern.starts_with('/');
-    pattern = pattern.trim_start_matches('/');
-    let directory_only = pattern.ends_with('/');
-    pattern = pattern.trim_end_matches('/');
-    if pattern.is_empty() {
-        return None;
-    }
-
-    let pattern = pattern.replace('\\', "/");
-    Some(CloudMcpIgnoreRule {
-        base_path: base_path.trim_matches('/').to_string(),
-        has_slash: pattern.contains('/'),
-        pattern,
-        negated,
-        directory_only,
-        anchored,
-    })
-}
-
-fn cloud_mcp_gitignore_glob_matches(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let value = value.chars().collect::<Vec<_>>();
-    let mut memo = vec![vec![None; value.len() + 1]; pattern.len() + 1];
-
-    fn matches_from(
-        pattern: &[char],
-        value: &[char],
-        memo: &mut [Vec<Option<bool>>],
-        pattern_index: usize,
-        value_index: usize,
-    ) -> bool {
-        if let Some(result) = memo[pattern_index][value_index] {
-            return result;
-        }
-
-        let result = if pattern_index == pattern.len() {
-            value_index == value.len()
-        } else {
-            match pattern[pattern_index] {
-                '*' => {
-                    let is_double_star = pattern.get(pattern_index + 1) == Some(&'*');
-                    let next_pattern_index = pattern_index + if is_double_star { 2 } else { 1 };
-                    if matches_from(pattern, value, memo, next_pattern_index, value_index) {
-                        true
-                    } else {
-                        let mut next_value_index = value_index;
-                        let mut matched = false;
-                        while next_value_index < value.len()
-                            && (is_double_star || value[next_value_index] != '/')
-                        {
-                            next_value_index += 1;
-                            if matches_from(
-                                pattern,
-                                value,
-                                memo,
-                                next_pattern_index,
-                                next_value_index,
-                            ) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        matched
-                    }
-                }
-                '?' => {
-                    value_index < value.len()
-                        && value[value_index] != '/'
-                        && matches_from(pattern, value, memo, pattern_index + 1, value_index + 1)
-                }
-                expected => {
-                    value_index < value.len()
-                        && expected == value[value_index]
-                        && matches_from(pattern, value, memo, pattern_index + 1, value_index + 1)
-                }
-            }
-        };
-
-        memo[pattern_index][value_index] = Some(result);
-        result
-    }
-
-    matches_from(&pattern, &value, &mut memo, 0, 0)
-}
-
-fn cloud_mcp_git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    if app_shutdown_requested() {
-        return None;
-    }
-
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = command.spawn().ok()?;
-    loop {
-        if app_shutdown_requested() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => {
-                let _ = child.kill();
-                return None;
-            }
-        }
-    }
-
-    let output = child.wait_with_output().ok()?;
-    output.status.success().then_some(output.stdout)
-}
-
-fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFileEntry>, bool)> {
-    let output = cloud_mcp_git_output(
-        root,
-        &[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ],
-    )?;
-
-    let mut file_paths = output
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .filter_map(cloud_mcp_normalized_git_path)
-        .collect::<Vec<_>>();
-    file_paths.sort();
-    file_paths.dedup();
-
-    let mut folder_paths = HashSet::new();
-    for file_path in &file_paths {
-        for folder_path in cloud_mcp_parent_folders_for_relative_path(file_path) {
-            folder_paths.insert(folder_path);
-        }
-    }
-    let mut folder_paths = folder_paths.into_iter().collect::<Vec<_>>();
-    folder_paths.sort();
-
-    let mut entries = Vec::new();
-    let mut truncated = false;
-    for folder_path in folder_paths {
-        if entries.len() >= CLOUD_MCP_FILETREE_LIMIT {
-            truncated = true;
-            break;
-        }
-        let path = root.join(&folder_path);
-        let metadata = fs::symlink_metadata(&path).ok();
-        if metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.file_type().is_symlink())
-        {
-            continue;
-        }
-        entries.push(CloudMcpFileEntry {
-            relative_path: folder_path,
-            kind: "directory".to_string(),
-            size: None,
-            modified_ms: metadata
-                .as_ref()
-                .and_then(|metadata| cloud_mcp_modified_ms(metadata)),
-            references: Vec::new(),
-        });
-    }
-
-    for file_path in file_paths {
-        if entries.len() >= CLOUD_MCP_FILETREE_LIMIT {
-            truncated = true;
-            break;
-        }
-        let path = root.join(&file_path);
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            continue;
-        }
-        let size = Some(metadata.len());
-        entries.push(CloudMcpFileEntry {
-            relative_path: file_path,
-            kind: "file".to_string(),
-            size,
-            modified_ms: cloud_mcp_modified_ms(&metadata),
-            // Reference extraction used to read every source file here; the
-            // data never left the process (filetree sync is disabled), so the
-            // scan stays metadata-only.
-            references: Vec::new(),
-        });
-    }
-
-    Some((entries, truncated))
-}
-
-fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
-    if let Some(filetree) = cloud_mcp_collect_git_visible_filetree(root) {
-        return filetree;
-    }
-
-    let ignore_matcher = CloudMcpIgnoreMatcher::from_root(root);
-    let mut entries = Vec::new();
-    let mut queue = VecDeque::new();
-    queue.push_back((root.to_path_buf(), 0usize));
-    let mut truncated = false;
-
-    while let Some((directory, depth)) = queue.pop_front() {
-        if entries.len() >= CLOUD_MCP_FILETREE_LIMIT {
-            truncated = true;
-            break;
-        }
-        if depth > CLOUD_MCP_FILETREE_MAX_DEPTH {
-            truncated = true;
-            continue;
-        }
-
-        let Ok(read_dir) = fs::read_dir(&directory) else {
-            continue;
-        };
-
-        for entry in read_dir.flatten() {
-            if entries.len() >= CLOUD_MCP_FILETREE_LIMIT {
-                truncated = true;
-                break;
-            }
-
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if cloud_mcp_skip_filetree_name(&file_name) {
-                continue;
-            }
-
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-
-            let path = entry.path();
-            let relative_path = path
-                .strip_prefix(root)
-                .unwrap_or(path.as_path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            let Some(relative_path) = cloud_mcp_normalized_git_path(relative_path.as_bytes())
-            else {
-                continue;
-            };
-            if ignore_matcher.ignores(&relative_path, file_type.is_dir()) {
-                continue;
-            }
-
-            if file_type.is_dir() {
-                entries.push(CloudMcpFileEntry {
-                    relative_path,
-                    kind: "directory".to_string(),
-                    size: None,
-                    modified_ms: entry
-                        .metadata()
-                        .ok()
-                        .and_then(|metadata| cloud_mcp_modified_ms(&metadata)),
-                    references: Vec::new(),
-                });
-                queue.push_back((path, depth + 1));
-            } else if file_type.is_file() {
-                let metadata = entry.metadata().ok();
-                let size = metadata.as_ref().map(fs::Metadata::len);
-                entries.push(CloudMcpFileEntry {
-                    relative_path,
-                    kind: "file".to_string(),
-                    size,
-                    modified_ms: metadata
-                        .as_ref()
-                        .and_then(|metadata| cloud_mcp_modified_ms(metadata)),
-                    references: Vec::new(),
-                });
-            }
-        }
-    }
-
-    (entries, truncated)
-}
-
 fn cloud_mcp_policy_candidate(path: &Path) -> bool {
     let file_name = path
         .file_name()
@@ -9892,10 +9491,6 @@ fn cloud_mcp_workspace_kind_is_container(workspace_kind: &str) -> bool {
     workspace_kind == "container"
 }
 
-fn cloud_mcp_workspace_kind_filetree_authoritative(workspace_kind: &str) -> bool {
-    matches!(workspace_kind, "git_repo" | "project")
-}
-
 fn cloud_mcp_prepare_workspace_bundle(
     repo_path: String,
     workspace_id: Option<String>,
@@ -9925,81 +9520,6 @@ fn cloud_mcp_prepare_workspace_bundle(
     Ok(CloudMcpPreparedWorkspaceBundle { primary, children })
 }
 
-fn cloud_mcp_container_mount_filetree(
-    workspace_root: &Path,
-    mounts: &[WorkspaceProjectMount],
-) -> (Vec<CloudMcpFileEntry>, bool) {
-    let manifest = workspace_mount_manifest_from_projects(workspace_root, mounts);
-    let mut entries = manifest
-        .iter()
-        .map(|mount| CloudMcpFileEntry {
-            relative_path: mount.workspace_relative_path.clone(),
-            kind: if mount.mount_kind == "container" {
-                "container".to_string()
-            } else {
-                "project".to_string()
-            },
-            size: None,
-            modified_ms: fs::metadata(&mount.root_path)
-                .ok()
-                .and_then(|metadata| cloud_mcp_modified_ms(&metadata)),
-            references: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    (entries, false)
-}
-
-fn cloud_mcp_apply_project_mount_boundaries(
-    workspace_root: &Path,
-    filetree: Vec<CloudMcpFileEntry>,
-    filetree_truncated: bool,
-    project_mounts: &[WorkspaceProjectMount],
-) -> (Vec<CloudMcpFileEntry>, bool) {
-    if project_mounts.is_empty() {
-        return (filetree, filetree_truncated);
-    }
-
-    let project_paths = project_mounts
-        .iter()
-        .map(|mount| normalize_git_status_path(&mount.workspace_relative_path))
-        .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
-    if project_paths.is_empty() {
-        return (filetree, filetree_truncated);
-    }
-
-    let manifest_paths = workspace_mount_manifest_from_projects(workspace_root, project_mounts)
-        .into_iter()
-        .map(|mount| normalize_git_status_path(&mount.workspace_relative_path))
-        .filter(|path| !path.is_empty())
-        .collect::<HashSet<_>>();
-    let is_inside_project_mount = |entry_path: &str| {
-        project_paths.iter().any(|project_path| {
-            entry_path == project_path || entry_path.starts_with(&format!("{project_path}/"))
-        })
-    };
-
-    let mut entries = filetree
-        .into_iter()
-        .filter(|entry| {
-            let entry_path = normalize_git_status_path(&entry.relative_path);
-            !manifest_paths.contains(&entry_path) && !is_inside_project_mount(&entry_path)
-        })
-        .collect::<Vec<_>>();
-    let (mount_entries, _) = cloud_mcp_container_mount_filetree(workspace_root, project_mounts);
-    entries.extend(mount_entries);
-    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    entries.dedup_by(|left, right| left.relative_path == right.relative_path);
-
-    let truncated = filetree_truncated || entries.len() > CLOUD_MCP_FILETREE_LIMIT;
-    if entries.len() > CLOUD_MCP_FILETREE_LIMIT {
-        entries.truncate(CLOUD_MCP_FILETREE_LIMIT);
-    }
-
-    (entries, truncated)
-}
-
 fn cloud_mcp_prepare_workspace_from_root(
     root: PathBuf,
     workspace_id: Option<String>,
@@ -10012,15 +9532,6 @@ fn cloud_mcp_prepare_workspace_from_root(
         cloud_mcp_project_mounts_for_workspace_sync(&root, &workspace_kind, &detected_mounts);
     let (workspace_id, workspace_name) =
         cloud_mcp_workspace_identity(&root, workspace_id.as_deref(), workspace_name.as_deref());
-    let (filetree, filetree_truncated) =
-        if cloud_mcp_workspace_kind_filetree_authoritative(&workspace_kind) {
-            let (entries, truncated) = cloud_mcp_collect_filetree(&root);
-            cloud_mcp_apply_project_mount_boundaries(&root, entries, truncated, &project_mounts)
-        } else if cloud_mcp_workspace_kind_is_container(&workspace_kind) {
-            cloud_mcp_container_mount_filetree(&root, &project_mounts)
-        } else {
-            (Vec::new(), false)
-        };
     let (policy_graph_path, policy_graph) = cloud_mcp_find_policy_graph(&root)
         .map(|(path, value)| (path, Some(value)))
         .unwrap_or_else(|| (String::new(), None));
@@ -10032,8 +9543,6 @@ fn cloud_mcp_prepare_workspace_from_root(
         project_mounts,
         workspace_id,
         workspace_name,
-        filetree,
-        filetree_truncated,
         policy_graph_path,
         policy_graph,
     })
@@ -10131,8 +9640,6 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
     match endpoint {
         "/v1/status" => Some("status"),
         "/v1/events" => Some("event"),
-        "/v1/sync/push" => Some("sync_push"),
-        "/v1/sync/pull" => Some("sync_pull"),
         "/v1/context/pack" => Some("context_pack"),
         "/v1/task/history" => Some("task_history"),
         "/v1/workspace/todos/hydrate" => Some("workspace_todo_hydrate"),
@@ -10758,7 +10265,6 @@ async fn cloud_mcp_register_prepared_workspace(
         },
         last_synced_ms: Some(now_ms),
         last_error: String::new(),
-        file_count: prepared.filetree.len(),
         policy_graph_detected,
         policy_graph_path: prepared.policy_graph_path.clone(),
     };
@@ -10778,9 +10284,6 @@ async fn cloud_mcp_register_prepared_workspace(
             "workspace_role": "desktop_workspace",
             "display_surface": "dashboard_workspace",
             "project_mounts": prepared.project_mounts.clone(),
-            "file_count": workspace_status.file_count,
-            "filetree_truncated": prepared.filetree_truncated,
-            "filetree_authoritative": cloud_mcp_workspace_kind_filetree_authoritative(&prepared.workspace_kind),
             "policy_graph_detected": policy_graph_detected,
             "policy_graph_path": workspace_status.policy_graph_path,
             "context_pack_model": true,
@@ -10823,13 +10326,6 @@ async fn cloud_mcp_register_prepared_workspace(
         )
         .await;
     }
-    let filetree_response: Result<Value, String> = Ok(json!({
-        "ok": true,
-        "skipped": true,
-        "reason": "filetree_sync_disabled",
-        "repoId": repo_id.clone(),
-        "repoPath": prepared.root_display.clone(),
-    }));
     let log_path = cloud_mcp_workspace_log(
         &prepared.root,
         reason,
@@ -10839,13 +10335,6 @@ async fn cloud_mcp_register_prepared_workspace(
             "repo_id": repo_id,
             "workspace_kind": prepared.workspace_kind.clone(),
             "project_mount_count": prepared.project_mounts.len(),
-            "file_count": workspace_status.file_count,
-            "filetree_truncated": prepared.filetree_truncated,
-            "filetree_synced": filetree_response.is_ok(),
-            "filetree_sync_error": filetree_response
-                .as_ref()
-                .err()
-                .map(|error| clean_terminal_telemetry_text(error)),
             "policy_graph_detected": policy_graph_detected,
             "synced": true,
         }),
@@ -11006,134 +10495,6 @@ fn cloud_mcp_short_agent_label(agent_id: &str) -> Option<String> {
         None
     } else {
         Some(label)
-    }
-}
-
-fn cloud_mcp_terminal_claimed_paths(
-    coordination: Option<&TerminalCoordinationSession>,
-    local_task_id: Option<&str>,
-) -> Vec<Value> {
-    let Some(coordination) = coordination else {
-        return Vec::new();
-    };
-    let Some(local_task_id) = local_task_id.filter(|value| !value.trim().is_empty()) else {
-        return Vec::new();
-    };
-    let conn = match rusqlite::Connection::open(&coordination.db_path) {
-        Ok(conn) => conn,
-        Err(_) => return Vec::new(),
-    };
-    let mut claimed_paths = Vec::new();
-    let mut seen = std::collections::HashSet::<String>::new();
-    let mut statement = match conn.prepare(
-        "SELECT r.resource_key, l.mode, l.reason
-         FROM leases l
-         JOIN resources r ON r.id=l.resource_id
-         WHERE l.session_id=?1 AND l.task_id=?2 AND l.status='active'
-         ORDER BY l.acquired_at DESC
-         LIMIT 50",
-    ) {
-        Ok(statement) => statement,
-        Err(_) => return Vec::new(),
-    };
-    let rows = match statement.query_map(
-        rusqlite::params![coordination.session_id.as_str(), local_task_id],
-        |row| {
-            let resource_key: String = row.get(0)?;
-            let mode: String = row.get(1)?;
-            let reason: Option<String> = row.get(2)?;
-            let path = resource_key
-                .strip_prefix("file:")
-                .unwrap_or(resource_key.as_str())
-                .to_string();
-            Ok(json!({
-                "resource_key": resource_key,
-                "path": path,
-                "mode": mode,
-                "reason": reason,
-                "lease_state": "active",
-                "file_state": "lease",
-            }))
-        },
-    ) {
-        Ok(rows) => rows,
-        Err(_) => return Vec::new(),
-    };
-    for row in rows.filter_map(Result::ok) {
-        let key = row["resource_key"]
-            .as_str()
-            .or_else(|| row["path"].as_str())
-            .unwrap_or_default()
-            .to_string();
-        if seen.insert(key) {
-            claimed_paths.push(row);
-        }
-    }
-    if let Ok(mut statement) = conn.prepare(
-        "SELECT resource_key, status, intent_summary
-         FROM task_resource_intents
-         WHERE task_id=?1
-           AND status IN ('parked', 'parked_cycle_prevented', 'waiting', 'blocked', 'resume_ready', 'resume_requested')
-         ORDER BY updated_at DESC
-         LIMIT 50",
-    ) {
-        if let Ok(rows) = statement.query_map([local_task_id], |row| {
-            let resource_key: String = row.get(0)?;
-            let status: String = row.get(1)?;
-            let reason: Option<String> = row.get(2)?;
-            let path = resource_key
-                .strip_prefix("file:")
-                .unwrap_or(resource_key.as_str())
-                .to_string();
-            Ok(json!({
-                "resource_key": resource_key,
-                "path": path,
-                "mode": "write",
-                "status": status,
-                "reason": reason,
-                "parked": true,
-            }))
-        }) {
-            for row in rows.filter_map(Result::ok) {
-                let key = row["resource_key"]
-                    .as_str()
-                    .or_else(|| row["path"].as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if seen.insert(key) {
-                    claimed_paths.push(row);
-                }
-            }
-        }
-    }
-    claimed_paths
-}
-
-fn cloud_mcp_terminal_active_task_id(
-    coordination: Option<&TerminalCoordinationSession>,
-) -> Option<String> {
-    let coordination = coordination?;
-    let conn = rusqlite::Connection::open(&coordination.db_path).ok()?;
-    let task_id = conn
-        .query_row(
-            "SELECT t.id
-             FROM agent_sessions s
-             JOIN tasks t ON t.id=s.task_id
-             WHERE s.id=?1
-               AND s.status='active'
-               AND t.claimed_session_id=s.id
-               AND t.status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped')
-             ORDER BY t.updated_at DESC
-             LIMIT 1",
-            [coordination.session_id.as_str()],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()?;
-    let task_id = task_id.trim();
-    if task_id.is_empty() {
-        None
-    } else {
-        Some(task_id.to_string())
     }
 }
 
@@ -11427,26 +10788,48 @@ fn cloud_mcp_work_subject(work_brief: &str) -> String {
     }
 }
 
-fn cloud_mcp_title_from_changed_files(changed_files: &[Value]) -> Option<String> {
-    if changed_files.is_empty() {
+fn cloud_mcp_git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    if app_shutdown_requested() {
         return None;
     }
-    if changed_files.len() == 1 {
-        let file = &changed_files[0];
-        let path = file["path"].as_str().unwrap_or_default().trim();
-        if path.is_empty() {
-            return Some("Update one file".to_string());
-        }
-        let action = match file["change_kind"].as_str().unwrap_or_default() {
-            "added" => "Create",
-            "deleted" => "Remove",
-            "renamed" => "Rename",
-            "copied" => "Copy",
-            _ => "Update",
-        };
-        return Some(format!("{action} {path}").chars().take(160).collect());
+
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
-    Some(format!("Update {} files", changed_files.len()))
+
+    let mut child = command.spawn().ok()?;
+    loop {
+        if app_shutdown_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+
+    let output = child.wait_with_output().ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 fn cloud_mcp_git_changed_files(root: &Path) -> Vec<Value> {
@@ -11549,79 +10932,8 @@ fn cloud_mcp_git_changed_files_for_scope(root: &Path, scopes: &[Value]) -> Vec<V
     cloud_mcp_filter_git_changed_files_by_scope(cloud_mcp_git_changed_files(root), scopes)
 }
 
-async fn cloud_mcp_claim_terminal_lane(
-    state: &CloudMcpState,
-    repo_id: &str,
-    agent_id: &str,
-    lane: &str,
-    prompt: &str,
-    working_directory: &Path,
-    coordination: Option<&TerminalCoordinationSession>,
-) {
-    if lane.trim().is_empty() {
-        return;
-    }
-    let status_working_directory =
-        cloud_mcp_terminal_repo_root_path(working_directory, coordination);
-    let agent_label = cloud_mcp_short_agent_label(agent_id);
-    let agent_label = agent_label.as_deref();
-    let payload = json!({
-        "source": "rust-diffforge-terminal",
-        "repo_id": repo_id,
-        "agent_id": agent_id,
-        "agent_label": agent_label,
-        "lane": lane,
-        "reason": format!("Starting terminal task: {}", cloud_mcp_prompt_summary(prompt)),
-        "metadata": {
-            "agent_label": agent_label,
-            "workspace_root": workspace_path_display(&status_working_directory),
-            "session_id": coordination.map(|coordination| coordination.session_id.clone()),
-        },
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let _ = cloud_mcp_post_event_endpoint(state, "lane_claimed", &payload).await;
-}
-
-async fn cloud_mcp_release_terminal_lane(
-    state: &CloudMcpState,
-    repo_id: &str,
-    agent_id: &str,
-    lane: &str,
-    working_directory: &Path,
-    coordination: Option<&TerminalCoordinationSession>,
-    pane_id: &str,
-    instance_id: u64,
-    reason: &str,
-) {
-    let status_working_directory =
-        cloud_mcp_terminal_repo_root_path(working_directory, coordination);
-    let agent_label = cloud_mcp_short_agent_label(agent_id);
-    let agent_label = agent_label.as_deref();
-    let payload = json!({
-        "source": "rust-diffforge-terminal-lifecycle",
-        "repo_id": repo_id,
-        "agent_id": agent_id,
-        "agent_label": agent_label,
-        "self_agent_id": agent_id,
-        "current_agent_id": agent_id,
-        "lane": lane,
-        "workspace_root": workspace_path_display(&status_working_directory),
-        "terminal_id": pane_id,
-        "terminal_instance_id": instance_id,
-        "reason": reason,
-        "metadata": {
-            "agent_label": agent_label,
-            "reason": reason,
-            "terminal_id": pane_id,
-            "terminal_instance_id": instance_id,
-        },
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let _ = cloud_mcp_post_event_endpoint(state, "lane_released", &payload).await;
-}
-
 async fn cloud_mcp_sync_terminal_agent_status(
-    state: &CloudMcpState,
+    _state: &CloudMcpState,
     repo_id: &str,
     agent_id: &str,
     lane: &str,
@@ -11638,85 +10950,29 @@ async fn cloud_mcp_sync_terminal_agent_status(
 ) {
     let status_working_directory =
         cloud_mcp_terminal_repo_root_path(working_directory, coordination);
-    let claimed_paths = cloud_mcp_terminal_claimed_paths(coordination, local_task_id);
-    let has_claimed_paths = !claimed_paths.is_empty();
     let agent_label = cloud_mcp_short_agent_label(agent_id);
     let agent_label = agent_label.as_deref();
-    let payload = json!({
-        "source": "rust-diffforge-terminal-lifecycle",
-        "spec_source": if has_claimed_paths { "rust_terminal_lease_scope" } else { "rust_terminal_lifecycle" },
-        "record_spec_activity": false,
-        "repo_id": repo_id,
-        "agent_id": agent_id,
-        "agent_label": agent_label,
-        "self_agent_id": agent_id,
-        "current_agent_id": agent_id,
-        "status": status,
-        "lane": lane,
-        "current_prompt": current_prompt,
-        "progress_summary": progress_summary,
-        "task_id": local_task_id,
-        "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
-        "claimed_paths": claimed_paths,
-        "workspace_root": workspace_path_display(&status_working_directory),
-        "terminal_id": pane_id,
-        "terminal_instance_id": instance_id,
-        "metadata": {
-            "agent_label": agent_label,
-            "agent_kind": coordination.map(|coordination| coordination.agent_kind.clone()),
-            "coding_agent": coordination.map(|coordination| coordination.agent_kind.clone()),
-            "managed_by": "rust-diffforge",
-            "reason": reason,
-            "terminal_id": pane_id,
-            "terminal_instance_id": instance_id,
-            "workspace_root": workspace_path_display(&status_working_directory),
-            "session_id": coordination.map(|coordination| coordination.session_id.clone()),
-            "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
-            "local_coordination_task_id": local_task_id,
-            "coordination_task_id": local_task_id,
-            "local_lease_file_evidence": has_claimed_paths,
-            "local_active_leases": claimed_paths,
-        },
-        "ts_ms": cloud_mcp_now_ms(),
-    });
     log_terminal_status_event(
-        "backend.cloud_mcp.agent_status.send",
+        "backend.cloud_mcp.agent_status.local_only",
         json!({
-            "endpoint": "agent_heartbeat",
-            "payload": payload.clone(),
+            "skipped": true,
+            "skip_reason": "agent_status_is_event_based",
+            "sync_kind": "terminal_agent_status",
+            "repo_id": repo_id,
+            "agent_id": agent_id,
+            "agent_label": agent_label,
+            "lane": lane,
             "reason": reason,
             "server_status": status,
+            "has_current_prompt": current_prompt.is_some(),
             "terminal_ground_truth_hint": progress_summary,
+            "task_id": local_task_id,
+            "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
+            "workspace_root": workspace_path_display(&status_working_directory),
+            "terminal_id": pane_id,
+            "terminal_instance_id": instance_id,
         }),
     );
-    let result = cloud_mcp_post_event_endpoint(state, "agent_heartbeat", &payload).await;
-    match &result {
-        Ok(value) => log_terminal_status_event(
-            "backend.cloud_mcp.agent_status.result",
-            json!({
-                "agent_id": agent_id,
-                "endpoint": "agent_heartbeat",
-                "ok": true,
-                "reason": reason,
-                "server_status": status,
-                "terminal_id": pane_id,
-                "terminal_instance_id": instance_id,
-                "result": value,
-            }),
-        ),
-        Err(error) => log_terminal_status_event(
-            "backend.cloud_mcp.agent_status.error",
-            json!({
-                "agent_id": agent_id,
-                "endpoint": "agent_heartbeat",
-                "error": clean_terminal_telemetry_text(error),
-                "reason": reason,
-                "server_status": status,
-                "terminal_id": pane_id,
-                "terminal_instance_id": instance_id,
-            }),
-        ),
-    }
 }
 
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
@@ -12050,18 +11306,6 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
         }
     }
     if cloud_mcp_lifecycle_status_releases_lane(status) {
-        cloud_mcp_release_terminal_lane(
-            state,
-            &repo_id,
-            &agent_id,
-            lane,
-            working_directory,
-            coordination,
-            pane_id,
-            instance_id,
-            status,
-        )
-        .await;
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.remove(&terminal_key);
     }
@@ -12188,18 +11432,6 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         coordination,
         local_task_id,
         Some(close_context.session_mode.as_str()),
-        reason,
-    )
-    .await;
-    cloud_mcp_release_terminal_lane(
-        state,
-        &repo_id,
-        &agent_id,
-        &lane,
-        working_directory,
-        coordination,
-        pane_id,
-        instance_id,
         reason,
     )
     .await;
@@ -12603,7 +11835,7 @@ async fn cloud_mcp_observe_terminal_output(
         lane,
         _prompt,
         work_brief,
-        working_directory,
+        _working_directory,
         repo_root,
         prompt_event_id,
         prompt_event_source,
@@ -12711,14 +11943,6 @@ async fn cloud_mcp_observe_terminal_output(
         runtime.terminal_contexts.remove(&terminal_key);
         return;
     }
-    let scan_root = working_directory.clone();
-    let changed_files =
-        match tauri::async_runtime::spawn_blocking(move || cloud_mcp_git_changed_files(&scan_root))
-            .await
-        {
-            Ok(files) => files,
-            Err(_) => Vec::new(),
-        };
     let brief = format!(
         "Ready for patch submission: {}",
         cloud_mcp_work_subject(&work_brief)
@@ -12737,7 +11961,6 @@ async fn cloud_mcp_observe_terminal_output(
             "source": "terminal_prompt_ready",
             "status": "review",
             "completion_gate": "submit_patch_required",
-            "changed_file_count": changed_files.len(),
         }),
     );
     cloud_mcp_sync_terminal_agent_status(
@@ -12754,18 +11977,6 @@ async fn cloud_mcp_observe_terminal_output(
         None,
         local_task_id.as_deref(),
         Some(session_mode.as_str()),
-        "terminal_prompt_ready",
-    )
-    .await;
-    cloud_mcp_release_terminal_lane(
-        &state,
-        &repo_id,
-        &agent_id,
-        &lane,
-        &repo_root,
-        None,
-        pane_id,
-        instance_id,
         "terminal_prompt_ready",
     )
     .await;
@@ -12992,12 +12203,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 todo_dispatch_id: effective_todo_dispatch_id.clone(),
                 todo_command_id: effective_todo_command_id.clone(),
                 created_ms: cloud_mcp_now_ms(),
-                last_changed_hash: String::new(),
-                last_checkpoint_ms: 0,
                 local_task_id: local_task_id.clone(),
-                reported_change: false,
-                stable_review_reported: false,
-                stable_change_cycles: 0,
                 saw_agent_activity: false,
                 work_brief: String::new(),
                 work_brief_reported: false,
@@ -13173,31 +12379,6 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 "terminal_context_ready",
             )
             .await;
-            cloud_mcp_claim_terminal_lane(
-                &state,
-                &repo_id,
-                &agent_id,
-                &suggested_lane,
-                payload["prompt"].as_str().unwrap_or_default(),
-                &status_working_directory,
-                coordination.as_ref(),
-            )
-            .await;
-            let tracker_state = state.clone();
-            tauri::async_runtime::spawn(async move {
-                cloud_mcp_track_terminal_file_changes(
-                    tracker_state,
-                    terminal_key,
-                    pane_id,
-                    instance_id,
-                    working_directory,
-                    coordination,
-                    repo_id,
-                    agent_id,
-                    suggested_lane,
-                )
-                .await;
-            });
         }
         Err(error) => {
             let _ = cloud_mcp_workspace_log(
@@ -13214,269 +12395,6 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                     "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
                 }),
             );
-        }
-    }
-}
-
-async fn cloud_mcp_track_terminal_file_changes(
-    state: CloudMcpState,
-    terminal_key: String,
-    pane_id: String,
-    instance_id: u64,
-    working_directory: PathBuf,
-    coordination: Option<TerminalCoordinationSession>,
-    repo_id: String,
-    agent_id: String,
-    lane: String,
-) {
-    let status_working_directory =
-        cloud_mcp_terminal_repo_root_path(&working_directory, coordination.as_ref());
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_secs(8)).await;
-        if let Some((local_task_id, work_brief, session_mode)) = {
-            let runtime = state.inner.lock().await;
-            runtime.terminal_contexts.get(&terminal_key).map(|entry| {
-                (
-                    entry.local_task_id.clone(),
-                    entry.work_brief.clone(),
-                    entry.session_mode.clone(),
-                )
-            })
-        } {
-            let heartbeat_brief = if work_brief.trim().is_empty() {
-                "Terminal task is active.".to_string()
-            } else {
-                format!("Working on: {}", cloud_mcp_work_subject(&work_brief))
-            };
-            cloud_mcp_sync_terminal_agent_status(
-                &state,
-                &repo_id,
-                &agent_id,
-                &lane,
-                "active",
-                None,
-                &heartbeat_brief,
-                &working_directory,
-                &pane_id,
-                instance_id,
-                coordination.as_ref(),
-                local_task_id.as_deref(),
-                Some(session_mode.as_str()),
-                "rust_terminal_activity_watch",
-            )
-            .await;
-        }
-        let local_task_id_for_scope = {
-            let runtime = state.inner.lock().await;
-            runtime
-                .terminal_contexts
-                .get(&terminal_key)
-                .and_then(|entry| entry.local_task_id.clone())
-        };
-        let local_task_id_for_scope = local_task_id_for_scope
-            .or_else(|| cloud_mcp_terminal_active_task_id(coordination.as_ref()));
-        let Some(local_task_id_for_scope) = local_task_id_for_scope
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        else {
-            let mut runtime = state.inner.lock().await;
-            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
-                entry.last_changed_hash.clear();
-                entry.reported_change = false;
-                entry.stable_review_reported = false;
-                entry.stable_change_cycles = 0;
-            } else {
-                break;
-            }
-            continue;
-        };
-        {
-            let mut runtime = state.inner.lock().await;
-            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
-                if entry.local_task_id.as_deref() != Some(local_task_id_for_scope.as_str()) {
-                    entry.local_task_id = Some(local_task_id_for_scope.clone());
-                    entry.last_changed_hash.clear();
-                    entry.reported_change = false;
-                    entry.stable_review_reported = false;
-                    entry.stable_change_cycles = 0;
-                }
-            } else {
-                break;
-            }
-        }
-        let scopes = cloud_mcp_terminal_claimed_paths(
-            coordination.as_ref(),
-            Some(local_task_id_for_scope.as_str()),
-        );
-        let scan_root = working_directory.clone();
-        let changed_files = match tauri::async_runtime::spawn_blocking(move || {
-            cloud_mcp_git_changed_files_for_scope(&scan_root, &scopes)
-        })
-        .await
-        {
-            Ok(files) => files,
-            Err(_) => Vec::new(),
-        };
-        let changed_hash = if changed_files.is_empty() {
-            String::new()
-        } else {
-            cloud_mcp_short_hash(&serde_json::to_string(&changed_files).unwrap_or_default())
-        };
-        let Some((should_report, should_complete, work_brief)) = ({
-            let mut runtime = state.inner.lock().await;
-            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
-                let work_brief = entry.work_brief.clone();
-                if changed_hash.is_empty() {
-                    entry.last_changed_hash.clear();
-                    entry.stable_change_cycles = 0;
-                    Some((false, false, work_brief))
-                } else if entry.last_changed_hash == changed_hash {
-                    if entry.reported_change {
-                        entry.stable_change_cycles = entry.stable_change_cycles.saturating_add(1);
-                    }
-                    Some((
-                        false,
-                        entry.reported_change
-                            && !entry.stable_review_reported
-                            && entry.stable_change_cycles >= 4,
-                        work_brief,
-                    ))
-                } else {
-                    entry.last_changed_hash = changed_hash.clone();
-                    entry.last_checkpoint_ms = cloud_mcp_now_ms();
-                    entry.reported_change = true;
-                    entry.stable_review_reported = false;
-                    entry.stable_change_cycles = 0;
-                    Some((true, false, work_brief))
-                }
-            } else {
-                None
-            }
-        }) else {
-            break;
-        };
-        let work_subject = cloud_mcp_work_subject(&work_brief);
-        let fallback_title = if work_brief.trim().is_empty() {
-            cloud_mcp_title_from_changed_files(&changed_files)
-        } else {
-            None
-        };
-        if should_complete {
-            let brief = format!(
-                "Changes look stable; waiting for terminal prompt: {}",
-                fallback_title.as_deref().unwrap_or(&work_subject)
-            );
-            let _ = cloud_mcp_workspace_log(
-                &status_working_directory,
-                "cloud_mcp.context_pack.work_review",
-                "",
-                "",
-                json!({
-                    "agent_id": agent_id,
-                    "pane_id": pane_id,
-                    "instance_id": instance_id,
-                    "repo_id": repo_id,
-                    "local_task_id": local_task_id_for_scope.as_str(),
-                    "status": "active",
-                    "completion_gate": "terminal_prompt_ready_required",
-                    "changed_file_count": changed_files.len(),
-                }),
-            );
-            cloud_mcp_sync_terminal_agent_status(
-                &state,
-                &repo_id,
-                &agent_id,
-                &lane,
-                "active",
-                None,
-                &brief,
-                &working_directory,
-                &pane_id,
-                instance_id,
-                coordination.as_ref(),
-                Some(local_task_id_for_scope.as_str()),
-                Some("managed_patch"),
-                "stable_file_changes_ready",
-            )
-            .await;
-            let mut runtime = state.inner.lock().await;
-            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
-                entry.reported_change = false;
-                entry.stable_review_reported = true;
-                entry.stable_change_cycles = 0;
-            }
-            continue;
-        }
-        if !should_report {
-            continue;
-        }
-        if cloud_mcp_connected_or_connect(&state).await.is_err() {
-            continue;
-        }
-        let brief = format!(
-            "Updated {} file(s) while working on: {}",
-            changed_files.len(),
-            fallback_title.as_deref().unwrap_or(&work_subject)
-        );
-        let payload = json!({
-            "source": "rust-diffforge-terminal",
-            "repo_id": repo_id,
-            "agent_id": agent_id,
-            "self_agent_id": agent_id,
-            "current_agent_id": agent_id,
-            "terminal_id": pane_id,
-            "terminal_instance_id": instance_id,
-            "task_id": local_task_id_for_scope.as_str(),
-            "subtask": work_subject,
-            "brief": brief,
-            "changed_files": changed_files,
-            "agent_status": "active",
-            "workspace_root": workspace_path_display(&status_working_directory),
-            "metadata": {
-                "session_id": coordination.as_ref().map(|coordination| coordination.session_id.clone()),
-                "change_hash": changed_hash,
-            },
-            "ts_ms": cloud_mcp_now_ms(),
-        });
-        match cloud_mcp_post_event_endpoint(&state, "checkpoint_recorded", &payload).await {
-            Ok(response) => {
-                let data = cloud_mcp_response_data(&response);
-                let other_agent_count = data["peers"].as_array().map(Vec::len).unwrap_or(0);
-                let lane_conflict_count = data["conflicts"]["lanes"]
-                    .as_array()
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                let _ = cloud_mcp_workspace_log(
-                    &status_working_directory,
-                    "cloud_mcp.context_pack.subtask_checkpoint",
-                    "",
-                    "",
-                    json!({
-                        "agent_id": agent_id,
-                        "pane_id": pane_id,
-                        "instance_id": instance_id,
-                        "repo_id": repo_id,
-                        "changed_file_count": payload["changed_files"].as_array().map(Vec::len).unwrap_or(0),
-                        "other_agent_count": other_agent_count,
-                        "lane_conflict_count": lane_conflict_count,
-                    }),
-                );
-            }
-            Err(error) => {
-                let _ = cloud_mcp_workspace_log(
-                    &status_working_directory,
-                    "cloud_mcp.context_pack.subtask_checkpoint_error",
-                    "",
-                    "",
-                    json!({
-                        "agent_id": agent_id,
-                        "pane_id": pane_id,
-                        "instance_id": instance_id,
-                        "repo_id": repo_id,
-                        "error": clean_terminal_telemetry_text(&error),
-                    }),
-                );
-            }
         }
     }
 }
@@ -14922,7 +13840,7 @@ async fn cloud_mcp_sync_terminal_status_event(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
-    let reason = clean_option(reason).unwrap_or_else(|| "terminal_status_event".to_string());
+    let reason = clean_option(reason).unwrap_or_else(|| "terminal_lifecycle_delta".to_string());
     let device_profile = cloud_mcp_desktop_device_profile();
     let repo_path = cloud_mcp_payload_text(
         &workspace,
@@ -27374,6 +26292,16 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn asset_transfer_remote_commands_are_rust_owned() {
+        assert!(cloud_mcp_remote_command_is_rust_owned(&json!({
+            "command_kind": "upload_asset"
+        })));
+        assert!(cloud_mcp_remote_command_is_rust_owned(&json!({
+            "command_kind": "download_asset"
+        })));
+    }
+
+    #[test]
     fn terminal_nickname_text_only_allows_workspace_pool_names() {
         let payload = json!({
             "terminal_nickname": "b-o-b",
@@ -27466,7 +26394,7 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn cloud_workspace_bundle_prepares_container_manifest_and_child_filetrees() {
+    fn cloud_workspace_bundle_prepares_container_manifest_and_child_projects() {
         let root = test_cloud_root("diffforge-cloud-container-bundle");
         create_cloud_package_project(&root.join("frontend"));
         create_cloud_package_project(&root.join("backend"));
@@ -27478,29 +26406,19 @@ mod cloud_mcp_tests {
             Some("Suite".to_string()),
         )
         .unwrap();
-        let primary_paths = bundle
-            .primary
-            .filetree
-            .iter()
-            .map(|entry| entry.relative_path.as_str())
-            .collect::<HashSet<_>>();
-
         assert_eq!(bundle.primary.workspace_kind, "container");
         assert_eq!(bundle.primary.project_mounts.len(), 2);
         assert_eq!(bundle.children.len(), 2);
-        assert!(primary_paths.contains("backend"));
-        assert!(primary_paths.contains("frontend"));
-        assert!(!primary_paths.contains("README.md"));
+        assert!(bundle.primary.project_mounts.iter().any(|mount| {
+            mount.workspace_relative_path == "backend"
+        }));
+        assert!(bundle.primary.project_mounts.iter().any(|mount| {
+            mount.workspace_relative_path == "frontend"
+        }));
         assert!(bundle
             .children
             .iter()
             .all(|child| child.workspace_kind == "project"));
-        assert!(bundle.children.iter().all(|child| {
-            child
-                .filetree
-                .iter()
-                .any(|entry| entry.relative_path == "src/app.js")
-        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -27528,13 +26446,6 @@ mod cloud_mcp_tests {
             Some("Suite".to_string()),
         )
         .unwrap();
-        let primary_paths = bundle
-            .primary
-            .filetree
-            .iter()
-            .map(|entry| (entry.relative_path.as_str(), entry.kind.as_str()))
-            .collect::<HashSet<_>>();
-
         assert_eq!(bundle.primary.workspace_kind, "git_repo");
         assert_eq!(bundle.primary.project_mounts.len(), 1);
         assert_eq!(
@@ -27542,73 +26453,14 @@ mod cloud_mcp_tests {
             "packages/mobile"
         );
         assert_eq!(bundle.children.len(), 1);
-        assert!(primary_paths.contains(&("README.md", "file")));
-        assert!(primary_paths.contains(&("src", "directory")));
-        assert!(primary_paths.contains(&("src/root.rs", "file")));
-        assert!(primary_paths.contains(&("packages", "container")));
-        assert!(primary_paths.contains(&("packages/mobile", "project")));
-        assert!(!primary_paths
-            .iter()
-            .any(|(path, _)| *path == "packages/mobile/src/app.js"));
-        assert!(bundle.children[0]
-            .filetree
-            .iter()
-            .any(|entry| entry.relative_path == "src/app.js"));
+        assert_eq!(bundle.children[0].workspace_kind, "project");
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn container_filetree_payload_is_mount_manifest_not_authoritative_tree() {
-        let root = test_cloud_root("diffforge-cloud-container-filetree-payload");
-        create_cloud_package_project(&root.join("frontend"));
-        fs::write(root.join("README.md"), "# parent only\n").unwrap();
-
-        let project_mounts = cloud_mcp_container_project_mounts(&root);
-        let (filetree, truncated) = cloud_mcp_container_mount_filetree(&root, &project_mounts);
-        let paths = filetree
-            .iter()
-            .map(|entry| entry.relative_path.as_str())
-            .collect::<HashSet<_>>();
-
-        assert!(!project_mounts.is_empty());
-        assert!(!truncated);
-        assert!(paths.contains("frontend"));
-        assert!(!paths.contains("README.md"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nested_container_filetree_payload_preserves_container_layers() {
-        let root = test_cloud_root("diffforge-cloud-nested-container-filetree");
-        create_cloud_package_project(&root.join("product-a").join("frontend"));
-        create_cloud_package_project(&root.join("product-a").join("backend"));
-        create_cloud_package_project(&root.join("product-b").join("api"));
-        fs::write(root.join("README.md"), "# parent only\n").unwrap();
-
-        let project_mounts = cloud_mcp_container_project_mounts(&root);
-        let (filetree, truncated) = cloud_mcp_container_mount_filetree(&root, &project_mounts);
-        let path_kinds = filetree
-            .iter()
-            .map(|entry| (entry.relative_path.as_str(), entry.kind.as_str()))
-            .collect::<HashSet<_>>();
-
-        assert_eq!(project_mounts.len(), 3);
-        assert!(!truncated);
-        assert!(path_kinds.contains(&("product-a", "container")));
-        assert!(path_kinds.contains(&("product-b", "container")));
-        assert!(path_kinds.contains(&("product-a/frontend", "project")));
-        assert!(path_kinds.contains(&("product-a/backend", "project")));
-        assert!(path_kinds.contains(&("product-b/api", "project")));
-        assert!(!path_kinds.iter().any(|(path, _)| *path == "README.md"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn plain_unknown_workspace_bundle_is_discovery_only_not_authoritative_filetree() {
-        let root = test_cloud_root("diffforge-cloud-plain-discovery-filetree");
+    fn plain_unknown_workspace_bundle_is_metadata_only() {
+        let root = test_cloud_root("diffforge-cloud-plain-metadata");
         fs::create_dir_all(root.join("archive")).unwrap();
         fs::write(
             root.join("private-notes.txt"),
@@ -27625,10 +26477,8 @@ mod cloud_mcp_tests {
         .unwrap();
 
         assert_eq!(bundle.primary.workspace_kind, "plain");
-        assert!(bundle.primary.filetree.is_empty());
         assert!(bundle.primary.project_mounts.is_empty());
         assert!(bundle.children.is_empty());
-        assert!(!cloud_mcp_workspace_kind_filetree_authoritative("plain"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -27654,124 +26504,6 @@ mod cloud_mcp_tests {
         assert!(error.contains("task_id returned by start_task"));
     }
 
-    #[test]
-    fn cloud_mcp_filetree_fallback_respects_gitignore_without_git_repo() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-cloud-filetree-no-git-{suffix}"));
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("logs")).unwrap();
-        fs::create_dir_all(root.join(".codex")).unwrap();
-        fs::create_dir_all(root.join(".agents")).unwrap();
-        fs::write(
-            root.join(".gitignore"),
-            "logs/\n.codex/\n.mcp.json\nignored.log\n",
-        )
-        .unwrap();
-        fs::write(root.join("src").join("app.rs"), "fn main() {}\n").unwrap();
-        fs::write(root.join("README.md"), "# visible\n").unwrap();
-        fs::write(root.join("logs").join("events.jsonl"), "{}\n").unwrap();
-        fs::write(root.join(".codex").join("config.toml"), "model = 'x'\n").unwrap();
-        fs::write(root.join(".agents").join("cache.json"), "{}\n").unwrap();
-        fs::write(root.join(".mcp.json"), "{}\n").unwrap();
-        fs::write(root.join("ignored.log"), "ignored\n").unwrap();
-
-        let (entries, truncated) = cloud_mcp_collect_filetree(&root);
-        let paths = entries
-            .iter()
-            .map(|entry| entry.relative_path.as_str())
-            .collect::<HashSet<_>>();
-
-        assert!(!truncated);
-        assert!(paths.contains("src"));
-        assert!(paths.contains("src/app.rs"));
-        assert!(paths.contains("README.md"));
-        assert!(!paths.contains(".gitignore"));
-        assert!(!paths.contains("logs"));
-        assert!(!paths.contains("logs/events.jsonl"));
-        assert!(!paths.contains(".codex"));
-        assert!(!paths.contains(".codex/config.toml"));
-        assert!(!paths.contains(".agents"));
-        assert!(!paths.contains(".agents/cache.json"));
-        assert!(!paths.contains(".mcp.json"));
-        assert!(!paths.contains("ignored.log"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cloud_mcp_filetree_fallback_all_ignored_can_be_empty() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-cloud-filetree-empty-{suffix}"));
-        fs::create_dir_all(root.join("logs")).unwrap();
-        fs::write(root.join(".gitignore"), "*\n").unwrap();
-        fs::write(root.join("logs").join("events.jsonl"), "{}\n").unwrap();
-        fs::write(root.join("CLAUDE.md"), "ignored locally\n").unwrap();
-
-        let (entries, truncated) = cloud_mcp_collect_filetree(&root);
-
-        assert!(!truncated);
-        assert!(entries.is_empty());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cloud_mcp_filetree_uses_git_visible_paths() {
-        if Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
-
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let root = env::temp_dir().join(format!("diffforge-cloud-filetree-{suffix}"));
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("assets")).unwrap();
-        fs::create_dir_all(root.join("ignored_dir")).unwrap();
-        fs::write(root.join(".gitignore"), "ignored.log\nignored_dir/\n").unwrap();
-        fs::write(root.join("src").join("app.rs"), "fn main() {}\n").unwrap();
-        fs::write(root.join("package-lock.json"), "{}\n").unwrap();
-        fs::write(root.join("assets").join("logo.png"), b"png").unwrap();
-        fs::write(root.join("ignored.log"), "ignored\n").unwrap();
-        fs::write(root.join("ignored_dir").join("hidden.rs"), "ignored\n").unwrap();
-
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("init")
-            .output()
-            .unwrap();
-        if !init.status.success() {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-
-        let (entries, truncated) = cloud_mcp_collect_filetree(&root);
-        let paths = entries
-            .iter()
-            .map(|entry| entry.relative_path.as_str())
-            .collect::<HashSet<_>>();
-
-        assert!(!truncated);
-        assert!(paths.contains("src"));
-        assert!(paths.contains("src/app.rs"));
-        assert!(paths.contains("assets"));
-        assert!(paths.contains("assets/logo.png"));
-        assert!(paths.contains("package-lock.json"));
-        assert!(!paths.contains(".gitignore"));
-        assert!(!paths.contains("ignored.log"));
-        assert!(!paths.contains("ignored_dir"));
-        assert!(!paths.contains("ignored_dir/hidden.rs"));
-
-        let _ = fs::remove_dir_all(root);
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -28413,14 +27145,51 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
     base_url_override: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
-    let path = cloud_mcp_payload_text(input, &["path", "local_path", "localPath"])
-        .ok_or_else(|| "upload_asset requires path or local_path.".to_string())?;
+    let mut input = input.clone();
+    let path = match cloud_mcp_payload_text(&input, &["path", "local_path", "localPath"]) {
+        Some(path) => path,
+        None => {
+            let asset_id = cloud_mcp_payload_text(&input, &["asset_id", "assetId", "id"])
+                .ok_or_else(|| "upload_asset requires asset_id or path/local_path.".to_string())?;
+            let row = cloud_mcp_asset_row_with_local_copy(&asset_id)?;
+            let local_path = cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"])
+                .ok_or_else(|| "Asset has no local copy on this device to upload.".to_string())?;
+            let object = input
+                .as_object_mut()
+                .ok_or_else(|| "upload_asset arguments must be an object.".to_string())?;
+            object.insert("path".to_string(), json!(local_path.clone()));
+            object.insert("local_path".to_string(), json!(local_path.clone()));
+            object.insert("localPath".to_string(), json!(local_path.clone()));
+            for key in [
+                "asset_id",
+                "assetId",
+                "name",
+                "filename",
+                "kind",
+                "mime_type",
+                "mimeType",
+                "size_bytes",
+                "sizeBytes",
+                "sha256",
+                "metadata",
+                "source_kind",
+                "sourceKind",
+            ] {
+                if !object.contains_key(key) {
+                    if let Some(value) = row.get(key) {
+                        object.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+            local_path
+        }
+    };
     diffforge_reject_untracked_asset_path_for_tracking(Path::new(&path), "upload a tracked asset")?;
     let repo_path = repo_path.unwrap_or_default().trim().to_string();
     let req = cloud_mcp_repo_request(
         repo_path,
         workspace_id.map(str::to_string),
-        cloud_mcp_payload_text(input, &["workspace_name", "workspaceName"]),
+        cloud_mcp_payload_text(&input, &["workspace_name", "workspaceName"]),
     );
     let workspace_id_text = workspace_id.unwrap_or_default();
     let base_url = base_url_override
@@ -28433,7 +27202,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
         workspace_id_text,
         req.workspace_name.as_deref(),
         Path::new(&path),
-        input,
+        &input,
     )?;
     cloud_mcp_asset_store_local_row(&row)?;
     let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
@@ -28449,7 +27218,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
     let mut attached_process_reset = false;
     if let Some(object) = payload.as_object_mut() {
         attached_process_reset = cloud_mcp_asset_attach_process_reset_flag(object);
-        if let Some(cloud_id) = cloud_mcp_payload_text(input, &["cloud_id", "cloudId"]) {
+        if let Some(cloud_id) = cloud_mcp_payload_text(&input, &["cloud_id", "cloudId"]) {
             object.insert("cloud_id".to_string(), json!(cloud_id));
             object.insert("cloudId".to_string(), json!(cloud_id));
         }
@@ -28518,7 +27287,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
         }
         let transfer_id = cloud_mcp_asset_prepare_transfer_id(&prepare, "upload")?;
         let transfer_cloud_id = cloud_mcp_payload_text(&prepare, &["cloud_id", "cloudId"])
-            .or_else(|| cloud_mcp_payload_text(input, &["cloud_id", "cloudId"]))
+            .or_else(|| cloud_mcp_payload_text(&input, &["cloud_id", "cloudId"]))
             .unwrap_or_else(|| "diffforge-ai-cloud".to_string());
         let bytes_total = cloud_mcp_payload_i64(&prepare, &["size_bytes", "sizeBytes"])
             .or_else(|| Some(cloud_mcp_asset_row_i64(&row, &["size_bytes", "sizeBytes"])))
@@ -30353,21 +29122,23 @@ pub(crate) fn cloud_mcp_forward_terminal_todo_plan_update(
     cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "terminal_todo_plan_update")
 }
 
-fn cloud_mcp_proxy_push_current_filetree_snapshot(
-    _base_url: &str,
-    repo_id: &str,
-    workspace_root: &Path,
-    _workspace_id: Option<&str>,
-    _workspace_name: Option<&str>,
-    _reason: &str,
-) -> Result<Value, String> {
-    Ok(json!({
-        "ok": true,
-        "skipped": true,
-        "reason": "filetree_sync_disabled",
-        "repoId": repo_id,
-        "repoPath": workspace_path_display(workspace_root),
-    }))
+fn cloud_mcp_normalized_relative_path(value: &str) -> Option<String> {
+    let path = value
+        .replace('\\', "/")
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    if path.is_empty()
+        || path == ".git"
+        || path == ".agents"
+        || path.starts_with(".git/")
+        || path.starts_with(".agents/")
+        || path.starts_with("../")
+        || path.contains("/../")
+    {
+        return None;
+    }
+    Some(path)
 }
 
 fn cloud_mcp_lease_path_from_resource_key(resource_key: &str) -> Option<String> {
@@ -30380,7 +29151,7 @@ fn cloud_mcp_lease_path_from_resource_key(resource_key: &str) -> Option<String> 
         return None;
     }
     let path = trimmed.strip_prefix("file:").unwrap_or(trimmed);
-    cloud_mcp_normalized_git_path(path.as_bytes())
+    cloud_mcp_normalized_relative_path(path)
 }
 
 pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
@@ -30409,12 +29180,9 @@ pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
     let Some(path) = cloud_mcp_lease_path_from_resource_key(resource_key) else {
         return Ok(json!({"skipped": true, "reason": "non_file_resource"}));
     };
-    // Leases are locally authoritative: the coordination kernel records them
-    // and `lane_claimed` already reports the lane transition to the cloud.
-    // The per-lease "agent_heartbeat" event this used to queue duplicated the
-    // agent status sync (which carries claimed paths on every transition) and
-    // kept the sync outbox permanently busy, so lease acquisition no longer
-    // emits any cloud event.
+    // Leases are locally authoritative: the coordination kernel records them,
+    // and lane transitions are reported separately when needed. Lease
+    // acquisition no longer emits a cloud event.
     log_cloud_sync_event(
         "lease.local_only",
         json!({
@@ -30453,10 +29221,6 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
         .ok_or_else(|| {
             "submit_patch Cloud sync requires the task_id returned by start_task.".to_string()
         })?;
-    let main_repo_path = repo_path
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
     let repo_path_text = repo_path
         .or(worktree_path)
         .map(str::trim)
@@ -30590,37 +29354,12 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
 
     let event_kind = "submit_patch";
     let payload = Value::Object(arguments);
-    let should_sync_filetree_for_submit = ok
-        && (auto_merge_status == "applied"
-            || matches!(task_status.as_str(), "merged" | "done" | "completed"));
-    let filetree_sync = if should_sync_filetree_for_submit {
-        if let (Some(repo_id), Some(repo_path)) =
-            (identity.repo_id.as_deref(), main_repo_path.as_ref())
-        {
-            match cloud_mcp_proxy_push_current_filetree_snapshot(
-                &base_url,
-                repo_id,
-                repo_path,
-                identity.workspace_id.as_deref(),
-                identity.workspace_name.as_deref(),
-                "submit_patch_pre_accept_filetree_resync",
-            ) {
-                Ok(response) => json!({"ok": true, "response": response}),
-                Err(error) => json!({"ok": false, "error": error}),
-            }
-        } else {
-            json!({"ok": false, "error": "missing_repo_for_filetree_resync"})
-        }
-    } else {
-        json!({"ok": false, "skipped": true, "reason": "patch_not_applied_to_main"})
-    };
     identity.log(
         "cloud_mcp.agent_submit_patch.queued",
         "submit_patch",
         json!({
             "activity": "agent submit_patch queued for background Cloud history sync",
             "baseUrl": base_url,
-            "filetreeSync": filetree_sync,
             "taskStatus": task_status,
             "taskId": active_task_id,
         }),
@@ -30643,7 +29382,6 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
         .unwrap_or_else(|error| json!({"ok": false, "error": error}))
     };
     if let Some(object) = queued.as_object_mut() {
-        object.insert("filetree_sync".to_string(), filetree_sync);
         object.insert("isolated_prune".to_string(), isolated_prune);
     }
     Ok(queued)
@@ -30796,46 +29534,17 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
 
     let event_kind = "task_completed";
     let payload = Value::Object(arguments);
-    let should_sync_filetree = file_authority_text == "bounded_direct_edit"
-        && matches!(task_status, "done" | "completed" | "merged");
-    let filetree_sync = if should_sync_filetree {
-        if let (Some(repo_id), Some(repo_path)) =
-            (identity.repo_id.as_deref(), identity.repo_path.as_ref())
-        {
-            match cloud_mcp_proxy_push_current_filetree_snapshot(
-                &base_url,
-                repo_id,
-                repo_path,
-                identity.workspace_id.as_deref(),
-                identity.workspace_name.as_deref(),
-                "direct_edit_complete_filetree_resync",
-            ) {
-                Ok(response) => json!({"ok": true, "response": response}),
-                Err(error) => json!({"ok": false, "error": error}),
-            }
-        } else {
-            json!({"ok": false, "skipped": true, "reason": "missing_repo_for_filetree_resync"})
-        }
-    } else {
-        json!({"ok": false, "skipped": true, "reason": "non_file_authority_completion"})
-    };
     identity.log(
         "cloud_mcp.agent_complete_task.queued",
         "complete_task",
         json!({
             "activity": "agent complete_task queued for background Cloud history sync",
             "baseUrl": base_url,
-            "filetreeSync": filetree_sync,
             "taskStatus": task_status,
             "taskId": active_task_id,
         }),
     );
-    let mut queued =
-        cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_complete_task")?;
-    if let Some(object) = queued.as_object_mut() {
-        object.insert("filetree_sync".to_string(), filetree_sync);
-    }
-    Ok(queued)
+    cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_complete_task")
 }
 
 fn cloud_mcp_submit_patch_changed_file_paths(submit_result: &Value) -> Vec<String> {
