@@ -1093,7 +1093,6 @@ const WORKSPACE_APP_STARTUP_SHARED_MCP_IDLE_DELAY_MS = 450;
 const WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS = 1600;
 const WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS = 350;
 const WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS = 5000;
-const WORKSPACE_ARCHITECTURE_GRAPH_LIST_REFRESH_MS = 900;
 const WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS = 90;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
@@ -14839,19 +14838,11 @@ export default function App() {
       return;
     }
     if (terminalStatusEventSyncInFlightRef.current.has(key)) {
-      scheduleTerminalStatusEventSyncFlush(key, 1000);
+      scheduleTerminalStatusEventSyncFlush(key, 0);
       return;
     }
     const item = terminalStatusEventSyncQueueRef.current.get(key);
     if (!item) {
-      return;
-    }
-    const hotDelayMs = getTerminalInputHotDelayMs(900);
-    if (
-      hotDelayMs > 0
-      && !["closed", "closing", "exited", "provider-turn-error"].includes(item.eventType)
-    ) {
-      scheduleTerminalStatusEventSyncFlush(key, hotDelayMs);
       return;
     }
     terminalStatusEventSyncQueueRef.current.delete(key);
@@ -15482,23 +15473,6 @@ export default function App() {
     const diagnosticToken = authStore.getToken();
 
     const syncWorkspaceCatalog = async () => {
-      const hotDelayMs = getTerminalInputHotDelayMs(1000);
-      if (hotDelayMs > 0) {
-        syncTimer = window.setTimeout(() => {
-          syncTimer = 0;
-          void syncWorkspaceCatalog().catch((error) => {
-            if (!disposed) {
-              workspaceCatalogSyncKeyRef.current = "";
-              logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_catalog_sync.failed", {
-                message: getErrorMessage(error, "Unable to sync workspace catalog."),
-                workspaceCount: targets.length,
-              });
-            }
-          });
-        }, hotDelayMs);
-        return;
-      }
-
       workspaceCatalogSyncKeyRef.current = syncKey;
       void recordCloudConnectionDiagnostic(diagnosticToken, {
         channel: "rust-client-sync",
@@ -15550,7 +15524,7 @@ export default function App() {
     syncTimer = window.setTimeout(() => {
       syncTimer = 0;
       void syncWorkspaceCatalog();
-    }, 500);
+    }, 0);
 
     return () => {
       disposed = true;
@@ -15560,7 +15534,6 @@ export default function App() {
     };
   }, [
     authState,
-    getTerminalInputHotDelayMs,
     shouldShowWorkspaceSetup,
     user,
     workspaceCatalogSyncKey,
@@ -15611,23 +15584,6 @@ export default function App() {
     const diagnosticToken = authStore.getToken();
 
     const syncHydratedWorkspaces = async () => {
-      const hotDelayMs = getTerminalInputHotDelayMs(1600);
-      if (hotDelayMs > 0) {
-        syncTimer = window.setTimeout(() => {
-          syncTimer = 0;
-          void syncHydratedWorkspaces().catch((error) => {
-            if (!disposed) {
-              workspaceCloudSyncKeyRef.current = "";
-              logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_sync.failed", {
-                message: getErrorMessage(error, "Unable to sync hydrated workspaces."),
-                workspaceCount: targets.length,
-              });
-            }
-          });
-        }, hotDelayMs);
-        return;
-      }
-
       workspaceCloudSyncKeyRef.current = syncKey;
       void recordCloudConnectionDiagnostic(diagnosticToken, {
         channel: "rust-client-sync",
@@ -15695,7 +15651,7 @@ export default function App() {
           });
         }
       });
-    }, 900);
+    }, 0);
 
     return () => {
       disposed = true;
@@ -15705,7 +15661,6 @@ export default function App() {
     };
   }, [
     authState,
-    getTerminalInputHotDelayMs,
     shouldShowWorkspaceSetup,
     user,
     workspaceHydrationReady,
@@ -15757,13 +15712,8 @@ export default function App() {
         terminalPresenceSyncPendingRef.current = null;
         return;
       }
-      const hotDelayMs = getTerminalInputHotDelayMs(120);
-      if (hotDelayMs > 0) {
-        terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, hotDelayMs);
-        return;
-      }
       if (terminalPresenceSyncInFlightRef.current) {
-        terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 120);
+        terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 0);
         return;
       }
 
@@ -15780,7 +15730,7 @@ export default function App() {
           && !disposed
           && !terminalPresenceSyncTimerRef.current
         ) {
-          terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 120);
+          terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 0);
         }
       };
       window.setTimeout(releasePresenceSyncGate, 0);
@@ -15840,7 +15790,7 @@ export default function App() {
     if (terminalPresenceSyncTimerRef.current) {
       window.clearTimeout(terminalPresenceSyncTimerRef.current);
     }
-    terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 120);
+    terminalPresenceSyncTimerRef.current = window.setTimeout(flushPresence, 0);
 
     return () => {
       disposed = true;
@@ -15851,7 +15801,6 @@ export default function App() {
     };
   }, [
     authState,
-    getTerminalInputHotDelayMs,
     shouldShowWorkspaceSetup,
     terminalPresenceSyncKey,
     terminalPresenceWorkspaces,
@@ -15896,12 +15845,6 @@ export default function App() {
       if (reason === "workspace_mcp_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
         return;
       }
-      const hotDelayMs = getTerminalInputHotDelayMs(1600);
-      if (hotDelayMs > 0) {
-        scheduleWorkspaceMcpSync(reason, hotDelayMs);
-        return;
-      }
-
       const diagnosticToken = authStore.getToken();
       try {
         await recordCloudConnectionDiagnostic(diagnosticToken, {
@@ -15981,9 +15924,9 @@ export default function App() {
       }
     };
 
-    scheduleWorkspaceMcpSync("workspace_mcp_snapshot", 900);
+    scheduleWorkspaceMcpSync("workspace_mcp_snapshot", 0);
     const handleWorkspaceMcpRegistryUpdated = () => {
-      scheduleWorkspaceMcpSync("workspace_mcp_registry_updated", 250);
+      scheduleWorkspaceMcpSync("workspace_mcp_registry_updated", 0);
     };
     window.addEventListener(
       WORKSPACE_MCP_REGISTRY_UPDATED_EVENT,
@@ -16007,7 +15950,6 @@ export default function App() {
     };
   }, [
     authState,
-    getTerminalInputHotDelayMs,
     shouldShowWorkspaceSetup,
     user,
     workspaceMcpSyncTargetKey,
@@ -17714,7 +17656,8 @@ export default function App() {
     const workspaceId = activatedWorkspaceIdForGraphSync;
     const repositories = workspaceArchitectureRepositoriesFromScan(activatedArchitectureRepositoryScanSnapshot);
     if (
-      !repoPath
+      visibleView !== "architecture"
+      || !repoPath
       || !workspaceId
       || activatedArchitectureRepositoryScanState !== "ready"
       || !repositories.length
@@ -17722,37 +17665,32 @@ export default function App() {
       return undefined;
     }
 
-    const initialRepoPath = graphText(
-      activatedWorkspaceGraphState.architectureSelectedRepoPath
+    const stateKey = workspaceGraphStateKey(repoPath, workspaceId);
+    const currentState = workspaceGraphStateRef.current[stateKey] || {};
+    const selectedRepoPath = graphText(
+      currentState.architectureSelectedRepoPath
+        || activatedWorkspaceGraphState.architectureSelectedRepoPath
         || workspaceArchitectureRepoPath(repositories[0]),
     );
-    if (!initialRepoPath) {
+    if (!selectedRepoPath) {
       return undefined;
     }
 
-    const interval = window.setInterval(() => {
-      const stateKey = workspaceGraphStateKey(repoPath, workspaceId);
-      const currentState = workspaceGraphStateRef.current[stateKey] || {};
-      const currentScan = currentState.architectureRepositoryScanSnapshot || activatedArchitectureRepositoryScanSnapshot;
-      const currentRepositories = workspaceArchitectureRepositoriesFromScan(currentScan);
-      const selectedRepoPath = graphText(
-        currentState.architectureSelectedRepoPath
-          || initialRepoPath,
-      );
-      const selectedRepoKey = workspaceArchitectureRepoKey(selectedRepoPath);
-      const selectedRepo = currentRepositories.find((repo) => (
-        workspaceArchitectureRepoKey(workspaceArchitectureRepoPath(repo)) === selectedRepoKey
-      ));
+    const selectedRepoKey = workspaceArchitectureRepoKey(selectedRepoPath);
+    const selectedRepo = repositories.find((repo) => (
+      workspaceArchitectureRepoKey(workspaceArchitectureRepoPath(repo)) === selectedRepoKey
+    ));
+    const refreshTimer = window.setTimeout(() => {
       refreshWorkspaceArchitectureGraphList(workspaceId, workspaceArchitectureRepoPath(selectedRepo) || selectedRepoPath, {
         refresh: true,
-        reason: "workspace_architecture_graph_list_background_refresh",
+        reason: "workspace_architecture_graph_list_visible_refresh",
         silent: true,
         workspaceName: activatedWorkspaceNameForGraphSync,
         workspaceRootDirectory: repoPath,
       }).catch(() => {});
-    }, WORKSPACE_ARCHITECTURE_GRAPH_LIST_REFRESH_MS);
+    }, 0);
 
-    return () => window.clearInterval(interval);
+    return () => window.clearTimeout(refreshTimer);
   }, [
     activatedArchitectureRepositoryScanSnapshot,
     activatedArchitectureRepositoryScanState,
@@ -17761,6 +17699,7 @@ export default function App() {
     activatedWorkspaceNameForGraphSync,
     activatedWorkspaceTerminalWorkingDirectory,
     refreshWorkspaceArchitectureGraphList,
+    visibleView,
   ]);
 
   useEffect(() => {
@@ -18406,7 +18345,6 @@ export default function App() {
       ];
     };
     const syncRemoteControlState = async (reason, lifecycleOverride = null) => {
-      await new Promise((resolve) => window.setTimeout(resolve, lifecycleOverride ? 40 : 180));
       const workspacesSnapshot = Array.isArray(terminalPresenceWorkspacesRef.current)
         ? terminalPresenceWorkspacesRef.current
         : [];

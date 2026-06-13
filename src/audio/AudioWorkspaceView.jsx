@@ -255,36 +255,29 @@ import {
   AudioTabButton,
   AudioTabPanel,
   AudioDictionaryPanel,
-  AudioDictionarySummaryBar,
-  AudioDictionaryStat,
-  AudioDictionaryComposer,
-  AudioDictionaryComposerTopline,
-  AudioDictionaryComposerGrid,
   AudioDictionaryTextarea,
-  AudioDictionaryListHeader,
   AudioDictionaryList,
-  AudioDictionaryCard,
-  AudioDictionaryCardTopline,
-  AudioDictionaryTitleInput,
   AudioDictionaryMetaPill,
   AudioDictionaryEmpty,
-  AudioRulesTabs,
-  AudioRulesTab,
-  AudioRulesHint,
-  AudioRulesList,
-  AudioRuleRow,
-  AudioRuleFields,
-  AudioRuleFieldRow,
   AudioRuleTextarea,
   AudioRuleToggle,
   AudioRuleIconButton,
-  AudioRulesActionsRow,
-  AudioRulesPreview,
-  AudioRulesPreviewResult,
+  AudioRulePanelHeader,
+  AudioRulePanelTitle,
+  AudioRuleListItem,
+  AudioRuleListText,
+  AudioRuleListTitle,
+  AudioRuleListMeta,
+  AudioRuleListActions,
+  AudioRuleEditorPanel,
+  AudioRuleEditorHeader,
+  AudioRuleEditorTitle,
+  AudioRuleEditorBody,
+  AudioRuleFieldLabel,
+  AudioRuleFieldCaption,
+  AudioRuleStatusLine,
   AudioHistoryStatusBadge,
   AudioHistoryPanel,
-  AudioHistoryStats,
-  AudioHistoryStatChip,
   AudioHistoryVirtualList,
   AudioHistoryList,
   AudioHistoryRow,
@@ -295,15 +288,6 @@ import {
   AudioHistoryProvider,
   AudioHistoryCopyButton,
   AudioHistoryMeta,
-  AudioInsightCard,
-  AudioInsightCardTopline,
-  AudioInsightLabel,
-  AudioInsightSubValue,
-  AudioInsightValue,
-  AudioWpmGauge,
-  AudioHeatmapGrid,
-  AudioHeatmapColumn,
-  AudioHeatmapCell,
   AudioRuntimeHint,
   AudioProgressPanel,
   AudioProgressTopline,
@@ -330,11 +314,15 @@ import {
   AudioBarIdleReveal,
   AudioBarIdleLine,
   AudioBarRecordButton,
+  AudioBarRecordCluster,
   AudioBarShortcutHint,
+  AudioBarHistoryActions,
   AudioWidgetFocusStage,
   AudioWidgetLogo,
   AudioWidgetMeter,
   AudioWidgetLoader,
+  AudioWidgetHistoryTray,
+  AudioHistoryQuickButton,
   McpWorkspaceSurface,
   McpHeaderPanel,
   McpTitleRow,
@@ -453,6 +441,7 @@ import {
   ButtonBotIcon,
   ButtonTerminalIcon,
   ButtonKeyIcon,
+  ButtonBackIcon,
   ButtonMicIcon,
   ButtonMicOffIcon,
   ButtonHubIcon,
@@ -496,6 +485,7 @@ const AUDIO_INPUT_METER_BARS = 18;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
+const AUDIO_WIDGET_HISTORY_TRAY_SIZE = { width: 132, height: 112 };
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
@@ -532,8 +522,11 @@ const AUDIO_MODIFIER_CODES = new Set([
 const AUDIO_SETTINGS_TABS = [
   { id: "general", label: "General" },
   { id: "dictionary", label: "Dictionary" },
+  { id: "snippets", label: "Snippets" },
+  { id: "transforms", label: "Transforms" },
   { id: "history", label: "History" },
 ];
+const VOICE_RULE_TAB_IDS = new Set(["dictionary", "snippets", "transforms"]);
 const AUDIO_WIDGET_THEME_META_COLORS = {
   [AUDIO_WIDGET_THEME_DARK]: "#030508",
   [AUDIO_WIDGET_THEME_LIGHT]: "#f5f5f7",
@@ -571,6 +564,10 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
 ];
 // Transcripts longer than this get the 3-line clamp + "Show more" toggle.
 const AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS = 220;
+const AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT = 124;
+const AUDIO_HISTORY_ROW_GAP = 8;
+const AUDIO_HISTORY_VIRTUAL_OVERSCAN_ROWS = 4;
+const AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT = 420;
 
 function isMacPlatform() {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
@@ -736,6 +733,8 @@ async function copyTextToClipboard(text) {
   textarea.style.position = "fixed";
   textarea.style.top = "-1000px";
   textarea.style.opacity = "0";
+  textarea.style.userSelect = "text";
+  textarea.style.webkitUserSelect = "text";
   document.body.appendChild(textarea);
   textarea.select();
 
@@ -1196,6 +1195,209 @@ function buildAudioHistoryInsights(history) {
   };
 }
 
+function isAudioHistoryClampable(entryText) {
+  const text = String(entryText || "");
+  if (text.length > AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS) {
+    return true;
+  }
+
+  let lineBreaks = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) === 10) {
+      lineBreaks += 1;
+      if (lineBreaks >= 3) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function buildAudioHistoryRows(history) {
+  return (Array.isArray(history) ? history : []).map((entry, index) => {
+    const entryText = String(entry?.text || "");
+    return {
+      clampable: isAudioHistoryClampable(entryText),
+      entry,
+      entryKey: getAudioHistoryEntryKey(entry, index),
+      entryText,
+      index,
+      meta: formatAudioHistoryMeta(entry),
+      providerLabel: formatAudioProviderLabel(entry?.provider),
+      timestamp: formatHistoryTimestamp(entry?.createdAt),
+    };
+  });
+}
+
+function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
+  const items = Array.isArray(rows) ? rows : [];
+  if (!items.length) {
+    return { items: [], totalHeight: 0 };
+  }
+
+  const viewportHeight = Math.max(
+    1,
+    Number(viewport?.height || AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT),
+  );
+  const scrollTop = Math.max(0, Number(viewport?.scrollTop || 0));
+  const overscanPx = AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT * AUDIO_HISTORY_VIRTUAL_OVERSCAN_ROWS;
+  const startBoundary = Math.max(0, scrollTop - overscanPx);
+  const endBoundary = scrollTop + viewportHeight + overscanPx;
+  const offsets = [];
+  const heights = [];
+  let totalHeight = 0;
+
+  items.forEach((row, index) => {
+    const measuredHeight = Number(rowHeights?.get?.(row.entryKey) || 0);
+    const height = measuredHeight > 0 ? measuredHeight : AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT;
+    offsets[index] = totalHeight;
+    heights[index] = height;
+    totalHeight += height + (index === items.length - 1 ? 0 : AUDIO_HISTORY_ROW_GAP);
+  });
+
+  let startIndex = 0;
+  while (
+    startIndex < items.length - 1
+    && offsets[startIndex] + heights[startIndex] < startBoundary
+  ) {
+    startIndex += 1;
+  }
+
+  let endIndex = startIndex;
+  while (endIndex < items.length && offsets[endIndex] <= endBoundary) {
+    endIndex += 1;
+  }
+
+  if (endIndex <= startIndex) {
+    endIndex = Math.min(items.length, startIndex + 1);
+  }
+
+  return {
+    items: items.slice(startIndex, endIndex).map((row, sliceIndex) => {
+      const index = startIndex + sliceIndex;
+      return {
+        row,
+        top: offsets[index],
+      };
+    }),
+    totalHeight,
+  };
+}
+
+function AudioHistoryVirtualRow({
+  copied,
+  expanded,
+  onCopy,
+  onMeasure,
+  onToggle,
+  row,
+  top,
+  totalCount,
+}) {
+  const rowRef = useRef(null);
+
+  useEffect(() => {
+    const node = rowRef.current;
+    if (!node) {
+      return undefined;
+    }
+
+    let frame = 0;
+    let observer = null;
+    const measure = () => {
+      const commitMeasure = () => {
+        frame = 0;
+        onMeasure(row.entryKey, node.getBoundingClientRect().height);
+      };
+
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        if (frame) {
+          window.cancelAnimationFrame(frame);
+        }
+        frame = window.requestAnimationFrame(commitMeasure);
+      } else {
+        commitMeasure();
+      }
+    };
+
+    measure();
+
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(measure);
+      observer.observe(node);
+    } else if (typeof window !== "undefined") {
+      window.addEventListener("resize", measure);
+    }
+
+    return () => {
+      if (frame && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(frame);
+      }
+      observer?.disconnect?.();
+      if (typeof ResizeObserver === "undefined" && typeof window !== "undefined") {
+        window.removeEventListener("resize", measure);
+      }
+    };
+  }, [expanded, onMeasure, row.entryKey, row.entryText]);
+
+  return (
+    <AudioHistoryRow
+      aria-posinset={row.index + 1}
+      aria-setsize={totalCount}
+      data-expanded={expanded ? "true" : "false"}
+      ref={rowRef}
+      role="listitem"
+      style={{
+        left: 0,
+        position: "absolute",
+        right: 0,
+        top: 0,
+        transform: `translateY(${top}px)`,
+      }}
+    >
+      <AudioHistoryRowTopline>
+        <span>{row.timestamp}</span>
+        <AudioHistoryRowActions>
+          {row.entry.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED && (
+            <AudioHistoryStatusBadge>Cancelled</AudioHistoryStatusBadge>
+          )}
+          <AudioHistoryProvider data-provider={row.entry.provider}>
+            {row.providerLabel}
+          </AudioHistoryProvider>
+          <AudioHistoryCopyButton
+            aria-label="Copy previous prompt"
+            data-copied={copied ? "true" : undefined}
+            onClick={() => onCopy(row.entry, row.index)}
+            title="Copy previous prompt"
+            type="button"
+          >
+            {copied ? (
+              <ButtonCheckIcon aria-hidden="true" />
+            ) : (
+              <ButtonCopyIcon aria-hidden="true" />
+            )}
+            <span>{copied ? "Copied" : "Copy"}</span>
+          </AudioHistoryCopyButton>
+        </AudioHistoryRowActions>
+      </AudioHistoryRowTopline>
+      <strong>{row.entryText}</strong>
+      <AudioHistoryRowFootline>
+        <AudioHistoryMeta>{row.meta}</AudioHistoryMeta>
+        {row.clampable && (
+          <AudioHistoryExpandButton
+            aria-expanded={expanded}
+            onClick={() => onToggle(row.entryKey)}
+            type="button"
+          >
+            {expanded ? "Show less" : "Show more"}
+          </AudioHistoryExpandButton>
+        )}
+      </AudioHistoryRowFootline>
+    </AudioHistoryRow>
+  );
+}
+
 export default function AudioWorkspaceView({
   audioActionState,
   audioDownloadProgress,
@@ -1234,11 +1436,9 @@ export default function AudioWorkspaceView({
     () => lastKnownForgeBilling || { state: "idle", remaining: null, error: "" },
   );
   const [audioWidgetStyleSetting, setAudioWidgetStyleSetting] = useState(readAudioWidgetStyle);
-  const [voiceRulesTab, setVoiceRulesTab] = useState("dictionary");
-  const [voiceRulesPreviewInput, setVoiceRulesPreviewInput] = useState("");
   const [voiceRulesError, setVoiceRulesError] = useState("");
-  const [dictionaryDraftName, setDictionaryDraftName] = useState("");
-  const [dictionaryDraftTermsText, setDictionaryDraftTermsText] = useState("");
+  const [voiceRuleEditor, setVoiceRuleEditor] = useState(null);
+  const [voiceRuleSaveState, setVoiceRuleSaveState] = useState("idle");
   const voiceRulesSaveTimerRef = useRef(0);
   const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
   const [audioShortcutError, setAudioShortcutError] = useState("");
@@ -1249,6 +1449,14 @@ export default function AudioWorkspaceView({
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
   const copiedAudioHistoryTimerRef = useRef(0);
+  const audioHistoryViewportRef = useRef(null);
+  const audioHistoryScrollFrameRef = useRef(0);
+  const audioHistoryRowHeightsRef = useRef(new Map());
+  const [audioHistoryViewport, setAudioHistoryViewport] = useState({
+    height: AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT,
+    scrollTop: 0,
+  });
+  const [audioHistoryMeasureVersion, setAudioHistoryMeasureVersion] = useState(0);
   const isCloudMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const isForgeMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
   const isForgeAgentMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
@@ -1343,36 +1551,45 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
-  const audioHistoryInsights = useMemo(() => buildAudioHistoryInsights(audioHistory), [audioHistory]);
-  const voiceRulesPreview = useMemo(() => (
-    voiceRulesPreviewInput.trim()
-      ? applyVoiceTextPipeline(voiceRulesPreviewInput, voiceRules)
-      : null
-  ), [voiceRulesPreviewInput, voiceRules]);
+  const audioHistoryRows = useMemo(() => buildAudioHistoryRows(audioHistory), [audioHistory]);
+  const audioHistoryVirtualWindow = useMemo(() => (
+    buildAudioHistoryVirtualWindow(
+      audioHistoryRows,
+      audioHistoryViewport,
+      audioHistoryRowHeightsRef.current,
+    )
+  ), [audioHistoryRows, audioHistoryViewport, audioHistoryMeasureVersion]);
   const dictionaryLists = useMemo(() => (
     Array.isArray(voiceRules.dictionary) ? voiceRules.dictionary : []
   ), [voiceRules.dictionary]);
-  const selectedDictionaryListCount = useMemo(() => (
-    dictionaryLists.filter((list) => list?.selected !== false).length
-  ), [dictionaryLists]);
-  const dictionaryDraftTerms = useMemo(() => (
-    parseDictionaryTerms(dictionaryDraftTermsText)
-  ), [dictionaryDraftTermsText]);
-  const activeDictionaryTermCount = useMemo(() => {
-    const seen = new Set();
-    for (const list of dictionaryLists) {
-      if (list?.selected === false) {
-        continue;
-      }
-      for (const term of list?.terms || []) {
-        const key = String(term).trim().toLowerCase();
-        if (key) {
-          seen.add(key);
-        }
-      }
+  const snippetRules = useMemo(() => (
+    Array.isArray(voiceRules.snippets) ? voiceRules.snippets : []
+  ), [voiceRules.snippets]);
+  const transformRules = useMemo(() => (
+    Array.isArray(voiceRules.transforms) ? voiceRules.transforms : []
+  ), [voiceRules.transforms]);
+  const voiceRuleEditorTerms = useMemo(() => (
+    voiceRuleEditor?.kind === "dictionary"
+      ? parseDictionaryTerms(voiceRuleEditor.draft?.termsText || "")
+      : []
+  ), [voiceRuleEditor]);
+  const voiceRuleEditorCanSave = useMemo(() => {
+    const draft = voiceRuleEditor?.draft || {};
+
+    if (voiceRuleEditor?.kind === "dictionary") {
+      return Boolean(String(draft.name || "").trim() || voiceRuleEditorTerms.length);
     }
-    return seen.size;
-  }, [dictionaryLists]);
+
+    if (voiceRuleEditor?.kind === "snippets") {
+      return Boolean(String(draft.trigger || "").trim() && String(draft.expansion || "").trim());
+    }
+
+    if (voiceRuleEditor?.kind === "transforms") {
+      return Boolean(String(draft.match || "").trim());
+    }
+
+    return false;
+  }, [voiceRuleEditor, voiceRuleEditorTerms]);
   const toggleAudioHistoryExpanded = useCallback((entryKey) => {
     setExpandedAudioHistoryIds((current) => {
       const next = new Set(current);
@@ -1383,6 +1600,120 @@ export default function AudioWorkspaceView({
       }
       return next;
     });
+  }, []);
+
+  const syncAudioHistoryViewport = useCallback((node) => {
+    if (!node) {
+      return;
+    }
+
+    const nextViewport = {
+      height: node.clientHeight || AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT,
+      scrollTop: node.scrollTop || 0,
+    };
+
+    setAudioHistoryViewport((current) => (
+      current.height === nextViewport.height && current.scrollTop === nextViewport.scrollTop
+        ? current
+        : nextViewport
+    ));
+  }, []);
+
+  const handleAudioHistoryScroll = useCallback((event) => {
+    const node = event.currentTarget;
+    if (!node) {
+      return;
+    }
+
+    if (
+      audioHistoryScrollFrameRef.current
+      && typeof window !== "undefined"
+      && typeof window.cancelAnimationFrame === "function"
+    ) {
+      window.cancelAnimationFrame(audioHistoryScrollFrameRef.current);
+    }
+
+    const update = () => {
+      audioHistoryScrollFrameRef.current = 0;
+      syncAudioHistoryViewport(node);
+    };
+
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      audioHistoryScrollFrameRef.current = window.requestAnimationFrame(update);
+    } else {
+      update();
+    }
+  }, [syncAudioHistoryViewport]);
+
+  const measureAudioHistoryRow = useCallback((entryKey, height) => {
+    const roundedHeight = Math.ceil(Number(height || 0));
+    if (!entryKey || roundedHeight <= 0) {
+      return;
+    }
+
+    const currentHeight = audioHistoryRowHeightsRef.current.get(entryKey) || 0;
+    if (Math.abs(currentHeight - roundedHeight) <= 1) {
+      return;
+    }
+
+    audioHistoryRowHeightsRef.current.set(entryKey, roundedHeight);
+    setAudioHistoryMeasureVersion((version) => version + 1);
+  }, []);
+
+  useEffect(() => {
+    const validKeys = new Set(audioHistoryRows.map((row) => row.entryKey));
+    let changed = false;
+
+    audioHistoryRowHeightsRef.current.forEach((_height, entryKey) => {
+      if (!validKeys.has(entryKey)) {
+        audioHistoryRowHeightsRef.current.delete(entryKey);
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      setAudioHistoryMeasureVersion((version) => version + 1);
+    }
+  }, [audioHistoryRows]);
+
+  useEffect(() => {
+    if (activeAudioTab !== "history") {
+      return undefined;
+    }
+
+    const node = audioHistoryViewportRef.current;
+    if (!node) {
+      return undefined;
+    }
+
+    const sync = () => syncAudioHistoryViewport(node);
+    sync();
+
+    let observer = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(sync);
+      observer.observe(node);
+    } else if (typeof window !== "undefined") {
+      window.addEventListener("resize", sync);
+    }
+
+    return () => {
+      observer?.disconnect?.();
+      if (typeof ResizeObserver === "undefined" && typeof window !== "undefined") {
+        window.removeEventListener("resize", sync);
+      }
+    };
+  }, [activeAudioTab, syncAudioHistoryViewport]);
+
+  useEffect(() => () => {
+    if (
+      audioHistoryScrollFrameRef.current
+      && typeof window !== "undefined"
+      && typeof window.cancelAnimationFrame === "function"
+    ) {
+      window.cancelAnimationFrame(audioHistoryScrollFrameRef.current);
+      audioHistoryScrollFrameRef.current = 0;
+    }
   }, []);
 
   const stopAudioInputPreview = useCallback(async () => {
@@ -1563,8 +1894,29 @@ export default function AudioWorkspaceView({
         .then(() => setVoiceRulesError(""))
         .catch((rulesError) => {
           setVoiceRulesError(getErrorMessage(rulesError, "Unable to save voice rules."));
-        });
+      });
     }, 700);
+  }, []);
+
+  const saveVoiceRulesImmediately = useCallback(async (nextRules) => {
+    if (voiceRulesSaveTimerRef.current) {
+      window.clearTimeout(voiceRulesSaveTimerRef.current);
+      voiceRulesSaveTimerRef.current = 0;
+    }
+
+    setVoiceRuleSaveState("saving");
+
+    try {
+      const savedRules = await saveVoiceTextRules(nextRules);
+      setVoiceRules(savedRules);
+      setVoiceRulesError("");
+      setVoiceRuleSaveState("saved");
+      return savedRules;
+    } catch (rulesError) {
+      setVoiceRulesError(getErrorMessage(rulesError, "Unable to save voice rules."));
+      setVoiceRuleSaveState("error");
+      throw rulesError;
+    }
   }, []);
 
   const updateVoiceRulesList = useCallback((kind, updater) => {
@@ -1585,45 +1937,141 @@ export default function AudioWorkspaceView({
   }, [updateVoiceRulesList]);
 
   const removeVoiceRuleEntry = useCallback((kind, entryId) => {
+    setVoiceRuleEditor((currentEditor) => (
+      currentEditor?.kind === kind && currentEditor?.id === entryId ? null : currentEditor
+    ));
     updateVoiceRulesList(kind, (entries) => entries.filter((entry) => entry.id !== entryId));
   }, [updateVoiceRulesList]);
 
-  const addVoiceRuleEntry = useCallback((kind) => {
-    const id = `${kind}-${Date.now()}`;
-    updateVoiceRulesList(kind, (entries) => {
-      const blankEntry = kind === "dictionary"
-        ? { id, name: `List ${entries.length + 1}`, terms: [], termsText: "", selected: true }
-        : kind === "snippets"
-          ? { id, trigger: "", expansion: "", enabled: true }
-          : { id, match: "", replacement: "", isRegex: false, enabled: true };
-      return [...entries, blankEntry];
-    });
-  }, [updateVoiceRulesList]);
-
-  const createDictionaryList = useCallback((event) => {
-    event?.preventDefault?.();
-
-    const name = String(dictionaryDraftName || "").trim();
-    const termsText = String(dictionaryDraftTermsText || "").trim();
-
-    if (!name && !dictionaryDraftTerms.length) {
+  const openVoiceRuleEditor = useCallback((kind, entry = null) => {
+    if (!VOICE_RULE_TAB_IDS.has(kind)) {
       return;
     }
 
-    const id = `dictionary-${Date.now()}`;
-    updateVoiceRulesList("dictionary", (entries) => [
-      ...entries,
-      {
-        id,
-        name: name || `List ${entries.length + 1}`,
-        terms: dictionaryDraftTerms,
-        termsText,
-        selected: true,
-      },
-    ]);
-    setDictionaryDraftName("");
-    setDictionaryDraftTermsText("");
-  }, [dictionaryDraftName, dictionaryDraftTerms, dictionaryDraftTermsText, updateVoiceRulesList]);
+    const draft = kind === "dictionary"
+      ? {
+        name: entry?.name || "",
+        selected: entry?.selected !== false,
+        termsText: entry?.termsText ?? (entry?.terms || []).join(", "),
+      }
+      : kind === "snippets"
+        ? {
+          enabled: entry?.enabled !== false,
+          expansion: entry?.expansion || "",
+          trigger: entry?.trigger || "",
+        }
+        : {
+          enabled: entry?.enabled !== false,
+          isRegex: entry?.isRegex === true,
+          match: entry?.match || "",
+          replacement: entry?.replacement || "",
+        };
+
+    setVoiceRuleSaveState("idle");
+    setVoiceRuleEditor({
+      draft,
+      id: entry?.id || "",
+      kind,
+      mode: entry?.id ? "edit" : "new",
+    });
+  }, []);
+
+  const closeVoiceRuleEditor = useCallback(() => {
+    setVoiceRuleEditor(null);
+    setVoiceRuleSaveState("idle");
+  }, []);
+
+  const updateVoiceRuleEditorDraft = useCallback((patch) => {
+    setVoiceRuleSaveState("idle");
+    setVoiceRuleEditor((currentEditor) => (
+      currentEditor
+        ? {
+          ...currentEditor,
+          draft: {
+            ...currentEditor.draft,
+            ...patch,
+          },
+        }
+        : currentEditor
+    ));
+  }, []);
+
+  const saveVoiceRuleEditor = useCallback(async (event) => {
+    event?.preventDefault?.();
+
+    if (!voiceRuleEditor || voiceRuleSaveState === "saving") {
+      return;
+    }
+
+    const { draft, id, kind, mode } = voiceRuleEditor;
+    const currentEntries = Array.isArray(voiceRules[kind]) ? voiceRules[kind] : [];
+    const nextId = id || `${kind}-${Date.now()}`;
+    let nextEntry = null;
+
+    if (kind === "dictionary") {
+      const name = String(draft?.name || "").trim();
+      const termsText = String(draft?.termsText || "");
+      const terms = parseDictionaryTerms(termsText);
+
+      if (!name && !terms.length) {
+        return;
+      }
+
+      nextEntry = {
+        id: nextId,
+        name: name || `List ${currentEntries.length + 1}`,
+        selected: draft?.selected !== false,
+        terms,
+      };
+    } else if (kind === "snippets") {
+      const trigger = String(draft?.trigger || "").trim();
+      const expansion = String(draft?.expansion || "").trim();
+
+      if (!trigger || !expansion) {
+        return;
+      }
+
+      nextEntry = {
+        id: nextId,
+        enabled: draft?.enabled !== false,
+        expansion,
+        trigger,
+      };
+    } else if (kind === "transforms") {
+      const match = String(draft?.match || "").trim();
+
+      if (!match) {
+        return;
+      }
+
+      nextEntry = {
+        id: nextId,
+        enabled: draft?.enabled !== false,
+        isRegex: draft?.isRegex === true,
+        match,
+        replacement: String(draft?.replacement || ""),
+      };
+    }
+
+    if (!nextEntry) {
+      return;
+    }
+
+    const existingIndex = currentEntries.findIndex((entry) => entry.id === nextId);
+    const nextEntries = mode === "edit" && existingIndex >= 0
+      ? currentEntries.map((entry) => (entry.id === nextId ? nextEntry : entry))
+      : [...currentEntries, nextEntry];
+    const nextRules = { ...voiceRules, [kind]: nextEntries };
+
+    setVoiceRules(nextRules);
+
+    try {
+      await saveVoiceRulesImmediately(nextRules);
+      setVoiceRuleEditor(null);
+    } catch {
+      // Keep the editor open so the user can retry.
+    }
+  }, [saveVoiceRulesImmediately, voiceRuleEditor, voiceRuleSaveState, voiceRules]);
 
   const updateOrchestratorRealtimeEnabled = useCallback((enabled) => {
     setOrchestratorRealtimeEnabled(Boolean(enabled));
@@ -1992,17 +2440,86 @@ export default function AudioWorkspaceView({
     setUninstallModalOpen(false);
   }, [onUninstallModel]);
 
+  const selectAudioTab = useCallback((tabId) => {
+    setActiveAudioTab(tabId);
+    setVoiceRuleEditor(null);
+    setVoiceRuleSaveState("idle");
+  }, []);
+
+  const handleAudioTabKeyDown = useCallback((event) => {
+    const currentIndex = AUDIO_SETTINGS_TABS.findIndex((tab) => tab.id === activeAudioTab);
+    if (currentIndex < 0) {
+      return;
+    }
+
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % AUDIO_SETTINGS_TABS.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + AUDIO_SETTINGS_TABS.length) % AUDIO_SETTINGS_TABS.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = AUDIO_SETTINGS_TABS.length - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    const nextTab = AUDIO_SETTINGS_TABS[nextIndex];
+    selectAudioTab(nextTab.id);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`audio-tab-${nextTab.id}`)?.focus();
+    });
+  }, [activeAudioTab, selectAudioTab]);
+
+  const isVoiceRuleTab = VOICE_RULE_TAB_IDS.has(activeAudioTab);
+  const activeVoiceRuleTitle = activeAudioTab === "dictionary"
+    ? "Dictionary"
+    : activeAudioTab === "snippets"
+      ? "Snippets"
+      : "Transforms";
+  const activeVoiceRuleEntries = activeAudioTab === "dictionary"
+    ? dictionaryLists
+    : activeAudioTab === "snippets"
+      ? snippetRules
+      : activeAudioTab === "transforms"
+        ? transformRules
+        : [];
+  const activeVoiceRuleAddLabel = activeAudioTab === "dictionary"
+    ? "Add dictionary list"
+    : activeAudioTab === "snippets"
+      ? "Add snippet"
+      : "Add transform";
+  const activeVoiceRuleEmptyTitle = activeAudioTab === "dictionary"
+    ? "No lists yet"
+    : activeAudioTab === "snippets"
+      ? "No snippets yet"
+      : "No transforms yet";
+  const editorDraft = voiceRuleEditor?.draft || {};
+  const editorTitle = voiceRuleEditor?.kind === "dictionary"
+    ? (voiceRuleEditor.mode === "new" ? "New list" : (editorDraft.name || "Edit list"))
+    : voiceRuleEditor?.kind === "snippets"
+      ? (voiceRuleEditor.mode === "new" ? "New snippet" : (editorDraft.trigger || "Edit snippet"))
+      : (voiceRuleEditor?.mode === "new" ? "New transform" : (editorDraft.match || "Edit transform"));
+  const editorStatus = voiceRuleSaveState === "saving"
+    ? "Saving"
+    : voiceRuleSaveState === "error"
+      ? "Save failed"
+      : "Ready";
+
   return (
     <AudioWorkspaceSurface aria-label="Workspace audio">
-      <AudioTabBar role="tablist" aria-label="Audio settings sections">
+      <AudioTabBar onKeyDown={handleAudioTabKeyDown} role="tablist" aria-label="Audio settings sections">
         {AUDIO_SETTINGS_TABS.map((tab) => (
           <AudioTabButton
             aria-controls={`audio-tabpanel-${tab.id}`}
             aria-selected={activeAudioTab === tab.id}
             id={`audio-tab-${tab.id}`}
             key={tab.id}
-            onClick={() => setActiveAudioTab(tab.id)}
+            onClick={() => selectAudioTab(tab.id)}
             role="tab"
+            tabIndex={activeAudioTab === tab.id ? 0 : -1}
             type="button"
           >
             {tab.label}
@@ -2612,254 +3129,267 @@ export default function AudioWorkspaceView({
           </AudioTabPanel>
         )}
 
-        {activeAudioTab === "dictionary" && (
+        {isVoiceRuleTab && (
           <AudioDictionaryPanel
-            aria-labelledby="audio-tab-dictionary"
-            id="audio-tabpanel-dictionary"
+            aria-labelledby={`audio-tab-${activeAudioTab}`}
+            id={`audio-tabpanel-${activeAudioTab}`}
             role="tabpanel"
           >
-            <AudioRulesTabs aria-label="Voice rule type" role="group">
-              {[
-                { id: "dictionary", label: "Dictionary" },
-                { id: "snippets", label: "Snippets" },
-                { id: "transforms", label: "Transforms" },
-              ].map((tab) => (
-                <AudioRulesTab
-                  aria-pressed={voiceRulesTab === tab.id}
-                  key={tab.id}
-                  onClick={() => setVoiceRulesTab(tab.id)}
-                  type="button"
-                >
-                  {tab.label}
-                </AudioRulesTab>
-              ))}
-            </AudioRulesTabs>
+            {voiceRuleEditor?.kind === activeAudioTab ? (
+              <AudioRuleEditorPanel as="form" onSubmit={saveVoiceRuleEditor}>
+                <AudioRuleEditorHeader>
+                  <SecondaryButton onClick={closeVoiceRuleEditor} type="button">
+                    <ButtonBackIcon aria-hidden="true" />
+                    <span>Back</span>
+                  </SecondaryButton>
+                  <AudioRuleEditorTitle>
+                    <strong>{editorTitle}</strong>
+                    <span aria-live="polite">{editorStatus}</span>
+                  </AudioRuleEditorTitle>
+                  <PrimaryButton
+                    disabled={!voiceRuleEditorCanSave || voiceRuleSaveState === "saving"}
+                    type="submit"
+                  >
+                    <ButtonCheckIcon aria-hidden="true" />
+                    <span>{voiceRuleSaveState === "saving" ? "Saving..." : "Save"}</span>
+                  </PrimaryButton>
+                </AudioRuleEditorHeader>
 
-            {voiceRulesTab === "dictionary" ? (
-              <>
-                <AudioDictionarySummaryBar>
-                  <AudioDictionaryStat>
-                    <strong>{dictionaryLists.length}</strong>
-                    <span>{dictionaryLists.length === 1 ? "list" : "lists"}</span>
-                  </AudioDictionaryStat>
-                  <AudioDictionaryStat>
-                    <strong>{selectedDictionaryListCount}</strong>
-                    <span>active</span>
-                  </AudioDictionaryStat>
-                  <AudioDictionaryStat>
-                    <strong>{activeDictionaryTermCount}</strong>
-                    <span>{activeDictionaryTermCount === 1 ? "word" : "words"}</span>
-                  </AudioDictionaryStat>
-                </AudioDictionarySummaryBar>
-
-                <AudioDictionaryComposer onSubmit={createDictionaryList}>
-                  <AudioDictionaryComposerTopline>
-                    <div>
-                      <strong>Create list</strong>
-                      <span>
-                        {dictionaryDraftTerms.length
-                          ? `${dictionaryDraftTerms.length} ${dictionaryDraftTerms.length === 1 ? "word" : "words"} ready`
-                          : "Names, APIs, people, commands"}
-                      </span>
-                    </div>
-                    <PrimaryButton
-                      disabled={!dictionaryDraftName.trim() && !dictionaryDraftTerms.length}
-                      type="submit"
-                    >
-                      <ButtonAddIcon aria-hidden="true" />
-                      <span>Create list</span>
-                    </PrimaryButton>
-                  </AudioDictionaryComposerTopline>
-                  <AudioDictionaryComposerGrid>
-                    <AudioCloudInput
-                      aria-label="New word list name"
-                      onChange={(event) => setDictionaryDraftName(event.target.value)}
-                      placeholder="List name"
-                      value={dictionaryDraftName}
-                    />
-                    <AudioDictionaryTextarea
-                      aria-label="New word list terms"
-                      onChange={(event) => setDictionaryDraftTermsText(event.target.value)}
-                      placeholder="Tauri, Deepgram, AppKit"
-                      value={dictionaryDraftTermsText}
-                    />
-                  </AudioDictionaryComposerGrid>
-                </AudioDictionaryComposer>
-
-                <AudioDictionaryListHeader>
-                  <span>Lists</span>
-                  <span>Saves automatically</span>
-                </AudioDictionaryListHeader>
-
-                {dictionaryLists.length ? (
-                  <AudioDictionaryList>
-                    {dictionaryLists.map((list) => (
-                      <AudioDictionaryCard data-disabled={list.selected === false ? "true" : undefined} key={list.id}>
-                        <AudioDictionaryCardTopline>
-                          <AudioRuleToggle
-                            aria-label={list.selected === false ? "Include word list in dictation" : "Exclude word list from dictation"}
-                            aria-pressed={list.selected !== false}
-                            onClick={() => updateVoiceRuleEntry("dictionary", list.id, { selected: list.selected === false })}
-                            type="button"
-                          />
-                          <AudioDictionaryTitleInput
-                            aria-label="Word list name"
-                            onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, { name: event.target.value })}
-                            placeholder="Untitled list"
-                            value={list.name || ""}
-                          />
-                          <AudioDictionaryMetaPill data-active={list.selected !== false ? "true" : "false"}>
-                            {list.selected === false ? "Paused" : "Active"}
-                          </AudioDictionaryMetaPill>
-                          <AudioDictionaryMetaPill>
-                            {(list.terms || []).length} {(list.terms || []).length === 1 ? "word" : "words"}
-                          </AudioDictionaryMetaPill>
-                          <AudioRuleIconButton
-                            aria-label="Delete word list"
-                            onClick={() => removeVoiceRuleEntry("dictionary", list.id)}
-                            type="button"
-                          >
-                            <ButtonDeleteIcon aria-hidden="true" />
-                          </AudioRuleIconButton>
-                        </AudioDictionaryCardTopline>
+                <AudioRuleEditorBody>
+                  {voiceRuleEditor.kind === "dictionary" && (
+                    <>
+                      <AudioRuleFieldLabel>
+                        <span>List name</span>
+                        <AudioCloudInput
+                          aria-label="Word list name"
+                          onChange={(event) => updateVoiceRuleEditorDraft({ name: event.target.value })}
+                          placeholder="List name"
+                          value={editorDraft.name || ""}
+                        />
+                      </AudioRuleFieldLabel>
+                      <AudioRuleFieldLabel>
+                        <span>Words</span>
                         <AudioDictionaryTextarea
                           aria-label="Word list terms"
-                          onChange={(event) => updateVoiceRuleEntry("dictionary", list.id, {
-                            termsText: event.target.value,
-                            terms: parseDictionaryTerms(event.target.value),
-                          })}
-                          placeholder="Add words separated by commas or new lines"
-                          value={list.termsText ?? (list.terms || []).join(", ")}
+                          onChange={(event) => updateVoiceRuleEditorDraft({ termsText: event.target.value })}
+                          placeholder="Tauri, Deepgram, AppKit"
+                          value={editorDraft.termsText || ""}
                         />
-                      </AudioDictionaryCard>
-                    ))}
+                        <AudioRuleFieldCaption>
+                          {voiceRuleEditorTerms.length} {voiceRuleEditorTerms.length === 1 ? "word" : "words"}
+                        </AudioRuleFieldCaption>
+                      </AudioRuleFieldLabel>
+                      <AudioRuleStatusLine>
+                        <McpSwitchButton
+                          aria-checked={editorDraft.selected !== false}
+                          aria-pressed={editorDraft.selected !== false}
+                          onClick={() => updateVoiceRuleEditorDraft({ selected: editorDraft.selected === false })}
+                          role="switch"
+                          type="button"
+                        >
+                          <span aria-hidden="true" />
+                          Active
+                        </McpSwitchButton>
+                      </AudioRuleStatusLine>
+                    </>
+                  )}
+
+                  {voiceRuleEditor.kind === "snippets" && (
+                    <>
+                      <AudioRuleFieldLabel>
+                        <span>Trigger</span>
+                        <AudioCloudInput
+                          aria-label="Snippet trigger"
+                          onChange={(event) => updateVoiceRuleEditorDraft({ trigger: event.target.value })}
+                          placeholder="gstack"
+                          value={editorDraft.trigger || ""}
+                        />
+                      </AudioRuleFieldLabel>
+                      <AudioRuleFieldLabel>
+                        <span>Expansion</span>
+                        <AudioRuleTextarea
+                          aria-label="Snippet expansion"
+                          onChange={(event) => updateVoiceRuleEditorDraft({ expansion: event.target.value })}
+                          placeholder="Full text"
+                          value={editorDraft.expansion || ""}
+                        />
+                      </AudioRuleFieldLabel>
+                      <AudioRuleStatusLine>
+                        <McpSwitchButton
+                          aria-checked={editorDraft.enabled !== false}
+                          aria-pressed={editorDraft.enabled !== false}
+                          onClick={() => updateVoiceRuleEditorDraft({ enabled: editorDraft.enabled === false })}
+                          role="switch"
+                          type="button"
+                        >
+                          <span aria-hidden="true" />
+                          Active
+                        </McpSwitchButton>
+                      </AudioRuleStatusLine>
+                    </>
+                  )}
+
+                  {voiceRuleEditor.kind === "transforms" && (
+                    <>
+                      <AudioRuleFieldLabel>
+                        <span>Match</span>
+                        <AudioCloudInput
+                          aria-label="Transform match"
+                          onChange={(event) => updateVoiceRuleEditorDraft({ match: event.target.value })}
+                          placeholder={editorDraft.isRegex ? "bug (\\d+)" : "new line"}
+                          value={editorDraft.match || ""}
+                        />
+                      </AudioRuleFieldLabel>
+                      <AudioRuleFieldLabel>
+                        <span>Replacement</span>
+                        <AudioRuleTextarea
+                          aria-label="Transform replacement"
+                          onChange={(event) => updateVoiceRuleEditorDraft({ replacement: event.target.value })}
+                          placeholder={editorDraft.isRegex ? "BUG-$1" : "Replacement"}
+                          value={editorDraft.replacement || ""}
+                        />
+                      </AudioRuleFieldLabel>
+                      <AudioRuleStatusLine>
+                        <McpSwitchButton
+                          aria-checked={editorDraft.enabled !== false}
+                          aria-pressed={editorDraft.enabled !== false}
+                          onClick={() => updateVoiceRuleEditorDraft({ enabled: editorDraft.enabled === false })}
+                          role="switch"
+                          type="button"
+                        >
+                          <span aria-hidden="true" />
+                          Active
+                        </McpSwitchButton>
+                        <McpSwitchButton
+                          aria-checked={editorDraft.isRegex === true}
+                          aria-pressed={editorDraft.isRegex === true}
+                          onClick={() => updateVoiceRuleEditorDraft({ isRegex: editorDraft.isRegex !== true })}
+                          role="switch"
+                          type="button"
+                        >
+                          <span aria-hidden="true" />
+                          Regex
+                        </McpSwitchButton>
+                      </AudioRuleStatusLine>
+                    </>
+                  )}
+                </AudioRuleEditorBody>
+              </AudioRuleEditorPanel>
+            ) : (
+              <>
+                <AudioRulePanelHeader>
+                  <AudioRulePanelTitle>
+                    <strong>{activeVoiceRuleTitle}</strong>
+                  </AudioRulePanelTitle>
+                  <SecondaryButton
+                    aria-label={activeVoiceRuleAddLabel}
+                    onClick={() => openVoiceRuleEditor(activeAudioTab)}
+                    title={activeVoiceRuleAddLabel}
+                    type="button"
+                  >
+                    <ButtonAddIcon aria-hidden="true" />
+                  </SecondaryButton>
+                </AudioRulePanelHeader>
+
+                {activeVoiceRuleEntries.length ? (
+                  <AudioDictionaryList>
+                    {activeVoiceRuleEntries.map((entry) => {
+                      const isDictionaryEntry = activeAudioTab === "dictionary";
+                      const isSnippetEntry = activeAudioTab === "snippets";
+                      const isTransformEntry = activeAudioTab === "transforms";
+                      const enabled = isDictionaryEntry ? entry.selected !== false : entry.enabled !== false;
+                      const entryTitle = isDictionaryEntry
+                        ? (entry.name || "Untitled list")
+                        : isSnippetEntry
+                          ? (entry.trigger || "Untitled snippet")
+                          : (entry.match || "Untitled transform");
+                      const transformReplacementPreview = isTransformEntry
+                        ? String(entry.replacement || "")
+                          .replace(/\n/g, "\\n")
+                          .replace(/\t/g, "\\t")
+                        : "";
+                      const entryMeta = isDictionaryEntry
+                        ? `${(entry.terms || []).length} ${(entry.terms || []).length === 1 ? "word" : "words"}`
+                        : isSnippetEntry
+                          ? (entry.expansion || "No expansion")
+                          : transformReplacementPreview
+                            ? `-> ${transformReplacementPreview}`
+                            : "Removes matching text";
+                      const togglePatch = isDictionaryEntry
+                        ? { selected: entry.selected === false }
+                        : { enabled: entry.enabled === false };
+                      const toggleLabel = enabled
+                        ? `Pause ${entryTitle}`
+                        : `Activate ${entryTitle}`;
+                      const deleteLabel = isDictionaryEntry
+                        ? `Delete word list ${entryTitle}`
+                        : isSnippetEntry
+                          ? `Delete snippet ${entryTitle}`
+                          : `Delete transform ${entryTitle}`;
+
+                      return (
+                        <AudioRuleListItem
+                          data-disabled={!enabled ? "true" : undefined}
+                          key={entry.id}
+                          onClick={() => openVoiceRuleEditor(activeAudioTab, entry)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              openVoiceRuleEditor(activeAudioTab, entry);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                        >
+                          <AudioRuleToggle
+                            aria-checked={enabled}
+                            aria-label={toggleLabel}
+                            aria-pressed={enabled}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              updateVoiceRuleEntry(activeAudioTab, entry.id, togglePatch);
+                            }}
+                            onKeyDown={(event) => event.stopPropagation()}
+                            role="switch"
+                            type="button"
+                          />
+                          <AudioRuleListText>
+                            <AudioRuleListTitle>{entryTitle}</AudioRuleListTitle>
+                            <AudioRuleListMeta>{entryMeta}</AudioRuleListMeta>
+                          </AudioRuleListText>
+                          <AudioRuleListActions onClick={(event) => event.stopPropagation()}>
+                            {isTransformEntry && entry.isRegex === true && (
+                              <AudioDictionaryMetaPill>Regex</AudioDictionaryMetaPill>
+                            )}
+                            <AudioDictionaryMetaPill data-active={enabled ? "true" : "false"}>
+                              {enabled ? "Active" : "Paused"}
+                            </AudioDictionaryMetaPill>
+                            <AudioRuleIconButton
+                              aria-label={deleteLabel}
+                              onClick={() => removeVoiceRuleEntry(activeAudioTab, entry.id)}
+                              onKeyDown={(event) => event.stopPropagation()}
+                              type="button"
+                            >
+                              <ButtonDeleteIcon aria-hidden="true" />
+                            </AudioRuleIconButton>
+                          </AudioRuleListActions>
+                        </AudioRuleListItem>
+                      );
+                    })}
                   </AudioDictionaryList>
                 ) : (
                   <AudioDictionaryEmpty>
-                    <strong>No lists yet</strong>
-                    <span>Add names, APIs, commands, or people you say often.</span>
+                    <strong>{activeVoiceRuleEmptyTitle}</strong>
+                    <SecondaryButton
+                      aria-label={activeVoiceRuleAddLabel}
+                      onClick={() => openVoiceRuleEditor(activeAudioTab)}
+                      type="button"
+                    >
+                      <ButtonAddIcon aria-hidden="true" />
+                      <span>{activeVoiceRuleAddLabel}</span>
+                    </SecondaryButton>
                   </AudioDictionaryEmpty>
-                )}
-              </>
-            ) : (
-              <>
-                <AudioRulesHint>
-                  {voiceRulesTab === "snippets"
-                    ? "Say a trigger word and it expands into the full text, like saying gstack to insert an entire prompt."
-                    : "Find-and-replace rules applied last, in order. Use them for spoken commands or regex cleanups."}
-                </AudioRulesHint>
-
-                <AudioRulesList>
-                  {voiceRulesTab === "snippets" && (voiceRules.snippets || []).map((entry) => (
-                    <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
-                      <AudioRuleToggle
-                        aria-label={entry.enabled === false ? "Enable snippet" : "Disable snippet"}
-                        aria-pressed={entry.enabled !== false}
-                        onClick={() => updateVoiceRuleEntry("snippets", entry.id, { enabled: entry.enabled === false })}
-                        type="button"
-                      />
-                      <AudioRuleFields>
-                        <AudioRuleFieldRow data-single="true">
-                          <AudioCloudInput
-                            aria-label="Trigger"
-                            onChange={(event) => updateVoiceRuleEntry("snippets", entry.id, { trigger: event.target.value })}
-                            placeholder="Trigger, e.g. gstack"
-                            value={entry.trigger || ""}
-                          />
-                        </AudioRuleFieldRow>
-                        <AudioRuleFieldRow data-single="true">
-                          <AudioRuleTextarea
-                            aria-label="Expansion"
-                            onChange={(event) => updateVoiceRuleEntry("snippets", entry.id, { expansion: event.target.value })}
-                            placeholder="Expands into this full text..."
-                            value={entry.expansion || ""}
-                          />
-                        </AudioRuleFieldRow>
-                      </AudioRuleFields>
-                      <AudioRuleIconButton
-                        aria-label="Delete snippet"
-                        onClick={() => removeVoiceRuleEntry("snippets", entry.id)}
-                        type="button"
-                      >
-                        <ButtonDeleteIcon aria-hidden="true" />
-                      </AudioRuleIconButton>
-                    </AudioRuleRow>
-                  ))}
-
-                  {voiceRulesTab === "transforms" && (voiceRules.transforms || []).map((entry) => (
-                    <AudioRuleRow data-disabled={entry.enabled === false ? "true" : undefined} key={entry.id}>
-                      <AudioRuleToggle
-                        aria-label={entry.enabled === false ? "Enable transform" : "Disable transform"}
-                        aria-pressed={entry.enabled !== false}
-                        onClick={() => updateVoiceRuleEntry("transforms", entry.id, { enabled: entry.enabled === false })}
-                        type="button"
-                      />
-                      <AudioRuleFields>
-                        <AudioRuleFieldRow>
-                          <AudioCloudInput
-                            aria-label="Match"
-                            onChange={(event) => updateVoiceRuleEntry("transforms", entry.id, { match: event.target.value })}
-                            placeholder={entry.isRegex ? "Pattern, e.g. bug (\\d+)" : "Match, e.g. new line"}
-                            value={entry.match || ""}
-                          />
-                          <AudioRuleTextarea
-                            aria-label="Replacement"
-                            onChange={(event) => updateVoiceRuleEntry("transforms", entry.id, { replacement: event.target.value })}
-                            placeholder={entry.isRegex ? "Replacement, e.g. BUG-$1" : "Replacement (newlines allowed)"}
-                            style={{ minHeight: 36 }}
-                            value={entry.replacement || ""}
-                          />
-                        </AudioRuleFieldRow>
-                        <AudioRulesActionsRow>
-                          <SecondaryButton
-                            aria-pressed={entry.isRegex === true}
-                            onClick={() => updateVoiceRuleEntry("transforms", entry.id, { isRegex: entry.isRegex !== true })}
-                            type="button"
-                          >
-                            <ButtonKeyIcon aria-hidden="true" />
-                            <span>{entry.isRegex ? "Regex: on" : "Regex: off"}</span>
-                          </SecondaryButton>
-                        </AudioRulesActionsRow>
-                      </AudioRuleFields>
-                      <AudioRuleIconButton
-                        aria-label="Delete transform"
-                        onClick={() => removeVoiceRuleEntry("transforms", entry.id)}
-                        type="button"
-                      >
-                        <ButtonDeleteIcon aria-hidden="true" />
-                      </AudioRuleIconButton>
-                    </AudioRuleRow>
-                  ))}
-
-                  {!(voiceRules[voiceRulesTab] || []).length && (
-                    <AudioRulesHint>
-                      {voiceRulesTab === "snippets"
-                        ? "No snippets yet."
-                        : "No transforms yet."}
-                    </AudioRulesHint>
                   )}
-                </AudioRulesList>
-
-                <AudioRulesActionsRow>
-                  <SecondaryButton onClick={() => addVoiceRuleEntry(voiceRulesTab)} type="button">
-                    <ButtonMicIcon aria-hidden="true" />
-                    <span>{voiceRulesTab === "snippets" ? "Add snippet" : "Add transform"}</span>
-                  </SecondaryButton>
-                  <SettingsHint>Synced to dictation instantly. Saves automatically.</SettingsHint>
-                </AudioRulesActionsRow>
-
-                <AudioRulesPreview>
-                  <strong>Try it</strong>
-                  <AudioCloudInput
-                    aria-label="Preview input"
-                    onChange={(event) => setVoiceRulesPreviewInput(event.target.value)}
-                    placeholder="Type what you'd say, e.g. run gstack with tauri new line done"
-                    value={voiceRulesPreviewInput}
-                  />
-                  {voiceRulesPreview && (
-                    <AudioRulesPreviewResult>{voiceRulesPreview.text}</AudioRulesPreviewResult>
-                  )}
-                </AudioRulesPreview>
               </>
             )}
 
@@ -2873,139 +3403,34 @@ export default function AudioWorkspaceView({
             id="audio-tabpanel-history"
             role="tabpanel"
           >
-            <AudioHistoryStats aria-label="Speech to text statistics">
-              <AudioInsightCard
-                aria-label={`Average words per minute${
-                  audioWpmPercentileLabel(audioHistoryInsights.averageWpm)
-                    ? `, ${audioWpmPercentileLabel(audioHistoryInsights.averageWpm)} of speakers`
-                    : ""
-                }`}
-              >
-                <AudioInsightValue>
-                  {audioHistoryInsights.averageWpm > 0
-                    ? formatInteger(audioHistoryInsights.averageWpm)
-                    : "0"}
-                </AudioInsightValue>
-                <AudioInsightLabel>Words per minute</AudioInsightLabel>
-                <AudioWpmGauge aria-hidden="true" viewBox="0 0 100 56">
-                  <path
-                    className="track"
-                    d="M 8 50 A 42 42 0 0 1 92 50"
-                  />
-                  <path
-                    className="fill"
-                    d="M 8 50 A 42 42 0 0 1 92 50"
-                    style={{
-                      strokeDasharray: 131.95,
-                      strokeDashoffset: 131.95 * (1 - Math.min(
-                        Math.max(audioHistoryInsights.averageWpm, 0) / AUDIO_WPM_GAUGE_MAX,
-                        1,
-                      )),
-                    }}
-                  />
-                  {audioWpmPercentileLabel(audioHistoryInsights.averageWpm) && (
-                    <text className="tier" textAnchor="middle" x="50" y="49">
-                      {audioWpmPercentileLabel(audioHistoryInsights.averageWpm).toUpperCase()}
-                    </text>
-                  )}
-                </AudioWpmGauge>
-              </AudioInsightCard>
-              <AudioInsightCard aria-label="Words spoken per day">
-                <AudioInsightCardTopline>
-                  <AudioInsightLabel>Daily speaking</AudioInsightLabel>
-                  <AudioInsightSubValue>
-                    {formatInteger(audioHistoryInsights.totalWords)} words
-                  </AudioInsightSubValue>
-                </AudioInsightCardTopline>
-                <AudioHeatmapGrid role="img" aria-label="Words spoken per day, recent weeks">
-                  {audioHistoryInsights.weeks.map((week, weekIndex) => (
-                    <AudioHeatmapColumn key={`week-${weekIndex}`}>
-                      {week.map((cell, dayIndex) => (
-                        cell ? (
-                          <AudioHeatmapCell
-                            data-level={cell.level}
-                            key={cell.key}
-                            title={cell.label}
-                          />
-                        ) : (
-                          <AudioHeatmapCell data-empty="true" key={`pad-${weekIndex}-${dayIndex}`} />
-                        )
-                      ))}
-                    </AudioHeatmapColumn>
-                  ))}
-                </AudioHeatmapGrid>
-              </AudioInsightCard>
-              <AudioInsightCard data-kind="totals">
-                <AudioHistoryStatChip>
-                  <span>Dictations</span>
-                  <strong>{formatInteger(audioHistoryInsights.totalDictations)}</strong>
-                </AudioHistoryStatChip>
-                <AudioHistoryStatChip>
-                  <span>Audio time</span>
-                  <strong>{formatAudioHistoryTotalDuration(audioHistoryInsights.audioMs)}</strong>
-                </AudioHistoryStatChip>
-              </AudioInsightCard>
-            </AudioHistoryStats>
-
             {audioHistory.length ? (
               <AudioHistoryVirtualList
                 aria-label="Speech to text history"
+                onScroll={handleAudioHistoryScroll}
+                ref={audioHistoryViewportRef}
                 role="list"
               >
-                <AudioHistoryList>
-                  {audioHistory.map((entry, index) => {
-                    const entryKey = getAudioHistoryEntryKey(entry, index);
-                    const copied = copiedAudioHistoryId === entryKey;
-                    const entryText = String(entry.text || "");
-                    const clampable = entryText.length > AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS
-                      || entryText.split("\n").length > 3;
-                    const expanded = expandedAudioHistoryIds.has(entryKey);
+                <AudioHistoryList
+                  style={{
+                    height: `${Math.max(audioHistoryVirtualWindow.totalHeight, 1)}px`,
+                  }}
+                >
+                  {audioHistoryVirtualWindow.items.map(({ row, top }) => {
+                    const copied = copiedAudioHistoryId === row.entryKey;
+                    const expanded = expandedAudioHistoryIds.has(row.entryKey);
 
                     return (
-                      <AudioHistoryRow
-                        data-expanded={expanded ? "true" : "false"}
-                        key={entryKey}
-                        role="listitem"
-                      >
-                        <AudioHistoryRowTopline>
-                          <span>{formatHistoryTimestamp(entry.createdAt)}</span>
-                          <AudioHistoryRowActions>
-                            {entry.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED && (
-                              <AudioHistoryStatusBadge>Cancelled</AudioHistoryStatusBadge>
-                            )}
-                            <AudioHistoryProvider data-provider={entry.provider}>
-                              {formatAudioProviderLabel(entry.provider)}
-                            </AudioHistoryProvider>
-                            <AudioHistoryCopyButton
-                              aria-label="Copy previous prompt"
-                              data-copied={copied ? "true" : undefined}
-                              onClick={() => copyAudioHistoryPrompt(entry, index)}
-                              title="Copy previous prompt"
-                              type="button"
-                            >
-                              {copied ? (
-                                <ButtonCheckIcon aria-hidden="true" />
-                              ) : (
-                                <ButtonCopyIcon aria-hidden="true" />
-                              )}
-                              <span>{copied ? "Copied" : "Copy"}</span>
-                            </AudioHistoryCopyButton>
-                          </AudioHistoryRowActions>
-                        </AudioHistoryRowTopline>
-                        <strong>{entryText}</strong>
-                        <AudioHistoryRowFootline>
-                          <AudioHistoryMeta>{formatAudioHistoryMeta(entry)}</AudioHistoryMeta>
-                          {clampable && (
-                            <AudioHistoryExpandButton
-                              aria-expanded={expanded}
-                              onClick={() => toggleAudioHistoryExpanded(entryKey)}
-                              type="button"
-                            >
-                              {expanded ? "Show less" : "Show more"}
-                            </AudioHistoryExpandButton>
-                          )}
-                        </AudioHistoryRowFootline>
-                      </AudioHistoryRow>
+                      <AudioHistoryVirtualRow
+                        copied={copied}
+                        expanded={expanded}
+                        key={row.entryKey}
+                        onCopy={copyAudioHistoryPrompt}
+                        onMeasure={measureAudioHistoryRow}
+                        onToggle={toggleAudioHistoryExpanded}
+                        row={row}
+                        top={top}
+                        totalCount={audioHistoryRows.length}
+                      />
                     );
                   })}
                 </AudioHistoryList>
@@ -3093,6 +3518,9 @@ export function AudioWidgetWindow() {
   const [finishPending, setFinishPending] = useState(false);
   const [cancelNotice, setCancelNotice] = useState(null);
   const [cancelNoticePaused, setCancelNoticePaused] = useState(false);
+  const [widgetHistory, setWidgetHistory] = useState(readAudioTranscriptionHistory);
+  const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
+  const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
   const audioBufferReadyAtRef = useRef(0);
@@ -3116,6 +3544,8 @@ export function AudioWidgetWindow() {
   const barSavedPlacementRef = useRef(null);
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
+  const historyTrayCloseTimerRef = useRef(0);
+  const copiedWidgetHistoryTimerRef = useRef(0);
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceTtsPlayerRef = useRef(null);
   // GPT-Realtime interim transcripts are token deltas, not cumulative
@@ -3590,8 +4020,70 @@ export function AudioWidgetWindow() {
   const bubbleCancelNoticeActive = cancelNoticeActive
     && !usesBottomAnchoredStyle
     && widgetStyle !== AUDIO_WIDGET_STYLE_HIDDEN;
+  const canUseBubbleHistoryTray = widgetStyle === AUDIO_WIDGET_STYLE_BUBBLE
+    && !widgetActive
+    && !cancelNoticeActive;
+  const bubbleHistoryTrayActive = canUseBubbleHistoryTray && historyTrayOpen;
   const bubbleCancelNoticeActiveRef = useRef(bubbleCancelNoticeActive);
   bubbleCancelNoticeActiveRef.current = bubbleCancelNoticeActive;
+
+  const refreshWidgetHistory = useCallback(() => {
+    setWidgetHistory(readAudioTranscriptionHistory());
+  }, []);
+
+  const copyWidgetHistorySlot = useCallback(async (slot) => {
+    const history = readAudioTranscriptionHistory();
+    setWidgetHistory(history);
+    const offset = slot === "previous" ? 1 : 0;
+    const transcript = String(history[offset]?.text || "").trim();
+
+    if (!transcript) {
+      setMessage(offset === 0 ? "No transcript yet" : "No previous transcript");
+      return;
+    }
+
+    const copied = await copyTextToClipboard(transcript);
+    if (!copied) {
+      setMessage("Unable to copy transcript");
+      return;
+    }
+
+    setCopiedWidgetHistorySlot(slot);
+    setMessage(offset === 0 ? "Latest transcript copied" : "Previous transcript copied");
+
+    if (copiedWidgetHistoryTimerRef.current) {
+      window.clearTimeout(copiedWidgetHistoryTimerRef.current);
+    }
+
+    copiedWidgetHistoryTimerRef.current = window.setTimeout(() => {
+      copiedWidgetHistoryTimerRef.current = 0;
+      setCopiedWidgetHistorySlot((currentSlot) => (currentSlot === slot ? "" : currentSlot));
+    }, 1300);
+  }, []);
+
+  const openBubbleHistoryTray = useCallback(() => {
+    if (!canUseBubbleHistoryTray) {
+      return;
+    }
+
+    if (historyTrayCloseTimerRef.current) {
+      window.clearTimeout(historyTrayCloseTimerRef.current);
+      historyTrayCloseTimerRef.current = 0;
+    }
+
+    setHistoryTrayOpen(true);
+  }, [canUseBubbleHistoryTray]);
+
+  const closeBubbleHistoryTray = useCallback(() => {
+    if (historyTrayCloseTimerRef.current) {
+      window.clearTimeout(historyTrayCloseTimerRef.current);
+    }
+
+    historyTrayCloseTimerRef.current = window.setTimeout(() => {
+      historyTrayCloseTimerRef.current = 0;
+      setHistoryTrayOpen(false);
+    }, 140);
+  }, []);
 
   // The hidden style keeps the window "visible" to the OS (global shortcuts
   // require it) but inert and invisible while idle. The bar style is always
@@ -3600,6 +4092,82 @@ export function AudioWidgetWindow() {
     const ignoreCursor = widgetStyle === AUDIO_WIDGET_STYLE_HIDDEN && !widgetActive;
     runWidgetWindowAction((windowHandle) => windowHandle.setIgnoreCursorEvents(ignoreCursor));
   }, [runWidgetWindowAction, widgetActive, widgetStyle]);
+
+  useEffect(() => {
+    if (canUseBubbleHistoryTray) {
+      return undefined;
+    }
+
+    if (historyTrayCloseTimerRef.current) {
+      window.clearTimeout(historyTrayCloseTimerRef.current);
+      historyTrayCloseTimerRef.current = 0;
+    }
+
+    setHistoryTrayOpen(false);
+    return undefined;
+  }, [canUseBubbleHistoryTray]);
+
+  useEffect(() => {
+    if (bubbleHistoryTrayActive) {
+      document.documentElement.dataset.audioWidgetHistoryTray = "true";
+      document.body.dataset.audioWidgetHistoryTray = "true";
+    } else {
+      delete document.documentElement.dataset.audioWidgetHistoryTray;
+      delete document.body.dataset.audioWidgetHistoryTray;
+    }
+
+    return () => {
+      delete document.documentElement.dataset.audioWidgetHistoryTray;
+      delete document.body.dataset.audioWidgetHistoryTray;
+    };
+  }, [bubbleHistoryTrayActive]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenHistory = () => {};
+
+    const refresh = () => {
+      if (!disposed) {
+        refreshWidgetHistory();
+      }
+    };
+
+    const handleStorage = (event) => {
+      if (event.key === "diffforge.audio.transcriptionHistory" || event.key === "diffforge.audio.lastTranscriptionResult") {
+        refresh();
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    listen(AUDIO_TRANSCRIPTION_RESULT_EVENT, refresh)
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenHistory = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlistenHistory();
+      window.removeEventListener("storage", handleStorage);
+    };
+  }, [refreshWidgetHistory]);
+
+  useEffect(() => () => {
+    if (historyTrayCloseTimerRef.current) {
+      window.clearTimeout(historyTrayCloseTimerRef.current);
+      historyTrayCloseTimerRef.current = 0;
+    }
+
+    if (copiedWidgetHistoryTimerRef.current) {
+      window.clearTimeout(copiedWidgetHistoryTimerRef.current);
+      copiedWidgetHistoryTimerRef.current = 0;
+    }
+  }, []);
 
   // The bar style docks the window bottom-center of the active monitor; the
   // user's bubble placement is restored on exit. The monitor work area keeps
@@ -3651,6 +4219,65 @@ export function AudioWidgetWindow() {
       }
     });
   }, [barVisible, cancelNoticeActive, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
+
+  // Bubble history controls live below the compact bubble, leaving the error
+  // popover's upward resize path untouched. The window grows down and widens
+  // around the bubble center, then restores the original placement.
+  useEffect(() => {
+    if (!bubbleHistoryTrayActive) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let savedPosition = null;
+
+    runWidgetWindowAction(async (windowHandle) => {
+      const scale = (await windowHandle.scaleFactor().catch(() => 1)) || 1;
+      const originalPosition = await windowHandle.outerPosition();
+
+      if (disposed) {
+        return;
+      }
+
+      savedPosition = originalPosition;
+      await windowHandle.setSize(new LogicalSize(
+        AUDIO_WIDGET_HISTORY_TRAY_SIZE.width,
+        AUDIO_WIDGET_HISTORY_TRAY_SIZE.height,
+      ));
+
+      const monitor = await currentMonitor().catch(() => null);
+      const centeredX = originalPosition.x
+        - Math.round(((AUDIO_WIDGET_HISTORY_TRAY_SIZE.width - AUDIO_WIDGET_COMPACT_SIZE.width) * scale) / 2);
+      let nextX = centeredX;
+
+      if (monitor) {
+        const area = monitor.workArea?.size?.width
+          ? monitor.workArea
+          : { position: monitor.position, size: monitor.size };
+        const maxX = area.position.x
+          + area.size.width
+          - Math.round(AUDIO_WIDGET_HISTORY_TRAY_SIZE.width * scale);
+        nextX = Math.max(area.position.x, Math.min(centeredX, maxX));
+      }
+
+      if (!disposed) {
+        await windowHandle.setPosition(new PhysicalPosition(nextX, originalPosition.y));
+      }
+    });
+
+    return () => {
+      disposed = true;
+      runWidgetWindowAction(async (windowHandle) => {
+        await windowHandle.setSize(new LogicalSize(
+          AUDIO_WIDGET_COMPACT_SIZE.width,
+          AUDIO_WIDGET_COMPACT_SIZE.height,
+        ));
+        if (savedPosition) {
+          await windowHandle.setPosition(savedPosition);
+        }
+      });
+    };
+  }, [bubbleHistoryTrayActive, runWidgetWindowAction]);
 
   // Bubble-style errors get a small card above the widget: the window grows
   // upward by the card height while the error shows, and the pill stays at
@@ -4045,6 +4672,7 @@ export function AudioWidgetWindow() {
         ...entry,
         status: AUDIO_TRANSCRIPTION_STATUS_INSERTED,
       }).catch(() => {});
+      refreshWidgetHistory();
       await invoke("insert_handsfree_transcribed_text", { text }).catch(() => {});
       return;
     }
@@ -4053,7 +4681,8 @@ export function AudioWidgetWindow() {
       ...entry,
       status: AUDIO_TRANSCRIPTION_STATUS_CANCELLED,
     }).catch(() => {});
-  }, []);
+    refreshWidgetHistory();
+  }, [refreshWidgetHistory]);
 
   const dismissCancelNotice = useCallback(() => {
     setCancelNotice(null);
@@ -4120,7 +4749,10 @@ export function AudioWidgetWindow() {
       return;
     }
     try {
-      await navigator.clipboard.writeText(transcript);
+      const copied = await copyTextToClipboard(transcript);
+      if (!copied) {
+        throw new Error("Clipboard unavailable");
+      }
       setMessage("Transcript copied");
     } catch {
       setMessage("Unable to copy the transcript");
@@ -4310,6 +4942,7 @@ export function AudioWidgetWindow() {
         sourceText: pipeline.changed ? rawTranscript : "",
         text: nextTranscript,
       });
+      refreshWidgetHistory();
 
       if (recordingRunRef.current !== recordingRunId) {
         return;
@@ -4357,7 +4990,7 @@ export function AudioWidgetWindow() {
       setWidgetState("error");
       setError(messageText);
     }
-  }, [closeWarmBuffer, publishCancelledTranscript]);
+  }, [closeWarmBuffer, publishCancelledTranscript, refreshWidgetHistory]);
 
   /**
    * Salvages a locally captured recording that was cancelled mid-flight: the
@@ -5159,6 +5792,31 @@ export function AudioWidgetWindow() {
     : `${recordingLocked ? "Recording locked" : "Recording audio"} ${String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
   const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
   const showWidgetCancelButton = (isRecordingFocus || isProcessingFocus) && !isClosingFocus;
+  const latestHistoryText = String(widgetHistory[0]?.text || "").trim();
+  const previousHistoryText = String(widgetHistory[1]?.text || "").trim();
+  const renderHistoryQuickButton = (slot, label, available, focusable = true) => {
+    const copied = copiedWidgetHistorySlot === slot;
+    return (
+      <AudioHistoryQuickButton
+        aria-label={label}
+        data-copied={copied ? "true" : undefined}
+        data-slot={slot}
+        disabled={!available}
+        onClick={(event) => {
+          event.stopPropagation();
+          copyWidgetHistorySlot(slot);
+        }}
+        onMouseDown={(event) => {
+          event.stopPropagation();
+        }}
+        tabIndex={available && focusable ? 0 : -1}
+        title={available ? label : (slot === "latest" ? "No transcript yet" : "No previous transcript")}
+        type="button"
+      >
+        {copied ? <ButtonCheckIcon aria-hidden="true" /> : <ButtonCopyIcon aria-hidden="true" />}
+      </AudioHistoryQuickButton>
+    );
+  };
 
   // One cancel-notice surface for both widget styles: X to dismiss now, copy,
   // undo (paste into target), open history, and the drain-to-zero auto-close.
@@ -5226,15 +5884,21 @@ export function AudioWidgetWindow() {
           <GlobalStyle />
           <AudioBarIdleShell aria-label="Dictation bar" data-theme={audioWidgetTheme}>
             <AudioBarIdleReveal>
-              <AudioBarRecordButton
-                aria-label={`Start dictation (${dictateShortcutLabel})`}
-                onClick={toggleTalk}
-                title={`Start dictation (${dictateShortcutLabel})`}
-                type="button"
-              />
-              <AudioBarShortcutHint aria-hidden="true">
-                {dictateShortcutLabel}
-              </AudioBarShortcutHint>
+              <AudioBarRecordCluster>
+                <AudioBarRecordButton
+                  aria-label={`Start dictation (${dictateShortcutLabel})`}
+                  onClick={toggleTalk}
+                  title={`Start dictation (${dictateShortcutLabel})`}
+                  type="button"
+                />
+                <AudioBarShortcutHint aria-hidden="true">
+                  {dictateShortcutLabel}
+                </AudioBarShortcutHint>
+              </AudioBarRecordCluster>
+              <AudioBarHistoryActions aria-label="Dictation copy shortcuts">
+                {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText))}
+                {renderHistoryQuickButton("previous", "Copy previous transcription", Boolean(previousHistoryText))}
+              </AudioBarHistoryActions>
             </AudioBarIdleReveal>
             <AudioBarIdleLine aria-hidden="true" />
           </AudioBarIdleShell>
@@ -5340,7 +6004,10 @@ export function AudioWidgetWindow() {
         data-opening={isOpeningFocus ? "true" : undefined}
         data-state={widgetState}
         data-theme={audioWidgetTheme}
+        data-history-tray={bubbleHistoryTrayActive ? "true" : undefined}
         onMouseDown={dragWidget}
+        onMouseEnter={openBubbleHistoryTray}
+        onMouseLeave={closeBubbleHistoryTray}
       >
         <AudioWidgetFocusStage
           aria-label={widgetLabel}
@@ -5394,6 +6061,13 @@ export function AudioWidgetWindow() {
             ×
           </AudioWidgetCancelButton>
         )}
+        <AudioWidgetHistoryTray
+          aria-hidden={!bubbleHistoryTrayActive}
+          aria-label="Dictation copy shortcuts"
+        >
+          {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText), bubbleHistoryTrayActive)}
+          {renderHistoryQuickButton("previous", "Copy previous transcription", Boolean(previousHistoryText), bubbleHistoryTrayActive)}
+        </AudioWidgetHistoryTray>
       </AudioWidgetShell>
     </>
   );

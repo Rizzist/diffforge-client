@@ -1445,7 +1445,8 @@ function applyStripOrder(items, order) {
 function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove, onReorderStart, railRef }) {
   const localPath = assetLocalPath(item);
   const name = useMemo(() => assetName(item), [item]);
-  const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath);
+  const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
+  const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [launching, setLaunching] = useState(false);
@@ -1471,6 +1472,13 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
       window.clearTimeout(statusTimerRef.current);
     }
   }, []);
+
+  const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
+    imageVersion,
+    localPath,
+    name,
+    showStatus,
+  });
 
   const openFloat = useCallback(async () => {
     if (!localPath || busy) return;
@@ -1500,13 +1508,32 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
       } else if (action === "delete") {
         await invoke("diffforge_delete_untracked_asset", { path: localPath });
         onChanged(localPath);
+      } else if (action === "upload") {
+        if (uploadState === "done") {
+          await copyPublicUrl();
+        } else if (uploadState === "private") {
+          await makePublic();
+        } else {
+          await uploadToCloud();
+        }
       }
     } catch (error) {
       showStatus(error?.message || String(error || "Action failed"));
     } finally {
       if (mountedRef.current) setBusy(false);
     }
-  }, [busy, localPath, name, onChanged, previewUrl, showStatus]);
+  }, [
+    busy,
+    copyPublicUrl,
+    localPath,
+    makePublic,
+    name,
+    onChanged,
+    previewUrl,
+    showStatus,
+    uploadState,
+    uploadToCloud,
+  ]);
 
   const clearDrag = useCallback((event) => {
     const drag = dragRef.current;
@@ -1639,6 +1666,19 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
       >
         <PushPin aria-hidden="true" />
       </StripTilePinButton>
+      <StripTileUploadButton
+        aria-label={snipUploadButtonTitle(uploadState, name)}
+        data-state={uploadState}
+        disabled={busy}
+        onClick={() => runAction("upload")}
+        title={snipUploadButtonTitle(uploadState, name)}
+        type="button"
+      >
+        <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
+      </StripTileUploadButton>
+      {uploadState === "uploading" || uploadState === "publishing"
+        ? <StripUploadProgress aria-hidden="true" />
+        : null}
       <StripTileActions>
         <StripTileActionButton
           aria-label={`Copy ${name}`}
@@ -2170,7 +2210,7 @@ const StripTile = styled.div`
   ${FloatStatusPill} {
     top: 6px;
     min-height: 21px;
-    max-width: calc(100% - 28px);
+    max-width: calc(100% - 62px);
     padding: 4px 8px 4px 6px;
     font-size: 10px;
     z-index: 5;
@@ -2242,21 +2282,113 @@ const StripTilePinButton = styled.button`
   }
 `;
 
+const StripTileUploadButton = styled.button`
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 4;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(125, 176, 255, 0.28);
+  border-radius: 999px;
+  color: #d8e9ff;
+  background: rgba(6, 10, 16, 0.74);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  > span:not([aria-hidden="true"]) {
+    display: none;
+  }
+
+  ${FloatUploadSpinner} {
+    width: 10px;
+    height: 10px;
+    border-width: 1.8px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.64);
+    color: #06121f;
+    background: #7db0ff;
+    transform: scale(1.05);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  &[data-state="uploading"],
+  &[data-state="publishing"] {
+    border-color: rgba(125, 176, 255, 0.58);
+    color: #e6f1ff;
+    background: rgba(18, 35, 60, 0.92);
+  }
+
+  &[data-state="uploading"]:disabled,
+  &[data-state="publishing"]:disabled {
+    opacity: 1;
+    cursor: progress;
+  }
+
+  &[data-state="private"] {
+    border-color: rgba(247, 201, 72, 0.55);
+    color: #f7e8c1;
+    background: rgba(38, 27, 4, 0.9);
+  }
+
+  &[data-state="private"]:hover:not(:disabled) {
+    color: #1c1503;
+    background: #f7c948;
+    border-color: transparent;
+  }
+
+  &[data-state="done"] {
+    border-color: rgba(94, 222, 153, 0.52);
+    color: #e6fff1;
+    background: rgba(8, 35, 24, 0.9);
+  }
+
+  &[data-state="done"]:hover:not(:disabled) {
+    color: #06150d;
+    background: #5ede99;
+    border-color: transparent;
+  }
+`;
+
+const StripUploadProgress = styled(FloatUploadProgress)`
+  height: 2px;
+  z-index: 4;
+`;
+
 const StripTileActions = styled.div`
   position: absolute;
-  right: 5px;
+  left: 50%;
   bottom: 5px;
   z-index: 3;
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: 3px;
+  gap: 2px;
+  padding: 2px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 999px;
   background: rgba(5, 8, 13, 0.78);
   opacity: 0;
   pointer-events: none;
-  transform: translateY(3px);
+  transform: translate(-50%, 3px);
   transition:
     opacity 120ms ease,
     transform 120ms ease;
@@ -2265,14 +2397,14 @@ const StripTileActions = styled.div`
   ${StripTile}:focus-within & {
     opacity: 1;
     pointer-events: auto;
-    transform: translateY(0);
+    transform: translate(-50%, 0);
   }
 `;
 
 const StripTileActionButton = styled.button`
   display: grid;
-  width: 20px;
-  height: 20px;
+  width: 17px;
+  height: 17px;
   place-items: center;
   padding: 0;
   border: 0;
@@ -2282,8 +2414,8 @@ const StripTileActionButton = styled.button`
   cursor: pointer;
 
   svg {
-    width: 12px;
-    height: 12px;
+    width: 10px;
+    height: 10px;
   }
 
   &:hover:not(:disabled) {

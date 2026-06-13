@@ -2,6 +2,7 @@ import styled, { createGlobalStyle, keyframes } from "styled-components";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
 import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
 import { CheckCircle } from "@styled-icons/material-rounded/CheckCircle";
 import { Close } from "@styled-icons/material-rounded/Close";
@@ -268,6 +269,17 @@ export const GlobalStyle = createGlobalStyle`
     overflow: hidden;
     border-radius: 999px;
     background: transparent !important;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  html[data-audio-widget="true"][data-audio-widget-history-tray="true"],
+  html[data-audio-widget="true"][data-audio-widget-history-tray="true"] body,
+  html[data-audio-widget="true"][data-audio-widget-history-tray="true"] #app,
+  body[data-audio-widget="true"][data-audio-widget-history-tray="true"],
+  body[data-audio-widget="true"][data-audio-widget-history-tray="true"] #app {
+    border-radius: 18px;
   }
 
   html[data-audio-widget="true"],
@@ -276,6 +288,14 @@ export const GlobalStyle = createGlobalStyle`
   body[data-audio-widget="true"] #app {
     min-width: 0;
     min-height: 0;
+  }
+
+  html[data-audio-widget="true"] img,
+  body[data-audio-widget="true"] img {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+    -webkit-touch-callout: none;
   }
 
   button {
@@ -7333,7 +7353,7 @@ export const AudioTabBar = styled.div`
   display: grid;
   width: min(1080px, 100%);
   justify-self: center;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
   gap: 6px;
   min-width: 0;
   padding: 5px;
@@ -7371,6 +7391,11 @@ export const AudioTabButton = styled.button`
   &:hover {
     color: var(--forge-text-soft);
     background: rgba(244, 247, 250, 0.04);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline-offset: 2px;
   }
 
   html[data-forge-theme="light"] & {
@@ -7414,6 +7439,218 @@ export const AudioDictionaryPanel = styled.section`
   min-height: 260px;
   min-width: 0;
   padding: 0;
+`;
+
+export const AudioRulePanelHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  > button {
+    width: 42px;
+    min-height: 42px;
+    flex: 0 0 42px;
+    padding: 0;
+  }
+`;
+
+export const AudioRulePanelTitle = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 15px;
+    font-weight: 820;
+    letter-spacing: 0;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const AudioRuleListItem = styled.div`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 58px;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.34);
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    opacity 140ms ease;
+
+  &:hover {
+    border-color: rgba(125, 160, 205, 0.28);
+    background: rgba(21, 27, 35, 0.52);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline-offset: 2px;
+  }
+
+  &[data-disabled="true"] {
+    opacity: 0.62;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.035);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.18);
+    background: var(--forge-surface-control);
+  }
+
+  @media (max-width: 640px) {
+    grid-template-columns: auto minmax(0, 1fr);
+
+    > div:last-child {
+      grid-column: 2;
+      justify-self: start;
+    }
+  }
+`;
+
+export const AudioRuleListText = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+`;
+
+export const AudioRuleListTitle = styled.strong`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text);
+  font-size: 13px;
+  font-weight: 780;
+  letter-spacing: 0;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+export const AudioRuleListMeta = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text-muted);
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: 0;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+export const AudioRuleListActions = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  flex-wrap: wrap;
+`;
+
+export const AudioRuleEditorPanel = styled.form`
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+`;
+
+export const AudioRuleEditorHeader = styled.div`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+
+  button {
+    min-height: 38px;
+    padding-inline: 12px;
+  }
+
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+`;
+
+export const AudioRuleEditorTitle = styled.div`
+  display: grid;
+  min-width: 0;
+  justify-items: center;
+  gap: 2px;
+  text-align: center;
+
+  strong {
+    max-width: 100%;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 15px;
+    font-weight: 820;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 720;
+    line-height: 1.2;
+  }
+
+  @media (max-width: 560px) {
+    justify-items: start;
+    text-align: left;
+  }
+`;
+
+export const AudioRuleEditorBody = styled.div`
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+`;
+
+export const AudioRuleFieldLabel = styled.label`
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 780;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+`;
+
+export const AudioRuleFieldCaption = styled.span`
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: 0;
+  line-height: 1.25;
+  text-transform: none;
+`;
+
+export const AudioRuleStatusLine = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 `;
 
 export const AudioDictionarySummaryBar = styled.div`
@@ -7709,6 +7946,12 @@ export const AudioDictionaryEmpty = styled.div`
     line-height: 1.45;
   }
 
+  button {
+    margin-top: 8px;
+    min-height: 36px;
+    padding-inline: 12px;
+  }
+
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
     background: var(--forge-surface);
@@ -7871,6 +8114,11 @@ export const AudioRuleToggle = styled.button`
     transform: translateX(12px);
     background: var(--forge-green);
   }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline-offset: 2px;
+  }
 `;
 
 export const AudioRuleIconButton = styled.button`
@@ -7895,6 +8143,11 @@ export const AudioRuleIconButton = styled.button`
   &:hover {
     color: var(--forge-red, #ff6b6b);
     background: rgba(255, 107, 107, 0.1);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline-offset: 2px;
   }
 `;
 
@@ -8197,6 +8450,7 @@ export const AudioHistoryVirtualList = styled.div`
   overscroll-behavior: contain;
   padding: 3px 3px 3px 0;
   border-radius: 8px;
+  contain: layout paint style;
 
   html[data-forge-theme="light"] & {
     scrollbar-color: rgba(0, 102, 204, 0.26) rgba(245, 245, 247, 0.9);
@@ -8204,9 +8458,9 @@ export const AudioHistoryVirtualList = styled.div`
 `;
 
 export const AudioHistoryList = styled.div`
-  display: grid;
-  gap: 8px;
+  position: relative;
   min-width: 0;
+  width: 100%;
 `;
 
 export const AudioHistoryRow = styled.div`
@@ -8633,6 +8887,9 @@ export const AudioWidgetShell = styled.main`
   box-shadow: none;
   background: transparent;
   clip-path: inset(0 var(--audio-widget-shell-clip-right) 0 0 round 999px);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   transition:
     clip-path 190ms cubic-bezier(0.3, 0, 0.2, 1),
     box-shadow 160ms ease,
@@ -8759,6 +9016,13 @@ export const AudioWidgetShell = styled.main`
   &[data-handoff="true"]::before,
   &[data-handoff="true"]::after {
     transition: none;
+  }
+
+  &[data-history-tray="true"] {
+    place-items: start center;
+    overflow: visible;
+    border-radius: 18px;
+    clip-path: none;
   }
 `;
 
@@ -9156,6 +9420,7 @@ export const AudioBarIdleReveal = styled.div`
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 8px;
   margin-bottom: 9px;
   opacity: 0;
   transform: translateY(8px) scale(0.9);
@@ -9167,6 +9432,15 @@ export const AudioBarIdleReveal = styled.div`
     transform: translateY(0) scale(1);
     pointer-events: auto;
   }
+`;
+
+export const AudioBarRecordCluster = styled.div`
+  position: relative;
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
 `;
 
 export const AudioBarRecordButton = styled.button`
@@ -9210,6 +9484,144 @@ export const AudioBarRecordButton = styled.button`
       radial-gradient(circle at 30% 18%, rgba(0, 102, 204, 0.08), transparent 55%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
     box-shadow: 0 10px 22px rgba(29, 29, 31, 0.2);
+  }
+`;
+
+export const AudioHistoryQuickButton = styled.button`
+  position: relative;
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(230, 236, 245, 0.16);
+  border-radius: 999px;
+  color: rgba(230, 236, 245, 0.78);
+  background:
+    radial-gradient(circle at 32% 18%, rgba(125, 176, 255, 0.12), transparent 54%),
+    rgba(19, 23, 30, 0.88);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 10px 22px rgba(0, 0, 0, 0.26);
+  cursor: pointer;
+  transform: translateY(0) scale(1);
+  transition:
+    border-color 130ms ease,
+    background 130ms ease,
+    color 130ms ease,
+    opacity 130ms ease,
+    transform 130ms ease;
+  user-select: none;
+  -webkit-app-region: no-drag;
+  -webkit-user-select: none;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &[data-slot="previous"]::after {
+    content: "2";
+    position: absolute;
+    right: 4px;
+    bottom: 3px;
+    display: grid;
+    width: 10px;
+    height: 10px;
+    place-items: center;
+    border-radius: 999px;
+    color: rgba(5, 8, 12, 0.92);
+    background: rgba(230, 236, 245, 0.9);
+    font-size: 7px;
+    font-weight: 900;
+    line-height: 1;
+  }
+
+  &[data-copied="true"] {
+    border-color: rgba(75, 212, 170, 0.48);
+    color: #c8fff0;
+    background: rgba(38, 152, 120, 0.28);
+  }
+
+  &[data-copied="true"]::after {
+    opacity: 0;
+  }
+
+  &:hover:not(:disabled) {
+    color: #ffffff;
+    border-color: rgba(125, 176, 255, 0.38);
+    background:
+      radial-gradient(circle at 32% 18%, rgba(125, 176, 255, 0.2), transparent 58%),
+      rgba(44, 55, 70, 0.94);
+    transform: translateY(-1px) scale(1.04);
+  }
+
+  &:active:not(:disabled) {
+    transform: translateY(0) scale(0.98);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.36;
+    transform: none;
+  }
+
+  html[data-audio-widget-theme="light"] &,
+  ${AudioBarIdleShell}[data-theme="light"] &,
+  ${AudioBarShell}[data-theme="light"] & {
+    border-color: rgba(29, 29, 31, 0.11);
+    color: rgba(29, 29, 31, 0.68);
+    background:
+      radial-gradient(circle at 32% 18%, rgba(0, 102, 204, 0.08), transparent 55%),
+      rgba(255, 255, 255, 0.96);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.9) inset,
+      0 9px 18px rgba(29, 29, 31, 0.12);
+  }
+
+  html[data-audio-widget-theme="light"] &[data-slot="previous"]::after,
+  ${AudioBarIdleShell}[data-theme="light"] &[data-slot="previous"]::after,
+  ${AudioBarShell}[data-theme="light"] &[data-slot="previous"]::after {
+    color: rgba(255, 255, 255, 0.96);
+    background: rgba(29, 29, 31, 0.72);
+  }
+
+  html[data-audio-widget-theme="light"] &[data-copied="true"],
+  ${AudioBarIdleShell}[data-theme="light"] &[data-copied="true"],
+  ${AudioBarShell}[data-theme="light"] &[data-copied="true"] {
+    border-color: rgba(22, 163, 74, 0.34);
+    color: rgba(21, 128, 61, 0.95);
+    background: rgba(220, 252, 231, 0.96);
+  }
+
+  html[data-audio-widget-theme="light"] &:hover:not(:disabled),
+  ${AudioBarIdleShell}[data-theme="light"] &:hover:not(:disabled),
+  ${AudioBarShell}[data-theme="light"] &:hover:not(:disabled) {
+    color: rgba(0, 73, 150, 0.98);
+    border-color: rgba(0, 102, 204, 0.22);
+    background:
+      radial-gradient(circle at 32% 18%, rgba(0, 102, 204, 0.14), transparent 58%),
+      rgba(255, 255, 255, 0.99);
+  }
+`;
+
+export const AudioBarHistoryActions = styled.div`
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  opacity: 0;
+  transform: translateX(-6px) scale(0.96);
+  transition:
+    opacity 150ms ease 45ms,
+    transform 180ms cubic-bezier(0.3, 0, 0.2, 1) 45ms;
+  -webkit-app-region: no-drag;
+
+  ${AudioBarIdleShell}:hover & {
+    opacity: 1;
+    transform: translateX(0) scale(1);
   }
 `;
 
@@ -9329,6 +9741,55 @@ export const AudioWidgetFocusStage = styled.div`
     opacity: 1;
     transform: translateX(0) scaleX(1);
   }
+
+  ${AudioWidgetShell}[data-history-tray="true"] & {
+    width: 64px;
+    height: 64px;
+    border-radius: 999px;
+  }
+`;
+
+export const AudioWidgetHistoryTray = styled.div`
+  position: absolute;
+  top: 70px;
+  left: 50%;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 28% 0%, rgba(125, 176, 255, 0.12), transparent 46%),
+    rgba(7, 10, 14, 0.88);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 14px 28px rgba(0, 0, 0, 0.26);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(-5px) scale(0.96);
+  transform-origin: top center;
+  transition:
+    opacity 150ms ease,
+    transform 180ms cubic-bezier(0.3, 0, 0.2, 1);
+  -webkit-app-region: no-drag;
+
+  ${AudioWidgetShell}[data-history-tray="true"] & {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+
+  html[data-audio-widget-theme="light"] & {
+    border-color: rgba(29, 29, 31, 0.08);
+    background:
+      radial-gradient(circle at 28% 0%, rgba(0, 102, 204, 0.08), transparent 48%),
+      rgba(247, 248, 251, 0.94);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.92) inset,
+      0 12px 24px rgba(29, 29, 31, 0.14);
+  }
 `;
 
 export const AudioWidgetHeader = styled.header`
@@ -9371,6 +9832,7 @@ export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
   flex: 0 0 auto;
   pointer-events: none;
   user-select: none;
+  -webkit-user-select: none;
   -webkit-user-drag: none;
   -webkit-touch-callout: none;
   border: 1px solid rgba(230, 236, 245, 0.14);
@@ -13814,6 +14276,10 @@ export const ButtonFullscreenExitIcon = styled(FullscreenExit)`
 `;
 
 export const ButtonAddIcon = styled(Add)`
+  ${buttonIconSize}
+`;
+
+export const ButtonBackIcon = styled(ArrowBack)`
   ${buttonIconSize}
 `;
 
