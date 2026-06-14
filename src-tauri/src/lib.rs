@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{Read, SeekFrom, Write},
     net::ToSocketAddrs,
@@ -4524,6 +4524,7 @@ pub fn run() {
             cloud_mcp_get_desktop_device_profile,
             cloud_mcp_set_desktop_session_token,
             cloud_mcp_get_status,
+            cloud_mcp_get_network_diagnostics,
             cloud_mcp_get_cached_workspace_todos,
             cloud_mcp_get_billing_status,
             cloud_mcp_register_workspace,

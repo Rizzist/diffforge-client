@@ -27158,9 +27158,9 @@ fn diffforge_agent_contract_markdown(variant: AgentContractVariant) -> String {
         return format!(
             "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge workspace note\n\n\
-Work normally from the visible project root. This file only documents repo-scoped Diff Forge architecture graph artifacts.\n\n\
+Work normally from the visible project root. This file only documents account-global Diff Forge architecture graph artifacts.\n\n\
 ## Architecture Graphs\n\n\
-- Diff Forge architecture graphs are repo-scoped artifacts under `.agents/architectures`.\n\
+- Diff Forge architecture graphs are account-global artifacts under the Diff Forge global architectures root. Use the absolute `globalGraphsRoot` from architecture_context when available.\n\
 - For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `.agents/architectures/graphs/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
 - Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
 - Preserve group `intent`, node `role`/`lifecycle`/`source`/`status`, edge `role`/`condition`/`event`/`criticality`, and api-corridor route/step props when updating existing graphs.\n\
@@ -27200,7 +27200,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 - Workspace MCP tools are namespaced as `<server_key>__<tool_name>` and can change when the user enables, disables, or configures MCPs in Diff Forge.\n\
 \n\
 ## Architecture graphs\n\n\
-- Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, a centralized per-repo global store outside the repo working tree; always use that absolute root (or `architecture_context.graphsRoot`) instead of assuming `.agents/architectures` inside the repo.\n\
+- Diff Forge architecture graphs are account-global agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`; use that absolute root (or `architecture_context.globalGraphsRoot`) instead of assuming `.agents/architectures` inside the repo.\n\
 - Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews, including when isolated worktrees are enabled. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
 - Architecture graph-only work is live artifact work, not a managed patch task: do not call `start_task`, `acquire_lease`, `checkpoint`, or `submit_patch` when the only files you create or edit are `.agents/architectures/graphs/*.arch`.\n\
 - For architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\

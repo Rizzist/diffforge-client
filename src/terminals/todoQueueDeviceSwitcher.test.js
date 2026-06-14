@@ -8,7 +8,7 @@ import {
   workspaceTodoItemsForDeviceWorkspace,
 } from "./todoQueueDeviceSwitcher.js";
 
-test("device switcher puts the local desktop first and dedupes its server echo", () => {
+test("device switcher puts the server-seen local desktop first and dedupes its echo", () => {
   const options = buildTodoQueueDeviceWorkspaceOptions({
     connectedDevices: [
       {
@@ -25,7 +25,9 @@ test("device switcher puts the local desktop first and dedupes its server echo",
         {
           device_id: "desktop-local",
           device_name: "Server Echo",
+          native_connected: true,
           status: "online",
+          web_connected: true,
           workspaces: [{ workspace_id: "ws-local", workspace_name: "Main repo" }],
         },
         {
@@ -45,9 +47,12 @@ test("device switcher puts the local desktop first and dedupes its server echo",
   });
 
   assert.equal(options[0].deviceId, "desktop-local");
-  assert.equal(options[0].deviceName, "Local Rig");
+  assert.equal(options[0].deviceName, "Server Echo");
   assert.equal(options[0].isLocal, true);
   assert.equal(options[0].liveState, "live");
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].serverSeen, true);
   assert.equal(
     options.filter((option) => option.deviceId === "desktop-local" && option.workspaceId === "ws-local").length,
     1,
@@ -57,6 +62,103 @@ test("device switcher puts the local desktop first and dedupes its server echo",
       && option.workspaceId === "ws-remote"
       && option.workspaceName === "Remote repo"
   )));
+});
+
+test("device switcher aliases local profile to the canonical server device", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId: "ws-local",
+    currentWorkspaceName: "Main repo",
+    deviceLiveState: {
+      devices: [
+        {
+          device_aliases: ["desktop-local", "web-local"],
+          device_id: "server-device",
+          device_name: "Syed MacBook Air",
+          form_factor: "desktop",
+          native_connected: true,
+          status: "online",
+          web_connected: true,
+          web_device_id: "web-local",
+          workspaces: [{ workspace_id: "ws-local", workspace_name: "Main repo" }],
+        },
+      ],
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Local Rig",
+      form_factor: "desktop",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "server-device");
+  assert.equal(options[0].deviceName, "Syed MacBook Air");
+  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].isCurrentWorkspace, true);
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.deepEqual(options[0].deviceAliases.sort(), ["desktop-local", "server-device", "web-local"].sort());
+});
+
+test("device switcher collapses local desktop workspace echoes to the current workspace", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId: "ws-current",
+    currentWorkspaceName: "Coding core",
+    deviceLiveState: {
+      devices: [
+        {
+          device_id: "macos-local",
+          native_connected: true,
+          status: "online",
+          web_connected: true,
+          workspaces: [
+            { workspace_id: "ws-stale" },
+            { workspace_id: "ws-current", workspace_name: "Coding core" },
+          ],
+        },
+      ],
+    },
+    localProfile: {
+      device_id: "macos-local",
+      device_name: "Syed MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "macos-local");
+  assert.equal(options[0].deviceName, "Syed MacBook Air");
+  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].workspaceId, "ws-current");
+  assert.equal(options[0].workspaceName, "Coding core");
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].platformLabel, "macos");
+});
+
+test("device switcher does not invent local device rows when server roster is present", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId: "ws-local",
+    deviceLiveState: {
+      devices: [
+        {
+          device_id: "server-remote",
+          device_name: "Studio Mac",
+          status: "online",
+        },
+      ],
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Local Rig",
+      form_factor: "desktop",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "server-remote");
+  assert.equal(options[0].isLocal, false);
 });
 
 test("mobile devices are selectable as devices without workspace todo views", () => {
@@ -116,6 +218,29 @@ test("workspaceTodos filtering keeps only the selected source device and workspa
 
   assert.equal(items.length, 1);
   assert.equal(items[0].todoId, "todo-remote");
+});
+
+test("workspaceTodos filtering accepts selected device aliases", () => {
+  const items = workspaceTodoItemsForDeviceWorkspace({
+    itemsByWorkspace: {
+      "ws-local": [
+        {
+          deviceId: "desktop-local",
+          status: "listed",
+          text: "Local alias todo",
+          todoId: "todo-local",
+          workspaceId: "ws-local",
+        },
+      ],
+    },
+  }, {
+    deviceAliases: ["server-device", "desktop-local"],
+    deviceId: "server-device",
+    workspaceId: "ws-local",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].todoId, "todo-local");
 });
 
 test("only local device current workspace selections are editable", () => {

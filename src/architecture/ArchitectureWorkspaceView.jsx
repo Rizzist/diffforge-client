@@ -6146,6 +6146,13 @@ function ArchitecturesPanel({
     Promise.resolve(onCreateNamedFolder(name))
       .then((entry) => {
         const entryPath = text(entry?.rootDirectory || entry?.root_directory || entry?.path);
+        const initialFolderPath = text(
+          entry?.initialFolderPath
+            || entry?.initial_folder_path
+            || entry?.folderPath
+            || entry?.folder_path
+            || name,
+        );
         setCreatingFolder(false);
         setDraftFolderName("");
         setFolderCreateState("idle");
@@ -6153,7 +6160,11 @@ function ArchitecturesPanel({
           setSelectedRepoPath(entryPath);
           setSelectedGraphId("");
           setSelectedGraph(null);
-          setCreatingGraph(false);
+          setDraftTitle("Architecture graph");
+          setDraftGraphTemplate("system");
+          setDraftLocationMode(initialFolderPath ? "folder" : "root");
+          setDraftFolderPath(initialFolderPath);
+          setCreatingGraph(Boolean(initialFolderPath));
         }
       })
       .catch((nextError) => {

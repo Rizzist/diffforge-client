@@ -3546,7 +3546,7 @@ export const WorkspaceAppToolLayout = styled.div`
   }
 
   [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
-    min-width: 300px;
+    min-width: 450px;
   }
 
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
@@ -12494,6 +12494,352 @@ export const WorkspaceGitPullActions = styled.div`
   }
 `;
 
+export const NetworkingOverlay = styled(WorkspaceSettingsOverlay)`
+  z-index: 34;
+  align-items: center;
+  padding: clamp(12px, 2.4vw, 22px);
+`;
+
+export const NetworkingDialog = styled(WorkspaceSettingsDialog)`
+  width: min(960px, 100%);
+  max-height: min(760px, 100%);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border-color: rgba(148, 163, 184, 0.22);
+`;
+
+export const NetworkingHeader = styled.header`
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 2px 10px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+
+  @media (max-width: 680px) {
+    align-items: stretch;
+    flex-direction: column;
+  }
+`;
+
+export const NetworkingToolbar = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+`;
+
+export const NetworkingSummaryGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 860px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+`;
+
+export const NetworkingMetric = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.28);
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 820;
+    line-height: 1;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 14px;
+    font-weight: 780;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.82);
+  }
+`;
+
+export const NetworkingSectionGrid = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+`;
+
+export const NetworkingSection = styled.section`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 6px;
+  background: rgba(9, 14, 21, 0.34);
+
+  &[data-span="wide"] {
+    grid-column: 1 / -1;
+  }
+
+  &[data-role="errors"] {
+    min-height: 112px;
+    max-height: 180px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.72);
+  }
+`;
+
+export const NetworkingSectionHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 11px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 760;
+    white-space: nowrap;
+  }
+`;
+
+export const NetworkingList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 6px;
+  background: rgba(2, 6, 23, 0.18);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(248, 250, 252, 0.72);
+  }
+`;
+
+export const NetworkingRow = styled.article`
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  background: transparent;
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  &[data-tone="error"] {
+    background: rgba(127, 29, 29, 0.14);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.08);
+  }
+`;
+
+export const NetworkingStatusDot = styled.span`
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #94a3b8;
+
+  &[data-tone="green"] {
+    background: #3ccb7f;
+  }
+
+  &[data-tone="blue"] {
+    background: #60a5fa;
+  }
+
+  &[data-tone="orange"] {
+    background: #f59e0b;
+  }
+
+  &[data-tone="red"] {
+    background: #ef6b6b;
+  }
+`;
+
+export const NetworkingRowMain = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 780;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  p {
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 620;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const NetworkingCategoryTopline = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 780;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const NetworkingCategoryCount = styled.span`
+  display: inline-grid;
+  min-width: 28px;
+  height: 24px;
+  place-items: center;
+  padding: 0 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.54);
+  color: var(--forge-text);
+  font-size: 12px;
+  font-weight: 840;
+  line-height: 1;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(241, 245, 249, 0.9);
+  }
+`;
+
+export const NetworkingCategoryMeter = styled.div`
+  position: relative;
+  width: 100%;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.13);
+
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: var(--network-progress, 0%);
+    border-radius: inherit;
+    background: #60a5fa;
+  }
+
+  &[data-tone="green"]::before {
+    background: #3ccb7f;
+  }
+
+  &[data-tone="orange"]::before {
+    background: #f59e0b;
+  }
+
+  &[data-tone="red"]::before {
+    background: #ef6b6b;
+  }
+`;
+
+export const NetworkingMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  min-width: 0;
+
+  span {
+    max-width: 100%;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span + span::before {
+    content: "/";
+    margin-right: 10px;
+    color: rgba(148, 163, 184, 0.55);
+  }
+`;
+
+export const NetworkingEmpty = styled.div`
+  display: grid;
+  min-height: 92px;
+  place-items: center;
+  padding: 12px;
+  border: 1px dashed rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  color: var(--forge-text-muted);
+  font-size: 12px;
+  font-weight: 760;
+  text-align: center;
+`;
+
 export const WorkspaceSettingsDialogHeader = styled.header`
   display: flex;
   min-width: 0;
@@ -15078,7 +15424,23 @@ export const WindowSyncPill = styled.button`
   font-weight: 750;
   letter-spacing: 0.02em;
   white-space: nowrap;
-  cursor: default;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.42);
+    color: #ffffff;
+    background: rgba(59, 130, 246, 0.18);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(96, 165, 250, 0.72);
+    outline-offset: 2px;
+  }
 
   &[data-state="live"] {
     border-color: rgba(74, 222, 128, 0.34);

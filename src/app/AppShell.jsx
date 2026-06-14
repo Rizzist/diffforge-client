@@ -385,6 +385,24 @@ import {
   WorkspaceGitPullRow,
   WorkspaceGitPullRepoMeta,
   WorkspaceGitPullActions,
+  NetworkingOverlay,
+  NetworkingDialog,
+  NetworkingHeader,
+  NetworkingToolbar,
+  NetworkingSummaryGrid,
+  NetworkingMetric,
+  NetworkingSectionGrid,
+  NetworkingSection,
+  NetworkingSectionHeader,
+  NetworkingList,
+  NetworkingRow,
+  NetworkingStatusDot,
+  NetworkingRowMain,
+  NetworkingCategoryTopline,
+  NetworkingCategoryCount,
+  NetworkingCategoryMeter,
+  NetworkingMeta,
+  NetworkingEmpty,
   WorkspaceSettingsDialogHeader,
   WorkspaceSettingsHeaderMain,
   WorkspaceSettingsHeaderMeta,
@@ -637,7 +655,7 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 ]);
 const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
 const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
-const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 300;
+const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 450;
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -2375,14 +2393,96 @@ function safeCloudMcpBool(value, fallback = false) {
   if (typeof value === "number") return value !== 0;
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
-    if (["1", "true", "yes", "on"].includes(normalized)) return true;
-    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    if (["1", "true", "yes", "on", "connected", "online", "active", "open", "ready", "live"].includes(normalized)) return true;
+    if (["0", "false", "no", "off", "disconnected", "offline", "inactive", "closed", "stale"].includes(normalized)) return false;
   }
   return fallback;
 }
 
 function normalizeCloudDeviceText(value) {
   return String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
+const CLOUD_DEVICE_ALIAS_KEYS = [
+  "id",
+  "device_id",
+  "deviceId",
+  "machine_id",
+  "machineId",
+  "native_device_id",
+  "nativeDeviceId",
+  "desktop_device_id",
+  "desktopDeviceId",
+  "web_device_id",
+  "webDeviceId",
+  "web_presence_device_id",
+  "webPresenceDeviceId",
+  "current_web_device_id",
+  "currentWebDeviceId",
+  "matched_device_id",
+  "matchedDeviceId",
+  "requested_target_device_id",
+  "requestedTargetDeviceId",
+  "device_aliases",
+  "deviceAliases",
+  "replaced_web_device_ids",
+  "replacedWebDeviceIds",
+];
+
+function cloudDeviceBoolFromKeys(object, keys, fallback = null) {
+  if (!object || typeof object !== "object") {
+    return fallback;
+  }
+  for (const key of keys) {
+    if (object[key] === undefined || object[key] === null) {
+      continue;
+    }
+    return safeCloudMcpBool(object[key], fallback ?? false);
+  }
+  return fallback;
+}
+
+function cloudDeviceSurfaceRecord(device, surfaceId) {
+  const surfaces = device?.surfaces;
+  if (Array.isArray(surfaces)) {
+    return surfaces.find((surface) => normalizeCloudDeviceText(surface?.id || surface?.label || surface?.name) === surfaceId) || {};
+  }
+  if (surfaces && typeof surfaces === "object") {
+    const direct = surfaces[surfaceId] || surfaces[surfaceId.toLowerCase()];
+    return direct && typeof direct === "object" ? direct : {};
+  }
+  return {};
+}
+
+function cloudDeviceAliasList(device, primaryId = "") {
+  const aliases = new Set();
+  const append = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    if (value && typeof value === "object") {
+      CLOUD_DEVICE_ALIAS_KEYS.forEach((key) => append(value[key]));
+      return;
+    }
+    if (typeof value !== "string" && typeof value !== "number") {
+      return;
+    }
+    const id = safeCloudMcpText(String(value), "").toLowerCase();
+    if (id) {
+      aliases.add(id);
+    }
+  };
+  append(primaryId);
+  append(device);
+  append(device?.device);
+  append(device?.rawDevice);
+  append(device?.raw_device);
+  append(device?.webPresence);
+  append(device?.web_presence);
+  append(cloudDeviceSurfaceRecord(device, "native"));
+  append(cloudDeviceSurfaceRecord(device, "web"));
+  return Array.from(aliases);
 }
 
 function cloudDevicePlatformLabel(platform) {
@@ -2414,7 +2514,7 @@ function cloudDevicePlatformIcon(device) {
   const explicit = normalizeCloudDeviceText(
     device?.platform_icon || device?.platformIcon || device?.device_icon || device?.deviceIcon,
   );
-  if (["apple", "windows", "linux", "mobile", "web", "desktop", "device"].includes(explicit)) {
+  if (["android", "apple", "ios", "windows", "linux", "mobile", "web", "desktop", "device"].includes(explicit)) {
     return explicit;
   }
   const platform = normalizeCloudDeviceText(device?.platform || device?.os || device?.system);
@@ -2428,13 +2528,9 @@ function cloudDevicePlatformIcon(device) {
       || device?.clientKind
       || device?.source,
   );
-  if (
-    ["mobile", "phone", "tablet", "ios", "android"].some((item) => (
-      formFactor.includes(item) || platform.includes(item)
-    ))
-  ) {
-    return "mobile";
-  }
+  if (platform.includes("android")) return "android";
+  if (platform.includes("ios") || platform.includes("iphone") || platform.includes("ipad")) return "ios";
+  if (["mobile", "phone", "tablet"].some((item) => formFactor.includes(item))) return "mobile";
   if (platform.includes("mac") || platform.includes("darwin")) return "apple";
   if (platform.includes("win")) return "windows";
   if (platform.includes("linux")) return "linux";
@@ -2481,7 +2577,7 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
   const statusConnected = statusText
     ? ["connected", "online", "open", "active", "ready"].includes(statusText)
     : true;
-  const connected = safeCloudMcpBool(
+  const genericConnected = safeCloudMcpBool(
     device.connected
       ?? device.online
       ?? device.native_connected
@@ -2490,6 +2586,32 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
       ?? device.webConnected,
     statusConnected,
   );
+  const nativeSurface = cloudDeviceSurfaceRecord(device, "native");
+  const webSurface = cloudDeviceSurfaceRecord(device, "web");
+  const webPresence = device.webPresence || device.web_presence || webSurface;
+  const sourceText = normalizeCloudDeviceText(
+    device.client_kind
+      || device.clientKind
+      || device.client_type
+      || device.clientType
+      || device.connection_source
+      || device.connectionSource
+      || device.source
+      || "",
+  );
+  const webLike = ["web", "browser", "next-dashboard"].some((token) => sourceText.includes(token));
+  const nativeConnected = cloudDeviceBoolFromKeys(
+    device,
+    ["native_connected", "nativeConnected", "native_online", "nativeOnline", "native_active", "nativeActive"],
+  ) ?? cloudDeviceBoolFromKeys(nativeSurface, ["connected", "active", "online", "open", "status", "state"])
+    ?? (webLike ? false : genericConnected);
+  const webConnected = cloudDeviceBoolFromKeys(
+    device,
+    ["web_connected", "webConnected", "web_active", "webActive", "web_open", "webOpen", "web_online", "webOnline"],
+  ) ?? cloudDeviceBoolFromKeys(webPresence, ["connected", "active", "online", "open", "status", "state"])
+    ?? cloudDeviceBoolFromKeys(webSurface, ["connected", "active", "online", "open", "status", "state"])
+    ?? false;
+  const connected = Boolean(nativeConnected || webConnected || genericConnected);
   if (!connected && !includeOffline) {
     return null;
   }
@@ -2499,8 +2621,11 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
     "",
   );
   const icon = cloudDevicePlatformIcon(device);
+  const deviceAliases = cloudDeviceAliasList(device, deviceId);
   return {
     connected,
+    deviceAliases,
+    device_aliases: deviceAliases,
     deviceId: deviceId || `${normalizeCloudDeviceText(displayName) || "device"}:${index}`,
     displayName,
     formFactor,
@@ -2509,6 +2634,8 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
       "",
     ) || cloudDeviceFormFactorLabel(formFactor, platform),
     icon,
+    nativeConnected,
+    native_connected: nativeConnected,
     platform,
     platformIcon: icon,
     platformLabel: safeCloudMcpText(
@@ -2516,6 +2643,8 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
       "",
     ) || cloudDevicePlatformLabel(platform),
     status: connected ? "connected" : "offline",
+    webConnected,
+    web_connected: webConnected,
   };
 }
 
@@ -4400,6 +4529,391 @@ function normalizeCloudSyncStatusEvent(payload) {
   };
 }
 
+function formatNetworkBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${Math.round(bytes)} B`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb.toFixed(kb >= 10 ? 0 : 1)} KB`;
+  }
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} MB`;
+}
+
+function formatNetworkDuration(value, fallback = "never") {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return fallback;
+  }
+  if (ms < 1000) {
+    return "now";
+  }
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) {
+    return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function networkString(value, fallback = "") {
+  const text = String(value ?? "").trim();
+  return text || fallback;
+}
+
+function networkNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function networkList(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+const NETWORK_CATEGORY_LABELS = {
+  todos: "Todos",
+  architectures: "Architectures",
+  assets: "Assets",
+  tasks: "Tasks",
+  tokenomics: "Tokenomics",
+  catalog: "Catalog",
+  remote_commands: "Remote commands",
+  tools: "Tools",
+  voice: "Voice",
+  system: "System",
+};
+
+const NETWORK_CATEGORY_ORDER = [
+  "todos",
+  "architectures",
+  "assets",
+  "tasks",
+  "tokenomics",
+  "catalog",
+  "tools",
+  "remote_commands",
+  "voice",
+  "system",
+];
+
+function networkDomainFromText(value) {
+  const raw = networkString(value).toLowerCase();
+  if (!raw) return "system";
+  if (raw.includes("todo")) return "todos";
+  if (raw.includes("architect") || raw.includes("graph")) return "architectures";
+  if (raw.includes("asset")) return "assets";
+  if (raw.includes("tokenomic") || raw.includes("billing") || raw.includes("usage")) return "tokenomics";
+  if (raw.includes("catalog") || raw.includes("workspace_deleted")) return "catalog";
+  if (raw.includes("remote_command")) return "remote_commands";
+  if (raw.includes("tool") || raw.includes("skill") || raw.includes("cli")) return "tools";
+  if (raw.includes("voice")) return "voice";
+  if (
+    raw.includes("task")
+    || raw.includes("history")
+    || raw.includes("checkpoint")
+    || raw.includes("terminal")
+    || raw.includes("prompt")
+    || raw.includes("patch")
+    || raw.includes("context")
+    || raw.includes("spec")
+  ) {
+    return "tasks";
+  }
+  return "system";
+}
+
+function networkDomainFromItem(item) {
+  const explicit = networkString(item?.domain || item?.category);
+  if (explicit) {
+    return explicit;
+  }
+  const summary = item?.payloadSummary || item?.payload_summary || {};
+  const arrayCounts = summary?.arrayCounts || summary?.array_counts || {};
+  for (const key of ["todos", "architectures", "graphs", "assets", "tools", "skills", "terminals"]) {
+    if (networkNumber(arrayCounts?.[key]) > 0) {
+      return networkDomainFromText(key);
+    }
+  }
+  return networkDomainFromText(
+    item?.eventKind
+      || item?.event_kind
+      || item?.kind
+      || item?.source
+      || item?.metadata?.eventKind
+      || item?.metadata?.event_kind
+      || item?.metadata?.requestKind
+      || item?.metadata?.request_kind
+      || item?.metadata?.kind
+      || item?.metadata?.source,
+  );
+}
+
+function networkCategoryLabel(domain) {
+  return NETWORK_CATEGORY_LABELS[domain] || domain
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || "System";
+}
+
+function networkCategorySortIndex(domain) {
+  const index = NETWORK_CATEGORY_ORDER.indexOf(domain);
+  return index >= 0 ? index : NETWORK_CATEGORY_ORDER.length;
+}
+
+function networkItemLabel(item, fallback = "network event") {
+  return networkString(
+    item?.eventKind
+      || item?.event_kind
+      || item?.kind
+      || item?.source
+      || item?.metadata?.eventKind
+      || item?.metadata?.requestKind
+      || item?.metadata?.id,
+    fallback,
+  );
+}
+
+function networkItemErrorText(item) {
+  return networkString(
+    item?.lastError
+      || item?.last_error
+      || item?.error
+      || item?.message
+      || item?.metadata?.error
+      || item?.metadata?.message,
+  );
+}
+
+function networkPayloadArrayCount(summary) {
+  if (!summary || typeof summary !== "object") {
+    return 0;
+  }
+  const arrayCounts = summary.arrayCounts || summary.array_counts || {};
+  return Object.values(arrayCounts).reduce((total, value) => {
+    const count = networkNumber(value);
+    return count > 0 ? total + count : total;
+  }, 0);
+}
+
+function networkItemSyncCount(item) {
+  const explicit = networkNumber(
+    item?.count
+      ?? item?.itemCount
+      ?? item?.item_count
+      ?? item?.payloadCount
+      ?? item?.payload_count,
+  );
+  if (explicit > 0) {
+    return Math.max(1, Math.floor(explicit));
+  }
+  const payloadCount = networkPayloadArrayCount(item?.payloadSummary || item?.payload_summary);
+  return payloadCount > 0 ? Math.max(1, Math.floor(payloadCount)) : 1;
+}
+
+function networkItemBytes(item) {
+  return networkNumber(item?.bytes ?? item?.payloadBytes ?? item?.payload_bytes);
+}
+
+function networkItemAgeMs(item, nowMs) {
+  const explicit = networkNumber(item?.ageMs ?? item?.age_ms);
+  if (explicit > 0) {
+    return explicit;
+  }
+  const updatedAtMs = networkNumber(item?.updatedAtMs ?? item?.updated_at_ms);
+  if (updatedAtMs > 0 && nowMs > 0) {
+    return Math.max(0, nowMs - updatedAtMs);
+  }
+  return 0;
+}
+
+function networkDirectionMatchesBucket(direction, bucket) {
+  const normalized = networkString(direction).toLowerCase();
+  if (bucket === "down") {
+    return normalized === "down" || normalized === "both";
+  }
+  return ["up", "both", "control"].includes(normalized);
+}
+
+function networkSourceLabel(item, fallback) {
+  const source = networkString(item?.__networkSource || item?.source, fallback);
+  if (source === "websocket") return "sent";
+  if (source === "inbox") return "received";
+  if (source === "outbox") return "queued";
+  return source;
+}
+
+function aggregateNetworkCategoryRows(normalized, bucket) {
+  const groups = new Map();
+  const ensureGroup = (domain) => {
+    const key = networkString(domain, "system").toLowerCase();
+    if (!groups.has(key)) {
+      groups.set(key, {
+        domain: key,
+        label: networkCategoryLabel(key),
+        primaryCount: 0,
+        fallbackCount: 0,
+        eventCount: 0,
+        bytes: 0,
+        latestAgeMs: 0,
+        states: new Set(),
+        sources: new Set(),
+        details: new Set(),
+        hasError: false,
+      });
+    }
+    return groups.get(key);
+  };
+  const addItem = (item, { primary = false, source = "" } = {}) => {
+    const domain = networkDomainFromItem(item);
+    const group = ensureGroup(domain);
+    const count = networkItemSyncCount(item);
+    if (primary) {
+      group.primaryCount += count;
+    } else {
+      group.fallbackCount += count;
+    }
+    group.eventCount += 1;
+    group.bytes += networkItemBytes(item);
+    const state = networkString(item?.state || item?.status);
+    if (state) {
+      group.states.add(state);
+    }
+    const sourceLabel = networkSourceLabel(item, source);
+    if (sourceLabel) {
+      group.sources.add(sourceLabel);
+    }
+    const detail = networkItemLabel(item, "");
+    if (detail) {
+      group.details.add(detail);
+    }
+    const ageMs = networkItemAgeMs(item, normalized.nowMs);
+    if (ageMs > 0 && (group.latestAgeMs <= 0 || ageMs < group.latestAgeMs)) {
+      group.latestAgeMs = ageMs;
+    }
+    group.hasError = group.hasError || Boolean(networkItemErrorText(item));
+  };
+
+  networkList(normalized.activities)
+    .filter((item) => networkDirectionMatchesBucket(item?.direction, bucket))
+    .forEach((item) => addItem(item, { primary: true, source: "sync" }));
+
+  const fallbackItems = bucket === "down"
+    ? normalized.inboxRecent.map((item) => ({ ...item, __networkSource: "received" }))
+    : [
+        ...normalized.outboxRows.map((item) => ({ ...item, __networkSource: "queued" })),
+        ...normalized.outboundRecent.map((item) => ({ ...item, __networkSource: "sent" })),
+      ];
+  fallbackItems.forEach((item) => addItem(item, { source: bucket === "down" ? "received" : "sent" }));
+
+  const rows = Array.from(groups.values()).map((group) => {
+    const count = Math.max(group.primaryCount, group.fallbackCount);
+    return {
+      ...group,
+      count,
+      details: Array.from(group.details).slice(0, 2),
+      sources: Array.from(group.sources).slice(0, 3),
+      states: Array.from(group.states).slice(0, 3),
+    };
+  }).filter((group) => group.count > 0 || group.eventCount > 0);
+  const maxCount = Math.max(1, ...rows.map((row) => row.count));
+  return rows
+    .map((row) => ({
+      ...row,
+      share: Math.max(0.08, Math.min(1, row.count / maxCount)),
+    }))
+    .sort((a, b) => (
+      b.count - a.count
+      || networkCategorySortIndex(a.domain) - networkCategorySortIndex(b.domain)
+      || a.label.localeCompare(b.label)
+    ));
+}
+
+function networkCategoryTotal(rows) {
+  return rows.reduce((total, row) => total + networkNumber(row.count), 0);
+}
+
+function networkCategorySummaryText(row, bucket) {
+  const unit = bucket === "down"
+    ? row.count === 1 ? "update" : "updates"
+    : row.count === 1 ? "change" : "changes";
+  const direction = bucket === "down" ? "from server" : "to server";
+  return `${row.count} ${unit} ${direction}`;
+}
+
+function networkPacketLossLabel(normalized) {
+  const health = normalized?.health || {};
+  const explicit = health.packetLossPercent
+    ?? health.packet_loss_percent
+    ?? health.packetLoss
+    ?? health.packet_loss;
+  const explicitNumber = Number(explicit);
+  if (Number.isFinite(explicitNumber)) {
+    const percent = explicitNumber <= 1 ? explicitNumber * 100 : explicitNumber;
+    return `${Math.max(0, Math.min(100, percent)).toFixed(percent >= 10 ? 0 : 1)}%`;
+  }
+  const failedCount = Math.max(
+    networkNumber(normalized?.syncActivity?.failedCount ?? normalized?.syncActivity?.failed_count),
+    networkNumber(normalized?.deadLetterCount),
+  );
+  const totalCount = Math.max(
+    0,
+    networkNumber(normalized?.upCount)
+      + networkNumber(normalized?.downCount)
+      + networkNumber(normalized?.controlCount)
+      + failedCount,
+  );
+  if (totalCount <= 0 || failedCount <= 0) {
+    return "0%";
+  }
+  return `${Math.min(100, Math.round((failedCount / totalCount) * 100))}%`;
+}
+
+function normalizeNetworkingDiagnostics(payload, syncStatus = null) {
+  const status = payload?.status && typeof payload.status === "object" ? payload.status : {};
+  const syncActivity = payload?.syncActivity || payload?.sync_activity || status?.syncActivity || status?.sync_activity || {};
+  const health = payload?.health && typeof payload.health === "object" ? payload.health : {};
+  const connection = payload?.connection && typeof payload.connection === "object" ? payload.connection : {};
+  const outbox = payload?.outbox && typeof payload.outbox === "object" ? payload.outbox : {};
+  const inbox = payload?.inbox && typeof payload.inbox === "object" ? payload.inbox : {};
+  const outbound = payload?.outbound && typeof payload.outbound === "object" ? payload.outbound : {};
+  const nowMs = networkNumber(payload?.nowMs ?? payload?.now_ms, Date.now());
+  return {
+    activities: networkList(syncActivity.activities),
+    connection: {
+      connected: Boolean(connection.globalWsConnected ?? connection.global_ws_connected ?? status.globalWsConnected ?? status.global_ws_connected),
+      error: networkString(connection.globalWsLastError || connection.global_ws_last_error || connection.lastError || connection.last_error || status.globalWsLastError || status.global_ws_last_error || status.lastError || status.last_error),
+      state: networkString(connection.globalWsStatus || connection.global_ws_status || connection.status || status.globalWsStatus || status.global_ws_status || status.status || syncStatus?.connection, syncStatus?.connection || "local"),
+      contract: networkString(connection.contract || status.connectionContract || status.connection_contract),
+    },
+    health,
+    inboxRecent: networkList(inbox.recent),
+    outboundRecent: networkList(outbound.recent),
+    nowMs,
+    outboxRows: networkList(outbox.rows),
+    pendingCount: networkNumber(outbox.pendingCount ?? outbox.pending_count ?? status.outboxPendingCount ?? status.outbox_pending_count ?? syncStatus?.pendingCount),
+    recentFrames: networkList(payload?.recentFrames || payload?.recent_frames),
+    registeredWorkspaceCount: networkNumber(status.registeredWorkspaceCount ?? status.registered_workspace_count),
+    retryingCount: networkNumber(outbox.retryingCount ?? outbox.retrying_count ?? status.outboxRetryingCount ?? status.outbox_retrying_count),
+    deadLetterCount: networkNumber(outbox.deadLetterCount ?? outbox.dead_letter_count ?? status.outboxDeadLetterCount ?? status.outbox_dead_letter_count),
+    syncActivity,
+    upCount: networkNumber(syncActivity.upCount ?? syncActivity.up_count ?? status.syncUpCount ?? status.sync_up_count ?? syncStatus?.upCount),
+    downCount: networkNumber(syncActivity.downCount ?? syncActivity.down_count ?? status.syncDownCount ?? status.sync_down_count ?? syncStatus?.downCount),
+    controlCount: networkNumber(syncActivity.controlCount ?? syncActivity.control_count ?? status.syncControlCount ?? status.sync_control_count ?? syncStatus?.controlCount),
+  };
+}
+
 function cloudWorkspaceLaunchState(progress) {
   const status = String(progress?.status || "").toLowerCase();
 
@@ -5649,6 +6163,181 @@ function WorkspaceTerminalRolePicker({
   );
 }
 
+function NetworkingInspector({
+  diagnostics,
+  error = "",
+  loading = false,
+  onClose,
+  onReconnect,
+  onRefresh,
+  syncStatus,
+}) {
+  const normalized = normalizeNetworkingDiagnostics(diagnostics || {}, syncStatus);
+  const connectionState = normalized.connection.connected
+    ? "connected"
+    : normalized.connection.state;
+  const pingAge = formatNetworkDuration(
+    normalized.health.pingAgeMs ?? normalized.health.ping_age_ms,
+    "none",
+  );
+  const pongAge = formatNetworkDuration(
+    normalized.health.pongAgeMs ?? normalized.health.pong_age_ms,
+    "none",
+  );
+  const packetLoss = networkPacketLossLabel(normalized);
+  const toServerRows = aggregateNetworkCategoryRows(normalized, "up");
+  const fromServerRows = aggregateNetworkCategoryRows(normalized, "down");
+  const toServerCount = networkCategoryTotal(toServerRows);
+  const fromServerCount = networkCategoryTotal(fromServerRows);
+  const errorRows = Array.from(new Set([
+    error,
+    normalized.connection.error,
+    ...normalized.activities.map(networkItemErrorText),
+    ...normalized.outboxRows.map(networkItemErrorText),
+    ...normalized.inboxRecent.map(networkItemErrorText),
+    ...normalized.outboundRecent.map(networkItemErrorText),
+  ].filter(Boolean))).slice(0, 10);
+
+  const renderNetworkCategoryRows = (items, emptyLabel, bucket = "up") => (
+    items.length ? (
+      <NetworkingList data-mode="categories">
+        {items.map((row) => {
+          const tone = row.hasError ? "red" : bucket === "down" ? "green" : "blue";
+          const summaryText = networkCategorySummaryText(row, bucket);
+          return (
+            <NetworkingRow key={`${bucket}:${row.domain}`} data-role="category">
+              <NetworkingStatusDot data-tone={tone} />
+              <NetworkingRowMain>
+                <NetworkingCategoryTopline>
+                  <strong title={row.label}>{row.label}</strong>
+                  <NetworkingCategoryCount>{row.count}</NetworkingCategoryCount>
+                </NetworkingCategoryTopline>
+                <p title={row.details.length ? `${summaryText} - ${row.details.join(", ")}` : summaryText}>
+                  {summaryText}
+                </p>
+                <NetworkingCategoryMeter
+                  aria-hidden="true"
+                  data-tone={tone}
+                  style={{ "--network-progress": `${Math.round(row.share * 100)}%` }}
+                />
+                <NetworkingMeta>
+                  <span>{row.eventCount} {row.eventCount === 1 ? "event" : "events"}</span>
+                  {row.bytes > 0 && <span>{formatNetworkBytes(row.bytes)}</span>}
+                  {row.states.map((state) => (
+                    <span key={`${row.domain}:state:${state}`}>{state}</span>
+                  ))}
+                  {row.sources.map((source) => (
+                    <span key={`${row.domain}:source:${source}`}>{source}</span>
+                  ))}
+                  {row.latestAgeMs > 0 && <span>{formatNetworkDuration(row.latestAgeMs)} ago</span>}
+                  {row.hasError && <span>error</span>}
+                </NetworkingMeta>
+              </NetworkingRowMain>
+            </NetworkingRow>
+          );
+        })}
+      </NetworkingList>
+    ) : (
+      <NetworkingEmpty>{emptyLabel}</NetworkingEmpty>
+    )
+  );
+
+  return (
+    <NetworkingOverlay role="presentation">
+      <NetworkingDialog aria-label="Networking diagnostics" role="dialog">
+        <NetworkingHeader>
+          <WorkspaceSettingsHeaderMain>
+            <PanelKicker>Network</PanelKicker>
+            <PanelHeading>Live Sync</PanelHeading>
+            <WorkspaceSettingsHeaderMeta>
+              <WorkspaceSettingsMetaPill>
+                <span>State</span>
+                <strong>{connectionState}</strong>
+              </WorkspaceSettingsMetaPill>
+              <WorkspaceSettingsMetaPill>
+                <span>Contract</span>
+                <strong>{normalized.connection.contract || "app_ws"}</strong>
+              </WorkspaceSettingsMetaPill>
+            </WorkspaceSettingsHeaderMeta>
+          </WorkspaceSettingsHeaderMain>
+          <NetworkingToolbar>
+            <SecondaryButton disabled={loading} onClick={onReconnect} type="button">
+              {loading ? <PendingIcon aria-hidden="true" /> : <ConnectedIcon aria-hidden="true" />}
+              <span>Reconnect</span>
+            </SecondaryButton>
+            <SecondaryButton disabled={loading} onClick={onRefresh} type="button">
+              {loading ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+              <span>{loading ? "Refreshing..." : "Refresh"}</span>
+            </SecondaryButton>
+            <WorkspaceModalCloseButton aria-label="Close networking diagnostics" onClick={onClose} title="Close" type="button">
+              <ButtonCloseIcon aria-hidden="true" />
+            </WorkspaceModalCloseButton>
+          </NetworkingToolbar>
+        </NetworkingHeader>
+
+        <NetworkingSummaryGrid>
+          <NetworkingMetric>
+            <span>Status</span>
+            <strong>{connectionState}</strong>
+          </NetworkingMetric>
+          <NetworkingMetric>
+            <span>Ping / Pong</span>
+            <strong>{pingAge} / {pongAge}</strong>
+          </NetworkingMetric>
+          <NetworkingMetric>
+            <span>Packet Loss</span>
+            <strong>{packetLoss}</strong>
+          </NetworkingMetric>
+          <NetworkingMetric>
+            <span>WebSocket</span>
+            <strong>{normalized.inboxRecent.length} in / {normalized.outboundRecent.length} out</strong>
+          </NetworkingMetric>
+        </NetworkingSummaryGrid>
+
+        <NetworkingSectionGrid>
+          <NetworkingSection>
+            <NetworkingSectionHeader>
+              <strong>From Server</strong>
+              <span>{fromServerCount} syncing</span>
+            </NetworkingSectionHeader>
+            {renderNetworkCategoryRows(fromServerRows, "No server updates are arriving.", "down")}
+          </NetworkingSection>
+
+          <NetworkingSection>
+            <NetworkingSectionHeader>
+              <strong>To Server</strong>
+              <span>{toServerCount} syncing</span>
+            </NetworkingSectionHeader>
+            {renderNetworkCategoryRows(toServerRows, "No client changes are being sent.", "up")}
+          </NetworkingSection>
+        </NetworkingSectionGrid>
+
+        <NetworkingSection data-role="errors">
+          <NetworkingSectionHeader>
+            <strong>Errors</strong>
+            <span>{errorRows.length ? `${errorRows.length} current` : "clear"}</span>
+          </NetworkingSectionHeader>
+          {errorRows.length ? (
+            <NetworkingList>
+              {errorRows.map((message, index) => (
+                <NetworkingRow key={`${message}:${index}`} data-tone="error">
+                  <NetworkingStatusDot data-tone="red" />
+                  <NetworkingRowMain>
+                    <strong>Error</strong>
+                    <p title={message}>{message}</p>
+                  </NetworkingRowMain>
+                </NetworkingRow>
+              ))}
+            </NetworkingList>
+          ) : (
+            <NetworkingEmpty>No errors recorded.</NetworkingEmpty>
+          )}
+        </NetworkingSection>
+      </NetworkingDialog>
+    </NetworkingOverlay>
+  );
+}
+
 function normalizeWorkspaceSettings(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -5799,7 +6488,12 @@ function persistWorkspaceLifecycleSettings(settings) {
 
 function readWorkspaceRailCollapsed() {
   try {
-    const settings = JSON.parse(window.localStorage.getItem(WORKSPACE_RAIL_STORAGE_KEY) || "{}");
+    window.localStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
+  } catch {
+    // Legacy cross-launch rail density should not affect the next app open.
+  }
+  try {
+    const settings = JSON.parse(window.sessionStorage.getItem(WORKSPACE_RAIL_STORAGE_KEY) || "{}");
     return Boolean(settings?.collapsed);
   } catch {
     return false;
@@ -5808,12 +6502,17 @@ function readWorkspaceRailCollapsed() {
 
 function persistWorkspaceRailCollapsed(collapsed) {
   try {
-    window.localStorage.setItem(
+    window.localStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
+  } catch {
+    // Legacy cleanup is best-effort.
+  }
+  try {
+    window.sessionStorage.setItem(
       WORKSPACE_RAIL_STORAGE_KEY,
       JSON.stringify({ collapsed: Boolean(collapsed) }),
     );
   } catch {
-    // Rail density is a visual preference; the expanded layout remains the safe default.
+    // Rail density is session-scoped; the expanded layout remains the safe launch default.
   }
 }
 
@@ -6036,7 +6735,15 @@ function workspaceArchitectureGraphListEntry(repoPath, patch = {}) {
 }
 
 function workspaceArchitectureGraphId(graph) {
-  return graphText(graph?.id || graph?.architectureId || graph?.architecture_id || graph?.graphId || graph?.graph_id);
+  return graphText(
+    graph?.localGraphId
+      || graph?.local_graph_id
+      || graph?.id
+      || graph?.architectureId
+      || graph?.architecture_id
+      || graph?.graphId
+      || graph?.graph_id,
+  );
 }
 
 function workspaceArchitectureCloudSyncSignature(graphs) {
@@ -6796,7 +7503,7 @@ export default function App() {
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
-  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
+  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolPortalHost, setWorkspaceToolPortalHost] = useState(null);
   const [accountToolDraft, setAccountToolDraft] = useState("");
@@ -6863,6 +7570,10 @@ export default function App() {
   // the quiet re-validation that runs when the cloud connection returns.
   const offlineSessionGraceRef = useRef(false);
   const [cloudSyncStatus, setCloudSyncStatus] = useState(null);
+  const [networkingOverlayOpen, setNetworkingOverlayOpen] = useState(false);
+  const [networkingDiagnostics, setNetworkingDiagnostics] = useState(null);
+  const [networkingDiagnosticsState, setNetworkingDiagnosticsState] = useState("idle");
+  const [networkingDiagnosticsError, setNetworkingDiagnosticsError] = useState("");
   const [cloudLiveSyncEpoch, setCloudLiveSyncEpoch] = useState(0);
   const cloudSyncConnectionRef = useRef("");
   const cloudLiveSyncEpochRef = useRef(0);
@@ -7923,17 +8634,6 @@ export default function App() {
     if (catalog.global && typeof catalog.global === "object") {
       entries.push(catalog.global);
     }
-    (Array.isArray(catalog.workspaces) ? catalog.workspaces : []).forEach((group) => {
-      (Array.isArray(group?.repositories) ? group.repositories : []).forEach((repo) => {
-        if (repo && typeof repo === "object") entries.push(repo);
-      });
-    });
-    (Array.isArray(catalog.folderRepositories) ? catalog.folderRepositories : []).forEach((repo) => {
-      if (repo && typeof repo === "object") entries.push(repo);
-    });
-    (Array.isArray(catalog.orphanRepositories) ? catalog.orphanRepositories : []).forEach((repo) => {
-      if (repo && typeof repo === "object") entries.push(repo);
-    });
     return entries;
   }, [architectureHub.catalog]);
 
@@ -7951,9 +8651,8 @@ export default function App() {
       if (!options.refresh) {
         return Promise.resolve(architectureHubRef.current.catalog);
       }
-      // A refresh must never be swallowed by an in-flight fetch: the startup
-      // fetch races workspace hydration, and dropping the post-hydration
-      // refresh latches a catalog with zero workspace groups forever.
+      // A refresh must never be swallowed by an in-flight fetch: startup and
+      // websocket refreshes can land close together.
       const pending = architectureHubCatalogPromiseRef.current || Promise.resolve(null);
       return pending.then(() => refreshArchitectureHubCatalog(options));
     }
@@ -7969,23 +8668,7 @@ export default function App() {
       refreshing: true,
       state: current.catalog ? current.state : "loading",
     }));
-    // Callers that know the current workspace list pass it explicitly: the
-    // ref mirrors below are synced by effects declared later in this
-    // component, so during the very commit where workspaces hydrate they
-    // still hold the previous (empty) list.
-    const workspaceList = Array.isArray(options.workspaceList) && options.workspaceList.length
-      ? options.workspaceList
-      : (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-        .map((workspace) => ({
-          workspaceId: graphText(workspace?.id),
-          workspaceName: graphText(workspace?.name),
-          rootDirectory: cleanWorkspaceRootDirectory(
-            getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace?.id)
-              || defaultWorkingDirectoryRef.current,
-          ),
-        }))
-        .filter((workspace) => workspace.workspaceId && workspace.rootDirectory);
-    const request = invoke("cloud_mcp_architecture_hub_catalog", { workspaces: workspaceList })
+    const request = invoke("cloud_mcp_architecture_hub_catalog", { workspaces: [] })
       .then((catalog) => {
         setArchitectureHub({
           catalog,
@@ -8015,14 +8698,6 @@ export default function App() {
   const resolveArchitectureHubSyncContext = useCallback((repoPath) => {
     const entry = findArchitectureHubEntry(repoPath);
     if (!entry) return null;
-    if (graphText(entry.scopeKind) === "workspace") {
-      return {
-        workspaceId: graphText(entry.workspaceId),
-        workspaceName: graphText(entry.workspaceName),
-        queueWorkspaceId: graphText(entry.workspaceId),
-        queueWorkspaceName: graphText(entry.workspaceName),
-      };
-    }
     return {
       workspaceId: graphText(entry.workspaceId)
         || graphText(architectureHubRef.current.catalog?.globalWorkspaceId)
@@ -8030,27 +8705,14 @@ export default function App() {
       workspaceName: graphText(entry.workspaceName) || graphText(entry.name),
       queueWorkspaceId: "",
       queueWorkspaceName: "",
-      scopeRepoId: graphText(entry.repoId),
-      scopeGitRepoIdentityId: graphText(entry.gitRepoIdentityId),
+      scopeRepoId: "",
+      scopeGitRepoIdentityId: "",
     };
   }, [findArchitectureHubEntry]);
 
   const refreshArchitectureHubGraphList = useCallback((repoPath, options = {}) => {
     const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
     if (!safeRepoPath) return Promise.resolve([]);
-    const entry = findArchitectureHubEntry(safeRepoPath);
-    if (entry && graphText(entry.scopeKind) === "workspace") {
-      const catalogGroups = architectureHubRef.current.catalog?.workspaces;
-      const group = (Array.isArray(catalogGroups) ? catalogGroups : []).find((candidate) => (
-        graphText(candidate?.workspaceId) === graphText(entry.workspaceId)
-      ));
-      return refreshWorkspaceArchitectureGraphList(entry.workspaceId, safeRepoPath, {
-        ...options,
-        workspaceName: graphText(entry.workspaceName),
-        workspaceRootDirectory: graphText(group?.rootDirectory),
-      });
-    }
-
     const repoKey = workspaceArchitectureRepoKey(safeRepoPath);
     const existingEntry = (architectureHubGraphStateRef.current.architectureGraphLists || {})[repoKey] || null;
     const existingGraphs = Array.isArray(existingEntry?.graphs) ? existingEntry.graphs : [];
@@ -8297,7 +8959,7 @@ export default function App() {
   }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
 
   // Account-level data loads at app startup, not on first tab visit: the
-  // architecture hub catalog plus a background prefetch of every repo's graph
+  // architecture hub catalog plus a background prefetch of the global graph
   // list, so opening the Architectures tab never shows a loading flash.
   useEffect(() => {
     if (authState !== "authenticated") return undefined;
@@ -8309,17 +8971,6 @@ export default function App() {
       if (cancelled || !catalog || typeof catalog !== "object") return;
       const entries = [];
       if (catalog.global && typeof catalog.global === "object") entries.push(catalog.global);
-      (Array.isArray(catalog.workspaces) ? catalog.workspaces : []).forEach((group) => {
-        (Array.isArray(group?.repositories) ? group.repositories : []).forEach((repo) => {
-          if (repo && typeof repo === "object") entries.push(repo);
-        });
-      });
-      (Array.isArray(catalog.folderRepositories) ? catalog.folderRepositories : []).forEach((repo) => {
-        if (repo && typeof repo === "object") entries.push(repo);
-      });
-      (Array.isArray(catalog.orphanRepositories) ? catalog.orphanRepositories : []).forEach((repo) => {
-        if (repo && typeof repo === "object") entries.push(repo);
-      });
 
       entries.slice(0, 32).forEach((entry, index) => {
         const repoPath = graphText(entry?.path || entry?.rootDirectory || entry?.root_directory);
@@ -8340,49 +8991,6 @@ export default function App() {
       prefetchTimers.clear();
     };
   }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
-
-  // The startup catalog fetch often runs before workspaces/settings hydrate,
-  // which builds (and caches) a catalog with zero workspace groups — git repo
-  // entries never appear. Rebuild whenever the effective workspace list (ids
-  // + root directories) actually changes. The list is computed from state
-  // (NOT the ref mirrors, which sync in later-declared effects and are stale
-  // during this very commit) and passed to the refresh explicitly.
-  const architectureHubWorkspaceList = useMemo(() => (
-    (Array.isArray(workspaces) ? workspaces : [])
-      .map((workspace) => ({
-        workspaceId: graphText(workspace?.id),
-        workspaceName: graphText(workspace?.name),
-        rootDirectory: cleanWorkspaceRootDirectory(
-          getWorkspaceRootDirectory(workspaceSettings, workspace?.id) || defaultWorkingDirectory,
-        ),
-      }))
-      .filter((workspace) => workspace.workspaceId && workspace.rootDirectory)
-  ), [defaultWorkingDirectory, workspaceSettings, workspaces]);
-  const architectureHubWorkspaceSignature = useMemo(() => (
-    architectureHubWorkspaceList
-      .map((workspace) => `${workspace.workspaceId}::${workspace.rootDirectory}`)
-      .sort()
-      .join("|")
-  ), [architectureHubWorkspaceList]);
-  const architectureHubWorkspaceSignatureRef = useRef("");
-  useEffect(() => {
-    if (authState !== "authenticated" || !architectureHubWorkspaceSignature) {
-      return;
-    }
-    if (architectureHubWorkspaceSignatureRef.current === architectureHubWorkspaceSignature) {
-      return;
-    }
-    architectureHubWorkspaceSignatureRef.current = architectureHubWorkspaceSignature;
-    void refreshArchitectureHubCatalog({
-      refresh: true,
-      workspaceList: architectureHubWorkspaceList,
-    });
-  }, [
-    architectureHubWorkspaceList,
-    architectureHubWorkspaceSignature,
-    authState,
-    refreshArchitectureHubCatalog,
-  ]);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -9475,6 +10083,14 @@ export default function App() {
   }, [updateCloudWorkspaceProgress]);
 
   const showView = useCallback((nextView, options = {}) => {
+    if (DEVICE_LEVEL_APP_VIEW_IDS.has(nextView)) {
+      setWorkspaceToolPaneMode((currentMode) => (
+        currentMode === TODO_QUEUE_PANE_MODE_MINIMIZED
+          ? currentMode
+          : TODO_QUEUE_PANE_MODE_MINIMIZED
+      ));
+    }
+
     if (nextView === activeView && nextView === visibleView) {
       return;
     }
@@ -13644,6 +14260,11 @@ export default function App() {
     event?.preventDefault?.();
     event?.stopPropagation?.();
 
+    if (networkingOverlayOpen) {
+      setNetworkingOverlayOpen(false);
+      return;
+    }
+
     if (workspaceCloseInFlightRef.current) {
       performCloseWindow({ reason: `${reason}_retry` });
       return;
@@ -13717,6 +14338,7 @@ export default function App() {
   }, [
     appHasOpenWorkspaceRuntime,
     buildEmptyAppCloseTerminalSnapshot,
+    networkingOverlayOpen,
     performCloseWindow,
     readAppCloseActiveTerminalSnapshot,
   ]);
@@ -13913,6 +14535,64 @@ export default function App() {
       }
     };
   }, [revalidateOfflineSessionQuietly]);
+
+  const refreshNetworkingDiagnostics = useCallback(async (options = {}) => {
+    const quiet = Boolean(options.quiet);
+    if (!quiet) {
+      setNetworkingDiagnosticsState("loading");
+    }
+    setNetworkingDiagnosticsError("");
+    try {
+      const diagnostics = await invoke("cloud_mcp_get_network_diagnostics");
+      setNetworkingDiagnostics(diagnostics);
+      setNetworkingDiagnosticsState("ready");
+    } catch (error) {
+      try {
+        const status = await invoke("cloud_mcp_get_status");
+        setNetworkingDiagnostics({ status });
+      } catch {
+        // The diagnostics command failure is the user-facing error.
+      }
+      setNetworkingDiagnosticsState("error");
+      setNetworkingDiagnosticsError(getErrorMessage(error, "Unable to load networking diagnostics."));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!networkingOverlayOpen) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let refreshTimer = 0;
+    let unlistenSyncStatus = null;
+    const refresh = (quiet = true) => {
+      if (!cancelled) {
+        void refreshNetworkingDiagnostics({ quiet });
+      }
+    };
+
+    refresh(false);
+    refreshTimer = window.setInterval(() => refresh(true), 1000);
+
+    listen("cloud-mcp-sync-status", () => refresh(true)).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSyncStatus = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (refreshTimer) {
+        window.clearInterval(refreshTimer);
+      }
+      if (unlistenSyncStatus) {
+        unlistenSyncStatus();
+      }
+    };
+  }, [networkingOverlayOpen, refreshNetworkingDiagnostics]);
 
   useEffect(() => {
     // Remote workspace activation that arrived while the window was closed:
@@ -17008,7 +17688,10 @@ export default function App() {
   const workspaceToolPaneAllowedOnView = !DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
   const workspaceToolPaneVisible = workspaceToolPaneHasWidth && workspaceToolPaneAllowedOnView;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
+  const workspaceToolPaneExpanded = !workspaceToolPaneMinimized;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const deviceLevelViewActive = DEVICE_LEVEL_APP_VIEW_IDS.has(activeView)
+    || DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
   const workspaceToolMinimizedSize = workspaceToolLayoutWidth > 0
     ? Math.min(4, Math.max(2.8, (WORKSPACE_TOOL_MINIMIZED_WIDTH_PX / workspaceToolLayoutWidth) * 100))
     : 3.2;
@@ -17044,19 +17727,70 @@ export default function App() {
   const shouldRenderAccountToolPanel = Boolean(
     !workspaceToolPortalOwnedByWorkspace || !hasSelectedWorkspace,
   );
+  const showNoWorkspaceSelectedFromWorkspaceTool = useCallback((telemetrySource = "workspace_tool") => {
+    cancelDeferredWorkspaceActivation();
+    selectedWorkspaceIdRef.current = "";
+    workspacePendingActivationIdRef.current = "";
+    setSelectedWorkspaceId("");
+    setWorkspacePendingActivationId("");
+    setWorkspaceCreateModalOpen(false);
+    setWorkspaceSettingsModalId("");
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource,
+    });
+  }, [cancelDeferredWorkspaceActivation, showView]);
+  const openNetworkingOverlay = useCallback(() => {
+    showNoWorkspaceSelectedFromWorkspaceTool("networking_overlay");
+    setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
+    if (!workspaceRailCollapsed) {
+      animateWorkspaceRailWidth(true);
+      persistWorkspaceRailCollapsed(true);
+      setWorkspaceRailCollapsed(true);
+    }
+    setNetworkingOverlayOpen(true);
+    void refreshNetworkingDiagnostics({ quiet: Boolean(networkingDiagnostics) });
+  }, [
+    animateWorkspaceRailWidth,
+    networkingDiagnostics,
+    refreshNetworkingDiagnostics,
+    showNoWorkspaceSelectedFromWorkspaceTool,
+    workspaceRailCollapsed,
+  ]);
+  const closeNetworkingOverlay = useCallback(() => {
+    setNetworkingOverlayOpen(false);
+  }, []);
+  const reconnectNetworkingOverlay = useCallback(async () => {
+    setNetworkingDiagnosticsState("loading");
+    setNetworkingDiagnosticsError("");
+    try {
+      const status = await invoke("cloud_mcp_connect");
+      setCloudSyncStatus(cloudSyncStatusFromRuntimeStatus(status));
+      await refreshNetworkingDiagnostics({ quiet: true });
+    } catch (error) {
+      setNetworkingDiagnosticsState("error");
+      setNetworkingDiagnosticsError(getErrorMessage(error, "Unable to reconnect Cloud Sync."));
+    }
+  }, [refreshNetworkingDiagnostics]);
   const minimizeWorkspaceToolPane = useCallback(() => {
     setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
   }, []);
   const restoreWorkspaceToolPane = useCallback(() => {
     setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
-  }, []);
+    if (deviceLevelViewActive) {
+      showNoWorkspaceSelectedFromWorkspaceTool("workspace_tool_restore_from_device_view");
+    }
+  }, [deviceLevelViewActive, showNoWorkspaceSelectedFromWorkspaceTool]);
   const toggleFullscreenWorkspaceToolPane = useCallback(() => {
     setWorkspaceToolPaneMode((currentMode) => (
       currentMode === TODO_QUEUE_PANE_MODE_FULLSCREEN
         ? TODO_QUEUE_PANE_MODE_NORMAL
         : TODO_QUEUE_PANE_MODE_FULLSCREEN
     ));
-  }, []);
+    if (deviceLevelViewActive) {
+      showNoWorkspaceSelectedFromWorkspaceTool("workspace_tool_fullscreen_from_device_view");
+    }
+  }, [deviceLevelViewActive, showNoWorkspaceSelectedFromWorkspaceTool]);
   const submitAccountToolDraft = useCallback(() => {
     const text = String(accountToolDraft || "").trim();
     if (!text) {
@@ -17101,10 +17835,23 @@ export default function App() {
   }, [authState]);
 
   useEffect(() => {
-    if (!workspaceToolPaneHasWidth && workspaceToolPaneMode !== TODO_QUEUE_PANE_MODE_NORMAL) {
+    if (!workspaceToolPaneHasWidth && workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN) {
       setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
     }
   }, [workspaceToolPaneHasWidth, workspaceToolPaneMode]);
+
+  useEffect(() => {
+    if (!deviceLevelViewActive || !workspaceToolPaneHasWidth || !workspaceToolPaneExpanded) {
+      return;
+    }
+
+    showNoWorkspaceSelectedFromWorkspaceTool("workspace_tool_expanded_device_view");
+  }, [
+    deviceLevelViewActive,
+    showNoWorkspaceSelectedFromWorkspaceTool,
+    workspaceToolPaneExpanded,
+    workspaceToolPaneHasWidth,
+  ]);
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
@@ -24398,10 +25145,11 @@ export default function App() {
             </WindowBackgroundPill>
             {cloudSyncPillState ? (
               <WindowSyncPill
-                aria-label={cloudSyncPillTitle}
+                aria-label={`Open networking diagnostics. ${cloudSyncPillTitle}`}
                 data-platform={windowControlPlatform}
                 data-state={cloudSyncPillState}
                 data-window-control
+                onClick={openNetworkingOverlay}
                 title={cloudSyncPillTitle}
                 type="button"
               >
@@ -26251,6 +26999,17 @@ export default function App() {
                 </ResizePanelGroup>
               </WorkspaceAppToolLayout>
               </DashboardShell>
+              {networkingOverlayOpen && (
+                <NetworkingInspector
+                  diagnostics={networkingDiagnostics}
+                  error={networkingDiagnosticsError}
+                  loading={networkingDiagnosticsState === "loading"}
+                  onClose={closeNetworkingOverlay}
+                  onReconnect={reconnectNetworkingOverlay}
+                  onRefresh={() => refreshNetworkingDiagnostics({ quiet: false })}
+                  syncStatus={cloudSyncStatus}
+                />
+              )}
               {lowCreditToastVisible && (
                 <LowCreditWarningToast role="status" aria-live="polite">
                   <LowCreditWarningCopy>

@@ -795,18 +795,6 @@ pub fn coordination_terminal_todo_plan_finish(
         .as_str()
         .or_else(|| input["sessionId"].as_str())
         .map(str::to_string);
-    let workspace_id = input["workspace_id"]
-        .as_str()
-        .or_else(|| input["workspaceId"].as_str())
-        .map(str::to_string);
-    let worktree_id = input["worktree_id"]
-        .as_str()
-        .or_else(|| input["worktreeId"].as_str())
-        .map(str::to_string);
-    let worktree_path = input["worktree_path"]
-        .as_str()
-        .or_else(|| input["worktreePath"].as_str())
-        .map(str::to_string);
     let finished = kernel.finish_terminal_todo_plan(
         &plan_ref,
         "completed",
@@ -819,28 +807,14 @@ pub fn coordination_terminal_todo_plan_finish(
     }));
     let compact_plan = response["data"]["result"]["compact_plan"].clone();
     let cloud = if !compact_plan.is_null() {
-        let repo_path = kernel.paths.repo_path.display().to_string();
-        let db_path = kernel.paths.db_path.clone();
-        let cloud_agent_id = agent_id.clone();
-        let cloud_session_id = session_id.clone();
-        let cloud_workspace_id = workspace_id.clone();
-        let cloud_worktree_id = worktree_id.clone();
-        let cloud_worktree_path = worktree_path.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let _ = crate::cloud_mcp_forward_terminal_todo_plan_update(
-                Some(&repo_path),
-                Some(&db_path),
-                cloud_workspace_id.as_deref(),
-                cloud_agent_id.as_deref(),
-                cloud_session_id.as_deref(),
-                None,
-                cloud_worktree_id.as_deref(),
-                cloud_worktree_path.as_deref(),
-                "user_finished_terminal_todo_plan",
-                &compact_plan,
-            );
-        });
-        json!({"ok": true, "queued": true, "mode": "background"})
+        json!({
+            "ok": true,
+            "queued": false,
+            "skipped": true,
+            "reason": "cloud_task_sync_removed",
+            "mode": "disabled",
+            "cloud_sync_mode": "disabled",
+        })
     } else {
         json!({"ok": false, "skipped": true, "reason": "no_compact_plan"})
     };

@@ -1126,6 +1126,11 @@ const SnippingOverlayGlobalStyle = createGlobalStyle`
     cursor: crosshair;
     user-select: none;
   }
+
+  #app,
+  #app * {
+    cursor: crosshair !important;
+  }
 `;
 
 const SnippingOverlayRoot = styled.main`
@@ -1145,6 +1150,7 @@ const SnippingOverlayRoot = styled.main`
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
+  cursor: crosshair;
 `;
 
 const SnippingOverlayHint = styled.div`

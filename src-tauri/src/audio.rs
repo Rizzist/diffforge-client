@@ -85,6 +85,7 @@ fn forge_voice_route_cache_fresh(ws_path: &str) -> Option<(CloudMcpWsTarget, Opt
 /// Frontend notification for mic arbitration: the voice agent's microphone
 /// feed was paused (dictation borrowed the mic) or resumed (dictation ended).
 const FORGE_VOICE_AGENT_MIC_EVENT: &str = "forge-voice-agent-mic";
+const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT: &str = "forge-floating-layout-changed";
 const AUDIO_WIDGET_SPACE_CHANGED_EVENT: &str = "forge-audio-widget-space-changed";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT: &str =
@@ -3355,11 +3356,17 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("audio_widget_space_change_observer_callback", || {
-                        macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+                        let use_full_monitor_bounds =
+                            macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+                        let payload = json!({
+                            "source": "macos_space",
+                            "useFullMonitorBounds": use_full_monitor_bounds,
+                        });
                         let _ = app_handle.emit(
-                            AUDIO_WIDGET_SPACE_CHANGED_EVENT,
-                            json!({ "source": "macos_space" }),
+                            FLOATING_SURFACE_LAYOUT_CHANGED_EVENT,
+                            payload.clone(),
                         );
+                        let _ = app_handle.emit(AUDIO_WIDGET_SPACE_CHANGED_EVENT, payload);
                     });
                 },
             );
@@ -4161,6 +4168,22 @@ fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool 
 #[cfg(not(target_os = "macos"))]
 fn macos_active_space_uses_full_monitor_bounds_cached() -> bool {
     false
+}
+
+fn floating_surface_anchor_area_for_monitor(
+    monitor: &tauri::Monitor,
+) -> (
+    tauri::PhysicalPosition<i32>,
+    tauri::PhysicalSize<u32>,
+    bool,
+) {
+    #[cfg(target_os = "macos")]
+    if macos_active_space_uses_full_monitor_bounds_cached() {
+        return (*monitor.position(), *monitor.size(), true);
+    }
+
+    let work_area = *monitor.work_area();
+    (work_area.position, work_area.size, false)
 }
 
 #[cfg(target_os = "macos")]

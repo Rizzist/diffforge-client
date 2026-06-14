@@ -22,11 +22,12 @@ import {
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
-const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = 7;
 const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
+const TOKENOMICS_DAILY_WARN_LIMIT_PERCENT = 13;
+const TOKENOMICS_DAILY_DANGER_LIMIT_PERCENT = 20;
 const TOKENOMICS_USAGE_RATE_WINDOWS = [
   { key: "5_hour", label: "5h" },
   { key: "weekly", label: "Weekly" },
@@ -1070,12 +1071,42 @@ function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selected
 
 function withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
   const directPercents = directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
-  return rows.map((row) => {
+  const withDirectPercents = rows.map((row) => {
     const weeklyLimitPercent = directPercents.get(row.key);
     return {
       ...row,
       weeklyLimitPercent: weeklyLimitPercent == null ? null : Math.max(0, Math.min(100, weeklyLimitPercent)),
       weeklyLimitPercentEstimated: false,
+    };
+  });
+  return withDailyTokenReferenceLimitPercents(withDirectPercents);
+}
+
+function dailyTokenReferencePercentPerToken(rows) {
+  return rows.reduce((highest, row) => {
+    const total = dailyUsageValue(row);
+    const percent = limitNumberOrNull(row?.weeklyLimitPercent);
+    if (total <= 0 || percent == null || percent <= TOKENOMICS_DAILY_WARN_LIMIT_PERCENT) {
+      return highest;
+    }
+    const percentPerToken = percent / total;
+    return Number.isFinite(percentPerToken) ? Math.max(highest, percentPerToken) : highest;
+  }, 0);
+}
+
+function withDailyTokenReferenceLimitPercents(rows) {
+  const percentPerToken = dailyTokenReferencePercentPerToken(rows);
+  if (!(percentPerToken > 0)) return rows;
+  return rows.map((row) => {
+    if (limitNumberOrNull(row?.weeklyLimitPercent) != null) return row;
+    const total = dailyUsageValue(row);
+    if (total <= 0) return row;
+    const estimatedPercent = Math.max(0, Math.min(100, total * percentPerToken));
+    if (estimatedPercent <= TOKENOMICS_DAILY_WARN_LIMIT_PERCENT) return row;
+    return {
+      ...row,
+      weeklyLimitPercent: estimatedPercent,
+      weeklyLimitPercentEstimated: true,
     };
   });
 }
@@ -1651,8 +1682,8 @@ function toneColor(tone) {
 function dailyPercentTone(value, weeklyLimitPercent) {
   if (value <= 0) return "quiet";
   if (weeklyLimitPercent == null) return "good";
-  if (weeklyLimitPercent > 20) return "danger";
-  if (weeklyLimitPercent > 13) return "warn";
+  if (weeklyLimitPercent > TOKENOMICS_DAILY_DANGER_LIMIT_PERCENT) return "danger";
+  if (weeklyLimitPercent > TOKENOMICS_DAILY_WARN_LIMIT_PERCENT) return "warn";
   return "good";
 }
 
@@ -2123,7 +2154,6 @@ function ensureTokenomicsCloudListener() {
 
   tokenomicsStore.cloudListenerPromise = Promise.all([
     listen(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, refreshFromCloud),
-    listen(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, refreshFromCloud),
   ])
     .then((handlers) => {
       tokenomicsStore.cloudUnlistens = handlers;

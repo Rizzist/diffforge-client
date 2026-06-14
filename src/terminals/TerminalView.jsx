@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { Android as DeviceAndroidIcon } from "@styled-icons/fa-brands/Android";
 import { Apple as DeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
 import { Linux as DeviceLinuxIcon } from "@styled-icons/fa-brands/Linux";
 import { Windows as DeviceWindowsIcon } from "@styled-icons/fa-brands/Windows";
@@ -119,7 +120,9 @@ import {
   getTodoQueuePromptEventSourceForSource,
 } from "./todoQueueSources.js";
 import {
+  TODO_QUEUE_DEVICE_KIND_DESKTOP,
   TODO_QUEUE_DEVICE_KIND_MOBILE,
+  TODO_QUEUE_DEVICE_KIND_UNKNOWN,
   buildTodoQueueDeviceWorkspaceOptions,
   todoQueueDeviceSelectionIsLocalEditable,
   workspaceTodoItemsForDeviceWorkspace,
@@ -749,7 +752,7 @@ const TerminalWorkspaceMain = styled.div`
   }
 
   [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
-    min-width: 300px;
+    min-width: 450px;
   }
 
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
@@ -2355,7 +2358,7 @@ const TODO_QUEUE_STORAGE_DISCARDED_STATUSES = new Set([
 ]);
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
 const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
-const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
+const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 450;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 2_000_000;
 const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 2_000_000;
@@ -2605,10 +2608,10 @@ const OrchestratorTopNav = styled.div`
      the container query below) instead of wrapping. */
   display: flex;
   flex-wrap: nowrap;
+  align-items: stretch;
   min-height: 40px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background: rgba(2, 4, 8, 0.44);
-  container-type: inline-size;
   overflow: hidden;
 
   html[data-forge-theme="light"] & {
@@ -2616,6 +2619,13 @@ const OrchestratorTopNav = styled.div`
     background: rgba(245, 245, 247, 0.86);
     backdrop-filter: saturate(180%) blur(20px);
   }
+`;
+
+const OrchestratorTopTabs = styled.div`
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  container-type: inline-size;
 `;
 
 const OrchestratorTopButton = styled.button`
@@ -2698,7 +2708,7 @@ const OrchestratorView = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
 `;
 
 const OrchestratorVoiceArea = styled.div`
@@ -3085,17 +3095,6 @@ const OrchestratorConnectedDevices = styled.div`
     overflow: hidden;
   }
 
-  &[data-panel="true"] {
-    height: 100%;
-    max-height: none;
-    align-content: start;
-    border-bottom: 0;
-  }
-
-  &[data-panel="true"][data-empty="true"] {
-    max-height: none;
-  }
-
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(0, 0, 0, 0.08);
     background: #ffffff;
@@ -3137,10 +3136,60 @@ const OrchestratorConnectedDeviceIcon = styled.span`
     height: 14px;
   }
 
+  &[data-platform="android"] {
+    border-color: rgba(61, 220, 132, 0.24);
+    color: #3ddc84;
+    background: rgba(61, 220, 132, 0.1);
+  }
+
+  &[data-platform="apple"],
+  &[data-platform="ios"] {
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #f5f7fb;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  &[data-platform="windows"] {
+    border-color: rgba(0, 164, 239, 0.24);
+    color: #36b8ff;
+    background: rgba(0, 164, 239, 0.1);
+  }
+
+  &[data-platform="linux"] {
+    border-color: rgba(255, 205, 72, 0.24);
+    color: #ffd65a;
+    background: rgba(255, 205, 72, 0.1);
+  }
+
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 102, 204, 0.16);
     color: #0066cc;
     background: rgba(0, 102, 204, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="android"] {
+    border-color: rgba(47, 141, 89, 0.2);
+    color: #23864f;
+    background: rgba(61, 220, 132, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="apple"],
+  html[data-forge-theme="light"] &[data-platform="ios"] {
+    border-color: rgba(29, 29, 31, 0.12);
+    color: #1d1d1f;
+    background: rgba(29, 29, 31, 0.05);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="windows"] {
+    border-color: rgba(0, 120, 215, 0.2);
+    color: #0078d7;
+    background: rgba(0, 120, 215, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="linux"] {
+    border-color: rgba(154, 101, 0, 0.2);
+    color: #8a5a00;
+    background: rgba(255, 205, 72, 0.16);
   }
 `;
 
@@ -3209,6 +3258,14 @@ const TodoDeviceSwitcher = styled.div`
   overflow-x: auto;
   overscroll-behavior-x: contain;
 
+  &[data-layout="strip"] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    padding: 8px 10px;
+    overflow: visible;
+  }
+
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(0, 0, 0, 0.08);
     background: #ffffff;
@@ -3218,12 +3275,12 @@ const TodoDeviceSwitcher = styled.div`
 const TodoDeviceButton = styled.button`
   display: grid;
   min-width: 128px;
-  max-width: 210px;
-  height: 42px;
+  max-width: 226px;
+  height: 56px;
   grid-template-columns: 24px minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
-  flex: 0 0 auto;
+  flex: 0 0 178px;
   padding: 6px 8px;
   border: 1px solid rgba(230, 236, 245, 0.09);
   border-radius: 8px;
@@ -3263,6 +3320,20 @@ const TodoDeviceButton = styled.button`
     color: #164377;
     background: rgba(0, 102, 204, 0.08);
   }
+
+  &[data-strip="true"] {
+    width: 100%;
+    max-width: none;
+    height: 56px;
+    min-width: 0;
+    flex: 1 1 auto;
+    padding: 6px 10px;
+  }
+
+  &[data-cluster="true"] {
+    border-color: rgba(125, 176, 255, 0.24);
+    background: rgba(18, 27, 41, 0.74);
+  }
 `;
 
 const TodoDeviceButtonIcon = styled.span`
@@ -3281,17 +3352,150 @@ const TodoDeviceButtonIcon = styled.span`
     height: 14px;
   }
 
+  &[data-platform="android"] {
+    border-color: rgba(61, 220, 132, 0.24);
+    color: #3ddc84;
+    background: rgba(61, 220, 132, 0.1);
+  }
+
+  &[data-platform="apple"],
+  &[data-platform="ios"] {
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #f5f7fb;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  &[data-platform="windows"] {
+    border-color: rgba(0, 164, 239, 0.24);
+    color: #36b8ff;
+    background: rgba(0, 164, 239, 0.1);
+  }
+
+  &[data-platform="linux"] {
+    border-color: rgba(255, 205, 72, 0.24);
+    color: #ffd65a;
+    background: rgba(255, 205, 72, 0.1);
+  }
+
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 102, 204, 0.16);
     color: #0066cc;
     background: rgba(0, 102, 204, 0.08);
   }
+
+  html[data-forge-theme="light"] &[data-platform="android"] {
+    border-color: rgba(47, 141, 89, 0.2);
+    color: #23864f;
+    background: rgba(61, 220, 132, 0.14);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="apple"],
+  html[data-forge-theme="light"] &[data-platform="ios"] {
+    border-color: rgba(29, 29, 31, 0.12);
+    color: #1d1d1f;
+    background: rgba(29, 29, 31, 0.05);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="windows"] {
+    border-color: rgba(0, 120, 215, 0.2);
+    color: #0078d7;
+    background: rgba(0, 120, 215, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-platform="linux"] {
+    border-color: rgba(154, 101, 0, 0.2);
+    color: #8a5a00;
+    background: rgba(255, 205, 72, 0.16);
+  }
+
+  &[data-platform="cluster"] {
+    border-color: rgba(125, 176, 255, 0.24);
+    color: #d7e6ff;
+    background: rgba(47, 128, 255, 0.12);
+  }
+`;
+
+const TodoDeviceClusterIconGrid = styled.span`
+  display: grid;
+  width: 18px;
+  height: 18px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  place-items: center;
+`;
+
+const TodoDeviceClusterIconSlot = styled.span`
+  display: inline-grid;
+  width: 8px;
+  height: 8px;
+  place-items: center;
+  color: #d7e6ff;
+  line-height: 0;
+
+  && svg {
+    width: 8px;
+    height: 8px;
+  }
+
+  &[data-platform="android"] {
+    color: #3ddc84;
+  }
+
+  &[data-platform="apple"],
+  &[data-platform="ios"] {
+    color: #f5f7fb;
+  }
+
+  &[data-platform="windows"] {
+    color: #36b8ff;
+  }
+
+  &[data-platform="linux"] {
+    color: #ffd65a;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0066cc;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="android"] {
+    color: #23864f;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="apple"],
+  html[data-forge-theme="light"] &[data-platform="ios"] {
+    color: #1d1d1f;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="windows"] {
+    color: #0078d7;
+  }
+
+  html[data-forge-theme="light"] &[data-platform="linux"] {
+    color: #8a5a00;
+  }
+`;
+
+const DeviceIosWordmark = styled.span`
+  display: inline-block;
+  overflow: hidden;
+  max-width: 20px;
+  background: linear-gradient(135deg, #0a84ff 0%, #bf5af2 50%, #ff2d55 100%);
+  color: transparent;
+  font-size: 9.5px;
+  font-weight: 900;
+  letter-spacing: 0;
+  line-height: 1;
+  text-align: center;
+  -webkit-background-clip: text;
+  background-clip: text;
 `;
 
 const TodoDeviceButtonCopy = styled.span`
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: 3px;
 `;
 
 const TodoDeviceButtonName = styled.span`
@@ -3316,6 +3520,51 @@ const TodoDeviceButtonMeta = styled.span`
 
   html[data-forge-theme="light"] & {
     color: #737780;
+  }
+`;
+
+const TodoDeviceBadgeRow = styled.span`
+  display: flex;
+  min-width: 0;
+  gap: 4px;
+  overflow: hidden;
+`;
+
+const TodoDeviceSurfaceBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  max-width: 56px;
+  height: 15px;
+  padding: 0 6px;
+  border: 1px solid rgba(145, 158, 177, 0.2);
+  border-radius: 7px;
+  color: rgba(160, 172, 190, 0.62);
+  background: rgba(145, 158, 177, 0.08);
+  font-size: 8px;
+  font-weight: 860;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &[data-active="true"] {
+    border-color: rgba(105, 158, 255, 0.52);
+    color: #7fa9ff;
+    background: rgba(47, 128, 255, 0.16);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(89, 97, 110, 0.68);
+    background: rgba(0, 0, 0, 0.035);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.28);
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
   }
 `;
 
@@ -3364,9 +3613,11 @@ const OrchestratorContent = styled.div`
 const OrchestratorHistoryView = styled.div`
   display: grid;
   width: 100%;
+  max-width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
+  box-sizing: border-box;
   grid-template-rows: auto minmax(0, 1fr) auto;
   color: #7f8da1;
   background: rgba(2, 4, 8, 0.76);
@@ -3382,7 +3633,10 @@ const OrchestratorHistoryView = styled.div`
 
 const OrchestratorHistoryToolbar = styled.div`
   display: flex;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   align-items: baseline;
   gap: 8px;
   padding: 8px 12px 7px;
@@ -3488,17 +3742,24 @@ const OrchestratorHistoryEngineChip = styled.span`
 
 const OrchestratorHistoryToolList = styled.div`
   display: flex;
+  width: 100%;
+  max-width: 100%;
   flex-direction: column;
+  min-width: 0;
   gap: 4px;
   margin-top: 6px;
+  overflow: hidden;
 `;
 
 const OrchestratorHistoryToolChip = styled.button`
   display: inline-flex;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   align-items: center;
   gap: 6px;
-  align-self: flex-start;
-  max-width: 100%;
+  align-self: stretch;
   padding: 2px 8px;
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 999px;
@@ -3509,8 +3770,19 @@ const OrchestratorHistoryToolChip = styled.button`
   letter-spacing: 0.03em;
   cursor: pointer;
   text-align: left;
+  overflow: hidden;
+
+  span {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   em {
+    flex: 1 1 auto;
+    min-width: 0;
     font-style: normal;
     font-weight: 600;
     color: rgba(148, 163, 184, 0.85);
@@ -3527,10 +3799,15 @@ const OrchestratorHistoryToolChip = styled.button`
 `;
 
 const OrchestratorHistoryToolDetail = styled.pre`
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   margin: 2px 0 0;
   padding: 7px 9px;
   max-height: 180px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.28);
@@ -3538,6 +3815,7 @@ const OrchestratorHistoryToolDetail = styled.pre`
   font-size: 10px;
   line-height: 1.45;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
 `;
 
@@ -3567,9 +3845,13 @@ const OrchestratorHistoryTurnStatusChip = styled.span`
 `;
 
 const OrchestratorHistoryScroll = styled.div`
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
 
   html[data-forge-theme="light"] & {
@@ -3582,6 +3864,9 @@ const OrchestratorHistoryError = styled.div`
   display: grid;
   gap: 6px;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   padding: 11px 14px;
   border-bottom: 1px solid rgba(239, 68, 68, 0.28);
   color: #fecaca;
@@ -3625,21 +3910,29 @@ const OrchestratorHistoryEmpty = styled.div`
 
 const OrchestratorHistoryList = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   min-height: 100%;
+  box-sizing: border-box;
   align-content: start;
   gap: 14px;
   padding: 14px clamp(8px, 2vw, 14px) 16px;
+  overflow-x: hidden;
 `;
 
 const OrchestratorHistoryTurn = styled.article`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 8px;
   padding: 9px 11px 11px;
   border: 1px solid rgba(148, 163, 184, 0.1);
   border-radius: 12px;
   background: rgba(10, 15, 24, 0.55);
+  overflow: hidden;
 
   &[data-pending="true"] {
     border-color: rgba(96, 165, 250, 0.2);
@@ -3661,7 +3954,10 @@ const OrchestratorHistoryTurn = styled.article`
 
 const OrchestratorHistoryUserMessage = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   justify-items: end;
   gap: 5px;
 `;
@@ -3669,14 +3965,18 @@ const OrchestratorHistoryUserMessage = styled.div`
 const OrchestratorHistoryAssistantMessage = styled.div`
   display: grid;
   width: min(88%, 540px);
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 5px;
   justify-self: start;
 `;
 
 const OrchestratorHistoryMessageActions = styled.div`
   display: flex;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   align-items: center;
   gap: 9px;
   color: #a7a7a7;
@@ -3796,6 +4096,7 @@ const OrchestratorHistoryTurnStatus = styled.div`
 const OrchestratorHistoryTranscript = styled.div`
   min-width: 0;
   max-width: min(86%, 460px);
+  box-sizing: border-box;
   padding: 11px 14px 12px;
   border: 1px solid rgba(255, 255, 255, 0.045);
   border-radius: 20px;
@@ -3804,7 +4105,9 @@ const OrchestratorHistoryTranscript = styled.div`
   font-size: 11.5px;
   font-weight: 660;
   line-height: 1.42;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
   box-shadow: none;
 
   &[data-pending="true"] {
@@ -3844,7 +4147,10 @@ const OrchestratorHistoryTranscript = styled.div`
 
 const OrchestratorHistoryLlm = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 5px;
   padding: 1px 4px 3px;
   background: transparent;
@@ -3867,12 +4173,15 @@ const OrchestratorHistoryLlmLabel = styled.div`
 `;
 
 const OrchestratorHistoryLlmText = styled.div`
+  max-width: 100%;
   min-width: 0;
   color: #dfe7f2;
   font-size: 12px;
   font-weight: 680;
   line-height: 1.46;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
 
   html[data-forge-theme="light"] & {
     color: #20242b;
@@ -3962,7 +4271,10 @@ const OrchestratorHistoryPlanHeader = styled.div`
 
 const OrchestratorHistoryPlanHeaderMain = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 4px;
 `;
 
@@ -4000,7 +4312,10 @@ const OrchestratorHistoryPlanMeta = styled.div`
 
 const OrchestratorHistoryPlanProgress = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 3px;
 `;
 
@@ -4023,13 +4338,19 @@ const OrchestratorHistoryPlanProgressBar = styled.span`
 
 const OrchestratorHistoryPlanSteps = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 8px;
 `;
 
 const OrchestratorHistoryPlanStep = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 6px;
   padding: 8px 0 0;
   border-top: 1px solid rgba(230, 236, 245, 0.08);
@@ -4064,19 +4385,28 @@ const OrchestratorHistoryPlanStepTitle = styled.div`
 
 const OrchestratorHistoryPlanStage = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 5px;
 `;
 
 const OrchestratorHistoryPlanTaskList = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   gap: 4px;
 `;
 
 const OrchestratorHistoryPlanTask = styled.div`
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   grid-template-columns: 20px minmax(0, 1fr) max-content 28px;
   column-gap: 8px;
   row-gap: 3px;
@@ -4159,12 +4489,15 @@ const OrchestratorHistoryPlanTaskText = styled.div`
 
 const OrchestratorHistoryPlanTaskStatus = styled.span`
   justify-self: end;
+  max-width: 100%;
   min-width: 0;
   color: #7f8da1;
   font-size: 9px;
   font-weight: 820;
   line-height: 1.2;
+  overflow: hidden;
   text-align: right;
+  text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
 
@@ -4335,7 +4668,10 @@ const OrchestratorHistoryPlanGoal = styled.div`
 
 const OrchestratorHistoryComposer = styled.form`
   display: flex;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   justify-content: center;
   padding: 10px 12px 12px;
   border-top: 1px solid rgba(230, 236, 245, 0.08);
@@ -4350,13 +4686,17 @@ const OrchestratorHistoryComposer = styled.form`
 const OrchestratorHistoryInputFrame = styled.div`
   position: relative;
   width: min(440px, 100%);
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
 `;
 
 const OrchestratorHistoryInput = styled.textarea`
   display: block;
   width: 100%;
+  max-width: 100%;
   min-width: 0;
+  box-sizing: border-box;
   min-height: 46px;
   max-height: 104px;
   padding: 12px 48px 12px 16px;
@@ -4370,6 +4710,7 @@ const OrchestratorHistoryInput = styled.textarea`
   line-height: 1.35;
   outline: none;
   resize: none;
+  overflow-x: hidden;
 
   &::placeholder {
     color: #657386;
@@ -11781,31 +12122,127 @@ function normalizeConnectedDeviceText(value) {
   return String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
 }
 
-function connectedDeviceIconFor(device) {
+function connectedDeviceHostPlatformKind() {
+  const platform = normalizeConnectedDeviceText(
+    (typeof navigator !== "undefined" && (navigator.userAgentData?.platform || navigator.platform))
+      || "",
+  );
+  const userAgent = normalizeConnectedDeviceText(
+    (typeof navigator !== "undefined" && navigator.userAgent)
+      || "",
+  );
+  const searchable = `${platform}-${userAgent}`;
+  if (searchable.includes("android")) return "android";
+  if (searchable.includes("iphone") || searchable.includes("ipad") || searchable.includes("ios")) return "ios";
+  if (searchable.includes("mac") || searchable.includes("darwin")) return "apple";
+  if (searchable.includes("win")) return "windows";
+  if (searchable.includes("linux")) return "linux";
+  return "";
+}
+
+function DeviceIosWordmarkIcon() {
+  return <DeviceIosWordmark>iOS</DeviceIosWordmark>;
+}
+
+function connectedDevicePlatformKind(device) {
   const icon = normalizeConnectedDeviceText(
     device?.platformIcon || device?.platform_icon || device?.deviceIcon || device?.device_icon || device?.icon,
   );
-  if (icon === "apple") return DeviceAppleIcon;
-  if (icon === "windows") return DeviceWindowsIcon;
-  if (icon === "linux") return DeviceLinuxIcon;
-  if (icon === "mobile") return DeviceSmartphoneIcon;
-  if (icon === "web") return DeviceWebIcon;
-  if (icon === "desktop") return DeviceComputerIcon;
-
-  const platform = normalizeConnectedDeviceText(device?.platform || device?.os);
-  const formFactor = normalizeConnectedDeviceText(device?.formFactor || device?.form_factor || device?.deviceType || device?.device_type);
+  const platform = normalizeConnectedDeviceText(
+    device?.platform
+      || device?.platformLabel
+      || device?.platform_label
+      || device?.os
+      || device?.osName
+      || device?.os_name,
+  );
+  const formFactor = normalizeConnectedDeviceText(
+    device?.formFactor
+      || device?.form_factor
+      || device?.formFactorLabel
+      || device?.form_factor_label
+      || device?.deviceType
+      || device?.device_type
+      || device?.deviceKind
+      || device?.device_kind,
+  );
+  const name = normalizeConnectedDeviceText(
+    device?.deviceName
+      || device?.device_name
+      || device?.displayName
+      || device?.display_name
+      || device?.machineName
+      || device?.machine_name
+      || device?.hostname
+      || device?.name
+      || device?.label,
+  );
+  const deviceId = normalizeConnectedDeviceText(
+    device?.deviceId
+      || device?.device_id
+      || device?.machineId
+      || device?.machine_id
+      || device?.id,
+  );
+  const searchable = [platform, formFactor, name, deviceId].filter(Boolean).join("-");
+  const formFactorLooksMobile = ["mobile", "phone", "tablet"].some((item) => formFactor.includes(item));
+  const localPlatform = device?.isLocal ? connectedDeviceHostPlatformKind() : "";
+  if (icon === "android" || searchable.includes("android")) return "android";
+  if (
+    icon === "ios"
+    || searchable.includes("ios")
+    || searchable.includes("iphone")
+    || searchable.includes("ipad")
+  ) {
+    return "ios";
+  }
+  if (
+    platform.includes("mac")
+    || platform.includes("darwin")
+    || platform.includes("macos")
+    || formFactor.includes("macbook")
+    || name.includes("macbook")
+    || name.includes("imac")
+    || name.includes("mac-mini")
+    || name.includes("mac-studio")
+  ) {
+    return formFactorLooksMobile ? "ios" : "apple";
+  }
+  if (platform.includes("win") || name.includes("windows")) return "windows";
+  if (platform.includes("linux") || name.includes("linux")) return "linux";
+  if (icon === "apple") return formFactorLooksMobile ? "ios" : "apple";
+  if (icon === "windows") return "windows";
+  if (icon === "linux") return "linux";
+  if (icon === "web") return "web";
+  if (icon === "desktop") return localPlatform || "desktop";
+  if (icon === "mobile") return "mobile";
   if (
     ["mobile", "phone", "tablet", "ios", "android"].some((item) => (
       formFactor.includes(item) || platform.includes(item)
     ))
   ) {
-    return DeviceSmartphoneIcon;
+    return "mobile";
   }
-  if (platform.includes("mac") || platform.includes("darwin")) return DeviceAppleIcon;
-  if (platform.includes("win")) return DeviceWindowsIcon;
-  if (platform.includes("linux")) return DeviceLinuxIcon;
-  if (["pc", "desktop", "laptop", "macbook", "computer"].some((item) => formFactor.includes(item))) return DeviceComputerIcon;
+  if (["pc", "desktop", "laptop", "computer"].some((item) => formFactor.includes(item))) {
+    return localPlatform || "desktop";
+  }
+  return localPlatform || "unknown";
+}
+
+function connectedDeviceIconForPlatform(platformKind) {
+  if (platformKind === "android") return DeviceAndroidIcon;
+  if (platformKind === "ios") return DeviceIosWordmarkIcon;
+  if (platformKind === "apple") return DeviceAppleIcon;
+  if (platformKind === "windows") return DeviceWindowsIcon;
+  if (platformKind === "linux") return DeviceLinuxIcon;
+  if (platformKind === "mobile") return DeviceSmartphoneIcon;
+  if (platformKind === "web") return DeviceWebIcon;
+  if (platformKind === "desktop") return DeviceComputerIcon;
   return DeviceGenericIcon;
+}
+
+function connectedDeviceIconFor(device) {
+  return connectedDeviceIconForPlatform(connectedDevicePlatformKind(device));
 }
 
 function normalizeOrchestratorConnectedDevice(device, index = 0) {
@@ -12542,6 +12979,7 @@ function buildOrchestratorDeviceRows(options = []) {
       formFactorLabel: "",
       isLocal: false,
       liveState: "unknown",
+      platformIcon: "",
       platformLabel: "",
       workspaces: [],
     };
@@ -12567,6 +13005,7 @@ function buildOrchestratorDeviceRows(options = []) {
       formFactorLabel: previous.formFactorLabel || option.formFactorLabel || "",
       isLocal: Boolean(previous.isLocal || option.isLocal),
       liveState: previous.liveState === "live" ? previous.liveState : nextLiveState,
+      platformIcon: previous.platformIcon || option.platformIcon || option.icon || "",
       platformLabel: previous.platformLabel || option.platformLabel || "",
       workspaces,
     });
@@ -12584,26 +13023,100 @@ function buildOrchestratorDeviceRows(options = []) {
     .slice(0, 12);
 }
 
-function orchestratorDeviceRowMeta(row) {
-  if (!row) {
-    return "";
+const TODO_DEVICE_CLUSTER_PLATFORM_ORDER = [
+  "apple",
+  "windows",
+  "linux",
+  "android",
+  "ios",
+  "desktop",
+  "mobile",
+  "web",
+  "unknown",
+];
+
+function todoDeviceIconSource(row = {}, option = null) {
+  return {
+    ...(option || {}),
+    deviceId: option?.deviceId || row.deviceId || "",
+    deviceName: option?.deviceName || row.deviceName || "",
+    deviceType: option?.deviceKind || row.deviceKind || "",
+    formFactor: option?.formFactorLabel || option?.deviceKind || row.formFactorLabel || row.deviceKind || "",
+    isLocal: Boolean(option?.isLocal || row.isLocal),
+    platform: option?.platformLabel || row.platformLabel || "",
+    platformIcon: option?.platformIcon || row.platformIcon || "",
+  };
+}
+
+function todoDeviceOptionRank(option, selectedOptionId = "", currentWorkspaceId = "") {
+  if (!option) {
+    return 99;
   }
-  const descriptor = row.formFactorLabel || row.platformLabel || (
-    row.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE
-      ? "Mobile"
-      : row.deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP
-        ? "Desktop"
-        : "Device"
-  );
-  const workspaceCount = Array.isArray(row.workspaces) ? row.workspaces.length : 0;
-  const workspaceSummary = workspaceCount > 0
-    ? `${workspaceCount} workspace${workspaceCount === 1 ? "" : "s"}`
-    : "No workspaces";
-  return [
-    row.isLocal ? "This device" : "",
-    descriptor,
-    workspaceSummary,
-  ].filter(Boolean).join(" · ");
+  const optionId = String(option.id || "");
+  const workspaceId = String(option.workspaceId || "").trim();
+  const currentId = String(currentWorkspaceId || "").trim();
+  if (optionId && optionId === selectedOptionId) return 0;
+  if (option.isLocal && option.isCurrentWorkspace) return 1;
+  if (option.isLocal && currentId && workspaceId === currentId) return 2;
+  if (option.isLocal) return 3;
+  if (option.isCurrentWorkspace) return 4;
+  if (currentId && workspaceId === currentId) return 5;
+  if (!workspaceId) return 6;
+  if (option.liveState === "live") return 7;
+  return 8;
+}
+
+function todoDeviceOptionForRow(row, options = [], selectedOptionId = "", currentWorkspaceId = "") {
+  const deviceId = normalizeWorkspaceTodoDeviceId(row?.deviceId);
+  const matches = (Array.isArray(options) ? options : [])
+    .filter((option) => normalizeWorkspaceTodoDeviceId(option?.deviceId) === deviceId);
+  if (!matches.length) {
+    return null;
+  }
+  return matches
+    .slice()
+    .sort((left, right) => {
+      const rank = todoDeviceOptionRank(left, selectedOptionId, currentWorkspaceId)
+        - todoDeviceOptionRank(right, selectedOptionId, currentWorkspaceId);
+      if (rank !== 0) return rank;
+      return String(left.deviceName || "").localeCompare(String(right.deviceName || ""));
+    })[0];
+}
+
+function todoDevicePickerRows(deviceRows = [], options = [], selectedOptionId = "", currentWorkspaceId = "") {
+  return (Array.isArray(deviceRows) ? deviceRows : [])
+    .map((row) => {
+      const option = todoDeviceOptionForRow(row, options, selectedOptionId, currentWorkspaceId);
+      if (!option) {
+        return null;
+      }
+      return { ...row, option };
+    })
+    .filter(Boolean);
+}
+
+function todoDeviceClusterPlatformKinds(rows = []) {
+  const counts = new Map();
+  const firstSeen = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((row, index) => {
+    const kind = connectedDevicePlatformKind(todoDeviceIconSource(row, row.option)) || "unknown";
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+    if (!firstSeen.has(kind)) {
+      firstSeen.set(kind, index);
+    }
+  });
+  return Array.from(counts.entries())
+    .sort(([leftKind, leftCount], [rightKind, rightCount]) => {
+      if (rightCount !== leftCount) return rightCount - leftCount;
+      const leftOrder = TODO_DEVICE_CLUSTER_PLATFORM_ORDER.indexOf(leftKind);
+      const rightOrder = TODO_DEVICE_CLUSTER_PLATFORM_ORDER.indexOf(rightKind);
+      const safeLeftOrder = leftOrder === -1 ? TODO_DEVICE_CLUSTER_PLATFORM_ORDER.length : leftOrder;
+      const safeRightOrder = rightOrder === -1 ? TODO_DEVICE_CLUSTER_PLATFORM_ORDER.length : rightOrder;
+      if (safeLeftOrder !== safeRightOrder) return safeLeftOrder - safeRightOrder;
+      return (firstSeen.get(leftKind) || 0) - (firstSeen.get(rightKind) || 0);
+    })
+    .map(([kind]) => kind)
+    .slice(0, 4);
 }
 
 function OrchestratorVoiceCanvasRing({
@@ -12954,6 +13467,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const orchestratorHistoryScrollRef = useRef(null);
   const skipEditBlurCommitRef = useRef(false);
   const [todoDeviceSelectionId, setTodoDeviceSelectionId] = useState("");
+  const [todoDevicePickerExpanded, setTodoDevicePickerExpanded] = useState(false);
+  const [todoDeviceSelectionRevealed, setTodoDeviceSelectionRevealed] = useState(false);
   const todoDeviceOptions = useMemo(() => buildTodoQueueDeviceWorkspaceOptions({
     connectedDevices,
     currentWorkspaceId: orchestratorPanelWorkspaceId,
@@ -12985,7 +13500,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
     if (!todoDeviceOptions.some((option) => option.id === todoDeviceSelectionId)) {
-      setTodoDeviceSelectionId(todoDeviceOptions[0].id);
+      const defaultOption = todoDeviceOptions.find((option) => option.isLocal && option.isCurrentWorkspace)
+        || todoDeviceOptions.find((option) => option.isLocal)
+        || todoDeviceOptions[0];
+      setTodoDeviceSelectionId(defaultOption.id);
     }
   }, [todoDeviceOptions, todoDeviceSelectionId]);
   const selectedTodoDevice = useMemo(() => (
@@ -12993,6 +13511,39 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       || todoDeviceOptions[0]
       || null
   ), [todoDeviceOptions, todoDeviceSelectionId]);
+  const todoDeviceRows = useMemo(() => todoDevicePickerRows(
+    orchestratorDeviceRows,
+    todoDeviceOptions,
+    selectedTodoDevice?.id || todoDeviceSelectionId,
+    orchestratorPanelWorkspaceId,
+  ), [
+    orchestratorDeviceRows,
+    orchestratorPanelWorkspaceId,
+    selectedTodoDevice?.id,
+    todoDeviceOptions,
+    todoDeviceSelectionId,
+  ]);
+  const todoDeviceClusterActive = todoDeviceRows.length > 2;
+  const selectedTodoDeviceRow = useMemo(() => (
+    todoDeviceRows.find((row) => row.option?.id === selectedTodoDevice?.id)
+      || todoDeviceRows.find((row) => row.option?.isLocal)
+      || todoDeviceRows[0]
+      || null
+  ), [selectedTodoDevice?.id, todoDeviceRows]);
+  const todoDeviceClusterKinds = useMemo(
+    () => todoDeviceClusterPlatformKinds(todoDeviceRows),
+    [todoDeviceRows],
+  );
+  useEffect(() => {
+    if (!todoDeviceClusterActive) {
+      if (todoDevicePickerExpanded) {
+        setTodoDevicePickerExpanded(false);
+      }
+      if (todoDeviceSelectionRevealed) {
+        setTodoDeviceSelectionRevealed(false);
+      }
+    }
+  }, [todoDeviceClusterActive, todoDevicePickerExpanded, todoDeviceSelectionRevealed]);
   const todoSelectionEditable = todoQueueDeviceSelectionIsLocalEditable(
     selectedTodoDevice,
     orchestratorPanelWorkspaceId,
@@ -14968,6 +15519,170 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }
     onRemoveItemAttachment?.(item.id, attachment);
   }, [onRemoveItemAttachment, todoSelectionEditable]);
+  const showOrchestratorDeviceRows = !workspaceScopedTabsEnabled && activeOrchestratorSection === "todo";
+  const renderOrchestratorDeviceRows = () => (
+    <OrchestratorConnectedDevices
+      aria-label="Connected devices"
+      data-empty={showOrchestratorDeviceRows && orchestratorDeviceRows.length ? undefined : "true"}
+    >
+      {showOrchestratorDeviceRows && orchestratorDeviceRows.map((device) => {
+        const iconDevice = {
+          deviceName: device.deviceName,
+          deviceId: device.deviceId,
+          deviceType: device.deviceKind,
+          formFactor: device.formFactorLabel || device.deviceKind,
+          isLocal: device.isLocal,
+          platform: device.platformLabel,
+          platformIcon: device.platformIcon,
+        };
+        const devicePlatformKind = connectedDevicePlatformKind(iconDevice);
+        const DeviceIcon = connectedDeviceIconForPlatform(devicePlatformKind);
+        return (
+          <OrchestratorConnectedDeviceRow
+            key={device.deviceId}
+            title={device.deviceName}
+          >
+            <OrchestratorConnectedDeviceIcon aria-hidden="true" data-platform={devicePlatformKind}>
+              <DeviceIcon />
+            </OrchestratorConnectedDeviceIcon>
+            <OrchestratorConnectedDeviceCopy>
+              <OrchestratorConnectedDeviceName title={device.deviceName}>
+                {device.deviceName}
+              </OrchestratorConnectedDeviceName>
+            </OrchestratorConnectedDeviceCopy>
+            <OrchestratorConnectedDeviceStatus
+              aria-label={device.liveState === "live" ? "Live" : device.liveState === "offline" ? "Offline" : "Unknown"}
+              data-live-state={device.liveState || "unknown"}
+              role="img"
+            />
+          </OrchestratorConnectedDeviceRow>
+        );
+      })}
+    </OrchestratorConnectedDevices>
+  );
+  const renderTodoDeviceStrip = (row, renderOptions = {}) => {
+    const option = row?.option;
+    if (!option) {
+      return null;
+    }
+    const iconDevice = todoDeviceIconSource(row, option);
+    const devicePlatformKind = connectedDevicePlatformKind(iconDevice);
+    const DeviceIcon = connectedDeviceIconForPlatform(devicePlatformKind);
+    const meta = todoDeviceOptionMeta(option);
+    const surfaceBadges = [
+      { active: Boolean(option.nativeConnected), id: "native", label: "NATIVE" },
+      { active: Boolean(option.webConnected), id: "web", label: "WEB" },
+    ];
+    const surfaceTitle = surfaceBadges
+      .filter((surface) => surface.active)
+      .map((surface) => surface.label)
+      .join(" + ");
+    const active = selectedTodoDevice?.id === option.id;
+    return (
+      <TodoDeviceButton
+        aria-pressed={active ? "true" : "false"}
+        data-active={active ? "true" : undefined}
+        data-strip="true"
+        data-todo-control="true"
+        key={renderOptions.key || option.id}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setTodoDeviceSelectionId(option.id);
+          if (todoDeviceClusterActive) {
+            setTodoDevicePickerExpanded(false);
+            setTodoDeviceSelectionRevealed(true);
+          }
+        }}
+        title={`${option.deviceName}${meta ? ` · ${meta}` : ""}${surfaceTitle ? ` · ${surfaceTitle}` : ""}`}
+        type="button"
+      >
+        <TodoDeviceButtonIcon aria-hidden="true" data-platform={devicePlatformKind}>
+          <DeviceIcon />
+        </TodoDeviceButtonIcon>
+        <TodoDeviceButtonCopy>
+          <TodoDeviceButtonName>{option.deviceName}</TodoDeviceButtonName>
+          <TodoDeviceButtonMeta>{meta}</TodoDeviceButtonMeta>
+          <TodoDeviceBadgeRow aria-hidden="true">
+            {surfaceBadges.map((surface) => (
+              <TodoDeviceSurfaceBadge
+                data-active={surface.active ? "true" : undefined}
+                key={surface.id}
+              >
+                {surface.label}
+              </TodoDeviceSurfaceBadge>
+            ))}
+          </TodoDeviceBadgeRow>
+        </TodoDeviceButtonCopy>
+        <TodoDeviceLiveDot
+          aria-hidden="true"
+          data-live-state={option.liveState || "unknown"}
+        />
+      </TodoDeviceButton>
+    );
+  };
+  const renderTodoDeviceClusterStrip = () => {
+    const clusterKinds = todoDeviceClusterKinds.length ? todoDeviceClusterKinds : ["unknown"];
+    const liveState = todoDeviceRows.some((row) => row.option?.liveState === "live") ? "live" : "unknown";
+    return (
+      <TodoDeviceButton
+        aria-expanded={todoDevicePickerExpanded ? "true" : "false"}
+        aria-label={todoDevicePickerExpanded ? "Hide devices" : "Show devices"}
+        data-cluster="true"
+        data-strip="true"
+        data-todo-control="true"
+        key="todo-device-cluster"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setTodoDevicePickerExpanded((expanded) => !expanded);
+        }}
+        title={`${todoDeviceRows.length} devices`}
+        type="button"
+      >
+        <TodoDeviceButtonIcon aria-hidden="true" data-platform="cluster">
+          <TodoDeviceClusterIconGrid>
+            {clusterKinds.map((kind) => {
+              const ClusterIcon = connectedDeviceIconForPlatform(kind);
+              return (
+                <TodoDeviceClusterIconSlot data-platform={kind} key={kind}>
+                  <ClusterIcon />
+                </TodoDeviceClusterIconSlot>
+              );
+            })}
+          </TodoDeviceClusterIconGrid>
+        </TodoDeviceButtonIcon>
+        <TodoDeviceButtonCopy>
+          <TodoDeviceButtonName>Devices</TodoDeviceButtonName>
+          <TodoDeviceButtonMeta>
+            {todoDeviceRows.length} device{todoDeviceRows.length === 1 ? "" : "s"}
+          </TodoDeviceButtonMeta>
+        </TodoDeviceButtonCopy>
+        <TodoDeviceLiveDot
+          aria-hidden="true"
+          data-live-state={liveState}
+        />
+      </TodoDeviceButton>
+    );
+  };
+  const renderTodoDevicePickerStrips = () => {
+    const rows = todoDeviceClusterActive
+      ? todoDevicePickerExpanded
+        ? todoDeviceRows
+        : todoDeviceSelectionRevealed && selectedTodoDeviceRow
+          ? [selectedTodoDeviceRow]
+          : []
+      : todoDeviceRows;
+    return (
+      <TodoDeviceSwitcher
+        aria-label="Todo device"
+        data-layout="strip"
+      >
+        {todoDeviceClusterActive ? renderTodoDeviceClusterStrip() : null}
+        {rows.map((row) => renderTodoDeviceStrip(row))}
+      </TodoDeviceSwitcher>
+    );
+  };
 
   return (
     <TodoQueueSurface
@@ -14977,25 +15692,27 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       data-tool-fullscreen={paneFullscreen ? "true" : undefined}
     >
       <OrchestratorTopNav aria-label="Workspace tool">
-        {workspaceToolTabs.map((tool) => (
-          <OrchestratorTopButton
-            aria-label={tool.label}
-            data-active={activeWorkspaceTool === tool.id ? "true" : "false"}
-            key={tool.id}
-            onClick={() => setActiveWorkspaceTool(tool.id)}
-            title={tool.label}
-            type="button"
-          >
-            <span data-has-compact={tool.compactLabel ? "true" : undefined} data-label="full">
-              {tool.label}
-            </span>
-            {tool.compactLabel && (
-              <span data-label="compact">
-                {tool.compactLabel}
+        <OrchestratorTopTabs>
+          {workspaceToolTabs.map((tool) => (
+            <OrchestratorTopButton
+              aria-label={tool.label}
+              data-active={activeWorkspaceTool === tool.id ? "true" : "false"}
+              key={tool.id}
+              onClick={() => setActiveWorkspaceTool(tool.id)}
+              title={tool.label}
+              type="button"
+            >
+              <span data-has-compact={tool.compactLabel ? "true" : undefined} data-label="full">
+                {tool.label}
               </span>
-            )}
-          </OrchestratorTopButton>
-        ))}
+              {tool.compactLabel && (
+                <span data-label="compact">
+                  {tool.compactLabel}
+                </span>
+              )}
+            </OrchestratorTopButton>
+          ))}
+        </OrchestratorTopTabs>
       </OrchestratorTopNav>
       {workspaceScopedTabsEnabled && (
         <WorkspaceToolSurface data-tool="plans" hidden={activeWorkspaceTool !== "plans"}>
@@ -15043,6 +15760,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             <OrchestratorVoicePaneControls aria-label="Orchestrator pane controls">
               <WorkspaceToolControlButton
                 aria-label="Minimize workspace tools"
+                data-control="minimize"
                 onClick={onMinimizePane}
                 title="Minimize"
                 type="button"
@@ -15079,6 +15797,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
               )}
               <WorkspaceToolControlButton
                 aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
+                data-control="fullscreen"
                 onClick={onToggleFullscreenPane}
                 title={paneFullscreen ? "Exit big view" : "Big view"}
                 type="button"
@@ -15143,49 +15862,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
               Voice History
             </OrchestratorSectionButton>
           </OrchestratorSectionTabs>
+          {renderOrchestratorDeviceRows()}
           <OrchestratorContent>
             {activeOrchestratorSection === "todo" ? (
               workspaceScopedTabsEnabled ? (
-              <TodoQueueBoard
-                onPointerDown={handleBoardPointerDown}
-                ref={todoBoardRef}
-              >
-                <TodoDeviceSwitcher aria-label="Todo device and workspace">
-                  {todoDeviceOptions.map((option) => {
-                    const DeviceIcon = connectedDeviceIconFor({
-                      ...option,
-                      formFactor: option.deviceKind,
-                    });
-                    const meta = todoDeviceOptionMeta(option);
-                    return (
-                      <TodoDeviceButton
-                        aria-pressed={selectedTodoDevice?.id === option.id ? "true" : "false"}
-                        data-active={selectedTodoDevice?.id === option.id ? "true" : undefined}
-                        data-todo-control="true"
-                        key={option.id}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          setTodoDeviceSelectionId(option.id);
-                        }}
-                        title={`${option.deviceName}${meta ? ` · ${meta}` : ""}`}
-                        type="button"
-                      >
-                        <TodoDeviceButtonIcon aria-hidden="true">
-                          <DeviceIcon />
-                        </TodoDeviceButtonIcon>
-                        <TodoDeviceButtonCopy>
-                          <TodoDeviceButtonName>{option.deviceName}</TodoDeviceButtonName>
-                          <TodoDeviceButtonMeta>{meta}</TodoDeviceButtonMeta>
-                        </TodoDeviceButtonCopy>
-                        <TodoDeviceLiveDot
-                          aria-hidden="true"
-                          data-live-state={option.liveState || "unknown"}
-                        />
-                      </TodoDeviceButton>
-                    );
-                  })}
-                </TodoDeviceSwitcher>
+                <TodoQueueBoard
+                  onPointerDown={handleBoardPointerDown}
+                  ref={todoBoardRef}
+                >
+                {renderTodoDevicePickerStrips()}
                 <TodoQueueList aria-label="Todo objects" ref={todoListRef} role="list">
                   {displayedTodoQueueItems.map((item) => {
                     const isEditing = editingItemId === item.id;
@@ -15586,49 +16271,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
                 {todoSelectionEditable && dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
               </TodoQueueBoard>
-              ) : (
-                <OrchestratorConnectedDevices
-                  aria-label="Connected devices"
-                  data-empty={orchestratorDeviceRows.length ? undefined : "true"}
-                  data-panel="true"
-                >
-                  {orchestratorDeviceRows.map((device) => {
-                    const DeviceIcon = connectedDeviceIconFor({
-                      deviceType: device.deviceKind,
-                      formFactor: device.formFactorLabel || device.deviceKind,
-                      platform: device.platformLabel,
-                    });
-                    const meta = orchestratorDeviceRowMeta(device);
-                    const workspaceNames = device.workspaces
-                      .map((workspace) => workspace.name)
-                      .filter(Boolean)
-                      .slice(0, 4)
-                      .join(", ");
-                    return (
-                      <OrchestratorConnectedDeviceRow
-                        key={device.deviceId}
-                        title={workspaceNames ? `${device.deviceName} · ${workspaceNames}` : device.deviceName}
-                      >
-                        <OrchestratorConnectedDeviceIcon aria-hidden="true">
-                          <DeviceIcon />
-                        </OrchestratorConnectedDeviceIcon>
-                        <OrchestratorConnectedDeviceCopy>
-                          <OrchestratorConnectedDeviceName>{device.deviceName}</OrchestratorConnectedDeviceName>
-                          <OrchestratorConnectedDeviceMeta>{meta}</OrchestratorConnectedDeviceMeta>
-                        </OrchestratorConnectedDeviceCopy>
-                        <OrchestratorConnectedDeviceStatus
-                          aria-label={device.liveState === "live" ? "Live" : device.liveState === "offline" ? "Offline" : "Unknown"}
-                          data-live-state={device.liveState || "unknown"}
-                          role="img"
-                        />
-                      </OrchestratorConnectedDeviceRow>
-                    );
-                  })}
-                  {!orchestratorDeviceRows.length && (
-                    <TodoQueueReadOnlyState>No connected devices</TodoQueueReadOnlyState>
-                  )}
-                </OrchestratorConnectedDevices>
-              )
+              ) : null
             ) : (
               <OrchestratorHistoryView aria-label="Voice history">
                 <OrchestratorHistoryToolbar>
@@ -16222,7 +16865,7 @@ function TerminalView({
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
-  const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
+  const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const workspaceToolPortaled = Boolean(workspaceToolPortalTarget);
   const effectiveTodoQueuePaneMode = workspaceToolPaneMode || todoQueuePaneMode;

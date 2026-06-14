@@ -13,6 +13,8 @@ const CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
 const CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 15;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
+const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+const CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS: u64 = 45;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
 const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
 const CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS: u64 = 3600;
@@ -97,6 +99,8 @@ const CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT: usize = 8;
 const CLOUD_MCP_SYNC_ACTIVITY_BACKLOG_MS: u64 = 2_000;
 const CLOUD_MCP_SYNC_ACTIVITY_STALE_MS: u64 = 5 * 60 * 1000;
 const CLOUD_MCP_SYNC_ACTIVITY_FAILED_TTL_MS: u64 = 10_000;
+const CLOUD_MCP_NETWORK_RECENT_FRAME_MAX: usize = 80;
+const CLOUD_MCP_NETWORK_DIAGNOSTIC_OUTBOX_LIMIT: usize = 64;
 
 static CLOUD_MCP_SYNC_STATUS_APP: OnceLock<AppHandle> = OnceLock::new();
 static CLOUD_MCP_SYNC_STATUS_CONNECTION: std::sync::Mutex<Option<&'static str>> =
@@ -105,6 +109,11 @@ static CLOUD_MCP_SYNC_STATUS_LAST: std::sync::Mutex<Option<(String, u64)>> =
     std::sync::Mutex::new(None);
 static CLOUD_MCP_SYNC_ACTIVITIES: OnceLock<StdMutex<HashMap<String, CloudMcpSyncActivity>>> =
     OnceLock::new();
+static CLOUD_MCP_WS_LAST_INBOUND_MS: AtomicU64 = AtomicU64::new(0);
+static CLOUD_MCP_WS_LAST_OUTBOUND_MS: AtomicU64 = AtomicU64::new(0);
+static CLOUD_MCP_WS_LAST_PING_SENT_MS: AtomicU64 = AtomicU64::new(0);
+static CLOUD_MCP_WS_LAST_PONG_RECEIVED_MS: AtomicU64 = AtomicU64::new(0);
+static CLOUD_MCP_NETWORK_RECENT_FRAMES: OnceLock<StdMutex<VecDeque<Value>>> = OnceLock::new();
 
 static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
@@ -287,7 +296,6 @@ struct CloudMcpRuntimeSnapshots {
     workspace_servers: Option<Value>,
     agent_installations: Option<Value>,
     cli_states: Option<Value>,
-    tokenomics: Option<Value>,
 }
 
 struct CloudMcpRuntime {
@@ -1353,6 +1361,8 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
              'checkpoint',
              'checkpoint_recorded',
              'subtask_checkpoint',
+             'terminal_todo_plan_updated',
+             'terminal_todo_plan_update',
              'terminal_task_plan_updated',
              'terminal_task_plan_update',
              'submit_patch',
@@ -1570,9 +1580,6 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
             | "todo_queue_state"
             | "workspace_architecture_snapshot"
             | "workspace_architectures_snapshot"
-            | "workspace_architecture_updated"
-            | "workspace_architecture_graph_updated"
-            | "architecture_graph_updated"
     );
     if !is_snapshot {
         return None;
@@ -1642,7 +1649,9 @@ fn cloud_mcp_outbox_idempotency_key(
     let normalized_kind = event_kind.trim().to_ascii_lowercase();
     if matches!(
         normalized_kind.as_str(),
-        "workspace_todo_dispatch_status" | "todo_dispatch_status" | "todo_dispatch_update"
+        "workspace_todo_dispatch_status"
+            | "todo_dispatch_status"
+            | "todo_dispatch_update"
             | "workspace_sync"
             | "workspace_registration"
     ) {
@@ -1931,7 +1940,12 @@ fn cloud_mcp_sync_activity_domain(raw: &str) -> &'static str {
     }
 }
 
-fn cloud_mcp_sync_activity_size_class(state: &str, count: usize, bytes: u64, domain: &str) -> &'static str {
+fn cloud_mcp_sync_activity_size_class(
+    state: &str,
+    count: usize,
+    bytes: u64,
+    domain: &str,
+) -> &'static str {
     let state = state.trim().to_ascii_lowercase();
     if bytes >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_BYTES
         || count >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT
@@ -1973,7 +1987,14 @@ fn cloud_mcp_sync_payload_bytes(payload: &Value) -> u64 {
 fn cloud_mcp_sync_activity_for_endpoint(
     endpoint: &str,
     payload: &Value,
-) -> Option<(&'static str, &'static str, &'static str, usize, u64, &'static str)> {
+) -> Option<(
+    &'static str,
+    &'static str,
+    &'static str,
+    usize,
+    u64,
+    &'static str,
+)> {
     let count = cloud_mcp_sync_payload_count(payload);
     let bytes = cloud_mcp_sync_payload_bytes(payload);
     let (domain, direction, state) = match endpoint {
@@ -2005,9 +2026,7 @@ fn cloud_mcp_sync_activity_for_endpoint(
         "/v1/cloud/repo-catalog" => ("catalog", "down", "applying"),
         "/v1/tools/account" => ("tools", "down", "applying"),
         "/v1/tools/skills" | "/v1/tools/cli-snapshot" => ("tools", "up", "active"),
-        "/v1/cloud/sqlite/hard-reset" | "/v1/cloud/server-reset" => {
-            ("system", "control", "active")
-        }
+        "/v1/cloud/sqlite/hard-reset" | "/v1/cloud/server-reset" => ("system", "control", "active"),
         _ => return None,
     };
     Some((
@@ -2085,7 +2104,8 @@ fn cloud_mcp_fail_sync_activity_key(key: &str) {
             activity.state = "failed".to_string();
             activity.size_class = "large".to_string();
             activity.updated_at_ms = now;
-            activity.expires_at_ms = Some(now.saturating_add(CLOUD_MCP_SYNC_ACTIVITY_FAILED_TTL_MS));
+            activity.expires_at_ms =
+                Some(now.saturating_add(CLOUD_MCP_SYNC_ACTIVITY_FAILED_TTL_MS));
         }
     }
     cloud_mcp_emit_sync_status(None);
@@ -2111,7 +2131,10 @@ fn cloud_mcp_record_asset_transfer_activity(
         asset_id.trim(),
         transfer_id.trim()
     );
-    if matches!(status.as_str(), "completed" | "complete" | "uploaded" | "downloaded") {
+    if matches!(
+        status.as_str(),
+        "completed" | "complete" | "uploaded" | "downloaded"
+    ) {
         let key = format!("assets:{sync_direction}:{source}");
         cloud_mcp_clear_sync_activity_key(&key);
         return;
@@ -2243,7 +2266,10 @@ fn cloud_mcp_push_sync_activity_json(
     if durable {
         aggregate.durable_count = aggregate.durable_count.saturating_add(count);
     }
-    if matches!(state.as_str(), "queued" | "active" | "applying" | "hydrating" | "streaming") {
+    if matches!(
+        state.as_str(),
+        "queued" | "active" | "applying" | "hydrating" | "streaming"
+    ) {
         aggregate.active_count = aggregate.active_count.saturating_add(count);
     }
     if state == "retrying" {
@@ -2350,7 +2376,8 @@ fn cloud_mcp_sync_activity_aggregate() -> CloudMcpSyncActivityAggregate {
         || aggregate.retrying_activity_count > 0
         || aggregate.failed_count > 0
         || stale_backlog
-        || aggregate.up_count.saturating_add(aggregate.down_count) >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT;
+        || aggregate.up_count.saturating_add(aggregate.down_count)
+            >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT;
     aggregate.size_class = if aggregate.syncing { "large" } else { "live" };
     aggregate
 }
@@ -2392,6 +2419,248 @@ fn cloud_mcp_sync_activity_payload(aggregate: &CloudMcpSyncActivityAggregate) ->
     })
 }
 
+fn cloud_mcp_network_recent_frames() -> &'static StdMutex<VecDeque<Value>> {
+    CLOUD_MCP_NETWORK_RECENT_FRAMES
+        .get_or_init(|| StdMutex::new(VecDeque::with_capacity(CLOUD_MCP_NETWORK_RECENT_FRAME_MAX)))
+}
+
+fn cloud_mcp_record_network_frame(
+    direction: &str,
+    kind: &str,
+    state: &str,
+    bytes: u64,
+    metadata: Value,
+) {
+    let now = cloud_mcp_now_ms();
+    let domain = cloud_mcp_network_domain_from_parts(kind, &metadata);
+    let frame = json!({
+        "direction": direction,
+        "domain": domain,
+        "kind": kind,
+        "state": state,
+        "bytes": bytes,
+        "metadata": metadata,
+        "updatedAtMs": now,
+        "updated_at_ms": now,
+    });
+    if let Ok(mut frames) = cloud_mcp_network_recent_frames().lock() {
+        frames.push_front(frame);
+        while frames.len() > CLOUD_MCP_NETWORK_RECENT_FRAME_MAX {
+            frames.pop_back();
+        }
+    }
+}
+
+fn cloud_mcp_network_recent_frame_values(limit: usize) -> Vec<Value> {
+    let limit = limit.clamp(1, CLOUD_MCP_NETWORK_RECENT_FRAME_MAX);
+    cloud_mcp_network_recent_frames()
+        .lock()
+        .map(|frames| frames.iter().take(limit).cloned().collect())
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_network_domain_from_parts(kind: &str, metadata: &Value) -> &'static str {
+    if let Some(raw) = cloud_mcp_payload_text(
+        metadata,
+        &[
+            "eventKind",
+            "event_kind",
+            "requestKind",
+            "request_kind",
+            "kind",
+            "source",
+        ],
+    ) {
+        let domain = cloud_mcp_sync_activity_domain(&raw);
+        if domain != "system" || kind.trim().is_empty() {
+            return domain;
+        }
+    }
+    cloud_mcp_sync_activity_domain(kind)
+}
+
+fn cloud_mcp_store_ws_inbound(kind: &str, bytes: u64, metadata: Value) {
+    let now = cloud_mcp_now_ms();
+    CLOUD_MCP_WS_LAST_INBOUND_MS.store(now, Ordering::Release);
+    cloud_mcp_record_network_frame("down", kind, "received", bytes, metadata);
+}
+
+fn cloud_mcp_store_ws_outbound(kind: &str, bytes: u64, metadata: Value) {
+    let now = cloud_mcp_now_ms();
+    CLOUD_MCP_WS_LAST_OUTBOUND_MS.store(now, Ordering::Release);
+    cloud_mcp_record_network_frame("up", kind, "sent", bytes, metadata);
+}
+
+fn cloud_mcp_network_payload_summary(payload: &Value) -> Value {
+    let Some(object) = payload.as_object() else {
+        return json!({
+            "kind": payload.as_str().unwrap_or_default(),
+            "type": if payload.is_array() { "array" } else { "value" },
+        });
+    };
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "kind",
+        "event_kind",
+        "eventKind",
+        "request_kind",
+        "requestKind",
+        "source",
+        "reason",
+        "workspace_id",
+        "workspaceId",
+        "workspace_name",
+        "workspaceName",
+        "repo_id",
+        "repoId",
+        "id",
+        "cloud_event_id",
+        "cloudEventId",
+        "contract",
+    ] {
+        if let Some(value) = object.get(key) {
+            if value.is_string() || value.is_number() || value.is_boolean() {
+                summary.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let mut array_counts = serde_json::Map::new();
+    for key in [
+        "refs",
+        "items",
+        "todos",
+        "assets",
+        "transfers",
+        "workspaces",
+        "graphs",
+        "architectures",
+        "servers",
+        "tools",
+        "skills",
+        "terminals",
+    ] {
+        if let Some(count) = object.get(key).and_then(Value::as_array).map(Vec::len) {
+            array_counts.insert(key.to_string(), json!(count));
+        }
+    }
+    if !array_counts.is_empty() {
+        summary.insert("arrayCounts".to_string(), Value::Object(array_counts));
+    }
+    summary.insert(
+        "topLevelKeys".to_string(),
+        json!(object.keys().take(18).cloned().collect::<Vec<_>>()),
+    );
+    Value::Object(summary)
+}
+
+fn cloud_mcp_outbox_diagnostic_rows(limit: usize) -> Vec<Value> {
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return Vec::new();
+    };
+    let limit = limit.clamp(1, CLOUD_MCP_NETWORK_DIAGNOSTIC_OUTBOX_LIMIT);
+    let now = cloud_mcp_now_ms();
+    let mut statement = match conn.prepare(&format!(
+        "SELECT outbox_id, idempotency_key, coalesce_key, event_kind, priority,
+                payload_hash, payload_json, status, attempt_count, next_attempt_at_ms,
+                last_error, cloud_event_id, created_at_ms, updated_at_ms, acked_at_ms
+         FROM {CLOUD_MCP_OUTBOX_TABLE}
+         WHERE status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
+         ORDER BY
+           CASE status
+             WHEN 'in_flight' THEN 0
+             WHEN 'retrying' THEN 1
+             WHEN 'queued' THEN 2
+             ELSE 3
+           END,
+           priority ASC,
+           updated_at_ms DESC
+         LIMIT ?1"
+    )) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match statement.query_map(rusqlite::params![limit as i64], |row| {
+        let payload_json: String = row.get(6)?;
+        let status: String = row.get(7)?;
+        let event_kind: String = row.get(3)?;
+        let next_attempt_at_ms = row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0) as u64;
+        let created_at_ms = row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0) as u64;
+        let updated_at_ms = row.get::<_, Option<i64>>(13)?.unwrap_or(0).max(0) as u64;
+        let acked_at_ms = row.get::<_, Option<i64>>(14)?.unwrap_or(0).max(0) as u64;
+        let payload = serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::Null);
+        let payload_summary = cloud_mcp_network_payload_summary(&payload);
+        Ok(json!({
+            "outboxId": row.get::<_, String>(0)?,
+            "outbox_id": row.get::<_, String>(0)?,
+            "idempotencyKey": row.get::<_, String>(1)?,
+            "idempotency_key": row.get::<_, String>(1)?,
+            "coalesceKey": row.get::<_, String>(2)?,
+            "coalesce_key": row.get::<_, String>(2)?,
+            "eventKind": event_kind.clone(),
+            "event_kind": event_kind.clone(),
+            "domain": cloud_mcp_sync_activity_domain(&event_kind),
+            "priority": row.get::<_, i64>(4)?,
+            "payloadHash": row.get::<_, String>(5)?,
+            "payload_hash": row.get::<_, String>(5)?,
+            "payloadBytes": payload_json.len(),
+            "payload_bytes": payload_json.len(),
+            "payloadSummary": payload_summary.clone(),
+            "payload_summary": payload_summary,
+            "status": status.clone(),
+            "state": cloud_mcp_activity_state_from_outbox_status(&status),
+            "attemptCount": row.get::<_, i64>(8)?,
+            "attempt_count": row.get::<_, i64>(8)?,
+            "nextAttemptAtMs": next_attempt_at_ms,
+            "next_attempt_at_ms": next_attempt_at_ms,
+            "dueInMs": next_attempt_at_ms.saturating_sub(now),
+            "due_in_ms": next_attempt_at_ms.saturating_sub(now),
+            "lastError": row.get::<_, String>(10)?,
+            "last_error": row.get::<_, String>(10)?,
+            "cloudEventId": row.get::<_, String>(11)?,
+            "cloud_event_id": row.get::<_, String>(11)?,
+            "createdAtMs": created_at_ms,
+            "created_at_ms": created_at_ms,
+            "updatedAtMs": updated_at_ms,
+            "updated_at_ms": updated_at_ms,
+            "ackedAtMs": acked_at_ms,
+            "acked_at_ms": acked_at_ms,
+            "ageMs": now.saturating_sub(created_at_ms),
+            "age_ms": now.saturating_sub(created_at_ms),
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.flatten().collect()
+}
+
+fn cloud_mcp_network_health_payload(now: u64) -> Value {
+    let last_inbound_ms = CLOUD_MCP_WS_LAST_INBOUND_MS.load(Ordering::Acquire);
+    let last_outbound_ms = CLOUD_MCP_WS_LAST_OUTBOUND_MS.load(Ordering::Acquire);
+    let last_ping_sent_ms = CLOUD_MCP_WS_LAST_PING_SENT_MS.load(Ordering::Acquire);
+    let last_pong_received_ms = CLOUD_MCP_WS_LAST_PONG_RECEIVED_MS.load(Ordering::Acquire);
+    json!({
+        "lastInboundMs": last_inbound_ms,
+        "last_inbound_ms": last_inbound_ms,
+        "lastOutboundMs": last_outbound_ms,
+        "last_outbound_ms": last_outbound_ms,
+        "lastPingSentMs": last_ping_sent_ms,
+        "last_ping_sent_ms": last_ping_sent_ms,
+        "lastPongReceivedMs": last_pong_received_ms,
+        "last_pong_received_ms": last_pong_received_ms,
+        "inboundSilenceMs": if last_inbound_ms > 0 { now.saturating_sub(last_inbound_ms) } else { 0 },
+        "inbound_silence_ms": if last_inbound_ms > 0 { now.saturating_sub(last_inbound_ms) } else { 0 },
+        "pingAgeMs": if last_ping_sent_ms > 0 { now.saturating_sub(last_ping_sent_ms) } else { 0 },
+        "ping_age_ms": if last_ping_sent_ms > 0 { now.saturating_sub(last_ping_sent_ms) } else { 0 },
+        "pongAgeMs": if last_pong_received_ms > 0 { now.saturating_sub(last_pong_received_ms) } else { 0 },
+        "pong_age_ms": if last_pong_received_ms > 0 { now.saturating_sub(last_pong_received_ms) } else { 0 },
+        "keepaliveIntervalMs": CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS.saturating_mul(1_000),
+        "keepalive_interval_ms": CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS.saturating_mul(1_000),
+        "silenceWatchdogMs": CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS.saturating_mul(1_000),
+        "silence_watchdog_ms": CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS.saturating_mul(1_000),
+    })
+}
+
 // Pushes the live sync pill state ("connecting"/"connected"/"blocked" plus
 // outbox depth) to the webview. Deduped + rate limited so per-row outbox acks
 // do not flood the UI; connection or queue-empty transitions always emit.
@@ -2409,15 +2678,11 @@ fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
     let retrying = aggregate.retrying_count;
     let dead_letter = aggregate.dead_letter_count;
     let oldest_pending_ms = aggregate.oldest_pending_ms;
-    let syncing = aggregate.syncing
-        || (syncing_hint.unwrap_or(false) && aggregate.size_class == "large");
+    let syncing =
+        aggregate.syncing || (syncing_hint.unwrap_or(false) && aggregate.size_class == "large");
     let fingerprint = format!(
         "{connection}:{}:{}:{}:{}:{}:{syncing}",
-        aggregate.up_count,
-        aggregate.down_count,
-        retrying,
-        dead_letter,
-        aggregate.size_class
+        aggregate.up_count, aggregate.down_count, retrying, dead_letter, aggregate.size_class
     );
     let now = cloud_mcp_now_ms();
     {
@@ -2669,6 +2934,8 @@ fn cloud_mcp_task_event_kind_removed(event_kind: &str) -> bool {
             | "checkpoint"
             | "checkpoint_recorded"
             | "subtask_checkpoint"
+            | "terminal_todo_plan_updated"
+            | "terminal_todo_plan_update"
             | "terminal_task_plan_updated"
             | "terminal_task_plan_update"
             | "submit_patch"
@@ -2891,19 +3158,19 @@ async fn cloud_mcp_send_event_over_app_ws_once(
         response_rx,
     )
     .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => {
-                state.global_ws_pending.lock().await.remove(&request_id);
-                cloud_mcp_fail_sync_activity_key(&sync_activity_key);
-                return Err("Cloud MCP app websocket event response was cancelled.".to_string());
-            }
-            Err(_) => {
-                state.global_ws_pending.lock().await.remove(&request_id);
-                cloud_mcp_fail_sync_activity_key(&sync_activity_key);
-                return Err("Cloud MCP app websocket event request timed out.".to_string());
-            }
-        };
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            cloud_mcp_fail_sync_activity_key(&sync_activity_key);
+            return Err("Cloud MCP app websocket event response was cancelled.".to_string());
+        }
+        Err(_) => {
+            state.global_ws_pending.lock().await.remove(&request_id);
+            cloud_mcp_fail_sync_activity_key(&sync_activity_key);
+            return Err("Cloud MCP app websocket event request timed out.".to_string());
+        }
+    };
     if response.get("ok").and_then(Value::as_bool) == Some(false)
         || response.get("kind").and_then(Value::as_str) == Some("error")
     {
@@ -3412,14 +3679,14 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     } else {
         "tokenomics_delta"
     };
-    let payload = json!({
-        "source": "rust-diffforge-device-live-tokenomics",
-        "event_kind": "device_live_state_tokenomics",
+    let storage_payload = json!({
+        "source": "rust-diffforge-tokenomics",
+        "event_kind": tokenomics_event_kind,
         "tokenomics_event_kind": tokenomics_event_kind,
         "scope": "account",
-        "billing_scope_type": billing_scope_type,
+        "billing_scope_type": billing_scope_type.clone(),
         "billing_scope_key": tokenomics_scope_key.as_str(),
-        "team_id": team_id,
+        "team_id": team_id.clone(),
         "account_scoped": true,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
@@ -3438,12 +3705,15 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         "hourly_count": hourly_count,
         "ts_ms": cloud_mcp_now_ms(),
     });
-
-    {
-        let mut snapshots = worker_state.runtime_snapshots.lock().await;
-        snapshots.tokenomics = Some(payload.clone());
-    }
-    cloud_mcp_publish_device_live_state_snapshot(&worker_state, &reason_for_worker).await;
+    cloud_mcp_enqueue_background_sync(
+        &worker_state,
+        format!("tokenomics:{tokenomics_scope_key}:{tokenomics_event_kind}"),
+        tokenomics_event_kind,
+        storage_payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        reason_for_worker.clone(),
+    )
+    .await;
 
     if let Some(cursor) = cloud_mcp_tokenomics_cursor_from_summary(&summary) {
         let mut tokenomics_cursor = worker_state.background_sync.tokenomics_cursor.lock().await;
@@ -3451,7 +3721,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     }
 
     log_terminal_status_event(
-        "backend.cloud_mcp.tokenomics_background.device_live_synced",
+        "backend.cloud_mcp.tokenomics_background.synced",
         json!({
             "reason": reason_for_worker,
             "tokenomics_event_kind": tokenomics_event_kind,
@@ -3477,8 +3747,17 @@ async fn tokenomics_publish_display_snapshot(
         team_id.as_deref(),
         "cloud_mcp_display_snapshot",
     );
+    let tokenomics_scope_key = tokenomics_billing_scope_key(
+        tokenomics_scope.scope_type.as_str(),
+        tokenomics_scope.team_id.as_deref(),
+    );
     let summary = tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)?;
     let device_profile = cloud_mcp_desktop_device_profile();
+    let hourly_count = summary
+        .get("hourly")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
     let snapshot_hash = format!(
         "{billing_scope_type}:{}:{}",
         team_id.clone().unwrap_or_default(),
@@ -3497,12 +3776,12 @@ async fn tokenomics_publish_display_snapshot(
             *last = snapshot_hash.clone();
         }
     }
-    let payload = json!({
-        "source": "rust-diffforge-device-live-tokenomics-display",
-        "event_kind": "device_live_state_tokenomics",
+    let storage_payload = json!({
+        "source": "rust-diffforge-tokenomics-display",
+        "event_kind": "tokenomics_device_display_snapshot",
         "tokenomics_event_kind": "tokenomics_device_display_snapshot",
-        "billing_scope_type": billing_scope_type,
-        "team_id": team_id,
+        "billing_scope_type": billing_scope_type.clone(),
+        "team_id": team_id.clone(),
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
@@ -3510,17 +3789,20 @@ async fn tokenomics_publish_display_snapshot(
         "platform": device_profile["platform"].clone(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
-        "summary": summary,
+        "summary": summary.clone(),
         "snapshot_hash": snapshot_hash,
         "ts_ms": cloud_mcp_now_ms(),
     });
-    {
-        let mut snapshots = worker_state.runtime_snapshots.lock().await;
-        snapshots.tokenomics = Some(payload.clone());
-    }
-    cloud_mcp_publish_device_live_state_snapshot(&worker_state, "tokenomics_display_snapshot")
-        .await;
-    Ok(json!({ "ok": true, "queued": true, "event_kind": "device_live_state_snapshot" }))
+    cloud_mcp_enqueue_background_sync(
+        &worker_state,
+        format!("tokenomics:{tokenomics_scope_key}:display"),
+        "tokenomics_device_display_snapshot",
+        storage_payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        "tokenomics_display_snapshot",
+    )
+    .await;
+    Ok(json!({ "ok": true, "queued": true, "event_kind": "tokenomics_device_display_snapshot", "hourly_count": hourly_count }))
 }
 
 fn cloud_mcp_base_url() -> String {
@@ -4466,40 +4748,6 @@ fn cloud_mcp_git_repo_identity_for_path_uncached(path: &Path) -> Value {
     })
 }
 
-fn cloud_mcp_apply_git_identity_to_value(value: &mut Value, identity: &Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object.insert("git_repo_identity".to_string(), identity.clone());
-    object.insert("gitRepoIdentity".to_string(), identity.clone());
-    for (field, aliases) in [
-        ("git_repo_present", &["gitRepoPresent"][..]),
-        ("git_repo_identity_id", &["gitRepoIdentityId"][..]),
-        ("git_repo_identity_kind", &["gitRepoIdentityKind"][..]),
-        ("git_repo_display_name", &["gitRepoDisplayName"][..]),
-        ("git_repo_root", &["gitRepoRoot"][..]),
-        ("git_repo_canonical_remote", &["gitRepoCanonicalRemote"][..]),
-        (
-            "git_repo_canonical_remote_hash",
-            &["gitRepoCanonicalRemoteHash"][..],
-        ),
-        ("git_repo_remote_count", &["gitRepoRemoteCount"][..]),
-        ("git_repo_remotes", &["gitRepoRemotes"][..]),
-        ("git_branch", &["gitBranch"][..]),
-        ("git_head_sha", &["gitHeadSha"][..]),
-    ] {
-        let item = identity
-            .get(field)
-            .or_else(|| aliases.iter().find_map(|alias| identity.get(*alias)))
-            .cloned()
-            .unwrap_or(Value::Null);
-        object.insert(field.to_string(), item.clone());
-        for alias in aliases {
-            object.insert((*alias).to_string(), item.clone());
-        }
-    }
-}
-
 fn cloud_mcp_workspace_location_fingerprint(root: &Path) -> String {
     format!(
         "loc-{}",
@@ -4685,9 +4933,8 @@ fn cloud_mcp_spawn_global_ws(state: &CloudMcpState) {
             .await;
         if let Err(panic) = result {
             let panic_message = cloud_mcp_panic_message(panic.as_ref());
-            let error = format!(
-                "Cloud MCP app websocket loop crashed: {panic_message}. Restarting now."
-            );
+            let error =
+                format!("Cloud MCP app websocket loop crashed: {panic_message}. Restarting now.");
             state.global_ws_started.store(false, Ordering::SeqCst);
             cloud_mcp_mark_global_ws_disconnected(&state, &error).await;
             if !app_shutdown_requested()
@@ -4817,8 +5064,8 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                 }
                 {
                     let mut runtime = state.inner.lock().await;
-                    let route_status =
-                        cloud_mcp_route_error_runtime_status(&error).unwrap_or("websocket_retrying");
+                    let route_status = cloud_mcp_route_error_runtime_status(&error)
+                        .unwrap_or("websocket_retrying");
                     runtime.connected = false;
                     runtime.status = route_status.to_string();
                     runtime.last_error = format!("Cloud MCP direct route unavailable: {error}");
@@ -5186,18 +5433,13 @@ async fn cloud_mcp_open_global_ws(
     let ready_timeout = sleep(Duration::from_secs(CLOUD_MCP_WS_READY_TIMEOUT_SECS));
     tokio::pin!(ready_timeout);
     let mut ready_seen = false;
-    // Deliberate connection health policy: a client ping every 30s keeps the
-    // protocol-level pong flowing, and 90s of total inbound silence (three
-    // missed pongs) proves the socket is dead. This replaces the old
-    // accidental health check where any single request timeout tore the
-    // shared connection down (which caused reconnect storms).
+    // Deliberate connection health policy: client keepalives keep pongs
+    // flowing, and several missed inbound frames prove the socket is dead.
+    // Inbound frames win the biased select before timer checks, so a queued
+    // pong never loses a race with the watchdog.
     let mut last_inbound_at = Instant::now();
-    // 15s ping / 45s silence (was 30s/90s): a half-dead socket parked
-    // inbound remote commands for the whole zombie window — the web-visible
-    // "115 seconds to activate a workspace" failure. Three missed ping/pong
-    // exchanges still have to elapse before declaring death, so transient
-    // hiccups don't cause reconnect storms.
-    let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+    let mut keepalive =
+        tokio::time::interval(Duration::from_secs(CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     CLOUD_MCP_GLOBAL_WS_LIVE.store(true, Ordering::Release);
     let result: Result<(), String> = loop {
@@ -5217,6 +5459,70 @@ async fn cloud_mcp_open_global_ws(
                 CLOUD_MCP_SHUTDOWN_GOODBYE_SENT.store(true, Ordering::Release);
                 break Err("App websocket closed for shutdown goodbye.".to_string());
             }
+            incoming = read.next() => {
+                let Some(incoming) = incoming else {
+                    break Err("Cloud MCP app websocket closed by server.".to_string());
+                };
+                let inbound_frame_seen = incoming.is_ok();
+                if inbound_frame_seen {
+                    last_inbound_at = Instant::now();
+                    CLOUD_MCP_WS_LAST_INBOUND_MS.store(cloud_mcp_now_ms(), Ordering::Release);
+                }
+                match incoming {
+                    Ok(Message::Text(text)) => cloud_mcp_handle_global_ws_message(state, text.as_str()).await,
+                    Ok(Message::Binary(bytes)) => {
+                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                            cloud_mcp_handle_global_ws_message(state, &text).await;
+                        } else {
+                            cloud_mcp_store_ws_inbound(
+                                "binary",
+                                bytes.len() as u64,
+                                json!({ "source": "websocket" }),
+                            );
+                        }
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        cloud_mcp_store_ws_inbound(
+                            "protocol_ping",
+                            payload.len() as u64,
+                            json!({ "source": "server" }),
+                        );
+                        if let Err(error) = write
+                            .send(Message::Pong(payload))
+                            .await
+                        {
+                            break Err(format!("Cloud MCP app websocket pong failed: {error}"));
+                        }
+                        cloud_mcp_store_ws_outbound(
+                            "protocol_pong",
+                            0,
+                            json!({ "source": "protocol_response" }),
+                        );
+                    }
+                    Ok(Message::Pong(payload)) => {
+                        CLOUD_MCP_WS_LAST_PONG_RECEIVED_MS
+                            .store(cloud_mcp_now_ms(), Ordering::Release);
+                        cloud_mcp_store_ws_inbound(
+                            "protocol_pong",
+                            payload.len() as u64,
+                            json!({ "source": "server" }),
+                        );
+                    }
+                    Ok(Message::Close(_)) => break Err("Cloud MCP app websocket closed.".to_string()),
+                    Err(error) => break Err(format!("Cloud MCP app websocket read failed: {error}")),
+                    _ => {}
+                }
+                if !ready_seen {
+                    let runtime = state.inner.lock().await;
+                    ready_seen = runtime.global_ws_connected
+                        && runtime.global_ws_connection_id.is_some()
+                        && runtime.global_ws_message_token.is_some();
+                }
+                if inbound_frame_seen {
+                    last_inbound_at = Instant::now();
+                    CLOUD_MCP_WS_LAST_INBOUND_MS.store(cloud_mcp_now_ms(), Ordering::Release);
+                }
+            }
             _ = &mut ready_timeout, if !ready_seen => {
                 break Err(format!(
                     "Cloud MCP app websocket did not send a ready frame within {} seconds.",
@@ -5224,21 +5530,31 @@ async fn cloud_mcp_open_global_ws(
                 ));
             }
             _ = keepalive.tick() => {
-                if last_inbound_at.elapsed() >= Duration::from_secs(45) {
-                    break Err(
-                        "Cloud MCP app websocket went silent (no frames for 45 seconds)."
-                            .to_string(),
-                    );
+                if last_inbound_at.elapsed() >= Duration::from_secs(CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS) {
+                    break Err(format!(
+                        "Cloud MCP app websocket went silent (no frames for {} seconds).",
+                        CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS
+                    ));
                 }
+                let ping_sent_ms = cloud_mcp_now_ms();
+                CLOUD_MCP_WS_LAST_PING_SENT_MS.store(ping_sent_ms, Ordering::Release);
                 if let Err(error) = write.send(Message::Ping(Default::default())).await {
                     break Err(format!(
                         "Cloud MCP app websocket keepalive ping failed (write failed): {error}"
                     ));
                 }
+                cloud_mcp_store_ws_outbound(
+                    "protocol_ping",
+                    0,
+                    json!({
+                        "id": format!("protocol-ping-{ping_sent_ms}"),
+                        "source": "keepalive",
+                    }),
+                );
                 // Application-level keepalive too: balancer/node websocket
                 // proxies may not forward protocol Ping/Pong frames, which
                 // would make a healthy idle connection look silent and trip
-                // the watchdog every 90s (an endless Connecting loop). The
+                // the watchdog every 45s (an endless Connecting loop). The
                 // server answers kind=ping with a kind=pong Text frame, which
                 // every proxy forwards and which refreshes last_inbound_at.
                 let message_auth = {
@@ -5263,39 +5579,14 @@ async fn cloud_mcp_open_global_ws(
                             "Cloud MCP app websocket keepalive ping failed (write failed): {error}"
                         ));
                     }
-                }
-            }
-            incoming = read.next() => {
-                let Some(incoming) = incoming else {
-                    break Err("Cloud MCP app websocket closed by server.".to_string());
-                };
-                if incoming.is_ok() {
-                    last_inbound_at = Instant::now();
-                }
-                match incoming {
-                    Ok(Message::Text(text)) => cloud_mcp_handle_global_ws_message(state, text.as_str()).await,
-                    Ok(Message::Binary(bytes)) => {
-                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            cloud_mcp_handle_global_ws_message(state, &text).await;
-                        }
-                    }
-                    Ok(Message::Ping(payload)) => {
-                        if let Err(error) = write
-                            .send(Message::Pong(payload))
-                            .await
-                        {
-                            break Err(format!("Cloud MCP app websocket pong failed: {error}"));
-                        }
-                    }
-                    Ok(Message::Close(_)) => break Err("Cloud MCP app websocket closed.".to_string()),
-                    Err(error) => break Err(format!("Cloud MCP app websocket read failed: {error}")),
-                    _ => {}
-                }
-                if !ready_seen {
-                    let runtime = state.inner.lock().await;
-                    ready_seen = runtime.global_ws_connected
-                        && runtime.global_ws_connection_id.is_some()
-                        && runtime.global_ws_message_token.is_some();
+                    cloud_mcp_store_ws_outbound(
+                        "ping",
+                        cloud_mcp_sync_payload_bytes(&envelope),
+                        json!({
+                            "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                            "source": "keepalive",
+                        }),
+                    );
                 }
             }
             outgoing = rx.recv() => {
@@ -5352,6 +5643,16 @@ async fn cloud_mcp_open_global_ws(
                     }
                     break Err(format!("Cloud MCP app websocket write failed: {error}"));
                 }
+                cloud_mcp_store_ws_outbound(
+                    if outgoing_kind.is_empty() { "message" } else { &outgoing_kind },
+                    cloud_mcp_sync_payload_bytes(&outgoing),
+                    json!({
+                        "id": if outgoing_id.is_empty() { Value::Null } else { json!(outgoing_id.clone()) },
+                        "requestKind": outgoing.get("request_kind").or_else(|| outgoing.get("requestKind")).cloned().unwrap_or(Value::Null),
+                        "repoId": outgoing.get("repo_id").or_else(|| outgoing.get("repoId")).cloned().unwrap_or(Value::Null),
+                        "workspaceId": outgoing.get("workspace_id").or_else(|| outgoing.get("workspaceId")).cloned().unwrap_or(Value::Null),
+                    }),
+                );
                 if cloud_mcp_voice_ws_kind(&outgoing_kind) {
                     cloud_mcp_log_voice_shared_ws(
                         "voice_agent.shared_ws.write_finished",
@@ -5538,6 +5839,23 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return;
     };
+    let message_kind = cloud_mcp_payload_text(&message, &["kind", "event_kind", "eventKind"])
+        .unwrap_or_else(|| "message".to_string());
+    cloud_mcp_store_ws_inbound(
+        &message_kind,
+        text.len() as u64,
+        json!({
+            "id": message.get("id").cloned().unwrap_or(Value::Null),
+            "requestKind": message.get("request_kind").or_else(|| message.get("requestKind")).cloned().unwrap_or(Value::Null),
+            "eventKind": message.get("event_kind").or_else(|| message.get("eventKind")).cloned().unwrap_or(Value::Null),
+            "repoId": message.get("repo_id").or_else(|| message.get("repoId")).cloned().unwrap_or(Value::Null),
+            "workspaceId": message.get("workspace_id").or_else(|| message.get("workspaceId")).cloned().unwrap_or(Value::Null),
+        }),
+    );
+    if message_kind == "pong" {
+        CLOUD_MCP_WS_LAST_PONG_RECEIVED_MS.store(cloud_mcp_now_ms(), Ordering::Release);
+        return;
+    }
     if let Some((error_message, details)) = cloud_mcp_registration_blocked_error(&message) {
         cloud_mcp_mark_registration_blocked(state, error_message, details).await;
         return;
@@ -5774,8 +6092,8 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             return;
         }
     }
-    let direct_kind = cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"])
-        .unwrap_or_default();
+    let direct_kind =
+        cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind", "requestKind"]).unwrap_or_default();
     let direct_account_todo_delta = cloud_mcp_is_account_todo_delta_event_kind(&direct_kind)
@@ -6464,11 +6782,7 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if event_kind == "account_device_live_state_snapshot" {
-                if let Err(error) = tokenomics_record_cloud_account_state(&app, &event) {
-                    eprintln!("Unable to cache account device Tokenomics state: {error}");
-                }
                 let _ = app.emit(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, event.clone());
-                let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
                 continue;
             }
             if event_kind == "tokenomics_refresh_requested" {
@@ -6717,12 +7031,12 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
 }
 
 /// Headless architecture sync: while no webview dispatcher is alive, scan the
-/// known workspace roots for `.agents/architectures/graphs/*.arch` changes
-/// (signature over the listed graphs) and push snapshots through the durable
-/// outbox. The webview owns the same detection when it is open.
-pub(crate) fn cloud_mcp_start_architecture_headless_watcher(app: AppHandle, state: CloudMcpState) {
+/// account-global architecture root for graph changes and push an authoritative
+/// snapshot through the durable outbox. The webview owns the same detection
+/// when it is open.
+pub(crate) fn cloud_mcp_start_architecture_headless_watcher(_app: AppHandle, state: CloudMcpState) {
     tauri::async_runtime::spawn(async move {
-        let mut signatures: HashMap<String, String> = HashMap::new();
+        let mut last_signature = String::new();
         loop {
             sleep(Duration::from_secs(60)).await;
             if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
@@ -6731,74 +7045,28 @@ pub(crate) fn cloud_mcp_start_architecture_headless_watcher(app: AppHandle, stat
             if todo_dispatch_webview_dispatcher_active() {
                 continue;
             }
-            // Candidate roots: live registered workspaces first, then the
-            // Rust settings store (covers process restarts straight into
-            // background mode, before any workspace registration).
-            let mut candidates: HashMap<String, (String, String)> = HashMap::new();
-            {
-                let runtime = state.inner.lock().await;
-                for workspace in runtime.registered_workspaces.values() {
-                    if workspace.workspace_id.trim().is_empty() || workspace.root.trim().is_empty()
-                    {
-                        continue;
-                    }
-                    candidates.insert(
-                        workspace.workspace_id.clone(),
-                        (workspace.workspace_name.clone(), workspace.root.clone()),
-                    );
-                }
+            let graphs = tauri::async_runtime::spawn_blocking(move || {
+                cloud_mcp_collect_account_architecture_graphs(Value::Null)
+            })
+            .await
+            .unwrap_or_default();
+            let signature_body = serde_json::to_string(&graphs).unwrap_or_default();
+            let signature = format!("{:x}", Sha256::digest(signature_body.as_bytes()));
+            if last_signature == signature {
+                continue;
             }
-            let settings = app_local_state_read(&app, "workspace-settings");
-            if let Some(entries) = settings.as_object() {
-                for (workspace_id, entry) in entries {
-                    if candidates.contains_key(workspace_id) {
-                        continue;
-                    }
-                    let root = entry
-                        .get("rootDirectory")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .unwrap_or_default();
-                    if workspace_id.trim().is_empty() || root.is_empty() {
-                        continue;
-                    }
-                    candidates.insert(workspace_id.clone(), (String::new(), root.to_string()));
-                }
-            }
-            for (workspace_id, (workspace_name, root)) in candidates {
-                if !Path::new(&root).is_dir() {
-                    continue;
-                }
-                let list_root = root.clone();
-                let Ok(Ok(list)) = tauri::async_runtime::spawn_blocking(move || {
-                    architecture_graphs_list_value(list_root)
-                })
-                .await
-                else {
-                    continue;
-                };
-                let graphs = list.get("graphs").cloned().unwrap_or(Value::Null);
-                let graph_count = graphs.as_array().map(Vec::len).unwrap_or(0);
-                if graph_count == 0 {
-                    continue;
-                }
-                let signature = format!("{:x}", Sha256::digest(graphs.to_string().as_bytes()));
-                if signatures.get(&workspace_id) == Some(&signature) {
-                    continue;
-                }
-                signatures.insert(workspace_id.clone(), signature);
-                let _ = cloud_mcp_sync_workspace_architectures_internal(
-                    &state,
-                    root,
-                    workspace_id,
-                    (!workspace_name.is_empty()).then_some(workspace_name),
-                    graphs,
-                    Some("architecture_headless_watcher".to_string()),
-                    None,
-                    None,
-                )
-                .await;
-            }
+            last_signature = signature;
+            let _ = cloud_mcp_sync_workspace_architectures_internal(
+                &state,
+                String::new(),
+                ARCHITECTURE_GLOBAL_WORKSPACE_ID.to_string(),
+                Some("Global".to_string()),
+                json!(graphs),
+                Some("architecture_headless_watcher".to_string()),
+                None,
+                None,
+            )
+            .await;
         }
     });
 }
@@ -7443,19 +7711,9 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
         let action_for_worker = action.clone();
         let transfer_result = tokio::task::spawn_blocking(move || {
             if action_for_worker == "upload" {
-                cloud_mcp_forward_agent_upload_asset(
-                    None,
-                    None,
-                    base_url.as_deref(),
-                    &input,
-                )
+                cloud_mcp_forward_agent_upload_asset(None, None, base_url.as_deref(), &input)
             } else {
-                cloud_mcp_forward_agent_download_asset(
-                    None,
-                    None,
-                    base_url.as_deref(),
-                    &input,
-                )
+                cloud_mcp_forward_agent_download_asset(None, None, base_url.as_deref(), &input)
             }
         })
         .await
@@ -7883,7 +8141,15 @@ async fn cloud_mcp_report_terminal_output_status(
 }
 
 fn cloud_mcp_is_tokenomics_state_event(event_kind: &str) -> bool {
-    matches!(event_kind, "tokenomics_account_snapshot")
+    matches!(
+        event_kind,
+        "tokenomics_account_snapshot"
+            | "tokenomics_hourly_usage_snapshot"
+            | "tokenomics_delta"
+            | "tokenomics_device_display_snapshot"
+            | "tokenomics_status"
+            | "tokenomics_sync_delta"
+    )
 }
 
 fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, _event: &Value) -> bool {
@@ -7949,11 +8215,7 @@ fn cloud_mcp_event_originated_from_this_device(event: &Value) -> bool {
 fn cloud_mcp_is_workspace_architecture_wake_event(event_kind: &str, _event: &Value) -> bool {
     if matches!(
         event_kind,
-        "workspace_architecture_snapshot"
-            | "workspace_architectures_snapshot"
-            | "workspace_architecture_updated"
-            | "workspace_architecture_graph_updated"
-            | "architecture_graph_updated"
+        "workspace_architecture_snapshot" | "workspace_architectures_snapshot"
     ) {
         return true;
     }
@@ -8260,11 +8522,9 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let terminal_clear_reason = cloud_mcp_payload_text(
-            workspace,
-            &["terminal_clear_reason", "terminalClearReason"],
-        )
-        .unwrap_or_default();
+        let terminal_clear_reason =
+            cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
+                .unwrap_or_default();
         let terminal_list_empty_authoritative = workspace
             .get("terminal_list_empty_authoritative")
             .or_else(|| workspace.get("terminalListEmptyAuthoritative"))
@@ -9014,28 +9274,10 @@ fn cloud_mcp_terminal_list_empty_authoritative(workspace: &Value) -> bool {
         .or_else(|| workspace.get("terminalListEmptyAuthoritative"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let clear_reason = cloud_mcp_payload_text(
-        workspace,
-        &["terminal_clear_reason", "terminalClearReason"],
-    )
-    .unwrap_or_default();
+    let clear_reason =
+        cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
+            .unwrap_or_default();
     explicit_empty && clear_reason == "all_terminals_closed"
-}
-
-fn cloud_mcp_live_state_terminal_key(terminal: &Value, index: usize) -> String {
-    cloud_mcp_payload_text(
-        terminal,
-        &[
-            "terminal_id",
-            "terminalId",
-            "pane_id",
-            "paneId",
-            "target_terminal_id",
-            "targetTerminalId",
-            "id",
-        ],
-    )
-    .unwrap_or_else(|| format!("terminal-{index}"))
 }
 
 fn cloud_mcp_live_state_workspace_key(workspace: &Value, index: usize) -> String {
@@ -9043,32 +9285,259 @@ fn cloud_mcp_live_state_workspace_key(workspace: &Value, index: usize) -> String
         .unwrap_or_else(|| format!("workspace-{index}"))
 }
 
+fn cloud_mcp_compact_insert_value(
+    target: &mut serde_json::Map<String, Value>,
+    key: &str,
+    source: &Value,
+    aliases: &[&str],
+) {
+    if let Some(value) = aliases
+        .iter()
+        .find_map(|alias| source.get(*alias).filter(|value| !value.is_null()))
+    {
+        target.insert(key.to_string(), value.clone());
+    }
+}
+
+fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Value {
+    let mut item = serde_json::Map::new();
+    cloud_mcp_compact_insert_value(
+        &mut item,
+        "terminal_id",
+        terminal,
+        &[
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+            "pane_id",
+            "paneId",
+            "id",
+        ],
+    );
+    for (key, aliases) in [
+        ("pane_id", &["pane_id", "paneId"][..]),
+        (
+            "presence_agent_id",
+            &["presence_agent_id", "presenceAgentId"][..],
+        ),
+        (
+            "agent_kind",
+            &[
+                "agent_kind",
+                "agentKind",
+                "agent_id",
+                "agentId",
+                "role",
+                "provider",
+            ][..],
+        ),
+        ("agent_label", &["agent_label", "agentLabel", "label"][..]),
+        (
+            "terminal_name",
+            &[
+                "terminal_name",
+                "terminalName",
+                "terminal_nickname",
+                "terminalNickname",
+                "display_name",
+                "displayName",
+            ][..],
+        ),
+        ("status", &["status", "state"][..]),
+        ("session_state", &["session_state", "sessionState"][..]),
+        (
+            "activity_status",
+            &["activity_status", "activityStatus"][..],
+        ),
+        ("display_status", &["display_status", "displayStatus"][..]),
+        (
+            "terminal_status",
+            &["terminal_status", "terminalStatus"][..],
+        ),
+        ("command_phase", &["command_phase", "commandPhase"][..]),
+        (
+            "execution_phase",
+            &["execution_phase", "executionPhase"][..],
+        ),
+        (
+            "readiness",
+            &["readiness", "terminal_readiness", "terminalReadiness"][..],
+        ),
+        (
+            "turn_id",
+            &["turn_id", "turnId", "latest_turn_id", "latestTurnId"][..],
+        ),
+        (
+            "turn_status",
+            &[
+                "turn_status",
+                "turnStatus",
+                "latest_turn_status",
+                "latestTurnStatus",
+            ][..],
+        ),
+        (
+            "last_known_runtime",
+            &["last_known_runtime", "lastKnownRuntime"][..],
+        ),
+        (
+            "runtime_read_only",
+            &["runtime_read_only", "runtimeReadOnly"][..],
+        ),
+        ("commandable", &["commandable"][..]),
+        ("connected", &["connected"][..]),
+        (
+            "native_connected",
+            &["native_connected", "nativeConnected"][..],
+        ),
+        ("input_ready", &["input_ready", "inputReady"][..]),
+        (
+            "parked",
+            &["parked", "terminal_parked", "terminalParked"][..],
+        ),
+        ("thread_id", &["thread_id", "threadId"][..]),
+        (
+            "provider_session_id",
+            &[
+                "provider_session_id",
+                "providerSessionId",
+                "session_id",
+                "sessionId",
+            ][..],
+        ),
+        (
+            "session_id",
+            &[
+                "provider_session_id",
+                "providerSessionId",
+                "session_id",
+                "sessionId",
+            ][..],
+        ),
+        (
+            "todo_id",
+            &["todo_id", "todoId", "current_todo_id", "currentTodoId"][..],
+        ),
+        (
+            "todo_dispatch_id",
+            &[
+                "todo_dispatch_id",
+                "todoDispatchId",
+                "dispatch_id",
+                "dispatchId",
+            ][..],
+        ),
+        ("color", &["color", "accent", "accentColor"][..]),
+        (
+            "color_slot",
+            &[
+                "color_slot",
+                "colorSlot",
+                "color_index",
+                "colorIndex",
+                "slot",
+            ][..],
+        ),
+        ("waiting_on", &["waiting_on", "waitingOn"][..]),
+    ] {
+        cloud_mcp_compact_insert_value(&mut item, key, terminal, aliases);
+    }
+    item.entry("terminal_index".to_string()).or_insert_with(|| {
+        terminal
+            .get("terminal_index")
+            .or_else(|| terminal.get("terminalIndex"))
+            .cloned()
+            .unwrap_or_else(|| json!(index))
+    });
+    Value::Object(item)
+}
+
+fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (String, Value) {
+    let workspace_key = cloud_mcp_live_state_workspace_key(workspace, index);
+    let mut item = serde_json::Map::new();
+    item.insert("workspace_id".to_string(), json!(workspace_key.clone()));
+    for (key, aliases) in [
+        (
+            "device_id",
+            &["device_id", "deviceId", "machine_id", "machineId"][..],
+        ),
+        (
+            "workspace_name",
+            &["workspace_name", "workspaceName", "name"][..],
+        ),
+        (
+            "workspace_active",
+            &["workspace_active", "workspaceActive", "active"][..],
+        ),
+        (
+            "workspace_status",
+            &["workspace_status", "workspaceStatus", "status", "state"][..],
+        ),
+        (
+            "workspace_order",
+            &[
+                "workspace_order",
+                "workspaceOrder",
+                "workspace_index",
+                "workspaceIndex",
+                "sort_order",
+                "sortOrder",
+                "order",
+            ][..],
+        ),
+        (
+            "last_known_runtime",
+            &["last_known_runtime", "lastKnownRuntime"][..],
+        ),
+        (
+            "runtime_read_only",
+            &["runtime_read_only", "runtimeReadOnly"][..],
+        ),
+        ("commandable", &["commandable"][..]),
+        ("terminal_count", &["terminal_count", "terminalCount"][..]),
+        (
+            "terminal_list_authoritative",
+            &["terminal_list_authoritative", "terminalListAuthoritative"][..],
+        ),
+        (
+            "terminal_list_empty_authoritative",
+            &[
+                "terminal_list_empty_authoritative",
+                "terminalListEmptyAuthoritative",
+            ][..],
+        ),
+        (
+            "terminal_clear_reason",
+            &["terminal_clear_reason", "terminalClearReason"][..],
+        ),
+        (
+            "last_known_terminal_fallback",
+            &["last_known_terminal_fallback", "lastKnownTerminalFallback"][..],
+        ),
+    ] {
+        cloud_mcp_compact_insert_value(&mut item, key, workspace, aliases);
+    }
+    if workspace.get("terminals").is_some() {
+        let terminals = cloud_mcp_live_state_values(workspace.get("terminals"))
+            .into_iter()
+            .enumerate()
+            .map(|(terminal_index, terminal)| {
+                cloud_mcp_compact_terminal_live_state(&terminal, terminal_index)
+            })
+            .collect::<Vec<_>>();
+        item.entry("terminal_count".to_string())
+            .or_insert_with(|| json!(terminals.len()));
+        item.insert("terminals".to_string(), Value::Array(terminals));
+    }
+    (workspace_key, Value::Object(item))
+}
+
 fn cloud_mcp_live_state_workspace_from_snapshot(
     workspace: &Value,
     index: usize,
 ) -> (String, Value) {
-    let workspace_key = cloud_mcp_live_state_workspace_key(workspace, index);
-    let mut value = workspace.clone();
-    if let Some(object) = value.as_object_mut() {
-        object
-            .entry("workspace_id".to_string())
-            .or_insert_with(|| json!(workspace_key.clone()));
-        match object.get("terminals").cloned() {
-            Some(Value::Array(terminal_items)) => {
-                let mut terminals = serde_json::Map::new();
-                for (terminal_index, terminal) in terminal_items.into_iter().enumerate() {
-                    terminals.insert(
-                        cloud_mcp_live_state_terminal_key(&terminal, terminal_index),
-                        terminal,
-                    );
-                }
-                object.insert("terminals".to_string(), Value::Object(terminals));
-            }
-            Some(Value::Object(_)) => {}
-            _ => {}
-        }
-    }
-    (workspace_key, value)
+    cloud_mcp_compact_workspace_live_state(workspace, index)
 }
 
 fn cloud_mcp_live_contract_deprecated_key(key: &str) -> bool {
@@ -9180,15 +9649,9 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop".to_string());
     let mut workspaces = serde_json::Map::new();
-    let mut coding_agents = Vec::<Value>::new();
-    let mut cli_states = serde_json::Map::new();
     let mut app_context = Value::Null;
-    let mut tokenomics = Value::Null;
     let mut has_app_context = false;
     let mut has_workspace_state = false;
-    let mut has_agent_inventory = false;
-    let mut has_cli_state = false;
-    let mut has_tokenomics = false;
 
     let lifecycle_workspaces = cloud_mcp_lifecycle_workspaces(state).await;
     if !lifecycle_workspaces.is_empty() {
@@ -9230,78 +9693,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
                 cloud_mcp_live_state_merge_object(existing, workspace_value);
             }
         }
-        if let Some(snapshot) = snapshots.workspace_servers.as_ref() {
-            if snapshot.get("workspaces").is_some() {
-                has_workspace_state = true;
-            }
-            for (index, workspace) in snapshot
-                .get("workspaces")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                let (workspace_key, mut workspace_value) =
-                    cloud_mcp_live_state_workspace_from_snapshot(workspace, index);
-                let mut mcps = serde_json::Map::new();
-                for (server_index, server) in workspace
-                    .get("servers")
-                    .or_else(|| workspace.get("mcps"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .enumerate()
-                {
-                    let key = cloud_mcp_payload_text(
-                        server,
-                        &["server_key", "serverKey", "key", "id", "name"],
-                    )
-                    .unwrap_or_else(|| format!("server-{server_index}"));
-                    mcps.insert(key, server.clone());
-                }
-                if let Some(object) = workspace_value.as_object_mut() {
-                    object.insert("mcps".to_string(), Value::Object(mcps));
-                }
-                let existing = workspaces.entry(workspace_key).or_insert_with(|| json!({}));
-                cloud_mcp_live_state_merge_object(existing, workspace_value);
-            }
-        }
-        if let Some(snapshot) = snapshots.agent_installations.as_ref() {
-            has_agent_inventory = true;
-            has_cli_state = true;
-            coding_agents = snapshot
-                .get("coding_agents")
-                .or_else(|| snapshot.get("agents"))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for (index, agent) in coding_agents.iter().enumerate() {
-                let key = cloud_mcp_payload_text(agent, &["id", "agent_id", "agentId"])
-                    .unwrap_or_else(|| format!("agent-{index}"));
-                cli_states.insert(key, agent.clone());
-            }
-        }
-        if let Some(snapshot) = snapshots.cli_states.as_ref() {
-            has_cli_state = true;
-            for (index, cli) in snapshot
-                .get("clis")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                let key = cloud_mcp_payload_text(
-                    cli,
-                    &["id", "cli_id", "cliId", "agent_id", "agentId", "binary", "name"],
-                )
-                .unwrap_or_else(|| format!("cli-{index}"));
-                cli_states.insert(key, cli.clone());
-            }
-        }
-        if let Some(snapshot) = snapshots.tokenomics.as_ref() {
-            has_tokenomics = true;
-            tokenomics = snapshot.clone();
-        }
     }
 
     let mut payload = json!({
@@ -9319,6 +9710,7 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         "client_kind": device_profile["client_kind"].clone(),
         "status": "connected",
         "connected": true,
+        "native_connected": true,
         "snapshot_id": format!("device-live-state-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
         "ts_ms": cloud_mcp_now_ms(),
     });
@@ -9328,15 +9720,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         }
         if has_workspace_state {
             object.insert("workspaces".to_string(), Value::Object(workspaces));
-        }
-        if has_agent_inventory {
-            object.insert("coding_agents".to_string(), Value::Array(coding_agents));
-        }
-        if has_cli_state {
-            object.insert("cli_states".to_string(), Value::Object(cli_states));
-        }
-        if has_tokenomics {
-            object.insert("tokenomics".to_string(), tokenomics);
         }
     }
     cloud_mcp_sanitize_live_contract_in_place(&mut payload);
@@ -10255,6 +10638,8 @@ async fn cloud_mcp_fetch_direct_route_async(
     let region_hint = cloud_mcp_region_hint();
     let body = json!({
         "requestedPath": endpoint_path,
+        "clientId": CLOUD_MCP_RUST_CLIENT_ID,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "billingScopeType": billing_scope_type,
         "scopeType": billing_scope_type,
         "teamId": team_id,
@@ -10271,6 +10656,7 @@ async fn cloud_mcp_fetch_direct_route_async(
         .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
         .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
+        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
         .header("x-diffforge-scope-type", billing_scope_type)
@@ -10358,7 +10744,10 @@ fn cloud_mcp_route_state_is_provisioning(route_state: &str, backend_status: &str
     let backend_status = backend_status.trim().to_ascii_lowercase();
     matches!(
         route_state.as_str(),
-        "assignment_booting" | "dns_propagating" | "route_not_configured" | "route_not_browser_ready"
+        "assignment_booting"
+            | "dns_propagating"
+            | "route_not_configured"
+            | "route_not_browser_ready"
     ) || matches!(
         backend_status.as_str(),
         "booting" | "pending" | "starting" | "provisioning" | "deactivated"
@@ -11144,21 +11533,20 @@ async fn cloud_mcp_post_json_endpoint(
         return Err(error);
     };
 
-    let sync_activity_key =
-        cloud_mcp_sync_activity_for_endpoint(endpoint, payload).map(
-            |(domain, direction, state, count, bytes, size_class)| {
-                cloud_mcp_record_sync_activity(
-                    domain,
-                    direction,
-                    state,
-                    count,
-                    bytes,
-                    false,
-                    size_class,
-                    &format!("endpoint:{endpoint}:{}", uuid::Uuid::new_v4()),
-                )
-            },
-        );
+    let sync_activity_key = cloud_mcp_sync_activity_for_endpoint(endpoint, payload).map(
+        |(domain, direction, state, count, bytes, size_class)| {
+            cloud_mcp_record_sync_activity(
+                domain,
+                direction,
+                state,
+                count,
+                bytes,
+                false,
+                size_class,
+                &format!("endpoint:{endpoint}:{}", uuid::Uuid::new_v4()),
+            )
+        },
+    );
 
     match cloud_mcp_ws_request(state, ws_kind, payload).await {
         Ok(value) => {
@@ -11307,7 +11695,9 @@ async fn cloud_mcp_send_outbox_row_now(
     row: &CloudMcpOutboxRow,
 ) -> Result<Value, String> {
     if cloud_mcp_task_event_kind_removed(&row.event_kind) {
-        return Ok(cloud_mcp_task_event_removed_outbox_response(&row.event_kind));
+        return Ok(cloud_mcp_task_event_removed_outbox_response(
+            &row.event_kind,
+        ));
     }
     let payload = serde_json::from_str::<Value>(&row.payload_json)
         .map_err(|error| format!("Unable to decode Cloud sync outbox payload: {error}"))?;
@@ -11684,19 +12074,11 @@ fn cloud_mcp_payload_items(payload: &Value, keys: &[&str], limit: usize) -> Vec<
 }
 
 fn cloud_mcp_workspace_terminal_items(workspace: &Value) -> Vec<Value> {
-    cloud_mcp_payload_items(
-        workspace,
-        &["terminals"],
-        64,
-    )
+    cloud_mcp_payload_items(workspace, &["terminals"], 64)
 }
 
 fn cloud_mcp_workspace_server_items(workspace: &Value) -> Vec<Value> {
-    let direct = cloud_mcp_payload_items(
-        workspace,
-        &["mcps", "servers"],
-        128,
-    );
+    let direct = cloud_mcp_payload_items(workspace, &["mcps", "servers"], 128);
     if !direct.is_empty() {
         return direct;
     }
@@ -11813,7 +12195,8 @@ async fn cloud_mcp_register_prepared_workspace(
         }
         runtime.last_connected_ms = Some(now_ms);
     }
-    let registration_response = cloud_mcp_ws_send_workspace_registration(state, &workspace_status).await?;
+    let registration_response =
+        cloud_mcp_ws_send_workspace_registration(state, &workspace_status).await?;
     cloud_mcp_publish_device_live_state_snapshot(state, "workspace_registered").await;
     let status = cloud_mcp_status_snapshot(state).await;
     Ok(CloudMcpWorkspaceRegistrationResult {
@@ -12802,8 +13185,9 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         .or_else(|| (!metadata.agent_id.trim().is_empty()).then_some(metadata.agent_id.as_str()))
         .unwrap_or("terminal");
     let thread_id = metadata.thread_id.trim();
-    let terminal_nickname = cloud_mcp_normalize_terminal_nickname(metadata.terminal_nickname.trim())
-        .or_else(|| cloud_mcp_normalize_terminal_nickname(metadata.terminal_name.trim()));
+    let terminal_nickname =
+        cloud_mcp_normalize_terminal_nickname(metadata.terminal_nickname.trim())
+            .or_else(|| cloud_mcp_normalize_terminal_nickname(metadata.terminal_name.trim()));
     let terminal_display_name = terminal_nickname
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -14012,7 +14396,12 @@ async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
         ),
         (
             "provider_session_id",
-            &["provider_session_id", "providerSessionId", "session_id", "sessionId"][..],
+            &[
+                "provider_session_id",
+                "providerSessionId",
+                "session_id",
+                "sessionId",
+            ][..],
         ),
     ] {
         if let Some(value) = cloud_mcp_payload_text(&details, source_keys) {
@@ -14459,6 +14848,105 @@ async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMc
 }
 
 #[tauri::command]
+async fn cloud_mcp_get_network_diagnostics(
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let now = cloud_mcp_now_ms();
+    let status = cloud_mcp_status_snapshot(state.inner()).await;
+    let status_value = serde_json::to_value(&status).unwrap_or_else(|_| json!({}));
+    let sync_activity = status.sync_activity.clone();
+    let activities = sync_activity
+        .get("activities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let recent_frames = cloud_mcp_network_recent_frame_values(CLOUD_MCP_NETWORK_RECENT_FRAME_MAX);
+    let inbound_recent = recent_frames
+        .iter()
+        .filter(|frame| {
+            let direction = frame
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            matches!(direction, "down" | "both" | "control")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let outbound_recent = recent_frames
+        .iter()
+        .filter(|frame| {
+            let direction = frame
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            matches!(direction, "up" | "both" | "control")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let outbox_rows = cloud_mcp_outbox_diagnostic_rows(CLOUD_MCP_NETWORK_DIAGNOSTIC_OUTBOX_LIMIT);
+    Ok(json!({
+        "nowMs": now,
+        "now_ms": now,
+        "status": status_value,
+        "connection": {
+            "connected": status.connected,
+            "status": status.status.clone(),
+            "lastError": status.last_error.clone(),
+            "last_error": status.last_error.clone(),
+            "lastConnectedMs": status.last_connected_ms,
+            "last_connected_ms": status.last_connected_ms,
+            "globalWsConnected": status.global_ws_connected,
+            "global_ws_connected": status.global_ws_connected,
+            "globalWsStatus": status.global_ws_status.clone(),
+            "global_ws_status": status.global_ws_status.clone(),
+            "globalWsLastError": status.global_ws_last_error.clone(),
+            "global_ws_last_error": status.global_ws_last_error.clone(),
+            "globalWsLastConnectedMs": status.global_ws_last_connected_ms,
+            "global_ws_last_connected_ms": status.global_ws_last_connected_ms,
+            "contract": status.connection_contract.clone(),
+        },
+        "health": cloud_mcp_network_health_payload(now),
+        "outbox": {
+            "pendingCount": status.outbox_pending_count,
+            "pending_count": status.outbox_pending_count,
+            "retryingCount": status.outbox_retrying_count,
+            "retrying_count": status.outbox_retrying_count,
+            "deadLetterCount": status.outbox_dead_letter_count,
+            "dead_letter_count": status.outbox_dead_letter_count,
+            "oldestPendingMs": status.outbox_oldest_pending_ms,
+            "oldest_pending_ms": status.outbox_oldest_pending_ms,
+            "rows": outbox_rows,
+        },
+        "inbox": {
+            "activityCount": activities.iter().filter(|activity| {
+                let direction = activity
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                matches!(direction, "down" | "both" | "control")
+            }).count(),
+            "activity_count": activities.iter().filter(|activity| {
+                let direction = activity
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                matches!(direction, "down" | "both" | "control")
+            }).count(),
+            "recent": inbound_recent,
+        },
+        "outbound": {
+            "recent": outbound_recent,
+        },
+        "syncActivity": sync_activity.clone(),
+        "sync_activity": sync_activity,
+        "recentFrames": recent_frames.clone(),
+        "recent_frames": recent_frames,
+        "registeredWorkspaces": status.registered_workspaces.clone(),
+        "registered_workspaces": status.registered_workspaces,
+    }))
+}
+
+#[tauri::command]
 async fn cloud_mcp_get_cached_workspace_todos(
     repo_path: Option<String>,
     workspace_id: Option<String>,
@@ -14552,8 +15040,9 @@ async fn cloud_mcp_workspace_catalog_upsert(
         }
     }
     let local_workspace = Value::Object(workspace.clone());
-    let workspace_id = cloud_mcp_payload_text(&local_workspace, &["workspace_id", "workspaceId", "id"])
-        .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
+    let workspace_id =
+        cloud_mcp_payload_text(&local_workspace, &["workspace_id", "workspaceId", "id"])
+            .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
     if let Some(scope_key) = scope_key
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -15225,11 +15714,9 @@ async fn cloud_mcp_sync_device_live_terminals(
             ],
         )
         .unwrap_or(workspace_index as u64);
-        let terminal_clear_reason = cloud_mcp_payload_text(
-            workspace,
-            &["terminal_clear_reason", "terminalClearReason"],
-        )
-        .unwrap_or_default();
+        let terminal_clear_reason =
+            cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
+                .unwrap_or_default();
         let terminal_list_empty_authoritative = workspace
             .get("terminal_list_empty_authoritative")
             .or_else(|| workspace.get("terminalListEmptyAuthoritative"))
@@ -15697,9 +16184,8 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         if workspace_runtime_shutdown {
             cloud_mcp_mark_terminal_last_known_read_only(&mut terminal_value);
         }
-        let terminal_removes_from_snapshot =
-            !workspace_runtime_shutdown
-                && cloud_mcp_terminal_state_removes_from_live_snapshot(&terminal_value);
+        let terminal_removes_from_snapshot = !workspace_runtime_shutdown
+            && cloud_mcp_terminal_state_removes_from_live_snapshot(&terminal_value);
         let existing_index = terminals.iter().position(|terminal| {
             cloud_mcp_presence_terminal_matches_instance(
                 terminal,
@@ -16128,14 +16614,16 @@ async fn cloud_mcp_sync_terminal_status_event(
         ],
     )
     .unwrap_or_else(|| native_rail_state.replace('_', " "));
-    let display_status = cloud_mcp_payload_text(
-        &terminal,
-        &["display_status", "displayStatus"],
-    )
-    .unwrap_or_else(|| native_rail_label.clone());
+    let display_status = cloud_mcp_payload_text(&terminal, &["display_status", "displayStatus"])
+        .unwrap_or_else(|| native_rail_label.clone());
     let terminal_status = cloud_mcp_payload_text(
         &terminal,
-        &["terminal_status", "terminalStatus", "status_after", "statusAfter"],
+        &[
+            "terminal_status",
+            "terminalStatus",
+            "status_after",
+            "statusAfter",
+        ],
     )
     .unwrap_or_else(|| status.clone());
     let turn_status =
@@ -16508,7 +16996,11 @@ fn cloud_mcp_mark_workspace_inactive_in_snapshot(
     changed
 }
 
-fn cloud_mcp_deactivated_workspace_snapshot(workspace_id: &str, reason: &str, observed_at_ms: u64) -> Value {
+fn cloud_mcp_deactivated_workspace_snapshot(
+    workspace_id: &str,
+    reason: &str,
+    observed_at_ms: u64,
+) -> Value {
     let device_profile = cloud_mcp_desktop_device_profile();
     json!({
         "source": "rust-diffforge-workspace-runtime",
@@ -16803,6 +17295,8 @@ async fn cloud_mcp_sync_tokenomics_state(
     let device_profile = cloud_mcp_desktop_device_profile();
     cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
+    let tokenomics_scope_key =
+        tokenomics_billing_scope_key(billing_scope_type.as_str(), team_id.as_deref());
     let hourly_count = summary
         .get("hourly")
         .and_then(Value::as_array)
@@ -16819,14 +17313,15 @@ async fn cloud_mcp_sync_tokenomics_state(
         "tokenomics_hourly_usage_snapshot"
     };
     let reason_for_ack = clean_reason.clone();
-    let sync_key = "device_live_state_snapshot:tokenomics".to_string();
-    let payload = json!({
-        "source": "rust-diffforge-device-live-tokenomics",
-        "event_kind": "device_live_state_tokenomics",
+    let sync_key = format!("tokenomics:{tokenomics_scope_key}:{tokenomics_event_kind}");
+    let storage_payload = json!({
+        "source": "rust-diffforge-tokenomics",
+        "event_kind": tokenomics_event_kind,
         "tokenomics_event_kind": tokenomics_event_kind,
         "scope": "account",
-        "billing_scope_type": billing_scope_type,
-        "team_id": team_id,
+        "billing_scope_type": billing_scope_type.clone(),
+        "billing_scope_key": tokenomics_scope_key.as_str(),
+        "team_id": team_id.clone(),
         "account_scoped": true,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
@@ -16840,19 +17335,22 @@ async fn cloud_mcp_sync_tokenomics_state(
         "client_kind": device_profile["client_kind"].clone(),
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
-        "reason": clean_reason,
-        "summary": summary,
+        "reason": clean_reason.clone(),
+        "summary": summary.clone(),
         "hourly_count": hourly_count,
         "ts_ms": cloud_mcp_now_ms(),
     });
-
-    {
-        let mut snapshots = state.inner().runtime_snapshots.lock().await;
-        snapshots.tokenomics = Some(payload.clone());
-    }
-    cloud_mcp_publish_device_live_state_snapshot(state.inner(), &reason_for_ack).await;
+    cloud_mcp_enqueue_background_sync(
+        state.inner(),
+        sync_key.clone(),
+        tokenomics_event_kind,
+        storage_payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        reason_for_ack.clone(),
+    )
+    .await;
     Ok(cloud_mcp_background_sync_ack(
-        "device_live_state_snapshot",
+        tokenomics_event_kind,
         &sync_key,
         &reason_for_ack,
         json!({
@@ -17499,25 +17997,24 @@ async fn cloud_mcp_update_voice_plan_steps(
 }
 
 fn cloud_mcp_architecture_payload_base(
-    req: &CloudMcpRepoRequest,
-    workspace_id: &str,
-    workspace_name: Option<&str>,
+    _req: &CloudMcpRepoRequest,
+    _workspace_id: &str,
+    _workspace_name: Option<&str>,
     reason: &str,
 ) -> Value {
     let device_profile = cloud_mcp_desktop_device_profile();
-    let mut payload = json!({
+    json!({
         "source": "rust-diffforge-architecture",
         "reason": reason,
-        "repo_id": req.repo_id,
-        "repoId": req.repo_id,
-        "repo_path": req.root_display,
-        "repoPath": req.root_display,
-        "workspace_root": req.root_display,
-        "workspaceRoot": req.root_display,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
-        "workspace_name": workspace_name.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
+        "scope": "account",
+        "architecture_scope": "global",
+        "architectureScope": "global",
+        "repo_id": ARCHITECTURE_GLOBAL_REPO_ID,
+        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
+        "workspace_id": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        "workspace_name": "Global",
+        "workspaceName": "Global",
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "deviceId": device_profile["device_id"].clone(),
@@ -17526,88 +18023,140 @@ fn cloud_mcp_architecture_payload_base(
         "device_name": device_profile["device_name"].clone(),
         "machine_name": device_profile["machine_name"].clone(),
         "ts_ms": cloud_mcp_now_ms(),
-    });
-    let identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
-    cloud_mcp_apply_git_identity_to_value(&mut payload, &identity);
-    let has_git_identity = identity
-        .get("git_repo_identity_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some();
-    if !has_git_identity {
-        // Non-git folders sync under a name-based identity so the same folder
-        // name converges to the same cloud rows on every device.
-        let folder_identity =
-            architecture_cloud_identity_for_repo_path(Path::new(&req.root_display));
-        if !folder_identity.is_empty() {
-            if let Some(object) = payload.as_object_mut() {
-                object.insert("repo_id".to_string(), json!(folder_identity.clone()));
-                object.insert("repoId".to_string(), json!(folder_identity));
-            }
-        }
-    }
-    payload
+    })
 }
 
-fn cloud_mcp_apply_architecture_scope(
-    payload: &mut Value,
-    scope_repo_id: Option<&str>,
-    scope_git_repo_identity_id: Option<&str>,
+fn cloud_mcp_architecture_graph_id(graph: &Value) -> String {
+    cloud_mcp_payload_text(
+        graph,
+        &[
+            "id",
+            "architecture_id",
+            "architectureId",
+            "graph_id",
+            "graphId",
+        ],
+    )
+    .unwrap_or_default()
+}
+
+fn cloud_mcp_architecture_local_graph_id(graph: &Value) -> String {
+    cloud_mcp_payload_text(graph, &["local_graph_id", "localGraphId"])
+        .unwrap_or_else(|| cloud_mcp_architecture_graph_id(graph))
+}
+
+fn cloud_mcp_architecture_graph_for_global_sync(mut graph: Value) -> Value {
+    let local_graph_id = cloud_mcp_architecture_local_graph_id(&graph);
+    if local_graph_id.is_empty() {
+        return graph;
+    }
+    if let Some(object) = graph.as_object_mut() {
+        object.insert("id".to_string(), json!(local_graph_id.clone()));
+        object.insert("architecture_id".to_string(), json!(local_graph_id.clone()));
+        object.insert("architectureId".to_string(), json!(local_graph_id.clone()));
+        object.insert("graph_id".to_string(), json!(local_graph_id.clone()));
+        object.insert("graphId".to_string(), json!(local_graph_id.clone()));
+        object.insert("cloud_graph_id".to_string(), json!(local_graph_id.clone()));
+        object.insert("cloudGraphId".to_string(), json!(local_graph_id.clone()));
+        object.insert("local_graph_id".to_string(), json!(local_graph_id.clone()));
+        object.insert("localGraphId".to_string(), json!(local_graph_id));
+        object.insert(
+            "architecture_scope_id".to_string(),
+            json!(ARCHITECTURE_GLOBAL_REPO_ID),
+        );
+        object.insert(
+            "architectureScopeId".to_string(),
+            json!(ARCHITECTURE_GLOBAL_REPO_ID),
+        );
+        object.insert("scope_id".to_string(), json!(ARCHITECTURE_GLOBAL_REPO_ID));
+        object.insert("scopeId".to_string(), json!(ARCHITECTURE_GLOBAL_REPO_ID));
+        object.insert("architecture_scope_kind".to_string(), json!("global"));
+        object.insert("architectureScopeKind".to_string(), json!("global"));
+        object.insert("scope_kind".to_string(), json!("global"));
+        object.insert("scopeKind".to_string(), json!("global"));
+        object.insert("architecture_scope_name".to_string(), json!("Global"));
+        object.insert("architectureScopeName".to_string(), json!("Global"));
+        object.insert("scope_name".to_string(), json!("Global"));
+        object.insert("scopeName".to_string(), json!("Global"));
+        object.insert("architecture_account_path".to_string(), json!("global"));
+        object.insert("architectureAccountPath".to_string(), json!("global"));
+        object.insert("account_path".to_string(), json!("global"));
+        object.insert("accountPath".to_string(), json!("global"));
+        object.insert("account_path_parts".to_string(), json!(["Global"]));
+        object.insert("accountPathParts".to_string(), json!(["Global"]));
+    }
+    graph
+}
+
+fn cloud_mcp_architecture_graph_with_source(mut graph: Value) -> Value {
+    let Some(file_path) = cloud_mcp_payload_text(&graph, &["file_path", "filePath"]) else {
+        return graph;
+    };
+    let path = Path::new(&file_path);
+    let Ok(metadata) = fs::metadata(path) else {
+        return graph;
+    };
+    if !metadata.is_file() || metadata.len() > ARCHITECTURE_GRAPH_MAX_BYTES {
+        return graph;
+    }
+    let Ok(source) = fs::read_to_string(path) else {
+        return graph;
+    };
+    let hash = architecture_content_hash(&source);
+    let source_format = if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        "json"
+    } else {
+        "eraserDsl"
+    };
+    if let Some(object) = graph.as_object_mut() {
+        object.insert("source".to_string(), json!(source));
+        object.insert("sourceFormat".to_string(), json!(source_format));
+        object.insert("source_format".to_string(), json!(source_format));
+        object.insert("contentHash".to_string(), json!(hash.clone()));
+        object.insert("content_hash".to_string(), json!(hash.clone()));
+        object.insert("contentRevision".to_string(), json!(hash.clone()));
+        object.insert("content_revision".to_string(), json!(hash));
+    }
+    graph
+}
+
+fn cloud_mcp_push_account_architecture_graph(
+    output: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    graph: Value,
 ) {
-    let Some(scope_repo_id) = scope_repo_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let graph = cloud_mcp_prepare_architecture_graph(cloud_mcp_architecture_graph_for_global_sync(
+        cloud_mcp_architecture_graph_with_source(graph),
+    ));
+    let graph_id = cloud_mcp_architecture_graph_id(&graph);
+    if graph_id.is_empty() || !seen.insert(graph_id) {
         return;
-    };
-    let Some(object) = payload.as_object_mut() else {
-        return;
-    };
-    object.insert("repo_id".to_string(), json!(scope_repo_id));
-    object.insert("repoId".to_string(), json!(scope_repo_id));
-    let scope_git = scope_git_repo_identity_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match scope_git {
-        Some(identity_id) => {
-            object.insert("git_repo_identity_id".to_string(), json!(identity_id));
-            object.insert("gitRepoIdentityId".to_string(), json!(identity_id));
-        }
-        None => {
-            // Scoped payloads (account-global graphs, orphan repo caches) must
-            // not inherit the local directory's git identity: the scope repo id
-            // is the account-stable identity key.
-            for key in [
-                "git_repo_identity",
-                "gitRepoIdentity",
-                "git_repo_present",
-                "gitRepoPresent",
-                "git_repo_identity_id",
-                "gitRepoIdentityId",
-                "git_repo_identity_kind",
-                "gitRepoIdentityKind",
-                "git_repo_display_name",
-                "gitRepoDisplayName",
-                "git_repo_root",
-                "gitRepoRoot",
-                "git_repo_canonical_remote",
-                "gitRepoCanonicalRemote",
-                "git_repo_canonical_remote_hash",
-                "gitRepoCanonicalRemoteHash",
-                "git_repo_remote_count",
-                "gitRepoRemoteCount",
-                "git_repo_remotes",
-                "gitRepoRemotes",
-                "git_branch",
-                "gitBranch",
-                "git_head_sha",
-                "gitHeadSha",
-            ] {
-                object.remove(key);
+    }
+    output.push(graph);
+}
+
+fn cloud_mcp_collect_account_architecture_graphs(fallback_graphs: Value) -> Vec<Value> {
+    let mut graphs = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(global_root) = architecture_global_root_dir() {
+        if let Ok(list) = architecture_graphs_list_value(workspace_path_display(&global_root)) {
+            for graph in cloud_mcp_architecture_graphs_payload(list) {
+                cloud_mcp_push_account_architecture_graph(&mut graphs, &mut seen, graph);
             }
         }
     }
+
+    for graph in cloud_mcp_architecture_graphs_payload(fallback_graphs) {
+        cloud_mcp_push_account_architecture_graph(&mut graphs, &mut seen, graph);
+    }
+
+    graphs
 }
 
 fn cloud_mcp_architecture_graphs_payload(value: Value) -> Vec<Value> {
@@ -17700,8 +18249,17 @@ fn cloud_mcp_architecture_hydrated_graph(mut item: Value) -> Option<Value> {
             "graphId",
         ],
     )?;
+    let local_graph_id =
+        cloud_mcp_payload_text(&item, &["local_graph_id", "localGraphId"])
+            .unwrap_or_else(|| graph_id.clone());
     let object = item.as_object_mut()?;
-    object.insert("id".to_string(), json!(graph_id));
+    object.insert("id".to_string(), json!(local_graph_id.clone()));
+    object.insert("local_graph_id".to_string(), json!(local_graph_id.clone()));
+    object.insert("localGraphId".to_string(), json!(local_graph_id));
+    object.insert("cloud_graph_id".to_string(), json!(graph_id.clone()));
+    object.insert("cloudGraphId".to_string(), json!(graph_id.clone()));
+    object.insert("architecture_id".to_string(), json!(graph_id.clone()));
+    object.insert("architectureId".to_string(), json!(graph_id));
     object.insert("source".to_string(), json!(source));
     object
         .entry("sourceFormat".to_string())
@@ -17724,15 +18282,15 @@ async fn cloud_mcp_get_workspace_architectures(
     let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let mut payload = cloud_mcp_architecture_payload_base(
         &req,
-        workspace_id.as_deref().unwrap_or_default(),
-        workspace_name.as_deref(),
+        ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        Some("Global"),
         "architecture_index_pull",
     );
-    cloud_mcp_apply_architecture_scope(
-        &mut payload,
-        scope_repo_id.as_deref(),
-        scope_git_repo_identity_id.as_deref(),
-    );
+    let _ = (scope_repo_id, scope_git_repo_identity_id);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("architecture_scope".to_string(), json!("global"));
+        object.insert("architectureScope".to_string(), json!("global"));
+    }
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/list", &payload)
             .await?;
@@ -17748,6 +18306,14 @@ async fn cloud_mcp_list_account_architectures(
         "source": "rust-diffforge-architecture",
         "reason": "architecture_account_index_pull",
         "scope": "account",
+        "architecture_scope": "global",
+        "architectureScope": "global",
+        "repo_id": ARCHITECTURE_GLOBAL_REPO_ID,
+        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
+        "workspace_id": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        "workspace_name": "Global",
+        "workspaceName": "Global",
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "deviceId": device_profile["device_id"].clone(),
@@ -17803,28 +18369,20 @@ pub(crate) async fn cloud_mcp_sync_workspace_architectures_internal(
     );
     let mut payload = cloud_mcp_architecture_payload_base(
         &req,
-        &workspace_id,
-        workspace_name.as_deref(),
+        ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        Some("Global"),
         reason.as_deref().unwrap_or("architecture_index_sync"),
     );
-    cloud_mcp_apply_architecture_scope(
-        &mut payload,
-        scope_repo_id.as_deref(),
-        scope_git_repo_identity_id.as_deref(),
-    );
-    let graph_items = cloud_mcp_architecture_graphs_payload(graphs)
-        .into_iter()
-        .map(cloud_mcp_prepare_architecture_graph)
-        .collect::<Vec<_>>();
+    let _ = (scope_repo_id, scope_git_repo_identity_id);
+    let graph_items = cloud_mcp_collect_account_architecture_graphs(graphs);
     if let Some(object) = payload.as_object_mut() {
         object.insert(
             "event_kind".to_string(),
             json!("workspace_architecture_snapshot"),
         );
-        object.insert("graphs".to_string(), json!(graph_items.clone()));
-        object.insert("architectures".to_string(), json!(graph_items));
-        object.insert("content_transport".to_string(), json!("refs"));
-        object.insert("contentTransport".to_string(), json!("refs"));
+        object.insert("graphs".to_string(), json!(graph_items));
+        object.insert("content_transport".to_string(), json!("snapshot"));
+        object.insert("contentTransport".to_string(), json!("snapshot"));
     }
     cloud_mcp_post_event_endpoint(state, "workspace_architecture_snapshot", &payload).await
 }
@@ -17840,36 +18398,17 @@ async fn cloud_mcp_sync_workspace_architecture(
     scope_repo_id: Option<String>,
     scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
+    cloud_mcp_sync_workspace_architectures_internal(
+        state.inner(),
         repo_path,
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let mut payload = cloud_mcp_architecture_payload_base(
-        &req,
-        &workspace_id,
-        workspace_name.as_deref(),
-        reason.as_deref().unwrap_or("architecture_graph_save"),
-    );
-    cloud_mcp_apply_architecture_scope(
-        &mut payload,
-        scope_repo_id.as_deref(),
-        scope_git_repo_identity_id.as_deref(),
-    );
-    let graph = cloud_mcp_prepare_architecture_graph(graph);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "event_kind".to_string(),
-            json!("workspace_architecture_updated"),
-        );
-        object.insert("graph".to_string(), graph.clone());
-        object.insert("graphs".to_string(), json!([graph.clone()]));
-        object.insert("architecture".to_string(), graph.clone());
-        object.insert("architectures".to_string(), json!([graph]));
-        object.insert("content_transport".to_string(), json!("inline"));
-        object.insert("contentTransport".to_string(), json!("inline"));
-    }
-    cloud_mcp_post_event_endpoint(state.inner(), "workspace_architecture_updated", &payload).await
+        workspace_id,
+        workspace_name,
+        json!([graph]),
+        Some(reason.unwrap_or_else(|| "architecture_graph_save".to_string())),
+        scope_repo_id,
+        scope_git_repo_identity_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -17899,15 +18438,11 @@ async fn cloud_mcp_hydrate_workspace_architecture(
     }
     let mut payload = cloud_mcp_architecture_payload_base(
         &req,
-        workspace_id.as_deref().unwrap_or_default(),
-        workspace_name.as_deref(),
+        ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        Some("Global"),
         "architecture_content_hydrate",
     );
-    cloud_mcp_apply_architecture_scope(
-        &mut payload,
-        scope_repo_id.as_deref(),
-        scope_git_repo_identity_id.as_deref(),
-    );
+    let _ = (workspace_id, workspace_name, scope_repo_id, scope_git_repo_identity_id);
     if let Some(object) = payload.as_object_mut() {
         object.insert("refs".to_string(), json!(refs_array));
     }
@@ -17930,7 +18465,10 @@ async fn cloud_mcp_hydrate_workspace_architecture(
             saved_items.push(item);
             continue;
         };
-        let repo_for_write = repo_path.clone();
+        let repo_for_write = tauri::async_runtime::spawn_blocking(architecture_global_root_dir)
+            .await
+            .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
+        let repo_for_write = workspace_path_display(&repo_for_write);
         let saved = tauri::async_runtime::spawn_blocking(move || {
             architecture_graph_write_cloud_arch_blocking(repo_for_write, graph)
         })
@@ -17975,66 +18513,7 @@ async fn cloud_mcp_architecture_hub_catalog(
         "workspaceName": "Global",
     });
 
-    let mut covered_identity_keys = HashSet::<String>::new();
-    covered_identity_keys.insert(ARCHITECTURE_GLOBAL_REPO_ID.to_string());
-    let mut workspace_groups = Vec::new();
-    for workspace in workspaces.as_array().cloned().unwrap_or_default() {
-        let workspace_id =
-            cloud_mcp_payload_text(&workspace, &["workspaceId", "workspace_id", "id"])
-                .unwrap_or_default();
-        let workspace_name =
-            cloud_mcp_payload_text(&workspace, &["workspaceName", "workspace_name", "name"])
-                .unwrap_or_default();
-        let root_directory = cloud_mcp_payload_text(
-            &workspace,
-            &["rootDirectory", "root_directory", "repoPath", "repo_path"],
-        )
-        .unwrap_or_default();
-        if workspace_id.is_empty() || root_directory.is_empty() {
-            continue;
-        }
-        let Ok(root) = resolve_workspace_root_directory(Some(root_directory.as_str())) else {
-            continue;
-        };
-        let topology =
-            terminal_workspace_topology_scan_for_launch(terminal_state.inner(), &root).await;
-        let repositories =
-            architecture_repositories_from_mounts(&root, &topology.mounts).repositories;
-        let mut repo_entries = Vec::new();
-        for repo in repositories {
-            let repo_path = PathBuf::from(&repo.path);
-            let repo_id = cloud_mcp_repo_id_for_root(&repo_path);
-            let identity = cloud_mcp_git_repo_identity_for_path(&repo_path);
-            let git_repo_identity_id =
-                cloud_mcp_payload_text(&identity, &["git_repo_identity_id", "gitRepoIdentityId"])
-                    .unwrap_or_default();
-            covered_identity_keys.insert(repo_id.clone());
-            if !git_repo_identity_id.is_empty() {
-                covered_identity_keys.insert(git_repo_identity_id.clone());
-            }
-            // Non-git workspace folders sync under a name-based identity;
-            // cover it so they do not duplicate as standalone folder entries.
-            let central_identity = architecture_repo_identity_slug(&repo_path);
-            if !central_identity.is_empty() {
-                covered_identity_keys.insert(central_identity);
-            }
-            let mut entry = serde_json::to_value(&repo).unwrap_or_else(|_| json!({}));
-            if let Some(object) = entry.as_object_mut() {
-                object.insert("scopeKind".to_string(), json!("workspace"));
-                object.insert("repoId".to_string(), json!(repo_id));
-                object.insert("gitRepoIdentityId".to_string(), json!(git_repo_identity_id));
-                object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
-                object.insert("workspaceName".to_string(), json!(workspace_name.clone()));
-            }
-            repo_entries.push(entry);
-        }
-        workspace_groups.push(json!({
-            "workspaceId": workspace_id,
-            "workspaceName": workspace_name,
-            "rootDirectory": workspace_path_display(&root),
-            "repositories": repo_entries,
-        }));
-    }
+    let _ = (&terminal_state, &workspaces);
 
     let account_list = {
         let device_profile = cloud_mcp_desktop_device_profile();
@@ -18042,6 +18521,14 @@ async fn cloud_mcp_architecture_hub_catalog(
             "source": "rust-diffforge-architecture",
             "reason": "architecture_hub_catalog",
             "scope": "account",
+            "architecture_scope": "global",
+            "architectureScope": "global",
+            "repo_id": ARCHITECTURE_GLOBAL_REPO_ID,
+            "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
+            "workspace_id": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+            "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+            "workspace_name": "Global",
+            "workspaceName": "Global",
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
             "deviceId": device_profile["device_id"].clone(),
@@ -18055,114 +18542,7 @@ async fn cloud_mcp_architecture_hub_catalog(
     let mut cloud_error = String::new();
     if account_list.is_none() {
         cloud_error =
-            "Cloud architecture index is unavailable; showing local repos only.".to_string();
-    }
-    // Locally known central-store entries (named folders, agent-made folders,
-    // previously synced repos) show up even before any cloud round-trip.
-    let mut extra_entries = BTreeMap::<String, Value>::new();
-    let local_central_entries =
-        tauri::async_runtime::spawn_blocking(architecture_central_store_entries)
-            .await
-            .map_err(|error| format!("Architecture central store worker failed: {error}"))?
-            .unwrap_or_default();
-    for entry in local_central_entries {
-        let identity_key =
-            cloud_mcp_payload_text(&entry, &["identityKey", "repoId"]).unwrap_or_default();
-        if identity_key.is_empty() || covered_identity_keys.contains(&identity_key) {
-            continue;
-        }
-        extra_entries.insert(identity_key, entry);
-    }
-
-    let mut orphan_groups = BTreeMap::<String, Vec<Value>>::new();
-    if let Some(account_list) = &account_list {
-        for row in account_list
-            .get("graphs")
-            .or_else(|| account_list.get("architectures"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-        {
-            let identity_key = cloud_mcp_payload_text(&row, &["identity_key", "identityKey"])
-                .or_else(|| cloud_mcp_payload_text(&row, &["repo_id", "repoId"]))
-                .unwrap_or_default();
-            if identity_key.is_empty() || covered_identity_keys.contains(&identity_key) {
-                continue;
-            }
-            orphan_groups.entry(identity_key).or_default().push(row);
-        }
-    }
-    for (identity_key, rows) in orphan_groups {
-        let first = rows.first().cloned().unwrap_or_else(|| json!({}));
-        let cloud_name = cloud_mcp_payload_text(
-            &first,
-            &[
-                "git_repo_display_name",
-                "gitRepoDisplayName",
-                "workspace_name",
-                "workspaceName",
-            ],
-        )
-        .or_else(|| {
-            cloud_mcp_payload_text(&first, &["workspace_root", "workspaceRoot"]).and_then(|root| {
-                root.replace('\\', "/")
-                    .split('/')
-                    .filter(|part| !part.is_empty())
-                    .next_back()
-                    .map(str::to_string)
-            })
-        });
-        if let Some(existing) = extra_entries.get_mut(&identity_key) {
-            // The folder already exists locally; cloud rows only improve the
-            // display name for entries that had to fall back to their slug.
-            if let Some(object) = existing.as_object_mut() {
-                let is_named_folder = object["scopeKind"].as_str() == Some("folder");
-                if !is_named_folder {
-                    if let Some(name) = cloud_name {
-                        object.insert("name".to_string(), json!(name));
-                    }
-                }
-            }
-            continue;
-        }
-        let orphan_identity = identity_key.clone();
-        let orphan_root = tauri::async_runtime::spawn_blocking(move || {
-            architecture_orphan_root_dir(&orphan_identity)
-        })
-        .await
-        .map_err(|error| format!("Architecture orphan root worker failed: {error}"))??;
-        let is_named_folder = identity_key.starts_with("folder-");
-        let name = if is_named_folder {
-            cloud_name
-                .unwrap_or_else(|| identity_key.trim_start_matches("folder-").replace('-', " "))
-        } else {
-            cloud_name.unwrap_or_else(|| identity_key.clone())
-        };
-        extra_entries.insert(identity_key.clone(), json!({
-            "id": format!("orphan-{identity_key}"),
-            "name": name,
-            "path": workspace_path_display(&orphan_root),
-            "relativePath": ".",
-            "hasGit": false,
-            "architectureRoot": workspace_path_display(&orphan_root.join(".agents").join("architectures")),
-            "graphCount": rows.len(),
-            "scopeKind": if is_named_folder { "folder" } else { "orphan" },
-            "repoId": cloud_mcp_payload_text(&first, &["repo_id", "repoId"]).unwrap_or_else(|| identity_key.clone()),
-            "gitRepoIdentityId": cloud_mcp_payload_text(&first, &["git_repo_identity_id", "gitRepoIdentityId"]).unwrap_or_default(),
-            "identityKey": identity_key,
-            "workspaceId": cloud_mcp_payload_text(&first, &["workspace_id", "workspaceId"]).unwrap_or_default(),
-            "workspaceName": cloud_mcp_payload_text(&first, &["workspace_name", "workspaceName"]).unwrap_or_default(),
-        }));
-    }
-
-    let mut folder_entries = Vec::new();
-    let mut orphan_entries = Vec::new();
-    for (_, entry) in extra_entries {
-        if entry["scopeKind"].as_str() == Some("folder") {
-            folder_entries.push(entry);
-        } else {
-            orphan_entries.push(entry);
-        }
+            "Cloud architecture index is unavailable; showing the local global catalog.".to_string();
     }
 
     Ok(json!({
@@ -18170,9 +18550,9 @@ async fn cloud_mcp_architecture_hub_catalog(
         "version": 1,
         "builtAtMs": built_at_ms,
         "global": global_entry,
-        "workspaces": workspace_groups,
-        "folderRepositories": folder_entries,
-        "orphanRepositories": orphan_entries,
+        "workspaces": [],
+        "folderRepositories": [],
+        "orphanRepositories": [],
         "cloudIndexAvailable": account_list.is_some(),
         "cloudError": cloud_error,
         "globalRepoId": ARCHITECTURE_GLOBAL_REPO_ID,
@@ -18885,30 +19265,30 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
                 let mut stored_row = row.clone();
                 cloud_mcp_strip_asset_workspace_identity(&mut stored_row);
                 rusqlite::params![
-                cloud_mcp_base_url(),
-                cloud_mcp_asset_row_text(row, &["name", "filename", "file_name", "fileName"]),
-                cloud_mcp_asset_row_text(row, &["kind", "asset_kind", "assetKind"]),
-                cloud_mcp_asset_row_text(row, &["mime_type", "mimeType"]),
-                cloud_mcp_asset_row_i64(row, &["size_bytes", "sizeBytes"]),
-                cloud_mcp_asset_row_text(row, &["sha256"]),
-                cloud_mcp_asset_row_text(row, &["blob_id", "blobId"]),
-                cloud_mcp_asset_row_text(row, &["cloud_status", "cloudStatus", "status"]),
-                cloud_mcp_asset_row_text(row, &["local_status", "localStatus"]),
-                cloud_mcp_asset_row_text(row, &["local_path", "localPath", "path"]),
-                cloud_mcp_asset_row_text(row, &["object_key", "objectKey"]),
-                cloud_mcp_asset_row_text(
-                    row,
-                    &[
-                        "origin_device_id",
-                        "originDeviceId",
-                        "device_id",
-                        "deviceId"
-                    ]
-                ),
-                cloud_mcp_asset_row_text(row, &["updated_at", "updatedAt"]),
-                cloud_mcp_now_ms() as i64,
-                stored_row.to_string(),
-                asset_id,
+                    cloud_mcp_base_url(),
+                    cloud_mcp_asset_row_text(row, &["name", "filename", "file_name", "fileName"]),
+                    cloud_mcp_asset_row_text(row, &["kind", "asset_kind", "assetKind"]),
+                    cloud_mcp_asset_row_text(row, &["mime_type", "mimeType"]),
+                    cloud_mcp_asset_row_i64(row, &["size_bytes", "sizeBytes"]),
+                    cloud_mcp_asset_row_text(row, &["sha256"]),
+                    cloud_mcp_asset_row_text(row, &["blob_id", "blobId"]),
+                    cloud_mcp_asset_row_text(row, &["cloud_status", "cloudStatus", "status"]),
+                    cloud_mcp_asset_row_text(row, &["local_status", "localStatus"]),
+                    cloud_mcp_asset_row_text(row, &["local_path", "localPath", "path"]),
+                    cloud_mcp_asset_row_text(row, &["object_key", "objectKey"]),
+                    cloud_mcp_asset_row_text(
+                        row,
+                        &[
+                            "origin_device_id",
+                            "originDeviceId",
+                            "device_id",
+                            "deviceId"
+                        ]
+                    ),
+                    cloud_mcp_asset_row_text(row, &["updated_at", "updatedAt"]),
+                    cloud_mcp_now_ms() as i64,
+                    stored_row.to_string(),
+                    asset_id,
                 ]
             },
         )
@@ -19093,13 +19473,10 @@ async fn cloud_mcp_list_account_assets(
 }
 
 #[tauri::command]
-async fn cloud_mcp_list_asset_clouds(
-    state: State<'_, CloudMcpState>,
-) -> Result<Value, String> {
+async fn cloud_mcp_list_asset_clouds(state: State<'_, CloudMcpState>) -> Result<Value, String> {
     let payload = cloud_mcp_asset_payload_base("asset_clouds_list");
     let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/list", &payload)
-            .await?;
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/list", &payload).await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
 
@@ -19122,8 +19499,7 @@ async fn cloud_mcp_save_asset_cloud(
 ) -> Result<Value, String> {
     let payload = cloud_mcp_asset_cloud_payload("asset_cloud_save", Some(cloud));
     let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/save", &payload)
-            .await?;
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/save", &payload).await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
 
@@ -19139,12 +19515,8 @@ async fn cloud_mcp_validate_asset_cloud(
             "cloudId": cloud_id,
         })),
     );
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/clouds/validate",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/validate", &payload).await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
 
@@ -19160,12 +19532,8 @@ async fn cloud_mcp_set_default_asset_cloud(
             "cloudId": cloud_id,
         })),
     );
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/clouds/default",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/default", &payload).await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
 
@@ -19181,12 +19549,8 @@ async fn cloud_mcp_delete_asset_cloud(
             "cloudId": cloud_id,
         })),
     );
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/clouds/delete",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/clouds/delete", &payload).await?;
     Ok(response.get("data").cloned().unwrap_or(response))
 }
 
@@ -19204,22 +19568,14 @@ async fn cloud_mcp_register_account_asset(
     let req = cloud_mcp_asset_scope_request();
     let row = cloud_mcp_asset_local_row(&req, "", None, Path::new(&path), metadata)?;
     cloud_mcp_asset_store_local_row(&row)?;
-    let payload = cloud_mcp_asset_registration_payload_from_row(
-        "asset_register",
-        &row,
-    );
-    let cloud = match cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/register",
-        &payload,
-    )
-    .await
-    {
-        Ok(response) => {
-            json!({"ok": true, "response": response.get("data").cloned().unwrap_or(response)})
-        }
-        Err(error) => json!({"ok": false, "error": error}),
-    };
+    let payload = cloud_mcp_asset_registration_payload_from_row("asset_register", &row);
+    let cloud =
+        match cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/register", &payload).await {
+            Ok(response) => {
+                json!({"ok": true, "response": response.get("data").cloned().unwrap_or(response)})
+            }
+            Err(error) => json!({"ok": false, "error": error}),
+        };
     if upload.unwrap_or(false) {
         let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
         return cloud_mcp_upload_account_asset(state, asset_id, None).await;
@@ -19241,12 +19597,8 @@ async fn cloud_mcp_upload_account_asset(
 ) -> Result<Value, String> {
     let mut stale_prepare_error = None;
     for attempt in 0..2 {
-        match cloud_mcp_upload_account_asset_once(
-            state.inner(),
-            asset_id.clone(),
-            cloud_id.clone(),
-        )
-        .await
+        match cloud_mcp_upload_account_asset_once(state.inner(), asset_id.clone(), cloud_id.clone())
+            .await
         {
             Ok(result) => return Ok(result),
             Err(error)
@@ -19254,7 +19606,11 @@ async fn cloud_mcp_upload_account_asset(
                     && cloud_mcp_asset_transfer_error_requires_reprepare(&error, "upload") =>
             {
                 stale_prepare_error = Some(error);
-                cloud_mcp_delete_local_asset_transfer_rows(&asset_id, cloud_id.as_deref(), "upload");
+                cloud_mcp_delete_local_asset_transfer_rows(
+                    &asset_id,
+                    cloud_id.as_deref(),
+                    "upload",
+                );
                 continue;
             }
             Err(error) => return Err(error),
@@ -19309,22 +19665,17 @@ async fn cloud_mcp_upload_account_asset_once(
             }
         }
     }
-    let prepared = match cloud_mcp_post_json_endpoint(
-        state,
-        "/v1/assets/prepare-upload",
-        &payload,
-    )
-    .await
-    {
-        Ok(response) => {
-            cloud_mcp_asset_finish_process_reset(attached_process_reset, true);
-            response
-        }
-        Err(error) => {
-            cloud_mcp_asset_finish_process_reset(attached_process_reset, false);
-            return Err(error);
-        }
-    };
+    let prepared =
+        match cloud_mcp_post_json_endpoint(state, "/v1/assets/prepare-upload", &payload).await {
+            Ok(response) => {
+                cloud_mcp_asset_finish_process_reset(attached_process_reset, true);
+                response
+            }
+            Err(error) => {
+                cloud_mcp_asset_finish_process_reset(attached_process_reset, false);
+                return Err(error);
+            }
+        };
     let data = prepared.get("data").cloned().unwrap_or(prepared.clone());
     let upload_required = data
         .get("upload_required")
@@ -19367,10 +19718,7 @@ async fn cloud_mcp_upload_account_asset_once(
         let token = cloud_mcp_authorization_bearer(state).await?;
         attempts.push((
             http_target.url.clone(),
-            cloud_mcp_asset_http_headers(
-                token.as_deref(),
-                http_target.route_token.as_deref(),
-            )?,
+            cloud_mcp_asset_http_headers(token.as_deref(), http_target.route_token.as_deref())?,
         ));
     }
     let transfer_id = cloud_mcp_asset_prepare_transfer_id(&data, "upload")?;
@@ -19482,12 +19830,9 @@ async fn cloud_mcp_upload_account_asset_once(
             object.insert("cloud_id".to_string(), json!(transfer_cloud_id));
             object.insert("cloudId".to_string(), json!(transfer_cloud_id));
         }
-        let completed = cloud_mcp_post_json_endpoint(
-            state,
-            "/v1/assets/complete-upload",
-            &complete_payload,
-        )
-        .await?;
+        let completed =
+            cloud_mcp_post_json_endpoint(state, "/v1/assets/complete-upload", &complete_payload)
+                .await?;
         let completed_data = completed.get("data").cloned().unwrap_or(completed);
         cloud_mcp_update_asset_library_from_response(
             "asset_upload_direct_completed",
@@ -19523,7 +19868,11 @@ async fn cloud_mcp_download_account_asset(
                     && cloud_mcp_asset_transfer_error_requires_reprepare(&error, "download") =>
             {
                 stale_prepare_error = Some(error);
-                cloud_mcp_delete_local_asset_transfer_rows(&asset_id, cloud_id.as_deref(), "download");
+                cloud_mcp_delete_local_asset_transfer_rows(
+                    &asset_id,
+                    cloud_id.as_deref(),
+                    "download",
+                );
                 continue;
             }
             Err(error) => return Err(error),
@@ -19556,12 +19905,8 @@ async fn cloud_mcp_download_account_asset_once(
         }
         payload
     };
-    let prepared = cloud_mcp_post_json_endpoint(
-        state,
-        "/v1/assets/prepare-download",
-        &payload,
-    )
-    .await?;
+    let prepared =
+        cloud_mcp_post_json_endpoint(state, "/v1/assets/prepare-download", &payload).await?;
     let data = prepared.get("data").cloned().unwrap_or(prepared.clone());
     let download_url = cloud_mcp_payload_text(&data, &["download_url", "downloadUrl"])
         .ok_or_else(|| "Cloud did not return an asset download URL.".to_string())?;
@@ -19590,10 +19935,7 @@ async fn cloud_mcp_download_account_asset_once(
         let token = cloud_mcp_authorization_bearer(state).await?;
         attempts.push((
             http_target.url.clone(),
-            cloud_mcp_asset_http_headers(
-                token.as_deref(),
-                http_target.route_token.as_deref(),
-            )?,
+            cloud_mcp_asset_http_headers(token.as_deref(), http_target.route_token.as_deref())?,
         ));
     }
     let transfer_id = cloud_mcp_asset_prepare_transfer_id(&data, "download")?;
@@ -19612,7 +19954,9 @@ async fn cloud_mcp_download_account_asset_once(
     let name = cloud_mcp_sanitize_asset_filename(&raw_name, &format!("{asset_id}.asset"));
     let target_dir = match target_directory.map(PathBuf::from) {
         Some(dir) => dir,
-        None => cloud_mcp_managed_asset_root()?.join("downloads").join(&asset_id),
+        None => cloud_mcp_managed_asset_root()?
+            .join("downloads")
+            .join(&asset_id),
     };
     diffforge_reject_untracked_asset_path_for_tracking(&target_dir, "download a tracked asset")?;
     fs::create_dir_all(&target_dir)
@@ -19735,8 +20079,7 @@ async fn cloud_mcp_delete_cloud_account_asset(
         }
     }
     let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/delete-cloud", &payload)
-            .await?;
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/delete-cloud", &payload).await?;
     let data = response.get("data").cloned().unwrap_or(response);
     cloud_mcp_update_asset_library_from_response(
         "asset_delete_cloud",
@@ -19766,12 +20109,8 @@ async fn cloud_mcp_publish_account_asset(
             object.insert("cloudId".to_string(), json!(cloud_id));
         }
     }
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/publish-public",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/publish-public", &payload).await?;
     let data = response.get("data").cloned().unwrap_or(response);
     cloud_mcp_update_asset_library_from_response(
         "asset_publish_public",
@@ -19794,10 +20133,8 @@ async fn cloud_mcp_delete_local_account_asset(
     // sync metadata stays accurate everywhere. Best-effort: a failure here
     // never blocks the local delete.
     if let Some(row) = row {
-        let payload = cloud_mcp_asset_local_deleted_registration_payload(
-            "asset_local_deleted",
-            &row,
-        );
+        let payload =
+            cloud_mcp_asset_local_deleted_registration_payload("asset_local_deleted", &row);
         let _ = cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/register", &payload).await;
     }
     Ok(result)
@@ -19820,7 +20157,9 @@ async fn cloud_mcp_get_account_asset_status(
         transfer_id.as_deref(),
         CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS,
     )?;
-    Ok(cloud_mcp_asset_library_response_from_rows(assets, transfers, None))
+    Ok(cloud_mcp_asset_library_response_from_rows(
+        assets, transfers, None,
+    ))
 }
 
 #[tauri::command]
@@ -19875,6 +20214,7 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
         Value::Array(items) => json!({ "todos": items }),
         _ => return Err("Workspace todo sync payload must be an object or array.".to_string()),
     };
+    cloud_mcp_strip_workspace_todo_sync_sidecars(&mut payload);
     cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
 
     if let Some(object) = payload.as_object_mut() {
@@ -19913,61 +20253,14 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
         object.insert("pruneMissing".to_string(), json!(false));
         object.insert("ts_ms".to_string(), json!(cloud_mcp_now_ms()));
     }
-    let agent_session_context = cloud_mcp_agent_session_observe_todo_snapshot(
+    let _ = cloud_mcp_agent_session_observe_todo_snapshot(
         &base_url,
         &req.repo_id,
         &workspace_id,
         &workspace_name_value,
         &mut payload,
     );
-    let agent_session_summary_jobs =
-        cloud_mcp_agent_session_summary_jobs_from_context(&agent_session_context);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "agent_session_context".to_string(),
-            agent_session_context.clone(),
-        );
-        object.insert(
-            "agentSessionContext".to_string(),
-            agent_session_context.clone(),
-        );
-        object.insert(
-            "agent_session_summaries".to_string(),
-            json!(agent_session_context["sessions"].clone()),
-        );
-        object.insert(
-            "agentSessionSummaries".to_string(),
-            json!(agent_session_context["sessions"].clone()),
-        );
-        object.insert(
-            "agent_session_summary_jobs".to_string(),
-            json!(agent_session_summary_jobs.clone()),
-        );
-        object.insert(
-            "agentSessionSummaryJobs".to_string(),
-            json!(agent_session_summary_jobs),
-        );
-        object.insert(
-            "agent_session_summary_policy".to_string(),
-            json!({
-                "mode": "todos_with_cloud_llm_compression",
-                "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
-                "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
-                "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
-                "recent_session_limit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
-            }),
-        );
-        object.insert(
-            "agentSessionSummaryPolicy".to_string(),
-            json!({
-                "mode": "todos_with_cloud_llm_compression",
-                "chunkSize": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
-                "summaryItemLimit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
-                "recentRawTodoLimit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
-                "recentSessionLimit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
-            }),
-        );
-    }
+    cloud_mcp_strip_workspace_todo_sync_sidecars(&mut payload);
 
     log_terminal_status_event(
         "backend.workspace_todos.sync_send",
@@ -21007,12 +21300,7 @@ fn cloud_mcp_asset_device_local_available(device: &Value) -> bool {
     }
     let status = cloud_mcp_asset_normalized_status(&cloud_mcp_asset_row_text(
         device,
-        &[
-            "local_status",
-            "localStatus",
-            "status",
-            "availability",
-        ],
+        &["local_status", "localStatus", "status", "availability"],
     ));
     matches!(
         status.as_str(),
@@ -21042,8 +21330,7 @@ fn cloud_mcp_asset_device_is_current(device: &Value, current_device_id: &str) ->
 fn cloud_mcp_asset_remote_copy_available(row: &Value) -> bool {
     let device_profile = cloud_mcp_desktop_device_profile();
     let current_device_id =
-        cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-            .unwrap_or_default();
+        cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]).unwrap_or_default();
     for key in [
         "devices",
         "asset_devices",
@@ -21118,7 +21405,12 @@ fn cloud_mcp_asset_merge_local_overlay_row(remote: &mut Value, local: &Value) {
     if local_path.is_empty() && cloud_mcp_asset_local_unavailable_status(&local_status) {
         let previous_path = cloud_mcp_asset_row_text(
             local,
-            &["local_path_hint", "localPathHint", "last_local_path", "lastLocalPath"],
+            &[
+                "local_path_hint",
+                "localPathHint",
+                "last_local_path",
+                "lastLocalPath",
+            ],
         );
         cloud_mcp_asset_mark_local_unavailable(remote, &previous_path, &local_status);
         return;
@@ -21267,12 +21559,7 @@ fn cloud_mcp_update_asset_library_conn(
         .map_err(|error| format!("Unable to initialize asset cache: {error}"))?;
     conn.execute_batch("SAVEPOINT account_asset_cache_update")
         .map_err(|error| format!("Unable to start asset cache update: {error}"))?;
-    let result = cloud_mcp_update_asset_library_conn_inner(
-        conn,
-        source,
-        base_url,
-        response,
-    );
+    let result = cloud_mcp_update_asset_library_conn_inner(conn, source, base_url, response);
     match result {
         Ok(()) => conn
             .execute_batch("RELEASE SAVEPOINT account_asset_cache_update")
@@ -21444,8 +21731,7 @@ fn cloud_mcp_update_asset_library_conn_inner(
         }
     }
     if authoritative_full_snapshot {
-        let sql =
-            "SELECT asset_id, local_path, row_json FROM account_asset_items WHERE 1=1";
+        let sql = "SELECT asset_id, local_path, row_json FROM account_asset_items WHERE 1=1";
         let mut stmt = conn
             .prepare(sql)
             .map_err(|error| format!("Unable to prepare stale asset reconciliation: {error}"))?;
@@ -21533,8 +21819,9 @@ fn cloud_mcp_asset_library_rows_from_conn(
 ) -> Result<Vec<Value>, String> {
     cloud_mcp_asset_library_init_conn(conn)
         .map_err(|error| format!("Unable to initialize asset library cache: {error}"))?;
-    let mut sql = "SELECT row_json, local_path, local_status, asset_id FROM account_asset_items WHERE 1=1"
-        .to_string();
+    let mut sql =
+        "SELECT row_json, local_path, local_status, asset_id FROM account_asset_items WHERE 1=1"
+            .to_string();
     sql.push_str(" ORDER BY updated_at DESC, mirror_updated_at_ms DESC LIMIT ?");
     let limit = limit.clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS) as i64;
     let mut stmt = conn
@@ -21672,8 +21959,7 @@ fn cloud_mcp_asset_library_response_from_rows(
     let current_device_id =
         cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]).unwrap_or_default();
     let current_device_name =
-        cloud_mcp_payload_text(&device_profile, &["device_name", "deviceName"])
-            .unwrap_or_default();
+        cloud_mcp_payload_text(&device_profile, &["device_name", "deviceName"]).unwrap_or_default();
     json!({
         "kind": "account_assets",
         "version": 1,
@@ -21707,15 +21993,16 @@ fn cloud_mcp_asset_library_attach_current_device(library: &mut Value) {
     };
     let device_profile = cloud_mcp_desktop_device_profile();
     let current_device_id =
-        cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-            .unwrap_or_default();
+        cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]).unwrap_or_default();
     let current_device_name =
-        cloud_mcp_payload_text(&device_profile, &["device_name", "deviceName"])
-            .unwrap_or_default();
+        cloud_mcp_payload_text(&device_profile, &["device_name", "deviceName"]).unwrap_or_default();
     object.insert("device".to_string(), device_profile);
     object.insert("current_device_id".to_string(), json!(current_device_id));
     object.insert("currentDeviceId".to_string(), json!(current_device_id));
-    object.insert("current_device_name".to_string(), json!(current_device_name));
+    object.insert(
+        "current_device_name".to_string(),
+        json!(current_device_name),
+    );
     object.insert("currentDeviceName".to_string(), json!(current_device_name));
 }
 
@@ -21861,7 +22148,12 @@ fn cloud_mcp_workspace_todo_content(todo: &Value) -> String {
 fn cloud_mcp_workspace_todo_revision(todo: &Value) -> String {
     if let Some(revision) = cloud_mcp_payload_text(
         todo,
-        &["sync_revision", "syncRevision", "todo_revision", "todoRevision"],
+        &[
+            "sync_revision",
+            "syncRevision",
+            "todo_revision",
+            "todoRevision",
+        ],
     ) {
         return revision;
     }
@@ -22278,10 +22570,7 @@ fn cloud_mcp_account_todo_seq_i64(seq: u64) -> i64 {
     i64::try_from(seq).unwrap_or(i64::MAX)
 }
 
-fn cloud_mcp_account_todo_scope_key_from_parts(
-    scope_type: &str,
-    team_id: Option<&str>,
-) -> String {
+fn cloud_mcp_account_todo_scope_key_from_parts(scope_type: &str, team_id: Option<&str>) -> String {
     let scope_type = scope_type.trim().to_ascii_lowercase();
     if scope_type == "team" {
         let team_id = team_id.unwrap_or_default().trim();
@@ -22519,7 +22808,9 @@ fn cloud_mcp_account_todo_sync_states_from_conn(
         })
         .map_err(|error| format!("Unable to query account todo sync states: {error}"))?;
     for row in rows {
-        states.push(row.map_err(|error| format!("Unable to decode account todo sync state: {error}"))?);
+        states.push(
+            row.map_err(|error| format!("Unable to decode account todo sync state: {error}"))?,
+        );
     }
     Ok(states)
 }
@@ -22692,9 +22983,7 @@ fn cloud_mcp_account_todo_entry_source(entry: &Value) -> Option<Value> {
                     .or_else(|| payload.get("item"))
                     .filter(|value| value.is_object())
                     .cloned()
-                    .or_else(|| {
-                        cloud_mcp_workspace_todo_id(payload).map(|_| payload.clone())
-                    })
+                    .or_else(|| cloud_mcp_workspace_todo_id(payload).map(|_| payload.clone()))
             })
         })
         .or_else(|| {
@@ -22704,9 +22993,7 @@ fn cloud_mcp_account_todo_entry_source(entry: &Value) -> Option<Value> {
                     .or_else(|| payload.get("item"))
                     .filter(|value| value.is_object())
                     .cloned()
-                    .or_else(|| {
-                        cloud_mcp_workspace_todo_id(payload).map(|_| payload.clone())
-                    })
+                    .or_else(|| cloud_mcp_workspace_todo_id(payload).map(|_| payload.clone()))
             })
         })
         .or_else(|| cloud_mcp_workspace_todo_id(entry).map(|_| entry.clone()))
@@ -22829,7 +23116,9 @@ fn cloud_mcp_account_todo_delta_entries(value: &Value, event_kind: &str) -> Vec<
                                 .or_insert_with(|| json!("deleted"));
                         }
                         entry
-                    } else if let Some(todo_id) = item.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+                    } else if let Some(todo_id) =
+                        item.as_str().map(str::trim).filter(|id| !id.is_empty())
+                    {
                         json!({
                             "event_kind": "workspace_todo_deleted",
                             "todo_id": todo_id,
@@ -22908,7 +23197,12 @@ fn cloud_mcp_normalize_account_todo_entry(
         event,
         entry,
         todo,
-        &["account_id", "accountId", "todo_account_id", "todoAccountId"],
+        &[
+            "account_id",
+            "accountId",
+            "todo_account_id",
+            "todoAccountId",
+        ],
     )
     .unwrap_or_default();
     let status = if deleted {
@@ -22947,9 +23241,18 @@ fn cloud_mcp_normalize_account_todo_entry(
     normalized.insert("id".to_string(), json!(todo_id.clone()));
     normalized.insert("todo_id".to_string(), json!(todo_id.clone()));
     normalized.insert("todoId".to_string(), json!(todo_id.clone()));
-    normalized.insert("source_device_id".to_string(), json!(source_device_id.clone()));
-    normalized.insert("sourceDeviceId".to_string(), json!(source_device_id.clone()));
-    normalized.insert("todo_device_id".to_string(), json!(source_device_id.clone()));
+    normalized.insert(
+        "source_device_id".to_string(),
+        json!(source_device_id.clone()),
+    );
+    normalized.insert(
+        "sourceDeviceId".to_string(),
+        json!(source_device_id.clone()),
+    );
+    normalized.insert(
+        "todo_device_id".to_string(),
+        json!(source_device_id.clone()),
+    );
     normalized.insert("todoDeviceId".to_string(), json!(source_device_id.clone()));
     normalized.insert("device_id".to_string(), json!(source_device_id.clone()));
     normalized.insert("deviceId".to_string(), json!(source_device_id.clone()));
@@ -22969,8 +23272,14 @@ fn cloud_mcp_normalize_account_todo_entry(
         "todoWorkspaceId".to_string(),
         json!(source_workspace_id.clone()),
     );
-    normalized.insert("workspace_id".to_string(), json!(source_workspace_id.clone()));
-    normalized.insert("workspaceId".to_string(), json!(source_workspace_id.clone()));
+    normalized.insert(
+        "workspace_id".to_string(),
+        json!(source_workspace_id.clone()),
+    );
+    normalized.insert(
+        "workspaceId".to_string(),
+        json!(source_workspace_id.clone()),
+    );
     normalized.insert("status".to_string(), json!(status.clone()));
     normalized.insert("todo_status".to_string(), json!(status.clone()));
     normalized.insert("todoStatus".to_string(), json!(status.clone()));
@@ -23127,7 +23436,8 @@ fn cloud_mcp_apply_account_todo_delta_conn(
             event_seq,
             cursor,
             deleted,
-        )) = cloud_mcp_normalize_account_todo_entry(event, &entry, &event_kind) else {
+        )) = cloud_mcp_normalize_account_todo_entry(event, &entry, &event_kind)
+        else {
             result.ignored += 1;
             continue;
         };
@@ -23143,7 +23453,12 @@ fn cloud_mcp_apply_account_todo_delta_conn(
         }
         let account_id = cloud_mcp_payload_text(
             &normalized,
-            &["account_id", "accountId", "todo_account_id", "todoAccountId"],
+            &[
+                "account_id",
+                "accountId",
+                "todo_account_id",
+                "todoAccountId",
+            ],
         )
         .unwrap_or_else(|| event_account_id.clone());
         if result.account_id.is_empty() && !account_id.trim().is_empty() {
@@ -24664,12 +24979,17 @@ async fn cloud_mcp_enqueue_agent_session_observed(
 ) {
     let workspace_id = cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
         .unwrap_or_else(|| "workspace".to_string());
-    let session_key =
-        cloud_mcp_payload_text(
-            &payload,
-            &["provider_session_id", "providerSessionId", "session_id", "sessionId", "key"],
-        )
-            .unwrap_or_else(|| "session".to_string());
+    let session_key = cloud_mcp_payload_text(
+        &payload,
+        &[
+            "provider_session_id",
+            "providerSessionId",
+            "session_id",
+            "sessionId",
+            "key",
+        ],
+    )
+    .unwrap_or_else(|| "session".to_string());
     let sync_key = format!("agent_session:{workspace_id}:{session_key}");
     cloud_mcp_enqueue_background_sync(
         state,
@@ -28174,6 +28494,30 @@ fn cloud_mcp_limit_workspace_todo_sync_payload(value: &mut Value) {
     }
 }
 
+fn cloud_mcp_strip_workspace_todo_sync_sidecars(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                cloud_mcp_strip_workspace_todo_sync_sidecars(item);
+            }
+        }
+        Value::Object(object) => {
+            object.remove("agent_session_context");
+            object.remove("agentSessionContext");
+            object.remove("agent_session_summaries");
+            object.remove("agentSessionSummaries");
+            object.remove("agent_session_summary_jobs");
+            object.remove("agentSessionSummaryJobs");
+            object.remove("agent_session_summary_policy");
+            object.remove("agentSessionSummaryPolicy");
+            for child in object.values_mut() {
+                cloud_mcp_strip_workspace_todo_sync_sidecars(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn cloud_mcp_limit_workspace_todos_by_session(items: &mut Vec<Value>, workspace_fallback: &str) {
     if items.len() <= CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS {
         return;
@@ -28583,6 +28927,50 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn workspace_todo_sync_scrubs_agent_session_sidecars() {
+        let mut payload = json!({
+            "agent_session_context": {"sessions": [{"id": "session-a"}]},
+            "agentSessionSummaries": [{"id": "session-a"}],
+            "todos": [
+                {
+                    "id": "todo-a",
+                    "text": "Do the thing",
+                    "agent_session_summary_jobs": [{"kind": "job"}],
+                    "nested": {
+                        "agentSessionSummaryPolicy": {"mode": "todos_with_cloud_llm_compression"}
+                    }
+                }
+            ],
+            "payload": {
+                "agentSessionContext": {"sessions": [{"id": "session-b"}]},
+                "agent_session_summary_policy": {"mode": "todos_with_cloud_llm_compression"}
+            }
+        });
+
+        cloud_mcp_strip_workspace_todo_sync_sidecars(&mut payload);
+
+        assert!(payload.get("agent_session_context").is_none());
+        assert!(payload.get("agentSessionSummaries").is_none());
+        assert!(
+            payload["todos"][0]
+                .get("agent_session_summary_jobs")
+                .is_none()
+        );
+        assert!(
+            payload["todos"][0]["nested"]
+                .get("agentSessionSummaryPolicy")
+                .is_none()
+        );
+        assert!(payload["payload"].get("agentSessionContext").is_none());
+        assert!(
+            payload["payload"]
+                .get("agent_session_summary_policy")
+                .is_none()
+        );
+        assert_eq!(payload["todos"][0]["text"].as_str(), Some("Do the thing"));
+    }
+
+    #[test]
     fn agent_session_backfills_todo_provider_session_from_terminal_lifecycle() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
@@ -28837,10 +29225,7 @@ mod cloud_mcp_tests {
 
         assert!(local_path_buf.starts_with(expected_asset_root));
         assert_eq!(fs::read(&local_path_buf).unwrap(), b"fake png payload");
-        assert_eq!(
-            promoted["asset"]["assetScope"].as_str(),
-            Some("account")
-        );
+        assert_eq!(promoted["asset"]["assetScope"].as_str(), Some("account"));
         assert!(promoted["asset"]["workspaceId"].is_null());
         assert!(promoted["asset"]["repoId"].is_null());
         assert_eq!(promoted["asset"]["sourceKind"].as_str(), Some("imagegen"));
@@ -29009,7 +29394,10 @@ mod cloud_mcp_tests {
             deleted["asset"]["local_status"].as_str(),
             Some("local_deleted")
         );
-        assert_eq!(deleted["asset"]["cloud_status"].as_str(), Some("cloud_available"));
+        assert_eq!(
+            deleted["asset"]["cloud_status"].as_str(),
+            Some("cloud_available")
+        );
         assert!(deleted["asset"].get("repo_id").is_none());
         assert!(deleted["asset"].get("repoId").is_none());
         assert!(deleted["asset"].get("workspace_id").is_none());
@@ -30254,6 +30642,26 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn removed_coordination_event_kinds_stay_out_of_cloud_outbox() {
+        for event_kind in [
+            "agent_started_work",
+            "checkpoint_recorded",
+            "terminal_todo_plan_updated",
+            "submit_patch",
+            "task_completed",
+            "isolated_work_pruned",
+        ] {
+            assert!(
+                cloud_mcp_task_event_kind_removed(event_kind),
+                "{event_kind} should be blocked from /v1/events"
+            );
+        }
+
+        assert!(!cloud_mcp_task_event_kind_removed("workspace_todo_upserted"));
+        assert!(!cloud_mcp_task_event_kind_removed("workspace_todo_deleted"));
+    }
+
+    #[test]
     fn cloud_workspace_bundle_prepares_container_manifest_and_child_projects() {
         let root = test_cloud_root("diffforge-cloud-container-bundle");
         create_cloud_package_project(&root.join("frontend"));
@@ -30639,10 +31047,7 @@ pub(crate) fn cloud_mcp_forward_agent_list_assets(
     Ok(cloud_mcp_filter_asset_library_for_agent(input, library))
 }
 
-fn cloud_mcp_filter_asset_library_for_agent(
-    input: &Value,
-    library: Value,
-) -> Value {
+fn cloud_mcp_filter_asset_library_for_agent(input: &Value, library: Value) -> Value {
     let asset_ids =
         cloud_mcp_todo_mirror_text_values(input, &["asset_id", "assetId", "asset_ids", "assetIds"]);
     let transfer_ids = cloud_mcp_todo_mirror_text_values(
@@ -30831,10 +31236,7 @@ pub(crate) fn cloud_mcp_forward_agent_get_asset_root(
     }))
 }
 
-fn cloud_mcp_asset_registration_payload_from_row(
-    reason: &str,
-    row: &Value,
-) -> Value {
+fn cloud_mcp_asset_registration_payload_from_row(reason: &str, row: &Value) -> Value {
     let mut payload = cloud_mcp_asset_payload_base(reason);
     if let Some(object) = payload.as_object_mut() {
         for key in [
@@ -30903,8 +31305,8 @@ fn cloud_mcp_report_asset_local_deleted_blocking(
         "/v1/assets/register",
         &payload.to_string(),
     )?;
-    let parsed =
-        serde_json::from_str::<Value>(&response).unwrap_or_else(|_| json!({"raw_response": response}));
+    let parsed = serde_json::from_str::<Value>(&response)
+        .unwrap_or_else(|_| json!({"raw_response": response}));
     Ok(parsed.get("data").cloned().unwrap_or(parsed))
 }
 
@@ -31107,13 +31509,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
         .filter(|value| !value.is_empty())
         .map(|value| value.trim_end_matches('/').to_string())
         .unwrap_or_else(cloud_mcp_base_url);
-    let row = cloud_mcp_asset_local_row_with_input(
-        &req,
-        "",
-        None,
-        Path::new(&path),
-        &input,
-    )?;
+    let row = cloud_mcp_asset_local_row_with_input(&req, "", None, Path::new(&path), &input)?;
     cloud_mcp_asset_store_local_row(&row)?;
     let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
     let local_path = cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"])
@@ -31181,10 +31577,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
             let token = cloud_mcp_process_authorization_bearer();
             attempts.push((
                 http_target.url.clone(),
-                cloud_mcp_asset_http_headers(
-                    token.as_deref(),
-                    http_target.route_token.as_deref(),
-                )?,
+                cloud_mcp_asset_http_headers(token.as_deref(), http_target.route_token.as_deref())?,
             ));
         }
         let transfer_id = cloud_mcp_asset_prepare_transfer_id(&prepare, "upload")?;
@@ -31413,10 +31806,7 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
         let token = cloud_mcp_process_authorization_bearer();
         attempts.push((
             http_target.url.clone(),
-            cloud_mcp_asset_http_headers(
-                token.as_deref(),
-                http_target.route_token.as_deref(),
-            )?,
+            cloud_mcp_asset_http_headers(token.as_deref(), http_target.route_token.as_deref())?,
         ));
     }
     let transfer_id = cloud_mcp_asset_prepare_transfer_id(&prepare, "download")?;
@@ -31757,7 +32147,11 @@ fn cloud_mcp_asset_transfer_error_requires_reprepare(error: &str, direction: &st
         || lower.contains("prepared transfer")
 }
 
-fn cloud_mcp_delete_local_asset_transfer_rows(asset_id: &str, cloud_id: Option<&str>, direction: &str) {
+fn cloud_mcp_delete_local_asset_transfer_rows(
+    asset_id: &str,
+    cloud_id: Option<&str>,
+    direction: &str,
+) {
     let asset_id = asset_id.trim();
     if asset_id.is_empty() {
         return;
@@ -32705,10 +33099,7 @@ fn cloud_mcp_task_cloud_sync_disabled() -> bool {
     true
 }
 
-fn cloud_mcp_task_cloud_sync_disabled_response(
-    operation: &str,
-    task_id: Option<&str>,
-) -> Value {
+fn cloud_mcp_task_cloud_sync_disabled_response(operation: &str, task_id: Option<&str>) -> Value {
     json!({
         "ok": true,
         "queued": false,
@@ -32868,19 +33259,20 @@ pub(crate) fn cloud_mcp_forward_terminal_todo_plan_update(
     update_reason: &str,
     terminal_todo_plan: &Value,
 ) -> Result<Value, String> {
-    let active_task_id = local_task_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "terminal todo plan sync requires an active task_id.".to_string())?;
     if terminal_todo_plan.is_null() {
         return Err("terminal todo plan sync requires a compact terminal_todo_plan.".to_string());
     }
+    let active_task_id = local_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if cloud_mcp_task_cloud_sync_disabled() {
         return Ok(cloud_mcp_task_cloud_sync_disabled_response(
             "terminal_todo_plan_update",
-            Some(active_task_id),
+            active_task_id,
         ));
     }
+    let active_task_id = active_task_id
+        .ok_or_else(|| "terminal todo plan sync requires an active task_id.".to_string())?;
     let repo_path_text = repo_path
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -34685,6 +35077,8 @@ fn cloud_mcp_fetch_direct_route_blocking(
     let region_hint = cloud_mcp_region_hint();
     let body = json!({
         "requestedPath": endpoint_path,
+        "clientId": CLOUD_MCP_RUST_CLIENT_ID,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "billingScopeType": billing_scope_type,
         "scopeType": billing_scope_type,
         "teamId": team_id,
@@ -34701,6 +35095,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
         .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
+        .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
         .header("x-diffforge-scope-type", billing_scope_type)

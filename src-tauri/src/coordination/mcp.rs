@@ -4788,8 +4788,8 @@ fn run_submit_patch_job_worker(
     let _ = kernel.set_submit_job_phase(
         &submit_job_id,
         "running",
-        "cloud_syncing",
-        Some("Local patch submission completed; syncing advisory cloud context."),
+        "finalizing",
+        Some("Local patch submission completed; finalizing local coordination state."),
     );
     let task_after = kernel
         .query_json(
@@ -5144,8 +5144,8 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion. Cloud task/history sync is disabled; use todos for shared work state.".to_string(),
-        "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path, plus globalArchitecturesRoot/globalGraphsRoot for account-global graphs that sync across devices. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly (or write into globalGraphsRoot for account-wide cross-repo graphs) so the Architectures tab reloads file changes live.".to_string(),
-        "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
+        "architecture_context" => "Return the account-global Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .arch files in globalGraphsRoot; use the DSL folder line for named/nested folders.".to_string(),
+        "architecture_list" => "List account-global architecture graphs stored under globalGraphsRoot.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
         "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
         "architecture_revision_read" => "Read one local-only architecture revision snapshot by graph_id and revision_id. Use explicit revision reads only when the user asks to compare, recover, or reuse old architecture content.".to_string(),

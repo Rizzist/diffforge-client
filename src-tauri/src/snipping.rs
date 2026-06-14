@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use objc2_app_kit::NSWindow;
+use objc2_app_kit::{NSCursor, NSWindow};
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 #[cfg(target_os = "macos")]
@@ -189,6 +189,9 @@ struct SnippingState {
     /// tasks compare their ticket so stale timers cannot resurrect or hide the
     /// wrong visibility state.
     strip_visibility_generation: Arc<AtomicU64>,
+    /// Bumped whenever the native strip window is re-anchored; in-flight
+    /// position tweens compare their ticket and stop when superseded.
+    strip_position_animation_generation: Arc<AtomicU64>,
     /// Set by the watcher as soon as it sees mouse-up for a native preview
     /// drag, before the main-thread settle pass can decide whether the
     /// left-column quiet gate applies. This prevents a post-release Moved
@@ -234,6 +237,7 @@ impl SnippingState {
             strip_interaction_guard_until_ms: Arc::new(AtomicU64::new(0)),
             strip_outside_click_watcher_active: Arc::new(AtomicBool::new(false)),
             strip_visibility_generation: Arc::new(AtomicU64::new(0)),
+            strip_position_animation_generation: Arc::new(AtomicU64::new(0)),
             preview_post_release_check_pending: Arc::new(AtomicBool::new(false)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
@@ -3218,6 +3222,58 @@ fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow)
                     | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
             );
             ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+            snipping_force_area_crosshair_for_ns_window(ns_window);
+        });
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_set_area_crosshair_cursor_now() {
+    snipping_catch_objc("set_area_crosshair_cursor", || {
+        NSCursor::crosshairCursor().set();
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_restore_default_cursor_now() {
+    snipping_catch_objc("restore_default_cursor", || {
+        NSCursor::arrowCursor().set();
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_force_area_crosshair_for_ns_window(ns_window: &NSWindow) {
+    ns_window.setAcceptsMouseMovedEvents(true);
+    if ns_window.areCursorRectsEnabled() {
+        ns_window.disableCursorRects();
+    }
+    ns_window.discardCursorRects();
+    NSCursor::crosshairCursor().set();
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_restore_area_overlay_cursor_rects(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("restore_area_overlay_cursor_rects", || {
+            if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                return;
+            }
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            if !ns_window.areCursorRectsEnabled() {
+                ns_window.enableCursorRects();
+            }
+            ns_window.discardCursorRects();
+            if let Some(content_view) = ns_window.contentView() {
+                ns_window.invalidateCursorRectsForView(&content_view);
+            }
+            ns_window.resetCursorRects();
         });
     });
 }
@@ -3240,6 +3296,9 @@ fn snipping_order_overlay_front_regardless(window: &tauri::WebviewWindow) {
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
             ns_window.orderFrontRegardless();
+            if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                snipping_force_area_crosshair_for_ns_window(ns_window);
+            }
         });
     });
 }
@@ -3496,6 +3555,9 @@ fn snipping_make_overlay_key(window: &tauri::WebviewWindow) {
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
             ns_window.makeKeyAndOrderFront(None);
+            if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                snipping_force_area_crosshair_for_ns_window(ns_window);
+            }
         });
     });
 }
@@ -3517,6 +3579,7 @@ fn snipping_overlay_handle_mouse_moved() {
     if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    snipping_set_area_crosshair_cursor_now();
     snipping_catch_objc("overlay_handle_mouse_moved", || {
         let Some(app) = snipping_macos_event_tap_app() else {
             return;
@@ -3544,6 +3607,7 @@ fn snipping_overlay_handle_mouse_moved() {
             if !ns_window.isKeyWindow() {
                 ns_window.makeKeyAndOrderFront(None);
             }
+            snipping_force_area_crosshair_for_ns_window(ns_window);
             break;
         }
     });
@@ -3563,7 +3627,9 @@ fn register_snipping_overlay_mouse_monitors(app: &AppHandle) {
         snipping_catch_objc("register_overlay_mouse_monitors", || {
             use objc2_app_kit::{NSEvent, NSEventMask};
 
-            let mask = NSEventMask::MouseMoved;
+            let mask = NSEventMask::MouseMoved
+                | NSEventMask::LeftMouseDragged
+                | NSEventMask::CursorUpdate;
 
             let global_block =
                 block2::RcBlock::new(move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
@@ -3579,6 +3645,13 @@ fn register_snipping_overlay_mouse_monitors(app: &AppHandle) {
             let local_block = block2::RcBlock::new(
                 move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
                     snipping_overlay_handle_mouse_moved();
+                    if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                        let event_ref = unsafe { event.as_ref() };
+                        if event_ref.r#type() == objc2_app_kit::NSEventType::CursorUpdate {
+                            snipping_set_area_crosshair_cursor_now();
+                            return std::ptr::null_mut();
+                        }
+                    }
                     event.as_ptr()
                 },
             );
@@ -3773,7 +3846,10 @@ fn snipping_begin_area_snip_for(
 
     snipping_replace_area_sessions(app, sessions)?;
     #[cfg(target_os = "macos")]
-    SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
+    {
+        SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
+        snipping_set_area_crosshair_cursor_now();
+    }
 
     // Overlay windows left over from a display that disappeared since the
     // prewarm must not linger as stale full-screen surfaces.
@@ -3987,6 +4063,7 @@ fn snipping_reflow_preview_stack_for_space_change(app: &AppHandle) {
                     SNIPPING_FLOAT_ANIMATE_MS,
                     SnippingTweenEasing::Track,
                 );
+                snipping_strip_reposition_if_visible(&app_for_main, true);
             });
         });
     }
@@ -4011,8 +4088,16 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("space_change_observer_callback", || {
-                        macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+                        let use_full_monitor_bounds =
+                            macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
                         if let Some(app) = snipping_macos_event_tap_app() {
+                            let _ = app.emit(
+                                FLOATING_SURFACE_LAYOUT_CHANGED_EVENT,
+                                json!({
+                                    "source": "macos_space",
+                                    "useFullMonitorBounds": use_full_monitor_bounds,
+                                }),
+                            );
                             snipping_refreeze_area_snapshot_for_space_change(&app);
                             snipping_reflow_preview_stack_for_space_change(&app);
                         }
@@ -4064,8 +4149,12 @@ fn snipping_hide_area_overlay(app: &AppHandle) {
     SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
     snipping_unregister_escape_cancel(app);
     for (_, window) in snipping_overlay_windows(app) {
+        #[cfg(target_os = "macos")]
+        snipping_restore_area_overlay_cursor_rects(&window);
         snipping_hide_window_now(&window, "hide_area_overlay");
     }
+    #[cfg(target_os = "macos")]
+    snipping_restore_default_cursor_now();
     // Windows/Linux hide the real desktop icons for the whole area session;
     // teardown (finish, cancel, Escape) is where they come back.
     snipping_restore_desktop_icons_after_capture(app);
@@ -4890,13 +4979,8 @@ fn snipping_preview_stack_metrics_for_monitor(
 fn snipping_preview_stack_anchor_area_for_monitor(
     monitor: &tauri::Monitor,
 ) -> (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>) {
-    #[cfg(target_os = "macos")]
-    if macos_active_space_uses_full_monitor_bounds_cached() {
-        return (*monitor.position(), *monitor.size());
-    }
-
-    let work_area = *monitor.work_area();
-    (work_area.position, work_area.size)
+    let (position, size, _) = floating_surface_anchor_area_for_monitor(monitor);
+    (position, size)
 }
 
 fn snipping_monitor_overlap_area(
@@ -6502,6 +6586,7 @@ const SNIPPING_STRIP_LOGICAL_HEIGHT: f64 = 88.0;
 const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
 const SNIPPING_STRIP_RECENT_PAGE_LIMIT: usize = 64;
 const SNIPPING_STRIP_RECENT_PAGE_LIMIT_MAX: usize = 200;
+const SNIPPING_STRIP_POSITION_ANIMATE_MS: f64 = 180.0;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
 const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
@@ -6959,42 +7044,140 @@ fn snipping_strip_order_front_regardless(window: &tauri::WebviewWindow) {
     });
 }
 
-/// Full-width bar on the monitor the cursor is on, flush against the work
-/// area's edge: stuck to the very top (right under the macOS menu bar — the
-/// whole monitor in a fullscreen Space) or to the very bottom above the
-/// taskbar elsewhere. Returns the animation origin edge.
-fn snipping_strip_position(app: &AppHandle, window: &tauri::WebviewWindow) -> &'static str {
+#[derive(Clone, Copy)]
+struct SnippingStripPlacement {
+    origin: &'static str,
+    width_logical: f64,
+    position: tauri::PhysicalPosition<i32>,
+}
+
+fn snipping_strip_default_origin() -> &'static str {
     #[cfg(target_os = "macos")]
-    const SNIPPING_STRIP_ORIGIN: &str = "top";
+    {
+        "top"
+    }
     #[cfg(not(target_os = "macos"))]
-    const SNIPPING_STRIP_ORIGIN: &str = "bottom";
+    {
+        "bottom"
+    }
+}
+
+fn snipping_strip_target_placement(app: &AppHandle) -> Option<SnippingStripPlacement> {
     let monitor = app
         .cursor_position()
         .ok()
         .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
         .or_else(|| app.primary_monitor().ok().flatten());
-    let Some(monitor) = monitor else {
-        return SNIPPING_STRIP_ORIGIN;
-    };
-    let area = *monitor.work_area();
+    let monitor = monitor?;
+    let (area_position, area_size, _) = floating_surface_anchor_area_for_monitor(&monitor);
     let scale = monitor.scale_factor().max(0.1);
-    let width_logical = (area.size.width as f64 / scale).max(360.0);
-    let _ = window.set_size(tauri::LogicalSize::new(
-        width_logical,
-        SNIPPING_STRIP_LOGICAL_HEIGHT,
-    ));
-    let x = area.position.x;
+    let width_logical = (area_size.width as f64 / scale).max(360.0);
+    let x = area_position.x;
+    let origin = snipping_strip_default_origin();
     #[cfg(target_os = "macos")]
-    let y = area.position.y;
+    let y = area_position.y;
     #[cfg(not(target_os = "macos"))]
     let y = {
         let height = (SNIPPING_STRIP_LOGICAL_HEIGHT * scale).round() as i32;
-        area.position.y + area.size.height as i32 - height
+        area_position.y + area_size.height as i32 - height
     };
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
-        x, y,
-    )));
-    SNIPPING_STRIP_ORIGIN
+    Some(SnippingStripPlacement {
+        origin,
+        width_logical,
+        position: tauri::PhysicalPosition::new(x, y),
+    })
+}
+
+fn snipping_set_strip_position_now(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    position: tauri::PhysicalPosition<i32>,
+) {
+    app.state::<SnippingState>()
+        .strip_position_animation_generation
+        .fetch_add(1, Ordering::SeqCst);
+    let _ = window.set_position(tauri::Position::Physical(position));
+}
+
+fn snipping_animate_strip_position(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    target: tauri::PhysicalPosition<i32>,
+) {
+    let Ok(start) = window.outer_position() else {
+        snipping_set_strip_position_now(app, window, target);
+        return;
+    };
+    if start.x == target.x && start.y == target.y {
+        return;
+    }
+
+    let generation = app
+        .state::<SnippingState>()
+        .strip_position_animation_generation
+        .clone();
+    let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    let window = window.clone();
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            if generation.load(Ordering::SeqCst) != ticket {
+                return;
+            }
+            let progress = (started.elapsed().as_millis() as f64 / SNIPPING_STRIP_POSITION_ANIMATE_MS)
+                .min(1.0);
+            let eased = snipping_tween_eased(progress, SnippingTweenEasing::Track);
+            let x = start.x + (f64::from(target.x - start.x) * eased).round() as i32;
+            let y = start.y + (f64::from(target.y - start.y) * eased).round() as i32;
+            let frame_generation = generation.clone();
+            let window_for_frame = window.clone();
+            let _ = app.run_on_main_thread(move || {
+                if frame_generation.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
+                let _ = window_for_frame
+                    .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+            });
+            if progress >= 1.0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(SNIPPING_FLOAT_ANIMATE_FRAME_MS));
+        }
+    });
+}
+
+/// Full-width bar on the monitor the cursor is on, flush against the shared
+/// floating-surface anchor edge. In ordinary desktop Spaces that is the work
+/// area; in fullscreen/bare-edge Spaces it is the whole monitor.
+fn snipping_strip_position(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    animate: bool,
+) -> &'static str {
+    let Some(placement) = snipping_strip_target_placement(app) else {
+        return snipping_strip_default_origin();
+    };
+    let _ = window.set_size(tauri::LogicalSize::new(
+        placement.width_logical,
+        SNIPPING_STRIP_LOGICAL_HEIGHT,
+    ));
+    if animate {
+        snipping_animate_strip_position(app, window, placement.position);
+    } else {
+        snipping_set_strip_position_now(app, window, placement.position);
+    }
+    placement.origin
+}
+
+fn snipping_strip_reposition_if_visible(app: &AppHandle, animate: bool) {
+    let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
+    let _ = snipping_strip_position(app, &window, animate);
 }
 
 fn snipping_strip_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) {
@@ -7097,7 +7280,7 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
         return;
     };
     let generation = snipping_strip_next_visibility_generation(app);
-    let origin = snipping_strip_position(app, &window);
+    let origin = snipping_strip_position(app, &window, false);
     #[cfg(target_os = "macos")]
     snipping_convert_overlay_window_to_panel(&window);
     #[cfg(target_os = "macos")]

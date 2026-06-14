@@ -490,8 +490,10 @@ const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
 const AUDIO_WIDGET_SPACE_CHANGED_EVENT = "forge-audio-widget-space-changed";
+const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT = "forge-floating-layout-changed";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT = "forge-audio-widget-bubble-hover-changed";
+const CLOUD_MCP_SYNC_STATUS_EVENT = "cloud-mcp-sync-status";
 const AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY = "diffforge.audio.widgetBubblePlacement.v1";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
@@ -536,6 +538,7 @@ const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
 const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280, 700];
+const AUDIO_WIDGET_CLOUD_STATUS_POLL_MS = 5000;
 const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 34;
@@ -680,6 +683,19 @@ async function resolveAudioBarAnchorStrategy() {
   return {
     useFullMonitorBounds: browserFullscreenHint,
   };
+}
+
+function forgeCloudStatusIsConnected(status) {
+  if (!status || typeof status !== "object") {
+    return false;
+  }
+
+  const connection = String(status.connection || "").trim().toLowerCase();
+  if (connection === "connected") {
+    return true;
+  }
+
+  return Boolean(status.connected && (status.globalWsConnected ?? status.global_ws_connected));
 }
 
 function normalizeAudioWidgetBubblePlacement(value) {
@@ -4167,6 +4183,7 @@ export function AudioWidgetWindow() {
   const [widgetDragging, setWidgetDragging] = useState(false);
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
   const [polishStatus, setPolishStatus] = useState({ state: "idle", error: "" });
+  const [forgeCloudConnected, setForgeCloudConnected] = useState(false);
   const [barIdleHover, setBarIdleHover] = useState(false);
   const [barPlacementReadyKey, setBarPlacementReadyKey] = useState("");
   const audioBufferRef = useRef(null);
@@ -4208,6 +4225,7 @@ export function AudioWidgetWindow() {
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
   const polishStatusTimerRef = useRef(0);
+  const forgeCloudConnectedRef = useRef(false);
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceTtsPlayerRef = useRef(null);
   // GPT-Realtime interim transcripts are token deltas, not cumulative
@@ -4222,9 +4240,21 @@ export function AudioWidgetWindow() {
     setBarIdleHover((current) => (current === hovering ? current : hovering));
   }, []);
 
+  const setForgeCloudConnectionState = useCallback((connected) => {
+    const nextConnected = Boolean(connected);
+    forgeCloudConnectedRef.current = nextConnected;
+    setForgeCloudConnected((current) => (
+      current === nextConnected ? current : nextConnected
+    ));
+  }, []);
+
   useEffect(() => {
     widgetStateRef.current = widgetState;
   }, [widgetState]);
+
+  useEffect(() => {
+    forgeCloudConnectedRef.current = forgeCloudConnected;
+  }, [forgeCloudConnected]);
 
   useEffect(() => {
     barIdleHoverRef.current = barIdleHover;
@@ -4245,6 +4275,48 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     applyAudioWidgetThemePreference(audioWidgetTheme);
   }, [audioWidgetTheme]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenSyncStatus = () => {};
+
+    const applyStatus = (status) => {
+      if (!disposed) {
+        setForgeCloudConnectionState(forgeCloudStatusIsConnected(status));
+      }
+    };
+
+    const refresh = () => {
+      invoke("cloud_mcp_get_status")
+        .then(applyStatus)
+        .catch(() => {
+          if (!disposed) {
+            setForgeCloudConnectionState(false);
+          }
+        });
+    };
+
+    refresh();
+    const timer = window.setInterval(refresh, AUDIO_WIDGET_CLOUD_STATUS_POLL_MS);
+    listen(CLOUD_MCP_SYNC_STATUS_EVENT, (event) => {
+      applyStatus(event?.payload);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenSyncStatus = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      unlistenSyncStatus();
+    };
+  }, [setForgeCloudConnectionState]);
 
   useEffect(() => {
     // Keep the warm cloud dictation websocket parked while Diff Forge Cloud
@@ -4924,6 +4996,13 @@ export function AudioWidgetWindow() {
     if (polishStatus.state === "loading") {
       return;
     }
+    if (!forgeCloudConnectedRef.current) {
+      const messageText = "Connect to Diff Forge Cloud to polish text.";
+      setPolishStatus({ state: "error", error: messageText });
+      setMessage("Cloud disconnected");
+      resetPolishStatusSoon(2200);
+      return;
+    }
 
     const history = readAudioTranscriptionHistory();
     setWidgetHistory(history);
@@ -5302,7 +5381,7 @@ export function AudioWidgetWindow() {
     }
 
     const timer = window.setInterval(
-      () => positionBottomAnchoredWidget({ animate: false }),
+      () => positionBottomAnchoredWidget({ animate: true }),
       AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
     );
     return () => window.clearInterval(timer);
@@ -5315,20 +5394,24 @@ export function AudioWidgetWindow() {
 
     let disposed = false;
     let unlistenSpace = () => {};
+    let unlistenLayout = () => {};
     const timers = new Set();
     const schedulePosition = (delayMs) => {
       const timer = window.setTimeout(() => {
         timers.delete(timer);
         if (!disposed) {
-          positionBottomAnchoredWidget({ animate: delayMs <= 120 });
+          positionBottomAnchoredWidget({ animate: true });
         }
       }, delayMs);
       timers.add(timer);
     };
-
-    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, () => {
+    const handleLayoutChanged = () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+      timers.clear();
       AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach(schedulePosition);
-    })
+    };
+
+    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, handleLayoutChanged)
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
@@ -5338,10 +5421,21 @@ export function AudioWidgetWindow() {
         unlistenSpace = nextUnlisten;
       })
       .catch(() => {});
+    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, handleLayoutChanged)
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenLayout = nextUnlisten;
+      })
+      .catch(() => {});
 
     return () => {
       disposed = true;
       unlistenSpace();
+      unlistenLayout();
       timers.forEach((timer) => window.clearTimeout(timer));
       timers.clear();
     };
@@ -7231,6 +7325,8 @@ export function AudioWidgetWindow() {
   const latestHistoryText = String(widgetHistory[0]?.text || "").trim();
   const polishState = polishStatus.state || "idle";
   const polishLoading = polishState === "loading";
+  const polishCloudUnavailable = !forgeCloudConnected;
+  const polishDisabled = polishLoading || polishCloudUnavailable;
   const renderHistoryQuickButton = (slot, label, available, focusable = true) => {
     const copied = copiedWidgetHistorySlot === slot;
     return (
@@ -7258,17 +7354,24 @@ export function AudioWidgetWindow() {
     );
   };
   const renderPolishQuickButton = (focusable = true) => {
-    const title = polishState === "error" && polishStatus.error
-      ? polishStatus.error
-      : "Polish clipboard or latest transcription";
+    const title = polishCloudUnavailable
+      ? "Connect to Diff Forge Cloud to polish text"
+      : polishState === "error" && polishStatus.error
+        ? polishStatus.error
+        : "Polish clipboard or latest transcription";
     return (
       <AudioHistoryQuickButton
-        aria-label="Polish clipboard or latest transcription"
+        aria-label={polishCloudUnavailable
+          ? "Polish unavailable: Diff Forge Cloud disconnected"
+          : "Polish clipboard or latest transcription"}
         data-polish-state={polishState !== "idle" ? polishState : undefined}
         data-slot="polish"
-        disabled={polishLoading}
+        disabled={polishDisabled}
         onClick={(event) => {
           event.stopPropagation();
+          if (polishDisabled) {
+            return;
+          }
           polishLatestTranscript();
         }}
         onMouseDown={(event) => {
@@ -7277,7 +7380,7 @@ export function AudioWidgetWindow() {
         onPointerDown={(event) => {
           event.stopPropagation();
         }}
-        tabIndex={focusable ? 0 : -1}
+        tabIndex={!polishDisabled && focusable ? 0 : -1}
         title={title}
         type="button"
       >
