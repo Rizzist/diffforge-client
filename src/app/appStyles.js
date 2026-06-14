@@ -9503,6 +9503,11 @@ export const AudioBarShell = styled.div`
   transform: translateY(8px);
   transition: opacity 170ms ease, transform 220ms cubic-bezier(0.3, 0, 0.2, 1);
 
+  &[data-geometry-ready="false"] {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
   &[data-visible="true"] {
     opacity: 1;
     pointer-events: auto;
@@ -9803,6 +9808,11 @@ export const AudioBarIdleShell = styled.div`
 
   &[data-hover="true"] {
     cursor: pointer;
+  }
+
+  &[data-geometry-ready="false"] {
+    visibility: hidden;
+    pointer-events: none;
   }
 `;
 

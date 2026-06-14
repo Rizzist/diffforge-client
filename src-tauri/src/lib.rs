@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     io::{Read, SeekFrom, Write},
+    net::ToSocketAddrs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -82,6 +83,7 @@ const TERMINAL_MAX_COLS: u16 = 400;
 const TERMINAL_MAX_ROWS: u16 = 160;
 const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_TERMINAL_ACTIVITY_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
 const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 1024;
 const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
@@ -94,14 +96,21 @@ const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
 const TERMINAL_ACTIVITY_HOOK_POLL_MS: u64 = 50;
+const TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS: u64 = 2_000;
+const TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS: u64 = 150;
+const TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS: u64 = 1_000;
 const TERMINAL_ENTER_SEQUENCE: &str = "\x1b[13u";
 const TERMINAL_ENTER_SEQUENCE_MOD1: &str = "\x1b[13;1u";
 const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
-const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 128;
+const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 64;
 const MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES: usize = 256;
-const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 4;
+const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 2;
+const WORKSPACE_PROJECT_MOUNT_SCAN_ROOT_FANOUT: usize = 100;
+const WORKSPACE_PROJECT_MOUNT_SCAN_CHILD_FANOUT: usize = 20;
+const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DIRECTORIES: usize = 500;
+const WORKSPACE_PROJECT_MOUNT_CACHE_TTL_MS: u64 = 60_000;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACE_IMAGE_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_WORKSPACE_FILE_DIFF_BYTES: usize = 384 * 1024;
@@ -434,6 +443,8 @@ struct TerminalState {
     terminal_input_queues: Arc<StdMutex<HashMap<String, TerminalInputQueueHandle>>>,
     terminal_input_transport: Arc<StdMutex<Option<TerminalInputTransportEndpoint>>>,
     terminal_output_transport: Arc<StdMutex<Option<TerminalOutputTransportEndpoint>>>,
+    terminal_activity_transport: Arc<StdMutex<Option<TerminalActivityTransportEndpoint>>>,
+    terminal_activity_transport_tokens: Arc<StdMutex<HashMap<String, String>>>,
     terminal_output_transport_subscribers:
         Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
@@ -488,6 +499,30 @@ struct TerminalInputTransportAck {
 struct TerminalOutputTransportEndpoint {
     url: String,
     token: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalActivityTransportEndpoint {
+    host: String,
+    port: u16,
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalActivityTransportEnvelope {
+    r#type: String,
+    token: String,
+    event: Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalActivityTransportAck {
+    r#type: &'static str,
+    ok: bool,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -712,6 +747,12 @@ impl Drop for TerminalState {
         }
         if let Ok(mut transport) = self.terminal_output_transport.lock() {
             *transport = None;
+        }
+        if let Ok(mut transport) = self.terminal_activity_transport.lock() {
+            *transport = None;
+        }
+        if let Ok(mut tokens) = self.terminal_activity_transport_tokens.lock() {
+            tokens.clear();
         }
         if let Ok(mut subscribers) = self.terminal_output_transport_subscribers.lock() {
             subscribers.clear();
@@ -4200,6 +4241,8 @@ pub fn run() {
             terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
             terminal_input_transport: Arc::new(StdMutex::new(None)),
             terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
             terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),

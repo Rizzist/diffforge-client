@@ -1642,7 +1642,7 @@ export default function FilesWorkspaceView({
         return;
       }
 
-      const nextGitStatus = normalizeGitStatus(result?.gitStatus || entry.gitStatus || "");
+      const nextGitStatus = normalizeGitStatus(result?.gitStatus || "");
 
       setSelectedFile({
         ...entry,
@@ -1657,34 +1657,6 @@ export default function FilesWorkspaceView({
       setFileImageDataUrl(shouldPreviewImage ? result?.dataUrl || "" : "");
       setFileImageMimeType(shouldPreviewImage ? result?.mimeType || "" : "");
       setFileState("ready");
-
-      if (shouldPreviewImage || nextGitStatus !== "modified") {
-        return;
-      }
-
-      setFileDiffState("loading");
-
-      try {
-        const diffResult = await invoke("read_workspace_file_diff", {
-          root: workspaceRoot,
-          relativePath,
-        });
-
-        if (fileRequestIdRef.current !== requestId) {
-          return;
-        }
-
-        setFileDiff(diffResult?.diff || "");
-        setFileDiffTruncated(Boolean(diffResult?.truncated));
-        setFileDiffState("ready");
-      } catch (error) {
-        if (fileRequestIdRef.current !== requestId) {
-          return;
-        }
-
-        setFileDiffState("error");
-        setFileDiffError(getErrorMessage(error, "Unable to load file diff."));
-      }
     } catch (error) {
       if (fileRequestIdRef.current !== requestId) {
         return;

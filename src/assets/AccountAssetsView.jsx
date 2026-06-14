@@ -1636,8 +1636,8 @@ function AssetsPanel({
                 <AssetCardPreview
                   aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
-                  onClick={() => runAssetAction(shouldShowImagePreview ? "view" : "open", asset)}
-                  title={shouldShowImagePreview ? "Open big view and annotate" : shouldOpenHyperframeEditor ? "Open Hyperframe editor" : "Open file"}
+                  onDoubleClick={() => runAssetAction(shouldShowImagePreview ? "view" : "open", asset)}
+                  title={shouldShowImagePreview ? "Double-click to open big view and annotate" : shouldOpenHyperframeEditor ? "Double-click to open Hyperframe editor" : "Double-click to open file"}
                   type="button"
                 >
                   {shouldShowImagePreview ? (
@@ -2612,8 +2612,8 @@ function UntrackedAssetsPanel({
                 <AssetCardPreview
                   aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
-                  onClick={() => runUntrackedAction(shouldShowImagePreview ? "view" : "open", asset)}
-                  title={shouldShowImagePreview ? "Open big view and annotate" : shouldOpenHyperframeEditor ? "Open Hyperframe editor" : "Open file"}
+                  onDoubleClick={() => runUntrackedAction(shouldShowImagePreview ? "view" : "open", asset)}
+                  title={shouldShowImagePreview ? "Double-click to open big view and annotate" : shouldOpenHyperframeEditor ? "Double-click to open Hyperframe editor" : "Double-click to open file"}
                   type="button"
                 >
                   {shouldShowImagePreview ? (

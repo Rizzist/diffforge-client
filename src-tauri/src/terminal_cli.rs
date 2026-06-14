@@ -1493,9 +1493,10 @@ fn terminal_activity_env_vars(
     workspace_id: Option<&str>,
     terminal_index: Option<u16>,
     provider_id: &str,
+    activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> Vec<(String, String)> {
     let activity_path = terminal_activity_events_path(pane_id, instance_id);
-    vec![
+    let mut env_vars = vec![
         (
             "DIFFFORGE_TERMINAL_PANE_ID".to_string(),
             pane_id.to_string(),
@@ -1528,7 +1529,24 @@ fn terminal_activity_env_vars(
                 .to_string_lossy()
                 .to_string(),
         ),
-    ]
+    ];
+    if let Some(endpoint) = activity_transport {
+        env_vars.extend([
+            (
+                "DIFFFORGE_ACTIVITY_TRANSPORT_HOST".to_string(),
+                endpoint.host.clone(),
+            ),
+            (
+                "DIFFFORGE_ACTIVITY_TRANSPORT_PORT".to_string(),
+                endpoint.port.to_string(),
+            ),
+            (
+                "DIFFFORGE_ACTIVITY_TRANSPORT_TOKEN".to_string(),
+                endpoint.token.clone(),
+            ),
+        ]);
+    }
+    env_vars
 }
 
 fn extend_terminal_activity_env_vars(
@@ -1538,6 +1556,7 @@ fn extend_terminal_activity_env_vars(
     workspace_id: Option<&str>,
     terminal_index: Option<u16>,
     provider_id: &str,
+    activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) {
     let activity_env = terminal_activity_env_vars(
         pane_id,
@@ -1545,6 +1564,7 @@ fn extend_terminal_activity_env_vars(
         workspace_id,
         terminal_index,
         provider_id,
+        activity_transport,
     );
     for (key, value) in activity_env {
         env_vars.retain(|(existing_key, _)| existing_key != &key);
@@ -1890,23 +1910,27 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         terminal_cli_arg_or_env(args, "--debug-path", &["DIFFFORGE_ACTIVITY_DEBUG_PATH"])
             .map(PathBuf::from)
             .unwrap_or_else(|| terminal_activity_debug_path(&pane_id, instance_id));
+    let activity_transport = diff_forge_activity_hook_transport_config(args);
 
-    write_diff_forge_activity_hook_debug(
-        &debug_path,
-        "started",
-        &provider,
-        &pane_id,
-        instance_id,
-        &workspace_id,
-        &terminal_index,
-        &activity_path,
-        json!({
-            "argCount": args.len(),
-            "hasEventsPathArg": terminal_cli_arg_value(args, "--events-path").is_some(),
-            "hasPaneIdArg": terminal_cli_arg_value(args, "--pane-id").is_some(),
-            "hasInstanceIdArg": terminal_cli_arg_value(args, "--instance-id").is_some(),
-        }),
-    );
+    if activity_transport.is_none() {
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "started",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            json!({
+                "argCount": args.len(),
+                "hasEventsPathArg": terminal_cli_arg_value(args, "--events-path").is_some(),
+                "hasPaneIdArg": terminal_cli_arg_value(args, "--pane-id").is_some(),
+                "hasInstanceIdArg": terminal_cli_arg_value(args, "--instance-id").is_some(),
+                "transportConfigured": false,
+            }),
+        );
+    }
 
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
@@ -1945,6 +1969,25 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         &terminal_index,
         &hook_input,
     );
+    if let Some(transport) = activity_transport.as_ref() {
+        match send_diff_forge_activity_hook_transport(transport, &record) {
+            Ok(()) => return 0,
+            Err(error) => write_diff_forge_activity_hook_debug(
+                &debug_path,
+                "transport_fallback",
+                &provider,
+                &pane_id,
+                instance_id,
+                &workspace_id,
+                &terminal_index,
+                &activity_path,
+                json!({
+                    "error": error,
+                    "hookEventName": record.get("hookEventName").and_then(Value::as_str).unwrap_or_default(),
+                }),
+            ),
+        }
+    }
     if let Some(parent) = activity_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -1995,6 +2038,110 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
     }
 
     0
+}
+
+fn diff_forge_activity_hook_transport_config(args: &[String]) -> Option<(String, u16, String)> {
+    let host = terminal_cli_arg_or_env(
+        args,
+        "--transport-host",
+        &["DIFFFORGE_ACTIVITY_TRANSPORT_HOST"],
+    )?
+    .trim()
+    .to_string();
+    if host.is_empty() {
+        return None;
+    }
+    let port = terminal_cli_arg_or_env(
+        args,
+        "--transport-port",
+        &["DIFFFORGE_ACTIVITY_TRANSPORT_PORT"],
+    )?
+    .trim()
+    .parse::<u16>()
+    .ok()
+    .filter(|port| *port > 0)?;
+    let token = terminal_cli_arg_or_env(
+        args,
+        "--transport-token",
+        &["DIFFFORGE_ACTIVITY_TRANSPORT_TOKEN"],
+    )?
+    .trim()
+    .to_string();
+    if token.is_empty() {
+        return None;
+    }
+
+    Some((host, port, token))
+}
+
+fn send_diff_forge_activity_hook_transport(
+    transport: &(String, u16, String),
+    record: &Value,
+) -> Result<(), String> {
+    let (host, port, token) = transport;
+    let address = (host.as_str(), *port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Unable to resolve activity transport: {error}"))?
+        .find(|address| address.ip().is_loopback())
+        .ok_or_else(|| "Activity transport did not resolve to loopback.".to_string())?;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &address,
+        Duration::from_millis(TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS),
+    )
+    .map_err(|error| format!("Unable to connect to activity transport: {error}"))?;
+    let timeout = Some(Duration::from_millis(TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS));
+    let _ = stream.set_write_timeout(timeout);
+    let _ = stream.set_read_timeout(timeout);
+
+    let envelope = json!({
+        "type": "terminal-activity-hook",
+        "token": token,
+        "event": record,
+    });
+    let envelope_line = format!("{envelope}\n");
+    stream
+        .write_all(envelope_line.as_bytes())
+        .map_err(|error| format!("Unable to send activity event: {error}"))?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 128];
+    loop {
+        let response_len = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("Unable to read activity acknowledgement: {error}"))?;
+        if response_len == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..response_len]);
+        if response.len() > 1024 {
+            return Err("Activity acknowledgement is too large.".to_string());
+        }
+        if response.iter().any(|byte| *byte == b'\n') {
+            break;
+        }
+    }
+    if response.is_empty() {
+        return Err("Activity transport closed without acknowledgement.".to_string());
+    }
+    let response_end = response
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(response.len());
+    let response_text = std::str::from_utf8(&response[..response_end])
+        .map_err(|error| format!("Activity acknowledgement was not UTF-8: {error}"))?
+        .trim();
+    let response_value = serde_json::from_str::<Value>(response_text)
+        .map_err(|error| format!("Unable to parse activity acknowledgement: {error}"))?;
+    if response_value.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(response_value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Activity transport rejected event.")
+            .to_string())
+    }
 }
 
 fn write_diff_forge_activity_hook_debug(

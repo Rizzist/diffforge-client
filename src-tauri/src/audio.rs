@@ -3573,6 +3573,9 @@ fn audio_widget_apply_bar_hover_focus_to_ns_window(ns_window: &NSWindow, hoverin
         if !ns_window.isKeyWindow() {
             ns_window.makeKeyAndOrderFront(None);
         }
+        if let Some(content_view) = ns_window.contentView() {
+            let _ = ns_window.makeFirstResponder(Some(content_view.as_ref()));
+        }
     } else if ns_window.isKeyWindow() {
         ns_window.resignKeyWindow();
     }
@@ -4126,6 +4129,17 @@ fn macos_active_space_uses_full_monitor_bounds_cached() -> bool {
 fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool {
     let mut use_full_monitor_bounds = false;
     snipping_catch_objc("macos_active_space_full_monitor_bounds", || {
+        if let Some(main_thread_marker) = objc2::MainThreadMarker::new() {
+            let application = objc2_app_kit::NSApplication::sharedApplication(main_thread_marker);
+            let presentation_options = application.currentSystemPresentationOptions();
+            if presentation_options
+                .contains(objc2_app_kit::NSApplicationPresentationOptions::FullScreen)
+            {
+                use_full_monitor_bounds = true;
+                return;
+            }
+        }
+
         let current_app = objc2_app_kit::NSRunningApplication::currentApplication();
         let current_pid = current_app.processIdentifier();
         if current_pid <= 0 {

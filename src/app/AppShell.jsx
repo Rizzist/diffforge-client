@@ -6725,6 +6725,8 @@ export default function App() {
   const workspaceTerminalsSyncInFlightRef = useRef(false);
   const workspaceTerminalsSyncPendingRef = useRef(null);
   const workspaceTerminalsWorkspacesRef = useRef([]);
+  const workspaceTerminalIdentityCacheRef = useRef(new Map());
+  const workspaceTerminalExplicitEmptyRef = useRef(new Set());
   const terminalStatusEventSeqRef = useRef(new Map());
   const terminalStatusEventDedupRef = useRef(new Map());
   const terminalStatusEventEmitterRef = useRef(null);
@@ -11901,6 +11903,10 @@ export default function App() {
 
     const removedTerminalIndex = closingTerminalIndex;
     const nextIndexes = currentIndexes.filter((index) => index !== closingTerminalIndex);
+    if (nextIndexes.length === 0) {
+      workspaceTerminalExplicitEmptyRef.current.add(workspaceId);
+      workspaceTerminalIdentityCacheRef.current.delete(workspaceId);
+    }
 
     const nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => {
@@ -14755,7 +14761,7 @@ export default function App() {
         const presenceTerminalIndexes = displayedTerminalIndexes.length
           ? displayedTerminalIndexes
           : descriptor.logicalTerminalIndexes;
-        const terminals = presenceTerminalIndexes
+        const liveTerminals = presenceTerminalIndexes
           .map((terminalIndex) => {
             const normalizedRole = normalizeWorkspaceTerminalRole(
               descriptor.terminalRolesByIndex?.[terminalIndex],
@@ -14923,14 +14929,42 @@ export default function App() {
             };
           })
           .filter(Boolean);
+        const terminalListExplicitlyEmpty = workspaceTerminalExplicitEmptyRef.current.has(workspaceId);
+        const cachedTerminals = workspaceTerminalIdentityCacheRef.current.get(workspaceId) || [];
+        let terminals = liveTerminals;
+        let terminalListAuthoritative = false;
+        let lastKnownTerminalFallback = false;
+        if (liveTerminals.length) {
+          workspaceTerminalIdentityCacheRef.current.set(
+            workspaceId,
+            liveTerminals.map((terminal) => ({ ...terminal })),
+          );
+          workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
+        } else if (terminalListExplicitlyEmpty) {
+          workspaceTerminalIdentityCacheRef.current.delete(workspaceId);
+          terminalListAuthoritative = true;
+        } else if (cachedTerminals.length) {
+          terminals = cachedTerminals.map((terminal) => markTerminalLastKnownRuntimeReadOnly(terminal));
+          lastKnownTerminalFallback = true;
+        }
 
         return {
           commandable: true,
+          lastKnownTerminalFallback,
+          last_known_terminal_fallback: lastKnownTerminalFallback,
           lastKnownRuntime: false,
           last_known_runtime: false,
           repoPath,
           runtimeReadOnly: false,
           runtime_read_only: false,
+          terminalCount: terminals.length,
+          terminal_count: terminals.length,
+          terminalClearReason: terminalListAuthoritative ? "all_terminals_closed" : "",
+          terminal_clear_reason: terminalListAuthoritative ? "all_terminals_closed" : "",
+          terminalListAuthoritative,
+          terminal_list_authoritative: terminalListAuthoritative,
+          terminalListEmptyAuthoritative: terminalListAuthoritative,
+          terminal_list_empty_authoritative: terminalListAuthoritative,
           workspaceActive: true,
           workspace_active: true,
           workspaceId,
@@ -15606,12 +15640,35 @@ export default function App() {
       presenceTerminalsByWorkspaceId.set(
         presenceWorkspaceId,
         presenceWorkspace.terminals.slice(0, 32).map((terminal) => ({
-          agentKind: String(terminal?.agentKind || terminal?.agentId || ""),
+          activityStatus: String(terminal?.activityStatus || terminal?.activity_status || ""),
+          agentDisplayName: String(terminal?.agentDisplayName || terminal?.agent_display_name || ""),
+          agentId: String(terminal?.agentId || terminal?.agent_id || terminal?.agentKind || ""),
+          agentKind: String(terminal?.agentKind || terminal?.agent_id || terminal?.agentId || ""),
           agentLabel: String(terminal?.agentLabel || ""),
+          agentType: String(terminal?.agentType || terminal?.agent_type || ""),
           color: String(terminal?.color || ""),
-          colorSlot: Number(terminal?.colorSlot ?? 0),
-          terminalIndex: Number(terminal?.terminalIndex ?? 0),
-          terminalName: String(terminal?.terminalName || terminal?.displayName || ""),
+          colorSlot: Number(terminal?.colorSlot ?? terminal?.color_slot ?? 0),
+          displayName: String(terminal?.displayName || terminal?.display_name || terminal?.terminalName || ""),
+          displayStatus: String(terminal?.displayStatus || terminal?.display_status || ""),
+          nativeRailLabel: String(terminal?.nativeRailLabel || terminal?.native_rail_label || ""),
+          nativeRailState: String(terminal?.nativeRailState || terminal?.native_rail_state || ""),
+          paneId: String(terminal?.paneId || terminal?.pane_id || terminal?.terminalId || ""),
+          readiness: String(terminal?.readiness || ""),
+          sessionState: String(terminal?.sessionState || terminal?.session_state || ""),
+          status: String(terminal?.status || terminal?.terminalStatus || ""),
+          statusSeq: Number(terminal?.statusSeq ?? terminal?.status_seq ?? 0),
+          targetTerminalId: String(terminal?.targetTerminalId || terminal?.target_terminal_id || terminal?.paneId || terminal?.terminalId || ""),
+          terminalEpoch: String(terminal?.terminalEpoch || terminal?.terminal_epoch || ""),
+          terminalId: String(terminal?.terminalId || terminal?.terminal_id || terminal?.paneId || ""),
+          terminalIndex: Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? 0),
+          terminalInstanceId: String(terminal?.terminalInstanceId || terminal?.terminal_instance_id || ""),
+          terminalLifecycle: String(terminal?.terminalLifecycle || terminal?.terminal_lifecycle || ""),
+          terminalName: String(terminal?.terminalName || terminal?.terminal_name || terminal?.displayName || ""),
+          terminalNickname: String(terminal?.terminalNickname || terminal?.terminal_nickname || ""),
+          terminalStatus: String(terminal?.terminalStatus || terminal?.terminal_status || terminal?.status || ""),
+          threadId: String(terminal?.threadId || terminal?.thread_id || ""),
+          turnId: String(terminal?.turnId || terminal?.turn_id || ""),
+          turnStatus: String(terminal?.turnStatus || terminal?.turn_status || ""),
         })),
       );
     });
@@ -15633,6 +15690,8 @@ export default function App() {
       const workspaceActive = activeOverride === null
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
+      const terminalListAuthoritative = workspaceTerminalExplicitEmptyRef.current.has(workspaceId);
+      const terminals = presenceTerminalsByWorkspaceId.get(workspaceId) || [];
       targets.push({
         dashboardWorkspace: true,
         displaySurface: "dashboard_workspace",
@@ -15640,7 +15699,10 @@ export default function App() {
         mountId: "",
         projectName: "",
         repoPath: rootDirectory,
-        terminals: presenceTerminalsByWorkspaceId.get(workspaceId) || [],
+        terminalClearReason: terminalListAuthoritative ? "all_terminals_closed" : "",
+        terminalListEmptyAuthoritative: terminalListAuthoritative,
+        terminalListAuthoritative,
+        terminals,
         workspaceActive,
         workspaceId,
         workspaceIndex,
@@ -15708,6 +15770,8 @@ export default function App() {
       targets: targets.map((target) => ({
         active: Boolean(target.workspaceActive),
         terminals: Array.isArray(target.terminals) ? target.terminals : [],
+        terminalListEmptyAuthoritative: Boolean(target.terminalListEmptyAuthoritative),
+        terminalListAuthoritative: Boolean(target.terminalListAuthoritative),
         workspaceId: target.workspaceId,
         workspaceName: target.workspaceName || "",
       })),
@@ -15738,6 +15802,9 @@ export default function App() {
           dashboardWorkspace: true,
           displaySurface: target.displaySurface || "dashboard_workspace",
           terminals: Array.isArray(target.terminals) ? target.terminals : [],
+          terminalClearReason: target.terminalClearReason || "",
+          terminalListEmptyAuthoritative: Boolean(target.terminalListEmptyAuthoritative),
+          terminalListAuthoritative: Boolean(target.terminalListAuthoritative),
           workspaceActive: Boolean(target.workspaceActive),
           workspaceId: target.workspaceId,
           workspaceIndex: Number(target.workspaceIndex ?? 0),

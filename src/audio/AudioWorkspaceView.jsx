@@ -604,6 +604,31 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
     label: "Bottom bar",
   },
 ];
+
+function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible) {
+  if (cancelNoticeActive) {
+    return {
+      key: "notice",
+      margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
+      size: AUDIO_WIDGET_BAR_NOTICE_SIZE,
+    };
+  }
+
+  if (barVisible) {
+    return {
+      key: "active",
+      margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
+      size: AUDIO_WIDGET_BAR_SIZE,
+    };
+  }
+
+  return {
+    key: "idle",
+    margin: AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN,
+    size: AUDIO_WIDGET_BAR_IDLE_SIZE,
+  };
+}
+
 // Transcripts longer than this get the 3-line clamp + "Show more" toggle.
 const AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS = 220;
 const AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT = 124;
@@ -634,6 +659,8 @@ function shouldUseFullMonitorBoundsForAudioBar() {
 }
 
 async function resolveAudioBarAnchorStrategy() {
+  const browserFullscreenHint = shouldUseFullMonitorBoundsForAudioBar();
+
   if (!isMacPlatform()) {
     return { useFullMonitorBounds: false };
   }
@@ -641,14 +668,17 @@ async function resolveAudioBarAnchorStrategy() {
   try {
     const strategy = await invoke("audio_widget_bar_anchor_strategy");
     if (typeof strategy?.useFullMonitorBounds === "boolean") {
-      return strategy;
+      return {
+        ...strategy,
+        useFullMonitorBounds: strategy.useFullMonitorBounds || browserFullscreenHint,
+      };
     }
   } catch {
     // Older native builds and web previews fall back to the browser screen hint.
   }
 
   return {
-    useFullMonitorBounds: shouldUseFullMonitorBoundsForAudioBar(),
+    useFullMonitorBounds: browserFullscreenHint,
   };
 }
 
@@ -4138,6 +4168,7 @@ export function AudioWidgetWindow() {
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
   const [polishStatus, setPolishStatus] = useState({ state: "idle", error: "" });
   const [barIdleHover, setBarIdleHover] = useState(false);
+  const [barPlacementReadyKey, setBarPlacementReadyKey] = useState("");
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
   const audioBufferReadyAtRef = useRef(0);
@@ -4160,10 +4191,15 @@ export function AudioWidgetWindow() {
   const lastCancelledRef = useRef(null);
   const barSavedPlacementRef = useRef(null);
   const barPositionAnimationRef = useRef({ frame: 0, token: 0 });
+  const barPlacementGenerationRef = useRef(0);
+  const barPlacementReadyKeyRef = useRef("");
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
   const bubbleHistoryTrayActiveRef = useRef(false);
+  const bubbleHistoryTrayHoverRef = useRef(false);
+  const bubbleHistoryTrayPolishPinnedRef = useRef(false);
+  const bubbleHistoryTrayCloseDeferredRef = useRef(false);
   const widgetDraggingRef = useRef(false);
   const barIdleHoverRef = useRef(false);
   const barIdleModeRef = useRef(false);
@@ -4777,6 +4813,12 @@ export function AudioWidgetWindow() {
   const barVisible = usesBottomAnchoredStyle
     && (widgetActive || cancelNoticeActive);
   const barIdleMode = usesBottomAnchoredStyle && !barVisible;
+  const {
+    key: barGeometryKey,
+    margin: barGeometryMargin,
+    size: barGeometrySize,
+  } = getAudioWidgetBarGeometry(cancelNoticeActive, barVisible);
+  const barGeometryReady = !usesBottomAnchoredStyle || barPlacementReadyKey === barGeometryKey;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.
   const bubbleCancelNoticeActive = cancelNoticeActive
@@ -4826,6 +4868,47 @@ export function AudioWidgetWindow() {
     }, 1300);
   }, []);
 
+  const clearBubbleHistoryTrayCloseTimer = useCallback(() => {
+    if (historyTrayCloseTimerRef.current) {
+      window.clearTimeout(historyTrayCloseTimerRef.current);
+      historyTrayCloseTimerRef.current = 0;
+    }
+  }, []);
+
+  const scheduleBubbleHistoryTrayClose = useCallback((delayMs = 140) => {
+    if (historyTrayCloseTimerRef.current) {
+      return;
+    }
+
+    historyTrayCloseTimerRef.current = window.setTimeout(() => {
+      historyTrayCloseTimerRef.current = 0;
+      setHistoryTrayOpen(false);
+    }, delayMs);
+  }, []);
+
+  const releaseBubbleHistoryTrayPolishPin = useCallback(() => {
+    bubbleHistoryTrayPolishPinnedRef.current = false;
+
+    if (bubbleHistoryTrayCloseDeferredRef.current || !bubbleHistoryTrayHoverRef.current) {
+      bubbleHistoryTrayCloseDeferredRef.current = false;
+      scheduleBubbleHistoryTrayClose();
+      return;
+    }
+
+    bubbleHistoryTrayCloseDeferredRef.current = false;
+  }, [scheduleBubbleHistoryTrayClose]);
+
+  const pinBubbleHistoryTrayForPolish = useCallback(() => {
+    if (!canUseBubbleHistoryTrayRef.current || widgetDraggingRef.current) {
+      return;
+    }
+
+    bubbleHistoryTrayPolishPinnedRef.current = true;
+    bubbleHistoryTrayCloseDeferredRef.current = false;
+    clearBubbleHistoryTrayCloseTimer();
+    setHistoryTrayOpen(true);
+  }, [clearBubbleHistoryTrayCloseTimer]);
+
   const resetPolishStatusSoon = useCallback((delayMs = 1500) => {
     if (polishStatusTimerRef.current) {
       window.clearTimeout(polishStatusTimerRef.current);
@@ -4833,8 +4916,9 @@ export function AudioWidgetWindow() {
     polishStatusTimerRef.current = window.setTimeout(() => {
       polishStatusTimerRef.current = 0;
       setPolishStatus({ state: "idle", error: "" });
+      releaseBubbleHistoryTrayPolishPin();
     }, delayMs);
-  }, []);
+  }, [releaseBubbleHistoryTrayPolishPin]);
 
   const polishLatestTranscript = useCallback(async () => {
     if (polishStatus.state === "loading") {
@@ -4849,6 +4933,7 @@ export function AudioWidgetWindow() {
       window.clearTimeout(polishStatusTimerRef.current);
       polishStatusTimerRef.current = 0;
     }
+    pinBubbleHistoryTrayForPolish();
     setError("");
     setPolishStatus({ state: "loading", error: "" });
     setMessage("Polishing text");
@@ -4894,39 +4979,38 @@ export function AudioWidgetWindow() {
       }
       resetPolishStatusSoon(2600);
     }
-  }, [polishStatus.state, refreshWidgetHistory, resetPolishStatusSoon]);
+  }, [pinBubbleHistoryTrayForPolish, polishStatus.state, refreshWidgetHistory, resetPolishStatusSoon]);
 
   const openBubbleHistoryTray = useCallback(() => {
     if (!canUseBubbleHistoryTray || widgetDraggingRef.current) {
       return;
     }
 
-    if (historyTrayCloseTimerRef.current) {
-      window.clearTimeout(historyTrayCloseTimerRef.current);
-      historyTrayCloseTimerRef.current = 0;
-    }
+    bubbleHistoryTrayHoverRef.current = true;
+    bubbleHistoryTrayCloseDeferredRef.current = false;
+    clearBubbleHistoryTrayCloseTimer();
 
     setHistoryTrayOpen(true);
-  }, [canUseBubbleHistoryTray]);
+  }, [canUseBubbleHistoryTray, clearBubbleHistoryTrayCloseTimer]);
 
   const closeBubbleHistoryTray = useCallback(() => {
-    if (historyTrayCloseTimerRef.current) {
-      window.clearTimeout(historyTrayCloseTimerRef.current);
-    }
+    bubbleHistoryTrayHoverRef.current = false;
 
     if (widgetDraggingRef.current) {
-      historyTrayCloseTimerRef.current = 0;
+      clearBubbleHistoryTrayCloseTimer();
       if (bubbleHistoryTrayActiveRef.current) {
         historyTrayCloseAfterDragRef.current = true;
       }
       return;
     }
 
-    historyTrayCloseTimerRef.current = window.setTimeout(() => {
-      historyTrayCloseTimerRef.current = 0;
-      setHistoryTrayOpen(false);
-    }, 140);
-  }, []);
+    if (bubbleHistoryTrayPolishPinnedRef.current) {
+      bubbleHistoryTrayCloseDeferredRef.current = true;
+      return;
+    }
+
+    scheduleBubbleHistoryTrayClose();
+  }, [clearBubbleHistoryTrayCloseTimer, scheduleBubbleHistoryTrayClose]);
 
   const updateBarIdleHoverFromPointer = useCallback((event) => {
     setBarIdleHoverState(audioBarIdlePointerEventIsHovering(event, barIdleHoverRef.current));
@@ -4960,6 +5044,9 @@ export function AudioWidgetWindow() {
       window.clearTimeout(historyTrayCloseTimerRef.current);
       historyTrayCloseTimerRef.current = 0;
     }
+    bubbleHistoryTrayHoverRef.current = false;
+    bubbleHistoryTrayPolishPinnedRef.current = false;
+    bubbleHistoryTrayCloseDeferredRef.current = false;
 
     setHistoryTrayOpen(false);
     return undefined;
@@ -5020,6 +5107,9 @@ export function AudioWidgetWindow() {
       window.clearTimeout(historyTrayCloseTimerRef.current);
       historyTrayCloseTimerRef.current = 0;
     }
+    bubbleHistoryTrayHoverRef.current = false;
+    bubbleHistoryTrayPolishPinnedRef.current = false;
+    bubbleHistoryTrayCloseDeferredRef.current = false;
 
     if (widgetDragSettleTimerRef.current) {
       window.clearTimeout(widgetDragSettleTimerRef.current);
@@ -5087,17 +5177,19 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    const target = cancelNoticeActive
-      ? AUDIO_WIDGET_BAR_NOTICE_SIZE
-      : barVisible
-        ? AUDIO_WIDGET_BAR_SIZE
-        : AUDIO_WIDGET_BAR_IDLE_SIZE;
-    const margin = barVisible
-      ? AUDIO_WIDGET_BAR_BOTTOM_MARGIN
-      : AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN;
+    const placementGeneration = barPlacementGenerationRef.current + 1;
+    barPlacementGenerationRef.current = placementGeneration;
+    const isCurrentPlacement = () => (
+      barPlacementGenerationRef.current === placementGeneration
+      && widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR
+    );
+
+    const target = barGeometrySize;
+    const targetKey = barGeometryKey;
+    const margin = barGeometryMargin;
 
     runWidgetWindowAction(async (windowHandle) => {
-      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+      if (!isCurrentPlacement()) {
         return;
       }
       if (!barSavedPlacementRef.current) {
@@ -5110,15 +5202,19 @@ export function AudioWidgetWindow() {
           position: savedPosition,
         };
       }
-      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+      if (!isCurrentPlacement()) {
         return;
       }
+      const modeGeometryChanged = barPlacementReadyKeyRef.current !== targetKey;
       await windowHandle.setSize(new LogicalSize(target.width, target.height));
+      if (!isCurrentPlacement()) {
+        return;
+      }
       const [monitor, anchorStrategy] = await Promise.all([
         currentMonitor().catch(() => null),
         resolveAudioBarAnchorStrategy(),
       ]);
-      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+      if (!isCurrentPlacement()) {
         return;
       }
       if (monitor) {
@@ -5133,15 +5229,32 @@ export function AudioWidgetWindow() {
         const y = area.position.y
           + area.size.height
           - Math.round((target.height + margin) * scale);
-        if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+        if (!isCurrentPlacement()) {
           return;
         }
-        await setAudioBarWindowPosition(windowHandle, { x, y }, options.animate !== false);
+        await setAudioBarWindowPosition(
+          windowHandle,
+          { x, y },
+          options.animate !== false && !modeGeometryChanged,
+        );
+        if (!isCurrentPlacement()) {
+          return;
+        }
+        barPlacementReadyKeyRef.current = targetKey;
+        setBarPlacementReadyKey((currentKey) => (
+          currentKey === targetKey ? currentKey : targetKey
+        ));
+      } else {
+        barPlacementReadyKeyRef.current = targetKey;
+        setBarPlacementReadyKey((currentKey) => (
+          currentKey === targetKey ? currentKey : targetKey
+        ));
       }
     });
   }, [
-    barVisible,
-    cancelNoticeActive,
+    barGeometryKey,
+    barGeometryMargin,
+    barGeometrySize,
     runWidgetWindowAction,
     setAudioBarWindowPosition,
     usesBottomAnchoredStyle,
@@ -5154,10 +5267,13 @@ export function AudioWidgetWindow() {
   // is left under the bar.
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
+      barPlacementReadyKeyRef.current = "";
+      setBarPlacementReadyKey("");
       const saved = barSavedPlacementRef.current;
       const restoredPosition = readAudioWidgetBubblePlacement() || saved?.position || null;
       if (saved || restoredPosition) {
         barSavedPlacementRef.current = null;
+        barPlacementGenerationRef.current += 1;
         cancelBarPositionAnimation();
         runWidgetWindowAction(async (windowHandle) => {
           await windowHandle.setSize(
@@ -5186,7 +5302,7 @@ export function AudioWidgetWindow() {
     }
 
     const timer = window.setInterval(
-      positionBottomAnchoredWidget,
+      () => positionBottomAnchoredWidget({ animate: false }),
       AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
     );
     return () => window.clearInterval(timer);
@@ -5204,7 +5320,7 @@ export function AudioWidgetWindow() {
       const timer = window.setTimeout(() => {
         timers.delete(timer);
         if (!disposed) {
-          positionBottomAnchoredWidget();
+          positionBottomAnchoredWidget({ animate: delayMs <= 120 });
         }
       }, delayMs);
       timers.add(timer);
@@ -7244,6 +7360,7 @@ export function AudioWidgetWindow() {
           <GlobalStyle />
           <AudioBarIdleShell
             aria-label="Dictation bar"
+            data-geometry-ready={barGeometryReady ? "true" : "false"}
             data-hover={barIdleHover ? "true" : "false"}
             data-theme={audioWidgetTheme}
             onMouseLeave={clearBarIdleHover}
@@ -7283,12 +7400,14 @@ export function AudioWidgetWindow() {
         <GlobalStyle />
         <AudioBarShell
           aria-label={widgetLabel}
+          data-geometry-ready={barGeometryReady ? "true" : "false"}
           data-mode={cancelNotice ? "notice" : "active"}
           data-theme={audioWidgetTheme}
-          data-visible={barVisible ? "true" : "false"}
+          data-visible={barVisible && barGeometryReady ? "true" : "false"}
         >
           {cancelNotice ? cancelNoticeSurface : (
             <AudioBarSurface
+              key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
               onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
               role="status"
               style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}

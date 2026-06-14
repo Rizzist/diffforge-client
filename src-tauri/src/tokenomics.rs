@@ -6345,7 +6345,8 @@ fn tokenomics_should_replace_provider_limit(existing: &Value, incoming: &Value) 
     if !existing_unknown && incoming_unknown {
         return false;
     }
-    tokenomics_provider_limit_updated_at(incoming) >= tokenomics_provider_limit_updated_at(existing)
+    tokenomics_provider_limit_updated_at_unix(incoming)
+        >= tokenomics_provider_limit_updated_at_unix(existing)
 }
 
 fn tokenomics_provider_limit_key(limit: &Value) -> String {
@@ -6420,9 +6421,24 @@ fn tokenomics_provider_limit_is_unknown(limit: &Value) -> bool {
         || !has_percent
 }
 
-fn tokenomics_provider_limit_updated_at(limit: &Value) -> String {
-    tokenomics_value_string(limit, &["updated_at", "updatedAt", "last_known_at", "lastKnownAt"])
-        .unwrap_or_default()
+fn tokenomics_provider_limit_updated_at_unix(limit: &Value) -> u64 {
+    tokenomics_value_string(
+        limit,
+        &[
+            "limit_observed_at",
+            "limitObservedAt",
+            "sample_observed_at",
+            "sampleObservedAt",
+            "sample_at",
+            "sampleAt",
+            "updated_at",
+            "updatedAt",
+            "last_known_at",
+            "lastKnownAt",
+        ],
+    )
+    .and_then(|value| tokenomics_timestamp_unix(&value))
+    .unwrap_or(0)
 }
 
 fn tokenomics_codex_usage_cache_key(provider_account: &TokenomicsProviderAccount) -> String {
@@ -9387,6 +9403,38 @@ mod tokenomics_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["used_percent"], json!(98));
         assert_eq!(merged[0]["remaining_percent"], json!(2));
+    }
+
+    #[test]
+    fn tokenomics_provider_limit_merge_normalizes_timestamp_formats() {
+        let cloud_known = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:personal",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": 42,
+            "remaining_percent": 58,
+            "updated_at": "2026-06-14T12:00:00Z"
+        });
+        let stale_local = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:personal",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": 88,
+            "remaining_percent": 12,
+            "updated_at": "unix:1000"
+        });
+
+        let merged = tokenomics_merge_provider_limits(vec![cloud_known], vec![stale_local]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["used_percent"], json!(42));
+        assert_eq!(merged[0]["remaining_percent"], json!(58));
     }
 
     #[test]

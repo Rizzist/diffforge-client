@@ -1002,6 +1002,10 @@ function weeklyLimitRowTime(row = {}) {
       ?? row.sampleAt
       ?? row.sample_bucket_start
       ?? row.sampleBucketStart
+      ?? row.sample_observed_at
+      ?? row.sampleObservedAt
+      ?? row.limit_observed_at
+      ?? row.limitObservedAt
       ?? row.updated_at
       ?? row.updatedAt
       ?? row.last_known_at
@@ -1049,12 +1053,14 @@ function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selected
     series.sort((left, right) => left.time - right.time);
     let previous = null;
     for (const entry of series) {
-      if (previous) {
-        const sameWindow = !entry.resetKey || !previous.resetKey || entry.resetKey === previous.resetKey;
-        const delta = sameWindow && entry.used >= previous.used ? entry.used - previous.used : entry.used;
-        if (delta > 0) {
-          byDay.set(entry.day, Math.max(byDay.get(entry.day) || 0, delta));
-        }
+      const sameWindow = previous
+        ? (!entry.resetKey || !previous.resetKey || entry.resetKey === previous.resetKey)
+        : true;
+      const delta = previous && sameWindow && entry.used >= previous.used
+        ? entry.used - previous.used
+        : entry.used;
+      if (delta > 0) {
+        byDay.set(entry.day, Math.max(byDay.get(entry.day) || 0, delta));
       }
       previous = entry;
     }
@@ -1062,58 +1068,14 @@ function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selected
   return byDay;
 }
 
-function latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
-  const candidates = [
-    ...matchingWeeklyLimitRows(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
-    ...matchingWeeklyLimitRows(limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
-  ]
-    .map((row) => ({
-      time: weeklyLimitRowTime(row)?.getTime() || 0,
-      used: weeklyLimitUsedPercent(row),
-    }))
-    .filter((row) => row.used != null)
-    .sort((left, right) => right.time - left.time);
-  if (!candidates.length) return null;
-  const latestTime = candidates[0].time;
-  return Math.max(
-    ...candidates
-      .filter((row) => row.time === latestTime || latestTime === 0)
-      .map((row) => Math.max(0, Math.min(100, row.used))),
-  );
-}
-
 function withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
   const directPercents = directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
-  let knownTokenTotal = 0;
-  let knownPercentTotal = 0;
-  const seeded = rows.map((row) => {
+  return rows.map((row) => {
     const weeklyLimitPercent = directPercents.get(row.key);
-    const total = dailyUsageValue(row);
-    if (weeklyLimitPercent != null && total > 0) {
-      knownTokenTotal += total;
-      knownPercentTotal += weeklyLimitPercent;
-    }
-    return { ...row, weeklyLimitPercent, weeklyLimitPercentEstimated: false };
-  });
-
-  const tokenPercentRatio = knownTokenTotal > 0 && knownPercentTotal > 0
-    ? knownPercentTotal / knownTokenTotal
-    : null;
-  const latestUsedPercent = latestWeeklyLimitUsedPercent(limitSamples, limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
-  const visibleTokenTotal = seeded.reduce((sum, row) => sum + dailyUsageValue(row), 0);
-
-  return seeded.map((row) => {
-    if (row.weeklyLimitPercent != null || dailyUsageValue(row) <= 0) return row;
-    let weeklyLimitPercent = null;
-    if (tokenPercentRatio != null) {
-      weeklyLimitPercent = dailyUsageValue(row) * tokenPercentRatio;
-    } else if (latestUsedPercent != null && visibleTokenTotal > 0) {
-      weeklyLimitPercent = (dailyUsageValue(row) / visibleTokenTotal) * latestUsedPercent;
-    }
     return {
       ...row,
       weeklyLimitPercent: weeklyLimitPercent == null ? null : Math.max(0, Math.min(100, weeklyLimitPercent)),
-      weeklyLimitPercentEstimated: weeklyLimitPercent != null,
+      weeklyLimitPercentEstimated: false,
     };
   });
 }
@@ -1171,16 +1133,6 @@ function todayAggregate(dailyRows, selectedProvider, selectedAccountKey, selecte
   return aggregateRows(rows);
 }
 
-function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all", selectedDeviceId = "all") {
-  if (!Array.isArray(limits)) return [];
-  return limits.filter((limit) => (
-    (selectedProvider === "all" || providerKey(limit) === selectedProvider)
-      && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
-      && (selectedDeviceId === "all" || !rowDeviceId(limit) || rowDeviceId(limit) === selectedDeviceId)
-      && (selectedScopeKey === "all" || rowScopeKey(limit) === selectedScopeKey)
-  ));
-}
-
 function limitNumberOrNull(...values) {
   for (const value of values) {
     if (value == null || value === "") continue;
@@ -1210,11 +1162,89 @@ function parseLimitTimestamp(value) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+function limitTimestampMs(row = {}) {
+  return parseLimitTimestamp(
+    row.sample_at
+      ?? row.sampleAt
+      ?? row.sample_observed_at
+      ?? row.sampleObservedAt
+      ?? row.limit_observed_at
+      ?? row.limitObservedAt
+      ?? row.updated_at
+      ?? row.updatedAt
+      ?? row.last_known_at
+      ?? row.lastKnownAt,
+  )?.getTime() || 0;
+}
+
+function providerLimitAuthorityKey(row = {}, selectedDeviceId = "all") {
+  const devicePart = selectedDeviceId === "all" ? "account" : (rowDeviceId(row) || "unknown-device");
+  return [
+    rowScopeKey(row),
+    devicePart,
+    providerKey(row),
+    rowProviderAccountKey(row),
+    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+  ].join("::");
+}
+
+function providerLimitSourceRank(row = {}) {
+  const sourceKind = String(row?.limit_source_kind || row?.limitSourceKind || "").toLowerCase();
+  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+  const confidence = String(row?.confidence || "").toLowerCase();
+  if (sourceKind.includes("cloud") || source === "cloud") return 1;
+  if (confidence === "live" || source.includes("usage_api") || source.includes("statusline")) return 3;
+  if (confidence === "sampled_stale" || source.includes("sample")) return 2;
+  return 1;
+}
+
+function shouldReplaceProviderLimit(existing = {}, incoming = {}) {
+  const existingUnknown = providerLimitIsUnknown(existing);
+  const incomingUnknown = providerLimitIsUnknown(incoming);
+  if (existingUnknown && !incomingUnknown) return true;
+  if (!existingUnknown && incomingUnknown) return false;
+  const incomingMs = limitTimestampMs(incoming);
+  const existingMs = limitTimestampMs(existing);
+  if (incomingMs !== existingMs) return incomingMs > existingMs;
+  return providerLimitSourceRank(incoming) >= providerLimitSourceRank(existing);
+}
+
+function mergeProviderLimitRowsForDisplay(rows, selectedDeviceId = "all") {
+  const merged = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const key = providerLimitAuthorityKey(row, selectedDeviceId);
+    const existing = merged.get(key);
+    if (!existing || shouldReplaceProviderLimit(existing, row)) {
+      merged.set(key, row);
+    }
+  });
+  return [...merged.values()];
+}
+
+function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all", selectedDeviceId = "all") {
+  if (!Array.isArray(limits)) return [];
+  return mergeProviderLimitRowsForDisplay(limits.filter((limit) => (
+    (selectedProvider === "all" || providerKey(limit) === selectedProvider)
+      && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
+      && (selectedDeviceId === "all" || !rowDeviceId(limit) || rowDeviceId(limit) === selectedDeviceId)
+      && (selectedScopeKey === "all" || rowScopeKey(limit) === selectedScopeKey)
+  )), selectedDeviceId);
+}
+
 function limitResetDate(limit = {}) {
   const direct = parseLimitTimestamp(limit.reset_at ?? limit.resetAt ?? limit.limit_resets_at ?? limit.limitResetsAt);
   if (direct) return direct;
   const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
-  const updatedAt = parseLimitTimestamp(limit.updated_at ?? limit.updatedAt ?? limit.last_known_at ?? limit.lastKnownAt);
+  const updatedAt = parseLimitTimestamp(
+    limit.limit_observed_at
+      ?? limit.limitObservedAt
+      ?? limit.sample_observed_at
+      ?? limit.sampleObservedAt
+      ?? limit.updated_at
+      ?? limit.updatedAt
+      ?? limit.last_known_at
+      ?? limit.lastKnownAt,
+  );
   if (resetAfterSeconds != null && updatedAt) {
     return new Date(updatedAt.getTime() + Math.max(0, resetAfterSeconds) * 1000);
   }
@@ -1821,15 +1851,12 @@ function mergeProviderLimits(previousLimits, nextLimits) {
   const previousRows = Array.isArray(previousLimits) ? previousLimits : [];
   if (!Array.isArray(nextLimits)) return previousRows;
 
-  const previousByKey = new Map();
-  previousRows.forEach((row) => previousByKey.set(providerLimitKey(row), row));
   const merged = new Map();
+  previousRows.forEach((row) => merged.set(providerLimitKey(row), row));
   nextLimits.forEach((row) => {
     const key = providerLimitKey(row);
-    const existing = previousByKey.get(key);
-    if (existing && !providerLimitIsUnknown(existing) && providerLimitIsUnknown(row)) {
-      merged.set(key, existing);
-    } else {
+    const existing = merged.get(key);
+    if (!existing || shouldReplaceProviderLimit(existing, row)) {
       merged.set(key, row);
     }
   });
@@ -1841,7 +1868,14 @@ function mergeProviderLimitSamples(previousSamples, nextSamples) {
   if (!Array.isArray(nextSamples)) return previousRows;
 
   const merged = new Map();
-  nextSamples.forEach((row) => merged.set(providerLimitSampleKey(row), row));
+  previousRows.forEach((row) => merged.set(providerLimitSampleKey(row), row));
+  nextSamples.forEach((row) => {
+    const key = providerLimitSampleKey(row);
+    const existing = merged.get(key);
+    if (!existing || limitTimestampMs(row) >= limitTimestampMs(existing)) {
+      merged.set(key, row);
+    }
+  });
   return [...merged.values()];
 }
 

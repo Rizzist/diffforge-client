@@ -7052,9 +7052,24 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                             &["terminal_lifecycle", "terminalLifecycle", "lifecycle"],
                         )
                         .unwrap_or_else(|| terminal_status.clone());
+                        let activity_status = cloud_mcp_payload_text(terminal, &["activity_status", "activityStatus"]);
+                        let display_status = cloud_mcp_payload_text(terminal, &["display_status", "displayStatus"]);
+                        let native_rail_state = cloud_mcp_payload_text(terminal, &["native_rail_state", "nativeRailState"]);
+                        let native_rail_label = cloud_mcp_payload_text(terminal, &["native_rail_label", "nativeRailLabel"]);
+                        let terminal_id = cloud_mcp_payload_text(
+                            terminal,
+                            &["terminal_id", "terminalId", "pane_id", "paneId", "target_terminal_id", "targetTerminalId", "id"],
+                        );
+                        let pane_id = cloud_mcp_payload_text(
+                            terminal,
+                            &["pane_id", "paneId", "target_terminal_id", "targetTerminalId", "terminal_id", "terminalId"],
+                        );
                         json!({
+                            "activity_status": activity_status,
                             "agent_kind": cloud_mcp_payload_text(terminal, &["agent_kind", "agentKind", "agent_id", "agentId"]),
                             "agent_label": cloud_mcp_payload_text(terminal, &["agent_label", "agentLabel", "label"]),
+                            "agent_display_name": cloud_mcp_payload_text(terminal, &["agent_display_name", "agentDisplayName", "display_name", "displayName"]),
+                            "agent_type": cloud_mcp_payload_text(terminal, &["agent_type", "agentType"]),
                             "color": cloud_mcp_payload_text(terminal, &["color", "terminal_color", "terminalColor", "accent", "accentColor"]),
                             "terminal_color": cloud_mcp_payload_text(terminal, &["terminal_color", "terminalColor", "color", "accent", "accentColor"]),
                             "color_slot": terminal
@@ -7062,15 +7077,39 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                                 .or_else(|| terminal.get("colorSlot"))
                                 .cloned()
                                 .unwrap_or(Value::Null),
+                            "display_status": display_status,
+                            "native_rail_label": native_rail_label,
+                            "native_rail_state": native_rail_state,
+                            "pane_id": pane_id,
+                            "readiness": cloud_mcp_payload_text(terminal, &["readiness", "terminal_readiness", "terminalReadiness"]),
+                            "session_state": cloud_mcp_payload_text(terminal, &["session_state", "sessionState"]),
+                            "status_seq": terminal
+                                .get("status_seq")
+                                .or_else(|| terminal.get("statusSeq"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "target_terminal_id": terminal_id.clone(),
                             "terminal_index": terminal
                                 .get("terminal_index")
                                 .or_else(|| terminal.get("terminalIndex"))
                                 .cloned()
                                 .unwrap_or(Value::Null),
+                            "terminal_epoch": cloud_mcp_payload_text(terminal, &["terminal_epoch", "terminalEpoch"]),
+                            "terminal_id": terminal_id,
+                            "terminal_instance_id": terminal
+                                .get("terminal_instance_id")
+                                .or_else(|| terminal.get("terminalInstanceId"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
                             "terminal_name": terminal_name.clone(),
+                            "terminal_nickname": cloud_mcp_payload_text(terminal, &["terminal_nickname", "terminalNickname"]),
                             "display_name": terminal_name,
                             "status": terminal_status,
                             "terminal_lifecycle": terminal_lifecycle,
+                            "terminal_status": cloud_mcp_payload_text(terminal, &["terminal_status", "terminalStatus", "status"]),
+                            "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
+                            "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId"]),
+                            "turn_status": cloud_mcp_payload_text(terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
                             "last_known_runtime": true,
                             "lastKnownRuntime": true,
                             "runtime_read_only": true,
@@ -7082,6 +7121,23 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let terminal_clear_reason = cloud_mcp_payload_text(
+            workspace,
+            &["terminal_clear_reason", "terminalClearReason"],
+        )
+        .unwrap_or_default();
+        let terminal_list_empty_authoritative = workspace
+            .get("terminal_list_empty_authoritative")
+            .or_else(|| workspace.get("terminalListEmptyAuthoritative"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && terminal_clear_reason == "all_terminals_closed";
+        let terminal_list_authoritative = workspace
+            .get("terminal_list_authoritative")
+            .or_else(|| workspace.get("terminalListAuthoritative"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || terminal_list_empty_authoritative;
         let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
             "workspace_id": workspace_id,
@@ -7093,6 +7149,10 @@ fn cloud_mcp_normalize_workspace_catalog_items(
             "workspace_runtime_seq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
+            "terminal_count": last_known_terminals.len(),
+            "terminal_clear_reason": terminal_clear_reason,
+            "terminal_list_empty_authoritative": terminal_list_empty_authoritative,
+            "terminal_list_authoritative": terminal_list_authoritative,
             "terminals": last_known_terminals.clone(),
             "updated_at_ms": cloud_mcp_now_ms(),
         });
@@ -7787,11 +7847,40 @@ fn cloud_mcp_live_state_merge_object(target: &mut Value, incoming: Value) {
             let existing = target.entry(key.clone()).or_insert_with(|| json!({}));
             cloud_mcp_live_state_merge_object(existing, value.clone());
         } else if key == "terminals" || key == "mcps" || key == "cli_states" {
+            if key == "terminals"
+                && cloud_mcp_live_state_values(Some(value)).is_empty()
+                && !cloud_mcp_live_state_values(target.get(key)).is_empty()
+                && !cloud_mcp_terminal_list_empty_authoritative(&Value::Object(incoming.clone()))
+            {
+                continue;
+            }
             target.insert(key.clone(), value.clone());
         } else {
             target.insert(key.clone(), value.clone());
         }
     }
+}
+
+fn cloud_mcp_live_state_values(value: Option<&Value>) -> Vec<Value> {
+    match value {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::Object(items)) => items.values().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn cloud_mcp_terminal_list_empty_authoritative(workspace: &Value) -> bool {
+    let explicit_empty = workspace
+        .get("terminal_list_empty_authoritative")
+        .or_else(|| workspace.get("terminalListEmptyAuthoritative"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let clear_reason = cloud_mcp_payload_text(
+        workspace,
+        &["terminal_clear_reason", "terminalClearReason"],
+    )
+    .unwrap_or_default();
+    explicit_empty && clear_reason == "all_terminals_closed"
 }
 
 fn cloud_mcp_live_state_terminal_key(terminal: &Value, index: usize) -> String {
@@ -14052,6 +14141,23 @@ async fn cloud_mcp_sync_device_live_terminals(
             ],
         )
         .unwrap_or(workspace_index as u64);
+        let terminal_clear_reason = cloud_mcp_payload_text(
+            workspace,
+            &["terminal_clear_reason", "terminalClearReason"],
+        )
+        .unwrap_or_default();
+        let terminal_list_empty_authoritative = workspace
+            .get("terminal_list_empty_authoritative")
+            .or_else(|| workspace.get("terminalListEmptyAuthoritative"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && terminal_clear_reason == "all_terminals_closed";
+        let terminal_list_authoritative = workspace
+            .get("terminal_list_authoritative")
+            .or_else(|| workspace.get("terminalListAuthoritative"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || terminal_list_empty_authoritative;
         let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
             "workspace_active": workspace_active,
@@ -14061,6 +14167,9 @@ async fn cloud_mcp_sync_device_live_terminals(
             "workspace_runtime_seq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
+            "terminal_clear_reason": terminal_clear_reason,
+            "terminal_list_empty_authoritative": terminal_list_empty_authoritative,
+            "terminal_list_authoritative": terminal_list_authoritative,
             "last_known_runtime": workspace
                 .get("last_known_runtime")
                 .or_else(|| workspace.get("lastKnownRuntime"))

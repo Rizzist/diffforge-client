@@ -4360,6 +4360,33 @@ async fn terminal_open(
             .fetch_add(1, Ordering::Relaxed)
     });
     clear_terminal_activity_hook_files(&pane_id, instance_id);
+    let activity_transport =
+        match terminal_activity_transport_for_terminal(
+            app.clone(),
+            state.inner(),
+            &pane_id,
+            instance_id,
+        )
+        .await
+        {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.terminal_activity_transport.start_error",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    }),
+                );
+                None
+            }
+        };
+    let activity_hook_poll_ms = if activity_transport.is_some() {
+        TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS
+    } else {
+        TERMINAL_ACTIVITY_HOOK_POLL_MS
+    };
     ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if (!is_prewarm_pty || !plain_shell) && session_mode.should_prepare_coordination() {
@@ -4445,6 +4472,7 @@ async fn terminal_open(
             workspace_id.as_deref(),
             terminal_index,
             activity_provider_id,
+            activity_transport.as_ref(),
         );
         if terminal_coordination.is_some() {
             coordination_env_vars
@@ -4504,6 +4532,7 @@ async fn terminal_open(
             workspace_id.as_deref(),
             terminal_index,
             launch_provider_id,
+            activity_transport.as_ref(),
         );
         coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
         let launch_env_vars =
@@ -4631,6 +4660,7 @@ async fn terminal_open(
         cloud_mcp_state.inner().clone(),
         pane_id.clone(),
         instance_id,
+        activity_hook_poll_ms,
     );
 
     log_terminal_crash_forensics_event(
@@ -4975,7 +5005,7 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
 
 #[tauri::command]
 async fn terminal_start_agent(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
@@ -5032,6 +5062,28 @@ async fn terminal_start_agent(
         None,
     )
     .await?;
+    let activity_transport =
+        match terminal_activity_transport_for_terminal(
+            app.clone(),
+            state.inner(),
+            &pane_id,
+            instance.id,
+        )
+        .await
+        {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.terminal_activity_transport.start_error",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    }),
+                );
+                None
+            }
+        };
     refresh_codex_activity_hook_profile_for_launch(
         instance.coordination.as_ref(),
         definition.id,
@@ -5060,6 +5112,7 @@ async fn terminal_start_agent(
         Some(instance.metadata.workspace_id.as_str()),
         instance.metadata.terminal_index,
         definition.id,
+        activity_transport.as_ref(),
     );
     coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
     let launch_env_vars =
@@ -5090,7 +5143,7 @@ async fn terminal_start_agent(
 }
 
 async fn start_terminal_agent_in_prepared_pty(
-    _app: AppHandle,
+    app: AppHandle,
     cloud_mcp_state: CloudMcpState,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     _parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
@@ -5286,6 +5339,28 @@ async fn start_terminal_agent_in_prepared_pty(
                 message: error,
             };
         }
+        let terminal_state = app.state::<TerminalState>();
+        let activity_transport = match terminal_activity_transport_for_terminal(
+            app.clone(),
+            terminal_state.inner(),
+            &pane_id,
+            instance.id,
+        )
+        .await
+        {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.terminal_activity_transport.start_error",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    }),
+                );
+                None
+            }
+        };
         let mut coordination_env_vars = instance
             .coordination
             .as_ref()
@@ -5298,6 +5373,7 @@ async fn start_terminal_agent_in_prepared_pty(
             Some(instance.metadata.workspace_id.as_str()),
             instance.metadata.terminal_index,
             definition.id,
+            activity_transport.as_ref(),
         );
         let cloud_env_vars = match cloud_mcp_runtime_env_vars(&cloud_mcp_state).await {
             Ok(env_vars) => env_vars,
@@ -9517,12 +9593,162 @@ async fn read_terminal_activity_hook_chunk(
     Ok((next_offset, chunk))
 }
 
+async fn handle_terminal_activity_hook_event(
+    app: &AppHandle,
+    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    event: Value,
+    source: &str,
+) -> Result<(), String> {
+    let Some(instance) =
+        terminal_activity_hook_current_instance(terminals, pane_id, instance_id).await
+    else {
+        return Err("Terminal activity event target is not active.".to_string());
+    };
+    process_terminal_activity_hook_event(
+        app,
+        terminals,
+        cloud_mcp_state,
+        pane_id,
+        instance_id,
+        &instance,
+        &event,
+        source,
+    )
+    .await;
+    Ok(())
+}
+
+async fn process_terminal_activity_hook_event(
+    app: &AppHandle,
+    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    instance: &TerminalInstance,
+    event: &Value,
+    source: &str,
+) {
+    let architecture_payload = terminal_architecture_activity_payload(instance, event);
+    let Some(payload) = terminal_activity_hook_payload(instance, event) else {
+        if let Some(payload) = architecture_payload {
+            let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
+        }
+        let hook_event_name = terminal_activity_hook_string(
+            event,
+            &[
+                "hookEventName",
+                "hook_event_name",
+                "eventName",
+                "event_name",
+            ],
+        )
+        .unwrap_or_default();
+        if terminal_activity_hook_non_lifecycle_is_expected(&hook_event_name) {
+            return;
+        }
+        let event_keys = event
+            .as_object()
+            .map(|object| object.keys().take(16).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.unmapped",
+            json!({
+                "event_keys": event_keys,
+                "hook_event_name": clean_terminal_diagnostic_log_text(&hook_event_name),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "reason": if hook_event_name.is_empty() {
+                    "missing_hook_event_name"
+                } else {
+                    "unsupported_hook_event_name"
+                },
+                "source": source,
+            }),
+        );
+        return;
+    };
+    log_terminal_status_event(
+        "backend.terminal_activity_hook.lifecycle",
+        json!({
+            "activity_status": payload.activity_status.clone(),
+            "event_type": payload.event_type.clone(),
+            "hook_health_event": payload.hook_health_event.clone(),
+            "hook_health_status": payload.hook_health_status.clone(),
+            "hook_event_name": payload.hook_event_name.clone(),
+            "instance_id": payload.instance_id,
+            "pane_id": payload.pane_id.clone(),
+            "provider_session_id_present": payload.provider_session_id.is_some(),
+            "source": source,
+            "thread_id": payload.thread_id.clone(),
+            "workspace_id": payload.workspace_id.clone(),
+        }),
+    );
+    let cloud_payload = payload.clone();
+    let cloud_state = cloud_mcp_state.clone();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_sync_terminal_activity_hook_delta(&cloud_state, &cloud_payload).await;
+    });
+    if let Some(provider_session_id) = payload
+        .provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    {
+        if let Some(coordination) = instance.coordination.clone() {
+            tauri::async_runtime::spawn_blocking(move || {
+                match crate::coordination::CoordinationKernel::open(
+                    &coordination.repo_path,
+                    Some(PathBuf::from(&coordination.db_path)),
+                ) {
+                    Ok(kernel) => {
+                        let _ = kernel.record_session_provider_session_id(
+                            &coordination.session_id,
+                            &provider_session_id,
+                        );
+                    }
+                    Err(error) => log_terminal_status_event(
+                        "backend.terminal_activity_hook.provider_session_record_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                        }),
+                    ),
+                }
+            });
+        }
+    }
+    let resume_app = app.clone();
+    let resume_cloud_state = cloud_mcp_state.clone();
+    let resume_terminals = Arc::clone(terminals);
+    let resume_payload = payload.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = terminal_try_crash_todo_resume_prompt_once(
+            resume_app,
+            resume_cloud_state,
+            resume_terminals,
+            resume_payload,
+        )
+        .await;
+    });
+    todo_dispatch_observe_activity_hook(app, &payload);
+    terminal_hook_prompt_submitted_observe(app, instance, &payload);
+    terminal_native_plan_capture_observe(instance, event, &payload);
+    let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
+    if let Some(payload) = architecture_payload {
+        let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
+    }
+}
+
 fn spawn_terminal_activity_hook_watcher(
     app: AppHandle,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     cloud_mcp_state: CloudMcpState,
     pane_id: String,
     instance_id: u64,
+    poll_ms: u64,
 ) {
     let activity_events_path = terminal_activity_events_path(&pane_id, instance_id);
     let activity_debug_path = terminal_activity_debug_path(&pane_id, instance_id);
@@ -9565,123 +9791,17 @@ fn spawn_terminal_activity_hook_watcher(
                             let Ok(event) = serde_json::from_str::<Value>(line) else {
                                 continue;
                             };
-                            let architecture_payload =
-                                terminal_architecture_activity_payload(&instance, &event);
-                            let Some(payload) = terminal_activity_hook_payload(&instance, &event)
-                            else {
-                                if let Some(payload) = architecture_payload {
-                                    let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
-                                }
-                                let hook_event_name = terminal_activity_hook_string(
-                                    &event,
-                                    &[
-                                        "hookEventName",
-                                        "hook_event_name",
-                                        "eventName",
-                                        "event_name",
-                                    ],
-                                )
-                                .unwrap_or_default();
-                                if terminal_activity_hook_non_lifecycle_is_expected(
-                                    &hook_event_name,
-                                ) {
-                                    continue;
-                                }
-                                let event_keys = event
-                                    .as_object()
-                                    .map(|object| {
-                                        object.keys().take(16).cloned().collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
-                                log_terminal_status_event(
-                                    "backend.terminal_activity_hook.unmapped",
-                                    json!({
-                                        "event_keys": event_keys,
-                                        "hook_event_name": clean_terminal_diagnostic_log_text(&hook_event_name),
-                                        "instance_id": instance_id,
-                                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                        "reason": if hook_event_name.is_empty() {
-                                            "missing_hook_event_name"
-                                        } else {
-                                            "unsupported_hook_event_name"
-                                        },
-                                    }),
-                                );
-                                continue;
-                            };
-                            log_terminal_status_event(
-                                "backend.terminal_activity_hook.lifecycle",
-                                json!({
-                                    "activity_status": payload.activity_status.clone(),
-                                    "event_type": payload.event_type.clone(),
-                                    "hook_health_event": payload.hook_health_event.clone(),
-                                    "hook_health_status": payload.hook_health_status.clone(),
-                                    "hook_event_name": payload.hook_event_name.clone(),
-                                    "instance_id": payload.instance_id,
-                                    "pane_id": payload.pane_id.clone(),
-                                    "provider_session_id_present": payload.provider_session_id.is_some(),
-                                    "thread_id": payload.thread_id.clone(),
-                                    "workspace_id": payload.workspace_id.clone(),
-                                }),
-                            );
-                            let cloud_payload = payload.clone();
-                            let cloud_state = cloud_mcp_state.clone();
-                            tauri::async_runtime::spawn(async move {
-                                cloud_mcp_sync_terminal_activity_hook_delta(
-                                    &cloud_state,
-                                    &cloud_payload,
-                                )
-                                .await;
-                            });
-                            if let Some(provider_session_id) = payload
-                                .provider_session_id
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .map(str::to_string)
-                            {
-                                if let Some(coordination) = instance.coordination.clone() {
-                                    tauri::async_runtime::spawn_blocking(move || {
-                                        match crate::coordination::CoordinationKernel::open(
-                                            &coordination.repo_path,
-                                            Some(PathBuf::from(&coordination.db_path)),
-                                        ) {
-                                            Ok(kernel) => {
-                                                let _ = kernel.record_session_provider_session_id(
-                                                    &coordination.session_id,
-                                                    &provider_session_id,
-                                                );
-                                            }
-                                            Err(error) => log_terminal_status_event(
-                                                "backend.terminal_activity_hook.provider_session_record_error",
-                                                json!({
-                                                    "error": clean_terminal_diagnostic_log_text(&error),
-                                                }),
-                                            ),
-                                        }
-                                    });
-                                }
-                            }
-                            let resume_app = app.clone();
-                            let resume_cloud_state = cloud_mcp_state.clone();
-                            let resume_terminals = Arc::clone(&terminals);
-                            let resume_payload = payload.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let _ = terminal_try_crash_todo_resume_prompt_once(
-                                    resume_app,
-                                    resume_cloud_state,
-                                    resume_terminals,
-                                    resume_payload,
-                                )
-                                .await;
-                            });
-                            todo_dispatch_observe_activity_hook(&app, &payload);
-                            terminal_hook_prompt_submitted_observe(&app, &instance, &payload);
-                            terminal_native_plan_capture_observe(&instance, &event, &payload);
-                            let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
-                            if let Some(payload) = architecture_payload {
-                                let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
-                            }
+                            process_terminal_activity_hook_event(
+                                &app,
+                                &terminals,
+                                &cloud_mcp_state,
+                                &pane_id,
+                                instance_id,
+                                &instance,
+                                &event,
+                                "jsonl",
+                            )
+                            .await;
                         }
                     }
                 }
@@ -9758,15 +9878,20 @@ fn spawn_terminal_activity_hook_watcher(
                 }
             }
 
-            sleep(Duration::from_millis(TERMINAL_ACTIVITY_HOOK_POLL_MS)).await;
+            sleep(Duration::from_millis(poll_ms)).await;
         }
         log_terminal_status_event(
             "backend.terminal_activity_hook.watcher_stopped",
             json!({
                 "instance_id": instance_id,
                 "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "poll_ms": poll_ms,
             }),
         );
+        let state = app.state::<TerminalState>();
+        if let Ok(mut tokens) = state.terminal_activity_transport_tokens.lock() {
+            tokens.remove(&terminal_output_transport_key(&pane_id, instance_id));
+        };
     });
 }
 
@@ -10049,6 +10174,77 @@ async fn terminal_output_transport_endpoint(
     Ok(endpoint)
 }
 
+async fn terminal_activity_transport_endpoint_for_state(
+    app: AppHandle,
+    state: &TerminalState,
+) -> Result<TerminalActivityTransportEndpoint, String> {
+    if let Ok(transport) = state.terminal_activity_transport.lock() {
+        if let Some(endpoint) = transport.clone() {
+            return Ok(endpoint);
+        }
+    } else {
+        return Err("Unable to read terminal activity transport.".to_string());
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("Unable to start terminal activity transport: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("Unable to read terminal activity transport address: {error}"))?
+        .port();
+    let endpoint = TerminalActivityTransportEndpoint {
+        host: "127.0.0.1".to_string(),
+        port,
+        token: uuid::Uuid::new_v4().to_string(),
+    };
+
+    {
+        let mut transport = state
+            .terminal_activity_transport
+            .lock()
+            .map_err(|_| "Unable to save terminal activity transport.".to_string())?;
+        if let Some(existing) = transport.clone() {
+            return Ok(existing);
+        }
+        *transport = Some(endpoint.clone());
+    }
+
+    spawn_terminal_activity_transport_listener(app, listener);
+    Ok(endpoint)
+}
+
+async fn terminal_activity_transport_for_terminal(
+    app: AppHandle,
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+) -> Result<TerminalActivityTransportEndpoint, String> {
+    let endpoint = terminal_activity_transport_endpoint_for_state(app, state).await?;
+    let token = terminal_activity_transport_token_for_terminal(state, pane_id, instance_id)?;
+    Ok(TerminalActivityTransportEndpoint {
+        host: endpoint.host,
+        port: endpoint.port,
+        token,
+    })
+}
+
+fn terminal_activity_transport_token_for_terminal(
+    state: &TerminalState,
+    pane_id: &str,
+    instance_id: u64,
+) -> Result<String, String> {
+    let key = terminal_output_transport_key(pane_id, instance_id);
+    let mut tokens = state
+        .terminal_activity_transport_tokens
+        .lock()
+        .map_err(|_| "Unable to save terminal activity transport token.".to_string())?;
+    Ok(tokens
+        .entry(key)
+        .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone())
+}
+
 fn spawn_terminal_input_transport_listener(
     app: AppHandle,
     listener: TcpListener,
@@ -10082,6 +10278,23 @@ fn spawn_terminal_output_transport_listener(
             let token = expected_token.clone();
             tauri::async_runtime::spawn(async move {
                 handle_terminal_output_transport_connection(app_handle, stream, token).await;
+            });
+        }
+    });
+}
+
+fn spawn_terminal_activity_transport_listener(
+    app: AppHandle,
+    listener: TcpListener,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_terminal_activity_transport_connection(app_handle, stream).await;
             });
         }
     });
@@ -10253,6 +10466,110 @@ async fn handle_terminal_output_transport_connection(
 
     writer_task.abort();
     remove_terminal_output_transport_subscriber(&state, &key, subscriber_id);
+}
+
+async fn handle_terminal_activity_transport_connection(
+    app: AppHandle,
+    mut stream: TcpStream,
+) {
+    let result = match read_terminal_activity_transport_message(&mut stream).await {
+        Ok(text) => handle_terminal_activity_transport_message(&app, &text).await,
+        Err(error) => Err(error),
+    };
+    let ack = TerminalActivityTransportAck {
+        r#type: "terminal-activity-ack",
+        ok: result.is_ok(),
+        error: result.err(),
+    };
+    let response = serde_json::to_string(&ack).unwrap_or_else(|_| {
+        "{\"type\":\"terminal-activity-ack\",\"ok\":false,\"error\":\"Unable to serialize terminal activity acknowledgement.\"}".to_string()
+    });
+    let response_line = format!("{response}\n");
+    let _ = stream.write_all(response_line.as_bytes()).await;
+}
+
+async fn read_terminal_activity_transport_message(stream: &mut TcpStream) -> Result<String, String> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = timeout(
+            Duration::from_millis(TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS),
+            stream.read(&mut chunk),
+        )
+        .await
+        .map_err(|_| "Timed out reading activity transport message.".to_string())?
+        .map_err(|error| format!("Unable to read activity transport message: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > MAX_TERMINAL_ACTIVITY_TRANSPORT_MESSAGE_BYTES {
+            return Err("Terminal activity transport message is too large.".to_string());
+        }
+        if buffer.iter().any(|byte| *byte == b'\n') {
+            break;
+        }
+    }
+
+    if buffer.is_empty() {
+        return Err("Terminal activity transport message was empty.".to_string());
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(buffer.len());
+    String::from_utf8(buffer[..end].to_vec())
+        .map_err(|error| format!("Terminal activity transport message was not UTF-8: {error}"))
+}
+
+async fn handle_terminal_activity_transport_message(
+    app: &AppHandle,
+    text: &str,
+) -> Result<(), String> {
+    if text.len() > MAX_TERMINAL_ACTIVITY_TRANSPORT_MESSAGE_BYTES {
+        return Err("Terminal activity transport message is too large.".to_string());
+    }
+    let envelope = serde_json::from_str::<TerminalActivityTransportEnvelope>(text)
+        .map_err(|error| format!("Unable to parse terminal activity transport message: {error}"))?;
+    if envelope.r#type != "terminal-activity-hook" {
+        return Err("Terminal activity transport message had an unsupported type.".to_string());
+    }
+
+    let pane_id = terminal_activity_hook_string(&envelope.event, &["paneId", "pane_id"])
+        .ok_or_else(|| "Terminal activity event is missing pane id.".to_string())?;
+    validate_terminal_pane_id(&pane_id)?;
+    let instance_id = envelope
+        .event
+        .get("instanceId")
+        .or_else(|| envelope.event.get("instance_id"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Terminal activity event is missing instance id.".to_string())?;
+    let state = app.state::<TerminalState>();
+    let expected_token = {
+        let tokens = state
+            .terminal_activity_transport_tokens
+            .lock()
+            .map_err(|_| "Unable to read terminal activity transport token.".to_string())?;
+        tokens
+            .get(&terminal_output_transport_key(&pane_id, instance_id))
+            .cloned()
+    }
+    .ok_or_else(|| "Terminal activity event target is not registered.".to_string())?;
+    if envelope.token != expected_token {
+        return Err("Terminal activity transport authentication failed.".to_string());
+    }
+    let cloud_mcp_state = app.state::<CloudMcpState>();
+    handle_terminal_activity_hook_event(
+        app,
+        &state.terminals,
+        cloud_mcp_state.inner(),
+        &pane_id,
+        instance_id,
+        envelope.event,
+        "transport",
+    )
+    .await
 }
 
 fn remove_terminal_output_transport_subscriber(

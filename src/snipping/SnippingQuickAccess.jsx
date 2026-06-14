@@ -356,9 +356,12 @@ function snipTransferUpdatedAt(transfer) {
 }
 
 function snipTransferPercent(transfer) {
+  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+  if (status === "completed") return 100;
   const total = numberValue(transfer?.bytesTotal ?? transfer?.bytes_total, 0);
   const done = numberValue(transfer?.bytesDone ?? transfer?.bytes_done, 0);
   if (total <= 0) return null;
+  if (done <= 0) return null;
   return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
 }
 
@@ -613,7 +616,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
         setUploadPercent(100);
       } else {
         setUploadState("uploading");
-        setUploadPercent(0);
+        setUploadPercent(null);
       }
     };
     const bindAccountAssetEvent = (payload) => {
@@ -664,7 +667,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
 
   const uploadToCloud = useCallback(async () => {
     setUploadState("uploading");
-    setUploadPercent(0);
+    setUploadPercent(null);
     try {
       const result = await invoke("snipping_upload_untracked_asset_to_cloud", {
         request: {
@@ -2519,10 +2522,6 @@ export function SnippingStripWindow() {
   const stripDragGuardTimerRef = useRef(0);
   const closeFallbackTimerRef = useRef(0);
   const closeRequestTokenRef = useRef(0);
-  // Epoch-ms of the last close cue: the watchdog must not fight the hide
-  // animation, but a window still visible long after a close cue (or with no
-  // cue at all) has missed its open cue and must force itself visible.
-  const lastCloseCueMsRef = useRef(0);
 
   useFloatingWindowBody("strip");
 
@@ -2573,7 +2572,6 @@ export function SnippingStripWindow() {
     invoke("snipping_set_strip_interaction_guard", { active: false }).catch(() => {});
     const closeToken = closeRequestTokenRef.current + 1;
     closeRequestTokenRef.current = closeToken;
-    lastCloseCueMsRef.current = Date.now();
     setAnimPhase("closed");
     invoke("snipping_close_snip_strip").catch(() => {});
     if (closeFallbackTimerRef.current) {
@@ -2597,6 +2595,28 @@ export function SnippingStripWindow() {
   useEffect(() => {
     let cancelled = false;
     let unlistenAnim = null;
+    const scheduleCloseFallback = () => {
+      const closeToken = closeRequestTokenRef.current + 1;
+      closeRequestTokenRef.current = closeToken;
+      if (closeFallbackTimerRef.current) {
+        window.clearTimeout(closeFallbackTimerRef.current);
+      }
+      closeFallbackTimerRef.current = window.setTimeout(() => {
+        closeFallbackTimerRef.current = 0;
+        if (cancelled || closeRequestTokenRef.current !== closeToken || animPhaseRef.current !== "closed") return;
+        getCurrentWindow()
+          .isVisible()
+          .then((visible) => {
+            if (cancelled || !visible || closeRequestTokenRef.current !== closeToken || animPhaseRef.current !== "closed") return;
+            invoke("snipping_close_snip_strip").catch(() => {});
+          })
+          .catch(() => {
+            if (!cancelled && closeRequestTokenRef.current === closeToken && animPhaseRef.current === "closed") {
+              invoke("snipping_close_snip_strip").catch(() => {});
+            }
+          });
+      }, 360);
+    };
     const playOpen = () => {
       // Re-mount the strip on every open so it always shows fresh snips,
       // and two-frame the transition so the closed state paints first. The
@@ -2626,7 +2646,6 @@ export function SnippingStripWindow() {
           window.clearTimeout(closeFallbackTimerRef.current);
           closeFallbackTimerRef.current = 0;
         }
-        lastCloseCueMsRef.current = 0;
         if (animPhaseRef.current === "open") {
           setOpenNonce((nonce) => nonce + 1);
           setAnimPhase("open");
@@ -2634,8 +2653,8 @@ export function SnippingStripWindow() {
         }
         playOpen();
       } else {
-        lastCloseCueMsRef.current = Date.now();
         setAnimPhase("closed");
+        scheduleCloseFallback();
       }
     })
       .then((unlisten) => {
@@ -2646,28 +2665,12 @@ export function SnippingStripWindow() {
         unlistenAnim = unlisten;
       })
       .catch(() => {});
-    // Missed-cue watchdog. A visible closed shell means either a missed open
-    // cue or a failed native hide; after a close cue, retry close instead of
-    // reopening the invisible shell over the glass panel.
-    const watchdog = window.setInterval(() => {
-      if (cancelled || animPhaseRef.current === "open") return;
-      const sinceClose = Date.now() - lastCloseCueMsRef.current;
-      if (lastCloseCueMsRef.current > 0 && sinceClose < 260) return;
-      getCurrentWindow()
-        .isVisible()
-        .then((visible) => {
-          if (cancelled || !visible || animPhaseRef.current === "open") return;
-          if (lastCloseCueMsRef.current > 0) {
-            invoke("snipping_close_snip_strip").catch(() => {});
-            return;
-          }
-          playOpen();
-        })
-        .catch(() => {});
-    }, 250);
     return () => {
       cancelled = true;
-      window.clearInterval(watchdog);
+      if (closeFallbackTimerRef.current) {
+        window.clearTimeout(closeFallbackTimerRef.current);
+        closeFallbackTimerRef.current = 0;
+      }
       if (unlistenAnim) unlistenAnim();
     };
   }, []);
