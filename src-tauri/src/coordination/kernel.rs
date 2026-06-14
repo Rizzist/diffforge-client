@@ -17139,7 +17139,9 @@ impl CoordinationKernel {
         }
 
         let cloud_context = json!({
-            "endpoint": "/v1/context/pack",
+            "endpoint": Value::Null,
+            "disabled": true,
+            "reason": "cloud_task_context_sync_removed",
             "mode": "merge_resolution",
             "arguments": {
                 "mode": "merge_resolution",
@@ -20815,9 +20817,9 @@ impl CoordinationKernel {
                     "Worktree/managed patch sessions finish with submit_patch; direct/activity/remote sessions finish with complete_task."
                 ],
                 "cloud_mcp": {
-                    "mode": "automatic_rust_lifecycle",
-                    "agent_action_required": "use_cloud_returned_start_task_id_for_lease_checkpoint_submit_or_complete",
-                    "note": "Diff Forge publishes context packs, task lifecycle, checkpoint summaries, and merge context through the app/kernel cloud sync path."
+                    "mode": "task_history_sync_disabled",
+                    "agent_action_required": "use_local_start_task_id_for_lease_checkpoint_submit_or_complete",
+                    "note": "Task/context/history cloud sync is disabled. Use local coordination for leases/checkpoints/completion and todos for shared cloud work state."
                 }
             }
         })))
@@ -27179,7 +27181,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 ## Required flow for every user task\n\n\
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Architecture graph-only work is the direct-live exception: if the only edits are `.agents/architectures/graphs/*.arch`, do not call `start_task`, do not acquire a normal file lease, and do not call `submit_patch`. Use the architecture MCP context/list/reference tools, edit the graph file directly in the visible repo root, then report the graph path in the final summary.\n\
-3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission, then syncs its lifecycle to Cloud history in the background.\n\
+3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission. Task/context/history Cloud sync is disabled; todos are the shared cloud work state.\n\
 4. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
 5. Use normal shell and edit tools after the lease. Follow the active session file authority: `bounded_direct_edit` edits leased files directly in the visible repo root, while `worktree_required` edits leased files only inside the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT`. Do not sidestep into `.agents/worktrees` when the session is direct, and never edit another agent slot's worktree.\n\
 6. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
@@ -27187,7 +27189,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 8. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Cloud MCP is automatic\n\n\
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
-- Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, and merge context through the Rust cloud event path.\n\
+- Task/context/history Cloud sync is disabled. Diff Forge's Rust app/kernel keeps task lifecycle, checkpoint summaries, and merge context local while todos remain the shared cloud work state.\n\
 - Use the local coordination kernel for leases, completion, patch submission when enabled, and merge safety.\n\
 - For Git-managed files, obey the active file authority: direct sessions edit the visible repo root after leases; isolated sessions edit only through the assigned agent worktree/branch root.\n\
 - Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and finish through the reported completion mode.\n\
@@ -27523,7 +27525,7 @@ IDs:\n\
 Changed files under your temporary resolution lease:\n\
 {files}\n\n\
 Cloud context seed:\n\
-Rust owns Cloud context fetching and lifecycle sync. Do not call Cloud MCP directly; use this seed as the merge-resolution context identity if the host surfaces a context pack:\n\
+Task/context/history Cloud sync is disabled. Do not call Cloud MCP directly; use this seed only as local merge-resolution identity if the host surfaces it:\n\
 ```json\n{cloud_context_text}\n```\n\n\
 Rules:\n\
 - Current integration is the source of truth. Adapt stale patch intent onto current files instead of reverting newer accepted work.\n\
@@ -28182,8 +28184,6 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_else(|_| json!({}));
         let body = if path == "/v1/events" {
             json!({"data": fake_cloud_response_data("event", &request_json, default_task_id.as_str(), omit_task_id)})
-        } else if path == "/v1/task/history" {
-            json!({"data": fake_cloud_response_data("task_history", &request_json, default_task_id.as_str(), omit_task_id)})
         } else {
             json!({"data": {"ok": true}})
         }
@@ -28219,14 +28219,6 @@ mod tests {
                     "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
                 })
             }
-        } else if kind == "task_history" {
-            json!({
-                "kind": "task_history",
-                "version": 1,
-                "repo_id": "repo-test",
-                "workspace_id": "workspace-test",
-                "tasks": []
-            })
         } else {
             json!({"ok": true})
         }
@@ -31127,7 +31119,7 @@ Appwrite > Session Store: create session
             "start_task",
             json!({
                 "cloud_mcp_base_url": cloud_url.as_str(),
-                "plan": "Start locally while Cloud history sync is unavailable."
+                "plan": "Start locally with Cloud task/history sync disabled."
             }),
         );
 

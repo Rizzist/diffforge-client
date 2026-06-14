@@ -15970,8 +15970,7 @@ function TerminalView({
 
   const syncTodoQueueItemsToCloud = useCallback((items, options = {}) => {
     const workspaceId = terminalWorkspace?.id || "";
-    const repoPath = terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
-    if (!workspaceId || !repoPath) {
+    if (!workspaceId) {
       return;
     }
     const payload = buildTodoQueueCloudSyncPayload(items, options);
@@ -16035,51 +16034,6 @@ function TerminalView({
           return nextItems;
         });
       }).catch(() => {});
-      void invoke("cloud_mcp_sync_workspace_todos", {
-        reason: payload.reason,
-        repoPath,
-        todos: payload,
-        workspaceId,
-        workspaceName: terminalWorkspace?.name || "",
-      }).then((result) => {
-        // The server reports tombstoned ids back (including snapshot items it
-        // rejected as resurrections); prune them locally so ghosts self-heal.
-        const removedIds = collectWorkspaceTodoSyncRemovedIds(result);
-        if (!removedIds.length) {
-          return;
-        }
-        recordTodoQueueDeletedReceipts(
-          getTodoQueueDeletedReceiptStorageKey(workspaceId),
-          removedIds,
-        );
-        const removedSet = new Set(removedIds);
-        setTodoQueueItems((currentItems) => {
-          const nextItems = normalizeTodoQueueItemsForWorkspace(
-            currentItems.filter((item) => (
-              !removedSet.has(String(item?.id || "").trim())
-            )),
-            workspaceId,
-            cloudDesktopDeviceId,
-          );
-          if (nextItems.length === currentItems.length) {
-            return currentItems;
-          }
-          writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
-          logTerminalStatus("frontend.todo_queue.server_tombstones_pruned", {
-            prunedCount: currentItems.length - nextItems.length,
-            removedIdCount: removedIds.length,
-            workspaceId,
-          });
-          return nextItems;
-        });
-      }).catch((error) => {
-        logTerminalStatus("frontend.todo_queue.cloud_sync_error", {
-          message: error?.message || String(error || ""),
-          reason: payload.reason,
-          todoCount: payload.todos.length,
-          workspaceId,
-        });
-      });
     };
 
     if (todoQueueCloudSyncTimerRef.current) {
@@ -16093,11 +16047,7 @@ function TerminalView({
     todoQueueCloudSyncTimerRef.current = window.setTimeout(send, TODO_QUEUE_CLOUD_SYNC_DEBOUNCE_MS);
   }, [
     buildTodoQueueCloudSyncPayload,
-    cloudDesktopDeviceId,
-    defaultWorkingDirectory,
     terminalWorkspace?.id,
-    terminalWorkspace?.name,
-    terminalWorkspaceWorkingDirectory,
   ]);
 
   useEffect(() => () => {

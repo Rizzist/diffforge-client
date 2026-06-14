@@ -1129,10 +1129,6 @@ impl TerminalSessionMode {
         matches!(self, TerminalSessionMode::ManagedPatch)
     }
 
-    fn should_request_cloud_context_pack(self) -> bool {
-        matches!(self, TerminalSessionMode::ManagedPatch)
-    }
-
     fn from_request(
         value: Option<&str>,
         default_mode: TerminalSessionMode,
@@ -4628,7 +4624,6 @@ pub fn run() {
             cloud_mcp_request_workspace_todo_dispatch,
             cloud_mcp_record_todo_dispatch_status,
             cloud_mcp_get_activity,
-            cloud_mcp_get_task_history,
             cloud_mcp_hydrate_workspace_todos,
             agent_thread_session_discover,
             agent_thread_transcript,

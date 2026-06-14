@@ -15021,6 +15021,43 @@ export const WindowSyncPill = styled.button`
   }
 `;
 
+export const WindowSyncDirectionCounts = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 1px;
+`;
+
+export const WindowSyncDirectionCount = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 20px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: currentColor;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 9.5px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+
+  span {
+    font-size: 9px;
+    line-height: 1;
+  }
+
+  b {
+    font: inherit;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.08);
+  }
+`;
+
 /* One element for every pill state: the spin animation is never added,
    removed, or re-mounted on state changes, so it can never visibly reset.
    The dot variant is a uniform circle, so its (still running) rotation is

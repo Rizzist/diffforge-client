@@ -5442,71 +5442,10 @@ export default function ArchitectureWorkspaceView({
     setLocalArchitectureSnapshot(architectureSnapshot);
   }, [architectureSnapshot]);
 
-  useEffect(() => {
-    if (!repoPath || !activeWorkspaceId) {
-      return undefined;
-    }
-
-    let cancelled = false;
-    let unlistenTaskHistory = null;
-    listen("cloud-mcp-task-history-updated", (event) => {
-      if (cancelled) return;
-      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
-      const eventRepoPath = text(payload.repoPath || payload.repo_path);
-      const eventWorkspaceId = text(payload.workspaceId || payload.workspace_id);
-      if (
-        eventWorkspaceId
-        && activeWorkspaceId
-        && eventWorkspaceId !== activeWorkspaceId
-      ) {
-        return;
-      }
-      if (
-        eventRepoPath
-        && repoPath
-        && eventRepoPath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
-          !== repoPath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
-      ) {
-        return;
-      }
-      const taskHistory = payload.taskHistory || payload.task_history || payload.data || null;
-      if (taskHistory && typeof taskHistory === "object") {
-        setLocalArchitectureSnapshot(taskHistory);
-      }
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenTaskHistory = unlisten;
-    }).catch(() => {});
-
-    return () => {
-      cancelled = true;
-      if (unlistenTaskHistory) {
-        unlistenTaskHistory();
-      }
-    };
-  }, [activeWorkspaceId, repoPath]);
-
 	  useEffect(() => {
 	    setFinishedPlanRefs(new Set());
 	    setFinishPlanState({ error: "", planRef: "" });
 	  }, [repoPath, activeWorkspaceId]);
-
-  const refreshTaskHistorySnapshot = useCallback(() => {
-    if (!repoPath || !activeWorkspaceId) {
-      return Promise.resolve(null);
-    }
-    return invoke("cloud_mcp_get_task_history", {
-      repoPath,
-      workspaceId: activeWorkspaceId,
-      workspaceName: activeWorkspaceName,
-    }).then((result) => {
-      setLocalArchitectureSnapshot(result);
-      return result;
-    });
-  }, [repoPath, activeWorkspaceId, activeWorkspaceName]);
 
 	  const finishTerminalTodoPlan = useCallback((entry) => {
 	    const task = entry?.task || null;
@@ -5535,23 +5474,17 @@ export default function ArchitectureWorkspaceView({
 	          next.add(planRef);
 	          return next;
 	        });
-	        setFinishPlanState((current) => (
-	          current.planRef === planRef ? { error: "", planRef: "" } : current
-	        ));
-        void refreshTaskHistorySnapshot().catch((error) => {
-          setFinishPlanState((current) => ({
-            ...current,
-            error: `Plan finished locally. Cloud refresh failed: ${error?.message || String(error || "Unable to refresh task history.")}`,
-          }));
-        });
-      })
-      .catch((error) => {
-	        setFinishPlanState({
+		        setFinishPlanState((current) => (
+		          current.planRef === planRef ? { error: "", planRef: "" } : current
+		        ));
+	      })
+	      .catch((error) => {
+		        setFinishPlanState({
 	          error: error?.message || String(error || "Unable to finish terminal todo plan."),
 	          planRef: "",
-	        });
-      });
-  }, [refreshTaskHistorySnapshot, repoPath, activeWorkspaceId]);
+		        });
+	      });
+  }, [repoPath, activeWorkspaceId]);
 
   return (
     <ArchitectureSurface aria-label={`${workspace?.name || "Workspace"} Architecture`} data-state={architectureState}>

@@ -3831,7 +3831,7 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
             "ok": false,
             "queued": false,
             "coordination_authority": "local",
-            "cloud_sync_mode": "history_reference",
+            "cloud_sync_mode": "disabled",
             "error": error,
         }),
     };
@@ -3888,7 +3888,7 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         object.insert("coordination_authority".to_string(), json!("local"));
         object.insert(
             "cloud_sync_mode".to_string(),
-            json!("background_history_reference"),
+            cloud["cloud_sync_mode"].clone(),
         );
         if !start_authority_resolution.is_null() {
             object.insert("authority".to_string(), start_authority_resolution);
@@ -3929,7 +3929,6 @@ fn start_task_brief_for_agent(brief: &Value) -> Value {
 }
 
 fn cloud_start_task_for_agent(response: &Value) -> Value {
-    let context_pack = &response["context_pack"];
     let mut view = Map::new();
     view.insert(
         "ok".to_string(),
@@ -3943,82 +3942,6 @@ fn cloud_start_task_for_agent(response: &Value) -> Value {
     }
     let source_refs = cloud_start_task_source_refs(response);
     insert_if_present(&mut view, "source_todo", source_refs["source_todo"].clone());
-    insert_if_present(
-        &mut view,
-        "account_data",
-        context_pack
-            .get("account_data")
-            .or_else(|| context_pack.get("accountData"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    insert_if_present(
-        &mut view,
-        "todo_compression",
-        context_pack
-            .get("todo_compression")
-            .or_else(|| context_pack.get("todoCompression"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    insert_if_present(
-        &mut view,
-        "context_error",
-        pick_fields(context_pack, &["ok", "error", "message"]),
-    );
-    insert_if_present(
-        &mut view,
-        "task_history",
-        cloud_task_history_for_agent(&response["task_history"]),
-    );
-    insert_if_present(
-        &mut view,
-        "spec_activity",
-        pick_fields(
-            &response["spec_activity"],
-            &["recorded", "node_ids", "reason", "warnings", "error"],
-        ),
-    );
-    Value::Object(view)
-}
-
-fn cloud_task_history_for_agent(history: &Value) -> Value {
-    let mut view = Map::new();
-    insert_if_present(
-        &mut view,
-        "context_error",
-        pick_fields(history, &["ok", "error", "message"]),
-    );
-    if let Some(tasks) = history.get("tasks").and_then(Value::as_array) {
-        view.insert("task_count".to_string(), json!(tasks.len()));
-        view.insert(
-            "recent_tasks".to_string(),
-            Value::Array(
-                tasks
-                    .iter()
-                    .rev()
-                    .take(8)
-                    .map(|task| {
-                        pick_fields(
-                            task,
-                            &[
-                                "task_id",
-                                "status",
-                                "title",
-                                "original_prompt",
-                                "source_todo",
-                                "todo_id",
-                                "todo_dispatch_id",
-                                "prompt_event_id",
-                                "coding_agent",
-                                "updated_at",
-                            ],
-                        )
-                    })
-                    .collect(),
-            ),
-        );
-    }
     Value::Object(view)
 }
 
@@ -5220,7 +5143,7 @@ fn mcp_start_task_seen_for_task(
 
 fn tool_description(name: &str) -> String {
     match name {
-        "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion, then preserves its lifecycle to Cloud history in the background.".to_string(),
+        "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion. Cloud task/history sync is disabled; use todos for shared work state.".to_string(),
         "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path, plus globalArchitecturesRoot/globalGraphsRoot for account-global graphs that sync across devices. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly (or write into globalGraphsRoot for account-wide cross-repo graphs) so the Architectures tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
@@ -5689,7 +5612,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_start_task_agent_view_keeps_account_and_todo_context_only() {
+    fn cloud_start_task_agent_view_excludes_cloud_context_and_task_history() {
         let response = json!({
             "task_id": "task-cloud-1",
             "task": {
@@ -5745,18 +5668,14 @@ mod tests {
 
         assert_eq!(view["ok"].as_bool(), Some(true));
         assert_eq!(view["task_id"].as_str(), Some("task-cloud-1"));
-        assert_eq!(
-            view["account_data"]["account_sync"]["connected_device_count"].as_u64(),
-            Some(2)
-        );
-        assert_eq!(view["todo_compression"]["chunk_count"].as_u64(), Some(1));
-        assert_eq!(view["task_history"]["task_count"].as_u64(), Some(2));
-        assert_eq!(view["spec_activity"]["recorded"].as_bool(), Some(true));
+        assert!(view.get("account_data").is_none());
+        assert!(view.get("todo_compression").is_none());
+        assert!(view.get("task_history").is_none());
+        assert!(view.get("spec_activity").is_none());
         assert!(view.get("event").is_none());
         assert!(view.get("context_pack").is_none());
         assert!(view.get("peer_work").is_none());
         assert!(view.get("spec_summary").is_none());
-        assert!(view["task_history"].get("repo_id").is_none());
     }
 
     #[test]

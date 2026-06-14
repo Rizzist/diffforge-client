@@ -1263,6 +1263,71 @@ fn todo_store_set_item_status(item: &mut Value, status: &str, reason: &str) {
     }
 }
 
+fn todo_store_item_sync_id(item: &Value) -> String {
+    todo_dispatch_text(
+        item,
+        &[
+            "id",
+            "todo_id",
+            "todoId",
+            "client_todo_id",
+            "clientTodoId",
+            "command_id",
+            "commandId",
+        ],
+    )
+}
+
+fn todo_store_changed_items_for_sync(previous: &[Value], next: &[Value]) -> Vec<Value> {
+    let mut previous_by_id = HashMap::<String, String>::new();
+    for item in previous.iter().filter(|item| item.is_object()) {
+        let item_id = todo_store_item_sync_id(item);
+        if item_id.is_empty() {
+            continue;
+        }
+        previous_by_id.insert(
+            item_id,
+            serde_json::to_string(item).unwrap_or_else(|_| String::new()),
+        );
+    }
+    next.iter()
+        .filter(|item| item.is_object())
+        .filter_map(|item| {
+            let item_id = todo_store_item_sync_id(item);
+            if item_id.is_empty() {
+                return None;
+            }
+            let signature = serde_json::to_string(item).unwrap_or_else(|_| String::new());
+            (previous_by_id.get(&item_id) != Some(&signature)).then(|| item.clone())
+        })
+        .collect()
+}
+
+fn todo_store_push_items(app: &AppHandle, workspace_id: &str, items: Vec<Value>, reason: &str) {
+    let items = items
+        .into_iter()
+        .filter(|item| item.is_object() && !todo_store_item_sync_id(item).is_empty())
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return;
+    }
+    let workspace_id = workspace_id.to_string();
+    let reason = reason.to_string();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        for item in items {
+            let _ = cloud_mcp_sync_workspace_todo_item_internal(
+                &state,
+                workspace_id.clone(),
+                item,
+                Some(reason.clone()),
+            )
+            .await;
+        }
+    });
+}
+
 /// Durable removal push: tombstoned ids reach the account through the outbox
 /// without re-sending the (possibly stale) full queue file.
 fn todo_store_push_removals(
@@ -1279,20 +1344,15 @@ fn todo_store_push_removals(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<CloudMcpState>().inner().clone();
-        let payload = json!({
-            "todos": [],
-            "removed_todo_ids": removed_todo_ids.clone(),
-            "removedTodoIds": removed_todo_ids,
-        });
-        let _ = cloud_mcp_sync_workspace_todos_internal(
-            &state,
-            String::new(),
-            workspace_id,
-            None,
-            payload,
-            Some(reason),
-        )
-        .await;
+        for todo_id in removed_todo_ids {
+            let _ = cloud_mcp_sync_workspace_todo_delete_internal(
+                &state,
+                workspace_id.clone(),
+                todo_id,
+                Some(reason.clone()),
+            )
+            .await;
+        }
     });
 }
 
@@ -1321,20 +1381,7 @@ fn todo_store_push_corrections(
         );
     }
     let workspace_id = workspace_id.to_string();
-    let reason = reason.to_string();
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<CloudMcpState>().inner().clone();
-        let _ = cloud_mcp_sync_workspace_todos_internal(
-            &state,
-            String::new(),
-            workspace_id,
-            None,
-            json!({ "todos": items }),
-            Some(reason),
-        )
-        .await;
-    });
+    todo_store_push_items(app, &workspace_id, items, reason);
 }
 
 /// Tombstone + queue-store removal + journal + durable cloud removal in one
@@ -3212,6 +3259,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         // no lifecycle status), graft the running flip onto that row so the
         // prompt never sits status-less in history while the agent works.
         let mut wrote = false;
+        let mut sync_item: Option<Value> = None;
         if let Some(existing) = items
             .iter_mut()
             .find(|existing| todo_store_item_matches_id(existing, &item_id))
@@ -3220,14 +3268,24 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
                 < todo_store_status_rank("running")
             {
                 todo_store_set_item_status(existing, "running", "todo_queue_backend_submit");
+                sync_item = Some(existing.clone());
                 wrote = true;
             }
         } else {
             items.push(item.clone());
+            sync_item = Some(item.clone());
             wrote = true;
         }
         if wrote {
             todo_dispatch_queue_write(workspace_id, &items);
+            if let Some(sync_item) = sync_item {
+                todo_store_push_items(
+                    app,
+                    workspace_id,
+                    vec![sync_item],
+                    "terminal_direct_submit",
+                );
+            }
         }
     }
     todo_dispatch_journal_append(
@@ -3316,20 +3374,24 @@ fn todo_dispatch_push_queue_snapshot(
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<CloudMcpState>().inner().clone();
-        let mut payload = json!({ "todos": items });
-        if !removed_todo_ids.is_empty() {
-            payload["removed_todo_ids"] = json!(removed_todo_ids.clone());
-            payload["removedTodoIds"] = json!(removed_todo_ids);
+        for item in items {
+            let _ = cloud_mcp_sync_workspace_todo_item_internal(
+                &state,
+                workspace_id.clone(),
+                item,
+                Some(reason.clone()),
+            )
+            .await;
         }
-        let _ = cloud_mcp_sync_workspace_todos_internal(
-            &state,
-            String::new(),
-            workspace_id,
-            None,
-            payload,
-            Some(reason),
-        )
-        .await;
+        for todo_id in removed_todo_ids {
+            let _ = cloud_mcp_sync_workspace_todo_delete_internal(
+                &state,
+                workspace_id.clone(),
+                todo_id,
+                Some(reason.clone()),
+            )
+            .await;
+        }
     });
 }
 
@@ -3454,6 +3516,7 @@ async fn todo_dispatch_queue_sync(
             })
             .unwrap_or_default();
         let stored_items = todo_store_canonicalize_settled_items(stored_items);
+        let previous_items = stored_items.clone();
         let items = todo_store_keep_settled_sweep_flips_core(stored_items.clone(), items);
         // Status LWW: deliberate flips made through the store (history
         // Queue/Unqueue/retarget) outrank stale webview claims by stamp.
@@ -3462,7 +3525,9 @@ async fn todo_dispatch_queue_sync(
         // visible list (completed todos above all) survive the full-snapshot
         // rewrite so Todos History keeps showing them.
         let items = todo_store_retain_settled_items_core(stored_items, items, &tombstoned);
+        let changed_items = todo_store_changed_items_for_sync(&previous_items, &items);
         todo_dispatch_queue_write(&workspace_id, &items);
+        todo_store_push_items(&app, &workspace_id, changed_items, &reason);
         // Origin "webview": the webview's own changed-listener skips these to
         // avoid sync feedback loops; other windows still refresh.
         todo_store_emit_changed(&app, &workspace_id, &reason, "webview");

@@ -12896,7 +12896,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn non_free_modes_prepare_coordination_but_only_managed_patch_refreshes_context_pack() {
+    fn non_free_modes_prepare_coordination_and_only_managed_patch_requires_worktree() {
         let modes = [
             TerminalSessionMode::General,
             TerminalSessionMode::ManagedPatch,
@@ -12916,11 +12916,6 @@ mod terminal_tests {
                 mode.requires_managed_patch_worktree(),
                 mode == TerminalSessionMode::ManagedPatch,
                 "{mode:?} worktree gate changed"
-            );
-            assert_eq!(
-                mode.should_request_cloud_context_pack(),
-                mode == TerminalSessionMode::ManagedPatch,
-                "{mode:?} cloud context-pack gate changed"
             );
             assert_eq!(
                 mode.completion_mode(),

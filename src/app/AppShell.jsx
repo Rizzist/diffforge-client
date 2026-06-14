@@ -479,6 +479,8 @@ import {
   TitleMinimizeIcon,
   WindowBackgroundPill,
   WindowSyncPill,
+  WindowSyncDirectionCount,
+  WindowSyncDirectionCounts,
   WindowSyncPillIndicator,
   TitleMaximizeIcon,
   TitleRestoreIcon,
@@ -4121,6 +4123,78 @@ const CLOUD_SYNC_OFFLINE_STATUSES = [
   "websocket_retrying",
 ];
 
+function normalizeCloudSyncCount(value) {
+  const count = Number(value);
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+}
+
+function normalizeCloudSyncActivity(payload = {}) {
+  const activity = payload?.syncActivity || payload?.sync_activity || {};
+  const pendingCount = normalizeCloudSyncCount(
+    payload.pendingCount
+      ?? payload.pending_count
+      ?? payload.outboxPendingCount
+      ?? payload.outbox_pending_count
+      ?? activity.pendingCount
+      ?? activity.pending_count,
+  );
+  const upCount = normalizeCloudSyncCount(
+    payload.upCount
+      ?? payload.up_count
+      ?? payload.syncUpCount
+      ?? payload.sync_up_count
+      ?? activity.upCount
+      ?? activity.up_count
+      ?? pendingCount,
+  );
+  const downCount = normalizeCloudSyncCount(
+    payload.downCount
+      ?? payload.down_count
+      ?? payload.syncDownCount
+      ?? payload.sync_down_count
+      ?? activity.downCount
+      ?? activity.down_count,
+  );
+  const controlCount = normalizeCloudSyncCount(
+    payload.controlCount
+      ?? payload.control_count
+      ?? payload.syncControlCount
+      ?? payload.sync_control_count
+      ?? activity.controlCount
+      ?? activity.control_count,
+  );
+  const activityCount = normalizeCloudSyncCount(
+    payload.activityCount
+      ?? payload.activity_count
+      ?? payload.syncActivityCount
+      ?? payload.sync_activity_count
+      ?? activity.activityCount
+      ?? activity.activity_count
+      ?? upCount + downCount + controlCount,
+  );
+  const sizeClass = String(
+    payload.sizeClass
+      ?? payload.size_class
+      ?? payload.syncSizeClass
+      ?? payload.sync_size_class
+      ?? activity.sizeClass
+      ?? activity.size_class
+      ?? "live",
+  ).toLowerCase() === "large"
+    ? "large"
+    : "live";
+
+  return {
+    activityCount,
+    controlCount,
+    downCount,
+    pendingCount,
+    sizeClass,
+    syncing: Boolean(payload.syncing ?? activity.syncing) || sizeClass === "large",
+    upCount,
+  };
+}
+
 function cloudSyncStatusFromRuntimeStatus(status) {
   if (!status || typeof status !== "object") {
     return null;
@@ -4131,7 +4205,7 @@ function cloudSyncStatusFromRuntimeStatus(status) {
   const rawStatus = String(status.status || "").toLowerCase();
   const globalStatus = String(status.globalWsStatus || status.global_ws_status || "").toLowerCase();
   const statusKey = globalStatus || rawStatus;
-  const pendingCount = Number(status.outboxPendingCount ?? status.outbox_pending_count ?? 0) || 0;
+  const activity = normalizeCloudSyncActivity(status);
   return {
     connection: connected
       ? "connected"
@@ -4146,8 +4220,8 @@ function cloudSyncStatusFromRuntimeStatus(status) {
               : CLOUD_SYNC_LOCAL_STATUSES.includes(statusKey) || CLOUD_SYNC_LOCAL_STATUSES.includes(rawStatus)
                 ? "local"
                 : "connecting",
-    pendingCount,
-    syncing: connected && pendingCount > 0,
+    ...activity,
+    syncing: connected && activity.syncing,
     updatedAtMs: Date.now(),
   };
 }
@@ -4168,11 +4242,11 @@ function normalizeCloudSyncStatusEvent(payload) {
   ].includes(rawConnection)
     ? rawConnection
     : "connecting";
-  const pendingCount = Number(payload.pendingCount ?? payload.pending_count ?? 0) || 0;
+  const activity = normalizeCloudSyncActivity(payload);
   return {
     connection,
-    pendingCount,
-    syncing: Boolean(payload.syncing),
+    ...activity,
+    syncing: Boolean(payload.syncing) || activity.syncing,
     updatedAtMs: Number(payload.updatedAtMs ?? payload.updated_at_ms) || Date.now(),
   };
 }
@@ -17881,50 +17955,6 @@ export default function App() {
     visibleView,
   ]);
 
-  useEffect(() => {
-    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
-    if (!workspaceHydrationReady || !repoPath || !activatedWorkspaceIdForGraphSync) {
-      return undefined;
-    }
-
-    let cancelled = false;
-    const workspaceId = activatedWorkspaceIdForGraphSync;
-    const workspaceName = activatedWorkspaceNameForGraphSync || null;
-
-    setWorkspaceGraphStatus(repoPath, workspaceId, {
-      architectureState: "loading",
-      architectureError: "",
-    });
-
-    invoke("cloud_mcp_get_task_history", {
-      repoPath,
-      workspaceId,
-      workspaceName,
-    })
-      .then((result) => {
-        if (!cancelled) applyWorkspaceGraphSnapshot(repoPath, workspaceId, result);
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setWorkspaceGraphStatus(repoPath, workspaceId, {
-            architectureState: "error",
-            architectureError: getErrorMessage(error, "Unable to load Task History."),
-          });
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    activatedWorkspaceIdForGraphSync,
-    activatedWorkspaceNameForGraphSync,
-    activatedWorkspaceTerminalWorkingDirectory,
-    applyWorkspaceGraphSnapshot,
-    setWorkspaceGraphStatus,
-    workspaceHydrationReady,
-  ]);
-
   const selectedWorkspaceGraphStateKey = workspaceGraphStateKey(
     selectedWorkspaceFileRoot,
     selectedWorkspace?.id || "",
@@ -18068,7 +18098,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenTaskHistory = null;
     let unlistenWorkspaceTodos = null;
     let workspaceTodoRefreshTimer = 0;
 
@@ -18091,31 +18120,6 @@ export default function App() {
       }, 80);
     };
 
-    listen("cloud-mcp-task-history-updated", (event) => {
-      if (cancelled) return;
-      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
-      const repoPath = String(payload.repoPath || payload.repo_path || "").trim();
-      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
-      const taskHistory = payload.taskHistory || payload.task_history || payload.data || null;
-      if (payload.error) {
-        setWorkspaceGraphStatus(repoPath, workspaceId, {
-          architectureError: getErrorMessage(payload.error, "Unable to load Task History."),
-          architectureState: "error",
-        });
-        return;
-      }
-      if (!taskHistory || typeof taskHistory !== "object") {
-        return;
-      }
-      applyWorkspaceGraphSnapshot(repoPath, workspaceId, taskHistory);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenTaskHistory = unlisten;
-    }).catch(() => {});
-
     listen(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, () => {
       refreshCloudWorkspaceTodos();
     }).then((unlisten) => {
@@ -18132,64 +18136,11 @@ export default function App() {
         window.clearTimeout(workspaceTodoRefreshTimer);
         workspaceTodoRefreshTimer = 0;
       }
-      if (unlistenTaskHistory) {
-        unlistenTaskHistory();
-      }
       if (unlistenWorkspaceTodos) {
         unlistenWorkspaceTodos();
       }
     };
-  }, [applyWorkspaceGraphSnapshot, setWorkspaceGraphStatus]);
-
-  useEffect(() => {
-    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
-    const workspaceId = selectedWorkspace?.id || "";
-    const workspaceName = selectedWorkspace?.name || null;
-    if (
-      visibleView !== "architecture"
-      || !workspaceHydrationReady
-      || !repoPath
-      || !workspaceId
-    ) {
-      return undefined;
-    }
-
-    let cancelled = false;
-    const refreshTaskHistory = () => {
-      invoke("cloud_mcp_get_task_history", {
-        repoPath,
-        workspaceId,
-        workspaceName,
-      })
-        .then((result) => {
-          if (!cancelled) applyWorkspaceGraphSnapshot(repoPath, workspaceId, result);
-        })
-        .catch((error) => {
-          if (!cancelled) {
-            setWorkspaceGraphStatus(repoPath, workspaceId, {
-              architectureState: "error",
-              architectureError: getErrorMessage(error, "Unable to load Task History."),
-            });
-          }
-        });
-    };
-
-    refreshTaskHistory();
-    const intervalId = window.setInterval(refreshTaskHistory, 3500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(intervalId);
-    };
-  }, [
-    activatedWorkspaceTerminalWorkingDirectory,
-    applyWorkspaceGraphSnapshot,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspaceFileRoot,
-    setWorkspaceGraphStatus,
-    visibleView,
-    workspaceHydrationReady,
-  ]);
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -23820,12 +23771,20 @@ export default function App() {
   const isPaidPlanUser = isPaidUser(user) || billingStatus?.planStatus === "paid";
   const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
   const cloudSyncConnection = String(cloudSyncStatus?.connection || "local").toLowerCase();
+  const cloudSyncPendingCount = normalizeCloudSyncCount(cloudSyncStatus?.pendingCount);
+  const cloudSyncUpCount = normalizeCloudSyncCount(cloudSyncStatus?.upCount ?? cloudSyncPendingCount);
+  const cloudSyncDownCount = normalizeCloudSyncCount(cloudSyncStatus?.downCount);
+  const cloudSyncControlCount = normalizeCloudSyncCount(cloudSyncStatus?.controlCount);
+  const cloudSyncSizeClass = String(cloudSyncStatus?.sizeClass || "live").toLowerCase() === "large"
+    ? "large"
+    : "live";
+  const cloudSyncHasLargeActivity = Boolean(cloudSyncStatus?.syncing) || cloudSyncSizeClass === "large";
   const cloudSyncPillState = authState !== "authenticated"
     ? null
     : !isPaidPlanUser
       ? "local"
       : cloudSyncConnection === "connected"
-        ? cloudSyncStatus?.syncing || (cloudSyncStatus?.pendingCount || 0) > 0
+        ? cloudSyncHasLargeActivity
           ? "syncing"
           : "live"
         : [
@@ -23838,7 +23797,15 @@ export default function App() {
           ].includes(cloudSyncConnection)
           ? cloudSyncConnection
           : "connecting";
-  const cloudSyncPendingCount = Number(cloudSyncStatus?.pendingCount || 0);
+  const cloudSyncDirectionParts = [
+    cloudSyncUpCount > 0
+      ? `${cloudSyncUpCount} outgoing ${cloudSyncUpCount === 1 ? "change" : "changes"}`
+      : "",
+    cloudSyncDownCount > 0
+      ? `${cloudSyncDownCount} incoming ${cloudSyncDownCount === 1 ? "update" : "updates"}`
+      : "",
+  ].filter(Boolean);
+  const cloudSyncDirectionSummary = cloudSyncDirectionParts.join(" and ");
   const cloudSyncPillLabel = {
     blocked: "Blocked",
     connecting: "Connecting",
@@ -23854,12 +23821,16 @@ export default function App() {
     local: isPaidPlanUser
       ? "Local workspace features are available. Cloud sync has not connected yet."
       : "Local workspace features are available. Cloud sync features require a paid cloud plan.",
-    live: "Connected. Changes sync live to your account.",
+    live: cloudSyncDirectionSummary
+      ? `Connected. Live Sync is handling ${cloudSyncDirectionSummary}.`
+      : "Connected. Changes sync live to your account.",
     offline: "Cloud sync is unavailable right now. Local workspace features remain available.",
     provisioning: "Your cloud workspace is starting. Local workspace features remain available.",
-    syncing: cloudSyncPendingCount > 0
-      ? `Syncing ${cloudSyncPendingCount} queued change${cloudSyncPendingCount === 1 ? "" : "s"} to the cloud.`
-      : "Syncing queued changes to the cloud.",
+    syncing: cloudSyncDirectionSummary
+      ? `Syncing ${cloudSyncDirectionSummary}.`
+      : cloudSyncControlCount > 0
+        ? `Syncing ${cloudSyncControlCount} control ${cloudSyncControlCount === 1 ? "operation" : "operations"}.`
+        : "Syncing cloud activity.",
   }[cloudSyncPillState] || "";
   const shouldShowStartupPhases = !hasEnteredWorkspaceShell;
   const shouldShowLaunchScreen = shouldShowStartupPhases && (
@@ -23982,6 +23953,22 @@ export default function App() {
                   data-variant={["connecting", "provisioning", "syncing"].includes(cloudSyncPillState) ? "spinner" : "dot"}
                 />
                 <span>{cloudSyncPillLabel}</span>
+                {cloudSyncUpCount > 0 || cloudSyncDownCount > 0 ? (
+                  <WindowSyncDirectionCounts aria-hidden="true">
+                    {cloudSyncUpCount > 0 ? (
+                      <WindowSyncDirectionCount data-direction="up">
+                        <span>↑</span>
+                        <b>{cloudSyncUpCount}</b>
+                      </WindowSyncDirectionCount>
+                    ) : null}
+                    {cloudSyncDownCount > 0 ? (
+                      <WindowSyncDirectionCount data-direction="down">
+                        <span>↓</span>
+                        <b>{cloudSyncDownCount}</b>
+                      </WindowSyncDirectionCount>
+                    ) : null}
+                  </WindowSyncDirectionCounts>
+                ) : null}
               </WindowSyncPill>
             ) : null}
             <WindowControlButton
