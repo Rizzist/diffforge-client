@@ -86,6 +86,7 @@ fn forge_voice_route_cache_fresh(ws_path: &str) -> Option<(CloudMcpWsTarget, Opt
 /// feed was paused (dictation borrowed the mic) or resumed (dictation ended).
 const FORGE_VOICE_AGENT_MIC_EVENT: &str = "forge-voice-agent-mic";
 const AUDIO_WIDGET_SPACE_CHANGED_EVENT: &str = "forge-audio-widget-space-changed";
+const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bar-hover-changed";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT: &str = "forge-audio-dictation-raw-result";
 
 fn realtime_mic_holder_get(audio_state: &AudioState) -> RealtimeMicHolder {
@@ -3126,7 +3127,10 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
         }),
     );
     #[cfg(target_os = "macos")]
-    register_audio_widget_space_change_observer(app);
+    {
+        register_audio_widget_space_change_observer(app);
+        register_audio_widget_bar_hover_mouse_monitors(app);
+    }
 
     if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
         let visible = window.is_visible().ok();
@@ -3324,6 +3328,10 @@ const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
 
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_WIDGET_BAR_HOVER_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_WIDGET_BAR_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 fn register_audio_widget_space_change_observer(app: &AppHandle) {
@@ -3356,6 +3364,233 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
             };
             // The observer lives for the app's lifetime.
             std::mem::forget(token);
+        });
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_emit_bar_hover_changed(app: &AppHandle, hovering: bool) {
+    let previous = AUDIO_WIDGET_BAR_HOVER_ACTIVE.swap(hovering, Ordering::AcqRel);
+    if previous == hovering {
+        return;
+    }
+
+    let _ = app.emit(
+        AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT,
+        json!({ "hovering": hovering }),
+    );
+}
+
+const AUDIO_WIDGET_BAR_ACTIVE_WIDTH: f64 = 124.0;
+const AUDIO_WIDGET_BAR_ACTIVE_HEIGHT: f64 = 44.0;
+const AUDIO_WIDGET_BAR_NOTICE_WIDTH: f64 = 392.0;
+const AUDIO_WIDGET_BAR_NOTICE_HEIGHT: f64 = 52.0;
+const AUDIO_WIDGET_BAR_IDLE_WIDTH: f64 = 200.0;
+const AUDIO_WIDGET_BAR_IDLE_HEIGHT: f64 = 96.0;
+const AUDIO_WIDGET_BAR_FRAME_TOLERANCE: f64 = 8.0;
+
+fn audio_widget_bar_frame_matches_size(
+    width: f64,
+    height: f64,
+    target_width: f64,
+    target_height: f64,
+) -> bool {
+    (width - target_width).abs() <= AUDIO_WIDGET_BAR_FRAME_TOLERANCE
+        && (height - target_height).abs() <= AUDIO_WIDGET_BAR_FRAME_TOLERANCE
+}
+
+fn audio_widget_bar_frame_is_idle_size(width: f64, height: f64) -> bool {
+    audio_widget_bar_frame_matches_size(
+        width,
+        height,
+        AUDIO_WIDGET_BAR_IDLE_WIDTH,
+        AUDIO_WIDGET_BAR_IDLE_HEIGHT,
+    )
+}
+
+fn audio_widget_bar_frame_is_whole_hover_size(width: f64, height: f64) -> bool {
+    audio_widget_bar_frame_matches_size(
+        width,
+        height,
+        AUDIO_WIDGET_BAR_ACTIVE_WIDTH,
+        AUDIO_WIDGET_BAR_ACTIVE_HEIGHT,
+    ) || audio_widget_bar_frame_matches_size(
+        width,
+        height,
+        AUDIO_WIDGET_BAR_NOTICE_WIDTH,
+        AUDIO_WIDGET_BAR_NOTICE_HEIGHT,
+    )
+}
+
+fn audio_widget_bar_hover_from_top_left(
+    width: f64,
+    height: f64,
+    local_x: f64,
+    local_y: f64,
+    active: bool,
+) -> bool {
+    if local_x < 0.0 || local_y < 0.0 || local_x > width || local_y > height {
+        return false;
+    }
+
+    if audio_widget_bar_frame_is_idle_size(width, height) {
+        if active {
+            return local_y >= AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP;
+        }
+
+        return local_y >= (height - AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT).max(0.0);
+    }
+
+    audio_widget_bar_frame_is_whole_hover_size(width, height)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_bar_hover_from_bottom_left(
+    width: f64,
+    height: f64,
+    local_x: f64,
+    local_from_bottom: f64,
+    active: bool,
+) -> bool {
+    if local_x < 0.0
+        || local_from_bottom < 0.0
+        || local_x > width
+        || local_from_bottom > height
+    {
+        return false;
+    }
+
+    if audio_widget_bar_frame_is_idle_size(width, height) {
+        if active {
+            return local_from_bottom <= (height - AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP).max(0.0);
+        }
+
+        return local_from_bottom <= AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT;
+    }
+
+    audio_widget_bar_frame_is_whole_hover_size(width, height)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_apply_bar_hover_focus_to_ns_window(ns_window: &NSWindow, hovering: bool) {
+    if hovering {
+        if !ns_window.isKeyWindow() {
+            ns_window.makeKeyAndOrderFront(None);
+        }
+    } else if ns_window.isKeyWindow() {
+        ns_window.resignKeyWindow();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_apply_bar_hover_focus(app: &AppHandle, hovering: bool) {
+    let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+        return;
+    };
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("audio_widget_apply_bar_hover_focus", || {
+            let Ok(ns_ptr) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_ptr.is_null() {
+                return;
+            }
+
+            let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+            if !ns_window.isVisible() {
+                return;
+            }
+
+            audio_widget_apply_bar_hover_focus_to_ns_window(ns_window, hovering);
+        });
+    });
+}
+
+/// AppKit only sends mouseMoved to the key window. When another app is focused,
+/// the non-activating audio panel needs a native monitor to notice hover first;
+/// once the cursor is over a hoverable bar frame, it can take key status
+/// without activating Diff Forge or switching Spaces.
+#[cfg(target_os = "macos")]
+fn audio_widget_bar_handle_mouse_moved(app: &AppHandle) {
+    snipping_catch_objc("audio_widget_bar_handle_mouse_moved", || {
+        let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+            audio_widget_emit_bar_hover_changed(app, false);
+            return;
+        };
+        if !window.is_visible().unwrap_or(false) {
+            audio_widget_emit_bar_hover_changed(app, false);
+            return;
+        }
+
+        let Ok(ns_ptr) = window.ns_window() else {
+            audio_widget_emit_bar_hover_changed(app, false);
+            return;
+        };
+        if ns_ptr.is_null() {
+            audio_widget_emit_bar_hover_changed(app, false);
+            return;
+        }
+
+        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+        if !ns_window.isVisible() {
+            audio_widget_emit_bar_hover_changed(app, false);
+            return;
+        }
+
+        let frame = ns_window.frame();
+        let location = objc2_app_kit::NSEvent::mouseLocation();
+        let active = AUDIO_WIDGET_BAR_HOVER_ACTIVE.load(Ordering::Acquire);
+        let local_x = location.x - frame.origin.x;
+        let local_from_bottom = location.y - frame.origin.y;
+        let hovering = audio_widget_bar_hover_from_bottom_left(
+            frame.size.width,
+            frame.size.height,
+            local_x,
+            local_from_bottom,
+            active,
+        );
+
+        audio_widget_apply_bar_hover_focus_to_ns_window(ns_window, hovering);
+        audio_widget_emit_bar_hover_changed(app, hovering);
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
+    if AUDIO_WIDGET_BAR_HOVER_MONITORS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let global_app = app.clone();
+    let local_app = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        snipping_catch_objc("register_audio_widget_bar_hover_mouse_monitors", || {
+            use objc2_app_kit::{NSEvent, NSEventMask};
+
+            let mask = NSEventMask::MouseMoved;
+
+            let global_block =
+                block2::RcBlock::new(move |_event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                    audio_widget_bar_handle_mouse_moved(&global_app);
+                });
+            if let Some(token) =
+                NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
+            {
+                std::mem::forget(token);
+            }
+
+            let local_block = block2::RcBlock::new(
+                move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
+                    audio_widget_bar_handle_mouse_moved(&local_app);
+                    event.as_ptr()
+                },
+            );
+            let local_token =
+                unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block) };
+            if let Some(token) = local_token {
+                std::mem::forget(token);
+            }
         });
     });
 }
@@ -3640,9 +3875,19 @@ const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT: f64 = 34.0;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP: f64 = 14.0;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct AudioWidgetBarHoverSnapshotRequest {
     active: bool,
+    focus: bool,
+}
+
+impl Default for AudioWidgetBarHoverSnapshotRequest {
+    fn default() -> Self {
+        Self {
+            active: false,
+            focus: false,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -3658,7 +3903,103 @@ struct AudioWidgetBarAnchorStrategy {
 }
 
 #[cfg(target_os = "macos")]
-fn audio_widget_bar_anchor_strategy_for() -> AudioWidgetBarAnchorStrategy {
+fn audio_widget_cf_dictionary_value(
+    dictionary: &objc2_core_foundation::CFDictionary,
+    key: &str,
+) -> Option<*const std::ffi::c_void> {
+    let cf_key = objc2_core_foundation::CFString::from_str(key);
+    let cf_key_ref = cf_key.as_ref() as *const objc2_core_foundation::CFString;
+    let value = unsafe { dictionary.value(cf_key_ref.cast()) };
+    (!value.is_null()).then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_cf_number_i32(
+    dictionary: &objc2_core_foundation::CFDictionary,
+    key: &str,
+) -> Option<i32> {
+    let value = audio_widget_cf_dictionary_value(dictionary, key)?
+        as *const objc2_core_foundation::CFNumber;
+    let mut output: i32 = 0;
+    let ok = unsafe {
+        (*value).value(
+            objc2_core_foundation::CFNumberType::IntType,
+            (&mut output as *mut i32).cast(),
+        )
+    };
+    ok.then_some(output)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_window_bounds(
+    dictionary: &objc2_core_foundation::CFDictionary,
+) -> Option<objc2_core_foundation::CGRect> {
+    let bounds = audio_widget_cf_dictionary_value(dictionary, "kCGWindowBounds")?
+        as *const objc2_core_foundation::CFDictionary;
+    let mut rect = objc2_core_foundation::CGRect::default();
+    let ok = unsafe {
+        objc2_core_graphics::CGRectMakeWithDictionaryRepresentation(Some(&*bounds), &mut rect)
+    };
+    ok.then_some(rect)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_frontmost_app_has_fullscreen_window(frontmost_pid: i32) -> bool {
+    if frontmost_pid <= 0 {
+        return false;
+    }
+
+    let Some(windows) = objc2_core_graphics::CGWindowListCopyWindowInfo(
+        objc2_core_graphics::CGWindowListOption::OptionOnScreenOnly
+            | objc2_core_graphics::CGWindowListOption::ExcludeDesktopElements,
+        0,
+    ) else {
+        return false;
+    };
+
+    let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
+        return false;
+    };
+    let screens = objc2_app_kit::NSScreen::screens(main_thread_marker);
+    let screen_count = screens.count();
+    if screen_count == 0 {
+        return false;
+    }
+
+    for window_index in 0..windows.count() {
+        let window_ref =
+            unsafe { windows.value_at_index(window_index) } as *const objc2_core_foundation::CFDictionary;
+        if window_ref.is_null() {
+            continue;
+        }
+        let window_info = unsafe { &*window_ref };
+        if audio_widget_cf_number_i32(window_info, "kCGWindowOwnerPID") != Some(frontmost_pid) {
+            continue;
+        }
+
+        let Some(bounds) = audio_widget_window_bounds(window_info) else {
+            continue;
+        };
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            continue;
+        }
+
+        for screen_index in 0..screen_count {
+            let screen = screens.objectAtIndex(screen_index);
+            let frame = screen.frame();
+            let width_matches = (bounds.size.width - frame.size.width).abs() <= 4.0;
+            let height_matches = (bounds.size.height - frame.size.height).abs() <= 4.0;
+            if width_matches && height_matches {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_bar_anchor_strategy_on_main_thread() -> AudioWidgetBarAnchorStrategy {
     let mut use_full_monitor_bounds = false;
     snipping_catch_objc("audio_widget_bar_anchor_strategy", || {
         let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
@@ -3674,9 +4015,11 @@ fn audio_widget_bar_anchor_strategy_for() -> AudioWidgetBarAnchorStrategy {
 
         // In another app's fullscreen Space, macOS still reports the normal
         // desktop work area for this auxiliary window. Anchor against the full
-        // display while another app owns the active Space, then return to the
-        // Dock-safe work area when Diff Forge is frontmost again.
-        use_full_monitor_bounds = current_pid != frontmost_pid;
+        // display only when the frontmost app actually owns a screen-sized
+        // window; a normal desktop Space with another app frontmost should still
+        // use the Dock-safe work area.
+        use_full_monitor_bounds = current_pid != frontmost_pid
+            && audio_widget_frontmost_app_has_fullscreen_window(frontmost_pid);
     });
 
     AudioWidgetBarAnchorStrategy {
@@ -3684,11 +4027,22 @@ fn audio_widget_bar_anchor_strategy_for() -> AudioWidgetBarAnchorStrategy {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn audio_widget_bar_anchor_strategy_for(
+    app: &AppHandle,
+) -> Result<AudioWidgetBarAnchorStrategy, String> {
+    run_audio_widget_action_on_main_thread(app, "bar_anchor_strategy", |_app| {
+        Ok(audio_widget_bar_anchor_strategy_on_main_thread())
+    })
+}
+
 #[cfg(not(target_os = "macos"))]
-fn audio_widget_bar_anchor_strategy_for() -> AudioWidgetBarAnchorStrategy {
-    AudioWidgetBarAnchorStrategy {
+fn audio_widget_bar_anchor_strategy_for(
+    _app: &AppHandle,
+) -> Result<AudioWidgetBarAnchorStrategy, String> {
+    Ok(AudioWidgetBarAnchorStrategy {
         use_full_monitor_bounds: false,
-    }
+    })
 }
 
 fn audio_widget_bar_hover_snapshot_for(
@@ -3703,24 +4057,28 @@ fn audio_widget_bar_hover_snapshot_for(
             let position = window.outer_position().ok()?;
             let size = window.outer_size().ok()?;
             let scale = window.scale_factor().unwrap_or(1.0).max(0.1);
-            let local_x = cursor.x - f64::from(position.x);
-            let local_y = cursor.y - f64::from(position.y);
+            let local_x = (cursor.x - f64::from(position.x)) / scale;
+            let local_y = (cursor.y - f64::from(position.y)) / scale;
             let width = f64::from(size.width.max(1));
             let height = f64::from(size.height.max(1));
-
-            if local_x < 0.0 || local_y < 0.0 || local_x > width || local_y > height {
-                return Some(false);
-            }
-
-            let logical_y = local_y / scale;
+            let logical_width = width / scale;
             let logical_height = height / scale;
-            if request.active {
-                Some(logical_y >= AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP)
-            } else {
-                Some(logical_y >= (logical_height - AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT).max(0.0))
-            }
+
+            Some(audio_widget_bar_hover_from_top_left(
+                logical_width,
+                logical_height,
+                local_x,
+                local_y,
+                request.active,
+            ))
         })
         .unwrap_or(false);
+
+    #[cfg(target_os = "macos")]
+    if request.focus {
+        audio_widget_apply_bar_hover_focus(app, hovering);
+        audio_widget_emit_bar_hover_changed(app, hovering);
+    }
 
     AudioWidgetBarHoverSnapshot { hovering }
 }
@@ -6722,6 +7080,7 @@ struct ForgeDictationRawResultEvent {
 #[serde(rename_all = "camelCase", default)]
 struct AudioTranscriptionPolishRequest {
     text: String,
+    fallback_text: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -6732,6 +7091,42 @@ struct AudioTranscriptionPolishResult {
     llm_cleaned: bool,
     cleanup_ms: u64,
     model: String,
+}
+
+fn audio_transcription_polish_clipboard_text() -> Result<String, String> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("Unable to open system clipboard: {error}"))?;
+    clipboard
+        .get_text()
+        .map_err(|_| "Clipboard does not contain text to polish.".to_string())
+}
+
+fn write_audio_transcription_polish_clipboard_text(text: &str) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("Unable to open system clipboard: {error}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| format!("Transcript polished, but clipboard update failed: {error}"))
+}
+
+fn audio_transcription_polish_source_text(
+    request: AudioTranscriptionPolishRequest,
+) -> Result<String, String> {
+    if !request.text.trim().is_empty() {
+        return Ok(request.text);
+    }
+
+    let fallback_text = request.fallback_text.trim().to_string();
+    match audio_transcription_polish_clipboard_text() {
+        Ok(clipboard_text) if !clipboard_text.trim().is_empty() => Ok(clipboard_text),
+        Ok(_) if !fallback_text.is_empty() => Ok(fallback_text),
+        Ok(_) => Err("Clipboard does not contain text to polish, and there is no recent transcript.".to_string()),
+        Err(_) if !fallback_text.is_empty() => Ok(fallback_text),
+        Err(_) => Err(
+            "Clipboard does not contain text to polish, and there is no recent transcript."
+                .to_string(),
+        ),
+    }
 }
 
 fn forge_dictation_result_from_payload(
@@ -6911,7 +7306,14 @@ async fn polish_audio_transcription(
     cloud_mcp_state: State<'_, CloudMcpState>,
     request: AudioTranscriptionPolishRequest,
 ) -> Result<AudioTranscriptionPolishResult, String> {
-    let text = clean_deepgram_transcript_text(&request.text)?;
+    let source_text = audio_transcription_polish_source_text(request)?;
+    let text = clean_deepgram_transcript_text(&source_text).map_err(|error| {
+        if error.contains("did not produce any text") {
+            "Clipboard does not contain text to polish.".to_string()
+        } else {
+            error
+        }
+    })?;
     let keyterms = voice_dictionary_bias_terms(&app);
     let url = resolve_forge_voice_http_url(cloud_mcp_state.inner(), CLOUD_DICTATION_POLISH_PATH)
         .await?;
@@ -6951,6 +7353,7 @@ async fn polish_audio_transcription(
     if polished_text.is_empty() {
         return Err("Cloud transcript polish returned empty text.".to_string());
     }
+    write_audio_transcription_polish_clipboard_text(&polished_text)?;
 
     Ok(AudioTranscriptionPolishResult {
         text: polished_text,
@@ -7854,8 +8257,10 @@ async fn audio_widget_bar_hover_snapshot(
 }
 
 #[tauri::command]
-async fn audio_widget_bar_anchor_strategy() -> Result<AudioWidgetBarAnchorStrategy, String> {
-    Ok(audio_widget_bar_anchor_strategy_for())
+async fn audio_widget_bar_anchor_strategy(
+    app: AppHandle,
+) -> Result<AudioWidgetBarAnchorStrategy, String> {
+    audio_widget_bar_anchor_strategy_for(&app)
 }
 
 #[tauri::command]

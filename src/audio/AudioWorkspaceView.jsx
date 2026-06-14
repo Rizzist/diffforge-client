@@ -490,6 +490,7 @@ const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
 const AUDIO_WIDGET_SPACE_CHANGED_EVENT = "forge-audio-widget-space-changed";
+const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY = "diffforge.audio.widgetBubblePlacement.v1";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
@@ -1581,6 +1582,23 @@ function buildPolishedAudioHistoryVariants(entry, sourceText, polishedText) {
   });
 
   return nextVariants;
+}
+
+function findAudioHistoryEntryForPolish(history, sourceText) {
+  const needle = String(sourceText || "").trim();
+  if (!needle) {
+    return null;
+  }
+
+  return (Array.isArray(history) ? history : []).find((entry) => {
+    const candidates = [
+      entry?.text,
+      entry?.sourceText,
+      entry?.rawText,
+      ...audioHistoryVariants(entry).map((variant) => variant.text),
+    ];
+    return candidates.some((candidate) => String(candidate || "").trim() === needle);
+  }) || null;
 }
 
 function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
@@ -4147,6 +4165,7 @@ export function AudioWidgetWindow() {
   const bubbleHistoryTrayActiveRef = useRef(false);
   const widgetDraggingRef = useRef(false);
   const barIdleHoverRef = useRef(false);
+  const barIdleModeRef = useRef(false);
   const widgetDragSettleTimerRef = useRef(0);
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
@@ -4821,12 +4840,7 @@ export function AudioWidgetWindow() {
 
     const history = readAudioTranscriptionHistory();
     setWidgetHistory(history);
-    const entry = history[0];
-    const sourceText = audioHistoryEntryPolishText(entry);
-    if (!entry || !sourceText) {
-      setMessage("No transcript yet");
-      return;
-    }
+    const fallbackText = audioHistoryEntryPolishText(history[0]);
 
     if (polishStatusTimerRef.current) {
       window.clearTimeout(polishStatusTimerRef.current);
@@ -4834,35 +4848,37 @@ export function AudioWidgetWindow() {
     }
     setError("");
     setPolishStatus({ state: "loading", error: "" });
-    setMessage("Polishing transcript");
+    setMessage("Polishing text");
 
     try {
       const result = await invoke("polish_audio_transcription", {
         request: {
-          text: sourceText,
+          fallbackText,
         },
       });
       const polishedText = String(result?.text || "").trim();
       if (!polishedText) {
         throw new Error("Polish returned empty text.");
       }
+      const sourceText = String(result?.rawText || result?.raw_text || polishedText).trim();
+      const entry = findAudioHistoryEntryForPolish(history, sourceText);
 
       const nextVariants = buildPolishedAudioHistoryVariants(entry, sourceText, polishedText);
       await publishAudioTranscriptionResult({
-        ...entry,
+        ...(entry || {}),
         defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
-        id: entry.id || `${Date.now()}`,
-        provider: entry.provider || readAudioTranscriptionProvider(),
-        rawText: "",
-        source: "audio-llm-polished",
-        sourceText: sourceText !== polishedText ? sourceText : String(entry.sourceText || ""),
-        status: entry.status || AUDIO_TRANSCRIPTION_STATUS_INSERTED,
+        id: entry?.id || `polish-${Date.now()}`,
+        provider: entry?.provider || readAudioTranscriptionProvider(),
+        rawText: sourceText,
+        source: entry?.source || "audio-llm-polished-clipboard",
+        sourceText: sourceText !== polishedText ? sourceText : String(entry?.sourceText || ""),
+        status: entry?.status || AUDIO_TRANSCRIPTION_STATUS_INSERTED,
         text: polishedText,
         variants: nextVariants,
       });
       refreshWidgetHistory();
       setPolishStatus({ state: "success", error: "" });
-      setMessage("Transcript polished");
+      setMessage("Text polished");
       resetPolishStatusSoon(1500);
     } catch (polishError) {
       const messageText = getErrorMessage(polishError, "Unable to polish transcript.");
@@ -5213,13 +5229,46 @@ export function AudioWidgetWindow() {
   }, [positionBottomAnchoredWidget, usesBottomAnchoredStyle]);
 
   useEffect(() => {
+    barIdleModeRef.current = barIdleMode;
     if (!barIdleMode) {
       setBarIdleHoverState(false);
     }
   }, [barIdleMode, setBarIdleHoverState]);
 
   useEffect(() => {
-    if (!barIdleMode) {
+    let disposed = false;
+    let unlistenHover = () => {};
+
+    listen(AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+
+      const hovering = Boolean(event?.payload?.hovering);
+      if (barIdleModeRef.current) {
+        setBarIdleHoverState(hovering);
+      } else if (!hovering) {
+        setBarIdleHoverState(false);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenHover = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlistenHover();
+    };
+  }, [setBarIdleHoverState]);
+
+  useEffect(() => {
+    if (!usesBottomAnchoredStyle) {
       return undefined;
     }
 
@@ -5230,19 +5279,25 @@ export function AudioWidgetWindow() {
         const snapshot = await invoke("audio_widget_bar_hover_snapshot", {
           request: {
             active: barIdleHoverRef.current,
+            focus: true,
           },
         });
         if (!disposed) {
-          setBarIdleHoverState(Boolean(snapshot?.hovering));
+          if (barIdleModeRef.current) {
+            setBarIdleHoverState(Boolean(snapshot?.hovering));
+          } else if (!snapshot?.hovering) {
+            setBarIdleHoverState(false);
+          }
         }
       } catch {
         // Web previews and older native builds do not expose this helper.
       }
 
       if (!disposed) {
+        const hoveringIdleBar = barIdleModeRef.current && barIdleHoverRef.current;
         timer = window.setTimeout(
           poll,
-          barIdleHoverRef.current
+          hoveringIdleBar
             ? AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS
             : AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS,
         );
@@ -5256,7 +5311,7 @@ export function AudioWidgetWindow() {
         window.clearTimeout(timer);
       }
     };
-  }, [barIdleMode, setBarIdleHoverState]);
+  }, [setBarIdleHoverState, usesBottomAnchoredStyle]);
 
   // Bubble history controls use the same stable-anchor idea as the error
   // popover: resize the native frame in one direction while leaving the
@@ -6962,7 +7017,6 @@ export function AudioWidgetWindow() {
   const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
   const showWidgetCancelButton = (isRecordingFocus || isProcessingFocus) && !isClosingFocus;
   const latestHistoryText = String(widgetHistory[0]?.text || "").trim();
-  const latestPolishText = audioHistoryEntryPolishText(widgetHistory[0]);
   const polishState = polishStatus.state || "idle";
   const polishLoading = polishState === "loading";
   const renderHistoryQuickButton = (slot, label, available, focusable = true) => {
@@ -6992,18 +7046,15 @@ export function AudioWidgetWindow() {
     );
   };
   const renderPolishQuickButton = (focusable = true) => {
-    const available = Boolean(latestPolishText);
-    const title = available
-      ? polishState === "error" && polishStatus.error
-        ? polishStatus.error
-        : "Polish latest transcription"
-      : "No transcript yet";
+    const title = polishState === "error" && polishStatus.error
+      ? polishStatus.error
+      : "Polish clipboard or latest transcription";
     return (
       <AudioHistoryQuickButton
-        aria-label="Polish latest transcription"
+        aria-label="Polish clipboard or latest transcription"
         data-polish-state={polishState !== "idle" ? polishState : undefined}
         data-slot="polish"
-        disabled={!available || polishLoading}
+        disabled={polishLoading}
         onClick={(event) => {
           event.stopPropagation();
           polishLatestTranscript();
@@ -7014,7 +7065,7 @@ export function AudioWidgetWindow() {
         onPointerDown={(event) => {
           event.stopPropagation();
         }}
-        tabIndex={available && focusable ? 0 : -1}
+        tabIndex={focusable ? 0 : -1}
         title={title}
         type="button"
       >

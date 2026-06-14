@@ -818,6 +818,13 @@ fn diffforge_untrack_account_asset(
     } else {
         false
     };
+    let untracked_remote_row = row.clone();
+    thread::spawn(move || {
+        let _ = cloud_mcp_report_asset_local_deleted_blocking(
+            "asset_untracked",
+            &untracked_remote_row,
+        );
+    });
     diffforge_delete_tracked_asset_cache_row(&asset_id)?;
     diffforge_emit_untracked_assets_updated(&app, "untracked", item.clone());
     let _ = app.emit(

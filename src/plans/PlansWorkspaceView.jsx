@@ -237,22 +237,101 @@ function receiptDurationParts(item, nowMs) {
   return null;
 }
 
-function normalizeTerminalReceipts(receipts, paneId) {
+function sessionRefValues(value) {
+  const object = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const refs = new Set();
+  [
+    object.providerSessionId,
+    object.provider_session_id,
+    object.sessionId,
+    object.session_id,
+  ].forEach((candidate) => {
+    const cleaned = cleanText(candidate);
+    if (cleaned) refs.add(cleaned);
+  });
+  return refs;
+}
+
+function valueHasSessionRef(value, sessionId) {
+  const target = cleanText(sessionId);
+  if (!target) return false;
+  return sessionRefValues(value).has(target);
+}
+
+function planMatchesSession(plan, sessionId) {
+  if (!plan || typeof plan !== "object") return false;
+  return valueHasSessionRef(plan, sessionId);
+}
+
+function filterPlanSnapshotForSession(snapshot, sessionId) {
+  const targetSessionId = cleanText(sessionId);
+  if (!snapshot || typeof snapshot !== "object" || !targetSessionId) {
+    return null;
+  }
+  const history = (Array.isArray(snapshot.history) ? snapshot.history : [])
+    .filter((plan) => planMatchesSession(plan, targetSessionId));
+  const selectedPlan = planMatchesSession(snapshot.selected_plan || snapshot.selectedPlan, targetSessionId)
+    ? snapshot.selected_plan || snapshot.selectedPlan
+    : history[0] || null;
+  return {
+    ...snapshot,
+    history,
+    history_scope: "session",
+    selected_plan: selectedPlan,
+  };
+}
+
+function collectPlanTodoRefs(snapshot) {
+  const refs = new Set();
+  const addRef = (value) => {
+    const cleaned = cleanText(value);
+    if (cleaned) refs.add(cleaned);
+  };
+  const collectPlan = (plan) => {
+    if (!plan || typeof plan !== "object") return;
+    addRef(plan.todo_id || plan.todoId);
+    addRef(plan.plan_id || plan.planId || plan.id);
+    if (Array.isArray(plan.steps)) {
+      plan.steps.forEach((step) => {
+        addRef(step?.todo_id || step?.todoId || step?.id);
+      });
+    }
+  };
+  collectPlan(snapshot?.selected_plan || snapshot?.selectedPlan);
+  (Array.isArray(snapshot?.history) ? snapshot.history : []).forEach(collectPlan);
+  return refs;
+}
+
+function normalizeTerminalReceipts(receipts, paneId, options = {}) {
   const pane = cleanText(paneId);
+  const sessionId = cleanText(options.sessionId);
+  const planTodoRefs = options.planTodoRefs instanceof Set ? options.planTodoRefs : new Set();
   if (!pane || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
+    return [];
+  }
+  if (!sessionId) {
     return [];
   }
   return Object.entries(receipts)
     .map(([key, receipt]) => {
       if (!receipt || typeof receipt !== "object") return null;
-      if (cleanText(receipt.paneId) !== pane) return null;
+      if (cleanText(receipt.paneId || receipt.pane_id) !== pane) return null;
       const receivedAtMs = Number(receipt.receivedAtMs) || 0;
       const updatedAtMs = Number(receipt.updatedAtMs) || receivedAtMs;
       if (!receivedAtMs && !updatedAtMs) return null;
+      const commandId = cleanText(receipt.commandId) || cleanText(key);
+      const itemId = cleanText(receipt.itemId);
+      const receiptSessions = sessionRefValues(receipt);
+      if (receiptSessions.size) {
+        if (!receiptSessions.has(sessionId)) return null;
+      } else if (!planTodoRefs.has(commandId) && !planTodoRefs.has(itemId)) {
+        return null;
+      }
       return {
-        commandId: cleanText(receipt.commandId) || cleanText(key),
-        itemId: cleanText(receipt.itemId),
+        commandId,
+        itemId,
         receivedAtMs: receivedAtMs || updatedAtMs,
+        sessionId: Array.from(receiptSessions)[0] || "",
         status: cleanText(receipt.status).toLowerCase() || "queued",
         text: cleanText(receipt.text),
         updatedAtMs,
@@ -644,7 +723,7 @@ export default function PlansWorkspaceView({
   const snapshotSessionId = targetMatchesActiveRepo ? target.sessionId || "" : "";
   const snapshotTaskId = targetMatchesActiveRepo ? target.taskId || "" : "";
   const workspaceId = target.workspaceId || workspace?.id || "";
-  const hasSnapshotScope = Boolean(activeRepoPath);
+  const hasSnapshotScope = Boolean(activeRepoPath && snapshotSessionId);
   const snapshotCacheKeys = useMemo(() => {
     if (!hasSnapshotScope) {
       return { exact: "", repo: "" };
@@ -658,16 +737,9 @@ export default function PlansWorkspaceView({
       taskId: snapshotTaskId,
       workspaceId,
     };
-    if (snapshotTaskId || snapshotSessionId) {
-      return {
-        exact: planSnapshotCacheKey(baseKey),
-        repo: "",
-      };
-    }
-
     return {
-      exact: "",
-      repo: planSnapshotCacheKey(baseKey),
+      exact: planSnapshotCacheKey(baseKey),
+      repo: "",
     };
   }, [
     activeDbPath,
@@ -679,9 +751,17 @@ export default function PlansWorkspaceView({
     workspaceId,
   ]);
   const activeSnapshotRequestKey = snapshotCacheKeys.exact || snapshotCacheKeys.repo || "";
-  const scopedSnapshot = hasSnapshotScope ? snapshot : null;
+  const scopedSnapshot = useMemo(() => (
+    hasSnapshotScope
+      ? filterPlanSnapshotForSession(snapshot, snapshotSessionId)
+      : null
+  ), [hasSnapshotScope, snapshot, snapshotSessionId]);
   const selectedPlan = scopedSnapshot?.selected_plan || null;
   const planCandidates = Array.isArray(scopedSnapshot?.history) ? scopedSnapshot.history : [];
+  const sessionTodoRefs = useMemo(() => collectPlanTodoRefs(scopedSnapshot), [scopedSnapshot]);
+  const sessionTodoRefsKey = useMemo(() => (
+    Array.from(sessionTodoRefs).sort().join("\n")
+  ), [sessionTodoRefs]);
   const activePlanCandidate = planCandidates.find((plan) => !planIsTerminal(plan)) || null;
   const latestPlanCandidate = planCandidates[0] || null;
   const fallbackPlan = selectedPlan && !planIsTerminal(selectedPlan)
@@ -793,7 +873,7 @@ export default function PlansWorkspaceView({
     const receiptsWorkspaceId = cleanText(workspaceId);
     const paneId = cleanText(target.paneId);
     setSelectedTodoKey("");
-    if (!receiptsWorkspaceId || !paneId) {
+    if (!receiptsWorkspaceId || !paneId || !snapshotSessionId) {
       setTerminalTodoItems([]);
       return undefined;
     }
@@ -801,7 +881,10 @@ export default function PlansWorkspaceView({
     let unlisten = null;
     const applyReceipts = (receipts) => {
       if (cancelled) return;
-      setTerminalTodoItems(normalizeTerminalReceipts(receipts, paneId));
+      setTerminalTodoItems(normalizeTerminalReceipts(receipts, paneId, {
+        planTodoRefs: sessionTodoRefs,
+        sessionId: snapshotSessionId,
+      }));
     };
     const refresh = () => {
       invoke("todo_dispatch_receipts_get", { workspaceId: receiptsWorkspaceId })
@@ -832,7 +915,7 @@ export default function PlansWorkspaceView({
       window.clearInterval(intervalId);
       if (typeof unlisten === "function") unlisten();
     };
-  }, [target.paneId, workspaceId]);
+  }, [sessionTodoRefs, sessionTodoRefsKey, snapshotSessionId, target.paneId, workspaceId]);
 
   // Relative "sent x ago" labels and live running durations stay current.
   useEffect(() => {
@@ -957,7 +1040,12 @@ export default function PlansWorkspaceView({
       }
 
       const eventTaskId = planEventText(payload, ["taskId", "task_id"]);
-      const eventSessionId = planEventText(payload, ["sessionId", "session_id"]);
+      const eventSessionId = planEventText(payload, [
+        "providerSessionId",
+        "provider_session_id",
+        "sessionId",
+        "session_id",
+      ]);
       const eventAgentId = planEventText(payload, ["agentId", "agent_id"]);
       const targetTaskId = cleanText(state.snapshotTaskId);
       const targetSessionId = cleanText(state.snapshotSessionId);
@@ -1082,7 +1170,7 @@ export default function PlansWorkspaceView({
       ...(activeDbPath ? { dbPath: activeDbPath } : {}),
       input: {
 	        agentId: snapshotAgentId || displayedPlan?.agent_id || "",
-	        sessionId: snapshotSessionId || displayedPlan?.session_id || "",
+		        sessionId: snapshotSessionId || displayedPlan?.provider_session_id || displayedPlan?.session_id || "",
 	        planId: cleanText(displayedPlan?.plan_id || displayedPlan?.planId || displayedPlan?.id) || planRef,
 	        todoId: cleanText(displayedPlan?.todo_id || displayedPlan?.todoId),
 	        stepIndex,

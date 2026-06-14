@@ -1885,9 +1885,9 @@ function tokenomicsLimitPercentSignature(summary = {}) {
 }
 
 function mergeTokenomicsSummary(previous, next) {
-  if (!previous) return stripLegacyTokenomicsSummaryFields(next || {});
+  if (!previous) return next || {};
   if (!next) return previous;
-  const merged = {
+  return {
     ...previous,
     ...next,
     total: next.total || previous.total,
@@ -1908,25 +1908,6 @@ function mergeTokenomicsSummary(previous, next) {
     storage_usage: next.storage_usage || previous.storage_usage,
     storageUsage: next.storageUsage || previous.storageUsage,
   };
-  return stripLegacyTokenomicsSummaryFields(merged);
-}
-
-function stripLegacyTokenomicsSummaryFields(summary) {
-  const clean = { ...summary };
-  for (const key of [
-    "by_provider",
-    "by_account",
-    "by_model",
-    "daily_by_provider",
-    "monthly_by_provider",
-    "hourly_by_provider",
-    "session_hourly_by_provider",
-    "accounts",
-    "rollups",
-  ]) {
-    delete clean[key];
-  }
-  return clean;
 }
 
 const tokenomicsStore = {
@@ -2197,13 +2178,6 @@ function loadTokenomicsStore({ scan = false, force = false } = {}) {
   });
 
   return tokenomicsStore.loadPromise;
-}
-
-export function startAccountTokenomicsStartupScan(accountKey = "") {
-  resetTokenomicsStoreForAccount(accountKey);
-  ensureTokenomicsProgressListener();
-  ensureTokenomicsCloudListener();
-  return loadTokenomicsStore({ scan: true, force: true });
 }
 
 function startTokenomicsViewPolling() {

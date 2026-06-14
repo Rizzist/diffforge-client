@@ -7861,24 +7861,12 @@ function getVoiceAgentHighlightSessionSummaryRefs(summary) {
   const session = summary?.session || summary?.sessionRef || summary?.session_ref || {};
   return {
     sessionIds: getVoiceAgentHighlightStringValues(
-      summary?.agentSessionId,
-      summary?.agent_session_id,
       summary?.providerSessionId,
       summary?.provider_session_id,
-      summary?.nativeSessionId,
-      summary?.native_session_id,
-      summary?.terminalSessionId,
-      summary?.terminal_session_id,
       summary?.sessionId,
       summary?.session_id,
-      session?.agentSessionId,
-      session?.agent_session_id,
       session?.providerSessionId,
       session?.provider_session_id,
-      session?.nativeSessionId,
-      session?.native_session_id,
-      session?.terminalSessionId,
-      session?.terminal_session_id,
       session?.sessionId,
       session?.session_id,
     ),
@@ -10881,10 +10869,7 @@ function getTodoQueueAgentSessionMetadata(item = {}) {
       metadata[camelKey] = value;
     }
   };
-  textField("agentSessionId", "agent_session_id");
   textField("providerSessionId", "provider_session_id", "sessionId", "session_id");
-  textField("nativeSessionId", "native_session_id");
-  textField("terminalSessionId", "terminal_session_id", "sessionId", "session_id", "providerSessionId", "provider_session_id");
   textField("terminalId", "terminal_id", "targetTerminalId", "target_terminal_id", "paneId", "pane_id");
   textField("terminalInstanceId", "terminal_instance_id", "targetTerminalInstanceId", "target_terminal_instance_id", "instanceId", "instance_id");
   textField("threadId", "thread_id", "targetThreadId", "target_thread_id");
@@ -10905,10 +10890,7 @@ function getTodoQueueAgentSessionMetadata(item = {}) {
 function getTodoQueueAgentSessionCloudFields(item = {}) {
   const metadata = getTodoQueueAgentSessionMetadata(item);
   return {
-    ...(metadata.agentSessionId ? { agentSessionId: metadata.agentSessionId, agent_session_id: metadata.agentSessionId } : {}),
     ...(metadata.providerSessionId ? { providerSessionId: metadata.providerSessionId, provider_session_id: metadata.providerSessionId } : {}),
-    ...(metadata.nativeSessionId ? { nativeSessionId: metadata.nativeSessionId, native_session_id: metadata.nativeSessionId } : {}),
-    ...(metadata.terminalSessionId ? { terminalSessionId: metadata.terminalSessionId, terminal_session_id: metadata.terminalSessionId } : {}),
     ...(metadata.terminalId ? { terminalId: metadata.terminalId, terminal_id: metadata.terminalId } : {}),
     ...(metadata.terminalInstanceId ? { terminalInstanceId: metadata.terminalInstanceId, terminal_instance_id: metadata.terminalInstanceId } : {}),
     ...(Number.isInteger(metadata.terminalIndex) ? { terminalIndex: metadata.terminalIndex, terminal_index: metadata.terminalIndex } : {}),
@@ -10916,6 +10898,45 @@ function getTodoQueueAgentSessionCloudFields(item = {}) {
     ...(metadata.agentKind ? { agentKind: metadata.agentKind, agent_kind: metadata.agentKind } : {}),
     ...(metadata.provider ? { provider: metadata.provider } : {}),
   };
+}
+
+function getTodoQueueAcceptedSessionFields(dropResult) {
+  const sessionId = String(
+    dropResult?.providerSessionId
+      || dropResult?.provider_session_id
+      || dropResult?.acceptedDetail?.providerSessionId
+      || dropResult?.acceptedDetail?.provider_session_id
+      || dropResult?.acceptedDetail?.sessionId
+      || dropResult?.acceptedDetail?.session_id
+      || "",
+  ).trim();
+  if (!sessionId) {
+    return {};
+  }
+  return {
+    providerSessionId: sessionId,
+    provider_session_id: sessionId,
+    sessionId,
+    session_id: sessionId,
+  };
+}
+
+function getProviderSessionId(value = {}) {
+  return String(
+    value?.providerSessionId
+      || value?.provider_session_id
+      || value?.sessionId
+      || value?.session_id
+      || "",
+  ).trim();
+}
+
+function hasProviderSessionIdField(value = {}) {
+  if (!value || typeof value !== "object") return false;
+  return Object.prototype.hasOwnProperty.call(value, "providerSessionId")
+    || Object.prototype.hasOwnProperty.call(value, "provider_session_id")
+    || Object.prototype.hasOwnProperty.call(value, "sessionId")
+    || Object.prototype.hasOwnProperty.call(value, "session_id");
 }
 
 function getTodoQueuePendingPhase(pendingItem) {
@@ -11215,6 +11236,7 @@ function collectWorkspaceTodoSyncRemovedIds(result) {
 }
 
 function buildTodoQueueCloudSyncItem(item, {
+  clearProviderSessionId = false,
   deviceId = "",
   status = "",
   workspaceId = "",
@@ -11233,6 +11255,15 @@ function buildTodoQueueCloudSyncItem(item, {
   const note = getTodoQueueItemNote(normalizedItem);
   const queueState = normalizeTodoQueuePersistedQueueState(normalizedItem);
   const agentSessionFields = getTodoQueueAgentSessionCloudFields(normalizedItem);
+  const providerSessionCleared = Boolean(
+    clearProviderSessionId
+      && !agentSessionFields.providerSessionId
+      && (
+        normalizedItem.targetTerminalId
+          || Number.isInteger(normalizedItem.targetTerminalIndex)
+          || normalizedItem.targetThreadId
+      ),
+  );
   const cloudStatus = normalizeTodoQueueLifecycleStatus(status)
     || getTodoQueueItemCloudStatus(normalizedItem);
   return {
@@ -11278,7 +11309,12 @@ function buildTodoQueueCloudSyncItem(item, {
     ...(normalizedItem.planTask ? { planTask: normalizedItem.planTask } : {}),
     ...(normalizedItem.remoteCommand ? { remoteCommand: normalizedItem.remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
-    ...agentSessionFields,
+    ...(providerSessionCleared ? {
+      providerSessionId: "",
+      provider_session_id: "",
+      providerSessionIdCleared: true,
+      provider_session_id_cleared: true,
+    } : agentSessionFields),
     ...(getTodoQueueRemoteCommandDispatchId(normalizedItem) ? { lastDispatchId: getTodoQueueRemoteCommandDispatchId(normalizedItem) } : {}),
     ...(normalizedItem.targetAgentId ? { targetAgentId: normalizedItem.targetAgentId } : {}),
     ...(normalizedItem.targetTerminalId ? { targetTerminalId: normalizedItem.targetTerminalId } : {}),
@@ -15842,41 +15878,21 @@ function TerminalView({
     const liveTerminal = Number.isInteger(targetTerminalIndex)
       ? todoQueueLiveTerminalsRef.current.get(targetTerminalIndex) || null
       : null;
-    const liveProviderSessionId = String(
-      liveTerminal?.providerSessionId
-        || liveTerminal?.provider_session_id
-        || liveTerminal?.nativeSessionId
-        || liveTerminal?.native_session_id
-        || liveTerminal?.sessionId
-        || liveTerminal?.session_id
-        || "",
-    ).trim();
+    const liveProviderSessionId = getProviderSessionId(liveTerminal);
     const liveMetadata = liveTerminal ? getTodoQueueAgentSessionMetadata({
       agentKind: liveTerminal.agentId || liveTerminal.agent_id || liveTerminal.agentType || liveTerminal.agent_type || "",
-      nativeSessionId: liveTerminal.nativeSessionId || liveTerminal.native_session_id || liveProviderSessionId,
       provider: liveTerminal.provider || "",
       providerSessionId: liveProviderSessionId,
       terminalId: liveTerminal.paneId || liveTerminal.pane_id || liveTerminal.terminalId || liveTerminal.terminal_id || "",
       terminalIndex: targetTerminalIndex,
       terminalInstanceId: liveTerminal.instanceId || liveTerminal.instance_id || "",
-      terminalSessionId: liveProviderSessionId,
       threadId: liveTerminal.threadId || liveTerminal.thread_id || "",
     }) : {};
-    const pendingProviderSessionId = String(
-      pendingItem?.providerSessionId
-        || pendingItem?.provider_session_id
-        || pendingItem?.nativeSessionId
-        || pendingItem?.native_session_id
-        || pendingItem?.sessionId
-        || pendingItem?.session_id
-        || "",
-    ).trim();
+    const pendingProviderSessionId = getProviderSessionId(pendingItem);
     const pendingMetadata = getTodoQueueAgentSessionMetadata({
       ...(pendingItem || {}),
       ...(pendingProviderSessionId ? {
-        nativeSessionId: pendingProviderSessionId,
         providerSessionId: pendingProviderSessionId,
-        terminalSessionId: pendingProviderSessionId,
       } : {}),
     });
     const itemMetadata = getTodoQueueAgentSessionMetadata(item);
@@ -15908,15 +15924,6 @@ function TerminalView({
       );
       if (agentKind) metadata.agentKind = agentKind;
     }
-    if (!metadata.providerSessionId && metadata.terminalSessionId) {
-      metadata.providerSessionId = metadata.terminalSessionId;
-    }
-    if (!metadata.terminalSessionId && metadata.providerSessionId) {
-      metadata.terminalSessionId = metadata.providerSessionId;
-    }
-    if (!metadata.nativeSessionId && metadata.providerSessionId) {
-      metadata.nativeSessionId = metadata.providerSessionId;
-    }
     return metadata;
   }, []);
 
@@ -15924,6 +15931,10 @@ function TerminalView({
     const pendingItems = options.pendingItems || todoQueuePendingItemsRef.current || {};
     const workspaceId = terminalWorkspace?.id || "";
     const normalizedItems = normalizeTodoQueueItemsForWorkspace(items, workspaceId, cloudDesktopDeviceId);
+    const clearProviderSessionId = Boolean(
+      options.clearProviderSessionId
+        || options.reason === "provider_session_id_cleared",
+    );
     const cloudItems = normalizedItems
       .map((item) => {
         const pendingItem = pendingItems[item.id] || null;
@@ -15932,6 +15943,7 @@ function TerminalView({
           ...item,
           ...agentSessionMetadata,
         }, {
+          clearProviderSessionId,
           deviceId: cloudDesktopDeviceId,
           status: getTodoQueueItemCloudStatus(item, pendingItem),
           workspaceId,
@@ -15970,15 +15982,12 @@ function TerminalView({
       removedTodoIds: payload.removedTodoIds,
       todos: payload.todos.map((item) => ({
         agentKind: item.agentKind || item.agent_kind || "",
-        agentSessionId: item.agentSessionId || item.agent_session_id || "",
         id: item.id,
-        nativeSessionId: item.nativeSessionId || item.native_session_id || "",
         provider: item.provider || "",
         providerSessionId: item.providerSessionId || item.provider_session_id || "",
         reason: item.reason || item.todoStatusReason || item.statusReason || "",
         status: item.todoStatus || item.status || "",
         terminalInstanceId: item.terminalInstanceId || item.terminal_instance_id || "",
-        terminalSessionId: item.terminalSessionId || item.terminal_session_id || "",
         targetTerminalColor: item.targetTerminalColor || item.target_terminal_color || "",
         targetTerminalId: item.targetTerminalId || item.target_terminal_id || "",
         targetTerminalIndex: item.targetTerminalIndex ?? item.target_terminal_index ?? "",
@@ -16263,10 +16272,41 @@ function TerminalView({
     const nowMs = Date.now();
     const currentReceipts = pruneTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptsRef.current, nowMs);
     const existingReceipt = currentReceipts[receiptKey] || null;
+    const receiptIdentitySource = {
+      ...(item || {}),
+      ...(fields || {}),
+      targetTerminalId: fields.targetTerminalId
+        || fields.target_terminal_id
+        || fields.paneId
+        || fields.pane_id
+        || getTodoQueueTargetTerminalId(item)
+        || "",
+      targetTerminalIndex: fields.targetTerminalIndex
+        ?? fields.target_terminal_index
+        ?? getTodoQueueTargetTerminalIndex(item),
+      targetThreadId: fields.targetThreadId
+        || fields.target_thread_id
+        || getTodoQueueTargetThreadId(item)
+        || "",
+    };
+    const receiptSessionMetadata = getTodoQueueItemAgentSessionMetadataForSync(
+      receiptIdentitySource,
+      existingReceipt,
+    );
+    const receiptSessionFields = getTodoQueueAgentSessionCloudFields({
+      ...receiptIdentitySource,
+      ...receiptSessionMetadata,
+    });
+    const receiptSessionId = String(
+      receiptSessionFields.providerSessionId
+        || "",
+    ).trim();
     const nextReceipt = {
       commandId,
+      ...receiptSessionFields,
       itemId: String(item?.id || item?.itemId || existingReceipt?.itemId || ""),
       receivedAtMs: Number(existingReceipt?.receivedAtMs || nowMs),
+      ...(receiptSessionId ? { sessionId: receiptSessionId, session_id: receiptSessionId } : {}),
       status: normalizeTodoQueueRemoteCommandReceiptStatus(status),
       text: normalizeTodoQueueText(item?.text || existingReceipt?.text || "").slice(0, 180),
       updatedAtMs: nowMs,
@@ -16337,7 +16377,7 @@ function TerminalView({
       }).catch(() => {});
     }
     return receiptKey;
-  }, [terminalWorkspace?.id]);
+  }, [getTodoQueueItemAgentSessionMetadataForSync, terminalWorkspace?.id]);
 
   const updateWorkspaceFileDragState = useCallback((nextState) => {
     workspaceFileDragStateRef.current = nextState || null;
@@ -16979,15 +17019,9 @@ function TerminalView({
         mountId: projectTarget?.mountId || "",
         paneId,
         repoPath: projectTarget?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
-        sessionId: liveTerminal?.sessionId
-          || liveTerminal?.session_id
-          || coordination.sessionId
-          || coordination.session_id
-          || activeTask.sessionId
-          || activeTask.session_id
-          || providerBinding?.nativeSessionId
-          || providerBinding?.native_session_id
-          || thread?.transcriptSessionId
+        sessionId: getProviderSessionId(liveTerminal)
+          || getProviderSessionId(activeTask)
+          || getProviderSessionId(providerBinding)
           || "",
         taskId: liveTerminal?.taskId
           || liveTerminal?.task_id
@@ -17756,6 +17790,11 @@ function TerminalView({
     const promptEventId = String(event.promptEventId || event.pendingPromptId || event.promptId || "").trim();
     const promptEpoch = Number(event.promptEpoch ?? event.prompt_epoch ?? existing.promptEpoch ?? existing.prompt_epoch ?? 0);
     const agentType = String(event.agentType || event.agent_type || existing.agentType || existing.agent_type || "").trim();
+    const previousProviderSessionId = getProviderSessionId(existing);
+    const eventHasProviderSessionId = hasProviderSessionIdField(event);
+    const providerSessionId = eventHasProviderSessionId
+      ? getProviderSessionId(event)
+      : previousProviderSessionId;
     const agentDisplayName = String(
       event.agentDisplayName
         || event.agent_display_name
@@ -17790,23 +17829,18 @@ function TerminalView({
       prompt_epoch: Number.isFinite(promptEpoch) && promptEpoch > 0 ? Math.floor(promptEpoch) : 0,
       promptEventId: promptEventId || existing.promptEventId || existing.pendingPromptId || "",
       prompt_event_id: promptEventId || existing.prompt_event_id || existing.promptEventId || "",
+      providerSessionId,
+      provider_session_id: providerSessionId,
       status,
-      sessionId: event.sessionId
-        || event.session_id
-        || event.nativeSessionId
-        || event.native_session_id
-        || event.providerSessionId
-        || event.provider_session_id
-        || existing.sessionId
-        || existing.session_id
-        || "",
+      sessionId: providerSessionId,
+      session_id: providerSessionId,
       taskId: event.taskId || event.task_id || existing.taskId || existing.task_id || "",
       terminalIndex,
       threadId: event.threadId || existing.threadId || getTerminalThread(terminalIndex)?.id || "",
       updatedAt: nowIso,
       workspaceId: eventWorkspaceId || terminalWorkspace?.id || "",
     };
-    const sessionIdChanged = String(existing.sessionId || existing.session_id || "") !== String(nextTerminal.sessionId || "");
+    const providerSessionIdChanged = previousProviderSessionId !== providerSessionId;
     const changed = existing.inputReady !== nextTerminal.inputReady
       || String(existing.activityStatus || existing.activity_status || "") !== String(nextTerminal.activityStatus || "")
       || String(existing.agentDisplayName || existing.agent_display_name || "") !== String(nextTerminal.agentDisplayName || "")
@@ -17814,7 +17848,7 @@ function TerminalView({
       || String(existing.instanceId || "") !== String(nextTerminal.instanceId || "")
       || String(existing.paneId || "") !== String(nextTerminal.paneId || "")
       || String(existing.promptEventId || existing.pendingPromptId || "") !== String(nextTerminal.promptEventId || nextTerminal.pendingPromptId || "")
-      || sessionIdChanged
+      || providerSessionIdChanged
       || String(existing.provider || "") !== String(nextTerminal.provider || "")
       || String(existing.status || "") !== String(nextTerminal.status || "")
       || String(existing.taskId || existing.task_id || "") !== String(nextTerminal.taskId || "")
@@ -17823,10 +17857,11 @@ function TerminalView({
     if (changed || marksReady || marksBusy || eventType === "opened") {
       setTodoQueueDispatchRevision((revision) => revision + 1);
     }
-    if (sessionIdChanged && nextTerminal.sessionId) {
+    if (eventHasProviderSessionId && providerSessionIdChanged) {
       syncTodoQueueItemsToCloud(todoQueueItemsRef.current, {
+        clearProviderSessionId: !providerSessionId,
         force: true,
-        reason: "agent_session_id_observed",
+        reason: providerSessionId ? "provider_session_id_changed" : "provider_session_id_cleared",
       });
     }
     logTerminalStatus("frontend.todo_queue.live_terminal_lifecycle", {
@@ -18031,6 +18066,11 @@ function TerminalView({
     }
 
     const pendingItem = todoQueuePendingItemsRef.current[itemId] || null;
+    const inFlightSessionFields = getTodoQueueAgentSessionCloudFields({
+      ...(pendingItem || {}),
+      ...(inFlightPrompt || {}),
+      ...(fields || {}),
+    });
     const timeoutId = todoQueuePendingTimersRef.current.get(itemId);
     if (timeoutId) {
       window.clearTimeout(timeoutId);
@@ -18041,6 +18081,7 @@ function TerminalView({
       const completedItem = todoQueueItemsRef.current.find((item) => item.id === itemId) || null;
       if (completedItem) {
         recordTodoQueueRemoteCommandReceipt(completedItem, "completed", {
+          ...inFlightSessionFields,
           workspaceId: pendingItem?.workspaceId || terminalWorkspace?.id || "",
         });
       }
@@ -18151,6 +18192,7 @@ function TerminalView({
       };
       if (settledItem) {
         recordTodoQueueRemoteCommandReceipt(settledItem, recoverableSettleStatus, {
+          ...inFlightSessionFields,
           ...terminalAssignmentFields,
           reason,
           workspaceId: pendingItem?.workspaceId || fields.workspaceId || terminalWorkspace?.id || "",
@@ -19119,9 +19161,9 @@ function TerminalView({
           timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
         });
         const providerSessionId = String(
-          targetThread?.transcriptSessionId
-            || providerBinding?.nativeSessionId
-            || inFlightPrompt?.sessionId
+          getProviderSessionId(targetThread)
+            || getProviderSessionId(providerBinding)
+            || getProviderSessionId(inFlightPrompt)
             || "",
         ).trim();
 
@@ -19429,8 +19471,8 @@ function TerminalView({
         const acceptedAt = new Date().toISOString();
         const providerSessionId = String(
           payload.providerSessionId
-            || payload.nativeSessionId
-            || inFlightPrompt?.sessionId
+            || payload.provider_session_id
+            || getProviderSessionId(inFlightPrompt)
             || "",
         ).trim();
         const acceptedMatchedBy = "activity-hook-user-prompt-submit";
@@ -19488,8 +19530,8 @@ function TerminalView({
         completedAt,
         completedAtMs: Date.parse(completedAt) || Date.now(),
         sessionId: payload.providerSessionId
-          || payload.nativeSessionId
-          || currentInFlightPrompt?.sessionId
+          || payload.provider_session_id
+          || getProviderSessionId(currentInFlightPrompt)
           || "",
       };
       const settleReason = eventType === "provider-turn-completed"
@@ -19506,7 +19548,7 @@ function TerminalView({
         hookTimestampMs: Number.isFinite(hookTimestampMs) ? hookTimestampMs : 0,
         paneId: payloadPaneId,
         promptEventId: inFlightPrompt?.promptId || "",
-        providerSessionPresent: Boolean(payload.providerSessionId || payload.nativeSessionId),
+        providerSessionPresent: Boolean(payload.providerSessionId || payload.provider_session_id),
         reason: settleReason,
         source: inFlightPrompt?.source || "",
         submittedAtMs,
@@ -21071,6 +21113,7 @@ function TerminalView({
       : requestedTimeoutMs > 0
         ? requestedTimeoutMs
         : TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
+    const pendingSessionFields = getTodoQueueAgentSessionCloudFields(fields);
     const pendingItem = {
       cancellable: phase === "queued",
       commandId: String(fields.commandId || ""),
@@ -21094,6 +21137,7 @@ function TerminalView({
       timeoutAtMs: timeoutMs ? startedAtMs + timeoutMs : 0,
       timeoutMs,
       workspaceId: String(fields.workspaceId || terminalWorkspace?.id || ""),
+      ...pendingSessionFields,
     };
     updateTodoQueueItems((currentItems) => (
       currentItems.map((item) => (
@@ -21431,8 +21475,6 @@ function TerminalView({
       accepted: Boolean(
         event.providerSessionId
           || event.provider_session_id
-          || event.nativeSessionId
-          || event.native_session_id
           || event.sessionId
           || event.session_id,
       ),
@@ -21455,12 +21497,10 @@ function TerminalView({
       threadMessageText: text,
       threadId,
       workspaceId,
-      ...(event.providerSessionId || event.provider_session_id || event.nativeSessionId || event.native_session_id || event.sessionId || event.session_id
+      ...(event.providerSessionId || event.provider_session_id || event.sessionId || event.session_id
         ? {
           sessionId: event.providerSessionId
             || event.provider_session_id
-            || event.nativeSessionId
-            || event.native_session_id
             || event.sessionId
             || event.session_id
             || "",
@@ -22923,9 +22963,6 @@ function TerminalView({
         threadId: targetThread.id,
         type: "message-submitted",
         userMessage: safeThreadMessageText,
-        nativeSessionId: providerSessionId,
-        nativeSessionKind: providerSessionId ? "session" : "",
-        nativeSessionSource: providerSessionId ? "terminal-confirmed" : "",
         workspaceId,
         workspaceName: terminalWorkspace?.name || "",
       });
@@ -25422,28 +25459,14 @@ function TerminalView({
         workspaceLiveTerminal?.thread_id,
       ));
       const sessionIds = new Set(getVoiceAgentHighlightStringValues(
-        liveTerminal?.agentSessionId,
-        liveTerminal?.agent_session_id,
         liveTerminal?.providerSessionId,
         liveTerminal?.provider_session_id,
-        liveTerminal?.nativeSessionId,
-        liveTerminal?.native_session_id,
-        liveTerminal?.terminalSessionId,
-        liveTerminal?.terminal_session_id,
         liveTerminal?.sessionId,
         liveTerminal?.session_id,
-        workspaceLiveTerminal?.agentSessionId,
-        workspaceLiveTerminal?.agent_session_id,
         workspaceLiveTerminal?.providerSessionId,
         workspaceLiveTerminal?.provider_session_id,
-        workspaceLiveTerminal?.nativeSessionId,
-        workspaceLiveTerminal?.native_session_id,
-        workspaceLiveTerminal?.terminalSessionId,
-        workspaceLiveTerminal?.terminal_session_id,
         workspaceLiveTerminal?.sessionId,
         workspaceLiveTerminal?.session_id,
-        thread?.transcriptSessionId,
-        thread?.transcript_session_id,
       ));
       const terminalNames = new Set(getVoiceAgentHighlightStringValues(
         liveTerminal?.name,
@@ -25559,18 +25582,10 @@ function TerminalView({
       args.targetThreadIds,
     );
     const sessionIds = stringSet(
-      args.agent_session_id,
-      args.agentSessionId,
-      args.agent_session_ids,
-      args.agentSessionIds,
       args.provider_session_id,
       args.providerSessionId,
       args.provider_session_ids,
       args.providerSessionIds,
-      args.native_session_id,
-      args.nativeSessionId,
-      args.terminal_session_id,
-      args.terminalSessionId,
       args.session_id,
       args.sessionId,
       args.session_ids,
@@ -25649,18 +25664,9 @@ function TerminalView({
         const itemTerminalIndex = getTodoQueueTargetTerminalIndex(item) ?? metadata.terminalIndex;
         const itemThreadId = getTodoQueueTargetThreadId(item) || metadata.threadId || "";
         const itemSessionIds = getVoiceAgentHighlightStringValues(
-          metadata.agentSessionId,
           metadata.providerSessionId,
-          metadata.nativeSessionId,
-          metadata.terminalSessionId,
-          item?.agentSessionId,
-          item?.agent_session_id,
           item?.providerSessionId,
           item?.provider_session_id,
-          item?.nativeSessionId,
-          item?.native_session_id,
-          item?.terminalSessionId,
-          item?.terminal_session_id,
           item?.sessionId,
           item?.session_id,
         );
@@ -25725,15 +25731,12 @@ function TerminalView({
         ? args.sessionContext
         : null;
     const sessionMetadata = getTodoQueueAgentSessionMetadata({
-      agentSessionId: args.agent_session_id || args.agentSessionId || sessionContext?.agentSessionId || sessionContext?.agent_session_id || "",
       agentKind: args.agent_kind || args.agentKind || args.agent_type || args.agentType || sessionContext?.agentKind || sessionContext?.agent_kind || "",
-      nativeSessionId: args.native_session_id || args.nativeSessionId || sessionContext?.nativeSessionId || sessionContext?.native_session_id || "",
       provider: args.provider || sessionContext?.provider || "",
       providerSessionId: args.provider_session_id || args.providerSessionId || args.session_id || args.sessionId || sessionContext?.providerSessionId || sessionContext?.provider_session_id || "",
       terminalId: args.terminal_id || args.terminalId || args.target_terminal_id || args.targetTerminalId || sessionContext?.terminalId || sessionContext?.terminal_id || "",
       terminalIndex: args.terminal_index ?? args.terminalIndex ?? sessionContext?.terminalIndex ?? sessionContext?.terminal_index,
       terminalInstanceId: args.terminal_instance_id || args.terminalInstanceId || sessionContext?.terminalInstanceId || sessionContext?.terminal_instance_id || "",
-      terminalSessionId: args.terminal_session_id || args.terminalSessionId || args.session_id || args.sessionId || sessionContext?.terminalSessionId || sessionContext?.terminal_session_id || "",
       threadId: args.thread_id || args.threadId || sessionContext?.threadId || sessionContext?.thread_id || "",
     });
     const contextPrompt = normalizeTodoQueueText(
@@ -25771,7 +25774,7 @@ function TerminalView({
         action,
         agentType,
         count,
-        providerSessionPresent: Boolean(sessionMetadata.providerSessionId || sessionMetadata.nativeSessionId),
+        providerSessionPresent: Boolean(sessionMetadata.providerSessionId),
         result,
         surface: "tui_orchestrator_voice",
         workspaceId: terminalWorkspace?.id || "",
@@ -26842,6 +26845,7 @@ function TerminalView({
               || dropResult?.acceptedDetail,
           );
           const terminalSubmitConfirmed = Boolean(dropResult?.confirmedSubmit);
+          const acceptedSessionFields = getTodoQueueAcceptedSessionFields(dropResult);
           setTodoDropError("");
           logTerminalStatus("frontend.todo_queue.dispatch_consumed", {
             acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
@@ -26857,10 +26861,12 @@ function TerminalView({
           });
           if (terminalSubmitConfirmed) {
             recordTodoQueueRemoteCommandReceipt(queuedItem, "submitted", {
+              ...acceptedSessionFields,
               ...dispatchTerminalFields,
               workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
             });
             setTodoQueueItemPending(queuedItem.id, {
+              ...acceptedSessionFields,
               acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
               awaitingSessionAcceptance: !sessionAccepted,
               item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
@@ -26911,10 +26917,12 @@ function TerminalView({
 
           const consumeReason = "consumed";
           recordTodoQueueRemoteCommandReceipt(queuedItem, "completed", {
+            ...acceptedSessionFields,
             ...dispatchTerminalFields,
             workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
           });
           clearTodoQueueItemPending(queuedItem.id, consumeReason, {
+            ...acceptedSessionFields,
             acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
             awaitingSessionAcceptance: terminalSubmitConfirmed && !sessionAccepted,
             promptId: dropResult?.promptId || "",
@@ -27827,6 +27835,7 @@ function TerminalView({
               dropResult?.sessionAccepted
                 || dropResult?.acceptedDetail,
             );
+            const acceptedSessionFields = getTodoQueueAcceptedSessionFields(dropResult);
             if (dropResult?.confirmedSubmit && planTask && !dropResult?.planTaskStatusRecorded) {
               await recordVoicePlanTaskStatus(planTask, "dispatched", {
                 agentId: targetRole,
@@ -27841,6 +27850,7 @@ function TerminalView({
             if (currentDrag.itemId) {
               if (dropResult?.confirmedSubmit) {
                 setTodoQueueItemPending(currentDrag.itemId, {
+                  ...acceptedSessionFields,
                   acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
                   awaitingSessionAcceptance: !sessionAccepted,
                   item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
@@ -27886,6 +27896,7 @@ function TerminalView({
               }
 
               clearTodoQueueItemPending(currentDrag.itemId, "consumed", {
+                ...acceptedSessionFields,
                 promptId: dropResult?.promptId || "",
                 source,
                 submitConfirmed: Boolean(dropResult?.confirmedSubmit),

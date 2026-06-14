@@ -53,8 +53,46 @@ function jsonArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function jsonObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
 function text(value) {
   return String(value ?? "").trim();
+}
+
+function collectAssetRows(value, depth = 0) {
+  const object = jsonObject(value);
+  if (!object || depth > 5) return [];
+  const rows = [];
+  const addAsset = (item) => {
+    if (jsonObject(item) && text(item.assetId || item.asset_id)) rows.push(item);
+  };
+  jsonArray(object.items).forEach(addAsset);
+  jsonArray(object.assets).forEach(addAsset);
+  addAsset(object.asset);
+  addAsset(object.item);
+  ["data", "payload", "result", "stored", "account_assets", "accountAssets"].forEach((key) => {
+    rows.push(...collectAssetRows(object[key], depth + 1));
+  });
+  return rows;
+}
+
+function collectTransferRows(value, depth = 0) {
+  const object = jsonObject(value);
+  if (!object || depth > 5) return [];
+  const rows = [];
+  const addTransfer = (transfer) => {
+    if (jsonObject(transfer) && text(transfer.transferId || transfer.transfer_id || transfer.id)) {
+      rows.push(transfer);
+    }
+  };
+  jsonArray(object.transfers).forEach(addTransfer);
+  addTransfer(object.transfer);
+  ["data", "payload", "result", "stored", "account_assets", "accountAssets"].forEach((key) => {
+    rows.push(...collectTransferRows(object[key], depth + 1));
+  });
+  return rows;
 }
 
 export function assetIdentityKeys(asset) {
@@ -163,6 +201,27 @@ function normalizeAssetsLibrary(library) {
   };
 }
 
+function mergeAssetsLibraryEvent(library, eventPayload) {
+  const items = collectAssetRows(eventPayload);
+  const transfers = collectTransferRows(eventPayload);
+  if (!items.length && !transfers.length) return library;
+  const current = normalizeAssetsLibrary(library || {});
+  const nextItems = dedupeAssetRows([
+    ...jsonArray(current?.items),
+    ...items,
+  ]);
+  const nextTransfers = dedupeTransferRows([
+    ...jsonArray(current?.transfers),
+    ...transfers,
+  ]);
+  return normalizeAssetsLibrary({
+    ...(current || {}),
+    items: nextItems,
+    assets: nextItems,
+    transfers: nextTransfers,
+  });
+}
+
 function assetLibraryRequestOptions({ localOnly = false } = {}) {
   return {
     limit: DEFAULT_ASSET_LIBRARY_LIMIT,
@@ -236,7 +295,11 @@ function ensureAssetsLibraryListener() {
     return;
   }
 
-  assetsLibraryStore.listenerPromise = listen(ASSETS_UPDATED_EVENT, () => {
+  assetsLibraryStore.listenerPromise = listen(ASSETS_UPDATED_EVENT, (event) => {
+    updateAssetsLibraryStore((previous) => ({
+      library: mergeAssetsLibraryEvent(previous.library, event?.payload),
+      loading: false,
+    }));
     void loadCachedAssetsLibrary();
   })
     .then((unlisten) => {

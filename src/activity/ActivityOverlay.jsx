@@ -8,6 +8,7 @@ export const ACTIVITY_OVERLAY_HASH = "#/activity-overlay";
 export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.context";
 
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
+const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT = "cloud-mcp-account-assets-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
 // Dictation history: written by the audio widget window, shared via the
 // app-wide localStorage; every publish also broadcasts this event.
@@ -1418,6 +1419,7 @@ function useActivityOverlayData(context) {
     // deletes, sweeps) drive the authoritative todo cards; the fast path
     // updates them instantly, the debounced full refresh converges the rest.
     void addListener("todo-store-changed", { onEvent: refreshTodoOverview });
+    void addListener(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: true } });
     void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
     // The pre-created window keeps this panel mounted while hidden; the
     // moment Rust shows it, converge immediately instead of riding the poll.

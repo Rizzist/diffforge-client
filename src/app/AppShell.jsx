@@ -574,7 +574,7 @@ import SnippingQuickAccess, {
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
-import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
+import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
@@ -1132,7 +1132,6 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
-const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
@@ -6672,9 +6671,6 @@ export default function App() {
   // timestamp. Catalog broadcasts and list responses must not re-add these
   // unless the cloud entry is newer than the delete (an intentional revive);
   // stale ghosts are filtered out and the tombstone is re-sent to the cloud.
-  const tokenomicsSyncCursorRef = useRef("");
-  const tokenomicsSyncInFlightRef = useRef(false);
-  const tokenomicsSyncPendingRefreshRef = useRef(false);
   const tokenomicsForceResyncRef = useRef(null);
   const cloudMcpStartupWarmupKeyRef = useRef("");
   const workspaceCoordinationTargetsCacheRef = useRef(readWorkspaceCoordinationTargetsCache());
@@ -6957,9 +6953,6 @@ export default function App() {
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
-    tokenomicsSyncCursorRef.current = "";
-    tokenomicsSyncInFlightRef.current = false;
-    tokenomicsSyncPendingRefreshRef.current = false;
     void syncCloudMcpDesktopSessionToken(token, {
       accountScope: activeAccountScope,
       ...cloudMcpBillingEntitlementPayload(billingStatus, user),
@@ -9095,9 +9088,6 @@ export default function App() {
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
-    tokenomicsSyncCursorRef.current = "";
-    tokenomicsSyncInFlightRef.current = false;
-    tokenomicsSyncPendingRefreshRef.current = false;
     tokenomicsForceResyncRef.current = null;
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
@@ -9140,9 +9130,6 @@ export default function App() {
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
-    tokenomicsSyncCursorRef.current = "";
-    tokenomicsSyncInFlightRef.current = false;
-    tokenomicsSyncPendingRefreshRef.current = false;
     tokenomicsForceResyncRef.current = null;
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
@@ -17724,7 +17711,6 @@ export default function App() {
     setTokenomicsCloudResetState("resetting");
     try {
       await invoke("cloud_mcp_reset_device_tokenomics");
-      tokenomicsSyncCursorRef.current = "";
       setTokenomicsCloudResetMessage("Device Tokenomics reset; full resync queued.");
     } catch (error) {
       setTokenomicsCloudResetError(getErrorMessage(error, "Unable to reset this device's cloud Tokenomics."));
@@ -17764,8 +17750,6 @@ export default function App() {
       workspaceTerminalsSyncKeyRef.current = "";
       workspaceMcpSyncKeyRef.current = "";
       architectureCloudSyncSignatureRef.current = {};
-      tokenomicsSyncCursorRef.current = "";
-
       const pendingWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
         .map((workspace) => ({ ...workspace, syncState: "pending" }));
       workspacesRef.current = pendingWorkspaces;

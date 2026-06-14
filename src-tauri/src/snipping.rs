@@ -12,6 +12,7 @@ use xcap::{image::ImageFormat as XcapImageFormat, Monitor as XcapMonitor};
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT: &str = "forge-snip-source-updated";
+const SNIPPING_CLOUD_UPLOAD_EVENT: &str = "forge-snip-cloud-upload";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_OVERLAY_WINDOW_PREFIX: &str = "snipping-overlay";
@@ -1778,6 +1779,15 @@ fn xcap_monitor_for_area(area: &SnippingAreaMonitor) -> Result<XcapMonitor, Stri
 }
 
 fn xcap_monitor_for_full(app: &AppHandle) -> Result<XcapMonitor, String> {
+    if let Ok(cursor) = app.cursor_position() {
+        if let Ok(Some(monitor)) = app.monitor_from_point(cursor.x, cursor.y) {
+            let area = snipping_area_monitor_from_tauri_monitor(&monitor);
+            if let Ok(monitor) = xcap_monitor_for_area(&area) {
+                return Ok(monitor);
+            }
+        }
+    }
+
     if let Ok(area) = snipping_current_area_monitor(app) {
         if let Ok(monitor) = xcap_monitor_for_area(&area) {
             return Ok(monitor);
@@ -2129,39 +2139,133 @@ fn snipping_macos_sck_capture_monitor(
     )
 }
 
-/// Full-monitor capture for snips: xcap (CGWindowListCreateImage) first, and
-/// when macOS removes that legacy path, ScreenCaptureKit as the fallback.
-/// With `exclude_desktop_icons`, macOS goes straight to ScreenCaptureKit so
-/// Finder's icon windows can be filtered out of the captured frame.
+#[cfg(target_os = "macos")]
+fn snipping_macos_screencapture_monitor(
+    monitor: &XcapMonitor,
+) -> Result<xcap::image::RgbaImage, String> {
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let tmp_dir = root.join(".tmp");
+    fs::create_dir_all(&tmp_dir).map_err(|error| {
+        format!(
+            "Unable to create snipping temp directory {}: {error}",
+            tmp_dir.display()
+        )
+    })?;
+    let path = tmp_dir.join(format!(
+        ".snipping-screencapture-{}-{}.png",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    ));
+    let x = monitor
+        .x()
+        .map_err(|error| format!("Unable to read monitor x position: {error}"))?;
+    let y = monitor
+        .y()
+        .map_err(|error| format!("Unable to read monitor y position: {error}"))?;
+    let width = monitor
+        .width()
+        .map_err(|error| format!("Unable to read monitor width: {error}"))?
+        .max(1);
+    let height = monitor
+        .height()
+        .map_err(|error| format!("Unable to read monitor height: {error}"))?
+        .max(1);
+    let region = format!("{x},{y},{width},{height}");
+    let output = Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-R", &region])
+        .arg(&path)
+        .output()
+        .map_err(|error| format!("Unable to run macOS screenshot utility: {error}"))?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&path);
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr_text
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or("screencapture failed");
+        return Err(format!("macOS screenshot utility failed: {detail}"));
+    }
+    let image = xcap::image::open(&path)
+        .map_err(|error| format!("Unable to read macOS screenshot {}: {error}", path.display()))?
+        .to_rgba8();
+    let _ = fs::remove_file(&path);
+    Ok(image)
+}
+
+/// Full-monitor capture for snips. macOS goes through ScreenCaptureKit first:
+/// it is the modern path for fullscreen Spaces and it can exclude Finder's
+/// desktop-icon windows without changing the user's desktop. If that fails,
+/// the out-of-process macOS screenshot utility keeps legacy capture failures
+/// from bringing down the app process.
 fn snipping_capture_monitor_full_image(
     monitor: &XcapMonitor,
     exclude_desktop_icons: bool,
 ) -> Result<xcap::image::RgbaImage, String> {
     #[cfg(target_os = "macos")]
-    if exclude_desktop_icons {
-        if let Ok(image) = snipping_macos_sck_capture_monitor(monitor, &[], true) {
-            return Ok(image);
-        }
-        // SCK refused (permissions, old macOS): fall through and still
-        // deliver a screenshot, just with the icons visible.
+    {
+        let sck_result = snipping_macos_sck_capture_monitor(monitor, &[], exclude_desktop_icons);
+        return match sck_result {
+            Ok(image) => Ok(image),
+            Err(sck_error) => snipping_macos_screencapture_monitor(monitor)
+                .map_err(|fallback_error| format!("{sck_error}; fallback failed: {fallback_error}")),
+        };
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = exclude_desktop_icons;
-
-    match monitor.capture_image() {
-        Ok(image) => Ok(image),
-        Err(error) => {
-            #[cfg(target_os = "macos")]
-            {
-                if let Ok(image) =
-                    snipping_macos_sck_capture_monitor(monitor, &[], exclude_desktop_icons)
-                {
-                    return Ok(image);
-                }
-            }
-            Err(format!("Unable to capture screen: {error}"))
-        }
+    {
+        let _ = exclude_desktop_icons;
+        snipping_xcap_capture_monitor_image(monitor)
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_xcap_capture_monitor_image(
+    monitor: &XcapMonitor,
+) -> Result<xcap::image::RgbaImage, String> {
+    snipping_xcap_capture_monitor_image_guarded(monitor)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_xcap_capture_monitor_image_guarded(
+    monitor: &XcapMonitor,
+) -> Result<xcap::image::RgbaImage, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| monitor.capture_image()))
+        .map_err(|_| "Screen capture backend panicked while capturing the screen.".to_string())?
+        .map_err(|error| format!("Unable to capture screen: {error}"))
+}
+
+fn snipping_xcap_capture_monitor_region(
+    monitor: &XcapMonitor,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    #[cfg(target_os = "macos")]
+    {
+        snipping_catch_objc_result("xcap_capture_region", || {
+            snipping_xcap_capture_monitor_region_guarded(monitor, x, y, width, height)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        snipping_xcap_capture_monitor_region_guarded(monitor, x, y, width, height)
+    }
+}
+
+fn snipping_xcap_capture_monitor_region_guarded(
+    monitor: &XcapMonitor,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        monitor.capture_region(x, y, width, height)
+    }))
+    .map_err(|_| "Screen capture backend panicked while capturing the selected area.".to_string())?
+    .map_err(|error| format!("Unable to capture selected area: {error}"))
 }
 
 fn snipping_capture_area_image(
@@ -2199,9 +2303,7 @@ fn snipping_capture_area_image(
     thread::sleep(Duration::from_millis(
         SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS,
     ));
-    monitor
-        .capture_region(x, y, width, height)
-        .map_err(|error| format!("Unable to capture selected area: {error}"))
+    snipping_xcap_capture_monitor_region(monitor, x, y, width, height)
 }
 
 /// Mid-session capture that must NOT end the snip: tries the
@@ -2259,8 +2361,7 @@ fn snipping_capture_monitor_image_keeping_session(
         snipping_hide_window_now(overlay, "capture_region_hide_overlay");
     }
     thread::sleep(Duration::from_millis(60));
-    let captured = monitor
-        .capture_region(0, 0, width, height)
+    let captured = snipping_xcap_capture_monitor_region(monitor, 0, 0, width, height)
         .map_err(|error| format!("Unable to capture screen for snip re-freeze: {error}"));
     if let Some(overlay) = overlay.as_ref() {
         snipping_show_window_now(overlay, "capture_region_show_overlay");
@@ -4288,16 +4389,59 @@ async fn snipping_upload_untracked_asset_to_cloud(
     app: AppHandle,
     request: SnippingUploadAssetRequest,
 ) -> Result<Value, String> {
+    let requested_path = request.path.clone();
     let promoted = snipping_upload_untracked_asset_for(&app, request)?;
     let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId"])
         .ok_or_else(|| "Snip was tracked, but no asset id was returned.".to_string())?;
+    let local_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+        .unwrap_or_else(|| requested_path.clone());
+    let _ = app.emit(
+        SNIPPING_CLOUD_UPLOAD_EVENT,
+        json!({
+            "kind": "snip_cloud_upload_started",
+            "status": "uploading",
+            "asset_id": asset_id.clone(),
+            "assetId": asset_id.clone(),
+            "local_path": local_path.clone(),
+            "localPath": local_path,
+            "source_path": requested_path.clone(),
+            "sourcePath": requested_path.clone(),
+        }),
+    );
 
-    cloud_mcp_upload_account_asset(
+    if let Err(error) = cloud_mcp_upload_account_asset(
         app.state::<CloudMcpState>(),
         asset_id.clone(),
         None,
     )
-    .await?;
+    .await
+    {
+        let _ = app.emit(
+            SNIPPING_CLOUD_UPLOAD_EVENT,
+            json!({
+                "kind": "snip_cloud_upload_failed",
+                "status": "failed",
+                "asset_id": asset_id.clone(),
+                "assetId": asset_id,
+                "source_path": requested_path.clone(),
+                "sourcePath": requested_path.clone(),
+                "error": error.clone(),
+            }),
+        );
+        return Err(error);
+    }
+
+    let _ = app.emit(
+        SNIPPING_CLOUD_UPLOAD_EVENT,
+        json!({
+            "kind": "snip_cloud_upload_completed",
+            "status": "completed",
+            "asset_id": asset_id.clone(),
+            "assetId": asset_id.clone(),
+            "source_path": requested_path.clone(),
+            "sourcePath": requested_path.clone(),
+        }),
+    );
 
     if !snipping_upload_public_enabled(&app) {
         return Ok(json!({

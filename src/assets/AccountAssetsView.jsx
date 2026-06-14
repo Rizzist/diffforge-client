@@ -16,13 +16,18 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFileRenameOutline";
 import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
+import { Info } from "@styled-icons/material-rounded/Info";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
 import { Link } from "@styled-icons/material-rounded/Link";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
+import { PinOff } from "@styled-icons/fluentui-system-regular/PinOff";
 import { Public } from "@styled-icons/material-rounded/Public";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Settings } from "@styled-icons/material-rounded/Settings";
+import { CloudQueue } from "@styled-icons/material-rounded/CloudQueue";
+import { Computer } from "@styled-icons/material-rounded/Computer";
+import { Devices } from "@styled-icons/material-rounded/Devices";
 import MediaTranscriptChip from "./MediaTranscriptChip.jsx";
 import HyperframeEditor, {
   assetCanContainHyperframe,
@@ -275,6 +280,20 @@ function formatAssetBytes(bytes) {
   return `${size.toFixed(precision)} ${units[unitIndex]}`;
 }
 
+function formatAssetTimestamp(value) {
+  const source = text(value);
+  if (!source) return "";
+  const parsed = new Date(source);
+  if (Number.isNaN(parsed.getTime())) return source;
+  return parsed.toLocaleString([], {
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
 function assetTransferBytesSummary(transfer) {
   const total = Number(transfer?.bytesTotal ?? transfer?.bytes_total ?? 0) || 0;
   const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
@@ -292,21 +311,92 @@ function assetTransferDirectionLabel(transfer) {
   return "Syncing";
 }
 
-function assetSyncedDeviceNames(asset) {
+function assetDeviceRows(asset) {
+  return [
+    ...jsonArray(asset?.devices),
+    ...jsonArray(asset?.assetDevices),
+    ...jsonArray(asset?.asset_devices),
+    ...jsonArray(asset?.localCopies),
+    ...jsonArray(asset?.local_copies),
+    ...jsonArray(asset?.locations),
+  ].filter((device) => device && typeof device === "object");
+}
+
+function assetDeviceId(device) {
+  return text(
+    device?.deviceId
+      || device?.device_id
+      || device?.machineId
+      || device?.machine_id
+      || device?.id,
+  );
+}
+
+function assetDeviceName(device) {
+  return text(
+    device?.deviceName
+      || device?.device_name
+      || device?.machineName
+      || device?.machine_name
+      || device?.hostname
+      || device?.name,
+    assetDeviceId(device),
+  );
+}
+
+function assetDeviceLocalAvailable(device) {
+  const explicit = device?.localAvailable ?? device?.local_available ?? device?.available;
+  if (typeof explicit === "boolean") return explicit;
+  const status = text(
+    device?.localStatus
+      || device?.local_status
+      || device?.status
+      || device?.availability,
+  ).toLowerCase().replace(/[_\s]+/gu, "-");
+  return ["available", "local-available", "present", "ready", "synced"].includes(status);
+}
+
+function assetDeviceUpdatedAt(device) {
+  return text(
+    device?.updatedAt
+      || device?.updated_at
+      || device?.lastSeenAt
+      || device?.last_seen_at
+      || device?.seenAt
+      || device?.seen_at,
+  );
+}
+
+function assetRemoteDevices(asset, currentDeviceId = "") {
+  const currentId = text(currentDeviceId).toLowerCase();
   const seen = new Set();
-  const names = [];
-  jsonArray(asset?.devices).forEach((device) => {
-    const status = text(device?.localStatus || device?.local_status).toLowerCase();
-    if (status !== "local_available") return;
-    const name = text(device?.deviceName || device?.device_name)
-      || text(device?.deviceId || device?.device_id);
-    const key = name.toLowerCase();
+  const remoteDevices = [];
+  const localPath = assetLocalPath(asset);
+  assetDeviceRows(asset).forEach((device) => {
+    if (!assetDeviceLocalAvailable(device)) return;
+    const id = assetDeviceId(device);
+    const idKey = id.toLowerCase();
+    if (currentId && idKey === currentId) return;
+    if (device?.current || device?.isCurrent || device?.is_current || device?.currentDevice || device?.current_device) return;
+    const devicePath = text(device?.localPath || device?.local_path || device?.path);
+    if (!currentId && localPath && devicePath && devicePath === localPath) return;
+    const name = assetDeviceName(device);
+    const key = (id || name).toLowerCase();
     if (name && !seen.has(key)) {
       seen.add(key);
-      names.push(name);
+      remoteDevices.push({
+        ...device,
+        deviceId: id,
+        deviceName: name,
+        updatedAt: assetDeviceUpdatedAt(device),
+      });
     }
   });
-  return names;
+  return remoteDevices;
+}
+
+function assetRemoteDeviceNames(asset, currentDeviceId = "") {
+  return assetRemoteDevices(asset, currentDeviceId).map((device) => device.deviceName);
 }
 
 function assetLocalPath(asset) {
@@ -321,7 +411,7 @@ function assetLocalAvailable(asset) {
   const explicit = asset?.localAvailable ?? asset?.local_available;
   if (typeof explicit === "boolean") return explicit && Boolean(assetLocalPath(asset));
   const localStatus = text(asset?.localStatus || asset?.local_status).toLowerCase().replace(/[_\s]+/gu, "-");
-  if (["deleted", "local-deleted", "missing", "unavailable"].includes(localStatus)) return false;
+  if (["deleted", "local-deleted", "local-missing", "missing", "not-found", "unavailable"].includes(localStatus)) return false;
   return Boolean(assetLocalPath(asset));
 }
 
@@ -367,14 +457,80 @@ function assetCloudAvailable(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
 }
 
-function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel = "Cloud") {
+function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel = "Cloud", currentDeviceId = "") {
   const hasLocal = assetLocalAvailable(asset);
   const hasCloud = assetCloudAvailable(asset, cloudId);
-  const label = shortLabel(cloudLabel || "Cloud", 18);
-  if (hasLocal && hasCloud) return { hasCloud, hasLocal, label: `Local & ${label}`, statusKind: "done" };
-  if (hasCloud) return { hasCloud, hasLocal, label: `${label} only`, statusKind: "done" };
-  if (hasLocal) return { hasCloud, hasLocal, label: "Local only", statusKind: "parked" };
-  return { hasCloud, hasLocal, label: "Unavailable", statusKind: "failed" };
+  const remoteDevices = assetRemoteDevices(asset, currentDeviceId);
+  const remoteCount = remoteDevices.length;
+  const hasRemote = remoteCount > 0;
+  const parts = [];
+  if (hasLocal) parts.push("Local");
+  if (hasCloud) parts.push("Cloud");
+  if (hasRemote) parts.push(`Remote (${remoteCount})`);
+  if (!parts.length) {
+    return {
+      hasCloud,
+      hasLocal,
+      hasRemote,
+      label: "Unavailable",
+      remoteCount,
+      remoteDevices,
+      statusKind: "failed",
+    };
+  }
+  return {
+    hasCloud,
+    hasLocal,
+    hasRemote,
+    label: parts.join(" + "),
+    remoteCount,
+    remoteDevices,
+    statusKind: hasLocal || hasCloud ? "done" : "remote",
+  };
+}
+
+function AssetAvailabilityBadges({
+  availability,
+  cloudLabel = "Cloud",
+  currentDeviceName = "this device",
+  remoteDeviceNames = [],
+}) {
+  const remoteCount = numberValue(availability?.remoteCount);
+  const remoteLabel = remoteCount > 99 ? "99+" : String(remoteCount);
+  const remoteTitle = remoteDeviceNames.length
+    ? `Remote on ${remoteDeviceNames.join(", ")}`
+    : `Remote on ${remoteCount} device${remoteCount === 1 ? "" : "s"}`;
+  const groupLabel = `Availability: ${availability?.label || "Unavailable"}`;
+
+  if (!availability?.hasLocal && !availability?.hasCloud && !availability?.hasRemote) {
+    return (
+      <AssetAvailabilityBadgeGroup aria-label={groupLabel} title={groupLabel}>
+        <AssetAvailabilityBadge aria-label="Unavailable" data-kind="unavailable" title="No local, cloud, or remote copy found">
+          <span aria-hidden="true">!</span>
+        </AssetAvailabilityBadge>
+      </AssetAvailabilityBadgeGroup>
+    );
+  }
+
+  return (
+    <AssetAvailabilityBadgeGroup aria-label={groupLabel} title={groupLabel}>
+      {availability?.hasLocal && (
+        <AssetAvailabilityBadge aria-label={`Local on ${currentDeviceName}`} data-kind="local" title={`Local on ${currentDeviceName}`}>
+          <Computer aria-hidden="true" />
+        </AssetAvailabilityBadge>
+      )}
+      {availability?.hasCloud && (
+        <AssetAvailabilityBadge aria-label={`Cloud copy in ${cloudLabel}`} data-kind="cloud" title={`Cloud copy in ${cloudLabel}`}>
+          <CloudQueue aria-hidden="true" />
+        </AssetAvailabilityBadge>
+      )}
+      {availability?.hasRemote && (
+        <AssetAvailabilityBadge aria-label={remoteTitle} data-kind="remote" title={remoteTitle}>
+          <span aria-hidden="true">{remoteLabel}</span>
+        </AssetAvailabilityBadge>
+      )}
+    </AssetAvailabilityBadgeGroup>
+  );
 }
 
 function assetMimeType(asset) {
@@ -726,7 +882,25 @@ function AssetsPanel({
   const transfers = useMemo(() => assetLibraryTransfers(library), [library]);
   const aggregate = useMemo(() => assetLibraryAggregate(library), [library]);
   const libraryClouds = useMemo(() => assetLibraryClouds(library), [library]);
+  const currentDeviceId = text(
+    library?.currentDeviceId
+      || library?.current_device_id
+      || library?.deviceId
+      || library?.device_id
+      || library?.device?.deviceId
+      || library?.device?.device_id,
+  );
+  const currentDeviceName = text(
+    library?.currentDeviceName
+      || library?.current_device_name
+      || library?.deviceName
+      || library?.device_name
+      || library?.device?.deviceName
+      || library?.device?.device_name,
+    "This device",
+  );
   const [cloudsOverride, setCloudsOverride] = useState([]);
+  const [infoAssetId, setInfoAssetId] = useState("");
   const clouds = useMemo(() => {
     const byId = new Map();
     [...libraryClouds, ...cloudsOverride].forEach((cloud) => {
@@ -785,6 +959,9 @@ function AssetsPanel({
     () => new Set(filteredItems.map((asset) => assetId(asset)).filter(Boolean)),
     [filteredItems],
   );
+  const infoAsset = useMemo(() => (
+    filteredItems.find((asset) => assetId(asset) === infoAssetId) || null
+  ), [filteredItems, infoAssetId]);
   const optimisticTransferRows = useMemo(() => Object.values(optimisticTransfers), [optimisticTransfers]);
   const visibleTransfers = useMemo(() => {
     const rows = [...transfers, ...optimisticTransferRows];
@@ -809,8 +986,9 @@ function AssetsPanel({
       details: [selectedCloudLabel],
     });
   }, [activeToastKeySet, enqueueAssetToast, error, selectedCloudLabel]);
-  const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
-  const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
+  const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel, currentDeviceId).hasCloud).length;
+  const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel, currentDeviceId).hasLocal).length;
+  const remoteCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel, currentDeviceId).hasRemote).length;
   const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
     || visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
   const activeTransferSummary = useMemo(
@@ -831,6 +1009,7 @@ function AssetsPanel({
       const next = new Set([...current].filter((id) => visibleIds.has(id)));
       return next.size === current.size ? current : next;
     });
+    setInfoAssetId((current) => (current && !visibleIds.has(current) ? "" : current));
   }, [filteredItems]);
 
   const refresh = useCallback((options = { silent: true }) => (
@@ -866,6 +1045,15 @@ function AssetsPanel({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [cloudSettingsOpen]);
+
+  useEffect(() => {
+    if (!infoAssetId) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") setInfoAssetId("");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [infoAssetId]);
 
   const runCloudSettingsAction = useCallback(async (action, payload = {}) => {
     const cloudId = text(payload.cloudId || payload.cloud_id || payload.id);
@@ -1001,7 +1189,7 @@ function AssetsPanel({
     const id = assetId(asset);
     const name = assetName(asset, "asset");
     const localPath = assetLocalPath(asset);
-    const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
+    const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel, currentDeviceId);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
     if (action === "copyPublic") {
       const publicUrl = assetPublicUrl(asset);
@@ -1067,17 +1255,22 @@ function AssetsPanel({
       return;
     }
     if (action === "pin") {
-      // Re-opens the image as a draggable snip preview window; Rust reuses
-      // (shows + focuses) an existing preview for the same file, so pinning
-      // never duplicates one.
+      // Pin/unpin toggle, same as untracked scratch assets and the floating
+      // preview chrome. Rust owns the source of truth for which paths are live.
       if (!localPath) return;
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
       try {
-        await invoke("snipping_open_snip_float", { path: localPath });
+        const floatState = await invoke("snipping_snip_float_open", { path: localPath })
+          .catch(() => null);
+        if (floatState?.open) {
+          await invoke("snipping_close_snip_float_for_path", { path: localPath });
+        } else {
+          await invoke("snipping_open_snip_float", { path: localPath, focused: false });
+        }
       } catch (nextError) {
-        const message = nextError?.message || String(nextError || "Unable to pin asset preview.");
-        showAssetToast("error", "Pin failed", message, [name, localPath]);
+        const message = nextError?.message || String(nextError || "Unable to toggle asset preview.");
+        showAssetToast("error", "Pin toggle failed", message, [name, localPath]);
       } finally {
         setBusyKey((current) => (current === key ? "" : current));
       }
@@ -1173,6 +1366,7 @@ function AssetsPanel({
     }
   }, [
     clearOptimisticUploadTransfer,
+    currentDeviceId,
     effectiveCloudId,
     onOpenHyperframeAsset,
     refresh,
@@ -1223,7 +1417,7 @@ function AssetsPanel({
         let deletedCount = 0;
         for (const asset of selectedAssets) {
           const id = assetId(asset);
-          const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
+          const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel, currentDeviceId);
           if (!id) {
             continue;
           }
@@ -1255,6 +1449,7 @@ function AssetsPanel({
     refresh,
     selectedAssets,
     selectedImageAssets,
+    currentDeviceId,
     effectiveCloudId,
     selectedCloudLabel,
     showAssetToast,
@@ -1284,7 +1479,7 @@ function AssetsPanel({
           </div>
           <AssetHeaderActions>
             <AssetsSummary>
-              {filteredItems.length} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} {shortLabel(selectedCloudLabel, 14)}
+              {filteredItems.length} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} cloud · {remoteCount} remote
               {activeTransfers ? ` · ${activeTransfers} active` : ""}
               {activeTransferSummary ? ` · ${activeTransferSummary}` : ""}
             </AssetsSummary>
@@ -1359,14 +1554,15 @@ function AssetsPanel({
           {filteredItems.map((asset, index) => {
             const id = assetId(asset, `asset-${index}`);
             const name = assetName(asset, `Asset ${index + 1}`);
-            const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
+            const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel, currentDeviceId);
             const transfer = latestAssetTransfer(visibleTransfers, asset, effectiveCloudId);
             const transferStatus = transfer ? assetTransferStatusKind(transfer) : "";
             const transferActive = transferStatus === "active";
             const transferFailed = transferStatus === "failed";
             const transferPercent = transfer ? assetTransferPercent(transfer) : 0;
             const transferLabel = transfer ? assetTransferDirectionLabel(transfer) : "";
-            const syncedDeviceNames = assetSyncedDeviceNames(asset);
+            const remoteDeviceNames = assetRemoteDeviceNames(asset, currentDeviceId);
+            const showRemoteDeviceLine = remoteDeviceNames.length > 0;
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
             const localPath = availability.hasLocal ? assetLocalPath(asset) : "";
             const previewUrl = assetPreviewUrl(asset);
@@ -1397,6 +1593,7 @@ function AssetsPanel({
             const canView = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canUntrack = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
+            const showInfoAction = !availability.hasLocal || availability.hasCloud || availability.hasRemote;
             const primaryCloudAction = availability.hasCloud && availability.hasLocal
               ? "deleteCloud"
               : availability.hasCloud
@@ -1468,9 +1665,12 @@ function AssetsPanel({
                     </AssetDocumentPreview>
                   )}
                 </AssetCardPreview>
-                <AssetCardStatus data-status={availability.statusKind} title={`${selectedCloudLabel}: ${availability.label}`}>
-                  {availability.label}
-                </AssetCardStatus>
+                <AssetAvailabilityBadges
+                  availability={availability}
+                  cloudLabel={selectedCloudLabel}
+                  currentDeviceName={currentDeviceName}
+                  remoteDeviceNames={remoteDeviceNames}
+                />
                 {primaryCloudAction && (
                   <AssetTopActionButton
                     aria-label={primaryCloudLabel}
@@ -1554,16 +1754,12 @@ function AssetsPanel({
                 )}
                 <AssetUtilityStrip>
                   {canCopy && (
-                    <AssetUtilityButton
-                      aria-label={`Pin ${name} as a floating snip preview`}
-                      data-asset-pin="true"
+                    <AssetPinButton
                       disabled={pinBusy || Boolean(busyKey && !pinBusy)}
-                      onClick={() => runAssetAction("pin", asset)}
-                      title="Pin as floating snip preview"
-                      type="button"
-                    >
-                      <PushPin aria-hidden="true" />
-                    </AssetUtilityButton>
+                      localPath={localPath}
+                      name={name}
+                      onToggle={() => runAssetAction("pin", asset)}
+                    />
                   )}
                   {canUntrack && (
                     <AssetUtilityButton
@@ -1601,13 +1797,14 @@ function AssetsPanel({
                     <ContentCopy aria-hidden="true" />
                   </AssetIconButton>
                   <AssetIconButton
-                    aria-label={`Annotate ${name}`}
-                    disabled={!canView || viewBusy || Boolean(busyKey && !viewBusy)}
-                    onClick={() => runAssetAction("view", asset)}
-                    title="Annotate copy"
+                    aria-label={showInfoAction ? `Show availability for ${name}` : `Annotate ${name}`}
+                    data-primary={showInfoAction ? "true" : undefined}
+                    disabled={showInfoAction ? Boolean(busyKey) : (!canView || viewBusy || Boolean(busyKey && !viewBusy))}
+                    onClick={() => (showInfoAction ? setInfoAssetId(id) : runAssetAction("view", asset))}
+                    title={showInfoAction ? "File availability" : "Annotate copy"}
                     type="button"
                   >
-                    <ModeEdit aria-hidden="true" />
+                    {showInfoAction ? <Info aria-hidden="true" /> : <ModeEdit aria-hidden="true" />}
                   </AssetIconButton>
                   <AssetIconButton
                     aria-label={`Delete local copy of ${name}`}
@@ -1626,11 +1823,11 @@ function AssetsPanel({
                   {localPath ? (
                     <MediaTranscriptChip localPath={localPath} mediaName={name} />
                   ) : null}
-                  {syncedDeviceNames.length > 0 && (
-                    <AssetCardMetaLine title={`Synced to: ${syncedDeviceNames.join(", ")}`}>
-                      {syncedDeviceNames.length === 1
-                        ? `On ${syncedDeviceNames[0]}`
-                        : `On ${syncedDeviceNames.length} devices`}
+                  {showRemoteDeviceLine && (
+                    <AssetCardMetaLine title={`Remote devices: ${remoteDeviceNames.join(", ")}`}>
+                      {remoteDeviceNames.length === 1
+                        ? `Remote on ${remoteDeviceNames[0]}`
+                        : `Remote on ${remoteDeviceNames.length} devices`}
                     </AssetCardMetaLine>
                   )}
                   {isPublic && (
@@ -1644,7 +1841,151 @@ function AssetsPanel({
           })}
         </AssetGrid>
       )}
+      {infoAsset && (
+        <AssetInfoSheet
+          asset={infoAsset}
+          availability={assetAvailability(infoAsset, effectiveCloudId, selectedCloudLabel, currentDeviceId)}
+          cloudId={effectiveCloudId}
+          cloudLabel={selectedCloudLabel}
+          currentDeviceName={currentDeviceName}
+          onClose={() => setInfoAssetId("")}
+        />
+      )}
     </AssetsPane>
+  );
+}
+
+function AssetInfoSheet({
+  asset,
+  availability,
+  cloudId = DEFAULT_ASSET_CLOUD_ID,
+  cloudLabel = "Cloud",
+  currentDeviceName = "This device",
+  onClose,
+}) {
+  const name = assetName(asset, "Asset");
+  const localPath = availability?.hasLocal ? assetLocalPath(asset) : "";
+  const previousLocalPath = text(
+    asset?.lastLocalPath
+      || asset?.last_local_path
+      || asset?.localPathHint
+      || asset?.local_path_hint,
+  );
+  const cloudState = assetCloudState(asset, cloudId);
+  const cloudStatus = text(
+    cloudState?.cloudStatus
+      || cloudState?.cloud_status
+      || cloudState?.status
+      || asset?.cloudStatus
+      || asset?.cloud_status
+      || asset?.status,
+    availability?.hasCloud ? "available" : "not available",
+  );
+  const publicUrl = assetPublicUrl(asset);
+  const remoteDevices = jsonArray(availability?.remoteDevices);
+  const sizeBytes = Number(asset?.sizeBytes ?? asset?.size_bytes ?? 0) || 0;
+  const updatedAt = formatAssetTimestamp(asset?.updatedAt || asset?.updated_at);
+  const fileRows = [
+    ["Type", assetMimeType(asset) || assetFileTypeLabel(asset)],
+    ["Size", sizeBytes > 0 ? formatAssetBytes(sizeBytes) : ""],
+    ["SHA-256", assetSha(asset)],
+    ["Updated", updatedAt],
+  ].filter(([, value]) => text(value));
+
+  return (
+    <AssetInfoBackdrop onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose?.();
+    }}>
+      <AssetInfoPanel aria-label={`${name} availability`} aria-modal="true" role="dialog">
+        <AssetInfoHeader>
+          <div>
+            <AssetInfoEyebrow>Asset info</AssetInfoEyebrow>
+            <AssetInfoTitle>{name}</AssetInfoTitle>
+          </div>
+          <AssetInfoCloseButton aria-label="Close asset info" onClick={() => onClose?.()} title="Close" type="button">
+            <Close aria-hidden="true" />
+          </AssetInfoCloseButton>
+        </AssetInfoHeader>
+
+        <AssetInfoStatusGrid>
+          <AssetInfoStatusCard data-active={availability?.hasLocal ? "true" : "false"} data-kind="local">
+            <Computer aria-hidden="true" />
+            <strong>Local</strong>
+            <span>{availability?.hasLocal ? `Available on ${currentDeviceName}` : "Not on this device"}</span>
+          </AssetInfoStatusCard>
+          <AssetInfoStatusCard data-active={availability?.hasCloud ? "true" : "false"} data-kind="cloud">
+            <CloudQueue aria-hidden="true" />
+            <strong>Cloud</strong>
+            <span>{availability?.hasCloud ? `${shortLabel(cloudLabel, 22)} copy available` : "No cloud copy"}</span>
+          </AssetInfoStatusCard>
+          <AssetInfoStatusCard data-active={availability?.hasRemote ? "true" : "false"} data-kind="remote">
+            <Devices aria-hidden="true" />
+            <strong>Remote</strong>
+            <span>{availability?.hasRemote ? `${availability.remoteCount} device${availability.remoteCount === 1 ? "" : "s"}` : "No remote devices"}</span>
+          </AssetInfoStatusCard>
+        </AssetInfoStatusGrid>
+
+        <AssetInfoSection>
+          <AssetInfoSectionTitle>Location</AssetInfoSectionTitle>
+          <AssetInfoRows>
+            <AssetInfoRow>
+              <span>This device</span>
+              <strong title={localPath || previousLocalPath || undefined}>
+                {localPath || (previousLocalPath ? "Missing local file" : "No local copy")}
+              </strong>
+            </AssetInfoRow>
+            <AssetInfoRow>
+              <span>Cloud</span>
+              <strong>{availability?.hasCloud ? `${shortLabel(cloudLabel, 22)} · ${cloudStatus}` : "Not uploaded"}</strong>
+            </AssetInfoRow>
+            {publicUrl && (
+              <AssetInfoRow>
+                <span>Public link</span>
+                <strong title={publicUrl}>Available</strong>
+              </AssetInfoRow>
+            )}
+          </AssetInfoRows>
+        </AssetInfoSection>
+
+        <AssetInfoSection>
+          <AssetInfoSectionTitle>Remote devices</AssetInfoSectionTitle>
+          {remoteDevices.length ? (
+            <AssetInfoDeviceList>
+              {remoteDevices.map((device) => {
+                const deviceName = assetDeviceName(device);
+                const deviceId = assetDeviceId(device);
+                const updated = formatAssetTimestamp(device.updatedAt || device.updated_at);
+                return (
+                  <AssetInfoDeviceRow key={deviceId || deviceName}>
+                    <Devices aria-hidden="true" />
+                    <div>
+                      <strong>{deviceName}</strong>
+                      <span>{updated ? `Last seen ${updated}` : "Local copy reported by this device"}</span>
+                    </div>
+                  </AssetInfoDeviceRow>
+                );
+              })}
+            </AssetInfoDeviceList>
+          ) : (
+            <AssetInfoEmpty>No remote device has reported a local copy.</AssetInfoEmpty>
+          )}
+        </AssetInfoSection>
+
+        {fileRows.length > 0 && (
+          <AssetInfoSection>
+            <AssetInfoSectionTitle>File</AssetInfoSectionTitle>
+            <AssetInfoRows>
+              {fileRows.map(([label, value]) => (
+                <AssetInfoRow key={label}>
+                  <span>{label}</span>
+                  <strong title={value}>{value}</strong>
+                </AssetInfoRow>
+              ))}
+            </AssetInfoRows>
+          </AssetInfoSection>
+        )}
+      </AssetInfoPanel>
+    </AssetInfoBackdrop>
   );
 }
 
@@ -1989,7 +2330,7 @@ function useSnipFloatOpen(localPath) {
   return open;
 }
 
-function UntrackedPinButton({ localPath, name, disabled, onToggle }) {
+function AssetPinButton({ localPath, name, disabled, onToggle }) {
   const pinned = useSnipFloatOpen(localPath);
   return (
     <AssetFloatPinButton
@@ -2001,7 +2342,7 @@ function UntrackedPinButton({ localPath, name, disabled, onToggle }) {
       title={pinned ? "Unpin floating preview" : "Pin as draggable floating preview"}
       type="button"
     >
-      <PushPin aria-hidden="true" />
+      {pinned ? <PinOff aria-hidden="true" /> : <PushPin aria-hidden="true" />}
     </AssetFloatPinButton>
   );
 }
@@ -2316,7 +2657,7 @@ function UntrackedAssetsPanel({
                 </AssetSelectButton>
                 <AssetUtilityStrip>
                   {canCopy && (
-                    <UntrackedPinButton
+                    <AssetPinButton
                       disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
                       localPath={localPath}
                       name={name}
@@ -3071,14 +3412,15 @@ const AssetBatchButton = styled.button`
 const AssetGrid = styled.div`
   display: grid;
   flex: 1 1 0;
-  grid-template-columns: repeat(auto-fill, minmax(148px, 176px));
+  grid-template-columns: repeat(auto-fill, minmax(220px, 240px));
   grid-auto-rows: max-content;
-  gap: 10px;
+  gap: 12px;
+  align-items: start;
   align-content: start;
   min-width: 0;
   min-height: 120px;
   overflow: auto;
-  padding: 12px 2px 72px;
+  padding: 14px 4px 72px;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
@@ -3172,8 +3514,7 @@ const AssetCard = styled.article`
 `;
 
 /* Golden-ratio media stage, the same proportions as the floating snip
-   preview window; all hover chrome (status chip, select, action pill)
-   anchors to it, and the caption below makes the card a little taller. */
+   preview window. The caption is a separate title strip below it. */
 const AssetCardMedia = styled.div`
   position: relative;
   width: 100%;
@@ -3281,6 +3622,11 @@ const AssetCardStatus = styled.span`
     color: rgba(167, 243, 208, 0.86);
   }
 
+  &[data-status="remote"] {
+    border-color: rgba(125, 176, 255, 0.28);
+    color: rgba(191, 219, 254, 0.9);
+  }
+
   &[data-status="active"] {
     border-color: rgba(96, 165, 250, 0.24);
     color: rgba(191, 219, 254, 0.88);
@@ -3295,6 +3641,70 @@ const AssetCardStatus = styled.span`
   &[data-status="cancelled"] {
     border-color: rgba(251, 113, 133, 0.24);
     color: rgba(254, 205, 211, 0.86);
+  }
+`;
+
+const AssetAvailabilityBadgeGroup = styled.div`
+  position: absolute;
+  top: 7px;
+  left: 7px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  max-width: calc(100% - 84px);
+  padding: 3px;
+  gap: 4px;
+  border: 1px solid rgba(15, 23, 42, 0.74);
+  border-radius: 999px;
+  background: rgba(2, 6, 23, 0.78);
+  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.26);
+  backdrop-filter: blur(8px);
+`;
+
+const AssetAvailabilityBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.92);
+  background: rgba(15, 23, 42, 0.78);
+  font-size: 9px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  line-height: 1;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &[data-kind="local"] {
+    border-color: rgba(251, 191, 36, 0.58);
+    color: rgba(17, 24, 39, 0.96);
+    background: #f59e0b;
+  }
+
+  &[data-kind="cloud"] {
+    border-color: rgba(74, 222, 128, 0.58);
+    color: rgba(2, 44, 18, 0.96);
+    background: #22c55e;
+  }
+
+  &[data-kind="remote"] {
+    border-color: rgba(147, 197, 253, 0.58);
+    color: rgba(239, 246, 255, 0.98);
+    background: #3b82f6;
+  }
+
+  &[data-kind="unavailable"] {
+    border-color: rgba(253, 164, 175, 0.58);
+    color: rgba(255, 241, 242, 0.98);
+    background: #e11d48;
   }
 `;
 
@@ -3493,6 +3903,12 @@ const AssetTopActionButton = styled(AssetUtilityButton).attrs({ "data-asset-uplo
     pointer-events: auto;
     transform: translateY(0);
   }
+
+  &:disabled:not([data-busy="true"]) {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-3px);
+  }
 `;
 
 const AssetFloatPinButton = styled(AssetUtilityButton).attrs({ "data-asset-pin": "true" })``;
@@ -3541,7 +3957,16 @@ const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
 
   &:disabled {
     cursor: default;
+  }
+
+  &:disabled[data-selected="true"] {
     opacity: 0.55;
+  }
+
+  &:disabled:not([data-selected="true"]) {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-3px);
   }
 `;
 
@@ -3616,9 +4041,9 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
 `;
 
 const AssetCardCaption = styled.div`
-  flex: 1 0 auto;
+  flex: 0 0 auto;
   min-width: 0;
-  min-height: 34px;
+  min-height: 36px;
   padding: 6px 9px 7px;
   border-top: 1px solid rgba(148, 163, 184, 0.1);
   background: rgba(2, 6, 23, 0.55);
@@ -3647,6 +4072,262 @@ const AssetCardMetaLine = styled.span`
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+`;
+
+const AssetInfoBackdrop = styled.div`
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(2, 6, 23, 0.58);
+  backdrop-filter: blur(10px);
+`;
+
+const AssetInfoPanel = styled.section`
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100vh - 36px));
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(7, 10, 16, 0.96);
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.48);
+`;
+
+const AssetInfoHeader = styled.header`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+`;
+
+const AssetInfoEyebrow = styled.span`
+  display: block;
+  margin-bottom: 4px;
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0;
+  line-height: 1;
+  text-transform: uppercase;
+`;
+
+const AssetInfoTitle = styled.strong`
+  display: block;
+  overflow: hidden;
+  color: rgba(248, 250, 252, 0.96);
+  font-size: 16px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+`;
+
+const AssetInfoCloseButton = styled.button`
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.84);
+  background: rgba(15, 23, 42, 0.5);
+  font: inherit;
+  cursor: pointer;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    color: rgba(224, 242, 254, 0.94);
+    background: rgba(14, 165, 233, 0.14);
+  }
+`;
+
+const AssetInfoStatusGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const AssetInfoStatusCard = styled.div`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.42);
+
+  svg {
+    width: 16px;
+    height: 16px;
+    color: rgba(148, 163, 184, 0.82);
+  }
+
+  strong {
+    color: rgba(226, 232, 240, 0.94);
+    font-size: 11px;
+    font-weight: 850;
+    line-height: 1;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 10px;
+    font-weight: 650;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-active="true"][data-kind="local"] {
+    border-color: rgba(245, 158, 11, 0.36);
+    background: rgba(245, 158, 11, 0.13);
+
+    svg,
+    strong {
+      color: #fbbf24;
+    }
+  }
+
+  &[data-active="true"][data-kind="cloud"] {
+    border-color: rgba(34, 197, 94, 0.34);
+    background: rgba(34, 197, 94, 0.12);
+
+    svg,
+    strong {
+      color: #4ade80;
+    }
+  }
+
+  &[data-active="true"][data-kind="remote"] {
+    border-color: rgba(59, 130, 246, 0.36);
+    background: rgba(59, 130, 246, 0.13);
+
+    svg,
+    strong {
+      color: #93c5fd;
+    }
+  }
+`;
+
+const AssetInfoSection = styled.section`
+  display: grid;
+  gap: 7px;
+  padding: 11px 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+`;
+
+const AssetInfoSectionTitle = styled.strong`
+  color: rgba(203, 213, 225, 0.92);
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1;
+  text-transform: uppercase;
+`;
+
+const AssetInfoRows = styled.div`
+  display: grid;
+  gap: 6px;
+`;
+
+const AssetInfoRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(86px, 0.36fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+
+  span {
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 10px;
+    font-weight: 750;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(241, 245, 249, 0.92);
+    font-size: 10px;
+    font-weight: 750;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const AssetInfoDeviceList = styled.div`
+  display: grid;
+  gap: 6px;
+`;
+
+const AssetInfoDeviceRow = styled.div`
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(125, 176, 255, 0.16);
+  border-radius: 7px;
+  background: rgba(30, 41, 59, 0.32);
+
+  svg {
+    width: 16px;
+    height: 16px;
+    color: rgba(191, 219, 254, 0.9);
+  }
+
+  div {
+    min-width: 0;
+  }
+
+  strong,
+  span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(241, 245, 249, 0.94);
+    font-size: 11px;
+    font-weight: 850;
+  }
+
+  span {
+    margin-top: 2px;
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 9px;
+    font-weight: 650;
+  }
+`;
+
+const AssetInfoEmpty = styled.p`
+  margin: 0;
+  color: rgba(148, 163, 184, 0.82);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.35;
 `;
 
 const AssetTransferOverlay = styled.div`

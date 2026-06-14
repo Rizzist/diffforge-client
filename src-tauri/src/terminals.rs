@@ -7972,7 +7972,6 @@ async fn terminal_try_crash_todo_resume_prompt_once(
     let Some(provider_session_id) = payload
         .provider_session_id
         .as_deref()
-        .or(payload.native_session_id.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -9148,7 +9147,7 @@ fn terminal_activity_hook_payload(
         prompt_ready_at,
         completed_at,
         provider_session_id: provider_session_id.clone(),
-        native_session_id: provider_session_id,
+        native_session_id: None,
         provider_turn_id: provider_turn_id.clone(),
         turn_id: provider_turn_id,
         transcript_path: terminal_activity_hook_string(
@@ -9422,7 +9421,6 @@ fn terminal_native_plan_capture_observe(
         payload
             .provider_session_id
             .clone()
-            .or_else(|| payload.native_session_id.clone())
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     } else {
@@ -9638,7 +9636,6 @@ fn spawn_terminal_activity_hook_watcher(
                             if let Some(provider_session_id) = payload
                                 .provider_session_id
                                 .as_deref()
-                                .or(payload.native_session_id.as_deref())
                                 .map(str::trim)
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_string)

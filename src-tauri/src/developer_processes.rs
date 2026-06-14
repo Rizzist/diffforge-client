@@ -422,7 +422,7 @@ async fn list_developer_processes(
         active_workspace_root,
         workspace_roots,
         force.unwrap_or(false),
-        include_diagnostics.unwrap_or(false),
+        include_diagnostics.unwrap_or(true),
         include_ports.unwrap_or(false),
     )
     .await

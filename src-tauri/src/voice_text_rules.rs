@@ -10,6 +10,226 @@ const VOICE_DICTIONARY_LIST_NAME_CHARS: usize = 80;
 const VOICE_DICTIONARY_BIAS_TERM_LIMIT: usize = 100;
 const VOICE_DICTIONARY_BIAS_TERM_CHARS: usize = 64;
 const VOICE_DICTIONARY_WHISPER_PROMPT_CHARS: usize = 600;
+const DEFAULT_VOICE_DICTIONARY_LIST_ID: &str = "default-programmer-vocabulary";
+const DEFAULT_VOICE_DICTIONARY_LIST_NAME: &str = "Programmer vocabulary";
+const DEFAULT_VOICE_DICTIONARY_TERMS: &[&str] = &[
+    "Diff Forge AI",
+    "Diff Forge Cloud",
+    "Diff Forge",
+    "DiffForge",
+    "Rust client",
+    "token",
+    "tokens",
+    "tokenomics",
+    "model context",
+    "context window",
+    "workspace",
+    "workspaces",
+    "terminal",
+    "terminals",
+    "session",
+    "sessions",
+    "orchestrator",
+    "client",
+    "server",
+    "webview",
+    "clipboard",
+    "transcript",
+    "dictation",
+    "snippet",
+    "snippets",
+    "transform",
+    "transforms",
+    "dictionary",
+    "Codex",
+    "OpenAI",
+    "ChatGPT",
+    "GPT",
+    "GPT-5",
+    "Claude",
+    "Anthropic",
+    "Gemini",
+    "Copilot",
+    "GitHub Copilot",
+    "Hugging Face",
+    "AI",
+    "generative AI",
+    "LLM",
+    "LLMs",
+    "large language model",
+    "AI model",
+    "foundation model",
+    "agent",
+    "agents",
+    "subagent",
+    "subagents",
+    "AI agent",
+    "agentic AI",
+    "MCP",
+    "Model Context Protocol",
+    "RAG",
+    "embedding",
+    "embeddings",
+    "vector database",
+    "prompt",
+    "TypeScript",
+    "JavaScript",
+    "Python",
+    "Rust",
+    "SQL",
+    "Go",
+    "React",
+    "Next.js",
+    "Vue.js",
+    "Nuxt",
+    "Angular",
+    "Svelte",
+    "SvelteKit",
+    "Astro",
+    "Remix",
+    "SolidJS",
+    "Qwik",
+    "Node.js",
+    "Express",
+    "Fastify",
+    "NestJS",
+    "Hono",
+    "tRPC",
+    "GraphQL",
+    "Apollo",
+    "Django",
+    "Flask",
+    "FastAPI",
+    "Pydantic",
+    "SQLAlchemy",
+    "Spring Boot",
+    "ASP.NET Core",
+    ".NET",
+    "Laravel",
+    "Symfony",
+    "Ruby on Rails",
+    "Rails",
+    "Phoenix",
+    "Gin",
+    "Echo",
+    "Fiber",
+    "React Native",
+    "Flutter",
+    "SwiftUI",
+    "Electron",
+    "Vite",
+    "Tailwind CSS",
+    "Bootstrap",
+    "Prisma",
+    "Drizzle",
+    "Deepgram",
+    "Whisper",
+    "retrieval augmented generation",
+    "multi-agent",
+    "vector store",
+    "vector search",
+    "system prompt",
+    "prompt engineering",
+    "tool calling",
+    "function calling",
+    "inference",
+    "fine-tuning",
+    "evals",
+    "tokenizer",
+    "input tokens",
+    "output tokens",
+    "hallucination",
+    "guardrails",
+    "LangChain",
+    "LangGraph",
+    "LlamaIndex",
+    "Transformers",
+    "PyTorch",
+    "TensorFlow",
+    "JAX",
+    "ONNX",
+    "CUDA",
+    "Ollama",
+    "vLLM",
+    "llama.cpp",
+    "HTML",
+    "CSS",
+    "Java",
+    "C#",
+    "C++",
+    "PHP",
+    "Ruby",
+    "Kotlin",
+    "Swift",
+    "Bash",
+    "Shell",
+    "Markdown",
+    "SQLite",
+    "PostgreSQL",
+    "Postgres",
+    "MySQL",
+    "MongoDB",
+    "Redis",
+    "Elasticsearch",
+    "OpenSearch",
+    "Supabase",
+    "Firebase",
+    "Cloudflare",
+    "Vercel",
+    "Netlify",
+    "AWS",
+    "Azure",
+    "Google Cloud",
+    "GCP",
+    "Docker",
+    "Docker Compose",
+    "Kubernetes",
+    "Terraform",
+    "GitHub",
+    "GitHub Actions",
+    "Git",
+    "API",
+    "REST API",
+    "CLI",
+    "SDK",
+    "npm",
+    "pnpm",
+    "Yarn",
+    "Bun",
+    "Deno",
+    "JSON",
+    "YAML",
+    "TOML",
+    "XML",
+    "HTTP",
+    "HTTPS",
+    "WebSocket",
+    "OAuth",
+    "JWT",
+    "UUID",
+    "URL",
+    "URI",
+    "CI/CD",
+    "macOS",
+    "frontend",
+    "backend",
+    "full stack",
+    "middleware",
+    "database",
+    "schema",
+    "migration",
+    "cache",
+    "queue",
+    "worker",
+    "runtime",
+    "repository",
+    "branch",
+    "commit",
+    "merge",
+    "pull request",
+    "diff",
+    "patch",
+];
 
 fn voice_rule_default_enabled() -> bool {
     true
@@ -168,6 +388,36 @@ fn normalize_voice_dictionary_terms(terms: &[String]) -> Vec<String> {
     normalized
 }
 
+fn default_voice_dictionary_list() -> VoiceDictionaryList {
+    VoiceDictionaryList {
+        id: DEFAULT_VOICE_DICTIONARY_LIST_ID.to_string(),
+        name: DEFAULT_VOICE_DICTIONARY_LIST_NAME.to_string(),
+        terms: normalize_voice_dictionary_terms(
+            &DEFAULT_VOICE_DICTIONARY_TERMS
+                .iter()
+                .map(|term| (*term).to_string())
+                .collect::<Vec<_>>(),
+        ),
+        selected: true,
+        ..Default::default()
+    }
+}
+
+fn ensure_default_voice_dictionary_list(dictionary: &mut Vec<VoiceDictionaryList>) {
+    if dictionary
+        .iter()
+        .any(|list| list.id == DEFAULT_VOICE_DICTIONARY_LIST_ID)
+    {
+        return;
+    }
+
+    if dictionary.len() >= VOICE_DICTIONARY_MAX_LISTS {
+        return;
+    }
+
+    dictionary.push(default_voice_dictionary_list());
+}
+
 fn normalize_voice_text_rules(rules: VoiceTextRules) -> VoiceTextRules {
     let mut legacy_terms: Vec<String> = Vec::new();
     let mut dictionary: Vec<VoiceDictionaryList> = Vec::new();
@@ -210,6 +460,8 @@ fn normalize_voice_text_rules(rules: VoiceTextRules) -> VoiceTextRules {
             ..Default::default()
         });
     }
+
+    ensure_default_voice_dictionary_list(&mut dictionary);
 
     let snippets = rules
         .snippets
@@ -267,16 +519,16 @@ fn normalize_voice_text_rules(rules: VoiceTextRules) -> VoiceTextRules {
 
 fn read_voice_text_rules(app: &AppHandle) -> VoiceTextRules {
     let Ok(path) = voice_text_rules_path(app) else {
-        return VoiceTextRules::default();
+        return normalize_voice_text_rules(VoiceTextRules::default());
     };
 
     let Ok(contents) = fs::read_to_string(path) else {
-        return VoiceTextRules::default();
+        return normalize_voice_text_rules(VoiceTextRules::default());
     };
 
     serde_json::from_str::<VoiceTextRules>(&contents)
         .map(normalize_voice_text_rules)
-        .unwrap_or_default()
+        .unwrap_or_else(|_| normalize_voice_text_rules(VoiceTextRules::default()))
 }
 
 fn write_voice_text_rules(app: &AppHandle, rules: &VoiceTextRules) -> Result<(), String> {
@@ -452,14 +704,25 @@ mod voice_text_rules_tests {
             }],
         });
 
-        assert_eq!(rules.dictionary.len(), 1);
-        assert_eq!(rules.dictionary[0].name, "Project jargon");
+        let project = rules
+            .dictionary
+            .iter()
+            .find(|list| list.name == "Project jargon")
+            .expect("project dictionary exists");
+        let defaults = rules
+            .dictionary
+            .iter()
+            .find(|list| list.id == DEFAULT_VOICE_DICTIONARY_LIST_ID)
+            .expect("default dictionary exists");
+        assert_eq!(rules.dictionary.len(), 2);
         assert_eq!(
-            rules.dictionary[0].terms,
+            project.terms,
             vec!["Tauri".to_string(), "Deepgram".to_string()]
         );
-        assert!(rules.dictionary[0].selected);
-        assert!(!rules.dictionary[0].id.is_empty());
+        assert!(project.selected);
+        assert!(!project.id.is_empty());
+        assert_eq!(defaults.name, DEFAULT_VOICE_DICTIONARY_LIST_NAME);
+        assert!(defaults.selected);
         assert_eq!(rules.snippets.len(), 1);
         assert_eq!(rules.snippets[0].trigger, "gstack");
         assert_eq!(rules.snippets[0].expansion, "full prompt");
@@ -509,13 +772,24 @@ mod voice_text_rules_tests {
         .expect("rules parse");
         let rules = normalize_voice_text_rules(rules);
 
-        assert_eq!(rules.dictionary.len(), 1);
-        assert_eq!(rules.dictionary[0].name, "Imported");
+        let imported = rules
+            .dictionary
+            .iter()
+            .find(|list| list.name == "Imported")
+            .expect("imported dictionary exists");
+        let defaults = rules
+            .dictionary
+            .iter()
+            .find(|list| list.id == DEFAULT_VOICE_DICTIONARY_LIST_ID)
+            .expect("default dictionary exists");
+        assert_eq!(rules.dictionary.len(), 2);
         assert_eq!(
-            rules.dictionary[0].terms,
+            imported.terms,
             vec!["Tauri".to_string(), "Deepgram".to_string()]
         );
-        assert!(rules.dictionary[0].selected);
+        assert!(imported.selected);
+        assert_eq!(defaults.name, DEFAULT_VOICE_DICTIONARY_LIST_NAME);
+        assert!(defaults.selected);
     }
 
     #[test]
@@ -548,6 +822,16 @@ mod voice_text_rules_tests {
                 VoiceDictionaryList {
                     name: "Parked".to_string(),
                     terms: vec!["Skipped".to_string()],
+                    selected: false,
+                    ..Default::default()
+                },
+                VoiceDictionaryList {
+                    id: DEFAULT_VOICE_DICTIONARY_LIST_ID.to_string(),
+                    name: DEFAULT_VOICE_DICTIONARY_LIST_NAME.to_string(),
+                    terms: DEFAULT_VOICE_DICTIONARY_TERMS
+                        .iter()
+                        .map(|term| (*term).to_string())
+                        .collect(),
                     selected: false,
                     ..Default::default()
                 },
@@ -609,6 +893,31 @@ mod voice_text_rules_tests {
         // Snippets and transforms are empty, so any "enabled" key would have
         // leaked from the dictionary list's skipped legacy field.
         assert!(!json.contains("\"enabled\""));
+    }
+
+    #[test]
+    fn default_programmer_dictionary_is_selected_and_not_duplicated() {
+        let rules = normalize_voice_text_rules(VoiceTextRules::default());
+        let renormalized = normalize_voice_text_rules(rules.clone());
+
+        assert_eq!(rules.dictionary.len(), 1);
+        assert_eq!(rules.dictionary[0].id, DEFAULT_VOICE_DICTIONARY_LIST_ID);
+        assert_eq!(rules.dictionary[0].name, DEFAULT_VOICE_DICTIONARY_LIST_NAME);
+        assert!(rules.dictionary[0].selected);
+        assert!(rules.dictionary[0]
+            .terms
+            .contains(&"Diff Forge AI".to_string()));
+        assert!(rules.dictionary[0]
+            .terms
+            .contains(&"tokenomics".to_string()));
+        assert_eq!(
+            renormalized
+                .dictionary
+                .iter()
+                .filter(|list| list.id == DEFAULT_VOICE_DICTIONARY_LIST_ID)
+                .count(),
+            1
+        );
     }
 
     #[test]

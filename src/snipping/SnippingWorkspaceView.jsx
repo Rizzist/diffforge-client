@@ -40,6 +40,15 @@ const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
+
+function clearOverlaySnapshotPath(monitor) {
+  if (!monitor || typeof monitor !== "object") return monitor || null;
+  return {
+    ...monitor,
+    snapshotPath: "",
+    snapshot_path: "",
+  };
+}
 const SNIPPING_MODIFIER_CODES = new Set([
   "AltLeft",
   "AltRight",
@@ -720,6 +729,10 @@ export function SnippingOverlayWindow() {
   }, [drag]);
 
   const closeOverlay = useCallback(async () => {
+    setCapturing(false);
+    dragRef.current = null;
+    setDrag(null);
+    setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
     try {
       await invoke("snipping_cancel_area_snip");
     } catch {
@@ -764,7 +777,7 @@ export function SnippingOverlayWindow() {
       if (cancelled) return;
       const targetLabel = text(event.payload?.overlayLabel || event.payload?.overlay_label);
       if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
-      applyOverlayMonitor(event.payload?.monitor || event.payload || null);
+      applyOverlayMonitor(clearOverlaySnapshotPath(event.payload?.monitor || event.payload || null));
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -874,6 +887,10 @@ export function SnippingOverlayWindow() {
           scaleFactor: window.devicePixelRatio || 1,
         },
       });
+      setCapturing(false);
+      dragRef.current = null;
+      setDrag(null);
+      setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
       try {
         await overlayWindow.hide();
       } catch {

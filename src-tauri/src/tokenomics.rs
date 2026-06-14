@@ -7,6 +7,7 @@ const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_SYNC_LIMIT: usize = 2048;
 const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_BUCKET_SECS: u64 = 15 * 60;
 const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_5H_RETENTION_SECS: u64 = 48 * 60 * 60;
 const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_WEEKLY_RETENTION_SECS: u64 = 45 * 24 * 60 * 60;
+const TOKENOMICS_SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
 const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 const TOKENOMICS_CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v5-device-aware";
@@ -129,6 +130,8 @@ fn tokenomics_open_db(app: &AppHandle) -> Result<rusqlite::Connection, String> {
             db_path.display()
         )
     })?;
+    conn.busy_timeout(Duration::from_millis(TOKENOMICS_SQLITE_BUSY_TIMEOUT_MS))
+        .map_err(|error| format!("Unable to set Tokenomics database busy timeout: {error}"))?;
     tokenomics_prepare_db(&conn)?;
     Ok(conn)
 }
@@ -364,7 +367,6 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     if view_version == TOKENOMICS_VIEW_SCHEMA_VERSION {
         tokenomics_rebuild_rollups_for_identity_version(conn)?;
         tokenomics_repair_provider_api_costs(conn)?;
-        tokenomics_reconcile_codex_cached_usage_aliases(conn)?;
         return Ok(());
     }
     conn.execute_batch(&format!(
@@ -521,7 +523,6 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     .map_err(|error| format!("Unable to finalize Tokenomics database schema: {error}"))?;
     tokenomics_rebuild_rollups_for_identity_version(conn)?;
     tokenomics_repair_provider_api_costs(conn)?;
-    tokenomics_reconcile_codex_cached_usage_aliases(conn)?;
     Ok(())
 }
 

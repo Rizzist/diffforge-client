@@ -5,7 +5,7 @@ import { EMPTY_VOICE_TEXT_RULES, normalizeVoiceTextRules } from "./voicePipeline
 
 export const VOICE_TEXT_RULES_CHANGED_EVENT = "forge-voice-text-rules-changed";
 
-let cachedVoiceTextRules = EMPTY_VOICE_TEXT_RULES;
+let cachedVoiceTextRules = normalizeVoiceTextRules(EMPTY_VOICE_TEXT_RULES);
 
 export function peekVoiceTextRules() {
   return cachedVoiceTextRules;

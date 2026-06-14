@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_VOICE_DICTIONARY_LIST_ID,
   applyVoiceTextPipeline,
   normalizeVoiceTextRules,
   parseDictionaryTerms,
@@ -18,14 +19,14 @@ test("dictionary recases exact matches with word boundaries", () => {
 });
 
 test("unselected dictionary lists are ignored", () => {
-  const result = applyVoiceTextPipeline("use tauri and deepgram", {
+  const result = applyVoiceTextPipeline("use foobar and bazqux", {
     dictionary: [
-      { name: "Active", terms: ["Deepgram"] },
-      { name: "Parked", terms: ["Tauri"], selected: false },
+      { name: "Active", terms: ["BazQux"] },
+      { name: "Parked", terms: ["FooBar"], selected: false },
     ],
   });
 
-  assert.equal(result.text, "use tauri and Deepgram");
+  assert.equal(result.text, "use foobar and BazQux");
 });
 
 test("parseDictionaryTerms splits pasted text and dedupes case-insensitively", () => {
@@ -43,10 +44,13 @@ test("legacy phrase entries migrate into one imported list", () => {
     ],
   });
 
-  assert.equal(rules.dictionary.length, 1);
-  assert.equal(rules.dictionary[0].name, "Imported");
-  assert.deepEqual(rules.dictionary[0].terms, ["Tauri", "Deepgram"]);
-  assert.equal(rules.dictionary[0].selected, true);
+  const imported = rules.dictionary.find((list) => list.name === "Imported");
+  const defaults = rules.dictionary.find((list) => list.id === DEFAULT_VOICE_DICTIONARY_LIST_ID);
+  assert.equal(rules.dictionary.length, 2);
+  assert.deepEqual(imported?.terms, ["Tauri", "Deepgram"]);
+  assert.equal(imported?.selected, true);
+  assert.equal(defaults?.name, "Programmer vocabulary");
+  assert.equal(defaults?.selected, true);
 });
 
 test("snippets expand triggers case-insensitively, longest trigger first", () => {
@@ -114,12 +118,12 @@ test("dictionary recasing runs before snippet expansion", () => {
 });
 
 test("disabled rules are ignored", () => {
-  const result = applyVoiceTextPipeline("gstack tauri", {
-    dictionary: [{ name: "Parked", terms: ["Tauri"], selected: false }],
+  const result = applyVoiceTextPipeline("gstack zedword", {
+    dictionary: [{ name: "Parked", terms: ["ZedWord"], selected: false }],
     snippets: [{ trigger: "gstack", expansion: "nope", enabled: false }],
   });
 
-  assert.equal(result.text, "gstack tauri");
+  assert.equal(result.text, "gstack zedword");
   assert.equal(result.changed, false);
   assert.deepEqual(result.changes.snippets, []);
 });
@@ -134,15 +138,33 @@ test("normalize drops empty entries, trims, and defaults selection true", () => 
     transforms: [{ match: " new line ", replacement: "\n" }, { match: "" }],
   });
 
-  assert.equal(rules.dictionary.length, 1);
-  assert.equal(rules.dictionary[0].name, "Jargon");
-  assert.deepEqual(rules.dictionary[0].terms, ["Tauri"]);
-  assert.equal(rules.dictionary[0].selected, true);
-  assert.ok(rules.dictionary[0].id);
+  const jargon = rules.dictionary.find((list) => list.name === "Jargon");
+  const defaults = rules.dictionary.find((list) => list.id === DEFAULT_VOICE_DICTIONARY_LIST_ID);
+  assert.equal(rules.dictionary.length, 2);
+  assert.deepEqual(jargon?.terms, ["Tauri"]);
+  assert.equal(jargon?.selected, true);
+  assert.ok(jargon?.id);
+  assert.equal(defaults?.name, "Programmer vocabulary");
+  assert.equal(defaults?.selected, true);
   assert.equal(rules.snippets.length, 1);
   assert.equal(rules.snippets[0].trigger, "gstack");
   assert.equal(rules.transforms.length, 1);
   assert.equal(rules.transforms[0].match, "new line");
+});
+
+test("default programmer dictionary is selected and not duplicated", () => {
+  const first = normalizeVoiceTextRules(null);
+  const second = normalizeVoiceTextRules(first);
+
+  assert.equal(first.dictionary.length, 1);
+  assert.equal(first.dictionary[0].id, DEFAULT_VOICE_DICTIONARY_LIST_ID);
+  assert.equal(first.dictionary[0].selected, true);
+  assert.ok(first.dictionary[0].terms.includes("Diff Forge AI"));
+  assert.ok(first.dictionary[0].terms.includes("tokenomics"));
+  assert.equal(
+    second.dictionary.filter((list) => list.id === DEFAULT_VOICE_DICTIONARY_LIST_ID).length,
+    1,
+  );
 });
 
 test("pipeline reports source text and handles empty rules", () => {
