@@ -364,6 +364,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     if view_version == TOKENOMICS_VIEW_SCHEMA_VERSION {
         tokenomics_rebuild_rollups_for_identity_version(conn)?;
         tokenomics_repair_provider_api_costs(conn)?;
+        tokenomics_reconcile_codex_cached_usage_aliases(conn)?;
         return Ok(());
     }
     conn.execute_batch(&format!(
@@ -520,6 +521,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     .map_err(|error| format!("Unable to finalize Tokenomics database schema: {error}"))?;
     tokenomics_rebuild_rollups_for_identity_version(conn)?;
     tokenomics_repair_provider_api_costs(conn)?;
+    tokenomics_reconcile_codex_cached_usage_aliases(conn)?;
     Ok(())
 }
 
@@ -1949,6 +1951,349 @@ fn tokenomics_migrate_provider_account_key(
         tokenomics_rebuild_provider_rollups_from_events(conn, provider, agent_kind)?;
     }
 
+    let now = tokenomics_now_iso_like();
+    let now_unix = tokenomics_unix_now() as i64;
+    conn.execute(
+        "UPDATE tokenomics_provider_limit_samples
+         SET provider_account_key=?1, provider_account_label=?2, updated_at=?6, updated_at_unix=?7
+         WHERE provider=?3 AND agent_kind=?4 AND provider_account_key=?5",
+        rusqlite::params![
+            provider_account.key.as_str(),
+            provider_account.label.as_str(),
+            provider,
+            agent_kind,
+            old_key,
+            now.as_str(),
+            now_unix
+        ],
+    )
+    .map_err(|error| format!("Unable to migrate Tokenomics account limit samples: {error}"))?;
+
+    conn.execute(
+        "UPDATE tokenomics_cloud_rollups
+         SET subscription_key=CASE WHEN subscription_key=?5 THEN ?1 ELSE subscription_key END,
+             provider_account_key=CASE WHEN provider_account_key=?5 THEN ?1 ELSE provider_account_key END,
+             provider_account_label=?2,
+             updated_at=?6
+         WHERE provider=?3 AND agent_kind=?4
+           AND (provider_account_key=?5 OR subscription_key=?5)",
+        rusqlite::params![
+            provider_account.key.as_str(),
+            provider_account.label.as_str(),
+            provider,
+            agent_kind,
+            old_key,
+            now.as_str()
+        ],
+    )
+    .map_err(|error| format!("Unable to migrate cached cloud Tokenomics account rollups: {error}"))?;
+    tokenomics_rewrite_cloud_provider_limits_for_account_key(
+        conn,
+        provider,
+        agent_kind,
+        old_key,
+        provider_account,
+    )?;
+
+    Ok(())
+}
+
+fn tokenomics_provider_account_label_is_profile(label: &str) -> bool {
+    let clean = label.trim();
+    clean.starts_with("Codex · ")
+        || clean.starts_with("Codex • ")
+        || clean.starts_with("Claude · ")
+        || clean.starts_with("Claude • ")
+}
+
+fn tokenomics_clean_non_profile_provider_account_label(label: &str) -> Option<String> {
+    tokenomics_account_label_text(label.to_string())
+        .filter(|clean| !tokenomics_provider_account_label_is_profile(clean))
+}
+
+fn tokenomics_existing_provider_account_label_for_key(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    provider_account_key: &str,
+) -> Option<String> {
+    let provider_account_key = provider_account_key.trim();
+    if provider_account_key.is_empty() {
+        return None;
+    }
+    for table in [
+        "tokenomics_rollups",
+        "tokenomics_usage_events",
+        "tokenomics_cloud_rollups",
+    ] {
+        let sql = format!(
+            "SELECT provider_account_label
+             FROM {table}
+             WHERE provider=?1 AND agent_kind=?2
+               AND (provider_account_key=?3 OR subscription_key=?3)
+               AND COALESCE(provider_account_label, '')!=''
+             GROUP BY provider_account_label
+             ORDER BY COALESCE(SUM(total_tokens), 0) DESC, COUNT(*) DESC
+             LIMIT 1"
+        );
+        if let Ok(label) = conn.query_row(
+            &sql,
+            rusqlite::params![provider, agent_kind, provider_account_key],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Some(label) = tokenomics_clean_non_profile_provider_account_label(&label) {
+                return Some(label);
+            }
+        }
+    }
+    None
+}
+
+fn tokenomics_preferred_provider_account_label(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    provider_account_keys: &[&str],
+    fallback_label: &str,
+) -> String {
+    for key in provider_account_keys {
+        if let Some(label) =
+            tokenomics_existing_provider_account_label_for_key(conn, provider, agent_kind, key)
+        {
+            return label;
+        }
+    }
+    if let Some(label) = tokenomics_clean_non_profile_provider_account_label(fallback_label) {
+        return label;
+    }
+    let fallback_key = provider_account_keys
+        .iter()
+        .map(|key| key.trim())
+        .find(|key| !key.is_empty())
+        .unwrap_or_default();
+    let suffix = fallback_key
+        .rsplit(':')
+        .next()
+        .unwrap_or(fallback_key)
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let base_label = tokenomics_provider_account_base_label(provider, agent_kind);
+    if suffix.is_empty() {
+        base_label
+    } else {
+        format!("{base_label} {suffix}")
+    }
+}
+
+fn tokenomics_codex_usage_account_id(usage: &Value) -> Option<String> {
+    for keys in [
+        &["account_id", "accountId"][..],
+        &["chatgpt_account_id", "chatgptAccountId"][..],
+    ] {
+        if let Some(identifier) = tokenomics_value_string(usage, keys)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(identifier);
+        }
+        let mut identifiers = Vec::new();
+        tokenomics_collect_json_values_for_keys(usage, keys, &mut identifiers);
+        identifiers.sort();
+        identifiers.dedup();
+        if let Some(identifier) = identifiers
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
+        {
+            return Some(identifier);
+        }
+    }
+    None
+}
+
+fn tokenomics_codex_provider_account_key_from_usage_account_id(account_id: &str) -> String {
+    let hash = tokenomics_hash(&format!("openai:codex:{}", account_id.trim()));
+    let key_suffix = hash.get(0..32).unwrap_or(hash.as_str());
+    format!("openai:codex:{key_suffix}")
+}
+
+fn tokenomics_codex_canonical_provider_account_from_usage(
+    conn: &rusqlite::Connection,
+    usage: &Value,
+    fallback_account: &TokenomicsProviderAccount,
+) -> TokenomicsProviderAccount {
+    let Some(account_id) = tokenomics_codex_usage_account_id(usage) else {
+        return fallback_account.clone();
+    };
+    let canonical_key = tokenomics_codex_provider_account_key_from_usage_account_id(&account_id);
+    let label = tokenomics_preferred_provider_account_label(
+        conn,
+        "openai",
+        "codex",
+        &[canonical_key.as_str(), fallback_account.key.as_str()],
+        fallback_account.label.as_str(),
+    );
+    TokenomicsProviderAccount {
+        key: canonical_key,
+        label,
+    }
+}
+
+fn tokenomics_rewrite_cloud_provider_limits_for_account_key(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    old_key: &str,
+    provider_account: &TokenomicsProviderAccount,
+) -> Result<(), String> {
+    let mut limits = tokenomics_cloud_provider_limits(conn)?;
+    let mut changed = false;
+    for limit in &mut limits {
+        let row_provider =
+            tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+        let row_agent = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+            .unwrap_or_else(|| row_provider.clone());
+        let row_account_key = tokenomics_value_string(
+            limit,
+            &[
+                "provider_account_key",
+                "providerAccountKey",
+                "subscription_key",
+                "subscriptionKey",
+            ],
+        )
+        .unwrap_or_default();
+        if row_provider != provider || row_agent != agent_kind || row_account_key != old_key {
+            continue;
+        }
+        if let Some(object) = limit.as_object_mut() {
+            object.insert(
+                "provider_account_key".to_string(),
+                json!(provider_account.key.as_str()),
+            );
+            object.insert(
+                "providerAccountKey".to_string(),
+                json!(provider_account.key.as_str()),
+            );
+            object.insert(
+                "subscription_key".to_string(),
+                json!(provider_account.key.as_str()),
+            );
+            object.insert(
+                "subscriptionKey".to_string(),
+                json!(provider_account.key.as_str()),
+            );
+            object.insert(
+                "provider_account_label".to_string(),
+                json!(provider_account.label.as_str()),
+            );
+            object.insert(
+                "providerAccountLabel".to_string(),
+                json!(provider_account.label.as_str()),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        let value = serde_json::to_string(&limits)
+            .map_err(|error| format!("Unable to encode cached cloud Tokenomics limits: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+            rusqlite::params![TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY, value],
+        )
+        .map_err(|error| format!("Unable to rewrite cached cloud Tokenomics limits: {error}"))?;
+    }
+    Ok(())
+}
+
+fn tokenomics_reconcile_codex_provider_account_from_usage(
+    conn: &rusqlite::Connection,
+    provider_account: &TokenomicsProviderAccount,
+    usage: &Value,
+) -> Result<TokenomicsProviderAccount, String> {
+    let canonical_account =
+        tokenomics_codex_canonical_provider_account_from_usage(conn, usage, provider_account);
+    if canonical_account.key != provider_account.key {
+        tokenomics_migrate_provider_account_key(
+            conn,
+            "openai",
+            "codex",
+            provider_account.key.as_str(),
+            &canonical_account,
+        )?;
+    }
+    tokenomics_reconcile_provider_account_label(
+        conn,
+        "openai",
+        "codex",
+        &canonical_account,
+    )?;
+    let canonical_cache_key = tokenomics_codex_usage_cache_key(&canonical_account);
+    let _ = tokenomics_store_codex_usage_cache(conn, &canonical_cache_key, usage);
+    Ok(canonical_account)
+}
+
+fn tokenomics_reconcile_codex_cached_usage_aliases(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    let like_prefix = format!("{TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX}%");
+    let mut statement = conn
+        .prepare("SELECT key, value FROM tokenomics_meta WHERE key LIKE ?1")
+        .map_err(|error| format!("Unable to inspect Codex usage caches: {error}"))?;
+    let mapped = statement
+        .query_map(rusqlite::params![like_prefix], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Unable to query Codex usage caches: {error}"))?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row.map_err(|error| format!("Unable to read Codex usage cache row: {error}"))?);
+    }
+    drop(statement);
+
+    for (cache_key, cache_value) in rows {
+        let Some(old_key) = cache_key.strip_prefix(TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX) else {
+            continue;
+        };
+        if old_key.trim().is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(&cache_value) else {
+            continue;
+        };
+        let Some(usage) = parsed
+            .get("usage")
+            .filter(|value| value.is_object())
+            .or_else(|| parsed.as_object().map(|_| &parsed))
+        else {
+            continue;
+        };
+        if tokenomics_codex_usage_account_id(usage).is_none() {
+            continue;
+        }
+        let fallback_label = tokenomics_existing_provider_account_label_for_key(
+            conn,
+            "openai",
+            "codex",
+            old_key,
+        )
+        .unwrap_or_else(|| tokenomics_provider_account_base_label("openai", "codex"));
+        let fallback_account = TokenomicsProviderAccount {
+            key: old_key.to_string(),
+            label: fallback_label,
+        };
+        let canonical_account =
+            tokenomics_reconcile_codex_provider_account_from_usage(conn, &fallback_account, usage)?;
+        if canonical_account.key != old_key {
+            let canonical_cache_key = tokenomics_codex_usage_cache_key(&canonical_account);
+            conn.execute(
+                "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+                rusqlite::params![canonical_cache_key, cache_value],
+            )
+            .map_err(|error| format!("Unable to write canonical Codex usage cache: {error}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -1976,6 +2321,7 @@ fn tokenomics_reconcile_current_codex_account_label(
     conn: &rusqlite::Connection,
 ) -> Result<(), String> {
     let codex_account = tokenomics_provider_account("openai", "codex");
+    tokenomics_reconcile_codex_cached_usage_aliases(conn)?;
     tokenomics_migrate_provider_account_legacy_short_key(conn, "openai", "codex", &codex_account)?;
     tokenomics_reconcile_provider_account_label(conn, "openai", "codex", &codex_account)
 }
@@ -5774,6 +6120,8 @@ fn tokenomics_provider_limits(
         &codex_account,
         include_stale_provider_cache,
     ) {
+        let codex_account =
+            tokenomics_reconcile_codex_provider_account_from_usage(conn, &codex_account, &codex_usage)?;
         limits.extend(tokenomics_codex_live_limit_snapshots(
             &codex_plan,
             &codex_usage,
@@ -5804,8 +6152,9 @@ fn tokenomics_provider_limits(
     // completed login are skipped instead of rendering unknown rows.
     for (profile_id, profile_label, profile_dir) in agent_accounts_profiles_for_tokenomics("codex")
     {
-        let profile_plan =
-            tokenomics_codex_plan_state_for_auth_path(Some(profile_dir.join("auth.json")));
+        let auth_path = profile_dir.join("auth.json");
+        let profile_auth = tokenomics_read_json_file(auth_path.clone());
+        let profile_plan = tokenomics_codex_plan_state_for_auth_path(Some(auth_path));
         let has_token = profile_plan
             .get("access_token")
             .and_then(Value::as_str)
@@ -5814,16 +6163,30 @@ fn tokenomics_provider_limits(
         if !has_token {
             continue;
         }
-        let profile_account = TokenomicsProviderAccount {
-            key: format!("openai:codex:profile:{profile_id}"),
-            label: format!("Codex · {profile_label}"),
-        };
+        let mut profile_account =
+            tokenomics_provider_account_from_auth("openai", "codex", profile_auth.as_ref());
+        if profile_account.key.ends_with(":unknown") {
+            profile_account = TokenomicsProviderAccount {
+                key: format!("openai:codex:profile:{profile_id}"),
+                label: tokenomics_clean_non_profile_provider_account_label(&profile_label)
+                    .unwrap_or_else(|| {
+                        let hash = tokenomics_hash(&profile_id);
+                        let suffix = hash.get(0..8).unwrap_or(hash.as_str());
+                        format!("Codex account {suffix}")
+                    }),
+            };
+        }
         if let Some(profile_usage) = tokenomics_codex_live_usage(
             conn,
             &profile_plan,
             &profile_account,
             include_stale_provider_cache,
         ) {
+            let profile_account = tokenomics_reconcile_codex_provider_account_from_usage(
+                conn,
+                &profile_account,
+                &profile_usage,
+            )?;
             limits.extend(tokenomics_codex_live_limit_snapshots(
                 &profile_plan,
                 &profile_usage,
@@ -5904,6 +6267,7 @@ fn tokenomics_provider_limits(
 
     let local_device_id = tokenomics_local_device_id();
     tokenomics_tag_provider_limit_devices(&mut limits, &local_device_id);
+    limits = tokenomics_merge_provider_limits(Vec::new(), limits);
 
     if include_cloud_last_known {
         limits = tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, limits);
@@ -8530,6 +8894,169 @@ mod tokenomics_tests {
                 && row["total_tokens"] == json!(10)
                 && row["event_count"] == json!(1)
         }));
+    }
+
+    #[test]
+    fn tokenomics_codex_usage_account_id_canonicalizes_auth_alias_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        let old_key = "openai:codex:aab1026b325e96ceac50137608801027";
+        let usage = json!({
+            "account_id": "user-stable-chatgpt-account",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 12,
+                    "reset_after_seconds": 1200
+                }
+            }
+        });
+        let canonical_key = tokenomics_codex_provider_account_key_from_usage_account_id(
+            "user-stable-chatgpt-account",
+        );
+        assert_ne!(canonical_key, old_key);
+
+        conn.execute(
+            "INSERT INTO tokenomics_usage_events(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, workspace_id, repo_path, source_kind, source_path,
+               bucket_day, bucket_hour, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, total_tokens, estimated_cost_microusd, created_at, observed_at
+             ) VALUES(
+               'codex-event-a', 'openai', 'codex', 'gpt-5.5', ?1, ?1,
+               'Rizzist', NULL, '/tmp/repo', 'codex_token_count_jsonl', '/tmp/session.jsonl',
+               '2026-06-13', '2026-06-13T04', 3, 4, 1,
+               2, 10, 0, '2026-06-13T04:00:00Z', '2026-06-13T04:00:00Z'
+             )",
+            rusqlite::params![old_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, workspace_id, repo_path, bucket_width, bucket_start,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+               estimated_cost_microusd, event_count, updated_at
+             ) VALUES(
+               'codex-rollup-a', 'openai', 'codex', 'gpt-5.5', ?1, ?1,
+               'Rizzist', NULL, '/tmp/repo', 'day', '2026-06-13',
+               3, 4, 1, 2, 10, 0, 1, '2026-06-13T04:00:00Z'
+             )",
+            rusqlite::params![old_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_provider_limit_samples(
+               id, device_id, provider, agent_kind, provider_account_key, provider_account_label,
+               window_kind, sample_bucket_start, sample_bucket_unix, sample_at, sample_at_unix,
+               used_percent, remaining_percent, source, confidence, updated_at, updated_at_unix
+             ) VALUES(
+               'codex-sample-a', 'device-a', 'openai', 'codex', ?1, 'Codex · support',
+               '5_hour', '2026-06-13T04:00:00Z', 1780000000, '2026-06-13T04:00:00Z',
+               1780000000, 12, 88, 'cloud', 'live', '2026-06-13T04:00:00Z', 1780000000
+             )",
+            rusqlite::params![old_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_cloud_rollups(
+               id, device_id, provider, agent_kind, model, subscription_key,
+               provider_account_key, provider_account_label, workspace_id, repo_path,
+               bucket_width, bucket_start, total_tokens, event_count, updated_at, received_at
+             ) VALUES(
+               'codex-cloud-a', 'device-b', 'openai', 'codex', 'gpt-5.5', ?1,
+               ?1, 'Codex · support', NULL, NULL,
+               'hour', '2026-06-13T04', 5, 1, '2026-06-13T04:00:00Z', '2026-06-13T04:00:00Z'
+             )",
+            rusqlite::params![old_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+            rusqlite::params![
+                TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY,
+                json!([{
+                    "provider": "openai",
+                    "agent_kind": "codex",
+                    "provider_account_key": old_key,
+                    "provider_account_label": "Codex · support",
+                    "window_kind": "5_hour",
+                    "used_percent": 12
+                }])
+                .to_string()
+            ],
+        )
+        .unwrap();
+
+        let old_account = TokenomicsProviderAccount {
+            key: old_key.to_string(),
+            label: "Codex · support".to_string(),
+        };
+        let account =
+            tokenomics_reconcile_codex_provider_account_from_usage(&conn, &old_account, &usage)
+                .unwrap();
+
+        assert_eq!(account.key, canonical_key);
+        assert_eq!(account.label, "Rizzist");
+
+        let event = tokenomics_query_one(
+            &conn,
+            "SELECT provider_account_key, provider_account_label, subscription_key
+             FROM tokenomics_usage_events WHERE id='codex-event-a'",
+        )
+        .unwrap();
+        assert_eq!(event["provider_account_key"], json!(canonical_key));
+        assert_eq!(event["provider_account_label"], json!("Rizzist"));
+        assert_eq!(event["subscription_key"], json!(canonical_key));
+
+        let old_rollups: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_rollups WHERE provider_account_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_samples: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_provider_limit_samples WHERE provider_account_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_cloud_rollups: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_cloud_rollups WHERE provider_account_key=?1 OR subscription_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rollups, 0);
+        assert_eq!(old_samples, 0);
+        assert_eq!(old_cloud_rollups, 0);
+
+        let sample_label: String = conn
+            .query_row(
+                "SELECT provider_account_label FROM tokenomics_provider_limit_samples WHERE provider_account_key=?1",
+                rusqlite::params![canonical_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sample_label, "Rizzist");
+
+        let cloud_limits = tokenomics_cloud_provider_limits(&conn).unwrap();
+        assert_eq!(cloud_limits.len(), 1);
+        assert_eq!(cloud_limits[0]["provider_account_key"], json!(canonical_key));
+        assert_eq!(cloud_limits[0]["provider_account_label"], json!("Rizzist"));
+
+        let cache_key = tokenomics_codex_usage_cache_key(&account);
+        let cached_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_meta WHERE key=?1",
+                rusqlite::params![cache_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached_count, 1);
     }
 
     #[test]

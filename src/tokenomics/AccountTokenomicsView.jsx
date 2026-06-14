@@ -1820,17 +1820,18 @@ function providerLimitIsUnknown(row = {}) {
 function mergeProviderLimits(previousLimits, nextLimits) {
   const previousRows = Array.isArray(previousLimits) ? previousLimits : [];
   if (!Array.isArray(nextLimits)) return previousRows;
-  if (!nextLimits.length && previousRows.length) return previousRows;
 
+  const previousByKey = new Map();
+  previousRows.forEach((row) => previousByKey.set(providerLimitKey(row), row));
   const merged = new Map();
-  previousRows.forEach((row) => merged.set(providerLimitKey(row), row));
   nextLimits.forEach((row) => {
     const key = providerLimitKey(row);
-    const existing = merged.get(key);
+    const existing = previousByKey.get(key);
     if (existing && !providerLimitIsUnknown(existing) && providerLimitIsUnknown(row)) {
-      return;
+      merged.set(key, existing);
+    } else {
+      merged.set(key, row);
     }
-    merged.set(key, row);
   });
   return [...merged.values()];
 }
@@ -1838,10 +1839,8 @@ function mergeProviderLimits(previousLimits, nextLimits) {
 function mergeProviderLimitSamples(previousSamples, nextSamples) {
   const previousRows = Array.isArray(previousSamples) ? previousSamples : [];
   if (!Array.isArray(nextSamples)) return previousRows;
-  if (!nextSamples.length && previousRows.length) return previousRows;
 
   const merged = new Map();
-  previousRows.forEach((row) => merged.set(providerLimitSampleKey(row), row));
   nextSamples.forEach((row) => merged.set(providerLimitSampleKey(row), row));
   return [...merged.values()];
 }

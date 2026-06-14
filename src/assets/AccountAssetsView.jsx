@@ -8,12 +8,13 @@ import { Cached } from "@styled-icons/material-rounded/Cached";
 import { CheckBox } from "@styled-icons/material-rounded/CheckBox";
 import { CheckBoxOutlineBlank } from "@styled-icons/material-rounded/CheckBoxOutlineBlank";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
+import { CloudDownload } from "@styled-icons/material-rounded/CloudDownload";
+import { CloudOff } from "@styled-icons/material-rounded/CloudOff";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFileRenameOutline";
-import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
 import { Link } from "@styled-icons/material-rounded/Link";
@@ -329,11 +330,7 @@ function assetLocalPath(asset) {
   return text(
     asset?.localPath
       || asset?.local_path
-      || asset?.path
-      || asset?.localPathHint
-      || asset?.local_path_hint
-      || asset?.lastLocalPath
-      || asset?.last_local_path,
+      || asset?.path,
   );
 }
 
@@ -418,7 +415,7 @@ function assetIsImage(asset) {
 
 function assetPreviewUrl(asset) {
   const localPath = assetLocalPath(asset);
-  if (!localPath || !assetIsImage(asset)) return "";
+  if (!localPath || !assetLocalAvailable(asset) || !assetIsImage(asset)) return "";
   try {
     return convertFileSrc(localPath);
   } catch {
@@ -545,11 +542,18 @@ function assetTransferFailureCopyText(failure) {
   ].map((value) => text(value)).filter(Boolean).join("\n");
 }
 
-function assetTransferFailuresCopyText(failures) {
-  return jsonArray(failures)
-    .map(assetTransferFailureCopyText)
+function assetToastCopyText(toast) {
+  return [
+    text(toast?.title),
+    text(toast?.message),
+    ...jsonArray(toast?.details).map((detail) => text(detail)).filter(Boolean),
+  ]
     .filter(Boolean)
-    .join("\n\n");
+    .join("\n");
+}
+
+function createAssetToastId(kind = "toast") {
+  return `${kind}:${Date.now()}:${Math.random().toString(36).slice(2, 9)}`;
 }
 
 async function copyTextToClipboard(value) {
@@ -742,6 +746,51 @@ function AssetModeTabs({
   );
 }
 
+function useAssetToastController() {
+  const [assetToasts, setAssetToasts] = useState([]);
+  const dismissedToastKeysRef = useRef(new Set());
+
+  const enqueueAssetToast = useCallback((toast) => {
+    const kind = text(toast?.kind, "success");
+    const key = text(toast?.key, createAssetToastId(kind));
+    const nextToast = {
+      ...toast,
+      key,
+      kind,
+      createdAt: Date.now(),
+      details: jsonArray(toast?.details),
+    };
+    dismissedToastKeysRef.current.delete(key);
+    setAssetToasts((current) => {
+      const withoutDuplicate = current.filter((item) => item.key !== key);
+      return [...withoutDuplicate, nextToast].slice(-6);
+    });
+  }, []);
+
+  const dismissAssetToast = useCallback((key) => {
+    dismissedToastKeysRef.current.add(key);
+    setAssetToasts((current) => current.filter((toast) => toast.key !== key));
+  }, []);
+
+  const showAssetToast = useCallback((kind, title, message, details = [], key = "") => {
+    enqueueAssetToast({
+      kind,
+      title,
+      message,
+      details,
+      key: key || createAssetToastId(kind),
+    });
+  }, [enqueueAssetToast]);
+
+  return {
+    assetToasts,
+    dismissAssetToast,
+    dismissedToastKeysRef,
+    enqueueAssetToast,
+    showAssetToast,
+  };
+}
+
 function AssetsPanel({
   assetMode = "tracked",
   error = "",
@@ -787,9 +836,13 @@ function AssetsPanel({
   const [cloudSettingsError, setCloudSettingsError] = useState("");
   const [cloudSettingsBusy, setCloudSettingsBusy] = useState("");
   const [busyKey, setBusyKey] = useState("");
-  const [actionError, setActionError] = useState("");
-  const [actionNotice, setActionNotice] = useState("");
-  const actionNoticeTimerRef = useRef(0);
+  const {
+    assetToasts,
+    dismissAssetToast,
+    dismissedToastKeysRef,
+    enqueueAssetToast,
+    showAssetToast,
+  } = useAssetToastController();
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
   const [uploadPublic, setUploadPublic] = useState(readAssetUploadPublicPreference);
@@ -810,23 +863,6 @@ function AssetsPanel({
   ), [clouds, defaultCloudId, selectedCloudId]);
   const selectedCloudLabel = text(selectedCloud?.label || selectedCloud?.name, "Cloud");
   const effectiveCloudId = text(selectedCloud?.cloudId || selectedCloud?.cloud_id || selectedCloudId, DEFAULT_ASSET_CLOUD_ID);
-
-  const showActionNotice = useCallback((nextNotice) => {
-    setActionNotice(nextNotice);
-    if (actionNoticeTimerRef.current) {
-      window.clearTimeout(actionNoticeTimerRef.current);
-    }
-    actionNoticeTimerRef.current = window.setTimeout(() => {
-      actionNoticeTimerRef.current = 0;
-      setActionNotice("");
-    }, 2600);
-  }, []);
-
-  useEffect(() => () => {
-    if (actionNoticeTimerRef.current) {
-      window.clearTimeout(actionNoticeTimerRef.current);
-    }
-  }, []);
 
   useEffect(() => {
     if (!clouds.length) return;
@@ -889,7 +925,37 @@ function AssetsPanel({
     });
     return failures.slice(0, 4);
   }, [failedTransferFailures, transferActionFailure]);
-  const inlineError = error || (!transferActionFailure ? actionError : "");
+  const activeToastKeySet = useMemo(
+    () => new Set(assetToasts.map((toast) => toast.key)),
+    [assetToasts],
+  );
+  useEffect(() => {
+    const message = text(error);
+    if (!message) return;
+    const key = `asset-library-error:${message}`;
+    if (dismissedToastKeysRef.current.has(key) || activeToastKeySet.has(key)) return;
+    enqueueAssetToast({
+      kind: "error",
+      key,
+      title: "Assets failed to load",
+      message,
+      details: [selectedCloudLabel],
+    });
+  }, [activeToastKeySet, enqueueAssetToast, error, selectedCloudLabel]);
+  useEffect(() => {
+    transferFailures.forEach((failure) => {
+      const key = failure.key || assetTransferFailureDedupeKey(failure);
+      if (!key || dismissedToastKeysRef.current.has(key) || activeToastKeySet.has(key)) return;
+      enqueueAssetToast({
+        kind: "error",
+        key,
+        title: failure.title,
+        message: failure.message,
+        details: failure.details,
+        copyText: assetTransferFailureCopyText(failure),
+      });
+    });
+  }, [activeToastKeySet, enqueueAssetToast, transferFailures]);
   const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
   const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
   const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
@@ -1082,24 +1148,25 @@ function AssetsPanel({
     const id = assetId(asset);
     const name = assetName(asset, "asset");
     const localPath = assetLocalPath(asset);
+    const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
-    setActionNotice("");
     setTransferActionFailure(null);
     if (action === "copyPublic") {
       const publicUrl = assetPublicUrl(asset);
       if (!publicUrl) return;
       const key = `${action}:${id || publicUrl}`;
       setBusyKey(key);
-      setActionError("");
       try {
         const copied = await copyTextToClipboard(publicUrl);
         if (copied) {
-          showActionNotice("Public URL copied to clipboard.");
+          showAssetToast("success", "Public URL copied", "Public URL copied to clipboard.", [publicUrl]);
         } else {
-          setActionError("Public URL is ready, but clipboard access is unavailable.");
+          const message = "Public URL is ready, but clipboard access is unavailable.";
+          showAssetToast("error", "Copy failed", message, [publicUrl]);
         }
       } catch (nextError) {
-        setActionError(nextError?.message || String(nextError || "Unable to copy public URL."));
+        const message = nextError?.message || String(nextError || "Unable to copy public URL.");
+        showAssetToast("error", "Copy failed", message, [publicUrl]);
       } finally {
         setBusyKey((current) => (current === key ? "" : current));
       }
@@ -1108,14 +1175,14 @@ function AssetsPanel({
     if (action === "open") {
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
-      setActionError("");
       try {
         if (typeof onOpenHyperframeAsset === "function" && await onOpenHyperframeAsset(asset)) {
           return;
         }
         await openPath(localPath);
       } catch (nextError) {
-        setActionError(nextError?.message || String(nextError || "Unable to open asset."));
+        const message = nextError?.message || String(nextError || "Unable to open asset.");
+        showAssetToast("error", "Open failed", message, [name, localPath]);
       } finally {
         setBusyKey((current) => (current === key ? "" : current));
       }
@@ -1124,11 +1191,11 @@ function AssetsPanel({
     if (action === "copy") {
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
-      setActionError("");
       try {
         await invoke("diffforge_copy_asset_to_clipboard", { path: localPath });
       } catch (nextError) {
-        setActionError(nextError?.message || String(nextError || "Unable to copy asset."));
+        const message = nextError?.message || String(nextError || "Unable to copy asset.");
+        showAssetToast("error", "Copy failed", message, [name, localPath]);
       } finally {
         setBusyKey((current) => (current === key ? "" : current));
       }
@@ -1137,11 +1204,11 @@ function AssetsPanel({
     if (action === "view") {
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
-      setActionError("");
       try {
         await invoke("snipping_open_annotation_editor", { path: localPath });
       } catch (nextError) {
-        setActionError(nextError?.message || String(nextError || "Unable to open asset viewer."));
+        const message = nextError?.message || String(nextError || "Unable to open asset viewer.");
+        showAssetToast("error", "Viewer failed", message, [name, localPath]);
       } finally {
         setBusyKey((current) => (current === key ? "" : current));
       }
@@ -1154,11 +1221,11 @@ function AssetsPanel({
       if (!localPath) return;
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
-      setActionError("");
       try {
         await invoke("snipping_open_snip_float", { path: localPath });
       } catch (nextError) {
-        setActionError(nextError?.message || String(nextError || "Unable to pin asset preview."));
+        const message = nextError?.message || String(nextError || "Unable to pin asset preview.");
+        showAssetToast("error", "Pin failed", message, [name, localPath]);
       } finally {
         setBusyKey((current) => (current === key ? "" : current));
       }
@@ -1167,7 +1234,6 @@ function AssetsPanel({
     if (!id) return;
     const key = `${action}:${id}`;
     setBusyKey(key);
-    setActionError("");
     if (action === "upload") {
       setOptimisticUploadTransfer(asset, effectiveCloudId, "preparing");
     }
@@ -1195,9 +1261,10 @@ function AssetsPanel({
         if (publicUrl) {
           const copied = await copyTextToClipboard(publicUrl);
           if (copied) {
-            showActionNotice("Public URL copied to clipboard.");
+            showAssetToast("success", "Public URL copied", "Public URL copied to clipboard.", [publicUrl]);
           } else {
-            setActionError("Public URL created, but clipboard access is unavailable.");
+            const message = "Public URL created, but clipboard access is unavailable.";
+            showAssetToast("error", "Copy failed", message, [publicUrl]);
           }
         }
       } else if (action === "unpublish") {
@@ -1222,7 +1289,7 @@ function AssetsPanel({
           setOptimisticUploadTransfer(asset, effectiveCloudId, "completed");
           await refresh({ silent: true, force: true });
           if (!uploadPublic) {
-            showActionNotice("Uploaded to Cloud.");
+            showAssetToast("success", "Upload complete", "Uploaded to Cloud.", [name, selectedCloudLabel]);
             clearOptimisticUploadTransfer(asset, effectiveCloudId);
             return;
           }
@@ -1232,13 +1299,12 @@ function AssetsPanel({
               cloudId: effectiveCloudId,
             });
             await refresh({ silent: true, force: true });
-            showActionNotice("Uploaded and published with a public link.");
+            showAssetToast("success", "Upload complete", "Uploaded and published with a public link.", [name, selectedCloudLabel]);
           } catch (publishError) {
-            setActionError(
-              `Uploaded privately, but public link failed: ${
-                publishError?.message || String(publishError || "Publish failed.")
-              }`,
-            );
+            const message = `Uploaded privately, but public link failed: ${
+              publishError?.message || String(publishError || "Publish failed.")
+            }`;
+            showAssetToast("error", "Public link failed", message, [name, selectedCloudLabel]);
           } finally {
             clearOptimisticUploadTransfer(asset, effectiveCloudId);
           }
@@ -1246,6 +1312,13 @@ function AssetsPanel({
         }
       }
       await refresh({ silent: true, force: true });
+      if (action === "download") {
+        showAssetToast("success", "Download complete", "Downloaded local copy.", [name, selectedCloudLabel]);
+      } else if (action === "deleteLocal") {
+        showAssetToast("success", "Local copy deleted", availability?.hasCloud ? "Cloud copy is unchanged." : "Deleted local copy.", [name]);
+      } else if (action === "deleteCloud") {
+        showAssetToast("success", "Cloud copy deleted", availability?.hasLocal ? "Local copy is unchanged." : "Deleted Cloud copy.", [name, selectedCloudLabel]);
+      }
     } catch (nextError) {
       if (action === "upload") {
         setOptimisticUploadTransfer(asset, effectiveCloudId, "failed", {
@@ -1253,15 +1326,20 @@ function AssetsPanel({
         });
       }
       if (["upload", "download"].includes(action)) {
-        setTransferActionFailure(assetTransferFailureFromAction(
+        const failure = assetTransferFailureFromAction(
           action,
           asset,
           selectedCloudLabel,
           effectiveCloudId,
           nextError,
-        ));
+        );
+        setTransferActionFailure(failure);
+        showAssetToast("error", failure.title, failure.message, failure.details, failure.key);
       }
-      setActionError(nextError?.message || String(nextError || `Unable to ${action} asset.`));
+      const message = nextError?.message || String(nextError || `Unable to ${action} asset.`);
+      if (!["upload", "download"].includes(action)) {
+        showAssetToast("error", "Asset action failed", message, [name, selectedCloudLabel]);
+      }
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
@@ -1272,7 +1350,7 @@ function AssetsPanel({
     refresh,
     selectedCloudLabel,
     setOptimisticUploadTransfer,
-    showActionNotice,
+    showAssetToast,
     uploadPublic,
   ]);
 
@@ -1282,7 +1360,6 @@ function AssetsPanel({
     if (!id && !transferId) return;
     const key = `cancel:${id || transferId}`;
     setBusyKey(key);
-    setActionError("");
     try {
       await invoke("cloud_mcp_cancel_asset_transfer", {
         assetId: id || null,
@@ -1290,22 +1367,23 @@ function AssetsPanel({
       });
       await refresh({ silent: true, force: true });
     } catch (nextError) {
-      setActionError(nextError?.message || String(nextError || "Unable to cancel transfer."));
+      const message = nextError?.message || String(nextError || "Unable to cancel transfer.");
+      showAssetToast("error", "Cancel failed", message, [assetName(asset, "asset")]);
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [refresh]);
+  }, [refresh, showAssetToast]);
 
   const runSelectedAssetAction = useCallback(async (action) => {
     if (!selectedAssets.length) return;
     const key = `batch:${action}`;
     setBusyKey(key);
-    setActionError("");
     try {
       if (action === "annotate") {
         const paths = selectedImageAssets.map(assetLocalPath).filter(Boolean);
         if (!paths.length) {
-          setActionError("Select at least one local image to annotate.");
+          const message = "Select at least one local image to annotate.";
+          showAssetToast("error", "Selection action failed", message);
           return;
         }
         await invoke("snipping_open_annotation_editor_batch", {
@@ -1329,23 +1407,19 @@ function AssetsPanel({
             });
             deletedCount += 1;
           }
-          if (availability.hasCloud) {
-            await invoke("cloud_mcp_delete_cloud_account_asset", {
-              assetId: id,
-              cloudId: effectiveCloudId,
-            });
-            deletedCount += 1;
-          }
         }
         if (!deletedCount) {
-          setActionError("Selected assets could not be deleted.");
+          const message = "Selected assets do not have local copies to delete.";
+          showAssetToast("error", "Delete failed", message);
           return;
         }
         clearSelectedAssets();
         await refresh({ silent: true, force: true });
+        showAssetToast("success", "Local copies deleted", `Deleted ${deletedCount} local cop${deletedCount === 1 ? "y" : "ies"}. Cloud copies are unchanged.`);
       }
     } catch (nextError) {
-      setActionError(nextError?.message || String(nextError || `Unable to ${action} selected assets.`));
+      const message = nextError?.message || String(nextError || `Unable to ${action} selected assets.`);
+      showAssetToast("error", "Selection action failed", message);
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
@@ -1356,12 +1430,12 @@ function AssetsPanel({
     selectedImageAssets,
     effectiveCloudId,
     selectedCloudLabel,
+    showAssetToast,
   ]);
 
   return (
     <AssetsPane>
       <AssetControlsRegion>
-        <AssetTransferFailureBanner failures={transferFailures} />
         <AssetsHeader>
           <div>
             <AssetsKicker>Library</AssetsKicker>
@@ -1448,8 +1522,6 @@ function AssetsPanel({
             selectedCloudId={effectiveCloudId}
           />
         )}
-        {inlineError && <AssetError>{inlineError}</AssetError>}
-        {actionNotice && <AssetNotice aria-live="polite">{actionNotice}</AssetNotice>}
       </AssetControlsRegion>
       <AssetSelectionDock
         busy={Boolean(busyKey)}
@@ -1458,6 +1530,12 @@ function AssetsPanel({
         onAnnotate={() => runSelectedAssetAction("annotate")}
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedAssetAction("delete")}
+        deleteLabel="Delete local"
+      />
+      <AssetToastStack
+        onDismiss={dismissAssetToast}
+        selectionVisible={selectedAssets.length > 0}
+        toasts={assetToasts}
       />
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : "No assets registered yet."}</AssetEmptyState>
@@ -1475,7 +1553,7 @@ function AssetsPanel({
             const transferLabel = transfer ? assetTransferDirectionLabel(transfer) : "";
             const syncedDeviceNames = assetSyncedDeviceNames(asset);
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
-            const localPath = assetLocalPath(asset);
+            const localPath = availability.hasLocal ? assetLocalPath(asset) : "";
             const previewUrl = assetPreviewUrl(asset);
             const publicUrl = assetPublicUrl(asset);
             const isPublic = Boolean(publicUrl);
@@ -1506,14 +1584,41 @@ function AssetsPanel({
             const canView = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canUntrack = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
-            const showUpload = availability.hasLocal;
-            const showDownload = availability.hasCloud;
+            const primaryCloudAction = availability.hasCloud && availability.hasLocal
+              ? "deleteCloud"
+              : availability.hasCloud
+                ? "download"
+                : availability.hasLocal
+                  ? "upload"
+                  : "";
+            const primaryCloudBusy = primaryCloudAction === "deleteCloud"
+              ? deleteCloudBusy
+              : primaryCloudAction === "download"
+                ? downloadBusy
+                : uploadBusy;
+            const canPrimaryCloudAction = primaryCloudAction === "deleteCloud"
+              ? canDeleteCloud
+              : primaryCloudAction === "download"
+                ? canDownload
+                : primaryCloudAction === "upload"
+                  ? canUpload
+                  : false;
+            const primaryCloudTitle = primaryCloudAction === "deleteCloud"
+              ? "Delete Cloud copy"
+              : primaryCloudAction === "download"
+                ? "Download local copy"
+                : "Upload to Cloud";
+            const primaryCloudLabel = primaryCloudAction === "deleteCloud"
+              ? `Delete Cloud copy of ${name}`
+              : primaryCloudAction === "download"
+                ? `Download local copy of ${name}`
+                : `Upload ${name}`;
             const showPublish = availability.hasCloud;
-            const showDeleteCloud = availability.hasCloud;
-            const bottomDeleteAction = canDeleteLocal ? "deleteLocal" : canDeleteCloud ? "deleteCloud" : "";
-            const bottomDeleteBusy = canDeleteLocal ? deleteLocalBusy : deleteCloudBusy;
-            const canBottomDelete = Boolean(bottomDeleteAction);
-            const bottomDeleteTitle = canDeleteLocal ? "Delete local copy" : canDeleteCloud ? "Delete Cloud copy" : "Delete asset";
+            const showSecondaryCloudDelete = availability.hasCloud && !availability.hasLocal;
+            const bottomDeleteAction = canDeleteLocal ? "deleteLocal" : "";
+            const bottomDeleteBusy = deleteLocalBusy;
+            const canBottomDelete = canDeleteLocal;
+            const bottomDeleteTitle = canDeleteLocal ? "Delete local copy" : "No local copy to delete";
             const selected = selectedAssetIds.has(id);
 
             return (
@@ -1554,16 +1659,23 @@ function AssetsPanel({
                 <AssetCardStatus data-status={availability.statusKind} title={`${selectedCloudLabel}: ${availability.label}`}>
                   {availability.label}
                 </AssetCardStatus>
-                {showUpload && (
+                {primaryCloudAction && (
                   <AssetTopActionButton
-                    aria-label={`Upload ${name}`}
-                    data-busy={uploadBusy ? "true" : "false"}
-                    disabled={!canUpload || uploadBusy || Boolean(busyKey && !uploadBusy)}
-                    onClick={() => runAssetAction("upload", asset)}
-                    title={availability.hasCloud ? "Already in Cloud" : "Upload to Cloud"}
+                    aria-label={primaryCloudLabel}
+                    data-busy={primaryCloudBusy ? "true" : "false"}
+                    data-danger={primaryCloudAction === "deleteCloud" ? "true" : "false"}
+                    disabled={!canPrimaryCloudAction || primaryCloudBusy || Boolean(busyKey && !primaryCloudBusy)}
+                    onClick={() => runAssetAction(primaryCloudAction, asset)}
+                    title={primaryCloudTitle}
                     type="button"
                   >
-                    <CloudUpload aria-hidden="true" />
+                    {primaryCloudAction === "deleteCloud" ? (
+                      <CloudOff aria-hidden="true" />
+                    ) : primaryCloudAction === "download" ? (
+                      <CloudDownload aria-hidden="true" />
+                    ) : (
+                      <CloudUpload aria-hidden="true" />
+                    )}
                   </AssetTopActionButton>
                 )}
                 {transferActive && (
@@ -1623,17 +1735,6 @@ function AssetsPanel({
                       <MoveToInbox aria-hidden="true" />
                     </AssetUtilityButton>
                   )}
-                  {showDownload && (
-                    <AssetUtilityButton
-                      aria-label={`Download ${name}`}
-                      disabled={!canDownload || downloadBusy || Boolean(busyKey && !downloadBusy)}
-                      onClick={() => runAssetAction("download", asset)}
-                      title={availability.hasLocal ? "Already local" : "Download asset"}
-                      type="button"
-                    >
-                      <FileDownload aria-hidden="true" />
-                    </AssetUtilityButton>
-                  )}
                   {showPublish && !isPublic && (
                     <AssetUtilityButton
                       aria-label={`Make ${name} public`}
@@ -1669,7 +1770,7 @@ function AssetsPanel({
                       <LinkOff aria-hidden="true" />
                     </AssetUtilityButton>
                   )}
-                  {showDeleteCloud && bottomDeleteAction !== "deleteCloud" && (
+                  {showSecondaryCloudDelete && (
                     <AssetUtilityButton
                       aria-label={`Delete Cloud copy of ${name}`}
                       data-danger="true"
@@ -1678,7 +1779,7 @@ function AssetsPanel({
                       title="Delete Cloud copy"
                       type="button"
                     >
-                      <Cloud aria-hidden="true" />
+                      <CloudOff aria-hidden="true" />
                     </AssetUtilityButton>
                   )}
                 </AssetUtilityStrip>
@@ -1702,7 +1803,7 @@ function AssetsPanel({
                     <ModeEdit aria-hidden="true" />
                   </AssetIconButton>
                   <AssetIconButton
-                    aria-label={`Delete ${name}`}
+                    aria-label={`Delete local copy of ${name}`}
                     data-danger="true"
                     disabled={!canBottomDelete || bottomDeleteBusy || Boolean(busyKey && !bottomDeleteBusy)}
                     onClick={() => bottomDeleteAction && runAssetAction(bottomDeleteAction, asset)}
@@ -1740,22 +1841,50 @@ function AssetsPanel({
   );
 }
 
-function AssetTransferFailureBanner({ failures = [] }) {
-  const [copiedKey, setCopiedKey] = useState("");
+function AssetToastStack({ toasts = [], onDismiss, selectionVisible = false }) {
+  if (!toasts.length) return null;
+  return (
+    <AssetToastViewport
+      aria-live="polite"
+      data-selection-visible={selectionVisible ? "true" : "false"}
+    >
+      {toasts.map((toast) => (
+        <AssetToastCard
+          key={toast.key}
+          onDismiss={onDismiss}
+          toast={toast}
+        />
+      ))}
+    </AssetToastViewport>
+  );
+}
+
+function AssetToastCard({ toast, onDismiss }) {
+  const [paused, setPaused] = useState(false);
+  const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef(0);
-  const allFailureText = useMemo(() => assetTransferFailuresCopyText(failures), [failures]);
-  const copyFailureText = useCallback(async (key, value) => {
-    const copied = await copyTextToClipboard(value);
-    if (!copied) return;
-    setCopiedKey(key);
-    if (copiedTimerRef.current) {
-      window.clearTimeout(copiedTimerRef.current);
-    }
-    copiedTimerRef.current = window.setTimeout(() => {
-      copiedTimerRef.current = 0;
-      setCopiedKey("");
-    }, 1600);
+  const copyText = useMemo(() => text(toast.copyText, assetToastCopyText(toast)), [toast]);
+  const details = useMemo(() => jsonArray(toast.details).filter((detail) => text(detail)), [toast.details]);
+  const kind = text(toast.kind, "success");
+  const title = text(toast.title, kind === "error" ? "Asset action failed" : "Asset action complete");
+  const message = text(toast.message);
+
+  const pauseDismiss = useCallback(() => {
+    setPaused(true);
   }, []);
+
+  const resumeDismiss = useCallback((event) => {
+    if (event?.currentTarget?.contains?.(event.relatedTarget)) return;
+    setPaused(false);
+  }, []);
+
+  useEffect(() => {
+    if (paused) return undefined;
+    const timer = window.setTimeout(() => {
+      onDismiss(toast.key);
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [onDismiss, paused, toast.createdAt, toast.key]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) {
@@ -1763,53 +1892,60 @@ function AssetTransferFailureBanner({ failures = [] }) {
     }
   }, []);
 
-  if (!failures.length) return null;
+  const copyToast = useCallback(async () => {
+    const didCopy = await copyTextToClipboard(copyText);
+    if (!didCopy) return;
+    setCopied(true);
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = 0;
+      setCopied(false);
+    }, 1400);
+  }, [copyText]);
+
   return (
-    <AssetTransferFailurePanel aria-live="assertive" role="alert">
-      <AssetTransferFailureHeader>
-        <strong>{failures.length === 1 ? "Asset transfer failed" : `${failures.length} asset transfers failed`}</strong>
-        <AssetTransferFailureHeaderActions>
-          <span>Upload/download error details</span>
-          <AssetFailureCopyButton
-            aria-label="Copy all asset transfer errors"
-            data-copied={copiedKey === "all"}
-            disabled={!allFailureText}
-            onClick={() => void copyFailureText("all", allFailureText)}
-            title="Copy all errors"
-            type="button"
-          >
-            <ContentCopy aria-hidden="true" />
-            <span>{copiedKey === "all" ? "Copied" : "Copy all"}</span>
-          </AssetFailureCopyButton>
-        </AssetTransferFailureHeaderActions>
-      </AssetTransferFailureHeader>
-      <AssetTransferFailureList>
-        {failures.map((failure) => (
-          <AssetTransferFailureItem key={failure.key}>
-            <AssetTransferFailureItemHeader>
-              <AssetTransferFailureTitle>{failure.title}</AssetTransferFailureTitle>
-              <AssetFailureIconButton
-                aria-label={`Copy error for ${failure.title}`}
-                data-copied={copiedKey === failure.key}
-                onClick={() => void copyFailureText(failure.key, assetTransferFailureCopyText(failure))}
-                title="Copy this error"
-                type="button"
-              >
-                <ContentCopy aria-hidden="true" />
-              </AssetFailureIconButton>
-            </AssetTransferFailureItemHeader>
-            <AssetTransferFailureMessage>{failure.message}</AssetTransferFailureMessage>
-            {failure.details?.length ? (
-              <AssetTransferFailureMeta>
-                {failure.details.map((detail) => (
-                  <span key={detail}>{detail}</span>
-                ))}
-              </AssetTransferFailureMeta>
-            ) : null}
-          </AssetTransferFailureItem>
-        ))}
-      </AssetTransferFailureList>
-    </AssetTransferFailurePanel>
+    <AssetToast
+      data-kind={kind}
+      onBlur={resumeDismiss}
+      onFocus={pauseDismiss}
+      onMouseEnter={pauseDismiss}
+      onMouseLeave={resumeDismiss}
+      role={kind === "error" ? "alert" : "status"}
+    >
+      <AssetToastBody>
+        <AssetToastTitle>{title}</AssetToastTitle>
+        {message && <AssetToastMessage>{message}</AssetToastMessage>}
+        {details.length ? (
+          <AssetToastMeta>
+            {details.slice(0, 3).map((detail) => (
+              <span key={detail}>{detail}</span>
+            ))}
+          </AssetToastMeta>
+        ) : null}
+      </AssetToastBody>
+      <AssetToastActions>
+        <AssetToastIconButton
+          aria-label={`Copy ${title}`}
+          data-copied={copied ? "true" : "false"}
+          disabled={!copyText}
+          onClick={() => void copyToast()}
+          title={copied ? "Copied" : "Copy"}
+          type="button"
+        >
+          <ContentCopy aria-hidden="true" />
+        </AssetToastIconButton>
+        <AssetToastIconButton
+          aria-label={`Dismiss ${title}`}
+          onClick={() => onDismiss(toast.key)}
+          title="Dismiss"
+          type="button"
+        >
+          <Close aria-hidden="true" />
+        </AssetToastIconButton>
+      </AssetToastActions>
+    </AssetToast>
   );
 }
 
@@ -2082,7 +2218,13 @@ function UntrackedAssetsPanel({
 }) {
   const items = useMemo(() => assetLibraryItems(library), [library]);
   const [busyKey, setBusyKey] = useState("");
-  const [actionError, setActionError] = useState("");
+  const {
+    assetToasts,
+    dismissAssetToast,
+    dismissedToastKeysRef,
+    enqueueAssetToast,
+    showAssetToast,
+  } = useAssetToastController();
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
   const selectedAssets = useMemo(() => (
@@ -2091,6 +2233,23 @@ function UntrackedAssetsPanel({
   const selectedImageAssets = useMemo(() => (
     selectedAssets.filter((asset) => assetLocalAvailable(asset) && assetIsImage(asset) && assetLocalPath(asset))
   ), [selectedAssets]);
+  const activeToastKeySet = useMemo(
+    () => new Set(assetToasts.map((toast) => toast.key)),
+    [assetToasts],
+  );
+
+  useEffect(() => {
+    const message = text(error);
+    if (!message) return;
+    const key = `untracked-assets-error:${message}`;
+    if (dismissedToastKeysRef.current.has(key) || activeToastKeySet.has(key)) return;
+    enqueueAssetToast({
+      kind: "error",
+      key,
+      title: "Scratch assets failed to load",
+      message,
+    });
+  }, [activeToastKeySet, enqueueAssetToast, error, dismissedToastKeysRef]);
 
   useEffect(() => {
     const visibleIds = new Set(items.map((asset) => assetId(asset)).filter(Boolean));
@@ -2132,7 +2291,6 @@ function UntrackedAssetsPanel({
     if (!id || !localPath) return;
     const key = `${action}:${id}`;
     setBusyKey(key);
-    setActionError("");
     try {
       if (action === "open") {
         if (typeof onOpenHyperframeAsset === "function" && await onOpenHyperframeAsset(asset)) {
@@ -2173,24 +2331,25 @@ function UntrackedAssetsPanel({
           path: localPath,
         });
         await trackedRefresh({ silent: true, force: true });
+        showAssetToast("success", "Asset tracked", "Moved into tracked assets.", [name]);
       }
     } catch (nextError) {
-      setActionError(nextError?.message || String(nextError || `Unable to ${action} untracked asset.`));
+      const message = nextError?.message || String(nextError || `Unable to ${action} untracked asset.`);
+      showAssetToast("error", "Scratch action failed", message, [name, localPath]);
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [onDelete, onOpenHyperframeAsset, onPromote, onRename, trackedRefresh]);
+  }, [onDelete, onOpenHyperframeAsset, onPromote, onRename, showAssetToast, trackedRefresh]);
 
   const runSelectedUntrackedAction = useCallback(async (action) => {
     if (!selectedAssets.length) return;
     const key = `batch:${action}`;
     setBusyKey(key);
-    setActionError("");
     try {
       if (action === "annotate") {
         const paths = selectedImageAssets.map(assetLocalPath).filter(Boolean);
         if (!paths.length) {
-          setActionError("Select at least one local image to annotate.");
+          showAssetToast("error", "Selection action failed", "Select at least one local image to annotate.");
           return;
         }
         await invoke("snipping_open_annotation_editor_batch", {
@@ -2211,7 +2370,8 @@ function UntrackedAssetsPanel({
         await refresh({ silent: true, force: true });
       }
     } catch (nextError) {
-      setActionError(nextError?.message || String(nextError || `Unable to ${action} selected scratch assets.`));
+      const message = nextError?.message || String(nextError || `Unable to ${action} selected scratch assets.`);
+      showAssetToast("error", "Selection action failed", message);
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
@@ -2221,6 +2381,7 @@ function UntrackedAssetsPanel({
     refresh,
     selectedAssets,
     selectedImageAssets,
+    showAssetToast,
   ]);
 
   return (
@@ -2258,7 +2419,6 @@ function UntrackedAssetsPanel({
             </AssetIconButton>
           </AssetHeaderActions>
         </AssetsHeader>
-        {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
       </AssetControlsRegion>
       <AssetSelectionDock
         busy={Boolean(busyKey)}
@@ -2267,6 +2427,11 @@ function UntrackedAssetsPanel({
         onAnnotate={() => runSelectedUntrackedAction("annotate")}
         onClear={clearSelectedAssets}
         onDelete={() => runSelectedUntrackedAction("delete")}
+      />
+      <AssetToastStack
+        onDismiss={dismissAssetToast}
+        selectionVisible={selectedAssets.length > 0}
+        toasts={assetToasts}
       />
       {!items.length ? (
         <AssetEmptyState>
@@ -3004,7 +3169,15 @@ const AssetSelectionDockBar = styled.div`
 /* Floating batch-action dock for both asset views. Renders the last
    non-empty counts while animating out so "0 selected" never flashes, and
    every button hard-disables the moment the selection empties. */
-function AssetSelectionDock({ busy, count, imageCount, onAnnotate, onClear, onDelete }) {
+function AssetSelectionDock({
+  busy,
+  count,
+  deleteLabel = "Delete",
+  imageCount,
+  onAnnotate,
+  onClear,
+  onDelete,
+}) {
   const lastCountsRef = useRef({ count: 0, imageCount: 0 });
   if (count > 0) {
     lastCountsRef.current = { count, imageCount };
@@ -3034,7 +3207,7 @@ function AssetSelectionDock({ busy, count, imageCount, onAnnotate, onClear, onDe
         type="button"
       >
         <Delete aria-hidden="true" />
-        <span>Delete</span>
+        <span>{deleteLabel}</span>
       </AssetBatchButton>
       <AssetBatchButton disabled={!visible || busy} onClick={onClear} type="button">
         Clear
@@ -3413,6 +3586,19 @@ const AssetTopActionButton = styled(AssetUtilityButton).attrs({ "data-asset-uplo
     border-color: transparent;
   }
 
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.36);
+    color: rgba(254, 205, 211, 0.96);
+    background: rgba(127, 29, 29, 0.28);
+
+    &:hover:not(:disabled),
+    &:focus-visible {
+      border-color: rgba(251, 113, 133, 0.6);
+      color: rgba(255, 255, 255, 0.98);
+      background: rgba(190, 18, 60, 0.86);
+    }
+  }
+
   &[data-busy="true"] {
     opacity: 1;
     pointer-events: auto;
@@ -3652,119 +3838,89 @@ const AssetTransferCancel = styled.button`
   }
 `;
 
-const AssetTransferFailurePanel = styled.div`
-  display: grid;
-  flex: 0 0 auto;
-  gap: 8px;
-  min-width: 0;
-  overflow: hidden;
-  padding: 10px;
-  border: 1px solid rgba(248, 113, 113, 0.28);
-  border-radius: 8px;
-  color: rgba(254, 226, 226, 0.96);
-  background: rgba(127, 29, 29, 0.16);
-  box-shadow: 0 12px 28px rgba(2, 6, 23, 0.18);
-`;
-
-const AssetTransferFailureHeader = styled.div`
+const AssetToastViewport = styled.div`
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 32;
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(360px, calc(100vw - 28px));
+  pointer-events: none;
 
-  strong {
-    min-width: 0;
-    color: rgba(254, 242, 242, 0.98);
-    font-size: 11px;
-    font-weight: 900;
-    line-height: 1.2;
-    text-transform: uppercase;
+  &[data-selection-visible="true"] {
+    bottom: 76px;
   }
 
   @media (max-width: 620px) {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 3px;
+    right: 10px;
+    bottom: 12px;
+    left: 10px;
+    width: auto;
+
+    &[data-selection-visible="true"] {
+      bottom: 86px;
+    }
   }
 `;
 
-const AssetTransferFailureHeaderActions = styled.div`
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 7px;
-  min-width: 0;
-
-  > span {
-    flex: 0 0 auto;
-    color: rgba(254, 202, 202, 0.76);
-    font-size: 9px;
-    font-weight: 820;
-    line-height: 1.2;
-    text-transform: uppercase;
-  }
-
-  @media (max-width: 620px) {
-    width: 100%;
-    justify-content: space-between;
-  }
-`;
-
-const AssetTransferFailureList = styled.div`
+const AssetToast = styled.div`
   display: grid;
-  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+  width: 100%;
   min-width: 0;
-  max-height: clamp(92px, 13vh, 126px);
-  overflow-x: hidden;
-  overflow-y: auto;
-  padding-right: 2px;
-  overscroll-behavior: contain;
-  scroll-snap-type: y proximity;
-  scrollbar-gutter: stable;
-  scrollbar-width: thin;
+  padding: 10px;
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.94);
+  background: rgba(8, 14, 22, 0.94);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.46);
+  backdrop-filter: blur(14px);
+  pointer-events: auto;
+
+  &[data-kind="error"] {
+    border-color: rgba(248, 113, 113, 0.34);
+    background:
+      linear-gradient(135deg, rgba(127, 29, 29, 0.2), rgba(8, 14, 22, 0.94) 52%),
+      rgba(8, 14, 22, 0.94);
+  }
+
+  &[data-kind="success"] {
+    border-color: rgba(74, 222, 128, 0.32);
+    background:
+      linear-gradient(135deg, rgba(20, 83, 45, 0.2), rgba(8, 14, 22, 0.94) 52%),
+      rgba(8, 14, 22, 0.94);
+  }
 `;
 
-const AssetTransferFailureItem = styled.div`
+const AssetToastBody = styled.div`
   display: grid;
   gap: 4px;
   min-width: 0;
-  min-height: 88px;
-  padding: 7px 8px;
-  border: 1px solid rgba(248, 113, 113, 0.16);
-  border-radius: 7px;
-  background: rgba(2, 6, 23, 0.28);
-  scroll-snap-align: start;
 `;
 
-const AssetTransferFailureItemHeader = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 24px;
-  align-items: start;
-  gap: 6px;
+const AssetToastTitle = styled.strong`
   min-width: 0;
-`;
-
-const AssetTransferFailureTitle = styled.strong`
-  min-width: 0;
-  color: rgba(254, 242, 242, 0.96);
+  color: rgba(241, 245, 249, 0.96);
   font-size: 11px;
   font-weight: 900;
   line-height: 1.25;
   overflow-wrap: anywhere;
 `;
 
-const AssetTransferFailureMessage = styled.div`
+const AssetToastMessage = styled.div`
   min-width: 0;
-  color: rgba(254, 226, 226, 0.94);
+  color: rgba(203, 213, 225, 0.9);
   font-size: 10px;
   font-weight: 760;
   line-height: 1.35;
   overflow-wrap: anywhere;
 `;
 
-const AssetTransferFailureMeta = styled.div`
+const AssetToastMeta = styled.div`
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
@@ -3774,10 +3930,10 @@ const AssetTransferFailureMeta = styled.div`
     max-width: 100%;
     padding: 3px 5px;
     overflow: hidden;
-    border: 1px solid rgba(254, 202, 202, 0.14);
+    border: 1px solid rgba(148, 163, 184, 0.13);
     border-radius: 5px;
-    color: rgba(254, 202, 202, 0.84);
-    background: rgba(15, 23, 42, 0.3);
+    color: rgba(203, 213, 225, 0.76);
+    background: rgba(15, 23, 42, 0.42);
     font-size: 8px;
     font-weight: 820;
     line-height: 1.2;
@@ -3786,29 +3942,27 @@ const AssetTransferFailureMeta = styled.div`
   }
 `;
 
-const AssetFailureCopyButton = styled.button`
+const AssetToastActions = styled.div`
   display: inline-flex;
-  align-items: center;
+  align-items: start;
   gap: 5px;
-  min-height: 24px;
-  padding: 0 8px;
-  border: 1px solid rgba(254, 202, 202, 0.18);
+`;
+
+const AssetToastIconButton = styled.button`
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 6px;
-  color: rgba(254, 226, 226, 0.88);
-  background: rgba(15, 23, 42, 0.34);
-  font: inherit;
-  font-size: 9px;
-  font-weight: 850;
-  line-height: 1;
+  color: rgba(226, 232, 240, 0.78);
+  background: rgba(15, 23, 42, 0.44);
   cursor: pointer;
 
   svg {
-    width: 13px;
-    height: 13px;
-  }
-
-  span {
-    white-space: nowrap;
+    width: 14px;
+    height: 14px;
   }
 
   &:hover:not(:disabled),
@@ -3821,33 +3975,7 @@ const AssetFailureCopyButton = styled.button`
 
   &:disabled {
     cursor: default;
-    opacity: 0.5;
-  }
-`;
-
-const AssetFailureIconButton = styled.button`
-  display: inline-grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  padding: 0;
-  border: 1px solid rgba(254, 202, 202, 0.14);
-  border-radius: 6px;
-  color: rgba(254, 226, 226, 0.8);
-  background: rgba(15, 23, 42, 0.3);
-  cursor: pointer;
-
-  svg {
-    width: 13px;
-    height: 13px;
-  }
-
-  &:hover,
-  &:focus-visible,
-  &[data-copied="true"] {
-    border-color: rgba(45, 212, 191, 0.3);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.16);
+    opacity: 0.46;
   }
 `;
 
@@ -3916,30 +4044,6 @@ const AssetIconButton = styled.button`
       background: rgba(146, 64, 14, 0.26);
     }
   }
-`;
-
-const AssetError = styled.div`
-  padding: 8px 10px;
-  border: 1px solid rgba(248, 113, 113, 0.22);
-  border-radius: 8px;
-  color: rgba(254, 202, 202, 0.92);
-  background: rgba(127, 29, 29, 0.12);
-  font-size: 10px;
-  font-weight: 760;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-`;
-
-const AssetNotice = styled.div`
-  padding: 8px 10px;
-  border: 1px solid rgba(74, 222, 128, 0.22);
-  border-radius: 8px;
-  color: rgba(187, 247, 208, 0.94);
-  background: rgba(20, 83, 45, 0.14);
-  font-size: 10px;
-  font-weight: 760;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
 `;
 
 const AssetEmptyState = styled.div`

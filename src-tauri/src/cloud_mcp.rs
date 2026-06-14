@@ -25259,11 +25259,23 @@ fn cloud_mcp_limit_workspace_todo_sync_payload(value: &mut Value) {
             }
         }
         Value::Object(object) => {
+            let workspace_fallback = object
+                .get("workspace_id")
+                .or_else(|| object.get("workspaceId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             if let Some(items) = object.get_mut("todos").and_then(Value::as_array_mut) {
-                items.truncate(CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS);
+                cloud_mcp_limit_workspace_todos_by_session(items, &workspace_fallback);
+                for item in items.iter_mut() {
+                    cloud_mcp_limit_workspace_todo_sync_payload(item);
+                }
             }
             for (key, child) in object.iter_mut() {
                 let normalized_key = key.to_ascii_lowercase();
+                if normalized_key == "todos" {
+                    continue;
+                }
                 if matches!(
                     normalized_key.as_str(),
                     "src" | "dataurl" | "data_url" | "image_data" | "imagedata"
@@ -25291,6 +25303,34 @@ fn cloud_mcp_limit_workspace_todo_sync_payload(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn cloud_mcp_limit_workspace_todos_by_session(items: &mut Vec<Value>, workspace_fallback: &str) {
+    if items.len() <= CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS {
+        return;
+    }
+
+    let mut grouped = HashMap::<String, Vec<(usize, Value)>>::new();
+    for (index, item) in std::mem::take(items).into_iter().enumerate() {
+        let session_key = cloud_mcp_agent_session_key_from_value(&item, workspace_fallback)
+            .unwrap_or_else(|| {
+                cloud_mcp_payload_text(&item, &["todo_id", "todoId", "id"])
+                    .map(|todo_id| format!("unsessioned-todo:{todo_id}"))
+                    .unwrap_or_else(|| format!("unsessioned-index:{index}"))
+            });
+        grouped.entry(session_key).or_default().push((index, item));
+    }
+
+    let mut retained = Vec::<(usize, Value)>::new();
+    for mut group in grouped.into_values() {
+        if group.len() > CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS {
+            let drop_count = group.len() - CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS;
+            group.drain(0..drop_count);
+        }
+        retained.extend(group);
+    }
+    retained.sort_by_key(|(index, _)| *index);
+    items.extend(retained.into_iter().map(|(_, item)| item));
 }
 
 fn cloud_mcp_truncate_chars(value: &str, max_chars: usize) -> String {

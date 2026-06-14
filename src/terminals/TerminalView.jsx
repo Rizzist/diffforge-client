@@ -7803,6 +7803,114 @@ function getVoiceAgentHighlightQuery(args = {}) {
   );
 }
 
+function getVoiceAgentHighlightSessionSummaryItems(summary) {
+  const items = summary?.summaryItems
+    || summary?.summary_items
+    || summary?.rawTodos
+    || summary?.raw_todos
+    || summary?.rawRecentTodos
+    || summary?.raw_recent_todos
+    || [];
+  const chunks = summary?.chunks || [];
+  return [
+    ...(Array.isArray(items) ? items : []),
+    ...(Array.isArray(chunks) ? chunks : []),
+  ];
+}
+
+function voiceAgentHighlightSessionSummaryMatchesQuery(summary, query) {
+  if (!summary || typeof summary !== "object" || !query) {
+    return false;
+  }
+  const values = [
+    summary.title,
+    summary.summary,
+    summary.summaryText,
+    summary.summary_text,
+    summary.fallbackSummary,
+    summary.fallback_summary,
+  ];
+  getVoiceAgentHighlightSessionSummaryItems(summary).forEach((item) => {
+    values.push(
+      item?.text,
+      item?.summary,
+      item?.summaryText,
+      item?.summary_text,
+      item?.fallbackSummary,
+      item?.fallback_summary,
+      item?.todo?.text,
+      item?.todo?.title,
+    );
+    const inputTodos = item?.compressionJob?.inputTodos
+      || item?.compression_job?.input_todos
+      || item?.inputTodos
+      || item?.input_todos
+      || [];
+    if (Array.isArray(inputTodos)) {
+      inputTodos.forEach((todo) => {
+        values.push(todo?.text, todo?.title, todo?.todoText, todo?.todo_text);
+      });
+    }
+  });
+  return values.some((value) => (
+    normalizeTodoQueueText(value || "").toLowerCase().includes(query)
+  ));
+}
+
+function getVoiceAgentHighlightSessionSummaryRefs(summary) {
+  const session = summary?.session || summary?.sessionRef || summary?.session_ref || {};
+  return {
+    sessionIds: getVoiceAgentHighlightStringValues(
+      summary?.agentSessionId,
+      summary?.agent_session_id,
+      summary?.providerSessionId,
+      summary?.provider_session_id,
+      summary?.nativeSessionId,
+      summary?.native_session_id,
+      summary?.terminalSessionId,
+      summary?.terminal_session_id,
+      summary?.sessionId,
+      summary?.session_id,
+      session?.agentSessionId,
+      session?.agent_session_id,
+      session?.providerSessionId,
+      session?.provider_session_id,
+      session?.nativeSessionId,
+      session?.native_session_id,
+      session?.terminalSessionId,
+      session?.terminal_session_id,
+      session?.sessionId,
+      session?.session_id,
+    ),
+    terminalIds: getVoiceAgentHighlightStringValues(
+      summary?.terminalId,
+      summary?.terminal_id,
+      summary?.targetTerminalId,
+      summary?.target_terminal_id,
+      session?.terminalId,
+      session?.terminal_id,
+      session?.targetTerminalId,
+      session?.target_terminal_id,
+    ),
+    threadIds: getVoiceAgentHighlightStringValues(
+      summary?.threadId,
+      summary?.thread_id,
+      summary?.targetThreadId,
+      summary?.target_thread_id,
+      session?.threadId,
+      session?.thread_id,
+      session?.targetThreadId,
+      session?.target_thread_id,
+    ),
+    terminalIndex: normalizeTodoTerminalIndex(
+      summary?.terminalIndex
+        ?? summary?.terminal_index
+        ?? session?.terminalIndex
+        ?? session?.terminal_index,
+    ),
+  };
+}
+
 function voiceAgentHighlightScopeIsAll(args = {}) {
   const scope = String(
     args.scope
@@ -11802,6 +11910,23 @@ function workspaceTodoDispatchesForWorkspace(workspaceTodos, workspaceId) {
     : Array.isArray(dispatchCollection)
       ? dispatchCollection
       : [];
+}
+
+function workspaceTodoSessionSummariesForWorkspace(workspaceTodos, workspaceId) {
+  const compression = workspaceTodoCollectionForWorkspace(
+    workspaceTodos,
+    workspaceId,
+    ["todoCompressionBySession", "todo_compression_by_session", "todoCompression", "todo_compression"],
+    ["todoCompressionBySessionByWorkspace", "todo_compression_by_session_by_workspace"],
+  );
+  const sessions = compression?.sessionSummaries
+    || compression?.session_summaries
+    || compression?.sessions
+    || compression?.recentAgentSessions
+    || compression?.recent_agent_sessions;
+  return Array.isArray(sessions)
+    ? sessions
+    : [];
 }
 
 function getWorkspaceTodoIdentity(item) {
@@ -25491,6 +25616,7 @@ function TerminalView({
       const pendingItems = todoQueuePendingItemsRef.current || {};
       const localItems = todoQueueItemsRef.current || [];
       const cloudItems = workspaceTodoItemsForWorkspace(workspaceTodos, terminalWorkspace?.id || "");
+      const sessionSummaries = workspaceTodoSessionSummariesForWorkspace(workspaceTodos, terminalWorkspace?.id || "");
       [...localItems, ...cloudItems].forEach((item) => {
         const text = normalizeTodoQueueText(
           getTodoQueueItemTerminalText(item)
@@ -25547,6 +25673,23 @@ function TerminalView({
           );
           if (matchesTodoTarget) {
             addCandidate(candidate, "todo_query");
+          }
+        });
+      });
+      sessionSummaries.forEach((summary) => {
+        if (!voiceAgentHighlightSessionSummaryMatchesQuery(summary, query)) {
+          return;
+        }
+        const refs = getVoiceAgentHighlightSessionSummaryRefs(summary);
+        candidates.forEach((candidate) => {
+          const matchesSessionSummary = Boolean(
+            refs.terminalIds.some((terminalId) => candidate.terminalIds.has(terminalId))
+              || (Number.isInteger(refs.terminalIndex) && candidate.terminalIndex === refs.terminalIndex)
+              || refs.threadIds.some((threadId) => candidate.threadIds.has(threadId))
+              || refs.sessionIds.some((sessionId) => candidate.sessionIds.has(sessionId)),
+          );
+          if (matchesSessionSummary) {
+            addCandidate(candidate, "session_todo_query");
           }
         });
       });
