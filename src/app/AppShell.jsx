@@ -392,15 +392,21 @@ import {
   WorkspaceSettingsHeaderActions,
   WorkspaceSettingsMetaPill,
   WorkspaceModalCloseButton,
-  CrashRecoveryOverlay,
-  CrashRecoveryDialog,
-  CrashRecoveryIntro,
-  CrashRecoveryList,
+  AppCloseOverlay,
+  AppCloseDialog,
+  AppCloseHeader,
+  AppCloseBody,
+  AppCloseIntro,
+  AppCloseHint,
+  AppCloseMark,
+  AppCloseList,
+  AppCloseActions,
+  AppCloseActionButton,
+  AppCloseActionCopy,
   CrashRecoveryItem,
   CrashRecoveryItemTitle,
   CrashRecoveryItemBody,
   CrashRecoveryMeta,
-  CrashRecoveryActions,
   WorkspaceSettingsInput,
   WorkspaceSettingsSelect,
   WorkspaceSettingsSelectIcon,
@@ -540,8 +546,6 @@ import {
   WorkspaceCreateAgentLabel,
   WorkspaceCreateAgentStepper,
   WorkspaceCreateAgentStepButton,
-  WorkspaceCreatePreviewRow,
-  WorkspaceCreatePreviewDot,
   WorkspaceCreateFooter,
   VIEW_TRANSITION_MS
 } from "./appStyles";
@@ -2267,6 +2271,7 @@ const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
 const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 const WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS = 30000;
+const APP_CLOSE_TERMINAL_SNAPSHOT_TIMEOUT_MS = 5000;
 const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
@@ -2936,6 +2941,40 @@ function getTerminalNativeRailStateFields(state, label = "") {
   };
 }
 
+function markTerminalLastKnownRuntimeReadOnly(terminal = {}) {
+  return {
+    ...terminal,
+    commandable: false,
+    connected: false,
+    lastKnownRuntime: true,
+    last_known_runtime: true,
+    nativeConnected: false,
+    native_connected: false,
+    runtimeReadOnly: true,
+    runtime_read_only: true,
+  };
+}
+
+function markWorkspaceLastKnownRuntimeReadOnly(workspace = {}) {
+  const terminals = Array.isArray(workspace.terminals)
+    ? workspace.terminals.map((terminal) => markTerminalLastKnownRuntimeReadOnly(terminal))
+    : [];
+  return {
+    ...workspace,
+    commandable: false,
+    lastKnownRuntime: true,
+    last_known_runtime: true,
+    runtimeReadOnly: true,
+    runtime_read_only: true,
+    status: "deactivated",
+    terminals,
+    workspaceActive: false,
+    workspace_active: false,
+    workspaceStatus: "deactivated",
+    workspace_status: "deactivated",
+  };
+}
+
 function readCachedAgentStatuses() {
   try {
     const cached = JSON.parse(window.localStorage.getItem(AGENT_STATUS_CACHE_KEY) || "null");
@@ -3309,11 +3348,6 @@ function WorkspaceCreatePanel({
     () => expandWorkspaceCreateAgentCounts(roleOptions, availableAgentCounts),
     [availableAgentCounts, roleOptions],
   );
-  const roleLabelById = useMemo(() => {
-    const byId = new Map();
-    roleOptions.forEach((option) => byId.set(option.id, option));
-    return byId;
-  }, [roleOptions]);
 
   useEffect(() => {
     if (!visible) {
@@ -3510,44 +3544,30 @@ function WorkspaceCreatePanel({
                       <strong>{option.label}</strong>
                       <span>{agentState.statusLabel}</span>
                     </WorkspaceCreateAgentLabel>
-                    <WorkspaceCreateAgentStepper>
-                      <WorkspaceCreateAgentStepButton
-                        aria-label={`Remove one ${option.label} terminal`}
-                        disabled={creating || count === 0}
-                        onClick={() => adjustAgentCount(option.id, -1)}
-                        type="button"
-                      >
-                        -
-                      </WorkspaceCreateAgentStepButton>
-                      <strong>{count}</strong>
-                      <WorkspaceCreateAgentStepButton
-                        aria-label={`Add one ${option.label} terminal`}
-                        disabled={!canAddAgent}
-                        onClick={() => adjustAgentCount(option.id, 1)}
-                        type="button"
-                      >
-                        +
-                      </WorkspaceCreateAgentStepButton>
-                    </WorkspaceCreateAgentStepper>
                   </WorkspaceCreateAgentBody>
+                  <WorkspaceCreateAgentStepper>
+                    <WorkspaceCreateAgentStepButton
+                      aria-label={`Remove one ${option.label} terminal`}
+                      disabled={creating || count === 0}
+                      onClick={() => adjustAgentCount(option.id, -1)}
+                      type="button"
+                    >
+                      -
+                    </WorkspaceCreateAgentStepButton>
+                    <strong>{count}</strong>
+                    <WorkspaceCreateAgentStepButton
+                      aria-label={`Add one ${option.label} terminal`}
+                      disabled={!canAddAgent}
+                      onClick={() => adjustAgentCount(option.id, 1)}
+                      type="button"
+                    >
+                      +
+                    </WorkspaceCreateAgentStepButton>
+                  </WorkspaceCreateAgentStepper>
                 </WorkspaceCreateAgentCard>
               );
             })}
           </WorkspaceCreateAgentGrid>
-          <WorkspaceCreatePreviewRow aria-label="Terminals that will open">
-            {terminalRoles.length ? (
-              terminalRoles.map((roleId, index) => (
-                <WorkspaceCreatePreviewDot
-                  $color={TERMINAL_AGENT_COLOR_HEX_BY_SLOT[index % TERMINAL_AGENT_COLOR_HEX_BY_SLOT.length]}
-                  key={`${roleId}-${index}`}
-                >
-                  {roleLabelById.get(roleId)?.shortLabel || roleId}
-                </WorkspaceCreatePreviewDot>
-              ))
-            ) : (
-              <SettingsHint>Add at least one terminal to open with the workspace.</SettingsHint>
-            )}
-          </WorkspaceCreatePreviewRow>
         </WorkspaceCreateSection>
 
         {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
@@ -13288,7 +13308,11 @@ export default function App() {
   }, [workspaceTerminalFallbackRole, workspaceTerminalRoleOptions]);
 
   const readAppCloseActiveTerminalSnapshot = useCallback(async (source = "app_close") => {
-    const liveSessions = await invoke("terminal_live_sessions");
+    const liveSessions = await withTimeout(
+      invoke("terminal_live_sessions"),
+      APP_CLOSE_TERMINAL_SNAPSHOT_TIMEOUT_MS,
+      "Terminal activity check timed out.",
+    );
     return buildAppCloseActiveTerminalSnapshot(liveSessions, source);
   }, [buildAppCloseActiveTerminalSnapshot]);
 
@@ -13467,8 +13491,11 @@ export default function App() {
       return;
     }
 
+    const requestGeneratedAtMs = Date.now();
     const loadingConfirmation = {
       ...APP_CLOSE_CONFIRM_INITIAL_STATE,
+      generatedAtMs: requestGeneratedAtMs,
+      isOpen: true,
       isLoading: true,
       source: reason,
     };
@@ -13476,24 +13503,37 @@ export default function App() {
     setAppCloseConfirmState(loadingConfirmation);
 
     runWindowAction(async () => {
+      const closeRequestIsCurrent = () => {
+        const currentConfirmation = appCloseConfirmStateRef.current;
+        return Boolean(
+          currentConfirmation.isLoading
+            && currentConfirmation.generatedAtMs === requestGeneratedAtMs,
+        );
+      };
+
       try {
         const snapshot = await readAppCloseActiveTerminalSnapshot(reason);
-        if (snapshot.blockingCount > 0) {
-          appCloseConfirmStateRef.current = snapshot;
-          setAppCloseConfirmState(snapshot);
+        if (!closeRequestIsCurrent()) {
           return;
         }
 
-        appCloseConfirmStateRef.current = APP_CLOSE_CONFIRM_INITIAL_STATE;
-        setAppCloseConfirmState(APP_CLOSE_CONFIRM_INITIAL_STATE);
-        performCloseWindow({
-          expectedTerminalTotal: snapshot.terminalCount,
-          reason,
-        });
+        const confirmation = {
+          ...snapshot,
+          generatedAtMs: requestGeneratedAtMs,
+          isOpen: true,
+          isLoading: false,
+        };
+        appCloseConfirmStateRef.current = confirmation;
+        setAppCloseConfirmState(confirmation);
       } catch (error) {
+        if (!closeRequestIsCurrent()) {
+          return;
+        }
+
         const errorConfirmation = {
           ...APP_CLOSE_CONFIRM_INITIAL_STATE,
           error: getErrorMessage(error, "Unable to inspect running terminals before shutdown."),
+          generatedAtMs: requestGeneratedAtMs,
           isOpen: true,
           source: reason,
         };
@@ -13514,6 +13554,11 @@ export default function App() {
 
   const continueAppCloseAfterConfirmation = useCallback(() => {
     const currentConfirmation = appCloseConfirmStateRef.current;
+
+    if (currentConfirmation.isLoading) {
+      return;
+    }
+
     appCloseConfirmStateRef.current = APP_CLOSE_CONFIRM_INITIAL_STATE;
     setAppCloseConfirmState(APP_CLOSE_CONFIRM_INITIAL_STATE);
     performCloseWindow({
@@ -13521,6 +13566,22 @@ export default function App() {
       reason: `${currentConfirmation.source || "app_close"}_confirmed`,
     });
   }, [performCloseWindow]);
+
+  const keepRunningInBackgroundAfterConfirmation = useCallback(() => {
+    const currentConfirmation = appCloseConfirmStateRef.current;
+    appCloseConfirmStateRef.current = APP_CLOSE_CONFIRM_INITIAL_STATE;
+    setAppCloseConfirmState(APP_CLOSE_CONFIRM_INITIAL_STATE);
+    logTerminalStatus("frontend.app_close.background_selected", {
+      blockingCount: normalizeCloseCount(currentConfirmation.blockingCount),
+      reason: currentConfirmation.source || "app_close",
+      terminalCount: normalizeCloseCount(currentConfirmation.terminalCount),
+    });
+    void invoke("app_enter_background").catch((error) => {
+      logTerminalStatus("frontend.app_close.background_error", {
+        message: getErrorMessage(error, "Unable to keep Diff Forge running in the background."),
+      });
+    });
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -14741,8 +14802,8 @@ export default function App() {
     });
     return order;
   }, [workspaces]);
-  const workspaceTerminalsWorkspaces = useMemo(() => (
-    enabledWorkspaceRuntimeDescriptors
+  const workspaceTerminalsWorkspaces = useMemo(() => {
+    const activeWorkspaceRows = enabledWorkspaceRuntimeDescriptors
       .map((descriptor) => {
         const repoPath = String(descriptor.workingDirectory || "").trim();
         const workspaceId = String(descriptor.workspace?.id || "").trim();
@@ -14794,6 +14855,9 @@ export default function App() {
               liveTerminal && !["closed", "closing", "exited", "offline"].includes(liveStatus),
             );
             const terminalLifecycle = liveTerminalOpen ? "open" : "closed";
+            if (!liveTerminalOpen) {
+              return null;
+            }
             const liveRailActivity = String(
               liveTerminal?.activityStatus
                 || liveTerminal?.activity_status
@@ -14882,11 +14946,21 @@ export default function App() {
               activity_status: nativeRailState,
               color,
               colorSlot,
+              commandable: true,
+              connected: true,
+              displayStatus: nativeRailState,
+              display_status: nativeRailState,
               inputReady: Boolean(terminalLifecycle === "open" && readiness === "ready"),
+              lastKnownRuntime: false,
+              last_known_runtime: false,
               ...nativeRailFields,
+              nativeConnected: true,
+              native_connected: true,
               pane_id: paneId,
               paneId,
               readiness,
+              runtimeReadOnly: false,
+              runtime_read_only: false,
               sessionState: terminalLifecycle === "open" ? "session_attached" : "no_session",
               status,
               statusSeq,
@@ -14898,6 +14972,8 @@ export default function App() {
               terminalIndex,
               terminalInstanceId,
               terminalLifecycle,
+              terminalStatus: status,
+              terminal_status: status,
               displayName: terminalName,
               terminalName,
               terminal_name: terminalName,
@@ -14911,19 +14987,47 @@ export default function App() {
           .filter(Boolean);
 
         return {
+          commandable: true,
+          lastKnownRuntime: false,
+          last_known_runtime: false,
           repoPath,
+          runtimeReadOnly: false,
+          runtime_read_only: false,
           workspaceActive: true,
+          workspace_active: true,
           workspaceId,
+          workspace_id: workspaceId,
           workspaceIndex: workspaceSidebarOrderById.get(workspaceId) ?? 0,
           workspaceName: descriptor.workspace?.name || workspaceId,
+          workspace_name: descriptor.workspace?.name || workspaceId,
           workspaceOrder: workspaceSidebarOrderById.get(workspaceId) ?? 0,
           workspaceStatus: "active",
+          workspace_status: "active",
           terminals,
         };
       })
-      .filter(Boolean)
-  ), [
+      .filter(Boolean);
+    const activeWorkspaceIds = new Set(activeWorkspaceRows.map((workspace) => (
+      String(workspace?.workspaceId || workspace?.workspace_id || "").trim()
+    )).filter(Boolean));
+    const knownWorkspaceIds = new Set((workspaces || []).map((workspace) => (
+      String(workspace?.id || "").trim()
+    )).filter(Boolean));
+    const lastKnownRows = (Array.isArray(workspaceTerminalsWorkspacesRef.current)
+      ? workspaceTerminalsWorkspacesRef.current
+      : [])
+      .filter((workspace) => {
+        const workspaceId = String(workspace?.workspaceId || workspace?.workspace_id || "").trim();
+        return workspaceId && knownWorkspaceIds.has(workspaceId) && !activeWorkspaceIds.has(workspaceId);
+      })
+      .map((workspace) => markWorkspaceLastKnownRuntimeReadOnly(workspace));
+    return [
+      ...activeWorkspaceRows,
+      ...lastKnownRows,
+    ];
+  }, [
     enabledWorkspaceRuntimeDescriptors,
+    workspaces,
     workspaceSidebarOrderById,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
@@ -18396,25 +18500,46 @@ export default function App() {
           return workspace;
         }
         matched = true;
-        return {
+        const nextWorkspace = {
           ...workspace,
           repoPath: workspace?.repoPath || workspace?.repo_path || catalogTarget.repoPath,
           workspaceActive: Boolean(lifecycleOverride.active),
+          workspace_active: Boolean(lifecycleOverride.active),
           workspaceId: overrideWorkspaceId,
+          workspace_id: overrideWorkspaceId,
           workspaceName: workspace?.workspaceName || workspace?.workspace_name || catalogTarget.workspaceName,
+          workspace_name: workspace?.workspaceName || workspace?.workspace_name || catalogTarget.workspaceName,
           workspaceStatus: lifecycleOverride.active ? "active" : "deactivated",
-          ...(lifecycleOverride.active ? {} : { terminals: [] }),
+          workspace_status: lifecycleOverride.active ? "active" : "deactivated",
         };
+        if (lifecycleOverride.active) {
+          return {
+            ...nextWorkspace,
+            commandable: true,
+            lastKnownRuntime: false,
+            last_known_runtime: false,
+            runtimeReadOnly: false,
+            runtime_read_only: false,
+          };
+        }
+        return markWorkspaceLastKnownRuntimeReadOnly(nextWorkspace);
       });
       if (matched) {
         return adjusted;
       }
+      const fallbackWorkspace = {
+        ...catalogTarget,
+        workspaceActive: Boolean(lifecycleOverride.active),
+        workspace_active: Boolean(lifecycleOverride.active),
+        workspaceId: overrideWorkspaceId,
+        workspace_id: overrideWorkspaceId,
+        workspaceStatus: lifecycleOverride.active ? "active" : "deactivated",
+        workspace_status: lifecycleOverride.active ? "active" : "deactivated",
+        terminals: Array.isArray(catalogTarget.terminals) ? catalogTarget.terminals : [],
+      };
       return [
         ...adjusted,
-        {
-          ...catalogTarget,
-          terminals: [],
-        },
+        lifecycleOverride.active ? fallbackWorkspace : markWorkspaceLastKnownRuntimeReadOnly(fallbackWorkspace),
       ];
     };
     const syncRemoteControlState = async (reason, lifecycleOverride = null) => {
@@ -18422,17 +18547,17 @@ export default function App() {
         ? workspaceTerminalsWorkspacesRef.current
         : [];
       const catalogTargets = remoteControlWorkspaceCatalogTargets(lifecycleOverride);
-      if (catalogTargets.length > 0) {
-        await invoke("cloud_mcp_sync_device_live_workspaces", {
-          reason,
-          workspaces: catalogTargets,
-        }).catch(() => {});
-      }
       const adjustedWorkspaces = applyRemoteControlWorkspaceOverride(workspacesSnapshot, lifecycleOverride);
       if (adjustedWorkspaces.length > 0) {
         await invoke("cloud_mcp_sync_device_live_terminals", {
           reason,
           workspaces: adjustedWorkspaces,
+        }).catch(() => {});
+      }
+      if (catalogTargets.length > 0) {
+        await invoke("cloud_mcp_sync_device_live_workspaces", {
+          reason,
+          workspaces: catalogTargets,
         }).catch(() => {});
       }
       if (!lifecycleOverride) {
@@ -23783,8 +23908,10 @@ export default function App() {
         : "No live terminals to close"
       : "Counting live terminals"
     : `Step ${Math.min(workspaceClosePhaseIndex + 1, workspaceCloseTotalSteps)} / ${workspaceCloseTotalSteps}`;
+  const appCloseConfirmHasBlockingTerminals = appCloseConfirmState.blockingCount > 0;
   const appCloseConfirmTerminalLabel = appCloseConfirmState.blockingCount === 1 ? "terminal" : "terminals";
   const appCloseConfirmWorkspaceLabel = appCloseConfirmState.workspaces.length === 1 ? "workspace" : "workspaces";
+  const appCloseConfirmTitle = "Close Diff Forge AI?";
   const workspaceDeactivateReportedClosed = normalizeCloseCount(workspaceDeactivationState.closed);
   const workspaceDeactivateTotal = Math.max(
     normalizeCloseCount(workspaceDeactivationState.total),
@@ -25832,44 +25959,60 @@ export default function App() {
 	        </AppContent>
 
         {appCloseConfirmState.isOpen && (
-          <CrashRecoveryOverlay>
-            <CrashRecoveryDialog
+          <AppCloseOverlay>
+            <AppCloseDialog
               aria-labelledby="app-close-confirm-title"
               aria-modal="true"
               role="dialog"
             >
-              <WorkspaceSettingsDialogHeader>
+              <AppCloseHeader>
                 <WorkspaceSettingsHeaderMain>
-                  <PanelKicker>Shutdown check</PanelKicker>
-                  <PanelHeading id="app-close-confirm-title">
-                    {appCloseConfirmState.error ? "Confirm shutdown" : "Terminals still active"}
+                  <PanelKicker className="app-close-kicker">Close options</PanelKicker>
+                  <PanelHeading className="app-close-title" id="app-close-confirm-title">
+                    {appCloseConfirmTitle}
                   </PanelHeading>
                 </WorkspaceSettingsHeaderMain>
                 <WorkspaceSettingsHeaderActions>
                   <WorkspaceModalCloseButton
-                    aria-label="Cancel shutdown"
+                    aria-label="Stay in app"
                     onClick={cancelAppCloseConfirmation}
+                    title="Stay"
                     type="button"
                   >
                     <ButtonCloseIcon aria-hidden="true" />
                   </WorkspaceModalCloseButton>
                 </WorkspaceSettingsHeaderActions>
-              </WorkspaceSettingsDialogHeader>
+              </AppCloseHeader>
 
-              <CrashRecoveryIntro>
-                {appCloseConfirmState.error ? (
-                  <p>{appCloseConfirmState.error}</p>
-                ) : (
-                  <p>
-                    {appCloseConfirmState.blockingCount} {appCloseConfirmTerminalLabel} across{" "}
-                    {appCloseConfirmState.workspaces.length} {appCloseConfirmWorkspaceLabel} are not idle.
-                  </p>
-                )}
-                <p>Shutting down now will stop those terminal processes.</p>
-              </CrashRecoveryIntro>
+              <AppCloseBody>
+                <AppCloseIntro>
+                  {appCloseConfirmState.isLoading ? (
+                    <p>Checking running terminals before you choose what happens.</p>
+                  ) : appCloseConfirmState.error ? (
+                    <p>{appCloseConfirmState.error}</p>
+                  ) : appCloseConfirmHasBlockingTerminals ? (
+                    <p>
+                      {appCloseConfirmState.blockingCount} {appCloseConfirmTerminalLabel} across{" "}
+                      {appCloseConfirmState.workspaces.length} {appCloseConfirmWorkspaceLabel} are not idle.
+                    </p>
+                  ) : (
+                    <p>Close completely, keep Diff Forge AI tucked away, or stay right here.</p>
+                  )}
+                  {!appCloseConfirmState.isLoading && (
+                    <AppCloseHint>
+                      {appCloseConfirmHasBlockingTerminals
+                        ? "Close App stops terminals. Keep Running leaves them awake."
+                        : "Keep Running leaves terminals, sync, and hotkeys awake."}
+                    </AppCloseHint>
+                  )}
+                </AppCloseIntro>
+                <AppCloseMark aria-hidden="true">
+                  <img alt="" src="/logo.webp" />
+                </AppCloseMark>
+              </AppCloseBody>
 
-              {!appCloseConfirmState.error && (
-                <CrashRecoveryList>
+              {!appCloseConfirmState.error && appCloseConfirmHasBlockingTerminals && (
+                <AppCloseList>
                   {appCloseConfirmState.workspaces.map((workspace) => (
                     <CrashRecoveryItem key={workspace.workspaceId || workspace.repoPath || workspace.workspaceName}>
                       <CrashRecoveryItemTitle>
@@ -25894,21 +26037,50 @@ export default function App() {
                       ))}
                     </CrashRecoveryItem>
                   ))}
-                </CrashRecoveryList>
+                </AppCloseList>
               )}
 
-              <CrashRecoveryActions>
-                <SecondaryButton onClick={cancelAppCloseConfirmation} type="button">
+              <AppCloseActions aria-label="Close choices">
+                <AppCloseActionButton
+                  aria-label="Close Diff Forge AI completely"
+                  data-tone="danger"
+                  disabled={appCloseConfirmState.isLoading}
+                  onClick={continueAppCloseAfterConfirmation}
+                  type="button"
+                >
                   <ButtonCloseIcon aria-hidden="true" />
-                  <span>Cancel</span>
-                </SecondaryButton>
-                <PrimaryDangerButton onClick={continueAppCloseAfterConfirmation} type="button">
+                  <AppCloseActionCopy>
+                    <strong>Close App</strong>
+                    <small>Quit completely</small>
+                  </AppCloseActionCopy>
+                </AppCloseActionButton>
+                <AppCloseActionButton
+                  aria-label="Keep Diff Forge AI running in the background"
+                  data-tone="background"
+                  onClick={keepRunningInBackgroundAfterConfirmation}
+                  type="button"
+                >
+                  <TitleBackgroundIcon aria-hidden="true" />
+                  <AppCloseActionCopy>
+                    <strong>Keep Running</strong>
+                    <small>Hide window</small>
+                  </AppCloseActionCopy>
+                </AppCloseActionButton>
+                <AppCloseActionButton
+                  aria-label="Stay in Diff Forge AI"
+                  data-tone="stay"
+                  onClick={cancelAppCloseConfirmation}
+                  type="button"
+                >
                   <ButtonCheckIcon aria-hidden="true" />
-                  <span>Shut down anyway</span>
-                </PrimaryDangerButton>
-              </CrashRecoveryActions>
-            </CrashRecoveryDialog>
-          </CrashRecoveryOverlay>
+                  <AppCloseActionCopy>
+                    <strong>Stay</strong>
+                    <small>Keep working</small>
+                  </AppCloseActionCopy>
+                </AppCloseActionButton>
+              </AppCloseActions>
+            </AppCloseDialog>
+          </AppCloseOverlay>
         )}
 
         {workspaceCloseState.isActive && (

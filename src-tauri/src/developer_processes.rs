@@ -8,9 +8,15 @@ const DEVELOPER_PROCESS_COMMAND_LIMIT: usize = 4096;
 const DOCKER_DEVELOPER_OUTPUT_LIMIT: usize = 4096;
 const DOCKER_DEVELOPER_INSPECT_LIMIT: usize = 120;
 const DEVELOPER_PROCESS_PORT_SCAN_LIMIT: usize = 2048;
+const DEVELOPER_PROCESS_SNAPSHOT_CACHE_MS: u64 = 1500;
+const DEVELOPER_PROCESS_PORT_CACHE_MS: u64 = 60_000;
+const DOCKER_CONTAINER_SNAPSHOT_CACHE_MS: u64 = 25_000;
 
 struct DeveloperProcessMonitorState {
     system: Arc<StdMutex<SysSystem>>,
+    port_cache: Arc<StdMutex<DeveloperProcessPortCache>>,
+    snapshot_cache: Arc<StdMutex<Option<DeveloperProcessSnapshotCache>>>,
+    docker_container_cache: Arc<StdMutex<Option<DockerContainerSnapshotCache>>>,
 }
 
 impl DeveloperProcessMonitorState {
@@ -24,8 +30,43 @@ impl DeveloperProcessMonitorState {
 
         Self {
             system: Arc::new(StdMutex::new(system)),
+            port_cache: Arc::new(StdMutex::new(DeveloperProcessPortCache::default())),
+            snapshot_cache: Arc::new(StdMutex::new(None)),
+            docker_container_cache: Arc::new(StdMutex::new(None)),
         }
     }
+
+    fn invalidate_process_snapshot_cache(&self) {
+        if let Ok(mut cache) = self.snapshot_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    fn invalidate_docker_container_cache(&self) {
+        if let Ok(mut cache) = self.docker_container_cache.lock() {
+            *cache = None;
+        }
+    }
+}
+
+#[derive(Default)]
+struct DeveloperProcessPortCache {
+    sampled_at_ms: u64,
+    ports_by_pid: HashMap<u32, Vec<DeveloperProcessPort>>,
+}
+
+#[derive(Clone)]
+struct DeveloperProcessSnapshotCache {
+    key: String,
+    sampled_at_ms: u64,
+    snapshot: DeveloperProcessSnapshot,
+}
+
+#[derive(Clone)]
+struct DockerContainerSnapshotCache {
+    include_stats: bool,
+    sampled_at_ms: u64,
+    snapshot: Value,
 }
 
 #[derive(Serialize, Clone)]
@@ -33,12 +74,88 @@ impl DeveloperProcessMonitorState {
 struct DeveloperProcessSnapshot {
     platform: &'static str,
     sampled_at_ms: u64,
+    energy: DeveloperEnergySnapshot,
     processes: Vec<DeveloperProcessInfo>,
     groups: Vec<DeveloperProcessGroup>,
     total_cpu_percent: f64,
     total_memory_bytes: u64,
     high_activity_count: usize,
     protected_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DeveloperEnergySnapshot {
+    sampled_at_ms: u64,
+    total_score: f64,
+    active_group_count: usize,
+    top_label: String,
+    top_cause: String,
+    groups: Vec<DeveloperEnergyGroup>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DeveloperEnergyGroup {
+    id: String,
+    label: String,
+    description: String,
+    cause: String,
+    score: f64,
+    cpu_percent: f64,
+    memory_bytes: u64,
+    process_count: usize,
+    pids: Vec<u32>,
+    confidence: String,
+    intensity: String,
+}
+
+#[derive(Clone)]
+struct DeveloperEnergyGroupBuilder {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    cause: &'static str,
+    confidence: &'static str,
+    score: f64,
+    cpu_percent: f64,
+    memory_bytes: u64,
+    process_count: usize,
+    pids: Vec<u32>,
+}
+
+struct DeveloperEnergyBuildContext {
+    sampled_at_ms: u64,
+    seen_pids: HashSet<u32>,
+    groups: HashMap<&'static str, DeveloperEnergyGroupBuilder>,
+    app_core: Option<DeveloperEnergyCoreProcess>,
+}
+
+#[derive(Clone)]
+struct DeveloperEnergyCoreProcess {
+    pid: u32,
+    cpu_percent: f64,
+    memory_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DeveloperEnergyInternalSignals {
+    terminal_root_count: usize,
+    workspace_root_count: usize,
+    visible_process_count: usize,
+    docker_process_count: usize,
+    cloud: DeveloperEnergyCloudSignals,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeveloperEnergyCloudSignals {
+    global_ws_connected: bool,
+    global_ws_retrying: bool,
+    outbox_pending_count: usize,
+    outbox_retrying_count: usize,
+    outbox_dead_letter_count: usize,
+    registered_workspace_count: usize,
+    terminal_context_count: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -277,34 +394,49 @@ struct DeveloperTerminalProcessRoot {
 #[tauri::command]
 async fn list_developer_processes(
     state: State<'_, DeveloperProcessMonitorState>,
+    cloud_state: State<'_, CloudMcpState>,
     terminal_state: State<'_, TerminalState>,
     active_workspace_root: Option<String>,
     workspace_roots: Vec<String>,
+    force: Option<bool>,
 ) -> Result<DeveloperProcessSnapshot, String> {
     collect_developer_process_snapshot(
         state.inner(),
+        Some(cloud_state.inner()),
         terminal_state.inner(),
         active_workspace_root,
         workspace_roots,
+        force.unwrap_or(false),
     )
     .await
 }
 
 async fn collect_developer_process_snapshot(
     state: &DeveloperProcessMonitorState,
+    cloud_state: Option<&CloudMcpState>,
     terminal_state: &TerminalState,
     active_workspace_root: Option<String>,
     workspace_roots: Vec<String>,
+    force: bool,
 ) -> Result<DeveloperProcessSnapshot, String> {
     let active_workspace_root = normalize_optional_process_root(active_workspace_root.as_deref());
     let workspace_roots =
         normalize_process_roots(workspace_roots, active_workspace_root.as_deref());
     let app_pid = std::process::id();
+    let sampled_at_ms = current_time_ms();
+    let cache_key =
+        developer_process_snapshot_cache_key(active_workspace_root.as_deref(), &workspace_roots);
+    if !force {
+        if let Some(snapshot) =
+            developer_cached_process_snapshot(state, &cache_key, sampled_at_ms)
+        {
+            return Ok(snapshot);
+        }
+    }
 
     let terminal_roots = developer_terminal_process_roots(&terminal_state).await;
-    let bound_ports_by_pid = tauri::async_runtime::spawn_blocking(developer_bound_ports_by_pid)
-        .await
-        .unwrap_or_default();
+    let cloud_signals = developer_energy_cloud_signals(cloud_state).await;
+    let bound_ports_by_pid = developer_bound_ports_by_pid_cached(state, sampled_at_ms, force).await;
 
     let (
         processes,
@@ -313,6 +445,7 @@ async fn collect_developer_process_snapshot(
         total_memory_bytes,
         high_activity_count,
         protected_count,
+        energy,
     ) = {
         let mut system = state
             .system
@@ -326,18 +459,16 @@ async fn collect_developer_process_snapshot(
 
         let parent_map = developer_parent_map(&system);
         let child_map = developer_child_map(&system);
+        let app_descendant_pids = developer_descendant_pid_set(app_pid, &child_map);
         let terminal_roots_by_pid = terminal_roots
             .iter()
             .map(|root| (root.root_pid, root))
             .collect::<HashMap<_, _>>();
+        let mut energy = DeveloperEnergyBuildContext::new(sampled_at_ms);
         let mut processes = Vec::new();
 
         for (pid, process) in system.processes() {
             let pid_u32 = pid.as_u32();
-            if pid_u32 == app_pid {
-                continue;
-            }
-
             let parent_pid = process.parent().map(|value| value.as_u32());
             let terminal_link =
                 developer_terminal_link_for_process(pid_u32, &terminal_roots_by_pid, &parent_map);
@@ -345,6 +476,24 @@ async fn collect_developer_process_snapshot(
             let command = process_command_text(process.cmd());
             let executable = process.exe().map(process_path_display).unwrap_or_default();
             let cwd = process.cwd().map(process_path_display).unwrap_or_default();
+            let in_app_family = pid_u32 == app_pid || app_descendant_pids.contains(&pid_u32);
+            energy.add_process(
+                pid_u32,
+                &name,
+                &command,
+                &executable,
+                &cwd,
+                f64::from(process.cpu_usage()).max(0.0),
+                process.memory(),
+                pid_u32 == app_pid,
+                in_app_family,
+                terminal_link.is_some(),
+            );
+
+            if pid_u32 == app_pid {
+                continue;
+            }
+
             let attribution = if terminal_link.is_some() {
                 DeveloperProcessAttribution {
                     id: "diffForge",
@@ -466,6 +615,16 @@ async fn collect_developer_process_snapshot(
             })
             .count();
         let protected_count = processes.iter().filter(|process| !process.killable).count();
+        let energy_signals = DeveloperEnergyInternalSignals {
+            terminal_root_count: terminal_roots.len(),
+            workspace_root_count: workspace_roots.len(),
+            visible_process_count: processes.len(),
+            docker_process_count: processes
+                .iter()
+                .filter(|process| process.group_kind == "docker")
+                .count(),
+            cloud: cloud_signals,
+        };
 
         (
             processes,
@@ -474,19 +633,129 @@ async fn collect_developer_process_snapshot(
             total_memory_bytes,
             high_activity_count,
             protected_count,
+            energy.finish(energy_signals),
         )
     };
 
-    Ok(DeveloperProcessSnapshot {
+    let snapshot = DeveloperProcessSnapshot {
         platform: developer_process_platform(),
-        sampled_at_ms: current_time_ms(),
+        sampled_at_ms,
+        energy,
         processes,
         groups,
         total_cpu_percent,
         total_memory_bytes,
         high_activity_count,
         protected_count,
-    })
+    };
+    developer_store_process_snapshot_cache(state, cache_key, sampled_at_ms, &snapshot);
+    Ok(snapshot)
+}
+
+fn developer_process_snapshot_cache_key(
+    active_workspace_root: Option<&str>,
+    workspace_roots: &[String],
+) -> String {
+    let mut roots = workspace_roots.to_vec();
+    roots.sort();
+    format!(
+        "active={}\nroots={}",
+        active_workspace_root.unwrap_or_default(),
+        roots.join("\n")
+    )
+}
+
+fn developer_cached_process_snapshot(
+    state: &DeveloperProcessMonitorState,
+    cache_key: &str,
+    now_ms: u64,
+) -> Option<DeveloperProcessSnapshot> {
+    let cache = state.snapshot_cache.lock().ok()?;
+    let cache = cache.as_ref()?;
+    if cache.key != cache_key {
+        return None;
+    }
+    if now_ms.saturating_sub(cache.sampled_at_ms) > DEVELOPER_PROCESS_SNAPSHOT_CACHE_MS {
+        return None;
+    }
+    Some(cache.snapshot.clone())
+}
+
+fn developer_store_process_snapshot_cache(
+    state: &DeveloperProcessMonitorState,
+    cache_key: String,
+    sampled_at_ms: u64,
+    snapshot: &DeveloperProcessSnapshot,
+) {
+    if let Ok(mut cache) = state.snapshot_cache.lock() {
+        *cache = Some(DeveloperProcessSnapshotCache {
+            key: cache_key,
+            sampled_at_ms,
+            snapshot: snapshot.clone(),
+        });
+    }
+}
+
+async fn developer_bound_ports_by_pid_cached(
+    state: &DeveloperProcessMonitorState,
+    now_ms: u64,
+    force: bool,
+) -> HashMap<u32, Vec<DeveloperProcessPort>> {
+    if !force {
+        if let Ok(cache) = state.port_cache.lock() {
+            if now_ms.saturating_sub(cache.sampled_at_ms) <= DEVELOPER_PROCESS_PORT_CACHE_MS {
+                return cache.ports_by_pid.clone();
+            }
+        }
+    }
+
+    let ports_by_pid = tauri::async_runtime::spawn_blocking(developer_bound_ports_by_pid)
+        .await
+        .unwrap_or_default();
+    if let Ok(mut cache) = state.port_cache.lock() {
+        cache.sampled_at_ms = now_ms;
+        cache.ports_by_pid = ports_by_pid.clone();
+    }
+    ports_by_pid
+}
+
+async fn developer_energy_cloud_signals(
+    state: Option<&CloudMcpState>,
+) -> DeveloperEnergyCloudSignals {
+    let Some(state) = state else {
+        return DeveloperEnergyCloudSignals::default();
+    };
+
+    let (global_ws_connected, global_ws_retrying, registered_workspace_count, terminal_context_count) = {
+        let runtime = state.inner.lock().await;
+        let ws_status = runtime.global_ws_status.to_ascii_lowercase();
+        (
+            runtime.global_ws_connected,
+            !runtime.global_ws_connected
+                && (ws_status.contains("retry")
+                    || ws_status.contains("connecting")
+                    || ws_status.contains("resolving")
+                    || ws_status.contains("authenticating")),
+            runtime.registered_workspaces.len(),
+            runtime.terminal_contexts.len(),
+        )
+    };
+    let (
+        outbox_pending_count,
+        outbox_retrying_count,
+        outbox_dead_letter_count,
+        _outbox_oldest_pending_ms,
+    ) = cloud_mcp_outbox_status_counts();
+
+    DeveloperEnergyCloudSignals {
+        global_ws_connected,
+        global_ws_retrying,
+        outbox_pending_count,
+        outbox_retrying_count,
+        outbox_dead_letter_count,
+        registered_workspace_count,
+        terminal_context_count,
+    }
 }
 
 #[tauri::command]
@@ -510,9 +779,11 @@ async fn terminal_activity_snapshot(
     let activity_events_path_text = activity_events_path.to_string_lossy().to_string();
     let process_snapshot = collect_developer_process_snapshot(
         state.inner(),
+        None,
         terminal_state.inner(),
         None,
         Vec::new(),
+        false,
     )
     .await?;
 
@@ -1447,6 +1718,7 @@ fn kill_developer_process(
             true,
             developer_process_refresh_kind(),
         );
+        state.invalidate_process_snapshot_cache();
         return Ok(result);
     }
 
@@ -1489,6 +1761,7 @@ fn kill_developer_process(
             format!("Termination signal sent to process {pid}.")
         };
 
+        state.invalidate_process_snapshot_cache();
         Ok(DeveloperProcessKillResult {
             requested_pid: pid,
             include_tree,
@@ -1502,14 +1775,18 @@ fn kill_developer_process(
 
 #[tauri::command]
 async fn docker_developer_action(
+    state: State<'_, DeveloperProcessMonitorState>,
     action: String,
     workspace_roots: Vec<String>,
 ) -> Result<DockerDeveloperActionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         docker_developer_action_blocking(&action, workspace_roots)
     })
     .await
-    .map_err(|error| format!("Unable to join Docker action worker: {error}"))?
+    .map_err(|error| format!("Unable to join Docker action worker: {error}"))?;
+    state.invalidate_docker_container_cache();
+    state.invalidate_process_snapshot_cache();
+    result
 }
 
 const DOCKER_CONTAINER_LIST_LIMIT: usize = 200;
@@ -1624,12 +1901,60 @@ fn docker_cli_is_missing(result: &DockerDeveloperCommandResult) -> bool {
 /// stats. Runs entirely through the Rust CLI bridge so the panel keeps
 /// working in background/headless mode.
 #[tauri::command]
-async fn docker_containers_snapshot(include_stats: Option<bool>) -> Result<Value, String> {
+async fn docker_containers_snapshot(
+    state: State<'_, DeveloperProcessMonitorState>,
+    include_stats: Option<bool>,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    let include_stats = include_stats.unwrap_or(false);
+    let now_ms = current_time_ms();
+    if !force.unwrap_or(false) {
+        if let Some(snapshot) =
+            docker_cached_container_snapshot(state.inner(), include_stats, now_ms)
+        {
+            return Ok(snapshot);
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        docker_containers_snapshot_blocking(include_stats.unwrap_or(false))
+        docker_containers_snapshot_blocking(include_stats)
     })
     .await
     .map_err(|error| format!("Unable to join Docker snapshot worker: {error}"))?
+    .map(|snapshot| {
+        docker_store_container_snapshot(state.inner(), include_stats, now_ms, &snapshot);
+        snapshot
+    })
+}
+
+fn docker_cached_container_snapshot(
+    state: &DeveloperProcessMonitorState,
+    include_stats: bool,
+    now_ms: u64,
+) -> Option<Value> {
+    let cache = state.docker_container_cache.lock().ok()?;
+    let cache = cache.as_ref()?;
+    if include_stats && !cache.include_stats {
+        return None;
+    }
+    if now_ms.saturating_sub(cache.sampled_at_ms) > DOCKER_CONTAINER_SNAPSHOT_CACHE_MS {
+        return None;
+    }
+    Some(cache.snapshot.clone())
+}
+
+fn docker_store_container_snapshot(
+    state: &DeveloperProcessMonitorState,
+    include_stats: bool,
+    sampled_at_ms: u64,
+    snapshot: &Value,
+) {
+    if let Ok(mut cache) = state.docker_container_cache.lock() {
+        *cache = Some(DockerContainerSnapshotCache {
+            include_stats,
+            sampled_at_ms,
+            snapshot: snapshot.clone(),
+        });
+    }
 }
 
 fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, String> {
@@ -1765,12 +2090,19 @@ fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, Str
 /// Per-container control (start/stop/restart/pause/unpause/remove) with a
 /// feedback payload the Processes tab renders inline.
 #[tauri::command]
-async fn docker_container_action(container_ref: String, action: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn docker_container_action(
+    state: State<'_, DeveloperProcessMonitorState>,
+    container_ref: String,
+    action: String,
+) -> Result<Value, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         docker_container_action_blocking(&container_ref, &action)
     })
     .await
-    .map_err(|error| format!("Unable to join Docker container action worker: {error}"))?
+    .map_err(|error| format!("Unable to join Docker container action worker: {error}"))?;
+    state.invalidate_docker_container_cache();
+    state.invalidate_process_snapshot_cache();
+    result
 }
 
 fn docker_container_action_blocking(container_ref: &str, action: &str) -> Result<Value, String> {
@@ -3135,10 +3467,10 @@ fn developer_process_refresh_kind() -> ProcessRefreshKind {
     ProcessRefreshKind::nothing()
         .with_cpu()
         .with_memory()
-        .with_cmd(UpdateKind::Always)
-        .with_exe(UpdateKind::Always)
-        .with_cwd(UpdateKind::Always)
-        .with_tasks()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_cwd(UpdateKind::OnlyIfNotSet)
+        .without_tasks()
 }
 
 fn developer_process_platform() -> &'static str {
@@ -3195,6 +3527,513 @@ fn developer_descendant_count(pid: u32, child_map: &HashMap<u32, Vec<u32>>) -> u
     let mut seen = HashSet::new();
     developer_collect_descendants(pid, child_map, &mut seen);
     seen.len()
+}
+
+fn developer_descendant_pid_set(pid: u32, child_map: &HashMap<u32, Vec<u32>>) -> HashSet<u32> {
+    let mut seen = HashSet::new();
+    developer_collect_descendants(pid, child_map, &mut seen);
+    seen
+}
+
+impl DeveloperEnergyBuildContext {
+    fn new(sampled_at_ms: u64) -> Self {
+        Self {
+            sampled_at_ms,
+            seen_pids: HashSet::new(),
+            groups: HashMap::new(),
+            app_core: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_process(
+        &mut self,
+        pid: u32,
+        name: &str,
+        command: &str,
+        executable: &str,
+        cwd: &str,
+        cpu_percent: f64,
+        memory_bytes: u64,
+        is_app_process: bool,
+        in_app_family: bool,
+        terminal_owned: bool,
+    ) {
+        if !self.seen_pids.insert(pid) {
+            return;
+        }
+        if is_app_process {
+            self.app_core = Some(DeveloperEnergyCoreProcess {
+                pid,
+                cpu_percent: cpu_percent.max(0.0),
+                memory_bytes,
+            });
+            return;
+        }
+
+        let Some(category) = developer_energy_category_for_process(
+            name,
+            command,
+            executable,
+            cwd,
+            in_app_family,
+            terminal_owned,
+        ) else {
+            return;
+        };
+        let (label, description, cause, confidence) = developer_energy_category_metadata(category);
+        let builder = self.groups.entry(category).or_insert_with(|| DeveloperEnergyGroupBuilder {
+            id: category,
+            label,
+            description,
+            cause,
+            confidence,
+            score: 0.0,
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            process_count: 0,
+            pids: Vec::new(),
+        });
+        let cpu_percent = cpu_percent.max(0.0);
+        builder.score += developer_process_energy_score(category, cpu_percent, memory_bytes);
+        builder.cpu_percent += cpu_percent;
+        builder.memory_bytes = builder.memory_bytes.saturating_add(memory_bytes);
+        builder.process_count += 1;
+        builder.pids.push(pid);
+    }
+
+    fn finish(mut self, signals: DeveloperEnergyInternalSignals) -> DeveloperEnergySnapshot {
+        self.add_internal_app_core_breakdown(signals);
+
+        let mut groups = self
+            .groups
+            .into_values()
+            .map(|mut builder| {
+                builder.pids.sort_unstable();
+                DeveloperEnergyGroup {
+                    id: builder.id.to_string(),
+                    label: builder.label.to_string(),
+                    description: builder.description.to_string(),
+                    cause: builder.cause.to_string(),
+                    score: developer_round_energy(builder.score),
+                    cpu_percent: developer_round_energy(builder.cpu_percent),
+                    memory_bytes: builder.memory_bytes,
+                    process_count: builder.process_count,
+                    pids: builder.pids,
+                    confidence: builder.confidence.to_string(),
+                    intensity: developer_energy_intensity(builder.score).to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        groups.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+
+        let total_score = developer_round_energy(groups.iter().map(|group| group.score).sum());
+        let active_group_count = groups.iter().filter(|group| group.score >= 1.0).count();
+        let top_label = groups
+            .first()
+            .map(|group| group.label.clone())
+            .unwrap_or_else(|| "Idle".to_string());
+        let top_cause = groups
+            .first()
+            .map(|group| group.cause.clone())
+            .unwrap_or_else(|| "No notable Diff Forge energy activity detected.".to_string());
+
+        DeveloperEnergySnapshot {
+            sampled_at_ms: self.sampled_at_ms,
+            total_score,
+            active_group_count,
+            top_label,
+            top_cause,
+            groups,
+        }
+    }
+
+    fn add_internal_app_core_breakdown(&mut self, signals: DeveloperEnergyInternalSignals) {
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+
+        let has_terminals = signals.terminal_root_count > 0;
+        let has_workspaces = signals.workspace_root_count > 0;
+        let has_docker = signals.docker_process_count > 0;
+        let active_processes = signals.visible_process_count > 0;
+        let mut weights = vec![
+            (
+                "activityMonitor",
+                if active_processes { 0.42 } else { 0.28 },
+            ),
+            (
+                "terminalBackend",
+                if has_terminals { 0.15 } else { 0.03 },
+            ),
+            (
+                "workspaceFiles",
+                if has_workspaces { 0.10 } else { 0.04 },
+            ),
+            (
+                "dockerBridge",
+                if has_docker { 0.07 } else { 0.02 },
+            ),
+            ("appLifecycle", 0.08),
+            ("audioNative", 0.02),
+            ("snippingNative", 0.02),
+        ];
+        weights.extend(developer_energy_coordination_cloud_weights(
+            signals.cloud,
+            has_terminals,
+            has_workspaces,
+        ));
+        let total_weight = weights
+            .iter()
+            .map(|(_, weight)| *weight)
+            .sum::<f64>()
+            .max(1.0);
+
+        for (category, weight) in weights.drain(..) {
+            let normalized_weight = weight / total_weight;
+            self.add_weighted_internal_core_group(
+                category,
+                core.pid,
+                core.cpu_percent * normalized_weight,
+                (core.memory_bytes as f64 * normalized_weight).round() as u64,
+            );
+        }
+    }
+
+    fn add_weighted_internal_core_group(
+        &mut self,
+        category: &'static str,
+        pid: u32,
+        cpu_percent: f64,
+        memory_bytes: u64,
+    ) {
+        let (label, description, cause, confidence) = developer_energy_category_metadata(category);
+        let builder = self.groups.entry(category).or_insert_with(|| DeveloperEnergyGroupBuilder {
+            id: category,
+            label,
+            description,
+            cause,
+            confidence,
+            score: 0.0,
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            process_count: 0,
+            pids: Vec::new(),
+        });
+        builder.score += developer_process_energy_score(category, cpu_percent, memory_bytes);
+        builder.cpu_percent += cpu_percent;
+        builder.memory_bytes = builder.memory_bytes.saturating_add(memory_bytes);
+        builder.process_count = builder.process_count.max(1);
+        if !builder.pids.contains(&pid) {
+            builder.pids.push(pid);
+        }
+    }
+}
+
+fn developer_energy_coordination_cloud_weights(
+    cloud: DeveloperEnergyCloudSignals,
+    has_terminals: bool,
+    has_workspaces: bool,
+) -> Vec<(&'static str, f64)> {
+    const COORDINATION_CLOUD_BUDGET: f64 = 0.14;
+
+    let outbox_depth =
+        cloud.outbox_pending_count + cloud.outbox_retrying_count + cloud.outbox_dead_letter_count;
+    let mut relative = vec![
+        ("coordinationKernel", 0.22),
+        (
+            "cloudWebSocket",
+            if cloud.global_ws_connected {
+                0.20
+            } else if cloud.global_ws_retrying {
+                0.24
+            } else {
+                0.12
+            },
+        ),
+        (
+            "sqliteOutbox",
+            if outbox_depth > 0 {
+                0.22 + (outbox_depth.min(24) as f64 / 24.0) * 0.08
+            } else {
+                0.10
+            },
+        ),
+        (
+            "mcpBridge",
+            if has_terminals || cloud.terminal_context_count > 0 {
+                0.16
+            } else {
+                0.10
+            },
+        ),
+        (
+            "deviceLiveState",
+            if has_workspaces || cloud.registered_workspace_count > 0 {
+                0.15
+            } else {
+                0.08
+            },
+        ),
+        ("tokenomicsSync", 0.08),
+        ("cloudBackgroundWatchers", 0.10),
+    ];
+    let total = relative
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f64>()
+        .max(f64::EPSILON);
+
+    relative
+        .drain(..)
+        .map(|(category, weight)| (category, COORDINATION_CLOUD_BUDGET * weight / total))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn developer_energy_category_for_process(
+    name: &str,
+    command: &str,
+    executable: &str,
+    cwd: &str,
+    in_app_family: bool,
+    terminal_owned: bool,
+) -> Option<&'static str> {
+    if terminal_owned {
+        return Some("terminals");
+    }
+    if !in_app_family {
+        return None;
+    }
+
+    let haystack = [name, command, executable, cwd]
+        .join(" ")
+        .to_lowercase();
+
+    if haystack.contains("audio")
+        || haystack.contains("voice")
+        || haystack.contains("microphone")
+        || haystack.contains("whisper")
+        || haystack.contains("deepgram")
+    {
+        return Some("audio");
+    }
+    if haystack.contains("network")
+        || haystack.contains("cloud")
+        || haystack.contains("mcp")
+        || haystack.contains("reqwest")
+        || haystack.contains("websocket")
+    {
+        return Some("networking");
+    }
+    if haystack.contains("graphics")
+        || haystack.contains("media")
+        || haystack.contains("gpu")
+        || haystack.contains("compositor")
+    {
+        return Some("graphicsMedia");
+    }
+    if haystack.contains("activity monitor") || haystack.contains("process monitor") {
+        return Some("activityMonitor");
+    }
+    if haystack.contains("tauri://localhost")
+        || haystack.contains("webcontent")
+        || haystack.contains("webkit")
+        || haystack.contains("webview")
+        || haystack.contains("renderer")
+        || haystack.contains("localhost")
+    {
+        return Some("workspaceUi");
+    }
+    if haystack.contains("docker")
+        || haystack.contains("node")
+        || haystack.contains("npm")
+        || haystack.contains("vite")
+        || haystack.contains("cargo")
+        || haystack.contains("python")
+    {
+        return Some("workspaceServices");
+    }
+
+    Some("background")
+}
+
+fn developer_energy_category_metadata(
+    category: &str,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match category {
+        "workspaceUi" => (
+            "Workspace UI/WebViews",
+            "Tauri/WebKit views that host workspaces, tabs, files, settings, and panels.",
+            "WebView rendering, mounted tabs, visible panels, or browser-side work.",
+            "measured helper estimate",
+        ),
+        "graphicsMedia" => (
+            "Graphics and media",
+            "macOS graphics/media helpers used by WebViews, canvases, previews, and media.",
+            "Rendering, media compositing, canvas/WebGL, previews, or animation.",
+            "measured helper estimate",
+        ),
+        "networking" => (
+            "Networking and MCP",
+            "Network helpers, cloud sync, API requests, MCP bridges, and websocket traffic.",
+            "Cloud/API traffic, MCP calls, websocket work, or background sync.",
+            "measured helper estimate",
+        ),
+        "terminals" => (
+            "Terminals and agents",
+            "Diff Forge-owned terminal shells, coding agents, PTYs, and their child tools.",
+            "Agent CPU, terminal output, PTY activity, shell tools, or builds.",
+            "measured process estimate",
+        ),
+        "audio" => (
+            "Audio and voice",
+            "Audio capture, voice widgets, transcription helpers, and voice network paths.",
+            "Microphone capture, VAD, transcription, or voice streaming.",
+            "measured helper estimate",
+        ),
+        "activityMonitor" => (
+            "Process monitor",
+            "Process and energy sampling, process classification, port lookup, and Docker/process refresh work.",
+            "Processes tab sampling, CPU/memory refresh, process classification, or port scans.",
+            "internal estimate",
+        ),
+        "terminalBackend" => (
+            "Terminal backend",
+            "PTY management, terminal I/O transport, terminal cleanup, and terminal activity mapping.",
+            "PTY I/O, terminal output transport, terminal lifecycle, or agent terminal mapping.",
+            "internal estimate",
+        ),
+        "coordinationKernel" => (
+            "Coordination kernel",
+            "Task/session state, leases, checkpoints, patch lifecycle, and local coordination events.",
+            "Local task/session bookkeeping, lease checks, checkpoint writes, or patch state updates.",
+            "internal estimate",
+        ),
+        "cloudWebSocket" => (
+            "Cloud websocket",
+            "Cloud app websocket connection, route resolution, keepalive pings, reconnects, and live message routing.",
+            "Websocket keepalive, reconnecting, route lookup, cloud auth, or live cloud messages.",
+            "internal estimate",
+        ),
+        "sqliteOutbox" => (
+            "SQLite sync outbox",
+            "Durable Cloud sync queue, coalescing, retry bookkeeping, acknowledgement writes, and pending status counts.",
+            "Queued cloud events, retry rows, outbox SQLite reads/writes, or sync status updates.",
+            "internal estimate",
+        ),
+        "mcpBridge" => (
+            "MCP bridge",
+            "Coordination MCP proxy, workspace MCP gateway, tool routing, and agent metadata enrichment.",
+            "MCP calls, local proxy routing, workspace gateway traffic, or agent coordination tool activity.",
+            "internal estimate",
+        ),
+        "deviceLiveState" => (
+            "Device live state",
+            "Live workspace, terminal, server, architecture, and device snapshots published to Cloud.",
+            "Device/workspace/terminal snapshot publishing or live-state convergence.",
+            "internal estimate",
+        ),
+        "tokenomicsSync" => (
+            "Tokenomics sync",
+            "Usage scanning, account/provider reconciliation, tokenomics deltas, and billing-scope summary sync.",
+            "Tokenomics scans, local usage database reads, account reconciliation, or usage snapshot publishing.",
+            "internal estimate",
+        ),
+        "cloudBackgroundWatchers" => (
+            "Cloud watchers",
+            "Headless architecture checks, agent inventory checks, remote command listeners, and todo/cloud maintenance loops.",
+            "Background cloud watchers, remote command handling, inventory checks, or todo/cloud maintenance.",
+            "internal estimate",
+        ),
+        "workspaceFiles" => (
+            "Workspace and files",
+            "Workspace validation, file browsing, file actions, workspace metadata, and native file services.",
+            "Workspace/file requests, metadata work, validation, or file service activity.",
+            "internal estimate",
+        ),
+        "dockerBridge" => (
+            "Docker bridge",
+            "Docker container snapshots, stats, logs, lifecycle actions, and Compose-related checks.",
+            "Docker stats, container refresh, logs, or Compose bridge work.",
+            "internal estimate",
+        ),
+        "appLifecycle" => (
+            "App lifecycle and windows",
+            "Tauri IPC, app lifecycle, windows, deep links, tray/background mode, notifications, and shortcuts.",
+            "Tauri command handling, windows, background mode, shortcuts, or app lifecycle work.",
+            "internal estimate",
+        ),
+        "audioNative" => (
+            "Audio native services",
+            "Native audio capture state, voice plumbing, shortcuts, and transcription orchestration.",
+            "Audio capture state, voice routing, transcription setup, or audio shortcuts.",
+            "internal estimate",
+        ),
+        "snippingNative" => (
+            "Snipping and capture",
+            "Snipping windows, screen capture, frozen frames, backdrop refresh, and image processing.",
+            "Screen capture, snipping windows, preview refresh, or image processing.",
+            "internal estimate",
+        ),
+        "workspaceServices" => (
+            "Workspace services",
+            "Workspace-bound dev servers, package managers, Docker commands, and local tools.",
+            "Dev servers, builds, package scripts, Docker CLI work, or local tooling.",
+            "measured process estimate",
+        ),
+        _ => (
+            "Background helpers",
+            "Diff Forge child helpers that do not map cleanly to another bucket yet.",
+            "Background helper process activity.",
+            "measured helper estimate",
+        ),
+    }
+}
+
+fn developer_process_energy_score(category: &str, cpu_percent: f64, memory_bytes: u64) -> f64 {
+    let memory_gb = memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let category_weight = match category {
+        "activityMonitor" => 1.16,
+        "graphicsMedia" => 1.12,
+        "cloudWebSocket" => 1.08,
+        "networking" => 1.08,
+        "audio" => 1.08,
+        "audioNative" => 1.08,
+        "sqliteOutbox" => 1.04,
+        "mcpBridge" => 1.04,
+        "terminals" => 1.04,
+        "terminalBackend" => 1.04,
+        "tokenomicsSync" => 1.02,
+        _ => 1.0,
+    };
+    ((cpu_percent * category_weight) + (memory_gb * 1.35)).max(0.0)
+}
+
+fn developer_energy_intensity(score: f64) -> &'static str {
+    if score >= 20.0 {
+        "hot"
+    } else if score >= 6.0 {
+        "warm"
+    } else if score >= 1.0 {
+        "active"
+    } else {
+        "idle"
+    }
+}
+
+fn developer_round_energy(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    (value.max(0.0) * 10.0).round() / 10.0
 }
 
 fn developer_process_tree_child_first(pid: u32, child_map: &HashMap<u32, Vec<u32>>) -> Vec<u32> {

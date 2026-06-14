@@ -23,7 +23,8 @@ import {
   SettingsHint,
 } from "../app/appStyles";
 
-const PROCESS_REFRESH_MS = 6500;
+const PROCESS_REFRESH_MS = 15000;
+const DOCKER_REFRESH_MS = 30000;
 const HIGH_CPU_PERCENT = 65;
 const HIGH_MEMORY_BYTES = 1024 * 1024 * 1024;
 const PROCESS_BUSY_SPINNER_SEGMENTS = Array.from({ length: 8 }, (_, index) => index);
@@ -84,6 +85,33 @@ function formatCpu(value) {
     return "0%";
   }
   return cpu >= 100 ? `${Math.round(cpu)}%` : `${cpu.toFixed(1)}%`;
+}
+
+function formatEnergy(value) {
+  const score = Number(value || 0);
+  if (!Number.isFinite(score) || score <= 0) {
+    return "0.0";
+  }
+  return score >= 100 ? `${Math.round(score)}` : score.toFixed(1);
+}
+
+function energyTone(value) {
+  const score = Number(value || 0);
+  if (score >= 20) {
+    return "hot";
+  }
+  if (score >= 6) {
+    return "warm";
+  }
+  if (score >= 1) {
+    return "active";
+  }
+  return "neutral";
+}
+
+function formatProcessPlural(count) {
+  const value = Number(count || 0);
+  return `${value} process${value === 1 ? "" : "es"}`;
 }
 
 function normalizeProcessRoots(workspaceRoots) {
@@ -775,6 +803,78 @@ function ProcessBucket({
   );
 }
 
+function ProcessEnergySection({ energy }) {
+  const groups = Array.isArray(energy?.groups) ? energy.groups : [];
+  const visibleGroups = groups.filter((group) => (
+    Number(group?.score || 0) > 0 || Number(group?.processCount || 0) > 0
+  ));
+  const maxScore = Math.max(
+    1,
+    ...visibleGroups.map((group) => Number(group?.score || 0)),
+  );
+  const totalTone = energyTone(energy?.totalScore);
+
+  return (
+    <ProcessEnergyPanel aria-label="Diff Forge energy">
+      <ProcessEnergyHeader>
+        <div>
+          <strong>Diff Forge energy</strong>
+          <span>
+            {energy?.topLabel
+              ? `${energy.topLabel}: ${energy.topCause || "largest current source"}`
+              : "Estimated from live app, helper, terminal, and workspace processes."}
+          </span>
+        </div>
+        <ProcessEnergyTotal data-tone={totalTone}>
+          <span>Total</span>
+          <strong>{formatEnergy(energy?.totalScore)}</strong>
+        </ProcessEnergyTotal>
+      </ProcessEnergyHeader>
+
+      {visibleGroups.length === 0 ? (
+        <ProcessEnergyEmpty>No notable Diff Forge energy activity detected.</ProcessEnergyEmpty>
+      ) : (
+        <ProcessEnergyList role="list">
+          {visibleGroups.slice(0, 8).map((group) => {
+            const score = Number(group?.score || 0);
+            const width = `${Math.max(3, Math.min(100, (score / maxScore) * 100))}%`;
+            return (
+              <ProcessEnergyRow
+                data-tone={group?.intensity || energyTone(score)}
+                key={group?.id || group?.label}
+                role="listitem"
+                title={group?.description || group?.cause || ""}
+              >
+                <ProcessEnergyMain>
+                  <strong>{group?.label || "Diff Forge"}</strong>
+                  <span>{group?.cause || group?.description || ""}</span>
+                </ProcessEnergyMain>
+                <ProcessEnergyTrack aria-hidden="true">
+                  <span style={{ width }} />
+                </ProcessEnergyTrack>
+                <ProcessEnergyNumbers>
+                  <strong>{formatEnergy(score)}</strong>
+                  <span>
+                    {formatCpu(group?.cpuPercent)}
+                    {" / "}
+                    {formatBytes(group?.memoryBytes)}
+                    {" / "}
+                    {formatProcessPlural(group?.processCount)}
+                  </span>
+                </ProcessEnergyNumbers>
+              </ProcessEnergyRow>
+            );
+          })}
+        </ProcessEnergyList>
+      )}
+
+      <ProcessEnergyNote>
+        Main-process rows are internal estimates; helper and terminal rows use live process measurements.
+      </ProcessEnergyNote>
+    </ProcessEnergyPanel>
+  );
+}
+
 function formatContainerPorts(ports) {
   const entries = String(ports || "")
     .split(",")
@@ -947,6 +1047,8 @@ export default function ProcessesView({
   const [containerLogs, setContainerLogs] = useState(null);
   const mountedRef = useRef(false);
   const containersStateRef = useRef("");
+  const processLoadRef = useRef(null);
+  const containersLoadRef = useRef(null);
   const processOrderCounterRef = useRef(0);
   const processOrderRef = useRef(new Map());
 
@@ -956,16 +1058,20 @@ export default function ProcessesView({
   );
   const workspaceRootsKey = normalizedWorkspaceRoots.join("\n");
 
-  const loadProcesses = useCallback(async ({ silent = false } = {}) => {
+  const loadProcesses = useCallback(async ({ force = false, silent = false } = {}) => {
+    if (processLoadRef.current) {
+      return processLoadRef.current;
+    }
     if (!silent) {
       setRefreshState("loading");
     } else {
       setRefreshState((state) => (state === "loading" ? state : "refreshing"));
     }
 
-    try {
+    const request = (async () => {
       const result = await invoke("list_developer_processes", {
         activeWorkspaceRoot: "",
+        force,
         workspaceRoots: normalizedWorkspaceRoots,
       });
 
@@ -976,6 +1082,10 @@ export default function ProcessesView({
       setSnapshot(result);
       setError("");
       setRefreshState("idle");
+    })();
+    processLoadRef.current = request;
+    try {
+      await request;
     } catch (loadError) {
       if (!mountedRef.current) {
         return;
@@ -983,26 +1093,45 @@ export default function ProcessesView({
 
       setError(errorMessage(loadError));
       setRefreshState("idle");
+    } finally {
+      if (processLoadRef.current === request) {
+        processLoadRef.current = null;
+      }
     }
   }, [workspaceRootsKey]);
 
   // Containers are listed through the Rust docker CLI bridge, so the panel
   // keeps working in background/headless mode.
-  const loadContainers = useCallback(async ({ silent = false } = {}) => {
-    try {
-      const result = await invoke("docker_containers_snapshot", { includeStats: true });
+  const loadContainers = useCallback(async ({
+    force = false,
+    includeStats = true,
+    silent = false,
+  } = {}) => {
+    if (containersLoadRef.current) {
+      return containersLoadRef.current;
+    }
+    const request = (async () => {
+      const result = await invoke("docker_containers_snapshot", { force, includeStats });
       if (!mountedRef.current) {
         return;
       }
       containersStateRef.current = String(result?.state || "");
       setContainersSnapshot(result);
       setContainersError("");
+    })();
+    containersLoadRef.current = request;
+    try {
+      await request;
     } catch (loadError) {
       if (!mountedRef.current) {
         return;
       }
       if (!silent) {
         setContainersError(errorMessage(loadError, "Unable to load Docker containers."));
+      }
+    } finally {
+      if (containersLoadRef.current === request) {
+        containersLoadRef.current = null;
       }
     }
   }, []);
@@ -1012,20 +1141,25 @@ export default function ProcessesView({
     loadProcesses();
     loadContainers({ silent: true });
 
-    const intervalId = window.setInterval(() => {
+    const processIntervalId = window.setInterval(() => {
       if (document.visibilityState !== "hidden") {
         loadProcesses({ silent: true });
+      }
+    }, PROCESS_REFRESH_MS);
+    const containerIntervalId = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") {
         // A missing CLI never recovers on its own; skip the auto-poll and let
         // the manual Refresh button retry it.
         if (containersStateRef.current !== "cli_missing") {
           loadContainers({ silent: true });
         }
       }
-    }, PROCESS_REFRESH_MS);
+    }, DOCKER_REFRESH_MS);
 
     return () => {
       mountedRef.current = false;
-      window.clearInterval(intervalId);
+      window.clearInterval(processIntervalId);
+      window.clearInterval(containerIntervalId);
     };
   }, [loadContainers, loadProcesses]);
 
@@ -1101,8 +1235,8 @@ export default function ProcessesView({
         delete next[containerId];
         return next;
       });
-      await loadContainers({ silent: true });
-      await loadProcesses({ silent: true });
+      await loadContainers({ force: true, silent: true });
+      await loadProcesses({ force: true, silent: true });
     }
   }, [loadContainers, loadProcesses]);
 
@@ -1218,6 +1352,7 @@ export default function ProcessesView({
     (total, process) => total + Number(process.cpuPercent || 0),
     0,
   );
+  const energy = snapshot?.energy || null;
 
   const beginStopProcess = useCallback((process) => {
     if (!process.killable) {
@@ -1290,7 +1425,8 @@ export default function ProcessesView({
         result,
         targetProcessKey: "",
       });
-      await loadProcesses({ silent: true });
+      await loadProcesses({ force: true, silent: true });
+      await loadContainers({ force: true, silent: true });
     } catch (actionError) {
       setDockerActionState({
         state: "error",
@@ -1302,6 +1438,7 @@ export default function ProcessesView({
   }, [
     dockerActionState.state,
     dockerConfirmAction,
+    loadContainers,
     loadProcesses,
     normalizedWorkspaceRoots,
   ]);
@@ -1345,7 +1482,7 @@ export default function ProcessesView({
       }
     }
 
-    await loadProcesses({ silent: true });
+    await loadProcesses({ force: true, silent: true });
 
     if (failures.length) {
       setKillState({
@@ -1389,6 +1526,10 @@ export default function ProcessesView({
             <span>Memory</span>
             <strong>{formatBytes(totalMemoryBytes)}</strong>
           </ProcessMetric>
+          <ProcessMetric data-tone={energyTone(energy?.totalScore)}>
+            <span>Energy</span>
+            <strong>{formatEnergy(energy?.totalScore)}</strong>
+          </ProcessMetric>
           <SecondaryButton
             disabled={dockerActionState.state === "running"}
             onClick={() => beginDockerAction("relaunch", null)}
@@ -1408,8 +1549,8 @@ export default function ProcessesView({
           <SecondaryButton
             disabled={refreshState === "loading"}
             onClick={() => {
-              loadProcesses();
-              loadContainers();
+              loadProcesses({ force: true });
+              loadContainers({ force: true });
             }}
             type="button"
           >
@@ -1433,6 +1574,8 @@ export default function ProcessesView({
       {dockerActionState.result && (
         <ProcessDockerActionLog result={dockerActionState.result} />
       )}
+
+      <ProcessEnergySection energy={energy} />
 
       {containersSnapshot && containersSnapshot.state !== "cli_missing" && (
         <ProcessContainersPanel aria-label="Docker containers">
@@ -1733,6 +1876,24 @@ const ProcessMetric = styled.span`
       color: #e5bd83;
     }
   }
+
+  &[data-tone="warm"] {
+    border-color: rgba(255, 180, 76, 0.26);
+    background: rgba(255, 180, 76, 0.07);
+
+    strong {
+      color: #ffcf8b;
+    }
+  }
+
+  &[data-tone="active"] {
+    border-color: rgba(125, 176, 255, 0.24);
+    background: rgba(125, 176, 255, 0.07);
+
+    strong {
+      color: #9cc4ff;
+    }
+  }
 `;
 
 const ProcessInlineMessage = styled.p`
@@ -1759,6 +1920,226 @@ const ProcessInlineMessage = styled.p`
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
+  }
+`;
+
+const ProcessEnergyPanel = styled.section`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(125, 176, 255, 0.045), rgba(230, 236, 245, 0.012)),
+    rgba(8, 11, 16, 0.56);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+`;
+
+const ProcessEnergyHeader = styled.header`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+
+  > div {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 640;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 620px) {
+    align-items: start;
+    grid-template-columns: minmax(0, 1fr);
+  }
+`;
+
+const ProcessEnergyTotal = styled.span`
+  display: grid;
+  min-width: 72px;
+  gap: 2px;
+  justify-items: end;
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 9px;
+    font-weight: 780;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  strong {
+    color: var(--forge-text);
+    font-size: 16px;
+    font-weight: 860;
+    line-height: 1;
+  }
+
+  &[data-tone="hot"] strong {
+    color: #ffcf8b;
+  }
+
+  &[data-tone="warm"] strong {
+    color: #ffd7a1;
+  }
+
+  &[data-tone="active"] strong {
+    color: #9cc4ff;
+  }
+
+  @media (max-width: 620px) {
+    justify-items: start;
+  }
+`;
+
+const ProcessEnergyList = styled.div`
+  display: grid;
+  min-width: 0;
+  max-height: 108px;
+  gap: 3px;
+  overflow-y: auto;
+  padding-right: 2px;
+`;
+
+const ProcessEnergyRow = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 34px;
+  grid-template-columns: minmax(180px, 1fr) minmax(80px, 0.35fr) max-content;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 5px;
+  border-radius: 7px;
+  background: rgba(230, 236, 245, 0.026);
+
+  &[data-tone="hot"] {
+    background: rgba(223, 165, 90, 0.075);
+  }
+
+  &[data-tone="warm"] {
+    background: rgba(255, 180, 76, 0.055);
+  }
+
+  &[data-tone="active"] {
+    background: rgba(125, 176, 255, 0.055);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
+
+  @media (max-width: 720px) {
+    grid-template-columns: minmax(0, 1fr) max-content;
+  }
+`;
+
+const ProcessEnergyMain = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text-soft);
+    font-size: 11px;
+    font-weight: 760;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 620;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const ProcessEnergyTrack = styled.div`
+  height: 6px;
+  min-width: 70px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(230, 236, 245, 0.075);
+
+  span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #5ede99, #7db0ff);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 102, 204, 0.1);
+  }
+
+  @media (max-width: 720px) {
+    grid-column: 1 / -1;
+  }
+`;
+
+const ProcessEnergyNumbers = styled.div`
+  display: grid;
+  min-width: 118px;
+  justify-items: end;
+  gap: 2px;
+  text-align: right;
+
+  strong {
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 820;
+    line-height: 1;
+  }
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 9.5px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+`;
+
+const ProcessEnergyEmpty = styled.p`
+  margin: 0;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 640;
+`;
+
+const ProcessEnergyNote = styled.p`
+  margin: 0;
+  color: rgba(230, 236, 245, 0.42);
+  font-size: 10px;
+  font-weight: 620;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
   }
 `;
 

@@ -296,40 +296,59 @@ fn write_voice_text_rules(app: &AppHandle, rules: &VoiceTextRules) -> Result<(),
     fs::write(path, contents).map_err(|error| format!("Unable to save voice text rules: {error}"))
 }
 
-/// Union of terms across selected dictionary lists, used to bias speech
-/// recognition (Whisper initial prompt, own-key Deepgram keyterms, and the
-/// cloud dictation start frame, which forwards them to Deepgram server-side).
-/// Deduplicated case-insensitively in list order and capped so no backend
-/// gets an oversized vocabulary payload.
-fn voice_dictionary_bias_terms(app: &AppHandle) -> Vec<String> {
+fn push_voice_bias_term(seen: &mut Vec<String>, terms: &mut Vec<String>, value: &str) -> bool {
+    let cleaned = truncate_voice_rule_text(value, VOICE_DICTIONARY_BIAS_TERM_CHARS);
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    let key = cleaned.to_lowercase();
+    if seen.contains(&key) {
+        return false;
+    }
+
+    seen.push(key);
+    terms.push(cleaned);
+    terms.len() >= VOICE_DICTIONARY_BIAS_TERM_LIMIT
+}
+
+/// Recognition bias terms, used for Whisper's initial prompt, own-key Deepgram
+/// keyterms, and the cloud dictation start frame, which forwards them to
+/// Deepgram server-side. Includes selected dictionary terms plus enabled
+/// snippet triggers, but never snippet expansions.
+/// Deduplicated case-insensitively in UI order and capped so no backend gets an
+/// oversized vocabulary payload.
+fn voice_dictionary_bias_terms_from_rules(rules: &VoiceTextRules) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     let mut terms: Vec<String> = Vec::new();
 
-    for list in read_voice_text_rules(app).dictionary {
+    for list in &rules.dictionary {
         if !list.selected {
             continue;
         }
 
-        for term in list.terms {
-            let cleaned = truncate_voice_rule_text(&term, VOICE_DICTIONARY_BIAS_TERM_CHARS);
-            if cleaned.is_empty() {
-                continue;
-            }
-
-            let key = cleaned.to_lowercase();
-            if seen.contains(&key) {
-                continue;
-            }
-
-            seen.push(key);
-            terms.push(cleaned);
-            if terms.len() >= VOICE_DICTIONARY_BIAS_TERM_LIMIT {
+        for term in &list.terms {
+            if push_voice_bias_term(&mut seen, &mut terms, term) {
                 return terms;
             }
         }
     }
 
+    for snippet in &rules.snippets {
+        if !snippet.enabled {
+            continue;
+        }
+
+        if push_voice_bias_term(&mut seen, &mut terms, &snippet.trigger) {
+            return terms;
+        }
+    }
+
     terms
+}
+
+fn voice_dictionary_bias_terms(app: &AppHandle) -> Vec<String> {
+    voice_dictionary_bias_terms_from_rules(&read_voice_text_rules(app))
 }
 
 /// Whisper has no keyterm boosting; the closest equivalent is seeding the
@@ -514,6 +533,61 @@ mod voice_text_rules_tests {
         assert!(rules.snippets[0].enabled);
         assert!(rules.transforms[0].enabled);
         assert_eq!(rules.transforms[0].match_text, "new line");
+    }
+
+    #[test]
+    fn bias_terms_include_selected_dictionary_terms_and_enabled_snippet_triggers_only() {
+        let rules = normalize_voice_text_rules(VoiceTextRules {
+            dictionary: vec![
+                VoiceDictionaryList {
+                    name: "Selected".to_string(),
+                    terms: vec!["Tauri".to_string(), "GStack".to_string()],
+                    selected: true,
+                    ..Default::default()
+                },
+                VoiceDictionaryList {
+                    name: "Parked".to_string(),
+                    terms: vec!["Skipped".to_string()],
+                    selected: false,
+                    ..Default::default()
+                },
+            ],
+            snippets: vec![
+                VoiceSnippetEntry {
+                    trigger: "gstack".to_string(),
+                    expansion: "duplicate trigger expansion should not appear".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+                VoiceSnippetEntry {
+                    trigger: "shipit".to_string(),
+                    expansion: "snippet expansion should not appear".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+                VoiceSnippetEntry {
+                    trigger: "disabled-trigger".to_string(),
+                    expansion: "disabled expansion should not appear".to_string(),
+                    enabled: false,
+                    ..Default::default()
+                },
+            ],
+            transforms: Vec::new(),
+        });
+
+        let terms = voice_dictionary_bias_terms_from_rules(&rules);
+
+        assert_eq!(
+            terms,
+            vec![
+                "Tauri".to_string(),
+                "GStack".to_string(),
+                "shipit".to_string()
+            ]
+        );
+        assert!(!terms.contains(&"Skipped".to_string()));
+        assert!(!terms.contains(&"snippet expansion should not appear".to_string()));
+        assert!(!terms.contains(&"disabled-trigger".to_string()));
     }
 
     #[test]

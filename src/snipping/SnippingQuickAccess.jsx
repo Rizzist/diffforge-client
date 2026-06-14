@@ -1391,6 +1391,7 @@ const STRIP_TILE_STEP_PX = STRIP_TILE_WIDTH_PX + STRIP_TILE_GAP_PX;
 const STRIP_RAIL_PADDING_LEFT_PX = 14;
 const STRIP_VIRTUAL_OVERSCAN = 4;
 const STRIP_PAGE_PREFETCH_PX = 420;
+const SNIPPING_STRIP_DRAG_GUARD_RELEASE_MS = 220;
 
 function clampIndex(index, min, max) {
   return Math.max(min, Math.min(max, index));
@@ -1446,7 +1447,16 @@ function applyStripOrder(items, order) {
   return ordered;
 }
 
-function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove, onReorderStart, railRef }) {
+function StripSnipTile({
+  item,
+  onChanged,
+  onDragActivityChange,
+  onOpened,
+  onReorderEnd,
+  onReorderMove,
+  onReorderStart,
+  railRef,
+}) {
   const localPath = assetLocalPath(item);
   const name = useMemo(() => assetName(item), [item]);
   const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
@@ -1475,7 +1485,10 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
     if (statusTimerRef.current) {
       window.clearTimeout(statusTimerRef.current);
     }
-  }, []);
+    if (dragRef.current) {
+      onDragActivityChange?.(false);
+    }
+  }, [onDragActivityChange]);
 
   const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
     imageVersion,
@@ -1552,8 +1565,9 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
       }
     }
     dragRef.current = null;
+    onDragActivityChange?.(false);
     if (mountedRef.current) setPanning(false);
-  }, [localPath, onReorderEnd]);
+  }, [localPath, onDragActivityChange, onReorderEnd]);
 
   const startDrag = useCallback((event) => {
     if (!localPath || busy || event.button !== 0 || event.target.closest("button")) return;
@@ -1569,7 +1583,8 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
       railTop: railRect?.top ?? 0,
       mode: "pending",
     };
-  }, [busy, localPath, railRef]);
+    onDragActivityChange?.(true);
+  }, [busy, localPath, onDragActivityChange, railRef]);
 
   const continueDrag = useCallback((event) => {
     const drag = dragRef.current;
@@ -1637,10 +1652,21 @@ function StripSnipTile({ item, onChanged, onOpened, onReorderEnd, onReorderMove,
       })
       .finally(() => {
         dragRef.current = null;
+        onDragActivityChange?.(false);
         if (mountedRef.current) setPanning(false);
         if (mountedRef.current) setBusy(false);
       });
-  }, [busy, localPath, onOpened, onReorderEnd, onReorderMove, onReorderStart, railRef, showStatus]);
+  }, [
+    busy,
+    localPath,
+    onDragActivityChange,
+    onOpened,
+    onReorderEnd,
+    onReorderMove,
+    onReorderStart,
+    railRef,
+    showStatus,
+  ]);
 
   if (!localPath) return null;
 
@@ -1724,7 +1750,7 @@ function wheelUnit(event) {
   return 1;
 }
 
-export function SnippingRecentStrip() {
+export function SnippingRecentStrip({ onDragActivityChange }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -1882,6 +1908,16 @@ export function SnippingRecentStrip() {
       setNativeDrag(null);
     }
   }, [items]);
+
+  const nativeDragActive = Boolean(nativeDrag?.path);
+
+  useEffect(() => {
+    onDragActivityChange?.(nativeDragActive);
+  }, [nativeDragActive, onDragActivityChange]);
+
+  useEffect(() => () => {
+    onDragActivityChange?.(false);
+  }, [onDragActivityChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2042,7 +2078,13 @@ export function SnippingRecentStrip() {
   }, [renderEntries, viewport]);
 
   return (
-    <StripRail aria-label="Recent snips" onScroll={onScroll} onWheel={onWheel} ref={railRef}>
+    <StripRail
+      aria-label="Recent snips"
+      data-strip-interactive="true"
+      onScroll={onScroll}
+      onWheel={onWheel}
+      ref={railRef}
+    >
       {renderEntries.length ? (
         <StripVirtualCanvas
           style={{
@@ -2064,6 +2106,7 @@ export function SnippingRecentStrip() {
                   <StripSnipTile
                     item={entry.item}
                     onChanged={removePath}
+                    onDragActivityChange={onDragActivityChange}
                     onOpened={removePath}
                     onReorderEnd={endReorder}
                     onReorderMove={reorderPath}
@@ -2103,6 +2146,9 @@ export function SnippingStripWindow() {
   const [animOrigin, setAnimOrigin] = useState("top");
   const [openNonce, setOpenNonce] = useState(0);
   const animPhaseRef = useRef("open");
+  const stripDragGuardActiveRef = useRef(false);
+  const stripDragGuardCountRef = useRef(0);
+  const stripDragGuardTimerRef = useRef(0);
   // Epoch-ms of the last close cue: the watchdog must not fight the hide
   // animation, but a window still visible long after a close cue (or with no
   // cue at all) has missed its open cue and must force itself visible.
@@ -2113,6 +2159,40 @@ export function SnippingStripWindow() {
   useEffect(() => {
     animPhaseRef.current = animPhase;
   }, [animPhase]);
+
+  const setStripDragGuard = useCallback((active) => {
+    if (stripDragGuardTimerRef.current) {
+      window.clearTimeout(stripDragGuardTimerRef.current);
+      stripDragGuardTimerRef.current = 0;
+    }
+    if (active) {
+      stripDragGuardCountRef.current += 1;
+      if (!stripDragGuardActiveRef.current) {
+        stripDragGuardActiveRef.current = true;
+        invoke("snipping_set_strip_interaction_guard", { active: true }).catch(() => {});
+      }
+      return;
+    }
+    stripDragGuardCountRef.current = Math.max(0, stripDragGuardCountRef.current - 1);
+    if (stripDragGuardCountRef.current > 0) return;
+    stripDragGuardTimerRef.current = window.setTimeout(() => {
+      stripDragGuardTimerRef.current = 0;
+      if (stripDragGuardCountRef.current > 0) return;
+      stripDragGuardActiveRef.current = false;
+      invoke("snipping_set_strip_interaction_guard", { active: false }).catch(() => {});
+    }, SNIPPING_STRIP_DRAG_GUARD_RELEASE_MS);
+  }, []);
+
+  useEffect(() => () => {
+    if (stripDragGuardTimerRef.current) {
+      window.clearTimeout(stripDragGuardTimerRef.current);
+    }
+    invoke("snipping_set_strip_interaction_guard", { active: false }).catch(() => {});
+  }, []);
+
+  const closeStrip = useCallback(() => {
+    invoke("snipping_close_snip_strip").catch(() => {});
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -2188,25 +2268,38 @@ export function SnippingStripWindow() {
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        invoke("snipping_toggle_snip_strip").catch(() => {});
+        closeStrip();
       }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, []);
+  }, [closeStrip]);
 
-  const closeStrip = useCallback(() => {
-    invoke("snipping_toggle_snip_strip").catch(() => {});
-  }, []);
+  useEffect(() => {
+    const onPointerDown = (event) => {
+      if (stripDragGuardActiveRef.current) return;
+      const target = event.target;
+      if (target?.closest?.("[data-strip-interactive='true']")) return;
+      closeStrip();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [closeStrip]);
 
   return (
     <>
       <SnipFloatingGlobalStyle />
       <StripWindowShell data-anim={animPhase} data-origin={animOrigin}>
-        <StripCloseButton aria-label="Close dock" onClick={closeStrip} title="Close dock" type="button">
+        <StripCloseButton
+          aria-label="Close dock"
+          data-strip-interactive="true"
+          onClick={closeStrip}
+          title="Close dock"
+          type="button"
+        >
           <Close aria-hidden="true" />
         </StripCloseButton>
-        <SnippingRecentStrip key={openNonce} />
+        <SnippingRecentStrip key={openNonce} onDragActivityChange={setStripDragGuard} />
       </StripWindowShell>
     </>
   );

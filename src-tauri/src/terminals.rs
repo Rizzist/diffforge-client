@@ -3873,6 +3873,12 @@ async fn close_all_terminal_sessions(
         remove_terminal_parked_prompts_for_close(state, pane_id, instance.id, "close_all").await;
     }
 
+    let close_reason = if scoped_close {
+        "workspace_close_all"
+    } else {
+        "close_all"
+    };
+
     let mut notify_tasks = Vec::new();
     for (pane_id, instance) in &instances {
         let notify_state = cloud_mcp_state.clone();
@@ -3885,7 +3891,7 @@ async fn close_all_terminal_sessions(
                 &notify_pane_id,
                 notify_instance_id,
                 &notify_context,
-                "close_all",
+                close_reason,
             )
             .await;
         }));
@@ -4227,6 +4233,8 @@ async fn terminal_open(
     let requested_session_mode = request.session_mode;
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
+    let terminal_name = request.terminal_name.unwrap_or_default();
+    let terminal_nickname = request.terminal_nickname.unwrap_or_default();
     let terminal_index = request.terminal_index;
     let thread_id = request.thread_id;
     let requested_slot_key = request.slot_key;
@@ -4549,6 +4557,8 @@ async fn terminal_open(
         } else {
             kind.clone()
         },
+        terminal_name,
+        terminal_nickname,
     };
     let terminal_metadata_for_log = terminal_metadata.clone();
 

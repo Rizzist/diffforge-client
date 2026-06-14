@@ -58,7 +58,8 @@ const CLOUD_MCP_CREDIT_LEDGER_DB_FILE: &str = "diffforge-credit-ledger.sqlite";
 const CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT: i64 = 1_000_000;
 const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
 const CLOUD_MCP_OUTBOX_TABLE: &str = "cloud_sync_outbox";
-const CLOUD_MCP_ASSET_LIBRARY_DB_FILE: &str = "workspace-asset-library.sqlite";
+const CLOUD_MCP_ASSET_LIBRARY_DB_FILE: &str = "account-asset-library.sqlite";
+const CLOUD_MCP_LEGACY_ASSET_LIBRARY_DB_FILE: &str = "workspace-asset-library.sqlite";
 const CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS: usize = 1000;
 const CLOUD_MCP_MANAGED_ASSET_ROOT_DIR: &str = "assets";
 const CLOUD_MCP_LOCAL_HOME_ENV: &str = "RUST_DIFFFORGE_HOME";
@@ -4126,6 +4127,10 @@ async fn cloud_mcp_open_global_ws(
             .into_client_request()
             .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
         request.headers_mut().insert(
+            "x-diffforge-client-id",
+            HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+        );
+        request.headers_mut().insert(
             "x-diffforge-actor",
             HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
         );
@@ -7020,10 +7025,29 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                     .iter()
                     .take(32)
                     .map(|terminal| {
+                        let terminal_name = cloud_mcp_payload_text(
+                            terminal,
+                            &["terminal_name", "terminalName", "display_name", "displayName"],
+                        );
+                        let terminal_status =
+                            cloud_mcp_payload_text(terminal, &["status", "state"])
+                                .unwrap_or_else(|| {
+                                    if workspace_active {
+                                        "last_known".to_string()
+                                    } else {
+                                        "closed".to_string()
+                                    }
+                                });
+                        let terminal_lifecycle = cloud_mcp_payload_text(
+                            terminal,
+                            &["terminal_lifecycle", "terminalLifecycle", "lifecycle"],
+                        )
+                        .unwrap_or_else(|| terminal_status.clone());
                         json!({
                             "agent_kind": cloud_mcp_payload_text(terminal, &["agent_kind", "agentKind", "agent_id", "agentId"]),
                             "agent_label": cloud_mcp_payload_text(terminal, &["agent_label", "agentLabel", "label"]),
-                            "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
+                            "color": cloud_mcp_payload_text(terminal, &["color", "terminal_color", "terminalColor", "accent", "accentColor"]),
+                            "terminal_color": cloud_mcp_payload_text(terminal, &["terminal_color", "terminalColor", "color", "accent", "accentColor"]),
                             "color_slot": terminal
                                 .get("color_slot")
                                 .or_else(|| terminal.get("colorSlot"))
@@ -7034,14 +7058,16 @@ fn cloud_mcp_normalize_workspace_catalog_items(
                                 .or_else(|| terminal.get("terminalIndex"))
                                 .cloned()
                                 .unwrap_or(Value::Null),
-                            "terminal_name": cloud_mcp_payload_text(
-                                terminal,
-                                &["terminal_name", "terminalName", "display_name", "displayName"],
-                            ),
-                            "display_name": cloud_mcp_payload_text(
-                                terminal,
-                                &["terminal_name", "terminalName", "display_name", "displayName"],
-                            ),
+                            "terminal_name": terminal_name.clone(),
+                            "display_name": terminal_name,
+                            "status": terminal_status,
+                            "terminal_lifecycle": terminal_lifecycle,
+                            "last_known_runtime": true,
+                            "lastKnownRuntime": true,
+                            "runtime_read_only": true,
+                            "runtimeReadOnly": true,
+                            "commandable": false,
+                            "connected": false,
                         })
                     })
                     .collect::<Vec<_>>()
@@ -11419,6 +11445,18 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         .or_else(|| (!metadata.agent_id.trim().is_empty()).then_some(metadata.agent_id.as_str()))
         .unwrap_or("terminal");
     let thread_id = metadata.thread_id.trim();
+    let terminal_nickname = cloud_mcp_normalize_terminal_nickname(metadata.terminal_nickname.trim())
+        .or_else(|| cloud_mcp_normalize_terminal_nickname(metadata.terminal_name.trim()));
+    let terminal_display_name = terminal_nickname
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let value = metadata.terminal_name.trim();
+            (!value.is_empty()).then_some(value)
+        })
+        .unwrap_or(metadata.agent_id.as_str())
+        .to_string();
+    let terminal_nickname_text = terminal_nickname.unwrap_or_default();
     let payload = json!({
         "source": "rust-diffforge-terminal-open",
         "event_kind": "terminal_state_update",
@@ -11436,13 +11474,18 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "workspaceRuntimeSeq": workspace_runtime_seq,
         "workspace_runtime_epoch": workspace_runtime_epoch,
         "workspaceRuntimeEpoch": workspace_runtime_epoch,
-        "display_name": metadata.agent_id.as_str(),
+        "display_name": terminal_display_name.clone(),
+        "displayName": terminal_display_name.clone(),
         "terminal_id": pane_id,
         "target_terminal_id": pane_id,
         "pane_id": pane_id,
         "terminal_instance_id": instance_id,
         "terminal_index": metadata.terminal_index,
         "terminal_epoch": format!("{pane_id}:{instance_id}"),
+        "terminal_name": terminal_display_name.clone(),
+        "terminalName": terminal_display_name.clone(),
+        "terminal_nickname": terminal_nickname_text.clone(),
+        "terminalNickname": terminal_nickname_text,
         "terminal_lifecycle": "open",
         "terminalLifecycle": "open",
         "agent_id": agent_id,
@@ -11502,6 +11545,92 @@ fn cloud_mcp_presence_terminal_matches_instance(
     ) {
         Some(value) if value > 0 => value == instance_id,
         _ => true,
+    }
+}
+
+fn cloud_mcp_terminal_state_removes_from_live_snapshot(terminal: &Value) -> bool {
+    [
+        "status",
+        "state",
+        "activity_status",
+        "activityStatus",
+        "terminal_lifecycle",
+        "terminalLifecycle",
+        "event_type",
+        "eventType",
+    ]
+    .iter()
+    .filter_map(|key| terminal.get(*key).and_then(Value::as_str))
+    .map(|value| value.trim().to_ascii_lowercase())
+    .any(|value| {
+        matches!(
+            value.as_str(),
+            "closed" | "deleted" | "exited" | "removed" | "terminated"
+        ) || value.ends_with(".closed")
+            || value.ends_with("_closed")
+            || value.ends_with("-closed")
+            || value.ends_with(".removed")
+            || value.ends_with("_removed")
+            || value.ends_with("-removed")
+    })
+}
+
+fn cloud_mcp_terminal_state_is_workspace_runtime_shutdown(terminal: &Value) -> bool {
+    [
+        "reason",
+        "close_reason",
+        "closeReason",
+        "event_kind",
+        "eventKind",
+        "event_type",
+        "eventType",
+        "summary",
+    ]
+    .iter()
+    .filter_map(|key| terminal.get(*key).and_then(Value::as_str))
+    .map(|value| value.trim().to_ascii_lowercase())
+    .any(|value| {
+        value.contains("workspace_close")
+            || value.contains("workspace-close")
+            || value.contains("workspace_close_all")
+            || value.contains("workspace-close-all")
+            || value.contains("workspace_deactivate")
+            || value.contains("workspace-deactivate")
+            || value.contains("workspace_runtime")
+            || value.contains("workspace-runtime")
+            || value.contains("close_workspace")
+            || value.contains("close-workspace")
+    })
+}
+
+fn cloud_mcp_mark_terminal_last_known_read_only(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("last_known_runtime".to_string(), json!(true));
+    object.insert("lastKnownRuntime".to_string(), json!(true));
+    object.insert("runtime_read_only".to_string(), json!(true));
+    object.insert("runtimeReadOnly".to_string(), json!(true));
+    object.insert("commandable".to_string(), json!(false));
+    object.insert("native_connected".to_string(), json!(false));
+    object.insert("nativeConnected".to_string(), json!(false));
+    object.insert("connected".to_string(), json!(false));
+}
+
+fn cloud_mcp_mark_workspace_terminals_last_known_read_only(workspace: &mut Value) {
+    let Some(terminals) = workspace.get_mut("terminals") else {
+        return;
+    };
+    if let Some(terminals) = terminals.as_array_mut() {
+        for terminal in terminals {
+            cloud_mcp_mark_terminal_last_known_read_only(terminal);
+        }
+        return;
+    }
+    if let Some(terminals) = terminals.as_object_mut() {
+        for terminal in terminals.values_mut() {
+            cloud_mcp_mark_terminal_last_known_read_only(terminal);
+        }
     }
 }
 
@@ -11654,6 +11783,25 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
     let last_prompt = context_entry
         .map(|entry| entry.last_prompt.as_str())
         .filter(|value| !value.trim().is_empty());
+    let terminal_nickname =
+        cloud_mcp_normalize_terminal_nickname(close_context.metadata.terminal_nickname.trim())
+            .or_else(|| {
+                cloud_mcp_normalize_terminal_nickname(close_context.metadata.terminal_name.trim())
+            });
+    let terminal_display_name = terminal_nickname
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let value = close_context.metadata.terminal_name.trim();
+            (!value.is_empty()).then_some(value)
+        })
+        .or_else(|| {
+            let value = close_context.metadata.agent_id.trim();
+            (!value.is_empty()).then_some(value)
+        })
+        .unwrap_or(agent_kind)
+        .to_string();
+    let terminal_nickname_text = terminal_nickname.unwrap_or_default();
     let payload = json!({
         "source": "rust-diffforge-terminal-close",
         "event_kind": "terminal_state_update",
@@ -11671,13 +11819,18 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         "workspaceRuntimeSeq": workspace_runtime_seq,
         "workspace_runtime_epoch": workspace_runtime_epoch,
         "workspaceRuntimeEpoch": workspace_runtime_epoch,
-        "display_name": close_context.metadata.agent_id.as_str(),
+        "display_name": terminal_display_name.clone(),
+        "displayName": terminal_display_name.clone(),
         "terminal_id": pane_id,
         "target_terminal_id": pane_id,
         "pane_id": pane_id,
         "terminal_instance_id": instance_id,
         "terminal_index": terminal_index,
         "terminal_epoch": format!("{pane_id}:{instance_id}"),
+        "terminal_name": terminal_display_name.clone(),
+        "terminalName": terminal_display_name.clone(),
+        "terminal_nickname": terminal_nickname_text.clone(),
+        "terminalNickname": terminal_nickname_text,
         "terminal_lifecycle": "closed",
         "terminalLifecycle": "closed",
         "agent_id": agent_id,
@@ -13169,6 +13322,45 @@ async fn cloud_mcp_workspace_catalog_upsert(
         "workspace": cloud_workspace,
         "workspace_id": workspace_id,
     });
+    {
+        let device_profile = cloud_mcp_desktop_device_profile();
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        let mut workspace_items = snapshots
+            .workspace_catalog
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("workspaces"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let upsert_index = workspace_items.iter().position(|item| {
+            cloud_mcp_payload_text(item, &["workspace_id", "workspaceId", "id"]).as_deref()
+                == Some(workspace_id.as_str())
+        });
+        match upsert_index {
+            Some(index) => workspace_items[index] = payload["workspace"].clone(),
+            None => workspace_items.push(payload["workspace"].clone()),
+        }
+        snapshots.workspace_catalog = Some(json!({
+            "source": "rust-diffforge-workspace-catalog",
+            "event_kind": "device_live_state_snapshot",
+            "reason": "workspace_catalog_upsert",
+            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+            "device_id": device_profile["device_id"].clone(),
+            "device_name": device_profile["device_name"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machine_name": device_profile["machine_name"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "form_factor": device_profile["form_factor"].clone(),
+            "client_kind": device_profile["client_kind"].clone(),
+            "snapshot_id": format!("device-workspace-catalog-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
+            "snapshot_full": true,
+            "authoritative": true,
+            "workspaces": workspace_items,
+            "summary": "Desktop workspace catalog synced.",
+            "ts_ms": cloud_mcp_now_ms(),
+        }));
+    }
+    cloud_mcp_publish_device_live_state_snapshot(state.inner(), "workspace_catalog_upsert").await;
     cloud_mcp_post_event_endpoint(state.inner(), "workspace_catalog_upsert", &payload).await
 }
 
@@ -13598,6 +13790,46 @@ async fn cloud_mcp_sync_device_live_terminals(
                 );
                 let status = cloud_mcp_payload_text(terminal, &["status", "state"])
                     .unwrap_or_else(|| "active".to_string());
+                let native_rail_state = cloud_mcp_payload_text(
+                    terminal,
+                    &[
+                        "native_rail_state",
+                        "nativeRailState",
+                        "rail_state",
+                        "railState",
+                        "top_rail_state",
+                        "topRailState",
+                    ],
+                );
+                let native_rail_label = cloud_mcp_payload_text(
+                    terminal,
+                    &[
+                        "native_rail_label",
+                        "nativeRailLabel",
+                        "rail_label",
+                        "railLabel",
+                        "top_rail_label",
+                        "topRailLabel",
+                    ],
+                );
+                let activity_status = cloud_mcp_payload_text(
+                    terminal,
+                    &["activity_status", "activityStatus"],
+                )
+                .or_else(|| native_rail_state.clone())
+                .unwrap_or_else(|| status.clone());
+                let display_status = cloud_mcp_payload_text(
+                    terminal,
+                    &["display_status", "displayStatus"],
+                )
+                .or_else(|| native_rail_label.clone())
+                .or_else(|| native_rail_state.clone())
+                .unwrap_or_else(|| activity_status.clone());
+                let terminal_status = cloud_mcp_payload_text(
+                    terminal,
+                    &["terminal_status", "terminalStatus", "reported_status", "reportedStatus"],
+                )
+                .unwrap_or_else(|| status.clone());
                 let session_state =
                     cloud_mcp_payload_text(terminal, &["session_state", "sessionState"])
                         .unwrap_or_else(|| "unknown".to_string());
@@ -13643,7 +13875,9 @@ async fn cloud_mcp_sync_device_live_terminals(
                     ),
                     "agent_kind": agent_kind,
                     "agent_label": agent_label,
+                    "activity_status": activity_status,
                     "display_name": terminal_nickname.clone(),
+                    "display_status": display_status,
                     "status": status,
                     "session_state": session_state,
                     "terminal_name": terminal_nickname.clone(),
@@ -13652,9 +13886,12 @@ async fn cloud_mcp_sync_device_live_terminals(
                     "terminal_epoch": cloud_mcp_payload_text(terminal, &["terminal_epoch", "terminalEpoch"]),
                     "terminal_instance_id": terminal_instance_id,
                     "terminal_lifecycle": cloud_mcp_payload_text(terminal, &["terminal_lifecycle", "terminalLifecycle", "lifecycle"]),
-                    "native_rail_state": cloud_mcp_payload_text(terminal, &["native_rail_state", "nativeRailState", "rail_state", "railState", "top_rail_state", "topRailState"]),
-                    "native_rail_label": cloud_mcp_payload_text(terminal, &["native_rail_label", "nativeRailLabel", "rail_label", "railLabel", "top_rail_label", "topRailLabel"]),
+                    "native_rail_state": native_rail_state,
+                    "native_rail_label": native_rail_label,
                     "readiness": cloud_mcp_payload_text(terminal, &["readiness", "terminal_readiness", "terminalReadiness"]),
+                    "terminal_status": terminal_status,
+                    "command_phase": cloud_mcp_payload_text(terminal, &["command_phase", "commandPhase"]),
+                    "execution_phase": cloud_mcp_payload_text(terminal, &["execution_phase", "executionPhase"]),
                     "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId"]),
                     "turn_status": cloud_mcp_payload_text(terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
                     "status_seq": status_seq,
@@ -13680,6 +13917,29 @@ async fn cloud_mcp_sync_device_live_terminals(
                     "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
                     "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
                     "color_slot": cloud_mcp_payload_text(terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
+                    "last_known_runtime": terminal
+                        .get("last_known_runtime")
+                        .or_else(|| terminal.get("lastKnownRuntime"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "runtime_read_only": terminal
+                        .get("runtime_read_only")
+                        .or_else(|| terminal.get("runtimeReadOnly"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "commandable": terminal
+                        .get("commandable")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "connected": terminal
+                        .get("connected")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "native_connected": terminal
+                        .get("native_connected")
+                        .or_else(|| terminal.get("nativeConnected"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
                     "waiting_on": terminal
                         .get("waiting_on")
                         .or_else(|| terminal.get("waitingOn"))
@@ -13713,6 +13973,20 @@ async fn cloud_mcp_sync_device_live_terminals(
             "workspace_runtime_seq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
+            "last_known_runtime": workspace
+                .get("last_known_runtime")
+                .or_else(|| workspace.get("lastKnownRuntime"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "runtime_read_only": workspace
+                .get("runtime_read_only")
+                .or_else(|| workspace.get("runtimeReadOnly"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "commandable": workspace
+                .get("commandable")
+                .cloned()
+                .unwrap_or(Value::Null),
             "terminals": terminals,
         });
         normalized_workspaces.push(workspace_value);
@@ -14137,14 +14411,33 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
             object.insert("observed_at_ms".to_string(), json!(observed_at_ms));
             object.insert("observedAtMs".to_string(), json!(observed_at_ms));
         }
-        if let Some(existing) = terminals.iter_mut().find(|terminal| {
+        let workspace_runtime_shutdown =
+            cloud_mcp_terminal_state_is_workspace_runtime_shutdown(&terminal_value);
+        if workspace_runtime_shutdown {
+            cloud_mcp_mark_terminal_last_known_read_only(&mut terminal_value);
+        }
+        let terminal_removes_from_snapshot =
+            !workspace_runtime_shutdown
+                && cloud_mcp_terminal_state_removes_from_live_snapshot(&terminal_value);
+        let existing_index = terminals.iter().position(|terminal| {
             cloud_mcp_presence_terminal_matches_instance(
                 terminal,
                 &terminal_id,
                 terminal_instance_id,
             )
-        }) {
-            cloud_mcp_live_state_merge_object(existing, terminal_value);
+        });
+        if terminal_removes_from_snapshot {
+            terminals.retain(|terminal| {
+                !cloud_mcp_presence_terminal_matches_instance(
+                    terminal,
+                    &terminal_id,
+                    terminal_instance_id,
+                )
+            });
+        } else if let Some(existing_index) = existing_index {
+            if let Some(existing) = terminals.get_mut(existing_index) {
+                cloud_mcp_live_state_merge_object(existing, terminal_value);
+            }
         } else {
             terminals.push(terminal_value);
         }
@@ -14521,6 +14814,40 @@ async fn cloud_mcp_sync_terminal_status_event(
         execution_phase.as_deref().unwrap_or_default(),
         &turn_status,
     );
+    let native_rail_state = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "native_rail_state",
+            "nativeRailState",
+            "rail_state",
+            "railState",
+            "top_rail_state",
+            "topRailState",
+        ],
+    )
+    .unwrap_or_else(|| state_value.to_string());
+    let native_rail_label = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "native_rail_label",
+            "nativeRailLabel",
+            "rail_label",
+            "railLabel",
+            "top_rail_label",
+            "topRailLabel",
+        ],
+    )
+    .unwrap_or_else(|| native_rail_state.replace('_', " "));
+    let display_status = cloud_mcp_payload_text(
+        &terminal,
+        &["display_status", "displayStatus"],
+    )
+    .unwrap_or_else(|| native_rail_label.clone());
+    let terminal_status = cloud_mcp_payload_text(
+        &terminal,
+        &["terminal_status", "terminalStatus", "status_after", "statusAfter"],
+    )
+    .unwrap_or_else(|| status.clone());
     let turn_status =
         cloud_mcp_terminal_lifecycle_turn_status(&event_type, &turn_status, state_value);
     let readiness = readiness.unwrap_or_else(|| {
@@ -14578,10 +14905,37 @@ async fn cloud_mcp_sync_terminal_status_event(
         "state": state_value,
         "status": state_value,
         "activity_status": state_value,
+        "display_status": display_status,
+        "native_rail_label": native_rail_label,
+        "native_rail_state": native_rail_state,
+        "terminal_status": terminal_status,
         "readiness": readiness,
         "turn_status": turn_status,
         "command_phase": command_phase,
         "execution_phase": execution_phase,
+        "last_known_runtime": terminal
+            .get("last_known_runtime")
+            .or_else(|| terminal.get("lastKnownRuntime"))
+            .cloned()
+            .unwrap_or(Value::Bool(false)),
+        "runtime_read_only": terminal
+            .get("runtime_read_only")
+            .or_else(|| terminal.get("runtimeReadOnly"))
+            .cloned()
+            .unwrap_or(Value::Bool(false)),
+        "commandable": terminal
+            .get("commandable")
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
+        "connected": terminal
+            .get("connected")
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
+        "native_connected": terminal
+            .get("native_connected")
+            .or_else(|| terminal.get("nativeConnected"))
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
         "input_ready": input_ready,
         "turn_id": cloud_mcp_payload_text(&terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId", "active_turn_id", "activeTurnId"]),
         "thread_id": cloud_mcp_payload_text(&terminal, &["thread_id", "threadId"]),
@@ -14839,11 +15193,17 @@ fn cloud_mcp_mark_workspace_inactive_in_snapshot(
             workspace_object.insert("workspace_status".to_string(), json!("deactivated"));
             workspace_object.insert("workspaceStatus".to_string(), json!("deactivated"));
             workspace_object.insert("status".to_string(), json!("deactivated"));
+            workspace_object.insert("last_known_runtime".to_string(), json!(true));
+            workspace_object.insert("lastKnownRuntime".to_string(), json!(true));
+            workspace_object.insert("runtime_read_only".to_string(), json!(true));
+            workspace_object.insert("runtimeReadOnly".to_string(), json!(true));
+            workspace_object.insert("commandable".to_string(), json!(false));
             workspace_object.insert("reason".to_string(), json!(reason));
             workspace_object.insert("ts_ms".to_string(), json!(observed_at_ms));
             workspace_object.insert("updated_at_ms".to_string(), json!(observed_at_ms));
             workspace_object.insert("updatedAtMs".to_string(), json!(observed_at_ms));
         }
+        cloud_mcp_mark_workspace_terminals_last_known_read_only(workspace);
     }
     if changed {
         object.insert("reason".to_string(), json!(reason));
@@ -14876,6 +15236,11 @@ fn cloud_mcp_deactivated_workspace_snapshot(workspace_id: &str, reason: &str, ob
             "workspace_status": "deactivated",
             "workspaceStatus": "deactivated",
             "status": "deactivated",
+            "last_known_runtime": true,
+            "lastKnownRuntime": true,
+            "runtime_read_only": true,
+            "runtimeReadOnly": true,
+            "commandable": false,
             "terminals": [],
             "terminal_count": 0,
             "terminalCount": 0,
@@ -17370,11 +17735,29 @@ fn cloud_mcp_asset_http_headers(
         reqwest::header::HeaderValue::from_str(&billing_scope_type)
             .map_err(|error| format!("Invalid asset transfer scope header: {error}"))?,
     );
+    headers.insert(
+        "x-diffforge-scope-type",
+        reqwest::header::HeaderValue::from_str(&billing_scope_type)
+            .map_err(|error| format!("Invalid asset transfer scope header: {error}"))?,
+    );
     if let Some(team_id) = team_id {
         headers.insert(
             "x-diffforge-team-id",
             reqwest::header::HeaderValue::from_str(&team_id)
                 .map_err(|error| format!("Invalid asset transfer team header: {error}"))?,
+        );
+    }
+    let (plan_name, device_limit) = cloud_mcp_process_account_plan();
+    headers.insert(
+        "x-diffforge-plan-name",
+        reqwest::header::HeaderValue::from_str(&plan_name)
+            .map_err(|error| format!("Invalid asset transfer plan header: {error}"))?,
+    );
+    if let Some(device_limit) = device_limit {
+        headers.insert(
+            "x-diffforge-device-limit",
+            reqwest::header::HeaderValue::from_str(&device_limit.to_string())
+                .map_err(|error| format!("Invalid asset transfer device limit header: {error}"))?,
         );
     }
     if let Some(route_token) = route_token.filter(|value| !value.trim().is_empty()) {
@@ -18832,7 +19215,20 @@ fn cloud_mcp_extract_workspace_todos(value: &Value) -> Option<Value> {
 }
 
 fn cloud_mcp_asset_library_db_path() -> Option<PathBuf> {
-    cloud_mcp_local_cache_file_path(CLOUD_MCP_ASSET_LIBRARY_DB_FILE)
+    let path = cloud_mcp_local_cache_file_path(CLOUD_MCP_ASSET_LIBRARY_DB_FILE)?;
+    if !path.exists() {
+        if let Some(legacy_path) =
+            cloud_mcp_local_cache_file_path(CLOUD_MCP_LEGACY_ASSET_LIBRARY_DB_FILE)
+        {
+            if legacy_path.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::rename(&legacy_path, &path);
+            }
+        }
+    }
+    Some(path)
 }
 
 fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -30786,6 +31182,11 @@ fn cloud_mcp_proxy_post_json_endpoint(
             .as_str()
             .into_client_request()
             .map_err(|error| format!("Unable to create Cloud MCP websocket request: {error}"))?;
+        request.headers_mut().insert(
+            "x-diffforge-client-id",
+            HeaderValue::from_str(client_id.trim())
+                .map_err(|error| format!("Invalid Cloud MCP client id header: {error}"))?,
+        );
         request.headers_mut().insert(
             "x-diffforge-actor",
             HeaderValue::from_str(client_id.trim())

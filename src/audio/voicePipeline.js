@@ -174,12 +174,19 @@ function replaceSpokenPhrase(text, phrase, replacement) {
   );
 
   let replacements = 0;
-  const result = text.replace(pattern, (fullMatch, prefix) => {
+  const matches = [];
+  const result = text.replace(pattern, (fullMatch, prefix, original, offset) => {
     replacements += 1;
+    matches.push({
+      index: Number(offset || 0) + String(prefix || "").length,
+      original,
+      replacement,
+      trigger: phrase,
+    });
     return `${prefix}${replacement}`;
   });
 
-  return { text: result, replacements };
+  return { text: result, replacements, matches };
 }
 
 function applyDictionaryCorrections(text, lists) {
@@ -215,6 +222,7 @@ function applyDictionaryCorrections(text, lists) {
 function applySnippetExpansions(text, entries) {
   let nextText = text;
   let replacements = 0;
+  const changes = [];
   const ordered = entries
     .filter((entry) => entry.enabled)
     .slice()
@@ -224,9 +232,16 @@ function applySnippetExpansions(text, entries) {
     const outcome = replaceSpokenPhrase(nextText, entry.trigger, entry.expansion);
     nextText = outcome.text;
     replacements += outcome.replacements;
+    changes.push(...outcome.matches);
   }
 
-  return { text: nextText, replacements };
+  return {
+    text: nextText,
+    replacements,
+    changes: changes
+      .sort((left, right) => Number(left.index || 0) - Number(right.index || 0))
+      .map(({ index, ...change }) => change),
+  };
 }
 
 function applyTransformRules(text, entries) {
@@ -281,6 +296,9 @@ export function applyVoiceTextPipeline(text, rules) {
       dictionary: dictionaryPass.replacements,
       snippets: snippetPass.replacements,
       transforms: transformPass.replacements,
+    },
+    changes: {
+      snippets: snippetPass.changes,
     },
   };
 }

@@ -35,6 +35,7 @@ export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
 const MAX_AUDIO_TRANSCRIPTION_HISTORY_ITEMS = 500;
+const MAX_AUDIO_SNIPPET_CHANGE_TEXT_CHARS = 32000;
 const EMPTY_CAPTURE_STATS = {
   bufferMs: 0,
   frequencyBands: [],
@@ -159,6 +160,37 @@ function normalizeDeepgramLanguage(value) {
   }
 
   return language;
+}
+
+function normalizeAudioSnippetChangeText(value) {
+  const text = String(value ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return text.length > MAX_AUDIO_SNIPPET_CHANGE_TEXT_CHARS
+    ? text.slice(0, MAX_AUDIO_SNIPPET_CHANGE_TEXT_CHARS)
+    : text;
+}
+
+function normalizeAudioSnippetChanges(value) {
+  const items = Array.isArray(value) ? value : [];
+
+  return items
+    .map((change) => {
+      const original = normalizeAudioSnippetChangeText(change?.original);
+      const replacement = normalizeAudioSnippetChangeText(change?.replacement);
+      const trigger = normalizeAudioSnippetChangeText(change?.trigger) || original;
+
+      if (!original || !replacement) {
+        return null;
+      }
+
+      return { original, replacement, trigger };
+    })
+    .filter(Boolean);
 }
 
 function base64ToArrayBuffer(value) {
@@ -404,6 +436,9 @@ function normalizeTranscriptionResult(value) {
   const sourceText = typeof value.sourceText === "string" && value.sourceText.trim() !== text
     ? value.sourceText.trim()
     : "";
+  const snippetChanges = normalizeAudioSnippetChanges(
+    value.snippetChanges || value.changes?.snippets,
+  );
 
   return {
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
@@ -414,6 +449,7 @@ function normalizeTranscriptionResult(value) {
     provider,
     source,
     sourceText,
+    snippetChanges,
     status: value.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED
       ? AUDIO_TRANSCRIPTION_STATUS_CANCELLED
       : AUDIO_TRANSCRIPTION_STATUS_INSERTED,

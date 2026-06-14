@@ -2799,23 +2799,6 @@ const OrchestratorVoiceMicChip = styled.span`
   }
 `;
 
-const OrchestratorVoiceStatus = styled.div`
-  max-width: min(240px, calc(100% - 24px));
-  min-height: 15px;
-  color: rgba(212, 222, 238, 0.74);
-  font-size: 11px;
-  font-weight: 650;
-  line-height: 1.35;
-  text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-
-  html[data-forge-theme="light"] & {
-    color: rgba(35, 45, 62, 0.7);
-  }
-`;
-
 const orchestratorVoiceButtonSpin = keyframes`
   to {
     transform: rotate(360deg);
@@ -4778,6 +4761,7 @@ const TodoQueueItemBody = styled.div`
 `;
 
 const TodoQueueItemImageFrame = styled.div`
+  position: relative;
   display: grid;
   width: 128px;
   height: 128px;
@@ -4821,6 +4805,7 @@ const TodoQueueItemImageGrid = styled.div`
 `;
 
 const TodoQueueItemImageTile = styled.div`
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -4848,6 +4833,7 @@ const TodoQueueImageCountBadge = styled.span`
 `;
 
 const TodoQueueItemNoteFrame = styled.div`
+  position: relative;
   display: grid;
   width: 128px;
   height: 128px;
@@ -4865,6 +4851,70 @@ const TodoQueueItemNoteFrame = styled.div`
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.08);
     background: #fafafc;
+  }
+`;
+
+const TodoQueueItemAttachmentRemoveButton = styled.button`
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 3;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(239, 107, 107, 0.22);
+  border-radius: 999px;
+  color: #ffffff;
+  background: rgba(10, 15, 26, 0.76);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.28);
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.92);
+  transition:
+    background 130ms ease,
+    border-color 130ms ease,
+    opacity 130ms ease,
+    transform 130ms ease;
+
+  &:hover {
+    border-color: rgba(239, 107, 107, 0.42);
+    background: rgba(196, 43, 43, 0.84);
+  }
+
+  &:focus-visible {
+    border-color: rgba(255, 255, 255, 0.42);
+    outline: 2px solid rgba(255, 210, 210, 0.56);
+    outline-offset: 1px;
+    opacity: 1;
+    pointer-events: auto;
+    transform: scale(1);
+  }
+
+  ${TodoQueueItemImageFrame}:hover > &[data-preview-scope="frame"],
+  ${TodoQueueItemImageFrame}:focus-within > &[data-preview-scope="frame"],
+  ${TodoQueueItemImageTile}:hover &,
+  ${TodoQueueItemImageTile}:focus-within &,
+  ${TodoQueueItemNoteFrame}:hover &,
+  ${TodoQueueItemNoteFrame}:focus-within & {
+    opacity: 1;
+    pointer-events: auto;
+    transform: scale(1);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #ffffff;
+    background: rgba(29, 29, 31, 0.66);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(180, 35, 24, 0.9);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
   }
 `;
 
@@ -9179,6 +9229,41 @@ function getTodoQueueItemImages(item) {
   ].filter(Boolean));
 }
 
+function getTodoQueueItemWithImages(item, images) {
+  const nextItem = item && typeof item === "object" ? { ...item } : {};
+  const nextImages = dedupeTodoQueueImages(images);
+
+  delete nextItem.image;
+  delete nextItem.images;
+  delete nextItem.imageAttachments;
+  delete nextItem.image_attachments;
+  delete nextItem.imageDataUrl;
+  delete nextItem.image_data_url;
+  delete nextItem.imageSrc;
+  delete nextItem.image_src;
+
+  if (nextImages[0]) {
+    nextItem.image = nextImages[0];
+  }
+  if (nextImages.length > 1) {
+    nextItem.images = nextImages;
+  }
+
+  return nextItem;
+}
+
+function getTodoQueueItemWithoutNote(item) {
+  const nextItem = item && typeof item === "object" ? { ...item } : {};
+
+  delete nextItem.note;
+  delete nextItem.noteText;
+  delete nextItem.note_text;
+  delete nextItem.longText;
+  delete nextItem.long_text;
+
+  return nextItem;
+}
+
 function getTodoQueueItemImage(item) {
   return getTodoQueueItemImages(item)[0] || null;
 }
@@ -12224,6 +12309,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onOpenWorkspaceSettings,
   onQueueAllItems,
   onQueueItem,
+  onRemoveItemAttachment,
   onVoicePlanNeedsRequeue,
   onRequeueVoicePlanUnfinished,
   onRequeueVoicePlanTask,
@@ -14274,6 +14360,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     }
     onDispatchTodoToTarget(item, target, { mode, source });
   }, [onDispatchTodoToTarget, workspaceTodoDispatchTargets]);
+  const handleRemoveItemAttachment = useCallback((event, item, attachment) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onRemoveItemAttachment?.(item.id, attachment);
+  }, [onRemoveItemAttachment]);
 
   return (
     <TodoQueueSurface
@@ -14426,11 +14517,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 <OrchestratorVoiceLogo />
               </OrchestratorVoiceButton>
             </OrchestratorVoiceControls>
-            {orchestratorVoiceState === "starting" && (
-              <OrchestratorVoiceStatus aria-live="polite" role="status">
-                {orchestratorVoiceFeedback || "Preparing voice agent"}
-              </OrchestratorVoiceStatus>
-            )}
           </OrchestratorVoiceArea>
           <OrchestratorSectionTabs aria-label="Orchestrator section">
             <OrchestratorSectionButton
@@ -14601,12 +14687,54 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   {images.slice(0, 4).map((nextImage, imageIndex) => (
                                     <TodoQueueItemImageTile key={`${nextImage.src}:${imageIndex}`}>
                                       <TodoQueueItemImage alt="" src={nextImage.src} />
+                                      {!isEditing && !isPending && (
+                                        <TodoQueueItemAttachmentRemoveButton
+                                          aria-label={`Remove ${nextImage.name || "image"} from todo`}
+                                          data-preview-scope="tile"
+                                          data-todo-attachment-remove="true"
+                                          data-todo-control="true"
+                                          onClick={(event) => handleRemoveItemAttachment(event, item, {
+                                            index: imageIndex,
+                                            kind: "image",
+                                          })}
+                                          onPointerDown={(event) => {
+                                            event.preventDefault();
+                                            event.stopPropagation();
+                                          }}
+                                          title="Remove image"
+                                          type="button"
+                                        >
+                                          <Close aria-hidden="true" />
+                                        </TodoQueueItemAttachmentRemoveButton>
+                                      )}
                                     </TodoQueueItemImageTile>
                                   ))}
                                   <TodoQueueImageCountBadge>{images.length}</TodoQueueImageCountBadge>
                                 </TodoQueueItemImageGrid>
                               ) : (
-                                <TodoQueueItemImage alt="" src={image.src} />
+                                <>
+                                  <TodoQueueItemImage alt="" src={image.src} />
+                                  {!isEditing && !isPending && (
+                                    <TodoQueueItemAttachmentRemoveButton
+                                      aria-label={`Remove ${image.name || "image"} from todo`}
+                                      data-preview-scope="frame"
+                                      data-todo-attachment-remove="true"
+                                      data-todo-control="true"
+                                      onClick={(event) => handleRemoveItemAttachment(event, item, {
+                                        index: 0,
+                                        kind: "image",
+                                      })}
+                                      onPointerDown={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                      }}
+                                      title="Remove image"
+                                      type="button"
+                                    >
+                                      <Close aria-hidden="true" />
+                                    </TodoQueueItemAttachmentRemoveButton>
+                                  )}
+                                </>
                               )}
                             </TodoQueueItemImageFrame>
                           )}
@@ -14614,6 +14742,25 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             <TodoQueueItemNoteFrame>
                               <TodoQueueItemNoteTitle>{note.title}</TodoQueueItemNoteTitle>
                               <TodoQueueItemNoteIcon aria-hidden="true" />
+                              {!isEditing && !isPending && (
+                                <TodoQueueItemAttachmentRemoveButton
+                                  aria-label="Remove pasted note from todo"
+                                  data-preview-scope="frame"
+                                  data-todo-attachment-remove="true"
+                                  data-todo-control="true"
+                                  onClick={(event) => handleRemoveItemAttachment(event, item, {
+                                    kind: "note",
+                                  })}
+                                  onPointerDown={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                  }}
+                                  title="Remove note"
+                                  type="button"
+                                >
+                                  <Close aria-hidden="true" />
+                                </TodoQueueItemAttachmentRemoveButton>
+                              )}
                             </TodoQueueItemNoteFrame>
                           )}
                           <TodoQueueItemBody>
@@ -26125,8 +26272,70 @@ function TerminalView({
           normalizeTodoQueueText(item.text)
           || getTodoQueueItemImage(item)
           || getTodoQueueItemNote(item)
-        ))
+      ))
     ));
+  }, [updateTodoQueueItems]);
+
+  const removeTodoQueueItemAttachment = useCallback((itemId, attachment = {}) => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+
+    const kind = String(attachment?.kind || "image").trim().toLowerCase();
+    const removedTodoIds = [];
+
+    updateTodoQueueItems((currentItems) => {
+      let changed = false;
+      const nextItems = currentItems.map((item) => {
+        if (item.id !== safeItemId) {
+          return item;
+        }
+
+        if (kind === "note") {
+          if (!getTodoQueueItemNote(item)) {
+            return item;
+          }
+          changed = true;
+          const nextItem = getTodoQueueItemWithoutNote(item);
+          if (
+            !normalizeTodoQueueText(nextItem.text)
+            && !getTodoQueueItemImages(nextItem).length
+            && !getTodoQueueItemNote(nextItem)
+          ) {
+            removedTodoIds.push(item.id);
+          }
+          return nextItem;
+        }
+
+        const images = getTodoQueueItemImages(item);
+        const imageIndex = Number(attachment?.index ?? 0);
+        if (!images.length || !Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= images.length) {
+          return item;
+        }
+
+        changed = true;
+        const nextItem = getTodoQueueItemWithImages(
+          item,
+          images.filter((_, index) => index !== imageIndex),
+        );
+        if (
+          !normalizeTodoQueueText(nextItem.text)
+          && !getTodoQueueItemImages(nextItem).length
+          && !getTodoQueueItemNote(nextItem)
+        ) {
+          removedTodoIds.push(item.id);
+        }
+        return nextItem;
+      });
+
+      return changed ? nextItems : currentItems;
+    }, {
+      force: removedTodoIds.length > 0,
+      immediate: removedTodoIds.length > 0,
+      reason: kind === "note" ? "todo_queue_note_removed" : "todo_queue_image_removed",
+      removedTodoIds,
+    });
   }, [updateTodoQueueItems]);
 
   const dispatchQueuedTodoItems = useCallback(() => {
@@ -28851,6 +29060,7 @@ function TerminalView({
                           onRequeueVoicePlanUnfinished={handleRequeueVoicePlanUnfinished}
                           onRequeueVoicePlanTask={handleRequeueVoicePlanTask}
                           onRemoveItem={removeTodoQueueItem}
+                          onRemoveItemAttachment={removeTodoQueueItemAttachment}
                           onReorderItem={reorderTodoQueueItem}
                           onResumePlan={handleResumeTerminalPlan}
                           onSubmitDraft={submitTodoQueueDraft}

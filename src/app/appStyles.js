@@ -4861,9 +4861,12 @@ export const TerminalAgentDot = styled.span`
 
 export const TerminalStateDebugBadge = styled.span`
   display: inline-flex;
-  max-width: clamp(42px, 15cqi, 88px);
+  flex: 0 0 auto;
+  min-width: max-content;
+  max-width: none;
   height: 18px;
   align-items: center;
+  justify-content: center;
   padding: 0 6px;
   overflow: hidden;
   border: 1px solid rgba(148, 163, 184, 0.18);
@@ -7356,9 +7359,9 @@ export const AudioTabBar = styled.div`
   display: grid;
   width: min(1080px, 100%);
   justify-self: center;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
-  padding: 10px;
+  padding: 10px 10px 8px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background:
@@ -7366,8 +7369,8 @@ export const AudioTabBar = styled.div`
     rgba(7, 9, 13, 0.72);
 
   ${AudioHeroRow} {
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--forge-border);
+    padding-bottom: 0;
+    border-bottom: 0;
   }
 
   html[data-forge-theme="light"] & {
@@ -7823,6 +7826,167 @@ export const AudioDictionaryTextarea = styled.textarea`
     border-color: var(--forge-blue-soft);
     box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
   }
+`;
+
+export const AudioDictionaryTermTools = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(160px, 0.8fr) auto minmax(160px, 1fr);
+  align-items: center;
+  gap: 8px;
+
+  button {
+    min-height: 36px;
+    padding-inline: 12px;
+  }
+
+  @media (max-width: 720px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioDictionaryWordList = styled.div`
+  display: flex;
+  min-width: 0;
+  max-height: min(360px, 42vh);
+  flex-direction: column;
+  gap: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 4px 0;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(2, 4, 8, 0.48);
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
+`;
+
+export const AudioDictionaryWordRow = styled.div`
+  --audio-word-dot-color: #7db0ff;
+
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 35px;
+  grid-template-columns: 22px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 0;
+  padding: 6px 7px 6px 10px;
+  color: #edf5ff;
+  background: transparent;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+
+  &::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    justify-self: center;
+    border-radius: 999px;
+    background: var(--audio-word-dot-color);
+    transition: opacity 130ms ease;
+  }
+
+  &:hover,
+  &:focus-within {
+    background: rgba(125, 160, 205, 0.07);
+  }
+
+  &:hover::before,
+  &:focus-within::before {
+    opacity: 0.44;
+  }
+
+  > button {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-2px);
+  }
+
+  &:hover > button,
+  &:focus-within > button {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  html[data-forge-theme="light"] & {
+    --audio-word-dot-color: var(--forge-blue);
+
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-within {
+    background: rgba(0, 102, 204, 0.055);
+  }
+`;
+
+export const AudioDictionaryWordText = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+export const AudioDictionaryWordDeleteButton = styled.button`
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(239, 107, 107, 0.14);
+  border-radius: 6px;
+  color: #ffd0d0;
+  background: rgba(127, 29, 29, 0.18);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover {
+    border-color: rgba(239, 107, 107, 0.34);
+    background: rgba(239, 107, 107, 0.16);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(255, 210, 210, 0.5);
+    outline-offset: 1px;
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #b42318;
+    background: rgba(180, 35, 24, 0.08);
+  }
+`;
+
+export const AudioDictionaryWordEmpty = styled.div`
+  display: grid;
+  min-height: 96px;
+  place-items: center;
+  padding: 18px;
+  color: var(--forge-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: center;
 `;
 
 export const AudioDictionaryListHeader = styled.div`
@@ -8527,6 +8691,98 @@ export const AudioHistoryRow = styled.div`
   }
 
   html[data-forge-theme="light"] & > strong {
+    color: var(--forge-text);
+  }
+`;
+
+export const AudioHistorySnippetChanges = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  margin-top: 1px;
+`;
+
+export const AudioHistorySnippetChangeRow = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  padding: 5px 7px;
+  border-left: 2px solid rgba(95, 156, 255, 0.54);
+  border-radius: 6px;
+  background: rgba(95, 156, 255, 0.055);
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(0, 102, 204, 0.46);
+    background: rgba(0, 102, 204, 0.045);
+  }
+`;
+
+export const AudioHistorySnippetChangeBadge = styled.span`
+  display: inline-flex;
+  min-height: 18px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  border: 1px solid rgba(95, 156, 255, 0.26);
+  border-radius: 999px;
+  color: var(--forge-blue-soft);
+  background: rgba(95, 156, 255, 0.08);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.2);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.07);
+  }
+`;
+
+export const AudioHistorySnippetChangeText = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(42px, 0.32fr) auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 6px;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 680;
+  line-height: 1.35;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  span:first-child {
+    max-width: min(180px, 28vw);
+    color: var(--forge-text-soft);
+    font-weight: 780;
+    white-space: nowrap;
+  }
+
+  span:last-child {
+    display: -webkit-box;
+    color: var(--forge-text-muted);
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  small {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 760;
+    text-transform: uppercase;
+  }
+
+  html[data-forge-theme="light"] & span:first-child {
     color: var(--forge-text);
   }
 `;
@@ -9445,6 +9701,10 @@ export const AudioBarIdleShell = styled.div`
   align-items: center;
   justify-content: flex-end;
   padding-bottom: 6px;
+
+  &[data-hover="true"] {
+    cursor: pointer;
+  }
 `;
 
 export const AudioBarIdleReveal = styled.div`
@@ -9459,7 +9719,7 @@ export const AudioBarIdleReveal = styled.div`
   pointer-events: none;
   transition: opacity 150ms ease, transform 180ms cubic-bezier(0.3, 0, 0.2, 1);
 
-  ${AudioBarIdleShell}:hover & {
+  ${AudioBarIdleShell}[data-hover="true"] & {
     opacity: 1;
     transform: translateY(0) scale(1);
     pointer-events: auto;
@@ -9651,7 +9911,7 @@ export const AudioBarHistoryActions = styled.div`
     transform 180ms cubic-bezier(0.3, 0, 0.2, 1) 45ms;
   -webkit-app-region: no-drag;
 
-  ${AudioBarIdleShell}:hover & {
+  ${AudioBarIdleShell}[data-hover="true"] & {
     opacity: 1;
     transform: translateX(0) scale(1);
   }
@@ -9701,7 +9961,7 @@ export const AudioBarIdleLine = styled.span`
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   transition: background 150ms ease, width 160ms cubic-bezier(0.3, 0, 0.2, 1);
 
-  ${AudioBarIdleShell}:hover & {
+  ${AudioBarIdleShell}[data-hover="true"] & {
     width: 78px;
     background: rgba(230, 236, 245, 0.55);
   }
@@ -9712,7 +9972,7 @@ export const AudioBarIdleLine = styled.span`
     box-shadow: 0 2px 8px rgba(29, 29, 31, 0.18);
   }
 
-  ${AudioBarIdleShell}[data-theme="light"]:hover & {
+  ${AudioBarIdleShell}[data-theme="light"][data-hover="true"] & {
     background: rgba(29, 29, 31, 0.5);
   }
 `;
@@ -11989,6 +12249,296 @@ export const CrashRecoveryActions = styled.div`
   justify-content: flex-end;
   gap: 9px;
   flex-wrap: wrap;
+`;
+
+export const AppCloseOverlay = styled(CrashRecoveryOverlay)`
+  padding: clamp(18px, 5vw, 34px);
+`;
+
+export const AppCloseDialog = styled(CrashRecoveryDialog)`
+  width: min(610px, 100%);
+  min-height: min(377px, calc(100vh - 36px));
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+  border-color: rgba(125, 160, 205, 0.24);
+  background:
+    linear-gradient(145deg, rgba(98, 160, 255, 0.07), transparent 42%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.018)),
+    rgba(9, 14, 21, 0.985);
+  box-shadow:
+    0 24px 70px rgba(0, 0, 0, 0.58),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    background:
+      linear-gradient(145deg, rgba(0, 102, 204, 0.06), transparent 42%),
+      rgba(255, 255, 255, 0.96);
+    box-shadow: 0 22px 60px rgba(15, 23, 42, 0.14);
+  }
+`;
+
+export const AppCloseHeader = styled(WorkspaceSettingsDialogHeader)`
+  align-items: center;
+  gap: 16px;
+  padding: 22px 22px 14px;
+  border-bottom-color: rgba(230, 236, 245, 0.07);
+
+  .app-close-title {
+    margin-top: 2px;
+    font-size: clamp(22px, 4vw, 29px);
+    line-height: 1.12;
+  }
+
+  .app-close-kicker {
+    color: rgba(255, 196, 110, 0.86);
+    letter-spacing: 0.08em;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.07);
+  }
+
+  html[data-forge-theme="light"] & .app-close-kicker {
+    color: #9a5b00;
+  }
+`;
+
+export const AppCloseBody = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1.618fr) minmax(118px, 1fr);
+  gap: 20px;
+  align-items: center;
+  padding: 20px 22px 18px;
+
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+`;
+
+export const AppCloseIntro = styled(CrashRecoveryIntro)`
+  gap: 9px;
+  color: rgba(213, 221, 232, 0.84);
+  font-size: 14px;
+  line-height: 1.55;
+`;
+
+export const AppCloseHint = styled.p`
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid rgba(125, 176, 255, 0.2);
+  border-radius: 8px;
+  color: rgba(210, 226, 255, 0.9);
+  background: rgba(59, 130, 246, 0.09);
+  font-size: 12px;
+  font-weight: 720;
+
+  &::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    flex: 0 0 auto;
+    border-radius: 2px;
+    background: #ffbd6e;
+    box-shadow: 0 0 0 3px rgba(255, 189, 110, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.06);
+  }
+`;
+
+export const AppCloseMark = styled.div`
+  display: grid;
+  width: min(112px, 100%);
+  aspect-ratio: 1;
+  justify-self: end;
+  place-items: center;
+  border: 1px solid rgba(125, 160, 205, 0.24);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(255, 189, 110, 0.12), rgba(98, 160, 255, 0.09)),
+    rgba(14, 21, 31, 0.8);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+
+  img {
+    display: block;
+    width: 58px;
+    height: 58px;
+    border-radius: 8px;
+    object-fit: cover;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background:
+      linear-gradient(135deg, rgba(255, 189, 110, 0.16), rgba(0, 102, 204, 0.08)),
+      rgba(255, 255, 255, 0.82);
+    box-shadow: none;
+  }
+
+  @media (max-width: 560px) {
+    width: 76px;
+    justify-self: start;
+    order: -1;
+
+    img {
+      width: 42px;
+      height: 42px;
+    }
+  }
+`;
+
+export const AppCloseList = styled(CrashRecoveryList)`
+  margin: 0 22px 18px;
+  max-height: min(190px, 27vh);
+`;
+
+export const AppCloseActions = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.618fr) minmax(0, 1fr);
+  gap: 10px;
+  margin-top: auto;
+  padding: 16px 22px 22px;
+  border-top: 1px solid rgba(230, 236, 245, 0.07);
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(0, 0, 0, 0.07);
+  }
+
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+`;
+
+export const AppCloseActionButton = styled.button`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 72px;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(125, 160, 205, 0.2);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(18, 25, 35, 0.72);
+  text-align: left;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.38);
+    background: rgba(24, 34, 47, 0.86);
+    box-shadow: 0 12px 26px rgba(0, 0, 0, 0.18);
+    transform: translateY(-1px);
+  }
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.56;
+  }
+
+  &[data-tone="danger"] {
+    border-color: rgba(239, 107, 107, 0.3);
+    color: #ffd0d0;
+    background: rgba(80, 34, 38, 0.3);
+  }
+
+  &[data-tone="danger"]:hover:not(:disabled) {
+    border-color: rgba(239, 107, 107, 0.5);
+    background: rgba(98, 39, 44, 0.42);
+  }
+
+  &[data-tone="background"] {
+    border-color: rgba(125, 176, 255, 0.36);
+    background:
+      linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(255, 189, 110, 0.06)),
+      rgba(20, 28, 39, 0.8);
+  }
+
+  &[data-tone="background"]:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.54);
+    background:
+      linear-gradient(135deg, rgba(59, 130, 246, 0.24), rgba(255, 189, 110, 0.08)),
+      rgba(23, 33, 47, 0.9);
+  }
+
+  &[data-tone="stay"] {
+    border-color: rgba(80, 211, 154, 0.26);
+    background: rgba(28, 63, 51, 0.24);
+  }
+
+  svg {
+    width: 21px;
+    height: 21px;
+    color: currentColor;
+  }
+
+  strong,
+  small {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-size: 14px;
+    font-weight: 820;
+    line-height: 1.2;
+  }
+
+  small {
+    margin-top: 4px;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 680;
+    line-height: 1.2;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="danger"] {
+    border-color: rgba(180, 35, 24, 0.22);
+    color: var(--forge-red);
+    background: rgba(180, 35, 24, 0.055);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="background"] {
+    border-color: rgba(0, 102, 204, 0.28);
+    background: rgba(0, 102, 204, 0.07);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="stay"] {
+    border-color: rgba(24, 128, 86, 0.22);
+    background: rgba(24, 128, 86, 0.06);
+  }
+
+  @media (max-width: 560px) {
+    min-height: 58px;
+  }
+`;
+
+export const AppCloseActionCopy = styled.span`
+  display: block;
+  min-width: 0;
 `;
 
 export const WorkspaceSettingsHeaderMain = styled.div`
@@ -14630,17 +15180,25 @@ export const WorkspaceCreateDirChip = styled.button`
 
 export const WorkspaceCreateAgentGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(176px, 1fr));
-  gap: 9px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 `;
 
 export const WorkspaceCreateAgentCard = styled.div`
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas:
+    "icon stepper"
+    "body stepper";
   align-items: center;
-  gap: 11px;
-  min-height: 88px;
-  padding: 11px 12px;
+  gap: 7px 9px;
+  min-height: 86px;
+  padding: 10px 11px;
   border: 1px solid ${({ $active }) => ($active ? "rgba(138, 216, 255, 0.34)" : "var(--forge-border)")};
   border-radius: 10px;
   background: ${({ $active }) => ($active ? "var(--forge-surface-selected)" : "var(--forge-surface-raised)")};
@@ -14652,6 +15210,7 @@ export const WorkspaceCreateAgentCard = styled.div`
 `;
 
 export const WorkspaceCreateAgentIcon = styled.span`
+  grid-area: icon;
   display: grid;
   width: 38px;
   height: 38px;
@@ -14711,9 +15270,10 @@ export const WorkspaceCreateAgentOpenCodeIcon = styled.svg`
 `;
 
 export const WorkspaceCreateAgentBody = styled.div`
+  grid-area: body;
   display: grid;
   min-width: 0;
-  gap: 8px;
+  align-self: start;
 `;
 
 export const WorkspaceCreateAgentLabel = styled.div`
@@ -14723,7 +15283,7 @@ export const WorkspaceCreateAgentLabel = styled.div`
 
   > strong {
     color: var(--forge-text);
-    font-size: 12.5px;
+    font-size: 12px;
     font-weight: 800;
     line-height: 1.12;
     overflow-wrap: anywhere;
@@ -14740,11 +15300,12 @@ export const WorkspaceCreateAgentLabel = styled.div`
 `;
 
 export const WorkspaceCreateAgentStepper = styled.div`
+  grid-area: stepper;
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
   gap: 2px;
-  justify-self: start;
+  justify-self: end;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   background: var(--forge-bg-deep);

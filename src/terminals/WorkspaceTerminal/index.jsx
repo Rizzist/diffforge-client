@@ -12135,6 +12135,8 @@ function WorkspaceTerminal({
               workspaceRootWasEmptyAtSelection: Boolean(workspaceRootWasEmptyAtSelection),
               workspaceId: workspace?.id || "",
               workspaceName: workspace?.name || "",
+              terminalName: terminalRailAgentLabel,
+              terminalNickname,
               cols: initialSize.cols,
               rows: initialSize.rows,
               outputTransport: outputTransportPreferred,

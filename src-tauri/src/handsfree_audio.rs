@@ -537,6 +537,63 @@ fn audio_shortcut_is_bare_escape(shortcut: &str) -> bool {
     )
 }
 
+const AUDIO_SHORTCUT_MODIFIER_ALT_MASK: u8 = 1 << 0;
+const AUDIO_SHORTCUT_MODIFIER_CONTROL_MASK: u8 = 1 << 1;
+const AUDIO_SHORTCUT_MODIFIER_SUPER_MASK: u8 = 1 << 2;
+const AUDIO_SHORTCUT_MODIFIER_SHIFT_MASK: u8 = 1 << 3;
+
+fn audio_shortcut_modifier_mask(shortcut: &str) -> u8 {
+    let mut mask = 0;
+
+    for raw_token in shortcut.split('+') {
+        let normalized = raw_token
+            .trim()
+            .chars()
+            .filter(|character| !matches!(character, ' ' | '-' | '_'))
+            .collect::<String>()
+            .to_ascii_uppercase();
+
+        match normalized.as_str() {
+            "OPTION" | "ALT" => mask |= AUDIO_SHORTCUT_MODIFIER_ALT_MASK,
+            "CONTROL" | "CTRL" => mask |= AUDIO_SHORTCUT_MODIFIER_CONTROL_MASK,
+            "COMMAND" | "CMD" | "SUPER" | "META" => mask |= AUDIO_SHORTCUT_MODIFIER_SUPER_MASK,
+            "SHIFT" => mask |= AUDIO_SHORTCUT_MODIFIER_SHIFT_MASK,
+            "COMMANDORCONTROL" | "COMMANDORCTRL" | "CMDORCTRL" | "CMDORCONTROL" => {
+                #[cfg(target_os = "macos")]
+                {
+                    mask |= AUDIO_SHORTCUT_MODIFIER_SUPER_MASK;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    mask |= AUDIO_SHORTCUT_MODIFIER_CONTROL_MASK;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    mask
+}
+
+fn escape_scope_allows_modifier_mask(
+    event_modifier_mask: u8,
+    audio_active: bool,
+    push_to_talk_down: bool,
+    push_to_talk_shortcut: &str,
+) -> bool {
+    if event_modifier_mask == 0 {
+        return true;
+    }
+
+    if !audio_active || !push_to_talk_down {
+        return false;
+    }
+
+    let push_to_talk_modifier_mask = audio_shortcut_modifier_mask(push_to_talk_shortcut);
+    push_to_talk_modifier_mask != 0
+        && (event_modifier_mask & !push_to_talk_modifier_mask) == 0
+}
+
 // ---------------------------------------------------------------------------
 // Shared bare-Escape scope broker.
 //
@@ -651,8 +708,9 @@ static ESCAPE_SCOPE_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static ESCAPE_SCOPE_MONITOR_APP: OnceLock<StdMutex<Option<AppHandle>>> = OnceLock::new();
 
-/// Returns true when the event is a bare-Escape press this broker consumed.
-/// Modifier combos (cmd+esc, ...) always pass through untouched.
+/// Returns true when the event is an Escape press this broker consumed.
+/// Modifier combos pass through, except while a recording shortcut is still
+/// held; then Escape plus that shortcut's modifiers still means cancel.
 #[cfg(target_os = "macos")]
 fn escape_scope_handle_monitor_event(event: &objc2_app_kit::NSEvent) -> bool {
     if !escape_scope_any_active() {
@@ -664,21 +722,34 @@ fn escape_scope_handle_monitor_event(event: &objc2_app_kit::NSEvent) -> bool {
     if event.keyCode() != MACOS_ESCAPE_KEY_CODE {
         return false;
     }
-    let flags = event.modifierFlags();
-    if flags.intersects(
-        objc2_app_kit::NSEventModifierFlags::Command
-            | objc2_app_kit::NSEventModifierFlags::Option
-            | objc2_app_kit::NSEventModifierFlags::Control
-            | objc2_app_kit::NSEventModifierFlags::Shift,
-    ) {
-        return false;
-    }
     let Some(app) = ESCAPE_SCOPE_MONITOR_APP
         .get()
         .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
     else {
         return false;
     };
+    let flags = event.modifierFlags();
+    let mut event_modifier_mask = 0;
+    if flags.contains(objc2_app_kit::NSEventModifierFlags::Option) {
+        event_modifier_mask |= AUDIO_SHORTCUT_MODIFIER_ALT_MASK;
+    }
+    if flags.contains(objc2_app_kit::NSEventModifierFlags::Control) {
+        event_modifier_mask |= AUDIO_SHORTCUT_MODIFIER_CONTROL_MASK;
+    }
+    if flags.contains(objc2_app_kit::NSEventModifierFlags::Command) {
+        event_modifier_mask |= AUDIO_SHORTCUT_MODIFIER_SUPER_MASK;
+    }
+    if flags.contains(objc2_app_kit::NSEventModifierFlags::Shift) {
+        event_modifier_mask |= AUDIO_SHORTCUT_MODIFIER_SHIFT_MASK;
+    }
+    if !escape_scope_allows_modifier_mask(
+        event_modifier_mask,
+        ESCAPE_SCOPE_AUDIO_ACTIVE.load(Ordering::Acquire),
+        AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire),
+        &audio_push_to_talk_shortcut_for(&app),
+    ) {
+        return false;
+    }
     escape_scope_trigger_debounced(&app, "macos_key_monitor");
     true
 }
@@ -2020,6 +2091,14 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                 return false;
             }
 
+            #[cfg(target_os = "macos")]
+            {
+                // Push-to-talk should never steal the insertion caret from the
+                // app/text field the user selected before pressing the hotkey.
+                let _ = audio_widget_reassert_open_state(&app, false);
+                audio_widget_emit_open_reassert(&app, false);
+            }
+
             if AUDIO_PUSH_TO_TALK_IS_DOWN.swap(true, Ordering::AcqRel) {
                 log_audio_diagnostic_event("audio.ptt.handle.duplicate_press", json!({}));
                 return true;
@@ -2289,4 +2368,57 @@ async fn insert_handsfree_transcribed_text(
         installed: whisper_model_status_for(&app)?.installed,
         shortcut: audio_push_to_talk_shortcut_for(&app),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_scope_accepts_plain_escape_without_active_audio() {
+        assert!(escape_scope_allows_modifier_mask(
+            0,
+            false,
+            false,
+            "Alt+KeyP",
+        ));
+    }
+
+    #[test]
+    fn escape_scope_accepts_record_shortcut_modifiers_while_recording() {
+        assert!(escape_scope_allows_modifier_mask(
+            AUDIO_SHORTCUT_MODIFIER_ALT_MASK,
+            true,
+            true,
+            "Alt+KeyP",
+        ));
+        assert!(escape_scope_allows_modifier_mask(
+            AUDIO_SHORTCUT_MODIFIER_ALT_MASK | AUDIO_SHORTCUT_MODIFIER_SHIFT_MASK,
+            true,
+            true,
+            "Alt+Shift+KeyP",
+        ));
+    }
+
+    #[test]
+    fn escape_scope_rejects_unrelated_or_inactive_modifiers() {
+        assert!(!escape_scope_allows_modifier_mask(
+            AUDIO_SHORTCUT_MODIFIER_SHIFT_MASK,
+            true,
+            true,
+            "Alt+KeyP",
+        ));
+        assert!(!escape_scope_allows_modifier_mask(
+            AUDIO_SHORTCUT_MODIFIER_ALT_MASK,
+            false,
+            true,
+            "Alt+KeyP",
+        ));
+        assert!(!escape_scope_allows_modifier_mask(
+            AUDIO_SHORTCUT_MODIFIER_ALT_MASK,
+            true,
+            false,
+            "Alt+KeyP",
+        ));
+    }
 }

@@ -3089,6 +3089,8 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
                 "visible": visible,
             }),
         );
+        #[cfg(target_os = "macos")]
+        audio_widget_apply_macos_space_style(&window);
         return Ok(window);
     }
 
@@ -3112,6 +3114,8 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
     .always_on_top(true)
     .focused(false)
     .accept_first_mouse(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
     .transparent(true)
     .background_color(Color(0, 0, 0, 0))
     .visible(false)
@@ -3156,21 +3160,132 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
         ),
     }
 
+    #[cfg(target_os = "macos")]
+    audio_widget_apply_macos_space_style(&window);
+
     let app_handle = app.clone();
+    let window_for_events = window.clone();
     window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
-            log_audio_diagnostic_event(
-                "audio.widget.window.destroyed",
-                json!({
-                    "label": AUDIO_WIDGET_WINDOW_LABEL,
-                }),
-            );
-            emit_audio_widget_current_visibility(&app_handle, false);
+        match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                if APP_CLOSE_SHUTDOWN_IN_FLIGHT.load(Ordering::SeqCst)
+                    || APP_SHUTDOWN_PHASE.load(Ordering::SeqCst) != APP_SHUTDOWN_PHASE_RUNNING
+                {
+                    #[cfg(target_os = "macos")]
+                    snipping_restore_window_class_for_close_now(&window_for_events);
+                    return;
+                }
+                api.prevent_close();
+                if let Some(window) = app_handle.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+                    let _ = window.hide();
+                }
+                emit_audio_widget_current_visibility(&app_handle, false);
+            }
+            WindowEvent::Destroyed => {
+                log_audio_diagnostic_event(
+                    "audio.widget.window.destroyed",
+                    json!({
+                        "label": AUDIO_WIDGET_WINDOW_LABEL,
+                    }),
+                );
+                emit_audio_widget_current_visibility(&app_handle, false);
+            }
+            _ => {}
         }
     });
 
     Ok(window)
 }
+
+/// Cross-Space style for the always-available audio widget. Tauri's
+/// `visible_on_all_workspaces` only covers ordinary Spaces on macOS; widgets
+/// shown while another app owns a fullscreen Space also need AppKit's
+/// FullScreenAuxiliary behavior and a level above the fullscreen window.
+/// Re-asserted on ensure/show because these are mutable NSWindow properties.
+#[cfg(target_os = "macos")]
+fn audio_widget_apply_macos_space_style(window: &tauri::WebviewWindow) {
+    snipping_convert_overlay_window_to_panel(window);
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("audio_widget_apply_macos_space_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+            ns_window.setAcceptsMouseMovedEvents(true);
+        });
+    });
+}
+
+/// Surfaces the widget even while Diff Forge is not active, such as when a
+/// push-to-talk action opens it inside another app's fullscreen Space.
+#[cfg(target_os = "macos")]
+fn audio_widget_order_front_regardless(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("audio_widget_order_front_regardless", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.orderFrontRegardless();
+        });
+    });
+}
+
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
+
+#[cfg(target_os = "macos")]
+fn audio_widget_reassert_open_state(app: &AppHandle, make_key: bool) -> bool {
+    let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+        return false;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return false;
+    }
+    audio_widget_apply_macos_space_style(&window);
+    audio_widget_order_front_regardless(&window);
+    if make_key {
+        snipping_make_overlay_key(&window);
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_emit_open_reassert(app: &AppHandle, make_key: bool) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(AUDIO_WIDGET_REASSERT_SHOW_MS)).await;
+        if !audio_widget_reassert_open_state(&app, make_key) {
+            return;
+        }
+        sleep(Duration::from_millis(
+            AUDIO_WIDGET_COLD_BOOT_REASSERT_MS.saturating_sub(AUDIO_WIDGET_REASSERT_SHOW_MS),
+        ))
+        .await;
+        let _ = audio_widget_reassert_open_state(&app, make_key);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_emit_open_reassert(_app: &AppHandle, _make_key: bool) {}
 
 fn run_audio_widget_action_on_main_thread<T, F>(
     app: &AppHandle,
@@ -3271,13 +3386,21 @@ fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Resu
 
     run_audio_widget_action_on_main_thread(app, "show", move |app| {
         let window = ensure_audio_widget_window(app)?;
+        #[cfg(target_os = "macos")]
+        audio_widget_apply_macos_space_style(&window);
         window
             .show()
             .map_err(|error| format!("Unable to show audio widget: {error}"))?;
+        #[cfg(target_os = "macos")]
+        audio_widget_order_front_regardless(&window);
 
         if focus {
+            #[cfg(target_os = "macos")]
+            snipping_make_overlay_key(&window);
+            #[cfg(not(target_os = "macos"))]
             let _ = window.set_focus();
         }
+        audio_widget_emit_open_reassert(app, focus);
 
         Ok(())
     })
@@ -3357,6 +3480,55 @@ fn audio_widget_status_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Str
         }),
     );
     Ok(visibility)
+}
+
+const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT: f64 = 34.0;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP: f64 = 14.0;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWidgetBarHoverSnapshotRequest {
+    active: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWidgetBarHoverSnapshot {
+    hovering: bool,
+}
+
+fn audio_widget_bar_hover_snapshot_for(
+    app: &AppHandle,
+    request: &AudioWidgetBarHoverSnapshotRequest,
+) -> AudioWidgetBarHoverSnapshot {
+    let hovering = app
+        .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+        .filter(|window| window.is_visible().unwrap_or(false))
+        .and_then(|window| {
+            let cursor = app.cursor_position().ok()?;
+            let position = window.outer_position().ok()?;
+            let size = window.outer_size().ok()?;
+            let scale = window.scale_factor().unwrap_or(1.0).max(0.1);
+            let local_x = cursor.x - f64::from(position.x);
+            let local_y = cursor.y - f64::from(position.y);
+            let width = f64::from(size.width.max(1));
+            let height = f64::from(size.height.max(1));
+
+            if local_x < 0.0 || local_y < 0.0 || local_x > width || local_y > height {
+                return Some(false);
+            }
+
+            let logical_y = local_y / scale;
+            let logical_height = height / scale;
+            if request.active {
+                Some(logical_y >= AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP)
+            } else {
+                Some(logical_y >= (logical_height - AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT).max(0.0))
+            }
+        })
+        .unwrap_or(false);
+
+    AudioWidgetBarHoverSnapshot { hovering }
 }
 
 fn emit_audio_widget_visibility_changed(app: &AppHandle, visibility: &AudioWidgetVisibility) {
@@ -7225,6 +7397,14 @@ async fn stop_forge_dictation_transcription(
 async fn audio_widget_status(app: AppHandle) -> Result<AudioWidgetVisibility, String> {
     log_audio_diagnostic_event("audio.widget.status.command", json!({}));
     audio_widget_status_for(&app)
+}
+
+#[tauri::command]
+async fn audio_widget_bar_hover_snapshot(
+    app: AppHandle,
+    request: AudioWidgetBarHoverSnapshotRequest,
+) -> Result<AudioWidgetBarHoverSnapshot, String> {
+    Ok(audio_widget_bar_hover_snapshot_for(&app, &request))
 }
 
 #[tauri::command]

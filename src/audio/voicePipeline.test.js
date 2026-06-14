@@ -59,6 +59,18 @@ test("snippets expand triggers case-insensitively, longest trigger first", () =>
 
   assert.equal(result.text, "[short prompt] and [long prompt] please");
   assert.equal(result.counts.snippets, 2);
+  assert.deepEqual(result.changes.snippets, [
+    {
+      original: "Gstack",
+      replacement: "[short prompt]",
+      trigger: "gstack",
+    },
+    {
+      original: "gstack pro",
+      replacement: "[long prompt]",
+      trigger: "gstack pro",
+    },
+  ]);
 });
 
 test("snippet expansions keep dollar signs literal", () => {
@@ -109,6 +121,7 @@ test("disabled rules are ignored", () => {
 
   assert.equal(result.text, "gstack tauri");
   assert.equal(result.changed, false);
+  assert.deepEqual(result.changes.snippets, []);
 });
 
 test("normalize drops empty entries, trims, and defaults selection true", () => {

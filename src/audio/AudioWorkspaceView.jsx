@@ -256,7 +256,12 @@ import {
   AudioTabButton,
   AudioTabPanel,
   AudioDictionaryPanel,
-  AudioDictionaryTextarea,
+  AudioDictionaryTermTools,
+  AudioDictionaryWordDeleteButton,
+  AudioDictionaryWordEmpty,
+  AudioDictionaryWordList,
+  AudioDictionaryWordRow,
+  AudioDictionaryWordText,
   AudioDictionaryList,
   AudioDictionaryMetaPill,
   AudioDictionaryEmpty,
@@ -291,6 +296,10 @@ import {
   AudioHistoryProvider,
   AudioHistoryCopyButton,
   AudioHistoryMeta,
+  AudioHistorySnippetChangeBadge,
+  AudioHistorySnippetChangeRow,
+  AudioHistorySnippetChangeText,
+  AudioHistorySnippetChanges,
   AudioInsightCard,
   AudioInsightCardTopline,
   AudioInsightLabel,
@@ -510,6 +519,11 @@ const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 6;
 // zone so hovering it can reveal the round record button + shortcut hint.
 const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
+const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
+const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
+const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 34;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP = 14;
 // Extra window height for the small error card shown above the bubble; the
 // window shifts up by the same amount so the pill stays put on screen.
 const AUDIO_WIDGET_ERROR_POPOVER_HEIGHT = 62;
@@ -589,6 +603,44 @@ function isWindowsPlatform() {
   return typeof navigator !== "undefined" && /win/i.test(navigator.platform || "");
 }
 
+function shouldUseFullMonitorBoundsForAudioBar() {
+  if (!isMacPlatform() || typeof window === "undefined" || !window.screen) {
+    return false;
+  }
+
+  const screenHeight = Number(window.screen.height || 0);
+  const availableHeight = Number(window.screen.availHeight || 0);
+  if (!Number.isFinite(screenHeight) || !Number.isFinite(availableHeight) || screenHeight <= 0) {
+    return false;
+  }
+
+  return availableHeight >= screenHeight - 2;
+}
+
+function audioBarIdlePointerEventIsHovering(event, active) {
+  const viewportHeight = Number(window.innerHeight || AUDIO_WIDGET_BAR_IDLE_SIZE.height);
+  const viewportWidth = Number(window.innerWidth || AUDIO_WIDGET_BAR_IDLE_SIZE.width);
+  const x = Number(event?.clientX ?? -1);
+  const y = Number(event?.clientY ?? -1);
+
+  if (
+    !Number.isFinite(x)
+    || !Number.isFinite(y)
+    || x < 0
+    || y < 0
+    || x > viewportWidth
+    || y > viewportHeight
+  ) {
+    return false;
+  }
+
+  if (active) {
+    return y >= AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP;
+  }
+
+  return y >= Math.max(0, viewportHeight - AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT);
+}
+
 const isFocusedAudioWidgetState = (state) => state === "arming"
   || state === "recording"
   || state === "transcribing"
@@ -625,6 +677,11 @@ function getErrorMessage(error, fallback) {
   }
 
   return fallback;
+}
+
+function formatDictionaryTermsDraftText(terms) {
+  const value = Array.isArray(terms) ? terms.join("\n") : String(terms ?? "");
+  return parseDictionaryTerms(value).join("\n");
 }
 
 function formatFileSize(size) {
@@ -854,6 +911,56 @@ function normalizeShortcutForCompare(value) {
     .join("+");
 }
 
+function normalizeShortcutModifierForCancel(token) {
+  const compact = normalizeShortcutTokenForCompare(token);
+
+  if (compact === "option") return "alt";
+  if (compact === "ctrl") return "control";
+  if (compact === "command" || compact === "cmd" || compact === "meta") return "super";
+  if (compact === "commandorcontrol" || compact === "commandorctrl" || compact === "cmdorcontrol" || compact === "cmdorctrl") {
+    return isMacPlatform() ? "super" : "control";
+  }
+
+  if (compact === "alt" || compact === "control" || compact === "shift" || compact === "super") {
+    return compact;
+  }
+
+  return "";
+}
+
+function shortcutModifierSetForCancel(shortcut) {
+  const modifiers = new Set();
+  String(shortcut || "")
+    .split("+")
+    .forEach((token) => {
+      const modifier = normalizeShortcutModifierForCancel(token);
+      if (modifier) {
+        modifiers.add(modifier);
+      }
+    });
+  return modifiers;
+}
+
+function eventModifierSetForCancel(event) {
+  const modifiers = new Set();
+  if (event.ctrlKey) modifiers.add("control");
+  if (event.altKey) modifiers.add("alt");
+  if (event.shiftKey) modifiers.add("shift");
+  if (event.metaKey) modifiers.add("super");
+  return modifiers;
+}
+
+function shortcutIsBareEscape(shortcut) {
+  const normalized = normalizeShortcutForCompare(shortcut);
+  return normalized === "escape" || normalized === "esc";
+}
+
+function keyboardEventIsEscape(event) {
+  const code = normalizeShortcutTokenForCompare(normalizeKeyboardShortcutCode(event.code || event.key || ""));
+  const key = normalizeShortcutTokenForCompare(event.key || "");
+  return code === "escape" || code === "esc" || key === "escape" || key === "esc";
+}
+
 function shortcutFromKeyboardEvent(event) {
   const code = normalizeKeyboardShortcutCode(event.code || event.key || "");
 
@@ -888,6 +995,28 @@ function shortcutMatchesEvent(shortcut, event) {
 
   return Boolean(eventShortcut)
     && normalizeShortcutForCompare(eventShortcut) === normalizeShortcutForCompare(shortcut);
+}
+
+function cancelShortcutMatchesEvent(shortcut, event, pushToTalkShortcut, pushToTalkDown) {
+  if (shortcutMatchesEvent(shortcut, event)) {
+    return true;
+  }
+
+  if (!pushToTalkDown || !shortcutIsBareEscape(shortcut) || !keyboardEventIsEscape(event)) {
+    return false;
+  }
+
+  const eventModifiers = eventModifierSetForCancel(event);
+  if (!eventModifiers.size) {
+    return true;
+  }
+
+  const pushToTalkModifiers = shortcutModifierSetForCancel(pushToTalkShortcut);
+  if (!pushToTalkModifiers.size) {
+    return false;
+  }
+
+  return [...eventModifiers].every((modifier) => pushToTalkModifiers.has(modifier));
 }
 
 function formatShortcutToken(token) {
@@ -1226,9 +1355,41 @@ function isAudioHistoryClampable(entryText) {
   return false;
 }
 
+function audioHistorySnippetChanges(entry) {
+  const changes = Array.isArray(entry?.snippetChanges)
+    ? entry.snippetChanges
+    : Array.isArray(entry?.changes?.snippets)
+      ? entry.changes.snippets
+      : [];
+
+  return changes
+    .map((change) => {
+      const original = String(change?.original || change?.trigger || "").trim();
+      const replacement = String(change?.replacement || "").trim();
+      const trigger = String(change?.trigger || original).trim();
+
+      if (!original || !replacement) {
+        return null;
+      }
+
+      return { original, replacement, trigger };
+    })
+    .filter(Boolean);
+}
+
+function audioHistoryEntryDisplayText(entry, snippetChanges) {
+  const sourceText = String(entry?.sourceText || "").trim();
+  if (snippetChanges.length && sourceText) {
+    return sourceText;
+  }
+
+  return String(entry?.text || "");
+}
+
 function buildAudioHistoryRows(history) {
   return (Array.isArray(history) ? history : []).map((entry, index) => {
-    const entryText = String(entry?.text || "");
+    const snippetChanges = audioHistorySnippetChanges(entry);
+    const entryText = audioHistoryEntryDisplayText(entry, snippetChanges);
     return {
       clampable: isAudioHistoryClampable(entryText),
       entry,
@@ -1237,6 +1398,7 @@ function buildAudioHistoryRows(history) {
       index,
       meta: formatAudioHistoryMeta(entry),
       providerLabel: formatAudioProviderLabel(entry?.provider),
+      snippetChanges,
       timestamp: formatHistoryTimestamp(entry?.createdAt),
     };
   });
@@ -1351,7 +1513,7 @@ function AudioHistoryVirtualRow({
         window.removeEventListener("resize", measure);
       }
     };
-  }, [expanded, onMeasure, row.entryKey, row.entryText]);
+  }, [expanded, onMeasure, row.entryKey, row.entryText, row.snippetChanges]);
 
   return (
     <AudioHistoryRow
@@ -1394,6 +1556,23 @@ function AudioHistoryVirtualRow({
         </AudioHistoryRowActions>
       </AudioHistoryRowTopline>
       <strong>{row.entryText}</strong>
+      {row.snippetChanges.length > 0 && (
+        <AudioHistorySnippetChanges aria-label="Snippet replacements">
+          {row.snippetChanges.map((change, index) => (
+            <AudioHistorySnippetChangeRow
+              key={`${change.trigger}-${index}`}
+              title={`${change.original} to ${change.replacement}`}
+            >
+              <AudioHistorySnippetChangeBadge>Snippet</AudioHistorySnippetChangeBadge>
+              <AudioHistorySnippetChangeText>
+                <span>{change.original}</span>
+                <small>to</small>
+                <span>{change.replacement}</span>
+              </AudioHistorySnippetChangeText>
+            </AudioHistorySnippetChangeRow>
+          ))}
+        </AudioHistorySnippetChanges>
+      )}
       <AudioHistoryRowFootline>
         <AudioHistoryMeta>{row.meta}</AudioHistoryMeta>
         {row.clampable && (
@@ -1586,6 +1765,17 @@ export default function AudioWorkspaceView({
       ? parseDictionaryTerms(voiceRuleEditor.draft?.termsText || "")
       : []
   ), [voiceRuleEditor]);
+  const voiceRuleEditorTermSearch = voiceRuleEditor?.kind === "dictionary"
+    ? String(voiceRuleEditor.draft?.termSearch || "").trim()
+    : "";
+  const visibleVoiceRuleEditorTerms = useMemo(() => {
+    if (!voiceRuleEditorTermSearch) {
+      return voiceRuleEditorTerms;
+    }
+
+    const needle = voiceRuleEditorTermSearch.toLowerCase();
+    return voiceRuleEditorTerms.filter((term) => term.toLowerCase().includes(needle));
+  }, [voiceRuleEditorTermSearch, voiceRuleEditorTerms]);
   const voiceRuleEditorCanSave = useMemo(() => {
     const draft = voiceRuleEditor?.draft || {};
 
@@ -1965,7 +2155,9 @@ export default function AudioWorkspaceView({
       ? {
         name: entry?.name || "",
         selected: entry?.selected !== false,
-        termsText: entry?.termsText ?? (entry?.terms || []).join(", "),
+        termInput: "",
+        termSearch: "",
+        termsText: formatDictionaryTermsDraftText(entry?.termsText ?? (entry?.terms || []).join("\n")),
       }
       : kind === "snippets"
         ? {
@@ -2008,6 +2200,42 @@ export default function AudioWorkspaceView({
         : currentEditor
     ));
   }, []);
+
+  const updateDictionaryEditorTerms = useCallback((terms, patch = {}) => {
+    updateVoiceRuleEditorDraft({
+      ...patch,
+      termsText: formatDictionaryTermsDraftText(terms),
+    });
+  }, [updateVoiceRuleEditorDraft]);
+
+  const addDictionaryEditorTerms = useCallback(() => {
+    if (voiceRuleEditor?.kind !== "dictionary") {
+      return;
+    }
+
+    const draft = voiceRuleEditor.draft || {};
+    const incomingTerms = parseDictionaryTerms(draft.termInput || "");
+    if (!incomingTerms.length) {
+      return;
+    }
+
+    updateDictionaryEditorTerms([...voiceRuleEditorTerms, ...incomingTerms], { termInput: "" });
+  }, [updateDictionaryEditorTerms, voiceRuleEditor, voiceRuleEditorTerms]);
+
+  const removeDictionaryEditorTerm = useCallback((termToRemove) => {
+    updateDictionaryEditorTerms(
+      voiceRuleEditorTerms.filter((term) => term.toLowerCase() !== String(termToRemove || "").toLowerCase()),
+    );
+  }, [updateDictionaryEditorTerms, voiceRuleEditorTerms]);
+
+  const handleDictionaryTermInputKeyDown = useCallback((event) => {
+    if (event.key !== "Enter") {
+      return;
+    }
+
+    event.preventDefault();
+    addDictionaryEditorTerms();
+  }, [addDictionaryEditorTerms]);
 
   const saveVoiceRuleEditor = useCallback(async (event) => {
     event?.preventDefault?.();
@@ -3182,16 +3410,63 @@ export default function AudioWorkspaceView({
                           value={editorDraft.name || ""}
                         />
                       </AudioRuleFieldLabel>
-                      <AudioRuleFieldLabel>
+                      <AudioRuleFieldLabel as="div">
                         <span>Words</span>
-                        <AudioDictionaryTextarea
-                          aria-label="Word list terms"
-                          onChange={(event) => updateVoiceRuleEditorDraft({ termsText: event.target.value })}
-                          placeholder="Tauri, Deepgram, AppKit"
-                          value={editorDraft.termsText || ""}
-                        />
+                        <AudioDictionaryTermTools>
+                          <AudioCloudInput
+                            aria-label="Add word"
+                            onChange={(event) => updateVoiceRuleEditorDraft({ termInput: event.target.value })}
+                            onKeyDown={handleDictionaryTermInputKeyDown}
+                            placeholder="Add word"
+                            value={editorDraft.termInput || ""}
+                          />
+                          <SecondaryButton
+                            aria-label="Add word to list"
+                            disabled={!parseDictionaryTerms(editorDraft.termInput || "").length}
+                            onClick={addDictionaryEditorTerms}
+                            type="button"
+                          >
+                            <ButtonAddIcon aria-hidden="true" />
+                            <span>Add</span>
+                          </SecondaryButton>
+                          <AudioCloudInput
+                            aria-label="Search words"
+                            onChange={(event) => updateVoiceRuleEditorDraft({ termSearch: event.target.value })}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                              }
+                            }}
+                            placeholder="Search words"
+                            value={editorDraft.termSearch || ""}
+                          />
+                        </AudioDictionaryTermTools>
+                        <AudioDictionaryWordList aria-label="Word list terms" role="list">
+                          {visibleVoiceRuleEditorTerms.length ? (
+                            visibleVoiceRuleEditorTerms.map((term) => (
+                              <AudioDictionaryWordRow key={term} role="listitem">
+                                <AudioDictionaryWordText title={term}>{term}</AudioDictionaryWordText>
+                                <AudioDictionaryWordDeleteButton
+                                  aria-label={`Delete word ${term}`}
+                                  onClick={() => removeDictionaryEditorTerm(term)}
+                                  type="button"
+                                >
+                                  <ButtonDeleteIcon aria-hidden="true" />
+                                </AudioDictionaryWordDeleteButton>
+                              </AudioDictionaryWordRow>
+                            ))
+                          ) : (
+                            <AudioDictionaryWordEmpty>
+                              {voiceRuleEditorTerms.length
+                                ? "No words match your search."
+                                : "Add words to this list."}
+                            </AudioDictionaryWordEmpty>
+                          )}
+                        </AudioDictionaryWordList>
                         <AudioRuleFieldCaption>
-                          {voiceRuleEditorTerms.length} {voiceRuleEditorTerms.length === 1 ? "word" : "words"}
+                          {voiceRuleEditorTermSearch
+                            ? `${visibleVoiceRuleEditorTerms.length} of ${voiceRuleEditorTerms.length}`
+                            : voiceRuleEditorTerms.length} {voiceRuleEditorTerms.length === 1 ? "word" : "words"}
                         </AudioRuleFieldCaption>
                       </AudioRuleFieldLabel>
                       <AudioRuleStatusLine>
@@ -3611,6 +3886,7 @@ export function AudioWidgetWindow() {
   const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
   const [widgetDragging, setWidgetDragging] = useState(false);
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
+  const [barIdleHover, setBarIdleHover] = useState(false);
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
   const audioBufferReadyAtRef = useRef(0);
@@ -3637,6 +3913,7 @@ export function AudioWidgetWindow() {
   const historyTrayCloseTimerRef = useRef(0);
   const bubbleHistoryTrayActiveRef = useRef(false);
   const widgetDraggingRef = useRef(false);
+  const barIdleHoverRef = useRef(false);
   const widgetDragSettleTimerRef = useRef(0);
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
@@ -3646,9 +3923,19 @@ export function AudioWidgetWindow() {
   // phrases; the live line accumulates them here between turn boundaries.
   const forgeVoiceRealtimeDraftRef = useRef("");
 
+  const setBarIdleHoverState = useCallback((nextHovering) => {
+    const hovering = Boolean(nextHovering);
+    barIdleHoverRef.current = hovering;
+    setBarIdleHover((current) => (current === hovering ? current : hovering));
+  }, []);
+
   useEffect(() => {
     widgetStateRef.current = widgetState;
   }, [widgetState]);
+
+  useEffect(() => {
+    barIdleHoverRef.current = barIdleHover;
+  }, [barIdleHover]);
 
   useEffect(() => {
     recorderModeRef.current = recorderMode;
@@ -4136,6 +4423,7 @@ export function AudioWidgetWindow() {
   const cancelNoticeActive = Boolean(cancelNotice);
   const barVisible = usesBottomAnchoredStyle
     && (widgetActive || cancelNoticeActive);
+  const barIdleMode = usesBottomAnchoredStyle && !barVisible;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.
   const bubbleCancelNoticeActive = cancelNoticeActive
@@ -4215,6 +4503,14 @@ export function AudioWidgetWindow() {
       setHistoryTrayOpen(false);
     }, 140);
   }, []);
+
+  const updateBarIdleHoverFromPointer = useCallback((event) => {
+    setBarIdleHoverState(audioBarIdlePointerEventIsHovering(event, barIdleHoverRef.current));
+  }, [setBarIdleHoverState]);
+
+  const clearBarIdleHover = useCallback(() => {
+    setBarIdleHoverState(false);
+  }, [setBarIdleHoverState]);
 
   // The hidden style keeps the window "visible" to the OS (global shortcuts
   // require it) but inert and invisible while idle. The bar style is always
@@ -4350,22 +4646,8 @@ export function AudioWidgetWindow() {
     };
   }, [scheduleWidgetDragFinish]);
 
-  // The bar style docks the window bottom-center of the active monitor; the
-  // user's bubble placement is restored on exit. The monitor work area keeps
-  // the line above the macOS Dock / Windows taskbar on whichever screen it is
-  // on, and in fullscreen (no dock/taskbar) the same math hugs the bare edge.
-  useEffect(() => {
+  const positionBottomAnchoredWidget = useCallback(() => {
     if (!usesBottomAnchoredStyle) {
-      const saved = barSavedPlacementRef.current;
-      if (saved) {
-        barSavedPlacementRef.current = null;
-        runWidgetWindowAction(async (windowHandle) => {
-          await windowHandle.setSize(
-            new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height),
-          );
-          await windowHandle.setPosition(saved.position);
-        });
-      }
       return;
     }
 
@@ -4388,9 +4670,11 @@ export function AudioWidgetWindow() {
       const monitor = await currentMonitor();
       if (monitor) {
         const scale = monitor.scaleFactor || 1;
-        const area = monitor.workArea?.size?.height
-          ? monitor.workArea
-          : { position: monitor.position, size: monitor.size };
+        const fullArea = { position: monitor.position, size: monitor.size };
+        const workArea = monitor.workArea?.size?.height ? monitor.workArea : null;
+        const area = shouldUseFullMonitorBoundsForAudioBar()
+          ? fullArea
+          : workArea || fullArea;
         const x = area.position.x
           + Math.round((area.size.width - (target.width * scale)) / 2);
         const y = area.position.y
@@ -4399,7 +4683,88 @@ export function AudioWidgetWindow() {
         await windowHandle.setPosition(new PhysicalPosition(x, y));
       }
     });
-  }, [barVisible, cancelNoticeActive, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
+  }, [barVisible, cancelNoticeActive, runWidgetWindowAction, usesBottomAnchoredStyle]);
+
+  // The bar style docks the window bottom-center of the active monitor; the
+  // user's bubble placement is restored on exit. The monitor work area keeps
+  // the line above the macOS Dock / Windows taskbar on ordinary desktops, while
+  // macOS fullscreen Spaces use the full monitor bounds so no reserved Dock gap
+  // is left under the bar.
+  useEffect(() => {
+    if (!usesBottomAnchoredStyle) {
+      const saved = barSavedPlacementRef.current;
+      if (saved) {
+        barSavedPlacementRef.current = null;
+        runWidgetWindowAction(async (windowHandle) => {
+          await windowHandle.setSize(
+            new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height),
+          );
+          await windowHandle.setPosition(saved.position);
+        });
+      }
+      return;
+    }
+
+    positionBottomAnchoredWidget();
+  }, [positionBottomAnchoredWidget, runWidgetWindowAction, usesBottomAnchoredStyle]);
+
+  useEffect(() => {
+    if (!usesBottomAnchoredStyle) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(
+      positionBottomAnchoredWidget,
+      AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [positionBottomAnchoredWidget, usesBottomAnchoredStyle]);
+
+  useEffect(() => {
+    if (!barIdleMode) {
+      setBarIdleHoverState(false);
+    }
+  }, [barIdleMode, setBarIdleHoverState]);
+
+  useEffect(() => {
+    if (!barIdleMode) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const snapshot = await invoke("audio_widget_bar_hover_snapshot", {
+          request: {
+            active: barIdleHoverRef.current,
+          },
+        });
+        if (!disposed) {
+          setBarIdleHoverState(Boolean(snapshot?.hovering));
+        }
+      } catch {
+        // Web previews and older native builds do not expose this helper.
+      }
+
+      if (!disposed) {
+        timer = window.setTimeout(
+          poll,
+          barIdleHoverRef.current
+            ? AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS
+            : AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS,
+        );
+      }
+    };
+
+    poll();
+    return () => {
+      disposed = true;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [barIdleMode, setBarIdleHoverState]);
 
   // Bubble history controls use the same stable-anchor idea as the error
   // popover: resize the native frame in one direction while leaving the
@@ -4446,7 +4811,7 @@ export function AudioWidgetWindow() {
     && !usesBottomAnchoredStyle;
 
   useEffect(() => {
-    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
+    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetDragging) {
       return undefined;
     }
     const wantsFocus = widgetTargetMode === "focus";
@@ -4541,16 +4906,22 @@ export function AudioWidgetWindow() {
         window.cancelAnimationFrame(compactFrame);
       }
     };
-  }, [runWidgetWindowAction, setWidgetFrameMode, widgetStyle, widgetTargetMode]);
+  }, [runWidgetWindowAction, setWidgetFrameMode, widgetDragging, widgetStyle, widgetTargetMode]);
 
   useEffect(() => {
-    if (!errorFrameActive) {
+    if (!errorFrameActive || widgetDragging) {
       return undefined;
     }
     let savedPosition = null;
     runWidgetWindowAction(async (windowHandle) => {
+      if (widgetDraggingRef.current) {
+        return;
+      }
       const scale = await windowHandle.scaleFactor().catch(() => 1);
       savedPosition = await windowHandle.outerPosition();
+      if (widgetDraggingRef.current) {
+        return;
+      }
       await windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_FOCUS_SIZE.width,
         AUDIO_WIDGET_FOCUS_SIZE.height + AUDIO_WIDGET_ERROR_POPOVER_HEIGHT,
@@ -4562,28 +4933,37 @@ export function AudioWidgetWindow() {
     });
     return () => {
       runWidgetWindowAction(async (windowHandle) => {
+        if (widgetDraggingRef.current) {
+          return;
+        }
         await windowHandle.setSize(new LogicalSize(
           AUDIO_WIDGET_FOCUS_SIZE.width,
           AUDIO_WIDGET_FOCUS_SIZE.height,
         ));
-        if (savedPosition) {
+        if (savedPosition && !widgetDraggingRef.current) {
           await windowHandle.setPosition(savedPosition);
         }
       });
     };
-  }, [errorFrameActive, runWidgetWindowAction]);
+  }, [errorFrameActive, runWidgetWindowAction, widgetDragging]);
 
   // Bubble-style cancel notice: morph the window into the notice pill at the
   // bubble's spot (nudged left if it would run off-screen), then restore the
   // compact bubble exactly where it was once the notice dismisses.
   useEffect(() => {
-    if (!bubbleCancelNoticeActive) {
+    if (!bubbleCancelNoticeActive || widgetDragging) {
       return undefined;
     }
     let savedPosition = null;
     runWidgetWindowAction(async (windowHandle) => {
+      if (widgetDraggingRef.current) {
+        return;
+      }
       const scale = (await windowHandle.scaleFactor().catch(() => 1)) || 1;
       savedPosition = await windowHandle.outerPosition();
+      if (widgetDraggingRef.current) {
+        return;
+      }
       await windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_BAR_NOTICE_SIZE.width,
         AUDIO_WIDGET_BAR_NOTICE_SIZE.height,
@@ -4602,16 +4982,19 @@ export function AudioWidgetWindow() {
     });
     return () => {
       runWidgetWindowAction(async (windowHandle) => {
+        if (widgetDraggingRef.current) {
+          return;
+        }
         await windowHandle.setSize(new LogicalSize(
           AUDIO_WIDGET_COMPACT_SIZE.width,
           AUDIO_WIDGET_COMPACT_SIZE.height,
         ));
-        if (savedPosition) {
+        if (savedPosition && !widgetDraggingRef.current) {
           await windowHandle.setPosition(savedPosition);
         }
       });
     };
-  }, [bubbleCancelNoticeActive, runWidgetWindowAction]);
+  }, [bubbleCancelNoticeActive, runWidgetWindowAction, widgetDragging]);
 
   const dragWidget = useCallback((event) => {
     if (event.button !== 0) {
@@ -4654,8 +5037,8 @@ export function AudioWidgetWindow() {
   }, [runWidgetWindowAction]);
 
   const closeWidget = useCallback(() => {
-    runWidgetWindowAction((windowHandle) => windowHandle.close());
-  }, [runWidgetWindowAction]);
+    invoke("hide_audio_widget").catch(() => {});
+  }, []);
 
   const pressPushToTalk = useCallback(() => {
     if (pushToTalkDownRef.current) {
@@ -4834,6 +5217,7 @@ export function AudioWidgetWindow() {
       latencyMs: Number(result?.latencyMs || 0),
       language: provider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
       provider,
+      snippetChanges: pipeline.changes?.snippets || [],
       source: provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "deepgram-nova-3-live"
         : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
@@ -5114,6 +5498,7 @@ export function AudioWidgetWindow() {
         latencyMs: Math.max(0, Date.now() - submittedAt),
         language: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
         provider: currentProvider,
+        snippetChanges: pipeline.changes?.snippets || [],
         source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
           ? "deepgram-nova-3-live"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
@@ -5784,7 +6169,12 @@ export function AudioWidgetWindow() {
 
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (shortcutMatchesEvent(widgetCancelShortcut, event)) {
+      if (cancelShortcutMatchesEvent(
+        widgetCancelShortcut,
+        event,
+        widgetPushToTalkShortcut,
+        pushToTalkDownRef.current,
+      )) {
         const widgetStateValue = widgetStateRef.current;
         const canCancelAudioRequest = pushToTalkDownRef.current
           || widgetStateValue === "arming"
@@ -6084,7 +6474,17 @@ export function AudioWidgetWindow() {
       return (
         <>
           <GlobalStyle />
-          <AudioBarIdleShell aria-label="Dictation bar" data-theme={audioWidgetTheme}>
+          <AudioBarIdleShell
+            aria-label="Dictation bar"
+            data-hover={barIdleHover ? "true" : "false"}
+            data-theme={audioWidgetTheme}
+            onMouseLeave={clearBarIdleHover}
+            onMouseMove={updateBarIdleHoverFromPointer}
+            onPointerCancel={clearBarIdleHover}
+            onPointerEnter={updateBarIdleHoverFromPointer}
+            onPointerLeave={clearBarIdleHover}
+            onPointerMove={updateBarIdleHoverFromPointer}
+          >
             <AudioBarIdleReveal>
               <AudioBarRecordCluster>
                 <AudioBarRecordButton

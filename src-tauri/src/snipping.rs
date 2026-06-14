@@ -41,6 +41,10 @@ const SNIPPING_MACOS_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 #[cfg(target_os = "macos")]
 const SNIPPING_MACOS_CG_EVENT_KEY_DOWN: u32 = 10;
 #[cfg(target_os = "macos")]
+const SNIPPING_MACOS_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xffff_fffe;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xffff_ffff;
+#[cfg(target_os = "macos")]
 const SNIPPING_MACOS_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 #[cfg(target_os = "macos")]
 const SNIPPING_MACOS_FLAG_SHIFT: u64 = 0x0002_0000;
@@ -57,6 +61,8 @@ const SNIPPING_MACOS_KEY_4: i64 = 21;
 
 #[cfg(target_os = "macos")]
 static SNIPPING_MACOS_EVENT_TAP_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static SNIPPING_MACOS_EVENT_TAP_HANDLE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "macos")]
 static SNIPPING_MACOS_EVENT_TAP_APP: OnceLock<StdMutex<Option<AppHandle>>> = OnceLock::new();
 
@@ -173,6 +179,11 @@ struct SnippingState {
     /// still being adopted by the OS. During this short phase, synthetic
     /// position/size moves must not trigger left-column queue reflow.
     preview_drag_handoff_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
+    /// Epoch-ms guard set by the strip webview while a tile drag is active or
+    /// has just ended. Outside-click dismissal checks this before hiding the
+    /// strip on focus loss or global mouse release.
+    strip_interaction_guard_until_ms: Arc<AtomicU64>,
+    strip_outside_click_watcher_active: Arc<AtomicBool>,
     /// Set by the watcher as soon as it sees mouse-up for a native preview
     /// drag, before the main-thread settle pass can decide whether the
     /// left-column quiet gate applies. This prevents a post-release Moved
@@ -215,6 +226,8 @@ impl SnippingState {
             preview_post_release_settling_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_strip_hover_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_handoff_until_ms: Arc::new(StdMutex::new(HashMap::new())),
+            strip_interaction_guard_until_ms: Arc::new(AtomicU64::new(0)),
+            strip_outside_click_watcher_active: Arc::new(AtomicBool::new(false)),
             preview_post_release_check_pending: Arc::new(AtomicBool::new(false)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
@@ -1188,6 +1201,27 @@ fn snipping_macos_event_tap_app() -> Option<AppHandle> {
 }
 
 #[cfg(target_os = "macos")]
+fn snipping_macos_reenable_event_tap(reason: &'static str) -> bool {
+    let tap = SNIPPING_MACOS_EVENT_TAP_HANDLE.load(Ordering::Acquire);
+    if tap == 0 {
+        log_terminal_status_event(
+            "backend.snipping.macos_event_tap.reenable_missing",
+            json!({ "reason": reason }),
+        );
+        return false;
+    }
+
+    unsafe {
+        CGEventTapEnable(tap as *mut std::ffi::c_void, true);
+    }
+    log_terminal_status_event(
+        "backend.snipping.macos_event_tap.reenabled",
+        json!({ "reason": reason }),
+    );
+    true
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_macos_default_action_for_key(
     app: &AppHandle,
     keycode: i64,
@@ -1225,6 +1259,15 @@ extern "C" fn snipping_macos_event_tap_callback(
     event: *mut std::ffi::c_void,
     _user_info: *mut std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
+    if event_type == SNIPPING_MACOS_CG_EVENT_TAP_DISABLED_BY_TIMEOUT {
+        let _ = snipping_macos_reenable_event_tap("disabled_by_timeout");
+        return event;
+    }
+    if event_type == SNIPPING_MACOS_CG_EVENT_TAP_DISABLED_BY_USER_INPUT {
+        let _ = snipping_macos_reenable_event_tap("disabled_by_user_input");
+        return event;
+    }
+
     if event_type != SNIPPING_MACOS_CG_EVENT_KEY_DOWN || event.is_null() {
         return event;
     }
@@ -1245,19 +1288,26 @@ extern "C" fn snipping_macos_event_tap_callback(
         return event;
     };
 
-    thread::spawn(move || match action {
-        SnippingShortcutAction::FullScreenshot => {
-            let _ = snipping_capture_full_for(
+    thread::spawn(move || {
+        let result = match action {
+            SnippingShortcutAction::FullScreenshot => snipping_capture_full_for(
                 &app,
                 "macos-default-override",
                 SnippingShortcutAction::FullScreenshot.default_shortcut(),
-            );
-        }
-        SnippingShortcutAction::AreaSnip => {
-            let _ = snipping_begin_area_snip_for(
+            ),
+            SnippingShortcutAction::AreaSnip => snipping_begin_area_snip_for(
                 &app,
                 "macos-default-override",
                 SnippingShortcutAction::AreaSnip.default_shortcut(),
+            ),
+        };
+        if let Err(error) = result {
+            log_terminal_status_event(
+                "backend.snipping.macos_default_shortcut.error",
+                json!({
+                    "action": action.label(),
+                    "error": error,
+                }),
             );
         }
     });
@@ -1270,6 +1320,7 @@ fn register_snipping_macos_event_tap(app: &AppHandle) -> Result<(), String> {
     snipping_set_macos_event_tap_app(app);
 
     if SNIPPING_MACOS_EVENT_TAP_STARTED.load(Ordering::SeqCst) {
+        let _ = snipping_macos_reenable_event_tap("registration_check");
         return Ok(());
     }
 
@@ -1298,9 +1349,11 @@ fn register_snipping_macos_event_tap(app: &AppHandle) -> Result<(), String> {
             let _ = sender.send(false);
             return;
         }
+        SNIPPING_MACOS_EVENT_TAP_HANDLE.store(tap as usize, Ordering::Release);
 
         let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
         if source.is_null() {
+            SNIPPING_MACOS_EVENT_TAP_HANDLE.store(0, Ordering::Release);
             let _ = sender.send(false);
             return;
         }
@@ -6246,6 +6299,10 @@ const SNIPPING_STRIP_RECENT_PAGE_LIMIT_MAX: usize = 200;
 const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
 const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
+const SNIPPING_STRIP_INTERACTION_GUARD_ACTIVE_MS: u64 = 30_000;
+const SNIPPING_STRIP_INTERACTION_GUARD_RELEASE_MS: u64 = 220;
+const SNIPPING_STRIP_FOCUS_LOSS_CLOSE_DELAY_MS: u64 = 90;
+const SNIPPING_STRIP_OUTSIDE_CLICK_POLL_MS: u64 = 18;
 
 /// Newest-first listing of saved snip files and their edited copies. The
 /// on-disk `snips` and `edits` directories are the durable history (the
@@ -6380,6 +6437,151 @@ fn snipping_recent_snips(
     }))
 }
 
+fn snipping_cursor_inside_window(app: &AppHandle, window: &tauri::WebviewWindow) -> bool {
+    let Ok(cursor) = app.cursor_position() else {
+        return false;
+    };
+    let Ok(position) = window.outer_position() else {
+        return false;
+    };
+    let Ok(size) = window.outer_size() else {
+        return false;
+    };
+    cursor.x >= f64::from(position.x)
+        && cursor.x <= f64::from(position.x) + f64::from(size.width)
+        && cursor.y >= f64::from(position.y)
+        && cursor.y <= f64::from(position.y) + f64::from(size.height)
+}
+
+fn snipping_strip_auto_close_guard_active(app: &AppHandle) -> bool {
+    let state = app.state::<SnippingState>();
+    if state
+        .strip_interaction_guard_until_ms
+        .load(Ordering::SeqCst)
+        > snipping_now_epoch_ms()
+    {
+        return true;
+    }
+    if state
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| !sessions.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if state
+        .preview_strip_hover_labels
+        .lock()
+        .map(|labels| !labels.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    snipping_any_preview_drag_handoff_active(app)
+}
+
+fn snipping_strip_mark_interaction_guard(app: &AppHandle, active: bool) {
+    let guard_until_ms = if active {
+        snipping_now_epoch_ms() + SNIPPING_STRIP_INTERACTION_GUARD_ACTIVE_MS
+    } else {
+        snipping_now_epoch_ms() + SNIPPING_STRIP_INTERACTION_GUARD_RELEASE_MS
+    };
+    app.state::<SnippingState>()
+        .strip_interaction_guard_until_ms
+        .store(guard_until_ms, Ordering::SeqCst);
+}
+
+fn snipping_strip_close_if_visible(app: &AppHandle, only_if_unfocused: bool) {
+    let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
+    snipping_strip_hide_animated(app, window, only_if_unfocused);
+}
+
+fn snipping_strip_schedule_focus_loss_close(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(
+            SNIPPING_STRIP_FOCUS_LOSS_CLOSE_DELAY_MS,
+        ))
+        .await;
+        if snipping_strip_auto_close_guard_active(&app) {
+            return;
+        }
+        let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+            return;
+        };
+        if !window.is_visible().unwrap_or(false) || window.is_focused().unwrap_or(false) {
+            return;
+        }
+        snipping_strip_hide_animated(&app, window, true);
+    });
+}
+
+fn snipping_strip_start_outside_click_watcher(app: &AppHandle) {
+    if !snipping_mouse_button_state_supported() {
+        return;
+    }
+    let state = app.state::<SnippingState>();
+    if state
+        .strip_outside_click_watcher_active
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let app = app.clone();
+    let watcher_active = state.strip_outside_click_watcher_active.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut was_down = snipping_left_mouse_button_pressed();
+        let mut outside_click_candidate = false;
+        loop {
+            sleep(Duration::from_millis(SNIPPING_STRIP_OUTSIDE_CLICK_POLL_MS)).await;
+            let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
+                break;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                break;
+            }
+
+            let is_down = snipping_left_mouse_button_pressed();
+            if is_down && !was_down {
+                outside_click_candidate = !snipping_cursor_inside_window(&app, &window)
+                    && !snipping_strip_auto_close_guard_active(&app);
+            } else if !is_down && was_down {
+                if outside_click_candidate
+                    && !snipping_cursor_inside_window(&app, &window)
+                    && !snipping_strip_auto_close_guard_active(&app)
+                {
+                    snipping_strip_hide_animated(&app, window, false);
+                    break;
+                }
+                outside_click_candidate = false;
+            }
+            if is_down && outside_click_candidate && snipping_strip_auto_close_guard_active(&app) {
+                outside_click_candidate = false;
+            }
+            was_down = is_down;
+        }
+        watcher_active.store(false, Ordering::SeqCst);
+    });
+}
+
+#[tauri::command]
+fn snipping_set_strip_interaction_guard(app: AppHandle, active: bool) -> Result<(), String> {
+    snipping_strip_mark_interaction_guard(&app, active);
+    Ok(())
+}
+
+#[tauri::command]
+fn snipping_close_snip_strip(app: AppHandle) -> Result<(), String> {
+    snipping_strip_close_if_visible(&app, false);
+    Ok(())
+}
+
 fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     if let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) {
         return Some(window);
@@ -6407,6 +6609,14 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     .visible(false)
     .build()
     .ok()?;
+    {
+        let app_for_focus = app.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::Focused(false) = event {
+                snipping_strip_schedule_focus_loss_close(&app_for_focus);
+            }
+        });
+    }
     // A transparent window still paints the webview's default backdrop until
     // the background color is cleared (the same faint full-size square the
     // monitor popover had).
@@ -6625,11 +6835,13 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     #[cfg(not(target_os = "macos"))]
     snipping_focus_window_now(&window, "strip_focus");
     snipping_strip_emit_anim(app, "open", Some(origin));
+    snipping_strip_start_outside_click_watcher(app);
     snipping_strip_emit_open_reassert(app, origin);
 }
 
 /// Tray-click toggle for the recent-snips bar. The strip is persistent now:
-/// only this explicit toggle, Escape, or the strip's close button hides it.
+/// explicit close controls and click-away can hide it, while drag guards keep
+/// in/out strip drags from being treated as dismissal clicks.
 pub(crate) fn snipping_strip_toggle(app: &AppHandle) {
     let Some(window) = snipping_strip_window(app) else {
         return;

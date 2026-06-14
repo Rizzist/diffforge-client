@@ -983,6 +983,8 @@ struct TerminalInstanceMetadata {
     thread_id: String,
     agent_id: String,
     agent_kind: String,
+    terminal_name: String,
+    terminal_nickname: String,
 }
 
 impl Default for TerminalInstanceMetadata {
@@ -995,6 +997,8 @@ impl Default for TerminalInstanceMetadata {
             thread_id: String::new(),
             agent_id: String::new(),
             agent_kind: String::new(),
+            terminal_name: String::new(),
+            terminal_nickname: String::new(),
         }
     }
 }
@@ -1676,6 +1680,8 @@ struct TerminalOpenRequest {
     mount_id: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
+    terminal_name: Option<String>,
+    terminal_nickname: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
     output_transport: Option<bool>,
@@ -4448,6 +4454,8 @@ pub fn run() {
             snipping_close_annotation_editor,
             snipping_recent_snips,
             snipping_toggle_snip_strip,
+            snipping_close_snip_strip,
+            snipping_set_strip_interaction_guard,
             snipping_float_assigned_path,
             snipping_preview_drag_started,
             snipping_consume_snip_preview,
@@ -4457,6 +4465,7 @@ pub fn run() {
             snipping_copy_untracked_asset_to_clipboard,
             snipping_cancel_area_snip,
             audio_widget_status,
+            audio_widget_bar_hover_snapshot,
             show_audio_widget,
             hide_audio_widget,
             toggle_audio_widget,
