@@ -11,7 +11,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import "@vscode/codicons/dist/codicon.css";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import {
@@ -78,7 +78,12 @@ import {
   isTerminalControlHistoryPrompt,
 } from "../threads/terminalControlPrompts.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
-import TerminalView from "../terminals/TerminalView.jsx";
+import TerminalView, {
+  TODO_QUEUE_PANE_MODE_FULLSCREEN,
+  TODO_QUEUE_PANE_MODE_MINIMIZED,
+  TODO_QUEUE_PANE_MODE_NORMAL,
+  TodoQueuePanel,
+} from "../terminals/TerminalView.jsx";
 import {
   disposeSharedNotificationSfx,
   getSharedNotificationSfx,
@@ -243,6 +248,12 @@ import {
   RailGlobalActions,
   RailActionButton,
   WorkspaceViewStack,
+  WorkspaceAppToolLayout,
+  WorkspaceAppToolPortalHost,
+  WorkspaceAppToolMinimizedRail,
+  WorkspaceAppToolRailControls,
+  WorkspaceAppToolRailButton,
+  WorkspaceAppToolRailLabel,
   WorkspaceViewPane,
   WorkspaceRuntimeLayer,
   WorkspaceIdleSurface,
@@ -602,6 +613,31 @@ const WINDOW_RESIZE_EDGES = [
 const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture"]);
 const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps"]);
+const WORKSPACE_TAB_VIEW_BY_ID = {
+  terminals: DEFAULT_WORKSPACE_VIEW,
+  files: "files",
+  history: "architecture",
+};
+const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
+const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "processes", "snipping", "audio", "tokenomics", "settings"]);
+const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps"]);
+const REMOTE_NAVIGATION_COMMANDS = new Set([
+  "workspace_select",
+  "select_workspace",
+  "switch_workspace",
+  "workspace_tab_select",
+  "select_workspace_tab",
+  "switch_workspace_tab",
+  "workspace_open_tab",
+  "app_view_select",
+  "select_app_view",
+  "switch_app_view",
+  "app_navigate",
+  "app_open_view",
+]);
+const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
+const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
+const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 300;
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -616,6 +652,53 @@ const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
 
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function normalizeRemoteCommandName(value) {
+  return String(value || "").trim().toLowerCase().replace(/[.\s-]+/g, "_");
+}
+
+function normalizeWorkspaceTabId(value) {
+  const normalized = normalizeRemoteCommandName(value);
+  if (normalized === "terminal" || normalized === "term") {
+    return "terminals";
+  }
+  if (normalized === "file" || normalized === "workspace_files") {
+    return "files";
+  }
+  if (normalized === "histories" || normalized === "task_history" || normalized === "todo_history") {
+    return "history";
+  }
+  return WORKSPACE_TAB_IDS.has(normalized) ? normalized : "";
+}
+
+function normalizeAccountAppViewId(value) {
+  const normalized = normalizeRemoteCommandName(value);
+  if (normalized === "tool" || normalized === "architectures" || normalized === "architecture_tools") {
+    return "tools";
+  }
+  if (normalized === "asset") {
+    return "assets";
+  }
+  if (normalized === "process") {
+    return "processes";
+  }
+  if (normalized === "snippet" || normalized === "snippets" || normalized === "voice_snippets") {
+    return "audio";
+  }
+  if (normalized === "snip" || normalized === "snips" || normalized === "screenshot" || normalized === "screenshots") {
+    return "snipping";
+  }
+  if (normalized === "audio_settings" || normalized === "voice" || normalized === "microphone") {
+    return "audio";
+  }
+  if (normalized === "token" || normalized === "tokens" || normalized === "credits") {
+    return "tokenomics";
+  }
+  if (normalized === "setting" || normalized === "preferences") {
+    return "settings";
+  }
+  return ACCOUNT_APP_VIEW_IDS.has(normalized) ? normalized : "";
 }
 
 function workspaceGitPullPromptCheckKey(workspaceId, rootDirectory) {
@@ -2478,6 +2561,51 @@ function cloudKnownDevicesFromRuntimeStatus(status) {
   return Array.from(byId.values()).slice(0, 48);
 }
 
+function cloudDeviceLiveStateFromRuntimeStatus(status) {
+  const liveRuntime = status?.liveRuntimeStatus || status?.live_runtime_status || {};
+  const clientConnection = liveRuntime?.client_connection || liveRuntime?.clientConnection || {};
+  const snapshot = [
+    status?.account_device_live_state_snapshot,
+    status?.accountDeviceLiveStateSnapshot,
+    status?.device_live_state_snapshot,
+    status?.deviceLiveStateSnapshot,
+    liveRuntime?.account_device_live_state_snapshot,
+    liveRuntime?.accountDeviceLiveStateSnapshot,
+    liveRuntime?.device_live_state_snapshot,
+    liveRuntime?.deviceLiveStateSnapshot,
+    clientConnection?.account_device_live_state_snapshot,
+    clientConnection?.accountDeviceLiveStateSnapshot,
+  ].find((value) => value && typeof value === "object") || null;
+  const serverRoster = [
+    status?.server_roster,
+    status?.serverRoster,
+    status?.account_device_server_roster,
+    status?.accountDeviceServerRoster,
+    liveRuntime?.server_roster,
+    liveRuntime?.serverRoster,
+    liveRuntime?.account_device_server_roster,
+    liveRuntime?.accountDeviceServerRoster,
+    clientConnection?.server_roster,
+    clientConnection?.serverRoster,
+  ].find((value) => value && (typeof value === "object" || Array.isArray(value))) || null;
+
+  if (!snapshot && !serverRoster) {
+    return null;
+  }
+
+  return {
+    ...(snapshot && !Array.isArray(snapshot) ? snapshot : {}),
+    ...(snapshot ? {
+      accountDeviceLiveStateSnapshot: snapshot,
+      account_device_live_state_snapshot: snapshot,
+    } : {}),
+    ...(serverRoster ? {
+      serverRoster,
+      server_roster: serverRoster,
+    } : {}),
+  };
+}
+
 function cloudWorkspaceTodosFromRuntimeStatus(status) {
   const liveRuntime = status?.liveRuntimeStatus || status?.live_runtime_status || {};
   const workspaceTodos = status?.workspaceTodos
@@ -2657,6 +2785,7 @@ const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
   attempt: 0,
   connectedDevices: [],
   detail: "Waiting for web sign-in.",
+  deviceLiveState: null,
   knownDevices: [],
   stage: "idle",
   status: "idle",
@@ -3873,6 +4002,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   const statusKey = globalStatus || runtimeStatus;
   const connectedDevices = cloudConnectedDevicesFromRuntimeStatus(status);
   const knownDevices = cloudKnownDevicesFromRuntimeStatus(status);
+  const deviceLiveState = cloudDeviceLiveStateFromRuntimeStatus(status);
   const workspaceTodos = cloudWorkspaceTodosFromRuntimeStatus(status);
   const storageUsage = cloudStorageUsageFromRuntimeStatus(status);
 
@@ -3880,6 +4010,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Your cloud workspace is connected and ready for live work.",
+      deviceLiveState,
       knownDevices,
       stage: "workspace_socket",
       status: "connected",
@@ -3893,6 +4024,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Local workspace features are available. Cloud sync starts in the background.",
+      deviceLiveState,
       knownDevices,
       stage: "idle",
       status: "idle",
@@ -3906,6 +4038,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Minting a short-lived Appwrite token for the desktop runtime.",
+      deviceLiveState,
       knownDevices,
       stage: "cloud_auth",
       status: "active",
@@ -3919,6 +4052,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Your cloud workspace is being prepared. Local work is available while it starts.",
+      deviceLiveState,
       knownDevices,
       stage: "cloud_instance",
       status: "active",
@@ -3932,6 +4066,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Finding the personal or team backend assigned to this account.",
+      deviceLiveState,
       knownDevices,
       stage: "cloud_route",
       status: "active",
@@ -3945,6 +4080,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "The backend is reachable; waiting for the workspace process to accept the live connection.",
+      deviceLiveState,
       knownDevices,
       stage: "cloud_instance",
       status: "active",
@@ -3958,6 +4094,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "The live socket is open; syncing the initial device and workspace state.",
+      deviceLiveState,
       knownDevices,
       stage: "workspace_socket",
       status: "active",
@@ -3971,6 +4108,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Cloud sync is unavailable right now. Local workspace features remain available.",
+      deviceLiveState,
       knownDevices,
       stage: "cloud_instance",
       status: "warn",
@@ -3990,6 +4128,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
           || status?.last_error
           || "Open the Diff Forge dashboard and remove a registered device, then reconnect this desktop.",
       ),
+      deviceLiveState,
       knownDevices,
       stage: "workspace_socket",
       status: "error",
@@ -4003,6 +4142,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "The live workspace connection is being re-established.",
+      deviceLiveState,
       knownDevices,
       stage: "workspace_socket",
       status: "active",
@@ -4015,6 +4155,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   return {
     connectedDevices,
     detail: "Requesting the assigned cloud workspace and waiting for it to become ready.",
+    deviceLiveState,
     knownDevices,
     stage: "cloud_route",
     status: "active",
@@ -4040,6 +4181,11 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     : Array.isArray(previous?.knownDevices)
       ? previous.knownDevices
       : connectedDevices;
+  const deviceLiveState = progress?.deviceLiveState && typeof progress.deviceLiveState === "object"
+    ? progress.deviceLiveState
+    : previous?.deviceLiveState && typeof previous.deviceLiveState === "object"
+      ? previous.deviceLiveState
+      : null;
   const workspaceTodos = progress?.workspaceTodos && typeof progress.workspaceTodos === "object"
     ? progress.workspaceTodos
     : previous?.workspaceTodos && typeof previous.workspaceTodos === "object"
@@ -4055,6 +4201,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     return {
       ...previous,
       connectedDevices,
+      deviceLiveState,
       knownDevices,
       storageUsage,
       updatedAt: Date.now(),
@@ -4070,6 +4217,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
         Number(previous?.attempt ?? 0) || 0,
       ),
       connectedDevices,
+      deviceLiveState,
       knownDevices,
       storageUsage,
       updatedAt: Date.now(),
@@ -4081,6 +4229,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
     connectedDevices,
     detail: String(progress?.detail || previous.detail || ""),
+    deviceLiveState,
     knownDevices,
     stage: nextStage,
     status: nextStatus,
@@ -6647,6 +6796,11 @@ export default function App() {
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
+  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
+  const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
+  const [workspaceToolPortalHost, setWorkspaceToolPortalHost] = useState(null);
+  const [accountToolDraft, setAccountToolDraft] = useState("");
+  const [accountToolItems, setAccountToolItems] = useState([]);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [workspacePendingActivationId, setWorkspacePendingActivationId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -6676,6 +6830,10 @@ export default function App() {
   // and flickered the app between login and dashboard.
   const billingStatusRef = useRef(null);
   billingStatusRef.current = billingStatus;
+  const workspaceToolLayoutRef = useRef(null);
+  const workspaceToolPanelRef = useRef(null);
+  const workspaceToolMainPanelRef = useRef(null);
+  const workspaceAppContextSyncKeyRef = useRef("");
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
@@ -9235,6 +9393,7 @@ export default function App() {
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
+    workspaceAppContextSyncKeyRef.current = "";
     tokenomicsForceResyncRef.current = null;
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
@@ -9282,6 +9441,7 @@ export default function App() {
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
+    workspaceAppContextSyncKeyRef.current = "";
     tokenomicsForceResyncRef.current = null;
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
@@ -16837,6 +16997,190 @@ export default function App() {
     : hasSelectedWorkspace
       ? "No active workspace."
       : "No workspace selected.";
+  const selectedWorkspaceHasMountedRuntime = Boolean(
+    selectedWorkspace?.id
+      && enabledWorkspaceRuntimeDescriptors.some((runtimeDescriptor) => (
+        runtimeDescriptor.workspace?.id === selectedWorkspace.id
+      )),
+  );
+  const workspaceToolPaneHasWidth = workspaceToolLayoutWidth === 0
+    || workspaceToolLayoutWidth >= WORKSPACE_TOOL_VISIBLE_MIN_WIDTH;
+  const workspaceToolPaneAllowedOnView = !DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
+  const workspaceToolPaneVisible = workspaceToolPaneHasWidth && workspaceToolPaneAllowedOnView;
+  const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
+  const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const workspaceToolMinimizedSize = workspaceToolLayoutWidth > 0
+    ? Math.min(4, Math.max(2.8, (WORKSPACE_TOOL_MINIMIZED_WIDTH_PX / workspaceToolLayoutWidth) * 100))
+    : 3.2;
+  const workspaceToolRestoredMinSize = workspaceToolLayoutWidth > 0
+    ? Math.min(70, Math.max(20, (WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX / workspaceToolLayoutWidth) * 100))
+    : 20;
+  const workspaceToolPanelSize = workspaceToolPaneVisible
+    ? workspaceToolPaneMinimized
+      ? workspaceToolMinimizedSize
+      : workspaceToolPaneFullscreen
+        ? 62
+        : Math.max(30, workspaceToolRestoredMinSize)
+    : 0;
+  const workspaceMainPanelSize = workspaceToolPaneVisible ? 100 - workspaceToolPanelSize : 100;
+  const workspaceToolPanelMinSize = workspaceToolPaneVisible
+    ? workspaceToolPaneMinimized
+      ? workspaceToolMinimizedSize
+      : workspaceToolRestoredMinSize
+    : 0;
+  const workspaceToolPanelMaxSize = workspaceToolPaneVisible
+    ? workspaceToolPaneMinimized
+      ? workspaceToolMinimizedSize
+      : 70
+    : 0;
+  const workspaceMainPanelMinSize = workspaceToolPaneVisible
+    ? workspaceToolPaneMinimized ? 72 : 30
+    : 100;
+  const workspaceToolPortalOwnedByWorkspace = Boolean(
+    workspaceToolPortalHost
+      && selectedWorkspace?.id
+      && selectedWorkspaceHasMountedRuntime,
+  );
+  const shouldRenderAccountToolPanel = Boolean(
+    !workspaceToolPortalOwnedByWorkspace || !hasSelectedWorkspace,
+  );
+  const minimizeWorkspaceToolPane = useCallback(() => {
+    setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
+  }, []);
+  const restoreWorkspaceToolPane = useCallback(() => {
+    setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+  }, []);
+  const toggleFullscreenWorkspaceToolPane = useCallback(() => {
+    setWorkspaceToolPaneMode((currentMode) => (
+      currentMode === TODO_QUEUE_PANE_MODE_FULLSCREEN
+        ? TODO_QUEUE_PANE_MODE_NORMAL
+        : TODO_QUEUE_PANE_MODE_FULLSCREEN
+    ));
+  }, []);
+  const submitAccountToolDraft = useCallback(() => {
+    const text = String(accountToolDraft || "").trim();
+    if (!text) {
+      return [];
+    }
+    const item = {
+      createdAt: new Date().toISOString(),
+      id: `account-orchestrator-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      kind: "todo",
+      source: "account-orchestrator",
+      text,
+      workspaceId: selectedWorkspace?.id || "",
+    };
+    setAccountToolItems((items) => [...items, item]);
+    setAccountToolDraft("");
+    return [item];
+  }, [accountToolDraft, selectedWorkspace?.id]);
+
+  useLayoutEffect(() => {
+    const element = workspaceToolLayoutRef.current;
+    if (!element) {
+      return undefined;
+    }
+
+    const updateWidth = () => {
+      const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
+      setWorkspaceToolLayoutWidth((currentWidth) => (
+        currentWidth === nextWidth ? currentWidth : nextWidth
+      ));
+    };
+
+    updateWidth();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateWidth);
+      return () => window.removeEventListener("resize", updateWidth);
+    }
+
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [authState]);
+
+  useEffect(() => {
+    if (!workspaceToolPaneHasWidth && workspaceToolPaneMode !== TODO_QUEUE_PANE_MODE_NORMAL) {
+      setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+    }
+  }, [workspaceToolPaneHasWidth, workspaceToolPaneMode]);
+
+  useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      workspaceToolMainPanelRef.current?.resize?.(workspaceMainPanelSize);
+      workspaceToolPanelRef.current?.resize?.(workspaceToolPanelSize);
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    workspaceMainPanelSize,
+    workspaceToolPanelSize,
+  ]);
+
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !workspaceHydrationReady
+      || workspaceSyncState === "loading"
+      || workspaceSyncState === "creating"
+    ) {
+      return undefined;
+    }
+
+    const selectedContext = selectedWorkspace?.id
+      ? {
+        activated: Boolean(selectedWorkspaceIsActivated),
+        root_directory: selectedWorkspaceFileRoot || "",
+        workspace_id: selectedWorkspace.id,
+        workspace_name: selectedWorkspace.name || "",
+      }
+      : null;
+    const appContext = {
+      active_view: activeView,
+      activated_workspace_id: activatedWorkspaceId || "",
+      selected_workspace: selectedContext,
+      visible_view: visibleView,
+    };
+    const syncKey = JSON.stringify({
+      activeView,
+      activatedWorkspaceId,
+      cloudLiveSyncEpoch,
+      selectedContext,
+      visibleView,
+    });
+    if (workspaceAppContextSyncKeyRef.current === syncKey) {
+      return undefined;
+    }
+    workspaceAppContextSyncKeyRef.current = syncKey;
+    invoke("cloud_mcp_sync_device_live_app_context", {
+      appContext,
+      reason: "app_context_changed",
+    }).catch((error) => {
+      workspaceAppContextSyncKeyRef.current = "";
+      logBigViewSyncDiagnosticEvent("cloud_mcp.app_context_sync.failed", {
+        activeView,
+        message: getErrorMessage(error, "Unable to sync app context."),
+        selectedWorkspaceId: selectedWorkspace?.id || "",
+        visibleView,
+      });
+    });
+    return undefined;
+  }, [
+    activeView,
+    activatedWorkspaceId,
+    authState,
+    cloudLiveSyncEpoch,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceFileRoot,
+    selectedWorkspaceIsActivated,
+    user,
+    visibleView,
+    workspaceHydrationReady,
+    workspaceSyncState,
+  ]);
   useEffect(() => {
     const selectedWorkspaceId = selectedWorkspace?.id || "";
     const selectedRuntimeActive = Boolean(selectedWorkspaceRuntimeDescriptor);
@@ -18332,7 +18676,7 @@ export default function App() {
     };
     const remoteCommandKind = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
-      return String(
+      return normalizeRemoteCommandName(
         event?.command_kind
           || event?.commandKind
           || event?.action
@@ -18342,8 +18686,27 @@ export default function App() {
           || payload.action
           || payload.command
           || "create_task",
-      ).trim().toLowerCase().replace(/[.\s-]+/g, "_");
+      );
     };
+    const remoteCommandIsNavigationAction = (commandKind) => (
+      REMOTE_NAVIGATION_COMMANDS.has(normalizeRemoteCommandName(commandKind))
+    );
+    const remoteCommandIsDeviceOnlyNavigationAction = (commandKind) => (
+      ["app_view_select", "select_app_view", "switch_app_view", "app_navigate", "app_open_view"]
+        .includes(normalizeRemoteCommandName(commandKind))
+    );
+    const remoteCommandWorkspaceTab = (event) => remoteCommandStringField(event, [
+      "workspace_tab",
+      "workspaceTab",
+      "tab",
+      "view",
+    ]);
+    const remoteCommandAppView = (event) => remoteCommandStringField(event, [
+      "app_view",
+      "appView",
+      "view",
+      "tab",
+    ]);
     const remoteCommandIsCreateTask = (commandKind) => (
       !commandKind
       || commandKind === "create_task"
@@ -18361,7 +18724,7 @@ export default function App() {
         "install_agent",
         "agent_update",
         "update_agent",
-      ].includes(String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_"))
+      ].includes(normalizeRemoteCommandName(commandKind))
     );
     const recordRemoteCommandStatus = (event, status, message, details = null) => (
       invoke("cloud_mcp_record_remote_command_status", {
@@ -18819,15 +19182,107 @@ export default function App() {
       targetThreadId,
       workspaceId,
     }) => {
-      const normalizedKind = commandKind.replace(/\./g, "_");
+      const normalizedKind = normalizeRemoteCommandName(commandKind);
       const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
       const target = { targetTerminalId, targetTerminalIndex, targetTerminalName, targetThreadId };
       await recordRemoteCommandStatus(event, "validating", "Desktop is validating the remote control command.");
+      if ([
+        "app_view_select",
+        "select_app_view",
+        "switch_app_view",
+        "app_navigate",
+        "app_open_view",
+      ].includes(normalizedKind)) {
+        const nextView = normalizeAccountAppViewId(remoteCommandAppView(event));
+        if (!nextView) {
+          await recordRemoteCommandStatus(event, "failed", "Remote navigation did not include a supported app view.", {
+            commandId,
+            commandKind,
+          });
+          return;
+        }
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const rawShowWindow = event?.show_window ?? event?.showWindow ?? payload.show_window ?? payload.showWindow;
+        const shouldShowWindow = typeof rawShowWindow === "undefined"
+          ? true
+          : remoteCommandBooleanField(event, ["show_window", "showWindow"]);
+        if (shouldShowWindow) {
+          void invoke("app_exit_background").catch(() => {});
+        }
+        showView(nextView, {
+          immediate: true,
+          telemetrySource: "remote_control_navigation",
+          telemetryWorkspaceId: selectedWorkspaceIdRef.current,
+        });
+        await recordRemoteCommandStatus(event, "completed", `Opened ${nextView} on this desktop.`, {
+          appView: nextView,
+          commandId,
+          commandKind,
+        });
+        return;
+      }
       if (!targetWorkspace) {
         await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
           commandId,
           commandKind,
           workspaceId,
+        });
+        return;
+      }
+      if ([
+        "workspace_select",
+        "select_workspace",
+        "switch_workspace",
+        "workspace_tab_select",
+        "select_workspace_tab",
+        "switch_workspace_tab",
+        "workspace_open_tab",
+      ].includes(normalizedKind)) {
+        const tabId = [
+          "workspace_tab_select",
+          "select_workspace_tab",
+          "switch_workspace_tab",
+          "workspace_open_tab",
+        ].includes(normalizedKind)
+          ? normalizeWorkspaceTabId(remoteCommandWorkspaceTab(event))
+          : "terminals";
+        if (!tabId) {
+          await recordRemoteCommandStatus(event, "failed", "Remote navigation did not include a supported workspace tab.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const rawShowWindow = event?.show_window ?? event?.showWindow ?? payload.show_window ?? payload.showWindow;
+        const shouldShowWindow = typeof rawShowWindow === "undefined"
+          ? true
+          : remoteCommandBooleanField(event, ["show_window", "showWindow"]);
+        if (shouldShowWindow) {
+          void invoke("app_exit_background").catch(() => {});
+        }
+        const activated = requestWorkspaceActivation(workspaceId, "remote_control_navigation");
+        if (!activated) {
+          await recordRemoteCommandStatus(event, "blocked", "Workspace could not be selected on this desktop.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const nextView = WORKSPACE_TAB_VIEW_BY_ID[tabId] || DEFAULT_WORKSPACE_VIEW;
+        showView(nextView, {
+          immediate: true,
+          telemetrySource: "remote_control_navigation",
+          telemetryWorkspaceId: workspaceId,
+        });
+        await recordRemoteCommandStatus(event, "completed", `Opened ${tabId} for ${targetWorkspace.name || workspaceId}.`, {
+          commandId,
+          commandKind,
+          workspaceId,
+          workspaceTab: tabId,
+          view: nextView,
         });
         return;
       }
@@ -19516,11 +19971,13 @@ export default function App() {
             "agent_account_switch", "switch_agent_account", "agent_profile_switch", "account_switch",
             "terminal_output_status", "terminal_status", "terminal_output", "terminal_activity_status",
             "plan_release_stage", "release_plan_stage", "plan_release", "release_stage",
-          ].includes(String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_"))) {
+          ].includes(normalizeRemoteCommandName(commandKind))) {
             return;
           }
-          const receiptWorkspaceId = workspaceId || (agentPackageAction ? "device" : "");
-          if (!workspaceId && !agentPackageAction) {
+          const navigationAction = remoteCommandIsNavigationAction(commandKind);
+          const deviceOnlyNavigationAction = remoteCommandIsDeviceOnlyNavigationAction(commandKind);
+          const receiptWorkspaceId = workspaceId || (agentPackageAction || deviceOnlyNavigationAction ? "device" : "");
+          if (!workspaceId && !agentPackageAction && !deviceOnlyNavigationAction) {
             await recordRemoteCommandStatus(
               event,
               "failed",
@@ -19576,7 +20033,7 @@ export default function App() {
             }
             return;
           }
-          if (!remoteCommandIsCreateTask(commandKind)) {
+          if (navigationAction || !remoteCommandIsCreateTask(commandKind)) {
             try {
               await handleRemoteLifecycleControl({
                 agentId,
@@ -19713,7 +20170,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, manageWorkspaceAgents, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, showView, syncAgentInstallationsToCloud, workspaces]);
 
   const openSelectedWorkspaceSettings = useCallback(() => {
     if (selectedWorkspace) {
@@ -24333,6 +24790,23 @@ export default function App() {
                 </RailFooter>
               </WorkspaceRail>
 
+              <WorkspaceAppToolLayout
+                data-workspace-tool-fullscreen={workspaceToolPaneVisible && workspaceToolPaneFullscreen ? "true" : "false"}
+                data-workspace-tool-pane-mode={workspaceToolPaneMode}
+                data-workspace-tool-visible={workspaceToolPaneVisible ? "true" : "false"}
+                ref={workspaceToolLayoutRef}
+              >
+                <ResizePanelGroup
+                  id="workspace-app-main-tools"
+                  orientation="horizontal"
+                >
+                  <ResizePanel
+                    data-workspace-main-panel="true"
+                    defaultSize={`${workspaceMainPanelSize}%`}
+                    id="workspace-app-main-view"
+                    minSize={`${workspaceMainPanelMinSize}%`}
+                    ref={workspaceToolMainPanelRef}
+                  >
               <WorkspaceViewStack>
                 <WorkspaceViewPane
                   aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
@@ -24395,9 +24869,20 @@ export default function App() {
                             billingStatus={billingStatus}
                             connectedDevices={cloudWorkspaceProgress.connectedDevices}
                             defaultWorkingDirectory={defaultWorkingDirectory}
+                            deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
                             knownDevices={cloudWorkspaceProgress.knownDevices}
                             storageUsage={cloudWorkspaceProgress.storageUsage}
                             workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
+                            workspaceScopedToolTabsEnabled={Boolean(selectedWorkspace)}
+                            workspaceToolPaneMode={workspaceToolPaneMode}
+                            workspaceToolPaneVisible={workspaceToolPaneVisible}
+                            workspaceToolPortalTarget={
+                              workspaceToolPortalHost
+                                && runtimeWorkspace.id === selectedWorkspace?.id
+                                && selectedWorkspaceHasMountedRuntime
+                                ? workspaceToolPortalHost
+                                : null
+                            }
                             terminalWorkspace={runtimeWorkspace}
                             terminalRenderAgentsByIndex={runtimeDescriptor.terminalRenderAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
@@ -24436,6 +24921,9 @@ export default function App() {
                             onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
                             onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
                             onRefreshGitSnapshot={refreshWorkspaceGitSnapshotPreload}
+                            onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
+                            onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
+                            onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
                             onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
                             refreshAgentStatuses={refreshAgentStatuses}
@@ -25681,6 +26169,87 @@ export default function App() {
                   </WorkspaceGitPullOverlay>
                 )}
               </WorkspaceViewStack>
+                  </ResizePanel>
+                  <>
+                    {workspaceToolPaneVisible && (
+                      <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
+                    )}
+                      <ResizePanel
+                        aria-hidden={workspaceToolPaneVisible ? undefined : "true"}
+                        data-pane-mode={workspaceToolPaneMode}
+                        data-visible={workspaceToolPaneVisible ? "true" : "false"}
+                        data-workspace-tool-panel="true"
+                        defaultSize={`${workspaceToolPanelSize}%`}
+                        id="workspace-app-tool-panel"
+                        maxSize={`${workspaceToolPanelMaxSize}%`}
+                        minSize={`${workspaceToolPanelMinSize}%`}
+                        ref={workspaceToolPanelRef}
+                      >
+                        <WorkspaceAppToolPortalHost
+                          aria-hidden={workspaceToolPaneVisible ? undefined : "true"}
+                          ref={setWorkspaceToolPortalHost}
+                        >
+                          {shouldRenderAccountToolPanel ? (
+                            workspaceToolPaneMinimized ? (
+                              <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
+                                <WorkspaceAppToolRailControls>
+                                  <WorkspaceAppToolRailButton
+                                    aria-label="Unminimize app tools"
+                                    onClick={restoreWorkspaceToolPane}
+                                    title="Unminimize"
+                                    type="button"
+                                  >
+                                    <TitleRestoreIcon aria-hidden="true" />
+                                  </WorkspaceAppToolRailButton>
+                                </WorkspaceAppToolRailControls>
+                                <WorkspaceAppToolRailLabel>Tools</WorkspaceAppToolRailLabel>
+                              </WorkspaceAppToolMinimizedRail>
+                            ) : (
+                              <TodoQueuePanel
+                                accountKey={user?.id || user?.email || ""}
+                                agentStatuses={agentStatuses}
+                                billingStatus={billingStatus}
+                                connectedDevices={cloudWorkspaceProgress.connectedDevices}
+                                coordinationTargets={selectedWorkspace
+                                  ? getWorkspaceCoordinationTargetsForRoot(
+                                    workspaceCoordinationTargetsByRoot,
+                                    selectedWorkspaceFileRoot,
+                                  )
+                                  : []}
+                                defaultWorkingDirectory={defaultWorkingDirectory}
+                                draft={accountToolDraft}
+                                items={accountToolItems}
+                                onDraftChange={setAccountToolDraft}
+                                onMinimizePane={minimizeWorkspaceToolPane}
+                                onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
+                                onQueueItem={() => {}}
+                                onRemoveItem={(itemId) => {
+                                  setAccountToolItems((items) => items.filter((item) => item.id !== itemId));
+                                }}
+                                onSubmitDraft={submitAccountToolDraft}
+                                onToggleFullscreenPane={toggleFullscreenWorkspaceToolPane}
+                                onUpdateItem={(itemId, text) => {
+                                  setAccountToolItems((items) => items.map((item) => (
+                                    item.id === itemId ? { ...item, text } : item
+                                  )));
+                                }}
+                                paneMode={workspaceToolPaneMode}
+                                pendingItems={{}}
+                                queueItems={accountToolItems}
+                                rootDirectory={selectedWorkspaceFileRoot || defaultWorkingDirectory}
+                                storageUsage={cloudWorkspaceProgress.storageUsage}
+                                workspace={selectedWorkspace || null}
+                                workspaceId={selectedWorkspace?.id || ""}
+                                workspaceScopedTabsEnabled={Boolean(selectedWorkspace)}
+                                workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
+                              />
+                            )
+                          ) : null}
+                        </WorkspaceAppToolPortalHost>
+                      </ResizePanel>
+                  </>
+                </ResizePanelGroup>
+              </WorkspaceAppToolLayout>
               </DashboardShell>
               {lowCreditToastVisible && (
                 <LowCreditWarningToast role="status" aria-live="polite">

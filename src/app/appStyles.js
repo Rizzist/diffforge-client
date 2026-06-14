@@ -3524,6 +3524,155 @@ export const WorkspaceViewStack = styled.div`
   background: var(--forge-bg);
 `;
 
+export const WorkspaceAppToolLayout = styled.div`
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--forge-bg);
+
+  &[data-workspace-tool-fullscreen="true"] [data-workspace-main-panel="true"] {
+    opacity: 0.36;
+    filter: brightness(0.6) saturate(0.78);
+    pointer-events: none;
+  }
+
+  &[data-workspace-tool-fullscreen="true"] [data-workspace-tool-resize-handle="true"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
+    min-width: 300px;
+  }
+
+  [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
+    position: absolute !important;
+    inset: 0;
+    z-index: 320;
+    flex: none !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    overflow: visible;
+    box-shadow:
+      0 34px 90px rgba(0, 0, 0, 0.54),
+      0 0 0 1px rgba(230, 236, 245, 0.08);
+  }
+`;
+
+export const WorkspaceAppToolPortalHost = styled.div`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+export const WorkspaceAppToolMinimizedRail = styled.aside`
+  display: grid;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: 1fr;
+  place-items: center;
+  padding: 7px 2px;
+  border-left: 1px solid rgba(230, 236, 245, 0.08);
+  color: rgba(232, 238, 248, 0.86);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
+    rgba(0, 0, 0, 0.72);
+  box-shadow:
+    inset 1px 0 0 rgba(255, 255, 255, 0.045),
+    0 8px 22px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+  backdrop-filter: blur(18px) saturate(135%);
+
+  html[data-forge-theme="light"] & {
+    border-left-color: rgba(0, 0, 0, 0.08);
+    color: #2a2c31;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.5)),
+      rgba(18, 20, 24, 0.2);
+    box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.8);
+  }
+`;
+
+export const WorkspaceAppToolRailControls = styled.div`
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  transform: translateX(-50%);
+`;
+
+export const WorkspaceAppToolRailButton = styled.button`
+  box-sizing: border-box;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  color: rgba(232, 238, 248, 0.68);
+  background: transparent;
+  cursor: pointer;
+  line-height: 0;
+  outline: none;
+
+  svg {
+    display: block;
+    width: 11px;
+    height: 11px;
+    margin: 0;
+  }
+
+  &:hover,
+  &:focus-visible {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #5d626c;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #1d1d1f;
+    background: rgba(0, 0, 0, 0.07);
+  }
+`;
+
+export const WorkspaceAppToolRailLabel = styled.div`
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  color: rgba(232, 238, 248, 0.7);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-transform: uppercase;
+  user-select: none;
+
+  html[data-forge-theme="light"] & {
+    color: #2a2c31;
+  }
+`;
+
 export const WorkspaceViewPane = styled.div`
   position: absolute;
   inset: 0;

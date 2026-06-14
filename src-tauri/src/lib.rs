@@ -4558,6 +4558,7 @@ pub fn run() {
             cloud_mcp_workspace_catalog_delete,
             cloud_mcp_workspace_catalog_list,
             cloud_mcp_sync_device_live_state_snapshot,
+            cloud_mcp_sync_device_live_app_context,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_update_voice_plan_steps,
             cloud_mcp_get_workspace_architectures,

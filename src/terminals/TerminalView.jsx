@@ -18,6 +18,7 @@ import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
 import { North } from "@styled-icons/material-rounded/North";
 import { Smartphone as DeviceSmartphoneIcon } from "@styled-icons/material-rounded/Smartphone";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled, { keyframes } from "styled-components";
 
 import {
@@ -117,6 +118,12 @@ import {
   getTodoQueueLifecycleSourceForSource,
   getTodoQueuePromptEventSourceForSource,
 } from "./todoQueueSources.js";
+import {
+  TODO_QUEUE_DEVICE_KIND_MOBILE,
+  buildTodoQueueDeviceWorkspaceOptions,
+  todoQueueDeviceSelectionIsLocalEditable,
+  workspaceTodoItemsForDeviceWorkspace,
+} from "./todoQueueDeviceSwitcher.js";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,
@@ -2435,9 +2442,11 @@ const WORKSPACE_TOOL_TABS = [
   { id: "git", label: "Git" },
   { id: "tokenomics", label: "Tokenomics", compactLabel: "Tokens" },
 ];
-const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
-const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
-const TODO_QUEUE_PANE_MODE_FULLSCREEN = "fullscreen";
+const WORKSPACE_SCOPED_TOOL_TAB_IDS = new Set(["plans", "git"]);
+const noopWorkspaceToolHandler = () => {};
+export const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
+export const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
+export const TODO_QUEUE_PANE_MODE_FULLSCREEN = "fullscreen";
 
 const TodoQueueSurface = styled.aside`
   display: grid;
@@ -2689,7 +2698,7 @@ const OrchestratorView = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
 `;
 
 const OrchestratorVoiceArea = styled.div`
@@ -3076,6 +3085,17 @@ const OrchestratorConnectedDevices = styled.div`
     overflow: hidden;
   }
 
+  &[data-panel="true"] {
+    height: 100%;
+    max-height: none;
+    align-content: start;
+    border-bottom: 0;
+  }
+
+  &[data-panel="true"][data-empty="true"] {
+    max-height: none;
+  }
+
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(0, 0, 0, 0.08);
     background: #ffffff;
@@ -3165,8 +3185,173 @@ const OrchestratorConnectedDeviceStatus = styled.span`
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: #57d489;
-  box-shadow: 0 0 0 3px rgba(87, 212, 137, 0.12);
+  background: #7d8796;
+  box-shadow: 0 0 0 3px rgba(125, 135, 150, 0.1);
+
+  &[data-live-state="live"] {
+    background: #57d489;
+    box-shadow: 0 0 0 3px rgba(87, 212, 137, 0.12);
+  }
+
+  &[data-live-state="offline"] {
+    background: #687386;
+    box-shadow: 0 0 0 3px rgba(104, 115, 134, 0.1);
+  }
+`;
+
+const TodoDeviceSwitcher = styled.div`
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+  padding: 9px 10px 8px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.075);
+  background: rgba(2, 4, 8, 0.38);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    background: #ffffff;
+  }
+`;
+
+const TodoDeviceButton = styled.button`
+  display: grid;
+  min-width: 128px;
+  max-width: 210px;
+  height: 42px;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  border: 1px solid rgba(230, 236, 245, 0.09);
+  border-radius: 8px;
+  color: #b7c4d7;
+  background: rgba(11, 16, 24, 0.72);
+  cursor: pointer;
+  outline: none;
+  text-align: left;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.28);
+    color: #eef5ff;
+    background: rgba(18, 27, 41, 0.88);
+    transform: translateY(-1px);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(125, 176, 255, 0.42);
+    color: #f6fbff;
+    background: rgba(47, 128, 255, 0.16);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    color: #4b5565;
+    background: #f7f8fb;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    color: #164377;
+    background: rgba(0, 102, 204, 0.08);
+  }
+`;
+
+const TodoDeviceButtonIcon = styled.span`
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid rgba(125, 176, 255, 0.18);
+  border-radius: 7px;
+  color: #d7e6ff;
+  background: rgba(47, 128, 255, 0.1);
+  line-height: 0;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
+  }
+`;
+
+const TodoDeviceButtonCopy = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+`;
+
+const TodoDeviceButtonName = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10.5px;
+  font-weight: 840;
+  line-height: 1.12;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const TodoDeviceButtonMeta = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: #7f8b9d;
+  font-size: 9.5px;
+  font-weight: 740;
+  line-height: 1.12;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #737780;
+  }
+`;
+
+const TodoDeviceLiveDot = styled.span`
+  display: inline-flex;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #7d8796;
+  box-shadow: 0 0 0 3px rgba(125, 135, 150, 0.1);
+
+  &[data-live-state="live"] {
+    background: #57d489;
+    box-shadow: 0 0 0 3px rgba(87, 212, 137, 0.12);
+  }
+
+  &[data-live-state="offline"] {
+    background: #687386;
+    box-shadow: 0 0 0 3px rgba(104, 115, 134, 0.1);
+  }
+`;
+
+const TodoQueueReadOnlyState = styled.div`
+  display: grid;
+  min-height: 96px;
+  place-items: center;
+  padding: 18px 16px;
+  color: #7f8da1;
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1.35;
+  text-align: center;
+
+  html[data-forge-theme="light"] & {
+    color: #737780;
+  }
 `;
 
 const OrchestratorContent = styled.div`
@@ -4356,7 +4541,7 @@ const TodoQueueBoard = styled.div`
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   background: rgba(2, 4, 8, 0.76);
   overflow: hidden;
 
@@ -12271,6 +12456,156 @@ function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId, de
     .slice(0, 24);
 }
 
+function getWorkspaceTodoMirrorText(item) {
+  return normalizeTodoQueueText(
+    item?.body
+      || item?.todoText
+      || item?.todo_text
+      || item?.text
+      || item?.todoBodyPreview
+      || item?.todo_body_preview
+      || item?.textPreview
+      || item?.text_preview
+      || item?.title
+      || "",
+  );
+}
+
+function normalizeWorkspaceTodoMirrorItems(items = [], selection = null) {
+  const deviceId = normalizeWorkspaceTodoDeviceId(selection?.deviceId);
+  const workspaceId = String(selection?.workspaceId || "").trim();
+  const workspaceName = String(selection?.workspaceName || workspaceId || "").trim();
+  const deviceName = String(selection?.deviceName || "Device").trim();
+  const seen = new Set();
+  return (Array.isArray(items) ? items : [])
+    .map((item, index) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+      const todoId = getWorkspaceTodoIdentity(item) || `cloud-todo-${index}`;
+      const key = `${deviceId || "device"}:${workspaceId || "workspace"}:${todoId}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      seen.add(key);
+      const text = getWorkspaceTodoMirrorText(item);
+      if (!text) {
+        return null;
+      }
+      const status = getWorkspaceTodoStatus(item);
+      return {
+        cloudTodoId: todoId,
+        createdAt: item?.createdAt || item?.created_at || "",
+        deviceId,
+        displayDeviceName: deviceName,
+        displayStatus: status,
+        displayStatusLabel: workspaceTodoPeerStatusLabel(status),
+        displayWorkspaceName: workspaceName,
+        id: `cloud-mirror-${key}`,
+        llmTitle: String(item?.llmTitle || item?.llm_title || "").trim(),
+        readOnly: true,
+        source: "cloud-mirrored-todo",
+        status,
+        text,
+        todoStatus: status,
+        workspaceId,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 80);
+}
+
+function todoDeviceOptionMeta(option) {
+  if (!option) {
+    return "";
+  }
+  if (option.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE) {
+    return option.formFactorLabel || option.platformLabel || "Mobile";
+  }
+  return option.workspaceName || option.formFactorLabel || option.platformLabel || "Desktop";
+}
+
+function buildOrchestratorDeviceRows(options = []) {
+  const byDeviceId = new Map();
+  (Array.isArray(options) ? options : []).forEach((option, index) => {
+    if (!option || typeof option !== "object") {
+      return;
+    }
+    const deviceId = normalizeWorkspaceTodoDeviceId(option.deviceId || option.id || `device-${index}`);
+    if (!deviceId) {
+      return;
+    }
+    const previous = byDeviceId.get(deviceId) || {
+      deviceId,
+      deviceKind: TODO_QUEUE_DEVICE_KIND_UNKNOWN,
+      deviceName: "",
+      formFactorLabel: "",
+      isLocal: false,
+      liveState: "unknown",
+      platformLabel: "",
+      workspaces: [],
+    };
+    const workspaceId = String(option.workspaceId || "").trim();
+    const workspaceName = String(option.workspaceName || workspaceId || "").trim();
+    const workspaces = previous.workspaces.slice();
+    if (workspaceId && !workspaces.some((workspace) => workspace.id === workspaceId)) {
+      workspaces.push({
+        id: workspaceId,
+        isCurrentWorkspace: Boolean(option.isCurrentWorkspace),
+        name: workspaceName || workspaceId,
+      });
+    }
+    const nextLiveState = String(option.liveState || "").trim() || "unknown";
+    byDeviceId.set(deviceId, {
+      ...previous,
+      deviceKind: previous.deviceKind !== TODO_QUEUE_DEVICE_KIND_UNKNOWN
+        ? previous.deviceKind
+        : option.deviceKind || previous.deviceKind,
+      deviceName: option.isLocal || !previous.deviceName
+        ? option.deviceName || previous.deviceName || `Device ${index + 1}`
+        : previous.deviceName,
+      formFactorLabel: previous.formFactorLabel || option.formFactorLabel || "",
+      isLocal: Boolean(previous.isLocal || option.isLocal),
+      liveState: previous.liveState === "live" ? previous.liveState : nextLiveState,
+      platformLabel: previous.platformLabel || option.platformLabel || "",
+      workspaces,
+    });
+  });
+  return Array.from(byDeviceId.values())
+    .filter((row) => row.isLocal || row.liveState !== "offline")
+    .sort((left, right) => {
+      if (left.isLocal !== right.isLocal) {
+        return left.isLocal ? -1 : 1;
+      }
+      if (left.liveState === "live" && right.liveState !== "live") return -1;
+      if (right.liveState === "live" && left.liveState !== "live") return 1;
+      return String(left.deviceName).localeCompare(String(right.deviceName));
+    })
+    .slice(0, 12);
+}
+
+function orchestratorDeviceRowMeta(row) {
+  if (!row) {
+    return "";
+  }
+  const descriptor = row.formFactorLabel || row.platformLabel || (
+    row.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE
+      ? "Mobile"
+      : row.deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP
+        ? "Desktop"
+        : "Device"
+  );
+  const workspaceCount = Array.isArray(row.workspaces) ? row.workspaces.length : 0;
+  const workspaceSummary = workspaceCount > 0
+    ? `${workspaceCount} workspace${workspaceCount === 1 ? "" : "s"}`
+    : "No workspaces";
+  return [
+    row.isLocal ? "This device" : "",
+    descriptor,
+    workspaceSummary,
+  ].filter(Boolean).join(" · ");
+}
+
 function OrchestratorVoiceCanvasRing({
   active = false,
   hasSignal = false,
@@ -12441,22 +12776,25 @@ function OrchestratorVoiceCanvasRing({
   );
 }
 
-const TodoQueuePanel = memo(function TodoQueuePanel({
+export const TodoQueuePanel = memo(function TodoQueuePanel({
   accountKey = "",
   activeDragItemId = "",
   onAddToolTodo,
   billingStatus = null,
   connectedDevices = [],
   defaultWorkingDirectory = "",
+  deviceLiveState = null,
   dispatchTargets = [],
-  draft,
+  draft = "",
   dropError = "",
   agentStatuses = [],
-  items,
+  items = [],
   getItemAccentColor = null,
   coordinationTargets = [],
   gitRepositoriesPreload = null,
   gitSnapshotsPreload = null,
+  knownDevices = [],
+  localDesktopProfile = null,
   onRefreshGitRepositories = null,
   onRefreshGitSnapshot = null,
   onBeginWorkspaceFileDrag,
@@ -12464,9 +12802,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onCancelQueuedItem,
   onCancelVoicePlan,
   onCancelVoicePlanTask,
-  onDraftChange,
+  onDraftChange = noopWorkspaceToolHandler,
   onDispatchTodoToTarget,
-  onMinimizePane,
+  onMinimizePane = noopWorkspaceToolHandler,
   onOpenWorkspaceSettings,
   onQueueAllItems,
   onQueueItem,
@@ -12477,12 +12815,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onRemoveItem,
   onReorderItem,
   onResumePlan,
-  onSubmitDraft,
+  onSubmitDraft = noopWorkspaceToolHandler,
   onToggleTerminalBreakout,
   onToggleWindowBreakout,
   windowBreakoutActive = false,
   todoLlmTitles = null,
-  onToggleFullscreenPane,
+  onToggleFullscreenPane = noopWorkspaceToolHandler,
   onUpdateItem,
   onVoiceAgentToolCall,
   onVoicePlanServerResult,
@@ -12497,6 +12835,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   workspace,
   workspaceError = "",
   workspaceId,
+  workspaceScopedTabsEnabled = true,
   workspaceTodos = null,
 }) {
   const orchestratorPanelWorkspaceId = workspaceId || workspace?.id || "";
@@ -12505,6 +12844,16 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     [orchestratorPanelWorkspaceId, rootDirectory],
   );
   const [activeWorkspaceTool, setActiveWorkspaceTool] = useState("orchestrator");
+  const workspaceToolTabs = useMemo(() => (
+    WORKSPACE_TOOL_TABS.filter((tool) => (
+      workspaceScopedTabsEnabled || !WORKSPACE_SCOPED_TOOL_TAB_IDS.has(tool.id)
+    ))
+  ), [workspaceScopedTabsEnabled]);
+  useEffect(() => {
+    if (!workspaceToolTabs.some((tool) => tool.id === activeWorkspaceTool)) {
+      setActiveWorkspaceTool("orchestrator");
+    }
+  }, [activeWorkspaceTool, workspaceToolTabs]);
 
   // Prefetch the app-level tools cache (architectures + skills) as soon as the
   // orchestrator panel mounts so the Tools tab opens instantly, never "loading".
@@ -12604,6 +12953,68 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const todoListRef = useRef(null);
   const orchestratorHistoryScrollRef = useRef(null);
   const skipEditBlurCommitRef = useRef(false);
+  const [todoDeviceSelectionId, setTodoDeviceSelectionId] = useState("");
+  const todoDeviceOptions = useMemo(() => buildTodoQueueDeviceWorkspaceOptions({
+    connectedDevices,
+    currentWorkspaceId: orchestratorPanelWorkspaceId,
+    currentWorkspaceName: workspace?.name || workspace?.workspaceName || "",
+    deviceLiveState,
+    knownDevices,
+    localProfile: localDesktopProfile,
+    workspaceTodos,
+  }), [
+    connectedDevices,
+    deviceLiveState,
+    knownDevices,
+    localDesktopProfile,
+    orchestratorPanelWorkspaceId,
+    workspace?.name,
+    workspace?.workspaceName,
+    workspaceTodos,
+  ]);
+  const orchestratorDeviceRows = useMemo(
+    () => buildOrchestratorDeviceRows(todoDeviceOptions),
+    [todoDeviceOptions],
+  );
+  const orchestratorPrimarySectionLabel = workspaceScopedTabsEnabled ? "Todo" : "Devices";
+  useEffect(() => {
+    if (!todoDeviceOptions.length) {
+      if (todoDeviceSelectionId) {
+        setTodoDeviceSelectionId("");
+      }
+      return;
+    }
+    if (!todoDeviceOptions.some((option) => option.id === todoDeviceSelectionId)) {
+      setTodoDeviceSelectionId(todoDeviceOptions[0].id);
+    }
+  }, [todoDeviceOptions, todoDeviceSelectionId]);
+  const selectedTodoDevice = useMemo(() => (
+    todoDeviceOptions.find((option) => option.id === todoDeviceSelectionId)
+      || todoDeviceOptions[0]
+      || null
+  ), [todoDeviceOptions, todoDeviceSelectionId]);
+  const todoSelectionEditable = todoQueueDeviceSelectionIsLocalEditable(
+    selectedTodoDevice,
+    orchestratorPanelWorkspaceId,
+  );
+  const todoSelectionMobile = selectedTodoDevice?.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE;
+  const selectedWorkspaceTodoItems = useMemo(() => (
+    todoSelectionEditable || todoSelectionMobile
+      ? []
+      : workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selectedTodoDevice)
+  ), [
+    selectedTodoDevice,
+    todoSelectionEditable,
+    todoSelectionMobile,
+    workspaceTodos,
+  ]);
+  const remoteTodoQueueItems = useMemo(
+    () => normalizeWorkspaceTodoMirrorItems(selectedWorkspaceTodoItems, selectedTodoDevice),
+    [selectedTodoDevice, selectedWorkspaceTodoItems],
+  );
+  const displayedTodoQueueItems = todoSelectionEditable ? items : remoteTodoQueueItems;
+  const displayedTodoQueuePendingItems = todoSelectionEditable ? pendingItems : {};
+  const workspaceTodoPeerItems = todoSelectionEditable && Array.isArray(peerItems) ? peerItems : [];
 
   const updateVoiceHistoryTurn = useCallback((turnKey, updater) => {
     const safeTurnKey = String(turnKey || "").trim();
@@ -13691,15 +14102,21 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   ]);
 
   const handleDraftKeyDown = useCallback((event) => {
+    if (!todoSelectionEditable) {
+      return;
+    }
     if (event.key !== "Enter" || event.shiftKey) {
       return;
     }
 
     event.preventDefault();
     onSubmitDraft();
-  }, [onSubmitDraft]);
+  }, [onSubmitDraft, todoSelectionEditable]);
 
   const handleDraftPaste = useCallback((event) => {
+    if (!todoSelectionEditable) {
+      return;
+    }
     const imageFiles = getTodoClipboardImageFiles(event.clipboardData);
     const note = getTodoQueueNoteFromPastedText(event.clipboardData?.getData?.("text/plain") || "");
 
@@ -13755,18 +14172,24 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           workspaceId,
         });
       });
-  }, [draft, items.length, onSubmitDraft, workspaceId]);
+  }, [draft, items.length, onSubmitDraft, todoSelectionEditable, workspaceId]);
 
   const handleSubmit = useCallback((event) => {
     event.preventDefault();
+    if (!todoSelectionEditable) {
+      return;
+    }
     onSubmitDraft();
-  }, [onSubmitDraft]);
+  }, [onSubmitDraft, todoSelectionEditable]);
 
   // Media dropped on the draft composer (snip preview windows or OS files)
   // becomes a brand-new todo carrying the attachment — same flow as pasting
   // an image, including dropping straight into edit mode.
   useEffect(() => {
     const handleComposerMediaDrop = (event) => {
+      if (!todoSelectionEditable) {
+        return;
+      }
       const detail = event?.detail || {};
       if (String(detail.workspaceId || "").trim() !== String(workspaceId || "").trim()) {
         return;
@@ -13787,9 +14210,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     return () => {
       window.removeEventListener(TODO_COMPOSER_MEDIA_DROP_EVENT, handleComposerMediaDrop);
     };
-  }, [onSubmitDraft, workspaceId]);
+  }, [onSubmitDraft, todoSelectionEditable, workspaceId]);
 
   const beginItemEdit = useCallback((item) => {
+    if (!todoSelectionEditable) {
+      return;
+    }
     const text = normalizeTodoQueueText(item?.text);
     if (!item?.id || pendingItems[item.id]) {
       return;
@@ -13798,7 +14224,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     setEditingItemId(item.id);
     setEditingDraft(text);
     skipEditBlurCommitRef.current = false;
-  }, [pendingItems]);
+  }, [pendingItems, todoSelectionEditable]);
 
   const clearItemEdit = useCallback(() => {
     setEditingItemId("");
@@ -13806,14 +14232,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, []);
 
   const commitItemEdit = useCallback(() => {
-    if (!editingItemId) {
+    if (!editingItemId || !todoSelectionEditable) {
       return;
     }
 
     onUpdateItem?.(editingItemId, editingDraft);
     skipEditBlurCommitRef.current = true;
     clearItemEdit();
-  }, [clearItemEdit, editingDraft, editingItemId, onUpdateItem]);
+  }, [clearItemEdit, editingDraft, editingItemId, onUpdateItem, todoSelectionEditable]);
 
   const handleItemEditBlur = useCallback(() => {
     if (skipEditBlurCommitRef.current) {
@@ -13845,6 +14271,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, []);
 
   const handleBoardPointerDown = useCallback((event) => {
+    if (!todoSelectionEditable) {
+      return;
+    }
     if (
       event.target === draftTextAreaRef.current
       || event.target?.closest?.("[data-todo-card='true']")
@@ -13855,7 +14284,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
     event.preventDefault();
     focusDraftTextArea();
-  }, [focusDraftTextArea]);
+  }, [focusDraftTextArea, todoSelectionEditable]);
 
   const setTodoItemElement = useCallback((itemId, element) => {
     if (element) {
@@ -13905,6 +14334,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [clearPendingTodoDragGesture, onBeginTodoDrag]);
 
   const handlePointerDown = useCallback((event, item) => {
+    if (!todoSelectionEditable) {
+      return;
+    }
     if (
       event.button !== 0
       || event.detail > 1
@@ -14020,6 +14452,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     clearPendingTodoDragGesture,
     editingItemId,
     pendingItems,
+    todoSelectionEditable,
     workspaceId,
   ]);
 
@@ -14046,10 +14479,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [editingDraft, editingItemId]);
 
   useEffect(() => {
-    if (editingItemId && !items.some((item) => item.id === editingItemId)) {
+    if (
+      editingItemId
+      && (!todoSelectionEditable || !items.some((item) => item.id === editingItemId))
+    ) {
       clearItemEdit();
     }
-  }, [clearItemEdit, editingItemId, items]);
+  }, [clearItemEdit, editingItemId, items, todoSelectionEditable]);
 
   useEffect(() => {
     if (activeWorkspaceTool !== "orchestrator") {
@@ -14359,7 +14795,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
   useEffect(() => {
     const drag = todoReorderDragRef.current;
-    if (!reorderingItemId || !drag) {
+    if (!todoSelectionEditable || !reorderingItemId || !drag) {
       return undefined;
     }
 
@@ -14414,7 +14850,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       window.removeEventListener("pointerup", endDrag);
       window.removeEventListener("pointercancel", endDrag);
     };
-  }, [items, onReorderItem, reorderingItemId]);
+  }, [items, onReorderItem, reorderingItemId, todoSelectionEditable]);
 
   const orchestratorVoiceLevel = getOrchestratorVoiceLevel(orchestratorVoiceStats);
   const paneFullscreen = paneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
@@ -14462,7 +14898,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     || orchestratorVoiceState === "listening"
     || orchestratorVoiceState === "processing";
   const orchestratorChatCanSend = Boolean(orchestratorChatDraft.trim()) && !orchestratorChatBusy;
-  const autoQueueAllEligibleCount = items.reduce((count, item) => {
+  const autoQueueAllEligibleCount = todoSelectionEditable ? items.reduce((count, item) => {
     if (
       pendingItems[item.id]
       || !(
@@ -14475,13 +14911,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     }
 
     return count + 1;
-  }, 0);
-  const orchestratorConnectedDevices = useMemo(
-    () => normalizeOrchestratorConnectedDevices(connectedDevices),
-    [connectedDevices],
-  );
-  const workspaceTodoPeerItems = Array.isArray(peerItems) ? peerItems : [];
+  }, 0) : 0;
   const todoLlmTitleFor = useCallback((item) => {
+    if (item?.readOnly && item?.llmTitle) {
+      return item.llmTitle;
+    }
     if (!todoLlmTitles || typeof todoLlmTitles.get !== "function") {
       return "";
     }
@@ -14507,9 +14941,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const workspaceTodoDispatchTargets = Array.isArray(dispatchTargets)
     ? dispatchTargets.filter((target) => target?.canQueue !== false)
     : [];
-  const showTodoDispatchTargets = workspaceTodoDispatchTargets.length > 0
+  const showTodoDispatchTargets = todoSelectionEditable
+    && workspaceTodoDispatchTargets.length > 0
     && typeof onDispatchTodoToTarget === "function";
   const handleDispatchTargetChange = useCallback((event, item, source) => {
+    if (!todoSelectionEditable) {
+      event.target.value = "";
+      return;
+    }
     const { mode, targetId } = parseTodoQueueDeviceSendValue(event.target.value);
     event.target.value = "";
     if (!targetId || typeof onDispatchTodoToTarget !== "function") {
@@ -14520,12 +14959,15 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
     onDispatchTodoToTarget(item, target, { mode, source });
-  }, [onDispatchTodoToTarget, workspaceTodoDispatchTargets]);
+  }, [onDispatchTodoToTarget, todoSelectionEditable, workspaceTodoDispatchTargets]);
   const handleRemoveItemAttachment = useCallback((event, item, attachment) => {
     event.preventDefault();
     event.stopPropagation();
+    if (!todoSelectionEditable) {
+      return;
+    }
     onRemoveItemAttachment?.(item.id, attachment);
-  }, [onRemoveItemAttachment]);
+  }, [onRemoveItemAttachment, todoSelectionEditable]);
 
   return (
     <TodoQueueSurface
@@ -14535,7 +14977,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       data-tool-fullscreen={paneFullscreen ? "true" : undefined}
     >
       <OrchestratorTopNav aria-label="Workspace tool">
-        {WORKSPACE_TOOL_TABS.map((tool) => (
+        {workspaceToolTabs.map((tool) => (
           <OrchestratorTopButton
             aria-label={tool.label}
             data-active={activeWorkspaceTool === tool.id ? "true" : "false"}
@@ -14555,15 +14997,17 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorTopButton>
         ))}
       </OrchestratorTopNav>
-      <WorkspaceToolSurface data-tool="plans" hidden={activeWorkspaceTool !== "plans"}>
-        <PlansWorkspaceView
-          repoTargets={coordinationTargets}
-          onResumePlan={onResumePlan}
-          rootDirectory={selectedTerminalPlanTarget?.repoPath || rootDirectory}
-          selectedTerminal={selectedTerminalPlanTarget}
-          workspace={workspace}
-        />
-      </WorkspaceToolSurface>
+      {workspaceScopedTabsEnabled && (
+        <WorkspaceToolSurface data-tool="plans" hidden={activeWorkspaceTool !== "plans"}>
+          <PlansWorkspaceView
+            repoTargets={coordinationTargets}
+            onResumePlan={onResumePlan}
+            rootDirectory={selectedTerminalPlanTarget?.repoPath || rootDirectory}
+            selectedTerminal={selectedTerminalPlanTarget}
+            workspace={workspace}
+          />
+        </WorkspaceToolSurface>
+      )}
       {activeWorkspaceTool === "tools" ? (
         <WorkspaceToolSurface data-tool="tools">
           <WorkspaceToolsDragPanel
@@ -14573,7 +15017,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             workspaceId={workspace?.id || ""}
           />
         </WorkspaceToolSurface>
-      ) : activeWorkspaceTool === "git" ? (
+      ) : activeWorkspaceTool === "git" && workspaceScopedTabsEnabled ? (
         <WorkspaceToolSurface data-tool="git">
           <GitWorkspaceView
             onRefreshRepositories={onRefreshGitRepositories}
@@ -14605,30 +15049,34 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               >
                 <TitleMinimizeIcon aria-hidden="true" />
               </WorkspaceToolControlButton>
-              <WorkspaceToolControlButton
-                aria-label={terminalBreakoutActive ? "Exit terminal breakout canvas" : "Open terminal breakout canvas"}
-                aria-pressed={terminalBreakoutActive ? "true" : "false"}
-                data-active={terminalBreakoutActive ? "true" : undefined}
-                data-control="breakout"
-                onClick={onToggleTerminalBreakout}
-                title={terminalBreakoutActive ? "Exit breakout" : "Breakout"}
-                type="button"
-              >
-                <ButtonHubIcon aria-hidden="true" />
-              </WorkspaceToolControlButton>
-              <WorkspaceToolControlButton
-                aria-label={windowBreakoutActive
-                  ? "Return terminals from their own windows"
-                  : "Break terminals out into their own windows"}
-                aria-pressed={windowBreakoutActive ? "true" : "false"}
-                data-active={windowBreakoutActive ? "true" : undefined}
-                data-control="window-breakout"
-                onClick={onToggleWindowBreakout}
-                title={windowBreakoutActive ? "Return windows" : "Window Breakout"}
-                type="button"
-              >
-                <OpenInNew aria-hidden="true" />
-              </WorkspaceToolControlButton>
+              {workspaceScopedTabsEnabled && (
+                <>
+                  <WorkspaceToolControlButton
+                    aria-label={terminalBreakoutActive ? "Exit terminal breakout canvas" : "Open terminal breakout canvas"}
+                    aria-pressed={terminalBreakoutActive ? "true" : "false"}
+                    data-active={terminalBreakoutActive ? "true" : undefined}
+                    data-control="breakout"
+                    onClick={onToggleTerminalBreakout}
+                    title={terminalBreakoutActive ? "Exit breakout" : "Breakout"}
+                    type="button"
+                  >
+                    <ButtonHubIcon aria-hidden="true" />
+                  </WorkspaceToolControlButton>
+                  <WorkspaceToolControlButton
+                    aria-label={windowBreakoutActive
+                      ? "Return terminals from their own windows"
+                      : "Break terminals out into their own windows"}
+                    aria-pressed={windowBreakoutActive ? "true" : "false"}
+                    data-active={windowBreakoutActive ? "true" : undefined}
+                    data-control="window-breakout"
+                    onClick={onToggleWindowBreakout}
+                    title={windowBreakoutActive ? "Return windows" : "Window Breakout"}
+                    type="button"
+                  >
+                    <OpenInNew aria-hidden="true" />
+                  </WorkspaceToolControlButton>
+                </>
+              )}
               <WorkspaceToolControlButton
                 aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
                 onClick={onToggleFullscreenPane}
@@ -14685,7 +15133,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               onClick={() => setActiveOrchestratorSection("todo")}
               type="button"
             >
-              Todo
+              {orchestratorPrimarySectionLabel}
             </OrchestratorSectionButton>
             <OrchestratorSectionButton
               data-active={activeOrchestratorSection === "history" ? "true" : "false"}
@@ -14695,40 +15143,54 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               Voice History
             </OrchestratorSectionButton>
           </OrchestratorSectionTabs>
-          <OrchestratorConnectedDevices
-            aria-label="Connected devices"
-            data-empty={orchestratorConnectedDevices.length ? undefined : "true"}
-          >
-            {orchestratorConnectedDevices.map((device) => {
-              const DeviceIcon = device.icon;
-              return (
-                <OrchestratorConnectedDeviceRow key={device.deviceId}>
-                  <OrchestratorConnectedDeviceIcon aria-hidden="true">
-                    <DeviceIcon />
-                  </OrchestratorConnectedDeviceIcon>
-                  <OrchestratorConnectedDeviceCopy>
-                    <OrchestratorConnectedDeviceName title={device.displayName}>
-                      {device.displayName}
-                    </OrchestratorConnectedDeviceName>
-                    <OrchestratorConnectedDeviceMeta>
-                      {device.platformLabel} · {device.formFactorLabel}
-                    </OrchestratorConnectedDeviceMeta>
-                  </OrchestratorConnectedDeviceCopy>
-                  <OrchestratorConnectedDeviceStatus aria-hidden="true" />
-                </OrchestratorConnectedDeviceRow>
-              );
-            })}
-          </OrchestratorConnectedDevices>
           <OrchestratorContent>
             {activeOrchestratorSection === "todo" ? (
+              workspaceScopedTabsEnabled ? (
               <TodoQueueBoard
                 onPointerDown={handleBoardPointerDown}
                 ref={todoBoardRef}
               >
+                <TodoDeviceSwitcher aria-label="Todo device and workspace">
+                  {todoDeviceOptions.map((option) => {
+                    const DeviceIcon = connectedDeviceIconFor({
+                      ...option,
+                      formFactor: option.deviceKind,
+                    });
+                    const meta = todoDeviceOptionMeta(option);
+                    return (
+                      <TodoDeviceButton
+                        aria-pressed={selectedTodoDevice?.id === option.id ? "true" : "false"}
+                        data-active={selectedTodoDevice?.id === option.id ? "true" : undefined}
+                        data-todo-control="true"
+                        key={option.id}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setTodoDeviceSelectionId(option.id);
+                        }}
+                        title={`${option.deviceName}${meta ? ` · ${meta}` : ""}`}
+                        type="button"
+                      >
+                        <TodoDeviceButtonIcon aria-hidden="true">
+                          <DeviceIcon />
+                        </TodoDeviceButtonIcon>
+                        <TodoDeviceButtonCopy>
+                          <TodoDeviceButtonName>{option.deviceName}</TodoDeviceButtonName>
+                          <TodoDeviceButtonMeta>{meta}</TodoDeviceButtonMeta>
+                        </TodoDeviceButtonCopy>
+                        <TodoDeviceLiveDot
+                          aria-hidden="true"
+                          data-live-state={option.liveState || "unknown"}
+                        />
+                      </TodoDeviceButton>
+                    );
+                  })}
+                </TodoDeviceSwitcher>
                 <TodoQueueList aria-label="Todo objects" ref={todoListRef} role="list">
-                  {items.map((item) => {
+                  {displayedTodoQueueItems.map((item) => {
                     const isEditing = editingItemId === item.id;
-                    const pendingItem = pendingItems[item.id] || null;
+                    const itemReadOnly = !todoSelectionEditable || Boolean(item.readOnly);
+                    const pendingItem = displayedTodoQueuePendingItems[item.id] || null;
                     const isPending = Boolean(pendingItem);
                     const pendingPhase = getTodoQueuePendingPhase(pendingItem);
                     const isQueued = pendingPhase === "queued";
@@ -14741,6 +15203,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                     const hasPreview = Boolean(images.length || note);
                     const recoverableStatus = getTodoQueueRecoverableStatus(item);
                     const recoverableStatusLabel = todoQueueRecoverableStatusLabel(recoverableStatus);
+                    const mirrorStatusLabel = itemReadOnly && item.displayStatusLabel
+                      ? item.displayStatusLabel
+                      : "";
                     const targetAgentId = getTodoQueueTargetAgentId(item);
                     const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
                     const hasTerminalTarget = Number.isInteger(targetTerminalIndex)
@@ -14756,30 +15221,31 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                       <TodoQueueItemCard
                         data-snip-drop-todo-id={item.id}
                         data-todo-card="true"
-                        data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
-                        data-todo-editing={isEditing ? "true" : undefined}
+                        data-todo-dragging={!itemReadOnly && activeDragItemId === item.id ? "true" : undefined}
+                        data-todo-editing={!itemReadOnly && isEditing ? "true" : undefined}
                         data-todo-pending={isPending ? "true" : undefined}
                         data-todo-queued={isQueued ? "true" : undefined}
-                        data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
-                        data-todo-status={recoverableStatus || undefined}
+                        data-todo-readonly={itemReadOnly ? "true" : undefined}
+                        data-todo-reordering={!itemReadOnly && reorderingItemId === item.id ? "true" : undefined}
+                        data-todo-status={recoverableStatus || item.displayStatus || undefined}
                         data-todo-targeted={targetAgentId || hasTerminalTarget ? "true" : undefined}
-                        data-todo-cancellable={isQueued ? "true" : undefined}
+                        data-todo-cancellable={!itemReadOnly && isQueued ? "true" : undefined}
                         data-todo-sending={isSending ? "true" : undefined}
                         key={item.id}
                         onDoubleClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
-                          if (isPending) {
+                          if (itemReadOnly || isPending) {
                             return;
                           }
                           beginItemEdit(item);
                         }}
-	                        onPointerDown={(event) => handlePointerDown(event, item)}
+	                        onPointerDown={itemReadOnly ? undefined : (event) => handlePointerDown(event, item)}
 	                        ref={(element) => setTodoItemElement(item.id, element)}
 	                        role="listitem"
 	                        style={todoAccentColor ? { "--todo-agent-color": todoAccentColor } : undefined}
 	                      >
-                        {!isEditing && (
+                        {!itemReadOnly && !isEditing && (
                           <TodoQueueItemActionButton
                             aria-label={actionLabel}
                             data-action={isQueued ? "cancel" : "queue"}
@@ -14806,7 +15272,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             {isQueued ? <Close aria-hidden="true" /> : <AddToQueue aria-hidden="true" />}
                           </TodoQueueItemActionButton>
                         )}
-                        {!isEditing && !isSending && showTodoDispatchTargets && (
+                        {!itemReadOnly && !isEditing && !isSending && showTodoDispatchTargets && (
                           <TodoQueueDispatchSelect
                             aria-label="Send todo to device"
                             data-todo-control="true"
@@ -14848,7 +15314,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   {images.slice(0, 4).map((nextImage, imageIndex) => (
                                     <TodoQueueItemImageTile key={`${nextImage.src}:${imageIndex}`}>
                                       <TodoQueueItemImage alt="" src={nextImage.src} />
-                                      {!isEditing && !isPending && (
+                                      {!itemReadOnly && !isEditing && !isPending && (
                                         <TodoQueueItemAttachmentRemoveButton
                                           aria-label={`Remove ${nextImage.name || "image"} from todo`}
                                           data-preview-scope="tile"
@@ -14875,7 +15341,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                               ) : (
                                 <>
                                   <TodoQueueItemImage alt="" src={image.src} />
-                                  {!isEditing && !isPending && (
+                                  {!itemReadOnly && !isEditing && !isPending && (
                                     <TodoQueueItemAttachmentRemoveButton
                                       aria-label={`Remove ${image.name || "image"} from todo`}
                                       data-preview-scope="frame"
@@ -14903,7 +15369,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             <TodoQueueItemNoteFrame>
                               <TodoQueueItemNoteTitle>{note.title}</TodoQueueItemNoteTitle>
                               <TodoQueueItemNoteIcon aria-hidden="true" />
-                              {!isEditing && !isPending && (
+                              {!itemReadOnly && !isEditing && !isPending && (
                                 <TodoQueueItemAttachmentRemoveButton
                                   aria-label="Remove pasted note from todo"
                                   data-preview-scope="frame"
@@ -14925,7 +15391,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             </TodoQueueItemNoteFrame>
                           )}
                           <TodoQueueItemBody>
-                            {isEditing && !isPending ? (
+                            {!itemReadOnly && isEditing && !isPending ? (
                               <TodoQueueItemEditor
                                 aria-label="Edit todo"
                                 data-todo-control="true"
@@ -14951,9 +15417,19 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                 {recoverableStatusLabel}
                               </TodoQueueStatusPill>
                             )}
+                            {!isEditing && !recoverableStatusLabel && mirrorStatusLabel && (
+                              <TodoQueueStatusPill data-todo-status={item.displayStatus || "listed"}>
+                                {mirrorStatusLabel}
+                              </TodoQueueStatusPill>
+                            )}
+                            {itemReadOnly && item.displayWorkspaceName && (
+                              <TodoQueuePeerMeta>
+                                <TodoQueuePeerPill>{item.displayWorkspaceName}</TodoQueuePeerPill>
+                              </TodoQueuePeerMeta>
+                            )}
                           </TodoQueueItemBody>
                         </TodoQueueItemContent>
-                        {!isEditing && !isPending && (
+                        {!itemReadOnly && !isEditing && !isPending && (
                           <TodoQueueDeleteButton
                             aria-label="Delete todo"
                             data-todo-control="true"
@@ -15056,46 +15532,103 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                       </TodoQueueItemCard>
                     );
                   })}
-                  <TodoQueueComposer
-                    data-snip-drop-composer="true"
-                    data-todo-composer="true"
-                    onSubmit={handleSubmit}
-                  >
-                    <TodoQueueTextArea
-                      aria-label="New todo"
-                      maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
-                      onChange={(event) => onDraftChange(event.target.value)}
-                      onKeyDown={handleDraftKeyDown}
-                      onPaste={handleDraftPaste}
-                      placeholder="Type a todo..."
-                      ref={draftTextAreaRef}
-                      rows={1}
-                      spellCheck="true"
-                      value={draft}
-                    />
-                    <TodoQueueDraftBullet aria-hidden="true" />
-                  </TodoQueueComposer>
+                  {!displayedTodoQueueItems.length && !workspaceTodoPeerItems.length && !todoSelectionEditable && (
+                    <TodoQueueReadOnlyState>
+                      {todoSelectionMobile
+                        ? "No todos"
+                        : `No mirrored todos${selectedTodoDevice?.workspaceName ? ` in ${selectedTodoDevice.workspaceName}` : ""}`}
+                    </TodoQueueReadOnlyState>
+                  )}
+                  {todoSelectionEditable && (
+                    <TodoQueueComposer
+                      data-snip-drop-composer="true"
+                      data-todo-composer="true"
+                      onSubmit={handleSubmit}
+                    >
+                      <TodoQueueTextArea
+                        aria-label="New todo"
+                        maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
+                        onChange={(event) => onDraftChange(event.target.value)}
+                        onKeyDown={handleDraftKeyDown}
+                        onPaste={handleDraftPaste}
+                        placeholder="Type a todo..."
+                        ref={draftTextAreaRef}
+                        rows={1}
+                        spellCheck="true"
+                        value={draft}
+                      />
+                      <TodoQueueDraftBullet aria-hidden="true" />
+                    </TodoQueueComposer>
+                  )}
                 </TodoQueueList>
-                <TodoQueueFooterActions>
-                  <TodoQueueAutoQueueAllButton
-                    aria-label="Autoqueue all todos"
-                    data-todo-control="true"
-                    disabled={!autoQueueAllEligibleCount}
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      onQueueAllItems?.();
-                    }}
-                    title={autoQueueAllEligibleCount ? "Queue all unqueued todos" : "No unqueued todos"}
-                    type="button"
-                  >
-                    <AddToQueue aria-hidden="true" />
-                    <span>Autoqueue all</span>
-                  </TodoQueueAutoQueueAllButton>
-                </TodoQueueFooterActions>
+                {todoSelectionEditable && (
+                  <TodoQueueFooterActions>
+                    <TodoQueueAutoQueueAllButton
+                      aria-label="Autoqueue all todos"
+                      data-todo-control="true"
+                      disabled={!autoQueueAllEligibleCount}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (!todoSelectionEditable) {
+                          return;
+                        }
+                        onQueueAllItems?.();
+                      }}
+                      title={autoQueueAllEligibleCount ? "Queue all unqueued todos" : "No unqueued todos"}
+                      type="button"
+                    >
+                      <AddToQueue aria-hidden="true" />
+                      <span>Autoqueue all</span>
+                    </TodoQueueAutoQueueAllButton>
+                  </TodoQueueFooterActions>
+                )}
 
-                {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
+                {todoSelectionEditable && dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
               </TodoQueueBoard>
+              ) : (
+                <OrchestratorConnectedDevices
+                  aria-label="Connected devices"
+                  data-empty={orchestratorDeviceRows.length ? undefined : "true"}
+                  data-panel="true"
+                >
+                  {orchestratorDeviceRows.map((device) => {
+                    const DeviceIcon = connectedDeviceIconFor({
+                      deviceType: device.deviceKind,
+                      formFactor: device.formFactorLabel || device.deviceKind,
+                      platform: device.platformLabel,
+                    });
+                    const meta = orchestratorDeviceRowMeta(device);
+                    const workspaceNames = device.workspaces
+                      .map((workspace) => workspace.name)
+                      .filter(Boolean)
+                      .slice(0, 4)
+                      .join(", ");
+                    return (
+                      <OrchestratorConnectedDeviceRow
+                        key={device.deviceId}
+                        title={workspaceNames ? `${device.deviceName} · ${workspaceNames}` : device.deviceName}
+                      >
+                        <OrchestratorConnectedDeviceIcon aria-hidden="true">
+                          <DeviceIcon />
+                        </OrchestratorConnectedDeviceIcon>
+                        <OrchestratorConnectedDeviceCopy>
+                          <OrchestratorConnectedDeviceName>{device.deviceName}</OrchestratorConnectedDeviceName>
+                          <OrchestratorConnectedDeviceMeta>{meta}</OrchestratorConnectedDeviceMeta>
+                        </OrchestratorConnectedDeviceCopy>
+                        <OrchestratorConnectedDeviceStatus
+                          aria-label={device.liveState === "live" ? "Live" : device.liveState === "offline" ? "Offline" : "Unknown"}
+                          data-live-state={device.liveState || "unknown"}
+                          role="img"
+                        />
+                      </OrchestratorConnectedDeviceRow>
+                    );
+                  })}
+                  {!orchestratorDeviceRows.length && (
+                    <TodoQueueReadOnlyState>No connected devices</TodoQueueReadOnlyState>
+                  )}
+                </OrchestratorConnectedDevices>
+              )
             ) : (
               <OrchestratorHistoryView aria-label="Voice history">
                 <OrchestratorHistoryToolbar>
@@ -15547,6 +16080,7 @@ function TerminalView({
   billingStatus = null,
   connectedDevices = [],
   defaultWorkingDirectory = "",
+  deviceLiveState = null,
   knownDevices = [],
   storageUsage = null,
   terminalWorkspace,
@@ -15571,6 +16105,9 @@ function TerminalView({
   gitSnapshotsPreload = null,
   onRefreshGitRepositories = null,
   onRefreshGitSnapshot = null,
+  onMinimizeWorkspaceToolPane = null,
+  onRestoreWorkspaceToolPane = null,
+  onToggleFullscreenWorkspaceToolPane = null,
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -15604,6 +16141,10 @@ function TerminalView({
   workspaceThreadRestoreReady = true,
   workspaceTerminalAgentLaunchReady,
   workspaceTerminalRenderAgent,
+  workspaceScopedToolTabsEnabled = true,
+  workspaceToolPaneMode = "",
+  workspaceToolPaneVisible = false,
+  workspaceToolPortalTarget = null,
   workspaceThreads = {},
   workspaceTodos = null,
   workspaces = [],
@@ -15683,6 +16224,8 @@ function TerminalView({
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
+  const workspaceToolPortaled = Boolean(workspaceToolPortalTarget);
+  const effectiveTodoQueuePaneMode = workspaceToolPaneMode || todoQueuePaneMode;
   // No terminal tabs: every terminal is always visible in the resize grid
   // (rows split vertically, terminals within a row split horizontally) and
   // can be dragged between positions. The empty visibility map keeps every
@@ -15695,8 +16238,11 @@ function TerminalView({
     hasVisibleWorkspaceTerminalPanes
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
   );
-  const todoQueuePaneMinimized = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
-  const todoQueuePaneFullscreen = todoQueuePaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
+  const effectiveTodoQueueVisible = workspaceToolPortaled
+    ? Boolean(hasWorkspaceTerminals)
+    : todoQueueVisible;
+  const todoQueuePaneMinimized = effectiveTodoQueuePaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
+  const todoQueuePaneFullscreen = effectiveTodoQueuePaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
   const todoQueueMinimizedSize = terminalWorkspaceMainWidth > 0
     ? Math.min(4, Math.max(2.8, (TODO_QUEUE_MINIMIZED_WIDTH_PX / terminalWorkspaceMainWidth) * 100))
     : 3.2;
@@ -15783,6 +16329,7 @@ function TerminalView({
     () => buildWorkspaceTodoDeviceMap(knownDevices, connectedDevices),
     [connectedDevices, knownDevices],
   );
+  const [cloudDesktopDeviceProfile, setCloudDesktopDeviceProfile] = useState(null);
   const [cloudDesktopDeviceId, setCloudDesktopDeviceId] = useState("");
   todoQueueItemsRef.current = todoQueueItems;
   terminalBreakoutPhaseRef.current = terminalBreakoutPhase;
@@ -19723,13 +20270,13 @@ function TerminalView({
   }, [shouldShowWorkspaceSetup]);
 
   useEffect(() => {
-    if (!todoQueueVisible && todoQueuePaneMode !== TODO_QUEUE_PANE_MODE_NORMAL) {
+    if (!workspaceToolPortaled && !todoQueueVisible && todoQueuePaneMode !== TODO_QUEUE_PANE_MODE_NORMAL) {
       setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
     }
-  }, [todoQueuePaneMode, todoQueueVisible]);
+  }, [todoQueuePaneMode, todoQueueVisible, workspaceToolPortaled]);
 
   useEffect(() => {
-    if (!todoQueueVisible || !hasVisibleWorkspaceTerminalPanes) {
+    if (workspaceToolPortaled || !todoQueueVisible || !hasVisibleWorkspaceTerminalPanes) {
       return undefined;
     }
 
@@ -19746,6 +20293,7 @@ function TerminalView({
     terminalGridPanelSize,
     todoQueuePanelSize,
     todoQueueVisible,
+    workspaceToolPortaled,
   ]);
 
   useLayoutEffect(() => {
@@ -20550,6 +21098,9 @@ function TerminalView({
     invoke("cloud_mcp_get_desktop_device_profile").then((profile) => {
       if (cancelled) {
         return;
+      }
+      if (profile && typeof profile === "object") {
+        setCloudDesktopDeviceProfile(profile);
       }
       const deviceId = String(profile?.device_id || profile?.deviceId || "").trim();
       if (deviceId) {
@@ -28249,20 +28800,32 @@ function TerminalView({
   ]);
 
   const minimizeTodoQueuePane = useCallback(() => {
+    if (workspaceToolPortaled && onMinimizeWorkspaceToolPane) {
+      onMinimizeWorkspaceToolPane();
+      return;
+    }
     setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
-  }, []);
+  }, [onMinimizeWorkspaceToolPane, workspaceToolPortaled]);
 
   const restoreTodoQueuePane = useCallback(() => {
+    if (workspaceToolPortaled && onRestoreWorkspaceToolPane) {
+      onRestoreWorkspaceToolPane();
+      return;
+    }
     setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
-  }, []);
+  }, [onRestoreWorkspaceToolPane, workspaceToolPortaled]);
 
   const toggleFullscreenTodoQueuePane = useCallback(() => {
+    if (workspaceToolPortaled && onToggleFullscreenWorkspaceToolPane) {
+      onToggleFullscreenWorkspaceToolPane();
+      return;
+    }
     setTodoQueuePaneMode((currentMode) => (
       currentMode === TODO_QUEUE_PANE_MODE_FULLSCREEN
         ? TODO_QUEUE_PANE_MODE_NORMAL
         : TODO_QUEUE_PANE_MODE_FULLSCREEN
     ));
-  }, []);
+  }, [onToggleFullscreenWorkspaceToolPane, workspaceToolPortaled]);
 
   const getTerminalSlotStyle = useCallback((terminalIndex) => {
     const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
@@ -29033,8 +29596,93 @@ function TerminalView({
     />
   ) : null;
 
+  const workspaceToolPaneContent = effectiveTodoQueueVisible ? (
+    todoQueuePaneMinimized ? (
+      <WorkspaceToolMinimizedRail aria-label="Workspace tools minimized">
+        <WorkspaceToolRailControls>
+          <WorkspaceToolControlButton
+            aria-label="Unminimize workspace tools"
+            onClick={restoreTodoQueuePane}
+            title="Unminimize"
+            type="button"
+          >
+            <TitleRestoreIcon aria-hidden="true" />
+          </WorkspaceToolControlButton>
+        </WorkspaceToolRailControls>
+        <WorkspaceToolRailLabel>Tools</WorkspaceToolRailLabel>
+      </WorkspaceToolMinimizedRail>
+    ) : (
+      <TodoQueuePanel
+        accountKey={accountKey}
+        activeDragItemId={todoDragState?.itemId || ""}
+        agentStatuses={agentStatuses}
+        billingStatus={billingStatus}
+        connectedDevices={connectedDevices}
+        coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
+        defaultWorkingDirectory={defaultWorkingDirectory}
+        deviceLiveState={deviceLiveState}
+        dispatchTargets={workspaceTodoDispatchTargets}
+        draft={todoQueueDraft}
+        dropError={todoDropError}
+        getItemAccentColor={getTodoQueueItemAccentColor}
+        gitRepositoriesPreload={gitRepositoriesPreload}
+        gitSnapshotsPreload={gitSnapshotsPreload}
+        items={visibleTodoQueueItems}
+        knownDevices={knownDevices}
+        localDesktopProfile={cloudDesktopDeviceProfile}
+        onRefreshGitRepositories={onRefreshGitRepositories}
+        onRefreshGitSnapshot={onRefreshGitSnapshot}
+        onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
+        onBeginTodoDrag={handleBeginTodoDrag}
+        onCancelQueuedItem={cancelQueuedTodoQueueItem}
+        onCancelVoicePlan={handleCancelVoicePlan}
+        onCancelVoicePlanTask={handleCancelVoicePlanTask}
+        onDraftChange={setTodoQueueDraft}
+        onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
+        onMinimizePane={minimizeTodoQueuePane}
+        onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+        onAddToolTodo={addWorkspaceToolTodo}
+        onQueueAllItems={queueAllTodoQueueItems}
+        onQueueItem={queueTodoQueueItem}
+        onVoicePlanNeedsRequeue={handleVoicePlanNeedsRequeue}
+        onRequeueVoicePlanUnfinished={handleRequeueVoicePlanUnfinished}
+        onRequeueVoicePlanTask={handleRequeueVoicePlanTask}
+        onRemoveItem={removeTodoQueueItem}
+        onRemoveItemAttachment={removeTodoQueueItemAttachment}
+        onReorderItem={reorderTodoQueueItem}
+        onResumePlan={handleResumeTerminalPlan}
+        onSubmitDraft={submitTodoQueueDraft}
+        onToggleTerminalBreakout={toggleTerminalBreakout}
+        onToggleWindowBreakout={toggleWindowBreakout}
+        windowBreakoutActive={windowBreakoutActive}
+        onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
+        onUpdateItem={updateTodoQueueItemText}
+        onVoiceAgentToolCall={handleVoiceAgentToolCall}
+        onVoicePlanServerResult={handleVoicePlanServerResult}
+        paneMode={effectiveTodoQueuePaneMode}
+        peerItems={workspaceTodoPeerItems}
+        pendingItems={todoQueuePendingItems}
+        queueItems={todoQueueItems}
+        rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
+        selectedTerminalPlanTarget={selectedTerminalPlanTarget}
+        storageUsage={storageUsage}
+        terminalBreakoutActive={terminalBreakoutVisible}
+        todoLlmTitles={workspaceTodoLlmTitles}
+        workspace={terminalWorkspace}
+        workspaceError={workspaceError}
+        workspaceId={terminalWorkspace?.id || ""}
+        workspaceScopedTabsEnabled={workspaceScopedToolTabsEnabled}
+        workspaceTodos={workspaceTodos}
+      />
+    )
+  ) : null;
+  const workspaceToolPortal = workspaceToolPortaled && workspaceToolPaneContent
+    ? createPortal(workspaceToolPaneContent, workspaceToolPortalTarget)
+    : null;
+
   return (
     <ForgeWorkspace aria-label="Forge workspace" data-motion={viewMotion}>
+      {workspaceToolPortal}
       {shouldShowWorkspaceSetup ? (
         <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
           <SetupHeader>
@@ -29086,8 +29734,8 @@ function TerminalView({
         </WorkspaceSetupPanel>
       ) : (
           <TerminalWorkspaceMain
-            data-workspace-tool-fullscreen={todoQueuePaneFullscreen ? "true" : "false"}
-            data-workspace-tool-pane-mode={todoQueuePaneMode}
+            data-workspace-tool-fullscreen={!workspaceToolPortaled && todoQueuePaneFullscreen ? "true" : "false"}
+            data-workspace-tool-pane-mode={effectiveTodoQueuePaneMode}
             ref={terminalWorkspaceMainRef}
           >
             {hasVisibleWorkspaceTerminalPanes ? (
@@ -29097,18 +29745,18 @@ function TerminalView({
               >
                 <ResizePanel
                   data-workspace-tool-main-grid="true"
-                  defaultSize={todoQueueVisible ? `${terminalGridPanelSize}%` : "100%"}
+                  defaultSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelSize}%` : "100%"}
                   id={`workspace-terminal-main-grid-${terminalWorkspace.id}`}
-                  minSize={todoQueueVisible ? `${terminalGridPanelMinSize}%` : "100%"}
+                  minSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelMinSize}%` : "100%"}
                   ref={terminalGridPanelRef}
                 >
                   {terminalWorkspaceContent}
                 </ResizePanel>
-                {todoQueueVisible && (
+                {!workspaceToolPortaled && todoQueueVisible && (
                   <>
                     <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
                     <ResizePanel
-                      data-pane-mode={todoQueuePaneMode}
+                      data-pane-mode={effectiveTodoQueuePaneMode}
                       data-workspace-tool-panel="true"
                       defaultSize={`${todoQueuePanelSize}%`}
                       id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
@@ -29116,80 +29764,7 @@ function TerminalView({
                       minSize={`${todoQueuePanelMinSize}%`}
                       ref={todoQueuePanelRef}
                     >
-                      {todoQueuePaneMinimized ? (
-                        <WorkspaceToolMinimizedRail aria-label="Workspace tools minimized">
-                          <WorkspaceToolRailControls>
-                            <WorkspaceToolControlButton
-                              aria-label="Unminimize workspace tools"
-                              onClick={restoreTodoQueuePane}
-                              title="Unminimize"
-                              type="button"
-                            >
-                              <TitleRestoreIcon aria-hidden="true" />
-                            </WorkspaceToolControlButton>
-                          </WorkspaceToolRailControls>
-                          <WorkspaceToolRailLabel>Tools</WorkspaceToolRailLabel>
-                        </WorkspaceToolMinimizedRail>
-                      ) : (
-                        <TodoQueuePanel
-                          accountKey={accountKey}
-                          activeDragItemId={todoDragState?.itemId || ""}
-                          agentStatuses={agentStatuses}
-                          billingStatus={billingStatus}
-                          connectedDevices={connectedDevices}
-                          coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
-                          defaultWorkingDirectory={defaultWorkingDirectory}
-                          dispatchTargets={workspaceTodoDispatchTargets}
-                          draft={todoQueueDraft}
-                          dropError={todoDropError}
-                          getItemAccentColor={getTodoQueueItemAccentColor}
-                          gitRepositoriesPreload={gitRepositoriesPreload}
-                          gitSnapshotsPreload={gitSnapshotsPreload}
-                          items={visibleTodoQueueItems}
-                          onRefreshGitRepositories={onRefreshGitRepositories}
-                          onRefreshGitSnapshot={onRefreshGitSnapshot}
-                          onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
-                          onBeginTodoDrag={handleBeginTodoDrag}
-                          onCancelQueuedItem={cancelQueuedTodoQueueItem}
-                          onCancelVoicePlan={handleCancelVoicePlan}
-                          onCancelVoicePlanTask={handleCancelVoicePlanTask}
-                          onDraftChange={setTodoQueueDraft}
-                          onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
-                          onMinimizePane={minimizeTodoQueuePane}
-                          onOpenWorkspaceSettings={onOpenWorkspaceSettings}
-                          onAddToolTodo={addWorkspaceToolTodo}
-                          onQueueAllItems={queueAllTodoQueueItems}
-                          onQueueItem={queueTodoQueueItem}
-                          onVoicePlanNeedsRequeue={handleVoicePlanNeedsRequeue}
-                          onRequeueVoicePlanUnfinished={handleRequeueVoicePlanUnfinished}
-                          onRequeueVoicePlanTask={handleRequeueVoicePlanTask}
-                          onRemoveItem={removeTodoQueueItem}
-                          onRemoveItemAttachment={removeTodoQueueItemAttachment}
-                          onReorderItem={reorderTodoQueueItem}
-                          onResumePlan={handleResumeTerminalPlan}
-                          onSubmitDraft={submitTodoQueueDraft}
-                          onToggleTerminalBreakout={toggleTerminalBreakout}
-                          onToggleWindowBreakout={toggleWindowBreakout}
-                          windowBreakoutActive={windowBreakoutActive}
-                          onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
-                          onUpdateItem={updateTodoQueueItemText}
-                          onVoiceAgentToolCall={handleVoiceAgentToolCall}
-                          onVoicePlanServerResult={handleVoicePlanServerResult}
-                          paneMode={todoQueuePaneMode}
-                          peerItems={workspaceTodoPeerItems}
-                          pendingItems={todoQueuePendingItems}
-                          queueItems={todoQueueItems}
-                          rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
-                          selectedTerminalPlanTarget={selectedTerminalPlanTarget}
-                          storageUsage={storageUsage}
-                          terminalBreakoutActive={terminalBreakoutVisible}
-                          todoLlmTitles={workspaceTodoLlmTitles}
-                          workspace={terminalWorkspace}
-                          workspaceError={workspaceError}
-                          workspaceId={terminalWorkspace.id}
-                          workspaceTodos={workspaceTodos}
-                        />
-                      )}
+                      {workspaceToolPaneContent}
                     </ResizePanel>
                   </>
                 )}
