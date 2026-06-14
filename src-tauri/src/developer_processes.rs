@@ -428,6 +428,75 @@ async fn list_developer_processes(
     .await
 }
 
+#[tauri::command]
+async fn developer_energy_snapshot(
+    state: State<'_, DeveloperProcessMonitorState>,
+    cloud_state: State<'_, CloudMcpState>,
+    terminal_state: State<'_, TerminalState>,
+    workspace_roots: Vec<String>,
+) -> Result<DeveloperEnergySnapshot, String> {
+    collect_light_developer_energy_snapshot(
+        state.inner(),
+        Some(cloud_state.inner()),
+        terminal_state.inner(),
+        workspace_roots,
+    )
+    .await
+}
+
+async fn collect_light_developer_energy_snapshot(
+    state: &DeveloperProcessMonitorState,
+    cloud_state: Option<&CloudMcpState>,
+    terminal_state: &TerminalState,
+    workspace_roots: Vec<String>,
+) -> Result<DeveloperEnergySnapshot, String> {
+    let sampled_at_ms = current_time_ms();
+    let app_pid = std::process::id();
+    let app_sys_pid = SysPid::from_u32(app_pid);
+    let terminal_roots = developer_terminal_process_roots(terminal_state).await;
+    let cloud_signals = developer_energy_cloud_signals(cloud_state).await;
+    let workspace_roots = normalize_process_roots(workspace_roots, None);
+    let docker_container_count = developer_cached_docker_container_count(state);
+
+    let (cpu_percent, memory_bytes) = {
+        let mut system = state
+            .system
+            .lock()
+            .map_err(|_| "Process monitor state is unavailable.".to_string())?;
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[app_sys_pid]),
+            true,
+            developer_process_refresh_kind(false),
+        );
+        system
+            .process(app_sys_pid)
+            .map(|process| (f64::from(process.cpu_usage()).max(0.0), process.memory()))
+            .unwrap_or((0.0, 0))
+    };
+
+    let mut energy = DeveloperEnergyBuildContext::new(sampled_at_ms);
+    energy.add_process(
+        app_pid,
+        "Diff Forge AI",
+        "",
+        "",
+        "",
+        cpu_percent,
+        memory_bytes,
+        true,
+        true,
+        false,
+    );
+
+    Ok(energy.finish_light(DeveloperEnergyInternalSignals {
+        terminal_root_count: terminal_roots.len(),
+        workspace_root_count: workspace_roots.len(),
+        visible_process_count: 0,
+        docker_process_count: docker_container_count,
+        cloud: cloud_signals,
+    }))
+}
+
 async fn collect_developer_process_snapshot(
     state: &DeveloperProcessMonitorState,
     cloud_state: Option<&CloudMcpState>,
@@ -2024,6 +2093,21 @@ fn docker_store_container_snapshot(
             snapshot: snapshot.clone(),
         });
     }
+}
+
+fn developer_cached_docker_container_count(state: &DeveloperProcessMonitorState) -> usize {
+    state
+        .docker_container_cache
+        .lock()
+        .ok()
+        .and_then(|cache| {
+            cache
+                .as_ref()
+                .and_then(|snapshot| snapshot.snapshot.get("containers"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or(0)
 }
 
 fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, String> {
@@ -3674,8 +3758,16 @@ impl DeveloperEnergyBuildContext {
     }
 
     fn finish(mut self, signals: DeveloperEnergyInternalSignals) -> DeveloperEnergySnapshot {
-        self.add_internal_app_core_breakdown(signals);
+        self.add_internal_app_core_breakdown(signals, true);
+        self.into_snapshot()
+    }
 
+    fn finish_light(mut self, signals: DeveloperEnergyInternalSignals) -> DeveloperEnergySnapshot {
+        self.add_internal_app_core_breakdown(signals, false);
+        self.into_snapshot()
+    }
+
+    fn into_snapshot(self) -> DeveloperEnergySnapshot {
         let mut groups = self
             .groups
             .into_values()
@@ -3726,7 +3818,11 @@ impl DeveloperEnergyBuildContext {
         }
     }
 
-    fn add_internal_app_core_breakdown(&mut self, signals: DeveloperEnergyInternalSignals) {
+    fn add_internal_app_core_breakdown(
+        &mut self,
+        signals: DeveloperEnergyInternalSignals,
+        include_activity_monitor: bool,
+    ) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
@@ -3736,14 +3832,7 @@ impl DeveloperEnergyBuildContext {
         let has_docker = signals.docker_process_count > 0;
         let active_processes = signals.visible_process_count > 0;
         let mut weights = vec![
-            (
-                "activityMonitor",
-                if active_processes { 0.42 } else { 0.28 },
-            ),
-            (
-                "terminalBackend",
-                if has_terminals { 0.15 } else { 0.03 },
-            ),
+            ("terminalBackend", if has_terminals { 0.15 } else { 0.03 }),
             (
                 "workspaceFiles",
                 if has_workspaces { 0.10 } else { 0.04 },
@@ -3756,6 +3845,12 @@ impl DeveloperEnergyBuildContext {
             ("audioNative", 0.02),
             ("snippingNative", 0.02),
         ];
+        if include_activity_monitor {
+            weights.push((
+                "activityMonitor",
+                if active_processes { 0.42 } else { 0.28 },
+            ));
+        }
         weights.extend(developer_energy_coordination_cloud_weights(
             signals.cloud,
             has_terminals,

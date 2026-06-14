@@ -217,18 +217,6 @@ import {
   PendingIcon,
   StatusButton,
   ApiBase,
-  PricingScreen,
-  PricingHero,
-  PricingCopy,
-  PricingTitle,
-  PricingText,
-  PricingActions,
-  PricingPlans,
-  PricingPlanCard,
-  PlanEyebrow,
-  PlanPrice,
-  PlanDescription,
-  PlanFeatureList,
   AuthenticatedWorkspaceFrame,
   WorkspaceStartupOverlay,
   WorkspaceStartupDetails,
@@ -578,7 +566,6 @@ import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 
 const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
-const PRICING_URL = "https://diffforge.ai/pricing";
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
 const AUTH_STARTUP_TIMEOUT_MS = 30000;
@@ -594,7 +581,6 @@ const CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED = false;
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
-const PLAN_REFRESH_TIMEOUT_MS = 5000;
 const BILLING_STATUS_REFRESH_MS = 60000;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
 const LOW_CREDIT_WARNING_THRESHOLD = 1000;
@@ -3901,6 +3887,19 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     };
   }
 
+  if (["starting", "idle", "local"].includes(statusKey)) {
+    return {
+      connectedDevices,
+      detail: "Local workspace features are available. Cloud sync starts in the background.",
+      knownDevices,
+      stage: "idle",
+      status: "idle",
+      storageUsage,
+      title: "Local",
+      workspaceTodos,
+    };
+  }
+
   if (statusKey === "authenticating") {
     return {
       connectedDevices,
@@ -3910,6 +3909,19 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       status: "active",
       storageUsage,
       title: "Preparing cloud auth",
+      workspaceTodos,
+    };
+  }
+
+  if (["route_provisioning", "assignment_booting", "dns_propagating"].includes(statusKey)) {
+    return {
+      connectedDevices,
+      detail: "Your cloud workspace is being prepared. Local work is available while it starts.",
+      knownDevices,
+      stage: "cloud_instance",
+      status: "active",
+      storageUsage,
+      title: "Provisioning",
       workspaceTodos,
     };
   }
@@ -3927,7 +3939,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     };
   }
 
-  if (["connecting", "opening_websocket", "websocket_retrying", "retrying"].includes(statusKey)) {
+  if (["connecting", "opening_websocket"].includes(statusKey)) {
     return {
       connectedDevices,
       detail: "The backend is reachable; waiting for the workspace process to accept the live connection.",
@@ -3935,20 +3947,33 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "cloud_instance",
       status: "active",
       storageUsage,
-      title: "Setting up your instance",
+      title: "Connecting",
       workspaceTodos,
     };
   }
 
-  if (["handshaking", "websocket_handshaking"].includes(statusKey)) {
+  if (["desktop_registering", "handshaking", "websocket_handshaking"].includes(statusKey)) {
     return {
       connectedDevices,
-      detail: "The websocket is open; waiting for the cloud workspace ready frame.",
+      detail: "The live socket is open; syncing the initial device and workspace state.",
       knownDevices,
       stage: "workspace_socket",
       status: "active",
       storageUsage,
-      title: "Linking the live workspace",
+      title: "Syncing",
+      workspaceTodos,
+    };
+  }
+
+  if (["websocket_retrying", "retrying", "offline"].includes(statusKey)) {
+    return {
+      connectedDevices,
+      detail: "Cloud sync is unavailable right now. Local workspace features remain available.",
+      knownDevices,
+      stage: "cloud_instance",
+      status: "warn",
+      storageUsage,
+      title: "Offline",
       workspaceTodos,
     };
   }
@@ -4074,6 +4099,27 @@ const CLOUD_SYNC_BLOCKED_STATUSES = [
   "blocked",
   "websocket_auth_missing",
 ];
+const CLOUD_SYNC_LOCAL_STATUSES = [
+  "starting",
+  "idle",
+  "local",
+  "auth_missing",
+];
+const CLOUD_SYNC_PROVISIONING_STATUSES = [
+  "route_provisioning",
+  "assignment_booting",
+  "dns_propagating",
+];
+const CLOUD_SYNC_SYNCING_STATUSES = [
+  "desktop_registering",
+  "handshaking",
+  "websocket_handshaking",
+];
+const CLOUD_SYNC_OFFLINE_STATUSES = [
+  "offline",
+  "retrying",
+  "websocket_retrying",
+];
 
 function cloudSyncStatusFromRuntimeStatus(status) {
   if (!status || typeof status !== "object") {
@@ -4083,13 +4129,23 @@ function cloudSyncStatusFromRuntimeStatus(status) {
     status.connected && (status.globalWsConnected ?? status.global_ws_connected),
   );
   const rawStatus = String(status.status || "").toLowerCase();
+  const globalStatus = String(status.globalWsStatus || status.global_ws_status || "").toLowerCase();
+  const statusKey = globalStatus || rawStatus;
   const pendingCount = Number(status.outboxPendingCount ?? status.outbox_pending_count ?? 0) || 0;
   return {
     connection: connected
       ? "connected"
-      : CLOUD_SYNC_BLOCKED_STATUSES.includes(rawStatus)
+      : CLOUD_SYNC_BLOCKED_STATUSES.includes(statusKey) || CLOUD_SYNC_BLOCKED_STATUSES.includes(rawStatus)
         ? "blocked"
-        : "connecting",
+        : CLOUD_SYNC_PROVISIONING_STATUSES.includes(statusKey) || CLOUD_SYNC_PROVISIONING_STATUSES.includes(rawStatus)
+          ? "provisioning"
+          : CLOUD_SYNC_SYNCING_STATUSES.includes(statusKey) || CLOUD_SYNC_SYNCING_STATUSES.includes(rawStatus)
+            ? "syncing"
+            : CLOUD_SYNC_OFFLINE_STATUSES.includes(statusKey) || CLOUD_SYNC_OFFLINE_STATUSES.includes(rawStatus)
+              ? "offline"
+              : CLOUD_SYNC_LOCAL_STATUSES.includes(statusKey) || CLOUD_SYNC_LOCAL_STATUSES.includes(rawStatus)
+                ? "local"
+                : "connecting",
     pendingCount,
     syncing: connected && pendingCount > 0,
     updatedAtMs: Date.now(),
@@ -4100,7 +4156,18 @@ function normalizeCloudSyncStatusEvent(payload) {
   if (!payload || typeof payload !== "object") {
     return null;
   }
-  const connection = String(payload.connection || "connecting");
+  const rawConnection = String(payload.connection || "local").toLowerCase();
+  const connection = [
+    "blocked",
+    "connected",
+    "connecting",
+    "local",
+    "offline",
+    "provisioning",
+    "syncing",
+  ].includes(rawConnection)
+    ? rawConnection
+    : "connecting";
   const pendingCount = Number(payload.pendingCount ?? payload.pending_count ?? 0) || 0;
   return {
     connection,
@@ -6970,6 +7037,10 @@ export default function App() {
       cloudMcpStartupWarmupKeyRef.current = "";
       return undefined;
     }
+    if (!isPaidUser(user) && billingStatus?.planStatus !== "paid") {
+      cloudMcpStartupWarmupKeyRef.current = "";
+      return undefined;
+    }
 
     const warmupKey = `${activeAccountScopeKey}:${token}`;
     if (cloudMcpStartupWarmupKeyRef.current === warmupKey) {
@@ -9105,13 +9176,13 @@ export default function App() {
   }, [setSignedOut]);
 
   const setAuthenticated = useCallback((sessionUser, options = {}) => {
-    const isPaid = isPaidUser(sessionUser);
+    const cloudEnabled = isPaidUser(sessionUser);
 
     authStore.setAuthenticated(
       sessionUser,
-      isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.",
+      "Initializing workspace...",
     );
-    if (isPaid) {
+    if (cloudEnabled) {
       updateCloudWorkspaceProgress({
         detail: "Passing your signed-in session to the cloud runtime.",
         stage: "desktop_session",
@@ -9119,12 +9190,17 @@ export default function App() {
         title: "Preparing cloud workspace",
       });
     } else {
-      setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
+      updateCloudWorkspaceProgress({
+        detail: "Local workspace features are available. Cloud sync is not enabled for this plan.",
+        stage: "idle",
+        status: "idle",
+        title: "Local",
+      });
     }
-    if (options.syncCloud !== false) {
+    if (cloudEnabled && options.syncCloud !== false) {
       void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
         ...cloudMcpBillingEntitlementPayload(billingStatusRef.current, sessionUser),
-        onProgress: isPaid ? updateCloudWorkspaceProgress : undefined,
+        onProgress: updateCloudWorkspaceProgress,
       });
     }
     workspaceTerminalsSyncKeyRef.current = "";
@@ -9134,9 +9210,9 @@ export default function App() {
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
-    setWorkspaceState(isPaid ? "initializing" : "billingRequired");
+    setWorkspaceState("initializing");
     setWorkspaceSyncState("idle");
-    setWorkspaceListHydrated(!isPaid);
+    setWorkspaceListHydrated(false);
     setWorkspaceHydrationReady(false);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
@@ -9157,7 +9233,7 @@ export default function App() {
     agentInitialStatusUserRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
-    setStartupAgentGateState(isPaid ? "checking" : "idle");
+    setStartupAgentGateState("checking");
     setStartupAgentUpdateMessage("");
     setWorkspaceError("");
   }, [updateCloudWorkspaceProgress]);
@@ -10253,58 +10329,6 @@ export default function App() {
     }
   }, []);
 
-  const connectCloudWorkspaceForAuthenticatedSession = useCallback(async ({
-    accountScope,
-    flowId,
-    sessionUser,
-    step,
-    successMessage,
-    token,
-  }) => {
-    if (!isPaidUser(sessionUser)) {
-      return null;
-    }
-
-    await recordCloudSigninDiagnostic(token, {
-      flowId,
-      step,
-      status: "start",
-      message: "starting Cloud MCP connection before desktop auth is accepted",
-      details: {},
-    });
-
-    try {
-      const status = await syncCloudMcpDesktopSessionToken(token, {
-        accountScope,
-        connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
-        connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
-        flowId,
-        ...cloudMcpBillingEntitlementPayload(billingStatusRef.current, sessionUser),
-        onProgress: updateCloudWorkspaceProgress,
-        requireConnected: true,
-      });
-
-      await recordCloudSigninDiagnostic(token, {
-        flowId,
-        step,
-        status: "ok",
-        message: successMessage,
-        details: status || {},
-      });
-
-      return status;
-    } catch (cloudError) {
-      await recordCloudSigninDiagnostic(token, {
-        flowId,
-        step,
-        status: "error",
-        message: getErrorMessage(cloudError, "Cloud workspace connection failed."),
-        details: { requireConnected: true },
-      });
-      throw cloudError;
-    }
-  }, [updateCloudWorkspaceProgress]);
-
   const validateStoredSession = useCallback(async () => {
     const token = authStore.getToken();
     const validationFlowId = authFlowIdRef.current;
@@ -10345,39 +10369,7 @@ export default function App() {
         return;
       }
 
-      const sessionNeedsCloudWorkspace = isPaidUser(session.user);
-      let cloudConnectCompleted = false;
-
-      if (sessionNeedsCloudWorkspace) {
-        authStore.setChecking("Checking saved desktop session. Connecting your cloud workspace...");
-        try {
-          await connectCloudWorkspaceForAuthenticatedSession({
-            flowId: `restore-${validationFlowId}`,
-            sessionUser: session.user,
-            step: "desktop_restore.cloud_workspace",
-            successMessage: "Cloud MCP connection completed from saved desktop session",
-            token,
-          });
-          cloudConnectCompleted = true;
-        } catch (cloudError) {
-          // The saved session already validated; a sync transport that cannot
-          // connect right now must not demote a valid session back to the
-          // sign-in screen. Enter the app and let the background websocket
-          // loop keep retrying (the sync pill shows Connecting).
-          updateCloudWorkspaceProgress({
-            detail: getErrorMessage(cloudError, "Cloud sync is still connecting in the background."),
-            stage: "cloud_instance",
-            status: "active",
-            title: "Cloud sync connecting in background",
-          });
-        }
-
-        if (validationFlowId !== authFlowIdRef.current) {
-          return;
-        }
-      }
-
-      setAuthenticated(session.user, { syncCloud: !cloudConnectCompleted });
+      setAuthenticated(session.user);
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
         return;
@@ -10424,10 +10416,8 @@ export default function App() {
       });
     }
   }, [
-    connectCloudWorkspaceForAuthenticatedSession,
     setAuthenticated,
     setSignedOut,
-    updateCloudWorkspaceProgress,
   ]);
 
   const revalidateOfflineSessionQuietly = useCallback(async () => {
@@ -10524,49 +10514,9 @@ export default function App() {
         return true;
       }
 
-      const sessionNeedsCloudWorkspace = isPaidUser(session.user);
-      let cloudConnectCompleted = false;
-
-      if (sessionNeedsCloudWorkspace) {
-        authStore.setExchanging("Browser callback matched. Connecting your cloud workspace...");
-        failureStep = "desktop_signin.cloud_workspace";
-        try {
-          await connectCloudWorkspaceForAuthenticatedSession({
-            accountScope: {
-              id: "personal",
-              type: "personal",
-              label: "Personal",
-              teamId: null,
-            },
-            flowId: callback.state,
-            sessionUser: session.user,
-            step: "desktop_signin.cloud_workspace",
-            successMessage: "Cloud MCP connection completed after deeplink",
-            token: session.token,
-          });
-          cloudConnectCompleted = true;
-        } catch (cloudError) {
-          // Auth must never be hostage to the sync transport: the deeplink
-          // exchange already proved the session, so a websocket that cannot
-          // connect right now enters the app anyway and keeps retrying in the
-          // background (the sync pill shows Connecting). Signing out here used
-          // to wipe the valid session over a transport outage.
-          updateCloudWorkspaceProgress({
-            detail: getErrorMessage(cloudError, "Cloud sync is still connecting in the background."),
-            stage: "cloud_instance",
-            status: "active",
-            title: "Cloud sync connecting in background",
-          });
-        }
-
-        if (loginFlowId !== authFlowIdRef.current) {
-          return true;
-        }
-      }
-
       authStore.persistAuthenticatedSession(session);
       authStore.clearPending();
-      setAuthenticated(session.user, { syncCloud: !cloudConnectCompleted });
+      setAuthenticated(session.user);
       authCallbackCompletedStateRef.current = callback.state;
     } catch (error) {
       if (loginFlowId !== authFlowIdRef.current) {
@@ -10593,10 +10543,8 @@ export default function App() {
 
     return true;
   }, [
-    connectCloudWorkspaceForAuthenticatedSession,
     setAuthenticated,
     setSignedOut,
-    updateCloudWorkspaceProgress,
   ]);
 
   const startWebLogin = useCallback(async () => {
@@ -10625,54 +10573,6 @@ export default function App() {
       );
     }
   }, [setSignedOut]);
-
-  const openPricing = useCallback(async () => {
-    try {
-      await withTimeout(
-        openUrl(PRICING_URL),
-        OPEN_BROWSER_TIMEOUT_MS,
-        "Unable to open pricing.",
-      );
-    } catch (error) {
-      authStore.setError(getErrorMessage(error, "Unable to open pricing."));
-    }
-  }, []);
-
-  const refreshSubscriptionStatus = useCallback(async () => {
-    const token = authStore.getToken();
-    const refreshFlowId = authFlowIdRef.current;
-
-    if (!isSafeAuthValue(token)) {
-      setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
-      return;
-    }
-
-    authStore.setMessage("Checking plan status...");
-    authStore.setError("");
-
-    try {
-      const session = await withTimeout(
-        invoke("validate_desktop_session", { token }),
-        PLAN_REFRESH_TIMEOUT_MS,
-        "Plan status check timed out.",
-      );
-      if (refreshFlowId !== authFlowIdRef.current) {
-        return;
-      }
-
-      setAuthenticated(session.user);
-    } catch (error) {
-      if (refreshFlowId !== authFlowIdRef.current) {
-        return;
-      }
-
-      setSignedOut(
-        "Your desktop session expired. Sign in again with the web app.",
-        getErrorMessage(error, "Unable to refresh plan status."),
-        { clearPending: true },
-      );
-    }
-  }, [setAuthenticated, setSignedOut]);
 
   const refreshBillingStatus = useCallback(async ({ quiet = false } = {}) => {
     if (authState !== "authenticated") {
@@ -11349,7 +11249,7 @@ export default function App() {
 
     previousAccountScopeKeyRef.current = activeAccountScopeKey;
 
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated") {
       return;
     }
 
@@ -11361,7 +11261,7 @@ export default function App() {
     setWorkspaceListHydrated(false);
     setWorkspaceHydrationReady(false);
     loadWorkspaces();
-  }, [activeAccountScopeKey, authState, loadWorkspaces, user]);
+  }, [activeAccountScopeKey, authState, loadWorkspaces]);
 
   // Cross-device workspace sync: cloud-diffforge broadcasts the full active
   // catalog whenever any device creates, renames, or deletes a workspace.
@@ -14174,21 +14074,20 @@ export default function App() {
       return;
     }
 
-    if (workspaceState === "ready" && isPaidUser(user)) {
+    if (workspaceState === "ready") {
       setHasEnteredWorkspaceShell(true);
     }
-  }, [authState, user, workspaceState]);
+  }, [authState, workspaceState]);
 
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
       || !["initializing", "ready"].includes(workspaceState)
     ) {
       return undefined;
     }
 
-    const userKey = `${user?.id || user?.email || "paid-user"}:${activeAccountScopeKey}`;
+    const userKey = `${user?.id || user?.email || "user"}:${activeAccountScopeKey}`;
 
     if (agentInitialStatusUserRef.current !== userKey) {
       const startupFlowId = startupAgentFlowIdRef.current + 1;
@@ -23853,29 +23752,47 @@ export default function App() {
   const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
   const isPaidPlanUser = isPaidUser(user) || billingStatus?.planStatus === "paid";
   const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
+  const cloudSyncConnection = String(cloudSyncStatus?.connection || "local").toLowerCase();
   const cloudSyncPillState = authState !== "authenticated"
     ? null
     : !isPaidPlanUser
-      ? "upgrade"
-      : (cloudSyncStatus?.connection || "connecting") !== "connected"
-        ? "connecting"
-        : cloudSyncStatus?.syncing || (cloudSyncStatus?.pendingCount || 0) > 0
+      ? "local"
+      : cloudSyncConnection === "connected"
+        ? cloudSyncStatus?.syncing || (cloudSyncStatus?.pendingCount || 0) > 0
           ? "syncing"
-          : "live";
+          : "live"
+        : [
+            "blocked",
+            "connecting",
+            "local",
+            "offline",
+            "provisioning",
+            "syncing",
+          ].includes(cloudSyncConnection)
+          ? cloudSyncConnection
+          : "connecting";
   const cloudSyncPendingCount = Number(cloudSyncStatus?.pendingCount || 0);
   const cloudSyncPillLabel = {
+    blocked: "Blocked",
     connecting: "Connecting",
+    local: "Local",
     live: "Live Sync",
+    offline: "Offline",
+    provisioning: "Provisioning",
     syncing: "Syncing",
-    upgrade: "Upgrade",
   }[cloudSyncPillState] || "";
   const cloudSyncPillTitle = {
+    blocked: "Cloud sync needs account attention before it can connect.",
     connecting: "Establishing the live cloud connection. Changes are saved locally and sync once connected.",
+    local: isPaidPlanUser
+      ? "Local workspace features are available. Cloud sync has not connected yet."
+      : "Local workspace features are available. Cloud sync features require a paid cloud plan.",
     live: "Connected. Changes sync live to your account.",
+    offline: "Cloud sync is unavailable right now. Local workspace features remain available.",
+    provisioning: "Your cloud workspace is starting. Local workspace features remain available.",
     syncing: cloudSyncPendingCount > 0
       ? `Syncing ${cloudSyncPendingCount} queued change${cloudSyncPendingCount === 1 ? "" : "s"} to the cloud.`
       : "Syncing queued changes to the cloud.",
-    upgrade: "Upgrade to unlock live cloud sync across your devices.",
   }[cloudSyncPillState] || "";
   const shouldShowStartupPhases = !hasEnteredWorkspaceShell;
   const shouldShowLaunchScreen = shouldShowStartupPhases && (
@@ -23990,13 +23907,12 @@ export default function App() {
                 data-platform={windowControlPlatform}
                 data-state={cloudSyncPillState}
                 data-window-control
-                onClick={cloudSyncPillState === "upgrade" ? openPricing : undefined}
                 title={cloudSyncPillTitle}
                 type="button"
               >
                 <WindowSyncPillIndicator
                   aria-hidden="true"
-                  data-variant={["syncing", "connecting"].includes(cloudSyncPillState) ? "spinner" : "dot"}
+                  data-variant={["connecting", "provisioning", "syncing"].includes(cloudSyncPillState) ? "spinner" : "dot"}
                 />
                 <span>{cloudSyncPillLabel}</span>
               </WindowSyncPill>
@@ -24099,90 +24015,6 @@ export default function App() {
                 )}
               </SplashCenter>
             </SplashScreen>
-          ) : authState === "authenticated" && !userIsPaid ? (
-            <PricingScreen aria-label="Desktop pricing">
-              <PricingHero>
-                <BrandMark as="div" aria-label="Diffforge">
-                  <img src="/logo.webp" alt="" />
-                  <strong>Diffforge</strong>
-                </BrandMark>
-                <PricingCopy>
-                  <Kicker>Plan required</Kicker>
-                  <PricingTitle>Upgrade to unlock the desktop workspace</PricingTitle>
-                  <PricingText>
-                    You are signed in as {displayName}. Free accounts can review pricing here,
-                    but the desktop dashboard stays locked until your plan is paid.
-                  </PricingText>
-                </PricingCopy>
-                <PricingActions>
-                  <PrimaryButton onClick={openPricing} type="button">
-                    <ButtonBrowserIcon aria-hidden="true" />
-                    <span>Open pricing</span>
-                  </PrimaryButton>
-                  <SecondaryButton onClick={refreshSubscriptionStatus} type="button">
-                    <ButtonRefreshIcon aria-hidden="true" />
-                    <span>Check status</span>
-                  </SecondaryButton>
-                  <SecondaryButton onClick={logout} type="button">
-                    <ButtonLogoutIcon aria-hidden="true" />
-                    <span>Sign out</span>
-                  </SecondaryButton>
-                </PricingActions>
-                {authError && <FormMessage $state="error">{authError}</FormMessage>}
-              </PricingHero>
-
-              <PricingPlans aria-label="Plans">
-                <PricingPlanCard>
-                  <PlanEyebrow>{planLabel}</PlanEyebrow>
-                  <PlanPrice>$0</PlanPrice>
-                  <PlanDescription>Browser login, pricing access, and account setup.</PlanDescription>
-                  <PlanFeatureList>
-                    <li>Web account login</li>
-                    <li>Pricing and billing status</li>
-                    <li>Desktop dashboard locked</li>
-                  </PlanFeatureList>
-                </PricingPlanCard>
-
-                <PricingPlanCard data-featured="true">
-                  <PlanEyebrow>Plus</PlanEyebrow>
-                  <PlanPrice>
-                    $40<span>/mo</span>
-                  </PlanPrice>
-                  <PlanDescription>Paid status unlocks the native dashboard shell with 10,000 monthly credits.</PlanDescription>
-                  <PlanFeatureList>
-                    <li>Desktop workspace dashboard</li>
-                    <li>Cloud workspace sync</li>
-                    <li>10,000 included credits</li>
-                  </PlanFeatureList>
-                </PricingPlanCard>
-
-                <PricingPlanCard data-featured="true">
-                  <PlanEyebrow>Pro</PlanEyebrow>
-                  <PlanPrice>
-                    $100<span>/mo</span>
-                  </PlanPrice>
-                  <PlanDescription>Higher allowance for heavier cloud AI, voice, and orchestration work.</PlanDescription>
-                  <PlanFeatureList>
-                    <li>Everything in Plus</li>
-                    <li>20,000 included credits</li>
-                    <li>Priority native app access</li>
-                  </PlanFeatureList>
-                </PricingPlanCard>
-
-                <PricingPlanCard data-featured="true">
-                  <PlanEyebrow>Ultra</PlanEyebrow>
-                  <PlanPrice>
-                    $200<span>/mo</span>
-                  </PlanPrice>
-                  <PlanDescription>Largest monthly allowance for intensive cloud AI and orchestration work.</PlanDescription>
-                  <PlanFeatureList>
-                    <li>Everything in Pro</li>
-                    <li>50,000 included credits</li>
-                    <li>Maximum monthly AI allowance</li>
-                  </PlanFeatureList>
-                </PricingPlanCard>
-              </PricingPlans>
-            </PricingScreen>
           ) : authState === "authenticated" ? (
             <AuthenticatedWorkspaceFrame>
               <DashboardShell

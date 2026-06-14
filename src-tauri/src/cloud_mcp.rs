@@ -1659,6 +1659,10 @@ fn cloud_mcp_sync_connection_for_runtime(connected: bool, status: &str) -> &'sta
         "device_limit_reached" | "device_limit_exceeded" | "blocked" | "websocket_auth_missing" => {
             "blocked"
         }
+        "starting" | "idle" | "signed_out" | "auth_missing" => "local",
+        "route_provisioning" | "assignment_booting" | "dns_propagating" => "provisioning",
+        "desktop_registering" | "websocket_handshaking" | "handshaking" => "syncing",
+        "websocket_retrying" | "retrying" => "offline",
         _ => "connecting",
     }
 }
@@ -1699,7 +1703,7 @@ fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
         .lock()
         .ok()
         .and_then(|value| *value)
-        .unwrap_or("connecting");
+        .unwrap_or("local");
     let (pending, retrying, dead_letter, oldest_pending_ms) = cloud_mcp_outbox_status_counts();
     let syncing = syncing_hint.unwrap_or(connection == "connected" && pending > 0);
     let fingerprint = format!("{connection}:{}:{syncing}", pending > 0);
@@ -3915,14 +3919,19 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                 }
                 {
                     let mut runtime = state.inner.lock().await;
+                    let route_status =
+                        cloud_mcp_route_error_runtime_status(&error).unwrap_or("websocket_retrying");
                     runtime.connected = false;
-                    runtime.status = "websocket_retrying".to_string();
+                    runtime.status = route_status.to_string();
                     runtime.last_error = format!("Cloud MCP direct route unavailable: {error}");
                     runtime.global_ws_connected = false;
-                    runtime.global_ws_status = "retrying".to_string();
+                    runtime.global_ws_status = route_status.to_string();
                     runtime.global_ws_last_error = clean_terminal_telemetry_text(&error);
                 }
-                cloud_mcp_note_sync_connection(false, "websocket_retrying");
+                cloud_mcp_note_sync_connection(
+                    false,
+                    cloud_mcp_route_error_runtime_status(&error).unwrap_or("websocket_retrying"),
+                );
                 tokio::select! {
                     _ = sleep(Duration::from_secs(2)) => {}
                     _ = state.global_ws_reconnect.notified() => {}
@@ -9016,8 +9025,8 @@ async fn cloud_mcp_fetch_direct_route_async(
         "deviceLimit": device_limit,
         "deviceId": device_id,
         "regionHint": region_hint,
-        "waitForReady": true,
-        "waitMs": 8_000,
+        "waitForReady": false,
+        "waitMs": 0,
     });
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -9077,7 +9086,61 @@ async fn cloud_mcp_fetch_direct_route_async(
                 .unwrap_or("route rejected")
         ));
     }
-    Ok(cloud_mcp_direct_target_from_route(&parsed, endpoint_path))
+    let target = cloud_mcp_direct_target_from_route(&parsed, endpoint_path);
+    if target.is_none() {
+        let route_state = parsed
+            .get("route_state")
+            .or_else(|| parsed.get("routeState"))
+            .and_then(Value::as_str)
+            .unwrap_or("route_not_ready");
+        let backend_status = parsed
+            .get("backend_status")
+            .or_else(|| parsed.get("backendStatus"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let retry_after_ms = parsed
+            .get("retry_after_ms")
+            .or_else(|| parsed.get("retryAfterMs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let waiting = parsed
+            .get("waiting")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if waiting || cloud_mcp_route_state_is_provisioning(route_state, backend_status) {
+            return Err(format!(
+                "Cloud MCP route pending: route_state={route_state}; backend_status={backend_status}; retry_after_ms={retry_after_ms}"
+            ));
+        }
+    }
+    Ok(target)
+}
+
+fn cloud_mcp_route_state_is_provisioning(route_state: &str, backend_status: &str) -> bool {
+    let route_state = route_state.trim().to_ascii_lowercase();
+    let backend_status = backend_status.trim().to_ascii_lowercase();
+    matches!(
+        route_state.as_str(),
+        "assignment_booting" | "dns_propagating" | "route_not_configured" | "route_not_browser_ready"
+    ) || matches!(
+        backend_status.as_str(),
+        "booting" | "pending" | "starting" | "provisioning" | "deactivated"
+    )
+}
+
+fn cloud_mcp_route_error_runtime_status(error: &str) -> Option<&'static str> {
+    let error = error.to_ascii_lowercase();
+    if error.contains("route pending")
+        || error.contains("assignment_booting")
+        || error.contains("dns_propagating")
+        || error.contains("backend_status=booting")
+        || error.contains("backend_status=pending")
+        || error.contains("backend_status=starting")
+        || error.contains("backend_status=provisioning")
+    {
+        return Some("route_provisioning");
+    }
+    None
 }
 
 fn cloud_mcp_direct_target_from_route(

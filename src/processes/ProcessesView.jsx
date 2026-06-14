@@ -23,10 +23,9 @@ import {
   SettingsHint,
 } from "../app/appStyles";
 
-const PROCESS_REFRESH_MS = 15000;
-const DOCKER_REFRESH_MS = 120000;
-const PROCESS_DIAGNOSTICS_ENABLED = true;
-const PROCESS_PORTS_ENABLED = false;
+const ENERGY_REFRESH_MS = 15000;
+const DOCKER_REFRESH_MS = 15000;
+const DEEP_SCAN_PORTS_ENABLED = false;
 const HIGH_CPU_PERCENT = 65;
 const HIGH_MEMORY_BYTES = 1024 * 1024 * 1024;
 const PROCESS_BUSY_SPINNER_SEGMENTS = Array.from({ length: 8 }, (_, index) => index);
@@ -871,7 +870,7 @@ function ProcessEnergySection({ energy }) {
       )}
 
       <ProcessEnergyNote>
-        Main-process rows are internal estimates; helper and terminal rows use live process measurements.
+        Lightweight internal estimates; process-level details are collected only by Deep scan.
       </ProcessEnergyNote>
     </ProcessEnergyPanel>
   );
@@ -1029,7 +1028,10 @@ export default function ProcessesView({
   onCloseTrackedTerminal,
   workspaceRoots = [],
 }) {
-  const [snapshot, setSnapshot] = useState(null);
+  const [energySnapshot, setEnergySnapshot] = useState(null);
+  const [deepScanSnapshot, setDeepScanSnapshot] = useState(null);
+  const [deepScanState, setDeepScanState] = useState("idle");
+  const [deepScanError, setDeepScanError] = useState("");
   const [refreshState, setRefreshState] = useState("idle");
   const [error, setError] = useState("");
   const [confirmAction, setConfirmAction] = useState(null);
@@ -1049,7 +1051,8 @@ export default function ProcessesView({
   const [containerLogs, setContainerLogs] = useState(null);
   const mountedRef = useRef(false);
   const containersStateRef = useRef("");
-  const processLoadRef = useRef(null);
+  const energyLoadRef = useRef(null);
+  const deepScanLoadRef = useRef(null);
   const containersLoadRef = useRef(null);
   const processOrderCounterRef = useRef(0);
   const processOrderRef = useRef(new Map());
@@ -1060,9 +1063,9 @@ export default function ProcessesView({
   );
   const workspaceRootsKey = normalizedWorkspaceRoots.join("\n");
 
-  const loadProcesses = useCallback(async ({ force = false, silent = false } = {}) => {
-    if (processLoadRef.current) {
-      return processLoadRef.current;
+  const loadEnergy = useCallback(async ({ silent = false } = {}) => {
+    if (energyLoadRef.current) {
+      return energyLoadRef.current;
     }
     if (!silent) {
       setRefreshState("loading");
@@ -1071,11 +1074,7 @@ export default function ProcessesView({
     }
 
     const request = (async () => {
-      const result = await invoke("list_developer_processes", {
-        activeWorkspaceRoot: "",
-        force,
-        includeDiagnostics: PROCESS_DIAGNOSTICS_ENABLED,
-        includePorts: PROCESS_PORTS_ENABLED,
+      const result = await invoke("developer_energy_snapshot", {
         workspaceRoots: normalizedWorkspaceRoots,
       });
 
@@ -1083,7 +1082,7 @@ export default function ProcessesView({
         return;
       }
 
-      setSnapshot(result);
+      setEnergySnapshot(result);
       setError("");
       if (!silent) {
         setRefreshState("idle");
@@ -1091,7 +1090,7 @@ export default function ProcessesView({
         setRefreshState((state) => (state === "refreshing" ? "idle" : state));
       }
     })();
-    processLoadRef.current = request;
+    energyLoadRef.current = request;
     try {
       await request;
     } catch (loadError) {
@@ -1099,15 +1098,56 @@ export default function ProcessesView({
         return;
       }
 
-      setError(errorMessage(loadError));
+      setError(errorMessage(loadError, "Unable to load Diff Forge energy."));
       if (!silent) {
         setRefreshState("idle");
       } else {
         setRefreshState((state) => (state === "refreshing" ? "idle" : state));
       }
     } finally {
-      if (processLoadRef.current === request) {
-        processLoadRef.current = null;
+      if (energyLoadRef.current === request) {
+        energyLoadRef.current = null;
+      }
+    }
+  }, [workspaceRootsKey]);
+
+  const loadDeepScan = useCallback(async ({ force = true } = {}) => {
+    if (deepScanLoadRef.current) {
+      return deepScanLoadRef.current;
+    }
+    setDeepScanState("loading");
+    setDeepScanError("");
+
+    const request = (async () => {
+      const result = await invoke("list_developer_processes", {
+        activeWorkspaceRoot: "",
+        force,
+        includeDiagnostics: true,
+        includePorts: DEEP_SCAN_PORTS_ENABLED,
+        workspaceRoots: normalizedWorkspaceRoots,
+      });
+
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setDeepScanSnapshot(result);
+      setDeepScanError("");
+      setDeepScanState("idle");
+    })();
+    deepScanLoadRef.current = request;
+    try {
+      await request;
+    } catch (loadError) {
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setDeepScanError(errorMessage(loadError, "Unable to run deep process scan."));
+      setDeepScanState("idle");
+    } finally {
+      if (deepScanLoadRef.current === request) {
+        deepScanLoadRef.current = null;
       }
     }
   }, [workspaceRootsKey]);
@@ -1151,23 +1191,23 @@ export default function ProcessesView({
   const refreshAll = useCallback(async ({ force = false } = {}) => {
     setRefreshState("loading");
     await Promise.allSettled([
-      loadProcesses({ force, silent: true }),
+      loadEnergy({ silent: true }),
       loadContainers({ force, includeStats: false, silent: true }),
     ]);
     if (mountedRef.current) {
       setRefreshState("idle");
     }
-  }, [loadContainers, loadProcesses]);
+  }, [loadContainers, loadEnergy]);
 
   useEffect(() => {
     mountedRef.current = true;
     refreshAll();
 
-    const processIntervalId = window.setInterval(() => {
+    const energyIntervalId = window.setInterval(() => {
       if (document.visibilityState !== "hidden") {
-        loadProcesses({ silent: true });
+        loadEnergy({ silent: true });
       }
-    }, PROCESS_REFRESH_MS);
+    }, ENERGY_REFRESH_MS);
     const containerIntervalId = window.setInterval(() => {
       if (document.visibilityState !== "hidden") {
         // A missing CLI never recovers on its own; skip the auto-poll and let
@@ -1180,10 +1220,10 @@ export default function ProcessesView({
 
     return () => {
       mountedRef.current = false;
-      window.clearInterval(processIntervalId);
+      window.clearInterval(energyIntervalId);
       window.clearInterval(containerIntervalId);
     };
-  }, [loadContainers, loadProcesses, refreshAll]);
+  }, [loadContainers, loadEnergy, refreshAll]);
 
   const fetchContainerLogs = useCallback(async (container) => {
     setContainerLogs({
@@ -1258,9 +1298,9 @@ export default function ProcessesView({
         return next;
       });
       await loadContainers({ force: true, silent: true });
-      await loadProcesses({ force: true, silent: true });
+      await loadEnergy({ silent: true });
     }
-  }, [loadContainers, loadProcesses]);
+  }, [loadContainers, loadEnergy]);
 
   const beginContainerAction = useCallback((container, action) => {
     if (action === "remove") {
@@ -1305,7 +1345,9 @@ export default function ProcessesView({
     return groups;
   }, [containersSnapshot]);
 
-  const allProcesses = Array.isArray(snapshot?.processes) ? snapshot.processes : [];
+  const allProcesses = Array.isArray(deepScanSnapshot?.processes)
+    ? deepScanSnapshot.processes
+    : [];
   const buckets = useMemo(() => {
     const diffForge = [];
     const untracked = [];
@@ -1374,10 +1416,16 @@ export default function ProcessesView({
     (total, process) => total + Number(process.cpuPercent || 0),
     0,
   );
-  const energy = snapshot?.energy || null;
-  const energyGroups = Array.isArray(energy?.groups) ? energy.groups : [];
-  const showEnergyDiagnostics = energyGroups.length > 0;
+  const containers = Array.isArray(containersSnapshot?.containers)
+    ? containersSnapshot.containers
+    : [];
+  const runningContainerCount = containers
+    .filter((container) => container.state === "running")
+    .length;
+  const energy = energySnapshot || deepScanSnapshot?.energy || null;
+  const showEnergyDiagnostics = Boolean(energy);
   const isRefreshing = refreshState === "loading" || refreshState === "refreshing";
+  const isDeepScanning = deepScanState === "loading";
 
   const beginStopProcess = useCallback((process) => {
     if (!process.killable) {
@@ -1450,8 +1498,8 @@ export default function ProcessesView({
         result,
         targetProcessKey: "",
       });
-      await loadProcesses({ force: true, silent: true });
       await loadContainers({ force: true, silent: true });
+      await loadEnergy({ silent: true });
     } catch (actionError) {
       setDockerActionState({
         state: "error",
@@ -1464,7 +1512,7 @@ export default function ProcessesView({
     dockerActionState.state,
     dockerConfirmAction,
     loadContainers,
-    loadProcesses,
+    loadEnergy,
     normalizedWorkspaceRoots,
   ]);
 
@@ -1507,7 +1555,7 @@ export default function ProcessesView({
       }
     }
 
-    await loadProcesses({ force: true, silent: true });
+    await loadDeepScan({ force: true });
 
     if (failures.length) {
       setKillState({
@@ -1524,32 +1572,24 @@ export default function ProcessesView({
       state: "done",
       message: `${actionWord} requested for ${affectedCount} process${affectedCount === 1 ? "" : "es"}.`,
     });
-  }, [confirmAction, killState.state, loadProcesses, onCloseTrackedTerminal]);
+  }, [confirmAction, killState.state, loadDeepScan, onCloseTrackedTerminal]);
 
   return (
     <ProcessSurface>
       <ProcessHeader>
         <div>
           <PanelKicker>Processes</PanelKicker>
-          <PanelHeading>Developer process monitor</PanelHeading>
-          <PageSubline>{snapshot?.platform || "native"} desktop snapshot / global controls</PageSubline>
+          <PanelHeading>Energy and containers</PanelHeading>
+          <PageSubline>lightweight Diff Forge energy / Docker controls</PageSubline>
         </div>
         <ProcessHeaderActions>
           <ProcessMetric>
-            <span>Total</span>
-            <strong>{visibleProcesses.length}</strong>
+            <span>Containers</span>
+            <strong>{containers.length}</strong>
           </ProcessMetric>
-          <ProcessMetric data-tone={highActivityCount > 0 ? "hot" : "neutral"}>
-            <span>Hot</span>
-            <strong>{highActivityCount}</strong>
-          </ProcessMetric>
-          <ProcessMetric>
-            <span>CPU</span>
-            <strong>{formatCpu(totalCpuPercent)}</strong>
-          </ProcessMetric>
-          <ProcessMetric>
-            <span>Memory</span>
-            <strong>{formatBytes(totalMemoryBytes)}</strong>
+          <ProcessMetric data-tone={runningContainerCount > 0 ? "active" : "neutral"}>
+            <span>Running</span>
+            <strong>{runningContainerCount}</strong>
           </ProcessMetric>
           {showEnergyDiagnostics && (
             <ProcessMetric data-tone={energyTone(energy?.totalScore)}>
@@ -1586,6 +1626,19 @@ export default function ProcessesView({
             </RefreshIconSlot>
             <span>{isRefreshing ? "Refreshing..." : "Refresh"}</span>
           </SecondaryButton>
+          <SecondaryButton
+            data-refreshing={isDeepScanning ? "true" : undefined}
+            disabled={isDeepScanning}
+            onClick={() => {
+              loadDeepScan({ force: true });
+            }}
+            type="button"
+          >
+            <RefreshIconSlot data-spinning={isDeepScanning ? "true" : undefined}>
+              <ButtonProcessIcon aria-hidden="true" />
+            </RefreshIconSlot>
+            <span>{isDeepScanning ? "Scanning..." : "Deep scan"}</span>
+          </SecondaryButton>
         </ProcessHeaderActions>
       </ProcessHeader>
 
@@ -1612,7 +1665,7 @@ export default function ProcessesView({
             <strong>Containers</strong>
             <span data-tone={containersSnapshot.daemonRunning ? "ok" : "warn"}>
               {containersSnapshot.daemonRunning
-                ? `${(containersSnapshot.containers || []).length} total / ${(containersSnapshot.containers || []).filter((container) => container.state === "running").length} running`
+                ? `${containers.length} total / ${runningContainerCount} running`
                 : "Docker daemon offline"}
             </span>
           </ProcessContainersHeader>
@@ -1696,17 +1749,45 @@ export default function ProcessesView({
         </ProcessContainersPanel>
       )}
 
-      <ProcessBucketsGrid>
-        {buckets.filter((bucket) => bucket.processes.length).map((bucket) => (
-          <ProcessBucket
-            bucket={bucket}
-            dockerActionState={dockerActionState}
-            key={bucket.id}
-            onDockerAction={beginDockerAction}
-            onStopProcess={beginStopProcess}
-          />
-        ))}
-      </ProcessBucketsGrid>
+      {deepScanError && <FormMessage $state="error">{deepScanError}</FormMessage>}
+      {deepScanSnapshot && (
+        <ProcessDeepScanPanel aria-label="Deep process scan results">
+          <ProcessDeepScanHeader>
+            <div>
+              <strong>Deep scan</strong>
+              <span>
+                {visibleProcesses.length} shown / {formatCpu(totalCpuPercent)} / {formatBytes(totalMemoryBytes)}
+                {highActivityCount ? ` / ${highActivityCount} hot` : ""}
+              </span>
+            </div>
+            <SecondaryButton
+              onClick={() => {
+                setDeepScanSnapshot(null);
+                setDeepScanError("");
+              }}
+              type="button"
+            >
+              <ButtonDeleteIcon aria-hidden="true" />
+              <span>Clear</span>
+            </SecondaryButton>
+          </ProcessDeepScanHeader>
+          {visibleProcesses.length === 0 ? (
+            <ProcessContainersNotice>No process rows found.</ProcessContainersNotice>
+          ) : (
+            <ProcessBucketsGrid>
+              {buckets.filter((bucket) => bucket.processes.length).map((bucket) => (
+                <ProcessBucket
+                  bucket={bucket}
+                  dockerActionState={dockerActionState}
+                  key={bucket.id}
+                  onDockerAction={beginDockerAction}
+                  onStopProcess={beginStopProcess}
+                />
+              ))}
+            </ProcessBucketsGrid>
+          )}
+        </ProcessDeepScanPanel>
+      )}
 
       {confirmAction && (
         <ProcessConfirmOverlay role="presentation">
@@ -1818,7 +1899,7 @@ const ProcessSurface = styled.section`
   align-content: start;
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px;
-  overflow: hidden;
+  overflow: auto;
   padding: 16px;
   background:
     linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
@@ -2379,6 +2460,59 @@ const ProcessDockerOutput = styled.pre`
     border-color: var(--forge-border);
     color: var(--forge-text-soft);
     background: var(--forge-surface);
+  }
+`;
+
+const ProcessDeepScanPanel = styled.section`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+  overflow: hidden;
+  padding: 8px 10px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 10px;
+  background: rgba(230, 236, 245, 0.018);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+`;
+
+const ProcessDeepScanHeader = styled.header`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  > div {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10.5px;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    min-height: 30px;
   }
 `;
 

@@ -3973,6 +3973,26 @@ fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
+fn snipping_reflow_preview_stack_for_space_change(app: &AppHandle) {
+    for delay_ms in SNIPPING_FLOAT_SPACE_REFLOW_DELAYS_MS {
+        let app_for_thread = app.clone();
+        thread::spawn(move || {
+            if delay_ms > 0 {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+            let app_for_main = app_for_thread.clone();
+            let _ = app_for_thread.run_on_main_thread(move || {
+                snipping_reflow_preview_stack(
+                    &app_for_main,
+                    SNIPPING_FLOAT_ANIMATE_MS,
+                    SnippingTweenEasing::Track,
+                );
+            });
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
 static SNIPPING_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Watches macOS Space changes while the app runs; when the user swipes to
@@ -3991,8 +4011,10 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("space_change_observer_callback", || {
+                        macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
                         if let Some(app) = snipping_macos_event_tap_app() {
                             snipping_refreeze_area_snapshot_for_space_change(&app);
+                            snipping_reflow_preview_stack_for_space_change(&app);
                         }
                     });
                 },
@@ -4007,6 +4029,7 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
             };
             // The observer lives for the app's lifetime.
             std::mem::forget(token);
+            macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
         });
     });
 }
@@ -4483,6 +4506,8 @@ const SNIPPING_STRIP_TILE_LOGICAL_WIDTH: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH * 0.
 const SNIPPING_STRIP_TILE_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_HEIGHT * 0.5;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
+#[cfg(target_os = "macos")]
+const SNIPPING_FLOAT_SPACE_REFLOW_DELAYS_MS: [u64; 4] = [0, 120, 280, 700];
 // Fallback settle deadline pushed forward by every Moved event. On platforms
 // with a live mouse-button probe the watcher usually resolves the drop the
 // moment the button releases, except for left-column post-release settling.
@@ -4839,7 +4864,7 @@ fn snipping_preview_stack_metrics_for_monitor(
     width: f64,
     height: f64,
 ) -> SnippingPreviewStackMetrics {
-    let work_area = *monitor.work_area();
+    let (area_position, area_size) = snipping_preview_stack_anchor_area_for_monitor(monitor);
     let scale = monitor.scale_factor().max(0.1);
     let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
     let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
@@ -4847,19 +4872,31 @@ fn snipping_preview_stack_metrics_for_monitor(
     let height_physical = (height * scale).round().max(1.0) as i32;
     SnippingPreviewStackMetrics {
         key: SnippingPreviewStackMonitorKey {
-            x: work_area.position.x,
-            y: work_area.position.y,
-            width: work_area.size.width,
-            height: work_area.size.height,
+            x: area_position.x,
+            y: area_position.y,
+            width: area_size.width,
+            height: area_size.height,
             scale_micros: (scale * 1_000_000.0).round() as i64,
         },
-        x: work_area.position.x + margin,
-        top_limit: work_area.position.y + margin,
-        bottom_edge: work_area.position.y + work_area.size.height as i32 - margin,
+        x: area_position.x + margin,
+        top_limit: area_position.y + margin,
+        bottom_edge: area_position.y + area_size.height as i32 - margin,
         gap,
         width_physical,
         height_physical,
     }
+}
+
+fn snipping_preview_stack_anchor_area_for_monitor(
+    monitor: &tauri::Monitor,
+) -> (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>) {
+    #[cfg(target_os = "macos")]
+    if macos_active_space_uses_full_monitor_bounds_cached() {
+        return (*monitor.position(), *monitor.size());
+    }
+
+    let work_area = *monitor.work_area();
+    (work_area.position, work_area.size)
 }
 
 fn snipping_monitor_overlap_area(
@@ -4868,11 +4905,11 @@ fn snipping_monitor_overlap_area(
     height: i32,
     monitor: &tauri::Monitor,
 ) -> i64 {
-    let area = *monitor.work_area();
-    let left = position.x.max(area.position.x);
-    let top = position.y.max(area.position.y);
-    let right = (position.x + width.max(1)).min(area.position.x + area.size.width as i32);
-    let bottom = (position.y + height.max(1)).min(area.position.y + area.size.height as i32);
+    let (area_position, area_size) = snipping_preview_stack_anchor_area_for_monitor(monitor);
+    let left = position.x.max(area_position.x);
+    let top = position.y.max(area_position.y);
+    let right = (position.x + width.max(1)).min(area_position.x + area_size.width as i32);
+    let bottom = (position.y + height.max(1)).min(area_position.y + area_size.height as i32);
     i64::from((right - left).max(0)) * i64::from((bottom - top).max(0))
 }
 

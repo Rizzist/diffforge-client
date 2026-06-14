@@ -491,6 +491,7 @@ const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
 const AUDIO_WIDGET_SPACE_CHANGED_EVENT = "forge-audio-widget-space-changed";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT = "forge-audio-widget-bar-hover-changed";
+const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT = "forge-audio-widget-bubble-hover-changed";
 const AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY = "diffforge.audio.widgetBubblePlacement.v1";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
@@ -534,7 +535,7 @@ const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
-const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280];
+const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280, 700];
 const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 34;
@@ -4166,6 +4167,7 @@ export function AudioWidgetWindow() {
   const widgetDraggingRef = useRef(false);
   const barIdleHoverRef = useRef(false);
   const barIdleModeRef = useRef(false);
+  const canUseBubbleHistoryTrayRef = useRef(false);
   const widgetDragSettleTimerRef = useRef(0);
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
@@ -4787,6 +4789,7 @@ export function AudioWidgetWindow() {
   const bubbleHistoryTrayVisible = bubbleHistoryTrayActive && !widgetDragging;
   const bubbleCancelNoticeActiveRef = useRef(bubbleCancelNoticeActive);
   bubbleCancelNoticeActiveRef.current = bubbleCancelNoticeActive;
+  canUseBubbleHistoryTrayRef.current = canUseBubbleHistoryTray;
   bubbleHistoryTrayActiveRef.current = bubbleHistoryTrayActive;
 
   const refreshWidgetHistory = useCallback(() => {
@@ -5312,6 +5315,99 @@ export function AudioWidgetWindow() {
       }
     };
   }, [setBarIdleHoverState, usesBottomAnchoredStyle]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenHover = () => {};
+
+    listen(AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT, (event) => {
+      if (disposed || !canUseBubbleHistoryTrayRef.current) {
+        return;
+      }
+
+      if (Boolean(event?.payload?.hovering)) {
+        openBubbleHistoryTray();
+      } else {
+        closeBubbleHistoryTray();
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenHover = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlistenHover();
+    };
+  }, [closeBubbleHistoryTray, openBubbleHistoryTray]);
+
+  useEffect(() => {
+    if (!canUseBubbleHistoryTray) {
+      invoke("audio_widget_bar_hover_snapshot", {
+        request: {
+          bubble: true,
+          enabled: false,
+          focus: false,
+        },
+      }).catch(() => {});
+      return undefined;
+    }
+
+    let disposed = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const snapshot = await invoke("audio_widget_bar_hover_snapshot", {
+          request: {
+            active: bubbleHistoryTrayActiveRef.current,
+            bubble: true,
+            enabled: true,
+            focus: true,
+          },
+        });
+        if (!disposed) {
+          if (snapshot?.hovering) {
+            openBubbleHistoryTray();
+          } else {
+            closeBubbleHistoryTray();
+          }
+        }
+      } catch {
+        // Web previews and older native builds do not expose this helper.
+      }
+
+      if (!disposed) {
+        const hoveringBubbleTray = bubbleHistoryTrayActiveRef.current;
+        timer = window.setTimeout(
+          poll,
+          hoveringBubbleTray
+            ? AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS
+            : AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS,
+        );
+      }
+    };
+
+    poll();
+    return () => {
+      disposed = true;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+      invoke("audio_widget_bar_hover_snapshot", {
+        request: {
+          bubble: true,
+          enabled: false,
+          focus: false,
+        },
+      }).catch(() => {});
+    };
+  }, [canUseBubbleHistoryTray, closeBubbleHistoryTray, openBubbleHistoryTray]);
 
   // Bubble history controls use the same stable-anchor idea as the error
   // popover: resize the native frame in one direction while leaving the
@@ -7187,6 +7283,7 @@ export function AudioWidgetWindow() {
         <GlobalStyle />
         <AudioBarShell
           aria-label={widgetLabel}
+          data-mode={cancelNotice ? "notice" : "active"}
           data-theme={audioWidgetTheme}
           data-visible={barVisible ? "true" : "false"}
         >
@@ -7252,6 +7349,7 @@ export function AudioWidgetWindow() {
         <GlobalStyle />
         <AudioBarShell
           aria-label="Transcript cancelled"
+          data-mode="notice"
           data-theme={audioWidgetTheme}
           data-visible="true"
         >

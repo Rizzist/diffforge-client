@@ -3646,37 +3646,35 @@ const AssetCardStatus = styled.span`
 
 const AssetAvailabilityBadgeGroup = styled.div`
   position: absolute;
-  top: 7px;
+  top: 8px;
   left: 7px;
-  z-index: 3;
+  z-index: 4;
   display: inline-flex;
   align-items: center;
   max-width: calc(100% - 84px);
-  padding: 3px;
   gap: 4px;
-  border: 1px solid rgba(15, 23, 42, 0.74);
-  border-radius: 999px;
-  background: rgba(2, 6, 23, 0.78);
-  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.26);
-  backdrop-filter: blur(8px);
+  overflow: hidden;
+  pointer-events: none;
 `;
 
 const AssetAvailabilityBadge = styled.span`
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  flex: 0 0 auto;
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
-  color: rgba(226, 232, 240, 0.92);
-  background: rgba(15, 23, 42, 0.78);
-  font-size: 9px;
+  color: rgba(226, 232, 240, 0.84);
+  background: rgba(7, 10, 16, 0.85);
+  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.2);
+  font-size: 8.5px;
   font-weight: 900;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
   line-height: 1;
+  backdrop-filter: blur(8px);
 
   svg {
     width: 13px;
@@ -3684,27 +3682,27 @@ const AssetAvailabilityBadge = styled.span`
   }
 
   &[data-kind="local"] {
-    border-color: rgba(251, 191, 36, 0.58);
-    color: rgba(17, 24, 39, 0.96);
-    background: #f59e0b;
+    border-color: rgba(251, 191, 36, 0.24);
+    color: rgba(254, 240, 138, 0.92);
+    background: rgba(113, 63, 18, 0.22);
   }
 
   &[data-kind="cloud"] {
-    border-color: rgba(74, 222, 128, 0.58);
-    color: rgba(2, 44, 18, 0.96);
-    background: #22c55e;
+    border-color: rgba(74, 222, 128, 0.24);
+    color: rgba(187, 247, 208, 0.92);
+    background: rgba(22, 101, 52, 0.2);
   }
 
   &[data-kind="remote"] {
-    border-color: rgba(147, 197, 253, 0.58);
-    color: rgba(239, 246, 255, 0.98);
-    background: #3b82f6;
+    border-color: rgba(125, 176, 255, 0.28);
+    color: rgba(207, 227, 255, 0.94);
+    background: rgba(37, 64, 110, 0.26);
   }
 
   &[data-kind="unavailable"] {
-    border-color: rgba(253, 164, 175, 0.58);
-    color: rgba(255, 241, 242, 0.98);
-    background: #e11d48;
+    border-color: rgba(251, 113, 133, 0.22);
+    color: rgba(254, 205, 211, 0.9);
+    background: rgba(127, 29, 29, 0.2);
   }
 `;
 
@@ -3790,13 +3788,13 @@ const AssetShareButton = styled.button`
 
 const AssetUtilityStrip = styled.div.attrs({ "data-asset-utilities": "true" })`
   position: absolute;
-  top: 31px;
+  top: 42px;
   left: 7px;
   z-index: 5;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  max-height: calc(100% - 37px);
+  max-height: calc(100% - 48px);
   overflow: auto;
   opacity: 0;
   pointer-events: none;

@@ -4356,6 +4356,7 @@ pub fn run() {
             tools_check_cli_binaries,
             tools_run_cli_action,
             list_developer_processes,
+            developer_energy_snapshot,
             terminal_activity_snapshot,
             kill_developer_process,
             docker_developer_action,

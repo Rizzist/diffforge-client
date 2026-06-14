@@ -656,7 +656,7 @@ export const workspaceCloseSpin = keyframes`
 `;
 
 export const WorkspaceCloseOverlay = styled.div`
-  position: fixed;
+  position: absolute;
   inset: 0;
   z-index: 5000;
   display: grid;
@@ -9494,8 +9494,9 @@ export const AudioBarShell = styled.div`
   position: fixed;
   inset: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
   padding: 3px;
   opacity: 0;
   pointer-events: none;
@@ -9512,10 +9513,13 @@ export const AudioBarShell = styled.div`
 export const AudioBarSurface = styled.div`
   position: relative;
   display: flex;
-  width: 100%;
-  height: 100%;
+  width: min(100%, 118px);
+  height: min(100%, 38px);
   align-items: center;
+  flex: none;
   gap: 10px;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
   padding: 0 9px;
   border: 1px solid rgba(230, 236, 245, 0.14);
@@ -9526,6 +9530,38 @@ export const AudioBarSurface = styled.div`
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.07) inset,
     0 12px 30px rgba(0, 0, 0, 0.38);
+
+  ${AudioBarShell}[data-mode="notice"] & {
+    width: min(100%, 386px);
+    height: min(100%, 46px);
+  }
+
+  ${AudioBarShell}[data-mode="active"] & {
+    transform-origin: bottom center;
+    animation: audioBarSurfaceGrow 190ms cubic-bezier(0.3, 0, 0.2, 1) both;
+  }
+
+  @keyframes audioBarSurfaceGrow {
+    from {
+      width: 64px;
+      height: 5px;
+      opacity: 0.92;
+      transform: translateY(-3px);
+    }
+
+    to {
+      width: min(100%, 118px);
+      height: min(100%, 38px);
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    ${AudioBarShell}[data-mode="active"] & {
+      animation: none;
+    }
+  }
 
   ${AudioBarShell}[data-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.1);
@@ -14897,6 +14933,19 @@ export const WindowSyncPill = styled.button`
     background: rgba(59, 130, 246, 0.12);
   }
 
+  &[data-state="provisioning"] {
+    border-color: rgba(255, 170, 92, 0.4);
+    color: rgba(255, 214, 170, 0.95);
+    background: rgba(255, 122, 24, 0.14);
+  }
+
+  &[data-state="offline"],
+  &[data-state="blocked"] {
+    border-color: rgba(248, 113, 113, 0.4);
+    color: rgba(254, 202, 202, 0.95);
+    background: rgba(239, 68, 68, 0.12);
+  }
+
   &[data-state="upgrade"] {
     border-color: rgba(255, 170, 92, 0.4);
     color: rgba(255, 214, 170, 0.95);
@@ -14935,6 +14984,19 @@ export const WindowSyncPill = styled.button`
     border-color: rgba(37, 99, 235, 0.35);
     color: rgba(29, 78, 216, 0.9);
     background: rgba(59, 130, 246, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-state="provisioning"] {
+    border-color: rgba(234, 88, 12, 0.36);
+    color: rgba(194, 65, 12, 0.95);
+    background: rgba(255, 122, 24, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-state="offline"],
+  html[data-forge-theme="light"] &[data-state="blocked"] {
+    border-color: rgba(220, 38, 38, 0.35);
+    color: rgba(185, 28, 28, 0.95);
+    background: rgba(239, 68, 68, 0.1);
   }
 
   html[data-forge-theme="light"] &[data-state="upgrade"] {
