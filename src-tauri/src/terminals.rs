@@ -650,7 +650,7 @@ fn signal_opencode_theme_refresh(root_pid: u32) -> Result<Vec<u32>, String> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        developer_process_refresh_kind(),
+        developer_process_refresh_kind(true),
     );
 
     let child_map = developer_child_map(&system);

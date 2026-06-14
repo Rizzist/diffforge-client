@@ -17,6 +17,9 @@ import {
   AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
   AUDIO_TRANSCRIPTION_STATUS_CANCELLED,
   AUDIO_TRANSCRIPTION_STATUS_INSERTED,
+  AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
+  AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
+  AUDIO_TRANSCRIPTION_VARIANT_RAW,
   AUDIO_WIDGET_STYLE_BAR,
   AUDIO_WIDGET_STYLE_BUBBLE,
   AUDIO_WIDGET_STYLE_HIDDEN,
@@ -295,6 +298,9 @@ import {
   AudioHistoryExpandButton,
   AudioHistoryProvider,
   AudioHistoryCopyButton,
+  AudioHistoryVariantButton,
+  AudioHistoryVariantControl,
+  AudioHistoryVariantLabel,
   AudioHistoryMeta,
   AudioHistorySnippetChangeBadge,
   AudioHistorySnippetChangeRow,
@@ -344,6 +350,7 @@ import {
   AudioWidgetLoader,
   AudioWidgetHistoryTray,
   AudioHistoryQuickButton,
+  AudioPolishQuickSpinner,
   McpWorkspaceSurface,
   McpHeaderPanel,
   McpTitleRow,
@@ -463,10 +470,12 @@ import {
   ButtonTerminalIcon,
   ButtonKeyIcon,
   ButtonBackIcon,
+  ButtonForwardIcon,
   ButtonMicIcon,
   ButtonMicOffIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
+  ButtonPolishIcon,
   FileChevronIcon,
   FileExpandIcon,
   FileFolderTreeIcon,
@@ -479,6 +488,9 @@ export const AUDIO_WIDGET_HASH = "#/audio-widget";
 export const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT = "forge-audio-widget-visibility-changed";
 const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
+const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
+const AUDIO_WIDGET_SPACE_CHANGED_EVENT = "forge-audio-widget-space-changed";
+const AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY = "diffforge.audio.widgetBubblePlacement.v1";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
 const AUDIO_SETTINGS_CHANGED_EVENT = "forge-audio-settings-changed";
 const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
@@ -519,7 +531,9 @@ const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 6;
 // zone so hovering it can reveal the round record button + shortcut hint.
 const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
+const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
+const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280];
 const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 34;
@@ -617,6 +631,67 @@ function shouldUseFullMonitorBoundsForAudioBar() {
   return availableHeight >= screenHeight - 2;
 }
 
+async function resolveAudioBarAnchorStrategy() {
+  if (!isMacPlatform()) {
+    return { useFullMonitorBounds: false };
+  }
+
+  try {
+    const strategy = await invoke("audio_widget_bar_anchor_strategy");
+    if (typeof strategy?.useFullMonitorBounds === "boolean") {
+      return strategy;
+    }
+  } catch {
+    // Older native builds and web previews fall back to the browser screen hint.
+  }
+
+  return {
+    useFullMonitorBounds: shouldUseFullMonitorBoundsForAudioBar(),
+  };
+}
+
+function normalizeAudioWidgetBubblePlacement(value) {
+  const x = Number(value?.x);
+  const y = Number(value?.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+  };
+}
+
+function readAudioWidgetBubblePlacement() {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+
+  try {
+    return normalizeAudioWidgetBubblePlacement(
+      JSON.parse(window.localStorage.getItem(AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY) || "null"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function writeAudioWidgetBubblePlacement(position) {
+  const normalized = normalizeAudioWidgetBubblePlacement(position);
+  if (!normalized || typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+
+  try {
+    window.localStorage.setItem(AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // Placement persistence is best-effort.
+  }
+
+  return normalized;
+}
+
 function audioBarIdlePointerEventIsHovering(event, active) {
   const viewportHeight = Number(window.innerHeight || AUDIO_WIDGET_BAR_IDLE_SIZE.height);
   const viewportWidth = Number(window.innerWidth || AUDIO_WIDGET_BAR_IDLE_SIZE.width);
@@ -677,6 +752,10 @@ function getErrorMessage(error, fallback) {
   }
 
   return fallback;
+}
+
+function releaseAudioWidgetKeyboardFocus() {
+  invoke("audio_widget_release_keyboard_focus").catch(() => {});
 }
 
 function formatDictionaryTermsDraftText(terms) {
@@ -1386,22 +1465,122 @@ function audioHistoryEntryDisplayText(entry, snippetChanges) {
   return String(entry?.text || "");
 }
 
-function buildAudioHistoryRows(history) {
+function audioHistoryVariantLabel(id, fallback = "") {
+  if (fallback) {
+    return fallback;
+  }
+  if (id === AUDIO_TRANSCRIPTION_VARIANT_RAW) {
+    return "Raw";
+  }
+  if (id === AUDIO_TRANSCRIPTION_VARIANT_POLISHED) {
+    return "Polished";
+  }
+  return "Cleaned";
+}
+
+function audioHistoryVariants(entry) {
+  const variants = Array.isArray(entry?.variants) ? entry.variants : [];
+  return variants
+    .map((variant) => {
+      const id = String(variant?.id || "").trim();
+      const text = String(variant?.text || "").trim();
+      if (!id || !text) {
+        return null;
+      }
+      return {
+        id,
+        label: audioHistoryVariantLabel(id, String(variant?.label || "").trim()),
+        text,
+      };
+    })
+    .filter(Boolean);
+}
+
+function audioHistorySelectedVariant(entry, variants, entryKey, selectedVariantIds) {
+  if (!variants.length) {
+    return null;
+  }
+
+  const selectedId = selectedVariantIds?.get?.(entryKey)
+    || String(entry?.defaultVariantId || "").trim()
+    || variants[variants.length - 1]?.id;
+  return variants.find((variant) => variant.id === selectedId) || variants[variants.length - 1];
+}
+
+function buildAudioHistoryRows(history, selectedVariantIds) {
   return (Array.isArray(history) ? history : []).map((entry, index) => {
-    const snippetChanges = audioHistorySnippetChanges(entry);
-    const entryText = audioHistoryEntryDisplayText(entry, snippetChanges);
+    const entryKey = getAudioHistoryEntryKey(entry, index);
+    const variants = audioHistoryVariants(entry);
+    const variant = audioHistorySelectedVariant(entry, variants, entryKey, selectedVariantIds);
+    const isRawVariant = variant?.id === AUDIO_TRANSCRIPTION_VARIANT_RAW;
+    const snippetChanges = isRawVariant ? [] : audioHistorySnippetChanges(entry);
+    const entryText = variant?.text || audioHistoryEntryDisplayText(entry, snippetChanges);
+    const variantIndex = variant ? variants.findIndex((candidate) => candidate.id === variant.id) : -1;
     return {
       clampable: isAudioHistoryClampable(entryText),
       entry,
-      entryKey: getAudioHistoryEntryKey(entry, index),
+      entryKey,
       entryText,
       index,
       meta: formatAudioHistoryMeta(entry),
       providerLabel: formatAudioProviderLabel(entry?.provider),
       snippetChanges,
       timestamp: formatHistoryTimestamp(entry?.createdAt),
+      variant,
+      variantIndex,
+      variants,
     };
   });
+}
+
+function audioHistoryEntryPolishText(entry) {
+  const text = String(entry?.text || "").trim();
+  if (text) {
+    return text;
+  }
+  const variants = audioHistoryVariants(entry);
+  const preferred = variants.find((variant) => variant.id === AUDIO_TRANSCRIPTION_VARIANT_CLEANED)
+    || variants.find((variant) => variant.id === AUDIO_TRANSCRIPTION_VARIANT_RAW)
+    || variants[0];
+  return String(preferred?.text || "").trim();
+}
+
+function buildPolishedAudioHistoryVariants(entry, sourceText, polishedText) {
+  const nextVariants = [];
+  const seen = new Set();
+  const pushVariant = (variant) => {
+    const id = String(variant?.id || "").trim();
+    const text = String(variant?.text || "").trim();
+    if (!id || !text || seen.has(id)) {
+      return;
+    }
+    seen.add(id);
+    nextVariants.push({
+      id,
+      label: audioHistoryVariantLabel(id, String(variant?.label || "").trim()),
+      text,
+    });
+  };
+
+  audioHistoryVariants(entry)
+    .filter((variant) => variant.id !== AUDIO_TRANSCRIPTION_VARIANT_POLISHED)
+    .forEach(pushVariant);
+
+  if (!seen.has(AUDIO_TRANSCRIPTION_VARIANT_RAW)) {
+    pushVariant({
+      id: AUDIO_TRANSCRIPTION_VARIANT_RAW,
+      label: "Original",
+      text: sourceText,
+    });
+  }
+
+  pushVariant({
+    id: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
+    label: "Polished",
+    text: polishedText,
+  });
+
+  return nextVariants;
 }
 
 function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
@@ -1465,6 +1644,7 @@ function AudioHistoryVirtualRow({
   onCopy,
   onMeasure,
   onToggle,
+  onVariantStep,
   row,
   top,
   totalCount,
@@ -1513,7 +1693,7 @@ function AudioHistoryVirtualRow({
         window.removeEventListener("resize", measure);
       }
     };
-  }, [expanded, onMeasure, row.entryKey, row.entryText, row.snippetChanges]);
+  }, [expanded, onMeasure, row.entryKey, row.entryText, row.snippetChanges, row.variant?.id]);
 
   return (
     <AudioHistoryRow
@@ -1533,6 +1713,29 @@ function AudioHistoryVirtualRow({
       <AudioHistoryRowTopline>
         <span>{row.timestamp}</span>
         <AudioHistoryRowActions>
+          {row.variants.length > 1 && (
+            <AudioHistoryVariantControl aria-label="Compare transcript versions">
+              <AudioHistoryVariantButton
+                aria-label="Show previous transcript version"
+                onClick={() => onVariantStep(row, -1)}
+                title="Show previous transcript version"
+                type="button"
+              >
+                <ButtonBackIcon aria-hidden="true" />
+              </AudioHistoryVariantButton>
+              <AudioHistoryVariantLabel>
+                {row.variant?.label || "Version"}
+              </AudioHistoryVariantLabel>
+              <AudioHistoryVariantButton
+                aria-label="Show next transcript version"
+                onClick={() => onVariantStep(row, 1)}
+                title="Show next transcript version"
+                type="button"
+              >
+                <ButtonForwardIcon aria-hidden="true" />
+              </AudioHistoryVariantButton>
+            </AudioHistoryVariantControl>
+          )}
           {row.entry.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED && (
             <AudioHistoryStatusBadge>Cancelled</AudioHistoryStatusBadge>
           )}
@@ -1542,7 +1745,7 @@ function AudioHistoryVirtualRow({
           <AudioHistoryCopyButton
             aria-label="Copy previous prompt"
             data-copied={copied ? "true" : undefined}
-            onClick={() => onCopy(row.entry, row.index)}
+            onClick={() => onCopy(row.entry, row.index, row.variant)}
             title="Copy previous prompt"
             type="button"
           >
@@ -1620,6 +1823,7 @@ export default function AudioWorkspaceView({
   const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [expandedAudioHistoryIds, setExpandedAudioHistoryIds] = useState(() => new Set());
+  const [audioHistoryVariantIds, setAudioHistoryVariantIds] = useState(() => new Map());
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
@@ -1637,6 +1841,7 @@ export default function AudioWorkspaceView({
   const [capturingAudioShortcut, setCapturingAudioShortcut] = useState("");
   const audioInputPreviewRef = useRef(null);
   const audioInputRunRef = useRef(0);
+  const audioInputLoadRunRef = useRef(0);
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
   const copiedAudioHistoryTimerRef = useRef(0);
@@ -1743,7 +1948,10 @@ export default function AudioWorkspaceView({
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
   const audioHistoryInsights = useMemo(() => buildAudioHistoryInsights(audioHistory), [audioHistory]);
-  const audioHistoryRows = useMemo(() => buildAudioHistoryRows(audioHistory), [audioHistory]);
+  const audioHistoryRows = useMemo(
+    () => buildAudioHistoryRows(audioHistory, audioHistoryVariantIds),
+    [audioHistory, audioHistoryVariantIds],
+  );
   const audioHistoryVirtualWindow = useMemo(() => (
     buildAudioHistoryVirtualWindow(
       audioHistoryRows,
@@ -1938,6 +2146,8 @@ export default function AudioWorkspaceView({
   }, [audioInputState]);
 
   const loadAudioInputDevices = useCallback(async () => {
+    const loadRunId = audioInputLoadRunRef.current + 1;
+    audioInputLoadRunRef.current = loadRunId;
     const currentState = audioInputStateRef.current;
 
     if (currentState !== "previewing") {
@@ -1947,6 +2157,9 @@ export default function AudioWorkspaceView({
 
     try {
       const devices = await listAudioInputDevices();
+      if (audioInputLoadRunRef.current !== loadRunId) {
+        return;
+      }
       setAudioInputDevices(devices);
 
       const currentDeviceId = audioInputDeviceIdRef.current;
@@ -1977,6 +2190,9 @@ export default function AudioWorkspaceView({
           : "Enable input to open a native stream from the selected source.");
       }
     } catch (deviceError) {
+      if (audioInputLoadRunRef.current !== loadRunId) {
+        return;
+      }
       audioInputStateRef.current = "error";
       setAudioInputState("error");
       setAudioInputMessage(getAudioInputErrorMessage(deviceError, "Unable to list audio input sources."));
@@ -2339,8 +2555,8 @@ export default function AudioWorkspaceView({
     notifyAudioSettingsChanged("widget-style");
   }, []);
 
-  const copyAudioHistoryPrompt = useCallback(async (entry, index) => {
-    const text = String(entry?.text || "").trim();
+  const copyAudioHistoryPrompt = useCallback(async (entry, index, variant = null) => {
+    const text = String(variant?.text || entry?.text || "").trim();
     if (!text) {
       return;
     }
@@ -2361,6 +2577,20 @@ export default function AudioWorkspaceView({
       copiedAudioHistoryTimerRef.current = 0;
       setCopiedAudioHistoryId((currentId) => (currentId === entryKey ? "" : currentId));
     }, 1600);
+  }, []);
+
+  const stepAudioHistoryVariant = useCallback((row, direction) => {
+    if (!row?.entryKey || !Array.isArray(row.variants) || row.variants.length < 2) {
+      return;
+    }
+
+    setAudioHistoryVariantIds((current) => {
+      const next = new Map(current);
+      const currentIndex = Math.max(0, row.variantIndex);
+      const nextIndex = (currentIndex + direction + row.variants.length) % row.variants.length;
+      next.set(row.entryKey, row.variants[nextIndex].id);
+      return next;
+    });
   }, []);
 
   const selectAudioMode = useCallback((nextMode) => {
@@ -3791,6 +4021,7 @@ export default function AudioWorkspaceView({
                         onCopy={copyAudioHistoryPrompt}
                         onMeasure={measureAudioHistoryRow}
                         onToggle={toggleAudioHistoryExpanded}
+                        onVariantStep={stepAudioHistoryVariant}
                         row={row}
                         top={top}
                         totalCount={audioHistoryRows.length}
@@ -3886,6 +4117,7 @@ export function AudioWidgetWindow() {
   const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
   const [widgetDragging, setWidgetDragging] = useState(false);
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
+  const [polishStatus, setPolishStatus] = useState({ state: "idle", error: "" });
   const [barIdleHover, setBarIdleHover] = useState(false);
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
@@ -3908,6 +4140,7 @@ export function AudioWidgetWindow() {
   const undoRequestedIdRef = useRef(0);
   const lastCancelledRef = useRef(null);
   const barSavedPlacementRef = useRef(null);
+  const barPositionAnimationRef = useRef({ frame: 0, token: 0 });
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
@@ -3917,11 +4150,14 @@ export function AudioWidgetWindow() {
   const widgetDragSettleTimerRef = useRef(0);
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
+  const polishStatusTimerRef = useRef(0);
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceTtsPlayerRef = useRef(null);
   // GPT-Realtime interim transcripts are token deltas, not cumulative
   // phrases; the live line accumulates them here between turn boundaries.
   const forgeVoiceRealtimeDraftRef = useRef("");
+  const forgeDictationHistoryRef = useRef(null);
+  widgetStyleRef.current = widgetStyle;
 
   const setBarIdleHoverState = useCallback((nextHovering) => {
     const hovering = Boolean(nextHovering);
@@ -4144,6 +4380,12 @@ export function AudioWidgetWindow() {
 
     const recordingRunId = recordingRunRef.current + 1;
     recordingRunRef.current = recordingRunId;
+    forgeDictationHistoryRef.current = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+      ? {
+        createdAt: new Date().toISOString(),
+        id: `forge-dictation-${Date.now()}-${recordingRunId}`,
+      }
+      : null;
     setError("");
     setFinishPending(false);
     setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT ? "Starting.." : "Arming buffer");
@@ -4202,8 +4444,11 @@ export function AudioWidgetWindow() {
         });
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
         setMessage("Connecting Diff Forge Cloud");
+        const forgeHistory = forgeDictationHistoryRef.current;
         await invoke("start_forge_dictation_transcription", {
           request: {
+            historyCreatedAt: forgeHistory?.createdAt || "",
+            historyId: forgeHistory?.id || "",
             llmCleanup: readForgeLlmCleanup(),
             language: readDeepgramLanguage(),
           },
@@ -4391,6 +4636,90 @@ export function AudioWidgetWindow() {
     }
   }, []);
 
+  const saveBubblePlacementFromWindow = useCallback(async (windowHandle) => {
+    if (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+      return null;
+    }
+
+    const position = await windowHandle.outerPosition().catch(() => null);
+    return writeAudioWidgetBubblePlacement(position);
+  }, []);
+
+  const cancelBarPositionAnimation = useCallback(() => {
+    const animation = barPositionAnimationRef.current;
+    animation.token += 1;
+    if (
+      animation.frame
+      && typeof window !== "undefined"
+      && typeof window.cancelAnimationFrame === "function"
+    ) {
+      window.cancelAnimationFrame(animation.frame);
+    }
+    animation.frame = 0;
+  }, []);
+
+  const setAudioBarWindowPosition = useCallback(async (windowHandle, target, animate = true) => {
+    const targetX = Math.round(target.x);
+    const targetY = Math.round(target.y);
+    const currentPosition = await windowHandle.outerPosition().catch(() => null);
+    const distance = currentPosition
+      ? Math.hypot(targetX - currentPosition.x, targetY - currentPosition.y)
+      : 0;
+    const canAnimate = animate
+      && currentPosition
+      && distance >= 2
+      && typeof window !== "undefined"
+      && typeof window.requestAnimationFrame === "function"
+      && typeof performance !== "undefined"
+      && typeof performance.now === "function";
+
+    if (!canAnimate) {
+      cancelBarPositionAnimation();
+      await windowHandle.setPosition(new PhysicalPosition(targetX, targetY));
+      return;
+    }
+
+    cancelBarPositionAnimation();
+    const animation = barPositionAnimationRef.current;
+    const token = animation.token;
+    const startX = currentPosition.x;
+    const startY = currentPosition.y;
+    const startedAt = performance.now();
+
+    await new Promise((resolve) => {
+      const step = async (now) => {
+        if (barPositionAnimationRef.current.token !== token) {
+          resolve();
+          return;
+        }
+
+        const progress = Math.min(1, (now - startedAt) / AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS);
+        const eased = 1 - ((1 - progress) ** 3);
+        const nextX = Math.round(startX + ((targetX - startX) * eased));
+        const nextY = Math.round(startY + ((targetY - startY) * eased));
+
+        await windowHandle.setPosition(new PhysicalPosition(nextX, nextY)).catch(() => {});
+        if (barPositionAnimationRef.current.token !== token) {
+          resolve();
+          return;
+        }
+        if (progress >= 1) {
+          barPositionAnimationRef.current.frame = 0;
+          resolve();
+          return;
+        }
+
+        barPositionAnimationRef.current.frame = window.requestAnimationFrame(step);
+      };
+
+      animation.frame = window.requestAnimationFrame(step);
+    });
+  }, [cancelBarPositionAnimation]);
+
+  useEffect(() => () => {
+    cancelBarPositionAnimation();
+  }, [cancelBarPositionAnimation]);
+
   const scheduleWidgetDragFinish = useCallback((delayMs = 240) => {
     if (widgetDragSettleTimerRef.current) {
       window.clearTimeout(widgetDragSettleTimerRef.current);
@@ -4402,6 +4731,9 @@ export function AudioWidgetWindow() {
       historyTrayCloseAfterDragRef.current = false;
       widgetDraggingRef.current = false;
       setWidgetDragging(false);
+      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+        runWidgetWindowAction(saveBubblePlacementFromWindow);
+      }
       if (closeHistoryTray) {
         setHistoryTrayOpen(false);
         runWidgetWindowAction((windowHandle) => (
@@ -4412,7 +4744,7 @@ export function AudioWidgetWindow() {
         ));
       }
     }, delayMs);
-  }, [runWidgetWindowAction]);
+  }, [runWidgetWindowAction, saveBubblePlacementFromWindow]);
 
   const widgetTargetMode = isFocusedAudioWidgetState(widgetState) ? "focus" : "compact";
   const widgetActive = widgetState === "arming"
@@ -4472,6 +4804,79 @@ export function AudioWidgetWindow() {
     }, 1300);
   }, []);
 
+  const resetPolishStatusSoon = useCallback((delayMs = 1500) => {
+    if (polishStatusTimerRef.current) {
+      window.clearTimeout(polishStatusTimerRef.current);
+    }
+    polishStatusTimerRef.current = window.setTimeout(() => {
+      polishStatusTimerRef.current = 0;
+      setPolishStatus({ state: "idle", error: "" });
+    }, delayMs);
+  }, []);
+
+  const polishLatestTranscript = useCallback(async () => {
+    if (polishStatus.state === "loading") {
+      return;
+    }
+
+    const history = readAudioTranscriptionHistory();
+    setWidgetHistory(history);
+    const entry = history[0];
+    const sourceText = audioHistoryEntryPolishText(entry);
+    if (!entry || !sourceText) {
+      setMessage("No transcript yet");
+      return;
+    }
+
+    if (polishStatusTimerRef.current) {
+      window.clearTimeout(polishStatusTimerRef.current);
+      polishStatusTimerRef.current = 0;
+    }
+    setError("");
+    setPolishStatus({ state: "loading", error: "" });
+    setMessage("Polishing transcript");
+
+    try {
+      const result = await invoke("polish_audio_transcription", {
+        request: {
+          text: sourceText,
+        },
+      });
+      const polishedText = String(result?.text || "").trim();
+      if (!polishedText) {
+        throw new Error("Polish returned empty text.");
+      }
+
+      const nextVariants = buildPolishedAudioHistoryVariants(entry, sourceText, polishedText);
+      await publishAudioTranscriptionResult({
+        ...entry,
+        defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
+        id: entry.id || `${Date.now()}`,
+        provider: entry.provider || readAudioTranscriptionProvider(),
+        rawText: "",
+        source: "audio-llm-polished",
+        sourceText: sourceText !== polishedText ? sourceText : String(entry.sourceText || ""),
+        status: entry.status || AUDIO_TRANSCRIPTION_STATUS_INSERTED,
+        text: polishedText,
+        variants: nextVariants,
+      });
+      refreshWidgetHistory();
+      setPolishStatus({ state: "success", error: "" });
+      setMessage("Transcript polished");
+      resetPolishStatusSoon(1500);
+    } catch (polishError) {
+      const messageText = getErrorMessage(polishError, "Unable to polish transcript.");
+      setPolishStatus({ state: "error", error: messageText });
+      setMessage("Polish failed");
+      setError(messageText);
+      if (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+        widgetStateRef.current = "error";
+        setWidgetState("error");
+      }
+      resetPolishStatusSoon(2600);
+    }
+  }, [polishStatus.state, refreshWidgetHistory, resetPolishStatusSoon]);
+
   const openBubbleHistoryTray = useCallback(() => {
     if (!canUseBubbleHistoryTray || widgetDraggingRef.current) {
       return;
@@ -4519,6 +4924,13 @@ export function AudioWidgetWindow() {
     const ignoreCursor = widgetStyle === AUDIO_WIDGET_STYLE_HIDDEN && !widgetActive;
     runWidgetWindowAction((windowHandle) => windowHandle.setIgnoreCursorEvents(ignoreCursor));
   }, [runWidgetWindowAction, widgetActive, widgetStyle]);
+
+  useEffect(() => {
+    if (isBusyAudioWidgetState(widgetState)) {
+      return;
+    }
+    releaseAudioWidgetKeyboardFocus();
+  }, [widgetState]);
 
   useEffect(() => {
     if (canUseBubbleHistoryTray) {
@@ -4600,6 +5012,11 @@ export function AudioWidgetWindow() {
       window.clearTimeout(copiedWidgetHistoryTimerRef.current);
       copiedWidgetHistoryTimerRef.current = 0;
     }
+
+    if (polishStatusTimerRef.current) {
+      window.clearTimeout(polishStatusTimerRef.current);
+      polishStatusTimerRef.current = 0;
+    }
   }, []);
 
   useEffect(() => {
@@ -4646,7 +5063,7 @@ export function AudioWidgetWindow() {
     };
   }, [scheduleWidgetDragFinish]);
 
-  const positionBottomAnchoredWidget = useCallback(() => {
+  const positionBottomAnchoredWidget = useCallback((options = {}) => {
     if (!usesBottomAnchoredStyle) {
       return;
     }
@@ -4661,18 +5078,35 @@ export function AudioWidgetWindow() {
       : AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN;
 
     runWidgetWindowAction(async (windowHandle) => {
+      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+        return;
+      }
       if (!barSavedPlacementRef.current) {
+        const persistedBubblePosition = readAudioWidgetBubblePlacement();
+        const currentPosition = await windowHandle.outerPosition().catch(() => null);
+        const savedPosition = persistedBubblePosition
+          || writeAudioWidgetBubblePlacement(currentPosition)
+          || currentPosition;
         barSavedPlacementRef.current = {
-          position: await windowHandle.outerPosition(),
+          position: savedPosition,
         };
       }
+      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+        return;
+      }
       await windowHandle.setSize(new LogicalSize(target.width, target.height));
-      const monitor = await currentMonitor();
+      const [monitor, anchorStrategy] = await Promise.all([
+        currentMonitor().catch(() => null),
+        resolveAudioBarAnchorStrategy(),
+      ]);
+      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+        return;
+      }
       if (monitor) {
         const scale = monitor.scaleFactor || 1;
         const fullArea = { position: monitor.position, size: monitor.size };
         const workArea = monitor.workArea?.size?.height ? monitor.workArea : null;
-        const area = shouldUseFullMonitorBoundsForAudioBar()
+        const area = anchorStrategy.useFullMonitorBounds
           ? fullArea
           : workArea || fullArea;
         const x = area.position.x
@@ -4680,10 +5114,19 @@ export function AudioWidgetWindow() {
         const y = area.position.y
           + area.size.height
           - Math.round((target.height + margin) * scale);
-        await windowHandle.setPosition(new PhysicalPosition(x, y));
+        if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
+          return;
+        }
+        await setAudioBarWindowPosition(windowHandle, { x, y }, options.animate !== false);
       }
     });
-  }, [barVisible, cancelNoticeActive, runWidgetWindowAction, usesBottomAnchoredStyle]);
+  }, [
+    barVisible,
+    cancelNoticeActive,
+    runWidgetWindowAction,
+    setAudioBarWindowPosition,
+    usesBottomAnchoredStyle,
+  ]);
 
   // The bar style docks the window bottom-center of the active monitor; the
   // user's bubble placement is restored on exit. The monitor work area keeps
@@ -4693,20 +5136,30 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
       const saved = barSavedPlacementRef.current;
-      if (saved) {
+      const restoredPosition = readAudioWidgetBubblePlacement() || saved?.position || null;
+      if (saved || restoredPosition) {
         barSavedPlacementRef.current = null;
+        cancelBarPositionAnimation();
         runWidgetWindowAction(async (windowHandle) => {
           await windowHandle.setSize(
             new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height),
           );
-          await windowHandle.setPosition(saved.position);
+          if (restoredPosition) {
+            await windowHandle.setPosition(new PhysicalPosition(restoredPosition.x, restoredPosition.y));
+            writeAudioWidgetBubblePlacement(restoredPosition);
+          }
         });
       }
       return;
     }
 
     positionBottomAnchoredWidget();
-  }, [positionBottomAnchoredWidget, runWidgetWindowAction, usesBottomAnchoredStyle]);
+  }, [
+    cancelBarPositionAnimation,
+    positionBottomAnchoredWidget,
+    runWidgetWindowAction,
+    usesBottomAnchoredStyle,
+  ]);
 
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
@@ -4718,6 +5171,45 @@ export function AudioWidgetWindow() {
       AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
     );
     return () => window.clearInterval(timer);
+  }, [positionBottomAnchoredWidget, usesBottomAnchoredStyle]);
+
+  useEffect(() => {
+    if (!usesBottomAnchoredStyle || !isMacPlatform()) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlistenSpace = () => {};
+    const timers = new Set();
+    const schedulePosition = (delayMs) => {
+      const timer = window.setTimeout(() => {
+        timers.delete(timer);
+        if (!disposed) {
+          positionBottomAnchoredWidget();
+        }
+      }, delayMs);
+      timers.add(timer);
+    };
+
+    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, () => {
+      AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach(schedulePosition);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenSpace = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlistenSpace();
+      timers.forEach((timer) => window.clearTimeout(timer));
+      timers.clear();
+    };
   }, [positionBottomAnchoredWidget, usesBottomAnchoredStyle]);
 
   useEffect(() => {
@@ -4806,8 +5298,11 @@ export function AudioWidgetWindow() {
   // upward by the card height while the error shows, and the pill stays at
   // its original spot on screen. (The resize effect itself is declared after
   // the frame-mode effect below so its size wins within the same commit.)
-  const errorFrameActive = widgetState === "error"
-    && Boolean(error)
+  const polishErrorFrameActive = polishStatus.state === "error"
+    && Boolean(polishStatus.error)
+    && !usesBottomAnchoredStyle;
+  const errorFrameText = polishErrorFrameActive ? polishStatus.error : error;
+  const errorFrameActive = ((widgetState === "error" && Boolean(error)) || polishErrorFrameActive)
     && !usesBottomAnchoredStyle;
 
   useEffect(() => {
@@ -5490,14 +5985,38 @@ export function AudioWidgetWindow() {
 
       const pipeline = applyVoiceTextPipeline(rawTranscript, peekVoiceTextRules());
       const nextTranscript = (pipeline.text || "").trim() || rawTranscript;
+      const forgeHistory = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+        ? forgeDictationHistoryRef.current
+        : null;
+      const forgeRawTranscript = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+        ? String(result?.rawText || "").trim()
+        : "";
+      const forgeHistoryVariants = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+        && result?.llmCleaned
+        && forgeRawTranscript
+        ? [
+          {
+            id: AUDIO_TRANSCRIPTION_VARIANT_RAW,
+            label: "Raw",
+            text: forgeRawTranscript,
+          },
+          {
+            id: AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
+            label: "Cleaned",
+            text: nextTranscript,
+          },
+        ]
+        : [];
 
       await publishAudioTranscriptionResult({
         audioMs: Number(result?.audioMs || 0),
-        createdAt: new Date().toISOString(),
-        id: `${Date.now()}`,
+        createdAt: forgeHistory?.createdAt || new Date().toISOString(),
+        defaultVariantId: forgeHistoryVariants.length > 1 ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED : "",
+        id: forgeHistory?.id || `${Date.now()}`,
         latencyMs: Math.max(0, Date.now() - submittedAt),
         language: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
         provider: currentProvider,
+        rawText: forgeHistoryVariants.length > 1 ? forgeRawTranscript : "",
         snippetChanges: pipeline.changes?.snippets || [],
         source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
           ? "deepgram-nova-3-live"
@@ -5508,6 +6027,7 @@ export function AudioWidgetWindow() {
             : "whisper-local",
         sourceText: pipeline.changed ? rawTranscript : "",
         text: nextTranscript,
+        variants: forgeHistoryVariants,
       });
       refreshWidgetHistory();
 
@@ -5880,9 +6400,16 @@ export function AudioWidgetWindow() {
 
     const syncAudioSettings = (event) => {
       const reason = event?.payload?.reason || "";
+      const nextWidgetStyle = readAudioWidgetStyle();
+      if (
+        nextWidgetStyle === AUDIO_WIDGET_STYLE_BAR
+        && widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR
+      ) {
+        runWidgetWindowAction(saveBubblePlacementFromWindow);
+      }
       setRecorderMode(readAudioRecorderMode());
       setAudioWidgetTheme(readAudioWidgetTheme());
-      setWidgetStyle(readAudioWidgetStyle());
+      setWidgetStyle(nextWidgetStyle);
       setTranscriptionProvider(readAudioTranscriptionProvider());
       setDeepgramApiKey(readDeepgramApiKey());
       setDeepgramLanguage(readDeepgramLanguage());
@@ -5923,7 +6450,7 @@ export function AudioWidgetWindow() {
       unlistenSettingsChanged();
       window.removeEventListener("storage", handleStorage);
     };
-  }, [refreshShortcutStatus, refreshStatus]);
+  }, [refreshShortcutStatus, refreshStatus, runWidgetWindowAction, saveBubblePlacementFromWindow]);
 
   useEffect(() => {
     let disposed = false;
@@ -5949,6 +6476,59 @@ export function AudioWidgetWindow() {
       unlisten();
     };
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT, async (event) => {
+      if (disposed) {
+        return;
+      }
+
+      const rawText = String(event.payload?.rawText || event.payload?.text || "").trim();
+      const historyId = String(event.payload?.historyId || "").trim();
+      if (!rawText || !historyId) {
+        return;
+      }
+
+      const createdAt = String(event.payload?.createdAt || "").trim() || new Date().toISOString();
+      await publishAudioTranscriptionResult({
+        audioMs: Math.max(0, Number(event.payload?.audioSeconds || 0) * 1000),
+        createdAt,
+        defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_RAW,
+        id: historyId,
+        language: readDeepgramLanguage(),
+        latencyMs: Math.max(0, Date.now() - new Date(createdAt).getTime()),
+        provider: AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
+        rawText,
+        source: "forge-nova3-dictation-raw",
+        text: rawText,
+        variants: [
+          {
+            id: AUDIO_TRANSCRIPTION_VARIANT_RAW,
+            label: "Raw",
+            text: rawText,
+          },
+        ],
+      });
+      refreshWidgetHistory();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [refreshWidgetHistory]);
 
   useEffect(() => {
     let disposed = false;
@@ -6382,7 +6962,9 @@ export function AudioWidgetWindow() {
   const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
   const showWidgetCancelButton = (isRecordingFocus || isProcessingFocus) && !isClosingFocus;
   const latestHistoryText = String(widgetHistory[0]?.text || "").trim();
-  const previousHistoryText = String(widgetHistory[1]?.text || "").trim();
+  const latestPolishText = audioHistoryEntryPolishText(widgetHistory[0]);
+  const polishState = polishStatus.state || "idle";
+  const polishLoading = polishState === "loading";
   const renderHistoryQuickButton = (slot, label, available, focusable = true) => {
     const copied = copiedWidgetHistorySlot === slot;
     return (
@@ -6406,6 +6988,45 @@ export function AudioWidgetWindow() {
         type="button"
       >
         {copied ? <ButtonCheckIcon aria-hidden="true" /> : <ButtonCopyIcon aria-hidden="true" />}
+      </AudioHistoryQuickButton>
+    );
+  };
+  const renderPolishQuickButton = (focusable = true) => {
+    const available = Boolean(latestPolishText);
+    const title = available
+      ? polishState === "error" && polishStatus.error
+        ? polishStatus.error
+        : "Polish latest transcription"
+      : "No transcript yet";
+    return (
+      <AudioHistoryQuickButton
+        aria-label="Polish latest transcription"
+        data-polish-state={polishState !== "idle" ? polishState : undefined}
+        data-slot="polish"
+        disabled={!available || polishLoading}
+        onClick={(event) => {
+          event.stopPropagation();
+          polishLatestTranscript();
+        }}
+        onMouseDown={(event) => {
+          event.stopPropagation();
+        }}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+        }}
+        tabIndex={available && focusable ? 0 : -1}
+        title={title}
+        type="button"
+      >
+        {polishLoading ? (
+          <AudioPolishQuickSpinner aria-hidden="true" />
+        ) : polishState === "success" ? (
+          <ButtonCheckIcon aria-hidden="true" />
+        ) : polishState === "error" ? (
+          <ButtonCloseIcon aria-hidden="true" />
+        ) : (
+          <ButtonPolishIcon aria-hidden="true" />
+        )}
       </AudioHistoryQuickButton>
     );
   };
@@ -6486,6 +7107,9 @@ export function AudioWidgetWindow() {
             onPointerMove={updateBarIdleHoverFromPointer}
           >
             <AudioBarIdleReveal>
+              <AudioBarHistoryActions aria-label="Transcript polish shortcut" data-side="left">
+                {renderPolishQuickButton()}
+              </AudioBarHistoryActions>
               <AudioBarRecordCluster>
                 <AudioBarRecordButton
                   aria-label={`Start dictation (${dictateShortcutLabel})`}
@@ -6497,9 +7121,8 @@ export function AudioWidgetWindow() {
                   {dictateShortcutLabel}
                 </AudioBarShortcutHint>
               </AudioBarRecordCluster>
-              <AudioBarHistoryActions aria-label="Dictation copy shortcuts">
+              <AudioBarHistoryActions aria-label="Dictation copy shortcut" data-side="right">
                 {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText))}
-                {renderHistoryQuickButton("previous", "Copy previous transcription", Boolean(previousHistoryText))}
               </AudioBarHistoryActions>
             </AudioBarIdleReveal>
             <AudioBarIdleLine aria-hidden="true" />
@@ -6591,8 +7214,8 @@ export function AudioWidgetWindow() {
     <>
       <GlobalStyle />
       {errorFrameActive && (
-        <AudioWidgetErrorPopover data-theme={audioWidgetTheme} role="alert" title={error}>
-          {error}
+        <AudioWidgetErrorPopover data-theme={audioWidgetTheme} role="alert" title={errorFrameText}>
+          {errorFrameText}
         </AudioWidgetErrorPopover>
       )}
       <AudioWidgetShell
@@ -6667,10 +7290,10 @@ export function AudioWidgetWindow() {
         )}
         <AudioWidgetHistoryTray
           aria-hidden={!bubbleHistoryTrayVisible}
-          aria-label="Dictation copy shortcuts"
+          aria-label="Dictation quick actions"
         >
           {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText), bubbleHistoryTrayVisible)}
-          {renderHistoryQuickButton("previous", "Copy previous transcription", Boolean(previousHistoryText), bubbleHistoryTrayVisible)}
+          {renderPolishQuickButton(bubbleHistoryTrayVisible)}
         </AudioWidgetHistoryTray>
       </AudioWidgetShell>
     </>

@@ -9,8 +9,10 @@ const CLOUD_VOICE_AGENT_CONTRACT: &str = "diffforge.voice_agent.v1";
 const CLOUD_VOICE_AGENT_WS_PATH: &str = "/v1/voice/ws";
 const CLOUD_DICTATION_CONTRACT: &str = "diffforge.voice_dictation.v1";
 const CLOUD_DICTATION_WS_PATH: &str = "/v1/voice/dictation/ws";
+const CLOUD_DICTATION_POLISH_PATH: &str = "/v1/voice/dictation/polish";
 const CLOUD_DICTATION_START_TIMEOUT_SECS: u64 = 20;
 const CLOUD_DICTATION_RESULT_TIMEOUT_SECS: u64 = 45;
+const CLOUD_DICTATION_POLISH_TIMEOUT_SECS: u64 = 20;
 // Warm dictation pool: while Diff Forge Cloud dictation is the selected
 // provider, a pre-authenticated websocket stays parked on the cloud ready
 // frame so press-to-talk skips auth, route resolution, and the TLS/WS
@@ -32,6 +34,9 @@ const CLOUD_DICTATION_WARM_RETRY_MAX_MS: u64 = 30_000;
 const CLOUD_DICTATION_CLEANED_WAIT_SECS: u64 = 6;
 const CLOUD_DICTATION_CLEANED_PROGRESS_EXTEND_SECS: u64 = 3;
 const CLOUD_DICTATION_CLEANED_WAIT_CAP_SECS: u64 = 15;
+const AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS: u64 = 8;
+const NATIVE_AUDIO_COMMAND_TIMEOUT_SECS: u64 = 12;
+const NATIVE_AUDIO_FINISH_TIMEOUT_SECS: u64 = 30;
 // Cold-connect route cache, keyed by websocket path: every successful voice
 // route resolve (mostly the dictation warm keeper's) is remembered briefly so
 // a cold press-to-talk skips the serial auth + heartbeat + balancer round
@@ -80,6 +85,8 @@ fn forge_voice_route_cache_fresh(ws_path: &str) -> Option<(CloudMcpWsTarget, Opt
 /// Frontend notification for mic arbitration: the voice agent's microphone
 /// feed was paused (dictation borrowed the mic) or resumed (dictation ended).
 const FORGE_VOICE_AGENT_MIC_EVENT: &str = "forge-voice-agent-mic";
+const AUDIO_WIDGET_SPACE_CHANGED_EVENT: &str = "forge-audio-widget-space-changed";
+const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT: &str = "forge-audio-dictation-raw-result";
 
 fn realtime_mic_holder_get(audio_state: &AudioState) -> RealtimeMicHolder {
     audio_state
@@ -494,16 +501,67 @@ enum NativeAudioCommand {
 
 #[derive(Clone)]
 struct NativeAudioWorker {
-    command_tx: std::sync::mpsc::Sender<NativeAudioCommand>,
+    command_tx: Arc<StdMutex<std::sync::mpsc::Sender<NativeAudioCommand>>>,
 }
 
 impl NativeAudioWorker {
     fn new() -> Self {
+        Self {
+            command_tx: Arc::new(StdMutex::new(Self::spawn_command_tx())),
+        }
+    }
+
+    fn spawn_command_tx() -> std::sync::mpsc::Sender<NativeAudioCommand> {
         let (command_tx, command_rx) = std::sync::mpsc::channel::<NativeAudioCommand>();
 
         thread::spawn(move || native_audio_worker_loop(command_rx));
 
-        Self { command_tx }
+        command_tx
+    }
+
+    fn command_tx(&self) -> Result<std::sync::mpsc::Sender<NativeAudioCommand>, String> {
+        self.command_tx
+            .lock()
+            .map(|command_tx| command_tx.clone())
+            .map_err(|_| "Native audio worker lock is unavailable.".to_string())
+    }
+
+    fn restart_after_timeout(&self, action: &'static str) {
+        log_whisper_local_audio_event(
+            "audio.worker.restart",
+            None,
+            json!({
+                "reason": "command_timeout",
+                "action": action,
+            }),
+        );
+
+        if let Ok(mut command_tx) = self.command_tx.lock() {
+            *command_tx = Self::spawn_command_tx();
+        }
+    }
+
+    fn run_command_with_timeout<T>(
+        &self,
+        action: &'static str,
+        timeout_duration: Duration,
+        command: impl FnOnce(std::sync::mpsc::Sender<Result<T, String>>) -> NativeAudioCommand,
+    ) -> Result<T, String> {
+        let (response, response_rx) = std::sync::mpsc::channel();
+        self.command_tx()?
+            .send(command(response))
+            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
+
+        match response_rx.recv_timeout(timeout_duration) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.restart_after_timeout(action);
+                Err("Audio input engine timed out. The mic engine was reset; try again.".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("Native audio worker did not respond.".to_string())
+            }
+        }
     }
 
     fn attach_realtime_stream(
@@ -528,47 +586,39 @@ impl NativeAudioWorker {
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
         replay_buffered: bool,
     ) -> Result<AudioInputMonitorStatus, String> {
-        let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx
-            .send(NativeAudioCommand::AttachRealtime {
+        self.run_command_with_timeout(
+            "attach_realtime",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::AttachRealtime {
                 audio_tx,
                 replay_buffered,
                 response,
-            })
-            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Native audio worker did not respond.".to_string())?
+            },
+        )
     }
 
     fn begin_capture(&self) -> Result<(), String> {
-        let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx
-            .send(NativeAudioCommand::Begin { response })
-            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Native audio worker did not respond.".to_string())?
+        self.run_command_with_timeout(
+            "begin_capture",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::Begin { response },
+        )
     }
 
     fn finish_capture(&self) -> Result<AudioInputCaptureResult, String> {
-        let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx
-            .send(NativeAudioCommand::Finish { response })
-            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Native audio worker did not respond.".to_string())?
+        self.run_command_with_timeout(
+            "finish_capture",
+            Duration::from_secs(NATIVE_AUDIO_FINISH_TIMEOUT_SECS),
+            |response| NativeAudioCommand::Finish { response },
+        )
     }
 
     fn detach_realtime_stream(&self) -> Result<(), String> {
-        let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx
-            .send(NativeAudioCommand::DetachRealtime { response })
-            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Native audio worker did not respond.".to_string())?
+        self.run_command_with_timeout(
+            "detach_realtime",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::DetachRealtime { response },
+        )
     }
 
     fn start_monitor(
@@ -576,30 +626,26 @@ impl NativeAudioWorker {
         app: AppHandle,
         request: AudioInputMonitorRequest,
     ) -> Result<AudioInputMonitorStatus, String> {
-        let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx
-            .send(NativeAudioCommand::Start {
+        self.run_command_with_timeout(
+            "start_monitor",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::Start {
                 app,
                 request,
                 response,
-            })
-            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Native audio worker did not respond.".to_string())?
+            },
+        )
     }
 
     fn stop_monitor(
         &self,
         request: Option<AudioInputMonitorRequest>,
     ) -> Result<AudioInputMonitorStatus, String> {
-        let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx
-            .send(NativeAudioCommand::Stop { request, response })
-            .map_err(|_| "Native audio worker is unavailable.".to_string())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Native audio worker did not respond.".to_string())?
+        self.run_command_with_timeout(
+            "stop_monitor",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::Stop { request, response },
+        )
     }
 }
 
@@ -3079,6 +3125,8 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
             "label": AUDIO_WIDGET_WINDOW_LABEL,
         }),
     );
+    #[cfg(target_os = "macos")]
+    register_audio_widget_space_change_observer(app);
 
     if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
         let visible = window.is_visible().ok();
@@ -3248,12 +3296,72 @@ fn audio_widget_order_front_regardless(window: &tauri::WebviewWindow) {
 }
 
 #[cfg(target_os = "macos")]
+fn audio_widget_resign_key_window_if_needed(
+    window: &tauri::WebviewWindow,
+    context: &'static str,
+) -> bool {
+    let mut released = false;
+    snipping_catch_objc(context, || {
+        let Ok(ns_window) = window.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        if ns_window.isKeyWindow() {
+            ns_window.resignKeyWindow();
+            released = true;
+        }
+    });
+    released
+}
+
+#[cfg(target_os = "macos")]
 const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
 
 #[cfg(target_os = "macos")]
-fn audio_widget_reassert_open_state(app: &AppHandle, make_key: bool) -> bool {
+static AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn register_audio_widget_space_change_observer(app: &AppHandle) {
+    if AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        snipping_catch_objc("register_audio_widget_space_change_observer", || {
+            let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+            let center = workspace.notificationCenter();
+            let block = block2::RcBlock::new(
+                move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                    snipping_catch_objc("audio_widget_space_change_observer_callback", || {
+                        let _ = app_handle.emit(
+                            AUDIO_WIDGET_SPACE_CHANGED_EVENT,
+                            json!({ "source": "macos_space" }),
+                        );
+                    });
+                },
+            );
+            let token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
+            // The observer lives for the app's lifetime.
+            std::mem::forget(token);
+        });
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_reassert_open_state(app: &AppHandle, _make_key: bool) -> bool {
     let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
         return false;
     };
@@ -3262,9 +3370,6 @@ fn audio_widget_reassert_open_state(app: &AppHandle, make_key: bool) -> bool {
     }
     audio_widget_apply_macos_space_style(&window);
     audio_widget_order_front_regardless(&window);
-    if make_key {
-        snipping_make_overlay_key(&window);
-    }
     true
 }
 
@@ -3376,6 +3481,33 @@ where
     result
 }
 
+#[cfg(target_os = "macos")]
+fn audio_widget_release_keyboard_focus_on_main_thread(app: &AppHandle) -> Result<bool, String> {
+    log_audio_diagnostic_event("audio.widget.release_keyboard_focus.request", json!({}));
+
+    run_audio_widget_action_on_main_thread(app, "release_keyboard_focus", |app| {
+        let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+            return Ok(false);
+        };
+
+        let released = audio_widget_resign_key_window_if_needed(
+            &window,
+            "audio_widget_release_keyboard_focus",
+        );
+
+        log_audio_diagnostic_event(
+            "audio.widget.release_keyboard_focus.result",
+            json!({ "released": released }),
+        );
+        Ok(released)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_release_keyboard_focus_on_main_thread(_app: &AppHandle) -> Result<bool, String> {
+    Ok(false)
+}
+
 fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Result<(), String> {
     log_audio_diagnostic_event(
         "audio.widget.show_window.request",
@@ -3393,10 +3525,25 @@ fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Resu
             .map_err(|error| format!("Unable to show audio widget: {error}"))?;
         #[cfg(target_os = "macos")]
         audio_widget_order_front_regardless(&window);
+        #[cfg(target_os = "macos")]
+        let released_keyboard = audio_widget_resign_key_window_if_needed(
+            &window,
+            "audio_widget_show_release_keyboard_focus",
+        );
+        #[cfg(target_os = "macos")]
+        if released_keyboard {
+            log_audio_diagnostic_event(
+                "audio.widget.show_window.keyboard_focus_released",
+                json!({}),
+            );
+        }
 
         if focus {
             #[cfg(target_os = "macos")]
-            snipping_make_overlay_key(&window);
+            log_audio_diagnostic_event(
+                "audio.widget.show_window.focus_skipped_macos",
+                json!({ "reason": "audio_widget_must_not_steal_keyboard" }),
+            );
             #[cfg(not(target_os = "macos"))]
             let _ = window.set_focus();
         }
@@ -3411,6 +3558,13 @@ fn hide_audio_widget_window_on_main_thread(app: &AppHandle) -> Result<(), String
 
     run_audio_widget_action_on_main_thread(app, "hide", |app| {
         if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = audio_widget_resign_key_window_if_needed(
+                    &window,
+                    "audio_widget_hide_release_keyboard_focus",
+                );
+            }
             window
                 .hide()
                 .map_err(|error| format!("Unable to hide audio widget: {error}"))?;
@@ -3497,6 +3651,46 @@ struct AudioWidgetBarHoverSnapshot {
     hovering: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWidgetBarAnchorStrategy {
+    use_full_monitor_bounds: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_bar_anchor_strategy_for() -> AudioWidgetBarAnchorStrategy {
+    let mut use_full_monitor_bounds = false;
+    snipping_catch_objc("audio_widget_bar_anchor_strategy", || {
+        let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        let current_app = objc2_app_kit::NSRunningApplication::currentApplication();
+        let Some(frontmost_app) = workspace.frontmostApplication() else {
+            return;
+        };
+        let current_pid = current_app.processIdentifier();
+        let frontmost_pid = frontmost_app.processIdentifier();
+        if current_pid <= 0 || frontmost_pid <= 0 {
+            return;
+        }
+
+        // In another app's fullscreen Space, macOS still reports the normal
+        // desktop work area for this auxiliary window. Anchor against the full
+        // display while another app owns the active Space, then return to the
+        // Dock-safe work area when Diff Forge is frontmost again.
+        use_full_monitor_bounds = current_pid != frontmost_pid;
+    });
+
+    AudioWidgetBarAnchorStrategy {
+        use_full_monitor_bounds,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_bar_anchor_strategy_for() -> AudioWidgetBarAnchorStrategy {
+    AudioWidgetBarAnchorStrategy {
+        use_full_monitor_bounds: false,
+    }
+}
+
 fn audio_widget_bar_hover_snapshot_for(
     app: &AppHandle,
     request: &AudioWidgetBarHoverSnapshotRequest,
@@ -3581,7 +3775,12 @@ fn show_audio_widget_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Strin
         }
     };
 
-    if let Err(error) = show_audio_widget_window_on_main_thread(app, true) {
+    #[cfg(target_os = "macos")]
+    let focus_widget = false;
+    #[cfg(not(target_os = "macos"))]
+    let focus_widget = true;
+
+    if let Err(error) = show_audio_widget_window_on_main_thread(app, focus_widget) {
         log_audio_diagnostic_event(
             "audio.widget.show.window_error",
             json!({
@@ -3656,7 +3855,19 @@ async fn whisper_model_status(app: AppHandle) -> Result<WhisperModelStatus, Stri
 
 #[tauri::command]
 async fn audio_input_devices() -> Result<Vec<AudioInputDeviceSummary>, String> {
-    audio_input_devices_for_host(&cpal_host())
+    match timeout(
+        Duration::from_secs(AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(|| audio_input_devices_for_host(&cpal_host())),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("Unable to list audio input sources: {error}")),
+        Err(_) => Err(
+            "Audio input source check timed out. The OS audio device service did not respond."
+                .to_string(),
+        ),
+    }
 }
 
 #[tauri::command]
@@ -6465,6 +6676,8 @@ async fn stop_deepgram_realtime_transcription(
 struct ForgeDictationStartRequest {
     llm_cleanup: Option<bool>,
     language: Option<String>,
+    history_id: Option<String>,
+    history_created_at: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -6491,6 +6704,34 @@ struct ForgeDictationResult {
     cancelled: bool,
     llm_cleaned: bool,
     audio_seconds: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ForgeDictationRawResultEvent {
+    history_id: String,
+    created_at: String,
+    text: String,
+    raw_text: String,
+    cleanup_pending: bool,
+    llm_cleanup_requested: bool,
+    audio_seconds: i64,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct AudioTranscriptionPolishRequest {
+    text: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AudioTranscriptionPolishResult {
+    text: String,
+    raw_text: String,
+    llm_cleaned: bool,
+    cleanup_ms: u64,
+    model: String,
 }
 
 fn forge_dictation_result_from_payload(
@@ -6571,11 +6812,181 @@ async fn resolve_forge_dictation_cloud_route(
     Ok((ws_target, auth_bearer))
 }
 
+async fn resolve_forge_voice_http_url(
+    cloud_mcp_state: &CloudMcpState,
+    endpoint_path: &str,
+) -> Result<String, String> {
+    cloud_mcp_wait_for_app_ws_auth(cloud_mcp_state)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!("Diff Forge Cloud audio tools need the signed-in Diff Forge AI connection. {error}")
+        })?;
+    let ws_target = cloud_mcp_resolve_ws_target(
+        cloud_mcp_state,
+        &cloud_mcp_base_url(),
+        endpoint_path,
+    )
+    .await
+    .map_err(|error| format!("Cloud audio route unavailable: {error}"))?;
+    let url = cloud_mcp_http_url_from_ws_url(&ws_target.ws_url)
+        .ok_or_else(|| "Cloud audio direct route URL is invalid.".to_string())?;
+    Ok(cloud_mcp_http_url_with_route_token(
+        url,
+        ws_target.route_token.as_deref(),
+    ))
+}
+
+async fn forge_audio_cloud_http_headers(
+    cloud_mcp_state: &CloudMcpState,
+) -> Result<reqwest::header::HeaderMap, String> {
+    let token = cloud_mcp_authorization_bearer(cloud_mcp_state)
+        .await?
+        .ok_or_else(|| {
+            "Cloud auth token is unavailable; sign in before polishing transcripts.".to_string()
+        })?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|error| format!("Invalid cloud polish auth header: {error}"))?,
+    );
+    headers.insert(
+        "x-diffforge-client-id",
+        reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+    headers.insert(
+        "x-diffforge-actor",
+        reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+
+    let device_profile = cloud_mcp_desktop_device_profile();
+    if let Some(device_id) = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]) {
+        headers.insert(
+            "x-diffforge-device-id",
+            reqwest::header::HeaderValue::from_str(&device_id)
+                .map_err(|error| format!("Invalid cloud polish device header: {error}"))?,
+        );
+    }
+
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(cloud_mcp_state).await;
+    headers.insert(
+        "x-diffforge-billing-scope-type",
+        reqwest::header::HeaderValue::from_str(&billing_scope_type)
+            .map_err(|error| format!("Invalid cloud polish scope header: {error}"))?,
+    );
+    headers.insert(
+        "x-diffforge-scope-type",
+        reqwest::header::HeaderValue::from_str(&billing_scope_type)
+            .map_err(|error| format!("Invalid cloud polish scope header: {error}"))?,
+    );
+    if let Some(team_id) = team_id {
+        headers.insert(
+            "x-diffforge-team-id",
+            reqwest::header::HeaderValue::from_str(&team_id)
+                .map_err(|error| format!("Invalid cloud polish team header: {error}"))?,
+        );
+    }
+
+    let (plan_name, device_limit) = cloud_mcp_account_plan(cloud_mcp_state).await;
+    headers.insert(
+        "x-diffforge-plan-name",
+        reqwest::header::HeaderValue::from_str(&plan_name)
+            .map_err(|error| format!("Invalid cloud polish plan header: {error}"))?,
+    );
+    if let Some(device_limit) = device_limit {
+        headers.insert(
+            "x-diffforge-device-limit",
+            reqwest::header::HeaderValue::from_str(&device_limit.to_string())
+                .map_err(|error| format!("Invalid cloud polish device limit header: {error}"))?,
+        );
+    }
+
+    Ok(headers)
+}
+
+#[tauri::command]
+async fn polish_audio_transcription(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    request: AudioTranscriptionPolishRequest,
+) -> Result<AudioTranscriptionPolishResult, String> {
+    let text = clean_deepgram_transcript_text(&request.text)?;
+    let keyterms = voice_dictionary_bias_terms(&app);
+    let url = resolve_forge_voice_http_url(cloud_mcp_state.inner(), CLOUD_DICTATION_POLISH_PATH)
+        .await?;
+    let headers = forge_audio_cloud_http_headers(cloud_mcp_state.inner()).await?;
+    let payload = json!({
+        "text": text,
+        "keyterms": keyterms,
+    });
+    let response = http_client(Duration::from_secs(CLOUD_DICTATION_POLISH_TIMEOUT_SECS))?
+        .post(url)
+        .headers(headers)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("Unable to polish transcript through Diff Forge Cloud: {error}"))?;
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Cloud polish response was invalid JSON: {error}"))?;
+    if !status.is_success() {
+        let message = body
+            .pointer("/error/message")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("Cloud transcript polish failed.");
+        return Err(format!("Cloud transcript polish failed ({status}): {message}"));
+    }
+
+    let data = body.get("data").unwrap_or(&body);
+    let polished_text = data
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if polished_text.is_empty() {
+        return Err("Cloud transcript polish returned empty text.".to_string());
+    }
+
+    Ok(AudioTranscriptionPolishResult {
+        text: polished_text,
+        raw_text: data
+            .get("raw_text")
+            .or_else(|| data.get("rawText"))
+            .and_then(Value::as_str)
+            .unwrap_or(&text)
+            .trim()
+            .to_string(),
+        llm_cleaned: data
+            .get("llm_cleaned")
+            .or_else(|| data.get("llmCleaned"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        cleanup_ms: data
+            .get("cleanup_ms")
+            .or_else(|| data.get("cleanupMs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        model: data
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_forge_dictation_stream(
     app: AppHandle,
     connection: ForgeDictationConnection,
     start_request: Value,
+    history_id: String,
+    history_created_at: String,
     mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut control_rx: mpsc::UnboundedReceiver<ForgeDictationControl>,
     ready_tx: oneshot::Sender<Result<(), String>>,
@@ -6776,6 +7187,23 @@ async fn run_forge_dictation_stream(
                                     .unwrap_or(false);
                                 match parsed {
                                     Ok(mut result) if cleanup_pending => {
+                                        if !result.cancelled && !result.raw_text.trim().is_empty() {
+                                            let _ = app.emit(
+                                                AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT,
+                                                ForgeDictationRawResultEvent {
+                                                    history_id: history_id.clone(),
+                                                    created_at: history_created_at.clone(),
+                                                    text: result.raw_text.clone(),
+                                                    raw_text: result.raw_text.clone(),
+                                                    cleanup_pending,
+                                                    llm_cleanup_requested: payload
+                                                        .get("llm_cleanup_requested")
+                                                        .and_then(Value::as_bool)
+                                                        .unwrap_or(false),
+                                                    audio_seconds: result.audio_seconds,
+                                                },
+                                            );
+                                        }
                                         // Raw transcript is in hand; give the
                                         // cleaned follow-up frame a bounded
                                         // window, then return raw as-is.
@@ -7144,6 +7572,22 @@ async fn start_forge_dictation_transcription(
     let command_started_at = Instant::now();
     let llm_cleanup = request.llm_cleanup.unwrap_or(true);
     let language = clean_deepgram_language(request.language)?;
+    let history_id = request
+        .history_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(128).collect::<String>())
+        .unwrap_or_else(|| format!("forge-dictation-{}", uuid::Uuid::new_v4()));
+    let history_created_at = request
+        .history_created_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(64)
+        .collect::<String>();
     log_audio_diagnostic_event(
         "audio.forge_dictation.start.command",
         json!({
@@ -7280,6 +7724,8 @@ async fn start_forge_dictation_transcription(
         app,
         connection,
         start_request,
+        history_id,
+        history_created_at,
         audio_rx,
         control_rx,
         ready_tx,
@@ -7408,6 +7854,16 @@ async fn audio_widget_bar_hover_snapshot(
 }
 
 #[tauri::command]
+async fn audio_widget_bar_anchor_strategy() -> Result<AudioWidgetBarAnchorStrategy, String> {
+    Ok(audio_widget_bar_anchor_strategy_for())
+}
+
+#[tauri::command]
+async fn audio_widget_release_keyboard_focus(app: AppHandle) -> Result<bool, String> {
+    audio_widget_release_keyboard_focus_on_main_thread(&app)
+}
+
+#[tauri::command]
 async fn show_audio_widget(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
@@ -7503,6 +7959,9 @@ async fn insert_transcribed_text(
             shortcut: audio_push_to_talk_shortcut_for(&app),
         });
     }
+
+    #[cfg(target_os = "macos")]
+    let _ = audio_widget_release_keyboard_focus_on_main_thread(&app);
 
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(220));

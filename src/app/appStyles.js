@@ -3,6 +3,8 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
+import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
+import { AutoFixHigh } from "@styled-icons/material-rounded/AutoFixHigh";
 import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
 import { CheckCircle } from "@styled-icons/material-rounded/CheckCircle";
 import { Close } from "@styled-icons/material-rounded/Close";
@@ -8904,6 +8906,67 @@ export const AudioHistoryStatusBadge = styled.span`
   }
 `;
 
+export const AudioHistoryVariantControl = styled.div`
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 3px;
+  border: 1px solid rgba(125, 160, 205, 0.22);
+  border-radius: 999px;
+  background: rgba(21, 27, 35, 0.58);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.14);
+    background: rgba(0, 102, 204, 0.045);
+  }
+`;
+
+export const AudioHistoryVariantButton = styled.button`
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    color 160ms ease;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: rgba(125, 160, 205, 0.14);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.08);
+  }
+`;
+
+export const AudioHistoryVariantLabel = styled.span`
+  min-width: 52px;
+  color: var(--forge-text-soft);
+  font-size: 10px;
+  font-weight: 820;
+  line-height: 1;
+  text-align: center;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+  }
+`;
+
 export const AudioHistoryCopyButton = styled.button`
   display: inline-flex;
   min-height: 24px;
@@ -9841,6 +9904,28 @@ export const AudioHistoryQuickButton = styled.button`
     opacity: 0;
   }
 
+  &[data-polish-state="loading"] {
+    border-color: rgba(255, 159, 67, 0.42);
+    color: var(--forge-orange, #ff9f43);
+    background: rgba(255, 159, 67, 0.14);
+  }
+
+  &[data-polish-state="loading"]:disabled {
+    opacity: 1;
+  }
+
+  &[data-polish-state="success"] {
+    border-color: rgba(75, 212, 170, 0.5);
+    color: #c8fff0;
+    background: rgba(38, 152, 120, 0.28);
+  }
+
+  &[data-polish-state="error"] {
+    border-color: rgba(239, 107, 107, 0.52);
+    color: #ffd9d9;
+    background: rgba(148, 38, 47, 0.34);
+  }
+
   &:hover:not(:disabled) {
     color: #ffffff;
     border-color: rgba(125, 176, 255, 0.38);
@@ -9858,6 +9943,10 @@ export const AudioHistoryQuickButton = styled.button`
     cursor: default;
     opacity: 0.36;
     transform: none;
+  }
+
+  &[data-polish-state="loading"]:disabled {
+    opacity: 1;
   }
 
   html[data-audio-widget-theme="light"] &,
@@ -9888,6 +9977,30 @@ export const AudioHistoryQuickButton = styled.button`
     background: rgba(220, 252, 231, 0.96);
   }
 
+  html[data-audio-widget-theme="light"] &[data-polish-state="loading"],
+  ${AudioBarIdleShell}[data-theme="light"] &[data-polish-state="loading"],
+  ${AudioBarShell}[data-theme="light"] &[data-polish-state="loading"] {
+    border-color: rgba(193, 95, 0, 0.3);
+    color: #b35a00;
+    background: rgba(255, 247, 237, 0.96);
+  }
+
+  html[data-audio-widget-theme="light"] &[data-polish-state="success"],
+  ${AudioBarIdleShell}[data-theme="light"] &[data-polish-state="success"],
+  ${AudioBarShell}[data-theme="light"] &[data-polish-state="success"] {
+    border-color: rgba(22, 163, 74, 0.34);
+    color: rgba(21, 128, 61, 0.95);
+    background: rgba(220, 252, 231, 0.96);
+  }
+
+  html[data-audio-widget-theme="light"] &[data-polish-state="error"],
+  ${AudioBarIdleShell}[data-theme="light"] &[data-polish-state="error"],
+  ${AudioBarShell}[data-theme="light"] &[data-polish-state="error"] {
+    border-color: rgba(220, 38, 38, 0.3);
+    color: rgba(153, 27, 27, 0.96);
+    background: rgba(254, 226, 226, 0.96);
+  }
+
   html[data-audio-widget-theme="light"] &:hover:not(:disabled),
   ${AudioBarIdleShell}[data-theme="light"] &:hover:not(:disabled),
   ${AudioBarShell}[data-theme="light"] &:hover:not(:disabled) {
@@ -9899,17 +10012,40 @@ export const AudioHistoryQuickButton = styled.button`
   }
 `;
 
+export const AudioPolishQuickSpinner = styled.span`
+  width: 13px;
+  height: 13px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  opacity: 0.9;
+  animation: audioPolishQuickSpin 720ms linear infinite;
+
+  @keyframes audioPolishQuickSpin {
+    to { transform: rotate(360deg); }
+  }
+`;
+
 export const AudioBarHistoryActions = styled.div`
   display: inline-flex;
+  width: 30px;
   flex: none;
   align-items: center;
-  gap: 5px;
+  justify-content: center;
   opacity: 0;
-  transform: translateX(-6px) scale(0.96);
+  transform: translateX(var(--audio-bar-action-offset, -6px)) scale(0.96);
   transition:
     opacity 150ms ease 45ms,
     transform 180ms cubic-bezier(0.3, 0, 0.2, 1) 45ms;
   -webkit-app-region: no-drag;
+
+  &[data-side="left"] {
+    --audio-bar-action-offset: 6px;
+  }
+
+  &[data-side="right"] {
+    --audio-bar-action-offset: -6px;
+  }
 
   ${AudioBarIdleShell}[data-hover="true"] & {
     opacity: 1;
@@ -14881,6 +15017,14 @@ export const ButtonAddIcon = styled(Add)`
 `;
 
 export const ButtonBackIcon = styled(ArrowBack)`
+  ${buttonIconSize}
+`;
+
+export const ButtonForwardIcon = styled(ArrowForward)`
+  ${buttonIconSize}
+`;
+
+export const ButtonPolishIcon = styled(AutoFixHigh)`
   ${buttonIconSize}
 `;
 

@@ -22,6 +22,9 @@ export const AUDIO_RECORDER_MODE_TOGGLE_TO_TALK = "toggle-to-talk";
 export const AUDIO_RECORDER_MODE_HYBRID = "hybrid";
 export const AUDIO_TRANSCRIPTION_STATUS_INSERTED = "inserted";
 export const AUDIO_TRANSCRIPTION_STATUS_CANCELLED = "cancelled";
+export const AUDIO_TRANSCRIPTION_VARIANT_RAW = "raw";
+export const AUDIO_TRANSCRIPTION_VARIANT_CLEANED = "cleaned";
+export const AUDIO_TRANSCRIPTION_VARIANT_POLISHED = "polished";
 export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO = "auto";
 export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL = "manual";
 export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT = "diffforge:audio-orchestrator-submission-mode";
@@ -191,6 +194,96 @@ function normalizeAudioSnippetChanges(value) {
       return { original, replacement, trigger };
     })
     .filter(Boolean);
+}
+
+function normalizeTranscriptionText(value) {
+  return typeof value === "string"
+    ? value
+      .split(/\r?\n/)
+      .filter((line) => {
+        const lowercase = line.trim().toLowerCase();
+
+        return !(
+          lowercase.includes("the binary 'main.exe' is deprecated")
+          || lowercase.includes("the binary \"main.exe\" is deprecated")
+          || lowercase.includes("the binary 'main' is deprecated")
+          || lowercase.includes("the binary \"main\" is deprecated")
+          || lowercase.includes("deprecation-warning")
+        );
+      })
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+    : "";
+}
+
+function normalizeTranscriptionVariantId(value) {
+  const id = String(value || "").trim().toLowerCase();
+  if (id === AUDIO_TRANSCRIPTION_VARIANT_RAW || id === "original") {
+    return AUDIO_TRANSCRIPTION_VARIANT_RAW;
+  }
+  if (
+    id === AUDIO_TRANSCRIPTION_VARIANT_CLEANED
+    || id === "llm"
+    || id === "llm-cleaned"
+    || id === "pasted"
+  ) {
+    return AUDIO_TRANSCRIPTION_VARIANT_CLEANED;
+  }
+  if (id === AUDIO_TRANSCRIPTION_VARIANT_POLISHED || id === "polish" || id === "manual-cleaned") {
+    return AUDIO_TRANSCRIPTION_VARIANT_POLISHED;
+  }
+  return "";
+}
+
+function normalizeTranscriptionVariants(value, text) {
+  const variants = [];
+  const seenIds = new Set();
+
+  const addVariant = (variant, fallbackId, fallbackLabel) => {
+    const variantText = normalizeTranscriptionText(variant?.text);
+    if (!variantText) {
+      return;
+    }
+
+    const id = normalizeTranscriptionVariantId(variant?.id || fallbackId);
+    if (!id || seenIds.has(id)) {
+      return;
+    }
+
+    const label = typeof variant?.label === "string" && variant.label.trim()
+      ? variant.label.trim().slice(0, 32)
+      : fallbackLabel;
+    seenIds.add(id);
+    variants.push({ id, label, text: variantText });
+  };
+
+  if (Array.isArray(value?.variants)) {
+    value.variants.forEach((variant) => addVariant(variant, variant?.id, variant?.label));
+  }
+
+  const rawText = normalizeTranscriptionText(value?.rawText || value?.raw_text);
+  const cleanedText = normalizeTranscriptionText(value?.cleanedText || value?.cleaned_text)
+    || (value?.llmCleaned || value?.llm_cleaned ? text : "");
+
+  if (rawText) {
+    addVariant(
+      { id: AUDIO_TRANSCRIPTION_VARIANT_RAW, label: "Raw", text: rawText },
+      AUDIO_TRANSCRIPTION_VARIANT_RAW,
+      "Raw",
+    );
+  }
+
+  if (cleanedText) {
+    addVariant(
+      { id: AUDIO_TRANSCRIPTION_VARIANT_CLEANED, label: "Cleaned", text: cleanedText },
+      AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
+      "Cleaned",
+    );
+  }
+
+  return variants;
 }
 
 function base64ToArrayBuffer(value) {
@@ -392,25 +485,7 @@ function normalizeTranscriptionResult(value) {
 
   // Line breaks are intentional structure from the LLM cleanup pass (lists,
   // paragraph breaks), so whitespace collapses per line, not globally.
-  const text = typeof value.text === "string"
-    ? value.text
-      .split(/\r?\n/)
-      .filter((line) => {
-        const lowercase = line.trim().toLowerCase();
-
-        return !(
-          lowercase.includes("the binary 'main.exe' is deprecated")
-          || lowercase.includes("the binary \"main.exe\" is deprecated")
-          || lowercase.includes("the binary 'main' is deprecated")
-          || lowercase.includes("the binary \"main\" is deprecated")
-          || lowercase.includes("deprecation-warning")
-        );
-      })
-      .map((line) => line.replace(/\s+/g, " ").trim())
-      .join("\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim()
-    : "";
+  const text = normalizeTranscriptionText(value.text);
 
   if (!text) {
     return null;
@@ -439,6 +514,11 @@ function normalizeTranscriptionResult(value) {
   const snippetChanges = normalizeAudioSnippetChanges(
     value.snippetChanges || value.changes?.snippets,
   );
+  const variants = normalizeTranscriptionVariants(value, text);
+  const defaultVariantId = normalizeTranscriptionVariantId(value.defaultVariantId)
+    || (variants.some((variant) => variant.id === AUDIO_TRANSCRIPTION_VARIANT_CLEANED)
+      ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED
+      : variants[0]?.id || "");
 
   return {
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
@@ -454,6 +534,8 @@ function normalizeTranscriptionResult(value) {
       ? AUDIO_TRANSCRIPTION_STATUS_CANCELLED
       : AUDIO_TRANSCRIPTION_STATUS_INSERTED,
     text,
+    defaultVariantId,
+    variants,
     wordCount,
   };
 }

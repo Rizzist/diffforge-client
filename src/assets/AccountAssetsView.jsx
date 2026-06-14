@@ -18,7 +18,6 @@ import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFile
 import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
 import { Link } from "@styled-icons/material-rounded/Link";
-import { LinkOff } from "@styled-icons/material-rounded/LinkOff";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { Public } from "@styled-icons/material-rounded/Public";
@@ -157,11 +156,6 @@ function assetTransferStatusKind(transfer) {
   return assetStatusKind(transfer?.status || transfer?.transferStatus || transfer?.transfer_status);
 }
 
-function assetTransferStatusLabel(transfer) {
-  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, "failed");
-  return status.replace(/[_-]+/gu, " ");
-}
-
 function assetTransferAssetId(transfer) {
   return text(transfer?.assetId || transfer?.asset_id);
 }
@@ -296,17 +290,6 @@ function assetTransferDirectionLabel(transfer) {
   if (direction === "upload") return "Uploading";
   if (direction === "download") return "Downloading";
   return "Syncing";
-}
-
-function assetTransferFailureError(transfer) {
-  return text(
-    transfer?.error
-      || transfer?.errorMessage
-      || transfer?.error_message
-      || transfer?.message
-      || transfer?.detail
-      || transfer?.reason,
-  );
 }
 
 function assetSyncedDeviceNames(asset) {
@@ -472,34 +455,6 @@ function assetTransferFailureDetails({
   return details;
 }
 
-function assetTransferFailureFromTransfer(transfer, asset, cloudLabel, cloudId) {
-  const direction = assetTransferDirection(transfer);
-  if (!["upload", "download"].includes(direction)) return null;
-  const operation = direction === "download" ? "Download" : "Upload";
-  const assetIdValue = assetTransferAssetId(transfer);
-  const name = assetName(asset, assetIdValue ? shortLabel(assetIdValue, 20) : "asset");
-  const errorMessage = assetTransferFailureError(transfer)
-    || `${operation} ${assetTransferStatusLabel(transfer)} without an error message.`;
-  const actualCloudId = assetTransferCloudId(transfer) || cloudId;
-  return {
-    assetId: assetIdValue,
-    cloudId: actualCloudId,
-    details: assetTransferFailureDetails({
-      asset,
-      assetIdValue,
-      cloudId: actualCloudId,
-      cloudLabel,
-      direction,
-      transfer,
-    }),
-    direction,
-    key: `transfer:${direction}:${actualCloudId}:${assetIdValue}:${assetTransferId(transfer) || assetTransferUpdatedAt(transfer)}`,
-    message: errorMessage,
-    title: `${operation} failed for ${name}`,
-    updatedAt: assetTransferUpdatedAt(transfer),
-  };
-}
-
 function assetTransferFailureFromAction(action, asset, cloudLabel, cloudId, error) {
   const direction = action === "download" ? "download" : action === "upload" ? "upload" : "";
   if (!direction) return null;
@@ -525,23 +480,6 @@ function assetTransferFailureFromAction(action, asset, cloudLabel, cloudId, erro
   };
 }
 
-function assetTransferFailureDedupeKey(failure) {
-  return [
-    failure?.direction,
-    failure?.cloudId,
-    failure?.assetId,
-    failure?.message,
-  ].map((value) => text(value).toLowerCase()).join(":");
-}
-
-function assetTransferFailureCopyText(failure) {
-  return [
-    failure?.title,
-    failure?.message,
-    ...jsonArray(failure?.details),
-  ].map((value) => text(value)).filter(Boolean).join("\n");
-}
-
 function assetToastCopyText(toast) {
   return [
     text(toast?.title),
@@ -564,27 +502,6 @@ async function copyTextToClipboard(value) {
     return true;
   }
   return false;
-}
-
-/* Library uploads default to private; this device-local preference flips the
-   upload action to also publish a public link (snips have their own separate
-   setting in the Snipping tab). */
-const ASSET_UPLOAD_PUBLIC_STORAGE_KEY = "diffforge.assets.uploadPublicOnUpload";
-
-function readAssetUploadPublicPreference() {
-  try {
-    return window.localStorage.getItem(ASSET_UPLOAD_PUBLIC_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function writeAssetUploadPublicPreference(enabled) {
-  try {
-    window.localStorage.setItem(ASSET_UPLOAD_PUBLIC_STORAGE_KEY, enabled ? "1" : "0");
-  } catch {
-    // Preference persistence is best-effort.
-  }
 }
 
 export default function AccountAssetsView({
@@ -845,17 +762,8 @@ function AssetsPanel({
   } = useAssetToastController();
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
-  const [uploadPublic, setUploadPublic] = useState(readAssetUploadPublicPreference);
   const [optimisticTransfers, setOptimisticTransfers] = useState({});
-  const [transferActionFailure, setTransferActionFailure] = useState(null);
 
-  const toggleUploadPublic = useCallback(() => {
-    setUploadPublic((current) => {
-      const next = !current;
-      writeAssetUploadPublicPreference(next);
-      return next;
-    });
-  }, []);
   const selectedCloud = useMemo(() => (
     clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === selectedCloudId)
       || clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === defaultCloudId)
@@ -884,47 +792,6 @@ function AssetsPanel({
       .filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
       .filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId);
   }, [effectiveCloudId, optimisticTransferRows, transfers, visibleAssetIds]);
-  const assetById = useMemo(() => {
-    const byId = new Map();
-    filteredItems.forEach((asset) => {
-      const id = assetId(asset);
-      if (id) byId.set(id, asset);
-    });
-    return byId;
-  }, [filteredItems]);
-  const failedTransferFailures = useMemo(() => {
-    const seen = new Set();
-    return visibleTransfers
-      .filter((transfer) => assetTransferStatusKind(transfer) === "failed")
-      .filter((transfer) => ["upload", "download"].includes(assetTransferDirection(transfer)))
-      .filter((transfer) => !assetTransferClearedOnRestart(transfer))
-      .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left))
-      .map((transfer) => {
-        const transferAsset = assetById.get(assetTransferAssetId(transfer)) || null;
-        if (assetTransferShadowedByAsset(transfer, transferAsset, effectiveCloudId)) return null;
-        return assetTransferFailureFromTransfer(transfer, transferAsset, selectedCloudLabel, effectiveCloudId);
-      })
-      .filter(Boolean)
-      .filter((failure) => {
-        const key = assetTransferFailureDedupeKey(failure);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, 4);
-  }, [assetById, effectiveCloudId, selectedCloudLabel, visibleTransfers]);
-  const transferFailures = useMemo(() => {
-    const failures = [];
-    const seen = new Set();
-    [transferActionFailure, ...failedTransferFailures].forEach((failure) => {
-      if (!failure) return;
-      const key = assetTransferFailureDedupeKey(failure);
-      if (seen.has(key)) return;
-      seen.add(key);
-      failures.push(failure);
-    });
-    return failures.slice(0, 4);
-  }, [failedTransferFailures, transferActionFailure]);
   const activeToastKeySet = useMemo(
     () => new Set(assetToasts.map((toast) => toast.key)),
     [assetToasts],
@@ -942,20 +809,6 @@ function AssetsPanel({
       details: [selectedCloudLabel],
     });
   }, [activeToastKeySet, enqueueAssetToast, error, selectedCloudLabel]);
-  useEffect(() => {
-    transferFailures.forEach((failure) => {
-      const key = failure.key || assetTransferFailureDedupeKey(failure);
-      if (!key || dismissedToastKeysRef.current.has(key) || activeToastKeySet.has(key)) return;
-      enqueueAssetToast({
-        kind: "error",
-        key,
-        title: failure.title,
-        message: failure.message,
-        details: failure.details,
-        copyText: assetTransferFailureCopyText(failure),
-      });
-    });
-  }, [activeToastKeySet, enqueueAssetToast, transferFailures]);
   const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
   const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
   const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
@@ -1150,7 +1003,6 @@ function AssetsPanel({
     const localPath = assetLocalPath(asset);
     const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
-    setTransferActionFailure(null);
     if (action === "copyPublic") {
       const publicUrl = assetPublicUrl(asset);
       if (!publicUrl) return;
@@ -1239,8 +1091,8 @@ function AssetsPanel({
     }
     try {
       if (action === "untrack") {
-        // Untracking only moves the local copy back to scratch; cloud private
-        // and public copies stay until their own delete/unpublish buttons.
+        // Untracking only moves the local copy back to scratch; cloud copies
+        // stay until the CloudOff action removes private and public storage.
         if (!localPath) return;
         await invoke("diffforge_untrack_account_asset", {
           assetId: id,
@@ -1267,11 +1119,6 @@ function AssetsPanel({
             showAssetToast("error", "Copy failed", message, [publicUrl]);
           }
         }
-      } else if (action === "unpublish") {
-        await invoke("cloud_mcp_unpublish_account_asset", {
-          assetId: id,
-          cloudId: effectiveCloudId,
-        });
       } else {
         const command = action === "upload"
           ? "cloud_mcp_upload_account_asset"
@@ -1288,26 +1135,8 @@ function AssetsPanel({
         if (action === "upload") {
           setOptimisticUploadTransfer(asset, effectiveCloudId, "completed");
           await refresh({ silent: true, force: true });
-          if (!uploadPublic) {
-            showAssetToast("success", "Upload complete", "Uploaded to Cloud.", [name, selectedCloudLabel]);
-            clearOptimisticUploadTransfer(asset, effectiveCloudId);
-            return;
-          }
-          try {
-            await invoke("cloud_mcp_publish_account_asset", {
-              assetId: id,
-              cloudId: effectiveCloudId,
-            });
-            await refresh({ silent: true, force: true });
-            showAssetToast("success", "Upload complete", "Uploaded and published with a public link.", [name, selectedCloudLabel]);
-          } catch (publishError) {
-            const message = `Uploaded privately, but public link failed: ${
-              publishError?.message || String(publishError || "Publish failed.")
-            }`;
-            showAssetToast("error", "Public link failed", message, [name, selectedCloudLabel]);
-          } finally {
-            clearOptimisticUploadTransfer(asset, effectiveCloudId);
-          }
+          showAssetToast("success", "Upload complete", "Uploaded privately to Cloud.", [name, selectedCloudLabel]);
+          clearOptimisticUploadTransfer(asset, effectiveCloudId);
           return;
         }
       }
@@ -1317,7 +1146,7 @@ function AssetsPanel({
       } else if (action === "deleteLocal") {
         showAssetToast("success", "Local copy deleted", availability?.hasCloud ? "Cloud copy is unchanged." : "Deleted local copy.", [name]);
       } else if (action === "deleteCloud") {
-        showAssetToast("success", "Cloud copy deleted", availability?.hasLocal ? "Local copy is unchanged." : "Deleted Cloud copy.", [name, selectedCloudLabel]);
+        showAssetToast("success", "Cloud copy deleted", availability?.hasLocal ? "Private and public Cloud copies were removed. Local copy is unchanged." : "Private and public Cloud copies were removed.", [name, selectedCloudLabel]);
       }
     } catch (nextError) {
       if (action === "upload") {
@@ -1333,7 +1162,6 @@ function AssetsPanel({
           effectiveCloudId,
           nextError,
         );
-        setTransferActionFailure(failure);
         showAssetToast("error", failure.title, failure.message, failure.details, failure.key);
       }
       const message = nextError?.message || String(nextError || `Unable to ${action} asset.`);
@@ -1351,7 +1179,6 @@ function AssetsPanel({
     selectedCloudLabel,
     setOptimisticUploadTransfer,
     showAssetToast,
-    uploadPublic,
   ]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
@@ -1499,18 +1326,6 @@ function AssetsPanel({
               </AssetCloudButton>
             );
           })}
-          <AssetCloudButton
-            aria-pressed={uploadPublic}
-            data-active={uploadPublic}
-            onClick={toggleUploadPublic}
-            title={uploadPublic
-              ? "New uploads publish a public link immediately. Click to keep uploads private."
-              : "New uploads stay private. Click to also publish a public link on upload."}
-            type="button"
-          >
-            <Public aria-hidden="true" />
-            <span>{uploadPublic ? "Public on upload" : "Private on upload"}</span>
-          </AssetCloudButton>
         </AssetCloudControls>
         {cloudSettingsOpen && (
           <AssetCloudSettingsPanel
@@ -1571,7 +1386,6 @@ function AssetsPanel({
             const copyBusy = busyKey === `copy:${id}`;
             const copyPublicBusy = busyKey === `copyPublic:${id}`;
             const publishBusy = busyKey === `publish:${id}`;
-            const unpublishBusy = busyKey === `unpublish:${id}`;
             const pinBusy = busyKey === `pin:${id}`;
             const untrackBusy = busyKey === `untrack:${id}`;
             const canUpload = canRunAssetAction && !transferActive && availability.hasLocal && !availability.hasCloud && Boolean(localPath);
@@ -1580,7 +1394,6 @@ function AssetsPanel({
             const canDeleteLocal = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
             const canPublish = canRunAssetAction && !transferActive && availability.hasCloud && !isPublic;
             const canCopyPublic = isPublic;
-            const canUnpublish = canRunAssetAction && !transferActive && isPublic;
             const canView = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canUntrack = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
@@ -1604,16 +1417,15 @@ function AssetsPanel({
                   ? canUpload
                   : false;
             const primaryCloudTitle = primaryCloudAction === "deleteCloud"
-              ? "Delete Cloud copy"
+              ? "Remove from Cloud"
               : primaryCloudAction === "download"
                 ? "Download local copy"
                 : "Upload to Cloud";
             const primaryCloudLabel = primaryCloudAction === "deleteCloud"
-              ? `Delete Cloud copy of ${name}`
+              ? `Remove ${name} from Cloud`
               : primaryCloudAction === "download"
                 ? `Download local copy of ${name}`
                 : `Upload ${name}`;
-            const showPublish = availability.hasCloud;
             const showSecondaryCloudDelete = availability.hasCloud && !availability.hasLocal;
             const bottomDeleteAction = canDeleteLocal ? "deleteLocal" : "";
             const bottomDeleteBusy = deleteLocalBusy;
@@ -1710,6 +1522,36 @@ function AssetsPanel({
                 >
                   {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
                 </AssetSelectButton>
+                {availability.hasCloud && (
+                  <AssetShareActions data-visible="true">
+                    {!isPublic && (
+                      <AssetShareButton
+                        aria-label={`Make ${name} public and copy URL`}
+                        data-primary="true"
+                        disabled={!canPublish || publishBusy || Boolean(busyKey && !publishBusy)}
+                        onClick={() => runAssetAction("publish", asset)}
+                        title="Make public and copy URL"
+                        type="button"
+                      >
+                        <Public aria-hidden="true" />
+                        <span>Make public</span>
+                      </AssetShareButton>
+                    )}
+                    {isPublic && (
+                      <AssetShareButton
+                        aria-label={`Copy public URL for ${name}`}
+                        data-primary="true"
+                        disabled={!canCopyPublic || copyPublicBusy || Boolean(busyKey && !copyPublicBusy)}
+                        onClick={() => runAssetAction("copyPublic", asset)}
+                        title="Copy public URL"
+                        type="button"
+                      >
+                        <Link aria-hidden="true" />
+                        <span>Copy URL</span>
+                      </AssetShareButton>
+                    )}
+                  </AssetShareActions>
+                )}
                 <AssetUtilityStrip>
                   {canCopy && (
                     <AssetUtilityButton
@@ -1735,48 +1577,13 @@ function AssetsPanel({
                       <MoveToInbox aria-hidden="true" />
                     </AssetUtilityButton>
                   )}
-                  {showPublish && !isPublic && (
-                    <AssetUtilityButton
-                      aria-label={`Make ${name} public`}
-                      data-primary="true"
-                      disabled={!canPublish || publishBusy || Boolean(busyKey && !publishBusy)}
-                      onClick={() => runAssetAction("publish", asset)}
-                      title="Make public and copy URL"
-                      type="button"
-                    >
-                      <Public aria-hidden="true" />
-                    </AssetUtilityButton>
-                  )}
-                  {isPublic && (
-                    <AssetUtilityButton
-                      aria-label={`Copy public URL for ${name}`}
-                      disabled={!canCopyPublic || copyPublicBusy || Boolean(busyKey && !copyPublicBusy)}
-                      onClick={() => runAssetAction("copyPublic", asset)}
-                      title="Copy public URL"
-                      type="button"
-                    >
-                      <Link aria-hidden="true" />
-                    </AssetUtilityButton>
-                  )}
-                  {isPublic && (
-                    <AssetUtilityButton
-                      aria-label={`Make ${name} private`}
-                      data-warning="true"
-                      disabled={!canUnpublish || unpublishBusy || Boolean(busyKey && !unpublishBusy)}
-                      onClick={() => runAssetAction("unpublish", asset)}
-                      title="Make private"
-                      type="button"
-                    >
-                      <LinkOff aria-hidden="true" />
-                    </AssetUtilityButton>
-                  )}
                   {showSecondaryCloudDelete && (
                     <AssetUtilityButton
-                      aria-label={`Delete Cloud copy of ${name}`}
+                      aria-label={`Remove ${name} from Cloud`}
                       data-danger="true"
                       disabled={!canDeleteCloud || deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
                       onClick={() => runAssetAction("deleteCloud", asset)}
-                      title="Delete Cloud copy"
+                      title="Remove from Cloud"
                       type="button"
                     >
                       <CloudOff aria-hidden="true" />
@@ -3308,6 +3115,7 @@ const AssetCard = styled.article`
     }
 
     [data-asset-select="true"],
+    [data-asset-share="true"],
     [data-asset-upload="true"] {
       opacity: 1;
       pointer-events: auto;
@@ -3348,6 +3156,7 @@ const AssetCard = styled.article`
     }
 
     [data-asset-select="true"],
+    [data-asset-share="true"],
     [data-asset-upload="true"] {
       opacity: 1;
       pointer-events: auto;
@@ -3486,6 +3295,86 @@ const AssetCardStatus = styled.span`
   &[data-status="cancelled"] {
     border-color: rgba(251, 113, 133, 0.24);
     color: rgba(254, 205, 211, 0.86);
+  }
+`;
+
+const AssetShareActions = styled.div.attrs({ "data-asset-share": "true" })`
+  position: absolute;
+  top: 42px;
+  right: 7px;
+  z-index: 5;
+  display: flex;
+  max-width: calc(100% - 18px);
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  transition: opacity 130ms ease, transform 130ms ease;
+
+  &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+`;
+
+const AssetShareButton = styled.button`
+  display: inline-flex;
+  max-width: 132px;
+  min-height: 24px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid rgba(125, 176, 255, 0.28);
+  border-radius: 999px;
+  color: rgba(219, 234, 254, 0.94);
+  background: rgba(7, 10, 16, 0.88);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+
+  svg {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 176, 255, 0.6);
+    color: #06121f;
+    background: #7db0ff;
+    transform: translateX(-1px);
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.32);
+    color: rgba(204, 251, 241, 0.98);
+    background: rgba(13, 148, 136, 0.22);
+  }
+
+  &[data-warning="true"] {
+    border-color: rgba(251, 191, 36, 0.26);
+    color: rgba(254, 240, 138, 0.94);
+    background: rgba(113, 63, 18, 0.22);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
   }
 `;
 

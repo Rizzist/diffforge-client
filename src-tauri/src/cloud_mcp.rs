@@ -17571,31 +17571,27 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
     let updated = conn
         .execute(
             "UPDATE account_asset_items
-             SET repo_id=?1,
-                 workspace_id=?2,
-                 workspace_name=?3,
-                 name=?4,
-                 kind=?5,
-                 mime_type=?6,
-                 size_bytes=?7,
-                 sha256=?8,
-                 blob_id=?9,
-                 cloud_status=?10,
-                 local_status=?11,
-                 local_path=?12,
-                 object_key=?13,
-                 origin_device_id=?14,
-                 updated_at=?15,
-                 mirror_updated_at_ms=?16,
-                 row_json=?17
-             WHERE asset_id=?18",
+             SET base_url=?1,
+                 name=?2,
+                 kind=?3,
+                 mime_type=?4,
+                 size_bytes=?5,
+                 sha256=?6,
+                 blob_id=?7,
+                 cloud_status=?8,
+                 local_status=?9,
+                 local_path=?10,
+                 object_key=?11,
+                 origin_device_id=?12,
+                 updated_at=?13,
+                 mirror_updated_at_ms=?14,
+                 row_json=?15
+             WHERE asset_id=?16",
             {
                 let mut stored_row = row.clone();
                 cloud_mcp_strip_asset_workspace_identity(&mut stored_row);
                 rusqlite::params![
-                "",
-                "",
-                "",
+                cloud_mcp_base_url(),
                 cloud_mcp_asset_row_text(row, &["name", "filename", "file_name", "fileName"]),
                 cloud_mcp_asset_row_text(row, &["kind", "asset_kind", "assetKind"]),
                 cloud_mcp_asset_row_text(row, &["mime_type", "mimeType"]),
@@ -18148,29 +18144,31 @@ async fn cloud_mcp_upload_account_asset_once(
         }
         Err(error) => {
             cloud_mcp_clear_asset_transfer_cancel(&[&asset_id, &transfer_id]);
-            // Tag the failed upload in the cloud too, so the transfer session
-            // does not linger as "uploading" until the websocket drops.
-            let status = if error.contains("cancelled by user") {
-                "interrupted"
-            } else {
-                "failed"
-            };
-            let failure_report = cloud_mcp_asset_transfer_progress_row(
-                &asset_id,
-                &transfer_id,
-                &transfer_cloud_id,
-                "upload",
-                status,
-                bytes_total,
-                0,
-                Some(&error),
-            );
-            let _ = cloud_mcp_post_json_endpoint(
-                state,
-                "/v1/assets/report-transfer-progress",
-                &failure_report,
-            )
-            .await;
+            if !cloud_mcp_asset_transfer_error_requires_reprepare(&error, "upload") {
+                // Tag the failed upload in the cloud too, so the transfer session
+                // does not linger as "uploading" until the websocket drops.
+                let status = if error.contains("cancelled by user") {
+                    "interrupted"
+                } else {
+                    "failed"
+                };
+                let failure_report = cloud_mcp_asset_transfer_progress_row(
+                    &asset_id,
+                    &transfer_id,
+                    &transfer_cloud_id,
+                    "upload",
+                    status,
+                    bytes_total,
+                    0,
+                    Some(&error),
+                );
+                let _ = cloud_mcp_post_json_endpoint(
+                    state,
+                    "/v1/assets/report-transfer-progress",
+                    &failure_report,
+                )
+                .await;
+            }
             return Err(error);
         }
     };
@@ -18484,41 +18482,6 @@ async fn cloud_mcp_publish_account_asset(
     cloud_mcp_update_asset_library_from_response(
         "asset_publish_public",
         Some("/v1/assets/publish-public"),
-        &payload,
-        &data,
-    );
-    Ok(data)
-}
-
-#[tauri::command]
-async fn cloud_mcp_unpublish_account_asset(
-    state: State<'_, CloudMcpState>,
-    asset_id: String,
-    cloud_id: Option<String>,
-) -> Result<Value, String> {
-    let mut payload = cloud_mcp_asset_payload_base("asset_unpublish_public");
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("asset_id".to_string(), json!(asset_id));
-        object.insert("assetId".to_string(), json!(asset_id));
-        if let Some(cloud_id) = cloud_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("cloud_id".to_string(), json!(cloud_id));
-            object.insert("cloudId".to_string(), json!(cloud_id));
-        }
-    }
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/unpublish-public",
-        &payload,
-    )
-    .await?;
-    let data = response.get("data").cloned().unwrap_or(response);
-    cloud_mcp_update_asset_library_from_response(
-        "asset_unpublish_public",
-        Some("/v1/assets/unpublish-public"),
         &payload,
         &data,
     );
@@ -26266,6 +26229,63 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn deleting_local_account_asset_stays_account_scoped() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("asset-delete-local-account-scope");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let local_path = root.join("snip.png");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&local_path, b"fake png payload").unwrap();
+
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        let asset_id = "asset-snip-delete-local";
+        cloud_mcp_asset_store_local_row(&json!({
+            "asset_id": asset_id,
+            "assetId": asset_id,
+            "repo_id": "legacy-repo",
+            "repoId": "legacy-repo",
+            "workspace_id": "legacy-workspace",
+            "workspaceId": "legacy-workspace",
+            "workspace_name": "Legacy Workspace",
+            "workspaceName": "Legacy Workspace",
+            "name": "snip.png",
+            "kind": "image",
+            "mime_type": "image/png",
+            "size_bytes": 16,
+            "sha256": "fake-sha",
+            "blob_id": "blob-snip-delete-local",
+            "cloud_status": "cloud_available",
+            "local_status": "local_available",
+            "local_path": local_path.to_str().unwrap(),
+            "object_key": "diffforge/assets/blobs/blob-snip-delete-local",
+            "origin_device_id": "device-a",
+            "updated_at": "2026-06-14T00:00:00.000Z"
+        }))
+        .unwrap();
+
+        let deleted = cloud_mcp_delete_local_asset_copy(asset_id, true).unwrap();
+        assert!(!local_path.exists());
+        assert_eq!(deleted["asset"]["assetScope"].as_str(), Some("account"));
+        assert_eq!(
+            deleted["asset"]["local_status"].as_str(),
+            Some("local_deleted")
+        );
+        assert_eq!(deleted["asset"]["cloud_status"].as_str(), Some("cloud_available"));
+        assert!(deleted["asset"].get("repo_id").is_none());
+        assert!(deleted["asset"].get("repoId").is_none());
+        assert!(deleted["asset"].get("workspace_id").is_none());
+        assert!(deleted["asset"].get("workspaceId").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn desktop_device_key_metadata_is_stable_and_namespaced() {
         let (key_id, public_key) = cloud_mcp_desktop_device_key_metadata_for_secret(
             "macos-native-1",
@@ -28755,16 +28775,18 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "upload failed".to_string());
         let message = format!("Asset upload returned {}: {}", status.as_u16(), detail);
-        let _ = cloud_mcp_asset_store_local_transfer_progress(
-            &fail_asset_id,
-            &fail_transfer_id,
-            &fail_cloud_id,
-            "upload",
-            "failed",
-            bytes_total,
-            0,
-            Some(&message),
-        );
+        if !cloud_mcp_asset_transfer_error_requires_reprepare(&message, "upload") {
+            let _ = cloud_mcp_asset_store_local_transfer_progress(
+                &fail_asset_id,
+                &fail_transfer_id,
+                &fail_cloud_id,
+                "upload",
+                "failed",
+                bytes_total,
+                0,
+                Some(&message),
+            );
+        }
         return Err(message);
     }
     let completed_bytes = bytes_total.max(i64::try_from(length).unwrap_or(i64::MAX));
@@ -28884,18 +28906,8 @@ fn cloud_mcp_download_asset_streaming_blocking(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "download failed".to_string());
         let message = format!("Asset download returned {}: {}", status.as_u16(), detail);
-        let _ = cloud_mcp_asset_store_local_transfer_progress(
-            &fail_asset_id,
-            &fail_transfer_id,
-            &fail_cloud_id,
-            "download",
-            "failed",
-            expected_size,
-            0,
-            Some(&message),
-        );
-        if let Some(reporter) = failure_reporter.as_ref() {
-            let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
+        if !cloud_mcp_asset_transfer_error_requires_reprepare(&message, "download") {
+            let _ = cloud_mcp_asset_store_local_transfer_progress(
                 &fail_asset_id,
                 &fail_transfer_id,
                 &fail_cloud_id,
@@ -28904,7 +28916,19 @@ fn cloud_mcp_download_asset_streaming_blocking(
                 expected_size,
                 0,
                 Some(&message),
-            ));
+            );
+            if let Some(reporter) = failure_reporter.as_ref() {
+                let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
+                    &fail_asset_id,
+                    &fail_transfer_id,
+                    &fail_cloud_id,
+                    "download",
+                    "failed",
+                    expected_size,
+                    0,
+                    Some(&message),
+                ));
+            }
         }
         return Err(message);
     }

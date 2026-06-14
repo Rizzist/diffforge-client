@@ -2352,6 +2352,9 @@ async fn insert_handsfree_transcribed_text(
         });
     }
 
+    #[cfg(target_os = "macos")]
+    let _ = audio_widget_release_keyboard_focus_on_main_thread(&app);
+
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(AUDIO_HANDSFREE_INSERT_DELAY_MS));
         insert_text_with_enigo(&text)

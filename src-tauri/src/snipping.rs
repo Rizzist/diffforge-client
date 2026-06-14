@@ -184,6 +184,10 @@ struct SnippingState {
     /// strip on focus loss or global mouse release.
     strip_interaction_guard_until_ms: Arc<AtomicU64>,
     strip_outside_click_watcher_active: Arc<AtomicBool>,
+    /// Bumped on every strip show/close. Delayed show reassertions and hide
+    /// tasks compare their ticket so stale timers cannot resurrect or hide the
+    /// wrong visibility state.
+    strip_visibility_generation: Arc<AtomicU64>,
     /// Set by the watcher as soon as it sees mouse-up for a native preview
     /// drag, before the main-thread settle pass can decide whether the
     /// left-column quiet gate applies. This prevents a post-release Moved
@@ -228,6 +232,7 @@ impl SnippingState {
             preview_drag_handoff_until_ms: Arc::new(StdMutex::new(HashMap::new())),
             strip_interaction_guard_until_ms: Arc::new(AtomicU64::new(0)),
             strip_outside_click_watcher_active: Arc::new(AtomicBool::new(false)),
+            strip_visibility_generation: Arc::new(AtomicU64::new(0)),
             preview_post_release_check_pending: Arc::new(AtomicBool::new(false)),
             preview_closing: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
@@ -4249,6 +4254,26 @@ async fn snipping_publish_uploaded_asset(
     }))
 }
 
+#[tauri::command]
+async fn snipping_delete_uploaded_asset_from_cloud(
+    app: AppHandle,
+    request: SnippingPublishAssetRequest,
+) -> Result<Value, String> {
+    let asset_id = request.asset_id.trim().to_string();
+    if asset_id.is_empty() {
+        return Err("An asset id is required to remove a snip from Cloud.".to_string());
+    }
+    let deleted =
+        cloud_mcp_delete_cloud_account_asset(app.state::<CloudMcpState>(), asset_id.clone(), None)
+            .await?;
+    Ok(json!({
+        "kind": "snip_cloud_upload_deleted",
+        "asset_id": asset_id.clone(),
+        "assetId": asset_id,
+        "deleted": deleted,
+    }))
+}
+
 /// Full snip share chain for the preview/strip upload button: promote the
 /// untracked snip into the tracked library, upload it to the cloud, and —
 /// when the snip upload-public setting is on — publish a public link so the
@@ -6492,15 +6517,61 @@ fn snipping_strip_mark_interaction_guard(app: &AppHandle, active: bool) {
         .store(guard_until_ms, Ordering::SeqCst);
 }
 
+fn snipping_strip_next_visibility_generation(app: &AppHandle) -> u64 {
+    app.state::<SnippingState>()
+        .strip_visibility_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1
+}
+
 fn snipping_strip_close_if_visible(app: &AppHandle, only_if_unfocused: bool) {
     let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
         return;
     };
-    if !window.is_visible().unwrap_or(false) {
-        return;
-    }
     snipping_strip_hide_animated(app, window, only_if_unfocused);
 }
+
+#[cfg(target_os = "macos")]
+fn snipping_strip_force_hide_now(window: &tauri::WebviewWindow) {
+    snipping_hide_window_now(window, "strip_force_hide_tauri");
+    snipping_catch_objc("strip_force_hide_order_out", || {
+        let Ok(ns_window) = window.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setAlphaValue(0.0);
+        ns_window.orderOut(None);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_strip_force_hide_now(window: &tauri::WebviewWindow) {
+    snipping_hide_window_now(window, "strip_force_hide");
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_strip_restore_show_alpha(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let window_for_alpha = window_for_main.clone();
+    let _ = window_for_main.run_on_main_thread(move || {
+        snipping_catch_objc("strip_restore_alpha", || {
+            let Ok(ns_window) = window_for_alpha.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setAlphaValue(1.0);
+        });
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_strip_restore_show_alpha(_window: &tauri::WebviewWindow) {}
 
 fn snipping_strip_schedule_focus_loss_close(app: &AppHandle) {
     let app = app.clone();
@@ -6518,7 +6589,7 @@ fn snipping_strip_schedule_focus_loss_close(app: &AppHandle) {
         if !window.is_visible().unwrap_or(false) || window.is_focused().unwrap_or(false) {
             return;
         }
-        snipping_strip_hide_animated(&app, window, true);
+        snipping_strip_hide_animated(&app, window, false);
     });
 }
 
@@ -6761,13 +6832,23 @@ fn snipping_strip_reassert_open_state(
     app: &AppHandle,
     origin: &'static str,
     emit_anim: bool,
+    generation: u64,
 ) -> bool {
+    if app
+        .state::<SnippingState>()
+        .strip_visibility_generation
+        .load(Ordering::SeqCst)
+        != generation
+    {
+        return false;
+    }
     let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) else {
         return false;
     };
     if !window.is_visible().unwrap_or(false) {
         return false;
     }
+    snipping_strip_restore_show_alpha(&window);
     #[cfg(target_os = "macos")]
     {
         snipping_convert_overlay_window_to_panel(&window);
@@ -6781,18 +6862,18 @@ fn snipping_strip_reassert_open_state(
     true
 }
 
-fn snipping_strip_emit_open_reassert(app: &AppHandle, origin: &'static str) {
+fn snipping_strip_emit_open_reassert(app: &AppHandle, origin: &'static str, generation: u64) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(SNIPPING_STRIP_REASSERT_SHOW_MS)).await;
-        if !snipping_strip_reassert_open_state(&app, origin, true) {
+        if !snipping_strip_reassert_open_state(&app, origin, true, generation) {
             return;
         }
         sleep(Duration::from_millis(
             SNIPPING_STRIP_COLD_BOOT_REASSERT_MS.saturating_sub(SNIPPING_STRIP_REASSERT_SHOW_MS),
         ))
         .await;
-        let _ = snipping_strip_reassert_open_state(&app, origin, false);
+        let _ = snipping_strip_reassert_open_state(&app, origin, false, generation);
     });
 }
 
@@ -6801,15 +6882,27 @@ fn snipping_strip_hide_animated(
     window: tauri::WebviewWindow,
     only_if_unfocused: bool,
 ) {
+    if only_if_unfocused && window.is_focused().unwrap_or(false) {
+        return;
+    }
+    let generation = snipping_strip_next_visibility_generation(app);
+    let generation_state = app
+        .state::<SnippingState>()
+        .strip_visibility_generation
+        .clone();
     snipping_strip_emit_anim(app, "close", None);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(SNIPPING_STRIP_CLOSE_ANIM_MS)).await;
+        if generation_state.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let generation_state_for_main = generation_state.clone();
         let _ = app.run_on_main_thread(move || {
-            if only_if_unfocused && window.is_focused().unwrap_or(false) {
+            if generation_state_for_main.load(Ordering::SeqCst) != generation {
                 return;
             }
-            snipping_hide_window_now(&window, "strip_hide_animated");
+            snipping_strip_force_hide_now(&window);
         });
     });
 }
@@ -6822,11 +6915,13 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     let Some(window) = snipping_strip_window(app) else {
         return;
     };
+    let generation = snipping_strip_next_visibility_generation(app);
     let origin = snipping_strip_position(app, &window);
     #[cfg(target_os = "macos")]
     snipping_convert_overlay_window_to_panel(&window);
     #[cfg(target_os = "macos")]
     snipping_strip_apply_macos_overlay_style(&window);
+    snipping_strip_restore_show_alpha(&window);
     snipping_show_window_now(&window, "strip_show");
     #[cfg(target_os = "macos")]
     snipping_strip_order_front_regardless(&window);
@@ -6836,7 +6931,7 @@ pub(crate) fn snipping_strip_show(app: &AppHandle) {
     snipping_focus_window_now(&window, "strip_focus");
     snipping_strip_emit_anim(app, "open", Some(origin));
     snipping_strip_start_outside_click_watcher(app);
-    snipping_strip_emit_open_reassert(app, origin);
+    snipping_strip_emit_open_reassert(app, origin, generation);
 }
 
 /// Tray-click toggle for the recent-snips bar. The strip is persistent now:

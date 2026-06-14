@@ -25,7 +25,7 @@ impl DeveloperProcessMonitorState {
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            developer_process_refresh_kind(),
+            developer_process_refresh_kind(true),
         );
 
         Self {
@@ -92,6 +92,19 @@ struct DeveloperEnergySnapshot {
     top_label: String,
     top_cause: String,
     groups: Vec<DeveloperEnergyGroup>,
+}
+
+impl DeveloperEnergySnapshot {
+    fn idle(sampled_at_ms: u64) -> Self {
+        Self {
+            sampled_at_ms,
+            total_score: 0.0,
+            active_group_count: 0,
+            top_label: "Diagnostics off".to_string(),
+            top_cause: "Energy diagnostics are disabled for the low-power process list.".to_string(),
+            groups: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -399,6 +412,8 @@ async fn list_developer_processes(
     active_workspace_root: Option<String>,
     workspace_roots: Vec<String>,
     force: Option<bool>,
+    include_diagnostics: Option<bool>,
+    include_ports: Option<bool>,
 ) -> Result<DeveloperProcessSnapshot, String> {
     collect_developer_process_snapshot(
         state.inner(),
@@ -407,6 +422,8 @@ async fn list_developer_processes(
         active_workspace_root,
         workspace_roots,
         force.unwrap_or(false),
+        include_diagnostics.unwrap_or(false),
+        include_ports.unwrap_or(false),
     )
     .await
 }
@@ -418,14 +435,20 @@ async fn collect_developer_process_snapshot(
     active_workspace_root: Option<String>,
     workspace_roots: Vec<String>,
     force: bool,
+    include_diagnostics: bool,
+    include_ports: bool,
 ) -> Result<DeveloperProcessSnapshot, String> {
     let active_workspace_root = normalize_optional_process_root(active_workspace_root.as_deref());
     let workspace_roots =
         normalize_process_roots(workspace_roots, active_workspace_root.as_deref());
     let app_pid = std::process::id();
     let sampled_at_ms = current_time_ms();
-    let cache_key =
-        developer_process_snapshot_cache_key(active_workspace_root.as_deref(), &workspace_roots);
+    let cache_key = developer_process_snapshot_cache_key(
+        active_workspace_root.as_deref(),
+        &workspace_roots,
+        include_diagnostics,
+        include_ports,
+    );
     if !force {
         if let Some(snapshot) =
             developer_cached_process_snapshot(state, &cache_key, sampled_at_ms)
@@ -435,8 +458,16 @@ async fn collect_developer_process_snapshot(
     }
 
     let terminal_roots = developer_terminal_process_roots(&terminal_state).await;
-    let cloud_signals = developer_energy_cloud_signals(cloud_state).await;
-    let bound_ports_by_pid = developer_bound_ports_by_pid_cached(state, sampled_at_ms, force).await;
+    let cloud_signals = if include_diagnostics {
+        developer_energy_cloud_signals(cloud_state).await
+    } else {
+        DeveloperEnergyCloudSignals::default()
+    };
+    let bound_ports_by_pid = if include_ports {
+        developer_bound_ports_by_pid_cached(state, sampled_at_ms, force).await
+    } else {
+        HashMap::new()
+    };
 
     let (
         processes,
@@ -454,12 +485,16 @@ async fn collect_developer_process_snapshot(
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            developer_process_refresh_kind(),
+            developer_process_refresh_kind(include_diagnostics),
         );
 
         let parent_map = developer_parent_map(&system);
         let child_map = developer_child_map(&system);
-        let app_descendant_pids = developer_descendant_pid_set(app_pid, &child_map);
+        let app_descendant_pids = if include_diagnostics {
+            developer_descendant_pid_set(app_pid, &child_map)
+        } else {
+            HashSet::new()
+        };
         let terminal_roots_by_pid = terminal_roots
             .iter()
             .map(|root| (root.root_pid, root))
@@ -473,22 +508,36 @@ async fn collect_developer_process_snapshot(
             let terminal_link =
                 developer_terminal_link_for_process(pid_u32, &terminal_roots_by_pid, &parent_map);
             let name = clean_process_text(&process.name().to_string_lossy());
-            let command = process_command_text(process.cmd());
-            let executable = process.exe().map(process_path_display).unwrap_or_default();
-            let cwd = process.cwd().map(process_path_display).unwrap_or_default();
-            let in_app_family = pid_u32 == app_pid || app_descendant_pids.contains(&pid_u32);
-            energy.add_process(
-                pid_u32,
-                &name,
-                &command,
-                &executable,
-                &cwd,
-                f64::from(process.cpu_usage()).max(0.0),
-                process.memory(),
-                pid_u32 == app_pid,
-                in_app_family,
-                terminal_link.is_some(),
-            );
+            let command = if include_diagnostics {
+                process_command_text(process.cmd())
+            } else {
+                String::new()
+            };
+            let executable = if include_diagnostics {
+                process.exe().map(process_path_display).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let cwd = if include_diagnostics {
+                process.cwd().map(process_path_display).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if include_diagnostics {
+                let in_app_family = pid_u32 == app_pid || app_descendant_pids.contains(&pid_u32);
+                energy.add_process(
+                    pid_u32,
+                    &name,
+                    &command,
+                    &executable,
+                    &cwd,
+                    f64::from(process.cpu_usage()).max(0.0),
+                    process.memory(),
+                    pid_u32 == app_pid,
+                    in_app_family,
+                    terminal_link.is_some(),
+                );
+            }
 
             if pid_u32 == app_pid {
                 continue;
@@ -498,6 +547,12 @@ async fn collect_developer_process_snapshot(
                 DeveloperProcessAttribution {
                     id: "diffForge",
                     label: "Diff Forge terminal",
+                    workspace_root: String::new(),
+                }
+            } else if !include_diagnostics {
+                DeveloperProcessAttribution {
+                    id: "system",
+                    label: "System",
                     workspace_root: String::new(),
                 }
             } else {
@@ -520,7 +575,11 @@ async fn collect_developer_process_snapshot(
             };
 
             let child_pids = child_map.get(&pid_u32).cloned().unwrap_or_default();
-            let child_count = developer_descendant_count(pid_u32, &child_map);
+            let child_count = if include_diagnostics {
+                developer_descendant_count(pid_u32, &child_map)
+            } else {
+                child_pids.len()
+            };
             let risk = developer_process_risk(&classification, &attribution);
             let kill_disabled_reason =
                 developer_kill_disabled_reason(pid_u32, &classification, &risk);
@@ -633,7 +692,11 @@ async fn collect_developer_process_snapshot(
             total_memory_bytes,
             high_activity_count,
             protected_count,
-            energy.finish(energy_signals),
+            if include_diagnostics {
+                energy.finish(energy_signals)
+            } else {
+                DeveloperEnergySnapshot::idle(sampled_at_ms)
+            },
         )
     };
 
@@ -655,12 +718,16 @@ async fn collect_developer_process_snapshot(
 fn developer_process_snapshot_cache_key(
     active_workspace_root: Option<&str>,
     workspace_roots: &[String],
+    include_diagnostics: bool,
+    include_ports: bool,
 ) -> String {
     let mut roots = workspace_roots.to_vec();
     roots.sort();
     format!(
-        "active={}\nroots={}",
+        "active={}\ndiagnostics={}\nports={}\nroots={}",
         active_workspace_root.unwrap_or_default(),
+        include_diagnostics,
+        include_ports,
         roots.join("\n")
     )
 }
@@ -783,6 +850,8 @@ async fn terminal_activity_snapshot(
         terminal_state.inner(),
         None,
         Vec::new(),
+        false,
+        false,
         false,
     )
     .await?;
@@ -1692,7 +1761,7 @@ fn kill_developer_process(
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        developer_process_refresh_kind(),
+        developer_process_refresh_kind(true),
     );
 
     if system.process(SysPid::from_u32(pid)).is_none() {
@@ -1716,7 +1785,7 @@ fn kill_developer_process(
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            developer_process_refresh_kind(),
+            developer_process_refresh_kind(true),
         );
         state.invalidate_process_snapshot_cache();
         return Ok(result);
@@ -1745,7 +1814,7 @@ fn kill_developer_process(
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            developer_process_refresh_kind(),
+            developer_process_refresh_kind(true),
         );
 
         if killed_pids.is_empty() {
@@ -3463,14 +3532,16 @@ fn docker_command_error_message(prefix: &str, result: &DockerDeveloperCommandRes
     format!("{prefix} {detail}")
 }
 
-fn developer_process_refresh_kind() -> ProcessRefreshKind {
-    ProcessRefreshKind::nothing()
-        .with_cpu()
-        .with_memory()
-        .with_cmd(UpdateKind::OnlyIfNotSet)
-        .with_exe(UpdateKind::OnlyIfNotSet)
-        .with_cwd(UpdateKind::OnlyIfNotSet)
-        .without_tasks()
+fn developer_process_refresh_kind(include_metadata: bool) -> ProcessRefreshKind {
+    let kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+    if include_metadata {
+        kind.with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cwd(UpdateKind::OnlyIfNotSet)
+            .without_tasks()
+    } else {
+        kind.without_tasks()
+    }
 }
 
 fn developer_process_platform() -> &'static str {

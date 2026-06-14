@@ -9073,6 +9073,7 @@ export default function App() {
     setWorkspaces([]);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
+    activatedWorkspaceIdRef.current = "";
     setWorkspaceSyncState("idle");
     setWorkspaceListHydrated(false);
     setWorkspaceHydrationReady(false);
@@ -9152,6 +9153,7 @@ export default function App() {
     setWorkspaceHydrationReady(false);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
+    activatedWorkspaceIdRef.current = "";
     setWorkspacePendingActivationId("");
     workspacePendingActivationIdRef.current = "";
     setWorkspaceNameDraft("");
@@ -10010,6 +10012,7 @@ export default function App() {
           .map((enabledWorkspaceId) => findWorkspaceById(workspacesRef.current, enabledWorkspaceId))
           .find(Boolean);
         const nextActivatedWorkspaceId = nextActivatedWorkspace?.id || "";
+        activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
         setActivatedWorkspaceId(nextActivatedWorkspaceId);
       }
       if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
@@ -10138,7 +10141,9 @@ export default function App() {
         .find(Boolean)
         || nextWorkspaces[0]
         || null;
-      setActivatedWorkspaceId(nextActivatedWorkspace?.id || "");
+      const nextActivatedWorkspaceId = nextActivatedWorkspace?.id || "";
+      activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
+      setActivatedWorkspaceId(nextActivatedWorkspaceId);
     }
     if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
       setSelectedWorkspaceId(nextWorkspaces[0]?.id || "");
@@ -11267,7 +11272,9 @@ export default function App() {
 
         return nextSelected?.id || "";
       });
-      setActivatedWorkspaceId(nextActivated?.id || "");
+      const nextActivatedWorkspaceId = nextActivated?.id || "";
+      activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
+      setActivatedWorkspaceId(nextActivatedWorkspaceId);
     };
 
     // Local-first: the on-disk catalog renders immediately; the cloud catalog
@@ -11362,6 +11369,7 @@ export default function App() {
     setWorkspaces([]);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
+    activatedWorkspaceIdRef.current = "";
     setWorkspaceSyncState("loading");
     setWorkspaceListHydrated(false);
     setWorkspaceHydrationReady(false);
@@ -11398,7 +11406,9 @@ export default function App() {
       setWorkspaces(merged);
       if (activatedWorkspaceIdRef.current
         && !findWorkspaceById(merged, activatedWorkspaceIdRef.current)) {
-        setActivatedWorkspaceId(merged[0]?.id || "");
+        const nextActivatedWorkspaceId = merged[0]?.id || "";
+        activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
+        setActivatedWorkspaceId(nextActivatedWorkspaceId);
       }
       setSelectedWorkspaceId((currentSelectedId) => (
         findWorkspaceById(merged, currentSelectedId) ? currentSelectedId : (merged[0]?.id || "")
@@ -11533,6 +11543,7 @@ export default function App() {
       workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId(workspace.id);
+      activatedWorkspaceIdRef.current = workspace.id;
       setActivatedWorkspaceId(workspace.id);
       updateWorkspaceLifecycleSettings({
         defaultWorkspaceId: currentLifecycleSettings.defaultWorkspaceId || "",
@@ -13307,14 +13318,38 @@ export default function App() {
     };
   }, [workspaceTerminalFallbackRole, workspaceTerminalRoleOptions]);
 
+  const appHasOpenWorkspaceRuntime = useCallback(() => {
+    const lifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+    const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(lifecycleSettings.enabledWorkspaceIds);
+    const currentWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
+    const hasKnownWorkspace = (workspaceId) => Boolean(findWorkspaceById(currentWorkspaces, workspaceId));
+    const activatedId = String(activatedWorkspaceIdRef.current || "").trim();
+    return Boolean(
+      enabledWorkspaceIds.some(hasKnownWorkspace)
+        || (activatedId && hasKnownWorkspace(activatedId)),
+    );
+  }, []);
+
+  const buildEmptyAppCloseTerminalSnapshot = useCallback((source = "app_close", generatedAtMs = Date.now()) => ({
+    ...APP_CLOSE_CONFIRM_INITIAL_STATE,
+    generatedAtMs,
+    source,
+    terminalCount: 0,
+    workspaces: [],
+  }), []);
+
   const readAppCloseActiveTerminalSnapshot = useCallback(async (source = "app_close") => {
+    if (!appHasOpenWorkspaceRuntime()) {
+      return buildEmptyAppCloseTerminalSnapshot(source);
+    }
+
     const liveSessions = await withTimeout(
       invoke("terminal_live_sessions"),
       APP_CLOSE_TERMINAL_SNAPSHOT_TIMEOUT_MS,
       "Terminal activity check timed out.",
     );
     return buildAppCloseActiveTerminalSnapshot(liveSessions, source);
-  }, [buildAppCloseActiveTerminalSnapshot]);
+  }, [appHasOpenWorkspaceRuntime, buildAppCloseActiveTerminalSnapshot, buildEmptyAppCloseTerminalSnapshot]);
 
   const performCloseWindow = useCallback((eventOrOptions = null, maybeOptions = {}) => {
     const options = eventOrOptions && typeof eventOrOptions === "object" && typeof eventOrOptions.stopPropagation !== "function"
@@ -13492,6 +13527,17 @@ export default function App() {
     }
 
     const requestGeneratedAtMs = Date.now();
+    if (!appHasOpenWorkspaceRuntime()) {
+      const confirmation = {
+        ...buildEmptyAppCloseTerminalSnapshot(reason, requestGeneratedAtMs),
+        isOpen: true,
+        isLoading: false,
+      };
+      appCloseConfirmStateRef.current = confirmation;
+      setAppCloseConfirmState(confirmation);
+      return;
+    }
+
     const loadingConfirmation = {
       ...APP_CLOSE_CONFIRM_INITIAL_STATE,
       generatedAtMs: requestGeneratedAtMs,
@@ -13541,7 +13587,12 @@ export default function App() {
         setAppCloseConfirmState(errorConfirmation);
       }
     });
-  }, [performCloseWindow, readAppCloseActiveTerminalSnapshot]);
+  }, [
+    appHasOpenWorkspaceRuntime,
+    buildEmptyAppCloseTerminalSnapshot,
+    performCloseWindow,
+    readAppCloseActiveTerminalSnapshot,
+  ]);
 
   const cancelAppCloseConfirmation = useCallback(() => {
     const currentConfirmation = appCloseConfirmStateRef.current;
@@ -13935,6 +13986,7 @@ export default function App() {
     setWorkspaces([]);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
+    activatedWorkspaceIdRef.current = "";
     setWorkspacePendingActivationId("");
     setWorkspaceSyncState("idle");
     setWorkspaceListHydrated(false);

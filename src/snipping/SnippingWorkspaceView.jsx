@@ -574,8 +574,8 @@ export default function SnippingWorkspaceView({
             <AudioRecorderOptionRow>
               <SettingsHint>
                 {uploadPublic
-                  ? "Snip uploads mint a public link instantly, ready to copy."
-                  : "Snip uploads stay private; each snip needs an explicit Make public step."}
+                  ? "Snip uploads create a public URL immediately."
+                  : "Snip uploads create a private Cloud copy first."}
               </SettingsHint>
               <McpSwitchButton
                 aria-pressed={uploadPublic ? "true" : "false"}
@@ -584,7 +584,7 @@ export default function SnippingWorkspaceView({
                 type="button"
               >
                 <span aria-hidden="true" />
-                {togglingUploadPublic ? "Switching" : uploadPublic ? "Public" : "Private"}
+                {togglingUploadPublic ? "Switching" : uploadPublic ? "Public upload" : "Private upload"}
               </McpSwitchButton>
             </AudioRecorderOptionRow>
             {lastCapture?.localPath && (

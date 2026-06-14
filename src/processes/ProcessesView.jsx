@@ -24,7 +24,9 @@ import {
 } from "../app/appStyles";
 
 const PROCESS_REFRESH_MS = 15000;
-const DOCKER_REFRESH_MS = 30000;
+const DOCKER_REFRESH_MS = 120000;
+const PROCESS_DIAGNOSTICS_ENABLED = false;
+const PROCESS_PORTS_ENABLED = false;
 const HIGH_CPU_PERCENT = 65;
 const HIGH_MEMORY_BYTES = 1024 * 1024 * 1024;
 const PROCESS_BUSY_SPINNER_SEGMENTS = Array.from({ length: 8 }, (_, index) => index);
@@ -1072,6 +1074,8 @@ export default function ProcessesView({
       const result = await invoke("list_developer_processes", {
         activeWorkspaceRoot: "",
         force,
+        includeDiagnostics: PROCESS_DIAGNOSTICS_ENABLED,
+        includePorts: PROCESS_PORTS_ENABLED,
         workspaceRoots: normalizedWorkspaceRoots,
       });
 
@@ -1081,7 +1085,11 @@ export default function ProcessesView({
 
       setSnapshot(result);
       setError("");
-      setRefreshState("idle");
+      if (!silent) {
+        setRefreshState("idle");
+      } else {
+        setRefreshState((state) => (state === "refreshing" ? "idle" : state));
+      }
     })();
     processLoadRef.current = request;
     try {
@@ -1092,7 +1100,11 @@ export default function ProcessesView({
       }
 
       setError(errorMessage(loadError));
-      setRefreshState("idle");
+      if (!silent) {
+        setRefreshState("idle");
+      } else {
+        setRefreshState((state) => (state === "refreshing" ? "idle" : state));
+      }
     } finally {
       if (processLoadRef.current === request) {
         processLoadRef.current = null;
@@ -1104,7 +1116,7 @@ export default function ProcessesView({
   // keeps working in background/headless mode.
   const loadContainers = useCallback(async ({
     force = false,
-    includeStats = true,
+    includeStats = false,
     silent = false,
   } = {}) => {
     if (containersLoadRef.current) {
@@ -1136,10 +1148,20 @@ export default function ProcessesView({
     }
   }, []);
 
+  const refreshAll = useCallback(async ({ force = false } = {}) => {
+    setRefreshState("loading");
+    await Promise.allSettled([
+      loadProcesses({ force, silent: true }),
+      loadContainers({ force, includeStats: false, silent: true }),
+    ]);
+    if (mountedRef.current) {
+      setRefreshState("idle");
+    }
+  }, [loadContainers, loadProcesses]);
+
   useEffect(() => {
     mountedRef.current = true;
-    loadProcesses();
-    loadContainers({ silent: true });
+    refreshAll();
 
     const processIntervalId = window.setInterval(() => {
       if (document.visibilityState !== "hidden") {
@@ -1151,7 +1173,7 @@ export default function ProcessesView({
         // A missing CLI never recovers on its own; skip the auto-poll and let
         // the manual Refresh button retry it.
         if (containersStateRef.current !== "cli_missing") {
-          loadContainers({ silent: true });
+          loadContainers({ includeStats: false, silent: true });
         }
       }
     }, DOCKER_REFRESH_MS);
@@ -1161,7 +1183,7 @@ export default function ProcessesView({
       window.clearInterval(processIntervalId);
       window.clearInterval(containerIntervalId);
     };
-  }, [loadContainers, loadProcesses]);
+  }, [loadContainers, loadProcesses, refreshAll]);
 
   const fetchContainerLogs = useCallback(async (container) => {
     setContainerLogs({
@@ -1353,6 +1375,9 @@ export default function ProcessesView({
     0,
   );
   const energy = snapshot?.energy || null;
+  const energyGroups = Array.isArray(energy?.groups) ? energy.groups : [];
+  const showEnergyDiagnostics = energyGroups.length > 0;
+  const isRefreshing = refreshState === "loading" || refreshState === "refreshing";
 
   const beginStopProcess = useCallback((process) => {
     if (!process.killable) {
@@ -1526,10 +1551,12 @@ export default function ProcessesView({
             <span>Memory</span>
             <strong>{formatBytes(totalMemoryBytes)}</strong>
           </ProcessMetric>
-          <ProcessMetric data-tone={energyTone(energy?.totalScore)}>
-            <span>Energy</span>
-            <strong>{formatEnergy(energy?.totalScore)}</strong>
-          </ProcessMetric>
+          {showEnergyDiagnostics && (
+            <ProcessMetric data-tone={energyTone(energy?.totalScore)}>
+              <span>Energy</span>
+              <strong>{formatEnergy(energy?.totalScore)}</strong>
+            </ProcessMetric>
+          )}
           <SecondaryButton
             disabled={dockerActionState.state === "running"}
             onClick={() => beginDockerAction("relaunch", null)}
@@ -1547,15 +1574,17 @@ export default function ProcessesView({
             <span>Rebuild</span>
           </SecondaryButton>
           <SecondaryButton
-            disabled={refreshState === "loading"}
+            data-refreshing={isRefreshing ? "true" : undefined}
+            disabled={isRefreshing}
             onClick={() => {
-              loadProcesses({ force: true });
-              loadContainers({ force: true });
+              refreshAll({ force: true });
             }}
             type="button"
           >
-            <ButtonRefreshIcon aria-hidden="true" />
-            <span>{refreshState === "loading" ? "Refreshing..." : "Refresh"}</span>
+            <RefreshIconSlot data-spinning={isRefreshing ? "true" : undefined}>
+              <ButtonRefreshIcon aria-hidden="true" />
+            </RefreshIconSlot>
+            <span>{isRefreshing ? "Refreshing..." : "Refresh"}</span>
           </SecondaryButton>
         </ProcessHeaderActions>
       </ProcessHeader>
@@ -1575,7 +1604,7 @@ export default function ProcessesView({
         <ProcessDockerActionLog result={dockerActionState.result} />
       )}
 
-      <ProcessEnergySection energy={energy} />
+      {showEnergyDiagnostics && <ProcessEnergySection energy={energy} />}
 
       {containersSnapshot && containersSnapshot.state !== "cli_missing" && (
         <ProcessContainersPanel aria-label="Docker containers">
@@ -1837,6 +1866,28 @@ const ProcessHeaderActions = styled.div`
   @media (max-width: 980px) {
     width: 100%;
     justify-content: flex-start;
+  }
+`;
+
+const processRefreshSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
+const RefreshIconSlot = styled.span`
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  line-height: 0;
+
+  &[data-spinning="true"] {
+    animation: ${processRefreshSpin} 850ms linear infinite;
+  }
+
+  svg {
+    display: block;
   }
 `;
 

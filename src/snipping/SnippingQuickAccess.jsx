@@ -6,6 +6,7 @@ import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { BlurOn } from "@styled-icons/material-rounded/BlurOn";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { CloudOff } from "@styled-icons/material-rounded/CloudOff";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Crop } from "@styled-icons/material-rounded/Crop";
@@ -467,11 +468,12 @@ async function copyTextToClipboard(value) {
 
 /**
  * Upload-button state machine shared by the floating preview and the strip
- * tile: idle -> uploading -> done when the snip upload-public setting mints a
- * link during upload, or idle -> uploading -> private -> publishing -> done
- * when snip uploads stay private and "Make public" is an explicit second
- * step. In "done" the same button becomes "Copy URL" for the public link. A
- * different adopted snip or an annotation save resets to idle because the
+ * tile: idle -> uploading -> private for private snip uploads, or idle ->
+ * uploading -> done when the snip upload-public setting mints a link during
+ * upload. The primary button is then "Unupload" for private copies and
+ * "Copy URL" for public links; the single CloudOff delete path removes both
+ * private sync storage and any public copy/link.
+ * A different adopted snip or an annotation save resets to idle because the
  * uploaded asset no longer matches the visible pixels.
  */
 function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
@@ -540,6 +542,25 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     }
   }, [assetId, showStatus]);
 
+  const deleteCloudUpload = useCallback(async () => {
+    if (!assetId) return;
+    const previousState = uploadState;
+    setUploadState("deleting");
+    try {
+      await invoke("snipping_delete_uploaded_asset_from_cloud", {
+        request: { assetId },
+      });
+      setAssetId("");
+      setPublicUrl("");
+      setUrlCopied(false);
+      setUploadState("idle");
+      showStatus("Cloud upload removed");
+    } catch (error) {
+      setUploadState(previousState === "done" || publicUrl ? "done" : "private");
+      throw error;
+    }
+  }, [assetId, publicUrl, showStatus, uploadState]);
+
   const copyPublicUrl = useCallback(async () => {
     const copied = await copyTextToClipboard(publicUrl);
     showStatus(copied ? "URL copied" : "Clipboard is not available in this webview.");
@@ -554,25 +575,37 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     }, 1400);
   }, [publicUrl, showStatus]);
 
-  return { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied };
+  return {
+    copyPublicUrl,
+    deleteCloudUpload,
+    makePublic,
+    uploadState,
+    uploadToCloud,
+    urlCopied,
+  };
 }
 
 /* Shared icon+label body for the snip upload button across its five states;
    the surrounding button supplies state styling via data-state. */
 function SnipUploadButtonBody({ uploadState, urlCopied }) {
-  if (uploadState === "uploading" || uploadState === "publishing") {
+  if (["uploading", "publishing", "deleting"].includes(uploadState)) {
+    const label = uploadState === "publishing"
+      ? "Publishing"
+      : uploadState === "deleting"
+        ? "Removing"
+        : "Uploading";
     return (
       <>
         <FloatUploadSpinner aria-hidden="true" />
-        <span>{uploadState === "publishing" ? "Publishing" : "Uploading"}</span>
+        <span>{label}</span>
       </>
     );
   }
   if (uploadState === "private") {
     return (
       <>
-        <Public aria-hidden="true" />
-        <span>Make public</span>
+        <CloudOff aria-hidden="true" />
+        <span>Unupload</span>
       </>
     );
   }
@@ -616,7 +649,8 @@ function SnipStatusPill({ status }) {
 function snipUploadButtonTitle(uploadState, name) {
   if (uploadState === "uploading") return `Uploading ${name}`;
   if (uploadState === "publishing") return `Publishing ${name}`;
-  if (uploadState === "private") return `Make ${name} public`;
+  if (uploadState === "deleting") return `Removing ${name} from Cloud`;
+  if (uploadState === "private") return `Remove Cloud upload of ${name}`;
   if (uploadState === "done") return `Copy public URL for ${name}`;
   return `Upload ${name}`;
 }
@@ -885,7 +919,14 @@ export function SnippingFloatWindow() {
     }
   }, []);
 
-  const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
+  const {
+    copyPublicUrl,
+    deleteCloudUpload,
+    makePublic,
+    uploadState,
+    uploadToCloud,
+    urlCopied,
+  } = useSnipCloudUpload({
     imageVersion,
     localPath,
     name,
@@ -936,10 +977,14 @@ export function SnippingFloatWindow() {
         if (uploadState === "done") {
           await copyPublicUrl();
         } else if (uploadState === "private") {
-          await makePublic();
+          await deleteCloudUpload();
         } else {
           await uploadToCloud();
         }
+      } else if (action === "publish") {
+        await makePublic();
+      } else if (action === "deleteCloud") {
+        await deleteCloudUpload();
       }
     } catch (error) {
       if (action === "delete") {
@@ -952,7 +997,18 @@ export function SnippingFloatWindow() {
         setBusy(false);
       }
     }
-  }, [beginClosing, copyPublicUrl, localPath, makePublic, name, previewUrl, showStatus, uploadState, uploadToCloud]);
+  }, [
+    beginClosing,
+    copyPublicUrl,
+    deleteCloudUpload,
+    localPath,
+    makePublic,
+    name,
+    previewUrl,
+    showStatus,
+    uploadState,
+    uploadToCloud,
+  ]);
 
   // Manual double-press detection: the native window drag begins on the
   // first press, so a synthetic dblclick event is not reliable here.
@@ -1015,16 +1071,42 @@ export function SnippingFloatWindow() {
         >
           <Close aria-hidden="true" />
         </FloatCloseButton>
-        <FloatUploadButton
-          aria-label={snipUploadButtonTitle(uploadState, name)}
-          data-state={uploadState}
-          disabled={busy || closing}
-          onClick={() => runAction("upload")}
-          title={snipUploadButtonTitle(uploadState, name)}
-          type="button"
-        >
-          <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
-        </FloatUploadButton>
+        <FloatUploadControls data-state={uploadState}>
+          {uploadState === "done" && (
+            <FloatUploadSideButton
+              aria-label={`Remove Cloud upload of ${name}`}
+              data-danger="true"
+              disabled={busy || closing}
+              onClick={() => runAction("deleteCloud")}
+              title="Remove Cloud upload"
+              type="button"
+            >
+              <CloudOff aria-hidden="true" />
+            </FloatUploadSideButton>
+          )}
+          {uploadState === "private" && (
+            <FloatUploadSideButton
+              aria-label={`Make ${name} public`}
+              data-primary="true"
+              disabled={busy || closing}
+              onClick={() => runAction("publish")}
+              title="Make public"
+              type="button"
+            >
+              <Public aria-hidden="true" />
+            </FloatUploadSideButton>
+          )}
+          <FloatUploadButton
+            aria-label={snipUploadButtonTitle(uploadState, name)}
+            data-state={uploadState}
+            disabled={busy || closing}
+            onClick={() => runAction("upload")}
+            title={snipUploadButtonTitle(uploadState, name)}
+            type="button"
+          >
+            <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
+          </FloatUploadButton>
+        </FloatUploadControls>
         {uploadState === "uploading" || uploadState === "publishing"
           ? <FloatUploadProgress aria-hidden="true" />
           : null}
@@ -1156,10 +1238,25 @@ const FloatCloseButton = styled.button`
   }
 `;
 
-const FloatUploadButton = styled.button`
+const FloatUploadControls = styled.div`
   position: absolute;
   top: 6px;
   right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+
+  &[data-state="uploading"],
+  &[data-state="publishing"],
+  &[data-state="deleting"],
+  &[data-state="private"],
+  &[data-state="done"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+`;
+
+const FloatUploadButton = styled.button`
   display: inline-flex;
   min-height: 22px;
   align-items: center;
@@ -1189,32 +1286,29 @@ const FloatUploadButton = styled.button`
     cursor: default;
   }
 
-  /* Mid-flow and uploaded chrome stays visible without hover (overrides the
-     parent's hidden-until-hover rule): the user must see progress, the
-     pending Make public step, and the Copy URL affordance at a glance. */
   &[data-state="uploading"],
   &[data-state="publishing"],
+  &[data-state="deleting"],
   &[data-state="private"],
   &[data-state="done"] {
-    opacity: 1;
     pointer-events: auto;
   }
 
   &[data-state="uploading"]:disabled,
-  &[data-state="publishing"]:disabled {
+  &[data-state="publishing"]:disabled,
+  &[data-state="deleting"]:disabled {
     opacity: 1;
     cursor: progress;
   }
 
-  /* Private = uploaded but not shared yet: amber prompt for the next step. */
   &[data-state="private"] {
-    border-color: rgba(247, 201, 72, 0.5);
-    color: #f7e8c1;
+    border-color: rgba(251, 113, 133, 0.42);
+    color: #ffe4e6;
   }
 
   &[data-state="private"]:hover:not(:disabled) {
-    color: #1c1503;
-    background: #f7c948;
+    color: #fff;
+    background: rgba(190, 18, 60, 0.88);
     border-color: transparent;
   }
 
@@ -1227,6 +1321,47 @@ const FloatUploadButton = styled.button`
     color: #06150d;
     background: #5ede99;
     border-color: transparent;
+  }
+`;
+
+const FloatUploadSideButton = styled.button`
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #f8fafc;
+  background: rgba(7, 10, 16, 0.85);
+  cursor: pointer;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.58);
+    color: #06121f;
+    background: #7db0ff;
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.34);
+    color: rgba(204, 251, 241, 0.98);
+    background: rgba(13, 148, 136, 0.24);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.34);
+    color: rgba(254, 205, 211, 0.98);
+    background: rgba(127, 29, 29, 0.24);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 `;
 
@@ -1490,7 +1625,14 @@ function StripSnipTile({
     }
   }, [onDragActivityChange]);
 
-  const { copyPublicUrl, makePublic, uploadState, uploadToCloud, urlCopied } = useSnipCloudUpload({
+  const {
+    copyPublicUrl,
+    deleteCloudUpload,
+    makePublic,
+    uploadState,
+    uploadToCloud,
+    urlCopied,
+  } = useSnipCloudUpload({
     imageVersion,
     localPath,
     name,
@@ -1529,10 +1671,14 @@ function StripSnipTile({
         if (uploadState === "done") {
           await copyPublicUrl();
         } else if (uploadState === "private") {
-          await makePublic();
+          await deleteCloudUpload();
         } else {
           await uploadToCloud();
         }
+      } else if (action === "publish") {
+        await makePublic();
+      } else if (action === "deleteCloud") {
+        await deleteCloudUpload();
       }
     } catch (error) {
       showStatus(error?.message || String(error || "Action failed"));
@@ -1542,6 +1688,7 @@ function StripSnipTile({
   }, [
     busy,
     copyPublicUrl,
+    deleteCloudUpload,
     localPath,
     makePublic,
     name,
@@ -1696,16 +1843,42 @@ function StripSnipTile({
       >
         <PushPin aria-hidden="true" />
       </StripTilePinButton>
-      <StripTileUploadButton
-        aria-label={snipUploadButtonTitle(uploadState, name)}
-        data-state={uploadState}
-        disabled={busy}
-        onClick={() => runAction("upload")}
-        title={snipUploadButtonTitle(uploadState, name)}
-        type="button"
-      >
-        <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
-      </StripTileUploadButton>
+      <StripUploadControls data-state={uploadState}>
+        {uploadState === "done" && (
+          <StripUploadSideButton
+            aria-label={`Remove Cloud upload of ${name}`}
+            data-danger="true"
+            disabled={busy}
+            onClick={() => runAction("deleteCloud")}
+            title="Remove Cloud upload"
+            type="button"
+          >
+            <CloudOff aria-hidden="true" />
+          </StripUploadSideButton>
+        )}
+        {uploadState === "private" && (
+          <StripUploadSideButton
+            aria-label={`Make ${name} public`}
+            data-primary="true"
+            disabled={busy}
+            onClick={() => runAction("publish")}
+            title="Make public"
+            type="button"
+          >
+            <Public aria-hidden="true" />
+          </StripUploadSideButton>
+        )}
+        <StripTileUploadButton
+          aria-label={snipUploadButtonTitle(uploadState, name)}
+          data-state={uploadState}
+          disabled={busy}
+          onClick={() => runAction("upload")}
+          title={snipUploadButtonTitle(uploadState, name)}
+          type="button"
+        >
+          <SnipUploadButtonBody uploadState={uploadState} urlCopied={urlCopied} />
+        </StripTileUploadButton>
+      </StripUploadControls>
       {uploadState === "uploading" || uploadState === "publishing"
         ? <StripUploadProgress aria-hidden="true" />
         : null}
@@ -2149,6 +2322,8 @@ export function SnippingStripWindow() {
   const stripDragGuardActiveRef = useRef(false);
   const stripDragGuardCountRef = useRef(0);
   const stripDragGuardTimerRef = useRef(0);
+  const closeFallbackTimerRef = useRef(0);
+  const closeRequestTokenRef = useRef(0);
   // Epoch-ms of the last close cue: the watchdog must not fight the hide
   // animation, but a window still visible long after a close cue (or with no
   // cue at all) has missed its open cue and must force itself visible.
@@ -2187,11 +2362,41 @@ export function SnippingStripWindow() {
     if (stripDragGuardTimerRef.current) {
       window.clearTimeout(stripDragGuardTimerRef.current);
     }
+    if (closeFallbackTimerRef.current) {
+      window.clearTimeout(closeFallbackTimerRef.current);
+    }
     invoke("snipping_set_strip_interaction_guard", { active: false }).catch(() => {});
   }, []);
 
   const closeStrip = useCallback(() => {
+    if (stripDragGuardTimerRef.current) {
+      window.clearTimeout(stripDragGuardTimerRef.current);
+      stripDragGuardTimerRef.current = 0;
+    }
+    stripDragGuardCountRef.current = 0;
+    stripDragGuardActiveRef.current = false;
+    invoke("snipping_set_strip_interaction_guard", { active: false }).catch(() => {});
+    const closeToken = closeRequestTokenRef.current + 1;
+    closeRequestTokenRef.current = closeToken;
+    lastCloseCueMsRef.current = Date.now();
+    setAnimPhase("closed");
     invoke("snipping_close_snip_strip").catch(() => {});
+    if (closeFallbackTimerRef.current) {
+      window.clearTimeout(closeFallbackTimerRef.current);
+    }
+    closeFallbackTimerRef.current = window.setTimeout(() => {
+      closeFallbackTimerRef.current = 0;
+      if (closeRequestTokenRef.current !== closeToken || animPhaseRef.current !== "closed") return;
+      getCurrentWindow()
+        .isVisible()
+        .then((visible) => {
+          if (!visible || closeRequestTokenRef.current !== closeToken || animPhaseRef.current !== "closed") return;
+          invoke("snipping_close_snip_strip").catch(() => {});
+        })
+        .catch(() => {
+          invoke("snipping_close_snip_strip").catch(() => {});
+        });
+    }, 360);
   }, []);
 
   useEffect(() => {
@@ -2221,6 +2426,11 @@ export function SnippingStripWindow() {
       const origin = text(payload.origin) === "bottom" ? "bottom" : "top";
       setAnimOrigin(origin);
       if (phase === "open") {
+        closeRequestTokenRef.current += 1;
+        if (closeFallbackTimerRef.current) {
+          window.clearTimeout(closeFallbackTimerRef.current);
+          closeFallbackTimerRef.current = 0;
+        }
         lastCloseCueMsRef.current = 0;
         if (animPhaseRef.current === "open") {
           setOpenNonce((nonce) => nonce + 1);
@@ -2241,18 +2451,21 @@ export function SnippingStripWindow() {
         unlistenAnim = unlisten;
       })
       .catch(() => {});
-    // Missed-cue watchdog. The open cue is emitted the moment Rust shows the
-    // window, which loses against the first page boot (no listener yet) and
-    // can lose again on re-shows under load. Any tick that finds the window
-    // visible, the shell closed, and no recent close cue plays the open.
+    // Missed-cue watchdog. A visible closed shell means either a missed open
+    // cue or a failed native hide; after a close cue, retry close instead of
+    // reopening the invisible shell over the glass panel.
     const watchdog = window.setInterval(() => {
       if (cancelled || animPhaseRef.current === "open") return;
       const sinceClose = Date.now() - lastCloseCueMsRef.current;
-      if (lastCloseCueMsRef.current > 0 && sinceClose < 700) return;
+      if (lastCloseCueMsRef.current > 0 && sinceClose < 260) return;
       getCurrentWindow()
         .isVisible()
         .then((visible) => {
           if (cancelled || !visible || animPhaseRef.current === "open") return;
+          if (lastCloseCueMsRef.current > 0) {
+            invoke("snipping_close_snip_strip").catch(() => {});
+            return;
+          }
           playOpen();
         })
         .catch(() => {});
@@ -2566,11 +2779,17 @@ const StripTilePinButton = styled.button`
   }
 `;
 
-const StripTileUploadButton = styled.button`
+const StripUploadControls = styled.div`
   position: absolute;
   top: 5px;
   right: 5px;
   z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+`;
+
+const StripTileUploadButton = styled.button`
   display: grid;
   width: 22px;
   height: 22px;
@@ -2616,27 +2835,29 @@ const StripTileUploadButton = styled.button`
   }
 
   &[data-state="uploading"],
-  &[data-state="publishing"] {
+  &[data-state="publishing"],
+  &[data-state="deleting"] {
     border-color: rgba(125, 176, 255, 0.58);
     color: #e6f1ff;
     background: rgba(18, 35, 60, 0.92);
   }
 
   &[data-state="uploading"]:disabled,
-  &[data-state="publishing"]:disabled {
+  &[data-state="publishing"]:disabled,
+  &[data-state="deleting"]:disabled {
     opacity: 1;
     cursor: progress;
   }
 
   &[data-state="private"] {
-    border-color: rgba(247, 201, 72, 0.55);
-    color: #f7e8c1;
-    background: rgba(38, 27, 4, 0.9);
+    border-color: rgba(251, 113, 133, 0.52);
+    color: #ffe4e6;
+    background: rgba(76, 22, 26, 0.9);
   }
 
   &[data-state="private"]:hover:not(:disabled) {
-    color: #1c1503;
-    background: #f7c948;
+    color: #fff;
+    background: rgba(190, 18, 60, 0.9);
     border-color: transparent;
   }
 
@@ -2650,6 +2871,48 @@ const StripTileUploadButton = styled.button`
     color: #06150d;
     background: #5ede99;
     border-color: transparent;
+  }
+`;
+
+const StripUploadSideButton = styled.button`
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #eef6ff;
+  background: rgba(6, 10, 16, 0.78);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24);
+  cursor: pointer;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.58);
+    color: #06121f;
+    background: #7db0ff;
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.34);
+    color: rgba(204, 251, 241, 0.98);
+    background: rgba(13, 148, 136, 0.24);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.34);
+    color: rgba(254, 205, 211, 0.98);
+    background: rgba(127, 29, 29, 0.24);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 `;
 
