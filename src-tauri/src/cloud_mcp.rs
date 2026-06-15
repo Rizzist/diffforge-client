@@ -1979,6 +1979,39 @@ fn cloud_mcp_tokenomics_response_bool(value: &Value, keys: &[&str]) -> Option<bo
     None
 }
 
+fn cloud_mcp_tokenomics_response_bool_is_false(value: &Value, keys: &[&str]) -> bool {
+    let candidates = [
+        Some(value),
+        value.get("data"),
+        value.get("payload"),
+        value.get("ack"),
+        value.get("result"),
+        value.get("stored"),
+        value.get("data").and_then(|data| data.get("payload")),
+        value.get("data").and_then(|data| data.get("ack")),
+        value.get("payload").and_then(|payload| payload.get("data")),
+        value.get("payload").and_then(|payload| payload.get("ack")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        for key in keys {
+            if let Some(value) = candidate.get(*key) {
+                if value.as_bool() == Some(false) {
+                    return true;
+                }
+                if let Some(text) = value.as_str() {
+                    if matches!(
+                        text.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "no" | "off"
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn cloud_mcp_tokenomics_server_cursor_from_value(value: &Value) -> Option<String> {
     cloud_mcp_tokenomics_response_text(
         value,
@@ -2035,11 +2068,96 @@ fn cloud_mcp_tokenomics_ack_requests_snapshot(value: &Value) -> bool {
     .unwrap_or(false)
 }
 
+fn cloud_mcp_tokenomics_response_kind_matches(value: &Value, accepted: &[&str]) -> bool {
+    let candidates = [
+        Some(value),
+        value.get("data"),
+        value.get("payload"),
+        value.get("ack"),
+        value.get("result"),
+        value.get("stored"),
+        value.get("data").and_then(|data| data.get("payload")),
+        value.get("data").and_then(|data| data.get("ack")),
+        value.get("payload").and_then(|payload| payload.get("data")),
+        value.get("payload").and_then(|payload| payload.get("ack")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        for keys in [
+            &["event_kind", "eventKind"][..],
+            &["tokenomics_event_kind", "tokenomicsEventKind"][..],
+            &["request_kind", "requestKind"][..],
+            &["response_kind", "responseKind"][..],
+            &["kind"][..],
+        ] {
+            if let Some(kind) = cloud_mcp_payload_text(candidate, keys) {
+                let normalized = kind.trim().to_ascii_lowercase();
+                if accepted.iter().any(|value| normalized == *value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn cloud_mcp_tokenomics_response_request_kind_matches(value: &Value, accepted: &[&str]) -> bool {
+    let candidates = [
+        Some(value),
+        value.get("data"),
+        value.get("payload"),
+        value.get("ack"),
+        value.get("result"),
+        value.get("stored"),
+        value.get("data").and_then(|data| data.get("payload")),
+        value.get("data").and_then(|data| data.get("ack")),
+        value.get("payload").and_then(|payload| payload.get("data")),
+        value.get("payload").and_then(|payload| payload.get("ack")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        for keys in [
+            &["request_kind", "requestKind"][..],
+            &["response_kind", "responseKind"][..],
+            &["kind"][..],
+        ] {
+            if let Some(kind) = cloud_mcp_payload_text(candidate, keys) {
+                let normalized = kind.trim().to_ascii_lowercase();
+                if accepted.iter().any(|value| normalized == *value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn cloud_mcp_tokenomics_cursor_response_has_state(value: &Value) -> bool {
+    cloud_mcp_tokenomics_server_cursor_from_value(value).is_some()
+        || cloud_mcp_tokenomics_device_seq_from_value(value).is_some()
+        || cloud_mcp_tokenomics_ack_requests_snapshot(value)
+        || cloud_mcp_tokenomics_response_bool(value, &["accepted", "ingested"]).is_some()
+}
+
+fn cloud_mcp_tokenomics_strict_ingest_ack_response(value: &Value) -> bool {
+    cloud_mcp_tokenomics_response_kind_matches(value, &[CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT])
+        || (cloud_mcp_tokenomics_response_kind_matches(
+            value,
+            &[
+                "tokenomics_cursor_response",
+                "tokenomics_cursor_ack",
+                "tokenomics_cursor_request_ack",
+            ],
+        ) && cloud_mcp_tokenomics_cursor_response_has_state(value))
+        || (cloud_mcp_tokenomics_response_request_kind_matches(
+            value,
+            &[CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT],
+        ) && cloud_mcp_tokenomics_cursor_response_has_state(value))
+}
+
 fn cloud_mcp_tokenomics_ack_accepted(value: &Value) -> bool {
-    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+    if cloud_mcp_tokenomics_response_bool_is_false(value, &["ok"]) {
         return false;
     }
-    if cloud_mcp_tokenomics_response_bool(value, &["accepted", "ingested"]) == Some(false) {
+    if cloud_mcp_tokenomics_response_bool_is_false(value, &["accepted", "ingested"]) {
         return false;
     }
     true
@@ -2049,6 +2167,16 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
     source_payload: Option<&Value>,
     response: &Value,
 ) -> Result<Value, String> {
+    if !cloud_mcp_tokenomics_strict_ingest_ack_response(response) {
+        return Ok(json!({
+            "ok": true,
+            "accepted": false,
+            "ignored": true,
+            "reason": "not_tokenomics_ingest_ack",
+            "requires_snapshot": false,
+            "requiresSnapshot": false,
+        }));
+    }
     if !cloud_mcp_tokenomics_ack_accepted(response) {
         return Ok(json!({
             "ok": false,
@@ -5166,8 +5294,7 @@ fn cloud_mcp_tokenomics_device_packet_payload(
         "device": device_profile.clone(),
         "device_id": device_id.clone(),
         "deviceId": device_id.clone(),
-        "device_aliases": device_aliases.clone(),
-        "deviceAliases": device_aliases,
+        "device_aliases": device_aliases,
         "device_name": device_profile["device_name"].clone(),
         "deviceName": device_profile["device_name"].clone(),
         "machine_id": device_id.clone(),
@@ -5201,10 +5328,8 @@ fn cloud_mcp_tokenomics_device_packet_payload(
         "localSyncCursor": local_sync_cursor,
         "device_cursor_ms": now_ms,
         "deviceCursorMs": now_ms,
-        "provider_accounts": provider_accounts.clone(),
-        "providerAccounts": provider_accounts,
-        "hourly_groups": hourly_groups.clone(),
-        "hourlyGroups": hourly_groups,
+        "provider_accounts": provider_accounts,
+        "hourly_groups": hourly_groups,
         "windows": windows,
         "hourly_count": hourly_count,
         "hourlyCount": hourly_count,
@@ -8432,7 +8557,10 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind", "requestKind"]).unwrap_or_default();
-    if direct_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT {
+    if direct_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT
+        || direct_request_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT
+        || cloud_mcp_tokenomics_strict_ingest_ack_response(&message)
+    {
         cloud_mcp_handle_tokenomics_ingest_ack(state, &message, "direct").await;
         return;
     }
@@ -8499,7 +8627,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         if event_kind == "account_device_live_state_snapshot" {
             cloud_mcp_cache_account_device_live_state_snapshot(state, &event).await;
         }
-        if event_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT {
+        if event_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT
+            || cloud_mcp_tokenomics_strict_ingest_ack_response(&event)
+        {
             cloud_mcp_handle_tokenomics_ingest_ack(state, &event, "cloud_event").await;
             return;
         }
@@ -8775,14 +8905,19 @@ async fn cloud_mcp_send_tokenomics_cursor_request(
         &billing_scope_key,
         reason,
     )?;
-    let response = cloud_mcp_send_event_over_app_ws_once(
+    let response = cloud_mcp_ws_request_with_timeout(
         state,
         CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT,
         &payload,
-        "tokenomics-cursor",
+        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
     )
     .await?;
     let ack = cloud_mcp_tokenomics_persist_ingest_ack(Some(&payload), &response)?;
+    if ack.get("ignored").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "Tokenomics cursor request did not return a tokenomics cursor response.".to_string(),
+        );
+    }
     if ack
         .get("requires_snapshot")
         .or_else(|| ack.get("requiresSnapshot"))
@@ -32822,6 +32957,55 @@ mod cloud_mcp_tests {
         assert_eq!(
             packet["hourly_groups"][0]["rows"].as_array().map(Vec::len),
             Some(1)
+        );
+        assert!(packet.get("providerAccounts").is_none());
+        assert!(packet.get("hourlyGroups").is_none());
+        assert!(packet.get("deviceAliases").is_none());
+    }
+
+    #[test]
+    fn tokenomics_transport_ack_does_not_advance_sync_state() {
+        let response = json!({
+            "ok": true,
+            "data": {
+                "cloud_event_id": "event-a",
+                "event_kind": CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+                "device_seq": 7,
+                "server_cursor": "server-cursor-7",
+            }
+        });
+
+        assert!(!cloud_mcp_tokenomics_strict_ingest_ack_response(
+            &response
+        ));
+        let ack = cloud_mcp_tokenomics_persist_ingest_ack(None, &response).unwrap();
+        assert_eq!(ack["accepted"].as_bool(), Some(false));
+        assert_eq!(ack["ignored"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn tokenomics_app_ws_data_cursor_response_is_strict_ack() {
+        let response = json!({
+            "ok": true,
+            "data": {
+                "kind": "tokenomics_cursor_response",
+                "device_id": "device-a",
+                "billing_scope_key": "personal",
+                "acked_device_seq": 7,
+                "server_cursor": "server-cursor-7",
+            }
+        });
+
+        assert!(cloud_mcp_tokenomics_strict_ingest_ack_response(
+            &response
+        ));
+        assert_eq!(
+            cloud_mcp_tokenomics_server_cursor_from_value(&response).as_deref(),
+            Some("server-cursor-7")
+        );
+        assert_eq!(
+            cloud_mcp_tokenomics_device_seq_from_value(&response),
+            Some(7)
         );
     }
 

@@ -863,6 +863,85 @@ function summaryForMappedNativeDevices(summary = {}) {
   return summary;
 }
 
+function summaryArray(summary = {}, ...keys) {
+  let fallback = [];
+  for (const key of keys) {
+    const rows = Array.isArray(summary?.[key]) ? summary[key] : [];
+    if (rows.length) return rows;
+    if (!fallback.length) fallback = rows;
+  }
+  return fallback;
+}
+
+function hourlyRowsForDisplay(summary = {}) {
+  return summaryArray(summary, "hourly");
+}
+
+function providerRowsForDisplay(summary = {}) {
+  const legacy = summaryArray(summary, "by_device_provider");
+  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+}
+
+function accountRowsForDisplay(summary = {}) {
+  const legacy = summaryArray(summary, "by_device_account");
+  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+}
+
+function modelRowsForDisplay(summary = {}) {
+  const legacy = summaryArray(summary, "by_device_model");
+  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+}
+
+function dailyRowsForDisplay(summary = {}) {
+  const legacy = summaryArray(summary, "daily_by_device_provider");
+  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+}
+
+function usageRowsForDisplay(summary = {}) {
+  const legacy = [
+    ...summaryArray(summary, "by_device"),
+    ...summaryArray(summary, "by_device_provider"),
+    ...summaryArray(summary, "by_device_account"),
+    ...summaryArray(summary, "by_device_model"),
+    ...summaryArray(summary, "daily_by_device_provider"),
+  ];
+  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+}
+
+function normalizedLimitWindowKind(kind) {
+  const clean = String(kind || "").trim().toLowerCase();
+  if (["session_5h", "5-hour", "5h", "five_hour", "five-hour"].includes(clean)) return "5_hour";
+  return clean;
+}
+
+function normalizeLimitRowForDisplay(row = {}) {
+  const rawWindowKind = row?.window_kind
+    ?? row?.windowKind
+    ?? row?.limit_kind
+    ?? row?.limitKind
+    ?? row?.provider_window_kind
+    ?? row?.providerWindowKind
+    ?? "";
+  const windowKind = normalizedLimitWindowKind(rawWindowKind);
+  if (!windowKind || windowKind === rawWindowKind) return row;
+  return {
+    ...row,
+    provider_window_kind: row?.provider_window_kind ?? row?.providerWindowKind ?? rawWindowKind,
+    providerWindowKind: row?.providerWindowKind ?? row?.provider_window_kind ?? rawWindowKind,
+    window_kind: windowKind,
+    windowKind,
+    limit_kind: windowKind,
+    limitKind: windowKind,
+  };
+}
+
+function limitRowsForDisplay(summary = {}) {
+  return [
+    ...summaryArray(summary, "limits"),
+    ...summaryArray(summary, "latest_windows", "latestWindows"),
+  ].map(normalizeLimitRowForDisplay);
+}
+
 function tokenomicsDeviceIdentityMap(summary = {}) {
   const byId = new Map();
   tokenomicsDeviceIdentityRows(summary).forEach((identity) => {
@@ -1013,7 +1092,7 @@ function weeklyLimitSeriesKey(row = {}) {
 
 function matchingWeeklyLimitRows(rows, selectedProvider, selectedAccountKey, selectedDeviceId = "all", selectedScopeKey = "all") {
   return (Array.isArray(rows) ? rows : []).filter((row) => (
-    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "") === "weekly"
+    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "") === "weekly"
       && (selectedProvider === "all" || providerKey(row) === selectedProvider)
       && (selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey)
       && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
@@ -1204,7 +1283,7 @@ function providerLimitAuthorityKey(row = {}, selectedDeviceId = "all") {
     devicePart,
     providerKey(row),
     rowProviderAccountKey(row),
-    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
   ].join("::");
 }
 
@@ -1357,13 +1436,15 @@ function clientProjectedLimit(limit = {}) {
 }
 
 function mergeLimits(limits, windowKind) {
+  const normalizedWindowKind = normalizedLimitWindowKind(windowKind);
   const rows = limits
-    .filter((limit) => String(limit?.window_kind || limit?.windowKind || limit?.limit_kind || limit?.limitKind || "") === windowKind)
+    .map(normalizeLimitRowForDisplay)
+    .filter((limit) => normalizedLimitWindowKind(limit?.window_kind || limit?.windowKind || limit?.limit_kind || limit?.limitKind || "") === normalizedWindowKind)
     .map(clientProjectedLimit);
   if (!rows.length) {
     return {
-      windowKind,
-      label: windowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit",
+      windowKind: normalizedWindowKind,
+      label: normalizedWindowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit",
       planDetected: false,
       planName: "No plan detected",
       confidence: "unknown",
@@ -1375,7 +1456,7 @@ function mergeLimits(limits, windowKind) {
       paceStatus: "unknown",
       overPace: false,
       statusLabel: "Plan limit not exposed",
-      resetLabel: windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule",
+      resetLabel: normalizedWindowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule",
       ratePoints: [],
     };
   }
@@ -1383,16 +1464,29 @@ function mergeLimits(limits, windowKind) {
   const used = rows.reduce((sum, row) => sum + numeric(row?.used), 0);
   const allowanceValues = rows.map((row) => numeric(row?.allowance)).filter((value) => value > 0);
   const allowance = allowanceValues.length ? allowanceValues.reduce((sum, value) => sum + value, 0) : null;
+  const explicitUsedPercents = rows
+    .map((row) => limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent))
+    .filter((value) => value != null);
+  const explicitRemainingPercents = rows
+    .map((row) => limitNumberOrNull(row?.remaining_percent, row?.remainingPercent))
+    .filter((value) => value != null);
+  const averagePercent = (values) => values.length
+    ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
+    : null;
   const usedPercent = resetEstimated
     ? 0
     : allowance
       ? Math.max(0, Math.min(100, Math.round((used / allowance) * 100)))
-      : null;
-  const remainingPercent = resetEstimated ? 100 : (usedPercent == null ? null : Math.max(0, 100 - usedPercent));
-  const displayPercentKind = limitDisplayPercentKind(rows[0], windowKind);
+      : averagePercent(explicitUsedPercents);
+  const remainingPercent = resetEstimated
+    ? 100
+    : explicitRemainingPercents.length
+      ? Math.max(0, Math.min(100, averagePercent(explicitRemainingPercents)))
+      : (usedPercent == null ? null : Math.max(0, 100 - usedPercent));
+  const displayPercentKind = limitDisplayPercentKind(rows[0], normalizedWindowKind);
   const displayPercent = resetEstimated
     ? (displayPercentKind === "remaining" ? 100 : 0)
-    : limitDisplayPercent(rows[0], usedPercent, remainingPercent, windowKind);
+    : limitDisplayPercent(rows[0], usedPercent, remainingPercent, normalizedWindowKind);
   const paceDelta = resetEstimated
     ? 0
     : Math.round(rows.reduce((sum, row) => sum + numeric(row?.pace_delta_percent, row?.paceDeltaPercent), 0) / rows.length);
@@ -1405,8 +1499,8 @@ function mergeLimits(limits, windowKind) {
   const paceStatus = resetEstimated ? "on_pace" : limitPaceStatus(rows);
   const overPace = paceStatus === "over_pace" || paceDelta > 0;
   return {
-    windowKind,
-    label: rows[0]?.label || (windowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
+    windowKind: normalizedWindowKind,
+    label: rows[0]?.label || (normalizedWindowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
     planDetected: rows.some((row) => Boolean(row?.plan_detected ?? row?.planDetected)),
     planName: plans.length ? plans.join(" + ") : "No plan detected",
     confidence: confidences.includes("estimated") ? "estimated" : (confidences[0] || "unknown"),
@@ -1420,7 +1514,7 @@ function mergeLimits(limits, windowKind) {
     paceStatus,
     overPace,
     statusLabel: resetEstimated ? "Available" : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
-    resetLabel: limitResetLabel(rows, windowKind, claudeUnavailable),
+    resetLabel: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable),
     ratePoints,
     limitWindowSeconds: numeric(rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds),
     resetAfterSeconds: numeric(rows[0]?.reset_after_seconds, rows[0]?.resetAfterSeconds),
@@ -1529,11 +1623,11 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
   }
 
   const now = new Date();
-  now.setMinutes(0, 0, 0);
+  now.setUTCMinutes(0, 0, 0);
   const recent = [];
   for (let offset = bucketCount - 1; offset >= 0; offset -= 1) {
     const date = new Date(now);
-    date.setHours(now.getHours() - offset);
+    date.setUTCHours(now.getUTCHours() - offset);
     const key = hourKey(date);
     const aggregate = byHour.get(key) || { total: 0, input: 0, output: 0, cache: 0, cost: 0 };
     recent.push({
@@ -1554,10 +1648,10 @@ function parseHourBucketDate(row) {
 }
 
 function hourKey(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const hour = String(date.getUTCHours()).padStart(2, "0");
   return `${year}-${month}-${day}T${hour}`;
 }
 
@@ -1724,10 +1818,12 @@ function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selecte
 function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all", selectedScopeKey = "all") {
   if (selectedProvider === "all") return [];
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
-  const usageRows = Array.isArray(summary?.by_device_account) ? summary.by_device_account : [];
-  const limitRows = Array.isArray(summary?.limits) ? summary.limits : [];
+  const usageRows = accountRowsForDisplay(summary);
+  const accountRows = summaryArray(summary, "provider_accounts", "providerAccounts");
+  const limitRows = limitRowsForDisplay(summary);
   const rows = [
     ...usageRows,
+    ...accountRows,
     ...limitRows,
   ].filter((row) => (
     provider.match(row)
@@ -1758,12 +1854,9 @@ function deviceOptions(summary, selectedScopeKey = "all") {
   const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
   const identityMap = tokenomicsDeviceIdentityMap(summary);
   const rows = [
-    ...(Array.isArray(summary?.by_device) ? summary.by_device : []),
-    ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
-    ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
-    ...(Array.isArray(summary?.by_device_model) ? summary.by_device_model : []),
-    ...(Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : []),
-    ...(Array.isArray(summary?.hourly) ? summary.hourly : []),
+    ...usageRowsForDisplay(summary),
+    ...summaryArray(summary, "provider_accounts", "providerAccounts"),
+    ...limitRowsForDisplay(summary),
   ];
   const byDevice = new Map();
   for (const row of rows) {
@@ -1791,12 +1884,9 @@ function deviceOptions(summary, selectedScopeKey = "all") {
 
 function scopeOptions(summary) {
   const rows = [
-    ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
-    ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
-    ...(Array.isArray(summary?.by_device_model) ? summary.by_device_model : []),
-    ...(Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : []),
-    ...(Array.isArray(summary?.hourly) ? summary.hourly : []),
-    ...(Array.isArray(summary?.limits) ? summary.limits : []),
+    ...usageRowsForDisplay(summary),
+    ...summaryArray(summary, "provider_accounts", "providerAccounts"),
+    ...limitRowsForDisplay(summary),
   ];
   const byScope = new Map();
   for (const row of rows) {
@@ -1846,7 +1936,7 @@ function providerLimitSampleKey(row = {}) {
     rowDeviceId(row) || "unknown-device",
     providerKey(row),
     rowProviderAccountKey(row),
-    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
     String(row?.sample_bucket_start || row?.sampleBucketStart || row?.bucket_start || row?.bucketStart || ""),
   ].join("::");
 }
@@ -1911,7 +2001,7 @@ function providerLimitDisplayedRemainingPercent(row = {}) {
 }
 
 function tokenomicsLimitPercentSignature(summary = {}) {
-  const limits = Array.isArray(summary?.limits) ? summary.limits : [];
+  const limits = limitRowsForDisplay(summary);
   const limitSignature = mergeProviderLimits([], limits)
     .map((row) => {
       const remaining = providerLimitDisplayedRemainingPercent(row);
@@ -1939,16 +2029,17 @@ function tokenomicsLimitPercentSignature(summary = {}) {
 function mergeTokenomicsSummary(previous, next) {
   if (!previous) return next || {};
   if (!next) return previous;
+  const nextIsV2 = String(next.schema_version || next.schemaVersion || "").toLowerCase() === "tokenomics_v2";
   return {
     ...previous,
     ...next,
     total: next.total || previous.total,
-    by_device: next.by_device || previous.by_device,
-    by_device_provider: next.by_device_provider || previous.by_device_provider,
-    by_device_account: next.by_device_account || previous.by_device_account,
-    by_device_model: next.by_device_model || previous.by_device_model,
-    daily_by_device_provider: next.daily_by_device_provider || previous.daily_by_device_provider,
-    monthly_by_device_provider: next.monthly_by_device_provider || previous.monthly_by_device_provider,
+    by_device: next.by_device || (nextIsV2 ? undefined : previous.by_device),
+    by_device_provider: next.by_device_provider || (nextIsV2 ? undefined : previous.by_device_provider),
+    by_device_account: next.by_device_account || (nextIsV2 ? undefined : previous.by_device_account),
+    by_device_model: next.by_device_model || (nextIsV2 ? undefined : previous.by_device_model),
+    daily_by_device_provider: next.daily_by_device_provider || (nextIsV2 ? undefined : previous.daily_by_device_provider),
+    monthly_by_device_provider: next.monthly_by_device_provider || (nextIsV2 ? undefined : previous.monthly_by_device_provider),
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
     limits: mergeProviderLimits(previous.limits, next.limits),
@@ -2350,9 +2441,9 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   const visibleSummary = useMemo(() => summaryForMappedNativeDevices(summary), [summary]);
-  const providers = Array.isArray(visibleSummary?.by_device_provider) ? visibleSummary.by_device_provider : [];
+  const providers = providerRowsForDisplay(visibleSummary);
   const deviceFiltered = selectedDeviceId !== "all";
-  const modelRows = Array.isArray(visibleSummary?.by_device_model) ? visibleSummary.by_device_model : [];
+  const modelRows = modelRowsForDisplay(visibleSummary);
   const providerRows = providers;
   const scopes = useMemo(() => scopeOptions(visibleSummary), [visibleSummary]);
   const devices = useMemo(() => deviceOptions(visibleSummary, selectedScopeKey), [visibleSummary, selectedScopeKey]);
@@ -2390,14 +2481,15 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
       updateTokenomicsStore({ selectedAccountKey: "all" });
     }
   }, [accountOptions, selectedAccountKey, selectedProvider]);
-  const dailyRaw = Array.isArray(visibleSummary?.daily_by_device_provider) ? visibleSummary.daily_by_device_provider : [];
-  const hourlyRaw = Array.isArray(visibleSummary?.hourly) ? visibleSummary.hourly : [];
+  const dailyRaw = dailyRowsForDisplay(visibleSummary);
+  const hourlyRaw = hourlyRowsForDisplay(visibleSummary);
+  const limitRowsRaw = useMemo(() => limitRowsForDisplay(visibleSummary), [visibleSummary]);
   const limitSamplesRaw = Array.isArray(visibleSummary?.limit_samples)
     ? visibleSummary.limit_samples
     : (Array.isArray(visibleSummary?.limitSamples) ? visibleSummary.limitSamples : []);
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, limitSamplesRaw, visibleSummary?.limits, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
-    [dailyRaw, dailyWindowDays, limitSamplesRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, visibleSummary?.limits],
+    () => buildDailyRows(dailyRaw, limitSamplesRaw, limitRowsRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, limitRowsRaw, limitSamplesRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const today = useMemo(
     () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
@@ -2407,7 +2499,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
     [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
-  const deviceAccountRows = Array.isArray(visibleSummary?.by_device_account) ? visibleSummary.by_device_account : [];
+  const deviceAccountRows = accountRowsForDisplay(visibleSummary);
   const totalRows = deviceFiltered
     ? (selectedAccountKey === "all" ? providerRows : deviceAccountRows)
     : selectedAccountKey === "all" ? providerRows : deviceAccountRows;
@@ -2416,8 +2508,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, totalRows],
   );
   const limits = useMemo(
-    () => filterLimits(visibleSummary?.limits, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
-    [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, visibleSummary?.limits],
+    () => filterLimits(limitRowsRaw, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
+    [limitRowsRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
@@ -2440,14 +2532,14 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const credits = billingStatus?.credits || visibleSummary?.credits || {};
   const providerLimitGroups = useMemo(() => (
     ["codex", "claude"].map((providerId) => {
-      const providerLimits = filterLimits(visibleSummary?.limits, providerId, "all", selectedScopeKey, selectedDeviceId);
+      const providerLimits = filterLimits(limitRowsRaw, providerId, "all", selectedScopeKey, selectedDeviceId);
       return {
         providerId,
         fiveHour: mergeLimits(providerLimits, "5_hour"),
         weekly: mergeLimits(providerLimits, "weekly"),
       };
     })
-  ), [selectedDeviceId, selectedScopeKey, visibleSummary?.limits]);
+  ), [limitRowsRaw, selectedDeviceId, selectedScopeKey]);
   const storage = useMemo(
     () => storageUsageModel(billingStatus, visibleSummary, storageUsage),
     [billingStatus, storageUsage, visibleSummary],
