@@ -36,6 +36,13 @@ function normalizeAccountScope(scope) {
   return personalScope();
 }
 
+function accountScopeKey(scope) {
+  const normalized = normalizeAccountScope(scope);
+  return normalized.type === "team" && normalized.teamId
+    ? `team:${normalized.teamId}`
+    : "personal";
+}
+
 function normalizeAccountScopes(scopes) {
   const byId = new Map();
   [personalScope(), ...(Array.isArray(scopes) ? scopes : [])]
@@ -93,9 +100,22 @@ function emitAuthChange(partial) {
 }
 
 function applyNativeSnapshot(nextSnapshot) {
+  const nextUpdatedAtMs = Number(nextSnapshot?.updatedAtMs || 0);
+  const currentUpdatedAtMs = Number(snapshot.updatedAtMs || 0);
+  if (nextUpdatedAtMs > 0 && currentUpdatedAtMs > 0 && nextUpdatedAtMs < currentUpdatedAtMs) {
+    return snapshot;
+  }
   snapshot = normalizeSnapshot(nextSnapshot);
   listeners.forEach((listener) => listener());
   return snapshot;
+}
+
+function snapshotValuesEqual(left, right) {
+  try {
+    return JSON.stringify(left || null) === JSON.stringify(right || null);
+  } catch {
+    return left === right;
+  }
 }
 
 async function refreshNativeSnapshot() {
@@ -197,6 +217,9 @@ export const authStore = {
     return applyNativeCommand("desktop_auth_sign_out");
   },
   async applyBillingStatus(billingStatus) {
+    if (snapshotValuesEqual(snapshot.billingStatus, billingStatus)) {
+      return snapshot;
+    }
     return applyNativeCommand("desktop_auth_apply_billing_status", { billingStatus });
   },
   getActiveScope() {
@@ -212,12 +235,6 @@ export const authStore = {
       message,
       error: "",
     });
-    void applyNativeCommand("desktop_auth_set_stage", {
-      status: "checking",
-      stage: "session_restore",
-      message,
-      error: "",
-    }).catch(() => {});
   },
   setExchanging(message = "Finishing desktop sign in...") {
     emitAuthChange({
@@ -226,25 +243,18 @@ export const authStore = {
       message,
       error: "",
     });
-    void applyNativeCommand("desktop_auth_set_stage", {
-      status: "exchanging",
-      stage: "session_exchange",
-      message,
-      error: "",
-    }).catch(() => {});
   },
   setStage(stage, message) {
     emitAuthChange({
       stage,
       ...(typeof message === "string" ? { message } : {}),
     });
-    void applyNativeCommand("desktop_auth_set_stage", {
-      stage,
-      message: typeof message === "string" ? message : null,
-    }).catch(() => {});
   },
   async setActiveScope(scope) {
     const normalizedScope = normalizeAccountScope(scope);
+    if (accountScopeKey(snapshot.activeScope) === accountScopeKey(normalizedScope)) {
+      return snapshot;
+    }
     emitAuthChange({ activeScope: normalizedScope });
     return applyNativeCommand("desktop_auth_set_active_scope", { scope: normalizedScope });
   },
@@ -273,10 +283,8 @@ export const authStore = {
   },
   setMessage(message) {
     emitAuthChange({ message });
-    void applyNativeCommand("desktop_auth_set_stage", { message }).catch(() => {});
   },
   setError(error) {
     emitAuthChange({ error });
-    void applyNativeCommand("desktop_auth_set_stage", { error }).catch(() => {});
   },
 };

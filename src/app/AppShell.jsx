@@ -603,7 +603,7 @@ const AUTH_STARTUP_TIMEOUT_MS = 30000;
 const DEEP_LINK_STARTUP_TIMEOUT_MS = 3000;
 const SESSION_RESTORE_TIMEOUT_MS = 5000;
 const SESSION_RESTORE_TIMEOUT_MESSAGE = "Secure session check timed out after 5 seconds.";
-const AUTH_EXCHANGE_TIMEOUT_MS = 10000;
+const AUTH_EXCHANGE_TIMEOUT_MS = 15000;
 const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
@@ -8216,6 +8216,7 @@ export default function App() {
   const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const workspaceCatalogSyncKeyRef = useRef("");
+  const cloudMcpSessionContextSyncKeyRef = useRef("");
 
   useEffect(() => {
     let cancelled = false;
@@ -8510,9 +8511,21 @@ export default function App() {
   }, [activeAccountScope, activeAccountScopeKey, activeScope, authState]);
   useEffect(() => {
     if (authState !== "authenticated") {
+      cloudMcpSessionContextSyncKeyRef.current = "";
       return;
     }
 
+    let billingKey = "null";
+    try {
+      billingKey = JSON.stringify(billingStatus || null);
+    } catch {
+      billingKey = String(Boolean(billingStatus));
+    }
+    const sessionContextKey = `${activeAccountScopeKey}:${billingKey}`;
+    if (cloudMcpSessionContextSyncKeyRef.current === sessionContextKey) {
+      return;
+    }
+    cloudMcpSessionContextSyncKeyRef.current = sessionContextKey;
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
@@ -8520,6 +8533,10 @@ export default function App() {
       accountScope: activeAccountScope,
       billingStatus,
       flowId: `scope-${activeAccountScopeKey}`,
+    }).catch(() => {
+      if (cloudMcpSessionContextSyncKeyRef.current === sessionContextKey) {
+        cloudMcpSessionContextSyncKeyRef.current = "";
+      }
     });
   }, [activeAccountScope, activeAccountScopeKey, authState, billingStatus]);
   useEffect(() => {
@@ -15477,6 +15494,20 @@ export default function App() {
       window.clearTimeout(timeoutId);
     };
   }, [authInitialized]);
+
+  useEffect(() => {
+    if (
+      !authInitialized
+      || authState !== "authenticated"
+      || !user
+      || workspaceState !== "idle"
+    ) {
+      return undefined;
+    }
+
+    enterAuthenticatedWorkspace(user, { syncCloud: false });
+    return undefined;
+  }, [authInitialized, authState, enterAuthenticatedWorkspace, user, workspaceState]);
 
   useEffect(() => {
     if (
@@ -25521,7 +25552,7 @@ export default function App() {
     workspaceSyncState,
   ]);
 
-  const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
+  const isConnectivityBlocked = false;
   const isPaidPlanUser = accountIsPaid || billingStatus?.planStatus === "paid";
   const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
   const cloudSyncConnection = String(cloudSyncStatus?.connection || "local").toLowerCase();

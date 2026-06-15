@@ -2318,9 +2318,12 @@ function startTokenomicsViewPolling() {
 
 function tokenomicsLoadingLabel(status, summary, progress) {
   const phase = String(progress?.phase || "");
+  if (phase === "limits_ready") return "Updating live limits";
+  if (phase === "realtime_current_day") return "Updating today";
+  if (phase === "day_complete") return "Updated usage day";
   if (phase === "complete") return "Finalizing usage";
   if (phase === "catch_up") return "Catching up usage";
-  if (phase === "day_start" || phase === "backfill_start") return "Scanning 30-day usage";
+  if (phase === "day_start" || phase === "backfill_start") return "Scanning usage by day";
   return status === "scanning" || !summary ? "Scanning usage" : "Loading usage";
 }
 

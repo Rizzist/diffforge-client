@@ -4406,7 +4406,6 @@ pub fn run() {
             backend_ping,
             desktop_auth_snapshot_command,
             desktop_auth_start_login,
-            desktop_auth_set_stage,
             desktop_auth_validate_session,
             desktop_auth_handle_deep_link,
             desktop_auth_set_active_scope,

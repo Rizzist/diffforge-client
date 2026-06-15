@@ -352,6 +352,35 @@ fn desktop_auth_public_snapshot(snapshot: &Value) -> Value {
     public_snapshot
 }
 
+fn desktop_auth_snapshot_token(snapshot: &Value) -> Option<String> {
+    snapshot
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string)
+}
+
+fn desktop_auth_snapshot_pending_state(snapshot: &Value) -> String {
+    snapshot
+        .get("pendingState")
+        .or_else(|| snapshot.get("pending_state"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn desktop_auth_current_validation_snapshot(app: &AppHandle, token: &str) -> Option<Value> {
+    let current = desktop_auth_snapshot(app);
+    let current_token = desktop_auth_snapshot_token(&current)?;
+    if current_token != token || !desktop_auth_snapshot_pending_state(&current).is_empty() {
+        return None;
+    }
+    Some(current)
+}
+
 fn desktop_auth_persist_snapshot(app: &AppHandle, mut snapshot: Value) -> Result<Value, String> {
     let previous_version = desktop_auth_snapshot(app)
         .get("version")
@@ -436,6 +465,19 @@ async fn desktop_auth_sync_cloud_state(
     Ok(())
 }
 
+fn desktop_auth_sync_cloud_state_background(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+    snapshot: &Value,
+) {
+    let app = app.clone();
+    let cloud_mcp_state = cloud_mcp_state.clone();
+    let snapshot = snapshot.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = desktop_auth_sync_cloud_state(&app, &cloud_mcp_state, &snapshot).await;
+    });
+}
+
 pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
     app: &AppHandle,
     cloud_mcp_state: &CloudMcpState,
@@ -457,9 +499,16 @@ pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
     }
     match validate_desktop_session(token.to_string()).await {
         Ok(session) => {
+            let Some(current) = desktop_auth_current_validation_snapshot(app, token) else {
+                return false;
+            };
             let user = match desktop_auth_extract_session_user(&session) {
                 Ok(user) => user,
                 Err(error) => {
+                    let Some(_current) = desktop_auth_current_validation_snapshot(app, token)
+                    else {
+                        return false;
+                    };
                     if let Ok(next) = desktop_auth_persist_snapshot(
                         app,
                         desktop_auth_signed_out_snapshot(
@@ -474,10 +523,10 @@ pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
                 }
             };
             let active_scope = desktop_auth_normalize_scope(
-                snapshot.get("activeScope").unwrap_or(&Value::Null),
+                current.get("activeScope").unwrap_or(&Value::Null),
                 Some(&user),
             );
-            let mut next = snapshot.clone();
+            let mut next = current.clone();
             next["status"] = json!("authenticated");
             next["stage"] = json!("authenticated");
             next["message"] = json!("Initializing workspace...");
@@ -494,6 +543,9 @@ pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
                 .is_ok()
         }
         Err(error) => {
+            let Some(_current) = desktop_auth_current_validation_snapshot(app, token) else {
+                return false;
+            };
             let message = if desktop_auth_network_restore_error(&error) {
                 "Secure session could not be verified. Sign in again with the web app."
             } else {
@@ -644,38 +696,6 @@ async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn desktop_auth_set_stage(
-    app: AppHandle,
-    status: Option<String>,
-    stage: Option<String>,
-    message: Option<String>,
-    error: Option<String>,
-) -> Result<Value, String> {
-    let mut snapshot = desktop_auth_snapshot(&app);
-    if let Some(status) = status.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
-        match status.as_str() {
-            "checking" | "exchanging" | "waiting" => {
-                snapshot["status"] = json!(status);
-            }
-            "authenticated" => {
-                return Err("Authenticated state is owned by the native auth core.".to_string());
-            }
-            _ => {}
-        }
-    }
-    if let Some(stage) = stage.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
-        snapshot["stage"] = json!(stage);
-    }
-    if let Some(message) = message {
-        snapshot["message"] = json!(message);
-    }
-    if let Some(error) = error {
-        snapshot["error"] = json!(error);
-    }
-    desktop_auth_persist_snapshot(&app, snapshot).map(|snapshot| desktop_auth_public_snapshot(&snapshot))
-}
-
-#[tauri::command]
 async fn desktop_auth_validate_session(
     app: AppHandle,
     cloud_mcp_state: State<'_, CloudMcpState>,
@@ -692,7 +712,7 @@ async fn desktop_auth_validate_session(
             &app,
             desktop_auth_signed_out_snapshot(DESKTOP_AUTH_DEFAULT_MESSAGE, "", true),
         )?;
-        desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &snapshot).await?;
+        desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &snapshot);
         return Ok(desktop_auth_public_snapshot(&snapshot));
     };
     if snapshot.get("status").and_then(Value::as_str) != Some("authenticated") {
@@ -707,12 +727,15 @@ async fn desktop_auth_validate_session(
 
     match validate_desktop_session(token.clone()).await {
         Ok(session) => {
+            let Some(current) = desktop_auth_current_validation_snapshot(&app, &token) else {
+                return Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)));
+            };
             let user = desktop_auth_extract_session_user(&session)?;
             let active_scope = desktop_auth_normalize_scope(
-                snapshot.get("activeScope").unwrap_or(&Value::Null),
+                current.get("activeScope").unwrap_or(&Value::Null),
                 Some(&user),
             );
-            let mut next = snapshot.clone();
+            let mut next = current.clone();
             next["status"] = json!("authenticated");
             next["stage"] = json!("authenticated");
             next["message"] = json!("Initializing workspace...");
@@ -722,10 +745,13 @@ async fn desktop_auth_validate_session(
             next["activeScope"] = active_scope;
             next["pendingState"] = json!("");
             let next = desktop_auth_persist_snapshot(&app, next)?;
-            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(desktop_auth_public_snapshot(&next))
         }
         Err(error) => {
+            if desktop_auth_current_validation_snapshot(&app, &token).is_none() {
+                return Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)));
+            }
             let message = if desktop_auth_network_restore_error(&error) {
                 "Secure session could not be verified. Sign in again with the web app."
             } else {
@@ -733,7 +759,7 @@ async fn desktop_auth_validate_session(
             };
             let next =
                 desktop_auth_persist_snapshot(&app, desktop_auth_signed_out_snapshot(message, &error, true))?;
-            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(desktop_auth_public_snapshot(&next))
         }
     }
@@ -772,7 +798,7 @@ async fn desktop_auth_handle_deep_link(
                 true,
             ),
         )?;
-        desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+        desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
         return Ok(json!({
             "handled": true,
             "snapshot": desktop_auth_public_snapshot(&next),
@@ -788,10 +814,17 @@ async fn desktop_auth_handle_deep_link(
 
     match exchange_desktop_auth_code(code, callback_state.clone()).await {
         Ok(session) => {
+            let current = desktop_auth_snapshot(&app);
+            if desktop_auth_snapshot_pending_state(&current) != callback_state {
+                return Ok(json!({
+                    "handled": true,
+                    "snapshot": desktop_auth_public_snapshot(&current),
+                }));
+            }
             let token = desktop_auth_extract_session_token(&session)?;
             let user = desktop_auth_extract_session_user(&session)?;
             let active_scope = desktop_auth_normalize_scope(
-                snapshot.get("activeScope").unwrap_or(&Value::Null),
+                current.get("activeScope").unwrap_or(&Value::Null),
                 Some(&user),
             );
             let next = desktop_auth_persist_snapshot(
@@ -808,13 +841,21 @@ async fn desktop_auth_handle_deep_link(
                     "billingStatus": Value::Null,
                 }),
             )?;
-            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(json!({
                 "handled": true,
                 "snapshot": desktop_auth_public_snapshot(&next),
             }))
         }
         Err(error) => {
+            let current = desktop_auth_snapshot(&app);
+            if desktop_auth_snapshot_pending_state(&current) != callback_state {
+                return Ok(json!({
+                    "handled": true,
+                    "snapshot": desktop_auth_public_snapshot(&current),
+                    "error": error,
+                }));
+            }
             let next = desktop_auth_persist_snapshot(
                 &app,
                 desktop_auth_signed_out_snapshot(
@@ -823,7 +864,7 @@ async fn desktop_auth_handle_deep_link(
                     true,
                 ),
             )?;
-            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
             Ok(json!({
                 "handled": true,
                 "snapshot": desktop_auth_public_snapshot(&next),
@@ -841,9 +882,13 @@ async fn desktop_auth_set_active_scope(
 ) -> Result<Value, String> {
     let mut snapshot = desktop_auth_snapshot(&app);
     let user = snapshot.get("user").cloned().filter(Value::is_object);
-    snapshot["activeScope"] = desktop_auth_normalize_scope(&scope, user.as_ref());
+    let normalized_scope = desktop_auth_normalize_scope(&scope, user.as_ref());
+    if snapshot.get("activeScope") == Some(&normalized_scope) {
+        return Ok(desktop_auth_public_snapshot(&snapshot));
+    }
+    snapshot["activeScope"] = normalized_scope;
     let snapshot = desktop_auth_persist_snapshot(&app, snapshot)?;
-    desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &snapshot).await?;
+    desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &snapshot);
     Ok(desktop_auth_public_snapshot(&snapshot))
 }
 
@@ -854,9 +899,12 @@ async fn desktop_auth_apply_billing_status(
     billing_status: Value,
 ) -> Result<Value, String> {
     let mut snapshot = desktop_auth_snapshot(&app);
+    if snapshot.get("billingStatus") == Some(&billing_status) {
+        return Ok(desktop_auth_public_snapshot(&snapshot));
+    }
     snapshot["billingStatus"] = billing_status;
     let snapshot = desktop_auth_persist_snapshot(&app, snapshot)?;
-    desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &snapshot).await?;
+    desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &snapshot);
     Ok(desktop_auth_public_snapshot(&snapshot))
 }
 
@@ -876,7 +924,7 @@ async fn desktop_auth_sign_out(
         &app,
         desktop_auth_signed_out_snapshot(DESKTOP_AUTH_DEFAULT_MESSAGE, "", true),
     )?;
-    desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+    desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &next);
     if let Some(token) = token {
         let _ = logout_desktop_session(token).await;
     }

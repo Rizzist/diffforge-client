@@ -5427,7 +5427,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)
         } else {
             let scan_summary = if reason_for_summary == "tokenomics_source_changed" {
-                let scan_summary = tokenomics_scan_usage_for(&app, false, false)?;
+                let scan_summary = tokenomics_scan_realtime_usage_for(&app)?;
                 if tokenomics_summary_inserted_events(&scan_summary) == 0 {
                     return Ok(scan_summary);
                 }

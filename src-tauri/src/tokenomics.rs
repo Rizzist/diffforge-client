@@ -27,6 +27,7 @@ const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
 const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
 const TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX: &str = "cloud_account_sync_cursor:";
 static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static TOKENOMICS_REALTIME_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
 use std::io::BufRead as _;
 
@@ -86,25 +87,7 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
 async fn tokenomics_get_live_limits(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = tokenomics_open_db(&app)?;
-        let mut limits = tokenomics_provider_limits(&conn, false, false)?;
-        let sample_count = tokenomics_record_provider_limit_samples(&conn, &limits)?;
-        tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
-        let latest_window_count = tokenomics_record_latest_windows(&conn, &limits)?;
-        let limit_samples = tokenomics_provider_limit_sample_sync_rows(&conn, None, None)?;
-        let latest_windows = tokenomics_latest_window_rows(&conn, None, None)?;
-        Ok(json!({
-            "known": false,
-            "source": "rust_live_provider_limits",
-            "updated_at": tokenomics_now_iso_like(),
-            "limit_sample_count": sample_count,
-            "latest_window_count": latest_window_count,
-            "latestWindowCount": latest_window_count,
-            "limit_samples": limit_samples.clone(),
-            "limitSamples": limit_samples,
-            "latest_windows": latest_windows.clone(),
-            "latestWindows": latest_windows,
-            "limits": limits,
-        }))
+        tokenomics_live_limits_snapshot_from_conn(&conn)
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics live limits: {error}"))?
@@ -658,12 +641,52 @@ fn tokenomics_ensure_column(
     Ok(())
 }
 
+fn tokenomics_live_limits_snapshot_from_conn(conn: &rusqlite::Connection) -> Result<Value, String> {
+    let mut limits = tokenomics_provider_limits(conn, false, false)?;
+    let sample_count = tokenomics_record_provider_limit_samples(conn, &limits)?;
+    tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
+    let latest_window_count = tokenomics_record_latest_windows(conn, &limits)?;
+    let limit_samples = tokenomics_provider_limit_sample_sync_rows(conn, None, None)?;
+    let latest_windows = tokenomics_latest_window_rows(conn, None, None)?;
+    Ok(json!({
+        "known": false,
+        "source": "rust_live_provider_limits",
+        "updated_at": tokenomics_now_iso_like(),
+        "limit_sample_count": sample_count,
+        "latest_window_count": latest_window_count,
+        "latestWindowCount": latest_window_count,
+        "limit_samples": limit_samples.clone(),
+        "limitSamples": limit_samples,
+        "latest_windows": latest_windows.clone(),
+        "latestWindows": latest_windows,
+        "limits": limits,
+    }))
+}
+
 fn tokenomics_scan_usage_for(
     app: &AppHandle,
     emit_progress: bool,
     force_resync_last_30_days: bool,
 ) -> Result<Value, String> {
-    let scan_lock = TOKENOMICS_SCAN_LOCK.get_or_init(|| StdMutex::new(()));
+    tokenomics_scan_usage_for_mode(
+        app,
+        emit_progress,
+        force_resync_last_30_days,
+        TokenomicsScanMode::Backfill,
+    )
+}
+
+fn tokenomics_scan_realtime_usage_for(app: &AppHandle) -> Result<Value, String> {
+    tokenomics_scan_usage_for_mode(app, false, false, TokenomicsScanMode::Realtime)
+}
+
+fn tokenomics_scan_usage_for_mode(
+    app: &AppHandle,
+    emit_progress: bool,
+    force_resync_last_30_days: bool,
+    scan_mode: TokenomicsScanMode,
+) -> Result<Value, String> {
+    let scan_lock = scan_mode.lock();
     let _scan_guard = match scan_lock.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => {
@@ -675,6 +698,7 @@ fn tokenomics_scan_usage_for(
                 "inserted_events": 0,
                 "sources": [],
                 "forced_resync": force_resync_last_30_days,
+                "mode": scan_mode.label(),
             });
             return Ok(summary);
         }
@@ -690,7 +714,23 @@ fn tokenomics_scan_usage_for(
         tokenomics_reset_scan_caches_for_resync(&conn)?;
     }
     tokenomics_reconcile_codex_provider_before_scan(&conn)?;
-    let codex_result = tokenomics_scan_codex_state_db(app, &conn, emit_progress)?;
+    if let Ok(limits_summary) = tokenomics_live_limits_snapshot_from_conn(&conn) {
+        tokenomics_emit_scan_progress(
+            app,
+            emit_progress,
+            json!({
+                "phase": "limits_ready",
+                "day_index": 0,
+                "day_total": if scan_mode.is_realtime() { 1 } else { TOKENOMICS_INITIAL_BACKFILL_DAYS },
+                "day_label": "latest limits",
+                "files_scanned": 0,
+                "inserted_events": 0,
+                "mode": scan_mode.label(),
+                "summary": limits_summary,
+            }),
+        );
+    }
+    let codex_result = tokenomics_scan_codex_state_db(app, &conn, emit_progress, scan_mode)?;
     scanned_files += codex_result.files_scanned;
     inserted_events += codex_result.inserted_events;
     sources.push(json!({
@@ -727,14 +767,19 @@ fn tokenomics_scan_usage_for(
         let mut source_inserted = 0usize;
         let mut found_roots = 0usize;
         let source_now_unix = tokenomics_unix_now();
+        let realtime_day_start = tokenomics_utc_day_start_unix(source_now_unix);
         let source_last_event =
             tokenomics_latest_source_offset_timestamp(&conn, source.provider, source.agent_kind)?;
-        let source_region_kind = if source_last_event > 0 && !force_resync_last_30_days {
+        let source_region_kind = if scan_mode.is_realtime() {
+            "realtime_current_day"
+        } else if source_last_event > 0 && !force_resync_last_30_days {
             "catch_up"
         } else {
             "initial_backfill"
         };
-        let source_region_start = if source_region_kind == "catch_up" {
+        let source_region_start = if scan_mode.is_realtime() {
+            realtime_day_start
+        } else if source_region_kind == "catch_up" {
             source_last_event.saturating_sub(3_600)
         } else {
             source_now_unix.saturating_sub(TOKENOMICS_INITIAL_BACKFILL_DAYS * 86_400)
@@ -757,38 +802,111 @@ fn tokenomics_scan_usage_for(
                 "running",
                 newest_source_event,
             )?;
-            let files =
-                tokenomics_collect_candidate_files(&root, TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER);
-            for file in files {
-                if tokenomics_source_is_unchanged(
-                    &conn,
-                    source.provider,
-                    source.agent_kind,
-                    &file,
-                    TOKENOMICS_GENERIC_SCANNER_VERSION,
-                )? {
+            let files = tokenomics_collect_candidate_files_with_min_mtime(
+                &root,
+                TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER,
+                scan_mode.is_realtime().then_some(realtime_day_start),
+            );
+            let source_day_total = if scan_mode.is_realtime() {
+                1
+            } else {
+                TOKENOMICS_INITIAL_BACKFILL_DAYS
+            };
+            for day_offset in 0..source_day_total {
+                let day_files = files
+                    .iter()
+                    .filter(|file| {
+                        let (modified, _) = tokenomics_file_mtime_size(file);
+                        tokenomics_scan_day_offset_from_now(modified, source_now_unix)
+                            == day_offset
+                    })
+                    .collect::<Vec<_>>();
+                if day_files.is_empty() {
                     continue;
                 }
-                source_files += 1;
-                scanned_files += 1;
-                let scan = tokenomics_scan_file(
-                    &conn,
-                    source.provider,
-                    source.agent_kind,
-                    &provider_account,
-                    &file,
-                )?;
-                source_inserted += scan.inserted_events;
-                newest_source_event = newest_source_event.max(scan.last_event_timestamp);
-                tokenomics_upsert_source_offset(
-                    &conn,
-                    source.provider,
-                    source.agent_kind,
-                    &file,
-                    TOKENOMICS_GENERIC_SCANNER_VERSION,
-                    scan.last_line_index,
-                    scan.last_event_timestamp,
-                )?;
+                let day_candidate_count = day_files.len();
+                let day_index = day_offset + 1;
+                let day_label = tokenomics_scan_day_label_from_offset(day_offset);
+                tokenomics_emit_scan_progress(
+                    app,
+                    emit_progress,
+                    json!({
+                        "provider": source.provider,
+                        "agent_kind": source.agent_kind,
+                        "provider_account_key": provider_account.key.as_str(),
+                        "provider_account_label": provider_account.label.as_str(),
+                        "phase": if scan_mode.is_realtime() { "realtime_current_day" } else { "day_start" },
+                        "day_index": day_index,
+                        "day_total": source_day_total,
+                        "day_label": day_label.as_str(),
+                        "files_scanned": scanned_files,
+                        "inserted_events": inserted_events + source_inserted,
+                        "candidate_count": files.len(),
+                        "day_candidate_count": day_candidate_count,
+                        "mode": scan_mode.label(),
+                    }),
+                );
+                let day_files_before = scanned_files;
+                let day_inserted_before = inserted_events + source_inserted;
+                for file in day_files {
+                    if tokenomics_source_is_unchanged(
+                        &conn,
+                        source.provider,
+                        source.agent_kind,
+                        file,
+                        TOKENOMICS_GENERIC_SCANNER_VERSION,
+                    )? {
+                        continue;
+                    }
+                    source_files += 1;
+                    scanned_files += 1;
+                    let scan = tokenomics_scan_file(
+                        &conn,
+                        source.provider,
+                        source.agent_kind,
+                        &provider_account,
+                        file,
+                    )?;
+                    source_inserted += scan.inserted_events;
+                    newest_source_event = newest_source_event.max(scan.last_event_timestamp);
+                    tokenomics_upsert_source_offset(
+                        &conn,
+                        source.provider,
+                        source.agent_kind,
+                        file,
+                        TOKENOMICS_GENERIC_SCANNER_VERSION,
+                        scan.last_line_index,
+                        scan.last_event_timestamp,
+                    )?;
+                }
+                let day_files_scanned = scanned_files.saturating_sub(day_files_before);
+                let day_inserted_events =
+                    (inserted_events + source_inserted).saturating_sub(day_inserted_before);
+                let mut progress = json!({
+                    "provider": source.provider,
+                    "agent_kind": source.agent_kind,
+                    "provider_account_key": provider_account.key.as_str(),
+                    "provider_account_label": provider_account.label.as_str(),
+                    "phase": "day_complete",
+                    "day_index": day_index,
+                    "day_total": source_day_total,
+                    "day_label": day_label,
+                    "files_scanned": scanned_files,
+                    "inserted_events": inserted_events + source_inserted,
+                    "day_files_scanned": day_files_scanned,
+                    "day_inserted_events": day_inserted_events,
+                    "candidate_count": files.len(),
+                    "day_candidate_count": day_candidate_count,
+                    "mode": scan_mode.label(),
+                });
+                if day_files_scanned > 0 || day_inserted_events > 0 {
+                    if let Ok(summary) =
+                        tokenomics_summary_from_conn(&conn, true, Some(inserted_events + source_inserted))
+                    {
+                        progress["summary"] = summary;
+                    }
+                }
+                tokenomics_emit_scan_progress(app, emit_progress, progress);
             }
             tokenomics_upsert_usage_region(
                 &conn,
@@ -820,6 +938,7 @@ fn tokenomics_scan_usage_for(
         "inserted_events": inserted_events,
         "sources": sources,
         "forced_resync": force_resync_last_30_days,
+        "mode": scan_mode.label(),
     });
     if force_resync_last_30_days {
         summary["forced_resync"] = json!(true);
@@ -2030,6 +2149,34 @@ struct TokenomicsScanResult {
     status: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenomicsScanMode {
+    Backfill,
+    Realtime,
+}
+
+impl TokenomicsScanMode {
+    fn is_realtime(self) -> bool {
+        matches!(self, Self::Realtime)
+    }
+
+    fn lock(self) -> &'static StdMutex<()> {
+        if self.is_realtime() {
+            TOKENOMICS_REALTIME_SCAN_LOCK.get_or_init(|| StdMutex::new(()))
+        } else {
+            TOKENOMICS_SCAN_LOCK.get_or_init(|| StdMutex::new(()))
+        }
+    }
+
+    fn label(self) -> &'static str {
+        if self.is_realtime() {
+            "realtime"
+        } else {
+            "backfill"
+        }
+    }
+}
+
 struct TokenomicsCodexThreadCandidate {
     thread_id: String,
     rollout_path: PathBuf,
@@ -2832,6 +2979,34 @@ fn tokenomics_emit_scan_progress(app: &AppHandle, emit_progress: bool, payload: 
     let _ = app.emit(TOKENOMICS_SCAN_PROGRESS_EVENT, payload);
 }
 
+fn tokenomics_utc_day_start_unix(seconds: u64) -> u64 {
+    seconds
+        .checked_div(86_400)
+        .unwrap_or(0)
+        .saturating_mul(86_400)
+}
+
+fn tokenomics_scan_day_offset_from_now(updated_at_unix: u64, now_unix: u64) -> u64 {
+    let now_day = tokenomics_utc_day_start_unix(now_unix)
+        .checked_div(86_400)
+        .unwrap_or(0);
+    let updated_day = tokenomics_utc_day_start_unix(updated_at_unix)
+        .checked_div(86_400)
+        .unwrap_or(0);
+    now_day.saturating_sub(updated_day)
+}
+
+fn tokenomics_scan_day_label_from_offset(day_offset: u64) -> String {
+    if day_offset == 0 {
+        "today".to_string()
+    } else if day_offset == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{day_offset} days ago")
+    }
+}
+
+#[cfg(test)]
 fn tokenomics_scan_day_progress(
     updated_at_unix: u64,
     backfill_cutoff: u64,
@@ -3200,6 +3375,7 @@ fn tokenomics_scan_codex_state_db(
     app: &AppHandle,
     conn: &rusqlite::Connection,
     emit_progress: bool,
+    scan_mode: TokenomicsScanMode,
 ) -> Result<TokenomicsScanResult, String> {
     let Some(home) = tokenomics_home_dir() else {
         return Ok(TokenomicsScanResult {
@@ -3223,7 +3399,7 @@ fn tokenomics_scan_codex_state_db(
     let needs_scanner_reset = scan_state
         .as_ref()
         .map(|state| state.scanner_version.as_str() != TOKENOMICS_CODEX_SCANNER_VERSION)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let accountless_events: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM tokenomics_usage_events
@@ -3237,7 +3413,7 @@ fn tokenomics_scan_codex_state_db(
         tokenomics_delete_provider_rows(conn, "openai", "codex")?;
         tokenomics_delete_provider_scan_cache(conn, "openai", "codex")?;
         scan_state = None;
-    } else if needs_scanner_reset {
+    } else if needs_scanner_reset || (!scan_mode.is_realtime() && scan_state.is_none()) {
         tokenomics_delete_provider_scan_cache(conn, "openai", "codex")?;
         scan_state = None;
     }
@@ -3246,14 +3422,29 @@ fn tokenomics_scan_codex_state_db(
         .map(|state| state.initial_backfill_done)
         .unwrap_or(false);
     let now_unix = tokenomics_unix_now();
+    let realtime_day_start = tokenomics_utc_day_start_unix(now_unix);
     let backfill_cutoff = now_unix.saturating_sub(TOKENOMICS_INITIAL_BACKFILL_DAYS * 86_400);
-    let min_thread_updated_at = if initial_backfill_done {
+    let min_thread_updated_at = if scan_mode.is_realtime() {
+        realtime_day_start
+    } else if initial_backfill_done {
         scan_state
             .as_ref()
             .map(|state| state.last_event_timestamp.saturating_sub(3_600))
             .unwrap_or(0)
     } else {
         backfill_cutoff
+    };
+    let scan_region_kind = if scan_mode.is_realtime() {
+        "realtime_current_day"
+    } else if initial_backfill_done {
+        "catch_up"
+    } else {
+        "initial_backfill"
+    };
+    let scan_day_total = if scan_mode.is_realtime() {
+        1
+    } else {
+        TOKENOMICS_INITIAL_BACKFILL_DAYS
     };
     tokenomics_upsert_provider_account(
         conn,
@@ -3270,11 +3461,7 @@ fn tokenomics_scan_codex_state_db(
         "openai",
         "codex",
         &source_id,
-        if initial_backfill_done {
-            "catch_up"
-        } else {
-            "initial_backfill"
-        },
+        scan_region_kind,
         min_thread_updated_at,
         now_unix,
         "running",
@@ -3292,12 +3479,13 @@ fn tokenomics_scan_codex_state_db(
             "agent_kind": "codex",
             "provider_account_key": provider_account.key.as_str(),
             "provider_account_label": provider_account.label.as_str(),
-            "phase": if initial_backfill_done { "catch_up" } else { "backfill_start" },
+            "phase": if scan_mode.is_realtime() { "realtime_current_day" } else if initial_backfill_done { "catch_up" } else { "backfill_start" },
             "day_index": 0,
-            "day_total": TOKENOMICS_INITIAL_BACKFILL_DAYS,
-            "day_label": if initial_backfill_done { "latest usage" } else { "preparing 30-day scan" },
+            "day_total": scan_day_total,
+            "day_label": if scan_mode.is_realtime() { "today" } else if initial_backfill_done { "latest usage" } else { "preparing 30-day scan" },
             "files_scanned": 0,
             "inserted_events": 0,
+            "mode": scan_mode.label(),
         }),
     );
 
@@ -3325,7 +3513,7 @@ fn tokenomics_scan_codex_state_db(
                  FROM threads
                  WHERE COALESCE(rollout_path, '') != ''
                    AND (?1 = 0 OR updated_at >= ?1 OR updated_at >= ?2)
-                 ORDER BY updated_at ASC",
+                 ORDER BY updated_at DESC",
             )
             .map_err(|error| format!("Unable to prepare Codex Tokenomics query: {error}"))?;
         let mut rows = statement
@@ -3362,103 +3550,147 @@ fn tokenomics_scan_codex_state_db(
     let mut inserted_events = 0usize;
     let mut files_scanned = 0usize;
     let mut skipped_cached = 0usize;
-    let mut current_day_index = 0u64;
     let mut newest_event_timestamp = scan_state
         .as_ref()
         .map(|state| state.last_event_timestamp)
         .unwrap_or(backfill_cutoff);
 
-    for candidate in candidates.iter() {
-        let (day_index, day_total, day_label) =
-            tokenomics_scan_day_progress(candidate.updated_at_unix, backfill_cutoff, now_unix);
-        if day_index != current_day_index {
-            current_day_index = day_index;
-            let mut progress = json!({
+    for day_offset in 0..scan_day_total {
+        let day_candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                tokenomics_scan_day_offset_from_now(candidate.updated_at_unix, now_unix)
+                    == day_offset
+            })
+            .collect::<Vec<_>>();
+        if day_candidates.is_empty() {
+            continue;
+        }
+        let day_candidate_count = day_candidates.len();
+        let day_index = day_offset + 1;
+        let day_label = tokenomics_scan_day_label_from_offset(day_offset);
+        tokenomics_emit_scan_progress(
+            app,
+            emit_progress,
+            json!({
                 "provider": "openai",
                 "agent_kind": "codex",
                 "provider_account_key": provider_account.key.as_str(),
                 "provider_account_label": provider_account.label.as_str(),
-                "phase": if initial_backfill_done { "catch_up" } else { "day_start" },
+                "phase": if scan_mode.is_realtime() { "realtime_current_day" } else if initial_backfill_done { "catch_up" } else { "day_start" },
                 "day_index": day_index,
-                "day_total": day_total,
-                "day_label": day_label,
+                "day_total": scan_day_total,
+                "day_label": day_label.as_str(),
                 "files_scanned": files_scanned,
                 "inserted_events": inserted_events,
                 "candidate_count": candidates.len(),
+                "day_candidate_count": day_candidate_count,
+                "mode": scan_mode.label(),
+            }),
+        );
+
+        let day_files_before = files_scanned;
+        let day_inserted_before = inserted_events;
+        for candidate in day_candidates {
+            let (mtime, size) = tokenomics_file_mtime_size(&candidate.rollout_path);
+            let offset =
+                tokenomics_get_source_offset(conn, "openai", "codex", &candidate.rollout_path)?;
+            let existing_source_identity = tokenomics_existing_source_identity(
+                conn,
+                "openai",
+                "codex",
+                &candidate.rollout_path,
+            )?;
+            let offset_is_current = offset.as_ref().is_some_and(|offset| {
+                offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
+                    && offset.last_seen_mtime == mtime
+                    && offset.last_seen_size == size
             });
-            if files_scanned > 0 || inserted_events > 0 {
-                if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events))
-                {
-                    progress["summary"] = summary;
+            let can_resume_from_offset =
+                (initial_backfill_done || scan_mode.is_realtime()) && existing_source_identity.is_some();
+            if can_resume_from_offset && offset_is_current {
+                skipped_cached += 1;
+                if let Some(offset) = offset.as_ref() {
+                    newest_event_timestamp = newest_event_timestamp.max(offset.last_event_timestamp);
                 }
+                continue;
             }
-            tokenomics_emit_scan_progress(app, emit_progress, progress);
+            let start_after_line = if can_resume_from_offset {
+                offset
+                    .as_ref()
+                    .filter(|offset| {
+                        offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
+                            && size >= offset.last_seen_size
+                    })
+                    .map(|offset| offset.last_line_index)
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+            files_scanned += 1;
+            let file_scan = tokenomics_scan_codex_session_file(
+                conn,
+                &candidate.thread_id,
+                &candidate.rollout_path,
+                &candidate.source,
+                &candidate.model_provider,
+                candidate.model.as_deref(),
+                &provider_account,
+                candidate.cwd.as_deref(),
+                candidate.updated_at_unix,
+                start_after_line,
+                if scan_mode.is_realtime() {
+                    realtime_day_start
+                } else if initial_backfill_done {
+                    0
+                } else {
+                    backfill_cutoff
+                },
+            )?;
+            inserted_events += file_scan.inserted_events;
+            newest_event_timestamp = newest_event_timestamp.max(
+                file_scan
+                    .last_event_timestamp
+                    .max(candidate.updated_at_unix),
+            );
+            tokenomics_upsert_source_offset(
+                conn,
+                "openai",
+                "codex",
+                &candidate.rollout_path,
+                TOKENOMICS_CODEX_SCANNER_VERSION,
+                file_scan.last_line_index,
+                file_scan
+                    .last_event_timestamp
+                    .max(candidate.updated_at_unix),
+            )?;
         }
 
-        let (mtime, size) = tokenomics_file_mtime_size(&candidate.rollout_path);
-        let offset =
-            tokenomics_get_source_offset(conn, "openai", "codex", &candidate.rollout_path)?;
-        let existing_source_identity =
-            tokenomics_existing_source_identity(conn, "openai", "codex", &candidate.rollout_path)?;
-        let offset_is_current = offset.as_ref().is_some_and(|offset| {
-            offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
-                && offset.last_seen_mtime == mtime
-                && offset.last_seen_size == size
+        let day_files_scanned = files_scanned.saturating_sub(day_files_before);
+        let day_inserted_events = inserted_events.saturating_sub(day_inserted_before);
+        let mut progress = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": provider_account.key.as_str(),
+            "provider_account_label": provider_account.label.as_str(),
+            "phase": "day_complete",
+            "day_index": day_index,
+            "day_total": scan_day_total,
+            "day_label": day_label,
+            "files_scanned": files_scanned,
+            "inserted_events": inserted_events,
+            "day_files_scanned": day_files_scanned,
+            "day_inserted_events": day_inserted_events,
+            "candidate_count": candidates.len(),
+            "day_candidate_count": day_candidate_count,
+            "mode": scan_mode.label(),
         });
-        if initial_backfill_done && offset_is_current && existing_source_identity.is_some() {
-            skipped_cached += 1;
-            if let Some(offset) = offset.as_ref() {
-                newest_event_timestamp = newest_event_timestamp.max(offset.last_event_timestamp);
+        if day_files_scanned > 0 || day_inserted_events > 0 {
+            if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
+                progress["summary"] = summary;
             }
-            continue;
         }
-        let start_after_line = if initial_backfill_done && existing_source_identity.is_some() {
-            offset
-                .as_ref()
-                .filter(|offset| {
-                    offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
-                        && size >= offset.last_seen_size
-                })
-                .map(|offset| offset.last_line_index)
-                .unwrap_or(-1)
-        } else {
-            -1
-        };
-        files_scanned += 1;
-        let file_scan = tokenomics_scan_codex_session_file(
-            conn,
-            &candidate.thread_id,
-            &candidate.rollout_path,
-            &candidate.source,
-            &candidate.model_provider,
-            candidate.model.as_deref(),
-            &provider_account,
-            candidate.cwd.as_deref(),
-            candidate.updated_at_unix,
-            start_after_line,
-            if initial_backfill_done {
-                0
-            } else {
-                backfill_cutoff
-            },
-        )?;
-        inserted_events += file_scan.inserted_events;
-        newest_event_timestamp = newest_event_timestamp.max(
-            file_scan
-                .last_event_timestamp
-                .max(candidate.updated_at_unix),
-        );
-        tokenomics_upsert_source_offset(
-            conn,
-            "openai",
-            "codex",
-            &candidate.rollout_path,
-            TOKENOMICS_CODEX_SCANNER_VERSION,
-            file_scan.last_line_index,
-            file_scan
-                .last_event_timestamp
-                .max(candidate.updated_at_unix),
-        )?;
+        tokenomics_emit_scan_progress(app, emit_progress, progress);
     }
 
     let mut complete_progress = json!({
@@ -3467,12 +3699,13 @@ fn tokenomics_scan_codex_state_db(
         "provider_account_key": provider_account.key.as_str(),
         "provider_account_label": provider_account.label.as_str(),
         "phase": "complete",
-        "day_index": TOKENOMICS_INITIAL_BACKFILL_DAYS,
-        "day_total": TOKENOMICS_INITIAL_BACKFILL_DAYS,
+        "day_index": scan_day_total,
+        "day_total": scan_day_total,
         "day_label": "complete",
         "files_scanned": files_scanned,
         "inserted_events": inserted_events,
         "candidate_count": candidates.len(),
+        "mode": scan_mode.label(),
     });
     if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
         complete_progress["summary"] = summary;
@@ -3485,7 +3718,11 @@ fn tokenomics_scan_codex_state_db(
         "codex",
         &source_id,
         TOKENOMICS_CODEX_SCANNER_VERSION,
-        true,
+        if scan_mode.is_realtime() {
+            initial_backfill_done
+        } else {
+            true
+        },
         newest_event_timestamp.max(backfill_cutoff),
     )?;
     tokenomics_upsert_usage_region(
@@ -3493,11 +3730,7 @@ fn tokenomics_scan_codex_state_db(
         "openai",
         "codex",
         &source_id,
-        if initial_backfill_done {
-            "catch_up"
-        } else {
-            "initial_backfill"
-        },
+        scan_region_kind,
         min_thread_updated_at,
         now_unix,
         "complete",
@@ -3507,7 +3740,9 @@ fn tokenomics_scan_codex_state_db(
     Ok(TokenomicsScanResult {
         files_scanned,
         inserted_events,
-        status: if !initial_backfill_done {
+        status: if scan_mode.is_realtime() {
+            "realtime"
+        } else if !initial_backfill_done {
             "backfilled_30d"
         } else if files_scanned == 0 && skipped_cached > 0 {
             "cached"
@@ -3879,9 +4114,13 @@ fn tokenomics_normalized_model_key(model: Option<&str>) -> String {
         .collect()
 }
 
-fn tokenomics_collect_candidate_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+fn tokenomics_collect_candidate_files_with_min_mtime(
+    root: &Path,
+    limit: usize,
+    min_modified_unix: Option<u64>,
+) -> Vec<PathBuf> {
     let mut files = Vec::<(u64, PathBuf)>::new();
-    tokenomics_collect_candidate_files_inner(root, 0, &mut files);
+    tokenomics_collect_candidate_files_inner(root, 0, min_modified_unix, &mut files);
     files.sort_by(|left, right| right.0.cmp(&left.0));
     files
         .into_iter()
@@ -3893,6 +4132,7 @@ fn tokenomics_collect_candidate_files(root: &Path, limit: usize) -> Vec<PathBuf>
 fn tokenomics_collect_candidate_files_inner(
     root: &Path,
     depth: usize,
+    min_modified_unix: Option<u64>,
     files: &mut Vec<(u64, PathBuf)>,
 ) {
     if depth > 8 || files.len() > TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER.saturating_mul(8) {
@@ -3907,7 +4147,7 @@ fn tokenomics_collect_candidate_files_inner(
             continue;
         };
         if metadata.is_dir() {
-            tokenomics_collect_candidate_files_inner(&path, depth + 1, files);
+            tokenomics_collect_candidate_files_inner(&path, depth + 1, min_modified_unix, files);
             continue;
         }
         if !metadata.is_file() || metadata.len() > TOKENOMICS_SCAN_MAX_FILE_BYTES {
@@ -3927,6 +4167,9 @@ fn tokenomics_collect_candidate_files_inner(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
+        if min_modified_unix.is_some_and(|minimum| modified < minimum) {
+            continue;
+        }
         files.push((modified, path));
     }
 }
