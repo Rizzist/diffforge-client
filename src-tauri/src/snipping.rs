@@ -27,6 +27,7 @@ const SNIPPING_DESKTOP_ICONS_MARKER_FILE: &str = "snipping-desktop-icons-hidden.
 /// True only between a hide this process performed and its matching restore,
 /// so captures never double-hide and never touch a user's own icons-off setup.
 static SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP: AtomicBool = AtomicBool::new(false);
+static SNIPPING_AREA_BEGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
@@ -45,6 +46,8 @@ const SNIPPING_MACOS_CG_EVENT_KEY_DOWN: u32 = 10;
 const SNIPPING_MACOS_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xffff_fffe;
 #[cfg(target_os = "macos")]
 const SNIPPING_MACOS_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xffff_ffff;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 #[cfg(target_os = "macos")]
 const SNIPPING_MACOS_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 #[cfg(target_os = "macos")]
@@ -1299,6 +1302,18 @@ extern "C" fn snipping_macos_event_tap_callback(
     let Some(action) = snipping_macos_default_action_for_key(&app, keycode) else {
         return event;
     };
+
+    let is_autorepeat =
+        unsafe { CGEventGetIntegerValueField(event, SNIPPING_MACOS_KEYBOARD_EVENT_AUTOREPEAT) } != 0;
+    if is_autorepeat {
+        log_terminal_status_event(
+            "backend.snipping.macos_default_shortcut.autorepeat_ignored",
+            json!({
+                "action": action.label(),
+            }),
+        );
+        return std::ptr::null_mut();
+    }
 
     thread::spawn(move || {
         let result = match action {
@@ -3794,6 +3809,37 @@ fn snipping_area_session_labels(app: &AppHandle) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn snipping_area_session_active(app: &AppHandle) -> bool {
+    app.state::<SnippingState>()
+        .active_area_sessions
+        .lock()
+        .map(|guard| !guard.is_empty())
+        .unwrap_or(false)
+}
+
+struct SnippingAreaBeginGuard;
+
+impl Drop for SnippingAreaBeginGuard {
+    fn drop(&mut self) {
+        SNIPPING_AREA_BEGIN_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+fn snipping_try_begin_area_snip() -> Option<SnippingAreaBeginGuard> {
+    SNIPPING_AREA_BEGIN_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| SnippingAreaBeginGuard)
+}
+
+fn snipping_area_already_active_payload(reason: &str, shortcut: String) -> Value {
+    json!({
+        "kind": "snipping_area_already_active",
+        "reason": reason,
+        "shortcut": shortcut,
+    })
+}
+
 fn snipping_area_session_monitor(
     app: &AppHandle,
     label: &str,
@@ -3856,6 +3902,16 @@ fn snipping_begin_area_snip_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
+    if snipping_area_session_active(app) {
+        return Ok(snipping_area_already_active_payload(reason, shortcut));
+    }
+    let Some(_begin_guard) = snipping_try_begin_area_snip() else {
+        return Ok(snipping_area_already_active_payload(reason, shortcut));
+    };
+    if snipping_area_session_active(app) {
+        return Ok(snipping_area_already_active_payload(reason, shortcut));
+    }
+
     // Boot the preview window for this capture while the user is still
     // drawing the selection, so the draggable preview shows up instantly
     // when the snip finishes.

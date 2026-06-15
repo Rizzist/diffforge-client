@@ -753,7 +753,7 @@ const TerminalWorkspaceMain = styled.div`
   }
 
   [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
-    min-width: 300px;
+    min-width: 350px;
   }
 
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
@@ -764,7 +764,7 @@ const TerminalWorkspaceMain = styled.div`
     width: auto !important;
     height: auto !important;
     max-width: none !important;
-    min-width: 300px !important;
+    min-width: 350px !important;
     min-height: 0 !important;
     overflow: visible;
     box-shadow:
@@ -2359,7 +2359,7 @@ const TODO_QUEUE_STORAGE_DISCARDED_STATUSES = new Set([
 ]);
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
 const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
-const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
+const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 350;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 2_000_000;
 const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 2_000_000;

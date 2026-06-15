@@ -537,7 +537,7 @@ const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
-const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280, 700];
+const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280, 700, 1400, 2800];
 const AUDIO_WIDGET_CLOUD_STATUS_POLL_MS = 5000;
 const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
@@ -4256,7 +4256,6 @@ export function AudioWidgetWindow() {
   const barPositionAnimationRef = useRef({ frame: 0, token: 0 });
   const barPlacementGenerationRef = useRef(0);
   const barPlacementReadyKeyRef = useRef("");
-  const barFullscreenAnchorStrategyRef = useRef(null);
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
@@ -5334,9 +5333,7 @@ export function AudioWidgetWindow() {
       if (!barSavedPlacementRef.current) {
         const persistedBubblePosition = readAudioWidgetBubblePlacement();
         const currentPosition = await windowHandle.outerPosition().catch(() => null);
-        const savedPosition = persistedBubblePosition
-          || writeAudioWidgetBubblePlacement(currentPosition)
-          || currentPosition;
+        const savedPosition = persistedBubblePosition || currentPosition;
         barSavedPlacementRef.current = {
           position: savedPosition,
         };
@@ -5350,17 +5347,11 @@ export function AudioWidgetWindow() {
         height: target.height,
         margin,
         animate: options.animate !== false && !modeGeometryChanged,
-        ...(options.anchorStrategy?.useFullMonitorBounds ? { useFullMonitorBounds: true } : {}),
       });
       if (!isCurrentPlacement()) {
         return;
       }
       if (nativePlacement) {
-        if (nativePlacement.useFullMonitorBounds) {
-          barFullscreenAnchorStrategyRef.current = nativePlacement;
-        } else if (!options.anchorStrategy?.useFullMonitorBounds) {
-          barFullscreenAnchorStrategyRef.current = null;
-        }
         barPlacementReadyKeyRef.current = targetKey;
         setBarPlacementReadyKey((currentKey) => (
           currentKey === targetKey ? currentKey : targetKey
@@ -5372,14 +5363,9 @@ export function AudioWidgetWindow() {
       if (!isCurrentPlacement()) {
         return;
       }
-      const anchorStrategyHint = options.anchorStrategy
-        && typeof options.anchorStrategy === "object"
-        && options.anchorStrategy.useFullMonitorBounds
-        ? options.anchorStrategy
-        : null;
       const [monitor, anchorStrategy] = await Promise.all([
         currentMonitor().catch(() => null),
-        anchorStrategyHint || resolveAudioBarAnchorStrategy(),
+        resolveAudioBarAnchorStrategy(),
       ]);
       if (!isCurrentPlacement()) {
         return;
@@ -5431,7 +5417,6 @@ export function AudioWidgetWindow() {
   // is left under the bar.
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
-      barFullscreenAnchorStrategyRef.current = null;
       barPlacementReadyKeyRef.current = "";
       setBarPlacementReadyKey("");
       invoke("audio_widget_clear_bottom_bar_position").catch(() => {});
@@ -5468,10 +5453,7 @@ export function AudioWidgetWindow() {
     }
 
     const timer = window.setInterval(
-      () => positionBottomAnchoredWidget({
-        animate: true,
-        anchorStrategy: barFullscreenAnchorStrategyRef.current || undefined,
-      }),
+      () => positionBottomAnchoredWidget({ animate: true }),
       AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
     );
     return () => window.clearInterval(timer);
@@ -5486,35 +5468,22 @@ export function AudioWidgetWindow() {
     let unlistenSpace = () => {};
     let unlistenLayout = () => {};
     const timers = new Set();
-    const schedulePosition = (delayMs, anchorStrategy) => {
+    const schedulePosition = (delayMs) => {
       const timer = window.setTimeout(() => {
         timers.delete(timer);
         if (!disposed) {
-          positionBottomAnchoredWidget({ animate: true, anchorStrategy });
+          positionBottomAnchoredWidget({ animate: true });
         }
       }, delayMs);
       timers.add(timer);
     };
-    const handleLayoutChanged = (event, audioScoped) => {
+    const handleLayoutChanged = () => {
       timers.forEach((timer) => window.clearTimeout(timer));
       timers.clear();
-      const payload = event?.payload;
-      if (payload?.useFullMonitorBounds) {
-        barFullscreenAnchorStrategyRef.current = payload;
-      } else if (
-        audioScoped
-        && payload
-        && typeof payload.useFullMonitorBounds === "boolean"
-      ) {
-        barFullscreenAnchorStrategyRef.current = null;
-      }
-      const eventStrategy = barFullscreenAnchorStrategyRef.current || undefined;
-      AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach((delayMs) => {
-        schedulePosition(delayMs, eventStrategy);
-      });
+      AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach(schedulePosition);
     };
 
-    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, (event) => handleLayoutChanged(event, true))
+    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, handleLayoutChanged)
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
@@ -5524,7 +5493,7 @@ export function AudioWidgetWindow() {
         unlistenSpace = nextUnlisten;
       })
       .catch(() => {});
-    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, (event) => handleLayoutChanged(event, false))
+    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, handleLayoutChanged)
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();

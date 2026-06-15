@@ -3247,6 +3247,7 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
             emit_audio_widget_current_visibility(&app_handle, false);
         }
         WindowEvent::Destroyed => {
+            audio_widget_clear_bottom_bar_position_request();
             log_audio_diagnostic_event(
                 "audio.widget.window.destroyed",
                 json!({
@@ -3343,7 +3344,7 @@ const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
 #[cfg(target_os = "macos")]
-const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 4] = [0, 120, 280, 700];
+const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 6] = [0, 120, 280, 700, 1_400, 2_800];
 #[cfg(target_os = "macos")]
 const MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS: u64 = 2_500;
 
@@ -3393,7 +3394,7 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                     });
                 },
             );
-            let token = unsafe {
+            let active_space_token = unsafe {
                 center.addObserverForName_object_queue_usingBlock(
                     Some(objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification),
                     None,
@@ -3401,8 +3402,17 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                     &block,
                 )
             };
+            let active_app_token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidActivateApplicationNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
             // The observer lives for the app's lifetime.
-            std::mem::forget(token);
+            std::mem::forget(active_space_token);
+            std::mem::forget(active_app_token);
             macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
         });
     });
@@ -3731,10 +3741,10 @@ fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn audio_widget_reposition_stored_bottom_bar_for(app: &AppHandle, animate: bool) -> bool {
-    let Some(mut request) = audio_widget_last_bottom_bar_position_request() else {
+    let Some(layout) = audio_widget_last_bottom_bar_layout() else {
         return false;
     };
-    request.animate = animate;
+    let request = layout.into_request(animate);
     if objc2::MainThreadMarker::new().is_some() {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -3927,6 +3937,17 @@ fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Resu
         let window = ensure_audio_widget_window(app)?;
         #[cfg(target_os = "macos")]
         audio_widget_apply_macos_space_style(&window);
+        #[cfg(target_os = "macos")]
+        {
+            let _ = window.unminimize();
+            if let Some(layout) = audio_widget_last_bottom_bar_layout() {
+                let _ = audio_widget_position_bottom_bar_on_main_thread(
+                    app,
+                    &window,
+                    layout.into_request(false),
+                );
+            }
+        }
         window
             .show()
             .map_err(|error| format!("Unable to show audio widget: {error}"))?;
@@ -4109,6 +4130,7 @@ struct AudioWidgetBottomBarPositionRequest {
     height: f64,
     margin: f64,
     animate: bool,
+    #[allow(dead_code)]
     use_full_monitor_bounds: Option<bool>,
 }
 
@@ -4124,31 +4146,56 @@ impl Default for AudioWidgetBottomBarPositionRequest {
     }
 }
 
-static AUDIO_WIDGET_BOTTOM_BAR_REQUEST: OnceLock<
-    StdMutex<Option<AudioWidgetBottomBarPositionRequest>>,
-> = OnceLock::new();
-
-fn audio_widget_bottom_bar_request_slot(
-) -> &'static StdMutex<Option<AudioWidgetBottomBarPositionRequest>> {
-    AUDIO_WIDGET_BOTTOM_BAR_REQUEST.get_or_init(|| StdMutex::new(None))
+#[derive(Clone)]
+struct AudioWidgetBottomBarLayout {
+    width: f64,
+    height: f64,
+    margin: f64,
 }
 
-fn audio_widget_store_bottom_bar_position_request(request: &AudioWidgetBottomBarPositionRequest) {
-    if let Ok(mut current) = audio_widget_bottom_bar_request_slot().lock() {
-        let mut stored = request.clone();
-        stored.animate = false;
-        *current = Some(stored);
+impl AudioWidgetBottomBarLayout {
+    fn from_request(request: &AudioWidgetBottomBarPositionRequest) -> Self {
+        Self {
+            width: request.width,
+            height: request.height,
+            margin: request.margin,
+        }
+    }
+
+    fn into_request(self, animate: bool) -> AudioWidgetBottomBarPositionRequest {
+        AudioWidgetBottomBarPositionRequest {
+            width: self.width,
+            height: self.height,
+            margin: self.margin,
+            animate,
+            use_full_monitor_bounds: None,
+        }
+    }
+}
+
+static AUDIO_WIDGET_BOTTOM_BAR_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetBottomBarLayout>>> =
+    OnceLock::new();
+
+fn audio_widget_bottom_bar_layout_slot() -> &'static StdMutex<Option<AudioWidgetBottomBarLayout>> {
+    AUDIO_WIDGET_BOTTOM_BAR_LAYOUT.get_or_init(|| StdMutex::new(None))
+}
+
+fn audio_widget_store_bottom_bar_layout(request: &AudioWidgetBottomBarPositionRequest) {
+    if let Ok(mut current) = audio_widget_bottom_bar_layout_slot().lock() {
+        *current = Some(AudioWidgetBottomBarLayout::from_request(request));
     }
 }
 
 fn audio_widget_clear_bottom_bar_position_request() {
-    if let Ok(mut current) = audio_widget_bottom_bar_request_slot().lock() {
+    #[cfg(target_os = "macos")]
+    AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut current) = audio_widget_bottom_bar_layout_slot().lock() {
         *current = None;
     }
 }
 
-fn audio_widget_last_bottom_bar_position_request() -> Option<AudioWidgetBottomBarPositionRequest> {
-    audio_widget_bottom_bar_request_slot()
+fn audio_widget_last_bottom_bar_layout() -> Option<AudioWidgetBottomBarLayout> {
+    audio_widget_bottom_bar_layout_slot()
         .lock()
         .ok()
         .and_then(|current| current.clone())
@@ -4261,12 +4308,31 @@ fn audio_widget_macos_screen_for_mouse(
 }
 
 #[cfg(target_os = "macos")]
-fn audio_widget_macos_screen_for_window(
+fn audio_widget_macos_screen_for_tauri_window(
+    window: &tauri::WebviewWindow,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSScreen>> {
+    let Ok(ns_ptr) = window.ns_window() else {
+        return None;
+    };
+    if ns_ptr.is_null() {
+        return None;
+    }
+    let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+    ns_window.screen()
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_macos_target_screen_for_bottom_bar(
+    app: &AppHandle,
     ns_window: &NSWindow,
     main_thread_marker: objc2::MainThreadMarker,
 ) -> Option<objc2::rc::Retained<objc2_app_kit::NSScreen>> {
     audio_widget_macos_screen_for_mouse(main_thread_marker)
         .or_else(|| ns_window.screen())
+        .or_else(|| {
+            app.get_webview_window("main")
+                .and_then(|window| audio_widget_macos_screen_for_tauri_window(&window))
+        })
         .or_else(|| objc2_app_kit::NSScreen::mainScreen(main_thread_marker))
 }
 
@@ -4357,7 +4423,18 @@ fn macos_window_bounds_cover_screen(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
+fn macos_frontmost_non_current_application_pid(current_pid: i32) -> Option<i32> {
+    let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+    let frontmost = workspace.frontmostApplication()?;
+    let pid = frontmost.processIdentifier();
+    (pid > 0 && pid != current_pid).then_some(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_other_visible_app_has_fullscreen_window(
+    current_pid: i32,
+    target_frame: Option<&objc2_core_foundation::CGRect>,
+) -> bool {
     if current_pid <= 0 {
         return false;
     }
@@ -4378,6 +4455,7 @@ fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
     if screen_count == 0 {
         return false;
     }
+    let frontmost_pid = macos_frontmost_non_current_application_pid(current_pid);
 
     for window_index in 0..windows.count() {
         let window_ref = unsafe { windows.value_at_index(window_index) }
@@ -4392,6 +4470,13 @@ fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
         if owner_pid <= 0 || owner_pid == current_pid {
             continue;
         }
+        if target_frame.is_none() {
+            if let Some(frontmost_pid) = frontmost_pid {
+                if owner_pid != frontmost_pid {
+                    continue;
+                }
+            }
+        }
         if audio_widget_cf_number_i32(window_info, "kCGWindowLayer").unwrap_or(0) != 0 {
             continue;
         }
@@ -4400,6 +4485,13 @@ fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
             continue;
         };
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            continue;
+        }
+
+        if let Some(target_frame) = target_frame {
+            if macos_window_bounds_cover_screen(&bounds, target_frame) {
+                return true;
+            }
             continue;
         }
 
@@ -4421,7 +4513,9 @@ fn macos_active_space_uses_full_monitor_bounds_cached() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool {
+fn macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(
+    target_screen: Option<&objc2_app_kit::NSScreen>,
+) -> bool {
     let mut use_full_monitor_bounds = false;
     snipping_catch_objc("macos_active_space_full_monitor_bounds", || {
         if let Some(main_thread_marker) = objc2::MainThreadMarker::new() {
@@ -4446,7 +4540,9 @@ fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool 
         // display whenever another visible app owns a screen-sized window; the
         // auxiliary Diff Forge window itself can become frontmost while still
         // floating above that fullscreen Space.
-        use_full_monitor_bounds = macos_other_visible_app_has_fullscreen_window(current_pid);
+        let target_frame = target_screen.map(|screen| screen.frame());
+        use_full_monitor_bounds =
+            macos_other_visible_app_has_fullscreen_window(current_pid, target_frame.as_ref());
     });
     if use_full_monitor_bounds {
         MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(
@@ -4461,6 +4557,11 @@ fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool 
     }
     MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS.store(use_full_monitor_bounds, Ordering::Release);
     use_full_monitor_bounds
+}
+
+#[cfg(target_os = "macos")]
+fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool {
+    macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(None)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4516,113 +4617,121 @@ fn audio_widget_bar_anchor_strategy_for(
 }
 
 #[cfg(target_os = "macos")]
+fn audio_widget_position_bottom_bar_on_main_thread(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    request: AudioWidgetBottomBarPositionRequest,
+) -> Result<AudioWidgetBottomBarPositionResult, String> {
+    snipping_catch_objc_result("audio_widget_position_bottom_bar", || {
+        let width = audio_widget_positive_dimension(request.width, 64.0);
+        let height = audio_widget_positive_dimension(request.height, 64.0);
+        let margin = if request.margin.is_finite() {
+            request.margin.max(0.0)
+        } else {
+            0.0
+        };
+        let Ok(ns_ptr) = window.ns_window() else {
+            return Err("Unable to access audio widget native window.".to_string());
+        };
+        if ns_ptr.is_null() {
+            return Err("Audio widget native window is unavailable.".to_string());
+        }
+
+        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+        audio_widget_apply_macos_space_style_to_ns_window(ns_window);
+
+        let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
+            return Err("Audio widget AppKit placement must run on the main thread.".to_string());
+        };
+        let Some(screen) =
+            audio_widget_macos_target_screen_for_bottom_bar(app, ns_window, main_thread_marker)
+        else {
+            return Err("Unable to resolve the audio widget screen.".to_string());
+        };
+
+        let use_full_monitor_bounds =
+            macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(Some(
+                &screen,
+            ));
+        let source = if use_full_monitor_bounds {
+            "macos-fullscreen-space"
+        } else {
+            "appkit-visible-frame"
+        };
+        let screen_frame = screen.frame();
+        let visible_frame = screen.visibleFrame();
+        let anchor_frame = if use_full_monitor_bounds {
+            screen_frame
+        } else {
+            visible_frame
+        };
+
+        let x =
+            (anchor_frame.origin.x + ((anchor_frame.size.width - width) / 2.0).max(0.0)).round();
+        let y = (anchor_frame.origin.y + margin).round();
+        let target_frame = objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(x, y),
+            objc2_core_foundation::CGSize::new(width, height),
+        );
+
+        let animate = request.animate && !use_full_monitor_bounds;
+        ns_window.setFrame_display_animate(target_frame, true, animate);
+        ns_window.orderFrontRegardless();
+
+        let frame = ns_window.frame();
+        let result = AudioWidgetBottomBarPositionResult {
+            x: frame.origin.x,
+            y: frame.origin.y,
+            width: frame.size.width,
+            height: frame.size.height,
+            anchor_x: anchor_frame.origin.x,
+            anchor_y: anchor_frame.origin.y,
+            anchor_width: anchor_frame.size.width,
+            anchor_height: anchor_frame.size.height,
+            scale_factor: screen.backingScaleFactor(),
+            source: source.to_string(),
+            use_full_monitor_bounds,
+        };
+
+        log_audio_diagnostic_event(
+            "audio.widget.position_bottom_bar.native_done",
+            json!({
+                "x": result.x,
+                "y": result.y,
+                "width": result.width,
+                "height": result.height,
+                "anchor_x": result.anchor_x,
+                "anchor_y": result.anchor_y,
+                "anchor_width": result.anchor_width,
+                "anchor_height": result.anchor_height,
+                "screen_x": screen_frame.origin.x,
+                "screen_y": screen_frame.origin.y,
+                "screen_width": screen_frame.size.width,
+                "screen_height": screen_frame.size.height,
+                "visible_x": visible_frame.origin.x,
+                "visible_y": visible_frame.origin.y,
+                "visible_width": visible_frame.size.width,
+                "visible_height": visible_frame.size.height,
+                "scale_factor": result.scale_factor,
+                "source": result.source,
+                "use_full_monitor_bounds": result.use_full_monitor_bounds,
+                "request_full_monitor_bounds": request.use_full_monitor_bounds,
+            }),
+        );
+
+        audio_widget_store_bottom_bar_layout(&request);
+        Ok(result)
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn audio_widget_position_bottom_bar_for(
     app: &AppHandle,
     request: AudioWidgetBottomBarPositionRequest,
 ) -> Result<AudioWidgetBottomBarPositionResult, String> {
     run_audio_widget_action_on_main_thread(app, "position_bottom_bar", move |app| {
-        snipping_catch_objc_result("audio_widget_position_bottom_bar", || {
-            let window = ensure_audio_widget_window(app)?;
-            let width = audio_widget_positive_dimension(request.width, 64.0);
-            let height = audio_widget_positive_dimension(request.height, 64.0);
-            let margin = if request.margin.is_finite() {
-                request.margin.max(0.0)
-            } else {
-                0.0
-            };
-            let Ok(ns_ptr) = window.ns_window() else {
-                return Err("Unable to access audio widget native window.".to_string());
-            };
-            if ns_ptr.is_null() {
-                return Err("Audio widget native window is unavailable.".to_string());
-            }
-
-            let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
-            audio_widget_apply_macos_space_style_to_ns_window(ns_window);
-            if request.use_full_monitor_bounds == Some(true) {
-                MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(
-                    current_time_ms().saturating_add(MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS),
-                    Ordering::Release,
-                );
-            }
-
-            let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
-                return Err(
-                    "Audio widget AppKit placement must run on the main thread.".to_string()
-                );
-            };
-            let Some(screen) = audio_widget_macos_screen_for_window(ns_window, main_thread_marker)
-            else {
-                return Err("Unable to resolve the audio widget screen.".to_string());
-            };
-
-            let detected_full_monitor =
-                macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
-            let use_full_monitor_bounds = request
-                .use_full_monitor_bounds
-                .unwrap_or(detected_full_monitor);
-            let source = if request.use_full_monitor_bounds == Some(true) {
-                "request-fullscreen-space"
-            } else if use_full_monitor_bounds {
-                "macos-fullscreen-space"
-            } else {
-                "appkit-visible-frame"
-            };
-            let anchor_frame = if use_full_monitor_bounds {
-                screen.frame()
-            } else {
-                screen.visibleFrame()
-            };
-
-            let x = (anchor_frame.origin.x + ((anchor_frame.size.width - width) / 2.0).max(0.0))
-                .round();
-            let y = (anchor_frame.origin.y + margin).round();
-            let target_frame = objc2_core_foundation::CGRect::new(
-                objc2_core_foundation::CGPoint::new(x, y),
-                objc2_core_foundation::CGSize::new(width, height),
-            );
-
-            let animate = request.animate && !use_full_monitor_bounds;
-            ns_window.setFrame_display_animate(target_frame, true, animate);
-            ns_window.orderFrontRegardless();
-
-            let frame = ns_window.frame();
-            let result = AudioWidgetBottomBarPositionResult {
-                x: frame.origin.x,
-                y: frame.origin.y,
-                width: frame.size.width,
-                height: frame.size.height,
-                anchor_x: anchor_frame.origin.x,
-                anchor_y: anchor_frame.origin.y,
-                anchor_width: anchor_frame.size.width,
-                anchor_height: anchor_frame.size.height,
-                scale_factor: screen.backingScaleFactor(),
-                source: source.to_string(),
-                use_full_monitor_bounds,
-            };
-
-            log_audio_diagnostic_event(
-                "audio.widget.position_bottom_bar.native_done",
-                json!({
-                    "x": result.x,
-                    "y": result.y,
-                    "width": result.width,
-                    "height": result.height,
-                    "anchor_x": result.anchor_x,
-                    "anchor_y": result.anchor_y,
-                    "anchor_width": result.anchor_width,
-                    "anchor_height": result.anchor_height,
-                    "scale_factor": result.scale_factor,
-                    "source": result.source,
-                    "use_full_monitor_bounds": result.use_full_monitor_bounds,
-                }),
-            );
-
-            let mut stored_request = request.clone();
-            stored_request.use_full_monitor_bounds = use_full_monitor_bounds.then_some(true);
-            audio_widget_store_bottom_bar_position_request(&stored_request);
-            Ok(result)
-        })
+        let window = ensure_audio_widget_window(app)?;
+        audio_widget_position_bottom_bar_on_main_thread(app, &window, request)
     })
 }
 
@@ -4658,7 +4767,7 @@ fn audio_widget_position_bottom_bar_for(
         .set_position(tauri::PhysicalPosition::new(x, y))
         .map_err(|error| format!("Unable to position audio widget: {error}"))?;
 
-    audio_widget_store_bottom_bar_position_request(&request);
+    audio_widget_store_bottom_bar_layout(&request);
     Ok(AudioWidgetBottomBarPositionResult {
         x: x as f64,
         y: y as f64,

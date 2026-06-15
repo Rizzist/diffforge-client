@@ -697,6 +697,13 @@ export function SnippingOverlayWindow() {
   const [capturing, setCapturing] = useState(false);
   const [overlayMonitor, setOverlayMonitor] = useState(null);
   const dragRef = useRef(null);
+  const activePointerIdRef = useRef(null);
+  const capturingRef = useRef(false);
+
+  const setCapturingState = useCallback((value) => {
+    capturingRef.current = Boolean(value);
+    setCapturing(Boolean(value));
+  }, []);
   // One overlay window exists per display; backend events carry the target
   // overlay's label so each webview only applies its own monitor/backdrop.
   const windowLabel = useMemo(() => {
@@ -729,7 +736,8 @@ export function SnippingOverlayWindow() {
   }, [drag]);
 
   const closeOverlay = useCallback(async () => {
-    setCapturing(false);
+    setCapturingState(false);
+    activePointerIdRef.current = null;
     dragRef.current = null;
     setDrag(null);
     setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
@@ -742,15 +750,17 @@ export function SnippingOverlayWindow() {
         // Overlay close is best effort.
       }
     }
-  }, []);
+  }, [setCapturingState]);
 
   const applyOverlayMonitor = useCallback((monitor) => {
     setOverlayMonitor(monitor && typeof monitor === "object" ? monitor : null);
     setError("");
-    setCapturing(false);
-    dragRef.current = null;
+    if (dragRef.current || activePointerIdRef.current !== null || capturingRef.current) {
+      return;
+    }
+    setCapturingState(false);
     setDrag(null);
-  }, []);
+  }, [setCapturingState]);
 
   const loadOverlayStatus = useCallback(async () => {
     try {
@@ -831,9 +841,32 @@ export function SnippingOverlayWindow() {
     };
   }, []);
 
+  const releasePointerCapture = useCallback((event) => {
+    const pointerId = activePointerIdRef.current;
+    if (pointerId === null) return;
+    try {
+      event?.currentTarget?.releasePointerCapture?.(pointerId);
+    } catch {
+      // Pointer capture can already be gone after OS-level cancellation.
+    }
+    activePointerIdRef.current = null;
+  }, []);
+
+  const cancelActiveDrag = useCallback((event) => {
+    releasePointerCapture(event);
+    dragRef.current = null;
+    setDrag(null);
+  }, [releasePointerCapture]);
+
   const beginDrag = useCallback((event) => {
-    if (event.button !== 0 || capturing) return;
+    if ((event.pointerType === "mouse" && event.button !== 0) || capturingRef.current) return;
     event.preventDefault();
+    activePointerIdRef.current = event.pointerId;
+    try {
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    } catch {
+      activePointerIdRef.current = null;
+    }
     const point = overlayPoint(event);
     const nextDrag = {
       startX: point.x,
@@ -843,10 +876,11 @@ export function SnippingOverlayWindow() {
     };
     dragRef.current = nextDrag;
     setDrag(nextDrag);
-  }, [capturing, overlayPoint]);
+  }, [overlayPoint]);
 
   const updateDrag = useCallback((event) => {
-    if (!dragRef.current || capturing) return;
+    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
+    if (!dragRef.current || capturingRef.current) return;
     const point = overlayPoint(event);
     const nextDrag = {
       ...dragRef.current,
@@ -855,12 +889,18 @@ export function SnippingOverlayWindow() {
     };
     dragRef.current = nextDrag;
     setDrag(nextDrag);
-  }, [capturing, overlayPoint]);
+  }, [overlayPoint]);
 
-  const finishDrag = useCallback(async () => {
+  const finishDrag = useCallback(async (event) => {
+    if (event && activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
+    event?.preventDefault?.();
     const currentDrag = dragRef.current;
     dragRef.current = null;
-    if (!currentDrag || capturing) return;
+    releasePointerCapture(event);
+    if (!currentDrag || capturingRef.current) {
+      setDrag(null);
+      return;
+    }
 
     const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
     const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
@@ -874,7 +914,7 @@ export function SnippingOverlayWindow() {
       return;
     }
 
-    setCapturing(true);
+    setCapturingState(true);
     setError("");
     const overlayWindow = getCurrentWindow();
     try {
@@ -887,7 +927,7 @@ export function SnippingOverlayWindow() {
           scaleFactor: window.devicePixelRatio || 1,
         },
       });
-      setCapturing(false);
+      setCapturingState(false);
       dragRef.current = null;
       setDrag(null);
       setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
@@ -897,18 +937,20 @@ export function SnippingOverlayWindow() {
         // Rust also hides the overlay after capture.
       }
     } catch (captureError) {
-      setCapturing(false);
+      setCapturingState(false);
       setError(getErrorMessage(captureError, "Unable to capture selected area."));
     }
-  }, [capturing, closeOverlay]);
+  }, [closeOverlay, releasePointerCapture, setCapturingState]);
 
   return (
     <>
       <SnippingOverlayGlobalStyle />
       <SnippingOverlayRoot
-        onMouseDown={beginDrag}
-        onMouseMove={updateDrag}
-        onMouseUp={finishDrag}
+        onLostPointerCapture={cancelActiveDrag}
+        onPointerCancel={cancelActiveDrag}
+        onPointerDown={beginDrag}
+        onPointerMove={updateDrag}
+        onPointerUp={finishDrag}
         style={snapshotUrl ? { "--snipping-overlay-snapshot": `url("${snapshotUrl}")` } : undefined}
       >
         {!selection && !capturing && (
@@ -1151,6 +1193,7 @@ const SnippingOverlayRoot = styled.main`
     "Segoe UI",
     sans-serif;
   cursor: crosshair;
+  touch-action: none;
 `;
 
 const SnippingOverlayHint = styled.div`

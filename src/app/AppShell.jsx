@@ -657,7 +657,7 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 ]);
 const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
 const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
-const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 250;
+const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 350;
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -3015,7 +3015,17 @@ function foldCloudWebOnlyDeviceRows(devicesById) {
   const hasRegisteredInventory = canonicalEntries.some(([, device]) => device?.registered);
   const canonicalWithWeb = canonicalEntries.filter(([, device]) => device.webConnected === true);
   entries.forEach(([deviceId, device]) => {
-    if (!device?.webOnly) {
+    const platformAndForm = [
+      device?.platformIcon,
+      device?.platform,
+      device?.platformLabel,
+      device?.formFactor,
+      device?.formFactorLabel,
+      device?.icon,
+    ].map(normalizeCloudDeviceText).join(" ");
+    const mobileLike = ["mobile", "phone", "tablet", "android", "ios", "iphone", "ipad"]
+      .some((token) => platformAndForm.includes(token));
+    if (!device?.webOnly || cloudDeviceRowLooksRegistered(device) || mobileLike) {
       return;
     }
     const targetEntry = canonicalEntries.find(([, candidate]) => (
@@ -3193,6 +3203,8 @@ function cloudDeviceCandidatesFromAccountSnapshot(snapshot) {
   const clientConnection = snapshotRoot.client_connection || snapshotRoot.clientConnection || {};
   const connectionOverlay = cloudDeviceConnectionOverlayFromSnapshot(root, snapshotRoot);
   const output = [];
+  appendCloudDeviceCandidates(output, root.registered_devices || root.registeredDevices, { registered: true });
+  appendCloudDeviceCandidates(output, root.device_registry || root.deviceRegistry, { registered: true });
   appendCloudDeviceCandidates(output, snapshotRoot.registered_devices || snapshotRoot.registeredDevices, { registered: true });
   appendCloudDeviceCandidates(output, snapshotRoot.device_registry || snapshotRoot.deviceRegistry, { registered: true });
   appendCloudDeviceCandidates(output, snapshotRoot.device);
@@ -3274,11 +3286,8 @@ function cloudDeviceLiveStateFromRuntimeStatus(status) {
   };
 }
 
-function cloudAccountDeviceLiveStateSnapshotFromEventPayload(payload) {
-  if (!payload || typeof payload !== "object") {
-    return null;
-  }
-  const looksLikeAccountLiveState = (value) => Boolean(
+function cloudAccountDeviceLiveStateSnapshotValueLooksLive(value) {
+  return Boolean(
     value
       && typeof value === "object"
       && !Array.isArray(value)
@@ -3294,30 +3303,52 @@ function cloudAccountDeviceLiveStateSnapshotFromEventPayload(payload) {
           || value.clientConnection
       ),
   );
-  const snapshot = [
-    payload?.data,
-    payload?.payload,
-    payload?.account_device_live_state_snapshot,
-    payload?.accountDeviceLiveStateSnapshot,
-    payload?.device_live_state_snapshot,
-    payload?.deviceLiveStateSnapshot,
-  ].find(looksLikeAccountLiveState)
-    || (looksLikeAccountLiveState(payload) ? payload : null);
-  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+}
+
+function cloudAccountDeviceLiveStateSnapshotFromValue(value, depth = 0) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || depth > 5) {
     return null;
   }
-  return snapshot;
+  if (cloudAccountDeviceLiveStateSnapshotValueLooksLive(value)) {
+    return value;
+  }
+  for (const key of [
+    "initial_account_live_state",
+    "initialAccountLiveState",
+    "account_live_state",
+    "accountLiveState",
+    "account_device_live_state_snapshot",
+    "accountDeviceLiveStateSnapshot",
+    "device_live_state_snapshot",
+    "deviceLiveStateSnapshot",
+    "data",
+    "payload",
+    "event",
+  ]) {
+    const snapshot = cloudAccountDeviceLiveStateSnapshotFromValue(value[key], depth + 1);
+    if (snapshot) {
+      return snapshot;
+    }
+  }
+  return null;
+}
+
+function cloudAccountDeviceLiveStateSnapshotFromEventPayload(payload) {
+  return cloudAccountDeviceLiveStateSnapshotFromValue(payload);
 }
 
 function cloudDeviceLiveStateFromAccountSnapshot(snapshot, previous = null) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     return previous && typeof previous === "object" ? previous : null;
   }
-  return {
+  const merged = {
     ...(previous && typeof previous === "object" ? previous : {}),
     ...snapshot,
-    accountDeviceLiveStateSnapshot: snapshot,
-    account_device_live_state_snapshot: snapshot,
+  };
+  return {
+    ...merged,
+    accountDeviceLiveStateSnapshot: merged,
+    account_device_live_state_snapshot: merged,
   };
 }
 
@@ -4936,9 +4967,9 @@ function cloudDeviceRowLooksRegistered(device) {
     device?.registered
       || device?.registeredDevice
       || device?.registered_device
-      || device?.source === "registered_account_devices"
-      || device?.registry_scope === "registered_account_devices"
-      || device?.registryScope === "registered_account_devices"
+      || device?.source === "cloud_current_sqlite"
+      || device?.registry_scope === "cloud_current_sqlite"
+      || device?.registryScope === "cloud_current_sqlite"
   );
 }
 

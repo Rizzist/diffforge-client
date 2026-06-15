@@ -3546,7 +3546,7 @@ export const WorkspaceAppToolLayout = styled.div`
   }
 
   [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
-    min-width: 300px;
+    min-width: 350px;
   }
 
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
@@ -3557,7 +3557,7 @@ export const WorkspaceAppToolLayout = styled.div`
     width: auto !important;
     height: auto !important;
     max-width: none !important;
-    min-width: 300px !important;
+    min-width: 350px !important;
     min-height: 0 !important;
     overflow: visible;
     box-shadow:

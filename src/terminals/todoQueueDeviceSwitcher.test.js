@@ -503,7 +503,7 @@ test("device switcher uses next registered device payload as the stable inventor
             },
           ],
           registered_count: 2,
-          scope: "registered_account_devices",
+          scope: "cloud_current_sqlite",
         },
         devices: {
           "web-current-browser": {

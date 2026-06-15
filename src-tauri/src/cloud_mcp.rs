@@ -6913,6 +6913,8 @@ fn cloud_mcp_merge_account_live_state_snapshot(previous: Option<&Value>, next: V
     let Some(previous_object) = previous.as_object() else {
         return next;
     };
+    let previous_registry = cloud_mcp_registered_device_registry_from_response(previous);
+    let next_registry = cloud_mcp_registered_device_registry_from_response(&next);
 
     let mut merged = previous_object.clone();
     for (key, value) in next_object {
@@ -6934,6 +6936,28 @@ fn cloud_mcp_merge_account_live_state_snapshot(previous: Option<&Value>, next: V
         }
     }
 
+    let merged_registry = match (previous_registry.as_ref(), next_registry.as_ref()) {
+        (Some(previous_registry), Some(next_registry)) => Some(
+            cloud_mcp_merge_registered_device_registry(previous_registry, next_registry),
+        ),
+        (Some(previous_registry), None) => Some(previous_registry.clone()),
+        (None, Some(next_registry)) => Some(next_registry.clone()),
+        (None, None) => None,
+    };
+    if let Some(registry) = merged_registry {
+        let registered_count = cloud_mcp_registry_count(&registry);
+        for key in [
+            "registered_devices",
+            "registeredDevices",
+            "device_registry",
+            "deviceRegistry",
+        ] {
+            merged.insert(key.to_string(), registry.clone());
+        }
+        merged.insert("registered_device_count".to_string(), json!(registered_count));
+        merged.insert("known_device_count".to_string(), json!(registered_count));
+    }
+
     Value::Object(merged)
 }
 
@@ -6948,6 +6972,202 @@ fn cloud_mcp_registered_device_registry_from_response(value: &Value) -> Option<V
     .flatten()
     .find(|candidate| candidate.is_object())
     .cloned()
+}
+
+fn cloud_mcp_registry_item_aliases(item: &Value) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let paths: &[&[&str]] = &[
+        &["device_id"],
+        &["deviceId"],
+        &["machine_id"],
+        &["machineId"],
+        &["id"],
+        &["native_device_id"],
+        &["nativeDeviceId"],
+        &["target_native_device_id"],
+        &["targetNativeDeviceId"],
+        &["target_device_id"],
+        &["targetDeviceId"],
+        &["web_device_id"],
+        &["webDeviceId"],
+        &["web_presence", "web_device_id"],
+        &["webPresence", "webDeviceId"],
+        &["web_presence", "target_device_id"],
+        &["webPresence", "targetDeviceId"],
+        &["surfaces", "native", "device_id"],
+        &["surfaces", "native", "deviceId"],
+        &["surfaces", "web", "device_id"],
+        &["surfaces", "web", "deviceId"],
+    ];
+    for path in paths {
+        if let Some(value) = cloud_mcp_payload_text(item, path) {
+            let alias = value.trim().to_ascii_lowercase();
+            if !alias.is_empty() && !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+    }
+    aliases
+}
+
+fn cloud_mcp_registry_item_key(item: &Value, index: usize) -> String {
+    cloud_mcp_registry_item_aliases(item)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("registry-item-{index}"))
+}
+
+fn cloud_mcp_registry_array_non_empty(value: &Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_merge_registry_object(previous: &Value, next: &Value) -> Value {
+    let (Some(previous_object), Some(next_object)) = (previous.as_object(), next.as_object()) else {
+        return next.clone();
+    };
+    let mut merged = previous_object.clone();
+    for (key, value) in next_object {
+        merged.insert(key.clone(), value.clone());
+    }
+    for key in ["agents", "workspaces", "workspace_catalog", "workspaceCatalog"] {
+        if !cloud_mcp_registry_array_non_empty(next, key)
+            && cloud_mcp_registry_array_non_empty(previous, key)
+        {
+            if let Some(value) = previous_object.get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(merged)
+}
+
+fn cloud_mcp_registry_deleted_ids(value: &Value) -> HashSet<String> {
+    let mut deleted = HashSet::new();
+    for key in [
+        "deleted_device_ids",
+        "deletedDeviceIds",
+        "removed_device_ids",
+        "removedDeviceIds",
+    ] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    let alias = text.trim().to_ascii_lowercase();
+                    if !alias.is_empty() {
+                        deleted.insert(alias);
+                    }
+                } else {
+                    for alias in cloud_mcp_registry_item_aliases(item) {
+                        deleted.insert(alias);
+                    }
+                }
+            }
+        }
+    }
+    for key in ["tombstones", "deleted", "removed"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    let alias = text.trim().to_ascii_lowercase();
+                    if !alias.is_empty() {
+                        deleted.insert(alias);
+                    }
+                } else {
+                    for alias in cloud_mcp_registry_item_aliases(item) {
+                        deleted.insert(alias);
+                    }
+                }
+            }
+        }
+    }
+    deleted
+}
+
+fn cloud_mcp_registry_item_is_deleted(item: &Value, deleted: &HashSet<String>) -> bool {
+    !deleted.is_empty()
+        && cloud_mcp_registry_item_aliases(item)
+            .iter()
+            .any(|alias| deleted.contains(alias))
+}
+
+fn cloud_mcp_merge_registry_items(previous_registry: &Value, next_registry: &Value) -> Option<Vec<Value>> {
+    let previous_items = previous_registry.get("items").and_then(Value::as_array);
+    let next_items = next_registry.get("items").and_then(Value::as_array);
+    if previous_items.is_none() && next_items.is_none() {
+        return None;
+    }
+
+    let mut deleted = cloud_mcp_registry_deleted_ids(previous_registry);
+    deleted.extend(cloud_mcp_registry_deleted_ids(next_registry));
+    let mut by_key = HashMap::<String, Value>::new();
+    let mut order = Vec::<String>::new();
+
+    for (index, item) in previous_items.into_iter().flatten().enumerate() {
+        let key = cloud_mcp_registry_item_key(item, index);
+        if !by_key.contains_key(&key) {
+            order.push(key.clone());
+        }
+        by_key.insert(key, item.clone());
+    }
+
+    for (index, item) in next_items.into_iter().flatten().enumerate() {
+        let key = cloud_mcp_registry_item_key(item, index);
+        if let Some(previous_item) = by_key.get(&key) {
+            by_key.insert(key, cloud_mcp_merge_registry_object(previous_item, item));
+        } else {
+            order.push(key.clone());
+            by_key.insert(key, item.clone());
+        }
+    }
+
+    Some(
+        order
+            .into_iter()
+            .filter_map(|key| by_key.remove(&key))
+            .filter(|item| !cloud_mcp_registry_item_is_deleted(item, &deleted))
+            .collect(),
+    )
+}
+
+fn cloud_mcp_merge_registered_device_registry(previous_registry: &Value, next_registry: &Value) -> Value {
+    let (Some(previous_object), Some(next_object)) =
+        (previous_registry.as_object(), next_registry.as_object())
+    else {
+        return next_registry.clone();
+    };
+    let mut merged = previous_object.clone();
+    for (key, value) in next_object {
+        merged.insert(key.clone(), value.clone());
+    }
+    for key in ["agents", "workspaces"] {
+        if !cloud_mcp_registry_array_non_empty(next_registry, key)
+            && cloud_mcp_registry_array_non_empty(previous_registry, key)
+        {
+            if let Some(value) = previous_object.get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    if let Some(items) = cloud_mcp_merge_registry_items(previous_registry, next_registry) {
+        merged.insert("items".to_string(), Value::Array(items));
+    }
+    let merged_count = merged
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.len() as u64)
+        .unwrap_or_else(|| cloud_mcp_registry_count(&Value::Object(merged.clone())));
+    if merged_count > 0 {
+        merged.insert("count".to_string(), json!(merged_count));
+        merged.insert("registered_count".to_string(), json!(merged_count));
+        merged.insert("registeredCount".to_string(), json!(merged_count));
+        merged.insert("known_count".to_string(), json!(merged_count));
+        merged.insert("knownCount".to_string(), json!(merged_count));
+    }
+    Value::Object(merged)
 }
 
 fn cloud_mcp_registry_count(registry: &Value) -> u64 {
@@ -6983,8 +7203,15 @@ async fn cloud_mcp_refresh_registered_device_registry(
         .await
         .map_err(|error| format!("Unable to load registered devices: {error}"))?;
     let body = read_api_response(response, "Unable to load registered devices.").await?;
-    let registry = cloud_mcp_registered_device_registry_from_response(&body)
+    let mut registry = cloud_mcp_registered_device_registry_from_response(&body)
         .ok_or_else(|| "Registered devices response did not include a registry.".to_string())?;
+    if let Some(object) = registry.as_object_mut() {
+        object.insert("source".to_string(), json!("next_agents_devices"));
+        object.insert(
+            "registry_source".to_string(),
+            json!("next_agents_devices"),
+        );
+    }
     let registered_count = cloud_mcp_registry_count(&registry);
     let snapshot = json!({
         "contract": "diffforge.account_device_live_state.v1",
@@ -11557,16 +11784,81 @@ fn cloud_mcp_local_cloud_available_blocking(ws_url: &str) -> bool {
         }
     }
 
-    let available = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(350))
-        .build()
-        .and_then(|client| client.get(&health_url).send())
-        .map(|response| response.status().is_success())
-        .unwrap_or(false);
+    let available = cloud_mcp_probe_local_http_health(&health_url, Duration::from_millis(350));
     if let Ok(mut cache_guard) = cache.lock() {
         cache_guard.insert(health_url, (available, now));
     }
     available
+}
+
+fn cloud_mcp_parse_local_http_health_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.trim().strip_prefix("http://")?;
+    let (host, port_and_path) = if let Some(rest) = rest.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = rest[..end].to_string();
+        let port_and_path = rest[end + 1..].strip_prefix(':')?;
+        (host, port_and_path)
+    } else {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let (host, port) = authority.rsplit_once(':')?;
+        return Some((
+            host.to_string(),
+            port.parse::<u16>().ok()?,
+            format!("/{}", path.trim_start_matches('/')),
+        ));
+    };
+    let (port, path) = port_and_path.split_once('/').unwrap_or((port_and_path, ""));
+    Some((
+        host,
+        port.parse::<u16>().ok()?,
+        format!("/{}", path.trim_start_matches('/')),
+    ))
+}
+
+fn cloud_mcp_local_health_socket_addrs(host: &str, port: u16) -> Vec<std::net::SocketAddr> {
+    match host {
+        "127.0.0.1" => vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))],
+        "localhost" => vec![
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+        ],
+        "::1" => vec![std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            port,
+        ))],
+        _ => Vec::new(),
+    }
+}
+
+fn cloud_mcp_probe_local_http_health(url: &str, timeout_duration: Duration) -> bool {
+    let Some((host, port, path)) = cloud_mcp_parse_local_http_health_url(url) else {
+        return false;
+    };
+    for address in cloud_mcp_local_health_socket_addrs(&host, port) {
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, timeout_duration) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(timeout_duration));
+        let _ = stream.set_write_timeout(Some(timeout_duration));
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            continue;
+        }
+        let mut response = [0_u8; 64];
+        let Ok(read) = stream.read(&mut response) else {
+            continue;
+        };
+        if read == 0 {
+            continue;
+        }
+        let status_line = String::from_utf8_lossy(&response[..read]);
+        if status_line.starts_with("HTTP/1.1 2") || status_line.starts_with("HTTP/1.0 2") {
+            return true;
+        }
+    }
+    false
 }
 
 fn cloud_mcp_local_http_url_allowed(url: &str) -> bool {
@@ -16160,12 +16452,18 @@ async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result
     let token = cloud_mcp_authorization_bearer(state)
         .await?
         .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
+    let target = cloud_mcp_asset_http_target_async(state, "/v1/billing/status")
+        .await
+        .map_err(|error| format!("Cloud billing direct route unavailable: {error}"))?;
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
-        .post(api_endpoint("billing/status"))
-        .bearer_auth(token)
+        .post(&target.url)
+        .headers(cloud_mcp_asset_http_headers(
+            Some(token.as_str()),
+            target.route_token.as_deref(),
+        )?)
         .json(&json!({
             "scopeType": billing_scope_type,
             "teamId": team_id,
@@ -29994,6 +30292,91 @@ mod cloud_mcp_tests {
             transport: "direct_cloud_container".to_string(),
         });
         assert!(cloud_mcp_last_direct_route_fresh("/v1/voice/ws").is_none());
+    }
+
+    #[test]
+    fn account_live_state_merge_preserves_registered_device_inventory() {
+        let previous = json!({
+            "registered_devices": {
+                "source": "next_agents_devices",
+                "count": 2,
+                "registered_count": 2,
+                "items": [
+                    {
+                        "device_id": "macos-24c",
+                        "display_name": "Syed's MacBook Air",
+                        "registered": true,
+                        "connected": true,
+                        "native_connected": true,
+                        "web_connected": true,
+                        "workspaces": [{ "id": "ws-desktop" }],
+                        "agents": [{ "id": "agent-desktop" }]
+                    },
+                    {
+                        "device_id": "web-android-mobile-samsung-galaxy-s23-ultra",
+                        "display_name": "Samsung Galaxy S23 Ultra",
+                        "platform": "android",
+                        "form_factor": "mobile",
+                        "registered": true,
+                        "connected": false,
+                        "native_connected": false,
+                        "web_connected": false
+                    }
+                ],
+                "workspaces": [{ "id": "ws-desktop" }],
+                "agents": [{ "id": "agent-desktop" }]
+            }
+        });
+        let next = json!({
+            "registered_devices": {
+                "source": "cloud_hot_state",
+                "count": 1,
+                "registered_count": 1,
+                "items": [
+                    {
+                        "device_id": "macos-24c",
+                        "display_name": "Syed's MacBook Air",
+                        "registered": true,
+                        "connected": true,
+                        "native_connected": true,
+                        "web_connected": true,
+                        "workspaces": [],
+                        "agents": []
+                    }
+                ],
+                "workspaces": [],
+                "agents": []
+            },
+            "registered_device_count": 1,
+            "known_device_count": 1
+        });
+
+        let merged = cloud_mcp_merge_account_live_state_snapshot(Some(&previous), next);
+        let registry = merged
+            .get("registered_devices")
+            .expect("merged registry alias");
+        let items = registry
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("merged items");
+
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| {
+            item.get("display_name").and_then(Value::as_str)
+                == Some("Samsung Galaxy S23 Ultra")
+        }));
+        assert_eq!(
+            registry.get("workspaces").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            registry.get("agents").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(merged.get("registered_device_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(merged.get("known_device_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(merged.get("registeredDevices"), merged.get("registered_devices"));
+        assert_eq!(merged.get("deviceRegistry"), merged.get("registered_devices"));
     }
 
     struct ScopedCloudMcpEnv {
