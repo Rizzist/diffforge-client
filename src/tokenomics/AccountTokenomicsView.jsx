@@ -860,18 +860,7 @@ function rowsForMappedNativeDevices(rows = [], nativeDeviceIds = new Set()) {
 }
 
 function summaryForMappedNativeDevices(summary = {}) {
-  if (!summary || typeof summary !== "object") return summary;
-  const nativeDeviceIds = mappedNativeDeviceIds(summary);
-  return {
-    ...summary,
-    by_device: rowsForMappedNativeDevices(summary.by_device, nativeDeviceIds),
-    by_device_provider: rowsForMappedNativeDevices(summary.by_device_provider, nativeDeviceIds),
-    by_device_account: rowsForMappedNativeDevices(summary.by_device_account, nativeDeviceIds),
-    by_device_model: rowsForMappedNativeDevices(summary.by_device_model, nativeDeviceIds),
-    daily_by_device_provider: rowsForMappedNativeDevices(summary.daily_by_device_provider, nativeDeviceIds),
-    hourly: rowsForMappedNativeDevices(summary.hourly, nativeDeviceIds),
-    monthly_by_device_provider: rowsForMappedNativeDevices(summary.monthly_by_device_provider, nativeDeviceIds),
-  };
+  return summary;
 }
 
 function tokenomicsDeviceIdentityMap(summary = {}) {
@@ -1768,7 +1757,6 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
 function deviceOptions(summary, selectedScopeKey = "all") {
   const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
   const identityMap = tokenomicsDeviceIdentityMap(summary);
-  const nativeDeviceIds = mappedNativeDeviceIds(summary);
   const rows = [
     ...(Array.isArray(summary?.by_device) ? summary.by_device : []),
     ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
@@ -1782,7 +1770,6 @@ function deviceOptions(summary, selectedScopeKey = "all") {
     if (selectedScopeKey !== "all" && rowScopeKey(row) !== selectedScopeKey) continue;
     const id = rowDeviceId(row);
     if (!id) continue;
-    if (!nativeDeviceIds.has(id)) continue;
     const current = byDevice.get(id) || {
       key: id,
       current: currentDeviceId === id,
@@ -1994,40 +1981,10 @@ const tokenomicsStore = {
   subscribers: new Set(),
 };
 
-/* Device-authoritative cloud sync of the DISPLAY model: whatever summary
-   this store renders is published verbatim so the next dashboard and other
-   devices show byte-identical numbers. Throttled here; Rust additionally
-   hash-skips unchanged summaries so steady-state ticks cost nothing. */
-const TOKENOMICS_DISPLAY_PUBLISH_MIN_MS = 15_000;
-let tokenomicsDisplayPublishLastMs = 0;
-let tokenomicsDisplayPublishTimer = 0;
-
-function publishTokenomicsDisplaySnapshot() {
-  const summary = tokenomicsStore.state.summary;
-  if (!summary || typeof summary !== "object") {
-    return;
-  }
-  const now = Date.now();
-  const wait = Math.max(0, TOKENOMICS_DISPLAY_PUBLISH_MIN_MS - (now - tokenomicsDisplayPublishLastMs));
-  if (tokenomicsDisplayPublishTimer) {
-    return;
-  }
-  tokenomicsDisplayPublishTimer = window.setTimeout(() => {
-    tokenomicsDisplayPublishTimer = 0;
-    tokenomicsDisplayPublishLastMs = Date.now();
-    const current = tokenomicsStore.state.summary;
-    if (!current || typeof current !== "object") {
-      return;
-    }
-    invoke("tokenomics_publish_display_snapshot", { summary: current }).catch(() => {});
-  }, wait);
-}
-
 function notifyTokenomicsSubscribers() {
   for (const subscriber of tokenomicsStore.subscribers) {
     subscriber(tokenomicsStore.state);
   }
-  publishTokenomicsDisplaySnapshot();
 }
 
 function updateTokenomicsStore(patchOrUpdater) {

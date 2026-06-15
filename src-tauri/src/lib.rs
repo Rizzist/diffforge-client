@@ -4561,7 +4561,6 @@ pub fn run() {
             cloud_mcp_schedule_tokenomics_sync,
             cloud_mcp_reset_device_tokenomics,
             tokenomics_scan_usage,
-            tokenomics_publish_display_snapshot,
             tokenomics_scan_usage_silent,
             tokenomics_resync_last_30_days,
             tokenomics_get_summary,
