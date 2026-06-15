@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   TODO_QUEUE_DEVICE_KIND_MOBILE,
+  buildAccountLiveDeviceRows,
   buildTodoQueueDeviceWorkspaceOptions,
   todoQueueDeviceSelectionIsLocalEditable,
   workspaceTodoItemsForDeviceWorkspace,
@@ -643,6 +644,8 @@ test("device switcher lights native from account connection summary overlay", ()
   const options = buildTodoQueueDeviceWorkspaceOptions({
     deviceLiveState: {
       account_device_live_state_snapshot: {
+        account_id: "acct-1",
+        client_id: "rust-diffforge-agent",
         client_connection: {
           active_desktop_device_ids: ["desktop-local"],
           active_desktop_devices: [
@@ -690,6 +693,177 @@ test("device switcher lights native from account connection summary overlay", ()
     ["native", true],
     ["web", true],
   ]);
+});
+
+test("device switcher keeps registered roster while partial live updates light desktop surfaces", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    connectedDevices: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        native_connected: false,
+        status: "connected",
+        web_connected: true,
+      },
+    ],
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        account_id: "acct-1",
+        client_id: "rust-diffforge-agent",
+        client_connection: {
+          active_desktop_device_ids: ["desktop-local"],
+          active_desktop_devices: [
+            {
+              device_id: "desktop-local",
+              machine_id: "desktop-local",
+              native_connected: true,
+              status: "connected",
+            },
+          ],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            native_connected: false,
+            status: "connected",
+            web_connected: true,
+          },
+        },
+      },
+    },
+    knownDevices: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        form_factor: "pc",
+        native_connected: false,
+        platform: "macos",
+        registered: true,
+        status: "connected",
+        web_connected: false,
+      },
+      {
+        device_id: "android-phone",
+        device_name: "Samsung Galaxy S23 Ultra",
+        form_factor: "mobile",
+        native_connected: false,
+        platform: "android",
+        registered: true,
+        status: "offline",
+        web_connected: false,
+      },
+    ],
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.deepEqual(options.map((option) => option.deviceName), [
+    "Syed's MacBook Air",
+    "Samsung Galaxy S23 Ultra",
+  ]);
+  const mac = options.find((option) => option.deviceId === "desktop-local");
+  const phone = options.find((option) => option.deviceId === "android-phone");
+  assert.equal(mac?.nativeConnected, true);
+  assert.equal(mac?.webConnected, true);
+  assert.equal(mac?.liveState, "live");
+  assert.deepEqual(mac?.surfaces.map(({ id, active }) => [id, active]), [
+    ["native", true],
+    ["web", true],
+  ]);
+  assert.equal(phone?.nativeConnected, false);
+  assert.equal(phone?.webConnected, false);
+  assert.equal(phone?.liveState, "offline");
+});
+
+test("account devices rows mirror dashboard registry with live overlays", () => {
+  const rows = buildAccountLiveDeviceRows({
+    connectedDevices: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        native_connected: false,
+        status: "connected",
+        web_connected: true,
+      },
+    ],
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        account_id: "acct-1",
+        client_id: "rust-diffforge-agent",
+        client_connection: {
+          active_desktop_device_ids: ["desktop-local"],
+          active_desktop_devices: [
+            {
+              device_id: "desktop-local",
+              machine_id: "desktop-local",
+              native_connected: true,
+              status: "connected",
+            },
+          ],
+          active_web_target_device_ids: ["desktop-local"],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            native_connected: false,
+            status: "connected",
+            web_connected: true,
+          },
+        },
+        registered_devices: {
+          items: [
+            {
+              device_id: "desktop-local",
+              device_name: "Syed's MacBook Air",
+              form_factor: "pc",
+              native_connected: false,
+              platform: "macos",
+              registered: true,
+              status: "connected",
+              web_connected: false,
+            },
+            {
+              device_id: "android-phone",
+              device_name: "Samsung Galaxy S23 Ultra",
+              form_factor: "mobile",
+              native_connected: false,
+              platform: "android",
+              registered: true,
+              status: "offline",
+              web_connected: false,
+            },
+          ],
+        },
+      },
+    },
+    knownDevices: [],
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.deepEqual(rows.map((row) => row.deviceName), [
+    "Syed's MacBook Air",
+    "Samsung Galaxy S23 Ultra",
+  ]);
+  assert.equal(rows.length, 2);
+  const mac = rows.find((row) => row.deviceId === "desktop-local");
+  const phone = rows.find((row) => row.deviceId === "android-phone");
+  assert.equal(mac?.nativeConnected, true);
+  assert.equal(mac?.webConnected, true);
+  assert.equal(mac?.isLocal, true);
+  assert.equal(phone?.nativeConnected, false);
+  assert.equal(phone?.webConnected, false);
+  assert.equal(phone?.liveState, "offline");
 });
 
 test("device switcher treats false server surface flags as offline despite generic connected", () => {

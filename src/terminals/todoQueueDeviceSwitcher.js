@@ -1128,6 +1128,170 @@ function foldWebOnlyDeviceRows(devicesById, workspacesByDevice) {
   });
 }
 
+function collectAccountLiveDeviceEntries(deviceLiveState) {
+  const { root, snapshotRoot } = liveStateSnapshotRoot(deviceLiveState);
+  const result = { devices: [], workspaces: [] };
+  const collectContainer = (value, options = {}) => {
+    if (value && typeof value === "object") {
+      collectLiveStateEntries(value, result, null, 0, options);
+    }
+  };
+  const clientConnection = firstDeviceObject(
+    snapshotRoot.client_connection,
+    snapshotRoot.clientConnection,
+    snapshotRoot.connection_summary,
+    snapshotRoot.connectionSummary,
+    root.client_connection,
+    root.clientConnection,
+    root.connection_summary,
+    root.connectionSummary,
+  );
+
+  [
+    snapshotRoot.registered_devices,
+    snapshotRoot.registeredDevices,
+    snapshotRoot.device_registry,
+    snapshotRoot.deviceRegistry,
+    root.registered_devices,
+    root.registeredDevices,
+    root.device_registry,
+    root.deviceRegistry,
+  ].forEach((value) => collectContainer(value, { registered: true }));
+
+  [
+    snapshotRoot.devices,
+    snapshotRoot.device_map,
+    snapshotRoot.deviceMap,
+    snapshotRoot.devices_by_id,
+    snapshotRoot.devicesById,
+    snapshotRoot.items,
+    snapshotRoot.server_roster,
+    snapshotRoot.serverRoster,
+    root.devices,
+    root.device_map,
+    root.deviceMap,
+    root.devices_by_id,
+    root.devicesById,
+    root.items,
+    root.server_roster,
+    root.serverRoster,
+    clientConnection.active_desktop_devices,
+    clientConnection.activeDesktopDevices,
+    clientConnection.active_native_devices,
+    clientConnection.activeNativeDevices,
+    clientConnection.active_web_devices,
+    clientConnection.activeWebDevices,
+  ].forEach((value) => collectContainer(value));
+
+  return result;
+}
+
+export function buildAccountLiveDeviceRows({
+  connectedDevices = [],
+  deviceLiveState = null,
+  knownDevices = [],
+  localProfile = null,
+} = {}) {
+  const devicesById = new Map();
+  const workspacesByDevice = new Map();
+  const upsertNormalizedRecord = (record, index, options = {}) => {
+    const normalized = normalizeDeviceRecord(record, index, {
+      serverSeen: true,
+      ...options,
+    });
+    if (normalized) {
+      upsertDevice(devicesById, normalized);
+    }
+  };
+
+  (Array.isArray(knownDevices) ? knownDevices : []).forEach((device, index) => {
+    upsertNormalizedRecord(device, index);
+  });
+
+  const liveEntries = collectAccountLiveDeviceEntries(deviceLiveState);
+  applyConnectionOverlayToDevices(liveEntries.devices, deviceLiveState).forEach((device, index) => {
+    upsertDevice(devicesById, device);
+    liveEntries.workspaces
+      .filter((workspace) => aliasesIntersect(device.deviceAliases, workspace.deviceAliases || workspace.deviceId))
+      .forEach((workspace) => addWorkspace(workspacesByDevice, {
+        ...workspace,
+        deviceId: device.deviceId,
+      }));
+    if (!device.serverSeen) {
+      upsertNormalizedRecord(device, index);
+    }
+  });
+
+  (Array.isArray(connectedDevices) ? connectedDevices : []).forEach((device, index) => {
+    upsertNormalizedRecord(device, index);
+  });
+
+  const localDevice = normalizeDeviceRecord(localProfile || {}, 0, {
+    isLocal: true,
+    kind: TODO_QUEUE_DEVICE_KIND_DESKTOP,
+  });
+  if (localDevice) {
+    const localDeviceId = findDeviceKeyByAliases(devicesById, localDevice.deviceAliases);
+    if (localDeviceId) {
+      const serverDevice = devicesById.get(localDeviceId) || {};
+      const mergedLocalDevice = mergeDevice(serverDevice, {
+        ...localDevice,
+        deviceId: localDeviceId,
+      });
+      devicesById.set(localDeviceId, {
+        ...mergedLocalDevice,
+        deviceAliases: uniqueDeviceAliases(
+          mergedLocalDevice.deviceAliases,
+          serverDevice.deviceAliases,
+          localDevice.deviceAliases,
+          localDeviceId,
+        ),
+        deviceKind: mergedLocalDevice.deviceKind === TODO_QUEUE_DEVICE_KIND_UNKNOWN
+          ? TODO_QUEUE_DEVICE_KIND_DESKTOP
+          : mergedLocalDevice.deviceKind,
+        isLocal: true,
+        serverSeen: Boolean(serverDevice.serverSeen || mergedLocalDevice.serverSeen),
+      });
+    }
+  }
+
+  foldWebOnlyDeviceRows(devicesById, workspacesByDevice);
+  pruneToRegisteredDeviceRows(devicesById, workspacesByDevice);
+
+  return Array.from(devicesById.values())
+    .filter((device) => device.isLocal || device.serverSeen || device.registered || device.liveState !== "offline")
+    .map((device, index) => ({
+      deviceId: device.deviceId || `device-${index}`,
+      deviceKind: device.deviceKind || TODO_QUEUE_DEVICE_KIND_UNKNOWN,
+      deviceName: device.deviceName || `Device ${index + 1}`,
+      formFactorLabel: device.formFactorLabel || "",
+      isLocal: Boolean(device.isLocal),
+      liveState: device.liveState === "unknown" && device.connected === true ? "live" : device.liveState || "unknown",
+      nativeConnected: device.nativeConnected === true,
+      platformIcon: device.platformIcon || "",
+      platformLabel: device.platformLabel || "",
+      registered: Boolean(device.registered),
+      serverSeen: Boolean(device.serverSeen),
+      webConnected: device.webConnected === true,
+      workspaces: Array.from(workspacesByDevice.values())
+        .filter((workspace) => normalizeTodoQueueSwitcherId(workspace.deviceId) === device.deviceId)
+        .map((workspace) => ({
+          id: workspace.workspaceId,
+          isCurrentWorkspace: Boolean(workspace.isCurrentWorkspace),
+          name: workspace.workspaceName || workspace.workspaceId,
+        })),
+    }))
+    .sort((left, right) => {
+      if (left.isLocal !== right.isLocal) {
+        return left.isLocal ? -1 : 1;
+      }
+      if (left.liveState === "live" && right.liveState !== "live") return -1;
+      if (right.liveState === "live" && left.liveState !== "live") return 1;
+      return String(left.deviceName).localeCompare(String(right.deviceName));
+    })
+    .slice(0, 12);
+}
+
 function collectLiveStateEntries(value, result, inheritedDevice = null, depth = 0, options = {}) {
   if (!value || depth > 5) {
     return;

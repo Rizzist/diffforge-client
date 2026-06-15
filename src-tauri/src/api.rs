@@ -56,7 +56,7 @@ async fn read_api_response(
 
 #[tauri::command]
 async fn backend_ping() -> Result<BackendStatus, String> {
-    let endpoint = format!("{API_BASE_URL}/hello");
+    let endpoint = api_endpoint("hello");
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
 
     let response = client
@@ -82,13 +82,18 @@ async fn backend_ping() -> Result<BackendStatus, String> {
 }
 
 #[tauri::command]
+fn desktop_web_login_url() -> Result<String, String> {
+    Ok(desktop_web_login_url_base())
+}
+
+#[tauri::command]
 async fn exchange_desktop_auth_code(code: String, state: String) -> Result<Value, String> {
     validate_auth_value("Desktop auth code", &code)?;
     validate_auth_value("Desktop auth state", &state)?;
 
     let client = http_client(Duration::from_secs(AUTH_EXCHANGE_TIMEOUT_SECS))?;
     let response = client
-        .post(format!("{API_BASE_URL}/desktop/sessions/exchange"))
+        .post(api_endpoint("desktop/sessions/exchange"))
         .json(&ExchangeDesktopSessionRequest {
             code: &code,
             state: &state,
@@ -106,7 +111,7 @@ async fn validate_desktop_session(token: String) -> Result<Value, String> {
 
     let client = http_client(Duration::from_secs(SESSION_VALIDATE_TIMEOUT_SECS))?;
     let response = client
-        .get(format!("{API_BASE_URL}/desktop/session"))
+        .get(api_endpoint("desktop/session"))
         .bearer_auth(token)
         .send()
         .await
@@ -121,7 +126,7 @@ async fn logout_desktop_session(token: String) -> Result<Value, String> {
 
     let client = http_client(Duration::from_secs(LOGOUT_TIMEOUT_SECS))?;
     let response = client
-        .delete(format!("{API_BASE_URL}/desktop/session"))
+        .delete(api_endpoint("desktop/session"))
         .bearer_auth(token)
         .send()
         .await
@@ -182,7 +187,7 @@ async fn record_desktop_signin_diagnostic(
 
     let client = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))?;
     let response = client
-        .post(format!("{API_BASE_URL}/desktop/signin-diagnostics"))
+        .post(api_endpoint("desktop/signin-diagnostics"))
         .bearer_auth(token)
         .json(&DesktopSigninDiagnosticRequest {
             flow_id: flow_id.as_deref(),
@@ -263,7 +268,7 @@ async fn record_desktop_connection_diagnostic(
 
     let client = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))?;
     let response = client
-        .post(format!("{API_BASE_URL}/desktop/connection-diagnostics"))
+        .post(api_endpoint("desktop/connection-diagnostics"))
         .bearer_auth(token)
         .json(&payload)
         .send()

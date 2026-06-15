@@ -598,7 +598,7 @@ import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 
-const WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
+const DEFAULT_WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
 const AUTH_STARTUP_TIMEOUT_MS = 30000;
@@ -3278,6 +3278,22 @@ function cloudAccountDeviceLiveStateSnapshotFromEventPayload(payload) {
   if (!payload || typeof payload !== "object") {
     return null;
   }
+  const looksLikeAccountLiveState = (value) => Boolean(
+    value
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && (
+        value.devices
+          || value.device_map
+          || value.deviceMap
+          || value.registered_devices
+          || value.registeredDevices
+          || value.device_registry
+          || value.deviceRegistry
+          || value.client_connection
+          || value.clientConnection
+      ),
+  );
   const snapshot = [
     payload?.data,
     payload?.payload,
@@ -3285,8 +3301,8 @@ function cloudAccountDeviceLiveStateSnapshotFromEventPayload(payload) {
     payload?.accountDeviceLiveStateSnapshot,
     payload?.device_live_state_snapshot,
     payload?.deviceLiveStateSnapshot,
-  ].find((value) => value && typeof value === "object" && !Array.isArray(value))
-    || (payload.devices && typeof payload.devices === "object" ? payload : null);
+  ].find(looksLikeAccountLiveState)
+    || (looksLikeAccountLiveState(payload) ? payload : null);
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     return null;
   }
@@ -4412,7 +4428,17 @@ function createAuthState() {
 }
 
 async function desktopLoginUrlWithDevice(state) {
-  const url = new URL(WEB_LOGIN_URL);
+  let loginUrl = DEFAULT_WEB_LOGIN_URL;
+  try {
+    const resolvedLoginUrl = await invoke("desktop_web_login_url");
+    if (typeof resolvedLoginUrl === "string" && resolvedLoginUrl.trim()) {
+      loginUrl = resolvedLoginUrl.trim();
+    }
+  } catch {
+    // Older native builds still use the production desktop login URL.
+  }
+
+  const url = new URL(loginUrl);
   url.searchParams.set("state", state);
   try {
     const profile = await invoke("cloud_mcp_get_desktop_device_profile");
@@ -4864,27 +4890,114 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   };
 }
 
+function cloudDeviceDeletedIdsFromRegistryValue(value, ids = new Set()) {
+  if (!value || typeof value !== "object") {
+    return ids;
+  }
+  [
+    value.deleted_device_ids,
+    value.deletedDeviceIds,
+    value.removed_device_ids,
+    value.removedDeviceIds,
+  ].forEach((items) => {
+    safeCloudMcpArray(items).forEach((item) => {
+      const id = safeCloudMcpText(String(item || ""), "").toLowerCase();
+      if (id) ids.add(id);
+    });
+  });
+  safeCloudMcpArray(value.tombstones || value.deleted || value.removed).forEach((item) => {
+    cloudDeviceAliasList(item).forEach((id) => ids.add(id));
+  });
+  return ids;
+}
+
+function cloudDeviceDeletedIdsFromLiveState(deviceLiveState) {
+  const root = deviceLiveState?.account_device_live_state_snapshot
+    || deviceLiveState?.accountDeviceLiveStateSnapshot
+    || deviceLiveState?.data
+    || deviceLiveState
+    || {};
+  const ids = new Set();
+  cloudDeviceDeletedIdsFromRegistryValue(root, ids);
+  cloudDeviceDeletedIdsFromRegistryValue(root.registered_devices || root.registeredDevices, ids);
+  cloudDeviceDeletedIdsFromRegistryValue(root.device_registry || root.deviceRegistry, ids);
+  return ids;
+}
+
+function cloudDeviceRowIsDeleted(device, deletedIds = new Set()) {
+  if (!device || !deletedIds.size) {
+    return false;
+  }
+  return cloudDeviceAliasList(device).some((id) => deletedIds.has(id));
+}
+
+function cloudDeviceRowLooksRegistered(device) {
+  return Boolean(
+    device?.registered
+      || device?.registeredDevice
+      || device?.registered_device
+      || device?.source === "registered_account_devices"
+      || device?.registry_scope === "registered_account_devices"
+      || device?.registryScope === "registered_account_devices"
+  );
+}
+
+function mergeCloudDeviceProgressRows(previousRows = [], nextRows = [], deviceLiveState = null, limit = 48) {
+  const deletedIds = cloudDeviceDeletedIdsFromLiveState(deviceLiveState);
+  const byId = new Map();
+  const upsert = (device) => {
+    if (!device || typeof device !== "object" || cloudDeviceRowIsDeleted(device, deletedIds)) {
+      return;
+    }
+    upsertCloudConnectedDevice(byId, device);
+  };
+
+  // Same as the Next dashboard: registered devices are the stable inventory,
+  // and realtime live-state rows only overlay native/web liveness on top.
+  safeCloudMcpArray(previousRows)
+    .filter(cloudDeviceRowLooksRegistered)
+    .forEach(upsert);
+  safeCloudMcpArray(nextRows).forEach(upsert);
+  safeCloudMcpArray(previousRows)
+    .filter((device) => !cloudDeviceRowLooksRegistered(device))
+    .forEach(upsert);
+
+  return cloudDeviceRowsFromMap(byId, limit);
+}
+
 function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE) {
   const nextStage = String(progress?.stage || previous.stage || "idle");
   const nextStatus = String(progress?.status || previous.status || "idle");
   const previousStatus = String(previous?.status || "idle").toLowerCase();
   const previousRank = cloudWorkspaceStageRank(previous?.stage);
   const nextRank = cloudWorkspaceStageRank(nextStage);
-  const connectedDevices = Array.isArray(progress?.connectedDevices)
+  const progressConnectedDevices = Array.isArray(progress?.connectedDevices)
     ? progress.connectedDevices
     : Array.isArray(previous?.connectedDevices)
       ? previous.connectedDevices
       : [];
-  const knownDevices = Array.isArray(progress?.knownDevices)
+  const rawKnownDevices = Array.isArray(progress?.knownDevices)
     ? progress.knownDevices
     : Array.isArray(previous?.knownDevices)
       ? previous.knownDevices
-      : connectedDevices;
+      : progressConnectedDevices;
   const deviceLiveState = progress?.deviceLiveState && typeof progress.deviceLiveState === "object"
     ? progress.deviceLiveState
     : previous?.deviceLiveState && typeof previous.deviceLiveState === "object"
       ? previous.deviceLiveState
       : null;
+  const knownDevices = mergeCloudDeviceProgressRows(
+    previous?.knownDevices,
+    rawKnownDevices,
+    deviceLiveState,
+    48,
+  );
+  const connectedDevices = mergeCloudDeviceProgressRows(
+    previous?.connectedDevices,
+    progressConnectedDevices,
+    deviceLiveState,
+    12,
+  ).filter((device) => Boolean(device.connected || device.nativeConnected || device.webConnected));
   const workspaceTodos = progress?.workspaceTodos && typeof progress.workspaceTodos === "object"
     ? progress.workspaceTodos
     : previous?.workspaceTodos && typeof previous.workspaceTodos === "object"
@@ -19829,18 +19942,20 @@ export default function App() {
       if (!snapshot) {
         return;
       }
-      const deviceLiveState = cloudDeviceLiveStateFromAccountSnapshot(snapshot, null);
-      setCloudWorkspaceProgress((current) => normalizeCloudWorkspaceProgress({
-        ...current,
-        connectedDevices: cloudConnectedDevicesFromAccountSnapshot(deviceLiveState),
-        detail: current.detail || "Refreshing account device liveness.",
-        deviceLiveState: cloudDeviceLiveStateFromAccountSnapshot(snapshot, current.deviceLiveState),
-        knownDevices: cloudKnownDevicesFromAccountSnapshot(deviceLiveState),
-        stage: current.stage || "workspace_socket",
-        status: current.status === "connected" ? "connected" : "active",
-        title: current.title || "Cloud workspace",
-        updatedAt: Date.now(),
-      }, current));
+      setCloudWorkspaceProgress((current) => {
+        const deviceLiveState = cloudDeviceLiveStateFromAccountSnapshot(snapshot, current.deviceLiveState);
+        return normalizeCloudWorkspaceProgress({
+          ...current,
+          connectedDevices: cloudConnectedDevicesFromAccountSnapshot(deviceLiveState),
+          detail: current.detail || "Refreshing account device liveness.",
+          deviceLiveState,
+          knownDevices: cloudKnownDevicesFromAccountSnapshot(deviceLiveState),
+          stage: current.stage || "workspace_socket",
+          status: current.status === "connected" ? "connected" : "active",
+          title: current.title || "Cloud workspace",
+          updatedAt: Date.now(),
+        }, current);
+      });
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();

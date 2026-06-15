@@ -1,10 +1,10 @@
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
-const CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV: &str = "RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP";
 const CLOUD_MCP_LOCAL_CLOUD_BASE_URL: &str = "http://127.0.0.1:8080";
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = true;
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_APP_WS_URL";
 const CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_VOICE_WS_URL";
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL: &str = "ws://127.0.0.1:8080/v1/app/ws";
+const CLOUD_MCP_LOCAL_CLOUD_HEALTH_CACHE_MS: u64 = 2_000;
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 25;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
@@ -4672,34 +4672,8 @@ async fn tokenomics_publish_display_snapshot(
 }
 
 fn cloud_mcp_base_url() -> String {
-    if let Some(local_base_url) = cloud_mcp_local_cloud_base_url_if_available_blocking() {
-        return local_base_url;
-    }
-
-    if !cloud_mcp_base_url_override_allowed() {
-        return CLOUD_MCP_DEFAULT_BASE_URL.to_string();
-    }
-
-    [
-        "RUST_DIFFFORGE_CLOUD_MCP_URL",
-        "CLOUD_DIFFFORGE_CLOUD_MCP_URL",
-        "CLOUD_DIFFFORGE_BASE_URL",
-    ]
-    .iter()
-    .find_map(|key| {
-        env::var(key)
-            .ok()
-            .and_then(|value| cloud_mcp_normalized_base_url(&value))
-    })
-    .unwrap_or_else(|| CLOUD_MCP_DEFAULT_BASE_URL.to_string())
-}
-
-fn cloud_mcp_normalized_base_url(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_end_matches('/').to_string();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed)
+    cloud_mcp_local_cloud_base_url_if_available_blocking()
+        .unwrap_or_else(|| CLOUD_MCP_DEFAULT_BASE_URL.to_string())
 }
 
 fn cloud_mcp_env_flag(key: &str) -> Option<bool> {
@@ -4711,21 +4685,8 @@ fn cloud_mcp_env_flag(key: &str) -> Option<bool> {
     })
 }
 
-fn cloud_mcp_base_url_override_allowed() -> bool {
-    [
-        CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV,
-        "CLOUD_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP",
-    ]
-    .iter()
-    .any(|key| cloud_mcp_env_flag(key).unwrap_or(false))
-}
-
 fn cloud_mcp_dev_auth_token() -> Option<String> {
-    env::var("CLOUD_DIFFFORGE_DEV_TOKEN")
-        .or_else(|_| env::var("CLOUD_MCP_DEV_TOKEN"))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    None
 }
 
 fn cloud_mcp_process_auth_cache() -> &'static StdMutex<CloudMcpProcessAuthCache> {
@@ -4823,7 +4784,7 @@ async fn cloud_mcp_fetch_appwrite_jwt(
 
     let client = http_client(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))?;
     let response = client
-        .post(format!("{API_BASE_URL}/desktop/appwrite-jwt"))
+        .post(api_endpoint("desktop/appwrite-jwt"))
         .bearer_auth(desktop_session_token)
         .send()
         .await
@@ -4864,7 +4825,7 @@ async fn cloud_mcp_record_signin_diagnostic_with_token(
     };
 
     let _ = client
-        .post(format!("{API_BASE_URL}/desktop/signin-diagnostics"))
+        .post(api_endpoint("desktop/signin-diagnostics"))
         .bearer_auth(desktop_session_token)
         .json(&payload)
         .send()
@@ -4916,7 +4877,7 @@ async fn cloud_mcp_record_connection_diagnostic_with_token(
     });
 
     let _ = client
-        .post(format!("{API_BASE_URL}/desktop/connection-diagnostics"))
+        .post(api_endpoint("desktop/connection-diagnostics"))
         .bearer_auth(desktop_session_token)
         .json(&payload)
         .send()
@@ -4987,7 +4948,7 @@ fn cloud_mcp_fetch_appwrite_jwt_blocking(
         .build()
         .map_err(|error| format!("Unable to prepare Cloud MCP Appwrite auth: {error}"))?;
     let response = client
-        .post(format!("{API_BASE_URL}/desktop/appwrite-jwt"))
+        .post(api_endpoint("desktop/appwrite-jwt"))
         .bearer_auth(desktop_session_token)
         .send()
         .map_err(|error| format!("Unable to prepare Cloud MCP Appwrite auth: {error}"))?;
@@ -5198,10 +5159,8 @@ fn cloud_mcp_device_limit_for_plan(plan_name: &str) -> u64 {
     }
 }
 
-fn cloud_mcp_device_limit_from_value(value: Option<u64>, plan_name: &str) -> Option<u64> {
-    value
-        .filter(|limit| *limit <= 10_000)
-        .or_else(|| Some(cloud_mcp_device_limit_for_plan(plan_name)))
+fn cloud_mcp_device_limit_from_value(_value: Option<u64>, plan_name: &str) -> Option<u64> {
+    Some(cloud_mcp_device_limit_for_plan(plan_name))
 }
 
 async fn cloud_mcp_account_scope(state: &CloudMcpState) -> (String, Option<String>) {
@@ -6901,7 +6860,10 @@ async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpStat
         return;
     };
     let mut runtime = state.inner.lock().await;
-    runtime.account_device_live_state_snapshot = Some(snapshot);
+    runtime.account_device_live_state_snapshot = Some(cloud_mcp_merge_account_live_state_snapshot(
+        runtime.account_device_live_state_snapshot.as_ref(),
+        snapshot,
+    ));
 }
 
 async fn cloud_mcp_apply_account_device_live_state_snapshot(
@@ -6922,10 +6884,15 @@ async fn cloud_mcp_apply_account_device_live_state_snapshot(
         cloud_mcp_sync_activity_size_class("applying", count, bytes, "system"),
         activity_source,
     );
-    {
+    let snapshot = {
         let mut runtime = state.inner.lock().await;
+        let snapshot = cloud_mcp_merge_account_live_state_snapshot(
+            runtime.account_device_live_state_snapshot.as_ref(),
+            snapshot,
+        );
         runtime.account_device_live_state_snapshot = Some(snapshot.clone());
-    }
+        snapshot
+    };
     let _ = state.global_ws_events.send(json!({
         "kind": "account_device_live_state_snapshot",
         "event_kind": "account_device_live_state_snapshot",
@@ -6937,6 +6904,126 @@ async fn cloud_mcp_apply_account_device_live_state_snapshot(
         "data": snapshot,
     }));
     cloud_mcp_clear_sync_activity_key(&activity_key);
+}
+
+fn cloud_mcp_merge_account_live_state_snapshot(previous: Option<&Value>, next: Value) -> Value {
+    let (Some(previous), Some(next_object)) = (previous, next.as_object()) else {
+        return next;
+    };
+    let Some(previous_object) = previous.as_object() else {
+        return next;
+    };
+
+    let mut merged = previous_object.clone();
+    for (key, value) in next_object {
+        merged.insert(key.clone(), value.clone());
+    }
+
+    for key in [
+        "registered_devices",
+        "registeredDevices",
+        "device_registry",
+        "deviceRegistry",
+        "registered_device_count",
+        "known_device_count",
+    ] {
+        if !next_object.contains_key(key) {
+            if let Some(value) = previous_object.get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    Value::Object(merged)
+}
+
+fn cloud_mcp_registered_device_registry_from_response(value: &Value) -> Option<Value> {
+    [
+        value.get("registered_devices"),
+        value.get("registeredDevices"),
+        value.get("device_registry"),
+        value.get("deviceRegistry"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| candidate.is_object())
+    .cloned()
+}
+
+fn cloud_mcp_registry_count(registry: &Value) -> u64 {
+    cloud_mcp_payload_u64(registry, &["registered_count", "registeredCount", "count"])
+        .or_else(|| {
+            registry
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|items| items.len() as u64)
+        })
+        .unwrap_or_default()
+}
+
+async fn cloud_mcp_refresh_registered_device_registry(
+    state: &CloudMcpState,
+    reason: &str,
+) -> Result<(), String> {
+    let token = cloud_mcp_authorization_bearer(state)
+        .await?
+        .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
+    let response = client
+        .post(api_endpoint("agents/devices"))
+        .bearer_auth(token)
+        .json(&json!({
+            "billingScopeType": billing_scope_type,
+            "scopeType": billing_scope_type,
+            "teamId": team_id,
+            "force": true,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Unable to load registered devices: {error}"))?;
+    let body = read_api_response(response, "Unable to load registered devices.").await?;
+    let registry = cloud_mcp_registered_device_registry_from_response(&body)
+        .ok_or_else(|| "Registered devices response did not include a registry.".to_string())?;
+    let registered_count = cloud_mcp_registry_count(&registry);
+    let snapshot = json!({
+        "contract": "diffforge.account_device_live_state.v1",
+        "kind": "account_device_live_state",
+        "event_kind": "account_device_live_state_snapshot",
+        "service": "rust-diffforge",
+        "trigger": reason,
+        "updated_at": cloud_mcp_rfc3339_now(),
+        "updated_at_ms": cloud_mcp_now_ms(),
+        "registered_devices": registry.clone(),
+        "registeredDevices": registry.clone(),
+        "device_registry": registry.clone(),
+        "deviceRegistry": registry,
+        "registered_device_count": registered_count,
+        "known_device_count": registered_count,
+    });
+    cloud_mcp_apply_account_device_live_state_snapshot(
+        state,
+        snapshot,
+        reason,
+        "agents/devices:registered_device_registry",
+    )
+    .await;
+    Ok(())
+}
+
+fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, reason: &'static str) {
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = cloud_mcp_refresh_registered_device_registry(&state, reason).await {
+            log_cloud_sync_event(
+                "registered_device_registry.refresh_error",
+                json!({
+                    "reason": reason,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+        }
+    });
 }
 
 fn cloud_mcp_spawn_account_live_state_reconcile(state: &CloudMcpState, reason: &'static str) {
@@ -7138,6 +7225,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             )
             .await;
         }
+        cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_ready");
         cloud_mcp_record_signin_diagnostic(
             state,
             "websocket.ready",
@@ -7240,6 +7328,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         if let (Some(connection_id), Some(message_token)) = (connection_id, message_token) {
             cloud_mcp_replay_runtime_snapshots(state, &connection_id, &message_token).await;
         }
+        cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_live_state_reconcile(state, "websocket_hello_ack");
         return;
     }
@@ -11432,6 +11521,9 @@ fn cloud_mcp_local_docker_ws_target(endpoint_path: &str) -> Option<CloudMcpWsTar
     if !(ws_url.starts_with("ws://") || ws_url.starts_with("wss://")) {
         return None;
     }
+    if !cloud_mcp_local_cloud_available_blocking(&ws_url) {
+        return None;
+    }
 
     Some(CloudMcpWsTarget {
         ws_url,
@@ -11443,6 +11535,45 @@ fn cloud_mcp_local_docker_ws_target(endpoint_path: &str) -> Option<CloudMcpWsTar
 fn cloud_mcp_local_cloud_probe_enabled() -> bool {
     cloud_mcp_env_flag("RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD")
         .unwrap_or(CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED)
+}
+
+fn cloud_mcp_local_cloud_available_blocking(ws_url: &str) -> bool {
+    let Some(health_url) = cloud_mcp_local_cloud_health_url_from_ws_url(ws_url) else {
+        return false;
+    };
+    if !cloud_mcp_local_http_url_allowed(&health_url) {
+        return false;
+    }
+
+    static LOCAL_CLOUD_HEALTH_CACHE: OnceLock<StdMutex<HashMap<String, (bool, u64)>>> =
+        OnceLock::new();
+    let now = cloud_mcp_now_ms();
+    let cache = LOCAL_CLOUD_HEALTH_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(cache_guard) = cache.lock() {
+        if let Some((available, checked_ms)) = cache_guard.get(&health_url) {
+            if now.saturating_sub(*checked_ms) < CLOUD_MCP_LOCAL_CLOUD_HEALTH_CACHE_MS {
+                return *available;
+            }
+        }
+    }
+
+    let available = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(350))
+        .build()
+        .and_then(|client| client.get(&health_url).send())
+        .map(|response| response.status().is_success())
+        .unwrap_or(false);
+    if let Ok(mut cache_guard) = cache.lock() {
+        cache_guard.insert(health_url, (available, now));
+    }
+    available
+}
+
+fn cloud_mcp_local_http_url_allowed(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1:")
+        || lower.starts_with("http://localhost:")
+        || lower.starts_with("http://[::1]:")
 }
 
 fn cloud_mcp_local_cloud_health_url_from_ws_url(ws_url: &str) -> Option<String> {
@@ -16033,7 +16164,7 @@ async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
-        .post(format!("{API_BASE_URL}/billing/status"))
+        .post(api_endpoint("billing/status"))
         .bearer_auth(token)
         .json(&json!({
             "scopeType": billing_scope_type,
@@ -32031,16 +32162,7 @@ impl CloudMcpProxyIdentity {
             .or_else(|| env::var("CLOUD_MCP_AGENT_LABEL").ok())
             .or_else(|| agent_id.as_deref().and_then(cloud_mcp_short_agent_label));
 
-        let base_url = cloud_mcp_base_url_override_allowed()
-            .then(|| {
-                values
-                    .get("base-url")
-                    .cloned()
-                    .or_else(|| env::var("CLOUD_DIFFFORGE_BASE_URL").ok())
-                    .or_else(|| env::var("CLOUD_MCP_BASE_URL").ok())
-                    .and_then(|value| cloud_mcp_normalized_base_url(&value))
-            })
-            .flatten();
+        let base_url = None;
 
         let client_id = values
             .get("client-id")

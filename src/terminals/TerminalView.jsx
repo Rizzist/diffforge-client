@@ -123,6 +123,7 @@ import {
   TODO_QUEUE_DEVICE_KIND_DESKTOP,
   TODO_QUEUE_DEVICE_KIND_MOBILE,
   TODO_QUEUE_DEVICE_KIND_UNKNOWN,
+  buildAccountLiveDeviceRows,
   buildTodoQueueDeviceWorkspaceOptions,
   todoQueueDeviceSelectionIsLocalEditable,
   workspaceTodoItemsForDeviceWorkspace,
@@ -12958,73 +12959,6 @@ function normalizeWorkspaceTodoMirrorItems(items = [], selection = null) {
     .slice(0, 80);
 }
 
-function buildOrchestratorDeviceRows(options = []) {
-  const byDeviceId = new Map();
-  (Array.isArray(options) ? options : []).forEach((option, index) => {
-    if (!option || typeof option !== "object") {
-      return;
-    }
-    const deviceId = normalizeWorkspaceTodoDeviceId(option.deviceId || option.id || `device-${index}`);
-    if (!deviceId) {
-      return;
-    }
-    const previous = byDeviceId.get(deviceId) || {
-      deviceId,
-      deviceKind: TODO_QUEUE_DEVICE_KIND_UNKNOWN,
-      deviceName: "",
-      formFactorLabel: "",
-      isLocal: false,
-      liveState: "unknown",
-      nativeConnected: false,
-      platformIcon: "",
-      platformLabel: "",
-      serverSeen: false,
-      webConnected: false,
-      workspaces: [],
-    };
-    const workspaceId = String(option.workspaceId || "").trim();
-    const workspaceName = String(option.workspaceName || workspaceId || "").trim();
-    const workspaces = previous.workspaces.slice();
-    if (workspaceId && !workspaces.some((workspace) => workspace.id === workspaceId)) {
-      workspaces.push({
-        id: workspaceId,
-        isCurrentWorkspace: Boolean(option.isCurrentWorkspace),
-        name: workspaceName || workspaceId,
-      });
-    }
-    const nextLiveState = String(option.liveState || "").trim() || "unknown";
-    byDeviceId.set(deviceId, {
-      ...previous,
-      deviceKind: previous.deviceKind !== TODO_QUEUE_DEVICE_KIND_UNKNOWN
-        ? previous.deviceKind
-        : option.deviceKind || previous.deviceKind,
-      deviceName: option.isLocal || !previous.deviceName
-        ? option.deviceName || previous.deviceName || `Device ${index + 1}`
-        : previous.deviceName,
-      formFactorLabel: previous.formFactorLabel || option.formFactorLabel || "",
-      isLocal: Boolean(previous.isLocal || option.isLocal),
-      liveState: previous.liveState === "live" ? previous.liveState : nextLiveState,
-      nativeConnected: Boolean(previous.nativeConnected || option.nativeConnected === true),
-      platformIcon: previous.platformIcon || option.platformIcon || option.icon || "",
-      platformLabel: previous.platformLabel || option.platformLabel || "",
-      serverSeen: Boolean(previous.serverSeen || option.serverSeen),
-      webConnected: Boolean(previous.webConnected || option.webConnected === true),
-      workspaces,
-    });
-  });
-  return Array.from(byDeviceId.values())
-    .filter((row) => row.isLocal || row.serverSeen || row.liveState !== "offline")
-    .sort((left, right) => {
-      if (left.isLocal !== right.isLocal) {
-        return left.isLocal ? -1 : 1;
-      }
-      if (left.liveState === "live" && right.liveState !== "live") return -1;
-      if (right.liveState === "live" && left.liveState !== "live") return 1;
-      return String(left.deviceName).localeCompare(String(right.deviceName));
-    })
-    .slice(0, 12);
-}
-
 const TODO_DEVICE_CLUSTER_PLATFORM_ORDER = [
   "apple",
   "windows",
@@ -13085,10 +13019,76 @@ function todoDeviceOptionForRow(row, options = [], selectedOptionId = "", curren
     })[0];
 }
 
+function todoDeviceDisplayOnlyOptionForRow(row = {}) {
+  const deviceId = normalizeWorkspaceTodoDeviceId(row?.deviceId);
+  if (!deviceId) {
+    return null;
+  }
+  return {
+    connected: row.connected,
+    deviceAliases: Array.isArray(row.deviceAliases) ? row.deviceAliases : [deviceId],
+    deviceId,
+    deviceKind: row.deviceKind || TODO_QUEUE_DEVICE_KIND_UNKNOWN,
+    deviceName: row.deviceName || "Device",
+    formFactorLabel: row.formFactorLabel || "",
+    id: `account-device::${deviceId}`,
+    isCurrentWorkspace: false,
+    isDisplayOnly: true,
+    isLocal: Boolean(row.isLocal),
+    liveState: row.liveState === "unknown" && row.connected === true ? "live" : row.liveState || "unknown",
+    nativeConnected: row.nativeConnected === true,
+    platformIcon: row.platformIcon || "",
+    platformLabel: row.platformLabel || "",
+    serverSeen: Boolean(row.serverSeen),
+    surfaces: [
+      { active: row.nativeConnected === true, id: "native", label: "native" },
+      { active: row.webConnected === true, id: "web", label: "web" },
+    ],
+    webConnected: row.webConnected === true,
+    workspaceId: "",
+    workspaceName: "",
+  };
+}
+
+function todoDeviceDisplayOptionForRow(row = {}, option = null) {
+  const fallback = option || todoDeviceDisplayOnlyOptionForRow(row);
+  if (!fallback) {
+    return null;
+  }
+  return {
+    ...fallback,
+    deviceAliases: Array.isArray(fallback.deviceAliases) && fallback.deviceAliases.length
+      ? fallback.deviceAliases
+      : Array.isArray(row.deviceAliases)
+        ? row.deviceAliases
+        : fallback.deviceId
+          ? [fallback.deviceId]
+          : [],
+    deviceKind: row.deviceKind || fallback.deviceKind || TODO_QUEUE_DEVICE_KIND_UNKNOWN,
+    deviceName: row.deviceName || fallback.deviceName || "Device",
+    formFactorLabel: row.formFactorLabel || fallback.formFactorLabel || "",
+    liveState: row.liveState === "unknown" && row.connected === true
+      ? "live"
+      : row.liveState || fallback.liveState || "unknown",
+    nativeConnected: row.nativeConnected === true || fallback.nativeConnected === true,
+    platformIcon: row.platformIcon || fallback.platformIcon || fallback.icon || "",
+    platformLabel: row.platformLabel || fallback.platformLabel || "",
+    serverSeen: Boolean(row.serverSeen || fallback.serverSeen),
+    surfaces: [
+      { active: row.nativeConnected === true || fallback.nativeConnected === true, id: "native", label: "native" },
+      { active: row.webConnected === true || fallback.webConnected === true, id: "web", label: "web" },
+    ],
+    webConnected: row.webConnected === true || fallback.webConnected === true,
+  };
+}
+
 function todoDevicePickerRows(deviceRows = [], options = [], selectedOptionId = "", currentWorkspaceId = "") {
   return (Array.isArray(deviceRows) ? deviceRows : [])
     .map((row) => {
-      const option = todoDeviceOptionForRow(row, options, selectedOptionId, currentWorkspaceId);
+      const option = todoDeviceDisplayOptionForRow(
+        row,
+        todoDeviceOptionForRow(row, options, selectedOptionId, currentWorkspaceId),
+      );
       if (!option) {
         return null;
       }
@@ -13490,8 +13490,18 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     workspaceTodos,
   ]);
   const orchestratorDeviceRows = useMemo(
-    () => buildOrchestratorDeviceRows(todoDeviceOptions),
-    [todoDeviceOptions],
+    () => buildAccountLiveDeviceRows({
+      connectedDevices,
+      deviceLiveState,
+      knownDevices,
+      localProfile: localDesktopProfile,
+    }),
+    [
+      connectedDevices,
+      deviceLiveState,
+      knownDevices,
+      localDesktopProfile,
+    ],
   );
   const orchestratorPrimarySectionLabel = workspaceScopedTabsEnabled ? "Todo" : "Devices";
   useEffect(() => {
@@ -15585,18 +15595,24 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     const iconDevice = todoDeviceIconSource(row, option);
     const devicePlatformKind = connectedDevicePlatformKind(iconDevice);
     const DeviceIcon = connectedDeviceIconForPlatform(devicePlatformKind);
-    const active = selectedTodoDevice?.id === option.id;
+    const displayOnly = Boolean(option.isDisplayOnly);
+    const active = !displayOnly && selectedTodoDevice?.id === option.id;
     const liveLabel = option.liveState === "live" ? "Live" : option.liveState === "offline" ? "Offline" : "Unknown";
     return (
       <TodoDeviceButton
+        aria-disabled={displayOnly ? "true" : undefined}
         aria-pressed={active ? "true" : "false"}
         data-active={active ? "true" : undefined}
+        data-display-only={displayOnly ? "true" : undefined}
         data-strip="true"
         data-todo-control="true"
         key={renderOptions.key || option.id}
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
+          if (displayOnly) {
+            return;
+          }
           setTodoDeviceSelectionId(option.id);
           if (todoDeviceClusterActive) {
             setTodoDevicePickerExpanded(false);

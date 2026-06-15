@@ -43,7 +43,29 @@ use tokio_tungstenite::{
 
 pub mod coordination;
 
-const API_BASE_URL: &str = "https://diffforge.ai/api";
+const DEFAULT_API_BASE_URL: &str = "https://diffforge.ai/api";
+const DEFAULT_WEB_LOGIN_URL: &str = "https://diffforge.ai/desktop/login";
+
+fn api_base_url() -> String {
+    DEFAULT_API_BASE_URL.to_string()
+}
+
+fn api_endpoint(path: &str) -> String {
+    format!("{}/{}", api_base_url(), path.trim_start_matches('/'))
+}
+
+fn web_login_url_from_api_base(api_base: &str) -> Option<String> {
+    api_base
+        .trim_end_matches('/')
+        .strip_suffix("/api")
+        .map(|origin| format!("{origin}/desktop/login"))
+}
+
+fn desktop_web_login_url_base() -> String {
+    web_login_url_from_api_base(&api_base_url())
+        .unwrap_or_else(|| DEFAULT_WEB_LOGIN_URL.to_string())
+}
+
 const MIN_AUTH_VALUE_LENGTH: usize = 24;
 const MAX_AUTH_VALUE_LENGTH: usize = 192;
 const DEFAULT_API_TIMEOUT_SECS: u64 = 10;
@@ -4372,6 +4394,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend_ping,
+            desktop_web_login_url,
             exchange_desktop_auth_code,
             validate_desktop_session,
             logout_desktop_session,
