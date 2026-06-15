@@ -5,7 +5,7 @@ use std::{
     thread,
 };
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::{
     db::{StoragePaths, REPO_ID},
@@ -29,20 +29,20 @@ struct CoordinationWorkspaceTarget {
     has_kernel_db: bool,
 }
 
-#[derive(Clone, Debug)]
-struct CoordinationWorkspaceTargetSet {
-    input_root: PathBuf,
-    workspace_kind: String,
-    is_container: bool,
-    targets: Vec<CoordinationWorkspaceTarget>,
-}
-
 fn kernel(
     repo_path: Option<String>,
     db_path: Option<String>,
 ) -> Result<CoordinationKernel, String> {
-    let target = coordination_single_workspace_target(repo_path, db_path)?;
-    CoordinationKernel::open(target.repo_path, target.db_path)
+    root_kernel(repo_path, db_path)
+}
+
+fn root_kernel(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+) -> Result<CoordinationKernel, String> {
+    let input_root = coordination_input_root(repo_path)?;
+    let requested_db_path = clean_optional_path(db_path);
+    CoordinationKernel::open(input_root, requested_db_path)
 }
 
 fn kernel_for_worktree_input(
@@ -117,92 +117,22 @@ fn coordination_workspace_target_from_root(
         project_kind: "workspace_root".to_string(),
         workspace_relative_path: String::new(),
         is_workspace_root: true,
-        has_git: input_root.join(".git").exists(),
+        has_git: crate::workspace_is_exact_git_root(input_root),
         has_agents: input_root.join(".agents").is_dir(),
         has_kernel_db: kernel_db_path.exists(),
     }
-}
-
-fn coordination_workspace_target_from_mount(
-    mount: &crate::WorkspaceProjectMount,
-) -> CoordinationWorkspaceTarget {
-    let kernel_db_path = coordination_target_kernel_db_path(&mount.root_path, None);
-    CoordinationWorkspaceTarget {
-        repo_path: mount.root_path.clone(),
-        db_path: None,
-        mount_id: mount.mount_id.clone(),
-        project_name: mount.project_name.clone(),
-        project_kind: mount.project_kind.clone(),
-        workspace_relative_path: mount.workspace_relative_path.clone(),
-        is_workspace_root: false,
-        has_git: mount.has_git,
-        has_agents: mount.has_agents,
-        has_kernel_db: kernel_db_path.exists(),
-    }
-}
-
-fn coordination_workspace_target_set(
-    repo_path: Option<String>,
-    db_path: Option<String>,
-) -> Result<CoordinationWorkspaceTargetSet, String> {
-    let input_root = coordination_input_root(repo_path)?;
-    let requested_db_path = clean_optional_path(db_path);
-    let mounts = if input_root.exists() && input_root.is_dir() {
-        crate::workspace_project_mounts(&input_root)
-    } else {
-        Vec::new()
-    };
-    let selected_root_mount = crate::workspace_selected_root_mount(&input_root, &mounts).is_some();
-    let is_container = !selected_root_mount && !mounts.is_empty();
-    let workspace_kind = if input_root.exists() && input_root.is_dir() {
-        crate::workspace_kind_for_mounts(&input_root, &mounts)
-    } else {
-        "plain".to_string()
-    };
-    let targets = if workspace_kind == "broad_area" {
-        Vec::new()
-    } else if is_container {
-        mounts
-            .iter()
-            .map(coordination_workspace_target_from_mount)
-            .collect::<Vec<_>>()
-    } else {
-        vec![coordination_workspace_target_from_root(
-            &input_root,
-            requested_db_path,
-        )]
-    };
-
-    Ok(CoordinationWorkspaceTargetSet {
-        input_root,
-        workspace_kind,
-        is_container,
-        targets,
-    })
 }
 
 fn coordination_single_workspace_target(
     repo_path: Option<String>,
     db_path: Option<String>,
 ) -> Result<CoordinationWorkspaceTarget, String> {
-    let target_set = coordination_workspace_target_set(repo_path, db_path)?;
-    if target_set.is_container && target_set.targets.len() > 1 {
-        let labels = target_set
-            .targets
-            .iter()
-            .take(5)
-            .map(|target| target.workspace_relative_path.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "Workspace root is a container with multiple projects ({labels}). Select a project before using coordination commands."
-        ));
-    }
-    target_set
-        .targets
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No coordination target is available for this workspace.".to_string())
+    let input_root = coordination_input_root(repo_path)?;
+    let requested_db_path = clean_optional_path(db_path);
+    Ok(coordination_workspace_target_from_root(
+        &input_root,
+        requested_db_path,
+    ))
 }
 
 fn coordination_target_value(target: &CoordinationWorkspaceTarget) -> Value {
@@ -228,158 +158,6 @@ fn coordination_target_value(target: &CoordinationWorkspaceTarget) -> Value {
         "hasKernelDb": target.has_kernel_db,
         "has_kernel_db": target.has_kernel_db,
     })
-}
-
-fn coordination_target_annotation(target: &CoordinationWorkspaceTarget) -> Map<String, Value> {
-    let mut annotation = Map::new();
-    annotation.insert(
-        "source_repo_path".to_string(),
-        json!(crate::workspace_path_display(&target.repo_path)),
-    );
-    annotation.insert(
-        "sourceRepoPath".to_string(),
-        json!(crate::workspace_path_display(&target.repo_path)),
-    );
-    annotation.insert(
-        "source_mount_id".to_string(),
-        json!(target.mount_id.clone()),
-    );
-    annotation.insert("sourceMountId".to_string(), json!(target.mount_id.clone()));
-    annotation.insert(
-        "source_project_name".to_string(),
-        json!(target.project_name.clone()),
-    );
-    annotation.insert(
-        "sourceProjectName".to_string(),
-        json!(target.project_name.clone()),
-    );
-    annotation
-}
-
-fn annotate_coordination_snapshot_item(
-    item: &Value,
-    target: &CoordinationWorkspaceTarget,
-) -> Value {
-    if let Some(object) = item.as_object() {
-        let mut next = object.clone();
-        for (key, value) in coordination_target_annotation(target) {
-            next.entry(key).or_insert(value);
-        }
-        Value::Object(next)
-    } else {
-        item.clone()
-    }
-}
-
-fn aggregate_container_coordination_snapshots(
-    target_set: &CoordinationWorkspaceTargetSet,
-) -> Value {
-    let mut aggregate = Map::new();
-    let mut project_results = Vec::new();
-    let mut skipped = Vec::new();
-    let mut errors = Vec::new();
-
-    for target in &target_set.targets {
-        if !target.has_kernel_db {
-            skipped.push(coordination_target_value(target));
-            continue;
-        }
-
-        match CoordinationKernel::open_for_shutdown_cleanup(
-            &target.repo_path,
-            target.db_path.clone(),
-        )
-        .and_then(|kernel| kernel.get_snapshot())
-        {
-            Ok(snapshot) => {
-                let data = snapshot
-                    .get("data")
-                    .and_then(Value::as_object)
-                    .or_else(|| snapshot.as_object());
-                if let Some(data) = data {
-                    for (key, value) in data {
-                        if let Some(items) = value.as_array() {
-                            let entry = aggregate
-                                .entry(key.clone())
-                                .or_insert_with(|| Value::Array(Vec::new()));
-                            if let Some(aggregate_items) = entry.as_array_mut() {
-                                aggregate_items.extend(
-                                    items.iter().map(|item| {
-                                        annotate_coordination_snapshot_item(item, target)
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-                project_results.push(json!({
-                    "repoPath": crate::workspace_path_display(&target.repo_path),
-                    "repo_path": crate::workspace_path_display(&target.repo_path),
-                    "mountId": target.mount_id,
-                    "mount_id": target.mount_id,
-                    "projectName": target.project_name,
-                    "project_name": target.project_name,
-                    "status": "included",
-                }));
-            }
-            Err(error) => {
-                errors.push(json!({
-                    "repoPath": crate::workspace_path_display(&target.repo_path),
-                    "repo_path": crate::workspace_path_display(&target.repo_path),
-                    "mountId": target.mount_id,
-                    "mount_id": target.mount_id,
-                    "projectName": target.project_name,
-                    "project_name": target.project_name,
-                    "error": error,
-                }));
-            }
-        }
-    }
-
-    aggregate.insert("container".to_string(), json!(true));
-    aggregate.insert(
-        "repoPath".to_string(),
-        json!(crate::workspace_path_display(&target_set.input_root)),
-    );
-    aggregate.insert(
-        "repo_path".to_string(),
-        json!(crate::workspace_path_display(&target_set.input_root)),
-    );
-    aggregate.insert(
-        "workspaceKind".to_string(),
-        json!(target_set.workspace_kind.clone()),
-    );
-    aggregate.insert(
-        "workspace_kind".to_string(),
-        json!(target_set.workspace_kind.clone()),
-    );
-    aggregate.insert(
-        "projectMounts".to_string(),
-        Value::Array(
-            target_set
-                .targets
-                .iter()
-                .map(coordination_target_value)
-                .collect(),
-        ),
-    );
-    aggregate.insert(
-        "project_mounts".to_string(),
-        aggregate["projectMounts"].clone(),
-    );
-    aggregate.insert(
-        "projectSnapshots".to_string(),
-        Value::Array(project_results.clone()),
-    );
-    aggregate.insert(
-        "project_snapshots".to_string(),
-        Value::Array(project_results),
-    );
-    aggregate.insert("skippedProjects".to_string(), Value::Array(skipped.clone()));
-    aggregate.insert("skipped_projects".to_string(), Value::Array(skipped));
-    aggregate.insert("errors".to_string(), Value::Array(errors));
-
-    Value::Object(aggregate)
 }
 
 fn repo_path_from_worktree_input(input: &Value) -> Option<String> {
@@ -606,22 +384,64 @@ pub fn coordination_init(
 }
 
 #[tauri::command]
+pub fn coordination_bootstrap_workspace(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    agent_session_mode: Option<String>,
+) -> Result<Value, String> {
+    let input_root = coordination_input_root(repo_path)?;
+    let requested_db_path = clean_optional_path(db_path);
+    let paths = StoragePaths::new(input_root.clone(), requested_db_path.clone());
+    let had_agents_root = paths.agents_root.is_dir();
+    let had_kernel_db = paths.db_path.exists();
+
+    if !had_kernel_db {
+        let kernel = CoordinationKernel::open(input_root.clone(), requested_db_path)?;
+        if let Some(mode) = agent_session_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            kernel.update_repo_policy(&json!({ "agent_session_mode": mode }))?;
+        }
+    }
+
+    let has_kernel_db = paths.db_path.exists();
+    let has_agents_root = paths.agents_root.is_dir();
+    Ok(api_ok(json!({
+        "repoPath": crate::workspace_path_display(&input_root),
+        "repo_path": crate::workspace_path_display(&input_root),
+        "agentsRoot": crate::workspace_path_display(&paths.agents_root),
+        "agents_root": crate::workspace_path_display(&paths.agents_root),
+        "dbPath": crate::workspace_path_display(&paths.db_path),
+        "db_path": crate::workspace_path_display(&paths.db_path),
+        "created": !had_kernel_db && has_kernel_db,
+        "hadAgentsRoot": had_agents_root,
+        "had_agents_root": had_agents_root,
+        "hasAgentsRoot": has_agents_root,
+        "has_agents_root": has_agents_root,
+        "hadKernelDb": had_kernel_db,
+        "had_kernel_db": had_kernel_db,
+        "hasKernelDb": has_kernel_db,
+        "has_kernel_db": has_kernel_db,
+        "gitRepository": crate::workspace_is_exact_git_root(&input_root),
+        "git_repository": crate::workspace_is_exact_git_root(&input_root),
+    })))
+}
+
+#[tauri::command]
 pub fn coordination_workspace_targets(
     repo_path: Option<String>,
     db_path: Option<String>,
 ) -> Result<Value, String> {
-    let target_set = coordination_workspace_target_set(repo_path, db_path)?;
+    let target = coordination_single_workspace_target(repo_path, db_path)?;
     Ok(api_ok(json!({
-        "repoPath": crate::workspace_path_display(&target_set.input_root),
-        "repo_path": crate::workspace_path_display(&target_set.input_root),
-        "workspaceKind": target_set.workspace_kind,
-        "workspace_kind": target_set.workspace_kind,
-        "container": target_set.is_container,
-        "targets": target_set
-            .targets
-            .iter()
-            .map(coordination_target_value)
-            .collect::<Vec<_>>(),
+        "repoPath": crate::workspace_path_display(&target.repo_path),
+        "repo_path": crate::workspace_path_display(&target.repo_path),
+        "workspaceKind": if target.has_git { "git_repo" } else { "workspace_root" },
+        "workspace_kind": if target.has_git { "git_repo" } else { "workspace_root" },
+        "container": false,
+        "targets": [coordination_target_value(&target)],
     })))
 }
 
@@ -630,18 +450,7 @@ pub fn coordination_get_snapshot(
     repo_path: Option<String>,
     db_path: Option<String>,
 ) -> Result<Value, String> {
-    let target_set = coordination_workspace_target_set(repo_path, db_path)?;
-    if target_set.is_container {
-        return Ok(api_ok(aggregate_container_coordination_snapshots(
-            &target_set,
-        )));
-    }
-    let target = target_set
-        .targets
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No coordination target is available for this workspace.".to_string())?;
-    result(CoordinationKernel::open(target.repo_path, target.db_path)?.get_snapshot())
+    result(root_kernel(repo_path, db_path)?.get_snapshot())
 }
 
 #[tauri::command]
@@ -1159,60 +968,14 @@ pub fn coordination_deactivate_shared_mcp_daemon(
     repo_path: Option<String>,
     reason: Option<String>,
 ) -> Result<Value, String> {
-    let target_set = coordination_workspace_target_set(repo_path, None)?;
+    let input_root = coordination_input_root(repo_path)?;
     let reason = reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("workspace_deactivate");
 
-    if target_set.is_container {
-        let mut stopped = Vec::new();
-        stopped.push(
-            mcp::stop_shared_daemon_for_repo(&target_set.input_root, reason).unwrap_or_else(
-                |error| {
-                    json!({
-                        "repo_path": crate::workspace_path_display(&target_set.input_root),
-                        "status": "error",
-                        "target": "container_parent",
-                        "error": error,
-                    })
-                },
-            ),
-        );
-        stopped.extend(
-            target_set
-                .targets
-                .iter()
-                .map(|target| {
-                    mcp::stop_shared_daemon_for_repo(&target.repo_path, reason).unwrap_or_else(
-                        |error| {
-                            json!({
-                                "repo_path": crate::workspace_path_display(&target.repo_path),
-                                "mount_id": target.mount_id,
-                                "project_name": target.project_name,
-                                "status": "error",
-                                "error": error,
-                            })
-                        },
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
-        return Ok(api_ok(json!({
-            "repo_path": crate::workspace_path_display(&target_set.input_root),
-            "container": true,
-            "reason": reason,
-            "stopped": stopped,
-        })));
-    }
-
-    let target = target_set
-        .targets
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No coordination target is available for this workspace.".to_string())?;
-    mcp::stop_shared_daemon_for_repo(target.repo_path, reason).map(api_ok_from_data)
+    mcp::stop_shared_daemon_for_repo(input_root, reason).map(api_ok_from_data)
 }
 
 #[tauri::command]
@@ -1412,7 +1175,7 @@ pub fn coordination_get_repo_policy(
     db_path: Option<String>,
 ) -> Result<Value, String> {
     result(
-        kernel(repo_path, db_path)?
+        root_kernel(repo_path, db_path)?
             .repo_policy()
             .map(api_ok_from_data),
     )
@@ -1424,7 +1187,7 @@ pub fn coordination_update_repo_policy(
     db_path: Option<String>,
     input: Value,
 ) -> Result<Value, String> {
-    result(kernel(repo_path, db_path)?.update_repo_policy(&input))
+    result(root_kernel(repo_path, db_path)?.update_repo_policy(&input))
 }
 
 #[tauri::command]
@@ -1769,8 +1532,8 @@ mod tests {
     }
 
     #[test]
-    fn coordination_targets_expand_container_children_without_parent_agents() {
-        let root = test_root("expand-container");
+    fn coordination_targets_report_container_parent_only() {
+        let root = test_root("root-target-container");
         create_package_project(&root.join("frontend"));
         create_package_project(&root.join("backend"));
 
@@ -1779,29 +1542,19 @@ mod tests {
         let target_data = data(&targets);
         let target_paths = target_data["targets"].as_array().unwrap();
 
-        assert_eq!(target_data["container"].as_bool(), Some(true));
-        assert_eq!(target_paths.len(), 2);
-        assert!(target_paths.iter().any(|target| {
-            target["mountId"].as_str() == Some("backend")
-                && target["repoPath"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with("backend"))
-        }));
-        assert!(target_paths.iter().any(|target| {
-            target["mountId"].as_str() == Some("frontend")
-                && target["repoPath"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with("frontend"))
-        }));
-        assert!(!root.join(".agents").exists());
-
-        let snapshot = coordination_get_snapshot(Some(root.display().to_string()), None).unwrap();
-        let snapshot_data = data(&snapshot);
-        assert_eq!(snapshot_data["container"].as_bool(), Some(true));
+        assert_eq!(target_data["container"].as_bool(), Some(false));
+        assert_eq!(target_paths.len(), 1);
+        assert_eq!(target_paths[0]["mountId"].as_str(), Some(""));
+        assert!(target_paths[0]["isWorkspaceRoot"]
+            .as_bool()
+            .unwrap_or(false));
         assert_eq!(
-            snapshot_data["skippedProjects"].as_array().unwrap().len(),
-            2
+            PathBuf::from(target_paths[0]["repoPath"].as_str().unwrap_or_default())
+                .canonicalize()
+                .unwrap(),
+            root.canonicalize().unwrap()
         );
+
         assert!(!root.join(".agents").exists());
         assert!(!root.join("frontend").join(".agents").exists());
         assert!(!root.join("backend").join(".agents").exists());
@@ -1810,8 +1563,8 @@ mod tests {
     }
 
     #[test]
-    fn coordination_targets_expand_nested_container_leaf_projects_only() {
-        let root = test_root("expand-nested-container");
+    fn coordination_targets_ignore_nested_container_leaf_projects() {
+        let root = test_root("root-target-nested-container");
         create_package_project(&root.join("product-a").join("frontend"));
         create_package_project(&root.join("product-a").join("backend"));
         create_package_project(&root.join("product-b").join("api"));
@@ -1821,23 +1574,18 @@ mod tests {
         let target_data = data(&targets);
         let target_paths = target_data["targets"].as_array().unwrap();
 
-        assert_eq!(target_data["container"].as_bool(), Some(true));
-        assert_eq!(target_paths.len(), 3);
-        assert!(target_paths.iter().any(|target| {
-            target["mountId"].as_str() == Some("product-a/frontend")
-                && target["repoPath"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with("product-a/frontend"))
-        }));
-        assert!(target_paths.iter().any(|target| {
-            target["mountId"].as_str() == Some("product-a/backend")
-                && target["repoPath"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with("product-a/backend"))
-        }));
-        assert!(target_paths
-            .iter()
-            .all(|target| target["projectKind"].as_str() != Some("container")));
+        assert_eq!(target_data["container"].as_bool(), Some(false));
+        assert_eq!(target_paths.len(), 1);
+        assert_eq!(target_paths[0]["mountId"].as_str(), Some(""));
+        assert!(target_paths[0]["isWorkspaceRoot"]
+            .as_bool()
+            .unwrap_or(false));
+        assert_eq!(
+            PathBuf::from(target_paths[0]["repoPath"].as_str().unwrap_or_default())
+                .canonicalize()
+                .unwrap(),
+            root.canonicalize().unwrap()
+        );
         assert!(!root.join(".agents").exists());
         assert!(!root.join(".git").exists());
 
@@ -1845,21 +1593,33 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_container_single_repo_commands_refuse_parent_kernel() {
-        let root = test_root("refuse-parent");
+    fn container_single_repo_commands_use_parent_kernel() {
+        let root = test_root("parent-kernel");
         create_package_project(&root.join("frontend"));
         create_package_project(&root.join("backend"));
 
-        let error = coordination_workspace_mcp_registry(
+        let registry = coordination_workspace_mcp_registry(
             Some(root.display().to_string()),
             None,
             "workspace-1".to_string(),
             Some("Workspace".to_string()),
         )
-        .unwrap_err();
+        .unwrap();
+        let registry_data = data(&registry);
+        let root_path = root.canonicalize().unwrap();
+        let registry_repo_path = PathBuf::from(
+            registry_data["coordination_kernel"]["repo_path"]
+                .as_str()
+                .unwrap_or_default(),
+        )
+        .canonicalize()
+        .unwrap();
 
-        assert!(error.contains("multiple projects"));
-        assert!(!root.join(".agents").exists());
+        assert_eq!(
+            crate::normalized_path_key(&registry_repo_path),
+            crate::normalized_path_key(&root_path)
+        );
+        assert!(root.join(".agents").join("kernel.sqlite").exists());
         assert!(!root.join("frontend").join(".agents").exists());
         assert!(!root.join("backend").join(".agents").exists());
 
@@ -1867,8 +1627,8 @@ mod tests {
     }
 
     #[test]
-    fn container_snapshot_aggregates_existing_child_kernel_only() {
-        let root = test_root("aggregate-child");
+    fn container_snapshot_uses_parent_kernel_only() {
+        let root = test_root("parent-snapshot");
         let frontend = root.join("frontend");
         let backend = root.join("backend");
         create_package_project(&frontend);
@@ -1880,15 +1640,9 @@ mod tests {
 
         let snapshot = coordination_get_snapshot(Some(root.display().to_string()), None).unwrap();
         let snapshot_data = data(&snapshot);
-        let project_snapshots = snapshot_data["projectSnapshots"].as_array().unwrap();
-        let skipped_projects = snapshot_data["skippedProjects"].as_array().unwrap();
 
-        assert_eq!(snapshot_data["container"].as_bool(), Some(true));
-        assert_eq!(project_snapshots.len(), 1);
-        assert_eq!(skipped_projects.len(), 1);
-        assert_eq!(project_snapshots[0]["mountId"].as_str(), Some("frontend"));
-        assert_eq!(skipped_projects[0]["mountId"].as_str(), Some("backend"));
-        assert!(!root.join(".agents").exists());
+        assert_ne!(snapshot_data["container"].as_bool(), Some(true));
+        assert!(root.join(".agents").join("kernel.sqlite").exists());
         assert!(!frontend.join(".agents").exists());
         assert!(!frontend.join(".gitignore").exists());
         assert!(!backend.join(".agents").exists());
@@ -1897,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn single_child_container_commands_auto_target_child_project() {
+    fn single_child_container_commands_use_parent_kernel() {
         let root = test_root("single-child");
         let frontend = root.join("frontend");
         create_package_project(&frontend);
@@ -1910,7 +1664,7 @@ mod tests {
         )
         .unwrap();
         let registry_data = data(&registry);
-        let frontend_path = frontend.canonicalize().unwrap();
+        let root_path = root.canonicalize().unwrap();
         let registry_repo_path = PathBuf::from(
             registry_data["coordination_kernel"]["repo_path"]
                 .as_str()
@@ -1921,9 +1675,9 @@ mod tests {
 
         assert_eq!(
             crate::normalized_path_key(&registry_repo_path),
-            crate::normalized_path_key(&frontend_path)
+            crate::normalized_path_key(&root_path)
         );
-        assert!(!root.join(".agents").exists());
+        assert!(root.join(".agents").join("kernel.sqlite").exists());
         let registry_db_path = PathBuf::from(
             registry_data["coordination_kernel"]["db_path"]
                 .as_str()

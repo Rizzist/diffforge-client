@@ -16,10 +16,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine as _};
-use futures_util::{
-    future::{BoxFuture, FutureExt, Shared},
-    SinkExt, StreamExt,
-};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1595,6 +1592,7 @@ struct SavedTodoTextAttachment {
 struct ForgeWorkingDirectory {
     working_directory: String,
     empty_directory: bool,
+    git_repository: bool,
     workspace_kind: String,
     active_project_root: Option<String>,
     project_mounts: Vec<WorkspaceProjectMount>,
@@ -4508,6 +4506,8 @@ pub fn run() {
             audio_widget_status,
             audio_widget_bar_hover_snapshot,
             audio_widget_bar_anchor_strategy,
+            audio_widget_position_bottom_bar,
+            audio_widget_clear_bottom_bar_position,
             audio_widget_release_keyboard_focus,
             show_audio_widget,
             hide_audio_widget,
@@ -4673,6 +4673,7 @@ pub fn run() {
             terminal_pane_runtime_info,
             terminal_live_sessions,
             coordination::tauri_commands::coordination_init,
+            coordination::tauri_commands::coordination_bootstrap_workspace,
             coordination::tauri_commands::coordination_workspace_targets,
             coordination::tauri_commands::coordination_get_snapshot,
             coordination::tauri_commands::coordination_terminal_todo_plan_snapshot,

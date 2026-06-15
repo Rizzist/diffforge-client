@@ -685,6 +685,52 @@ async function resolveAudioBarAnchorStrategy() {
   };
 }
 
+function normalizeAudioBarAnchorNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function resolveAudioBarAnchorArea(anchorStrategy, monitor) {
+  const scale = normalizeAudioBarAnchorNumber(anchorStrategy?.scaleFactor)
+    || normalizeAudioBarAnchorNumber(monitor?.scaleFactor)
+    || 1;
+  const strategyArea = anchorStrategy?.area;
+  const strategyAreaX = normalizeAudioBarAnchorNumber(strategyArea?.position?.x);
+  const strategyAreaY = normalizeAudioBarAnchorNumber(strategyArea?.position?.y);
+  const strategyAreaWidth = normalizeAudioBarAnchorNumber(strategyArea?.size?.width);
+  const strategyAreaHeight = normalizeAudioBarAnchorNumber(strategyArea?.size?.height);
+
+  if (
+    strategyAreaX !== null
+    && strategyAreaY !== null
+    && strategyAreaWidth !== null
+    && strategyAreaHeight !== null
+    && strategyAreaWidth > 0
+    && strategyAreaHeight > 0
+  ) {
+    return {
+      area: {
+        position: { x: strategyAreaX, y: strategyAreaY },
+        size: { width: strategyAreaWidth, height: strategyAreaHeight },
+      },
+      scale,
+    };
+  }
+
+  if (!monitor) {
+    return null;
+  }
+
+  const fullArea = { position: monitor.position, size: monitor.size };
+  const workArea = monitor.workArea?.size?.height ? monitor.workArea : null;
+  return {
+    area: anchorStrategy?.useFullMonitorBounds
+      ? fullArea
+      : workArea || fullArea,
+    scale,
+  };
+}
+
 function forgeCloudStatusIsConnected(status) {
   if (!status || typeof status !== "object") {
     return false;
@@ -4210,6 +4256,7 @@ export function AudioWidgetWindow() {
   const barPositionAnimationRef = useRef({ frame: 0, token: 0 });
   const barPlacementGenerationRef = useRef(0);
   const barPlacementReadyKeyRef = useRef("");
+  const barFullscreenAnchorStrategyRef = useRef(null);
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
@@ -4845,6 +4892,19 @@ export function AudioWidgetWindow() {
     });
   }, [cancelBarPositionAnimation]);
 
+  const positionAudioBarWindowNatively = useCallback(async (request) => {
+    if (!isMacPlatform()) {
+      return null;
+    }
+
+    cancelBarPositionAnimation();
+    try {
+      return await invoke("audio_widget_position_bottom_bar", { request });
+    } catch {
+      return null;
+    }
+  }, [cancelBarPositionAnimation]);
+
   useEffect(() => () => {
     cancelBarPositionAnimation();
   }, [cancelBarPositionAnimation]);
@@ -5285,24 +5345,48 @@ export function AudioWidgetWindow() {
         return;
       }
       const modeGeometryChanged = barPlacementReadyKeyRef.current !== targetKey;
+      const nativePlacement = await positionAudioBarWindowNatively({
+        width: target.width,
+        height: target.height,
+        margin,
+        animate: options.animate !== false && !modeGeometryChanged,
+        ...(options.anchorStrategy?.useFullMonitorBounds ? { useFullMonitorBounds: true } : {}),
+      });
+      if (!isCurrentPlacement()) {
+        return;
+      }
+      if (nativePlacement) {
+        if (nativePlacement.useFullMonitorBounds) {
+          barFullscreenAnchorStrategyRef.current = nativePlacement;
+        } else if (!options.anchorStrategy?.useFullMonitorBounds) {
+          barFullscreenAnchorStrategyRef.current = null;
+        }
+        barPlacementReadyKeyRef.current = targetKey;
+        setBarPlacementReadyKey((currentKey) => (
+          currentKey === targetKey ? currentKey : targetKey
+        ));
+        return;
+      }
+
       await windowHandle.setSize(new LogicalSize(target.width, target.height));
       if (!isCurrentPlacement()) {
         return;
       }
+      const anchorStrategyHint = options.anchorStrategy
+        && typeof options.anchorStrategy === "object"
+        && options.anchorStrategy.useFullMonitorBounds
+        ? options.anchorStrategy
+        : null;
       const [monitor, anchorStrategy] = await Promise.all([
         currentMonitor().catch(() => null),
-        resolveAudioBarAnchorStrategy(),
+        anchorStrategyHint || resolveAudioBarAnchorStrategy(),
       ]);
       if (!isCurrentPlacement()) {
         return;
       }
-      if (monitor) {
-        const scale = monitor.scaleFactor || 1;
-        const fullArea = { position: monitor.position, size: monitor.size };
-        const workArea = monitor.workArea?.size?.height ? monitor.workArea : null;
-        const area = anchorStrategy.useFullMonitorBounds
-          ? fullArea
-          : workArea || fullArea;
+      const anchor = resolveAudioBarAnchorArea(anchorStrategy, monitor);
+      if (anchor) {
+        const { area, scale } = anchor;
         const x = area.position.x
           + Math.round((area.size.width - (target.width * scale)) / 2);
         const y = area.position.y
@@ -5334,6 +5418,7 @@ export function AudioWidgetWindow() {
     barGeometryKey,
     barGeometryMargin,
     barGeometrySize,
+    positionAudioBarWindowNatively,
     runWidgetWindowAction,
     setAudioBarWindowPosition,
     usesBottomAnchoredStyle,
@@ -5346,8 +5431,10 @@ export function AudioWidgetWindow() {
   // is left under the bar.
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
+      barFullscreenAnchorStrategyRef.current = null;
       barPlacementReadyKeyRef.current = "";
       setBarPlacementReadyKey("");
+      invoke("audio_widget_clear_bottom_bar_position").catch(() => {});
       const saved = barSavedPlacementRef.current;
       const restoredPosition = readAudioWidgetBubblePlacement() || saved?.position || null;
       if (saved || restoredPosition) {
@@ -5381,7 +5468,10 @@ export function AudioWidgetWindow() {
     }
 
     const timer = window.setInterval(
-      () => positionBottomAnchoredWidget({ animate: true }),
+      () => positionBottomAnchoredWidget({
+        animate: true,
+        anchorStrategy: barFullscreenAnchorStrategyRef.current || undefined,
+      }),
       AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
     );
     return () => window.clearInterval(timer);
@@ -5396,22 +5486,35 @@ export function AudioWidgetWindow() {
     let unlistenSpace = () => {};
     let unlistenLayout = () => {};
     const timers = new Set();
-    const schedulePosition = (delayMs) => {
+    const schedulePosition = (delayMs, anchorStrategy) => {
       const timer = window.setTimeout(() => {
         timers.delete(timer);
         if (!disposed) {
-          positionBottomAnchoredWidget({ animate: true });
+          positionBottomAnchoredWidget({ animate: true, anchorStrategy });
         }
       }, delayMs);
       timers.add(timer);
     };
-    const handleLayoutChanged = () => {
+    const handleLayoutChanged = (event, audioScoped) => {
       timers.forEach((timer) => window.clearTimeout(timer));
       timers.clear();
-      AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach(schedulePosition);
+      const payload = event?.payload;
+      if (payload?.useFullMonitorBounds) {
+        barFullscreenAnchorStrategyRef.current = payload;
+      } else if (
+        audioScoped
+        && payload
+        && typeof payload.useFullMonitorBounds === "boolean"
+      ) {
+        barFullscreenAnchorStrategyRef.current = null;
+      }
+      const eventStrategy = barFullscreenAnchorStrategyRef.current || undefined;
+      AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach((delayMs) => {
+        schedulePosition(delayMs, eventStrategy);
+      });
     };
 
-    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, handleLayoutChanged)
+    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, (event) => handleLayoutChanged(event, true))
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
@@ -5421,7 +5524,7 @@ export function AudioWidgetWindow() {
         unlistenSpace = nextUnlisten;
       })
       .catch(() => {});
-    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, handleLayoutChanged)
+    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, (event) => handleLayoutChanged(event, false))
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
@@ -7474,8 +7577,8 @@ export function AudioWidgetWindow() {
             onPointerMove={updateBarIdleHoverFromPointer}
           >
             <AudioBarIdleReveal>
-              <AudioBarHistoryActions aria-label="Transcript polish shortcut" data-side="left">
-                {renderPolishQuickButton()}
+              <AudioBarHistoryActions aria-label="Dictation copy shortcut" data-side="left">
+                {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText))}
               </AudioBarHistoryActions>
               <AudioBarRecordCluster>
                 <AudioBarRecordButton
@@ -7488,8 +7591,8 @@ export function AudioWidgetWindow() {
                   {dictateShortcutLabel}
                 </AudioBarShortcutHint>
               </AudioBarRecordCluster>
-              <AudioBarHistoryActions aria-label="Dictation copy shortcut" data-side="right">
-                {renderHistoryQuickButton("latest", "Copy latest transcription", Boolean(latestHistoryText))}
+              <AudioBarHistoryActions aria-label="Transcript polish shortcut" data-side="right">
+                {renderPolishQuickButton()}
               </AudioBarHistoryActions>
             </AudioBarIdleReveal>
             <AudioBarIdleLine aria-hidden="true" />

@@ -59,6 +59,8 @@ const SNIPPING_MACOS_FLAG_COMMAND: u64 = 0x0010_0000;
 const SNIPPING_MACOS_KEY_3: i64 = 20;
 #[cfg(target_os = "macos")]
 const SNIPPING_MACOS_KEY_4: i64 = 21;
+#[cfg(target_os = "macos")]
+const SNIPPING_AREA_CURSOR_GUARD_POLL_MS: u64 = 40;
 
 #[cfg(target_os = "macos")]
 static SNIPPING_MACOS_EVENT_TAP_STARTED: AtomicBool = AtomicBool::new(false);
@@ -3252,6 +3254,72 @@ fn snipping_force_area_crosshair_for_ns_window(ns_window: &NSWindow) {
 }
 
 #[cfg(target_os = "macos")]
+fn snipping_force_area_crosshair_for_visible_overlays(app: &AppHandle) {
+    if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    snipping_catch_objc("force_area_crosshair_for_visible_overlays", || {
+        NSCursor::crosshairCursor().set();
+
+        let location = objc2_app_kit::NSEvent::mouseLocation();
+        let mut forced_cursor_window = false;
+        for (_, window) in snipping_overlay_windows(app) {
+            let Ok(ns_ptr) = window.ns_window() else {
+                continue;
+            };
+            if ns_ptr.is_null() {
+                continue;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+            if !ns_window.isVisible() {
+                continue;
+            }
+            let frame = ns_window.frame();
+            let inside = location.x >= frame.origin.x
+                && location.x < frame.origin.x + frame.size.width
+                && location.y >= frame.origin.y
+                && location.y < frame.origin.y + frame.size.height;
+            if !inside {
+                continue;
+            }
+            if !ns_window.isKeyWindow() {
+                ns_window.makeKeyAndOrderFront(None);
+            }
+            snipping_force_area_crosshair_for_ns_window(ns_window);
+            forced_cursor_window = true;
+            break;
+        }
+
+        if !forced_cursor_window {
+            for (_, window) in snipping_overlay_windows(app) {
+                let Ok(ns_ptr) = window.ns_window() else {
+                    continue;
+                };
+                if ns_ptr.is_null() {
+                    continue;
+                }
+                let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+                if !ns_window.isVisible() {
+                    continue;
+                }
+                snipping_force_area_crosshair_for_ns_window(ns_window);
+                break;
+            }
+        }
+
+        NSCursor::crosshairCursor().set();
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_request_area_crosshair_reassertion(app: &AppHandle) {
+    let app_for_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        snipping_force_area_crosshair_for_visible_overlays(&app_for_main);
+    });
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_restore_area_overlay_cursor_rects(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
@@ -3566,6 +3634,40 @@ fn snipping_make_overlay_key(window: &tauri::WebviewWindow) {
 static SNIPPING_OVERLAY_MOUSE_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static SNIPPING_AREA_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static SNIPPING_AREA_CURSOR_GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// WebKit/AppKit can emit cursor updates after the overlay is shown, and a
+/// transparent non-activating panel does not always get a fresh mouse move
+/// immediately. While an area snip is ready, keep the native cursor pinned to
+/// the crosshair on the AppKit main thread.
+#[cfg(target_os = "macos")]
+fn snipping_start_area_cursor_guard(app: &AppHandle) {
+    snipping_request_area_crosshair_reassertion(app);
+    if SNIPPING_AREA_CURSOR_GUARD_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                SNIPPING_AREA_CURSOR_GUARD_ACTIVE.store(false, Ordering::Release);
+                if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire)
+                    || SNIPPING_AREA_CURSOR_GUARD_ACTIVE.swap(true, Ordering::AcqRel)
+                {
+                    return;
+                }
+            }
+
+            let app_for_main = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                snipping_force_area_crosshair_for_visible_overlays(&app_for_main);
+            });
+            sleep(Duration::from_millis(SNIPPING_AREA_CURSOR_GUARD_POLL_MS)).await;
+        }
+    });
+}
 
 /// AppKit routes mouseMoved events to the key window only, so with one
 /// overlay panel per display, hover tracking would stay stuck on whichever
@@ -3579,38 +3681,11 @@ fn snipping_overlay_handle_mouse_moved() {
     if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    snipping_set_area_crosshair_cursor_now();
-    snipping_catch_objc("overlay_handle_mouse_moved", || {
-        let Some(app) = snipping_macos_event_tap_app() else {
-            return;
-        };
-        let location = objc2_app_kit::NSEvent::mouseLocation();
-        for (_, window) in snipping_overlay_windows(&app) {
-            let Ok(ns_ptr) = window.ns_window() else {
-                continue;
-            };
-            if ns_ptr.is_null() {
-                continue;
-            }
-            let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
-            if !ns_window.isVisible() {
-                continue;
-            }
-            let frame = ns_window.frame();
-            let inside = location.x >= frame.origin.x
-                && location.x < frame.origin.x + frame.size.width
-                && location.y >= frame.origin.y
-                && location.y < frame.origin.y + frame.size.height;
-            if !inside {
-                continue;
-            }
-            if !ns_window.isKeyWindow() {
-                ns_window.makeKeyAndOrderFront(None);
-            }
-            snipping_force_area_crosshair_for_ns_window(ns_window);
-            break;
-        }
-    });
+    if let Some(app) = snipping_macos_event_tap_app() {
+        snipping_force_area_crosshair_for_visible_overlays(&app);
+    } else {
+        snipping_set_area_crosshair_cursor_now();
+    }
 }
 
 /// Installs the app-lifetime mouse-move monitors that drive cross-display
@@ -3848,7 +3923,7 @@ fn snipping_begin_area_snip_for(
     #[cfg(target_os = "macos")]
     {
         SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
-        snipping_set_area_crosshair_cursor_now();
+        snipping_start_area_cursor_guard(app);
     }
 
     // Overlay windows left over from a display that disappeared since the

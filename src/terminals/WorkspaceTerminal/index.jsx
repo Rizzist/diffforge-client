@@ -1109,6 +1109,7 @@ const TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS = 15000;
 const TERMINAL_CODING_AGENT_READY_RECONCILE_QUIET_MS = 850;
 const TERMINAL_CODING_AGENT_READY_RECONCILE_RETRY_MS = 350;
 const TERMINAL_CODING_AGENT_READY_RECONCILE_MAX_MS = 12000;
+const TERMINAL_PREWARM_PTY_REVEAL_SETTLE_MS = 520;
 const TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS = 250;
 const TERMINAL_THREAD_PROMPT_READY_EARLY_MIN_MS = 120;
 const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
@@ -1859,8 +1860,6 @@ function WorkspaceTerminal({
   onToggleFullscreenTerminal,
   onPopOutTerminalWindow,
   prewarmShell = false,
-  projectRoot = "",
-  mountId = "",
   startupReady = true,
   terminalBreakoutActive = false,
   terminalSelectionMode = "pointerdown",
@@ -2059,6 +2058,19 @@ function WorkspaceTerminal({
   const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
   const terminalUsesActivityHooks = !isGenericTerminal && terminalAgentUsesActivityHooks(terminalAgentKind);
+  const shouldDelayInitialPtyReveal = Boolean(agent && !isGenericTerminal && prewarmShell && !agentLaunchReady);
+  const [terminalPtyRevealReady, setTerminalPtyRevealReady] = useState(!shouldDelayInitialPtyReveal);
+  const terminalPtyRevealReadyRef = useRef(!shouldDelayInitialPtyReveal);
+  const setTerminalPtyRevealReadyState = useCallback((ready) => {
+    const nextReady = Boolean(ready);
+    terminalPtyRevealReadyRef.current = nextReady;
+    setTerminalPtyRevealReady(nextReady);
+  }, []);
+  useEffect(() => {
+    if (shouldDelayInitialPtyReveal) {
+      setTerminalPtyRevealReadyState(false);
+    }
+  }, [setTerminalPtyRevealReadyState, shouldDelayInitialPtyReveal]);
   const terminalDefaultSessionMode = defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady);
   const [, setTerminalSessionMode] = useState(terminalDefaultSessionMode);
   const terminalSessionModeRef = useRef(terminalDefaultSessionMode);
@@ -5017,6 +5029,10 @@ function WorkspaceTerminal({
     let visibleOutputRefreshTimer = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
+    let prewarmPtyOutputGateActive = false;
+    let prewarmPtyRevealTimer = 0;
+    let prewarmPtyDroppedBytes = 0;
+    let prewarmPtyDroppedChunks = 0;
     let outputBytes = 0;
     let outputChunks = 0;
     let visibleOutputBytes = 0;
@@ -6492,6 +6508,91 @@ function WorkspaceTerminal({
 
     const cancelTerminalOutputBatchTimers = () => {
       terminalGlobalRenderScheduler.cancel(renderSchedulerId);
+    };
+
+    const resetPrewarmPtyOutputGateCounters = () => {
+      prewarmPtyDroppedBytes = 0;
+      prewarmPtyDroppedChunks = 0;
+    };
+
+    const discardQueuedTerminalOutput = () => {
+      cancelTerminalOutputBatchTimers();
+      pendingOutputWrites.length = 0;
+      pendingOutputBytes = 0;
+      outputBatchQueuedAt = 0;
+    };
+
+    const hidePrewarmPtyOutput = (reason) => {
+      if (prewarmPtyRevealTimer) {
+        window.clearTimeout(prewarmPtyRevealTimer);
+        prewarmPtyRevealTimer = 0;
+      }
+      prewarmPtyOutputGateActive = true;
+      resetPrewarmPtyOutputGateCounters();
+      discardQueuedTerminalOutput();
+      setTerminalPtyRevealReadyState(false);
+      logTerminalDiagnosticEvent("frontend.prewarm_pty_output_gate.hide", {
+        paneId,
+        reason,
+        terminalIndex,
+      });
+    };
+
+    const revealPrewarmPtyOutput = (reason, delayMs = TERMINAL_PREWARM_PTY_REVEAL_SETTLE_MS) => {
+      if (isDisposed) {
+        return;
+      }
+
+      if (prewarmPtyRevealTimer) {
+        window.clearTimeout(prewarmPtyRevealTimer);
+      }
+
+      prewarmPtyRevealTimer = window.setTimeout(() => {
+        prewarmPtyRevealTimer = 0;
+        if (isDisposed) {
+          return;
+        }
+
+        const droppedBytes = prewarmPtyDroppedBytes;
+        const droppedChunks = prewarmPtyDroppedChunks;
+        prewarmPtyOutputGateActive = false;
+        resetPrewarmPtyOutputGateCounters();
+        discardQueuedTerminalOutput();
+        terminalFirstVisibleOutputAtRef.current = 0;
+        sawFirstOutput = false;
+        sawFirstVisibleOutput = false;
+        visibleOutputBytes = 0;
+        visibleOutputChunks = 0;
+
+        try {
+          terminal.clear?.();
+        } catch (_error) {
+          // Best-effort visual cleanup before the prepared PTY is revealed.
+        }
+        clearTerminalRendererRows("prewarm_pty_reveal", {
+          droppedBytes,
+          droppedChunks,
+          reason,
+        });
+        setTerminalPtyRevealReadyState(true);
+        resizeController?.resizeNow("prewarm_pty_reveal", {
+          force: true,
+          forceNative: true,
+          nativeDelayMs: 0,
+        });
+        refreshTerminalRenderer("prewarm_pty_reveal", {
+          droppedBytes,
+          droppedChunks,
+          reason,
+        });
+        logTerminalDiagnosticEvent("frontend.prewarm_pty_output_gate.reveal", {
+          droppedBytes,
+          droppedChunks,
+          paneId,
+          reason,
+          terminalIndex,
+        });
+      }, Math.max(0, Number(delayMs) || 0));
     };
 
     const combineTerminalOutputWrites = (writes) => {
@@ -9554,6 +9655,11 @@ function WorkspaceTerminal({
           const sourceChunks = Number.isFinite(payload.sourceChunks)
             ? Math.max(1, payload.sourceChunks)
             : 1;
+          if (prewarmPtyOutputGateActive) {
+            prewarmPtyDroppedBytes += terminalData.byteLength;
+            prewarmPtyDroppedChunks += sourceChunks;
+            return;
+          }
           const maskMs = Number.isFinite(payload.maskMs) ? payload.maskMs : 0;
           const debugExtraMs = Number.isFinite(payload.workerScheduledDelayMs)
             ? Math.max(0, payload.workerScheduledDelayMs)
@@ -12036,6 +12142,17 @@ function WorkspaceTerminal({
         const openKind = isGenericTerminal || shouldPrewarmShell ? "prewarm-pty" : agent.id;
         const openProvider = isGenericTerminal || shouldPrewarmShell ? null : agent.id;
         let agentStartedInCurrentPty = isGenericTerminal || !shouldPrewarmShell;
+        if (shouldPrewarmShell) {
+          hidePrewarmPtyOutput("terminal_open_prewarm");
+        } else {
+          if (prewarmPtyRevealTimer) {
+            window.clearTimeout(prewarmPtyRevealTimer);
+            prewarmPtyRevealTimer = 0;
+          }
+          prewarmPtyOutputGateActive = false;
+          resetPrewarmPtyOutputGateCounters();
+          setTerminalPtyRevealReadyState(true);
+        }
         const sessionModeForThisStart = normalizeTerminalSessionMode(
           terminalSessionModeRef.current,
           defaultTerminalSessionModeForRole(terminalRoleId, shouldPrewarmShell),
@@ -12054,9 +12171,8 @@ function WorkspaceTerminal({
           setPaneStage("starting", "Starting Agent", "Attaching the prepared terminal.");
           setTerminalError("");
 
-          const agentLaunchStartedAt = performance.now();
-
           setPaneStage("running", "Agent Running", "Terminal is connected.");
+          revealPrewarmPtyOutput(`${reason}_agent_started`, TERMINAL_PREWARM_PTY_REVEAL_SETTLE_MS);
           resizeController?.resizeNow("agent_launch_done");
           scheduleBlankStartupWatch("agent_launch_done");
           scheduleCodingAgentInputReady(`${reason}_agent_started`);
@@ -12126,8 +12242,6 @@ function WorkspaceTerminal({
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
               sessionMode: sessionModeForThisStart,
-              projectRoot: projectRoot || "",
-              mountId: mountId || "",
               slotKey: startupSlotKey,
               terminalIndex,
               threadId: startupThreadId,
@@ -12451,6 +12565,10 @@ function WorkspaceTerminal({
         window.clearTimeout(visibleOutputRefreshTimer);
         visibleOutputRefreshTimer = 0;
       }
+      if (prewarmPtyRevealTimer) {
+        window.clearTimeout(prewarmPtyRevealTimer);
+        prewarmPtyRevealTimer = 0;
+      }
       startupMetricTimers.forEach((timer) => window.clearTimeout(timer));
       startupMetricTimers.clear();
       startupWatchTimers.forEach((timer) => window.clearTimeout(timer));
@@ -12510,7 +12628,7 @@ function WorkspaceTerminal({
   // PTY lifetime must be tied to pane identity and explicit lifecycle actions only.
   // Volatile thread/global-state callbacks are intentionally excluded so ordinary
   // workspace-thread updates do not tear down live terminal processes.
-  }, [mountId, paneId, projectRoot, restartKey, terminalClosed, terminalIndex, terminalRoleId, terminalStartupUnblocked, workspace?.id]);
+  }, [paneId, restartKey, terminalClosed, terminalIndex, terminalRoleId, terminalStartupUnblocked, workspace?.id]);
 
   useEffect(() => {
     const pendingPrompt = thread?.pendingPrompt;
@@ -14086,9 +14204,11 @@ function WorkspaceTerminal({
   const xtermSurface = (
     <XtermSurface
       data-active={isActive ? "true" : "false"}
+      data-pty-reveal-ready={terminalPtyRevealReady ? "true" : "false"}
       data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
       data-parked={parkedPrompt ? "true" : "false"}
+      aria-hidden={terminalPtyRevealReady ? undefined : "true"}
       onDragEnterCapture={handleTerminalRawDragEnterCapture}
       onDragEnter={handleTerminalTodoDragEnter}
       onDragLeave={handleTerminalTodoDragLeave}

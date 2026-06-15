@@ -186,11 +186,20 @@ function wireArchitectureChangeEvents() {
 /** Serve-from-cache plus silent revalidate for the given workspace repos. */
 export function ensureWorkspaceToolsFresh(repoDescriptors) {
   wireArchitectureChangeEvents();
-  (Array.isArray(repoDescriptors) ? repoDescriptors : []).forEach(({ repoPath, label }) => {
+  const descriptors = Array.isArray(repoDescriptors) ? repoDescriptors : [];
+  const activeRepos = new Set();
+  descriptors.forEach(({ repoPath, label }) => {
     const cleaned = text(repoPath);
     if (!cleaned) return;
+    activeRepos.add(cleaned);
     workspaceToolsStore.knownRepos.set(cleaned, text(label, cleaned.split(/[\\/]/u).pop()));
     void loadArchitecturesForRepo(cleaned, workspaceToolsStore.knownRepos.get(cleaned));
+  });
+  workspaceToolsStore.knownRepos.forEach((_label, repoPath) => {
+    if (activeRepos.has(repoPath)) return;
+    workspaceToolsStore.knownRepos.delete(repoPath);
+    workspaceToolsStore.architecturesByRepo.delete(repoPath);
+    workspaceToolsStore.archAttemptedRepos.delete(repoPath);
   });
   void loadAccountSkills();
 }

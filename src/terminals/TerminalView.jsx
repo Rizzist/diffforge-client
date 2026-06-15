@@ -752,7 +752,7 @@ const TerminalWorkspaceMain = styled.div`
   }
 
   [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
-    min-width: 450px;
+    min-width: 300px;
   }
 
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
@@ -763,7 +763,7 @@ const TerminalWorkspaceMain = styled.div`
     width: auto !important;
     height: auto !important;
     max-width: none !important;
-    min-width: 0 !important;
+    min-width: 300px !important;
     min-height: 0 !important;
     overflow: visible;
     box-shadow:
@@ -2358,7 +2358,7 @@ const TODO_QUEUE_STORAGE_DISCARDED_STATUSES = new Set([
 ]);
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
 const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
-const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 450;
+const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 2_000_000;
 const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 2_000_000;
@@ -3104,7 +3104,7 @@ const OrchestratorConnectedDevices = styled.div`
 const OrchestratorConnectedDeviceRow = styled.div`
   display: grid;
   min-width: 0;
-  min-height: 36px;
+  min-height: 44px;
   grid-template-columns: 24px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
@@ -3196,7 +3196,7 @@ const OrchestratorConnectedDeviceIcon = styled.span`
 const OrchestratorConnectedDeviceCopy = styled.div`
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: 3px;
 `;
 
 const OrchestratorConnectedDeviceName = styled.div`
@@ -3214,19 +3214,50 @@ const OrchestratorConnectedDeviceName = styled.div`
   }
 `;
 
-const OrchestratorConnectedDeviceMeta = styled.div`
+const OrchestratorConnectedDeviceBadgeRow = styled.div`
+  display: flex;
   min-width: 0;
+  gap: 4px;
   overflow: hidden;
-  color: #8492a6;
-  font-size: 10px;
-  font-weight: 720;
-  line-height: 1.15;
+`;
+
+const OrchestratorConnectedDeviceBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  max-width: 56px;
+  height: 15px;
+  padding: 0 6px;
+  border: 1px solid rgba(145, 158, 177, 0.2);
+  border-radius: 7px;
+  color: rgba(160, 172, 190, 0.62);
+  background: rgba(145, 158, 177, 0.08);
+  font-size: 8px;
+  font-weight: 860;
+  line-height: 1;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 
-  html[data-forge-theme="light"] & {
-    color: #737780;
+  &[data-active="true"] {
+    border-color: rgba(105, 158, 255, 0.52);
+    color: #7fa9ff;
+    background: rgba(47, 128, 255, 0.16);
   }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(89, 97, 110, 0.68);
+    background: rgba(0, 0, 0, 0.035);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(0, 102, 204, 0.28);
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
+  }
+
 `;
 
 const OrchestratorConnectedDeviceStatus = styled.span`
@@ -3261,8 +3292,9 @@ const TodoDeviceSwitcher = styled.div`
   &[data-layout="strip"] {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    gap: 6px;
-    padding: 8px 10px;
+    gap: 0;
+    padding: 0;
+    background: rgba(2, 4, 8, 0.48);
     overflow: visible;
   }
 
@@ -3324,15 +3356,55 @@ const TodoDeviceButton = styled.button`
   &[data-strip="true"] {
     width: 100%;
     max-width: none;
-    height: 56px;
+    min-height: 36px;
+    height: 38px;
     min-width: 0;
     flex: 1 1 auto;
     padding: 6px 10px;
+    border: 0;
+    border-bottom: 1px solid rgba(230, 236, 245, 0.055);
+    border-radius: 0;
+    background: transparent;
+    transform: none;
+  }
+
+  &[data-strip="true"]:last-child {
+    border-bottom: 0;
+  }
+
+  &[data-strip="true"]:hover {
+    border-bottom-color: rgba(230, 236, 245, 0.075);
+    background: rgba(47, 128, 255, 0.08);
+    transform: none;
+  }
+
+  &[data-strip="true"][data-active="true"] {
+    border-bottom-color: rgba(125, 176, 255, 0.14);
+    background: rgba(47, 128, 255, 0.1);
   }
 
   &[data-cluster="true"] {
     border-color: rgba(125, 176, 255, 0.24);
     background: rgba(18, 27, 41, 0.74);
+  }
+
+  &[data-strip="true"][data-cluster="true"] {
+    background: transparent;
+  }
+
+  &[data-strip="true"][data-cluster="true"]:hover {
+    background: rgba(47, 128, 255, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-strip="true"] {
+    border-bottom-color: rgba(0, 0, 0, 0.06);
+    background: transparent;
+  }
+
+  html[data-forge-theme="light"] &[data-strip="true"]:hover,
+  html[data-forge-theme="light"] &[data-strip="true"][data-active="true"] {
+    border-bottom-color: rgba(0, 102, 204, 0.12);
+    background: rgba(0, 102, 204, 0.06);
   }
 `;
 
@@ -3501,71 +3573,11 @@ const TodoDeviceButtonCopy = styled.span`
 const TodoDeviceButtonName = styled.span`
   min-width: 0;
   overflow: hidden;
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 840;
   line-height: 1.12;
   text-overflow: ellipsis;
   white-space: nowrap;
-`;
-
-const TodoDeviceButtonMeta = styled.span`
-  min-width: 0;
-  overflow: hidden;
-  color: #7f8b9d;
-  font-size: 9.5px;
-  font-weight: 740;
-  line-height: 1.12;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-
-  html[data-forge-theme="light"] & {
-    color: #737780;
-  }
-`;
-
-const TodoDeviceBadgeRow = styled.span`
-  display: flex;
-  min-width: 0;
-  gap: 4px;
-  overflow: hidden;
-`;
-
-const TodoDeviceSurfaceBadge = styled.span`
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 0;
-  max-width: 56px;
-  height: 15px;
-  padding: 0 6px;
-  border: 1px solid rgba(145, 158, 177, 0.2);
-  border-radius: 7px;
-  color: rgba(160, 172, 190, 0.62);
-  background: rgba(145, 158, 177, 0.08);
-  font-size: 8px;
-  font-weight: 860;
-  line-height: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-
-  &[data-active="true"] {
-    border-color: rgba(105, 158, 255, 0.52);
-    color: #7fa9ff;
-    background: rgba(47, 128, 255, 0.16);
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.1);
-    color: rgba(89, 97, 110, 0.68);
-    background: rgba(0, 0, 0, 0.035);
-  }
-
-  html[data-forge-theme="light"] &[data-active="true"] {
-    border-color: rgba(0, 102, 204, 0.28);
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
-  }
 `;
 
 const TodoDeviceLiveDot = styled.span`
@@ -8222,7 +8234,7 @@ function normalizeTerminalCoordinationTargets(value) {
     .filter(Boolean);
 }
 
-function terminalCoordinationTargetForIndex(targets, terminalIndex, fallbackRoot = "") {
+function terminalCoordinationTargetForIndex(targets, _terminalIndex, fallbackRoot = "") {
   const normalizedTargets = normalizeTerminalCoordinationTargets(targets);
   if (!normalizedTargets.length) {
     return fallbackRoot
@@ -8230,13 +8242,7 @@ function terminalCoordinationTargetForIndex(targets, terminalIndex, fallbackRoot
       : null;
   }
 
-  if (normalizedTargets.length === 1) {
-    return normalizedTargets[0];
-  }
-
-  const safeTerminalIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
-  const targetIndex = safeTerminalIndex % normalizedTargets.length;
-  return normalizedTargets[targetIndex];
+  return normalizedTargets[0];
 }
 
 function normalizeVoiceAgentQueueArguments(value) {
@@ -12952,16 +12958,6 @@ function normalizeWorkspaceTodoMirrorItems(items = [], selection = null) {
     .slice(0, 80);
 }
 
-function todoDeviceOptionMeta(option) {
-  if (!option) {
-    return "";
-  }
-  if (option.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE) {
-    return option.formFactorLabel || option.platformLabel || "Mobile";
-  }
-  return option.workspaceName || option.formFactorLabel || option.platformLabel || "Desktop";
-}
-
 function buildOrchestratorDeviceRows(options = []) {
   const byDeviceId = new Map();
   (Array.isArray(options) ? options : []).forEach((option, index) => {
@@ -12979,8 +12975,11 @@ function buildOrchestratorDeviceRows(options = []) {
       formFactorLabel: "",
       isLocal: false,
       liveState: "unknown",
+      nativeConnected: false,
       platformIcon: "",
       platformLabel: "",
+      serverSeen: false,
+      webConnected: false,
       workspaces: [],
     };
     const workspaceId = String(option.workspaceId || "").trim();
@@ -13005,13 +13004,16 @@ function buildOrchestratorDeviceRows(options = []) {
       formFactorLabel: previous.formFactorLabel || option.formFactorLabel || "",
       isLocal: Boolean(previous.isLocal || option.isLocal),
       liveState: previous.liveState === "live" ? previous.liveState : nextLiveState,
+      nativeConnected: Boolean(previous.nativeConnected || option.nativeConnected === true),
       platformIcon: previous.platformIcon || option.platformIcon || option.icon || "",
       platformLabel: previous.platformLabel || option.platformLabel || "",
+      serverSeen: Boolean(previous.serverSeen || option.serverSeen),
+      webConnected: Boolean(previous.webConnected || option.webConnected === true),
       workspaces,
     });
   });
   return Array.from(byDeviceId.values())
-    .filter((row) => row.isLocal || row.liveState !== "offline")
+    .filter((row) => row.isLocal || row.serverSeen || row.liveState !== "offline")
     .sort((left, right) => {
       if (left.isLocal !== right.isLocal) {
         return left.isLocal ? -1 : 1;
@@ -15537,6 +15539,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         };
         const devicePlatformKind = connectedDevicePlatformKind(iconDevice);
         const DeviceIcon = connectedDeviceIconForPlatform(devicePlatformKind);
+        const surfaceBadges = [
+          { active: Boolean(device.nativeConnected), id: "native", label: "NATIVE" },
+          { active: Boolean(device.webConnected), id: "web", label: "WEB" },
+        ];
         return (
           <OrchestratorConnectedDeviceRow
             key={device.deviceId}
@@ -15549,6 +15555,17 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
               <OrchestratorConnectedDeviceName title={device.deviceName}>
                 {device.deviceName}
               </OrchestratorConnectedDeviceName>
+              <OrchestratorConnectedDeviceBadgeRow aria-hidden="true">
+                {surfaceBadges.map((surface) => (
+                  <OrchestratorConnectedDeviceBadge
+                    data-active={surface.active ? "true" : undefined}
+                    data-surface={surface.id}
+                    key={surface.id}
+                  >
+                    {surface.label}
+                  </OrchestratorConnectedDeviceBadge>
+                ))}
+              </OrchestratorConnectedDeviceBadgeRow>
             </OrchestratorConnectedDeviceCopy>
             <OrchestratorConnectedDeviceStatus
               aria-label={device.liveState === "live" ? "Live" : device.liveState === "offline" ? "Offline" : "Unknown"}
@@ -15568,16 +15585,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     const iconDevice = todoDeviceIconSource(row, option);
     const devicePlatformKind = connectedDevicePlatformKind(iconDevice);
     const DeviceIcon = connectedDeviceIconForPlatform(devicePlatformKind);
-    const meta = todoDeviceOptionMeta(option);
-    const surfaceBadges = [
-      { active: Boolean(option.nativeConnected), id: "native", label: "NATIVE" },
-      { active: Boolean(option.webConnected), id: "web", label: "WEB" },
-    ];
-    const surfaceTitle = surfaceBadges
-      .filter((surface) => surface.active)
-      .map((surface) => surface.label)
-      .join(" + ");
     const active = selectedTodoDevice?.id === option.id;
+    const liveLabel = option.liveState === "live" ? "Live" : option.liveState === "offline" ? "Offline" : "Unknown";
     return (
       <TodoDeviceButton
         aria-pressed={active ? "true" : "false"}
@@ -15594,7 +15603,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             setTodoDeviceSelectionRevealed(true);
           }
         }}
-        title={`${option.deviceName}${meta ? ` · ${meta}` : ""}${surfaceTitle ? ` · ${surfaceTitle}` : ""}`}
+        title={`${option.deviceName} · ${liveLabel}`}
         type="button"
       >
         <TodoDeviceButtonIcon aria-hidden="true" data-platform={devicePlatformKind}>
@@ -15602,17 +15611,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         </TodoDeviceButtonIcon>
         <TodoDeviceButtonCopy>
           <TodoDeviceButtonName>{option.deviceName}</TodoDeviceButtonName>
-          <TodoDeviceButtonMeta>{meta}</TodoDeviceButtonMeta>
-          <TodoDeviceBadgeRow aria-hidden="true">
-            {surfaceBadges.map((surface) => (
-              <TodoDeviceSurfaceBadge
-                data-active={surface.active ? "true" : undefined}
-                key={surface.id}
-              >
-                {surface.label}
-              </TodoDeviceSurfaceBadge>
-            ))}
-          </TodoDeviceBadgeRow>
         </TodoDeviceButtonCopy>
         <TodoDeviceLiveDot
           aria-hidden="true"
@@ -15654,9 +15652,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         </TodoDeviceButtonIcon>
         <TodoDeviceButtonCopy>
           <TodoDeviceButtonName>Devices</TodoDeviceButtonName>
-          <TodoDeviceButtonMeta>
-            {todoDeviceRows.length} device{todoDeviceRows.length === 1 ? "" : "s"}
-          </TodoDeviceButtonMeta>
         </TodoDeviceButtonCopy>
         <TodoDeviceLiveDot
           aria-hidden="true"
@@ -16898,7 +16893,9 @@ function TerminalView({
       ? 62
       : Math.max(30, todoQueueRestoredMinSize);
   const terminalGridPanelSize = 100 - todoQueuePanelSize;
-  const todoQueuePanelMinSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : todoQueueRestoredMinSize;
+  const todoQueuePanelMinSize = todoQueuePaneMinimized
+    ? `${todoQueueMinimizedSize}%`
+    : `${TODO_QUEUE_RESTORED_MIN_WIDTH_PX}px`;
   const todoQueuePanelMaxSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : 70;
   const terminalGridPanelMinSize = todoQueuePaneMinimized ? 72 : 30;
   const fullscreenTransitionTimerRef = useRef(0);
@@ -20924,8 +20921,8 @@ function TerminalView({
     }
 
     const frameId = window.requestAnimationFrame(() => {
-      terminalGridPanelRef.current?.resize?.(terminalGridPanelSize);
-      todoQueuePanelRef.current?.resize?.(todoQueuePanelSize);
+      terminalGridPanelRef.current?.resize?.(`${terminalGridPanelSize}%`);
+      todoQueuePanelRef.current?.resize?.(`${todoQueuePanelSize}%`);
       scheduleMeasureTerminalLayout();
     });
 
@@ -29725,7 +29722,6 @@ function TerminalView({
           const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
           const terminalPaneId = getTerminalPaneId(terminalIndex);
           const terminalActive = activePaneId === terminalPaneId;
-          const terminalProjectTarget = getTerminalProjectTarget(terminalIndex);
           const terminalBreakoutPlan = terminalBreakoutLivePlansByIndex.get(terminalIndex) || null;
           const breakoutPlanStatus = normalizeTerminalBreakoutPlanStatus(terminalBreakoutPlan?.status);
           const breakoutPlanSteps = terminalBreakoutPlanSteps(terminalBreakoutPlan);
@@ -30046,8 +30042,6 @@ function TerminalView({
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 onPopOutTerminalWindow={popOutTerminalWindowForIndex}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
-                projectRoot={terminalProjectTarget?.mountId ? terminalProjectTarget.repoPath : ""}
-                mountId={terminalProjectTarget?.mountId || ""}
                 startupReady={terminalStartupReady}
                 terminalBreakoutActive={terminalBreakoutLayoutActive}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
@@ -30209,10 +30203,6 @@ function TerminalView({
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       onPopOutTerminalWindow={popOutTerminalWindowForIndex}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
-      projectRoot={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId
-        ? getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.repoPath
-        : ""}
-      mountId={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId || ""}
       startupReady={terminalStartupReady}
       terminalBreakoutActive={false}
       terminalCount={terminalWorkspaceLogicalTerminalCount}
@@ -30404,7 +30394,7 @@ function TerminalView({
                       defaultSize={`${todoQueuePanelSize}%`}
                       id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
                       maxSize={`${todoQueuePanelMaxSize}%`}
-                      minSize={`${todoQueuePanelMinSize}%`}
+                      minSize={todoQueuePanelMinSize}
                       ref={todoQueuePanelRef}
                     >
                       {workspaceToolPaneContent}

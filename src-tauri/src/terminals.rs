@@ -1282,132 +1282,10 @@ fn terminal_instance_matches_workspace(
     instance.metadata.workspace_id == workspace_id
 }
 
-fn workspace_git_bootstrap_cache() -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrap>> {
-    static CACHE: OnceLock<StdMutex<HashMap<String, WorkspaceGitBootstrap>>> = OnceLock::new();
-    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-type WorkspaceGitBootstrapResult = Result<WorkspaceGitBootstrap, String>;
-
-#[derive(Clone)]
-struct WorkspaceGitBootstrapFlight {
-    id: u64,
-    future: Shared<BoxFuture<'static, WorkspaceGitBootstrapResult>>,
-}
-
-fn workspace_git_bootstrap_flights(
-) -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
-    static FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>>> =
-        OnceLock::new();
-    FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-static WORKSPACE_GIT_BOOTSTRAP_FLIGHT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn workspace_git_bootstrap_cache_key(root: &Path) -> String {
-    root.canonicalize()
-        .map(|path| normalized_path_key(&path))
-        .unwrap_or_else(|_| normalized_path_key(root))
-}
-
-fn cached_workspace_git_bootstrap(root: &Path) -> Option<WorkspaceGitBootstrap> {
-    let key = workspace_git_bootstrap_cache_key(root);
-    workspace_git_bootstrap_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&key).cloned())
-}
-
-fn remember_workspace_git_bootstrap(root: &Path, bootstrap: &WorkspaceGitBootstrap) {
-    let key = workspace_git_bootstrap_cache_key(root);
-    if let Ok(mut cache) = workspace_git_bootstrap_cache().lock() {
-        if cache.len() > 128 {
-            cache.clear();
-        }
-        cache.insert(key, bootstrap.clone());
-    }
-}
-
-fn forget_workspace_git_bootstrap_flight(key: &str, id: u64) {
-    if let Ok(mut flights) = workspace_git_bootstrap_flights().lock() {
-        if flights.get(key).is_some_and(|flight| flight.id == id) {
-            flights.remove(key);
-        }
-    }
-}
-
-async fn ensure_workspace_git_bootstrap_for_terminal(
-    root: &Path,
-    allow_git_init: bool,
-) -> Result<WorkspaceGitBootstrap, String> {
-    ensure_app_not_shutting_down("workspace Git bootstrap")?;
-
-    if !allow_git_init && !root.join(".git").exists() {
-        return Err(format!(
-            "Workspace Git bootstrap refused to initialize Git for {}. Diff Forge only initializes Git automatically when the selected workspace folder was empty.",
-            workspace_path_display(root)
-        ));
-    }
-
-    if let Some(bootstrap) = cached_workspace_git_bootstrap(root) {
-        return Ok(bootstrap);
-    }
-
-    let key = workspace_git_bootstrap_cache_key(root);
-    let root_for_flight = root.to_path_buf();
-    let (flight_id, flight) = {
-        let mut flights = workspace_git_bootstrap_flights()
-            .lock()
-            .map_err(|_| "Unable to lock workspace Git bootstrap flight registry.".to_string())?;
-        if let Some(existing) = flights.get(&key).cloned() {
-            (existing.id, existing.future)
-        } else {
-            let id = WORKSPACE_GIT_BOOTSTRAP_FLIGHT_ID.fetch_add(1, Ordering::Relaxed);
-            let future = async move {
-                match tauri::async_runtime::spawn_blocking(move || {
-                    ensure_workspace_git_ready_for_coordination(&root_for_flight)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(format!(
-                        "Workspace Git bootstrap worker failed before completion: {error}"
-                    )),
-                }
-            }
-            .boxed()
-            .shared();
-            flights.insert(
-                key.clone(),
-                WorkspaceGitBootstrapFlight {
-                    id,
-                    future: future.clone(),
-                },
-            );
-            (id, future)
-        }
-    };
-
-    let result = flight.await;
-    forget_workspace_git_bootstrap_flight(&key, flight_id);
-
-    match result {
-        Ok(bootstrap) => {
-            remember_workspace_git_bootstrap(root, &bootstrap);
-            Ok(bootstrap)
-        }
-        Err(error) => Err(format!(
-            "Unable to initialize workspace Git for terminal isolation: {error}"
-        )),
-    }
-}
-
 #[derive(Debug)]
 struct TerminalCoordinationLaunchTarget {
     root: PathBuf,
     enforcement_mode: &'static str,
-    requires_git_bootstrap: bool,
-    allows_git_init: bool,
 }
 
 fn terminal_workspace_topology_cache_key(root: &Path) -> String {
@@ -1514,35 +1392,6 @@ async fn terminal_workspace_topology_scan_for_launch_from_cache(
         cache_hit: false,
         scanned_ms,
     }
-}
-
-async fn terminal_workspace_topology_mounts_for_launch_from_cache(
-    cache: &Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
-    workspace_root: &Path,
-    now_ms: u64,
-    scanned_ms_override: Option<u64>,
-) -> Vec<WorkspaceProjectMount> {
-    terminal_workspace_topology_scan_for_launch_from_cache(
-        cache,
-        workspace_root,
-        now_ms,
-        scanned_ms_override,
-    )
-    .await
-    .mounts
-}
-
-async fn terminal_workspace_topology_mounts_for_launch(
-    state: &TerminalState,
-    workspace_root: &Path,
-) -> Vec<WorkspaceProjectMount> {
-    terminal_workspace_topology_mounts_for_launch_from_cache(
-        &state.workspace_topology_cache,
-        workspace_root,
-        terminal_now_ms(),
-        None,
-    )
-    .await
 }
 
 async fn terminal_workspace_topology_scan_for_launch(
@@ -2635,29 +2484,19 @@ async fn workspace_git_commit_and_push(
     .map_err(|error| format!("Unable to join Git commit worker: {error}"))?
 }
 
-fn terminal_git_root_for_coordination_target(root: &Path) -> Option<PathBuf> {
-    let top_level = workspace_git_top_level(root)?;
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    if root.starts_with(&top_level) {
-        Some(top_level)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 fn terminal_coordination_launch_target(
     workspace_root: &Path,
-    requested_project_root: Option<&str>,
-    requested_mount_id: Option<&str>,
+    _requested_project_root: Option<&str>,
+    _requested_mount_id: Option<&str>,
     _selected_workspace_was_empty_at_selection: bool,
     session_mode: TerminalSessionMode,
 ) -> Result<TerminalCoordinationLaunchTarget, String> {
     terminal_coordination_launch_target_with_mounts(
         workspace_root,
         None,
-        requested_project_root,
-        requested_mount_id,
+        _requested_project_root,
+        _requested_mount_id,
         _selected_workspace_was_empty_at_selection,
         session_mode,
     )
@@ -2665,115 +2504,18 @@ fn terminal_coordination_launch_target(
 
 fn terminal_coordination_launch_target_with_mounts(
     workspace_root: &Path,
-    topology_mounts: Option<&[WorkspaceProjectMount]>,
-    requested_project_root: Option<&str>,
-    requested_mount_id: Option<&str>,
+    _topology_mounts: Option<&[WorkspaceProjectMount]>,
+    _requested_project_root: Option<&str>,
+    _requested_mount_id: Option<&str>,
     _selected_workspace_was_empty_at_selection: bool,
     session_mode: TerminalSessionMode,
 ) -> Result<TerminalCoordinationLaunchTarget, String> {
-    let workspace_root_canonical = workspace_root
+    let target_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let owned_mounts;
-    let mounts = if let Some(mounts) = topology_mounts {
-        mounts
-    } else {
-        owned_mounts = workspace_project_mounts(&workspace_root_canonical);
-        owned_mounts.as_slice()
-    };
-    let requested_target = requested_project_root
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-        || requested_mount_id
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-    let mut target_root = match session_mode {
-        TerminalSessionMode::ManagedPatch => workspace_coordination_root_for_terminal_with_mounts(
-            workspace_root,
-            &workspace_root_canonical,
-            mounts,
-            requested_project_root,
-            requested_mount_id,
-        )?,
-        TerminalSessionMode::General => {
-            if !requested_target {
-                let selected_root =
-                    workspace_selected_root_mount(&workspace_root_canonical, mounts);
-                let project_count = mounts
-                    .iter()
-                    .filter(|mount| mount.mount_kind == "project")
-                    .count();
-                if selected_root.is_none() && project_count > 1 {
-                    return Ok(TerminalCoordinationLaunchTarget {
-                        root: workspace_root.to_path_buf(),
-                        enforcement_mode: "activity_only",
-                        requires_git_bootstrap: false,
-                        allows_git_init: false,
-                    });
-                }
-            }
-            workspace_coordination_root_for_terminal_with_mounts(
-                workspace_root,
-                &workspace_root_canonical,
-                mounts,
-                requested_project_root,
-                requested_mount_id,
-            )?
-        }
-        TerminalSessionMode::DirectEdit => {
-            let coordination_root = workspace_coordination_root_for_terminal_with_mounts(
-                workspace_root,
-                &workspace_root_canonical,
-                mounts,
-                requested_project_root,
-                requested_mount_id,
-            )?;
-            if terminal_git_root_for_coordination_target(&coordination_root).is_some() {
-                coordination_root
-            } else {
-                workspace_direct_edit_root_for_terminal_with_mounts(
-                    workspace_root,
-                    &workspace_root_canonical,
-                    mounts,
-                    requested_project_root,
-                    requested_mount_id,
-                )?
-            }
-        }
-        TerminalSessionMode::Activity
-        | TerminalSessionMode::RemoteOps
-        | TerminalSessionMode::Free => workspace_root.to_path_buf(),
-    };
-
-    if matches!(
-        session_mode,
-        TerminalSessionMode::ManagedPatch | TerminalSessionMode::General
-    ) {
-        if let Some(git_root) = terminal_git_root_for_coordination_target(&target_root) {
-            target_root = git_root;
-        }
-    }
-
-    let has_git = terminal_git_root_for_coordination_target(&target_root).is_some();
-    let has_requested_project_root = requested_project_root
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    let has_requested_mount_id = requested_mount_id
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    let selected_workspace_empty_git_bootstrap = !has_git
-        && !has_requested_project_root
-        && !has_requested_mount_id
-        && terminal_path_key_after_canonicalize(workspace_root)
-            == terminal_path_key_after_canonicalize(&target_root)
-        && workspace_directory_is_empty_for_git_bootstrap(&target_root)
-        && matches!(
-            session_mode,
-            TerminalSessionMode::ManagedPatch | TerminalSessionMode::General
-        );
-    let has_git_or_selected_empty_bootstrap = has_git || selected_workspace_empty_git_bootstrap;
+    let has_git = workspace_is_exact_git_root(&target_root);
     let agent_session_mode = terminal_agent_session_mode_for_root(&target_root);
-    let git_worktrees_enabled = has_git_or_selected_empty_bootstrap
+    let git_worktrees_enabled = has_git
         && agent_session_mode
             == crate::coordination::kernel::AGENT_SESSION_MODE_WORKTREE_COORDINATION;
     let direct_unmanaged_workspace = agent_session_mode
@@ -2781,19 +2523,16 @@ fn terminal_coordination_launch_target_with_mounts(
     let enforcement_mode = match session_mode {
         TerminalSessionMode::ManagedPatch if git_worktrees_enabled => "worktree_required",
         TerminalSessionMode::ManagedPatch if direct_unmanaged_workspace => "direct_unmanaged",
-        TerminalSessionMode::ManagedPatch if has_git_or_selected_empty_bootstrap => {
-            "bounded_direct_edit"
-        }
+        TerminalSessionMode::ManagedPatch if has_git => "bounded_direct_edit",
         TerminalSessionMode::ManagedPatch => {
             return Err(
-                "Managed patch mode requires an existing Git repo. Diff Forge only initializes Git automatically when the selected workspace folder was empty."
+                "Managed patch mode requires the selected workspace root to be an existing Git repo."
                     .to_string(),
             );
         }
         TerminalSessionMode::General if git_worktrees_enabled => "worktree_required",
         TerminalSessionMode::General if direct_unmanaged_workspace => "direct_unmanaged",
         TerminalSessionMode::General => "bounded_direct_edit",
-        TerminalSessionMode::DirectEdit if git_worktrees_enabled && has_git => "worktree_required",
         TerminalSessionMode::DirectEdit if direct_unmanaged_workspace => "direct_unmanaged",
         TerminalSessionMode::DirectEdit => "bounded_direct_edit",
         TerminalSessionMode::Activity => "activity_only",
@@ -2804,10 +2543,6 @@ fn terminal_coordination_launch_target_with_mounts(
     Ok(TerminalCoordinationLaunchTarget {
         root: target_root,
         enforcement_mode,
-        requires_git_bootstrap: enforcement_mode == "worktree_required"
-            && (!matches!(session_mode, TerminalSessionMode::General)
-                || selected_workspace_empty_git_bootstrap),
-        allows_git_init: selected_workspace_empty_git_bootstrap,
     })
 }
 
@@ -4228,8 +3963,8 @@ async fn terminal_open(
     let workspace_root_was_empty_at_selection = request
         .workspace_root_was_empty_at_selection
         .unwrap_or(false);
-    let requested_project_root = request.project_root;
-    let requested_mount_id = request.mount_id;
+    let _legacy_project_root = request.project_root;
+    let _legacy_mount_id = request.mount_id;
     let requested_session_mode = request.session_mode;
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
@@ -4390,25 +4125,16 @@ async fn terminal_open(
     ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if (!is_prewarm_pty || !plain_shell) && session_mode.should_prepare_coordination() {
-        let topology_mounts =
-            terminal_workspace_topology_mounts_for_launch(&state, &working_directory).await;
         let coordination_target = terminal_coordination_launch_target_with_mounts(
             &working_directory,
-            Some(&topology_mounts),
-            requested_project_root.as_deref(),
-            requested_mount_id.as_deref(),
+            None,
+            None,
+            None,
             workspace_root_was_empty_at_selection,
             session_mode,
         )?;
         let coordination_working_directory = coordination_target.root;
         terminal_project_root = coordination_working_directory.clone();
-        if coordination_target.requires_git_bootstrap {
-            ensure_workspace_git_bootstrap_for_terminal(
-                &coordination_working_directory,
-                coordination_target.allows_git_init,
-            )
-            .await?;
-        }
 
         let coordination_pty_id = if fresh_session {
             format!("{pane_id}-fresh-{instance_id}")
@@ -4845,28 +4571,12 @@ fn terminal_crash_recovery_targets(
                 continue;
             }
         };
-        let mounts = workspace_project_mounts(&working_directory);
-        let exact_repo = mounts.iter().any(|mount| {
-            normalized_path_key(&mount.root_path) == normalized_path_key(&working_directory)
+        targets.push(TerminalCrashRecoveryTarget {
+            label: workspace_path_display(&working_directory),
+            repo_path: working_directory,
+            db_path: None,
+            source: "requested_root".to_string(),
         });
-        let recovery_roots = if !exact_repo && !mounts.is_empty() {
-            mounts
-                .iter()
-                .filter(|mount| mount.has_git || mount.has_agents)
-                .map(|mount| mount.root_path.clone())
-                .collect::<Vec<_>>()
-        } else {
-            vec![working_directory]
-        };
-
-        for recovery_root in recovery_roots {
-            targets.push(TerminalCrashRecoveryTarget {
-                label: workspace_path_display(&recovery_root),
-                repo_path: recovery_root,
-                db_path: None,
-                source: "requested_root".to_string(),
-            });
-        }
     }
 
     (targets, errors)
@@ -12943,7 +12653,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -12965,7 +12674,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "worktree_required");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -12987,7 +12695,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "direct_unmanaged");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -13008,7 +12715,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&project.canonicalize().unwrap())
@@ -13029,7 +12735,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&empty_workspace.canonicalize().unwrap())
@@ -13038,7 +12743,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_bootstraps_empty_selected_workspace_when_policy_enabled() {
+    fn general_terminal_launch_target_keeps_empty_workspace_direct_when_policy_enabled() {
         let empty_workspace =
             terminal_test_directory("general_empty_selected_worktree_policy_launch_target");
         terminal_enable_agent_worktrees(&empty_workspace);
@@ -13052,8 +12757,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
-        assert!(target.requires_git_bootstrap);
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&empty_workspace.canonicalize().unwrap())
@@ -13062,7 +12766,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_bootstraps_reopened_metadata_only_workspace() {
+    fn general_terminal_launch_target_keeps_reopened_metadata_only_workspace_direct() {
         let workspace = terminal_test_directory("general_reopened_empty_launch_target");
         fs::create_dir_all(workspace.join(".agents").join("cloud-mcp")).unwrap();
         fs::write(workspace.join(".gitignore"), ".agents/\n/logs/\n").unwrap();
@@ -13083,8 +12787,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
-        assert!(target.allows_git_init);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&workspace.canonicalize().unwrap())
@@ -13106,13 +12808,11 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
-        assert!(!target.allows_git_init);
         assert!(!project.join(".git").exists());
     }
 
     #[test]
-    fn general_terminal_launch_target_does_not_bootstrap_requested_project_root() {
+    fn general_terminal_launch_target_ignores_requested_project_root() {
         let workspace = terminal_test_directory("general_empty_parent_requested_project");
         let project = workspace.join("app");
         fs::create_dir_all(&project).unwrap();
@@ -13128,10 +12828,9 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
-            normalized_path_key(&project.canonicalize().unwrap())
+            normalized_path_key(&workspace.canonicalize().unwrap())
         );
         assert!(!project.join(".git").exists());
     }
@@ -13149,13 +12848,12 @@ mod terminal_tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("requires an existing Git repo"));
-        assert!(error.contains("empty"));
+        assert!(error.contains("requires the selected workspace root"));
         assert!(!project.join(".git").exists());
     }
 
     #[test]
-    fn general_terminal_launch_target_promotes_git_subdirectory_to_top_level() {
+    fn general_terminal_launch_target_keeps_git_subdirectory_as_selected_root() {
         let repo = terminal_test_repo("general_git_subdir_launch_target");
         let subdir = repo.join("src").join("client");
         fs::create_dir_all(&subdir).unwrap();
@@ -13172,12 +12870,12 @@ mod terminal_tests {
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
-            normalized_path_key(&repo.canonicalize().unwrap())
+            normalized_path_key(&subdir.canonicalize().unwrap())
         );
     }
 
     #[test]
-    fn general_terminal_launch_target_makes_ambiguous_container_activity_only_until_project_selected(
+    fn general_terminal_launch_target_uses_workspace_root_until_project_selected(
     ) {
         let container = terminal_test_directory("general_multi_repo_container");
         let frontend = container.join("frontend");
@@ -13205,8 +12903,7 @@ mod terminal_tests {
             TerminalSessionMode::General,
         )
         .unwrap();
-        assert_eq!(container_target.enforcement_mode, "activity_only");
-        assert!(!container_target.requires_git_bootstrap);
+        assert_eq!(container_target.enforcement_mode, "bounded_direct_edit");
         assert_eq!(
             normalized_path_key(&container_target.root.canonicalize().unwrap()),
             normalized_path_key(&container.canonicalize().unwrap())
@@ -13223,7 +12920,7 @@ mod terminal_tests {
         assert_eq!(selected.enforcement_mode, "bounded_direct_edit");
         assert_eq!(
             normalized_path_key(&selected.root.canonicalize().unwrap()),
-            normalized_path_key(&frontend.canonicalize().unwrap())
+            normalized_path_key(&container.canonicalize().unwrap())
         );
     }
 
@@ -13244,12 +12941,14 @@ mod terminal_tests {
             .enable_all()
             .build()
             .unwrap();
-        let first = runtime.block_on(terminal_workspace_topology_mounts_for_launch_from_cache(
+        let first = runtime
+            .block_on(terminal_workspace_topology_scan_for_launch_from_cache(
             &cache,
             &container,
             1_000,
             Some(1_000),
-        ));
+            ))
+            .mounts;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].workspace_relative_path, "frontend");
 
@@ -13262,21 +12961,25 @@ mod terminal_tests {
             .unwrap();
         assert!(status.success());
 
-        let burst = runtime.block_on(terminal_workspace_topology_mounts_for_launch_from_cache(
+        let burst = runtime
+            .block_on(terminal_workspace_topology_scan_for_launch_from_cache(
             &cache,
             &container,
             1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1,
             Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1),
-        ));
+            ))
+            .mounts;
         assert_eq!(burst.len(), 1);
         assert_eq!(burst[0].workspace_relative_path, "frontend");
 
-        let later = runtime.block_on(terminal_workspace_topology_mounts_for_launch_from_cache(
+        let later = runtime
+            .block_on(terminal_workspace_topology_scan_for_launch_from_cache(
             &cache,
             &container,
             1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1,
             Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1),
-        ));
+            ))
+            .mounts;
         let mount_paths = later
             .iter()
             .map(|mount| mount.workspace_relative_path.as_str())
@@ -13287,7 +12990,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_auto_selects_single_git_mount() {
+    fn general_terminal_launch_target_does_not_auto_select_single_git_mount() {
         let container = terminal_test_directory("general_single_repo_container");
         let frontend = container.join("frontend");
         fs::create_dir_all(&frontend).unwrap();
@@ -13308,15 +13011,14 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
-            normalized_path_key(&frontend.canonicalize().unwrap())
+            normalized_path_key(&container.canonicalize().unwrap())
         );
     }
 
     #[test]
-    fn general_terminal_launch_target_finds_deep_selected_git_mount() {
+    fn general_terminal_launch_target_ignores_deep_selected_git_mount() {
         let container = terminal_test_directory("general_deep_repo_container");
         let deep_repo = container
             .join("clients")
@@ -13341,10 +13043,9 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(selected.enforcement_mode, "bounded_direct_edit");
-        assert!(!selected.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&selected.root.canonicalize().unwrap()),
-            normalized_path_key(&deep_repo.canonicalize().unwrap())
+            normalized_path_key(&container.canonicalize().unwrap())
         );
     }
 
@@ -13362,7 +13063,6 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "bounded_direct_edit");
-        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())

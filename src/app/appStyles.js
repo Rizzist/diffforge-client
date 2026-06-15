@@ -3546,7 +3546,7 @@ export const WorkspaceAppToolLayout = styled.div`
   }
 
   [data-workspace-tool-panel="true"]:not([data-pane-mode="minimized"]):not([data-pane-mode="fullscreen"]) {
-    min-width: 450px;
+    min-width: 300px;
   }
 
   [data-workspace-tool-panel="true"][data-pane-mode="fullscreen"] {
@@ -3557,7 +3557,7 @@ export const WorkspaceAppToolLayout = styled.div`
     width: auto !important;
     height: auto !important;
     max-width: none !important;
-    min-width: 0 !important;
+    min-width: 300px !important;
     min-height: 0 !important;
     overflow: visible;
     box-shadow:
@@ -4469,6 +4469,29 @@ export const XtermSurface = styled.div`
   --terminal-native-scrollbar-thumb-active: rgba(210, 221, 238, 0.64);
   --terminal-native-scrollbar-glass-edge: rgba(255, 255, 255, 0.14);
   --terminal-native-scrollbar-glass-shade: rgba(7, 11, 18, 0.18);
+
+  &[data-pty-reveal-ready="false"] {
+    cursor: default;
+  }
+
+  &[data-pty-reveal-ready="false"]::before {
+    content: "";
+    position: absolute;
+    z-index: 6;
+    inset: 0;
+    pointer-events: none;
+    background: ${TERMINAL_THEME_BACKGROUND};
+  }
+
+  html[data-forge-theme="light"] &[data-pty-reveal-ready="false"]::before {
+    background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
+  }
+
+  &[data-pty-reveal-ready="false"] .xterm {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
 
   &[data-terminal-breakout="true"] {
     --terminal-xterm-painted-bottom: 100% !important;
@@ -12753,6 +12776,14 @@ export const NetworkingCategoryTopline = styled.div`
   }
 `;
 
+export const NetworkingCategoryStats = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+`;
+
 export const NetworkingCategoryCount = styled.span`
   display: inline-grid;
   min-width: 28px;
@@ -12773,6 +12804,49 @@ export const NetworkingCategoryCount = styled.span`
   }
 `;
 
+export const NetworkingProgressValue = styled.span`
+  display: inline-grid;
+  min-width: 46px;
+  height: 24px;
+  place-items: center;
+  padding: 0 8px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 6px;
+  background: rgba(59, 130, 246, 0.12);
+  color: #93c5fd;
+  font-size: 11px;
+  font-weight: 860;
+  line-height: 1;
+  white-space: nowrap;
+
+  &[data-tone="green"] {
+    border-color: rgba(60, 203, 127, 0.28);
+    background: rgba(22, 163, 74, 0.12);
+    color: #86efac;
+  }
+
+  &[data-tone="red"] {
+    border-color: rgba(239, 107, 107, 0.32);
+    background: rgba(239, 68, 68, 0.12);
+    color: #fca5a5;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(239, 246, 255, 0.92);
+    color: #1d4ed8;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="green"] {
+    background: rgba(240, 253, 244, 0.92);
+    color: #047857;
+  }
+
+  html[data-forge-theme="light"] &[data-tone="red"] {
+    background: rgba(254, 242, 242, 0.92);
+    color: #b91c1c;
+  }
+`;
+
 export const NetworkingCategoryMeter = styled.div`
   position: relative;
   width: 100%;
@@ -12788,6 +12862,7 @@ export const NetworkingCategoryMeter = styled.div`
     width: var(--network-progress, 0%);
     border-radius: inherit;
     background: #60a5fa;
+    transition: width 220ms ease;
   }
 
   &[data-tone="green"]::before {

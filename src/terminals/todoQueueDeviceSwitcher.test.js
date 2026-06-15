@@ -137,6 +137,585 @@ test("device switcher collapses local desktop workspace echoes to the current wo
   assert.equal(options[0].platformLabel, "macos");
 });
 
+test("device switcher keeps web-sourced roster native badge tied to native_connected", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId: "ws-local",
+    currentWorkspaceName: "Coding core",
+    deviceLiveState: {
+      devices: [
+        {
+          client_kind: "next-dashboard",
+          connected: true,
+          device_id: "desktop-local",
+          device_name: "Syed's MacBook Air",
+          platform: "macos",
+          web_connected: true,
+          workspaces: [{ workspace_id: "ws-local", workspace_name: "Coding core" }],
+        },
+      ],
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Syed's MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].deviceName, "Syed's MacBook Air");
+  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].liveState, "live");
+  assert.equal(options[0].nativeConnected, false);
+  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].workspaceId, "ws-local");
+});
+
+test("device switcher treats generic connected browser rows as web live", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId: "ws-local",
+    currentWorkspaceName: "Coding core",
+    deviceLiveState: {
+      devices: [
+        {
+          client_kind: "next-dashboard",
+          connected: true,
+          device_id: "desktop-local",
+          device_name: "Syed's MacBook Air",
+          platform: "macos",
+          web_presence: {
+            web_device_id: "web-macos-desktop-chrome",
+          },
+          workspaces: [{ workspace_id: "ws-local", workspace_name: "Coding core" }],
+        },
+      ],
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Syed's MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].liveState, "live");
+  assert.equal(options[0].nativeConnected, false);
+  assert.equal(options[0].webConnected, true);
+});
+
+test("device switcher reads account live-state device maps and connection-summary surfaces", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    currentWorkspaceId: "ws-local",
+    currentWorkspaceName: "Coding core",
+    deviceLiveState: {
+      accountDeviceLiveStateSnapshot: {
+        client_connection: {
+          active_desktop_devices: [
+            {
+              device_id: "desktop-local",
+              device_name: "Syed's MacBook Air",
+              form_factor: "desktop",
+              native_connected: true,
+              platform: "macos",
+            },
+          ],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            form_factor: "desktop",
+            native_connected: true,
+            status: "connected",
+            web_connected: true,
+            workspaces: {
+              "ws-local": { workspace_id: "ws-local", workspace_name: "Coding core" },
+            },
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Syed's MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].liveState, "live");
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].workspaceId, "ws-local");
+});
+
+test("device switcher folds targeted web connection summaries into the canonical native device", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_web_devices: [
+            {
+              connected: true,
+              device_id: "web-macos-chrome",
+              device_name: "Device 4",
+              source: "next-diffforge-dashboard",
+              target_device_id: "desktop-local",
+              web_connected: true,
+              web_device_id: "web-macos-chrome",
+            },
+          ],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            native_connected: true,
+            status: "connected",
+            web_connected: true,
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Syed's MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].deviceName, "Syed's MacBook Air");
+  assert.equal(options[0].isLocal, true);
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.deepEqual(options[0].deviceAliases.sort(), ["desktop-local", "web-macos-chrome"].sort());
+});
+
+test("device switcher suppresses generic web-only echoes when the native device already has web presence", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_web_devices: [
+            {
+              connected: true,
+              device_id: "web-dashboard-1",
+              device_name: "Device 4",
+              source: "next-diffforge-dashboard",
+              web_connected: true,
+              web_device_id: "web-dashboard-1",
+            },
+            {
+              connected: true,
+              device_id: "web-dashboard-2",
+              device_name: "This device",
+              source: "next-diffforge-dashboard",
+              web_connected: true,
+              web_device_id: "web-dashboard-2",
+            },
+          ],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            native_connected: true,
+            status: "connected",
+            web_connected: true,
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Syed's MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.deepEqual(options[0].deviceAliases.sort(), ["desktop-local", "web-dashboard-1", "web-dashboard-2"].sort());
+});
+
+test("device switcher keeps registered inventory identity while overlaying web sessions", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_web_devices: [
+            {
+              connected: true,
+              device_id: "web-phone-browser",
+              device_name: "This device",
+              platform: "android",
+              source: "next-diffforge-dashboard",
+              target_device_id: "desktop-local",
+              web_connected: true,
+              web_device_id: "web-phone-browser",
+            },
+          ],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            form_factor: "pc",
+            native_connected: true,
+            platform: "macos",
+            status: "connected",
+            web_connected: true,
+          },
+          "android-phone": {
+            device_id: "android-phone",
+            device_name: "Samsung Galaxy S23 Ultra",
+            form_factor: "mobile",
+            native_connected: false,
+            platform: "android",
+            status: "offline",
+            web_connected: false,
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 2);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].deviceName, "Syed's MacBook Air");
+  assert.equal(options[0].platformLabel, "macos");
+  assert.equal(options[0].formFactorLabel, "pc");
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.equal(options[1].deviceId, "android-phone");
+  assert.equal(options[1].deviceName, "Samsung Galaxy S23 Ultra");
+  assert.equal(options[1].platformLabel, "android");
+  assert.equal(options[1].formFactorLabel, "mobile");
+  assert.equal(options[1].nativeConnected, false);
+  assert.equal(options[1].webConnected, false);
+  assert.equal(options[1].liveState, "offline");
+});
+
+test("device switcher drops generic web-only workspace rows when registered inventory exists", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            form_factor: "pc",
+            native_connected: true,
+            platform: "macos",
+            status: "connected",
+            web_connected: true,
+          },
+          "android-phone": {
+            device_id: "android-phone",
+            device_name: "Samsung Galaxy S23 Ultra",
+            form_factor: "mobile",
+            native_connected: false,
+            platform: "android",
+            status: "offline",
+            web_connected: false,
+          },
+          "web-current-browser": {
+            client_kind: "web",
+            device_id: "web-current-browser",
+            device_name: "This device",
+            source: "next-diffforge-dashboard",
+            status: "connected",
+            web_connected: true,
+            workspace_id: "ws-web",
+            workspace_name: "Browser workspace echo",
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 2);
+  assert.ok(options.every((option) => option.deviceName !== "This device"));
+  assert.ok(options.every((option) => option.deviceId !== "web-current-browser"));
+  assert.ok(options.some((option) => (
+    option.deviceId === "desktop-local"
+      && option.workspaceId === "ws-web"
+      && option.workspaceName === "Browser workspace echo"
+      && option.webConnected === true
+  )));
+  assert.ok(options.some((option) => (
+    option.deviceId === "android-phone"
+      && option.deviceName === "Samsung Galaxy S23 Ultra"
+      && option.liveState === "offline"
+  )));
+});
+
+test("device switcher uses next registered device payload as the stable inventory", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        registered_devices: {
+          account_id: "user-1",
+          authoritative: true,
+          count: 2,
+          items: [
+            {
+              device_id: "desktop-local",
+              device_name: "Syed's MacBook Air",
+              form_factor: "pc",
+              native_connected: true,
+              platform: "macos",
+              status: "connected",
+              web_connected: false,
+            },
+            {
+              device_id: "android-phone",
+              device_name: "Samsung Galaxy S23 Ultra",
+              form_factor: "mobile",
+              native_connected: false,
+              platform: "android",
+              status: "offline",
+              web_connected: false,
+            },
+          ],
+          registered_count: 2,
+          scope: "registered_account_devices",
+        },
+        devices: {
+          "web-current-browser": {
+            client_kind: "web",
+            device_id: "web-current-browser",
+            device_name: "This device",
+            source: "next-diffforge-dashboard",
+            status: "offline",
+            web_connected: false,
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "unmatched-local-profile",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 2);
+  assert.deepEqual(options.map((option) => option.deviceName), [
+    "Syed's MacBook Air",
+    "Samsung Galaxy S23 Ultra",
+  ]);
+  assert.ok(options.every((option) => option.deviceId !== "web-current-browser"));
+  assert.ok(options.every((option) => option.deviceName !== "This device"));
+  assert.equal(options.find((option) => option.deviceId === "desktop-local")?.webConnected, false);
+  assert.equal(options.find((option) => option.deviceId === "android-phone")?.liveState, "offline");
+});
+
+test("device switcher keeps app-shell registered inventory over live generic rows", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    connectedDevices: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        native_connected: false,
+        status: "connected",
+        web_connected: false,
+      },
+      {
+        client_kind: "next-dashboard",
+        device_id: "web-current-browser",
+        device_name: "This device",
+        source: "next-diffforge-dashboard",
+        status: "connected",
+        web_connected: true,
+      },
+    ],
+    knownDevices: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        form_factor: "pc",
+        native_connected: true,
+        platform: "macos",
+        registered: true,
+        status: "connected",
+        web_connected: false,
+      },
+      {
+        device_id: "android-phone",
+        device_name: "Samsung Galaxy S23 Ultra",
+        form_factor: "mobile",
+        native_connected: false,
+        platform: "android",
+        registered: true,
+        status: "offline",
+        web_connected: false,
+      },
+    ],
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.deepEqual(options.map((option) => option.deviceName), [
+    "Syed's MacBook Air",
+    "Samsung Galaxy S23 Ultra",
+  ]);
+  assert.ok(options.every((option) => option.deviceName !== "This device"));
+  assert.ok(options.every((option) => option.deviceId !== "web-current-browser"));
+  assert.equal(options.find((option) => option.deviceId === "desktop-local")?.nativeConnected, true);
+  assert.equal(options.find((option) => option.deviceId === "desktop-local")?.webConnected, false);
+  assert.equal(options.find((option) => option.deviceId === "android-phone")?.liveState, "offline");
+});
+
+test("device switcher lets account live-state surface flags override stale connected devices", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    connectedDevices: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        native_connected: true,
+        web_connected: true,
+      },
+    ],
+    currentWorkspaceId: "ws-local",
+    currentWorkspaceName: "Coding core",
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            native_connected: false,
+            status: "connected",
+            web_connected: true,
+            workspaces: {
+              "ws-local": { workspace_id: "ws-local", workspace_name: "Coding core" },
+            },
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Syed's MacBook Air",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-local");
+  assert.equal(options[0].liveState, "live");
+  assert.equal(options[0].nativeConnected, false);
+  assert.equal(options[0].webConnected, true);
+  assert.equal(options[0].workspaceId, "ws-local");
+});
+
+test("device switcher lights native from account connection summary overlay", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_desktop_device_ids: ["desktop-local"],
+          active_desktop_devices: [
+            {
+              device_id: "desktop-local",
+              machine_id: "desktop-local",
+              native_connected: true,
+              status: "connected",
+            },
+          ],
+        },
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Syed's MacBook Air",
+            native_connected: false,
+            status: "connected",
+            web_connected: true,
+          },
+        },
+        registered_devices: {
+          items: [
+            {
+              device_id: "desktop-local",
+              device_name: "Syed's MacBook Air",
+              form_factor: "pc",
+              native_connected: false,
+              platform: "macos",
+              registered: true,
+              status: "connected",
+              web_connected: true,
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceName, "Syed's MacBook Air");
+  assert.equal(options[0].liveState, "live");
+  assert.equal(options[0].nativeConnected, true);
+  assert.equal(options[0].webConnected, true);
+  assert.deepEqual(options[0].surfaces.map(({ id, active }) => [id, active]), [
+    ["native", true],
+    ["web", true],
+  ]);
+});
+
+test("device switcher treats false server surface flags as offline despite generic connected", () => {
+  const options = buildTodoQueueDeviceWorkspaceOptions({
+    deviceLiveState: {
+      devices: [
+        {
+          connected: true,
+          device_id: "desktop-offline",
+          device_name: "Sleeping Mac",
+          native_connected: false,
+          status: "connected",
+          web_connected: false,
+        },
+      ],
+    },
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].deviceId, "desktop-offline");
+  assert.equal(options[0].connected, false);
+  assert.equal(options[0].liveState, "offline");
+  assert.equal(options[0].nativeConnected, false);
+  assert.equal(options[0].webConnected, false);
+});
+
 test("device switcher does not invent local device rows when server roster is present", () => {
   const options = buildTodoQueueDeviceWorkspaceOptions({
     currentWorkspaceId: "ws-local",

@@ -52,10 +52,16 @@ const LIVE_STATE_STATUS_KEYS = [
 const LIVE_STATE_CONTAINER_KEYS = [
   "accountDeviceLiveStateSnapshot",
   "account_device_live_state_snapshot",
+  "clientConnection",
+  "client_connection",
   "serverRoster",
   "server_roster",
   "accountDeviceServerRoster",
   "account_device_server_roster",
+  "registeredDevices",
+  "registered_devices",
+  "deviceRegistry",
+  "device_registry",
   "devices",
   "items",
   "machines",
@@ -95,6 +101,8 @@ const DEVICE_ALIAS_KEYS = [
   "source_device_id",
   "targetDeviceId",
   "target_device_id",
+  "targetNativeDeviceId",
+  "target_native_device_id",
   "todoDeviceId",
   "todo_device_id",
   "machineId",
@@ -260,6 +268,112 @@ function aliasesIntersect(left = [], right = []) {
     .some((alias) => rightSet.has(alias));
 }
 
+function firstDeviceObject(...values) {
+  return values.find((value) => value && typeof value === "object" && !Array.isArray(value)) || {};
+}
+
+function collectDeviceIdsFromValue(value, ids = new Set()) {
+  if (!value) {
+    return ids;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectDeviceIdsFromValue(item, ids));
+    return ids;
+  }
+  if (typeof value === "object") {
+    deviceAliasesForRecord(value).forEach((id) => ids.add(id));
+    return ids;
+  }
+  const id = normalizeTodoQueueSwitcherId(value);
+  if (id) {
+    ids.add(id);
+  }
+  return ids;
+}
+
+function liveStateSnapshotRoot(value) {
+  if (!value || typeof value !== "object") {
+    return { root: {}, snapshotRoot: {} };
+  }
+  const root = value?.data && typeof value.data === "object" ? value.data : value;
+  const accountSnapshot = root.accountDeviceLiveStateSnapshot
+    || root.account_device_live_state_snapshot
+    || root.deviceLiveStateSnapshot
+    || root.device_live_state_snapshot
+    || null;
+  const snapshotRoot = accountSnapshot && typeof accountSnapshot === "object"
+    ? accountSnapshot
+    : root;
+  return { root, snapshotRoot };
+}
+
+function connectionOverlayFromLiveState(value) {
+  const { root, snapshotRoot } = liveStateSnapshotRoot(value);
+  const summary = firstDeviceObject(
+    snapshotRoot.client_connection,
+    snapshotRoot.clientConnection,
+    snapshotRoot.connection_summary,
+    snapshotRoot.connectionSummary,
+    root.client_connection,
+    root.clientConnection,
+    root.connection_summary,
+    root.connectionSummary,
+  );
+  const activeNativeIds = collectDeviceIdsFromValue([
+    summary.active_desktop_device_ids,
+    summary.activeDesktopDeviceIds,
+    summary.active_native_device_ids,
+    summary.activeNativeDeviceIds,
+    summary.active_desktop_devices,
+    summary.activeDesktopDevices,
+    summary.active_native_devices,
+    summary.activeNativeDevices,
+  ]);
+  const activeWebTargetIds = collectDeviceIdsFromValue([
+    summary.active_web_target_device_ids,
+    summary.activeWebTargetDeviceIds,
+  ]);
+  const activeWebDevices = Array.isArray(summary.active_web_devices)
+    ? summary.active_web_devices
+    : Array.isArray(summary.activeWebDevices)
+      ? summary.activeWebDevices
+      : [];
+  activeWebDevices.forEach((device) => {
+    collectDeviceIdsFromValue(
+      device?.target_device_id
+        || device?.targetDeviceId
+        || device?.target_native_device_id
+        || device?.targetNativeDeviceId,
+      activeWebTargetIds,
+    );
+  });
+  return { activeNativeIds, activeWebTargetIds };
+}
+
+function applyConnectionOverlayToDevices(devices, liveState) {
+  const { activeNativeIds, activeWebTargetIds } = connectionOverlayFromLiveState(liveState);
+  if (!activeNativeIds.size && !activeWebTargetIds.size) {
+    return devices;
+  }
+  return devices.map((device) => {
+    const aliases = uniqueDeviceAliases(device?.deviceAliases, device?.deviceId);
+    const nativeOverlayActive = aliases.some((id) => activeNativeIds.has(id));
+    const webOverlayActive = aliases.some((id) => activeWebTargetIds.has(id));
+    if (!nativeOverlayActive && !webOverlayActive) {
+      return device;
+    }
+    const nativeConnected = nativeOverlayActive ? true : device.nativeConnected;
+    const webConnected = webOverlayActive ? true : device.webConnected;
+    return {
+      ...device,
+      connected: true,
+      liveState: "live",
+      nativeConnected,
+      webConnected,
+    };
+  });
+}
+
 function recordLooksWebOnly(record) {
   const web = webPresenceForRecord(record);
   const source = [
@@ -274,7 +388,96 @@ function recordLooksWebOnly(record) {
     web?.client_kind,
     web?.source,
   ].map(normalizedToken).join(" ");
-  return source.includes("web") || source.includes("browser") || source.includes("next-dashboard");
+  return source.includes("web")
+    || source.includes("browser")
+    || source.includes("dashboard")
+    || source.includes("next-diffforge");
+}
+
+function idLooksWebOnly(value) {
+  const id = normalizeTodoQueueSwitcherId(value);
+  return !id || id === "dashboard-web" || id.startsWith("web-") || id.startsWith("browser-");
+}
+
+function objectHasEntries(value) {
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  return Boolean(value && typeof value === "object" && Object.keys(value).length > 0);
+}
+
+function recordHasNativeAnchor(record) {
+  if (!record || typeof record !== "object") {
+    return false;
+  }
+  const web = webPresenceForRecord(record);
+  const nativeSurface = surfaceRecordFor(record, "native");
+  const nativeIds = uniqueDeviceAliases(
+    record.deviceId,
+    record.device_id,
+    record.machineId,
+    record.machine_id,
+    record.nativeDeviceId,
+    record.native_device_id,
+    record.desktopDeviceId,
+    record.desktop_device_id,
+    record.targetNativeDeviceId,
+    record.target_native_device_id,
+    web?.nativeDeviceId,
+    web?.native_device_id,
+    nativeSurface?.deviceId,
+    nativeSurface?.device_id,
+    nativeSurface?.machineId,
+    nativeSurface?.machine_id,
+  );
+  const platformAndForm = [
+    record.platform,
+    record.os,
+    record.formFactor,
+    record.form_factor,
+    record.deviceType,
+    record.device_type,
+    web?.webPlatform,
+    web?.web_platform,
+    web?.webFormFactor,
+    web?.web_form_factor,
+  ].map(normalizedToken).join(" ");
+  const clientKind = [
+    record.clientKind,
+    record.client_kind,
+    record.clientType,
+    record.client_type,
+    record.connectionSource,
+    record.connection_source,
+    record.source,
+    nativeSurface?.clientKind,
+    nativeSurface?.client_kind,
+    nativeSurface?.clientType,
+    nativeSurface?.client_type,
+    nativeSurface?.source,
+  ].map(normalizedToken).join(" ");
+  const mobileLike = ["mobile", "phone", "tablet", "android", "ios", "iphone", "ipad"]
+    .some((token) => platformAndForm.includes(token));
+  const webLike = clientKind.includes("web")
+    || clientKind.includes("browser")
+    || clientKind.includes("dashboard")
+    || clientKind.includes("next-diffforge");
+  const nativeFlag = (boolFromKeys(record, NATIVE_CONNECTED_KEYS)
+    ?? boolFromKeys(nativeSurface, ["connected", "active", "online", "open", "status", "state"])) === true;
+  const nativeLike = ["native", "desktop", "tauri", "rust"].some((token) => clientKind.includes(token));
+  const workspaceCount = Number(record.workspaceCount ?? record.workspace_count ?? 0) || 0;
+  const hasWorkspaces = workspaceCount > 0
+    || objectHasEntries(record.workspaces)
+    || objectHasEntries(record.workspaceCatalog)
+    || objectHasEntries(record.workspace_catalog)
+    || objectHasEntries(record.workspaceStates)
+    || objectHasEntries(record.workspace_states);
+  const hasNativeId = nativeIds.some((id) => !idLooksWebOnly(id));
+  return Boolean(
+    !mobileLike
+      && (hasNativeId || hasWorkspaces)
+      && (!webLike || nativeFlag || nativeLike || hasWorkspaces)
+  );
 }
 
 function nativeConnectedForRecord(record, inherited = null) {
@@ -284,8 +487,11 @@ function nativeConnectedForRecord(record, inherited = null) {
   if (explicit !== null) {
     return explicit;
   }
+  if (webConnectedForRecord(record, null) !== null) {
+    return inherited?.nativeConnected ?? null;
+  }
   const generic = boolFromKeys(record, ["connected", "online", "live", "active", "status", "state"]);
-  if (generic !== null && !recordLooksWebOnly(record)) {
+  if (generic !== null && (!recordLooksWebOnly(record) || recordHasNativeAnchor(record))) {
     return generic;
   }
   return inherited?.nativeConnected ?? null;
@@ -294,16 +500,29 @@ function nativeConnectedForRecord(record, inherited = null) {
 function webConnectedForRecord(record, inherited = null) {
   const web = webPresenceForRecord(record);
   const webSurface = surfaceRecordFor(record, "web");
-  return boolFromKeys(record, WEB_CONNECTED_KEYS)
+  const explicit = boolFromKeys(record, WEB_CONNECTED_KEYS)
     ?? boolFromKeys(web, ["connected", "active", "online", "open", "status", "state"])
     ?? boolFromKeys(webSurface, ["connected", "active", "online", "open", "status", "state"])
-    ?? inherited?.webConnected
     ?? null;
+  if (explicit !== null) {
+    return explicit;
+  }
+  const generic = boolFromKeys(record, ["connected", "online", "live", "active", "status", "state"]);
+  if (generic !== null && recordLooksWebOnly(record)) {
+    return generic;
+  }
+  return inherited?.webConnected ?? null;
 }
 
 function liveStateFromSurfaces(nativeConnected, webConnected, explicitConnected, fallback = "unknown") {
+  const hasSurfaceState = nativeConnected !== null || webConnected !== null;
   if (nativeConnected === true || webConnected === true || explicitConnected === true) {
-    return "live";
+    if (!hasSurfaceState || nativeConnected === true || webConnected === true) {
+      return "live";
+    }
+  }
+  if (hasSurfaceState && nativeConnected !== true && webConnected !== true) {
+    return "offline";
   }
   if (
     (nativeConnected === false || nativeConnected === null)
@@ -319,9 +538,22 @@ function liveStateFromSurfaces(nativeConnected, webConnected, explicitConnected,
 }
 
 function mergeNullableBooleans(left, right) {
-  if (left === true || right === true) return true;
-  if (right === false) return false;
-  if (left === false) return false;
+  if (right === true || right === false) return right;
+  if (left === true || left === false) return left;
+  return null;
+}
+
+function mergeDeviceSurfaceBoolean(previous, next, key) {
+  const left = previous?.[key];
+  const right = next?.[key];
+  if (right === true) return true;
+  if (right === false) {
+    if (previous?.registered && !next?.registered && (left === true || left === false)) {
+      return left;
+    }
+    return false;
+  }
+  if (left === true || left === false) return left;
   return null;
 }
 
@@ -550,13 +782,15 @@ function normalizeDeviceRecord(record, index = 0, options = {}) {
   }
   const kind = forcedKind
     || deviceKindForRecord(record, inherited?.deviceKind || TODO_QUEUE_DEVICE_KIND_UNKNOWN);
+  const looksWebOnly = recordLooksWebOnly(record);
+  const hasNativeAnchor = recordHasNativeAnchor(record);
   const explicitConnected = normalizeLiveBoolean(readFirstKey(record, LIVE_STATE_PRESENT_KEYS));
   const nativeConnected = nativeConnectedForRecord(record, inherited);
   const webConnected = webConnectedForRecord(record, inherited);
-  const connected = mergeNullableBooleans(
-    mergeNullableBooleans(nativeConnected, webConnected),
-    explicitConnected,
-  );
+  const hasSurfaceConnectionState = nativeConnected !== null || webConnected !== null;
+  const connected = hasSurfaceConnectionState
+    ? Boolean(nativeConnected === true || webConnected === true)
+    : explicitConnected;
   const liveState = liveStateFromSurfaces(
     nativeConnected,
     webConnected,
@@ -605,8 +839,16 @@ function normalizeDeviceRecord(record, index = 0, options = {}) {
       record.os,
       inherited?.platformLabel,
     ),
+    registered: Boolean(
+      options.registered
+        || inherited?.registered
+        || record.registered
+        || record.registeredDevice
+        || record.registered_device
+    ),
     serverSeen: Boolean(options.serverSeen || inherited?.serverSeen),
     webConnected,
+    webOnly: Boolean(looksWebOnly && !hasNativeAnchor),
   };
 }
 
@@ -615,8 +857,11 @@ function mergeDevice(previous, next) {
     return {
       ...next,
       deviceAliases: uniqueDeviceAliases(next?.deviceAliases, next?.deviceId),
+      webOnly: Boolean(next?.webOnly),
     };
   }
+  const nextIsWebOverlay = Boolean(next.webOnly && previous.webOnly !== true);
+  const nextIsCanonicalIdentity = Boolean(previous.webOnly && !next.webOnly);
   const previousHasUsefulName = !deviceNameIsGeneric(previous.deviceName);
   const nextHasUsefulName = !deviceNameIsGeneric(next.deviceName);
   const preferNextName = Boolean(
@@ -627,8 +872,8 @@ function mergeDevice(previous, next) {
       ),
   ) || Boolean(!previous.deviceName && next.deviceName);
   const connected = mergeNullableBooleans(previous.connected, next.connected);
-  const nativeConnected = mergeNullableBooleans(previous.nativeConnected, next.nativeConnected);
-  const webConnected = mergeNullableBooleans(previous.webConnected, next.webConnected);
+  const nativeConnected = mergeDeviceSurfaceBoolean(previous, next, "nativeConnected");
+  const webConnected = mergeDeviceSurfaceBoolean(previous, next, "webConnected");
   const liveState = previous.liveState === "live" || next.liveState === "live"
     ? "live"
     : next.liveState !== "unknown"
@@ -639,21 +884,49 @@ function mergeDevice(previous, next) {
     ...next,
     connected,
     deviceAliases: uniqueDeviceAliases(previous.deviceAliases, previous.deviceId, next.deviceAliases, next.deviceId),
-    deviceKind: previous.deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP || previous.isLocal
+    deviceKind: nextIsWebOverlay
+      ? previous.deviceKind
+      : previous.deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP || previous.isLocal
       ? previous.deviceKind
       : next.deviceKind || previous.deviceKind,
-    deviceName: !preferNextName
+    deviceName: nextIsWebOverlay || !preferNextName
       ? previous.deviceName
       : next.deviceName,
-    formFactorLabel: previous.formFactorLabel || next.formFactorLabel || "",
+    formFactorLabel: nextIsCanonicalIdentity
+      ? next.formFactorLabel || previous.formFactorLabel || ""
+      : nextIsWebOverlay
+      ? previous.formFactorLabel || ""
+      : previous.formFactorLabel || next.formFactorLabel || "",
     isLocal: Boolean(previous.isLocal || next.isLocal),
     liveState,
     nativeConnected,
-    platformIcon: previous.platformIcon || next.platformIcon || "",
-    platformLabel: previous.platformLabel || next.platformLabel || "",
+    platformIcon: nextIsCanonicalIdentity
+      ? next.platformIcon || previous.platformIcon || ""
+      : nextIsWebOverlay
+      ? previous.platformIcon || ""
+      : previous.platformIcon || next.platformIcon || "",
+    platformLabel: nextIsCanonicalIdentity
+      ? next.platformLabel || previous.platformLabel || ""
+      : nextIsWebOverlay
+      ? previous.platformLabel || ""
+      : previous.platformLabel || next.platformLabel || "",
+    registered: Boolean(previous.registered || next.registered),
     serverSeen: Boolean(previous.serverSeen || next.serverSeen),
     webConnected,
+    webOnly: Boolean(previous.webOnly && next.webOnly),
   };
+}
+
+function shouldPreferDeviceKey(candidateId, currentId, previous = null, next = null) {
+  const safeCandidateId = normalizeTodoQueueSwitcherId(candidateId);
+  const safeCurrentId = normalizeTodoQueueSwitcherId(currentId);
+  if (!safeCandidateId || !safeCurrentId || safeCandidateId === safeCurrentId) {
+    return false;
+  }
+  if (idLooksWebOnly(safeCurrentId) && !idLooksWebOnly(safeCandidateId)) {
+    return true;
+  }
+  return Boolean(previous?.webOnly && !next?.webOnly && !idLooksWebOnly(safeCandidateId));
 }
 
 function addWorkspace(workspacesByDevice, entry) {
@@ -694,17 +967,23 @@ function upsertDevice(devicesById, device) {
   const existingKey = findDeviceKeyByAliases(devicesById, deviceAliases);
   const deviceId = existingKey || device.deviceId;
   const previous = devicesById.get(deviceId) || null;
+  const preferredDeviceId = shouldPreferDeviceKey(device.deviceId, deviceId, previous, device)
+    ? device.deviceId
+    : deviceId;
   const merged = mergeDevice(previous, {
     ...device,
     deviceAliases,
-    deviceId,
+    deviceId: preferredDeviceId,
   });
-  devicesById.set(deviceId, {
+  if (preferredDeviceId !== deviceId) {
+    devicesById.delete(deviceId);
+  }
+  devicesById.set(preferredDeviceId, {
     ...merged,
-    deviceAliases: uniqueDeviceAliases(merged.deviceAliases, deviceAliases, device.deviceId, deviceId),
-    deviceId,
+    deviceAliases: uniqueDeviceAliases(merged.deviceAliases, deviceAliases, device.deviceId, deviceId, preferredDeviceId),
+    deviceId: preferredDeviceId,
   });
-  return deviceId;
+  return preferredDeviceId;
 }
 
 function canonicalDeviceIdFor(devicesById, entry) {
@@ -716,12 +995,145 @@ function canonicalDeviceIdFor(devicesById, entry) {
   return findDeviceKeyByAliases(devicesById, aliases) || normalizeTodoQueueSwitcherId(entry?.deviceId);
 }
 
-function collectLiveStateEntries(value, result, inheritedDevice = null, depth = 0) {
+function moveWorkspaceEntriesToDevice(workspacesByDevice, fromDeviceId, toDeviceId, targetDevice = {}) {
+  const safeFromDeviceId = normalizeTodoQueueSwitcherId(fromDeviceId);
+  const safeToDeviceId = normalizeTodoQueueSwitcherId(toDeviceId);
+  if (!safeFromDeviceId || !safeToDeviceId || safeFromDeviceId === safeToDeviceId) {
+    return;
+  }
+  const fromPrefix = `${safeFromDeviceId}::`;
+  const entriesToMove = [];
+  for (const [key, entry] of workspacesByDevice.entries()) {
+    if (String(key || "").startsWith(fromPrefix)) {
+      entriesToMove.push([key, entry]);
+    }
+  }
+  entriesToMove.forEach(([key, entry]) => {
+    workspacesByDevice.delete(key);
+    addWorkspace(workspacesByDevice, {
+      ...entry,
+      deviceId: safeToDeviceId,
+      deviceKind: targetDevice.deviceKind || entry.deviceKind,
+      deviceName: targetDevice.deviceName || entry.deviceName,
+    });
+  });
+}
+
+function removeWorkspaceEntriesForDevice(workspacesByDevice, deviceId) {
+  const safeDeviceId = normalizeTodoQueueSwitcherId(deviceId);
+  if (!safeDeviceId) {
+    return;
+  }
+  const prefix = `${safeDeviceId}::`;
+  Array.from(workspacesByDevice.keys()).forEach((key) => {
+    if (String(key || "").startsWith(prefix)) {
+      workspacesByDevice.delete(key);
+    }
+  });
+}
+
+function pruneToRegisteredDeviceRows(devicesById, workspacesByDevice) {
+  const registeredEntries = Array.from(devicesById.entries())
+    .filter(([, device]) => device?.registered);
+  if (!registeredEntries.length) {
+    return;
+  }
+  for (const [deviceId, device] of Array.from(devicesById.entries())) {
+    if (device?.registered) {
+      continue;
+    }
+    const targetEntry = registeredEntries.find(([registeredId, registeredDevice]) => (
+      registeredId !== deviceId
+        && aliasesIntersect(registeredDevice.deviceAliases, device.deviceAliases)
+    ));
+    if (targetEntry) {
+      const [targetDeviceId, targetDevice] = targetEntry;
+      const currentTargetDevice = devicesById.get(targetDeviceId) || targetDevice;
+      devicesById.set(targetDeviceId, mergeDevice(currentTargetDevice, {
+        ...device,
+        deviceId: targetDeviceId,
+        deviceName: currentTargetDevice.deviceName,
+        registered: true,
+        webOnly: false,
+      }));
+      moveWorkspaceEntriesToDevice(workspacesByDevice, deviceId, targetDeviceId, currentTargetDevice);
+    } else {
+      removeWorkspaceEntriesForDevice(workspacesByDevice, deviceId);
+    }
+    devicesById.delete(deviceId);
+  }
+}
+
+function foldWebOnlyDeviceRows(devicesById, workspacesByDevice) {
+  const entries = Array.from(devicesById.entries());
+  const canonicalEntries = entries.filter(([, device]) => (
+    device
+      && device.webOnly !== true
+      && device.deviceKind !== TODO_QUEUE_DEVICE_KIND_MOBILE
+      && (device.serverSeen || device.isLocal || device.nativeConnected === true || !idLooksWebOnly(device.deviceId))
+  ));
+  if (!canonicalEntries.length) {
+    return;
+  }
+  const hasRegisteredInventory = canonicalEntries.some(([, device]) => device?.registered);
+  const canonicalWithWeb = canonicalEntries.filter(([, device]) => device.webConnected === true);
+  entries.forEach(([deviceId, device]) => {
+    if (
+      !device?.webOnly
+      || device.isLocal
+      || device.deviceKind === TODO_QUEUE_DEVICE_KIND_MOBILE
+    ) {
+      return;
+    }
+    const targetEntry = canonicalEntries.find(([, candidate]) => (
+      aliasesIntersect(candidate.deviceAliases, device.deviceAliases)
+    )) || (canonicalWithWeb.length === 1
+      ? canonicalWithWeb[0]
+      : (!hasRegisteredInventory && canonicalEntries.length === 1)
+        ? canonicalEntries[0]
+        : null);
+    if (!targetEntry) {
+      if (deviceNameIsGeneric(device.deviceName)) {
+        removeWorkspaceEntriesForDevice(workspacesByDevice, deviceId);
+        devicesById.delete(deviceId);
+      }
+      return;
+    }
+    const [targetDeviceId, targetDevice] = targetEntry;
+    const currentTargetDevice = devicesById.get(targetDeviceId) || targetDevice;
+    const merged = mergeDevice(currentTargetDevice, {
+      ...device,
+      connected: device.connected,
+      deviceId: targetDeviceId,
+      deviceKind: currentTargetDevice.deviceKind,
+      deviceName: currentTargetDevice.deviceName,
+      formFactorLabel: currentTargetDevice.formFactorLabel,
+      isLocal: currentTargetDevice.isLocal,
+      nativeConnected: null,
+      platformIcon: currentTargetDevice.platformIcon,
+      platformLabel: currentTargetDevice.platformLabel,
+      serverSeen: Boolean(currentTargetDevice.serverSeen || device.serverSeen),
+      webOnly: false,
+    });
+    devicesById.set(targetDeviceId, {
+      ...merged,
+      deviceAliases: uniqueDeviceAliases(merged.deviceAliases, currentTargetDevice.deviceAliases, device.deviceAliases, targetDeviceId, deviceId),
+      deviceId: targetDeviceId,
+      deviceName: currentTargetDevice.deviceName || merged.deviceName,
+      isLocal: Boolean(currentTargetDevice.isLocal || merged.isLocal),
+      webOnly: false,
+    });
+    moveWorkspaceEntriesToDevice(workspacesByDevice, deviceId, targetDeviceId, currentTargetDevice);
+    devicesById.delete(deviceId);
+  });
+}
+
+function collectLiveStateEntries(value, result, inheritedDevice = null, depth = 0, options = {}) {
   if (!value || depth > 5) {
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((item) => collectLiveStateEntries(item, result, inheritedDevice, depth + 1));
+    value.forEach((item) => collectLiveStateEntries(item, result, inheritedDevice, depth + 1, options));
     return;
   }
   if (typeof value !== "object") {
@@ -730,6 +1142,7 @@ function collectLiveStateEntries(value, result, inheritedDevice = null, depth = 
 
   const ownDevice = normalizeDeviceRecord(value, result.devices.length, {
     inherited: inheritedDevice,
+    registered: options.registered,
     serverSeen: true,
   });
   const currentDevice = ownDevice || inheritedDevice;
@@ -749,9 +1162,20 @@ function collectLiveStateEntries(value, result, inheritedDevice = null, depth = 
     });
   }
 
+  if (!ownDevice && !workspaceId) {
+    Object.values(value)
+      .filter((item) => item && typeof item === "object")
+      .forEach((item) => collectLiveStateEntries(item, result, currentDevice, depth + 1, options));
+  }
+
   LIVE_STATE_CONTAINER_KEYS.forEach((key) => {
     if (value[key] !== undefined && value[key] !== value) {
-      collectLiveStateEntries(value[key], result, currentDevice, depth + 1);
+      const registered = options.registered
+        || key === "registeredDevices"
+        || key === "registered_devices"
+        || key === "deviceRegistry"
+        || key === "device_registry";
+      collectLiveStateEntries(value[key], result, currentDevice, depth + 1, { registered });
     }
   });
 }
@@ -878,7 +1302,7 @@ export function buildTodoQueueDeviceWorkspaceOptions({
 
   const liveEntries = { devices: [], workspaces: [] };
   collectLiveStateEntries(deviceLiveState, liveEntries);
-  liveEntries.devices.forEach((device) => {
+  applyConnectionOverlayToDevices(liveEntries.devices, deviceLiveState).forEach((device) => {
     upsertDevice(devicesById, device);
   });
   liveEntries.workspaces.forEach((workspace) => addCanonicalWorkspace(workspace));
@@ -945,6 +1369,9 @@ export function buildTodoQueueDeviceWorkspaceOptions({
       });
     }
   }
+
+  foldWebOnlyDeviceRows(devicesById, workspacesByDevice);
+  pruneToRegisteredDeviceRows(devicesById, workspacesByDevice);
 
   const workspaceEntries = Array.from(workspacesByDevice.values());
   const workspaceEntriesByDevice = new Map();

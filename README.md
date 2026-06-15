@@ -92,7 +92,7 @@ IDEs were built for humans typing. ADEs are built for humans **orchestrating** �
 - 🌍 Embedded **web view** for in-app reference and testing
 - 🧪 **Developer process manager** for dev servers and long-running jobs
 - 🔔 Native **notifications** with action routing back into the app
-- 🧭 **Spec graphs**, **plans**, and **diagnostics** panels
+- 🧭 **Architecture graphs**, **plans**, and **diagnostics** panels
 - ⚡ Obsessively tuned: warm window pools, code-split webviews, paint-then-show windows, prewarmed sockets — *everything opens instantly*
 
 ---

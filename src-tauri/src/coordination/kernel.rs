@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -20777,7 +20777,7 @@ impl CoordinationKernel {
                 task_id,
                 "coordination-kernel.start_task",
                 json!({
-                    "meter": "task_created",
+                    "meter": "coordination.task",
                     "source": "coordination-kernel.start_task",
                     "task_id": task_id,
                     "taskId": task_id,
@@ -26423,77 +26423,15 @@ fn codex_managed_git_routes_for_general_worker_root(
             repo_root: write_root.to_path_buf(),
         });
     }
-    for repo_root in discover_nested_git_roots(write_root, 4, 256) {
-        routes.push(CodexManagedGitRoute { repo_root });
-    }
     Ok(routes)
 }
 
 fn codex_managed_git_routes_for_direct_root(
-    write_root: &Path,
+    _write_root: &Path,
     _slot_key: &str,
     _agent_kind: &str,
 ) -> Result<Vec<CodexManagedGitRoute>, String> {
-    let mut routes = Vec::new();
-    for repo_root in discover_nested_git_roots(write_root, 4, 256) {
-        routes.push(CodexManagedGitRoute { repo_root });
-    }
-    Ok(routes)
-}
-
-fn discover_nested_git_roots(root: &Path, max_depth: usize, max_roots: usize) -> Vec<PathBuf> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut roots = Vec::new();
-    let mut queue = VecDeque::from([(root.clone(), 0usize)]);
-    let mut seen = HashSet::new();
-    while let Some((directory, depth)) = queue.pop_front() {
-        if roots.len() >= max_roots {
-            break;
-        }
-        let key = process_path_text(&directory).to_ascii_lowercase();
-        if !seen.insert(key) {
-            continue;
-        }
-        if directory != root
-            && (directory.join(".git").is_dir() || directory.join(".git").is_file())
-        {
-            roots.push(directory);
-            continue;
-        }
-        if depth >= max_depth {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if matches!(
-                name.as_str(),
-                ".git"
-                    | ".agents"
-                    | ".codex"
-                    | ".claude"
-                    | "node_modules"
-                    | "target"
-                    | "dist"
-                    | "build"
-                    | ".next"
-                    | ".cache"
-            ) {
-                continue;
-            }
-            queue.push_back((path, depth + 1));
-        }
-    }
-    roots
+    Ok(Vec::new())
 }
 
 fn codex_permission_relative_path(root: &Path, child: &Path) -> Result<String, String> {

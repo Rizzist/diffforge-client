@@ -88,8 +88,7 @@ const FORGE_VOICE_AGENT_MIC_EVENT: &str = "forge-voice-agent-mic";
 const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT: &str = "forge-floating-layout-changed";
 const AUDIO_WIDGET_SPACE_CHANGED_EVENT: &str = "forge-audio-widget-space-changed";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bar-hover-changed";
-const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT: &str =
-    "forge-audio-widget-bubble-hover-changed";
+const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bubble-hover-changed";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT: &str = "forge-audio-dictation-raw-result";
 
 fn realtime_mic_holder_get(audio_state: &AudioState) -> RealtimeMicHolder {
@@ -560,7 +559,10 @@ impl NativeAudioWorker {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.restart_after_timeout(action);
-                Err("Audio input engine timed out. The mic engine was reset; try again.".to_string())
+                Err(
+                    "Audio input engine timed out. The mic engine was reset; try again."
+                        .to_string(),
+                )
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 Err("Native audio worker did not respond.".to_string())
@@ -673,8 +675,11 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 replay_buffered,
                 response,
             } => {
-                let result =
-                    attach_native_audio_realtime_stream(session.as_ref(), audio_tx, replay_buffered);
+                let result = attach_native_audio_realtime_stream(
+                    session.as_ref(),
+                    audio_tx,
+                    replay_buffered,
+                );
                 let _ = response.send(result);
             }
             NativeAudioCommand::Begin { response } => {
@@ -1129,8 +1134,7 @@ static MACOS_VOICE_PLAYBACK_QUEUE: OnceLock<Arc<StdMutex<VecDeque<f32>>>> = Once
 /// Hard cap on queued native playback (30s at the unit rate) so a runaway
 /// stream cannot grow the buffer unbounded.
 #[cfg(target_os = "macos")]
-const MACOS_VOICE_PLAYBACK_MAX_SAMPLES: usize =
-    (MACOS_VOICE_PROCESSING_SAMPLE_RATE as usize) * 30;
+const MACOS_VOICE_PLAYBACK_MAX_SAMPLES: usize = (MACOS_VOICE_PROCESSING_SAMPLE_RATE as usize) * 30;
 /// AUVoiceIO ducking controls are not exposed by coreaudio-rs, but they are
 /// documented in AudioToolbox/AudioUnitProperties.h. If these cannot be set,
 /// we fall back to raw cpal capture rather than letting macOS attenuate other
@@ -1268,9 +1272,8 @@ fn macos_voice_processing_core_device(
             "No default input device is available for voice processing.".to_string()
         });
     }
-    get_device_id_from_name(label, true).ok_or_else(|| {
-        format!("Input device {label} was not found for voice processing capture.")
-    })
+    get_device_id_from_name(label, true)
+        .ok_or_else(|| format!("Input device {label} was not found for voice processing capture."))
 }
 
 /// Builds a mic capture stream through macOS's VoiceProcessingIO audio unit,
@@ -1282,7 +1285,14 @@ fn build_macos_voice_processing_capture(
     app: AppHandle,
     device_id: String,
     label: &str,
-) -> Result<(MacosVoiceProcessingCapture, Arc<StdMutex<NativeAudioShared>>, u32), String> {
+) -> Result<
+    (
+        MacosVoiceProcessingCapture,
+        Arc<StdMutex<NativeAudioShared>>,
+        u32,
+    ),
+    String,
+> {
     use coreaudio::audio_unit::audio_format::LinearPcmFlags;
     use coreaudio::audio_unit::render_callback::{self, data};
     use coreaudio::audio_unit::{AudioUnit, Element, IOType, SampleFormat, Scope, StreamFormat};
@@ -1296,10 +1306,11 @@ fn build_macos_voice_processing_capture(
     };
 
     let core_device = macos_voice_processing_core_device(&device_id, label)?;
-    let mut unit = AudioUnit::new(IOType::VoiceProcessingIO)
-        .map_err(|error| describe("create", error))?;
+    let mut unit =
+        AudioUnit::new(IOType::VoiceProcessingIO).map_err(|error| describe("create", error))?;
     // EnableIO and formats only apply to an uninitialized unit.
-    unit.uninitialize().map_err(|error| describe("uninitialize", error))?;
+    unit.uninitialize()
+        .map_err(|error| describe("uninitialize", error))?;
     configure_macos_voice_processing_no_ducking(&mut unit)?;
     let enable: u32 = 1;
     unit.set_property(
@@ -1327,8 +1338,7 @@ fn build_macos_voice_processing_capture(
         Some(&core_device),
     )
     .map_err(|error| describe("select input device", error))?;
-    if let Some(output_device) =
-        coreaudio::audio_unit::macos_helpers::get_default_device_id(false)
+    if let Some(output_device) = coreaudio::audio_unit::macos_helpers::get_default_device_id(false)
     {
         let _ = unit.set_property(
             kAudioOutputUnitProperty_CurrentDevice,
@@ -1388,7 +1398,8 @@ fn build_macos_voice_processing_capture(
         Ok(())
     })
     .map_err(|error| describe("install render callback", error))?;
-    unit.initialize().map_err(|error| describe("initialize", error))?;
+    unit.initialize()
+        .map_err(|error| describe("initialize", error))?;
     unit.start().map_err(|error| describe("start", error))?;
     MACOS_VOICE_PROCESSING_ACTIVE.store(true, Ordering::Release);
 
@@ -3220,33 +3231,31 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
 
     let app_handle = app.clone();
     let window_for_events = window.clone();
-    window.on_window_event(move |event| {
-        match event {
-            WindowEvent::CloseRequested { api, .. } => {
-                if APP_CLOSE_SHUTDOWN_IN_FLIGHT.load(Ordering::SeqCst)
-                    || APP_SHUTDOWN_PHASE.load(Ordering::SeqCst) != APP_SHUTDOWN_PHASE_RUNNING
-                {
-                    #[cfg(target_os = "macos")]
-                    snipping_restore_window_class_for_close_now(&window_for_events);
-                    return;
-                }
-                api.prevent_close();
-                if let Some(window) = app_handle.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
-                    let _ = window.hide();
-                }
-                emit_audio_widget_current_visibility(&app_handle, false);
+    window.on_window_event(move |event| match event {
+        WindowEvent::CloseRequested { api, .. } => {
+            if APP_CLOSE_SHUTDOWN_IN_FLIGHT.load(Ordering::SeqCst)
+                || APP_SHUTDOWN_PHASE.load(Ordering::SeqCst) != APP_SHUTDOWN_PHASE_RUNNING
+            {
+                #[cfg(target_os = "macos")]
+                snipping_restore_window_class_for_close_now(&window_for_events);
+                return;
             }
-            WindowEvent::Destroyed => {
-                log_audio_diagnostic_event(
-                    "audio.widget.window.destroyed",
-                    json!({
-                        "label": AUDIO_WIDGET_WINDOW_LABEL,
-                    }),
-                );
-                emit_audio_widget_current_visibility(&app_handle, false);
+            api.prevent_close();
+            if let Some(window) = app_handle.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+                let _ = window.hide();
             }
-            _ => {}
+            emit_audio_widget_current_visibility(&app_handle, false);
         }
+        WindowEvent::Destroyed => {
+            log_audio_diagnostic_event(
+                "audio.widget.window.destroyed",
+                json!({
+                    "label": AUDIO_WIDGET_WINDOW_LABEL,
+                }),
+            );
+            emit_audio_widget_current_visibility(&app_handle, false);
+        }
+        _ => {}
     });
 
     Ok(window)
@@ -3270,17 +3279,22 @@ fn audio_widget_apply_macos_space_style(window: &tauri::WebviewWindow) {
                 return;
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
-                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
-            );
-            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
-            ns_window.setAcceptsMouseMovedEvents(true);
+            audio_widget_apply_macos_space_style_to_ns_window(ns_window);
         });
     });
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_apply_macos_space_style_to_ns_window(ns_window: &NSWindow) {
+    ns_window.setCollectionBehavior(
+        objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+            | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+            | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+            | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+            | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+    );
+    ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    ns_window.setAcceptsMouseMovedEvents(true);
 }
 
 /// Surfaces the widget even while Diff Forge is not active, such as when a
@@ -3328,6 +3342,10 @@ fn audio_widget_resign_key_window_if_needed(
 const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 4] = [0, 120, 280, 700];
+#[cfg(target_os = "macos")]
+const MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS: u64 = 2_500;
 
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -3341,6 +3359,10 @@ static AUDIO_WIDGET_BUBBLE_HOVER_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUDIO_WIDGET_BUBBLE_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 fn register_audio_widget_space_change_observer(app: &AppHandle) {
@@ -3356,17 +3378,18 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("audio_widget_space_change_observer_callback", || {
-                        let use_full_monitor_bounds =
-                            macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+                        let strategy = audio_widget_bar_anchor_strategy_on_main_thread(&app_handle);
                         let payload = json!({
                             "source": "macos_space",
-                            "useFullMonitorBounds": use_full_monitor_bounds,
+                            "area": strategy.area,
+                            "scaleFactor": strategy.scale_factor,
+                            "strategySource": strategy.source,
+                            "useFullMonitorBounds": strategy.use_full_monitor_bounds,
                         });
-                        let _ = app_handle.emit(
-                            FLOATING_SURFACE_LAYOUT_CHANGED_EVENT,
-                            payload.clone(),
-                        );
+                        let _ =
+                            app_handle.emit(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, payload.clone());
                         let _ = app_handle.emit(AUDIO_WIDGET_SPACE_CHANGED_EVENT, payload);
+                        audio_widget_schedule_stored_bottom_bar_reposition(&app_handle);
                     });
                 },
             );
@@ -3531,11 +3554,7 @@ fn audio_widget_bar_hover_from_bottom_left(
     local_from_bottom: f64,
     active: bool,
 ) -> bool {
-    if local_x < 0.0
-        || local_from_bottom < 0.0
-        || local_x > width
-        || local_from_bottom > height
-    {
+    if local_x < 0.0 || local_from_bottom < 0.0 || local_x > width || local_from_bottom > height {
         return false;
     }
 
@@ -3558,11 +3577,7 @@ fn audio_widget_bubble_hover_from_bottom_left(
     local_from_bottom: f64,
     active: bool,
 ) -> bool {
-    if local_x < 0.0
-        || local_from_bottom < 0.0
-        || local_x > width
-        || local_from_bottom > height
-    {
+    if local_x < 0.0 || local_from_bottom < 0.0 || local_x > width || local_from_bottom > height {
         return false;
     }
 
@@ -3715,6 +3730,22 @@ fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
+fn audio_widget_reposition_stored_bottom_bar_for(app: &AppHandle, animate: bool) -> bool {
+    let Some(mut request) = audio_widget_last_bottom_bar_position_request() else {
+        return false;
+    };
+    request.animate = animate;
+    if objc2::MainThreadMarker::new().is_some() {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = audio_widget_position_bottom_bar_for(&app, request);
+        });
+        return true;
+    }
+    audio_widget_position_bottom_bar_for(app, request).is_ok()
+}
+
+#[cfg(target_os = "macos")]
 fn audio_widget_reassert_open_state(app: &AppHandle, _make_key: bool) -> bool {
     let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
         return false;
@@ -3722,9 +3753,31 @@ fn audio_widget_reassert_open_state(app: &AppHandle, _make_key: bool) -> bool {
     if !window.is_visible().unwrap_or(false) {
         return false;
     }
+    if audio_widget_reposition_stored_bottom_bar_for(app, false) {
+        return true;
+    }
     audio_widget_apply_macos_space_style(&window);
     audio_widget_order_front_regardless(&window);
     true
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
+    let generation = AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    for delay_ms in AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let _ = audio_widget_reassert_open_state(&app, false);
+        });
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4021,8 +4074,208 @@ struct AudioWidgetBarHoverSnapshot {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AudioWidgetBarAnchorPosition {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWidgetBarAnchorSize {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWidgetBarAnchorArea {
+    position: AudioWidgetBarAnchorPosition,
+    size: AudioWidgetBarAnchorSize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AudioWidgetBarAnchorStrategy {
+    area: Option<AudioWidgetBarAnchorArea>,
+    scale_factor: f64,
+    source: String,
     use_full_monitor_bounds: bool,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct AudioWidgetBottomBarPositionRequest {
+    width: f64,
+    height: f64,
+    margin: f64,
+    animate: bool,
+    use_full_monitor_bounds: Option<bool>,
+}
+
+impl Default for AudioWidgetBottomBarPositionRequest {
+    fn default() -> Self {
+        Self {
+            width: 0.0,
+            height: 0.0,
+            margin: 0.0,
+            animate: false,
+            use_full_monitor_bounds: None,
+        }
+    }
+}
+
+static AUDIO_WIDGET_BOTTOM_BAR_REQUEST: OnceLock<
+    StdMutex<Option<AudioWidgetBottomBarPositionRequest>>,
+> = OnceLock::new();
+
+fn audio_widget_bottom_bar_request_slot(
+) -> &'static StdMutex<Option<AudioWidgetBottomBarPositionRequest>> {
+    AUDIO_WIDGET_BOTTOM_BAR_REQUEST.get_or_init(|| StdMutex::new(None))
+}
+
+fn audio_widget_store_bottom_bar_position_request(request: &AudioWidgetBottomBarPositionRequest) {
+    if let Ok(mut current) = audio_widget_bottom_bar_request_slot().lock() {
+        let mut stored = request.clone();
+        stored.animate = false;
+        *current = Some(stored);
+    }
+}
+
+fn audio_widget_clear_bottom_bar_position_request() {
+    if let Ok(mut current) = audio_widget_bottom_bar_request_slot().lock() {
+        *current = None;
+    }
+}
+
+fn audio_widget_last_bottom_bar_position_request() -> Option<AudioWidgetBottomBarPositionRequest> {
+    audio_widget_bottom_bar_request_slot()
+        .lock()
+        .ok()
+        .and_then(|current| current.clone())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWidgetBottomBarPositionResult {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    anchor_x: f64,
+    anchor_y: f64,
+    anchor_width: f64,
+    anchor_height: f64,
+    scale_factor: f64,
+    source: String,
+    use_full_monitor_bounds: bool,
+}
+
+fn audio_widget_bar_anchor_strategy_from_monitor(
+    monitor: &tauri::Monitor,
+    use_full_monitor_bounds: bool,
+    source: &'static str,
+) -> AudioWidgetBarAnchorStrategy {
+    let (position, size) = if use_full_monitor_bounds {
+        (*monitor.position(), *monitor.size())
+    } else {
+        let work_area = *monitor.work_area();
+        (work_area.position, work_area.size)
+    };
+
+    AudioWidgetBarAnchorStrategy {
+        area: Some(AudioWidgetBarAnchorArea {
+            position: AudioWidgetBarAnchorPosition {
+                x: position.x,
+                y: position.y,
+            },
+            size: AudioWidgetBarAnchorSize {
+                width: size.width,
+                height: size.height,
+            },
+        }),
+        scale_factor: monitor.scale_factor(),
+        source: source.to_string(),
+        use_full_monitor_bounds,
+    }
+}
+
+fn audio_widget_bar_anchor_strategy_without_monitor(
+    use_full_monitor_bounds: bool,
+    source: &'static str,
+) -> AudioWidgetBarAnchorStrategy {
+    AudioWidgetBarAnchorStrategy {
+        area: None,
+        scale_factor: 1.0,
+        source: source.to_string(),
+        use_full_monitor_bounds,
+    }
+}
+
+fn audio_widget_bar_anchor_strategy_for_active_monitor(
+    app: &AppHandle,
+    use_full_monitor_bounds: bool,
+    source: &'static str,
+) -> AudioWidgetBarAnchorStrategy {
+    app.cursor_position()
+        .ok()
+        .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
+        .or_else(|| {
+            app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+                .and_then(|window| window.current_monitor().ok().flatten())
+        })
+        .map(|monitor| {
+            audio_widget_bar_anchor_strategy_from_monitor(&monitor, use_full_monitor_bounds, source)
+        })
+        .unwrap_or_else(|| {
+            audio_widget_bar_anchor_strategy_without_monitor(
+                use_full_monitor_bounds,
+                "monitor-unavailable",
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_macos_rect_contains_point(
+    rect: &objc2_core_foundation::CGRect,
+    point: objc2_core_foundation::CGPoint,
+) -> bool {
+    point.x >= rect.origin.x
+        && point.y >= rect.origin.y
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_macos_screen_for_mouse(
+    main_thread_marker: objc2::MainThreadMarker,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSScreen>> {
+    let mouse_location = objc2_app_kit::NSEvent::mouseLocation();
+    let screens = objc2_app_kit::NSScreen::screens(main_thread_marker);
+    for screen_index in 0..screens.count() {
+        let screen = screens.objectAtIndex(screen_index);
+        if audio_widget_macos_rect_contains_point(&screen.frame(), mouse_location) {
+            return Some(screen);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_macos_screen_for_window(
+    ns_window: &NSWindow,
+    main_thread_marker: objc2::MainThreadMarker,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSScreen>> {
+    audio_widget_macos_screen_for_mouse(main_thread_marker)
+        .or_else(|| ns_window.screen())
+        .or_else(|| objc2_app_kit::NSScreen::mainScreen(main_thread_marker))
+}
+
+fn audio_widget_positive_dimension(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 1.0 {
+        value
+    } else {
+        fallback
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4067,6 +4320,43 @@ fn audio_widget_window_bounds(
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_WINDOW_SIZE_TOLERANCE: f64 = 32.0;
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_WINDOW_MIN_DIMENSION_RATIO: f64 = 0.965;
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_WINDOW_MIN_AREA_RATIO: f64 = 0.94;
+
+#[cfg(target_os = "macos")]
+fn macos_window_bounds_cover_screen(
+    bounds: &objc2_core_foundation::CGRect,
+    frame: &objc2_core_foundation::CGRect,
+) -> bool {
+    if bounds.size.width <= 0.0
+        || bounds.size.height <= 0.0
+        || frame.size.width <= 0.0
+        || frame.size.height <= 0.0
+    {
+        return false;
+    }
+
+    let width_nearly_full =
+        bounds.size.width >= frame.size.width - MACOS_FULLSCREEN_WINDOW_SIZE_TOLERANCE;
+    let height_nearly_full =
+        bounds.size.height >= frame.size.height - MACOS_FULLSCREEN_WINDOW_SIZE_TOLERANCE;
+    if width_nearly_full && height_nearly_full {
+        return true;
+    }
+
+    let width_ratio = bounds.size.width / frame.size.width;
+    let height_ratio = bounds.size.height / frame.size.height;
+    let area_ratio =
+        (bounds.size.width * bounds.size.height) / (frame.size.width * frame.size.height);
+    width_ratio >= MACOS_FULLSCREEN_WINDOW_MIN_DIMENSION_RATIO
+        && height_ratio >= MACOS_FULLSCREEN_WINDOW_MIN_DIMENSION_RATIO
+        && area_ratio >= MACOS_FULLSCREEN_WINDOW_MIN_AREA_RATIO
+}
+
+#[cfg(target_os = "macos")]
 fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
     if current_pid <= 0 {
         return false;
@@ -4090,8 +4380,8 @@ fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
     }
 
     for window_index in 0..windows.count() {
-        let window_ref =
-            unsafe { windows.value_at_index(window_index) } as *const objc2_core_foundation::CFDictionary;
+        let window_ref = unsafe { windows.value_at_index(window_index) }
+            as *const objc2_core_foundation::CFDictionary;
         if window_ref.is_null() {
             continue;
         }
@@ -4116,9 +4406,7 @@ fn macos_other_visible_app_has_fullscreen_window(current_pid: i32) -> bool {
         for screen_index in 0..screen_count {
             let screen = screens.objectAtIndex(screen_index);
             let frame = screen.frame();
-            let width_matches = (bounds.size.width - frame.size.width).abs() <= 4.0;
-            let height_matches = (bounds.size.height - frame.size.height).abs() <= 4.0;
-            if width_matches && height_matches {
+            if macos_window_bounds_cover_screen(&bounds, &frame) {
                 return true;
             }
         }
@@ -4160,8 +4448,18 @@ fn macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread() -> bool 
         // floating above that fullscreen Space.
         use_full_monitor_bounds = macos_other_visible_app_has_fullscreen_window(current_pid);
     });
-    MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS
-        .store(use_full_monitor_bounds, Ordering::Release);
+    if use_full_monitor_bounds {
+        MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(
+            current_time_ms().saturating_add(MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS),
+            Ordering::Release,
+        );
+    } else {
+        let sticky_until = MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.load(Ordering::Acquire);
+        if sticky_until > current_time_ms() {
+            use_full_monitor_bounds = true;
+        }
+    }
+    MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS.store(use_full_monitor_bounds, Ordering::Release);
     use_full_monitor_bounds
 }
 
@@ -4172,11 +4470,7 @@ fn macos_active_space_uses_full_monitor_bounds_cached() -> bool {
 
 fn floating_surface_anchor_area_for_monitor(
     monitor: &tauri::Monitor,
-) -> (
-    tauri::PhysicalPosition<i32>,
-    tauri::PhysicalSize<u32>,
-    bool,
-) {
+) -> (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>, bool) {
     #[cfg(target_os = "macos")]
     if macos_active_space_uses_full_monitor_bounds_cached() {
         return (*monitor.position(), *monitor.size(), true);
@@ -4187,26 +4481,195 @@ fn floating_surface_anchor_area_for_monitor(
 }
 
 #[cfg(target_os = "macos")]
-fn audio_widget_bar_anchor_strategy_on_main_thread() -> AudioWidgetBarAnchorStrategy {
-    AudioWidgetBarAnchorStrategy {
-        use_full_monitor_bounds: macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread(),
-    }
+fn audio_widget_bar_anchor_strategy_on_main_thread(
+    app: &AppHandle,
+) -> AudioWidgetBarAnchorStrategy {
+    let use_full_monitor_bounds =
+        macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+    let source = if use_full_monitor_bounds {
+        "macos-fullscreen-space"
+    } else {
+        "work-area"
+    };
+
+    audio_widget_bar_anchor_strategy_for_active_monitor(app, use_full_monitor_bounds, source)
 }
 
 #[cfg(target_os = "macos")]
 fn audio_widget_bar_anchor_strategy_for(
     app: &AppHandle,
 ) -> Result<AudioWidgetBarAnchorStrategy, String> {
-    run_audio_widget_action_on_main_thread(app, "bar_anchor_strategy", |_app| {
-        Ok(audio_widget_bar_anchor_strategy_on_main_thread())
+    run_audio_widget_action_on_main_thread(app, "bar_anchor_strategy", |app| {
+        Ok(audio_widget_bar_anchor_strategy_on_main_thread(app))
     })
 }
 
 #[cfg(not(target_os = "macos"))]
 fn audio_widget_bar_anchor_strategy_for(
-    _app: &AppHandle,
+    app: &AppHandle,
 ) -> Result<AudioWidgetBarAnchorStrategy, String> {
-    Ok(AudioWidgetBarAnchorStrategy {
+    Ok(audio_widget_bar_anchor_strategy_for_active_monitor(
+        app,
+        false,
+        "work-area",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_position_bottom_bar_for(
+    app: &AppHandle,
+    request: AudioWidgetBottomBarPositionRequest,
+) -> Result<AudioWidgetBottomBarPositionResult, String> {
+    run_audio_widget_action_on_main_thread(app, "position_bottom_bar", move |app| {
+        snipping_catch_objc_result("audio_widget_position_bottom_bar", || {
+            let window = ensure_audio_widget_window(app)?;
+            let width = audio_widget_positive_dimension(request.width, 64.0);
+            let height = audio_widget_positive_dimension(request.height, 64.0);
+            let margin = if request.margin.is_finite() {
+                request.margin.max(0.0)
+            } else {
+                0.0
+            };
+            let Ok(ns_ptr) = window.ns_window() else {
+                return Err("Unable to access audio widget native window.".to_string());
+            };
+            if ns_ptr.is_null() {
+                return Err("Audio widget native window is unavailable.".to_string());
+            }
+
+            let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+            audio_widget_apply_macos_space_style_to_ns_window(ns_window);
+            if request.use_full_monitor_bounds == Some(true) {
+                MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(
+                    current_time_ms().saturating_add(MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS),
+                    Ordering::Release,
+                );
+            }
+
+            let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
+                return Err(
+                    "Audio widget AppKit placement must run on the main thread.".to_string()
+                );
+            };
+            let Some(screen) = audio_widget_macos_screen_for_window(ns_window, main_thread_marker)
+            else {
+                return Err("Unable to resolve the audio widget screen.".to_string());
+            };
+
+            let detected_full_monitor =
+                macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+            let use_full_monitor_bounds = request
+                .use_full_monitor_bounds
+                .unwrap_or(detected_full_monitor);
+            let source = if request.use_full_monitor_bounds == Some(true) {
+                "request-fullscreen-space"
+            } else if use_full_monitor_bounds {
+                "macos-fullscreen-space"
+            } else {
+                "appkit-visible-frame"
+            };
+            let anchor_frame = if use_full_monitor_bounds {
+                screen.frame()
+            } else {
+                screen.visibleFrame()
+            };
+
+            let x = (anchor_frame.origin.x + ((anchor_frame.size.width - width) / 2.0).max(0.0))
+                .round();
+            let y = (anchor_frame.origin.y + margin).round();
+            let target_frame = objc2_core_foundation::CGRect::new(
+                objc2_core_foundation::CGPoint::new(x, y),
+                objc2_core_foundation::CGSize::new(width, height),
+            );
+
+            let animate = request.animate && !use_full_monitor_bounds;
+            ns_window.setFrame_display_animate(target_frame, true, animate);
+            ns_window.orderFrontRegardless();
+
+            let frame = ns_window.frame();
+            let result = AudioWidgetBottomBarPositionResult {
+                x: frame.origin.x,
+                y: frame.origin.y,
+                width: frame.size.width,
+                height: frame.size.height,
+                anchor_x: anchor_frame.origin.x,
+                anchor_y: anchor_frame.origin.y,
+                anchor_width: anchor_frame.size.width,
+                anchor_height: anchor_frame.size.height,
+                scale_factor: screen.backingScaleFactor(),
+                source: source.to_string(),
+                use_full_monitor_bounds,
+            };
+
+            log_audio_diagnostic_event(
+                "audio.widget.position_bottom_bar.native_done",
+                json!({
+                    "x": result.x,
+                    "y": result.y,
+                    "width": result.width,
+                    "height": result.height,
+                    "anchor_x": result.anchor_x,
+                    "anchor_y": result.anchor_y,
+                    "anchor_width": result.anchor_width,
+                    "anchor_height": result.anchor_height,
+                    "scale_factor": result.scale_factor,
+                    "source": result.source,
+                    "use_full_monitor_bounds": result.use_full_monitor_bounds,
+                }),
+            );
+
+            let mut stored_request = request.clone();
+            stored_request.use_full_monitor_bounds = use_full_monitor_bounds.then_some(true);
+            audio_widget_store_bottom_bar_position_request(&stored_request);
+            Ok(result)
+        })
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_position_bottom_bar_for(
+    app: &AppHandle,
+    request: AudioWidgetBottomBarPositionRequest,
+) -> Result<AudioWidgetBottomBarPositionResult, String> {
+    let window = ensure_audio_widget_window(app)?;
+    let width = audio_widget_positive_dimension(request.width, 64.0);
+    let height = audio_widget_positive_dimension(request.height, 64.0);
+    let margin = if request.margin.is_finite() {
+        request.margin.max(0.0)
+    } else {
+        0.0
+    };
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| format!("Unable to size audio widget: {error}"))?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| format!("Unable to resolve audio widget monitor: {error}"))?
+        .ok_or_else(|| "Audio widget monitor is unavailable.".to_string())?;
+    let work_area = *monitor.work_area();
+    let scale_factor = monitor.scale_factor();
+    let x = work_area.position.x
+        + ((work_area.size.width as f64 - (width * scale_factor)) / 2.0)
+            .max(0.0)
+            .round() as i32;
+    let y = work_area.position.y + work_area.size.height as i32
+        - ((height + margin) * scale_factor).round() as i32;
+    window
+        .set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|error| format!("Unable to position audio widget: {error}"))?;
+
+    audio_widget_store_bottom_bar_position_request(&request);
+    Ok(AudioWidgetBottomBarPositionResult {
+        x: x as f64,
+        y: y as f64,
+        width,
+        height,
+        anchor_x: work_area.position.x as f64,
+        anchor_y: work_area.position.y as f64,
+        anchor_width: work_area.size.width as f64,
+        anchor_height: work_area.size.height as f64,
+        scale_factor,
+        source: "tauri-work-area".to_string(),
         use_full_monitor_bounds: false,
     })
 }
@@ -4780,11 +5243,7 @@ fn cloud_voice_agent_ws_request(
             cloud_voice_agent_header(repo_id, "repo id")?,
         );
     }
-    cloud_mcp_apply_ws_auth_headers(
-        &mut request,
-        auth_bearer,
-        ws_target.route_token.as_deref(),
-    )?;
+    cloud_mcp_apply_ws_auth_headers(&mut request, auth_bearer, ws_target.route_token.as_deref())?;
     Ok(request)
 }
 
@@ -4807,9 +5266,7 @@ fn cloud_voice_agent_route_tts_playback(payload: Value) -> Value {
                     let decoded = payload
                         .pointer("/audio/base64")
                         .and_then(Value::as_str)
-                        .and_then(|base64_text| {
-                            general_purpose::STANDARD.decode(base64_text).ok()
-                        });
+                        .and_then(|base64_text| general_purpose::STANDARD.decode(base64_text).ok());
                     if let Some(bytes) = decoded {
                         macos_voice_playback_enqueue_linear16(&bytes, sample_rate);
                         if let Some(audio) = payload.get_mut("audio") {
@@ -5133,12 +5590,10 @@ fn cloud_voice_agent_event_completes_request(payload: &Value) -> bool {
 fn cloud_voice_agent_start_ready_result(payload: &Value) -> Option<Result<(), String>> {
     match cloud_voice_agent_event_kind(payload) {
         "voice_agent_stream_started" => Some(Ok(())),
-        "voice_agent_error" => Some(Err(
-            cloud_voice_agent_error_message(payload).unwrap_or_else(|| {
-                "Cloud voice agent returned an error before the media stream was ready."
-                    .to_string()
-            }),
-        )),
+        "voice_agent_error" => Some(Err(cloud_voice_agent_error_message(payload)
+            .unwrap_or_else(|| {
+                "Cloud voice agent returned an error before the media stream was ready.".to_string()
+            }))),
         "voice_agent_finished" => Some(Err(
             "Cloud voice agent finished before the media stream was ready.".to_string(),
         )),
@@ -5705,7 +6160,8 @@ async fn run_cloud_voice_agent_stream(
 
     if peer_closed && stream_error.is_none() && !client_stop_requested && !result_received {
         stream_error = Some(
-            "Cloud voice agent connection closed before final response, plan, or error.".to_string(),
+            "Cloud voice agent connection closed before final response, plan, or error."
+                .to_string(),
         );
     }
 
@@ -5905,8 +6361,9 @@ async fn run_cloud_voice_agent_stream(
                     if let Err(error) = write.send(Message::Pong(payload)).await {
                         let error_text = error.to_string();
                         if !is_expected_cloud_voice_agent_close_error(&error_text) {
-                            stream_error =
-                                Some(format!("Unable to answer cloud voice agent ping: {error_text}"));
+                            stream_error = Some(format!(
+                                "Unable to answer cloud voice agent ping: {error_text}"
+                            ));
                         }
                         break;
                     }
@@ -6146,29 +6603,28 @@ async fn start_cloud_voice_agent_stream(
     // A freshly cached voice route (under the cache TTL) skips the serial
     // app-ws auth wait, bearer prep, device heartbeat, and balancer round
     // trip; a failed connect surfaces normally and the retry resolves fresh.
-    let (ws_target, auth_bearer) =
-        match forge_voice_route_cache_fresh(CLOUD_VOICE_AGENT_WS_PATH) {
-            Some((ws_target, auth_bearer)) => {
-                spawn_cloud_voice_agent_desktop_log(
-                    cloud_mcp_state.inner(),
-                    "voice_media_route_resolved",
-                    "ok",
-                    "Rust desktop reused the freshly cached cloud voice media websocket route.",
-                    &voice_session_id,
-                    &workspace_id,
-                    &repo_id,
-                    json!({
-                        "direct": ws_target.route_token.is_some(),
-                        "transport": ws_target.transport.clone(),
-                        "cached": true,
-                    }),
-                );
-                (ws_target, auth_bearer)
-            }
-            None => {
-                match ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state.inner()).await {
-                    Ok(()) => {
-                        spawn_cloud_voice_agent_desktop_log(
+    let (ws_target, auth_bearer) = match forge_voice_route_cache_fresh(CLOUD_VOICE_AGENT_WS_PATH) {
+        Some((ws_target, auth_bearer)) => {
+            spawn_cloud_voice_agent_desktop_log(
+                cloud_mcp_state.inner(),
+                "voice_media_route_resolved",
+                "ok",
+                "Rust desktop reused the freshly cached cloud voice media websocket route.",
+                &voice_session_id,
+                &workspace_id,
+                &repo_id,
+                json!({
+                    "direct": ws_target.route_token.is_some(),
+                    "transport": ws_target.transport.clone(),
+                    "cached": true,
+                }),
+            );
+            (ws_target, auth_bearer)
+        }
+        None => {
+            match ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state.inner()).await {
+                Ok(()) => {
+                    spawn_cloud_voice_agent_desktop_log(
                             cloud_mcp_state.inner(),
                             "app_ws_auth_ready",
                             "ok",
@@ -6178,79 +6634,77 @@ async fn start_cloud_voice_agent_stream(
                             &repo_id,
                             json!({}),
                         );
-                    }
-                    Err(error) => {
-                        spawn_cloud_voice_agent_desktop_log(
-                            cloud_mcp_state.inner(),
-                            "app_ws_auth_not_ready",
-                            "error",
-                            &error,
-                            &voice_session_id,
-                            &workspace_id,
-                            &repo_id,
-                            json!({}),
-                        );
-                        return Err(error);
-                    }
                 }
-                let auth_bearer = match cloud_mcp_authorization_bearer(cloud_mcp_state.inner())
-                    .await
-                {
-                    Ok(token) => token,
-                    Err(error) => {
-                        spawn_cloud_voice_agent_desktop_log(
-                            cloud_mcp_state.inner(),
-                            "voice_media_auth_failed",
-                            "error",
-                            &error,
-                            &voice_session_id,
-                            &workspace_id,
-                            &repo_id,
-                            json!({}),
-                        );
-                        return Err(error);
-                    }
-                };
-                let ws_target = match cloud_mcp_resolve_ws_target(
-                    cloud_mcp_state.inner(),
-                    &cloud_mcp_base_url(),
-                    CLOUD_VOICE_AGENT_WS_PATH,
-                )
-                .await
-                {
-                    Ok(target) => target,
-                    Err(error) => {
-                        let message = format!("Cloud voice route unavailable: {error}");
-                        spawn_cloud_voice_agent_desktop_log(
-                            cloud_mcp_state.inner(),
-                            "voice_media_route_resolved",
-                            "error",
-                            &message,
-                            &voice_session_id,
-                            &workspace_id,
-                            &repo_id,
-                            json!({}),
-                        );
-                        return Err(message);
-                    }
-                };
-                forge_voice_route_cache_store(CLOUD_VOICE_AGENT_WS_PATH, &ws_target, &auth_bearer);
-                spawn_cloud_voice_agent_desktop_log(
-                    cloud_mcp_state.inner(),
-                    "voice_media_route_resolved",
-                    "ok",
-                    "Rust desktop resolved the dedicated cloud voice media websocket route.",
-                    &voice_session_id,
-                    &workspace_id,
-                    &repo_id,
-                    json!({
-                        "direct": ws_target.route_token.is_some(),
-                        "transport": ws_target.transport.clone(),
-                    }),
-                );
-                (ws_target, auth_bearer)
+                Err(error) => {
+                    spawn_cloud_voice_agent_desktop_log(
+                        cloud_mcp_state.inner(),
+                        "app_ws_auth_not_ready",
+                        "error",
+                        &error,
+                        &voice_session_id,
+                        &workspace_id,
+                        &repo_id,
+                        json!({}),
+                    );
+                    return Err(error);
+                }
             }
-        };
+            let auth_bearer = match cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await {
+                Ok(token) => token,
+                Err(error) => {
+                    spawn_cloud_voice_agent_desktop_log(
+                        cloud_mcp_state.inner(),
+                        "voice_media_auth_failed",
+                        "error",
+                        &error,
+                        &voice_session_id,
+                        &workspace_id,
+                        &repo_id,
+                        json!({}),
+                    );
+                    return Err(error);
+                }
+            };
+            let ws_target = match cloud_mcp_resolve_ws_target(
+                cloud_mcp_state.inner(),
+                &cloud_mcp_base_url(),
+                CLOUD_VOICE_AGENT_WS_PATH,
+            )
+            .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    let message = format!("Cloud voice route unavailable: {error}");
+                    spawn_cloud_voice_agent_desktop_log(
+                        cloud_mcp_state.inner(),
+                        "voice_media_route_resolved",
+                        "error",
+                        &message,
+                        &voice_session_id,
+                        &workspace_id,
+                        &repo_id,
+                        json!({}),
+                    );
+                    return Err(message);
+                }
+            };
+            forge_voice_route_cache_store(CLOUD_VOICE_AGENT_WS_PATH, &ws_target, &auth_bearer);
+            spawn_cloud_voice_agent_desktop_log(
+                cloud_mcp_state.inner(),
+                "voice_media_route_resolved",
+                "ok",
+                "Rust desktop resolved the dedicated cloud voice media websocket route.",
+                &voice_session_id,
+                &workspace_id,
+                &repo_id,
+                json!({
+                    "direct": ws_target.route_token.is_some(),
+                    "transport": ws_target.transport.clone(),
+                }),
+            );
+            (ws_target, auth_bearer)
+        }
+    };
 
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -6453,7 +6907,8 @@ async fn start_cloud_voice_agent_stream(
         )),
         Err(_elapsed) => Some((
             "start_ready_timeout",
-            "Cloud voice agent did not acknowledge the voice media websocket start request.".to_string(),
+            "Cloud voice agent did not acknowledge the voice media websocket start request."
+                .to_string(),
             json!({
                 "timeout_secs": CLOUD_VOICE_AGENT_STREAM_START_TIMEOUT_SECS,
             }),
@@ -6609,7 +7064,10 @@ async fn set_cloud_voice_agent_input_enabled(
             }))
         }
         RealtimeMicHolder::None => {
-            match audio_state.input_worker.attach_realtime_stream_silent(audio_tx) {
+            match audio_state
+                .input_worker
+                .attach_realtime_stream_silent(audio_tx)
+            {
                 Ok(_) => {
                     realtime_mic_holder_set(&audio_state, RealtimeMicHolder::VoiceAgent);
                     audio_state
@@ -6899,15 +7357,16 @@ async fn run_deepgram_realtime_stream(
 ) {
     let started_at = Instant::now();
     let keyterms = voice_dictionary_bias_terms(&app);
-    let mut request = match deepgram_realtime_url(&language, sample_rate, &keyterms).into_client_request() {
-        Ok(request) => request,
-        Err(error) => {
-            let message = format!("Unable to prepare Deepgram realtime stream: {error}");
-            let _ = ready_tx.send(Err(message.clone()));
-            let _ = finished_tx.send(Err(message));
-            return;
-        }
-    };
+    let mut request =
+        match deepgram_realtime_url(&language, sample_rate, &keyterms).into_client_request() {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!("Unable to prepare Deepgram realtime stream: {error}");
+                let _ = ready_tx.send(Err(message.clone()));
+                let _ = finished_tx.send(Err(message));
+                return;
+            }
+        };
     let auth_header = match HeaderValue::from_str(&format!("Token {api_key}")) {
         Ok(header) => header,
         Err(error) => {
@@ -7310,7 +7769,10 @@ fn audio_transcription_polish_source_text(
     match audio_transcription_polish_clipboard_text() {
         Ok(clipboard_text) if !clipboard_text.trim().is_empty() => Ok(clipboard_text),
         Ok(_) if !fallback_text.is_empty() => Ok(fallback_text),
-        Ok(_) => Err("Clipboard does not contain text to polish, and there is no recent transcript.".to_string()),
+        Ok(_) => Err(
+            "Clipboard does not contain text to polish, and there is no recent transcript."
+                .to_string(),
+        ),
         Err(_) if !fallback_text.is_empty() => Ok(fallback_text),
         Err(_) => Err(
             "Clipboard does not contain text to polish, and there is no recent transcript."
@@ -7348,7 +7810,11 @@ fn forge_dictation_result_from_payload(
     }
 
     Ok(ForgeDictationResult {
-        text: if text.is_empty() { raw_text.clone() } else { text },
+        text: if text.is_empty() {
+            raw_text.clone()
+        } else {
+            text
+        },
         raw_text,
         cancelled: payload
             .get("cancelled")
@@ -7383,7 +7849,9 @@ async fn resolve_forge_dictation_cloud_route(
         .await
         .map(|_| ())
         .map_err(|error| {
-            format!("Diff Forge Cloud dictation needs the signed-in Diff Forge AI connection. {error}")
+            format!(
+                "Diff Forge Cloud dictation needs the signed-in Diff Forge AI connection. {error}"
+            )
         })?;
     let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state).await?;
     let ws_target = cloud_mcp_resolve_ws_target(
@@ -7405,15 +7873,14 @@ async fn resolve_forge_voice_http_url(
         .await
         .map(|_| ())
         .map_err(|error| {
-            format!("Diff Forge Cloud audio tools need the signed-in Diff Forge AI connection. {error}")
+            format!(
+                "Diff Forge Cloud audio tools need the signed-in Diff Forge AI connection. {error}"
+            )
         })?;
-    let ws_target = cloud_mcp_resolve_ws_target(
-        cloud_mcp_state,
-        &cloud_mcp_base_url(),
-        endpoint_path,
-    )
-    .await
-    .map_err(|error| format!("Cloud audio route unavailable: {error}"))?;
+    let ws_target =
+        cloud_mcp_resolve_ws_target(cloud_mcp_state, &cloud_mcp_base_url(), endpoint_path)
+            .await
+            .map_err(|error| format!("Cloud audio route unavailable: {error}"))?;
     let url = cloud_mcp_http_url_from_ws_url(&ws_target.ws_url)
         .ok_or_else(|| "Cloud audio direct route URL is invalid.".to_string())?;
     Ok(cloud_mcp_http_url_with_route_token(
@@ -7505,8 +7972,8 @@ async fn polish_audio_transcription(
         }
     })?;
     let keyterms = voice_dictionary_bias_terms(&app);
-    let url = resolve_forge_voice_http_url(cloud_mcp_state.inner(), CLOUD_DICTATION_POLISH_PATH)
-        .await?;
+    let url =
+        resolve_forge_voice_http_url(cloud_mcp_state.inner(), CLOUD_DICTATION_POLISH_PATH).await?;
     let headers = forge_audio_cloud_http_headers(cloud_mcp_state.inner()).await?;
     let payload = json!({
         "text": text,
@@ -7518,7 +7985,9 @@ async fn polish_audio_transcription(
         .json(&payload)
         .send()
         .await
-        .map_err(|error| format!("Unable to polish transcript through Diff Forge Cloud: {error}"))?;
+        .map_err(|error| {
+            format!("Unable to polish transcript through Diff Forge Cloud: {error}")
+        })?;
     let status = response.status();
     let body = response
         .json::<Value>()
@@ -7530,7 +7999,9 @@ async fn polish_audio_transcription(
             .or_else(|| body.get("error"))
             .and_then(Value::as_str)
             .unwrap_or("Cloud transcript polish failed.");
-        return Err(format!("Cloud transcript polish failed ({status}): {message}"));
+        return Err(format!(
+            "Cloud transcript polish failed ({status}): {message}"
+        ));
     }
 
     let data = body.get("data").unwrap_or(&body);
@@ -7993,8 +8464,13 @@ async fn park_forge_dictation_warm_socket(
         oneshot::channel::<oneshot::Sender<Option<ForgeDictationWsStream>>>();
     {
         let mut slot_guard = audio_state.forge_dictation_warm.lock().await;
-        if !audio_state.forge_dictation_warm_desired.load(Ordering::SeqCst)
-            || audio_state.forge_dictation_warm_generation.load(Ordering::SeqCst) != generation
+        if !audio_state
+            .forge_dictation_warm_desired
+            .load(Ordering::SeqCst)
+            || audio_state
+                .forge_dictation_warm_generation
+                .load(Ordering::SeqCst)
+                != generation
         {
             drop(slot_guard);
             let _ = stream.close(None).await;
@@ -8067,8 +8543,13 @@ fn spawn_forge_dictation_warm_loop(app: AppHandle, generation: u64) {
         let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
         let mut retry_delay_ms = CLOUD_DICTATION_WARM_RETRY_MIN_MS;
         loop {
-            if !audio_state.forge_dictation_warm_desired.load(Ordering::SeqCst)
-                || audio_state.forge_dictation_warm_generation.load(Ordering::SeqCst) != generation
+            if !audio_state
+                .forge_dictation_warm_desired
+                .load(Ordering::SeqCst)
+                || audio_state
+                    .forge_dictation_warm_generation
+                    .load(Ordering::SeqCst)
+                    != generation
             {
                 return;
             }
@@ -8325,7 +8806,12 @@ async fn start_forge_dictation_transcription(
         finished_tx,
     ));
 
-    match timeout(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS), ready_rx).await {
+    match timeout(
+        Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS),
+        ready_rx,
+    )
+    .await
+    {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
             forge_dictation_release_mic(&app_handle, &audio_state).await;
@@ -8451,6 +8937,20 @@ async fn audio_widget_bar_anchor_strategy(
     app: AppHandle,
 ) -> Result<AudioWidgetBarAnchorStrategy, String> {
     audio_widget_bar_anchor_strategy_for(&app)
+}
+
+#[tauri::command]
+async fn audio_widget_position_bottom_bar(
+    app: AppHandle,
+    request: AudioWidgetBottomBarPositionRequest,
+) -> Result<AudioWidgetBottomBarPositionResult, String> {
+    audio_widget_position_bottom_bar_for(&app, request)
+}
+
+#[tauri::command]
+async fn audio_widget_clear_bottom_bar_position() -> Result<(), String> {
+    audio_widget_clear_bottom_bar_position_request();
+    Ok(())
 }
 
 #[tauri::command]
@@ -8734,13 +9234,18 @@ fn hyperframe_transcribe_with_whisper(
     let output = output_base.display().to_string();
     let threads = whisper_cli_thread_count().to_string();
     let args = [
-        "-m", model.as_str(),
-        "-f", audio.as_str(),
-        "-l", language.as_str(),
-        "-t", threads.as_str(),
+        "-m",
+        model.as_str(),
+        "-f",
+        audio.as_str(),
+        "-l",
+        language.as_str(),
+        "-t",
+        threads.as_str(),
         "-np",
         "-oj",
-        "-of", output.as_str(),
+        "-of",
+        output.as_str(),
     ];
     let capture = run_command_capture(
         &runtime,
@@ -8772,10 +9277,12 @@ fn hyperframe_transcribe_with_whisper(
                         if text.is_empty() {
                             return None;
                         }
-                        let from_ms =
-                            hyperframe_transcript_number(entry.pointer("/offsets/from").unwrap_or(&Value::Null));
-                        let to_ms =
-                            hyperframe_transcript_number(entry.pointer("/offsets/to").unwrap_or(&Value::Null));
+                        let from_ms = hyperframe_transcript_number(
+                            entry.pointer("/offsets/from").unwrap_or(&Value::Null),
+                        );
+                        let to_ms = hyperframe_transcript_number(
+                            entry.pointer("/offsets/to").unwrap_or(&Value::Null),
+                        );
                         Some(json!({
                             "end": to_ms / 1000.0,
                             "start": from_ms / 1000.0,

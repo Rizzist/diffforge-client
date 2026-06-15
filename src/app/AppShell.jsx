@@ -399,7 +399,9 @@ import {
   NetworkingStatusDot,
   NetworkingRowMain,
   NetworkingCategoryTopline,
+  NetworkingCategoryStats,
   NetworkingCategoryCount,
+  NetworkingProgressValue,
   NetworkingCategoryMeter,
   NetworkingMeta,
   NetworkingEmpty,
@@ -655,7 +657,7 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 ]);
 const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
 const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
-const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 450;
+const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 250;
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -1161,7 +1163,6 @@ const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
 const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
-const WORKSPACE_COORDINATION_TARGETS_STORAGE_KEY = "diffforge.workspaceCoordinationTargets.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_THEME_DARK = "dark";
 const APP_THEME_LIGHT = "light";
@@ -1219,6 +1220,7 @@ const REMOTE_TERMINAL_WINDOW_EVENT = "diffforge:remote-terminal-window";
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
+const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
@@ -2413,6 +2415,10 @@ const CLOUD_DEVICE_ALIAS_KEYS = [
   "nativeDeviceId",
   "desktop_device_id",
   "desktopDeviceId",
+  "target_device_id",
+  "targetDeviceId",
+  "target_native_device_id",
+  "targetNativeDeviceId",
   "web_device_id",
   "webDeviceId",
   "web_presence_device_id",
@@ -2485,6 +2491,193 @@ function cloudDeviceAliasList(device, primaryId = "") {
   return Array.from(aliases);
 }
 
+function uniqueCloudDeviceAliases(...aliasLists) {
+  return cloudDeviceAliasList({ deviceAliases: aliasLists }, "");
+}
+
+function cloudDeviceAliasesIntersect(left = [], right = []) {
+  const rightSet = new Set(uniqueCloudDeviceAliases(right));
+  return uniqueCloudDeviceAliases(left).some((alias) => rightSet.has(alias));
+}
+
+function firstCloudDeviceObject(...values) {
+  return values.find((value) => value && typeof value === "object" && !Array.isArray(value)) || {};
+}
+
+function collectCloudDeviceIdsFromValue(value, ids = new Set()) {
+  if (!value) {
+    return ids;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectCloudDeviceIdsFromValue(item, ids));
+    return ids;
+  }
+  if (typeof value === "object") {
+    cloudDeviceAliasList(value).forEach((id) => ids.add(id));
+    return ids;
+  }
+  const id = safeCloudMcpText(String(value), "").toLowerCase();
+  if (id) {
+    ids.add(id);
+  }
+  return ids;
+}
+
+function cloudDeviceConnectionSummaryFromSnapshot(root, snapshotRoot = root) {
+  return firstCloudDeviceObject(
+    snapshotRoot?.client_connection,
+    snapshotRoot?.clientConnection,
+    snapshotRoot?.connection_summary,
+    snapshotRoot?.connectionSummary,
+    root?.client_connection,
+    root?.clientConnection,
+    root?.connection_summary,
+    root?.connectionSummary,
+  );
+}
+
+function cloudDeviceConnectionOverlayFromSnapshot(root, snapshotRoot = root) {
+  const summary = cloudDeviceConnectionSummaryFromSnapshot(root, snapshotRoot);
+  const activeNativeIds = collectCloudDeviceIdsFromValue([
+    summary.active_desktop_device_ids,
+    summary.activeDesktopDeviceIds,
+    summary.active_native_device_ids,
+    summary.activeNativeDeviceIds,
+    summary.active_desktop_devices,
+    summary.activeDesktopDevices,
+    summary.active_native_devices,
+    summary.activeNativeDevices,
+  ]);
+  const activeWebTargetIds = collectCloudDeviceIdsFromValue([
+    summary.active_web_target_device_ids,
+    summary.activeWebTargetDeviceIds,
+  ]);
+  safeCloudMcpArray(summary.active_web_devices || summary.activeWebDevices).forEach((device) => {
+    collectCloudDeviceIdsFromValue(
+      device?.target_device_id
+        || device?.targetDeviceId
+        || device?.target_native_device_id
+        || device?.targetNativeDeviceId,
+      activeWebTargetIds,
+    );
+  });
+  return {
+    activeNativeIds,
+    activeWebTargetIds,
+  };
+}
+
+function applyCloudDeviceConnectionOverlay(candidates, overlay = {}) {
+  const activeNativeIds = overlay.activeNativeIds || new Set();
+  const activeWebTargetIds = overlay.activeWebTargetIds || new Set();
+  if (!activeNativeIds.size && !activeWebTargetIds.size) {
+    return candidates;
+  }
+  return candidates.map((candidate) => {
+    if (!candidate || typeof candidate !== "object") {
+      return candidate;
+    }
+    const aliases = cloudDeviceAliasList(candidate);
+    const nativeOverlayActive = aliases.some((id) => activeNativeIds.has(id));
+    const webOverlayActive = aliases.some((id) => activeWebTargetIds.has(id));
+    if (!nativeOverlayActive && !webOverlayActive) {
+      return candidate;
+    }
+    return {
+      ...candidate,
+      connected: true,
+      native_connected: nativeOverlayActive ? true : candidate.native_connected,
+      nativeConnected: nativeOverlayActive ? true : candidate.nativeConnected,
+      status: nativeOverlayActive || webOverlayActive ? "connected" : candidate.status,
+      web_connected: webOverlayActive ? true : candidate.web_connected,
+      webConnected: webOverlayActive ? true : candidate.webConnected,
+    };
+  });
+}
+
+function cloudDeviceObjectHasEntries(value) {
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  return Boolean(value && typeof value === "object" && Object.keys(value).length > 0);
+}
+
+function cloudDeviceIdLooksWebOnly(value) {
+  const id = safeCloudMcpText(String(value || ""), "").toLowerCase();
+  return !id || id === "dashboard-web" || id.startsWith("web-") || id.startsWith("browser-");
+}
+
+function cloudDeviceHasNativeAnchor(device = {}) {
+  const web = device.webPresence || device.web_presence || cloudDeviceSurfaceRecord(device, "web");
+  const nativeSurface = cloudDeviceSurfaceRecord(device, "native");
+  const nativeIds = [
+    device.deviceId,
+    device.device_id,
+    device.machineId,
+    device.machine_id,
+    device.nativeDeviceId,
+    device.native_device_id,
+    device.desktopDeviceId,
+    device.desktop_device_id,
+    device.targetNativeDeviceId,
+    device.target_native_device_id,
+    web?.nativeDeviceId,
+    web?.native_device_id,
+    nativeSurface?.deviceId,
+    nativeSurface?.device_id,
+    nativeSurface?.machineId,
+    nativeSurface?.machine_id,
+  ].map((value) => safeCloudMcpText(String(value || ""), "").toLowerCase()).filter(Boolean);
+  const platformAndForm = [
+    device.platform,
+    device.os,
+    device.form_factor,
+    device.formFactor,
+    device.device_type,
+    device.deviceType,
+    web?.web_platform,
+    web?.webPlatform,
+    web?.web_form_factor,
+    web?.webFormFactor,
+  ].map(normalizeCloudDeviceText).join(" ");
+  const clientKind = [
+    device.client_kind,
+    device.clientKind,
+    device.client_type,
+    device.clientType,
+    device.connection_source,
+    device.connectionSource,
+    device.source,
+    nativeSurface?.client_kind,
+    nativeSurface?.clientKind,
+    nativeSurface?.client_type,
+    nativeSurface?.clientType,
+    nativeSurface?.source,
+  ].map(normalizeCloudDeviceText).join(" ");
+  const mobileLike = ["mobile", "phone", "tablet", "android", "ios", "iphone", "ipad"]
+    .some((token) => platformAndForm.includes(token));
+  const webLike = clientKind.includes("web")
+    || clientKind.includes("browser")
+    || clientKind.includes("dashboard")
+    || clientKind.includes("next-diffforge");
+  const nativeFlag = (cloudDeviceBoolFromKeys(
+    device,
+    ["native_connected", "nativeConnected", "native_online", "nativeOnline", "native_active", "nativeActive"],
+  ) ?? cloudDeviceBoolFromKeys(nativeSurface, ["connected", "active", "online", "open", "status", "state"])) === true;
+  const nativeLike = ["native", "desktop", "tauri", "rust"].some((token) => clientKind.includes(token));
+  const workspaceCount = Number(device.workspace_count ?? device.workspaceCount ?? 0) || 0;
+  const hasWorkspaces = workspaceCount > 0
+    || cloudDeviceObjectHasEntries(device.workspaces)
+    || cloudDeviceObjectHasEntries(device.workspace_catalog || device.workspaceCatalog)
+    || cloudDeviceObjectHasEntries(device.workspace_states || device.workspaceStates);
+  const hasNativeId = nativeIds.some((id) => !cloudDeviceIdLooksWebOnly(id));
+  return Boolean(
+    !mobileLike
+      && (hasNativeId || hasWorkspaces)
+      && (!webLike || nativeFlag || nativeLike || hasWorkspaces)
+  );
+}
+
 function cloudDevicePlatformLabel(platform) {
   const normalized = normalizeCloudDeviceText(platform);
   if (normalized.includes("mac") || normalized.includes("darwin")) return "macOS";
@@ -2550,6 +2743,12 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
     return null;
   }
   const includeOffline = Boolean(options.includeOffline);
+  const registered = Boolean(
+    options.registered
+      || device.registered
+      || device.registeredDevice
+      || device.registered_device
+  );
   const deviceId = safeCloudMcpText(
     device.device_id || device.deviceId || device.machine_id || device.machineId || device.id,
     "",
@@ -2589,29 +2788,41 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
   const nativeSurface = cloudDeviceSurfaceRecord(device, "native");
   const webSurface = cloudDeviceSurfaceRecord(device, "web");
   const webPresence = device.webPresence || device.web_presence || webSurface;
-  const sourceText = normalizeCloudDeviceText(
-    device.client_kind
-      || device.clientKind
-      || device.client_type
-      || device.clientType
-      || device.connection_source
-      || device.connectionSource
-      || device.source
-      || "",
-  );
-  const webLike = ["web", "browser", "next-dashboard"].some((token) => sourceText.includes(token));
-  const nativeConnected = cloudDeviceBoolFromKeys(
+  const webKindText = [
+    device.client_kind,
+    device.clientKind,
+    device.client_type,
+    device.clientType,
+    device.connection_source,
+    device.connectionSource,
+    device.source,
+    webPresence?.client_kind,
+    webPresence?.clientKind,
+    webPresence?.source,
+    webSurface?.client_kind,
+    webSurface?.clientKind,
+    webSurface?.source,
+  ].map(normalizeCloudDeviceText).join(" ");
+  const nativeConnectedFromServer = cloudDeviceBoolFromKeys(
     device,
     ["native_connected", "nativeConnected", "native_online", "nativeOnline", "native_active", "nativeActive"],
   ) ?? cloudDeviceBoolFromKeys(nativeSurface, ["connected", "active", "online", "open", "status", "state"])
-    ?? (webLike ? false : genericConnected);
-  const webConnected = cloudDeviceBoolFromKeys(
+    ?? null;
+  const webConnectedFromServer = cloudDeviceBoolFromKeys(
     device,
     ["web_connected", "webConnected", "web_active", "webActive", "web_open", "webOpen", "web_online", "webOnline"],
   ) ?? cloudDeviceBoolFromKeys(webPresence, ["connected", "active", "online", "open", "status", "state"])
     ?? cloudDeviceBoolFromKeys(webSurface, ["connected", "active", "online", "open", "status", "state"])
-    ?? false;
-  const connected = Boolean(nativeConnected || webConnected || genericConnected);
+    ?? (webKindText.includes("web") || webKindText.includes("browser") || webKindText.includes("dashboard") || webKindText.includes("next-diffforge")
+      ? cloudDeviceBoolFromKeys(device, ["connected", "online", "live", "active", "status", "state"])
+      : null)
+    ?? null;
+  const hasSurfaceConnectionState = nativeConnectedFromServer !== null || webConnectedFromServer !== null;
+  const nativeConnected = nativeConnectedFromServer === true;
+  const webConnected = webConnectedFromServer === true;
+  const connected = hasSurfaceConnectionState
+    ? Boolean(nativeConnected || webConnected)
+    : Boolean(genericConnected);
   if (!connected && !includeOffline) {
     return null;
   }
@@ -2622,7 +2833,13 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
   );
   const icon = cloudDevicePlatformIcon(device);
   const deviceAliases = cloudDeviceAliasList(device, deviceId);
+  const webOnly = Boolean(
+    (webKindText.includes("web") || webKindText.includes("browser") || webKindText.includes("dashboard") || webKindText.includes("next-diffforge"))
+      && !cloudDeviceHasNativeAnchor(device)
+  );
   return {
+    client_kind: device.client_kind || device.clientKind || device.client_type || device.clientType || "",
+    clientKind: device.clientKind || device.client_kind || device.clientType || device.client_type || "",
     connected,
     deviceAliases,
     device_aliases: deviceAliases,
@@ -2642,10 +2859,243 @@ function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
       device.platform_label || device.platformLabel,
       "",
     ) || cloudDevicePlatformLabel(platform),
+    registered,
+    source: device.source || device.connection_source || device.connectionSource || "",
     status: connected ? "connected" : "offline",
+    targetDeviceId: device.targetDeviceId || device.target_device_id || device.targetNativeDeviceId || device.target_native_device_id || "",
+    target_device_id: device.target_device_id || device.targetDeviceId || device.target_native_device_id || device.targetNativeDeviceId || "",
+    webOnly,
     webConnected,
     web_connected: webConnected,
+    webPresence,
+    web_presence: webPresence,
   };
+}
+
+function cloudDeviceNameIsGeneric(name) {
+  const normalized = String(name || "").trim().toLowerCase();
+  return (
+    !normalized
+    || normalized === "this device"
+    || normalized === "diff forge client"
+    || /^device \d+$/i.test(normalized)
+  );
+}
+
+function cloudDeviceKeyShouldMigrate(candidateId, currentId, previous = null, next = null) {
+  const safeCandidateId = safeCloudMcpText(String(candidateId || ""), "").toLowerCase();
+  const safeCurrentId = safeCloudMcpText(String(currentId || ""), "").toLowerCase();
+  if (!safeCandidateId || !safeCurrentId || safeCandidateId === safeCurrentId) {
+    return false;
+  }
+  if (cloudDeviceIdLooksWebOnly(safeCurrentId) && !cloudDeviceIdLooksWebOnly(safeCandidateId)) {
+    return true;
+  }
+  return Boolean(previous?.webOnly && !next?.webOnly && !cloudDeviceIdLooksWebOnly(safeCandidateId));
+}
+
+function findCloudDeviceKeyByAliases(devicesById, aliases = []) {
+  const aliasList = uniqueCloudDeviceAliases(aliases);
+  if (!aliasList.length) {
+    return "";
+  }
+  for (const [deviceId, device] of devicesById.entries()) {
+    if (aliasList.includes(deviceId) || cloudDeviceAliasesIntersect(device.deviceAliases || device.device_aliases, aliasList)) {
+      return deviceId;
+    }
+  }
+  return "";
+}
+
+function mergeCloudConnectedDevice(previous, next) {
+  if (!previous) {
+    const aliases = uniqueCloudDeviceAliases(next?.deviceAliases, next?.device_aliases, next?.deviceId);
+    return {
+      ...next,
+      deviceAliases: aliases,
+      device_aliases: aliases,
+      webOnly: Boolean(next?.webOnly),
+    };
+  }
+  const nextIsWebOverlay = Boolean(next.webOnly && previous.webOnly !== true);
+  const nextIsCanonicalIdentity = Boolean(previous.webOnly && !next.webOnly);
+  const previousNameUseful = !cloudDeviceNameIsGeneric(previous.displayName);
+  const nextNameUseful = !cloudDeviceNameIsGeneric(next.displayName);
+  const nativeConnected = Boolean(previous.nativeConnected || next.nativeConnected);
+  const webConnected = Boolean(previous.webConnected || next.webConnected);
+  const connected = Boolean(previous.connected || next.connected || nativeConnected || webConnected);
+  const aliases = uniqueCloudDeviceAliases(
+    previous.deviceAliases,
+    previous.device_aliases,
+    previous.deviceId,
+    next.deviceAliases,
+    next.device_aliases,
+    next.deviceId,
+  );
+  return {
+    ...previous,
+    ...next,
+    connected,
+    deviceAliases: aliases,
+    device_aliases: aliases,
+    client_kind: nextIsWebOverlay ? previous.client_kind || previous.clientKind || "" : next.client_kind || previous.client_kind || "",
+    clientKind: nextIsWebOverlay ? previous.clientKind || previous.client_kind || "" : next.clientKind || previous.clientKind || "",
+    displayName: !nextIsWebOverlay && nextNameUseful && !previousNameUseful
+      ? next.displayName
+      : previous.displayName || next.displayName,
+    formFactor: nextIsCanonicalIdentity
+      ? next.formFactor || previous.formFactor || ""
+      : nextIsWebOverlay ? previous.formFactor || "" : previous.formFactor || next.formFactor || "",
+    formFactorLabel: nextIsCanonicalIdentity
+      ? next.formFactorLabel || previous.formFactorLabel || ""
+      : nextIsWebOverlay ? previous.formFactorLabel || "" : previous.formFactorLabel || next.formFactorLabel || "",
+    icon: nextIsCanonicalIdentity
+      ? next.icon || previous.icon || ""
+      : nextIsWebOverlay ? previous.icon || "" : previous.icon || next.icon || "",
+    nativeConnected,
+    native_connected: nativeConnected,
+    platform: nextIsCanonicalIdentity
+      ? next.platform || previous.platform || ""
+      : nextIsWebOverlay ? previous.platform || "" : previous.platform || next.platform || "",
+    platformIcon: nextIsCanonicalIdentity
+      ? next.platformIcon || previous.platformIcon || ""
+      : nextIsWebOverlay ? previous.platformIcon || "" : previous.platformIcon || next.platformIcon || "",
+    platformLabel: nextIsCanonicalIdentity
+      ? next.platformLabel || previous.platformLabel || ""
+      : nextIsWebOverlay ? previous.platformLabel || "" : previous.platformLabel || next.platformLabel || "",
+    source: nextIsWebOverlay ? previous.source || "" : next.source || previous.source || "",
+    status: connected ? "connected" : "offline",
+    registered: Boolean(previous.registered || next.registered),
+    webConnected,
+    web_connected: webConnected,
+    webOnly: Boolean(previous.webOnly && next.webOnly),
+  };
+}
+
+function upsertCloudConnectedDevice(devicesById, device) {
+  if (!device?.deviceId) {
+    return "";
+  }
+  const aliases = uniqueCloudDeviceAliases(device.deviceAliases, device.device_aliases, device.deviceId);
+  const existingKey = findCloudDeviceKeyByAliases(devicesById, aliases);
+  const currentKey = existingKey || device.deviceId;
+  const previous = devicesById.get(currentKey) || null;
+  const preferredKey = cloudDeviceKeyShouldMigrate(device.deviceId, currentKey, previous, device)
+    ? device.deviceId
+    : currentKey;
+  const merged = mergeCloudConnectedDevice(previous, {
+    ...device,
+    deviceAliases: aliases,
+    device_aliases: aliases,
+    deviceId: preferredKey,
+  });
+  const mergedAliases = uniqueCloudDeviceAliases(merged.deviceAliases, aliases, currentKey, preferredKey);
+  if (preferredKey !== currentKey) {
+    devicesById.delete(currentKey);
+  }
+  devicesById.set(preferredKey, {
+    ...merged,
+    deviceAliases: mergedAliases,
+    device_aliases: mergedAliases,
+    deviceId: preferredKey,
+  });
+  return preferredKey;
+}
+
+function foldCloudWebOnlyDeviceRows(devicesById) {
+  const entries = Array.from(devicesById.entries());
+  const canonicalEntries = entries.filter(([, device]) => (
+    device
+    && device.webOnly !== true
+    && !cloudDeviceIdLooksWebOnly(device.deviceId)
+  ));
+  if (!canonicalEntries.length) {
+    return;
+  }
+  const hasRegisteredInventory = canonicalEntries.some(([, device]) => device?.registered);
+  const canonicalWithWeb = canonicalEntries.filter(([, device]) => device.webConnected === true);
+  entries.forEach(([deviceId, device]) => {
+    if (!device?.webOnly) {
+      return;
+    }
+    const targetEntry = canonicalEntries.find(([, candidate]) => (
+      cloudDeviceAliasesIntersect(candidate.deviceAliases || candidate.device_aliases, device.deviceAliases || device.device_aliases)
+    )) || (canonicalWithWeb.length === 1
+      ? canonicalWithWeb[0]
+      : (!hasRegisteredInventory && canonicalEntries.length === 1)
+        ? canonicalEntries[0]
+        : null);
+    if (!targetEntry) {
+      if (cloudDeviceNameIsGeneric(device.displayName)) {
+        devicesById.delete(deviceId);
+      }
+      return;
+    }
+    const [targetDeviceId, targetDevice] = targetEntry;
+    const currentTargetDevice = devicesById.get(targetDeviceId) || targetDevice;
+    const merged = mergeCloudConnectedDevice(currentTargetDevice, {
+      ...device,
+      deviceId: targetDeviceId,
+      client_kind: currentTargetDevice.client_kind,
+      clientKind: currentTargetDevice.clientKind,
+      displayName: currentTargetDevice.displayName,
+      formFactor: currentTargetDevice.formFactor,
+      formFactorLabel: currentTargetDevice.formFactorLabel,
+      icon: currentTargetDevice.icon,
+      nativeConnected: currentTargetDevice.nativeConnected,
+      native_connected: currentTargetDevice.nativeConnected,
+      platform: currentTargetDevice.platform,
+      platformIcon: currentTargetDevice.platformIcon,
+      platformLabel: currentTargetDevice.platformLabel,
+      source: currentTargetDevice.source,
+      webOnly: false,
+    });
+    const aliases = uniqueCloudDeviceAliases(merged.deviceAliases, currentTargetDevice.deviceAliases, device.deviceAliases, targetDeviceId, deviceId);
+    devicesById.set(targetDeviceId, {
+      ...merged,
+      deviceAliases: aliases,
+      device_aliases: aliases,
+      deviceId: targetDeviceId,
+      displayName: currentTargetDevice.displayName || merged.displayName,
+      webOnly: false,
+    });
+    devicesById.delete(deviceId);
+  });
+}
+
+function pruneCloudRowsToRegisteredInventory(devicesById) {
+  const registeredEntries = Array.from(devicesById.entries())
+    .filter(([, device]) => device?.registered);
+  if (!registeredEntries.length) {
+    return;
+  }
+  Array.from(devicesById.entries()).forEach(([deviceId, device]) => {
+    if (device?.registered) {
+      return;
+    }
+    const targetEntry = registeredEntries.find(([registeredId, registeredDevice]) => (
+      registeredId !== deviceId
+        && cloudDeviceAliasesIntersect(registeredDevice.deviceAliases || registeredDevice.device_aliases, device.deviceAliases || device.device_aliases)
+    ));
+    if (targetEntry) {
+      const [targetDeviceId, targetDevice] = targetEntry;
+      const currentTargetDevice = devicesById.get(targetDeviceId) || targetDevice;
+      devicesById.set(targetDeviceId, mergeCloudConnectedDevice(currentTargetDevice, {
+        ...device,
+        deviceId: targetDeviceId,
+        displayName: currentTargetDevice.displayName,
+        registered: true,
+        webOnly: false,
+      }));
+    }
+    devicesById.delete(deviceId);
+  });
+}
+
+function cloudDeviceRowsFromMap(devicesById, limit) {
+  foldCloudWebOnlyDeviceRows(devicesById);
+  pruneCloudRowsToRegisteredInventory(devicesById);
+  return Array.from(devicesById.values()).slice(0, limit);
 }
 
 function cloudDeviceCandidatesFromRuntimeStatus(status) {
@@ -2656,6 +3106,7 @@ function cloudDeviceCandidatesFromRuntimeStatus(status) {
     || liveRuntime?.machines
     || [];
   return [
+    ...cloudDeviceCandidatesFromAccountSnapshot(cloudDeviceLiveStateFromRuntimeStatus(status)),
     ...safeCloudMcpArray(liveRuntime?.devices),
     ...safeCloudMcpArray(machineSource),
     ...safeCloudMcpArray(
@@ -2672,9 +3123,9 @@ function cloudConnectedDevicesFromRuntimeStatus(status) {
     if (!device) {
       return;
     }
-    byId.set(device.deviceId, { ...(byId.get(device.deviceId) || {}), ...device });
+    upsertCloudConnectedDevice(byId, device);
   });
-  return Array.from(byId.values()).slice(0, 12);
+  return cloudDeviceRowsFromMap(byId, 12);
 }
 
 function cloudKnownDevicesFromRuntimeStatus(status) {
@@ -2685,9 +3136,97 @@ function cloudKnownDevicesFromRuntimeStatus(status) {
     if (!device) {
       return;
     }
-    byId.set(device.deviceId, { ...(byId.get(device.deviceId) || {}), ...device });
+    upsertCloudConnectedDevice(byId, device);
   });
-  return Array.from(byId.values()).slice(0, 48);
+  return cloudDeviceRowsFromMap(byId, 48);
+}
+
+function appendCloudDeviceCandidates(output, value, options = {}) {
+  if (!value) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => appendCloudDeviceCandidates(output, item, options));
+    return;
+  }
+  if (typeof value !== "object") {
+    return;
+  }
+  if (Array.isArray(value.items)) {
+    appendCloudDeviceCandidates(output, value.items, options);
+    return;
+  }
+  if (Array.isArray(value.devices)) {
+    appendCloudDeviceCandidates(output, value.devices, options);
+    return;
+  }
+  const looksLikeDevice = Boolean(
+    value.device_id
+      || value.deviceId
+      || value.machine_id
+      || value.machineId
+      || value.native_connected !== undefined
+      || value.nativeConnected !== undefined
+      || value.web_connected !== undefined
+      || value.webConnected !== undefined,
+  );
+  if (looksLikeDevice) {
+    output.push(options.registered ? { ...value, registered: true } : value);
+    return;
+  }
+  Object.values(value).forEach((item) => appendCloudDeviceCandidates(output, item, options));
+}
+
+function cloudDeviceCandidatesFromAccountSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return [];
+  }
+  const root = snapshot?.data && typeof snapshot.data === "object" ? snapshot.data : snapshot;
+  const accountSnapshot = root.accountDeviceLiveStateSnapshot
+    || root.account_device_live_state_snapshot
+    || root.deviceLiveStateSnapshot
+    || root.device_live_state_snapshot
+    || null;
+  const snapshotRoot = accountSnapshot && typeof accountSnapshot === "object"
+    ? accountSnapshot
+    : root;
+  const clientConnection = snapshotRoot.client_connection || snapshotRoot.clientConnection || {};
+  const connectionOverlay = cloudDeviceConnectionOverlayFromSnapshot(root, snapshotRoot);
+  const output = [];
+  appendCloudDeviceCandidates(output, snapshotRoot.registered_devices || snapshotRoot.registeredDevices, { registered: true });
+  appendCloudDeviceCandidates(output, snapshotRoot.device_registry || snapshotRoot.deviceRegistry, { registered: true });
+  appendCloudDeviceCandidates(output, snapshotRoot.device);
+  appendCloudDeviceCandidates(output, snapshotRoot.devices);
+  appendCloudDeviceCandidates(output, snapshotRoot.device_map || snapshotRoot.deviceMap);
+  appendCloudDeviceCandidates(output, snapshotRoot.items);
+  appendCloudDeviceCandidates(output, snapshotRoot.server_roster || snapshotRoot.serverRoster);
+  appendCloudDeviceCandidates(output, clientConnection.active_desktop_devices || clientConnection.activeDesktopDevices);
+  appendCloudDeviceCandidates(output, clientConnection.active_web_devices || clientConnection.activeWebDevices);
+  return applyCloudDeviceConnectionOverlay(output, connectionOverlay);
+}
+
+function cloudConnectedDevicesFromAccountSnapshot(snapshot) {
+  const byId = new Map();
+  cloudDeviceCandidatesFromAccountSnapshot(snapshot).forEach((candidate, index) => {
+    const device = normalizeCloudConnectedDevice(candidate, index);
+    if (!device) {
+      return;
+    }
+    upsertCloudConnectedDevice(byId, device);
+  });
+  return cloudDeviceRowsFromMap(byId, 12);
+}
+
+function cloudKnownDevicesFromAccountSnapshot(snapshot) {
+  const byId = new Map();
+  cloudDeviceCandidatesFromAccountSnapshot(snapshot).forEach((candidate, index) => {
+    const device = normalizeCloudConnectedDevice(candidate, index, { includeOffline: true });
+    if (!device) {
+      return;
+    }
+    upsertCloudConnectedDevice(byId, device);
+  });
+  return cloudDeviceRowsFromMap(byId, 48);
 }
 
 function cloudDeviceLiveStateFromRuntimeStatus(status) {
@@ -2732,6 +3271,37 @@ function cloudDeviceLiveStateFromRuntimeStatus(status) {
       serverRoster,
       server_roster: serverRoster,
     } : {}),
+  };
+}
+
+function cloudAccountDeviceLiveStateSnapshotFromEventPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const snapshot = [
+    payload?.data,
+    payload?.payload,
+    payload?.account_device_live_state_snapshot,
+    payload?.accountDeviceLiveStateSnapshot,
+    payload?.device_live_state_snapshot,
+    payload?.deviceLiveStateSnapshot,
+  ].find((value) => value && typeof value === "object" && !Array.isArray(value))
+    || (payload.devices && typeof payload.devices === "object" ? payload : null);
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    return null;
+  }
+  return snapshot;
+}
+
+function cloudDeviceLiveStateFromAccountSnapshot(snapshot, previous = null) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    return previous && typeof previous === "object" ? previous : null;
+  }
+  return {
+    ...(previous && typeof previous === "object" ? previous : {}),
+    ...snapshot,
+    accountDeviceLiveStateSnapshot: snapshot,
+    account_device_live_state_snapshot: snapshot,
   };
 }
 
@@ -4406,6 +4976,14 @@ function normalizeCloudSyncCount(value) {
   return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
 }
 
+function normalizeCloudSyncPercent(value, fallback = 100) {
+  const percent = Number(value);
+  if (!Number.isFinite(percent)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(100, percent));
+}
+
 function normalizeCloudSyncActivity(payload = {}) {
   const activity = payload?.syncActivity || payload?.sync_activity || {};
   const pendingCount = normalizeCloudSyncCount(
@@ -4461,12 +5039,20 @@ function normalizeCloudSyncActivity(payload = {}) {
   ).toLowerCase() === "large"
     ? "large"
     : "live";
+  const progressPercent = normalizeCloudSyncPercent(
+    payload.progressPercent
+      ?? payload.progress_percent
+      ?? activity.progressPercent
+      ?? activity.progress_percent,
+    activityCount > 0 ? 0 : 100,
+  );
 
   return {
     activityCount,
     controlCount,
     downCount,
     pendingCount,
+    progressPercent,
     sizeClass,
     syncing: Boolean(payload.syncing ?? activity.syncing) || sizeClass === "large",
     upCount,
@@ -4577,6 +5163,11 @@ function networkNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function networkFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function networkList(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -4588,6 +5179,8 @@ const NETWORK_CATEGORY_LABELS = {
   tasks: "Tasks",
   tokenomics: "Tokenomics",
   catalog: "Catalog",
+  live_state: "Live state",
+  transport: "Transport",
   remote_commands: "Remote commands",
   tools: "Tools",
   voice: "Voice",
@@ -4601,15 +5194,30 @@ const NETWORK_CATEGORY_ORDER = [
   "tasks",
   "tokenomics",
   "catalog",
+  "live_state",
+  "transport",
   "tools",
   "remote_commands",
   "voice",
   "system",
 ];
 
+const NETWORK_TRANSPORT_TOKENS = new Set([
+  "ping",
+  "pong",
+  "protocol_ping",
+  "protocol_pong",
+  "client_liveness_ping",
+  "dashboard_liveness_ping",
+  "desktop_liveness_pong",
+  "agent_heartbeat",
+]);
+
 function networkDomainFromText(value) {
   const raw = networkString(value).toLowerCase();
   if (!raw) return "system";
+  if (networkTextIsTransport(raw)) return "transport";
+  if (networkTextIsLiveState(raw)) return "live_state";
   if (raw.includes("todo")) return "todos";
   if (raw.includes("architect") || raw.includes("graph")) return "architectures";
   if (raw.includes("asset")) return "assets";
@@ -4631,6 +5239,20 @@ function networkDomainFromText(value) {
     return "tasks";
   }
   return "system";
+}
+
+function networkTextIsTransport(raw) {
+  return raw.includes("keepalive")
+    || raw.split(/[^a-z0-9_]+/).some((token) => NETWORK_TRANSPORT_TOKENS.has(token));
+}
+
+function networkTextIsLiveState(raw) {
+  return raw.includes("live_state")
+    || raw.includes("account_live_state")
+    || raw.includes("device_live_state")
+    || raw.includes("account_device_live_state")
+    || raw.includes("web_presence")
+    || raw.includes("terminal_presence_snapshot");
 }
 
 function networkDomainFromItem(item) {
@@ -4726,6 +5348,69 @@ function networkItemBytes(item) {
   return networkNumber(item?.bytes ?? item?.payloadBytes ?? item?.payload_bytes);
 }
 
+function networkProgressFromState(item) {
+  const state = networkString(item?.state || item?.status).toLowerCase();
+  if (["complete", "completed", "synced", "acked", "sent", "received", "downloaded", "uploaded"].includes(state)) {
+    return 100;
+  }
+  if (state === "applying") return 80;
+  if (state === "hydrating") return 65;
+  if (["active", "in_flight", "streaming"].includes(state)) return 50;
+  if (state === "retrying") return 10;
+  return 0;
+}
+
+function networkProgressPercentLabel(value) {
+  const percent = Math.max(0, Math.min(100, networkNumber(value)));
+  return `${Math.round(percent)}%`;
+}
+
+function networkItemProgress(item) {
+  const ratio = networkFiniteNumber(item?.progressRatio ?? item?.progress_ratio);
+  let percent = networkFiniteNumber(item?.progressPercent ?? item?.progress_percent);
+  const done = networkFiniteNumber(
+    item?.progressDone
+      ?? item?.progress_done
+      ?? item?.bytesDone
+      ?? item?.bytes_done
+      ?? item?.metadata?.progressDone
+      ?? item?.metadata?.progress_done
+      ?? item?.metadata?.bytesDone
+      ?? item?.metadata?.bytes_done,
+  );
+  const total = networkFiniteNumber(
+    item?.progressTotal
+      ?? item?.progress_total
+      ?? item?.bytesTotal
+      ?? item?.bytes_total
+      ?? item?.metadata?.progressTotal
+      ?? item?.metadata?.progress_total
+      ?? item?.metadata?.bytesTotal
+      ?? item?.metadata?.bytes_total,
+  );
+  if (percent == null && ratio != null) {
+    percent = ratio * 100;
+  }
+  if (percent == null && done != null && total != null && total > 0) {
+    percent = (done / total) * 100;
+  }
+  if (percent == null) {
+    percent = networkProgressFromState(item);
+  }
+  const clampedPercent = Math.max(0, Math.min(100, percent));
+  const explicitComplete = item?.syncComplete ?? item?.sync_complete;
+  const failed = ["failed", "dead_letter", "rejected", "interrupted"].includes(
+    networkString(item?.state || item?.status).toLowerCase(),
+  );
+  return {
+    basis: networkString(item?.progressBasis || item?.progress_basis || item?.metadata?.progressBasis || item?.metadata?.progress_basis, "phase"),
+    complete: Boolean(explicitComplete) || (!failed && clampedPercent >= 100),
+    done: done == null ? 0 : Math.max(0, done),
+    percent: clampedPercent,
+    total: total == null ? 0 : Math.max(0, total),
+  };
+}
+
 function networkItemAgeMs(item, nowMs) {
   const explicit = networkNumber(item?.ageMs ?? item?.age_ms);
   if (explicit > 0) {
@@ -4744,6 +5429,43 @@ function networkDirectionMatchesBucket(direction, bucket) {
     return normalized === "down" || normalized === "both";
   }
   return ["up", "both", "control"].includes(normalized);
+}
+
+function networkItemLane(item) {
+  const explicit = networkString(item?.syncLane || item?.sync_lane || item?.lane).toLowerCase();
+  if (["sync", "live", "transport"].includes(explicit)) {
+    return explicit;
+  }
+  const domain = networkString(item?.domain).toLowerCase();
+  if (domain === "transport") {
+    return "transport";
+  }
+  if (domain === "live_state") {
+    return "live";
+  }
+  const raw = [
+    item?.eventKind,
+    item?.event_kind,
+    item?.kind,
+    item?.source,
+    item?.metadata?.eventKind,
+    item?.metadata?.event_kind,
+    item?.metadata?.requestKind,
+    item?.metadata?.request_kind,
+    item?.metadata?.kind,
+    item?.metadata?.source,
+  ].map((value) => networkString(value).toLowerCase()).filter(Boolean).join(" ");
+  if (networkTextIsTransport(raw)) {
+    return "transport";
+  }
+  if (networkTextIsLiveState(raw)) {
+    return "live";
+  }
+  return "sync";
+}
+
+function networkItemIsDurableSync(item) {
+  return networkItemLane(item) === "sync";
 }
 
 function networkSourceLabel(item, fallback) {
@@ -4766,7 +5488,10 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
         fallbackCount: 0,
         eventCount: 0,
         bytes: 0,
+        completeCount: 0,
         latestAgeMs: 0,
+        progressWeight: 0,
+        progressWeightedPercent: 0,
         states: new Set(),
         sources: new Set(),
         details: new Set(),
@@ -4779,6 +5504,7 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
     const domain = networkDomainFromItem(item);
     const group = ensureGroup(domain);
     const count = networkItemSyncCount(item);
+    const progress = networkItemProgress(item);
     if (primary) {
       group.primaryCount += count;
     } else {
@@ -4786,6 +5512,11 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
     }
     group.eventCount += 1;
     group.bytes += networkItemBytes(item);
+    group.progressWeight += Math.max(1, count);
+    group.progressWeightedPercent += progress.percent * Math.max(1, count);
+    if (progress.complete) {
+      group.completeCount += count;
+    }
     const state = networkString(item?.state || item?.status);
     if (state) {
       group.states.add(state);
@@ -4806,6 +5537,7 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
   };
 
   networkList(normalized.activities)
+    .filter(networkItemIsDurableSync)
     .filter((item) => networkDirectionMatchesBucket(item?.direction, bucket))
     .forEach((item) => addItem(item, { primary: true, source: "sync" }));
 
@@ -4815,13 +5547,25 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
         ...normalized.outboxRows.map((item) => ({ ...item, __networkSource: "queued" })),
         ...normalized.outboundRecent.map((item) => ({ ...item, __networkSource: "sent" })),
       ];
-  fallbackItems.forEach((item) => addItem(item, { source: bucket === "down" ? "received" : "sent" }));
+  fallbackItems
+    .filter(networkItemIsDurableSync)
+    .forEach((item) => {
+      const domain = networkDomainFromItem(item);
+      if (groups.get(networkString(domain, "system").toLowerCase())?.primaryCount > 0) {
+        return;
+      }
+      addItem(item, { source: bucket === "down" ? "received" : "sent" });
+    });
 
   const rows = Array.from(groups.values()).map((group) => {
     const count = Math.max(group.primaryCount, group.fallbackCount);
+    const progressPercent = group.progressWeight > 0
+      ? group.progressWeightedPercent / group.progressWeight
+      : 100;
     return {
       ...group,
       count,
+      progressPercent: Math.max(0, Math.min(100, progressPercent)),
       details: Array.from(group.details).slice(0, 2),
       sources: Array.from(group.sources).slice(0, 3),
       states: Array.from(group.states).slice(0, 3),
@@ -4849,7 +5593,7 @@ function networkCategorySummaryText(row, bucket) {
     ? row.count === 1 ? "update" : "updates"
     : row.count === 1 ? "change" : "changes";
   const direction = bucket === "down" ? "from server" : "to server";
-  return `${row.count} ${unit} ${direction}`;
+  return `${row.count} ${unit} ${direction} - ${networkProgressPercentLabel(row.progressPercent)} synced`;
 }
 
 function networkPacketLossLabel(normalized) {
@@ -5442,145 +6186,24 @@ function normalizeWorkspaceCoordinationTarget(value, fallbackRoot = "") {
   };
 }
 
-function normalizeWorkspaceCoordinationTargetResponse(response, fallbackRoot = "") {
-  const data = unwrapCloudCommandData(response, {});
-  const rootDirectory = cleanWorkspaceRootDirectory(
-    data.repoPath || data.repo_path || fallbackRoot,
-  );
-  const targets = (Array.isArray(data.targets) ? data.targets : [])
-    .map((target) => normalizeWorkspaceCoordinationTarget(target))
-    .filter(Boolean);
-
-  if (!targets.length && rootDirectory) {
-    targets.push(normalizeWorkspaceCoordinationTarget({
-      repoPath: rootDirectory,
-      isWorkspaceRoot: true,
-      projectKind: "workspace_root",
-    }));
-  }
-
-  return {
-    container: Boolean(data.container),
-    rootDirectory,
-    targets,
-    workspaceKind: String(data.workspaceKind || data.workspace_kind || "").trim(),
-  };
-}
-
-function workspaceCoordinationTargetFromScanEntry(value, fallbackRoot = "") {
-  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  const repoPath = cleanWorkspaceRootDirectory(
-    source.repoPath
-      || source.repo_path
-      || source.projectRoot
-      || source.project_root
-      || source.rootDirectory
-      || source.root_directory
-      || source.path
-      || fallbackRoot,
-  );
-  if (!repoPath) {
+function workspaceRootCoordinationTargetRecord(rootDirectory, rootGitRepository = false) {
+  const safeRoot = cleanWorkspaceRootDirectory(rootDirectory);
+  if (!safeRoot) {
     return null;
   }
 
-  const projectKind = String(
-    source.projectKind
-      || source.project_kind
-      || source.kind
-      || (
-        source.hasGit === true || source.has_git === true
-          ? "git_repo"
-          : getWorkspaceRootIdentity(repoPath) === getWorkspaceRootIdentity(fallbackRoot)
-            ? "workspace_root"
-            : "project_folder"
-      ),
-  ).trim();
-
-  return normalizeWorkspaceCoordinationTarget({
-    dbPath: source.dbPath || source.db_path,
-    hasAgents: source.hasAgents || source.has_agents,
-    hasGit: source.hasGit || source.has_git || projectKind === "git_repo",
-    hasKernelDb: source.hasKernelDb || source.has_kernel_db,
-    isWorkspaceRoot: source.isWorkspaceRoot
-      || source.is_workspace_root
-      || getWorkspaceRootIdentity(repoPath) === getWorkspaceRootIdentity(fallbackRoot),
-    mountId: source.mountId || source.mount_id,
-    projectKind,
-    projectName: source.projectName
-      || source.project_name
-      || source.name
-      || getDirectoryName(repoPath),
-    repoPath,
-    workspaceRelativePath: source.workspaceRelativePath
-      || source.workspace_relative_path
-      || source.relativePath
-      || source.relative_path,
-  }, fallbackRoot);
-}
-
-function workspaceCoordinationTargetResponseFromScanSnapshot(snapshot, fallbackRoot = "") {
-  const body = snapshot && typeof snapshot === "object" ? snapshot : {};
-  const raw = body.raw && typeof body.raw === "object" ? body.raw : {};
-  const rootDirectory = cleanWorkspaceRootDirectory(
-    body.root
-      || body.rootDirectory
-      || body.root_directory
-      || body.requestedRepoPath
-      || body.requested_repo_path
-      || raw.root
-      || raw.rootDirectory
-      || raw.root_directory
-      || raw.requestedRepoPath
-      || raw.requested_repo_path
-      || fallbackRoot,
-  );
-  if (!rootDirectory) {
-    return null;
-  }
-
-  const candidateLists = [
-    body.workspaceMounts,
-    body.workspace_mounts,
-    body.projectMounts,
-    body.project_mounts,
-    body.repositories,
-    body.mounts,
-    raw.workspaceMounts,
-    raw.workspace_mounts,
-    raw.projectMounts,
-    raw.project_mounts,
-    raw.repositories,
-    raw.mounts,
-  ].filter(Array.isArray);
-
-  const targets = dedupeWorkspaceCoordinationTargets(candidateLists.flatMap((list) => (
-    list.map((entry) => workspaceCoordinationTargetFromScanEntry(entry, rootDirectory))
-  )));
-  const rootTarget = workspaceCoordinationTargetFromScanEntry(
-    body.selectedRoot || body.selected_root || raw.selectedRoot || raw.selected_root || {
-      isWorkspaceRoot: true,
-      projectKind: "workspace_root",
-      projectName: getDirectoryName(rootDirectory),
-      repoPath: rootDirectory,
-    },
-    rootDirectory,
-  );
-  const completeTargets = dedupeWorkspaceCoordinationTargets([
-    rootTarget,
-    ...targets,
-  ]);
+  const target = normalizeWorkspaceCoordinationTarget({
+    hasGit: rootGitRepository,
+    isWorkspaceRoot: true,
+    projectKind: rootGitRepository ? "git_repo" : "workspace_root",
+    repoPath: safeRoot,
+  });
 
   return {
-    container: Boolean(body.container || raw.container),
-    rootDirectory,
-    targets: completeTargets,
-    workspaceKind: String(
-      body.workspaceKind
-        || body.workspace_kind
-        || raw.workspaceKind
-        || raw.workspace_kind
-        || "",
-    ).trim(),
+    container: false,
+    rootDirectory: safeRoot,
+    targets: target ? [target] : [],
+    workspaceKind: rootGitRepository ? "git_repo" : "workspace_root",
   };
 }
 
@@ -5589,130 +6212,12 @@ function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
   if (!safeRoot) {
     return [];
   }
-
   const record = targetsByRoot?.[getWorkspaceRootIdentity(safeRoot)];
   if (record?.targets?.length) {
     return record.targets;
   }
 
-  return [
-    normalizeWorkspaceCoordinationTarget({
-      repoPath: safeRoot,
-      isWorkspaceRoot: true,
-      projectKind: "workspace_root",
-    }),
-  ].filter(Boolean);
-}
-
-function workspaceCoordinationTargetRepoLabel(target) {
-  const relativePath = String(target?.workspaceRelativePath || "").trim();
-  const projectName = String(target?.projectName || "").trim();
-  const repoPath = cleanWorkspaceRootDirectory(target?.repoPath || "");
-  return relativePath || projectName || getDirectoryName(repoPath) || repoPath || "Repository";
-}
-
-function workspaceCoordinationTargetIsGitRepo(target) {
-  return Boolean(target?.hasGit || target?.projectKind === "git_repo");
-}
-
-function dedupeWorkspaceCoordinationTargets(targets) {
-  const seen = new Set();
-  return (Array.isArray(targets) ? targets : [])
-    .map((target) => normalizeWorkspaceCoordinationTarget(target))
-    .filter(Boolean)
-    .filter((target) => {
-      const key = getWorkspaceRootIdentity(target.repoPath);
-      if (!key || seen.has(key)) {
-        return false;
-      }
-      seen.add(key);
-      return true;
-    });
-}
-
-function normalizeWorkspaceCoordinationTargetsCacheRecord(value, fallbackRoot = "") {
-  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  const rootDirectory = cleanWorkspaceRootDirectory(
-    source.rootDirectory
-      || source.root_directory
-      || source.repoPath
-      || source.repo_path
-      || fallbackRoot,
-  );
-  if (!rootDirectory) {
-    return null;
-  }
-
-  const targets = dedupeWorkspaceCoordinationTargets(
-    Array.isArray(source.targets) ? source.targets : [],
-  );
-  if (!targets.length) {
-    return null;
-  }
-
-  return {
-    container: Boolean(source.container),
-    rootDirectory,
-    targets,
-    workspaceKind: String(source.workspaceKind || source.workspace_kind || "").trim(),
-  };
-}
-
-function readWorkspaceCoordinationTargetsCache() {
-  const cache = new Map();
-  try {
-    const rawStorage = window.localStorage.getItem(WORKSPACE_COORDINATION_TARGETS_STORAGE_KEY);
-    if (!rawStorage) {
-      return cache;
-    }
-
-    const parsed = JSON.parse(rawStorage);
-    const records = parsed?.records && typeof parsed.records === "object" && !Array.isArray(parsed.records)
-      ? parsed.records
-      : parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? parsed
-        : {};
-
-    Object.entries(records).forEach(([rootKey, record]) => {
-      if (rootKey === "version") {
-        return;
-      }
-      const normalized = normalizeWorkspaceCoordinationTargetsCacheRecord(record);
-      const normalizedRootKey = getWorkspaceRootIdentity(normalized?.rootDirectory || "");
-      if (normalizedRootKey) {
-        cache.set(normalizedRootKey, normalized);
-      }
-    });
-  } catch {
-    // Cached scan data is an optimization; workspace-open scans can rebuild it.
-  }
-  return cache;
-}
-
-function persistWorkspaceCoordinationTargetsCache(cache) {
-  try {
-    const records = {};
-    cache.forEach((record) => {
-      const normalized = normalizeWorkspaceCoordinationTargetsCacheRecord(record);
-      const rootKey = getWorkspaceRootIdentity(normalized?.rootDirectory || "");
-      if (!rootKey) {
-        return;
-      }
-      records[rootKey] = {
-        container: normalized.container,
-        rootDirectory: normalized.rootDirectory,
-        savedAtMs: Date.now(),
-        targets: normalized.targets,
-        workspaceKind: normalized.workspaceKind,
-      };
-    });
-    window.localStorage.setItem(
-      WORKSPACE_COORDINATION_TARGETS_STORAGE_KEY,
-      JSON.stringify({ version: 1, records }),
-    );
-  } catch {
-    // The app can still discover repositories during workspace open without cache writes.
-  }
+  return workspaceRootCoordinationTargetRecord(safeRoot)?.targets || [];
 }
 
 function getCloudSqliteResetCheckpointMessage(data) {
@@ -6202,7 +6707,8 @@ function NetworkingInspector({
     items.length ? (
       <NetworkingList data-mode="categories">
         {items.map((row) => {
-          const tone = row.hasError ? "red" : bucket === "down" ? "green" : "blue";
+          const progressValue = Math.round(Math.max(0, Math.min(100, row.progressPercent)));
+          const tone = row.hasError ? "red" : progressValue >= 100 ? "green" : bucket === "down" ? "green" : "blue";
           const summaryText = networkCategorySummaryText(row, bucket);
           return (
             <NetworkingRow key={`${bucket}:${row.domain}`} data-role="category">
@@ -6210,18 +6716,28 @@ function NetworkingInspector({
               <NetworkingRowMain>
                 <NetworkingCategoryTopline>
                   <strong title={row.label}>{row.label}</strong>
-                  <NetworkingCategoryCount>{row.count}</NetworkingCategoryCount>
+                  <NetworkingCategoryStats>
+                    <NetworkingProgressValue data-tone={tone}>
+                      {networkProgressPercentLabel(row.progressPercent)}
+                    </NetworkingProgressValue>
+                    <NetworkingCategoryCount>{row.count}</NetworkingCategoryCount>
+                  </NetworkingCategoryStats>
                 </NetworkingCategoryTopline>
                 <p title={row.details.length ? `${summaryText} - ${row.details.join(", ")}` : summaryText}>
                   {summaryText}
                 </p>
                 <NetworkingCategoryMeter
-                  aria-hidden="true"
+                  aria-label={`${row.label} sync progress`}
+                  aria-valuemax={100}
+                  aria-valuemin={0}
+                  aria-valuenow={progressValue}
                   data-tone={tone}
-                  style={{ "--network-progress": `${Math.round(row.share * 100)}%` }}
+                  role="progressbar"
+                  style={{ "--network-progress": `${Math.max(0, Math.min(100, row.progressPercent))}%` }}
                 />
                 <NetworkingMeta>
                   <span>{row.eventCount} {row.eventCount === 1 ? "event" : "events"}</span>
+                  {row.completeCount > 0 && <span>{row.completeCount}/{row.count} synced</span>}
                   {row.bytes > 0 && <span>{formatNetworkBytes(row.bytes)}</span>}
                   {row.states.map((state) => (
                     <span key={`${row.domain}:state:${state}`}>{state}</span>
@@ -6354,9 +6870,12 @@ function normalizeWorkspaceSettings(value) {
         const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
         const rootWasEmptyAtSelection = Boolean(settings?.rootWasEmptyAtSelection);
+        const rootGitRepositoryKnown = Object.prototype.hasOwnProperty.call(settings || {}, "rootGitRepository");
+        const rootGitRepository = Boolean(settings?.rootGitRepository);
         const agentSessionMode = normalizeAgentSessionMode(
           settings?.agentSessionMode,
           Boolean(settings?.gitWorktreesEnabled),
+          !rootGitRepositoryKnown || rootGitRepository,
         );
         const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
 
@@ -6377,6 +6896,7 @@ function normalizeWorkspaceSettings(value) {
           {
             rootDirectory: rootDirectory.slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH),
             rootWasEmptyAtSelection: rootDirectory ? rootWasEmptyAtSelection : false,
+            ...(rootDirectory && rootGitRepositoryKnown ? { rootGitRepository } : {}),
             agentSessionMode,
             gitWorktreesEnabled,
             terminalCount,
@@ -6489,30 +7009,19 @@ function persistWorkspaceLifecycleSettings(settings) {
 function readWorkspaceRailCollapsed() {
   try {
     window.localStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
+    window.sessionStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
   } catch {
-    // Legacy cross-launch rail density should not affect the next app open.
+    // Legacy rail density should not affect the next app open.
   }
-  try {
-    const settings = JSON.parse(window.sessionStorage.getItem(WORKSPACE_RAIL_STORAGE_KEY) || "{}");
-    return Boolean(settings?.collapsed);
-  } catch {
-    return false;
-  }
+  return false;
 }
 
-function persistWorkspaceRailCollapsed(collapsed) {
+function persistWorkspaceRailCollapsed() {
   try {
     window.localStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
+    window.sessionStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
   } catch {
     // Legacy cleanup is best-effort.
-  }
-  try {
-    window.sessionStorage.setItem(
-      WORKSPACE_RAIL_STORAGE_KEY,
-      JSON.stringify({ collapsed: Boolean(collapsed) }),
-    );
-  } catch {
-    // Rail density is session-scoped; the expanded layout remains the safe launch default.
   }
 }
 
@@ -6931,15 +7440,6 @@ function workspaceGraphSnapshotKey(snapshot) {
   );
 }
 
-function getWorkspaceGraphScanSnapshotForRoot(graphState, repoPath, workspaceId) {
-  const key = workspaceGraphStateKey(repoPath, workspaceId);
-  if (!key) {
-    return null;
-  }
-
-  return graphState?.[key]?.architectureRepositoryScanSnapshot || null;
-}
-
 function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
   if (!request || typeof request !== "object") {
     return "";
@@ -7055,21 +7555,40 @@ const AGENT_SESSION_MODE_OPTIONS = [
   },
 ];
 
-function normalizeAgentSessionMode(value, gitWorktreesEnabled = false) {
+function normalizeAgentSessionMode(value, gitWorktreesEnabled = false, safeModeAvailable = true) {
   const mode = String(value || "").trim().toLowerCase();
-  if (
-    mode === AGENT_SESSION_MODE_WORKTREE
-    || mode === AGENT_SESSION_MODE_COORDINATED
-    || mode === AGENT_SESSION_MODE_DIRECT
-  ) {
+  if (mode === AGENT_SESSION_MODE_WORKTREE) {
+    return safeModeAvailable ? AGENT_SESSION_MODE_WORKTREE : AGENT_SESSION_MODE_COORDINATED;
+  }
+  if (mode === AGENT_SESSION_MODE_COORDINATED || mode === AGENT_SESSION_MODE_DIRECT) {
     return mode;
   }
-  return gitWorktreesEnabled ? AGENT_SESSION_MODE_WORKTREE : AGENT_SESSION_MODE_COORDINATED;
+  return gitWorktreesEnabled && safeModeAvailable
+    ? AGENT_SESSION_MODE_WORKTREE
+    : AGENT_SESSION_MODE_COORDINATED;
+}
+
+function getWorkspaceRootGitRepositoryKnown(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId];
+  return Boolean(settings && Object.prototype.hasOwnProperty.call(settings, "rootGitRepository"));
+}
+
+function getWorkspaceRootGitRepository(workspaceSettings, workspaceId) {
+  return Boolean(workspaceSettings?.[workspaceId]?.rootGitRepository);
+}
+
+function getWorkspaceSafeModeAvailable(workspaceSettings, workspaceId) {
+  return !getWorkspaceRootGitRepositoryKnown(workspaceSettings, workspaceId)
+    || getWorkspaceRootGitRepository(workspaceSettings, workspaceId);
 }
 
 function getWorkspaceAgentSessionMode(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId] || {};
-  return normalizeAgentSessionMode(settings.agentSessionMode, settings.gitWorktreesEnabled);
+  return normalizeAgentSessionMode(
+    settings.agentSessionMode,
+    settings.gitWorktreesEnabled,
+    getWorkspaceSafeModeAvailable(workspaceSettings, workspaceId),
+  );
 }
 
 function getWorkspaceGitWorktreesEnabled(workspaceSettings, workspaceId) {
@@ -7110,15 +7629,27 @@ function findWorkspaceByEffectiveRoot(
   }) || null;
 }
 
-function getWorkspaceThreadStoreTargets(workspaces, workspaceSettings, defaultWorkingDirectory) {
+function getWorkspaceThreadStoreTargets(
+  workspaces,
+  workspaceSettings,
+  defaultWorkingDirectory,
+  runtimeWorkspaceIds = null,
+) {
   if (!Array.isArray(workspaces) || !workspaces.length) {
     return [];
   }
+
+  const runtimeWorkspaceIdSet = Array.isArray(runtimeWorkspaceIds)
+    ? new Set(runtimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()).filter(Boolean))
+    : null;
 
   return workspaces
     .map((workspace) => {
       const workspaceId = String(workspace?.id || "").trim();
       if (!workspaceId) {
+        return null;
+      }
+      if (runtimeWorkspaceIdSet && !runtimeWorkspaceIdSet.has(workspaceId)) {
         return null;
       }
       const rootDirectory = (
@@ -7338,6 +7869,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const currentSettings = settings?.[workspaceId] || {};
   const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
   const hasRootWasEmptyAtSelection = Object.prototype.hasOwnProperty.call(nextValues, "rootWasEmptyAtSelection");
+  const hasRootGitRepository = Object.prototype.hasOwnProperty.call(nextValues, "rootGitRepository");
   const hasGitWorktreesEnabled = Object.prototype.hasOwnProperty.call(nextValues, "gitWorktreesEnabled");
   const hasAgentSessionMode = Object.prototype.hasOwnProperty.call(nextValues, "agentSessionMode");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
@@ -7353,6 +7885,20 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
       ? nextValues.rootWasEmptyAtSelection
       : currentSettings.rootWasEmptyAtSelection)
     : false;
+  const carryCurrentRootGitRepository = !hasRootDirectory
+    || getWorkspaceRootIdentity(rootDirectory) === getWorkspaceRootIdentity(currentSettings.rootDirectory);
+  const rootGitRepositoryKnown = Boolean(rootDirectory)
+    && (
+      hasRootGitRepository
+      || (
+        carryCurrentRootGitRepository
+        && Object.prototype.hasOwnProperty.call(currentSettings, "rootGitRepository")
+      )
+    );
+  const rootGitRepository = rootGitRepositoryKnown
+    ? Boolean(hasRootGitRepository ? nextValues.rootGitRepository : currentSettings.rootGitRepository)
+    : false;
+  const safeModeAvailable = !rootGitRepositoryKnown || rootGitRepository;
   const terminalCount = normalizeWorkspaceTerminalCount(
     hasTerminalCount ? nextValues.terminalCount : currentSettings.terminalCount,
   );
@@ -7367,12 +7913,14 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     ? normalizeAgentSessionMode(
       nextValues.agentSessionMode,
       Boolean(currentSettings.gitWorktreesEnabled),
+      safeModeAvailable,
     )
     : hasGitWorktreesEnabled
-      ? normalizeAgentSessionMode("", Boolean(nextValues.gitWorktreesEnabled))
+      ? normalizeAgentSessionMode("", Boolean(nextValues.gitWorktreesEnabled), safeModeAvailable)
       : normalizeAgentSessionMode(
         currentSettings.agentSessionMode,
         Boolean(currentSettings.gitWorktreesEnabled),
+        safeModeAvailable,
       );
   const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
 
@@ -7389,6 +7937,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   nextSettings[workspaceId] = {
     rootDirectory,
     rootWasEmptyAtSelection,
+    ...(rootGitRepositoryKnown ? { rootGitRepository } : {}),
     agentSessionMode,
     gitWorktreesEnabled,
     terminalCount,
@@ -7558,6 +8107,7 @@ export default function App() {
   const [cloudAccountResetMessage, setCloudAccountResetMessage] = useState("");
   const [cloudAccountResetError, setCloudAccountResetError] = useState("");
   const [cloudWorkspaceProgress, setCloudWorkspaceProgress] = useState(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
+  const [cloudDesktopDeviceProfile, setCloudDesktopDeviceProfile] = useState(null);
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
     readDismissedLowCreditWarningKey,
   );
@@ -7670,6 +8220,7 @@ export default function App() {
   const workspaceTerminalsWorkspacesRef = useRef([]);
   const workspaceTerminalIdentityCacheRef = useRef(new Map());
   const workspaceTerminalExplicitEmptyRef = useRef(new Set());
+  const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
   const terminalStatusEventSeqRef = useRef(new Map());
   const terminalStatusEventDedupRef = useRef(new Map());
   const terminalStatusEventEmitterRef = useRef(null);
@@ -7679,15 +8230,26 @@ export default function App() {
   const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const workspaceCatalogSyncKeyRef = useRef("");
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke("cloud_mcp_get_desktop_device_profile").then((profile) => {
+      if (cancelled || !profile || typeof profile !== "object") {
+        return;
+      }
+      setCloudDesktopDeviceProfile(profile);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Workspace ids deleted on this device this session, mapped to the delete
   // timestamp. Catalog broadcasts and list responses must not re-add these
   // unless the cloud entry is newer than the delete (an intentional revive);
   // stale ghosts are filtered out and the tombstone is re-sent to the cloud.
   const tokenomicsForceResyncRef = useRef(null);
   const cloudMcpStartupWarmupKeyRef = useRef("");
-  const workspaceCoordinationTargetsCacheRef = useRef(readWorkspaceCoordinationTargetsCache());
-  const workspaceCoordinationTargetsStateKeyRef = useRef("");
-  const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
   useEffect(() => {
     agentStatusesRef.current = agentStatuses;
   }, [agentStatuses]);
@@ -8034,41 +8596,72 @@ export default function App() {
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
     : "";
+  const runtimeWorkspaceIdsForHydration = useMemo(() => {
+    const ids = [];
+    const seen = new Set();
+    const addWorkspaceId = (workspaceId) => {
+      const id = String(workspaceId || "").trim();
+      if (!id || seen.has(id) || !findWorkspaceById(workspaces, id)) {
+        return;
+      }
+      seen.add(id);
+      ids.push(id);
+    };
+
+    normalizeEnabledWorkspaceIds(workspaceLifecycleSettings.enabledWorkspaceIds).forEach(addWorkspaceId);
+    addWorkspaceId(activatedWorkspaceId);
+
+    return ids;
+  }, [activatedWorkspaceId, workspaceLifecycleSettings.enabledWorkspaceIds, workspaces]);
+  const runtimeWorkspaceRootKey = useMemo(() => JSON.stringify(
+    runtimeWorkspaceIdsForHydration.map((workspaceId) => [
+      workspaceId,
+      getWorkspaceRootIdentity(
+        getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+          || cleanWorkspaceRootDirectory(defaultWorkingDirectory),
+      ),
+    ]),
+  ), [
+    defaultWorkingDirectory,
+    runtimeWorkspaceIdsForHydration,
+    workspaceSettings,
+  ]);
   const workspaceActivationDeferred = Boolean(workspacePendingActivationId);
-  const workspaceHydrationKey = authState === "authenticated" && workspaceState === "ready"
+  const workspaceHydrationKey = authState === "authenticated"
+    && workspaceState === "ready"
+    && runtimeWorkspaceIdsForHydration.length > 0
     ? [
       activeAccountScopeKey,
-      selectedWorkspaceId || "none",
-      activatedWorkspaceId || "none",
-      getWorkspaceRootIdentity(activeWorkspaceHydrationRoot),
+      runtimeWorkspaceRootKey,
     ].join(":")
     : "";
   const workspaceCoordinationRootEntries = useMemo(() => {
     const entries = [];
     const seen = new Set();
 
-    workspaces.forEach((workspace) => {
-      const workspaceId = String(workspace?.id || "").trim();
-      if (!workspaceId) {
+    runtimeWorkspaceIdsForHydration.forEach((workspaceId) => {
+      const workspace = findWorkspaceById(workspaces, workspaceId);
+      const safeWorkspaceId = String(workspace?.id || "").trim();
+      if (!safeWorkspaceId) {
         return;
       }
       const rootDirectory = (
-        getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+        getWorkspaceRootDirectory(workspaceSettings, safeWorkspaceId)
         || cleanWorkspaceRootDirectory(defaultWorkingDirectory)
       );
-      const key = `${workspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
+      const key = `${safeWorkspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
       if (!rootDirectory || seen.has(key)) {
         return;
       }
       seen.add(key);
       entries.push({
         rootDirectory,
-        workspaceId,
+        workspaceId: safeWorkspaceId,
       });
     });
 
     return entries;
-  }, [defaultWorkingDirectory, workspaceSettings, workspaces]);
+  }, [defaultWorkingDirectory, runtimeWorkspaceIdsForHydration, workspaceSettings, workspaces]);
   const workspaceCoordinationRootKey = useMemo(
     () => JSON.stringify(workspaceCoordinationRootEntries.map((entry) => [
       entry.workspaceId,
@@ -8076,6 +8669,32 @@ export default function App() {
     ])),
     [workspaceCoordinationRootEntries],
   );
+  const workspaceCoordinationTargetsByRoot = useMemo(() => {
+    if (!workspaceHydrationReady || workspaceActivationDeferred) {
+      return {};
+    }
+
+    const nextTargetsByRoot = {};
+    workspaceCoordinationRootEntries.forEach((entry) => {
+      const rootKey = getWorkspaceRootIdentity(entry.rootDirectory);
+      if (!rootKey) {
+        return;
+      }
+      const record = workspaceRootCoordinationTargetRecord(
+        entry.rootDirectory,
+        getWorkspaceRootGitRepository(workspaceSettings, entry.workspaceId),
+      );
+      if (record) {
+        nextTargetsByRoot[rootKey] = record;
+      }
+    });
+    return nextTargetsByRoot;
+  }, [
+    workspaceActivationDeferred,
+    workspaceCoordinationRootEntries,
+    workspaceHydrationReady,
+    workspaceSettings,
+  ]);
 
   useEffect(() => {
     const ready = Boolean(workspaceHydrationKey);
@@ -8086,6 +8705,8 @@ export default function App() {
       ready,
       rootDirectory: activeWorkspaceHydrationRoot,
       rootIdentity: getWorkspaceRootIdentity(activeWorkspaceHydrationRoot),
+      runtimeWorkspaceCount: runtimeWorkspaceIdsForHydration.length,
+      runtimeWorkspaceRootKey,
       selectedWorkspaceId,
       workspaceActivationDeferred,
       workspaceState,
@@ -8095,6 +8716,8 @@ export default function App() {
     activeAccountScopeKey,
     activeWorkspaceHydrationRoot,
     logWorkspaceActivationTrace,
+    runtimeWorkspaceIdsForHydration,
+    runtimeWorkspaceRootKey,
     selectedWorkspaceId,
     workspaceActivationDeferred,
     workspaceHydrationKey,
@@ -8102,143 +8725,86 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (!workspaceHydrationReady || workspaceActivationDeferred) {
-      logWorkspaceActivationTrace("workspace.open.coordination_targets.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-        reason: !workspaceHydrationReady ? "hydration_not_ready" : "activation_deferred",
-        workspaceActivationDeferred,
-        workspaceHydrationReady,
-      });
+    if (!workspaceHydrationReady || workspaceActivationDeferred || !workspaceCoordinationRootEntries.length) {
       return undefined;
     }
 
-    if (!workspaceCoordinationRootEntries.length) {
-      logWorkspaceActivationTrace("workspace.open.coordination_targets.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-        workspaceHydrationReady,
-      });
-      workspaceCoordinationTargetsStateKeyRef.current = "";
-      setWorkspaceCoordinationTargetsByRoot({});
-      return undefined;
-    }
-
-    const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
-    const nextTargetsByRoot = {};
-    let cacheHitCount = 0;
-    let cacheUpdated = false;
-    let fallbackCount = 0;
-    let scanSnapshotCount = 0;
-
+    let disposed = false;
     workspaceCoordinationRootEntries.forEach((entry) => {
       const rootKey = getWorkspaceRootIdentity(entry.rootDirectory);
-      if (!rootKey) {
+      const bootstrapKey = `${entry.workspaceId}:${rootKey}`;
+      if (!rootKey || workspaceCoordinationBootstrapKeysRef.current.has(bootstrapKey)) {
         return;
       }
-
-      const scanSnapshot = getWorkspaceGraphScanSnapshotForRoot(
-        workspaceGraphState,
-        entry.rootDirectory,
-        entry.workspaceId,
-      );
-      const scanResponse = scanSnapshot
-        ? workspaceCoordinationTargetResponseFromScanSnapshot(scanSnapshot, entry.rootDirectory)
-        : null;
-      if (scanResponse?.targets?.length) {
-        const normalizedScanResponse = normalizeWorkspaceCoordinationTargetsCacheRecord(
-          scanResponse,
-          entry.rootDirectory,
-        );
-        if (normalizedScanResponse) {
-          workspaceCoordinationTargetsCacheRef.current.set(rootKey, normalizedScanResponse);
-          nextTargetsByRoot[rootKey] = normalizedScanResponse;
-          cacheUpdated = true;
-        } else {
-          nextTargetsByRoot[rootKey] = scanResponse;
+      workspaceCoordinationBootstrapKeysRef.current.add(bootstrapKey);
+      invoke("coordination_bootstrap_workspace", {
+        repoPath: entry.rootDirectory,
+        agentSessionMode: AGENT_SESSION_MODE_COORDINATED,
+      }).then((response) => {
+        if (disposed) {
+          return;
         }
-        scanSnapshotCount += 1;
-        return;
-      }
-
-      const cachedResponse = workspaceCoordinationTargetsCacheRef.current.get(rootKey);
-      if (cachedResponse?.targets?.length) {
-        nextTargetsByRoot[rootKey] = cachedResponse;
-        cacheHitCount += 1;
-        return;
-      }
-
-      const fallbackResponse = normalizeWorkspaceCoordinationTargetResponse(
-        null,
-        entry.rootDirectory,
-      );
-      nextTargetsByRoot[rootKey] = fallbackResponse;
-      fallbackCount += 1;
+        const data = unwrapCloudCommandData(response, response || {});
+        const rootGitRepository = Boolean(data?.gitRepository || data?.git_repository);
+        const previousAgentSessionMode = getWorkspaceAgentSessionMode(
+          workspaceSettingsRef.current,
+          entry.workspaceId,
+        );
+        setWorkspaceSettings((settings) => {
+          const currentRoot = getWorkspaceRootDirectory(settings, entry.workspaceId);
+          if (getWorkspaceRootIdentity(currentRoot) !== rootKey) {
+            return settings;
+          }
+          const nextSettings = updateWorkspaceLocalSettings(settings, entry.workspaceId, {
+            rootGitRepository,
+          });
+          if (nextSettings === settings) {
+            return settings;
+          }
+          workspaceSettingsRef.current = nextSettings;
+          persistWorkspaceSettings(nextSettings);
+          return nextSettings;
+        });
+        if (!rootGitRepository && previousAgentSessionMode === AGENT_SESSION_MODE_WORKTREE) {
+          invoke("coordination_update_repo_policy", {
+            repoPath: entry.rootDirectory,
+            input: {
+              agent_session_mode: AGENT_SESSION_MODE_COORDINATED,
+            },
+          }).catch(() => {});
+        }
+        logWorkspaceActivationTrace("workspace.open.coordination_bootstrap.done", entry.workspaceId, {
+          created: Boolean(data?.created),
+          hasKernelDb: Boolean(data?.hasKernelDb || data?.has_kernel_db),
+          rootDirectory: entry.rootDirectory,
+          rootGitRepository,
+        });
+      }).catch((error) => {
+        logWorkspaceActivationTrace("workspace.open.coordination_bootstrap.error", entry.workspaceId, {
+          error: getErrorMessage(error, "Unable to bootstrap workspace coordination."),
+          rootDirectory: entry.rootDirectory,
+        });
+      });
     });
 
-    if (cacheUpdated) {
-      persistWorkspaceCoordinationTargetsCache(workspaceCoordinationTargetsCacheRef.current);
-    }
-
-    const nextTargetsStateKey = JSON.stringify(
-      Object.entries(nextTargetsByRoot)
-        .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
-        .map(([rootKey, record]) => [
-          rootKey,
-          String(record?.workspaceKind || ""),
-          (Array.isArray(record?.targets) ? record.targets : [])
-            .map((target) => [
-              getWorkspaceRootIdentity(target?.repoPath || ""),
-              String(target?.projectKind || ""),
-              String(target?.mountKind || ""),
-              String(target?.mountId || ""),
-              String(target?.workspaceRelativePath || ""),
-              Boolean(target?.hasGit),
-              Boolean(target?.hasAgents),
-              Boolean(target?.hasKernelDb),
-            ])
-            .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
-        ]),
-    );
-    if (workspaceCoordinationTargetsStateKeyRef.current === nextTargetsStateKey) {
-      return undefined;
-    }
-    workspaceCoordinationTargetsStateKeyRef.current = nextTargetsStateKey;
-
-    logWorkspaceActivationTrace("workspace.open.coordination_targets.resolved", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-      cacheHitCount,
-      elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
-      fallbackCount,
-      rootCount: workspaceCoordinationRootEntries.length,
-      scanSnapshotCount,
-      targetCount: Object.values(nextTargetsByRoot).reduce((sum, record) => (
-        sum + (Array.isArray(record?.targets) ? record.targets.length : 0)
-      ), 0),
-    });
-    setWorkspaceCoordinationTargetsByRoot(nextTargetsByRoot);
-
-    return undefined;
+    return () => {
+      disposed = true;
+    };
   }, [
     workspaceActivationDeferred,
     logWorkspaceActivationTrace,
     workspaceCoordinationRootEntries,
     workspaceCoordinationRootKey,
-    workspaceGraphState,
     workspaceHydrationReady,
   ]);
 
   const workspaceNotificationRoots = useMemo(() => (
-    workspaceCoordinationRootEntries.flatMap((entry) => (
-      getWorkspaceCoordinationTargetsForRoot(
-        workspaceCoordinationTargetsByRoot,
-        entry.rootDirectory,
-      ).map((target) => ({
-        mountId: target.mountId || "",
-        rootDirectory: target.repoPath,
-        workspaceId: entry.workspaceId,
-        workspaceRootDirectory: entry.rootDirectory,
-      }))
-    ))
-  ), [
-    workspaceCoordinationRootEntries,
-    workspaceCoordinationTargetsByRoot,
-  ]);
+    workspaceCoordinationRootEntries.map((entry) => ({
+      rootDirectory: entry.rootDirectory,
+      workspaceId: entry.workspaceId,
+      workspaceRootDirectory: entry.rootDirectory,
+    }))
+  ), [workspaceCoordinationRootEntries]);
   const workspaceNotificationSummaries = useMemo(
     () => getWorkspaceNotificationSummaries(workspaceNotifications, workspaceThreads),
     [workspaceNotifications, workspaceThreads],
@@ -8263,8 +8829,13 @@ export default function App() {
     };
   }, [workspaceNotificationSurfaceVisible]);
   const workspaceThreadStoreTargets = useMemo(
-    () => getWorkspaceThreadStoreTargets(workspaces, workspaceSettings, defaultWorkingDirectory),
-    [defaultWorkingDirectory, workspaceSettings, workspaces],
+    () => getWorkspaceThreadStoreTargets(
+      workspaces,
+      workspaceSettings,
+      defaultWorkingDirectory,
+      runtimeWorkspaceIdsForHydration,
+    ),
+    [defaultWorkingDirectory, runtimeWorkspaceIdsForHydration, workspaceSettings, workspaces],
   );
   const workspaceThreadStoreKey = useMemo(
     () => getWorkspaceThreadStoreKey(workspaceThreadStoreTargets),
@@ -9215,14 +9786,18 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (!workspaces.length) {
+    if (!runtimeWorkspaceIdsForHydration.length) {
       return;
     }
 
     setWorkspaceThreads((currentThreads) => {
       let nextThreads = currentThreads;
 
-      workspaces.forEach((workspace) => {
+      runtimeWorkspaceIdsForHydration.forEach((workspaceId) => {
+        const workspace = findWorkspaceById(workspaces, workspaceId);
+        if (!workspace) {
+          return;
+        }
         const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspace.id);
         const terminalIndexes = getWorkspaceLogicalTerminalIndexes(
           workspaceTerminalLogicalIndexes,
@@ -9260,6 +9835,7 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
+    runtimeWorkspaceIdsForHydration,
     workspaces,
   ]);
 
@@ -9431,6 +10007,7 @@ export default function App() {
       workspaces,
       workspaceSettings,
       defaultWorkingDirectory,
+      runtimeWorkspaceIdsForHydration,
     );
     const storeKey = getWorkspaceThreadStoreKey(targets);
     if (!targets.length || workspaceThreadsHydratedKeyRef.current !== storeKey) {
@@ -9503,6 +10080,7 @@ export default function App() {
   }, [
     defaultWorkingDirectory,
     getTerminalInputHotDelayMs,
+    runtimeWorkspaceIdsForHydration,
     workspaceSettings,
     workspaceThreads,
     workspaces,
@@ -10209,7 +10787,7 @@ export default function App() {
   const toggleWorkspaceRailCollapsed = useCallback(() => {
     const nextCollapsed = !workspaceRailCollapsed;
     animateWorkspaceRailWidth(nextCollapsed);
-    persistWorkspaceRailCollapsed(nextCollapsed);
+    persistWorkspaceRailCollapsed();
     setWorkspaceRailCollapsed(nextCollapsed);
   }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
 
@@ -12050,8 +12628,16 @@ export default function App() {
       try {
         // The Rust list command already filters out workspaces whose catalog
         // delete is still queued in the outbox.
-        const result = await invoke("cloud_mcp_workspace_catalog_list");
+        const result = await invoke("cloud_mcp_workspace_catalog_list", {
+          scopeKey,
+          scopeType: activeWorkspaceScopePayload.scopeType,
+          teamId: activeWorkspaceScopePayload.teamId,
+        });
         if (activeAccountScopeKey !== scopeKey) {
+          return;
+        }
+        const resultScopeKey = String(result?.scopeKey || result?.scope_key || "").trim();
+        if (resultScopeKey !== scopeKey) {
           return;
         }
         const cloudItems = (Array.isArray(result?.workspaces) ? result.workspaces : [])
@@ -12087,7 +12673,7 @@ export default function App() {
         // websocket reconnects and the catalog broadcast refreshes us.
       }
     })();
-  }, [activeAccountScopeKey, expireDesktopSession]);
+  }, [activeAccountScopeKey, activeWorkspaceScopePayload, expireDesktopSession]);
 
   useEffect(() => {
     if (!previousAccountScopeKeyRef.current) {
@@ -12106,6 +12692,7 @@ export default function App() {
     }
 
     setWorkspaces([]);
+    workspacesRef.current = [];
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     activatedWorkspaceIdRef.current = "";
@@ -12132,6 +12719,10 @@ export default function App() {
       }
       const payload = event?.payload || {};
       if (!Array.isArray(payload.workspaces)) {
+        return;
+      }
+      const payloadScopeKey = String(payload.scopeKey || payload.scope_key || "").trim();
+      if (payloadScopeKey !== scopeKey || activeAccountScopeKey !== scopeKey) {
         return;
       }
       // The Rust event forwarder already drops workspaces whose catalog
@@ -12228,6 +12819,7 @@ export default function App() {
       const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
       const rootDirectory = normalizedRoot?.workingDirectory || "";
       const rootWasEmptyAtSelection = Boolean(normalizedRoot?.emptyDirectory);
+      const rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
 
       if (!rootDirectory) {
         throw new Error("Workspace root directory was not returned by validation.");
@@ -12266,6 +12858,7 @@ export default function App() {
       const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
         rootDirectory,
         rootWasEmptyAtSelection,
+        rootGitRepository,
         ...(terminalRoles
           ? { terminalCount: terminalRoles.length, terminalRoles }
           : {}),
@@ -12295,6 +12888,10 @@ export default function App() {
 
       const scopeKey = activeAccountScopeKey;
       void invoke("local_workspaces_store", { scopeKey, workspaces: nextWorkspaces }).catch(() => {});
+      void invoke("coordination_bootstrap_workspace", {
+        repoPath: rootDirectory,
+        agentSessionMode: AGENT_SESSION_MODE_COORDINATED,
+      }).catch(() => {});
 
       void (async () => {
         let catalogSynced = false;
@@ -12394,8 +12991,7 @@ export default function App() {
     const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
     const currentAgentSessionMode = getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id);
-    const agentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft);
-    const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
+    const requestedAgentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft);
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
     const currentTerminalRoles = getWorkspaceTerminalRoles(
       workspaceSettings,
@@ -12439,6 +13035,15 @@ export default function App() {
         ? await invoke("validate_workspace_root_directory", { path: rootValidationPath })
         : null;
       const rootDirectory = cleanedRoot ? normalizedRoot?.workingDirectory || "" : "";
+      const rootGitRepository = rootDirectory
+        ? Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository)
+        : false;
+      const agentSessionMode = normalizeAgentSessionMode(
+        requestedAgentSessionMode,
+        false,
+        rootGitRepository,
+      );
+      const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
       const effectiveRootDirectory = rootDirectory || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
       const duplicateWorkspace = findWorkspaceByEffectiveRoot(
         workspacesRef.current,
@@ -12634,6 +13239,7 @@ export default function App() {
         const nextSettings = updateWorkspaceLocalSettings(settings, selectedWorkspace.id, {
           rootDirectory,
           rootWasEmptyAtSelection,
+          rootGitRepository,
           agentSessionMode,
           gitWorktreesEnabled,
           terminalCount,
@@ -14815,7 +15421,6 @@ export default function App() {
     workspaceRuntimeDescriptorLogKeyRef.current = "";
     workspaceRuntimeSelectionLogKeyRef.current = "";
     workspaceMcpStartupIndexEmptyKeyRef.current = "";
-    workspaceCoordinationTargetsStateKeyRef.current = "";
     preparedTerminalsRef.current.clear();
     setStartupAgentGateState("idle");
     setStartupAgentUpdateMessage("");
@@ -15007,19 +15612,22 @@ export default function App() {
       return undefined;
     }
 
-    const userKey = `${user?.id || user?.email || "user"}:${activeAccountScopeKey}`;
+    const userKey = `${user?.id || user?.email || "user"}`;
 
     if (agentInitialStatusUserRef.current !== userKey) {
       const startupFlowId = startupAgentFlowIdRef.current + 1;
+      const cachedStartupStatuses = Array.isArray(agentStatusesRef.current)
+        ? agentStatusesRef.current
+        : agentStatuses;
+      const hasCachedStartupStatuses = cachedStartupStatuses.some((status) => status?.cached);
 
       startupAgentFlowIdRef.current = startupFlowId;
       agentInitialStatusUserRef.current = userKey;
-      setStartupAgentGateState("checking");
       setStartupAgentUpdateMessage("");
       refreshAudioModelStatus();
       loadWorkspaces();
 
-      refreshAgentStatuses().then((nextStatuses) => {
+      const applyStartupAgentStatuses = (nextStatuses) => {
         if (startupAgentFlowIdRef.current !== startupFlowId || agentInitialStatusUserRef.current !== userKey) {
           return;
         }
@@ -15037,13 +15645,26 @@ export default function App() {
         }
 
         finishStartupAgentGate(nextStatuses, "no_updates");
-      });
+      };
+      const refreshStartupAgentStatuses = () => {
+        refreshAgentStatuses().then(applyStartupAgentStatuses);
+      };
+
+      if (hasCachedStartupStatuses) {
+        applyStartupAgentStatuses(cachedStartupStatuses);
+        return scheduleWorkspaceStartupIdleTask(refreshStartupAgentStatuses, {
+          delayMs: WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS,
+          timeoutMs: WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS,
+        });
+      }
+
+      setStartupAgentGateState("checking");
+      refreshStartupAgentStatuses();
     }
 
     return undefined;
   }, [
     agentStatuses,
-    activeAccountScopeKey,
     authState,
     finishStartupAgentGate,
     loadWorkspaces,
@@ -15244,6 +15865,14 @@ export default function App() {
   const selectedWorkspaceAgentSessionMode = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id)
     : AGENT_SESSION_MODE_COORDINATED;
+  const selectedWorkspaceRootGitRepository = selectedWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspaceRootGitRepository(workspaceSettings, selectedWorkspace.id)
+    : false;
+  const selectedWorkspaceRootGitRepositoryKnown = selectedWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspaceRootGitRepositoryKnown(workspaceSettings, selectedWorkspace.id)
+    : false;
+  const selectedWorkspaceSafeModeAvailable = selectedWorkspaceRootGitRepository
+    || (!selectedWorkspaceRootGitRepositoryKnown && selectedWorkspaceAgentSessionMode === AGENT_SESSION_MODE_WORKTREE);
   const activatedWorkspaceTerminalRoles = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
@@ -15359,23 +15988,7 @@ export default function App() {
     : null;
   const selectedWorkspaceRootDisplay = selectedWorkspaceRootDirectory || defaultWorkingDirectory || "App directory";
   const activatedWorkspaceTerminalWorkingDirectory = activatedWorkspaceRootDirectory || defaultWorkingDirectory;
-  const enabledRuntimeWorkspaceIds = useMemo(() => {
-    const ids = [];
-    const seen = new Set();
-    const addWorkspaceId = (workspaceId) => {
-      const id = String(workspaceId || "").trim();
-      if (!id || seen.has(id) || !findWorkspaceById(workspaces, id)) {
-        return;
-      }
-      seen.add(id);
-      ids.push(id);
-    };
-
-    normalizeEnabledWorkspaceIds(workspaceLifecycleSettings.enabledWorkspaceIds).forEach(addWorkspaceId);
-    addWorkspaceId(activatedWorkspaceId);
-
-    return ids;
-  }, [activatedWorkspaceId, workspaceLifecycleSettings.enabledWorkspaceIds, workspaces]);
+  const enabledRuntimeWorkspaceIds = runtimeWorkspaceIdsForHydration;
   const workspaceRuntimeThreadSignature = useMemo(() => (
     enabledRuntimeWorkspaceIds.map((workspaceId) => {
       const workspaceThreadState = workspaceThreads?.[workspaceId] || {};
@@ -15571,6 +16184,7 @@ export default function App() {
     if (
       authState !== "authenticated"
       || shouldShowWorkspaceSetup
+      || visibleView !== "architecture"
       || !workspaceStartupWarmupTargets.length
     ) {
       return undefined;
@@ -15612,6 +16226,7 @@ export default function App() {
     logWorkspaceActivationTrace,
     shouldShowWorkspaceSetup,
     startWorkspaceArchitectureScan,
+    visibleView,
     workspaceStartupWarmupTargetKey,
     workspaceStartupWarmupTargets,
   ]);
@@ -16652,7 +17267,10 @@ export default function App() {
     [workspaceCatalogSyncTargets],
   );
   const workspaceMcpSyncTargets = useMemo(
-    () => workspaceCatalogSyncTargets.filter((target) => String(target?.repoPath || "").trim()),
+    () => workspaceCatalogSyncTargets.filter((target) => (
+      Boolean(target?.workspaceActive)
+        && String(target?.repoPath || "").trim()
+    )),
     [workspaceCatalogSyncTargets],
   );
   const workspaceMcpSyncTargetKey = useMemo(
@@ -16665,7 +17283,6 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !workspaceHydrationReady
-      || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
     ) {
@@ -16673,13 +17290,14 @@ export default function App() {
     }
 
     const targets = workspaceCatalogSyncTargets.filter((target) => target?.workspaceId);
-    if (targets.length === 0) {
+    if (shouldShowWorkspaceSetup && targets.length > 0) {
       return undefined;
     }
 
     const accountKey = user?.id || user?.email || "paid-user";
     const syncKey = JSON.stringify({
       accountKey,
+      scopeKey: activeAccountScopeKey,
       cloudLiveSyncEpoch,
       targets: targets.map((target) => ({
         active: Boolean(target.workspaceActive),
@@ -16707,6 +17325,7 @@ export default function App() {
         status: "start",
         message: "Rust client is syncing the desktop workspace catalog to cloud.",
         details: {
+          scopeKey: activeAccountScopeKey,
           workspaceCount: targets.length,
         },
       });
@@ -16740,6 +17359,7 @@ export default function App() {
           status: "ok",
           message: "Rust client workspace catalog sync completed.",
           details: {
+            scopeKey: activeAccountScopeKey,
             workspaceCount: targets.length,
           },
         });
@@ -16749,6 +17369,7 @@ export default function App() {
           logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_catalog_sync.failed", {
             message: getErrorMessage(error, "Unable to sync workspace catalog."),
             workspaceCount: targets.length,
+            scopeKey: activeAccountScopeKey,
           });
           await recordCloudConnectionDiagnostic(diagnosticToken, {
             channel: "rust-client-sync",
@@ -16756,6 +17377,7 @@ export default function App() {
             status: "error",
             message: getErrorMessage(error, "Unable to sync workspace catalog."),
             details: {
+              scopeKey: activeAccountScopeKey,
               workspaceCount: targets.length,
             },
           });
@@ -16776,6 +17398,7 @@ export default function App() {
     };
   }, [
     authState,
+    activeAccountScopeKey,
     shouldShowWorkspaceSetup,
     user,
     workspaceCatalogSyncKey,
@@ -16799,7 +17422,6 @@ export default function App() {
     ) {
       return undefined;
     }
-
     let disposed = false;
     const reason = "device_live_state_snapshot";
     const syncKey = `${workspaceTerminalsSyncKey}:${reason}:${cloudLiveSyncEpoch}`;
@@ -16937,6 +17559,10 @@ export default function App() {
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
     ) {
+      return undefined;
+    }
+    if (!workspaceMcpSyncTargets.length) {
+      workspaceMcpSyncKeyRef.current = "";
       return undefined;
     }
 
@@ -17708,9 +18334,9 @@ export default function App() {
   const workspaceMainPanelSize = workspaceToolPaneVisible ? 100 - workspaceToolPanelSize : 100;
   const workspaceToolPanelMinSize = workspaceToolPaneVisible
     ? workspaceToolPaneMinimized
-      ? workspaceToolMinimizedSize
-      : workspaceToolRestoredMinSize
-    : 0;
+      ? `${workspaceToolMinimizedSize}%`
+      : `${WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX}px`
+    : "0px";
   const workspaceToolPanelMaxSize = workspaceToolPaneVisible
     ? workspaceToolPaneMinimized
       ? workspaceToolMinimizedSize
@@ -17741,21 +18367,11 @@ export default function App() {
     });
   }, [cancelDeferredWorkspaceActivation, showView]);
   const openNetworkingOverlay = useCallback(() => {
-    showNoWorkspaceSelectedFromWorkspaceTool("networking_overlay");
-    setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
-    if (!workspaceRailCollapsed) {
-      animateWorkspaceRailWidth(true);
-      persistWorkspaceRailCollapsed(true);
-      setWorkspaceRailCollapsed(true);
-    }
     setNetworkingOverlayOpen(true);
     void refreshNetworkingDiagnostics({ quiet: Boolean(networkingDiagnostics) });
   }, [
-    animateWorkspaceRailWidth,
     networkingDiagnostics,
     refreshNetworkingDiagnostics,
-    showNoWorkspaceSelectedFromWorkspaceTool,
-    workspaceRailCollapsed,
   ]);
   const closeNetworkingOverlay = useCallback(() => {
     setNetworkingOverlayOpen(false);
@@ -17855,8 +18471,8 @@ export default function App() {
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
-      workspaceToolMainPanelRef.current?.resize?.(workspaceMainPanelSize);
-      workspaceToolPanelRef.current?.resize?.(workspaceToolPanelSize);
+      workspaceToolMainPanelRef.current?.resize?.(`${workspaceMainPanelSize}%`);
+      workspaceToolPanelRef.current?.resize?.(`${workspaceToolPanelSize}%`);
     });
 
     return () => window.cancelAnimationFrame(frameId);
@@ -18055,38 +18671,30 @@ export default function App() {
     if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetWorkspaceRoot) {
       return [];
     }
-    const discoveredTargets = dedupeWorkspaceCoordinationTargets(
-      getWorkspaceCoordinationTargetsForRoot(
-        workspaceCoordinationTargetsByRoot,
-        cloudSqliteResetWorkspaceRoot,
-      ),
-    );
-    const gitTargets = discoveredTargets.filter(workspaceCoordinationTargetIsGitRepo);
-    const seen = new Set();
-    return gitTargets
-      .map((target) => {
-        const repoPath = cleanWorkspaceRootDirectory(target?.repoPath || "");
-        const repoIdentity = getWorkspaceRootIdentity(repoPath);
-        if (!repoPath || !repoIdentity || seen.has(repoIdentity)) {
-          return null;
-        }
-        seen.add(repoIdentity);
-        const repoLabel = workspaceCoordinationTargetRepoLabel(target);
-        const relativePath = String(target?.workspaceRelativePath || "").trim();
-        return {
-          key: `${cloudSqliteResetWorkspaceId}:${repoIdentity}`,
-          repoIdentity,
-          repoLabel,
-          repoPath,
-          relativePath,
-          target,
-        };
-      })
-      .filter(Boolean);
+    if (!getWorkspaceRootGitRepository(workspaceSettings, cloudSqliteResetWorkspaceId)) {
+      return [];
+    }
+    const repoIdentity = getWorkspaceRootIdentity(cloudSqliteResetWorkspaceRoot);
+    const repoLabel = cloudSqliteResetWorkspaceRoot
+      .split(/[\\/]/u)
+      .filter(Boolean)
+      .pop() || cloudSqliteResetWorkspaceRoot;
+    return [{
+      key: `${cloudSqliteResetWorkspaceId}:${repoIdentity}`,
+      repoIdentity,
+      repoLabel,
+      repoPath: cloudSqliteResetWorkspaceRoot,
+      relativePath: "",
+      target: {
+        hasGit: true,
+        isWorkspaceRoot: true,
+        repoPath: cloudSqliteResetWorkspaceRoot,
+      },
+    }];
   }, [
     cloudSqliteResetWorkspaceId,
     cloudSqliteResetWorkspaceRoot,
-    workspaceCoordinationTargetsByRoot,
+    workspaceSettings,
   ]);
   const cloudSqliteResetSelectedRepoCards = useMemo(() => (
     cloudSqliteResetRepoCards.filter((card) => Boolean(cloudSqliteResetSelectedRepoKeys?.[card.key]))
@@ -18919,7 +19527,7 @@ export default function App() {
   useEffect(() => {
     const repoPath = activatedWorkspaceTerminalWorkingDirectory;
     const workspaceId = activatedWorkspaceIdForGraphSync;
-    if (!repoPath || !workspaceId) {
+    if (visibleView !== "architecture" || !repoPath || !workspaceId) {
       return undefined;
     }
 
@@ -18943,6 +19551,7 @@ export default function App() {
     activatedWorkspaceIdForGraphSync,
     activatedWorkspaceTerminalWorkingDirectory,
     startWorkspaceArchitectureScan,
+    visibleView,
   ]);
 
   useEffect(() => {
@@ -19189,6 +19798,7 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let unlistenAccountLiveState = null;
     let unlistenWorkspaceTodos = null;
     let workspaceTodoRefreshTimer = 0;
 
@@ -19211,6 +19821,34 @@ export default function App() {
       }, 80);
     };
 
+    listen(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, (event) => {
+      if (cancelled) {
+        return;
+      }
+      const snapshot = cloudAccountDeviceLiveStateSnapshotFromEventPayload(event?.payload);
+      if (!snapshot) {
+        return;
+      }
+      const deviceLiveState = cloudDeviceLiveStateFromAccountSnapshot(snapshot, null);
+      setCloudWorkspaceProgress((current) => normalizeCloudWorkspaceProgress({
+        ...current,
+        connectedDevices: cloudConnectedDevicesFromAccountSnapshot(deviceLiveState),
+        detail: current.detail || "Refreshing account device liveness.",
+        deviceLiveState: cloudDeviceLiveStateFromAccountSnapshot(snapshot, current.deviceLiveState),
+        knownDevices: cloudKnownDevicesFromAccountSnapshot(deviceLiveState),
+        stage: current.stage || "workspace_socket",
+        status: current.status === "connected" ? "connected" : "active",
+        title: current.title || "Cloud workspace",
+        updatedAt: Date.now(),
+      }, current));
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenAccountLiveState = unlisten;
+    }).catch(() => {});
+
     listen(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, () => {
       refreshCloudWorkspaceTodos();
     }).then((unlisten) => {
@@ -19226,6 +19864,9 @@ export default function App() {
       if (workspaceTodoRefreshTimer) {
         window.clearTimeout(workspaceTodoRefreshTimer);
         workspaceTodoRefreshTimer = 0;
+      }
+      if (unlistenAccountLiveState) {
+        unlistenAccountLiveState();
       }
       if (unlistenWorkspaceTodos) {
         unlistenWorkspaceTodos();
@@ -25811,6 +26452,9 @@ export default function App() {
                               <WorkspaceCreatePathText title={workspaceRootDraft || selectedWorkspaceRootDisplay}>
                                 {workspaceRootDraft || selectedWorkspaceRootDisplay || defaultWorkingDirectory || "Choose project root"}
                               </WorkspaceCreatePathText>
+                              {selectedWorkspaceRootGitRepository && (
+                                <WorkspaceCreatePathBadge $tone="good">git</WorkspaceCreatePathBadge>
+                              )}
                             </WorkspaceCreatePathBar>
                             <WorkspaceCreateFooter>
                               <SecondaryButton
@@ -25876,7 +26520,9 @@ export default function App() {
                               can conflict, and cannot pause or resume.
                             </SettingsHint>
                             <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
-                              {AGENT_SESSION_MODE_OPTIONS.map((option) => {
+                              {AGENT_SESSION_MODE_OPTIONS.filter((option) => (
+                                option.value !== AGENT_SESSION_MODE_WORKTREE || selectedWorkspaceSafeModeAvailable
+                              )).map((option) => {
                                 const active = workspaceAgentSessionModeDraft === option.value;
                                 const needsConfirm = option.value === AGENT_SESSION_MODE_DIRECT && !active;
                                 return (
@@ -26930,7 +27576,7 @@ export default function App() {
                         defaultSize={`${workspaceToolPanelSize}%`}
                         id="workspace-app-tool-panel"
                         maxSize={`${workspaceToolPanelMaxSize}%`}
-                        minSize={`${workspaceToolPanelMinSize}%`}
+                        minSize={workspaceToolPanelMinSize}
                         ref={workspaceToolPanelRef}
                       >
                         <WorkspaceAppToolPortalHost
@@ -26965,8 +27611,11 @@ export default function App() {
                                   )
                                   : []}
                                 defaultWorkingDirectory={defaultWorkingDirectory}
+                                deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
                                 draft={accountToolDraft}
                                 items={accountToolItems}
+                                knownDevices={cloudWorkspaceProgress.knownDevices}
+                                localDesktopProfile={cloudDesktopDeviceProfile}
                                 onDraftChange={setAccountToolDraft}
                                 onMinimizePane={minimizeWorkspaceToolPane}
                                 onOpenWorkspaceSettings={openSelectedWorkspaceSettings}

@@ -30,24 +30,48 @@ static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 use std::io::BufRead as _;
 
 #[tauri::command]
-async fn tokenomics_scan_usage(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || tokenomics_scan_usage_for(&app, true, false))
-        .await
-        .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))?
+async fn tokenomics_scan_usage(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let scan_app = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        tokenomics_scan_usage_for(&scan_app, true, false)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
+    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    Ok(summary)
 }
 
 #[tauri::command]
-async fn tokenomics_scan_usage_silent(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || tokenomics_scan_usage_for(&app, false, false))
-        .await
-        .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))?
+async fn tokenomics_scan_usage_silent(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let scan_app = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        tokenomics_scan_usage_for(&scan_app, false, false)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
+    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    Ok(summary)
 }
 
 #[tauri::command]
-async fn tokenomics_resync_last_30_days(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || tokenomics_scan_usage_for(&app, false, true))
-        .await
-        .map_err(|error| format!("Unable to join Tokenomics resync: {error}"))?
+async fn tokenomics_resync_last_30_days(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let scan_app = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        tokenomics_scan_usage_for(&scan_app, false, true)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics resync: {error}"))??;
+    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -102,14 +126,21 @@ async fn tokenomics_get_sync_delta(
 }
 
 #[tauri::command]
-async fn tokenomics_record_usage(app: AppHandle, usage: Value) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let conn = tokenomics_open_db(&app)?;
+async fn tokenomics_record_usage(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    usage: Value,
+) -> Result<Value, String> {
+    let record_app = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        let conn = tokenomics_open_db(&record_app)?;
         let inserted = tokenomics_record_usage_value(&conn, &usage, "manual")?;
         tokenomics_summary_from_conn(&conn, true, Some(inserted))
     })
     .await
-    .map_err(|error| format!("Unable to join Tokenomics record: {error}"))?
+    .map_err(|error| format!("Unable to join Tokenomics record: {error}"))??;
+    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    Ok(summary)
 }
 
 fn tokenomics_db_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -676,6 +707,43 @@ fn tokenomics_reset_scan_caches_for_resync(conn: &rusqlite::Connection) -> Resul
     conn.execute("DELETE FROM tokenomics_source_offsets", [])
         .map_err(|error| format!("Unable to reset Tokenomics source offsets: {error}"))?;
     Ok(())
+}
+
+fn tokenomics_summary_inserted_events(summary: &Value) -> usize {
+    summary
+        .get("scan")
+        .and_then(|scan| scan.get("inserted_events").or_else(|| scan.get("insertedEvents")))
+        .or_else(|| summary.get("inserted_events"))
+        .or_else(|| summary.get("insertedEvents"))
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or_default()
+}
+
+async fn tokenomics_enqueue_usage_sync_if_inserted(
+    app: AppHandle,
+    state: &CloudMcpState,
+    summary: &Value,
+) {
+    if tokenomics_summary_inserted_events(summary) == 0 {
+        return;
+    }
+    let signed_in = cloud_mcp_authorization_bearer(state)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !signed_in {
+        return;
+    }
+    let _ = cloud_mcp_enqueue_tokenomics_sync(
+        app,
+        state,
+        "tokenomics_usage_changed".to_string(),
+        false,
+        false,
+    )
+    .await;
 }
 
 struct TokenomicsSource {
@@ -5463,12 +5531,23 @@ fn tokenomics_sync_delta_from_conn(
     since_updated_at: Option<&str>,
     scope_filter: Option<&TokenomicsBillingScope>,
 ) -> Result<Value, String> {
+    tokenomics_sync_delta_from_conn_with_limit_sampling(conn, since_updated_at, scope_filter, true)
+}
+
+fn tokenomics_sync_delta_from_conn_with_limit_sampling(
+    conn: &rusqlite::Connection,
+    since_updated_at: Option<&str>,
+    scope_filter: Option<&TokenomicsBillingScope>,
+    record_limit_samples: bool,
+) -> Result<Value, String> {
     let clean_since = since_updated_at
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let hourly = tokenomics_account_hourly_sync_rollups(conn, clean_since, scope_filter)?;
     let mut limits = tokenomics_provider_limits(conn, false, false)?;
-    let _ = tokenomics_record_provider_limit_samples(conn, &limits);
+    if record_limit_samples {
+        let _ = tokenomics_record_provider_limit_samples(conn, &limits);
+    }
     tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
     let limit_samples = tokenomics_provider_limit_sample_sync_rows(conn, clean_since, scope_filter)?;
     let sync_cursor = hourly
