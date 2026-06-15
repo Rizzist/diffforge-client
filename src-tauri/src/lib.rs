@@ -4577,7 +4577,6 @@ pub fn run() {
             tokenomics_get_sync_payload,
             tokenomics_get_sync_delta,
             tokenomics_record_usage,
-            cloud_mcp_hard_reset_cloud_sqlite,
             cloud_mcp_reset_server_state,
             cloud_mcp_account_repo_catalog,
             cloud_mcp_get_account_tools,

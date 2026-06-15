@@ -8093,9 +8093,6 @@ export default function App() {
   const [tokenomicsCloudResetState, setTokenomicsCloudResetState] = useState("idle");
   const [tokenomicsCloudResetMessage, setTokenomicsCloudResetMessage] = useState("");
   const [tokenomicsCloudResetError, setTokenomicsCloudResetError] = useState("");
-  const [cloudAccountResetState, setCloudAccountResetState] = useState("idle");
-  const [cloudAccountResetMessage, setCloudAccountResetMessage] = useState("");
-  const [cloudAccountResetError, setCloudAccountResetError] = useState("");
   const [cloudWorkspaceProgress, setCloudWorkspaceProgress] = useState(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
   const [cloudDesktopDeviceProfile, setCloudDesktopDeviceProfile] = useState(null);
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
@@ -19396,63 +19393,6 @@ export default function App() {
     }
   }, [authState, user]);
 
-  const resetCloudAccountData = useCallback(async () => {
-    setCloudAccountResetMessage("");
-    setCloudAccountResetError("");
-
-    if (authState !== "authenticated" || !accountIsPaid) {
-      setCloudAccountResetError("Sign in with an active paid account before cleaning up cloud data.");
-      return;
-    }
-
-    const confirmed = window.confirm(
-      "Delete ALL cloud-diffforge data for this account? Local data stays on this device and will fully resync to the cloud afterwards.",
-    );
-    if (!confirmed) {
-      return;
-    }
-
-    setCloudAccountResetState("resetting");
-    try {
-      await invoke("cloud_mcp_hard_reset_cloud_sqlite", {
-        repoPath: selectedWorkspaceRootDirectory || defaultWorkingDirectoryRef.current || "",
-        workspaceId: selectedWorkspaceIdRef.current || "account",
-        workspaceName: "",
-        resetScope: "account",
-      });
-
-      // Fresh-slate resync: every sync signature/cursor clears so this
-      // client re-pushes everything as the authoritative copy.
-      workspaceCatalogSyncKeyRef.current = "";
-      workspaceTerminalsSyncKeyRef.current = "";
-      workspaceMcpSyncKeyRef.current = "";
-      architectureCloudSyncSignatureRef.current = {};
-      const pendingWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-        .map((workspace) => ({ ...workspace, syncState: "pending" }));
-      workspacesRef.current = pendingWorkspaces;
-      setWorkspaces(pendingWorkspaces);
-      await invoke("local_workspaces_store", {
-        scopeKey: activeAccountScopeKey,
-        workspaces: pendingWorkspaces,
-      }).catch(() => {});
-
-      window.dispatchEvent(new CustomEvent("diffforge:cloud-resync-requested"));
-      tokenomicsForceResyncRef.current?.();
-      await loadWorkspaces();
-      setCloudAccountResetMessage("Cloud account data deleted; this device is resyncing everything.");
-    } catch (error) {
-      setCloudAccountResetError(getErrorMessage(error, "Unable to clean up cloud account data."));
-    } finally {
-      setCloudAccountResetState("idle");
-    }
-  }, [
-    activeAccountScopeKey,
-    authState,
-    loadWorkspaces,
-    selectedWorkspaceRootDirectory,
-    user,
-  ]);
-
   useEffect(() => {
     if (!hasSelectedWorkspace && SELECTED_WORKSPACE_DETAIL_VIEWS.has(activeView)) {
       showView(DEFAULT_WORKSPACE_VIEW, {
@@ -27151,26 +27091,6 @@ export default function App() {
                       {tokenomicsCloudResetMessage && (
                         <AgentInstallMessage data-tone="success">
                           {tokenomicsCloudResetMessage}
-                        </AgentInstallMessage>
-                      )}
-                      <AccountCardFooter>
-                        <SettingsHint>
-                          Cloud cleanup: delete everything cloud-diffforge stores for this
-                          account, then resync it all from this device (local data stays).
-                        </SettingsHint>
-                        <PrimaryDangerButton
-                          disabled={cloudAccountResetState === "resetting"}
-                          onClick={resetCloudAccountData}
-                          type="button"
-                        >
-                          {cloudAccountResetState === "resetting" ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{cloudAccountResetState === "resetting" ? "Cleaning up..." : "Clean up cloud account"}</span>
-                        </PrimaryDangerButton>
-                      </AccountCardFooter>
-                      {cloudAccountResetError && <FormMessage $state="error">{cloudAccountResetError}</FormMessage>}
-                      {cloudAccountResetMessage && (
-                        <AgentInstallMessage data-tone="success">
-                          {cloudAccountResetMessage}
                         </AgentInstallMessage>
                       )}
                     </AccountCard>

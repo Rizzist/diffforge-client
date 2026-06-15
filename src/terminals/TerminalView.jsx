@@ -26201,7 +26201,7 @@ function TerminalView({
       syncTodoQueueItemsToCloud(todoQueueItemsRef.current, {
         force: true,
         immediate: true,
-        reason: "cloud_account_reset_resync",
+        reason: "cloud_device_deleted_resync",
       });
     };
     window.addEventListener("diffforge:cloud-resync-requested", handleCloudResync);

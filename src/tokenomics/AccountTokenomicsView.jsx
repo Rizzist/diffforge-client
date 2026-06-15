@@ -24,7 +24,7 @@ const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
-const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = 7;
+const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = TOKENOMICS_DAILY_WINDOW_DAYS;
 const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
 const TOKENOMICS_DAILY_WARN_LIMIT_PERCENT = 13;
 const TOKENOMICS_DAILY_DANGER_LIMIT_PERCENT = 20;
@@ -2296,7 +2296,7 @@ function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   ensureTokenomicsCloudListener();
   tokenomicsStore.pollSubscriberCount += 1;
-  void loadTokenomicsStore().finally(() => {
+  void loadTokenomicsStore({ scan: true, force: true }).finally(() => {
     void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
   });
 
@@ -2431,7 +2431,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
   useEffect(() => {
     resetTokenomicsStoreForAccount(accountKey);
-    void loadTokenomicsStore();
+    void loadTokenomicsStore({ scan: true, force: true });
   }, [accountKey]);
 
   useEffect(() => {

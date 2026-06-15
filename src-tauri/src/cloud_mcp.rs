@@ -3051,7 +3051,7 @@ fn cloud_mcp_sync_activity_for_endpoint(
         "/v1/cloud/repo-catalog" => ("catalog", "down", "applying"),
         "/v1/tools/account" => ("tools", "down", "applying"),
         "/v1/tools/skills" | "/v1/tools/cli-snapshot" => ("tools", "up", "active"),
-        "/v1/cloud/sqlite/hard-reset" | "/v1/cloud/server-reset" => ("system", "control", "active"),
+        "/v1/cloud/server-reset" => ("system", "control", "active"),
         _ => return None,
     };
     Some((
@@ -13522,10 +13522,7 @@ async fn cloud_mcp_ws_request_with_timeout(
     let mut last_error = String::new();
     // Destructive resets must never be re-sent on timeout: the server may still
     // be processing the first request, and a retry doubles the heavy work.
-    let retry_transient_errors = !matches!(
-        request_kind,
-        "hard_reset_cloud_sqlite" | "server_reset_cloud_state"
-    );
+    let retry_transient_errors = !matches!(request_kind, "server_reset_cloud_state");
     for attempt in 0..2 {
         match cloud_mcp_ws_request_once_with_timeout(state, request_kind, payload, response_timeout)
             .await
@@ -14276,7 +14273,6 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/tools/account" => Some("account_tools_get"),
         "/v1/tools/skills" => Some("account_tools_set_skills"),
         "/v1/tools/cli-snapshot" => Some("account_tools_cli_snapshot"),
-        "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
 }
@@ -20134,69 +20130,6 @@ fn cloud_mcp_tag_tokenomics_summary_device(summary: &mut Value, device_profile: 
 }
 
 #[tauri::command]
-async fn cloud_mcp_hard_reset_cloud_sqlite(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
-    reset_scope: Option<String>,
-) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
-        repo_path.clone(),
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let requested_reset_scope = reset_scope
-        .as_deref()
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty())
-        .unwrap_or("repo")
-        .to_ascii_lowercase();
-    let reset_scope = match requested_reset_scope.as_str() {
-        // Account scope is the "clean up the server" path: cloud-diffforge
-        // wipes every per-client SQLite scope, the hot state, the workspace
-        // mirror, and the deleted-ids ledger for the account, after which
-        // this client resyncs everything as the authoritative copy.
-        "account" | "account_full" | "account-full" => "account",
-        "repo" | "repository" | "git_repo" | "git-repo" => "repo",
-        "client" | "current" | "workspace" => "repo",
-        _ => "repo",
-    };
-    let payload = json!({
-        "source": "rust-diffforge-cloud-sqlite-hard-reset",
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": req.repo_id,
-        "repo_path": req.root_display,
-        "workspace_root": req.root_display,
-        "workspace_id": workspace_id,
-        "workspace_name": workspace_name,
-        "scope": reset_scope,
-        "confirm": "hard_reset_cloud_sqlite",
-        "device": device_profile.clone(),
-        "device_id": device_profile["device_id"].clone(),
-        "device_name": device_profile["device_name"].clone(),
-        "machine_id": device_profile["device_id"].clone(),
-        "machine_name": device_profile["machine_name"].clone(),
-        "platform": device_profile["platform"].clone(),
-        "form_factor": device_profile["form_factor"].clone(),
-        "client_kind": device_profile["client_kind"].clone(),
-        "agent_id": "rust-diffforge",
-        "self_agent_id": "rust-diffforge",
-        "current_agent_id": "rust-diffforge",
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/sqlite/hard-reset", &payload)
-            .await?;
-    {
-        let mut snapshots = state.runtime_snapshots.lock().await;
-        *snapshots = CloudMcpRuntimeSnapshots::default();
-    }
-    Ok(cloud_mcp_response_data(&response))
-}
-
-#[tauri::command]
 async fn cloud_mcp_reset_server_state(
     state: State<'_, CloudMcpState>,
     repo_path: String,
@@ -20222,7 +20155,6 @@ async fn cloud_mcp_reset_server_state(
         "repo" | "repository" | "git_repo" | "git-repo" => "repo",
         "repo_delete" | "repo-delete" | "repo_purge" | "repo-purge" => "repo_delete",
         "workspace" | "workspace_runtime" | "workspace-runtime" => "workspace",
-        "account" | "account_runtime" | "account-runtime" => "account_runtime",
         _ => "repo",
     };
     // Cloud-only repos have no local checkout, so the caller may address them
