@@ -894,6 +894,9 @@ export function SnippingFloatWindow() {
   // alone never fires while this window is unfocused, which used to hide the
   // buttons until a focusing click (and made every action cost two clicks).
   const [hoverArmed, setHoverArmed] = useState(false);
+  const [syntheticHoverKey, setSyntheticHoverKey] = useState("");
+  const rootRef = useRef(null);
+  const syntheticHoverFrameRef = useRef(0);
   const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
@@ -907,6 +910,11 @@ export function SnippingFloatWindow() {
     setClosing(true);
     setBusy(true);
     setHoverArmed(false);
+    if (syntheticHoverFrameRef.current) {
+      window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+      syntheticHoverFrameRef.current = 0;
+    }
+    setSyntheticHoverKey("");
     setLiveFrameUrl("");
     setStatus("");
   }, []);
@@ -955,6 +963,11 @@ export function SnippingFloatWindow() {
       setBusy(false);
       setStatus("");
       setHoverArmed(false);
+      if (syntheticHoverFrameRef.current) {
+        window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+        syntheticHoverFrameRef.current = 0;
+      }
+      setSyntheticHoverKey("");
       localPathRef.current = path;
       setLocalPath(path);
       setImageVersion((version) => version + 1);
@@ -987,6 +1000,54 @@ export function SnippingFloatWindow() {
     };
   }, [initialPath]);
 
+  const updateSyntheticHoverFromPoint = useCallback((clientX, clientY) => {
+    const x = Number(clientX);
+    const y = Number(clientY);
+    const root = rootRef.current;
+    if (
+      !root
+      || !Number.isFinite(x)
+      || !Number.isFinite(y)
+      || typeof document === "undefined"
+      || typeof document.elementFromPoint !== "function"
+    ) {
+      setSyntheticHoverKey("");
+      return;
+    }
+    const target = document.elementFromPoint(x, y);
+    const control = target?.closest?.("[data-float-hover-key]");
+    const nextKey = control && root.contains(control)
+      ? text(control.getAttribute("data-float-hover-key"))
+      : "";
+    setSyntheticHoverKey((current) => (current === nextKey ? current : nextKey));
+  }, []);
+
+  const updateSyntheticHoverFromMouseEvent = useCallback((event) => {
+    updateSyntheticHoverFromPoint(event.clientX, event.clientY);
+  }, [updateSyntheticHoverFromPoint]);
+
+  const scheduleSyntheticHoverFromPoint = useCallback((clientX, clientY) => {
+    if (syntheticHoverFrameRef.current) {
+      window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+    }
+    syntheticHoverFrameRef.current = window.requestAnimationFrame(() => {
+      syntheticHoverFrameRef.current = 0;
+      updateSyntheticHoverFromPoint(clientX, clientY);
+    });
+  }, [updateSyntheticHoverFromPoint]);
+
+  const hoverControlProps = useCallback((key) => ({
+    "data-float-hover-key": key,
+    "data-synthetic-hover": syntheticHoverKey === key ? "true" : "false",
+  }), [syntheticHoverKey]);
+
+  useEffect(() => () => {
+    if (syntheticHoverFrameRef.current) {
+      window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+      syntheticHoverFrameRef.current = 0;
+    }
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
@@ -996,7 +1057,17 @@ export function SnippingFloatWindow() {
       if (disposed) return;
       const payload = event?.payload || {};
       if (text(payload.label) !== ownLabel) return;
-      setHoverArmed(payload.hovered === true);
+      const hovered = payload.hovered === true;
+      setHoverArmed(hovered);
+      if (hovered) {
+        scheduleSyntheticHoverFromPoint(payload.clientX ?? payload.client_x, payload.clientY ?? payload.client_y);
+      } else {
+        if (syntheticHoverFrameRef.current) {
+          window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+          syntheticHoverFrameRef.current = 0;
+        }
+        setSyntheticHoverKey("");
+      }
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -1011,7 +1082,7 @@ export function SnippingFloatWindow() {
       disposed = true;
       unlisten();
     };
-  }, []);
+  }, [scheduleSyntheticHoverFromPoint]);
 
   useEffect(() => {
     localPathRef.current = localPath;
@@ -1231,8 +1302,17 @@ export function SnippingFloatWindow() {
         data-busy={busy ? "true" : "false"}
         data-closing={closing ? "true" : "false"}
         data-hovered={hoverArmed ? "true" : "false"}
+        onMouseLeave={() => {
+          if (syntheticHoverFrameRef.current) {
+            window.cancelAnimationFrame(syntheticHoverFrameRef.current);
+            syntheticHoverFrameRef.current = 0;
+          }
+          setSyntheticHoverKey("");
+        }}
+        onMouseMove={updateSyntheticHoverFromMouseEvent}
         onDoubleClick={() => runAction("edit")}
         onMouseDown={beginDrag}
+        ref={rootRef}
         title={`${name} — drag anywhere, double-click to annotate`}
       >
         {previewUrl ? (
@@ -1243,6 +1323,7 @@ export function SnippingFloatWindow() {
         <FloatCloseButton
           aria-label={`Dismiss ${name}`}
           disabled={closing}
+          {...hoverControlProps("dismiss")}
           onClick={dismissFloat}
           title="Dismiss"
           type="button"
@@ -1255,6 +1336,7 @@ export function SnippingFloatWindow() {
               aria-label={`Remove Cloud upload of ${name}`}
               data-danger="true"
               disabled={busy || closing}
+              {...hoverControlProps("delete-cloud")}
               onClick={() => runAction("deleteCloud")}
               title="Remove Cloud upload"
               type="button"
@@ -1267,6 +1349,7 @@ export function SnippingFloatWindow() {
               aria-label={`Make ${name} public`}
               data-primary="true"
               disabled={busy || closing}
+              {...hoverControlProps("publish")}
               onClick={() => runAction("publish")}
               title="Make public"
               type="button"
@@ -1278,6 +1361,7 @@ export function SnippingFloatWindow() {
             aria-label={snipUploadButtonTitle(uploadState, name)}
             data-state={uploadState}
             disabled={busy || closing}
+            {...hoverControlProps("upload")}
             onClick={() => runAction("upload")}
             title={snipUploadButtonTitle(uploadState, name)}
             type="button"
@@ -1298,6 +1382,7 @@ export function SnippingFloatWindow() {
           <FloatActionButton
             aria-label={`Copy ${name}`}
             disabled={busy || closing}
+            {...hoverControlProps("copy")}
             onClick={() => runAction("copy")}
             title="Copy image"
             type="button"
@@ -1307,6 +1392,7 @@ export function SnippingFloatWindow() {
           <FloatActionButton
             aria-label={`Annotate ${name}`}
             disabled={busy || closing}
+            {...hoverControlProps("edit")}
             onClick={() => runAction("edit")}
             title="Annotate copy"
             type="button"
@@ -1317,6 +1403,7 @@ export function SnippingFloatWindow() {
             aria-label={`Delete ${name}`}
             data-danger="true"
             disabled={busy || closing}
+            {...hoverControlProps("delete")}
             onClick={() => runAction("delete")}
             title="Delete file"
             type="button"
@@ -1416,7 +1503,8 @@ const FloatCloseButton = styled.button`
     height: 13px;
   }
 
-  &:hover {
+  &:hover,
+  &[data-synthetic-hover="true"] {
     border-color: rgba(239, 107, 107, 0.5);
     background: rgba(76, 22, 26, 0.9);
   }
@@ -1459,7 +1547,8 @@ const FloatUploadButton = styled.button`
     height: 12px;
   }
 
-  &:hover:not(:disabled) {
+  &:hover:not(:disabled),
+  &[data-synthetic-hover="true"]:not(:disabled) {
     color: #06121f;
     background: #7db0ff;
     border-color: transparent;
@@ -1490,7 +1579,8 @@ const FloatUploadButton = styled.button`
     color: #ffe4e6;
   }
 
-  &[data-state="private"]:hover:not(:disabled) {
+  &[data-state="private"]:hover:not(:disabled),
+  &[data-state="private"][data-synthetic-hover="true"]:not(:disabled) {
     color: #fff;
     background: rgba(190, 18, 60, 0.88);
     border-color: transparent;
@@ -1501,7 +1591,8 @@ const FloatUploadButton = styled.button`
     color: #d9f7e7;
   }
 
-  &[data-state="done"]:hover:not(:disabled) {
+  &[data-state="done"]:hover:not(:disabled),
+  &[data-state="done"][data-synthetic-hover="true"]:not(:disabled) {
     color: #06150d;
     background: #5ede99;
     border-color: transparent;
@@ -1525,7 +1616,8 @@ const FloatUploadSideButton = styled.button`
     height: 12px;
   }
 
-  &:hover:not(:disabled) {
+  &:hover:not(:disabled),
+  &[data-synthetic-hover="true"]:not(:disabled) {
     border-color: rgba(125, 176, 255, 0.58);
     color: #06121f;
     background: #7db0ff;
@@ -1640,12 +1732,14 @@ const FloatActionButton = styled.button`
     height: 14px;
   }
 
-  &:hover:not(:disabled) {
+  &:hover:not(:disabled),
+  &[data-synthetic-hover="true"]:not(:disabled) {
     color: #fff;
     background: rgba(125, 176, 255, 0.22);
   }
 
-  &[data-danger="true"]:hover:not(:disabled) {
+  &[data-danger="true"]:hover:not(:disabled),
+  &[data-danger="true"][data-synthetic-hover="true"]:not(:disabled) {
     color: #fff;
     background: rgba(214, 69, 69, 0.85);
   }

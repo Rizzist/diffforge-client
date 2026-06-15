@@ -26,7 +26,7 @@ function readLastTab() {
 }
 
 export default function BackgroundMonitorWindow() {
-  const { user } = useAuthSnapshot();
+  const { accountKey, user } = useAuthSnapshot();
   const [tab, setTabState] = useState(readLastTab);
   const [animPhase, setAnimPhase] = useState("closed");
   const [animOrigin, setAnimOrigin] = useState("top");
@@ -152,7 +152,7 @@ export default function BackgroundMonitorWindow() {
 
         <MonitorFill>
           {tab === "tokenomics" ? (
-            <AccountTokenomicsView accountKey={user?.id || user?.email || ""} />
+            <AccountTokenomicsView accountKey={accountKey || user?.id || user?.email || ""} />
           ) : (
             <MonitorActivityHost>
               <ActivityOverlayPanel embedded />

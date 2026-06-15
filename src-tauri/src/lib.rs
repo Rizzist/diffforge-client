@@ -72,10 +72,6 @@ const DEFAULT_API_TIMEOUT_SECS: u64 = 10;
 const AUTH_EXCHANGE_TIMEOUT_SECS: u64 = 10;
 const SESSION_VALIDATE_TIMEOUT_SECS: u64 = 5;
 const LOGOUT_TIMEOUT_SECS: u64 = 5;
-const DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED: bool = false;
-const DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED: bool = false;
-const DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS: u64 = 3;
-const DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT: usize = 600;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
 const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
 // Coding-agent npm packages ship multi-hundred-MB native binaries (Claude
@@ -1420,17 +1416,6 @@ struct BackendStatus {
 struct ExchangeDesktopSessionRequest<'a> {
     code: &'a str,
     state: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DesktopSigninDiagnosticRequest<'a> {
-    flow_id: Option<&'a str>,
-    source: &'a str,
-    step: &'a str,
-    status: &'a str,
-    message: Option<&'a str>,
-    details: Value,
 }
 
 #[derive(Clone, Copy)]
@@ -3893,15 +3878,32 @@ pub(crate) fn app_local_state_merge(
     Ok(current)
 }
 
+fn app_local_state_public_value(key: &str, value: Value) -> Value {
+    if key.trim().eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY) {
+        return desktop_auth_public_snapshot(&desktop_auth_snapshot_from_raw(value));
+    }
+    value
+}
+
+fn app_local_state_is_desktop_auth_key(key: &str) -> bool {
+    key.trim().eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY)
+}
+
 #[tauri::command]
 async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(app_local_state_read(&app, &key)))
-        .await
-        .map_err(|error| format!("App state load worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let value = app_local_state_read(&app, &key);
+        Ok(app_local_state_public_value(&key, value))
+    })
+    .await
+    .map_err(|error| format!("App state load worker failed: {error}"))?
 }
 
 #[tauri::command]
 async fn app_local_state_store(app: AppHandle, key: String, value: Value) -> Result<Value, String> {
+    if app_local_state_is_desktop_auth_key(&key) {
+        return Err("Desktop auth state is owned by the native auth core.".to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app_local_state_write(&app, &key, &value)?;
         Ok(json!({ "ok": true }))
@@ -3916,9 +3918,15 @@ async fn app_local_state_merge_command(
     key: String,
     patch: Value,
 ) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || app_local_state_merge(&app, &key, &patch))
-        .await
-        .map_err(|error| format!("App state merge worker failed: {error}"))?
+    if app_local_state_is_desktop_auth_key(&key) {
+        return Err("Desktop auth state is owned by the native auth core.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let value = app_local_state_merge(&app, &key, &patch)?;
+        Ok(app_local_state_public_value(&key, value))
+    })
+    .await
+    .map_err(|error| format!("App state merge worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -4309,9 +4317,11 @@ pub fn run() {
                 // Restore the persisted desktop session before the first
                 // connect so cloud auth comes up without waiting for the
                 // webview (background-capable startup).
-                let _ =
-                    cloud_mcp_restore_persisted_desktop_session(&cloud_mcp_app, &cloud_mcp_state)
-                        .await;
+                let _restored_auth = desktop_auth_restore_cloud_session_for_startup(
+                    &cloud_mcp_app,
+                    &cloud_mcp_state,
+                )
+                .await;
                 if cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok() {
                     let _ =
                         prewarm_cloud_voice_agent_stream_for_state(&cloud_mcp_state, true).await;
@@ -4394,12 +4404,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend_ping,
-            desktop_web_login_url,
-            exchange_desktop_auth_code,
-            validate_desktop_session,
-            logout_desktop_session,
-            record_desktop_signin_diagnostic,
-            record_desktop_connection_diagnostic,
+            desktop_auth_snapshot_command,
+            desktop_auth_start_login,
+            desktop_auth_set_stage,
+            desktop_auth_validate_session,
+            desktop_auth_handle_deep_link,
+            desktop_auth_set_active_scope,
+            desktop_auth_apply_billing_status,
+            desktop_auth_sign_out,
             local_workspaces_load,
             local_workspaces_store,
             app_local_state_load,
@@ -4528,7 +4540,6 @@ pub fn run() {
             snipping_cancel_area_snip,
             audio_widget_status,
             audio_widget_bar_hover_snapshot,
-            audio_widget_bar_anchor_strategy,
             audio_widget_position_bottom_bar,
             audio_widget_clear_bottom_bar_position,
             audio_widget_release_keyboard_focus,
@@ -4545,7 +4556,6 @@ pub fn run() {
             terminal_recover_crashed_sessions,
             cloud_mcp_connect,
             cloud_mcp_get_desktop_device_profile,
-            cloud_mcp_set_desktop_session_token,
             cloud_mcp_get_status,
             cloud_mcp_get_network_diagnostics,
             cloud_mcp_get_cached_workspace_todos,

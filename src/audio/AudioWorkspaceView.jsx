@@ -489,8 +489,6 @@ export const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT = "forge-audio-widget-visibil
 const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
-const AUDIO_WIDGET_SPACE_CHANGED_EVENT = "forge-audio-widget-space-changed";
-const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT = "forge-floating-layout-changed";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT = "forge-audio-widget-bubble-hover-changed";
 const CLOUD_MCP_SYNC_STATUS_EVENT = "cloud-mcp-sync-status";
@@ -537,7 +535,6 @@ const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
-const AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS = [0, 120, 280, 700, 1400, 2800];
 const AUDIO_WIDGET_CLOUD_STATUS_POLL_MS = 5000;
 const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
@@ -645,90 +642,6 @@ function isMacPlatform() {
 
 function isWindowsPlatform() {
   return typeof navigator !== "undefined" && /win/i.test(navigator.platform || "");
-}
-
-function shouldUseFullMonitorBoundsForAudioBar() {
-  if (!isMacPlatform() || typeof window === "undefined" || !window.screen) {
-    return false;
-  }
-
-  const screenHeight = Number(window.screen.height || 0);
-  const availableHeight = Number(window.screen.availHeight || 0);
-  if (!Number.isFinite(screenHeight) || !Number.isFinite(availableHeight) || screenHeight <= 0) {
-    return false;
-  }
-
-  return availableHeight >= screenHeight - 2;
-}
-
-async function resolveAudioBarAnchorStrategy() {
-  const browserFullscreenHint = shouldUseFullMonitorBoundsForAudioBar();
-
-  if (!isMacPlatform()) {
-    return { useFullMonitorBounds: false };
-  }
-
-  try {
-    const strategy = await invoke("audio_widget_bar_anchor_strategy");
-    if (typeof strategy?.useFullMonitorBounds === "boolean") {
-      return {
-        ...strategy,
-        useFullMonitorBounds: strategy.useFullMonitorBounds || browserFullscreenHint,
-      };
-    }
-  } catch {
-    // Older native builds and web previews fall back to the browser screen hint.
-  }
-
-  return {
-    useFullMonitorBounds: browserFullscreenHint,
-  };
-}
-
-function normalizeAudioBarAnchorNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function resolveAudioBarAnchorArea(anchorStrategy, monitor) {
-  const scale = normalizeAudioBarAnchorNumber(anchorStrategy?.scaleFactor)
-    || normalizeAudioBarAnchorNumber(monitor?.scaleFactor)
-    || 1;
-  const strategyArea = anchorStrategy?.area;
-  const strategyAreaX = normalizeAudioBarAnchorNumber(strategyArea?.position?.x);
-  const strategyAreaY = normalizeAudioBarAnchorNumber(strategyArea?.position?.y);
-  const strategyAreaWidth = normalizeAudioBarAnchorNumber(strategyArea?.size?.width);
-  const strategyAreaHeight = normalizeAudioBarAnchorNumber(strategyArea?.size?.height);
-
-  if (
-    strategyAreaX !== null
-    && strategyAreaY !== null
-    && strategyAreaWidth !== null
-    && strategyAreaHeight !== null
-    && strategyAreaWidth > 0
-    && strategyAreaHeight > 0
-  ) {
-    return {
-      area: {
-        position: { x: strategyAreaX, y: strategyAreaY },
-        size: { width: strategyAreaWidth, height: strategyAreaHeight },
-      },
-      scale,
-    };
-  }
-
-  if (!monitor) {
-    return null;
-  }
-
-  const fullArea = { position: monitor.position, size: monitor.size };
-  const workArea = monitor.workArea?.size?.height ? monitor.workArea : null;
-  return {
-    area: anchorStrategy?.useFullMonitorBounds
-      ? fullArea
-      : workArea || fullArea,
-    scale,
-  };
 }
 
 function forgeCloudStatusIsConnected(status) {
@@ -1910,9 +1823,14 @@ export default function AudioWorkspaceView({
   audioModelStatus,
   audioStatusState,
   audioWidgetVisible,
+  authState = "signedOut",
+  billingStatus = null,
+  billingStatusError = "",
+  billingStatusState = "idle",
   onDownloadModel,
   onCloseWidget,
   onOpenWidget,
+  onRefreshBillingStatus,
   onRefreshStatus,
   onUninstallModel,
   workspace,
@@ -1938,9 +1856,6 @@ export default function AudioWorkspaceView({
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
-  const [forgeBilling, setForgeBilling] = useState(
-    () => lastKnownForgeBilling || { state: "idle", remaining: null, error: "" },
-  );
   const [audioWidgetStyleSetting, setAudioWidgetStyleSetting] = useState(readAudioWidgetStyle);
   const [voiceRulesError, setVoiceRulesError] = useState("");
   const [voiceRuleEditor, setVoiceRuleEditor] = useState(null);
@@ -1969,10 +1884,39 @@ export default function AudioWorkspaceView({
   const isForgeAgentMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
   const deepgramReady = Boolean(deepgramApiKey.trim());
   const installed = Boolean(audioModelStatus?.installed);
+  const forgeBilling = useMemo(() => {
+    if (authState !== "authenticated") {
+      return {
+        state: "auth_required",
+        remaining: null,
+        error: "Sign in to Diff Forge AI to use cloud dictation.",
+      };
+    }
+    if (billingStatusState === "loading") {
+      return lastKnownForgeBilling || { state: "loading", remaining: null, error: "" };
+    }
+    if (billingStatusState === "error") {
+      return {
+        state: "billing_error",
+        remaining: null,
+        error: billingStatusError || "Unable to load billing status.",
+      };
+    }
+    if (billingStatus) {
+      const nextBilling = {
+        state: "ready",
+        remaining: extractRemainingForgeCredits(billingStatus),
+        error: "",
+      };
+      lastKnownForgeBilling = nextBilling;
+      return nextBilling;
+    }
+    return lastKnownForgeBilling || { state: "loading", remaining: null, error: "" };
+  }, [authState, billingStatus, billingStatusError, billingStatusState]);
   const forgeCreditsExhausted = forgeBilling.state === "ready"
     && forgeBilling.remaining !== null
     && forgeBilling.remaining <= 0;
-  const forgeReady = forgeBilling.state !== "error" && !forgeCreditsExhausted;
+  const forgeReady = !["auth_required", "billing_error"].includes(forgeBilling.state) && !forgeCreditsExhausted;
   const recorderOpen = Boolean(audioWidgetVisible);
   const recorderReady = (isForgeMode || isForgeAgentMode) ? forgeReady : isCloudMode ? deepgramReady : installed;
   const isBusy = audioActionState === "downloading"
@@ -2011,16 +1955,20 @@ export default function AudioWorkspaceView({
   const audioModeStatusLabel = isForgeMode
     ? (forgeBilling.state === "loading"
       ? "Checking credits"
-      : forgeBilling.state === "error"
+      : forgeBilling.state === "auth_required"
         ? "Sign in needed"
+        : forgeBilling.state === "billing_error"
+          ? "Billing unavailable"
         : forgeCreditsExhausted
           ? "No credits"
           : "Forge ready")
     : isForgeAgentMode
       ? (forgeBilling.state === "loading"
         ? "Starting.."
-        : forgeBilling.state === "error"
+        : forgeBilling.state === "auth_required"
           ? "Sign in needed"
+          : forgeBilling.state === "billing_error"
+            ? "Billing unavailable"
           : forgeCreditsExhausted
             ? "No credits"
             : "Voice ready")
@@ -2711,41 +2659,18 @@ export default function AudioWorkspaceView({
   }, []);
 
   const refreshForgeBilling = useCallback(async () => {
-    // Stale-while-revalidate: keep showing the last known billing state while
-    // the refresh runs; startup text only appears on the first load.
-    setForgeBilling((current) => (
-      current.state === "ready"
-        ? current
-        : lastKnownForgeBilling || { state: "loading", remaining: null, error: "" }
-    ));
-
-    try {
-      const billing = await invoke("cloud_mcp_get_billing_status");
-      const nextBilling = {
-        state: "ready",
-        remaining: extractRemainingForgeCredits(billing),
-        error: "",
-      };
-      lastKnownForgeBilling = nextBilling;
-      setForgeBilling(nextBilling);
-    } catch (billingError) {
-      lastKnownForgeBilling = null;
-      setForgeBilling({
-        state: "error",
-        remaining: null,
-        error: getErrorMessage(
-          billingError,
-          "Sign in to Diff Forge AI to use cloud dictation.",
-        ),
-      });
-    }
-  }, []);
+    await onRefreshBillingStatus?.({ quiet: false });
+  }, [onRefreshBillingStatus]);
 
   useEffect(() => {
-    if (isForgeMode || isForgeAgentMode) {
+    if (
+      (isForgeMode || isForgeAgentMode)
+      && authState === "authenticated"
+      && billingStatusState === "idle"
+    ) {
       refreshForgeBilling();
     }
-  }, [isForgeAgentMode, isForgeMode, refreshForgeBilling]);
+  }, [authState, billingStatusState, isForgeAgentMode, isForgeMode, refreshForgeBilling]);
 
   useEffect(() => {
     // Keep a pre-authenticated cloud dictation websocket parked whenever
@@ -3235,7 +3160,7 @@ export default function AudioWorkspaceView({
                   <SettingsHint>
                     {forgeBilling.state === "loading"
                       ? (isForgeAgentMode ? "Working.." : "Checking Diff Forge AI credits...")
-                      : forgeBilling.state === "error"
+                      : forgeBilling.state === "auth_required" || forgeBilling.state === "billing_error"
                         ? forgeBilling.error
                         : forgeCreditsExhausted
                           ? "No Diff Forge AI credits remaining. Top up to use cloud audio."
@@ -5342,6 +5267,7 @@ export function AudioWidgetWindow() {
         return;
       }
       const modeGeometryChanged = barPlacementReadyKeyRef.current !== targetKey;
+      const nativeOwnsBarPlacement = isMacPlatform();
       const nativePlacement = await positionAudioBarWindowNatively({
         width: target.width,
         height: target.height,
@@ -5358,21 +5284,27 @@ export function AudioWidgetWindow() {
         ));
         return;
       }
+      if (nativeOwnsBarPlacement) {
+        barPlacementReadyKeyRef.current = targetKey;
+        setBarPlacementReadyKey((currentKey) => (
+          currentKey === targetKey ? currentKey : targetKey
+        ));
+        return;
+      }
 
       await windowHandle.setSize(new LogicalSize(target.width, target.height));
       if (!isCurrentPlacement()) {
         return;
       }
-      const [monitor, anchorStrategy] = await Promise.all([
-        currentMonitor().catch(() => null),
-        resolveAudioBarAnchorStrategy(),
-      ]);
+      const monitor = await currentMonitor().catch(() => null);
       if (!isCurrentPlacement()) {
         return;
       }
-      const anchor = resolveAudioBarAnchorArea(anchorStrategy, monitor);
-      if (anchor) {
-        const { area, scale } = anchor;
+      if (monitor) {
+        const area = monitor.workArea?.size?.height
+          ? monitor.workArea
+          : { position: monitor.position, size: monitor.size };
+        const scale = Number(monitor.scaleFactor || 1) || 1;
         const x = area.position.x
           + Math.round((area.size.width - (target.width * scale)) / 2);
         const y = area.position.y
@@ -5410,11 +5342,9 @@ export function AudioWidgetWindow() {
     usesBottomAnchoredStyle,
   ]);
 
-  // The bar style docks the window bottom-center of the active monitor; the
-  // user's bubble placement is restored on exit. The monitor work area keeps
-  // the line above the macOS Dock / Windows taskbar on ordinary desktops, while
-  // macOS fullscreen Spaces use the full monitor bounds so no reserved Dock gap
-  // is left under the bar.
+  // The bar style reports its geometry to native code on macOS; Rust owns the
+  // actual HUD frame so browser timers cannot fight AppKit during Space swaps.
+  // Non-macOS builds keep the previous Tauri work-area fallback.
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
       barPlacementReadyKeyRef.current = "";
@@ -5448,7 +5378,7 @@ export function AudioWidgetWindow() {
   ]);
 
   useEffect(() => {
-    if (!usesBottomAnchoredStyle) {
+    if (!usesBottomAnchoredStyle || isMacPlatform()) {
       return undefined;
     }
 
@@ -5457,60 +5387,6 @@ export function AudioWidgetWindow() {
       AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS,
     );
     return () => window.clearInterval(timer);
-  }, [positionBottomAnchoredWidget, usesBottomAnchoredStyle]);
-
-  useEffect(() => {
-    if (!usesBottomAnchoredStyle || !isMacPlatform()) {
-      return undefined;
-    }
-
-    let disposed = false;
-    let unlistenSpace = () => {};
-    let unlistenLayout = () => {};
-    const timers = new Set();
-    const schedulePosition = (delayMs) => {
-      const timer = window.setTimeout(() => {
-        timers.delete(timer);
-        if (!disposed) {
-          positionBottomAnchoredWidget({ animate: true });
-        }
-      }, delayMs);
-      timers.add(timer);
-    };
-    const handleLayoutChanged = () => {
-      timers.forEach((timer) => window.clearTimeout(timer));
-      timers.clear();
-      AUDIO_WIDGET_BAR_SPACE_REPOSITION_DELAYS_MS.forEach(schedulePosition);
-    };
-
-    listen(AUDIO_WIDGET_SPACE_CHANGED_EVENT, handleLayoutChanged)
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-
-        unlistenSpace = nextUnlisten;
-      })
-      .catch(() => {});
-    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, handleLayoutChanged)
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-
-        unlistenLayout = nextUnlisten;
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      unlistenSpace();
-      unlistenLayout();
-      timers.forEach((timer) => window.clearTimeout(timer));
-      timers.clear();
-    };
   }, [positionBottomAnchoredWidget, usesBottomAnchoredStyle]);
 
   useEffect(() => {

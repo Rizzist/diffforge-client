@@ -86,7 +86,6 @@ fn forge_voice_route_cache_fresh(ws_path: &str) -> Option<(CloudMcpWsTarget, Opt
 /// feed was paused (dictation borrowed the mic) or resumed (dictation ended).
 const FORGE_VOICE_AGENT_MIC_EVENT: &str = "forge-voice-agent-mic";
 const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT: &str = "forge-floating-layout-changed";
-const AUDIO_WIDGET_SPACE_CHANGED_EVENT: &str = "forge-audio-widget-space-changed";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bubble-hover-changed";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT: &str = "forge-audio-dictation-raw-result";
@@ -3291,10 +3290,12 @@ fn audio_widget_apply_macos_space_style_to_ns_window(ns_window: &NSWindow) {
         objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
             | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
             | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+            | objc2_app_kit::NSWindowCollectionBehavior::Transient
             | objc2_app_kit::NSWindowCollectionBehavior::Stationary
             | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
     );
     ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    ns_window.setHidesOnDeactivate(false);
     ns_window.setAcceptsMouseMovedEvents(true);
 }
 
@@ -3344,7 +3345,7 @@ const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
 #[cfg(target_os = "macos")]
-const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 6] = [0, 120, 280, 700, 1_400, 2_800];
+const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 5] = [0, 150, 350, 800, 1_600];
 #[cfg(target_os = "macos")]
 const MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS: u64 = 2_500;
 
@@ -3379,17 +3380,6 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("audio_widget_space_change_observer_callback", || {
-                        let strategy = audio_widget_bar_anchor_strategy_on_main_thread(&app_handle);
-                        let payload = json!({
-                            "source": "macos_space",
-                            "area": strategy.area,
-                            "scaleFactor": strategy.scale_factor,
-                            "strategySource": strategy.source,
-                            "useFullMonitorBounds": strategy.use_full_monitor_bounds,
-                        });
-                        let _ =
-                            app_handle.emit(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, payload.clone());
-                        let _ = app_handle.emit(AUDIO_WIDGET_SPACE_CHANGED_EVENT, payload);
                         audio_widget_schedule_stored_bottom_bar_reposition(&app_handle);
                     });
                 },
@@ -3410,10 +3400,19 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                     &block,
                 )
             };
+            let app_center = objc2_foundation::NSNotificationCenter::defaultCenter();
+            let screen_parameters_token = unsafe {
+                app_center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSApplicationDidChangeScreenParametersNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
             // The observer lives for the app's lifetime.
             std::mem::forget(active_space_token);
             std::mem::forget(active_app_token);
-            macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
+            std::mem::forget(screen_parameters_token);
         });
     });
 }
@@ -4093,36 +4092,6 @@ struct AudioWidgetBarHoverSnapshot {
     hovering: bool,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioWidgetBarAnchorPosition {
-    x: i32,
-    y: i32,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioWidgetBarAnchorSize {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioWidgetBarAnchorArea {
-    position: AudioWidgetBarAnchorPosition,
-    size: AudioWidgetBarAnchorSize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AudioWidgetBarAnchorStrategy {
-    area: Option<AudioWidgetBarAnchorArea>,
-    scale_factor: f64,
-    source: String,
-    use_full_monitor_bounds: bool,
-}
-
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 struct AudioWidgetBottomBarPositionRequest {
@@ -4130,8 +4099,6 @@ struct AudioWidgetBottomBarPositionRequest {
     height: f64,
     margin: f64,
     animate: bool,
-    #[allow(dead_code)]
-    use_full_monitor_bounds: Option<bool>,
 }
 
 impl Default for AudioWidgetBottomBarPositionRequest {
@@ -4141,7 +4108,6 @@ impl Default for AudioWidgetBottomBarPositionRequest {
             height: 0.0,
             margin: 0.0,
             animate: false,
-            use_full_monitor_bounds: None,
         }
     }
 }
@@ -4168,7 +4134,6 @@ impl AudioWidgetBottomBarLayout {
             height: self.height,
             margin: self.margin,
             animate,
-            use_full_monitor_bounds: None,
         }
     }
 }
@@ -4215,70 +4180,6 @@ struct AudioWidgetBottomBarPositionResult {
     scale_factor: f64,
     source: String,
     use_full_monitor_bounds: bool,
-}
-
-fn audio_widget_bar_anchor_strategy_from_monitor(
-    monitor: &tauri::Monitor,
-    use_full_monitor_bounds: bool,
-    source: &'static str,
-) -> AudioWidgetBarAnchorStrategy {
-    let (position, size) = if use_full_monitor_bounds {
-        (*monitor.position(), *monitor.size())
-    } else {
-        let work_area = *monitor.work_area();
-        (work_area.position, work_area.size)
-    };
-
-    AudioWidgetBarAnchorStrategy {
-        area: Some(AudioWidgetBarAnchorArea {
-            position: AudioWidgetBarAnchorPosition {
-                x: position.x,
-                y: position.y,
-            },
-            size: AudioWidgetBarAnchorSize {
-                width: size.width,
-                height: size.height,
-            },
-        }),
-        scale_factor: monitor.scale_factor(),
-        source: source.to_string(),
-        use_full_monitor_bounds,
-    }
-}
-
-fn audio_widget_bar_anchor_strategy_without_monitor(
-    use_full_monitor_bounds: bool,
-    source: &'static str,
-) -> AudioWidgetBarAnchorStrategy {
-    AudioWidgetBarAnchorStrategy {
-        area: None,
-        scale_factor: 1.0,
-        source: source.to_string(),
-        use_full_monitor_bounds,
-    }
-}
-
-fn audio_widget_bar_anchor_strategy_for_active_monitor(
-    app: &AppHandle,
-    use_full_monitor_bounds: bool,
-    source: &'static str,
-) -> AudioWidgetBarAnchorStrategy {
-    app.cursor_position()
-        .ok()
-        .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
-        .or_else(|| {
-            app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
-                .and_then(|window| window.current_monitor().ok().flatten())
-        })
-        .map(|monitor| {
-            audio_widget_bar_anchor_strategy_from_monitor(&monitor, use_full_monitor_bounds, source)
-        })
-        .unwrap_or_else(|| {
-            audio_widget_bar_anchor_strategy_without_monitor(
-                use_full_monitor_bounds,
-                "monitor-unavailable",
-            )
-        })
 }
 
 #[cfg(target_os = "macos")]
@@ -4582,41 +4483,6 @@ fn floating_surface_anchor_area_for_monitor(
 }
 
 #[cfg(target_os = "macos")]
-fn audio_widget_bar_anchor_strategy_on_main_thread(
-    app: &AppHandle,
-) -> AudioWidgetBarAnchorStrategy {
-    let use_full_monitor_bounds =
-        macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
-    let source = if use_full_monitor_bounds {
-        "macos-fullscreen-space"
-    } else {
-        "work-area"
-    };
-
-    audio_widget_bar_anchor_strategy_for_active_monitor(app, use_full_monitor_bounds, source)
-}
-
-#[cfg(target_os = "macos")]
-fn audio_widget_bar_anchor_strategy_for(
-    app: &AppHandle,
-) -> Result<AudioWidgetBarAnchorStrategy, String> {
-    run_audio_widget_action_on_main_thread(app, "bar_anchor_strategy", |app| {
-        Ok(audio_widget_bar_anchor_strategy_on_main_thread(app))
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn audio_widget_bar_anchor_strategy_for(
-    app: &AppHandle,
-) -> Result<AudioWidgetBarAnchorStrategy, String> {
-    Ok(audio_widget_bar_anchor_strategy_for_active_monitor(
-        app,
-        false,
-        "work-area",
-    ))
-}
-
-#[cfg(target_os = "macos")]
 fn audio_widget_position_bottom_bar_on_main_thread(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
@@ -4649,22 +4515,8 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             return Err("Unable to resolve the audio widget screen.".to_string());
         };
 
-        let use_full_monitor_bounds =
-            macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(Some(
-                &screen,
-            ));
-        let source = if use_full_monitor_bounds {
-            "macos-fullscreen-space"
-        } else {
-            "appkit-visible-frame"
-        };
-        let screen_frame = screen.frame();
+        let anchor_frame = screen.frame();
         let visible_frame = screen.visibleFrame();
-        let anchor_frame = if use_full_monitor_bounds {
-            screen_frame
-        } else {
-            visible_frame
-        };
 
         let x =
             (anchor_frame.origin.x + ((anchor_frame.size.width - width) / 2.0).max(0.0)).round();
@@ -4674,7 +4526,7 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             objc2_core_foundation::CGSize::new(width, height),
         );
 
-        let animate = request.animate && !use_full_monitor_bounds;
+        let animate = request.animate;
         ns_window.setFrame_display_animate(target_frame, true, animate);
         ns_window.orderFrontRegardless();
 
@@ -4689,8 +4541,8 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             anchor_width: anchor_frame.size.width,
             anchor_height: anchor_frame.size.height,
             scale_factor: screen.backingScaleFactor(),
-            source: source.to_string(),
-            use_full_monitor_bounds,
+            source: "appkit-screen-frame".to_string(),
+            use_full_monitor_bounds: true,
         };
 
         log_audio_diagnostic_event(
@@ -4704,10 +4556,10 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                 "anchor_y": result.anchor_y,
                 "anchor_width": result.anchor_width,
                 "anchor_height": result.anchor_height,
-                "screen_x": screen_frame.origin.x,
-                "screen_y": screen_frame.origin.y,
-                "screen_width": screen_frame.size.width,
-                "screen_height": screen_frame.size.height,
+                "screen_x": anchor_frame.origin.x,
+                "screen_y": anchor_frame.origin.y,
+                "screen_width": anchor_frame.size.width,
+                "screen_height": anchor_frame.size.height,
                 "visible_x": visible_frame.origin.x,
                 "visible_y": visible_frame.origin.y,
                 "visible_width": visible_frame.size.width,
@@ -4715,7 +4567,6 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                 "scale_factor": result.scale_factor,
                 "source": result.source,
                 "use_full_monitor_bounds": result.use_full_monitor_bounds,
-                "request_full_monitor_bounds": request.use_full_monitor_bounds,
             }),
         );
 
@@ -9039,13 +8890,6 @@ async fn audio_widget_bar_hover_snapshot(
     request: AudioWidgetBarHoverSnapshotRequest,
 ) -> Result<AudioWidgetBarHoverSnapshot, String> {
     Ok(audio_widget_bar_hover_snapshot_for(&app, &request))
-}
-
-#[tauri::command]
-async fn audio_widget_bar_anchor_strategy(
-    app: AppHandle,
-) -> Result<AudioWidgetBarAnchorStrategy, String> {
-    audio_widget_bar_anchor_strategy_for(&app)
 }
 
 #[tauri::command]

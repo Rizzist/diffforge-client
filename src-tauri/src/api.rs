@@ -81,12 +81,808 @@ async fn backend_ping() -> Result<BackendStatus, String> {
     })
 }
 
-#[tauri::command]
-fn desktop_web_login_url() -> Result<String, String> {
-    Ok(desktop_web_login_url_base())
+const DESKTOP_AUTH_STATE_KEY: &str = "desktop-auth";
+const DESKTOP_AUTH_STATE_CHANGED_EVENT: &str = "desktop-auth-state-changed";
+const DESKTOP_AUTH_DEFAULT_MESSAGE: &str = "Sign in with your Diff Forge AI web account.";
+
+fn desktop_auth_text(value: &Value, keys: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in keys {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn desktop_auth_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for key in keys {
+        current = current.get(*key)?;
+    }
+    current.as_u64()
+}
+
+fn desktop_auth_safe_text(value: &Value, keys: &[&str]) -> String {
+    desktop_auth_text(value, keys).unwrap_or_default()
+}
+
+fn desktop_auth_personal_scope() -> Value {
+    json!({
+        "id": "personal",
+        "type": "personal",
+        "label": "Personal",
+        "teamId": Value::Null,
+    })
+}
+
+fn desktop_auth_scope_key(scope_type: &str, team_id: Option<&str>) -> String {
+    let scope_type = scope_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    if scope_type == "team" {
+        if let Some(team_id) = team_id.map(str::trim).filter(|value| !value.is_empty()) {
+            return format!("team:{team_id}");
+        }
+    }
+    "personal".to_string()
+}
+
+fn desktop_auth_normalize_scope(scope: &Value, user: Option<&Value>) -> Value {
+    let scope_type = desktop_auth_text(scope, &["type"])
+        .or_else(|| desktop_auth_text(scope, &["scopeType"]))
+        .unwrap_or_else(|| "personal".to_string())
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    let team_id = desktop_auth_text(scope, &["teamId"])
+        .or_else(|| desktop_auth_text(scope, &["team_id"]));
+    if scope_type == "team" {
+        if let Some(team_id) = team_id.as_deref().filter(|value| !value.trim().is_empty()) {
+            let scopes = desktop_auth_account_scopes(user);
+            let key = desktop_auth_scope_key("team", Some(team_id));
+            if let Some(scope) = scopes
+                .as_array()
+                .and_then(|items| items.iter().find(|item| desktop_auth_safe_text(item, &["id"]) == key))
+            {
+                return scope.clone();
+            }
+        }
+    }
+    desktop_auth_personal_scope()
+}
+
+fn desktop_auth_account_scopes(user: Option<&Value>) -> Value {
+    let mut scopes = vec![desktop_auth_personal_scope()];
+    let candidates = user
+        .and_then(|user| {
+            user.get("accountScopes")
+                .or_else(|| user.get("scopes"))
+                .and_then(Value::as_array)
+        })
+        .cloned()
+        .unwrap_or_default();
+
+    for scope in candidates {
+        let scope_type = desktop_auth_text(&scope, &["type"])
+            .or_else(|| desktop_auth_text(&scope, &["scopeType"]))
+            .unwrap_or_else(|| "personal".to_string())
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_");
+        let team_id = desktop_auth_text(&scope, &["teamId"])
+            .or_else(|| desktop_auth_text(&scope, &["team_id"]));
+        if scope_type == "team" {
+            if let Some(team_id) = team_id.as_deref().filter(|value| !value.trim().is_empty()) {
+                scopes.push(json!({
+                    "id": desktop_auth_scope_key("team", Some(team_id)),
+                    "type": "team",
+                    "label": desktop_auth_text(&scope, &["label"])
+                        .or_else(|| desktop_auth_text(&scope, &["team", "name"]))
+                        .unwrap_or_else(|| "Team".to_string()),
+                    "teamId": team_id,
+                    "team": scope.get("team").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for scope in scopes {
+        let id = desktop_auth_safe_text(&scope, &["id"]);
+        if seen.insert(id) {
+            deduped.push(scope);
+        }
+    }
+    json!(deduped)
+}
+
+fn desktop_auth_user_plan_status(user: Option<&Value>) -> String {
+    user.and_then(|user| {
+        desktop_auth_text(user, &["planStatus"])
+            .or_else(|| desktop_auth_text(user, &["plan_status"]))
+    })
+    .unwrap_or_else(|| "free".to_string())
+    .to_ascii_lowercase()
+}
+
+fn desktop_auth_plan_name_from_snapshot(snapshot: &Value) -> String {
+    let billing = snapshot.get("billingStatus").unwrap_or(&Value::Null);
+    let user = snapshot.get("user");
+    let plan_status = desktop_auth_user_plan_status(user);
+    let plan_name = desktop_auth_text(billing, &["planName"])
+        .or_else(|| desktop_auth_text(billing, &["plan_name"]))
+        .or_else(|| desktop_auth_text(billing, &["credits", "planName"]))
+        .or_else(|| desktop_auth_text(billing, &["credits", "plan_name"]))
+        .or_else(|| user.and_then(|user| desktop_auth_text(user, &["planName"])))
+        .or_else(|| user.and_then(|user| desktop_auth_text(user, &["plan_name"])))
+        .unwrap_or_else(|| if plan_status == "paid" { "plus" } else { "free" }.to_string());
+    cloud_mcp_plan_name_from_value(Some(plan_name))
+}
+
+fn desktop_auth_device_limit_from_snapshot(snapshot: &Value, plan_name: &str) -> u64 {
+    let billing = snapshot.get("billingStatus").unwrap_or(&Value::Null);
+    let user = snapshot.get("user").unwrap_or(&Value::Null);
+    desktop_auth_u64(billing, &["entitlements", "deviceLimit"])
+        .or_else(|| desktop_auth_u64(billing, &["limits", "deviceLimit"]))
+        .or_else(|| desktop_auth_u64(billing, &["user", "entitlements", "deviceLimit"]))
+        .or_else(|| desktop_auth_u64(user, &["entitlements", "deviceLimit"]))
+        .unwrap_or_else(|| cloud_mcp_device_limit_for_plan(plan_name))
+}
+
+fn desktop_auth_entitlements(snapshot: &Value) -> Value {
+    let user = snapshot.get("user");
+    let plan_status = desktop_auth_user_plan_status(user);
+    let plan_name = desktop_auth_plan_name_from_snapshot(snapshot);
+    let device_limit = desktop_auth_device_limit_from_snapshot(snapshot, &plan_name);
+    let paid = plan_status == "paid" || plan_name != "free";
+    json!({
+        "planName": plan_name,
+        "planStatus": if paid { "paid" } else { "free" },
+        "deviceLimit": device_limit,
+        "isPaid": paid,
+        "canUseCloudSync": paid,
+        "canUseForgeAudio": paid,
+        "canUseTokenomicsCloud": paid,
+    })
+}
+
+fn desktop_auth_account_key(user: Option<&Value>) -> String {
+    user.and_then(|user| {
+        desktop_auth_text(user, &["id"])
+            .or_else(|| desktop_auth_text(user, &["$id"]))
+            .or_else(|| desktop_auth_text(user, &["email"]))
+    })
+    .unwrap_or_default()
+}
+
+fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
+    let raw = raw.as_object().cloned().unwrap_or_default();
+    let user = raw.get("user").cloned().filter(Value::is_object);
+    let token = raw
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string)
+        .unwrap_or_default();
+    let pending_state = raw
+        .get("pendingState")
+        .or_else(|| raw.get("pending_state"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string)
+        .unwrap_or_default();
+    let stored_status = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("signedOut");
+    let status = if !token.is_empty() && user.is_some() {
+        "authenticated"
+    } else if matches!(stored_status, "waiting" | "exchanging" | "checking") && !pending_state.is_empty() {
+        stored_status
+    } else if stored_status == "checking" {
+        "checking"
+    } else {
+        "signedOut"
+    };
+    let stage = raw
+        .get("stage")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| if status == "authenticated" { "authenticated" } else { "idle" });
+    let message = raw
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DESKTOP_AUTH_DEFAULT_MESSAGE);
+    let error = raw
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let active_scope = raw
+        .get("activeScope")
+        .or_else(|| raw.get("active_scope"))
+        .map(|scope| desktop_auth_normalize_scope(scope, user.as_ref()))
+        .unwrap_or_else(desktop_auth_personal_scope);
+    let account_scopes = desktop_auth_account_scopes(user.as_ref());
+    let billing_status = raw.get("billingStatus").cloned().unwrap_or(Value::Null);
+    let mut snapshot = json!({
+        "status": status,
+        "stage": stage,
+        "message": message,
+        "error": error,
+        "user": user.clone().unwrap_or(Value::Null),
+        "token": token,
+        "activeScope": active_scope,
+        "accountScopes": account_scopes,
+        "pendingState": pending_state,
+        "billingStatus": billing_status,
+        "version": raw.get("version").and_then(Value::as_u64).unwrap_or(0),
+        "updatedAtMs": raw.get("updatedAtMs").and_then(Value::as_u64).unwrap_or(0),
+    });
+    snapshot["accountKey"] = json!(desktop_auth_account_key(user.as_ref()));
+    snapshot["entitlements"] = desktop_auth_entitlements(&snapshot);
+    snapshot
+}
+
+fn desktop_auth_snapshot(app: &AppHandle) -> Value {
+    desktop_auth_snapshot_from_raw(app_local_state_read(app, DESKTOP_AUTH_STATE_KEY))
+}
+
+fn desktop_auth_exchange_lock() -> &'static Mutex<()> {
+    static DESKTOP_AUTH_EXCHANGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    DESKTOP_AUTH_EXCHANGE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn desktop_auth_public_snapshot(snapshot: &Value) -> Value {
+    let mut public_snapshot = snapshot.clone();
+    if let Some(object) = public_snapshot.as_object_mut() {
+        object.remove("token");
+        object.remove("pendingState");
+        object.remove("pending_state");
+    }
+    public_snapshot
+}
+
+fn desktop_auth_persist_snapshot(app: &AppHandle, mut snapshot: Value) -> Result<Value, String> {
+    let previous_version = desktop_auth_snapshot(app)
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    snapshot["version"] = json!(previous_version.saturating_add(1));
+    snapshot["updatedAtMs"] = json!(current_time_ms());
+    let snapshot = desktop_auth_snapshot_from_raw(snapshot);
+    app_local_state_write(app, DESKTOP_AUTH_STATE_KEY, &snapshot)?;
+    #[cfg(unix)]
+    if let Ok(path) = app_local_state_path(app, DESKTOP_AUTH_STATE_KEY) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    let _ = app.emit(
+        DESKTOP_AUTH_STATE_CHANGED_EVENT,
+        desktop_auth_public_snapshot(&snapshot),
+    );
+    Ok(snapshot)
+}
+
+fn desktop_auth_signed_out_snapshot(message: &str, error: &str, clear_pending: bool) -> Value {
+    json!({
+        "status": "signedOut",
+        "stage": "idle",
+        "message": if message.trim().is_empty() { DESKTOP_AUTH_DEFAULT_MESSAGE } else { message.trim() },
+        "error": error.trim(),
+        "user": Value::Null,
+        "token": "",
+        "activeScope": desktop_auth_personal_scope(),
+        "pendingState": if clear_pending { json!("") } else { Value::Null },
+        "billingStatus": Value::Null,
+    })
+}
+
+fn desktop_auth_scope_payload(scope: &Value) -> (String, Option<String>) {
+    let scope_type = desktop_auth_text(scope, &["type"])
+        .or_else(|| desktop_auth_text(scope, &["scopeType"]))
+        .unwrap_or_else(|| "personal".to_string())
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    let team_id = desktop_auth_text(scope, &["teamId"])
+        .or_else(|| desktop_auth_text(scope, &["team_id"]));
+    if scope_type == "team" && team_id.is_some() {
+        ("team".to_string(), team_id)
+    } else {
+        ("personal".to_string(), None)
+    }
+}
+
+async fn desktop_auth_sync_cloud_state(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+    snapshot: &Value,
+) -> Result<(), String> {
+    let token = snapshot
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let active_scope = snapshot
+        .get("activeScope")
+        .cloned()
+        .unwrap_or_else(desktop_auth_personal_scope);
+    let (scope_type, team_id) = desktop_auth_scope_payload(&active_scope);
+    let entitlements = snapshot.get("entitlements").unwrap_or(&Value::Null);
+    let plan_name = desktop_auth_text(entitlements, &["planName"])
+        .unwrap_or_else(|| desktop_auth_plan_name_from_snapshot(snapshot));
+    let device_limit = desktop_auth_u64(entitlements, &["deviceLimit"])
+        .unwrap_or_else(|| cloud_mcp_device_limit_for_plan(&plan_name));
+    cloud_mcp_apply_desktop_auth_session(
+        app.clone(),
+        cloud_mcp_state,
+        token,
+        Some(scope_type),
+        team_id,
+        Some(plan_name),
+        Some(device_limit),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn desktop_auth_restore_cloud_session_for_startup(
+    app: &AppHandle,
+    cloud_mcp_state: &CloudMcpState,
+) -> bool {
+    let snapshot = desktop_auth_snapshot(app);
+    if snapshot.get("status").and_then(Value::as_str) != Some("authenticated") {
+        return false;
+    }
+    let Some(token) = snapshot
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+    else {
+        return false;
+    };
+    if token.is_empty() {
+        return false;
+    }
+    match validate_desktop_session(token.to_string()).await {
+        Ok(session) => {
+            let user = match desktop_auth_extract_session_user(&session) {
+                Ok(user) => user,
+                Err(error) => {
+                    if let Ok(next) = desktop_auth_persist_snapshot(
+                        app,
+                        desktop_auth_signed_out_snapshot(
+                            "Your desktop session expired. Sign in again with the web app.",
+                            &error,
+                            true,
+                        ),
+                    ) {
+                        let _ = desktop_auth_sync_cloud_state(app, cloud_mcp_state, &next).await;
+                    }
+                    return false;
+                }
+            };
+            let active_scope = desktop_auth_normalize_scope(
+                snapshot.get("activeScope").unwrap_or(&Value::Null),
+                Some(&user),
+            );
+            let mut next = snapshot.clone();
+            next["status"] = json!("authenticated");
+            next["stage"] = json!("authenticated");
+            next["message"] = json!("Initializing workspace...");
+            next["error"] = json!("");
+            next["token"] = json!(token);
+            next["user"] = user;
+            next["activeScope"] = active_scope;
+            next["pendingState"] = json!("");
+            let Ok(next) = desktop_auth_persist_snapshot(app, next) else {
+                return false;
+            };
+            desktop_auth_sync_cloud_state(app, cloud_mcp_state, &next)
+                .await
+                .is_ok()
+        }
+        Err(error) => {
+            let message = if desktop_auth_network_restore_error(&error) {
+                "Secure session could not be verified. Sign in again with the web app."
+            } else {
+                "Your desktop session expired. Sign in again with the web app."
+            };
+            if let Ok(next) = desktop_auth_persist_snapshot(
+                app,
+                desktop_auth_signed_out_snapshot(message, &error, true),
+            ) {
+                let _ = desktop_auth_sync_cloud_state(app, cloud_mcp_state, &next).await;
+            }
+            false
+        }
+    }
+}
+
+fn desktop_auth_percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 3);
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+fn desktop_auth_login_url(state: &str) -> String {
+    let mut pairs = vec![("state".to_string(), state.to_string())];
+    let device_profile = cloud_mcp_desktop_device_profile();
+    for (key, path) in [
+        ("desktopDeviceId", &["device_id", "deviceId"][..]),
+        ("desktopDeviceName", &["device_name", "deviceName", "machine_name", "machineName"][..]),
+        ("desktopPlatform", &["platform", "os"][..]),
+        ("desktopFormFactor", &["form_factor", "formFactor", "device_type", "deviceType"][..]),
+    ] {
+        if let Some(value) = cloud_mcp_payload_text(&device_profile, path) {
+            pairs.push((key.to_string(), value));
+        }
+    }
+    let query = pairs
+        .into_iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                desktop_auth_percent_encode_query_component(&key),
+                desktop_auth_percent_encode_query_component(&value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let base = desktop_web_login_url_base();
+    let separator = if base.contains('?') { "&" } else { "?" };
+    format!("{base}{separator}{query}")
+}
+
+fn desktop_auth_new_state() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn desktop_auth_query_value(url_value: &str, key: &str) -> Option<String> {
+    let query = url_value.split_once('?')?.1.split('#').next().unwrap_or("");
+    for part in query.split('&') {
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+        if name == key {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn desktop_auth_parse_callback(url_value: &str) -> Option<(String, String)> {
+    let url = url_value.trim();
+    let callback_base = url.split_once('?')?.0;
+    if callback_base != "diffforge://auth/callback" {
+        return None;
+    }
+    let code = desktop_auth_query_value(url, "code")?;
+    let state = desktop_auth_query_value(url, "state")?;
+    if !is_safe_auth_value(&code) || !is_safe_auth_value(&state) {
+        return None;
+    }
+    Some((code, state))
+}
+
+fn desktop_auth_extract_session_token(session: &Value) -> Result<String, String> {
+    session
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string)
+        .ok_or_else(|| "Desktop session response did not include a valid token.".to_string())
+}
+
+fn desktop_auth_extract_session_user(session: &Value) -> Result<Value, String> {
+    session
+        .get("user")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| "Desktop session response did not include a valid user.".to_string())
+}
+
+fn desktop_auth_network_restore_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unable to validate desktop session")
+        || lower.contains("unable to read diff forge ai api response")
+        || lower.contains("returned 500")
+        || lower.contains("returned 501")
+        || lower.contains("returned 502")
+        || lower.contains("returned 503")
+        || lower.contains("returned 504")
+        || lower.contains("unable to prepare backend request")
+        || lower.contains("timed out")
 }
 
 #[tauri::command]
+async fn desktop_auth_snapshot_command(app: AppHandle) -> Result<Value, String> {
+    Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)))
+}
+
+#[tauri::command]
+async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
+    let state = desktop_auth_new_state();
+    let snapshot = desktop_auth_persist_snapshot(
+        &app,
+        json!({
+            "status": "waiting",
+            "stage": "browser_handoff",
+            "message": "Opening secure web sign-in in your browser...",
+            "error": "",
+            "pendingState": state,
+        }),
+    )?;
+    Ok(json!({
+        "loginUrl": desktop_auth_login_url(&state),
+        "snapshot": desktop_auth_public_snapshot(&snapshot),
+    }))
+}
+
+#[tauri::command]
+async fn desktop_auth_set_stage(
+    app: AppHandle,
+    status: Option<String>,
+    stage: Option<String>,
+    message: Option<String>,
+    error: Option<String>,
+) -> Result<Value, String> {
+    let mut snapshot = desktop_auth_snapshot(&app);
+    if let Some(status) = status.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        match status.as_str() {
+            "checking" | "exchanging" | "waiting" => {
+                snapshot["status"] = json!(status);
+            }
+            "authenticated" => {
+                return Err("Authenticated state is owned by the native auth core.".to_string());
+            }
+            _ => {}
+        }
+    }
+    if let Some(stage) = stage.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        snapshot["stage"] = json!(stage);
+    }
+    if let Some(message) = message {
+        snapshot["message"] = json!(message);
+    }
+    if let Some(error) = error {
+        snapshot["error"] = json!(error);
+    }
+    desktop_auth_persist_snapshot(&app, snapshot).map(|snapshot| desktop_auth_public_snapshot(&snapshot))
+}
+
+#[tauri::command]
+async fn desktop_auth_validate_session(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let snapshot = desktop_auth_snapshot(&app);
+    let token = snapshot
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string);
+    let Some(token) = token else {
+        let snapshot = desktop_auth_persist_snapshot(
+            &app,
+            desktop_auth_signed_out_snapshot(DESKTOP_AUTH_DEFAULT_MESSAGE, "", true),
+        )?;
+        desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &snapshot).await?;
+        return Ok(desktop_auth_public_snapshot(&snapshot));
+    };
+    if snapshot.get("status").and_then(Value::as_str) != Some("authenticated") {
+        let mut checking = snapshot.clone();
+        checking["status"] = json!("checking");
+        checking["stage"] = json!("session_restore");
+        checking["message"] =
+            json!("Checking saved desktop session. You can still sign in with the web app.");
+        checking["error"] = json!("");
+        let _ = desktop_auth_persist_snapshot(&app, checking);
+    }
+
+    match validate_desktop_session(token.clone()).await {
+        Ok(session) => {
+            let user = desktop_auth_extract_session_user(&session)?;
+            let active_scope = desktop_auth_normalize_scope(
+                snapshot.get("activeScope").unwrap_or(&Value::Null),
+                Some(&user),
+            );
+            let mut next = snapshot.clone();
+            next["status"] = json!("authenticated");
+            next["stage"] = json!("authenticated");
+            next["message"] = json!("Initializing workspace...");
+            next["error"] = json!("");
+            next["token"] = json!(token);
+            next["user"] = user;
+            next["activeScope"] = active_scope;
+            next["pendingState"] = json!("");
+            let next = desktop_auth_persist_snapshot(&app, next)?;
+            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            Ok(desktop_auth_public_snapshot(&next))
+        }
+        Err(error) => {
+            let message = if desktop_auth_network_restore_error(&error) {
+                "Secure session could not be verified. Sign in again with the web app."
+            } else {
+                "Your desktop session expired. Sign in again with the web app."
+            };
+            let next =
+                desktop_auth_persist_snapshot(&app, desktop_auth_signed_out_snapshot(message, &error, true))?;
+            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            Ok(desktop_auth_public_snapshot(&next))
+        }
+    }
+}
+
+#[tauri::command]
+async fn desktop_auth_handle_deep_link(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    url: String,
+) -> Result<Value, String> {
+    let _exchange_guard = desktop_auth_exchange_lock().lock().await;
+    let Some((code, callback_state)) = desktop_auth_parse_callback(&url) else {
+        return Ok(json!({
+            "handled": false,
+            "snapshot": desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)),
+        }));
+    };
+    let snapshot = desktop_auth_snapshot(&app);
+    let pending_state = snapshot
+        .get("pendingState")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if pending_state.is_empty() || pending_state != callback_state {
+        if snapshot.get("status").and_then(Value::as_str) == Some("authenticated") {
+            return Ok(json!({
+                "handled": true,
+                "snapshot": desktop_auth_public_snapshot(&snapshot),
+            }));
+        }
+        let next = desktop_auth_persist_snapshot(
+            &app,
+            desktop_auth_signed_out_snapshot(
+                DESKTOP_AUTH_DEFAULT_MESSAGE,
+                "Desktop login state did not match. Start again from this app.",
+                true,
+            ),
+        )?;
+        desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+        return Ok(json!({
+            "handled": true,
+            "snapshot": desktop_auth_public_snapshot(&next),
+        }));
+    }
+
+    let mut exchanging = snapshot.clone();
+    exchanging["status"] = json!("exchanging");
+    exchanging["stage"] = json!("session_exchange");
+    exchanging["message"] = json!("Browser callback matched. Creating your desktop session...");
+    exchanging["error"] = json!("");
+    let _ = desktop_auth_persist_snapshot(&app, exchanging);
+
+    match exchange_desktop_auth_code(code, callback_state.clone()).await {
+        Ok(session) => {
+            let token = desktop_auth_extract_session_token(&session)?;
+            let user = desktop_auth_extract_session_user(&session)?;
+            let active_scope = desktop_auth_normalize_scope(
+                snapshot.get("activeScope").unwrap_or(&Value::Null),
+                Some(&user),
+            );
+            let next = desktop_auth_persist_snapshot(
+                &app,
+                json!({
+                    "status": "authenticated",
+                    "stage": "authenticated",
+                    "message": "Initializing workspace...",
+                    "error": "",
+                    "token": token,
+                    "user": user,
+                    "activeScope": active_scope,
+                    "pendingState": "",
+                    "billingStatus": Value::Null,
+                }),
+            )?;
+            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            Ok(json!({
+                "handled": true,
+                "snapshot": desktop_auth_public_snapshot(&next),
+            }))
+        }
+        Err(error) => {
+            let next = desktop_auth_persist_snapshot(
+                &app,
+                desktop_auth_signed_out_snapshot(
+                    DESKTOP_AUTH_DEFAULT_MESSAGE,
+                    &error,
+                    true,
+                ),
+            )?;
+            desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+            Ok(json!({
+                "handled": true,
+                "snapshot": desktop_auth_public_snapshot(&next),
+                "error": error,
+            }))
+        }
+    }
+}
+
+#[tauri::command]
+async fn desktop_auth_set_active_scope(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    scope: Value,
+) -> Result<Value, String> {
+    let mut snapshot = desktop_auth_snapshot(&app);
+    let user = snapshot.get("user").cloned().filter(Value::is_object);
+    snapshot["activeScope"] = desktop_auth_normalize_scope(&scope, user.as_ref());
+    let snapshot = desktop_auth_persist_snapshot(&app, snapshot)?;
+    desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &snapshot).await?;
+    Ok(desktop_auth_public_snapshot(&snapshot))
+}
+
+#[tauri::command]
+async fn desktop_auth_apply_billing_status(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    billing_status: Value,
+) -> Result<Value, String> {
+    let mut snapshot = desktop_auth_snapshot(&app);
+    snapshot["billingStatus"] = billing_status;
+    let snapshot = desktop_auth_persist_snapshot(&app, snapshot)?;
+    desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &snapshot).await?;
+    Ok(desktop_auth_public_snapshot(&snapshot))
+}
+
+#[tauri::command]
+async fn desktop_auth_sign_out(
+    app: AppHandle,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let snapshot = desktop_auth_snapshot(&app);
+    let token = snapshot
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string);
+    let next = desktop_auth_persist_snapshot(
+        &app,
+        desktop_auth_signed_out_snapshot(DESKTOP_AUTH_DEFAULT_MESSAGE, "", true),
+    )?;
+    desktop_auth_sync_cloud_state(&app, cloud_mcp_state.inner(), &next).await?;
+    if let Some(token) = token {
+        let _ = logout_desktop_session(token).await;
+    }
+    Ok(desktop_auth_public_snapshot(&next))
+}
+
 async fn exchange_desktop_auth_code(code: String, state: String) -> Result<Value, String> {
     validate_auth_value("Desktop auth code", &code)?;
     validate_auth_value("Desktop auth state", &state)?;
@@ -105,7 +901,6 @@ async fn exchange_desktop_auth_code(code: String, state: String) -> Result<Value
     read_api_response(response, "Desktop login expired. Try again.").await
 }
 
-#[tauri::command]
 async fn validate_desktop_session(token: String) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
 
@@ -120,7 +915,6 @@ async fn validate_desktop_session(token: String) -> Result<Value, String> {
     read_api_response(response, "Desktop session expired.").await
 }
 
-#[tauri::command]
 async fn logout_desktop_session(token: String) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
 
@@ -135,147 +929,65 @@ async fn logout_desktop_session(token: String) -> Result<Value, String> {
     read_api_response(response, "Unable to sign out desktop session.").await
 }
 
-fn clean_desktop_signin_diagnostic_text(value: impl AsRef<str>, max_len: usize) -> String {
-    value
-        .as_ref()
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(max_len)
-        .collect()
-}
+#[cfg(test)]
+mod desktop_auth_tests {
+    use super::*;
 
-#[tauri::command]
-async fn record_desktop_signin_diagnostic(
-    token: String,
-    flow_id: Option<String>,
-    source: Option<String>,
-    step: String,
-    status: String,
-    message: Option<String>,
-    details: Option<Value>,
-) -> Result<Value, String> {
-    if !DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED {
-        return Ok(json!({
-            "ok": true,
-            "stored": false,
-            "enabled": false,
+    #[test]
+    fn public_snapshot_redacts_private_auth_values() {
+        let token = "a".repeat(MIN_AUTH_VALUE_LENGTH);
+        let pending_state = "b".repeat(MIN_AUTH_VALUE_LENGTH);
+        let snapshot = desktop_auth_snapshot_from_raw(json!({
+            "status": "authenticated",
+            "stage": "authenticated",
+            "message": "ok",
+            "token": token,
+            "pendingState": pending_state,
+            "user": { "id": "user-1", "email": "user@example.com" },
         }));
+
+        assert_eq!(snapshot.get("token").and_then(Value::as_str), Some(token.as_str()));
+        let public_snapshot = desktop_auth_public_snapshot(&snapshot);
+
+        assert!(public_snapshot.get("token").is_none());
+        assert!(public_snapshot.get("pendingState").is_none());
+        assert_eq!(
+            public_snapshot.get("status").and_then(Value::as_str),
+            Some("authenticated")
+        );
+        assert_eq!(
+            public_snapshot.get("accountKey").and_then(Value::as_str),
+            Some("user-1")
+        );
     }
 
-    validate_auth_value("Desktop session", &token)?;
-    let step = clean_desktop_signin_diagnostic_text(step, 120);
-    if step.is_empty() {
-        return Err("Desktop sign-in diagnostic step is required.".to_string());
+    #[test]
+    fn team_scope_normalization_uses_only_account_scopes() {
+        let user = json!({
+            "id": "user-1",
+            "accountScopes": [
+                {
+                    "type": "team",
+                    "teamId": "known-team",
+                    "label": "Known Team"
+                }
+            ]
+        });
+
+        let known = desktop_auth_normalize_scope(
+            &json!({ "type": "team", "teamId": "known-team" }),
+            Some(&user),
+        );
+        assert_eq!(known.get("id").and_then(Value::as_str), Some("team:known-team"));
+        assert_eq!(known.get("label").and_then(Value::as_str), Some("Known Team"));
+
+        let unknown = desktop_auth_normalize_scope(
+            &json!({ "type": "team", "teamId": "unknown-team", "label": "Fabricated" }),
+            Some(&user),
+        );
+        assert_eq!(unknown.get("id").and_then(Value::as_str), Some("personal"));
+        assert!(unknown.get("teamId").is_some_and(Value::is_null));
     }
-    let status = clean_desktop_signin_diagnostic_text(status, 40);
-    let source = clean_desktop_signin_diagnostic_text(
-        source.unwrap_or_else(|| "rust-diffforge-ui".to_string()),
-        80,
-    );
-    let flow_id = flow_id
-        .map(|value| clean_desktop_signin_diagnostic_text(value, 160))
-        .filter(|value| !value.is_empty());
-    let message = message
-        .map(|value| clean_desktop_signin_diagnostic_text(
-            value,
-            DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT,
-        ))
-        .filter(|value| !value.is_empty());
-
-    let client = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))?;
-    let response = client
-        .post(api_endpoint("desktop/signin-diagnostics"))
-        .bearer_auth(token)
-        .json(&DesktopSigninDiagnosticRequest {
-            flow_id: flow_id.as_deref(),
-            source: &source,
-            step: &step,
-            status: &status,
-            message: message.as_deref(),
-            details: details.unwrap_or_else(|| json!({})),
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Unable to record desktop sign-in diagnostic: {error}"))?;
-
-    read_api_response(response, "Unable to record desktop sign-in diagnostic.").await
-}
-
-#[tauri::command]
-async fn record_desktop_connection_diagnostic(
-    token: String,
-    flow_id: Option<String>,
-    source: Option<String>,
-    channel: Option<String>,
-    workspace_id: Option<String>,
-    repo_id: Option<String>,
-    step: String,
-    status: String,
-    message: Option<String>,
-    details: Option<Value>,
-) -> Result<Value, String> {
-    if !DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED {
-        return Ok(json!({
-            "ok": true,
-            "stored": false,
-            "enabled": false,
-        }));
-    }
-
-    validate_auth_value("Desktop session", &token)?;
-    let step = clean_desktop_signin_diagnostic_text(step, 140);
-    if step.is_empty() {
-        return Err("Desktop connection diagnostic step is required.".to_string());
-    }
-    let status = clean_desktop_signin_diagnostic_text(status, 48);
-    let source = clean_desktop_signin_diagnostic_text(
-        source.unwrap_or_else(|| "rust-diffforge-ui".to_string()),
-        100,
-    );
-    let flow_id = flow_id
-        .map(|value| clean_desktop_signin_diagnostic_text(value, 180))
-        .filter(|value| !value.is_empty());
-    let channel = channel
-        .map(|value| clean_desktop_signin_diagnostic_text(value, 80))
-        .filter(|value| !value.is_empty());
-    let workspace_id = workspace_id
-        .map(|value| clean_desktop_signin_diagnostic_text(value, 180))
-        .filter(|value| !value.is_empty());
-    let repo_id = repo_id
-        .map(|value| clean_desktop_signin_diagnostic_text(value, 180))
-        .filter(|value| !value.is_empty());
-    let message = message
-        .map(|value| clean_desktop_signin_diagnostic_text(
-            value,
-            DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT,
-        ))
-        .filter(|value| !value.is_empty());
-
-    let payload = json!({
-        "flowId": flow_id,
-        "source": source,
-        "channel": channel,
-        "workspaceId": workspace_id,
-        "repoId": repo_id,
-        "step": step,
-        "status": status,
-        "message": message,
-        "details": details.unwrap_or_else(|| json!({})),
-    });
-
-    let client = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))?;
-    let response = client
-        .post(api_endpoint("desktop/connection-diagnostics"))
-        .bearer_auth(token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|error| format!("Unable to record desktop connection diagnostic: {error}"))?;
-
-    read_api_response(response, "Unable to record desktop connection diagnostic.").await
 }
 
 #[tauri::command]

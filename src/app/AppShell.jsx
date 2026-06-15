@@ -12,7 +12,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import "@vscode/codicons/dist/codicon.css";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
+import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import {
   TERMINAL_AGENT_COLOR_HEX_BY_SLOT,
@@ -597,8 +597,6 @@ import SnippingQuickAccess, {
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
-
-const DEFAULT_WEB_LOGIN_URL = "https://diffforge.ai/desktop/login";
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
 const AUTH_STARTUP_TIMEOUT_MS = 30000;
@@ -609,8 +607,6 @@ const AUTH_EXCHANGE_TIMEOUT_MS = 10000;
 const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
-const CLOUD_MCP_SIGNIN_DIAGNOSTICS_ENABLED = false;
-const CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED = false;
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
@@ -657,7 +653,7 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 ]);
 const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
 const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
-const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 350;
+const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 300;
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -878,69 +874,15 @@ function shouldShowLowCreditWarning(credits, dismissedKey) {
   return Boolean(isLow && warningKey && warningKey !== dismissedKey);
 }
 
-function safeDiagnosticDetails(details) {
-  if (!details || typeof details !== "object") {
-    return {};
-  }
-
-  try {
-    return JSON.parse(JSON.stringify(details));
-  } catch {
-    return {};
-  }
+async function recordCloudSigninDiagnostic() {
+  return undefined;
 }
 
-async function recordCloudSigninDiagnostic(token, event) {
-  if (!CLOUD_MCP_SIGNIN_DIAGNOSTICS_ENABLED || !isSafeAuthValue(token)) {
-    return;
-  }
-
-  try {
-    await invoke("record_desktop_signin_diagnostic", {
-      token,
-      flowId: event.flowId || "desktop-cloud-connect",
-      source: event.source || "rust-diffforge-ui",
-      step: event.step,
-      status: event.status || "ok",
-      message: event.message || "",
-      details: safeDiagnosticDetails(event.details),
-    });
-  } catch {
-    // Diagnostic logging must never block sign-in.
-  }
+async function recordCloudConnectionDiagnostic() {
+  return undefined;
 }
 
-async function recordCloudConnectionDiagnostic(token, event) {
-  if (!CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED || !isSafeAuthValue(token)) {
-    return;
-  }
-  const status = String(event?.status || "").trim().toLowerCase();
-  const terminalInputHotUntil = typeof window === "undefined"
-    ? 0
-    : Number(window.__diffforgeTerminalInputHotUntil || 0);
-  if (status !== "error" && terminalInputHotUntil > Date.now()) {
-    return;
-  }
-
-  try {
-    await invoke("record_desktop_connection_diagnostic", {
-      token,
-      channel: event.channel || "rust-client",
-      details: safeDiagnosticDetails(event.details),
-      flowId: event.flowId || "desktop-cloud-runtime",
-      message: event.message || "",
-      repoId: event.repoId || event.repo_id || "",
-      source: event.source || "rust-diffforge-ui",
-      status: event.status || "ok",
-      step: event.step,
-      workspaceId: event.workspaceId || event.workspace_id || "",
-    });
-  } catch {
-    // Connection diagnostics must never block app runtime behavior.
-  }
-}
-
-async function syncCloudMcpDesktopSessionToken(token, options = {}) {
+async function refreshCloudMcpSessionContext(options = {}) {
   const emitProgress = (progress) => {
     if (typeof options.onProgress !== "function") {
       return;
@@ -954,76 +896,63 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
   };
 
   try {
-    const safeToken = isSafeAuthValue(token) ? token : null;
     const flowId = options.flowId || "desktop-cloud-connect";
-    if (safeToken) {
-      emitProgress({
-        detail: "Passing your web session into the native cloud runtime.",
-        stage: "desktop_session",
-        status: "active",
-        title: "Securing desktop session",
-      });
-    }
-    await recordCloudConnectionDiagnostic(safeToken, {
+    emitProgress({
+      detail: "Refreshing your signed-in cloud context in the native runtime.",
+      stage: "desktop_session",
+      status: "active",
+      title: "Preparing cloud workspace",
+    });
+    await recordCloudConnectionDiagnostic({
       channel: "rust-client-auth",
       flowId,
-      step: "rust.cloud_mcp.desktop_token.set",
+      step: "rust.cloud_mcp.context.refresh",
       status: "start",
-      message: "Rust client is sending desktop session token to Cloud MCP runtime.",
+      message: "Rust client is refreshing native Cloud MCP auth context.",
       details: {
-        hasToken: Boolean(safeToken),
         requireConnected: Boolean(options.requireConnected),
       },
     });
-    await recordCloudSigninDiagnostic(safeToken, {
+    await recordCloudSigninDiagnostic({
       flowId,
-      step: "cloud_mcp.desktop_token.set",
+      step: "cloud_mcp.context.refresh",
       status: "start",
-      message: "sending desktop session token to Cloud MCP runtime",
+      message: "refreshing Cloud MCP auth context",
       details: {
         requireConnected: Boolean(options.requireConnected),
-        hasToken: Boolean(safeToken),
       },
     });
-    const accountScope = options.accountScope || authStore.getActiveScope?.() || null;
-    const scopePayload = accountScopeInvokePayload(accountScope);
-    const entitlementPayload = {
-      planName: options.planName || "plus",
-      deviceLimit: Number.isInteger(options.deviceLimit) ? options.deviceLimit : 3,
-    };
-    const status = await invoke("cloud_mcp_set_desktop_session_token", {
-      token: safeToken,
-      scopeType: scopePayload.scopeType,
-      teamId: scopePayload.teamId,
-      planName: entitlementPayload.planName,
-      deviceLimit: entitlementPayload.deviceLimit,
-    });
-    await recordCloudConnectionDiagnostic(safeToken, {
+    if (options.accountScope) {
+      await authStore.setActiveScope(options.accountScope);
+    }
+    if (options.billingStatus) {
+      await authStore.applyBillingStatus(options.billingStatus);
+    }
+    const status = await invoke("cloud_mcp_get_status");
+    await recordCloudConnectionDiagnostic({
       channel: "rust-client-auth",
       flowId,
-      step: "rust.cloud_mcp.desktop_token.set",
+      step: "rust.cloud_mcp.context.refresh",
       status: "ok",
-      message: "Cloud MCP runtime accepted desktop session token.",
+      message: "Cloud MCP runtime context refresh completed.",
       details: status,
     });
-    await recordCloudSigninDiagnostic(safeToken, {
+    await recordCloudSigninDiagnostic({
       flowId,
-      step: "cloud_mcp.desktop_token.set",
+      step: "cloud_mcp.context.refresh",
       status: "ok",
-      message: "Cloud MCP runtime accepted desktop session token",
+      message: "Cloud MCP runtime context refresh completed",
       details: status,
     });
 
-    if (safeToken) {
-      emitProgress({
-        detail: "The native runtime accepted your signed-in desktop session.",
-        stage: "desktop_session",
-        status: "complete",
-        title: "Desktop session accepted",
-      });
-    }
+    emitProgress({
+      detail: "The native runtime is using your signed-in cloud context.",
+      stage: "desktop_session",
+      status: "complete",
+      title: "Cloud context ready",
+    });
 
-    if (!options.requireConnected || !safeToken) {
+    if (!options.requireConnected) {
       return status;
     }
 
@@ -1041,7 +970,7 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
         status: "active",
         title: attempt === 1 ? "Preparing cloud auth" : "Still setting up your instance",
       });
-      await recordCloudSigninDiagnostic(safeToken, {
+      await recordCloudSigninDiagnostic({
         flowId,
         step: "cloud_mcp.connect.invoke",
         status: "start",
@@ -1061,7 +990,7 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
           CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
         );
         stopStatusPolling();
-        await recordCloudConnectionDiagnostic(safeToken, {
+        await recordCloudConnectionDiagnostic({
           channel: "rust-client-auth",
           flowId,
           step: "rust.cloud_mcp.connect",
@@ -1069,7 +998,7 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
           message: "Rust client Cloud MCP websocket connect command returned.",
           details: connectedStatus,
         });
-        await recordCloudSigninDiagnostic(safeToken, {
+        await recordCloudSigninDiagnostic({
           flowId,
           step: "cloud_mcp.connect.invoke",
           status: "ok",
@@ -1122,7 +1051,7 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
         status: "error",
         title: "Cloud workspace still unavailable",
       });
-      await recordCloudConnectionDiagnostic(token, {
+      await recordCloudConnectionDiagnostic({
         channel: "rust-client-auth",
         flowId: options.flowId || "desktop-cloud-connect",
         step: "rust.cloud_mcp.connect",
@@ -1130,7 +1059,7 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
         message: getErrorMessage(error, "Cloud MCP connection failed."),
         details: { requireConnected: true },
       });
-      await recordCloudSigninDiagnostic(token, {
+      await recordCloudSigninDiagnostic({
         flowId: options.flowId || "desktop-cloud-connect",
         step: "cloud_mcp.connect.invoke",
         status: "error",
@@ -4448,45 +4377,6 @@ function WorkspaceCreatePanel({
   );
 }
 
-function createAuthState() {
-  const bytes = new Uint8Array(32);
-  window.crypto.getRandomValues(bytes);
-
-  return btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
-async function desktopLoginUrlWithDevice(state) {
-  let loginUrl = DEFAULT_WEB_LOGIN_URL;
-  try {
-    const resolvedLoginUrl = await invoke("desktop_web_login_url");
-    if (typeof resolvedLoginUrl === "string" && resolvedLoginUrl.trim()) {
-      loginUrl = resolvedLoginUrl.trim();
-    }
-  } catch {
-    // Older native builds still use the production desktop login URL.
-  }
-
-  const url = new URL(loginUrl);
-  url.searchParams.set("state", state);
-  try {
-    const profile = await invoke("cloud_mcp_get_desktop_device_profile");
-    const deviceId = safeCloudMcpText(profile?.device_id || profile?.deviceId, "");
-    if (deviceId) url.searchParams.set("desktopDeviceId", deviceId);
-    const deviceName = safeCloudMcpText(profile?.device_name || profile?.deviceName || profile?.machine_name || profile?.machineName, "");
-    if (deviceName) url.searchParams.set("desktopDeviceName", deviceName);
-    const platform = safeCloudMcpText(profile?.platform || profile?.os, "");
-    if (platform) url.searchParams.set("desktopPlatform", platform);
-    const formFactor = safeCloudMcpText(profile?.form_factor || profile?.formFactor || profile?.device_type || profile?.deviceType, "");
-    if (formFactor) url.searchParams.set("desktopFormFactor", formFactor);
-  } catch {
-    // Desktop login can continue without the optional web-presence handoff.
-  }
-  return url.toString();
-}
-
 function isPaidUser(sessionUser) {
   return sessionUser?.planStatus === "paid";
 }
@@ -4576,32 +4466,6 @@ function billingPlanNameFromStatus(billingStatus, sessionUser) {
   return paid ? "plus" : "free";
 }
 
-function billingPlanDeviceLimitFromStatus(billingStatus, sessionUser) {
-  const explicitLimit = Number(
-    billingStatus?.entitlements?.deviceLimit
-      ?? billingStatus?.limits?.deviceLimit
-      ?? billingStatus?.user?.entitlements?.deviceLimit
-      ?? sessionUser?.deviceLimit
-      ?? sessionUser?.device_limit,
-  );
-  if (Number.isInteger(explicitLimit) && explicitLimit >= 0) {
-    return explicitLimit;
-  }
-  const planName = billingPlanNameFromStatus(billingStatus, sessionUser);
-  if (planName === "free") return 0;
-  if (planName === "pro") return 7;
-  if (planName === "ultra") return 20;
-  return 3;
-}
-
-function cloudMcpBillingEntitlementPayload(billingStatus, sessionUser) {
-  const planName = billingPlanNameFromStatus(billingStatus, sessionUser);
-  return {
-    planName,
-    deviceLimit: billingPlanDeviceLimitFromStatus(billingStatus, sessionUser),
-  };
-}
-
 function billingPlanLabelFromStatus(billingStatus, sessionUser) {
   const paid = isPaidUser(sessionUser) || billingStatus?.planStatus === "paid";
 
@@ -4629,27 +4493,6 @@ function billingPlanLabelFromStatus(billingStatus, sessionUser) {
   }
 
   return "Paid";
-}
-
-function parseAuthCallback(urlValue) {
-  try {
-    const url = new URL(urlValue);
-
-    if (url.protocol !== "diffforge:" || url.hostname !== "auth" || url.pathname !== "/callback") {
-      return null;
-    }
-
-    const code = url.searchParams.get("code") || "";
-    const state = url.searchParams.get("state") || "";
-
-    if (!isSafeAuthValue(code) || !isSafeAuthValue(state)) {
-      return null;
-    }
-
-    return { code, state };
-  } catch {
-    return null;
-  }
 }
 
 function getErrorMessage(error, fallback) {
@@ -8135,6 +7978,9 @@ export default function App() {
     error: authError,
     user,
     activeScope,
+    accountScopes: authAccountScopes,
+    accountKey: authAccountKey,
+    entitlements: authEntitlements,
   } = useAuthSnapshot();
   const [apiState, setApiState] = useState("checking");
   const [apiMessage, setApiMessage] = useState("Checking connection");
@@ -8259,10 +8105,6 @@ export default function App() {
   const authFlowIdRef = useRef(0);
   const authCallbackInFlightStateRef = useRef("");
   const authCallbackCompletedStateRef = useRef("");
-  // True while the app is running on a saved session that could not be
-  // re-validated because the API was unreachable (offline grace). Cleared by
-  // the quiet re-validation that runs when the cloud connection returns.
-  const offlineSessionGraceRef = useRef(false);
   const [cloudSyncStatus, setCloudSyncStatus] = useState(null);
   const [networkingOverlayOpen, setNetworkingOverlayOpen] = useState(false);
   const [networkingDiagnostics, setNetworkingDiagnostics] = useState(null);
@@ -8405,7 +8247,15 @@ export default function App() {
     workspaceTerminalRoleOptions,
     activeAgent,
   );
-  const accountScopes = useMemo(() => accountScopeOptionsFromUser(user), [user]);
+  const accountScopes = useMemo(() => (
+    Array.isArray(authAccountScopes) && authAccountScopes.length
+      ? authAccountScopes
+      : accountScopeOptionsFromUser(user)
+  ), [authAccountScopes, user]);
+  const accountIsPaid = Boolean(authEntitlements?.isPaid)
+    || Boolean(authEntitlements?.canUseCloudSync)
+    || isPaidUser(user)
+    || billingStatus?.planStatus === "paid";
   const getTerminalInputHotDelayMs = useCallback((extraMs = TERMINAL_INPUT_HOT_BACKGROUND_GRACE_MS) => {
     const globalHotUntil = typeof window === "undefined"
       ? 0
@@ -8663,37 +8513,27 @@ export default function App() {
       return;
     }
 
-    const token = authStore.getToken();
-    if (!isSafeAuthValue(token)) {
-      return;
-    }
-
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
-    void syncCloudMcpDesktopSessionToken(token, {
+    void refreshCloudMcpSessionContext({
       accountScope: activeAccountScope,
-      ...cloudMcpBillingEntitlementPayload(billingStatus, user),
+      billingStatus,
       flowId: `scope-${activeAccountScopeKey}`,
     });
-  }, [activeAccountScope, activeAccountScopeKey, authState, billingStatus, user]);
+  }, [activeAccountScope, activeAccountScopeKey, authState, billingStatus]);
   useEffect(() => {
     if (authState !== "authenticated") {
       cloudMcpStartupWarmupKeyRef.current = "";
       return undefined;
     }
 
-    const token = authStore.getToken();
-    if (!isSafeAuthValue(token)) {
-      cloudMcpStartupWarmupKeyRef.current = "";
-      return undefined;
-    }
-    if (!isPaidUser(user) && billingStatus?.planStatus !== "paid") {
+    if (!accountIsPaid) {
       cloudMcpStartupWarmupKeyRef.current = "";
       return undefined;
     }
 
-    const warmupKey = `${activeAccountScopeKey}:${token}`;
+    const warmupKey = `${activeAccountScopeKey}:${authState}:${billingStatus?.updatedAt || billingStatus?.credits?.updatedAt || ""}`;
     if (cloudMcpStartupWarmupKeyRef.current === warmupKey) {
       return undefined;
     }
@@ -8705,11 +8545,11 @@ export default function App() {
         return;
       }
 
-      void syncCloudMcpDesktopSessionToken(token, {
+      void refreshCloudMcpSessionContext({
         accountScope: activeAccountScope,
         connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
         connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
-        ...cloudMcpBillingEntitlementPayload(billingStatus, user),
+        billingStatus,
         flowId: `startup-cloud-mcp-${activeAccountScopeKey}`,
         requireConnected: true,
       }).catch((error) => {
@@ -8733,9 +8573,9 @@ export default function App() {
   }, [
     activeAccountScope,
     activeAccountScopeKey,
+    accountIsPaid,
     authState,
     billingStatus,
-    user,
   ]);
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
@@ -10691,9 +10531,6 @@ export default function App() {
       clearSession: options.clearSession !== false,
       clearPending: options.clearPending === true,
     });
-    if (options.clearSession !== false) {
-      void syncCloudMcpDesktopSessionToken("");
-    }
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
@@ -10740,16 +10577,12 @@ export default function App() {
     );
   }, [setSignedOut]);
 
-  const setAuthenticated = useCallback((sessionUser, options = {}) => {
+  const enterAuthenticatedWorkspace = useCallback((sessionUser, options = {}) => {
     const cloudEnabled = isPaidUser(sessionUser);
 
-    authStore.setAuthenticated(
-      sessionUser,
-      "Initializing workspace...",
-    );
     if (cloudEnabled) {
       updateCloudWorkspaceProgress({
-        detail: "Passing your signed-in session to the cloud runtime.",
+        detail: "Preparing your signed-in cloud runtime.",
         stage: "desktop_session",
         status: "active",
         title: "Preparing cloud workspace",
@@ -10763,8 +10596,8 @@ export default function App() {
       });
     }
     if (cloudEnabled && options.syncCloud !== false) {
-      void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
-        ...cloudMcpBillingEntitlementPayload(billingStatusRef.current, sessionUser),
+      void refreshCloudMcpSessionContext({
+        billingStatus: billingStatusRef.current,
         onProgress: updateCloudWorkspaceProgress,
       });
     }
@@ -10943,7 +10776,10 @@ export default function App() {
       return;
     }
 
-    authStore.setActiveScope(nextScope);
+    void authStore.setActiveScope(nextScope)
+      .catch((error) => {
+        authStore.setError(getErrorMessage(error, "Unable to switch account scope."));
+      });
   }, [accountScopes, activeAccountScopeKey]);
 
   useEffect(() => {
@@ -10969,7 +10805,14 @@ export default function App() {
 
     setSelectedWorkspaceId("");
     setWorkspaceSettingsModalId("");
-  }, []);
+    if (DEVICE_LEVEL_APP_VIEW_IDS.has(activeViewRef.current) || DEVICE_LEVEL_APP_VIEW_IDS.has(visibleViewRef.current)) {
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        immediate: true,
+        telemetrySource: "rail_selection_cleared",
+        telemetryWorkspaceId: activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current,
+      });
+    }
+  }, [showView]);
 
   useEffect(() => () => {
     window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
@@ -11904,46 +11747,42 @@ export default function App() {
   }, []);
 
   const validateStoredSession = useCallback(async () => {
-    const token = authStore.getToken();
     const validationFlowId = authFlowIdRef.current;
-
-    if (!isSafeAuthValue(token)) {
-      setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
-      return;
-    }
-
-    // Auth state is monotonic for a session: once the user is authenticated,
-    // restore validation must never demote them back to the sign-in screen
-    // (setChecking flips status to signedOut, which reads as login/dashboard
-    // flicker). Re-validation of a live session goes through the quiet path.
-    if (authStore.getSnapshot().status === "authenticated") {
-      return;
-    }
 
     authStore.setChecking("Checking saved desktop session. You can still sign in with the web app.");
 
     try {
-      const session = await withTimeout(
-        invoke("validate_desktop_session", { token }),
+      const nextAuth = await withTimeout(
+        authStore.validateSession(),
         SESSION_RESTORE_TIMEOUT_MS,
         SESSION_RESTORE_TIMEOUT_MESSAGE,
       );
-      await recordCloudSigninDiagnostic(token, {
+      await recordCloudSigninDiagnostic({
         flowId: `restore-${validationFlowId}`,
         step: "desktop_session.restore",
-        status: "ok",
-        message: "saved desktop session validated",
+        status: nextAuth?.status === "authenticated" ? "ok" : "warn",
+        message: nextAuth?.status === "authenticated"
+          ? "saved desktop session validated"
+          : "saved desktop session unavailable",
         details: {
-          hasUser: Boolean(session?.user),
-          email: session?.user?.email || "",
-          planStatus: session?.user?.planStatus || "",
+          hasUser: Boolean(nextAuth?.user),
+          email: nextAuth?.user?.email || "",
+          planStatus: nextAuth?.user?.planStatus || "",
         },
       });
       if (validationFlowId !== authFlowIdRef.current) {
         return;
       }
 
-      setAuthenticated(session.user);
+      if (nextAuth?.status === "authenticated" && nextAuth?.user) {
+        enterAuthenticatedWorkspace(nextAuth.user, { syncCloud: false });
+      } else {
+        setSignedOut(
+          nextAuth?.message || DEFAULT_AUTH_MESSAGE,
+          nextAuth?.error || "",
+          { clearPending: true, clearSession: false },
+        );
+      }
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
         return;
@@ -11956,27 +11795,11 @@ export default function App() {
         || /unable to read diff forge ai api response/i.test(restoreError)
         || /returned 5\d\d/i.test(restoreError)
         || /unable to prepare backend request/i.test(restoreError);
-      const storedUser = authStore.getSnapshot().user;
-
-      if (isNetworkRestoreError && storedUser && !isPaidUser(storedUser)) {
-        // Free accounts do not open a cloud workspace, so a saved pricing-screen
-        // session can survive a temporary API outage without entering sync limbo.
-        offlineSessionGraceRef.current = true;
-        await recordCloudSigninDiagnostic(token, {
-          flowId: `restore-${validationFlowId}`,
-          step: "desktop_session.restore",
-          status: "warn",
-          message: "offline session grace: network failure during session restore",
-          details: { didTimeout, restoreError },
-        });
-        setAuthenticated(storedUser);
-        return;
-      }
 
       const signedOutMessage = didTimeout || isNetworkRestoreError
         ? "Secure session could not be verified. Sign in again with the web app."
         : "Your desktop session expired. Sign in again with the web app.";
-      await recordCloudSigninDiagnostic(token, {
+      await recordCloudSigninDiagnostic({
         flowId: `restore-${validationFlowId}`,
         step: "desktop_session.restore",
         status: "error",
@@ -11990,97 +11813,37 @@ export default function App() {
       });
     }
   }, [
-    setAuthenticated,
+    enterAuthenticatedWorkspace,
     setSignedOut,
   ]);
 
-  const revalidateOfflineSessionQuietly = useCallback(async () => {
-    if (!offlineSessionGraceRef.current) {
-      return;
-    }
-    const token = authStore.getToken();
-    if (!isSafeAuthValue(token)) {
-      offlineSessionGraceRef.current = false;
-      return;
-    }
-    try {
-      const session = await invoke("validate_desktop_session", { token });
-      offlineSessionGraceRef.current = false;
-      if (session?.user) {
-        // Quiet refresh: update the stored user without resetting workspace
-        // state the user is already working in.
-        authStore.setAuthenticated(session.user);
-      }
-    } catch (error) {
-      const message = getErrorMessage(error, "");
-      const isNetworkError = /unable to validate desktop session/i.test(message)
-        || /unable to read diff forge ai api response/i.test(message)
-        || /returned 5\d\d/i.test(message)
-        || /unable to prepare backend request/i.test(message);
-      if (isNetworkError) {
-        return;
-      }
-      offlineSessionGraceRef.current = false;
-      expireDesktopSession(error);
-    }
-  }, [expireDesktopSession]);
-
   const completeDesktopLogin = useCallback(async (callbackUrl) => {
-    const callback = parseAuthCallback(callbackUrl);
-
-    if (!callback) {
-      return false;
-    }
-
-    const pendingState = authStore.getPendingState();
-
-    if (
-      callback.state === authCallbackInFlightStateRef.current
-      || callback.state === authCallbackCompletedStateRef.current
-    ) {
-      return true;
-    }
-
-    if (!pendingState || callback.state !== pendingState) {
-      if (!pendingState && authStore.getSnapshot().status === "authenticated") {
-        return true;
-      }
-
-      authFlowIdRef.current += 1;
-      setSignedOut(
-        DEFAULT_AUTH_MESSAGE,
-        "Desktop login state did not match. Start again from this app.",
-        { clearPending: true },
-      );
-      return true;
-    }
-
     authFlowIdRef.current += 1;
     const loginFlowId = authFlowIdRef.current;
-    authCallbackInFlightStateRef.current = callback.state;
+    authCallbackInFlightStateRef.current = callbackUrl;
     authStore.setExchanging("Browser callback matched. Creating your desktop session...");
-    let diagnosticToken = "";
-    let failureStep = "desktop_session.exchange";
 
     try {
-      const session = await withTimeout(
-        invoke("exchange_desktop_auth_code", {
-          code: callback.code,
-          state: callback.state,
-        }),
+      const result = await withTimeout(
+        authStore.completeDeepLink(callbackUrl),
         AUTH_EXCHANGE_TIMEOUT_MS,
         AUTH_EXCHANGE_TIMEOUT_MESSAGE,
       );
-      diagnosticToken = session?.token || "";
-      await recordCloudSigninDiagnostic(diagnosticToken, {
-        flowId: callback.state,
+      if (!result?.handled) {
+        return false;
+      }
+      const nextAuth = result?.snapshot || authStore.getSnapshot();
+      await recordCloudSigninDiagnostic({
+        flowId: "desktop-auth-callback",
         step: "desktop_session.exchange",
-        status: "ok",
-        message: "desktop auth code exchanged for desktop session",
+        status: nextAuth?.status === "authenticated" ? "ok" : "error",
+        message: nextAuth?.status === "authenticated"
+          ? "desktop auth code exchanged for desktop session"
+          : nextAuth?.error || "desktop auth callback did not authenticate",
         details: {
-          hasUser: Boolean(session?.user),
-          email: session?.user?.email || "",
-          planStatus: session?.user?.planStatus || "",
+          hasUser: Boolean(nextAuth?.user),
+          email: nextAuth?.user?.email || "",
+          planStatus: nextAuth?.user?.planStatus || "",
         },
       });
 
@@ -12088,18 +11851,24 @@ export default function App() {
         return true;
       }
 
-      authStore.persistAuthenticatedSession(session);
-      authStore.clearPending();
-      setAuthenticated(session.user);
-      authCallbackCompletedStateRef.current = callback.state;
+      if (nextAuth?.status === "authenticated" && nextAuth?.user) {
+        enterAuthenticatedWorkspace(nextAuth.user, { syncCloud: false });
+      } else {
+        setSignedOut(
+          nextAuth?.message || DEFAULT_AUTH_MESSAGE,
+          nextAuth?.error || "Desktop login expired. Try again.",
+          { clearPending: true, clearSession: false },
+        );
+      }
+      authCallbackCompletedStateRef.current = callbackUrl;
     } catch (error) {
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
       }
 
-      await recordCloudSigninDiagnostic(diagnosticToken, {
-        flowId: callback?.state,
-        step: failureStep,
+      await recordCloudSigninDiagnostic({
+        flowId: "desktop-auth-callback",
+        step: "desktop_session.exchange",
         status: "error",
         message: getErrorMessage(error, "Desktop login expired. Try again."),
         details: {},
@@ -12110,14 +11879,14 @@ export default function App() {
         { clearPending: true },
       );
     } finally {
-      if (authCallbackInFlightStateRef.current === callback.state) {
+      if (authCallbackInFlightStateRef.current === callbackUrl) {
         authCallbackInFlightStateRef.current = "";
       }
     }
 
     return true;
   }, [
-    setAuthenticated,
+    enterAuthenticatedWorkspace,
     setSignedOut,
   ]);
 
@@ -12125,11 +11894,13 @@ export default function App() {
     authFlowIdRef.current += 1;
     authCallbackInFlightStateRef.current = "";
     authCallbackCompletedStateRef.current = "";
-    const state = createAuthState();
-    authStore.setWaiting(state, "Opening secure web sign-in in your browser...");
 
     try {
-      const loginUrl = await desktopLoginUrlWithDevice(state);
+      const login = await authStore.startLogin();
+      const loginUrl = String(login?.loginUrl || "").trim();
+      if (!loginUrl) {
+        throw new Error("Desktop login URL was not returned by the native auth core.");
+      }
       await withTimeout(
         openUrl(loginUrl),
         OPEN_BROWSER_TIMEOUT_MS,
@@ -12164,6 +11935,7 @@ export default function App() {
 
     try {
       const nextBillingStatus = await invoke("cloud_mcp_get_billing_status");
+      await authStore.applyBillingStatus(nextBillingStatus).catch(() => {});
       setBillingStatus(nextBillingStatus);
       setBillingStatusState("ready");
       setBillingStatusError("");
@@ -12253,7 +12025,7 @@ export default function App() {
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || !cloudLiveSyncEpoch
     ) {
       return;
@@ -12849,7 +12621,7 @@ export default function App() {
   // Cross-device workspace sync: cloud-diffforge broadcasts the full active
   // catalog whenever any device creates, renames, or deletes a workspace.
   useEffect(() => {
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated" || !accountIsPaid) {
       return undefined;
     }
 
@@ -12931,12 +12703,11 @@ export default function App() {
   const createFirstWorkspace = useCallback(async (event, requestedTerminalRoles = null) => {
     event.preventDefault();
 
-    const token = authStore.getToken();
     const name = workspaceName;
     const requestedRoot = cleanWorkspaceRootDirectory(newWorkspaceRootDraft)
       || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
 
-    if (!isSafeAuthValue(token)) {
+    if (authState !== "authenticated") {
       expireDesktopSession("Desktop session required to create a workspace.");
       return;
     }
@@ -13079,6 +12850,7 @@ export default function App() {
     }
   }, [
     activeAccountScopeKey,
+    authState,
     defaultWorkingDirectory,
     expireDesktopSession,
     newWorkspaceRootDraft,
@@ -13123,7 +12895,6 @@ export default function App() {
       return;
     }
 
-    const token = authStore.getToken();
     const workspaceNameValue = workspaceNameDraft;
     const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
     const terminalRoles = normalizeWorkspaceTerminalRoles(
@@ -13146,7 +12917,7 @@ export default function App() {
     );
     const terminalRolesChanged = !areWorkspaceTerminalRolesEqual(currentTerminalRoles, terminalRoles);
 
-    if (!isSafeAuthValue(token)) {
+    if (authState !== "authenticated") {
       expireDesktopSession("Desktop session required to update workspace settings.");
       return;
     }
@@ -13437,6 +13208,7 @@ export default function App() {
   }, [
     selectedWorkspace,
     activeAccountScopeKey,
+    authState,
     expireDesktopSession,
     workspaceNameDraft,
     workspaceRootDraft,
@@ -14452,20 +14224,17 @@ export default function App() {
 
   const logout = useCallback(async () => {
     authFlowIdRef.current += 1;
-    const token = authStore.getToken();
 
     setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
 
-    if (isSafeAuthValue(token)) {
-      try {
-        await withTimeout(
-          invoke("logout_desktop_session", { token }),
-          LOGOUT_TIMEOUT_MS,
-          "Desktop sign out timed out.",
-        );
-      } catch {
-        // Local session cleanup still wins if the remote revoke cannot complete.
-      }
+    try {
+      await withTimeout(
+        authStore.signOut(),
+        LOGOUT_TIMEOUT_MS,
+        "Desktop sign out timed out.",
+      );
+    } catch {
+      // Local session cleanup still wins if the remote revoke cannot complete.
     }
   }, [setSignedOut]);
 
@@ -15264,9 +15033,6 @@ export default function App() {
         return;
       }
       handleSyncStatus(normalized);
-      if (normalized.connection === "connected") {
-        void revalidateOfflineSessionQuietly();
-      }
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -15284,7 +15050,7 @@ export default function App() {
         unlistenSyncStatus();
       }
     };
-  }, [revalidateOfflineSessionQuietly]);
+  }, []);
 
   const refreshNetworkingDiagnostics = useCallback(async (options = {}) => {
     const quiet = Boolean(options.quiet);
@@ -15393,7 +15159,7 @@ export default function App() {
       const terminalWorkspaces = Array.isArray(workspaceTerminalsWorkspacesRef.current)
         ? workspaceTerminalsWorkspacesRef.current
         : [];
-      if (authState === "authenticated" && isPaidUser(user) && terminalWorkspaces.length > 0) {
+      if (authState === "authenticated" && accountIsPaid && terminalWorkspaces.length > 0) {
         const terminalCount = terminalWorkspaces.reduce(
           (sum, workspace) => sum + (Array.isArray(workspace?.terminals) ? workspace.terminals.length : 0),
           0,
@@ -15407,7 +15173,7 @@ export default function App() {
             terminalCount,
             workspaceCount: terminalWorkspaces.length,
           });
-          void recordCloudConnectionDiagnostic(authStore.getToken(), {
+          void recordCloudConnectionDiagnostic({
             channel: "rust-client-sync",
             step: "rust.sync.workspace_terminals.reconnect",
             status: "error",
@@ -15425,7 +15191,7 @@ export default function App() {
     if (connection !== "connected" || previous === "connected" || !previous) {
       return;
     }
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated" || !accountIsPaid) {
       return;
     }
     // Reconnect after an offline stretch: reconcile the catalog right away so
@@ -15756,7 +15522,7 @@ export default function App() {
       return undefined;
     }
 
-    const userKey = `${user?.id || user?.email || "user"}`;
+    const userKey = `${authAccountKey || user?.id || user?.email || "user"}`;
 
     if (agentInitialStatusUserRef.current !== userKey) {
       const startupFlowId = startupAgentFlowIdRef.current + 1;
@@ -15814,6 +15580,7 @@ export default function App() {
     loadWorkspaces,
     refreshAgentStatuses,
     refreshAudioModelStatus,
+    authAccountKey,
     user,
     workspaceState,
   ]);
@@ -15858,7 +15625,7 @@ export default function App() {
       }
     }
 
-    const startupKey = `${user?.id || user?.email || "user"}:${selectedWorkspaceId || "workspace"}`;
+    const startupKey = `${authAccountKey || user?.id || user?.email || "user"}:${selectedWorkspaceId || "workspace"}`;
 
     if (audioAutoOpenStartupKeyRef.current === startupKey) {
       return;
@@ -15869,6 +15636,7 @@ export default function App() {
   }, [
     audioModelStatus,
     audioStatusState,
+    authAccountKey,
     authState,
     openAudioWidget,
     refreshAudioModelStatus,
@@ -15906,7 +15674,7 @@ export default function App() {
     waiting: "waiting",
   }[authState] || "ready";
   const displayName = user?.name || user?.email || "there";
-  const userIsPaid = isPaidUser(user);
+  const userIsPaid = accountIsPaid;
   const cloudWorkspaceReady = isCloudWorkspaceProgressReady(cloudWorkspaceProgress);
   const cloudWorkspaceStatusState = cloudWorkspaceLaunchState(cloudWorkspaceProgress);
   const cloudWorkspaceTitle = cloudWorkspaceProgress.title || "Preparing cloud workspace";
@@ -16782,7 +16550,7 @@ export default function App() {
         threadId: item.threadId,
         workspaceId: item.workspaceId,
       });
-      void recordCloudConnectionDiagnostic(item.diagnosticToken, {
+      void recordCloudConnectionDiagnostic({
         channel: "rust-client-sync",
         step: "rust.sync.terminal_status_event",
         status: "error",
@@ -16834,7 +16602,7 @@ export default function App() {
     const earlyEventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || !workspaceHydrationReady
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
@@ -16843,7 +16611,7 @@ export default function App() {
         logTerminalStatus("frontend.terminal_status.event_sync.skip", {
           authState,
           eventType: earlyEventType,
-          isPaidUser: isPaidUser(user),
+          isPaidUser: accountIsPaid,
           paneId: options.paneId || event.paneId || "",
           reason: "app_not_ready_for_status_sync",
           shouldShowWorkspaceSetup,
@@ -17225,7 +16993,6 @@ export default function App() {
       waiting_on: waitingOn,
     };
 
-    const diagnosticToken = authStore.getToken();
     const statusSyncKey = terminalKey;
     if (eventType === "provider-turn-completed") {
       logTerminalStatus("frontend.terminal_status.event_sync.completion_decision", {
@@ -17249,7 +17016,6 @@ export default function App() {
     const terminalStatusSyncItem = {
       agentId,
       commandPhase,
-      diagnosticToken,
       eventType,
       executionPhase,
       paneId,
@@ -17425,7 +17191,7 @@ export default function App() {
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || !workspaceHydrationReady
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
@@ -17438,7 +17204,7 @@ export default function App() {
       return undefined;
     }
 
-    const accountKey = user?.id || user?.email || "paid-user";
+    const accountKey = authAccountKey || user?.id || user?.email || "paid-user";
     const syncKey = JSON.stringify({
       accountKey,
       scopeKey: activeAccountScopeKey,
@@ -17459,11 +17225,9 @@ export default function App() {
 
     let disposed = false;
     let syncTimer = 0;
-    const diagnosticToken = authStore.getToken();
-
     const syncWorkspaceCatalog = async () => {
       workspaceCatalogSyncKeyRef.current = syncKey;
-      void recordCloudConnectionDiagnostic(diagnosticToken, {
+      void recordCloudConnectionDiagnostic({
         channel: "rust-client-sync",
         step: "rust.sync.workspace_catalog",
         status: "start",
@@ -17497,7 +17261,7 @@ export default function App() {
         if (disposed) {
           return;
         }
-        await recordCloudConnectionDiagnostic(diagnosticToken, {
+        await recordCloudConnectionDiagnostic({
           channel: "rust-client-sync",
           step: "rust.sync.workspace_catalog",
           status: "ok",
@@ -17515,7 +17279,7 @@ export default function App() {
             workspaceCount: targets.length,
             scopeKey: activeAccountScopeKey,
           });
-          await recordCloudConnectionDiagnostic(diagnosticToken, {
+          await recordCloudConnectionDiagnostic({
             channel: "rust-client-sync",
             step: "rust.sync.workspace_catalog",
             status: "error",
@@ -17542,6 +17306,7 @@ export default function App() {
     };
   }, [
     authState,
+    authAccountKey,
     activeAccountScopeKey,
     shouldShowWorkspaceSetup,
     user,
@@ -17557,7 +17322,7 @@ export default function App() {
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || !workspaceHydrationReady
       || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
@@ -17574,7 +17339,6 @@ export default function App() {
     }
 
     workspaceTerminalsSyncPendingRef.current = {
-      diagnosticToken: authStore.getToken(),
       reason,
       syncKey,
       terminalCount: workspaceTerminalsWorkspaces.reduce(
@@ -17653,7 +17417,7 @@ export default function App() {
               workspaceCount: pending.workspaceCount,
             });
           }
-          void recordCloudConnectionDiagnostic(pending.diagnosticToken, {
+          void recordCloudConnectionDiagnostic({
             channel: "rust-client-sync",
             step: "rust.sync.workspace_terminals",
             status: "error",
@@ -17696,7 +17460,7 @@ export default function App() {
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || !workspaceHydrationReady
       || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
@@ -17732,9 +17496,8 @@ export default function App() {
       if (reason === "device_live_state_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
         return;
       }
-      const diagnosticToken = authStore.getToken();
       try {
-        await recordCloudConnectionDiagnostic(diagnosticToken, {
+        await recordCloudConnectionDiagnostic({
           channel: "rust-client-sync",
           step: "rust.sync.workspace_servers",
           status: "start",
@@ -17770,7 +17533,7 @@ export default function App() {
           (sum, workspace) => sum + (Array.isArray(workspace?.servers) ? workspace.servers.length : 0),
           0,
         );
-        await recordCloudConnectionDiagnostic(diagnosticToken, {
+        await recordCloudConnectionDiagnostic({
           channel: "rust-client-sync",
           step: "rust.sync.workspace_servers",
           status: storedCount < serverCount ? "warn" : "ok",
@@ -17798,7 +17561,7 @@ export default function App() {
             workspaceCount: workspaceMcpSyncTargets.length,
           });
         }
-        await recordCloudConnectionDiagnostic(diagnosticToken, {
+        await recordCloudConnectionDiagnostic({
           channel: "rust-client-sync",
           step: "rust.sync.workspace_servers",
           status: "error",
@@ -17848,7 +17611,7 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated" || !accountIsPaid) {
       return undefined;
     }
 
@@ -17877,13 +17640,13 @@ export default function App() {
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
     ) {
       logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
         authState,
-        isPaidUser: isPaidUser(user),
+        isPaidUser: accountIsPaid,
         reason: "gate_not_ready",
         shouldShowWorkspaceSetup,
         workspaceSyncState,
@@ -18628,7 +18391,7 @@ export default function App() {
   useEffect(() => {
     if (
       authState !== "authenticated"
-      || !isPaidUser(user)
+      || !accountIsPaid
       || !workspaceHydrationReady
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
@@ -18868,7 +18631,7 @@ export default function App() {
   const isTokenomicsCloudResetting = tokenomicsCloudResetState === "resetting";
   const tokenomicsCloudResetDisabled = isTokenomicsCloudResetting
     || authState !== "authenticated"
-    || !isPaidUser(user);
+    || !accountIsPaid;
   useEffect(() => {
     const nextWorkspaceId = cloudSqliteResetWorkspace?.workspaceId || "";
     if (nextWorkspaceId !== cloudSqliteResetSelectedWorkspaceId) {
@@ -19581,7 +19344,7 @@ export default function App() {
     setTokenomicsCloudResetMessage("");
     setTokenomicsCloudResetError("");
 
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated" || !accountIsPaid) {
       setTokenomicsCloudResetError("Sign in with an active paid account before resetting cloud Tokenomics.");
       return;
     }
@@ -19606,7 +19369,7 @@ export default function App() {
     setCloudAccountResetMessage("");
     setCloudAccountResetError("");
 
-    if (authState !== "authenticated" || !isPaidUser(user)) {
+    if (authState !== "authenticated" || !accountIsPaid) {
       setCloudAccountResetError("Sign in with an active paid account before cleaning up cloud data.");
       return;
     }
@@ -25759,7 +25522,7 @@ export default function App() {
   ]);
 
   const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
-  const isPaidPlanUser = isPaidUser(user) || billingStatus?.planStatus === "paid";
+  const isPaidPlanUser = accountIsPaid || billingStatus?.planStatus === "paid";
   const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
   const cloudSyncConnection = String(cloudSyncStatus?.connection || "local").toLowerCase();
   const cloudSyncPendingCount = normalizeCloudSyncCount(cloudSyncStatus?.pendingCount);
@@ -26195,7 +25958,7 @@ export default function App() {
                   </WorkspaceList>
                 </RailTop>
 
-                <RailFooter data-rail-selection-preserve="true">
+                <RailFooter>
                   {shouldShowTerminalNav && (
                     <RailActionButton
                       aria-label="Terminals"
@@ -26397,7 +26160,7 @@ export default function App() {
                           key={runtimeWorkspace.id}
                         >
                           <TerminalView
-                            accountKey={user?.id || user?.email || ""}
+                            accountKey={authAccountKey || user?.id || user?.email || ""}
                             architectureTerminalActivity={workspaceArchitectureTerminalActivity[runtimeWorkspace.id]?.latest || null}
                             architectureWorkspaceRoot={runtimeDescriptor.workingDirectory}
                             architectureWorkspaceState={runtimeArchitectureGraphState}
@@ -27571,7 +27334,7 @@ export default function App() {
               ) : visibleView === "tokenomics" ? (
                 <ForgeWorkspace aria-label="Account Tokenomics" data-motion={viewMotion}>
                   <AccountTokenomicsView
-                    accountKey={user?.id || user?.email || ""}
+                    accountKey={authAccountKey || user?.id || user?.email || ""}
                     billingStatus={billingStatus}
                     storageUsage={cloudWorkspaceProgress.storageUsage}
                   />
@@ -27600,9 +27363,14 @@ export default function App() {
                     audioModelStatus={audioModelStatus}
                     audioStatusState={audioStatusState}
                     audioWidgetVisible={audioWidgetVisible}
+                    authState={authState}
+                    billingStatus={billingStatus}
+                    billingStatusError={billingStatusError}
+                    billingStatusState={billingStatusState}
                     onDownloadModel={downloadAudioModel}
                     onCloseWidget={closeAudioWidget}
                     onOpenWidget={openAudioWidget}
+                    onRefreshBillingStatus={refreshBillingStatus}
                     onRefreshStatus={refreshAudioModelStatus}
                     onUninstallModel={uninstallAudioModel}
                     workspace={selectedWorkspace}
@@ -27746,7 +27514,7 @@ export default function App() {
                               </WorkspaceAppToolMinimizedRail>
                             ) : (
                               <TodoQueuePanel
-                                accountKey={user?.id || user?.email || ""}
+                                accountKey={authAccountKey || user?.id || user?.email || ""}
                                 agentStatuses={agentStatuses}
                                 billingStatus={billingStatus}
                                 connectedDevices={cloudWorkspaceProgress.connectedDevices}

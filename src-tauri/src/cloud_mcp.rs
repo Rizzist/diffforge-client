@@ -98,6 +98,8 @@ const CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE: &str = "tokenomics_v2_sync_state";
 const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.v2";
 const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 2;
 const CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT: &str = "tokenomics_cursor_request";
+const CLOUD_MCP_TOKENOMICS_DELTA_REQUEST_EVENT: &str = "tokenomics_delta_request";
+const CLOUD_MCP_TOKENOMICS_DELTA_AVAILABLE_EVENT: &str = "tokenomics_delta_available";
 const CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT: &str = "tokenomics_device_delta";
 const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snapshot";
 const CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT: &str = "tokenomics_ingest_ack";
@@ -5782,111 +5784,30 @@ async fn cloud_mcp_fetch_appwrite_jwt(
 }
 
 async fn cloud_mcp_record_signin_diagnostic_with_token(
-    desktop_session_token: String,
-    step: &str,
-    status: &str,
-    message: &str,
-    details: Value,
+    _desktop_session_token: String,
+    _step: &str,
+    _status: &str,
+    _message: &str,
+    _details: Value,
 ) {
-    if !DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED
-        || validate_auth_value("Desktop session", &desktop_session_token).is_err()
-    {
-        return;
-    }
-
-    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))
-    else {
-        return;
-    };
-    let payload = DesktopSigninDiagnosticRequest {
-        flow_id: Some("cloud-mcp-connect"),
-        source: "rust-diffforge-cloud-mcp",
-        step,
-        status,
-        message: if message.trim().is_empty() {
-            None
-        } else {
-            Some(message)
-        },
-        details,
-    };
-
-    let _ = client
-        .post(api_endpoint("desktop/signin-diagnostics"))
-        .bearer_auth(desktop_session_token)
-        .json(&payload)
-        .send()
-        .await;
 }
 
 async fn cloud_mcp_record_signin_diagnostic(
-    state: &CloudMcpState,
-    step: &str,
-    status: &str,
-    message: &str,
-    details: Value,
+    _state: &CloudMcpState,
+    _step: &str,
+    _status: &str,
+    _message: &str,
+    _details: Value,
 ) {
-    let token = {
-        let auth = state.auth.lock().await;
-        auth.desktop_session_token.clone()
-    };
-
-    if let Some(token) = token {
-        cloud_mcp_record_signin_diagnostic_with_token(token, step, status, message, details).await;
-    }
-}
-
-async fn cloud_mcp_record_connection_diagnostic_with_token(
-    desktop_session_token: String,
-    step: &str,
-    status: &str,
-    message: &str,
-    details: Value,
-) {
-    if !DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED
-        || validate_auth_value("Desktop session", &desktop_session_token).is_err()
-    {
-        return;
-    }
-
-    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))
-    else {
-        return;
-    };
-    let payload = json!({
-        "flowId": "cloud-mcp-runtime",
-        "source": "rust-diffforge-cloud-mcp",
-        "channel": "rust-cloud-mcp",
-        "step": step,
-        "status": status,
-        "message": if message.trim().is_empty() { Value::Null } else { json!(message) },
-        "details": details,
-    });
-
-    let _ = client
-        .post(api_endpoint("desktop/connection-diagnostics"))
-        .bearer_auth(desktop_session_token)
-        .json(&payload)
-        .send()
-        .await;
 }
 
 async fn cloud_mcp_record_connection_diagnostic(
-    state: &CloudMcpState,
-    step: &str,
-    status: &str,
-    message: &str,
-    details: Value,
+    _state: &CloudMcpState,
+    _step: &str,
+    _status: &str,
+    _message: &str,
+    _details: Value,
 ) {
-    let token = {
-        let auth = state.auth.lock().await;
-        auth.desktop_session_token.clone()
-    };
-
-    if let Some(token) = token {
-        cloud_mcp_record_connection_diagnostic_with_token(token, step, status, message, details)
-            .await;
-    }
 }
 
 fn cloud_mcp_read_blocking_api_response(
@@ -6146,8 +6067,8 @@ fn cloud_mcp_device_limit_for_plan(plan_name: &str) -> u64 {
     }
 }
 
-fn cloud_mcp_device_limit_from_value(_value: Option<u64>, plan_name: &str) -> Option<u64> {
-    Some(cloud_mcp_device_limit_for_plan(plan_name))
+fn cloud_mcp_device_limit_from_value(value: Option<u64>, plan_name: &str) -> Option<u64> {
+    value.or_else(|| Some(cloud_mcp_device_limit_for_plan(plan_name)))
 }
 
 async fn cloud_mcp_account_scope(state: &CloudMcpState) -> (String, Option<String>) {
@@ -8545,6 +8466,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_live_state_reconcile(state, "websocket_hello_ack");
         cloud_mcp_spawn_tokenomics_cursor_request(state, "websocket_hello_ack");
+        cloud_mcp_spawn_tokenomics_account_delta_request(state, "websocket_hello_ack", false);
         return;
     }
     if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -8933,6 +8855,84 @@ async fn cloud_mcp_send_tokenomics_cursor_request(
     Ok(response)
 }
 
+async fn cloud_mcp_send_tokenomics_account_delta_request(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    reason: &str,
+    full: bool,
+) -> Result<Value, String> {
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let scope_key =
+        cloud_mcp_account_scope_key_from_parts(&billing_scope_type, team_id.as_deref());
+    let cursor = if full {
+        None
+    } else {
+        let app = app.clone();
+        let cursor_scope_type = billing_scope_type.clone();
+        let cursor_team_id = team_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            tokenomics_cloud_account_sync_cursor(
+                &app,
+                &cursor_scope_type,
+                cursor_team_id.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| format!("Unable to join Tokenomics cursor read: {error}"))??
+    };
+    {
+        let mut tokenomics_cursor = state.background_sync.tokenomics_cursor.lock().await;
+        if let Some(cursor) = cursor.as_deref() {
+            tokenomics_cursor.insert(scope_key.clone(), cursor.to_string());
+        } else {
+            tokenomics_cursor.remove(&scope_key);
+        }
+    }
+    let scope_payload =
+        cloud_mcp_account_scope_payload_from_parts(&billing_scope_type, team_id.as_deref());
+    let mut payload = json!({
+        "kind": CLOUD_MCP_TOKENOMICS_DELTA_REQUEST_EVENT,
+        "reason": reason,
+        "source": "rust-diffforge-desktop",
+        "delta": cursor.is_some(),
+        "since_sync_cursor": cursor.clone(),
+        "sinceSyncCursor": cursor.clone(),
+        "sync_cursor": cursor.clone(),
+        "syncCursor": cursor,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(scope_object) = scope_payload.as_object() {
+            for (key, value) in scope_object {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        object.retain(|_, value| !value.is_null());
+    }
+    let response = cloud_mcp_ws_request_with_timeout(
+        state,
+        CLOUD_MCP_TOKENOMICS_DELTA_REQUEST_EVENT,
+        &payload,
+        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
+    )
+    .await?;
+    let data = cloud_mcp_response_data(&response);
+    let recorded = tokenomics_record_cloud_account_state(app, &data)?;
+    let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, data.clone());
+    cloud_mcp_trigger_tokenomics_server_refresh(app, state);
+    log_cloud_sync_event(
+        "tokenomics.account_delta_request_ok",
+        json!({
+            "reason": reason,
+            "full": full,
+            "scope_key": scope_key,
+            "response_kind": data.get("kind").and_then(Value::as_str).unwrap_or("response"),
+            "stored_count": recorded.get("stored_count").cloned().unwrap_or(Value::Null),
+        }),
+    );
+    Ok(response)
+}
+
 fn cloud_mcp_spawn_tokenomics_cursor_request(state: &CloudMcpState, reason: &'static str) {
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
@@ -8965,6 +8965,31 @@ fn cloud_mcp_spawn_tokenomics_cursor_request(state: &CloudMcpState, reason: &'st
                 false,
             )
             .await;
+        }
+    });
+}
+
+fn cloud_mcp_spawn_tokenomics_account_delta_request(
+    state: &CloudMcpState,
+    reason: &'static str,
+    full: bool,
+) {
+    let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() else {
+        return;
+    };
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) =
+            cloud_mcp_send_tokenomics_account_delta_request(&app, &state, reason, full).await
+        {
+            log_cloud_sync_event(
+                "tokenomics.account_delta_request_error",
+                json!({
+                    "reason": reason,
+                    "full": full,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
         }
     });
 }
@@ -9406,6 +9431,11 @@ async fn cloud_mcp_start_remote_command_listener(
             if event_kind == "tokenomics_refresh_requested" {
                 let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
                 cloud_mcp_trigger_tokenomics_server_refresh(&app, &state_clone);
+                cloud_mcp_spawn_tokenomics_account_delta_request(
+                    &state_clone,
+                    "tokenomics_refresh_requested",
+                    false,
+                );
                 continue;
             }
             if event_kind == "device_deleted" || event_kind == "device.removed" {
@@ -9434,6 +9464,40 @@ async fn cloud_mcp_start_remote_command_listener(
                     );
                 }
                 let _ = app.emit(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, filtered);
+                continue;
+            }
+            if cloud_mcp_is_tokenomics_delta_signal_event(&event_kind) {
+                match tokenomics_record_cloud_account_state(&app, &event) {
+                    Ok(recorded) => {
+                        let stored_count = recorded
+                            .get("stored_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let stored_limit_count = recorded
+                            .get("stored_limit_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let stored_limit_sample_count = recorded
+                            .get("stored_limit_sample_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        if stored_count > 0
+                            || stored_limit_count > 0
+                            || stored_limit_sample_count > 0
+                        {
+                            let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
+                            cloud_mcp_trigger_tokenomics_server_refresh(&app, &state_clone);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Unable to cache cloud Tokenomics relay event: {error}");
+                    }
+                }
+                cloud_mcp_spawn_tokenomics_account_delta_request(
+                    &state_clone,
+                    "tokenomics_delta_available",
+                    false,
+                );
                 continue;
             }
             if cloud_mcp_is_tokenomics_state_event(&event_kind) {
@@ -10760,11 +10824,15 @@ async fn cloud_mcp_report_terminal_output_status(
 }
 
 fn cloud_mcp_is_tokenomics_state_event(event_kind: &str) -> bool {
+    matches!(event_kind, "tokenomics_status")
+}
+
+fn cloud_mcp_is_tokenomics_delta_signal_event(event_kind: &str) -> bool {
     matches!(
         event_kind,
-        "tokenomics_device_delta"
-            | "tokenomics_device_snapshot"
-            | "tokenomics_status"
+        CLOUD_MCP_TOKENOMICS_DELTA_AVAILABLE_EVENT
+            | CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT
+            | CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT
     )
 }
 
@@ -17250,108 +17318,18 @@ async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Resu
     Ok(result)
 }
 
-const CLOUD_MCP_SESSION_STATE_KEY: &str = "desktop-session";
+const CLOUD_MCP_LEGACY_SESSION_STATE_KEY: &str = "desktop-session";
 
-/// Persist the desktop session in Rust app-data so cloud auth restores
-/// process-side on the next launch without waiting for the webview (and so a
-/// background process can re-establish the websocket on its own). Security
-/// posture matches the webview's localStorage copy: plaintext on the user's
-/// own disk, but the file is chmod 0600 on unix.
-fn cloud_mcp_persist_desktop_session(
-    app: &AppHandle,
-    token: Option<&str>,
-    billing_scope_type: &str,
-    team_id: Option<&str>,
-    plan_name: &str,
-    device_limit: Option<u64>,
-) {
-    let value = match token {
-        Some(token) => json!({
-            "token": token,
-            "billingScopeType": billing_scope_type,
-            "teamId": team_id,
-            "planName": plan_name,
-            "deviceLimit": device_limit,
-            "savedAtMs": cloud_mcp_now_ms(),
-        }),
-        None => json!(null),
-    };
-    let _ = app_local_state_write(app, CLOUD_MCP_SESSION_STATE_KEY, &value);
-    #[cfg(unix)]
-    if token.is_some() {
-        if let Ok(path) = app_local_state_path(app, CLOUD_MCP_SESSION_STATE_KEY) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
+fn cloud_mcp_remove_legacy_desktop_session(app: &AppHandle) {
+    if let Ok(path) = app_local_state_path(app, CLOUD_MCP_LEGACY_SESSION_STATE_KEY) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("json.tmp"));
     }
 }
 
-/// Startup restore of the persisted desktop session into the cloud auth
-/// runtime, before any webview exists. The webview's own session validation
-/// still runs later and can replace or clear this.
-pub(crate) async fn cloud_mcp_restore_persisted_desktop_session(
-    app: &AppHandle,
-    state: &CloudMcpState,
-) -> bool {
-    let stored = app_local_state_read(app, CLOUD_MCP_SESSION_STATE_KEY);
-    let Some(token) = stored
-        .get("token")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-    else {
-        return false;
-    };
-    if validate_auth_value("Desktop session", &token).is_err() {
-        return false;
-    }
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope_from_values(
-        stored
-            .get("billingScopeType")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        stored
-            .get("teamId")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    );
-    let plan_name = cloud_mcp_plan_name_from_value(
-        stored
-            .get("planName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    );
-    let device_limit = cloud_mcp_device_limit_from_value(
-        stored.get("deviceLimit").and_then(Value::as_u64),
-        &plan_name,
-    );
-    {
-        let mut auth = state.auth.lock().await;
-        auth.desktop_session_token = Some(token.clone());
-        auth.appwrite_jwt = None;
-        auth.appwrite_jwt_expires_ms = None;
-        auth.billing_scope_type = billing_scope_type.clone();
-        auth.team_id = team_id.clone();
-        auth.plan_name = plan_name.clone();
-        auth.device_limit = device_limit;
-    }
-    cloud_mcp_update_process_auth_cache(
-        Some(token),
-        None,
-        None,
-        Some(billing_scope_type),
-        team_id,
-        Some(plan_name),
-        device_limit,
-    );
-    true
-}
-
-#[tauri::command]
-async fn cloud_mcp_set_desktop_session_token(
+async fn cloud_mcp_apply_desktop_auth_session(
     app: AppHandle,
-    state: State<'_, CloudMcpState>,
+    state: &CloudMcpState,
     token: Option<String>,
     scope_type: Option<String>,
     team_id: Option<String>,
@@ -17383,14 +17361,7 @@ async fn cloud_mcp_set_desktop_session_token(
     let account_context_changed = previous_auth.0 != desktop_session_token
         || previous_auth.1 != billing_scope_type
         || previous_auth.2 != team_id;
-    cloud_mcp_persist_desktop_session(
-        &app,
-        desktop_session_token.as_deref(),
-        &billing_scope_type,
-        team_id.as_deref(),
-        &plan_name,
-        device_limit,
-    );
+    cloud_mcp_remove_legacy_desktop_session(&app);
 
     {
         let mut auth = state.auth.lock().await;
@@ -17425,7 +17396,7 @@ async fn cloud_mcp_set_desktop_session_token(
             runtime.registered_workspaces.clear();
         }
         cloud_mcp_mark_global_ws_disconnected(
-            state.inner(),
+            state,
             "Cloud MCP account scope changed; reconnecting websocket with fresh scope.",
         )
         .await;
@@ -17446,7 +17417,7 @@ async fn cloud_mcp_set_desktop_session_token(
         state.global_ws_reconnect.notify_waiters();
     }
 
-    Ok(cloud_mcp_status_snapshot(state.inner()).await)
+    Ok(cloud_mcp_status_snapshot(state).await)
 }
 
 #[tauri::command]
@@ -31399,6 +31370,13 @@ mod cloud_mcp_tests {
             transport: "direct_cloud_container".to_string(),
         });
         assert!(cloud_mcp_last_direct_route_fresh("/v1/voice/ws").is_none());
+    }
+
+    #[test]
+    fn device_limit_normalization_preserves_explicit_values() {
+        assert_eq!(cloud_mcp_device_limit_from_value(Some(11), "plus"), Some(11));
+        assert_eq!(cloud_mcp_device_limit_from_value(Some(0), "ultra"), Some(0));
+        assert_eq!(cloud_mcp_device_limit_from_value(None, "pro"), Some(7));
     }
 
     #[test]

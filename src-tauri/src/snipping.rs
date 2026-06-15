@@ -6636,14 +6636,16 @@ fn snipping_open_snip_preview_window_for_with_size(
 }
 
 const SNIPPING_FLOAT_HOVER_EVENT: &str = "snipping-float-hover";
-const SNIPPING_FLOAT_HOVER_POLL_MS: u64 = 120;
+const SNIPPING_FLOAT_HOVER_POLL_MS: u64 = 33;
 static SNIPPING_FLOAT_HOVER_WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Hover state for the floating snip previews, derived from the global cursor
 /// position in Rust. Webview `:hover` only fires while macOS delivers
 /// mouse-moved events to the window, which depends on key/active status — the
 /// watcher makes the hover chrome appear whenever the cursor is over a
-/// preview, no matter which window or app has focus. One loop serves every
+/// preview, no matter which window or app has focus. While hovered it also
+/// streams client coordinates so the webview can synthesize per-button hover
+/// visuals when native mouse-move events are suppressed. One loop serves every
 /// preview and exits when the last one closes.
 fn snipping_start_float_hover_watcher(app: &AppHandle) {
     if SNIPPING_FLOAT_HOVER_WATCHER_ACTIVE.swap(true, Ordering::AcqRel) {
@@ -6651,7 +6653,7 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut hovered_by_label: HashMap<String, bool> = HashMap::new();
+        let mut hovered_by_label: HashMap<String, (bool, i32, i32)> = HashMap::new();
         loop {
             sleep(Duration::from_millis(SNIPPING_FLOAT_HOVER_POLL_MS)).await;
             let windows = app
@@ -6671,24 +6673,41 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
             }
             let cursor = app.cursor_position().ok();
             for (label, window) in windows {
-                let hovered = cursor
+                let (hovered, client_x, client_y) = cursor
                     .as_ref()
                     .and_then(|cursor| {
                         let position = window.outer_position().ok()?;
                         let size = window.outer_size().ok()?;
-                        Some(
-                            cursor.x >= f64::from(position.x)
-                                && cursor.x <= f64::from(position.x) + f64::from(size.width)
-                                && cursor.y >= f64::from(position.y)
-                                && cursor.y <= f64::from(position.y) + f64::from(size.height),
-                        )
+                        let scale = window.scale_factor().unwrap_or(1.0).max(0.1);
+                        let client_x = (cursor.x - f64::from(position.x)) / scale;
+                        let client_y = (cursor.y - f64::from(position.y)) / scale;
+                        let logical_width = f64::from(size.width.max(1)) / scale;
+                        let logical_height = f64::from(size.height.max(1)) / scale;
+                        let hovered = client_x >= 0.0
+                            && client_x <= logical_width
+                            && client_y >= 0.0
+                            && client_y <= logical_height;
+                        Some((hovered, client_x, client_y))
                     })
-                    .unwrap_or(false);
-                if hovered_by_label.insert(label.clone(), hovered) != Some(hovered) {
+                    .unwrap_or((false, -1.0, -1.0));
+                let rounded_x = if hovered { client_x.round() as i32 } else { -1 };
+                let rounded_y = if hovered { client_y.round() as i32 } else { -1 };
+                let snapshot = (hovered, rounded_x, rounded_y);
+                if hovered_by_label.insert(label.clone(), snapshot) != Some(snapshot) {
+                    let payload = if hovered {
+                        json!({
+                            "label": label.as_str(),
+                            "hovered": true,
+                            "clientX": client_x,
+                            "clientY": client_y,
+                        })
+                    } else {
+                        json!({ "label": label.as_str(), "hovered": false })
+                    };
                     let _ = window.emit_to(
                         label.as_str(),
                         SNIPPING_FLOAT_HOVER_EVENT,
-                        json!({ "label": label, "hovered": hovered }),
+                        payload,
                     );
                 }
             }

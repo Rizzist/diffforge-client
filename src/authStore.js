@@ -1,64 +1,13 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useSyncExternalStore } from "react";
 
-const SESSION_TOKEN_KEY = "diffforge.desktop.sessionToken";
-const SESSION_USER_KEY = "diffforge.desktop.user";
-const SESSION_SCOPE_KEY = "diffforge.desktop.accountScope";
-const PENDING_STATE_KEY = "diffforge.desktop.pendingAuthState";
-const AUTH_VALUE_PATTERN = /^[A-Za-z0-9_-]{24,192}$/;
+const AUTH_STATE_CHANGED_EVENT = "desktop-auth-state-changed";
+const AUTH_STATUS_VALUES = new Set(["authenticated", "checking", "exchanging", "signedOut", "waiting"]);
 
 export const DEFAULT_AUTH_MESSAGE = "Sign in with your Diff Forge AI web account.";
 
 const listeners = new Set();
-
-function canUseStorage() {
-  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
-}
-
-function readStorageValue(key) {
-  if (!canUseStorage()) {
-    return "";
-  }
-
-  return window.localStorage.getItem(key) || "";
-}
-
-function writeStorageValue(key, value) {
-  if (canUseStorage()) {
-    window.localStorage.setItem(key, value);
-  }
-}
-
-function removeStorageValue(key) {
-  if (canUseStorage()) {
-    window.localStorage.removeItem(key);
-  }
-}
-
-export function isSafeAuthValue(value) {
-  return typeof value === "string" && AUTH_VALUE_PATTERN.test(value);
-}
-
-function readStoredToken() {
-  const token = readStorageValue(SESSION_TOKEN_KEY);
-
-  return isSafeAuthValue(token) ? token : "";
-}
-
-function readPendingState() {
-  const state = readStorageValue(PENDING_STATE_KEY);
-
-  return isSafeAuthValue(state) ? state : "";
-}
-
-function readStoredUser() {
-  try {
-    const user = JSON.parse(readStorageValue(SESSION_USER_KEY) || "null");
-
-    return user && typeof user === "object" ? user : null;
-  } catch {
-    return null;
-  }
-}
 
 function personalScope() {
   return {
@@ -69,112 +18,119 @@ function personalScope() {
   };
 }
 
-function normalizeAccountScopes(user) {
-  const scopes = Array.isArray(user?.accountScopes)
-    ? user.accountScopes
-    : Array.isArray(user?.scopes)
-      ? user.scopes
-      : [];
-  const normalized = scopes
-    .map((scope) => {
-      const type = String(scope?.type || scope?.scopeType || "personal").trim().toLowerCase();
-      const teamId = typeof scope?.teamId === "string" ? scope.teamId.trim() : "";
-
-      if (type === "team" && teamId) {
-        return {
-          id: `team:${teamId}`,
-          type: "team",
-          label: String(scope?.label || scope?.team?.name || "Team").trim() || "Team",
-          teamId,
-          team: scope?.team || null,
-        };
-      }
-
-      return personalScope();
-    });
-  const byId = new Map();
-
-  [personalScope(), ...normalized].forEach((scope) => {
-    byId.set(scope.id, scope);
-  });
-
-  return Array.from(byId.values());
-}
-
-function normalizeAccountScope(value, user = readStoredUser()) {
-  const raw = value && typeof value === "object" ? value : {};
+function normalizeAccountScope(scope) {
+  const raw = scope && typeof scope === "object" ? scope : {};
   const type = String(raw.type || raw.scopeType || "personal").trim().toLowerCase();
   const teamId = typeof raw.teamId === "string" ? raw.teamId.trim() : "";
-  const scopes = normalizeAccountScopes(user);
 
   if (type === "team" && teamId) {
-    return scopes.find((scope) => scope.type === "team" && scope.teamId === teamId) || personalScope();
+    return {
+      id: raw.id || `team:${teamId}`,
+      type: "team",
+      label: String(raw.label || raw.team?.name || "Team").trim() || "Team",
+      teamId,
+      team: raw.team || null,
+    };
   }
 
   return personalScope();
 }
 
-function readStoredScope(user = readStoredUser()) {
-  try {
-    const scope = JSON.parse(readStorageValue(SESSION_SCOPE_KEY) || "null");
-
-    return normalizeAccountScope(scope, user);
-  } catch {
-    return personalScope();
-  }
+function normalizeAccountScopes(scopes) {
+  const byId = new Map();
+  [personalScope(), ...(Array.isArray(scopes) ? scopes : [])]
+    .map(normalizeAccountScope)
+    .forEach((scope) => byId.set(scope.id, scope));
+  return Array.from(byId.values());
 }
 
-let snapshot = {
-  status: "signedOut",
-  stage: "idle",
-  message: DEFAULT_AUTH_MESSAGE,
-  error: "",
-  user: readStoredUser(),
-  token: readStoredToken(),
-  activeScope: readStoredScope(),
-  pendingState: readPendingState(),
-  version: 0,
-};
+function normalizeAuthStatus(status, user) {
+  const normalized = String(status || "").trim();
+  if (normalized === "authenticated") {
+    return user ? "authenticated" : "signedOut";
+  }
+  return AUTH_STATUS_VALUES.has(normalized) ? normalized : "signedOut";
+}
+
+function normalizeSnapshot(nextSnapshot = {}) {
+  const user = nextSnapshot.user && typeof nextSnapshot.user === "object"
+    ? nextSnapshot.user
+    : null;
+  const status = normalizeAuthStatus(nextSnapshot.status, user);
+  const accountScopes = normalizeAccountScopes(nextSnapshot.accountScopes);
+  const activeScope = normalizeAccountScope(nextSnapshot.activeScope);
+
+  return {
+    status,
+    stage: String(nextSnapshot.stage || (status === "authenticated" ? "authenticated" : "idle")),
+    message: String(nextSnapshot.message || DEFAULT_AUTH_MESSAGE),
+    error: String(nextSnapshot.error || ""),
+    user,
+    activeScope: accountScopes.find((scope) => scope.id === activeScope.id) || activeScope,
+    accountScopes,
+    accountKey: String(nextSnapshot.accountKey || user?.id || user?.$id || user?.email || ""),
+    entitlements: nextSnapshot.entitlements && typeof nextSnapshot.entitlements === "object"
+      ? nextSnapshot.entitlements
+      : {},
+    billingStatus: nextSnapshot.billingStatus || null,
+    version: Number(nextSnapshot.version || 0),
+    updatedAtMs: Number(nextSnapshot.updatedAtMs || 0),
+  };
+}
+
+let snapshot = normalizeSnapshot();
+let nativeStarted = false;
+let nativeStartPromise = null;
+let nativeUnlisten = null;
 
 function emitAuthChange(partial) {
-  snapshot = {
+  snapshot = normalizeSnapshot({
     ...snapshot,
     ...partial,
-    version: snapshot.version + 1,
-  };
-
+    version: Number(snapshot.version || 0) + 1,
+  });
   listeners.forEach((listener) => listener());
 }
 
-function clearSessionStorage() {
-  removeStorageValue(SESSION_TOKEN_KEY);
-  removeStorageValue(SESSION_USER_KEY);
-  removeStorageValue(SESSION_SCOPE_KEY);
+function applyNativeSnapshot(nextSnapshot) {
+  snapshot = normalizeSnapshot(nextSnapshot);
+  listeners.forEach((listener) => listener());
+  return snapshot;
 }
 
-function clearPendingStorage() {
-  removeStorageValue(PENDING_STATE_KEY);
+async function refreshNativeSnapshot() {
+  const nextSnapshot = await invoke("desktop_auth_snapshot_command");
+  return applyNativeSnapshot(nextSnapshot);
 }
 
-function persistSessionStorage(session) {
-  if (!session?.token || !session?.user) {
-    throw new Error("Desktop session is missing.");
+function startNativeAuthBridge() {
+  if (nativeStartPromise) {
+    return nativeStartPromise;
   }
 
-  writeStorageValue(SESSION_TOKEN_KEY, session.token);
-  writeStorageValue(SESSION_USER_KEY, JSON.stringify(session.user));
-  const activeScope = readStoredScope(session.user);
-  writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
+  nativeStartPromise = (async () => {
+    if (!nativeStarted) {
+      nativeStarted = true;
+      try {
+        nativeUnlisten = await listen(AUTH_STATE_CHANGED_EVENT, (event) => {
+          applyNativeSnapshot(event.payload || {});
+        });
+      } catch (error) {
+        emitAuthChange({
+          error: error?.message || "Desktop auth listener is unavailable.",
+        });
+      }
+    }
 
-  return {
-    activeScope,
-    token: session.token,
-    user: session.user,
-  };
+    return refreshNativeSnapshot();
+  })();
+
+  return nativeStartPromise;
 }
 
 function subscribe(listener) {
   listeners.add(listener);
+  void startNativeAuthBridge();
 
   return () => {
     listeners.delete(listener);
@@ -185,32 +141,36 @@ function getSnapshot() {
   return snapshot;
 }
 
-function syncFromStorage() {
-  const token = readStoredToken();
-  const user = readStoredUser();
-  const activeScope = readStoredScope(user);
-  const pendingState = readPendingState();
-  const next = {
-    token,
-    user,
-    activeScope,
-    pendingState,
-  };
+async function applyNativeCommand(command, payload = {}) {
+  const result = await invoke(command, payload);
+  return sanitizeNativeAuthResult(result);
+}
 
-  if (snapshot.status === "authenticated" && !token) {
-    next.status = "signedOut";
-    next.stage = "idle";
-    next.message = "Your desktop session expired. Sign in again with the web app.";
-    next.error = "";
+function sanitizeNativeAuthResult(result) {
+  if (!result || typeof result !== "object") {
+    return result;
   }
 
-  emitAuthChange(next);
+  if (result.snapshot && typeof result.snapshot === "object") {
+    const snapshotResult = applyNativeSnapshot(result.snapshot);
+    const safeResult = { ...result };
+    delete safeResult.session;
+    delete safeResult.state;
+    return {
+      ...safeResult,
+      snapshot: snapshotResult,
+    };
+  }
+
+  return applyNativeSnapshot(result);
 }
 
 if (typeof window !== "undefined") {
-  window.addEventListener("storage", (event) => {
-    if ([SESSION_TOKEN_KEY, SESSION_USER_KEY, SESSION_SCOPE_KEY, PENDING_STATE_KEY].includes(event.key)) {
-      syncFromStorage();
+  void startNativeAuthBridge();
+  window.addEventListener("beforeunload", () => {
+    if (typeof nativeUnlisten === "function") {
+      nativeUnlisten();
+      nativeUnlisten = null;
     }
   });
 }
@@ -221,39 +181,43 @@ export function useAuthSnapshot() {
 
 export const authStore = {
   getSnapshot,
-  getToken() {
-    return readStoredToken();
+  refresh: refreshNativeSnapshot,
+  async startLogin() {
+    const result = await invoke("desktop_auth_start_login");
+    return sanitizeNativeAuthResult(result);
   },
-  getPendingState() {
-    return readPendingState();
+  async completeDeepLink(url) {
+    const result = await invoke("desktop_auth_handle_deep_link", { url });
+    return sanitizeNativeAuthResult(result);
+  },
+  async validateSession() {
+    return applyNativeCommand("desktop_auth_validate_session");
+  },
+  async signOut() {
+    return applyNativeCommand("desktop_auth_sign_out");
+  },
+  async applyBillingStatus(billingStatus) {
+    return applyNativeCommand("desktop_auth_apply_billing_status", { billingStatus });
   },
   getActiveScope() {
-    return readStoredScope(readStoredUser());
+    return snapshot.activeScope || personalScope();
   },
   getAccountScopes() {
-    return normalizeAccountScopes(readStoredUser());
+    return snapshot.accountScopes || [personalScope()];
   },
   setChecking(message) {
     emitAuthChange({
-      status: "signedOut",
+      status: "checking",
       stage: "session_restore",
       message,
       error: "",
-      user: readStoredUser(),
-      token: readStoredToken(),
-      activeScope: readStoredScope(),
-      pendingState: readPendingState(),
     });
-  },
-  setWaiting(pendingState, message = "Finish sign in in your browser, then return here.") {
-    writeStorageValue(PENDING_STATE_KEY, pendingState);
-    emitAuthChange({
-      status: "waiting",
-      stage: "browser_handoff",
+    void applyNativeCommand("desktop_auth_set_stage", {
+      status: "checking",
+      stage: "session_restore",
       message,
       error: "",
-      pendingState,
-    });
+    }).catch(() => {});
   },
   setExchanging(message = "Finishing desktop sign in...") {
     emitAuthChange({
@@ -262,56 +226,27 @@ export const authStore = {
       message,
       error: "",
     });
+    void applyNativeCommand("desktop_auth_set_stage", {
+      status: "exchanging",
+      stage: "session_exchange",
+      message,
+      error: "",
+    }).catch(() => {});
   },
   setStage(stage, message) {
     emitAuthChange({
       stage,
       ...(typeof message === "string" ? { message } : {}),
     });
+    void applyNativeCommand("desktop_auth_set_stage", {
+      stage,
+      message: typeof message === "string" ? message : null,
+    }).catch(() => {});
   },
-  setAuthenticated(sessionUser, message) {
-    const token = readStoredToken();
-    const activeScope = readStoredScope(sessionUser);
-
-    if (sessionUser && typeof sessionUser === "object") {
-      writeStorageValue(SESSION_USER_KEY, JSON.stringify(sessionUser));
-      writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
-    }
-
-    emitAuthChange({
-      status: "authenticated",
-      stage: "authenticated",
-      message: message ?? snapshot.message,
-      error: "",
-      user: sessionUser,
-      token,
-      activeScope,
-      pendingState: readPendingState(),
-    });
-  },
-  saveAuthenticatedSession(session, message) {
-    const persisted = persistSessionStorage(session);
-
-    emitAuthChange({
-      status: "authenticated",
-      stage: "authenticated",
-      message: message ?? snapshot.message,
-      error: "",
-      user: persisted.user,
-      token: persisted.token,
-      activeScope: persisted.activeScope,
-      pendingState: readPendingState(),
-    });
-  },
-  persistAuthenticatedSession(session) {
-    return persistSessionStorage(session);
-  },
-  setActiveScope(scope) {
-    const user = readStoredUser();
-    const activeScope = normalizeAccountScope(scope, user);
-
-    writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
-    emitAuthChange({ activeScope });
+  async setActiveScope(scope) {
+    const normalizedScope = normalizeAccountScope(scope);
+    emitAuthChange({ activeScope: normalizedScope });
+    return applyNativeCommand("desktop_auth_set_active_scope", { scope: normalizedScope });
   },
   setSignedOut({
     message = DEFAULT_AUTH_MESSAGE,
@@ -319,43 +254,29 @@ export const authStore = {
     clearSession = true,
     clearPending = false,
   } = {}) {
-    if (clearSession) {
-      clearSessionStorage();
-    }
-
-    if (clearPending) {
-      clearPendingStorage();
-    }
-
+    const clearNativeSession = clearSession || clearPending;
     emitAuthChange({
       status: "signedOut",
       stage: "idle",
       message,
       error,
-      user: clearSession ? null : readStoredUser(),
-      token: clearSession ? "" : readStoredToken(),
-      activeScope: clearSession ? personalScope() : readStoredScope(),
-      pendingState: clearPending ? "" : readPendingState(),
+      user: clearNativeSession ? null : snapshot.user,
+      activeScope: clearNativeSession ? personalScope() : snapshot.activeScope,
+      accountScopes: clearNativeSession ? [personalScope()] : snapshot.accountScopes,
+      accountKey: clearNativeSession ? "" : snapshot.accountKey,
+      entitlements: clearNativeSession ? {} : snapshot.entitlements,
+      billingStatus: clearNativeSession ? null : snapshot.billingStatus,
     });
-  },
-  clearPending() {
-    clearPendingStorage();
-    emitAuthChange({
-      pendingState: "",
-    });
-  },
-  clearSession() {
-    clearSessionStorage();
-    emitAuthChange({
-      user: null,
-      token: "",
-      activeScope: personalScope(),
-    });
+    if (clearNativeSession) {
+      void applyNativeCommand("desktop_auth_sign_out").catch(() => {});
+    }
   },
   setMessage(message) {
     emitAuthChange({ message });
+    void applyNativeCommand("desktop_auth_set_stage", { message }).catch(() => {});
   },
   setError(error) {
     emitAuthChange({ error });
+    void applyNativeCommand("desktop_auth_set_stage", { error }).catch(() => {});
   },
 };
