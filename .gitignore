@@ -14,3 +14,4 @@ logs/
 /pwa/Diff Forge AI - Google Play package/signing-key-info.txt
 /pwa/Diff Forge AI - Google Play package/signing.keystore
 /docs
+/src-tauri/vendor/cidre

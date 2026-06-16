@@ -115,6 +115,7 @@ struct DeveloperEnergyGroup {
     description: String,
     cause: String,
     score: f64,
+    share_percent: f64,
     cpu_percent: f64,
     memory_bytes: u64,
     process_count: usize,
@@ -3785,6 +3786,7 @@ impl DeveloperEnergyBuildContext {
                     description: builder.description.to_string(),
                     cause: builder.cause.to_string(),
                     score: developer_round_energy(builder.score),
+                    share_percent: 0.0,
                     cpu_percent: developer_round_energy(builder.cpu_percent),
                     memory_bytes: builder.memory_bytes,
                     process_count: builder.process_count,
@@ -3804,6 +3806,13 @@ impl DeveloperEnergyBuildContext {
         });
 
         let total_score = developer_round_energy(groups.iter().map(|group| group.score).sum());
+        for group in groups.iter_mut() {
+            group.share_percent = if total_score > 0.0 {
+                developer_round_energy((group.score / total_score) * 100.0)
+            } else {
+                0.0
+            };
+        }
         let active_group_count = groups.iter().filter(|group| group.score >= 1.0).count();
         let top_label = groups
             .first()

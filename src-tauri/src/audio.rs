@@ -3415,10 +3415,12 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
             if let Some(window) = app_handle.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
                 let _ = window.hide();
             }
+            let _ = audio_widget_hide_error_overlay_now(&app_handle);
             emit_audio_widget_current_visibility(&app_handle, false);
         }
         WindowEvent::Destroyed => {
             audio_widget_clear_bottom_bar_position_request();
+            audio_widget_clear_error_overlay_layout();
             log_audio_diagnostic_event(
                 "audio.widget.window.destroyed",
                 json!({
@@ -3429,6 +3431,47 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
         }
         _ => {}
     });
+
+    Ok(window)
+}
+
+fn ensure_audio_widget_error_overlay_window(
+    app: &AppHandle,
+) -> Result<tauri::WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window(AUDIO_WIDGET_ERROR_WINDOW_LABEL) {
+        let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+        let _ = window.set_ignore_cursor_events(true);
+        #[cfg(target_os = "macos")]
+        audio_widget_apply_macos_space_style(&window);
+        return Ok(window);
+    }
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        AUDIO_WIDGET_ERROR_WINDOW_LABEL,
+        WebviewUrl::App("index.html#/audio-widget-error".into()),
+    )
+    .title("Diff Forge Audio Error")
+    .inner_size(432.0, 64.0)
+    .min_inner_size(240.0, 48.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .focused(false)
+    .accept_first_mouse(false)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
+    .visible(false)
+    .shadow(false)
+    .build()
+    .map_err(|error| format!("Unable to create audio widget error overlay: {error}"))?;
+
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+    let _ = window.set_ignore_cursor_events(true);
+    #[cfg(target_os = "macos")]
+    audio_widget_apply_macos_space_style(&window);
 
     Ok(window)
 }
@@ -4684,6 +4727,7 @@ fn hide_audio_widget_window_on_main_thread(app: &AppHandle) -> Result<(), String
                 .hide()
                 .map_err(|error| format!("Unable to hide audio widget: {error}"))?;
         }
+        let _ = audio_widget_hide_error_overlay_now(app);
         #[cfg(target_os = "macos")]
         log_audio_widget_bottom_bar_debug_snapshot_for(
             app,
@@ -4822,6 +4866,52 @@ impl Default for AudioWidgetBottomBarPositionRequest {
     }
 }
 
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct AudioWidgetErrorOverlayRequest {
+    width: f64,
+    height: f64,
+    gap: f64,
+    animate: bool,
+}
+
+impl Default for AudioWidgetErrorOverlayRequest {
+    fn default() -> Self {
+        Self {
+            width: 0.0,
+            height: 0.0,
+            gap: 0.0,
+            animate: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AudioWidgetErrorOverlayLayout {
+    width: f64,
+    height: f64,
+    gap: f64,
+}
+
+impl AudioWidgetErrorOverlayLayout {
+    fn from_request(request: &AudioWidgetErrorOverlayRequest) -> Self {
+        Self {
+            width: request.width,
+            height: request.height,
+            gap: request.gap,
+        }
+    }
+
+    fn into_request(self, animate: bool) -> AudioWidgetErrorOverlayRequest {
+        AudioWidgetErrorOverlayRequest {
+            width: self.width,
+            height: self.height,
+            gap: self.gap,
+            animate,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AudioWidgetBottomBarLayout {
     width: f64,
@@ -4850,9 +4940,16 @@ impl AudioWidgetBottomBarLayout {
 
 static AUDIO_WIDGET_BOTTOM_BAR_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetBottomBarLayout>>> =
     OnceLock::new();
+static AUDIO_WIDGET_ERROR_OVERLAY_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetErrorOverlayLayout>>> =
+    OnceLock::new();
 
 fn audio_widget_bottom_bar_layout_slot() -> &'static StdMutex<Option<AudioWidgetBottomBarLayout>> {
     AUDIO_WIDGET_BOTTOM_BAR_LAYOUT.get_or_init(|| StdMutex::new(None))
+}
+
+fn audio_widget_error_overlay_layout_slot(
+) -> &'static StdMutex<Option<AudioWidgetErrorOverlayLayout>> {
+    AUDIO_WIDGET_ERROR_OVERLAY_LAYOUT.get_or_init(|| StdMutex::new(None))
 }
 
 fn audio_widget_store_bottom_bar_layout(request: &AudioWidgetBottomBarPositionRequest) {
@@ -4868,6 +4965,35 @@ fn audio_widget_store_bottom_bar_layout(request: &AudioWidgetBottomBarPositionRe
             "animate": request.animate,
         }),
     );
+}
+
+fn audio_widget_store_error_overlay_layout(request: &AudioWidgetErrorOverlayRequest) {
+    if let Ok(mut current) = audio_widget_error_overlay_layout_slot().lock() {
+        *current = Some(AudioWidgetErrorOverlayLayout::from_request(request));
+    }
+    log_audio_widget_bottom_bar_debug_event(
+        "audio.widget.error_overlay.layout.store",
+        json!({
+            "width": request.width,
+            "height": request.height,
+            "gap": request.gap,
+            "animate": request.animate,
+        }),
+    );
+}
+
+fn audio_widget_clear_error_overlay_layout() {
+    if let Ok(mut current) = audio_widget_error_overlay_layout_slot().lock() {
+        *current = None;
+    }
+    log_audio_widget_bottom_bar_debug_event("audio.widget.error_overlay.layout.clear", json!({}));
+}
+
+fn audio_widget_last_error_overlay_layout() -> Option<AudioWidgetErrorOverlayLayout> {
+    audio_widget_error_overlay_layout_slot()
+        .lock()
+        .ok()
+        .and_then(|current| current.clone())
 }
 
 fn audio_widget_clear_bottom_bar_position_request() {
@@ -4963,6 +5089,211 @@ fn audio_widget_positive_dimension(value: f64, fallback: f64) -> f64 {
     } else {
         fallback
     }
+}
+
+fn audio_widget_non_negative_dimension(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn audio_widget_clamp_coordinate(value: f64, min: f64, max: f64) -> f64 {
+    if max < min {
+        min.round()
+    } else {
+        value.clamp(min, max).round()
+    }
+}
+
+fn audio_widget_error_overlay_visible(app: &AppHandle) -> bool {
+    app.get_webview_window(AUDIO_WIDGET_ERROR_WINDOW_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_position_error_overlay_on_main_thread(
+    app: &AppHandle,
+    request: AudioWidgetErrorOverlayRequest,
+) -> Result<(), String> {
+    snipping_catch_objc_result("audio_widget_position_error_overlay", || {
+        let width = audio_widget_positive_dimension(request.width, 432.0);
+        let height = audio_widget_positive_dimension(request.height, 64.0);
+        let gap = audio_widget_non_negative_dimension(request.gap);
+        let overlay = ensure_audio_widget_error_overlay_window(app)?;
+        let Some(bar_window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+            return Err("Audio widget window is unavailable for error overlay.".to_string());
+        };
+        let Ok(bar_ptr) = bar_window.ns_window() else {
+            return Err("Unable to access audio widget native window.".to_string());
+        };
+        let Ok(overlay_ptr) = overlay.ns_window() else {
+            return Err("Unable to access audio widget error overlay native window.".to_string());
+        };
+        if bar_ptr.is_null() || overlay_ptr.is_null() {
+            return Err("Audio widget error overlay native windows are unavailable.".to_string());
+        }
+
+        let bar_ns_window: &NSWindow = unsafe { &*bar_ptr.cast::<NSWindow>() };
+        let overlay_ns_window: &NSWindow = unsafe { &*overlay_ptr.cast::<NSWindow>() };
+        audio_widget_apply_macos_space_style_to_ns_window(overlay_ns_window);
+        let _ = overlay.set_ignore_cursor_events(true);
+
+        let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
+            return Err("Audio widget error overlay placement must run on the main thread.".to_string());
+        };
+        let Some(screen) =
+            audio_widget_macos_target_screen_for_bottom_bar(app, bar_ns_window, main_thread_marker)
+        else {
+            return Err("Unable to resolve the audio widget error overlay screen.".to_string());
+        };
+
+        let screen_frame = screen.frame();
+        let visible_frame = screen.visibleFrame();
+        let bounds_resolution =
+            macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(Some(
+                screen.as_ref(),
+            ));
+        let anchor_frame = if bounds_resolution.use_full_monitor_bounds {
+            screen_frame
+        } else {
+            visible_frame
+        };
+        let bar_frame = bar_ns_window.frame();
+        let frame_before = overlay_ns_window.frame();
+        let raw_x = bar_frame.origin.x + ((bar_frame.size.width - width) / 2.0);
+        let raw_y = bar_frame.origin.y + bar_frame.size.height + gap;
+        let x = audio_widget_clamp_coordinate(
+            raw_x,
+            anchor_frame.origin.x,
+            anchor_frame.origin.x + anchor_frame.size.width - width,
+        );
+        let y = audio_widget_clamp_coordinate(
+            raw_y,
+            anchor_frame.origin.y,
+            anchor_frame.origin.y + anchor_frame.size.height - height,
+        );
+        let target_frame = objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(x, y),
+            objc2_core_foundation::CGSize::new(width, height),
+        );
+        let frame_matches_target =
+            audio_widget_rect_nearly_matches(&frame_before, &target_frame);
+        let was_visible = overlay.is_visible().unwrap_or(false);
+        let animate = request.animate && was_visible && !frame_matches_target;
+
+        log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+            app,
+            "audio.widget.error_overlay.position",
+            Some(overlay_ns_window),
+            Some(screen.as_ref()),
+            json!({
+                "request": {
+                    "width": request.width,
+                    "height": request.height,
+                    "gap": request.gap,
+                    "animate": request.animate,
+                },
+                "normalized": {
+                    "width": width,
+                    "height": height,
+                    "gap": gap,
+                },
+                "bar_frame": audio_widget_rect_debug_value(&bar_frame),
+                "frame_before": audio_widget_rect_debug_value(&frame_before),
+                "target_frame": audio_widget_rect_debug_value(&target_frame),
+                "was_visible": was_visible,
+                "animate": animate,
+                "bounds_resolution": macos_full_monitor_bounds_resolution_debug_value(
+                    &bounds_resolution,
+                ),
+            }),
+        );
+
+        if !frame_matches_target {
+            overlay_ns_window.setFrame_display_animate(target_frame, true, animate);
+        }
+        overlay
+            .show()
+            .map_err(|error| format!("Unable to show audio widget error overlay: {error}"))?;
+        overlay_ns_window.orderFrontRegardless();
+        audio_widget_store_error_overlay_layout(&request);
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_position_error_overlay_for(
+    app: &AppHandle,
+    request: AudioWidgetErrorOverlayRequest,
+) -> Result<(), String> {
+    run_audio_widget_action_on_main_thread(app, "position_error_overlay", move |app| {
+        audio_widget_position_error_overlay_on_main_thread(app, request)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_position_error_overlay_for(
+    app: &AppHandle,
+    request: AudioWidgetErrorOverlayRequest,
+) -> Result<(), String> {
+    let width = audio_widget_positive_dimension(request.width, 432.0);
+    let height = audio_widget_positive_dimension(request.height, 64.0);
+    let gap = audio_widget_non_negative_dimension(request.gap);
+    let overlay = ensure_audio_widget_error_overlay_window(app)?;
+    overlay
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| format!("Unable to size audio widget error overlay: {error}"))?;
+
+    let scale = overlay.scale_factor().unwrap_or(1.0);
+    if let Some(bar_window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+        if let (Ok(position), Ok(size)) = (bar_window.outer_position(), bar_window.outer_size()) {
+            let x = position.x
+                + ((size.width as f64 - (width * scale)) / 2.0).round() as i32;
+            let y = position.y - ((height + gap) * scale).round() as i32;
+            overlay
+                .set_position(tauri::PhysicalPosition::new(x, y))
+                .map_err(|error| {
+                    format!("Unable to position audio widget error overlay: {error}")
+                })?;
+        }
+    }
+
+    overlay
+        .show()
+        .map_err(|error| format!("Unable to show audio widget error overlay: {error}"))?;
+    let _ = overlay.set_ignore_cursor_events(true);
+    audio_widget_store_error_overlay_layout(&request);
+    Ok(())
+}
+
+fn audio_widget_reposition_error_overlay_for(app: &AppHandle, animate: bool) {
+    if !audio_widget_error_overlay_visible(app) {
+        return;
+    }
+    let Some(layout) = audio_widget_last_error_overlay_layout() else {
+        return;
+    };
+    let _ = audio_widget_position_error_overlay_for(app, layout.into_request(animate));
+}
+
+fn audio_widget_hide_error_overlay_now(app: &AppHandle) -> Result<(), String> {
+    audio_widget_clear_error_overlay_layout();
+    if let Some(window) = app.get_webview_window(AUDIO_WIDGET_ERROR_WINDOW_LABEL) {
+        let _ = window.set_ignore_cursor_events(true);
+        window
+            .hide()
+            .map_err(|error| format!("Unable to hide audio widget error overlay: {error}"))?;
+    }
+    Ok(())
+}
+
+fn audio_widget_hide_error_overlay_for(app: &AppHandle) -> Result<(), String> {
+    run_audio_widget_action_on_main_thread(app, "hide_error_overlay", |app| {
+        audio_widget_hide_error_overlay_now(app)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -5765,6 +6096,7 @@ fn audio_widget_position_bottom_bar_for(
     app: &AppHandle,
     request: AudioWidgetBottomBarPositionRequest,
 ) -> Result<AudioWidgetBottomBarPositionResult, String> {
+    let reposition_error_overlay = request.animate;
     log_audio_widget_bottom_bar_debug_snapshot_for(
         app,
         "audio.widget.bottom_bar.position.command",
@@ -5797,6 +6129,9 @@ fn audio_widget_position_bottom_bar_for(
             json!({ "error": clean_whisper_local_audio_log_text(error) }),
         ),
     }
+    if result.is_ok() {
+        audio_widget_reposition_error_overlay_for(app, reposition_error_overlay);
+    }
     result
 }
 
@@ -5805,6 +6140,7 @@ fn audio_widget_position_bottom_bar_for(
     app: &AppHandle,
     request: AudioWidgetBottomBarPositionRequest,
 ) -> Result<AudioWidgetBottomBarPositionResult, String> {
+    let reposition_error_overlay = request.animate;
     let window = ensure_audio_widget_window(app)?;
     let width = audio_widget_positive_dimension(request.width, 64.0);
     let height = audio_widget_positive_dimension(request.height, 64.0);
@@ -5833,7 +6169,7 @@ fn audio_widget_position_bottom_bar_for(
         .map_err(|error| format!("Unable to position audio widget: {error}"))?;
 
     audio_widget_store_bottom_bar_layout(&request);
-    Ok(AudioWidgetBottomBarPositionResult {
+    let result = AudioWidgetBottomBarPositionResult {
         x: x as f64,
         y: y as f64,
         width,
@@ -5845,7 +6181,9 @@ fn audio_widget_position_bottom_bar_for(
         scale_factor,
         source: "tauri-work-area".to_string(),
         use_full_monitor_bounds: false,
-    })
+    };
+    audio_widget_reposition_error_overlay_for(app, reposition_error_overlay);
+    Ok(result)
 }
 
 fn audio_widget_bar_hover_snapshot_for(
@@ -9046,17 +9384,24 @@ fn insert_audio_cleanup_selector_payload(
         return;
     };
     if let Some(value) = clean_audio_cleanup_selector_field(cleanup_engine) {
-        object.insert("cleanup_engine".to_string(), json!(value.clone()));
         object.insert("cleanupEngine".to_string(), json!(value));
     }
     if let Some(value) = clean_audio_cleanup_selector_field(cleanup_provider) {
-        object.insert("cleanup_provider".to_string(), json!(value.clone()));
         object.insert("cleanupProvider".to_string(), json!(value));
     }
     if let Some(value) = clean_audio_cleanup_selector_field(cleanup_model) {
-        object.insert("cleanup_model".to_string(), json!(value.clone()));
         object.insert("cleanupModel".to_string(), json!(value));
     }
+}
+
+fn cloud_audio_response_snippet(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(280)
+        .collect::<String>()
 }
 
 fn forge_dictation_result_from_payload(
@@ -9266,11 +9611,7 @@ async fn polish_audio_transcription(
     );
     if !polishing_prompt.trim().is_empty() {
         if let Some(object) = payload.as_object_mut() {
-            object.insert(
-                "polishing_system_prompt".to_string(),
-                json!(polishing_prompt.clone()),
-            );
-            object.insert("system_prompt".to_string(), json!(polishing_prompt));
+            object.insert("polishingPrompt".to_string(), json!(polishing_prompt));
         }
     }
     let response = http_client(Duration::from_secs(CLOUD_DICTATION_POLISH_TIMEOUT_SECS))?
@@ -9283,20 +9624,49 @@ async fn polish_audio_transcription(
             format!("Unable to polish transcript through Diff Forge Cloud: {error}")
         })?;
     let status = response.status();
-    let body = response
-        .json::<Value>()
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body_text = response
+        .text()
         .await
-        .map_err(|error| format!("Cloud polish response was invalid JSON: {error}"))?;
+        .map_err(|error| format!("Unable to read cloud polish response body: {error}"))?;
+    let body = serde_json::from_str::<Value>(&body_text).ok();
     if !status.is_success() {
         let message = body
-            .pointer("/error/message")
-            .or_else(|| body.get("error"))
-            .and_then(Value::as_str)
-            .unwrap_or("Cloud transcript polish failed.");
+            .as_ref()
+            .and_then(|body| {
+                body.pointer("/error/message")
+                    .or_else(|| body.get("error"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+            .or_else(|| {
+                let snippet = cloud_audio_response_snippet(&body_text);
+                (!snippet.is_empty()).then_some(snippet)
+            })
+            .unwrap_or_else(|| "Cloud transcript polish failed with an empty response.".to_string());
         return Err(format!(
             "Cloud transcript polish failed ({status}): {message}"
         ));
     }
+    let body = body.ok_or_else(|| {
+        let snippet = cloud_audio_response_snippet(&body_text);
+        if snippet.is_empty() {
+            format!(
+                "Cloud polish response was empty JSON ({status}; content-type: {}).",
+                content_type.trim()
+            )
+        } else {
+            format!(
+                "Cloud polish response was invalid JSON ({status}; content-type: {}): {snippet}",
+                content_type.trim()
+            )
+        }
+    })?;
 
     let data = body.get("data").unwrap_or(&body);
     let polished_text = data
@@ -10186,11 +10556,7 @@ async fn start_forge_dictation_transcription(
     );
     if llm_cleanup && !polishing_prompt.trim().is_empty() {
         if let Some(object) = start_request.as_object_mut() {
-            object.insert(
-                "polishing_system_prompt".to_string(),
-                json!(polishing_prompt.clone()),
-            );
-            object.insert("system_prompt".to_string(), json!(polishing_prompt));
+            object.insert("polishingPrompt".to_string(), json!(polishing_prompt));
         }
     }
 
@@ -10398,9 +10764,23 @@ async fn audio_widget_position_bottom_bar(
 }
 
 #[tauri::command]
-async fn audio_widget_clear_bottom_bar_position() -> Result<(), String> {
+async fn audio_widget_clear_bottom_bar_position(app: AppHandle) -> Result<(), String> {
     audio_widget_clear_bottom_bar_position_request();
+    audio_widget_hide_error_overlay_for(&app)?;
     Ok(())
+}
+
+#[tauri::command]
+async fn audio_widget_show_error_overlay(
+    app: AppHandle,
+    request: AudioWidgetErrorOverlayRequest,
+) -> Result<(), String> {
+    audio_widget_position_error_overlay_for(&app, request)
+}
+
+#[tauri::command]
+async fn audio_widget_hide_error_overlay(app: AppHandle) -> Result<(), String> {
+    audio_widget_hide_error_overlay_for(&app)
 }
 
 #[tauri::command]

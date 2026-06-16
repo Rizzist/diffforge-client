@@ -50,6 +50,7 @@ const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT = "cloud-mcp-account-assets-updated
 const SNIPPING_LIVE_PREVIEW_THROTTLE_MS = 45;
 const SNIPPING_LIVE_PREVIEW_MAX_EDGE = 512;
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
+const SNIPPING_DISPATCH_TARGETS_CHANGED_EVENT = "diffforge:snipping-dispatch-targets-changed";
 
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
 export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
@@ -305,6 +306,34 @@ function jsonObject(value) {
 
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function normalizeSnippingDispatchTargets(value) {
+  return jsonArray(value)
+    .map((target) => {
+      const workspaceId = text(target?.workspaceId || target?.workspace_id);
+      if (!workspaceId) return null;
+      const threads = jsonArray(target?.threads)
+        .map((thread, index) => {
+          const threadId = text(thread?.threadId || thread?.thread_id || thread?.id);
+          if (!threadId) return null;
+          const terminalIndex = Number(thread?.terminalIndex ?? thread?.terminal_index);
+          return {
+            color: text(thread?.color),
+            label: text(thread?.label || thread?.name, threadId),
+            terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : index,
+            threadId,
+          };
+        })
+        .filter(Boolean);
+      if (!threads.length) return null;
+      return {
+        workspaceId,
+        workspaceName: text(target?.workspaceName || target?.workspace_name, workspaceId),
+        threads,
+      };
+    })
+    .filter(Boolean);
 }
 
 function numberValue(value, fallback = 0) {
@@ -1312,7 +1341,6 @@ export function SnippingFloatWindow() {
         showStatus(copyStatus);
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: actionPath });
-        showStatus("Editor opened");
       } else if (action === "upload") {
         if (uploadState === "done") {
           await copyPublicUrl();
@@ -2047,7 +2075,6 @@ function StripSnipTile({
         showStatus(copyStatus);
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
-        showStatus("Editor opened");
       } else if (action === "delete") {
         await invoke("diffforge_delete_untracked_asset", { path: localPath });
         onChanged(localPath);
@@ -3549,6 +3576,16 @@ export function SnippingAnnotationEditorWindow() {
   const imageReady = imageLoadState === "ready" && canvasSize.width > 0 && canvasSize.height > 0;
   const imageLoading = imageLoadState === "loading";
   const imageLoadFailed = imageLoadState === "error";
+  const hasDispatchTargets = dispatchTargets.length > 0;
+
+  const applyDispatchTargets = useCallback((targets) => {
+    const nextTargets = normalizeSnippingDispatchTargets(targets);
+    setDispatchTargets(nextTargets);
+    setTargetWorkspaceId((current) => {
+      if (current && nextTargets.some((target) => target.workspaceId === current)) return current;
+      return text(nextTargets[0]?.workspaceId);
+    });
+  }, []);
 
   useEffect(() => {
     if (!activePath) {
@@ -3601,20 +3638,31 @@ export function SnippingAnnotationEditorWindow() {
 
   useEffect(() => {
     let disposed = false;
+    let unlistenTargets = () => {};
     invoke("snipping_dispatch_targets")
       .then((targets) => {
-        if (disposed || !Array.isArray(targets)) return;
-        setDispatchTargets(targets);
-        setTargetWorkspaceId((current) => {
-          if (current && targets.some((target) => target.workspaceId === current)) return current;
-          return text(targets[0]?.workspaceId);
-        });
+        if (disposed) return;
+        applyDispatchTargets(targets);
+      })
+      .catch(() => {});
+    listen(SNIPPING_DISPATCH_TARGETS_CHANGED_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload;
+      applyDispatchTargets(Array.isArray(payload) ? payload : payload?.targets);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlistenTargets = nextUnlisten;
+        }
       })
       .catch(() => {});
     return () => {
       disposed = true;
+      unlistenTargets();
     };
-  }, []);
+  }, [applyDispatchTargets]);
 
   const targetWorkspace = useMemo(
     () => dispatchTargets.find((target) => target.workspaceId === targetWorkspaceId) || null,
@@ -3702,9 +3750,8 @@ export function SnippingAnnotationEditorWindow() {
     };
   }, [beginEditorDispose]);
 
-  // The native window is created hidden; reveal it only once this webview has
-  // committed its first painted frame (double rAF) so opening never flashes
-  // an unpainted window.
+  // Native shows a pre-React shell immediately; after the first editor paint,
+  // reassert visibility/focus so the window is ready for drawing.
   useEffect(() => {
     let frame = window.requestAnimationFrame(() => {
       frame = window.requestAnimationFrame(() => {
@@ -4350,7 +4397,11 @@ export function SnippingAnnotationEditorWindow() {
       setStatus(imageLoadFailed ? "Unable to queue until the image loads." : "Image is still loading...");
       return;
     }
-    if (!targetWorkspaceId) {
+    if (!hasDispatchTargets) {
+      setStatus("No active coding-agent terminals are available");
+      return;
+    }
+    if (!targetWorkspaceId || !targetWorkspace) {
       setStatus("Pick a workspace first");
       return;
     }
@@ -4384,7 +4435,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to queue todo."));
     }
-  }, [activePath, annotationsByPath, exportActiveDataUrl, imageLoadFailed, imageReady, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
+  }, [activePath, annotationsByPath, exportActiveDataUrl, hasDispatchTargets, imageLoadFailed, imageReady, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
 
   const closeEditor = useCallback(() => {
     beginEditorDispose();
@@ -4722,18 +4773,21 @@ export function SnippingAnnotationEditorWindow() {
           </EditorFloatingRail>
 
           <EditorComposer onSubmit={queueTodo}>
-            <EditorComposerInner>
+            <EditorComposerInner data-disabled={!hasDispatchTargets ? "true" : "false"}>
               <input
                 aria-label="Todo for coding agent"
+                disabled={!hasDispatchTargets}
                 onChange={(event) => setTodoDraft(event.target.value)}
-                placeholder="Circle an area, describe the fix, send it to an agent…"
+                placeholder={hasDispatchTargets
+                  ? "Circle an area, describe the fix, send it to an agent…"
+                  : "Open an active coding-agent terminal to send a todo…"}
                 value={todoDraft}
               />
               <EditorComposerControls>
                 <Select
                   aria-label="Target workspace"
                   formatOptionLabel={workspaceOptionLabelRenderer}
-                  isDisabled={!dispatchTargets.length}
+                  isDisabled={!hasDispatchTargets}
                   isSearchable={false}
                   menuPlacement="top"
                   onChange={(option) => setTargetWorkspaceId(option?.value || "")}
@@ -4745,7 +4799,7 @@ export function SnippingAnnotationEditorWindow() {
                 <Select
                   aria-label="Target terminal"
                   formatOptionLabel={terminalOptionLabelRenderer}
-                  isDisabled={!(targetWorkspace?.threads || []).length}
+                  isDisabled={!hasDispatchTargets || !(targetWorkspace?.threads || []).length}
                   isSearchable={false}
                   menuPlacement="top"
                   onChange={(option) => setTargetThreadId(option?.value || "")}
@@ -4754,7 +4808,7 @@ export function SnippingAnnotationEditorWindow() {
                   styles={TARGET_SELECT_STYLES}
                   value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
                 />
-                <EditorSendButton aria-label="Queue todo with this image" disabled={!imageReady || !todoDraft.trim()} title="Queue todo with this image" type="submit">
+                <EditorSendButton aria-label="Queue todo with this image" disabled={!imageReady || !hasDispatchTargets || !todoDraft.trim()} title="Queue todo with this image" type="submit">
                   <Send aria-hidden="true" />
                 </EditorSendButton>
               </EditorComposerControls>
@@ -6085,6 +6139,11 @@ const EditorComposer = styled.form`
   input::placeholder {
     color: rgba(248, 250, 252, 0.4);
   }
+
+  input:disabled {
+    cursor: default;
+    color: rgba(248, 250, 252, 0.45);
+  }
 `;
 
 /* One composer card, centered at ~72% of the editor width (ChatGPT-style)
@@ -6109,6 +6168,16 @@ const EditorComposerInner = styled.div`
   &:focus-within {
     border-color: rgba(147, 197, 253, 0.45);
     box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+  }
+
+  &[data-disabled="true"] {
+    border-color: rgba(230, 236, 245, 0.1);
+    background: rgba(230, 236, 245, 0.045);
+  }
+
+  &[data-disabled="true"]:focus-within {
+    border-color: rgba(230, 236, 245, 0.1);
+    box-shadow: none;
   }
 `;
 

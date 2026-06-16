@@ -589,7 +589,9 @@ import ActivityOverlayWindow, {
   ACTIVITY_OVERLAY_HASH,
 } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, {
+  AudioWidgetErrorOverlayWindow,
   AudioWidgetWindow,
+  AUDIO_WIDGET_ERROR_HASH,
   AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT,
   AUDIO_WIDGET_HASH,
   AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT,
@@ -3910,6 +3912,7 @@ function AuthSquareBackdrop({ tone = "default" } = {}) {
 function WorkspaceIdleState({
   actionLabel = "",
   detail = "No workspace selected.",
+  flameActive = true,
   onAction = null,
   plan = "",
   title = BRAND_NAME,
@@ -3919,7 +3922,7 @@ function WorkspaceIdleState({
     <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
       <AuthSquareBackdrop tone="quiet" />
       {/* The signed-in plan rendered as its pricing-page flame tier. */}
-      <PlanFlame plan={plan} showControls={Boolean(plan)} />
+      <PlanFlame active={flameActive} plan={plan} showControls={Boolean(plan)} />
       <WorkspaceIdlePanel>
         <WorkspaceIdleLogo src="/logo.webp" alt="" />
         <WorkspaceIdleTitle>{title}</WorkspaceIdleTitle>
@@ -4255,10 +4258,13 @@ function WorkspaceCreatePanel({
           <SettingsLabel>Name</SettingsLabel>
           <WorkspaceSettingsInput
             autoFocus
+            autoComplete="off"
+            autoCorrect="off"
             disabled={creating}
             maxLength={80}
             onChange={(event) => setWorkspaceName(event.target.value)}
             placeholder="My workspace"
+            spellCheck={false}
             value={workspaceName}
           />
         </WorkspaceCreateSection>
@@ -8366,6 +8372,10 @@ export default function App() {
 
   if (window.location.hash === AUDIO_WIDGET_HASH) {
     return <AudioWidgetWindow />;
+  }
+
+  if (window.location.hash === AUDIO_WIDGET_ERROR_HASH) {
+    return <AudioWidgetErrorOverlayWindow />;
   }
 
   if (window.location.hash.startsWith(TERMINAL_WINDOW_HASH)) {
@@ -16951,7 +16961,7 @@ export default function App() {
           threadId: String(terminal?.threadId || terminal?.thread_id || "").trim(),
         };
       })
-      .filter(Boolean);
+      .filter((target) => target && target.threads.length > 0);
   }, [selectedWorkspaceId, workspaceTerminalsWorkspaces]);
   useEffect(() => {
     workspaceTerminalsWorkspacesRef.current = workspaceTerminalsWorkspaces;
@@ -18464,44 +18474,64 @@ export default function App() {
     workspaces,
   ]);
   useEffect(() => {
-    // Publish workspace + terminal targets so the annotation editor window
-    // can queue todos at a chosen workspace/terminal.
-    const targets = (Array.isArray(workspaces) ? workspaces : [])
-      .map((workspace) => {
-        const workspaceId = String(workspace?.id || "").trim();
+    // Publish only active workspace terminals backed by coding agents so the
+    // annotation editor never queues against a dormant workspace or plain shell.
+    const workspaceById = new Map((Array.isArray(workspaces) ? workspaces : [])
+      .map((workspace) => [String(workspace?.id || "").trim(), workspace])
+      .filter(([workspaceId]) => workspaceId));
+    const targets = (Array.isArray(workspaceTerminalsWorkspaces) ? workspaceTerminalsWorkspaces : [])
+      .map((presenceWorkspace) => {
+        const workspaceId = String(
+          presenceWorkspace?.workspaceId
+            || presenceWorkspace?.workspace_id
+            || "",
+        ).trim();
         if (!workspaceId) return null;
-        const entry = workspaceThreads?.[workspaceId] || {};
-        const presenceWorkspace = workspaceTerminalsWorkspaces.find((candidate) => (
-          String(candidate?.workspaceId || "").trim() === workspaceId
-        ));
-        const presenceTerminals = Array.isArray(presenceWorkspace?.terminals)
-          ? presenceWorkspace.terminals
-          : [];
-        const threads = Object.entries(entry.threads || {})
-          .map(([threadId, thread]) => {
-            if (!thread || thread.archivedAt) return null;
-            const bindings = thread.providerBindings || {};
-            const binding = bindings[thread.currentAgent] || Object.values(bindings)[0] || {};
+        const workspace = workspaceById.get(workspaceId);
+        if (!workspace) return null;
+        if (
+          presenceWorkspace?.commandable === false
+          || presenceWorkspace?.runtimeReadOnly
+          || presenceWorkspace?.runtime_read_only
+          || presenceWorkspace?.lastKnownRuntime
+          || presenceWorkspace?.last_known_runtime
+          || !(presenceWorkspace?.workspaceActive ?? presenceWorkspace?.workspace_active)
+        ) {
+          return null;
+        }
+        const threads = (Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [])
+          .map((terminal) => {
+            if (
+              terminal?.commandable === false
+              || terminal?.runtimeReadOnly
+              || terminal?.runtime_read_only
+              || terminal?.lastKnownRuntime
+              || terminal?.last_known_runtime
+            ) {
+              return null;
+            }
+            const agentId = String(
+              terminal?.agentId
+                || terminal?.agent_id
+                || terminal?.agentKind
+                || terminal?.agent_kind
+                || "",
+            ).trim().toLowerCase();
+            if (!agentId || agentId === WORKSPACE_TERMINAL_ROLE_GENERIC) return null;
+            const threadId = String(terminal?.threadId || terminal?.thread_id || "").trim();
+            if (!threadId) return null;
+            const terminalIndex = Number(terminal?.terminalIndex ?? terminal?.terminal_index);
             const label = String(
-              binding.terminalNickname
-                || binding.displayName
-                || thread.sessionName
-                || thread.title
+              terminal?.terminalNickname
+                || terminal?.terminalName
+                || terminal?.displayName
+                || terminal?.agentDisplayName
+                || terminal?.agentLabel
                 || "",
             ).trim();
-            if (!label) return null;
-            const presence = presenceTerminals.find((terminal) => (
-              String(terminal?.threadId || terminal?.thread_id || "").trim() === threadId
-            ));
-            const terminalIndex = Number(
-              thread.terminalIndex
-                ?? thread.terminalBinding?.terminalIndex
-                ?? presence?.terminalIndex
-                ?? presence?.terminal_index,
-            );
             return {
-              color: String(presence?.color || "").trim(),
-              label,
+              color: String(terminal?.color || "").trim(),
+              label: label || `Terminal ${Number.isInteger(terminalIndex) ? terminalIndex + 1 : ""}`.trim(),
               terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
               threadId,
             };
@@ -18514,9 +18544,9 @@ export default function App() {
           threads,
         };
       })
-      .filter(Boolean);
+      .filter((target) => target && target.threads.length > 0);
     invoke("snipping_set_dispatch_targets", { targets }).catch(() => {});
-  }, [workspaceTerminalsWorkspaces, workspaceThreads, workspaces]);
+  }, [workspaceTerminalsWorkspaces, workspaces]);
   useEffect(() => {
     let disposed = false;
     let unlistenAnnotationTodo = null;
@@ -26536,6 +26566,11 @@ export default function App() {
                       <WorkspaceIdleState
                         actionLabel="Create First Workspace"
                         detail="Create a workspace to start opening agents, files, and project history."
+                        flameActive={
+                          visibleView === DEFAULT_WORKSPACE_VIEW
+                            && !workspaceCreateModalOpen
+                            && !isWorkspaceSettingsOpen
+                        }
                         onAction={openCreateWorkspaceModal}
                         plan={billingPlanNameFromStatus(billingStatus, user)}
                         title="No Workspaces Selected"
@@ -27643,6 +27678,7 @@ export default function App() {
                     <WorkspaceIdleState
                       actionLabel="Create First Workspace"
                       detail="Create a workspace before browsing project files."
+                      flameActive={visibleView === "files" && !workspaceCreateModalOpen}
                       onAction={openCreateWorkspaceModal}
                       plan={billingPlanNameFromStatus(billingStatus, user)}
                       title="No Workspaces Selected"

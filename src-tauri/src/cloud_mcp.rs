@@ -27,6 +27,7 @@ const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT: &str = "cloud-mcp-account-devic
 const CLOUD_MCP_AUDIO_PREFERENCES_CHANGED_EVENT: &str = "forge-audio-preferences-changed";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
+const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions-updated";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT: &str = "cloud-mcp-workspace-catalog-changed";
@@ -882,10 +883,9 @@ fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
     let worker_state = state.clone();
     tauri::async_runtime::spawn(async move {
         let loop_state = worker_state.clone();
-        let result =
-            std::panic::AssertUnwindSafe(cloud_mcp_background_sync_worker(loop_state))
-                .catch_unwind()
-                .await;
+        let result = std::panic::AssertUnwindSafe(cloud_mcp_background_sync_worker(loop_state))
+            .catch_unwind()
+            .await;
         worker_state
             .background_sync
             .started
@@ -2627,13 +2627,23 @@ fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
     .ok_or_else(|| "Tokenomics day ack did not include a device id.".to_string())?;
     let billing_scope_key = cloud_mcp_tokenomics_response_text(
         response,
-        &["billing_scope_key", "billingScopeKey", "scope_key", "scopeKey"],
+        &[
+            "billing_scope_key",
+            "billingScopeKey",
+            "scope_key",
+            "scopeKey",
+        ],
     )
     .or_else(|| {
         source_payload.and_then(|payload| {
             cloud_mcp_tokenomics_response_text(
                 payload,
-                &["billing_scope_key", "billingScopeKey", "scope_key", "scopeKey"],
+                &[
+                    "billing_scope_key",
+                    "billingScopeKey",
+                    "scope_key",
+                    "scopeKey",
+                ],
             )
         })
     })
@@ -2891,22 +2901,32 @@ fn cloud_mcp_tokenomics_event_has_summary(value: &Value) -> bool {
         value.get("delta").filter(|candidate| candidate.is_object()),
         value.get("data").and_then(|data| data.get("summary")),
         value.get("data").and_then(|data| data.get("tokenomics")),
-        value.get("data").and_then(|data| data.get("tokenomics_delta")),
-        value.get("data").and_then(|data| data.get("tokenomicsDelta")),
+        value
+            .get("data")
+            .and_then(|data| data.get("tokenomics_delta")),
+        value
+            .get("data")
+            .and_then(|data| data.get("tokenomicsDelta")),
         value.get("data").and_then(|data| data.get("snapshot")),
         value
             .get("data")
             .and_then(|data| data.get("delta"))
             .filter(|candidate| candidate.is_object()),
-        value.get("payload").and_then(|payload| payload.get("summary")),
-        value.get("payload").and_then(|payload| payload.get("tokenomics")),
+        value
+            .get("payload")
+            .and_then(|payload| payload.get("summary")),
+        value
+            .get("payload")
+            .and_then(|payload| payload.get("tokenomics")),
         value
             .get("payload")
             .and_then(|payload| payload.get("tokenomics_delta")),
         value
             .get("payload")
             .and_then(|payload| payload.get("tokenomicsDelta")),
-        value.get("payload").and_then(|payload| payload.get("snapshot")),
+        value
+            .get("payload")
+            .and_then(|payload| payload.get("snapshot")),
         value
             .get("payload")
             .and_then(|payload| payload.get("delta"))
@@ -3078,13 +3098,23 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
     .ok_or_else(|| "Tokenomics ingest ack did not include a device id.".to_string())?;
     let billing_scope_key = cloud_mcp_tokenomics_response_text(
         response,
-        &["billing_scope_key", "billingScopeKey", "scope_key", "scopeKey"],
+        &[
+            "billing_scope_key",
+            "billingScopeKey",
+            "scope_key",
+            "scopeKey",
+        ],
     )
     .or_else(|| {
         source_payload.and_then(|payload| {
             cloud_mcp_tokenomics_response_text(
                 payload,
-                &["billing_scope_key", "billingScopeKey", "scope_key", "scopeKey"],
+                &[
+                    "billing_scope_key",
+                    "billingScopeKey",
+                    "scope_key",
+                    "scopeKey",
+                ],
             )
         })
     })
@@ -3110,8 +3140,7 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
 
     let conn = cloud_mcp_open_outbox_conn()?;
     let now = cloud_mcp_now_ms() as i64;
-    let current =
-        cloud_mcp_tokenomics_sync_state_from_conn(&conn, &device_id, &billing_scope_key);
+    let current = cloud_mcp_tokenomics_sync_state_from_conn(&conn, &device_id, &billing_scope_key);
     let ack_is_new = acked_device_seq
         .map(|seq| seq >= current.acked_device_seq)
         .unwrap_or(true);
@@ -3176,8 +3205,7 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
     )
     .map_err(|error| format!("Unable to persist Tokenomics ingest ack: {error}"))?;
     let day_bucket_acked =
-        cloud_mcp_tokenomics_mark_day_acked_from_payload(source_payload, response)
-            .unwrap_or(false);
+        cloud_mcp_tokenomics_mark_day_acked_from_payload(source_payload, response).unwrap_or(false);
     Ok(json!({
         "ok": true,
         "accepted": true,
@@ -3287,8 +3315,8 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
             &["device_id", "deviceId", "machine_id", "machineId"],
         )
         .unwrap_or_default();
-        let sync_unit = cloud_mcp_payload_text(payload, &["sync_unit", "syncUnit"])
-            .unwrap_or_default();
+        let sync_unit =
+            cloud_mcp_payload_text(payload, &["sync_unit", "syncUnit"]).unwrap_or_default();
         if device_id.is_empty() || sync_unit.is_empty() {
             return None;
         }
@@ -3434,9 +3462,9 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
     if normalized_kind == "asset_library_register" {
         let asset_id = cloud_mcp_payload_text(payload, &["asset_id", "assetId", "id"])
             .or_else(|| {
-                payload.get("asset").and_then(|asset| {
-                    cloud_mcp_payload_text(asset, &["asset_id", "assetId", "id"])
-                })
+                payload
+                    .get("asset")
+                    .and_then(|asset| cloud_mcp_payload_text(asset, &["asset_id", "assetId", "id"]))
             })
             .unwrap_or_default();
         if asset_id.is_empty() {
@@ -3447,24 +3475,19 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
             &["device_id", "deviceId", "machine_id", "machineId"],
         )
         .unwrap_or_default();
-        let scope_key =
-            cloud_mcp_payload_scope_key(payload).unwrap_or_else(cloud_mcp_process_account_scope_key);
-        return Some(format!(
-            "asset:{scope_key}:register:{device_id}:{asset_id}"
-        ));
+        let scope_key = cloud_mcp_payload_scope_key(payload)
+            .unwrap_or_else(cloud_mcp_process_account_scope_key);
+        return Some(format!("asset:{scope_key}:register:{device_id}:{asset_id}"));
     }
     if normalized_kind == "asset_library_report_transfer_progress" {
-        let transfer_id =
-            cloud_mcp_payload_text(payload, &["transfer_id", "transferId", "id"])
-                .unwrap_or_default();
+        let transfer_id = cloud_mcp_payload_text(payload, &["transfer_id", "transferId", "id"])
+            .unwrap_or_default();
         if transfer_id.is_empty() {
             return None;
         }
-        let scope_key =
-            cloud_mcp_payload_scope_key(payload).unwrap_or_else(cloud_mcp_process_account_scope_key);
-        return Some(format!(
-            "asset:{scope_key}:transfer-progress:{transfer_id}"
-        ));
+        let scope_key = cloud_mcp_payload_scope_key(payload)
+            .unwrap_or_else(cloud_mcp_process_account_scope_key);
+        return Some(format!("asset:{scope_key}:transfer-progress:{transfer_id}"));
     }
     if matches!(
         normalized_kind.as_str(),
@@ -3855,12 +3878,7 @@ fn cloud_mcp_tokenomics_sync_log_values(limit: usize) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn cloud_mcp_record_tokenomics_sync_log(
-    stage: &str,
-    state: &str,
-    reason: &str,
-    details: Value,
-) {
+fn cloud_mcp_record_tokenomics_sync_log(stage: &str, state: &str, reason: &str, details: Value) {
     let now = cloud_mcp_now_ms();
     let stage = clean_terminal_telemetry_text(stage);
     let state = clean_terminal_telemetry_text(state);
@@ -3928,12 +3946,7 @@ fn cloud_mcp_record_tokenomics_sync_log(
 }
 
 fn cloud_mcp_record_tokenomics_sync_error(stage: &str, reason: &str, error: &str) {
-    cloud_mcp_record_tokenomics_sync_log(
-        stage,
-        "error",
-        reason,
-        json!({ "error": error }),
-    );
+    cloud_mcp_record_tokenomics_sync_log(stage, "error", reason, json!({ "error": error }));
 }
 
 fn cloud_mcp_sync_activity_domain(raw: &str) -> &'static str {
@@ -4105,7 +4118,9 @@ fn cloud_mcp_sync_activity_size_class(
     if bytes >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_BYTES
         || count >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT
         || matches!(state.as_str(), "streaming" | "retrying" | "failed")
-        || (domain == "tokenomics" && matches!(state.as_str(), "queued" | "active" | "applying"))
+        || (domain == "tokenomics"
+            && matches!(state.as_str(), "queued" | "active" | "applying")
+            && (bytes > 0 || count >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT))
     {
         "large"
     } else {
@@ -4559,7 +4574,9 @@ fn cloud_mcp_tokenomics_bucket_sync_activity(
         }
 
         activity.remaining_count = activity.remaining_count.saturating_add(remaining_count);
-        activity.progress_done = activity.progress_done.saturating_add(acked_recent_count as u64);
+        activity.progress_done = activity
+            .progress_done
+            .saturating_add(acked_recent_count as u64);
         activity.progress_total = activity
             .progress_total
             .saturating_add((remaining_count + acked_recent_count) as u64);
@@ -4599,9 +4616,7 @@ fn cloud_mcp_device_live_unit_domain(sync_unit: &str) -> Option<&'static str> {
     }
 }
 
-fn cloud_mcp_device_live_unit_sync_activities(
-    now: u64,
-) -> Vec<CloudMcpDeviceLiveUnitSyncActivity> {
+fn cloud_mcp_device_live_unit_sync_activities(now: u64) -> Vec<CloudMcpDeviceLiveUnitSyncActivity> {
     #[derive(Clone)]
     struct UnitRow {
         acked_at_ms: i64,
@@ -4820,7 +4835,8 @@ fn cloud_mcp_push_sync_activity_json(
             || count >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT
             || matches!(state.as_str(), "streaming" | "retrying" | "failed")
             || (domain == "tokenomics"
-                && matches!(state.as_str(), "queued" | "active" | "applying")));
+                && matches!(state.as_str(), "queued" | "active" | "applying")
+                && (bytes > 0 || count >= CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT)));
     if large {
         aggregate.large_count = aggregate.large_count.saturating_add(count);
     }
@@ -4891,7 +4907,8 @@ fn cloud_mcp_sync_activity_aggregate() -> CloudMcpSyncActivityAggregate {
         {
             continue;
         }
-        if device_live_unit_activity_active && cloud_mcp_device_live_unit_event_kind(&row.event_kind)
+        if device_live_unit_activity_active
+            && cloud_mcp_device_live_unit_event_kind(&row.event_kind)
         {
             continue;
         }
@@ -6617,20 +6634,31 @@ fn cloud_mcp_tokenomics_timestamp_ms(value: &str) -> Option<i64> {
         .unwrap_or(text);
     if let Ok(number) = numeric.parse::<f64>() {
         if number.is_finite() && number > 0.0 {
-            return Some((if number < 1_000_000_000_000.0 {
-                number * 1000.0
-            } else {
-                number
-            })
-            .round() as i64);
+            return Some(
+                (if number < 1_000_000_000_000.0 {
+                    number * 1000.0
+                } else {
+                    number
+                })
+                .round() as i64,
+            );
         }
     }
     let year = text.get(0..4)?.parse::<i64>().ok()?;
     let month = text.get(5..7)?.parse::<i64>().ok()?;
     let day = text.get(8..10)?.parse::<i64>().ok()?;
-    let hour = text.get(11..13).and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
-    let minute = text.get(14..16).and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
-    let second = text.get(17..19).and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+    let hour = text
+        .get(11..13)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let minute = text
+        .get(14..16)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let second = text
+        .get(17..19)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
     Some(
         (cloud_mcp_tokenomics_days_from_civil(year, month, day) * 86_400
             + hour.clamp(0, 23) * 3_600
@@ -6731,10 +6759,7 @@ fn cloud_mcp_tokenomics_stable_hash_value(value: &Value) -> Value {
                 if VOLATILE_KEYS.contains(&key.as_str()) {
                     continue;
                 }
-                object.insert(
-                    key.clone(),
-                    cloud_mcp_tokenomics_stable_hash_value(child),
-                );
+                object.insert(key.clone(), cloud_mcp_tokenomics_stable_hash_value(child));
             }
             Value::Object(object)
         }
@@ -6760,9 +6785,11 @@ fn cloud_mcp_tokenomics_day_content_hash(
     })))
 }
 
-fn cloud_mcp_tokenomics_day_buckets(summary: &Value, now_ms: u64) -> Vec<CloudMcpTokenomicsDayBucket> {
-    let current_day_start =
-        cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
+fn cloud_mcp_tokenomics_day_buckets(
+    summary: &Value,
+    now_ms: u64,
+) -> Vec<CloudMcpTokenomicsDayBucket> {
+    let current_day_start = cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
     let oldest_day_start = current_day_start.saturating_sub(
         CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS
             .saturating_sub(1)
@@ -6818,7 +6845,9 @@ fn cloud_mcp_tokenomics_day_buckets(summary: &Value, now_ms: u64) -> Vec<CloudMc
             } else {
                 provider_accounts
                     .iter()
-                    .filter(|row| account_keys.contains(&cloud_mcp_tokenomics_provider_account_key(row)))
+                    .filter(|row| {
+                        account_keys.contains(&cloud_mcp_tokenomics_provider_account_key(row))
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             };
@@ -6859,7 +6888,10 @@ fn cloud_mcp_tokenomics_day_buckets(summary: &Value, now_ms: u64) -> Vec<CloudMc
             object.insert("sync_day_start_ms".to_string(), json!(day_start_ms));
             object.insert("sync_day".to_string(), json!(day_key.clone()));
             object.insert("sync_content_hash".to_string(), json!(content_hash.clone()));
-            if let Some(cursor) = summary.get("sync_cursor").or_else(|| summary.get("syncCursor")) {
+            if let Some(cursor) = summary
+                .get("sync_cursor")
+                .or_else(|| summary.get("syncCursor"))
+            {
                 object.insert("sync_cursor".to_string(), cursor.clone());
             }
             object.insert("hourly_count".to_string(), json!(hourly_rows.len()));
@@ -6933,8 +6965,10 @@ fn cloud_mcp_tokenomics_provider_account_key(row: &Value) -> String {
         ],
     )
     .unwrap_or_else(|| {
-        let provider = cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent = cloud_mcp_payload_text(row, &["agent_kind", "agentKind"]).unwrap_or_else(|| provider.clone());
+        let provider =
+            cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+        let agent = cloud_mcp_payload_text(row, &["agent_kind", "agentKind"])
+            .unwrap_or_else(|| provider.clone());
         format!("{provider}:{agent}:unknown")
     })
 }
@@ -6982,8 +7016,8 @@ fn cloud_mcp_tokenomics_provider_accounts(summary: &Value, now_ms: u64) -> Vec<V
 
 fn cloud_mcp_provider_account_identity_content_hash(account: &Value) -> String {
     let provider = cloud_mcp_payload_text(account, &["provider"]).unwrap_or_default();
-    let agent_kind =
-        cloud_mcp_payload_text(account, &["agent_kind", "agentKind"]).unwrap_or_else(|| provider.clone());
+    let agent_kind = cloud_mcp_payload_text(account, &["agent_kind", "agentKind"])
+        .unwrap_or_else(|| provider.clone());
     let account_key = cloud_mcp_tokenomics_provider_account_key(account);
     cloud_mcp_outbox_payload_hash(&json!({
         "provider": provider,
@@ -7015,9 +7049,10 @@ async fn cloud_mcp_sync_provider_account_identity_units(
         if account_key.trim().is_empty() {
             continue;
         }
-        let provider = cloud_mcp_payload_text(account, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent_kind =
-            cloud_mcp_payload_text(account, &["agent_kind", "agentKind"]).unwrap_or_else(|| provider.clone());
+        let provider =
+            cloud_mcp_payload_text(account, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+        let agent_kind = cloud_mcp_payload_text(account, &["agent_kind", "agentKind"])
+            .unwrap_or_else(|| provider.clone());
         let content_hash = cloud_mcp_provider_account_identity_content_hash(account);
         let sync_unit = format!("provider_account:{provider}:{agent_kind}:{account_key}");
         let unit_payload = json!({
@@ -7061,18 +7096,34 @@ fn cloud_mcp_tokenomics_hourly_groups(summary: &Value, now_ms: u64) -> Vec<Value
             let Some(bucket_start_ms) = cloud_mcp_tokenomics_bucket_start_ms(row) else {
                 continue;
             };
-            let provider = cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-            let agent_kind =
-                cloud_mcp_payload_text(row, &["agent_kind", "agentKind"]).unwrap_or_else(|| provider.clone());
-            let input = cloud_mcp_payload_i64(row, &["input_tokens", "inputTokens", "input"]).unwrap_or(0).max(0);
-            let output = cloud_mcp_payload_i64(row, &["output_tokens", "outputTokens", "output"]).unwrap_or(0).max(0);
-            let cache_read = cloud_mcp_payload_i64(row, &["cache_read_tokens", "cacheReadTokens", "cache_read"]).unwrap_or(0).max(0);
-            let cache_write = cloud_mcp_payload_i64(row, &["cache_write_tokens", "cacheWriteTokens", "cache_write"]).unwrap_or(0).max(0);
+            let provider =
+                cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+            let agent_kind = cloud_mcp_payload_text(row, &["agent_kind", "agentKind"])
+                .unwrap_or_else(|| provider.clone());
+            let input = cloud_mcp_payload_i64(row, &["input_tokens", "inputTokens", "input"])
+                .unwrap_or(0)
+                .max(0);
+            let output = cloud_mcp_payload_i64(row, &["output_tokens", "outputTokens", "output"])
+                .unwrap_or(0)
+                .max(0);
+            let cache_read =
+                cloud_mcp_payload_i64(row, &["cache_read_tokens", "cacheReadTokens", "cache_read"])
+                    .unwrap_or(0)
+                    .max(0);
+            let cache_write = cloud_mcp_payload_i64(
+                row,
+                &["cache_write_tokens", "cacheWriteTokens", "cache_write"],
+            )
+            .unwrap_or(0)
+            .max(0);
             let component_total = input
                 .saturating_add(output)
                 .saturating_add(cache_read)
                 .saturating_add(cache_write);
-            let reported_total = cloud_mcp_payload_i64(row, &["total_tokens", "totalTokens", "total"]).unwrap_or(0).max(0);
+            let reported_total =
+                cloud_mcp_payload_i64(row, &["total_tokens", "totalTokens", "total"])
+                    .unwrap_or(0)
+                    .max(0);
             let total = if component_total > 0 {
                 component_total
             } else {
@@ -7094,34 +7145,35 @@ fn cloud_mcp_tokenomics_hourly_groups(summary: &Value, now_ms: u64) -> Vec<Value
             .max(0);
             let provider_account_key = cloud_mcp_tokenomics_provider_account_key(row);
             let model = cloud_mcp_payload_text(row, &["model"]).unwrap_or_default();
-            let attribution =
-                if provider_account_key.contains(":unknown") { "unknown" } else { "token_based" };
-            let row_key = [
-                provider_account_key.as_str(),
-                model.as_str(),
-                attribution,
-            ]
-            .join("\u{1f}");
+            let attribution = if provider_account_key.contains(":unknown") {
+                "unknown"
+            } else {
+                "token_based"
+            };
+            let row_key =
+                [provider_account_key.as_str(), model.as_str(), attribution].join("\u{1f}");
             let rows_by_identity = grouped.entry(bucket_start_ms).or_default();
-            let aggregate = rows_by_identity.entry(row_key).or_insert_with(|| json!({
-                "provider_account_key": provider_account_key,
-                "provider": provider,
-                "agent_kind": agent_kind,
-                "model": model,
-                "input": 0,
-                "output": 0,
-                "cache_read": 0,
-                "cache_write": 0,
-                "total": 0,
-                "estimated_cost_microusd": 0,
-                "estimatedCostMicrousd": 0,
-                "provider_cost_microusd": 0,
-                "providerCostMicrousd": 0,
-                "cost": 0,
-                "events": 0,
-                "attribution": attribution,
-                "coverage": "device_local"
-            }));
+            let aggregate = rows_by_identity.entry(row_key).or_insert_with(|| {
+                json!({
+                    "provider_account_key": provider_account_key,
+                    "provider": provider,
+                    "agent_kind": agent_kind,
+                    "model": model,
+                    "input": 0,
+                    "output": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "total": 0,
+                    "estimated_cost_microusd": 0,
+                    "estimatedCostMicrousd": 0,
+                    "provider_cost_microusd": 0,
+                    "providerCostMicrousd": 0,
+                    "cost": 0,
+                    "events": 0,
+                    "attribution": attribution,
+                    "coverage": "device_local"
+                })
+            });
             if let Some(object) = aggregate.as_object_mut() {
                 let mut add_i64 = |key: &str, value: i64| {
                     let current = object.get(key).and_then(Value::as_i64).unwrap_or(0);
@@ -7173,16 +7225,28 @@ fn cloud_mcp_tokenomics_windows(summary: &Value, now_ms: u64) -> Vec<Value> {
     let mut windows = Vec::new();
     if let Some(rows) = summary.get("limits").and_then(Value::as_array) {
         for row in rows {
-            let window = cloud_mcp_payload_text(row, &["window_kind", "windowKind", "limit_kind", "limitKind"])
-                .unwrap_or_else(|| "session_5h".to_string());
+            let window = cloud_mcp_payload_text(
+                row,
+                &["window_kind", "windowKind", "limit_kind", "limitKind"],
+            )
+            .unwrap_or_else(|| "session_5h".to_string());
             if window != "5_hour" && window != "session_5h" && window != "weekly" {
                 continue;
             }
-            let normalized_window = if window == "5_hour" { "session_5h" } else { window.as_str() };
-            let reset_at_ms = cloud_mcp_payload_i64(row, &["reset_at_ms", "resetAtMs"]).or_else(|| {
-                cloud_mcp_payload_text(row, &["reset_at", "resetAt", "limit_resets_at", "limitResetsAt"])
+            let normalized_window = if window == "5_hour" {
+                "session_5h"
+            } else {
+                window.as_str()
+            };
+            let reset_at_ms = cloud_mcp_payload_i64(row, &["reset_at_ms", "resetAtMs"])
+                .or_else(|| {
+                    cloud_mcp_payload_text(
+                        row,
+                        &["reset_at", "resetAt", "limit_resets_at", "limitResetsAt"],
+                    )
                     .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
-            }).unwrap_or(0);
+                })
+                .unwrap_or(0);
             windows.push(json!({
                 "provider_account_key": cloud_mcp_tokenomics_provider_account_key(row),
                 "provider": cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
@@ -7218,10 +7282,11 @@ fn cloud_mcp_tokenomics_device_packet_payload(
 ) -> Result<Value, String> {
     let device_id = cloud_mcp_tokenomics_device_id_from_profile(device_profile)?;
     if !sync_state.device_id.is_empty() && sync_state.device_id != device_id {
-        return Err("Tokenomics sync state device id does not match the packet device.".to_string());
+        return Err(
+            "Tokenomics sync state device id does not match the packet device.".to_string(),
+        );
     }
-    if !sync_state.billing_scope_key.is_empty()
-        && sync_state.billing_scope_key != billing_scope_key
+    if !sync_state.billing_scope_key.is_empty() && sync_state.billing_scope_key != billing_scope_key
     {
         return Err(
             "Tokenomics sync state billing scope does not match the packet scope.".to_string(),
@@ -7371,7 +7436,11 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             if let Some(activity_key) = tokenomics_activity_key.as_deref() {
                 cloud_mcp_fail_sync_activity_key(activity_key);
             }
-            cloud_mcp_record_tokenomics_sync_error("device_profile_error", &reason_for_worker, &error);
+            cloud_mcp_record_tokenomics_sync_error(
+                "device_profile_error",
+                &reason_for_worker,
+                &error,
+            );
             log_terminal_status_event(
                 "backend.cloud_mcp.tokenomics_background.error",
                 json!({
@@ -7413,49 +7482,60 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "next_device_seq": sync_state.next_device_seq,
         }),
     );
+    let summary_since_cursor = if force_full || force_resync {
+        None
+    } else {
+        let cursor = sync_state.local_cursor.trim().to_string();
+        if cursor.is_empty() {
+            None
+        } else {
+            Some(cursor)
+        }
+    };
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
-        if force_resync {
+        let scan_summary = if force_resync {
             tokenomics_scan_usage_for(&app, false, true)?;
-            tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)
+            None
         } else if force_full {
             tokenomics_scan_usage_for(&app, false, false)?;
-            tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)
-        } else {
-            let scan_summary = if reason_for_summary == "tokenomics_source_changed" {
-                let scan_summary = tokenomics_scan_realtime_usage_for(&app)?;
-                if tokenomics_summary_inserted_events(&scan_summary) == 0 {
-                    return Ok(scan_summary);
-                }
-                Some(scan_summary)
-            } else {
-                None
-            };
-            let conn = tokenomics_open_db(&app)?;
-            tokenomics_reconcile_current_provider_accounts(&conn)?;
-            if limits_only {
-                let _ = tokenomics_sync_delta_from_conn_with_limit_sampling(
-                    &conn,
-                    None,
-                    Some(&tokenomics_scope),
-                    true,
-                )?;
+            None
+        } else if reason_for_summary == "tokenomics_source_changed" {
+            let scan_summary = tokenomics_scan_realtime_usage_for(&app)?;
+            if tokenomics_summary_inserted_events(&scan_summary) == 0 {
+                return Ok(scan_summary);
             }
-            drop(conn);
-            tokenomics_sync_summary_for_scope(&app, &tokenomics_scope).map(|mut summary| {
-                if let Some(scan_summary) = scan_summary {
-                    if let Some(object) = summary.as_object_mut() {
-                        if let Some(scan) = scan_summary.get("scan") {
-                            object.insert("scan".to_string(), scan.clone());
-                        }
-                        object.insert(
-                            "inserted_events".to_string(),
-                            json!(tokenomics_summary_inserted_events(&scan_summary)),
-                        );
-                    }
-                }
-                summary
-            })
+            Some(scan_summary)
+        } else {
+            None
+        };
+        let conn = tokenomics_open_db(&app)?;
+        tokenomics_reconcile_current_provider_accounts(&conn)?;
+        if limits_only {
+            return tokenomics_sync_delta_from_conn_with_limit_sampling(
+                &conn,
+                summary_since_cursor.as_deref(),
+                Some(&tokenomics_scope),
+                true,
+            );
         }
+        let mut summary = tokenomics_sync_delta_from_conn_with_limit_sampling(
+            &conn,
+            summary_since_cursor.as_deref(),
+            Some(&tokenomics_scope),
+            true,
+        )?;
+        if let Some(scan_summary) = scan_summary {
+            if let Some(object) = summary.as_object_mut() {
+                if let Some(scan) = scan_summary.get("scan") {
+                    object.insert("scan".to_string(), scan.clone());
+                }
+                object.insert(
+                    "inserted_events".to_string(),
+                    json!(tokenomics_summary_inserted_events(&scan_summary)),
+                );
+            }
+        }
+        Ok(summary)
     });
     let summary_result = match timeout(
         Duration::from_secs(CLOUD_MCP_TOKENOMICS_BACKGROUND_JOB_TIMEOUT_SECS),
@@ -7687,7 +7767,11 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 if let Some(activity_key) = tokenomics_activity_key.as_deref() {
                     cloud_mcp_fail_sync_activity_key(activity_key);
                 }
-                cloud_mcp_record_tokenomics_sync_error("day_state_error", &reason_for_worker, &error);
+                cloud_mcp_record_tokenomics_sync_error(
+                    "day_state_error",
+                    &reason_for_worker,
+                    &error,
+                );
                 log_terminal_status_event(
                     "backend.cloud_mcp.tokenomics_background.error",
                     json!({
@@ -9278,8 +9362,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                     runtime.global_ws_connection_id = None;
                     runtime.global_ws_message_token = None;
                 }
-                cloud_mcp_mark_global_ws_disconnected_without_reconnect_wake(&state, &error)
-                    .await;
+                cloud_mcp_mark_global_ws_disconnected_without_reconnect_wake(&state, &error).await;
             }
         }
 
@@ -10048,6 +10131,50 @@ fn cloud_mcp_value_is_account_live_state(value: &Value) -> bool {
         )
 }
 
+fn cloud_mcp_native_sessions_from_value(value: &Value) -> Option<Value> {
+    cloud_mcp_native_sessions_from_value_depth(value, 0)
+}
+
+fn cloud_mcp_native_sessions_from_value_depth(value: &Value, depth: usize) -> Option<Value> {
+    if depth > 5 || !value.is_object() {
+        return None;
+    }
+    if cloud_mcp_value_is_native_sessions(value) {
+        return Some(value.clone());
+    }
+    for key in [
+        "initial_native_sessions",
+        "initialNativeSessions",
+        "native_sessions",
+        "nativeSessions",
+        "data",
+        "payload",
+        "event",
+    ] {
+        if let Some(candidate) = value.get(key) {
+            if let Some(snapshot) = cloud_mcp_native_sessions_from_value_depth(candidate, depth + 1)
+            {
+                return Some(snapshot);
+            }
+        }
+    }
+    None
+}
+
+fn cloud_mcp_value_is_native_sessions(value: &Value) -> bool {
+    if !value.is_object() {
+        return false;
+    }
+    let kind =
+        cloud_mcp_payload_text(value, &["kind", "event_kind", "eventKind"]).unwrap_or_default();
+    let contract = cloud_mcp_payload_text(value, &["contract"]).unwrap_or_default();
+    contract == "diffforge.native_sessions.v1"
+        || matches!(
+            kind.as_str(),
+            "native_sessions_status" | "native_sessions_snapshot"
+        )
+}
+
 async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpState, event: &Value) {
     let Some(snapshot) = cloud_mcp_account_device_live_state_snapshot_from_event(event) else {
         return;
@@ -10146,7 +10273,10 @@ fn cloud_mcp_merge_account_live_state_snapshot(previous: Option<&Value>, next: V
         ] {
             merged.insert(key.to_string(), registry.clone());
         }
-        merged.insert("registered_device_count".to_string(), json!(registered_count));
+        merged.insert(
+            "registered_device_count".to_string(),
+            json!(registered_count),
+        );
         merged.insert("known_device_count".to_string(), json!(registered_count));
     }
 
@@ -10218,14 +10348,20 @@ fn cloud_mcp_registry_array_non_empty(value: &Value, key: &str) -> bool {
 }
 
 fn cloud_mcp_merge_registry_object(previous: &Value, next: &Value) -> Value {
-    let (Some(previous_object), Some(next_object)) = (previous.as_object(), next.as_object()) else {
+    let (Some(previous_object), Some(next_object)) = (previous.as_object(), next.as_object())
+    else {
         return next.clone();
     };
     let mut merged = previous_object.clone();
     for (key, value) in next_object {
         merged.insert(key.clone(), value.clone());
     }
-    for key in ["agents", "workspaces", "workspace_catalog", "workspaceCatalog"] {
+    for key in [
+        "agents",
+        "workspaces",
+        "workspace_catalog",
+        "workspaceCatalog",
+    ] {
         if !cloud_mcp_registry_array_non_empty(next, key)
             && cloud_mcp_registry_array_non_empty(previous, key)
         {
@@ -10286,7 +10422,10 @@ fn cloud_mcp_registry_item_is_deleted(item: &Value, deleted: &HashSet<String>) -
             .any(|alias| deleted.contains(alias))
 }
 
-fn cloud_mcp_merge_registry_items(previous_registry: &Value, next_registry: &Value) -> Option<Vec<Value>> {
+fn cloud_mcp_merge_registry_items(
+    previous_registry: &Value,
+    next_registry: &Value,
+) -> Option<Vec<Value>> {
     let previous_items = previous_registry.get("items").and_then(Value::as_array);
     let next_items = next_registry.get("items").and_then(Value::as_array);
     if previous_items.is_none() && next_items.is_none() {
@@ -10325,7 +10464,10 @@ fn cloud_mcp_merge_registry_items(previous_registry: &Value, next_registry: &Val
     )
 }
 
-fn cloud_mcp_merge_registered_device_registry(previous_registry: &Value, next_registry: &Value) -> Value {
+fn cloud_mcp_merge_registered_device_registry(
+    previous_registry: &Value,
+    next_registry: &Value,
+) -> Value {
     let (Some(previous_object), Some(next_object)) =
         (previous_registry.as_object(), next_registry.as_object())
     else {
@@ -10399,10 +10541,7 @@ async fn cloud_mcp_refresh_registered_device_registry(
         .ok_or_else(|| "Registered devices response did not include a registry.".to_string())?;
     if let Some(object) = registry.as_object_mut() {
         object.insert("source".to_string(), json!("next_agents_devices"));
-        object.insert(
-            "registry_source".to_string(),
-            json!("next_agents_devices"),
-        );
+        object.insert("registry_source".to_string(), json!("next_agents_devices"));
     }
     let registered_count = cloud_mcp_registry_count(&registry);
     let snapshot = json!({
@@ -10506,6 +10645,73 @@ fn cloud_mcp_spawn_account_live_state_reconcile(state: &CloudMcpState, reason: &
                     }
                 }
             }
+        }
+    });
+}
+
+async fn cloud_mcp_send_native_sessions_status_request(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    reason: &str,
+) -> Result<Value, String> {
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let scope_payload =
+        cloud_mcp_account_scope_payload_from_parts(&billing_scope_type, team_id.as_deref());
+    let mut payload = json!({
+        "kind": "native_sessions_status",
+        "reason": reason,
+        "source": "rust-diffforge-desktop",
+        "consumer_client_kind": "rust_desktop",
+        "device": cloud_mcp_desktop_device_profile(),
+        "limit": 500,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(scope_object) = scope_payload.as_object() {
+            for (key, value) in scope_object {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let response = cloud_mcp_ws_request_with_timeout(
+        state,
+        "native_sessions_status",
+        &payload,
+        Duration::from_secs(8),
+    )
+    .await?;
+    let snapshot = cloud_mcp_native_sessions_from_value(&response).unwrap_or_else(|| response.clone());
+    let _ = app.emit(
+        CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT,
+        json!({
+            "kind": "native_sessions_status",
+            "event_kind": "native_sessions_status",
+            "contract": "diffforge.native_sessions.v1",
+            "reason": reason,
+            "payload": snapshot,
+        }),
+    );
+    Ok(response)
+}
+
+fn cloud_mcp_spawn_native_sessions_status_request(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    reason: &'static str,
+) {
+    let app = app.clone();
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) =
+            cloud_mcp_send_native_sessions_status_request(&app, &state, reason).await
+        {
+            log_cloud_sync_event(
+                "native_sessions.refresh_error",
+                json!({
+                    "reason": reason,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
         }
     });
 }
@@ -10645,6 +10851,20 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 "contract": "diffforge.account_usage.v1",
                 "reason": "global_ws_ready",
                 "payload": initial_account_usage,
+            }));
+        }
+        if let Some(initial_native_sessions) = message
+            .get("initial_native_sessions")
+            .or_else(|| message.get("initialNativeSessions"))
+            .cloned()
+            .filter(|value| !value.is_null())
+        {
+            let _ = state.global_ws_events.send(json!({
+                "kind": "native_sessions_status",
+                "event_kind": "native_sessions_status",
+                "contract": "diffforge.native_sessions.v1",
+                "reason": "global_ws_ready",
+                "payload": initial_native_sessions,
             }));
         }
         if let Some(initial_account_live_state) = message
@@ -11119,21 +11339,10 @@ async fn cloud_mcp_enqueue_tokenomics_snapshot_from_ack(state: &CloudMcpState, r
     let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() else {
         return;
     };
-    let _ = cloud_mcp_enqueue_tokenomics_sync(
-        app,
-        state,
-        reason.to_string(),
-        true,
-        false,
-    )
-    .await;
+    let _ = cloud_mcp_enqueue_tokenomics_sync(app, state, reason.to_string(), true, false).await;
 }
 
-async fn cloud_mcp_handle_tokenomics_ingest_ack(
-    state: &CloudMcpState,
-    ack: &Value,
-    source: &str,
-) {
+async fn cloud_mcp_handle_tokenomics_ingest_ack(state: &CloudMcpState, ack: &Value, source: &str) {
     match cloud_mcp_tokenomics_persist_ingest_ack(None, ack) {
         Ok(result) => {
             let requires_snapshot = result
@@ -11143,7 +11352,11 @@ async fn cloud_mcp_handle_tokenomics_ingest_ack(
                 .unwrap_or(false);
             cloud_mcp_record_tokenomics_sync_log(
                 "ingest_ack",
-                if requires_snapshot { "queued" } else { "synced" },
+                if requires_snapshot {
+                    "queued"
+                } else {
+                    "synced"
+                },
                 source,
                 json!({
                     "accepted": result.get("accepted").cloned().unwrap_or_else(|| json!(true)),
@@ -11248,8 +11461,7 @@ async fn cloud_mcp_send_tokenomics_delivery_ack(
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_tokenomics_device_id_from_profile(&device_profile)?;
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
-    let scope_key =
-        cloud_mcp_account_scope_key_from_parts(&billing_scope_type, team_id.as_deref());
+    let scope_key = cloud_mcp_account_scope_key_from_parts(&billing_scope_type, team_id.as_deref());
     let server_cursor = cloud_mcp_tokenomics_server_cursor_from_value(event).unwrap_or_default();
     let applied_server_cursor = recorded
         .and_then(cloud_mcp_tokenomics_server_cursor_from_value)
@@ -11259,16 +11471,14 @@ async fn cloud_mcp_send_tokenomics_delivery_ack(
         .and_then(|value| cloud_mcp_payload_u64(value, &["stored_count", "storedCount"]))
         .unwrap_or(0);
     let stored_limit_count = recorded
-        .and_then(|value| {
-            cloud_mcp_payload_u64(value, &["stored_limit_count", "storedLimitCount"])
-        })
+        .and_then(|value| cloud_mcp_payload_u64(value, &["stored_limit_count", "storedLimitCount"]))
         .unwrap_or(0);
     let stored_limit_sample_count = recorded
         .and_then(|value| {
-            cloud_mcp_payload_u64(value, &[
-                "stored_limit_sample_count",
-                "storedLimitSampleCount",
-            ])
+            cloud_mcp_payload_u64(
+                value,
+                &["stored_limit_sample_count", "storedLimitSampleCount"],
+            )
         })
         .unwrap_or(0);
     let status = if status.trim().is_empty() {
@@ -11343,8 +11553,7 @@ async fn cloud_mcp_send_tokenomics_account_delta_request(
     origin_delivery_event: Option<Value>,
 ) -> Result<Value, String> {
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
-    let scope_key =
-        cloud_mcp_account_scope_key_from_parts(&billing_scope_type, team_id.as_deref());
+    let scope_key = cloud_mcp_account_scope_key_from_parts(&billing_scope_type, team_id.as_deref());
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_tokenomics_device_id_from_profile(&device_profile)?;
     let cursor = if full {
@@ -11655,11 +11864,9 @@ fn cloud_mcp_tokenomics_wake_receipt_key(event: &Value) -> Option<String> {
     let day_start_ms = cloud_mcp_tokenomics_day_start_from_value(event)
         .map(|value| value.to_string())
         .unwrap_or_default();
-    let sync_day = cloud_mcp_tokenomics_response_text(
-        event,
-        &["sync_day", "syncDay", "day_key", "dayKey"],
-    )
-    .unwrap_or_default();
+    let sync_day =
+        cloud_mcp_tokenomics_response_text(event, &["sync_day", "syncDay", "day_key", "dayKey"])
+            .unwrap_or_default();
     let content_hash = cloud_mcp_tokenomics_day_content_hash_from_value(event).unwrap_or_default();
     let server_cursor = cloud_mcp_tokenomics_server_cursor_from_value(event).unwrap_or_default();
     if packet_id.is_empty()
@@ -12011,6 +12218,23 @@ async fn cloud_mcp_start_remote_command_listener(
                 let _ = app.emit(CLOUD_MCP_ACCOUNT_USAGE_EVENT, event.clone());
                 continue;
             }
+            if (contract == "diffforge.native_sessions.v1" || event_kind == "native_sessions_status")
+                && event_kind != "native_sessions_changed"
+            {
+                if cloud_mcp_native_sessions_from_value(&event).is_some() {
+                    let _ = app.emit(CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT, event.clone());
+                }
+                continue;
+            }
+            if event_kind == "native_sessions_changed" {
+                let _ = app.emit(CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT, event.clone());
+                cloud_mcp_spawn_native_sessions_status_request(
+                    &app,
+                    &state_clone,
+                    "native_sessions_changed",
+                );
+                continue;
+            }
             if event_kind == "account_device_live_state_snapshot" {
                 cloud_mcp_apply_audio_preferences_from_account_live_state(
                     &app,
@@ -12206,11 +12430,12 @@ async fn cloud_mcp_start_remote_command_listener(
                         }),
                     );
                 }
-                let origin_delivery_event = if cloud_mcp_tokenomics_delivery_id_from_value(&event).is_some() {
-                    Some(event.clone())
-                } else {
-                    None
-                };
+                let origin_delivery_event =
+                    if cloud_mcp_tokenomics_delivery_id_from_value(&event).is_some() {
+                        Some(event.clone())
+                    } else {
+                        None
+                    };
                 cloud_mcp_spawn_tokenomics_account_delta_request_with_origin(
                     &state_clone,
                     "tokenomics_delta_available",
@@ -13728,23 +13953,30 @@ fn cloud_mcp_default_audio_polishing_prompt() -> String {
 }
 
 fn cloud_mcp_audio_preferences_timestamp(value: &Value) -> u64 {
-    ["updated_at_ms", "updatedAtMs", "prompt_updated_at_ms", "promptUpdatedAtMs"]
-        .iter()
-        .find_map(|key| {
-            value
-                .get(*key)
-                .and_then(|candidate| {
+    [
+        "updated_at_ms",
+        "updatedAtMs",
+        "prompt_updated_at_ms",
+        "promptUpdatedAtMs",
+    ]
+    .iter()
+    .find_map(|key| {
+        value.get(*key).and_then(|candidate| {
+            candidate
+                .as_u64()
+                .or_else(|| {
                     candidate
-                        .as_u64()
-                        .or_else(|| candidate.as_i64().and_then(|number| u64::try_from(number).ok()))
-                        .or_else(|| {
-                            candidate
-                                .as_str()
-                                .and_then(|text| text.trim().parse::<u64>().ok())
-                        })
+                        .as_i64()
+                        .and_then(|number| u64::try_from(number).ok())
+                })
+                .or_else(|| {
+                    candidate
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<u64>().ok())
                 })
         })
-        .unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 fn cloud_mcp_sanitize_audio_preferences(value: &Value) -> Option<Value> {
@@ -13787,8 +14019,14 @@ fn cloud_mcp_sanitize_audio_preferences(value: &Value) -> Option<Value> {
     let mut object = serde_json::Map::new();
     object.insert("polishing_system_prompt".to_string(), json!(prompt.clone()));
     object.insert("polishingSystemPrompt".to_string(), json!(prompt));
-    object.insert("max_chars".to_string(), json!(CLOUD_MCP_AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS));
-    object.insert("maxChars".to_string(), json!(CLOUD_MCP_AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS));
+    object.insert(
+        "max_chars".to_string(),
+        json!(CLOUD_MCP_AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS),
+    );
+    object.insert(
+        "maxChars".to_string(),
+        json!(CLOUD_MCP_AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS),
+    );
     object.insert("updated_at_ms".to_string(), json!(updated_at_ms));
     object.insert("updatedAtMs".to_string(), json!(updated_at_ms));
     Some(Value::Object(object))
@@ -13809,7 +14047,10 @@ fn cloud_mcp_audio_preferences_from_app(app: &AppHandle) -> Value {
     })
 }
 
-fn cloud_mcp_audio_preferences_write_app(app: &AppHandle, preferences: &Value) -> Result<(), String> {
+fn cloud_mcp_audio_preferences_write_app(
+    app: &AppHandle,
+    preferences: &Value,
+) -> Result<(), String> {
     app_local_state_write(app, CLOUD_MCP_AUDIO_PREFERENCES_STATE_KEY, preferences)
 }
 
@@ -15227,15 +15468,14 @@ fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (S
         item.insert("terminals".to_string(), Value::Array(terminals));
     }
     if workspace.get("mcps").is_some() || workspace.get("servers").is_some() {
-        let mcps = cloud_mcp_live_state_values(
-            workspace
-                .get("mcps")
-                .or_else(|| workspace.get("servers")),
-        )
-        .into_iter()
-        .enumerate()
-        .map(|(server_index, server)| cloud_mcp_compact_mcp_live_state(&server, server_index))
-        .collect::<Vec<_>>();
+        let mcps =
+            cloud_mcp_live_state_values(workspace.get("mcps").or_else(|| workspace.get("servers")))
+                .into_iter()
+                .enumerate()
+                .map(|(server_index, server)| {
+                    cloud_mcp_compact_mcp_live_state(&server, server_index)
+                })
+                .collect::<Vec<_>>();
         item.entry("mcp_server_count".to_string())
             .or_insert_with(|| json!(mcps.len()));
         item.insert("mcps".to_string(), Value::Array(mcps));
@@ -15252,11 +15492,20 @@ fn cloud_mcp_compact_mcp_live_state(server: &Value, index: usize) -> Value {
     let mut item = serde_json::Map::new();
     item.insert("server_key".to_string(), json!(server_key));
     for (key, aliases) in [
-        ("name", &["name", "label", "display_name", "displayName"][..]),
+        (
+            "name",
+            &["name", "label", "display_name", "displayName"][..],
+        ),
         ("version", &["version"][..]),
         ("transport", &["transport"][..]),
-        ("install_state", &["install_state", "installState", "status", "state"][..]),
-        ("workspace_enabled", &["workspace_enabled", "workspaceEnabled", "enabled"][..]),
+        (
+            "install_state",
+            &["install_state", "installState", "status", "state"][..],
+        ),
+        (
+            "workspace_enabled",
+            &["workspace_enabled", "workspaceEnabled", "enabled"][..],
+        ),
         ("tool_count", &["tool_count", "toolCount"][..]),
     ] {
         cloud_mcp_compact_insert_value(&mut item, key, server, aliases);
@@ -15450,10 +15699,16 @@ fn cloud_mcp_device_live_sync_identity_from_payload(
     })?;
     let sync_unit = cloud_mcp_payload_text(payload, &["sync_unit", "syncUnit"])
         .unwrap_or_else(|| "device_live_state_snapshot".to_string());
-    let hash_seed = cloud_mcp_outbox_stable_snapshot_hash_value("device_live_state_snapshot", payload);
+    let hash_seed =
+        cloud_mcp_outbox_stable_snapshot_hash_value("device_live_state_snapshot", payload);
     let content_hash = cloud_mcp_payload_text(
         payload,
-        &["sync_content_hash", "syncContentHash", "content_hash", "contentHash"],
+        &[
+            "sync_content_hash",
+            "syncContentHash",
+            "content_hash",
+            "contentHash",
+        ],
     )
     .unwrap_or_else(|| cloud_mcp_outbox_payload_hash(&hash_seed));
     let payload_hash = cloud_mcp_payload_text(payload, &["payload_hash", "payloadHash"])
@@ -15551,13 +15806,25 @@ fn cloud_mcp_device_live_mark_sync_acked_from_payload(
     let response_data = response.get("data").filter(|value| value.is_object());
     let server_cursor = cloud_mcp_payload_text(
         response,
-        &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+        &[
+            "server_cursor",
+            "serverCursor",
+            "sync_cursor",
+            "syncCursor",
+            "revision",
+        ],
     )
     .or_else(|| {
         response_data.and_then(|data| {
             cloud_mcp_payload_text(
                 data,
-                &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+                &[
+                    "server_cursor",
+                    "serverCursor",
+                    "sync_cursor",
+                    "syncCursor",
+                    "revision",
+                ],
             )
         })
     })
@@ -15675,9 +15942,10 @@ fn cloud_mcp_device_live_known_sync_units(
         ))
         .map_err(|error| format!("Unable to prepare device live-state sync unit query: {error}"))?;
     let rows = statement
-        .query_map(rusqlite::params![scope_key, device_id, like_prefix], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(
+            rusqlite::params![scope_key, device_id, like_prefix],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(|error| format!("Unable to query device live-state sync units: {error}"))?;
     Ok(rows.flatten().collect())
 }
@@ -15723,6 +15991,19 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop".to_string());
+    let (connection_id, session_started_at_ms) = {
+        let runtime = state.inner.lock().await;
+        (
+            runtime.global_ws_connection_id.clone(),
+            runtime
+                .global_ws_last_connected_ms
+                .or(runtime.last_connected_ms),
+        )
+    };
+    let session_started_at_ms = session_started_at_ms.unwrap_or_else(cloud_mcp_now_ms);
+    let session_id = connection_id
+        .clone()
+        .unwrap_or_else(|| format!("desktop-session-{}-{session_started_at_ms}", device_id));
     let mut workspaces = serde_json::Map::new();
     let mut app_context = Value::Null;
     let mut has_app_context = false;
@@ -15791,6 +16072,24 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let mut payload = json!({
         "source": "rust-diffforge-device-live-state",
         "reason": reason,
+        "device_id": device_id.clone(),
+        "machine_id": device_id.clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "client_type": device_profile["client_type"].clone(),
+        "connection_source": device_profile["connection_source"].clone(),
+        "connection_id": connection_id.clone(),
+        "session_id": session_id,
+        "session_started_at": session_started_at_ms,
+        "last_connected_at": session_started_at_ms,
+        "updated_at_ms": cloud_mcp_now_ms(),
+        "ts_ms": cloud_mcp_now_ms(),
+        "status": "connected",
+        "connected": true,
+        "native_connected": true,
         "device": {
             "id": device_id.clone(),
             "name": device_profile["device_name"].clone(),
@@ -15881,7 +16180,8 @@ async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, rea
         .await
         {
             Ok(response) => {
-                let _ = cloud_mcp_device_live_mark_sync_acked_from_payload(Some(&payload), &response);
+                let _ =
+                    cloud_mcp_device_live_mark_sync_acked_from_payload(Some(&payload), &response);
                 log_terminal_status_event(
                     "backend.cloud_mcp.device_live_state.ws.sent",
                     json!({
@@ -16540,14 +16840,14 @@ fn cloud_mcp_probe_local_http_health(url: &str, timeout_duration: Duration) -> b
         return false;
     };
     for address in cloud_mcp_local_health_socket_addrs(&host, port) {
-        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, timeout_duration) else {
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, timeout_duration)
+        else {
             continue;
         };
         let _ = stream.set_read_timeout(Some(timeout_duration));
         let _ = stream.set_write_timeout(Some(timeout_duration));
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-        );
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
         if stream.write_all(request.as_bytes()).is_err() {
             continue;
         }
@@ -21526,9 +21826,12 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
             "reason": reason,
             "ts_ms": cloud_mcp_now_ms(),
         });
-        let response =
-            cloud_mcp_sync_device_live_unit_event(state, "device_agent_installation_status", unit_payload)
-                .await?;
+        let response = cloud_mcp_sync_device_live_unit_event(
+            state,
+            "device_agent_installation_status",
+            unit_payload,
+        )
+        .await?;
         if response
             .get("skipped")
             .and_then(Value::as_bool)
@@ -23619,7 +23922,9 @@ fn cloud_mcp_restore_empty_workspace_snapshot_after_delete(
     count_kind: &str,
 ) {
     if removed > 0 && snapshot.is_none() {
-        *snapshot = Some(cloud_mcp_empty_workspace_snapshot(source, reason, count_kind));
+        *snapshot = Some(cloud_mcp_empty_workspace_snapshot(
+            source, reason, count_kind,
+        ));
     }
 }
 
@@ -24695,7 +25000,11 @@ fn cloud_mcp_architecture_graph_from_payload(payload: &Value) -> &Value {
     payload
         .get("graph")
         .filter(|value| value.is_object())
-        .or_else(|| payload.get("architecture").filter(|value| value.is_object()))
+        .or_else(|| {
+            payload
+                .get("architecture")
+                .filter(|value| value.is_object())
+        })
         .or_else(|| {
             payload
                 .get("graphs")
@@ -24724,14 +25033,17 @@ fn cloud_mcp_architecture_sync_identity_from_payload(
         &["device_id", "deviceId", "machine_id", "machineId"],
     )
     .or_else(|| {
-        cloud_mcp_payload_text(
-            graph,
-            &["device_id", "deviceId", "machine_id", "machineId"],
-        )
+        cloud_mcp_payload_text(graph, &["device_id", "deviceId", "machine_id", "machineId"])
     })?;
     let graph_id = cloud_mcp_payload_text(
         payload,
-        &["graph_id", "graphId", "architecture_id", "architectureId", "id"],
+        &[
+            "graph_id",
+            "graphId",
+            "architecture_id",
+            "architectureId",
+            "id",
+        ],
     )
     .or_else(|| {
         let value = cloud_mcp_architecture_graph_id(graph);
@@ -24816,16 +25128,30 @@ fn cloud_mcp_architecture_mark_sync_acked_from_payload(
     let response_payload = response
         .get("payload")
         .filter(|value| value.is_object())
-        .or_else(|| response_data.and_then(|data| data.get("payload").filter(|value| value.is_object())));
+        .or_else(|| {
+            response_data.and_then(|data| data.get("payload").filter(|value| value.is_object()))
+        });
     let server_cursor = cloud_mcp_payload_text(
         response,
-        &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+        &[
+            "server_cursor",
+            "serverCursor",
+            "sync_cursor",
+            "syncCursor",
+            "revision",
+        ],
     )
     .or_else(|| {
         response_data.and_then(|data| {
             cloud_mcp_payload_text(
                 data,
-                &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+                &[
+                    "server_cursor",
+                    "serverCursor",
+                    "sync_cursor",
+                    "syncCursor",
+                    "revision",
+                ],
             )
         })
     })
@@ -24833,7 +25159,13 @@ fn cloud_mcp_architecture_mark_sync_acked_from_payload(
         response_payload.and_then(|payload| {
             cloud_mcp_payload_text(
                 payload,
-                &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+                &[
+                    "server_cursor",
+                    "serverCursor",
+                    "sync_cursor",
+                    "syncCursor",
+                    "revision",
+                ],
             )
         })
     })
@@ -24942,16 +25274,14 @@ fn cloud_mcp_architecture_delta_payload(base: &Value, graph: Value) -> Option<Va
     let content_hash = cloud_mcp_architecture_graph_content_hash(&graph);
     let scope_key =
         cloud_mcp_payload_scope_key(base).unwrap_or_else(cloud_mcp_process_account_scope_key);
-    let device_id = cloud_mcp_payload_text(
-        base,
-        &["device_id", "deviceId", "machine_id", "machineId"],
-    )
-    .unwrap_or_else(|| {
-        cloud_mcp_desktop_device_profile()["device_id"]
-            .as_str()
-            .unwrap_or("rust-diffforge-desktop")
-            .to_string()
-    });
+    let device_id =
+        cloud_mcp_payload_text(base, &["device_id", "deviceId", "machine_id", "machineId"])
+            .unwrap_or_else(|| {
+                cloud_mcp_desktop_device_profile()["device_id"]
+                    .as_str()
+                    .unwrap_or("rust-diffforge-desktop")
+                    .to_string()
+            });
     let idempotency_key =
         format!("architecture-graph:{scope_key}:{device_id}:{graph_id}:{content_hash}");
     let mut payload = base.clone();
@@ -24965,7 +25295,10 @@ fn cloud_mcp_architecture_delta_payload(base: &Value, graph: Value) -> Option<Va
         object.insert("payload_hash".to_string(), json!(content_hash.clone()));
         object.insert("idempotency_key".to_string(), json!(idempotency_key));
         object.insert("sync_unit".to_string(), json!("architecture_graph"));
-        object.insert("fanout_contract".to_string(), json!("diffforge.architectures.v1"));
+        object.insert(
+            "fanout_contract".to_string(),
+            json!("diffforge.architectures.v1"),
+        );
         object.insert("content_transport".to_string(), json!("delta"));
         object.insert("snapshot_full".to_string(), json!(false));
         object.insert("graphs".to_string(), json!([graph.clone()]));
@@ -25239,7 +25572,10 @@ pub(crate) async fn cloud_mcp_sync_workspace_architectures_internal(
         }
         responses.push(response);
         if total_count > 1 {
-            sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS)).await;
+            sleep(Duration::from_millis(
+                CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS,
+            ))
+            .await;
         }
     }
 
@@ -26392,11 +26728,11 @@ fn cloud_mcp_account_asset_outbox_key(request_kind: &str, payload: &Value) -> St
     {
         return format!("asset:{scope_key}:{request_kind}:transfer:{transfer_id}");
     }
-    if let Some(asset_id) = cloud_mcp_payload_text(payload, &["asset_id", "assetId", "id"])
-        .or_else(|| {
-            payload.get("asset").and_then(|asset| {
-                cloud_mcp_payload_text(asset, &["asset_id", "assetId", "id"])
-            })
+    if let Some(asset_id) =
+        cloud_mcp_payload_text(payload, &["asset_id", "assetId", "id"]).or_else(|| {
+            payload
+                .get("asset")
+                .and_then(|asset| cloud_mcp_payload_text(asset, &["asset_id", "assetId", "id"]))
         })
     {
         return format!("asset:{scope_key}:{request_kind}:{device_id}:{asset_id}");
@@ -26408,10 +26744,13 @@ fn cloud_mcp_account_asset_outbox_key(request_kind: &str, payload: &Value) -> St
 }
 
 fn cloud_mcp_asset_registration_fingerprint(payload: &Value) -> String {
-    let local_path = cloud_mcp_payload_text(payload, &["local_path", "localPath", "path"])
-        .unwrap_or_default();
-    let local_available =
-        cloud_mcp_payload_bool(payload, &["local_available", "localAvailable"], !local_path.is_empty());
+    let local_path =
+        cloud_mcp_payload_text(payload, &["local_path", "localPath", "path"]).unwrap_or_default();
+    let local_available = cloud_mcp_payload_bool(
+        payload,
+        &["local_available", "localAvailable"],
+        !local_path.is_empty(),
+    );
     let local_status = cloud_mcp_payload_text(payload, &["local_status", "localStatus"])
         .unwrap_or_else(|| {
             if local_available {
@@ -26459,18 +26798,26 @@ fn cloud_mcp_asset_attach_sync_identity(payload: &mut Value) {
     .unwrap_or_default();
     let asset_id =
         cloud_mcp_payload_text(payload, &["asset_id", "assetId", "id"]).unwrap_or_default();
-    let idempotency_key =
-        format!("asset-device:{scope_key}:{device_id}:{asset_id}:{fingerprint}");
+    let idempotency_key = format!("asset-device:{scope_key}:{device_id}:{asset_id}:{fingerprint}");
     if let Some(object) = payload.as_object_mut() {
-        object.insert("asset_sync_protocol".to_string(), json!("diffforge.asset_device.v1"));
-        object.insert("assetSyncProtocol".to_string(), json!("diffforge.asset_device.v1"));
+        object.insert(
+            "asset_sync_protocol".to_string(),
+            json!("diffforge.asset_device.v1"),
+        );
+        object.insert(
+            "assetSyncProtocol".to_string(),
+            json!("diffforge.asset_device.v1"),
+        );
         object.insert("asset_fingerprint".to_string(), json!(fingerprint.clone()));
         object.insert("assetFingerprint".to_string(), json!(fingerprint.clone()));
         object.insert("local_fingerprint".to_string(), json!(fingerprint.clone()));
         object.insert("localFingerprint".to_string(), json!(fingerprint.clone()));
         object.insert("payload_hash".to_string(), json!(fingerprint.clone()));
         object.insert("payloadHash".to_string(), json!(fingerprint.clone()));
-        object.insert("idempotency_key".to_string(), json!(idempotency_key.clone()));
+        object.insert(
+            "idempotency_key".to_string(),
+            json!(idempotency_key.clone()),
+        );
         object.insert("idempotencyKey".to_string(), json!(idempotency_key));
     }
 }
@@ -26594,7 +26941,13 @@ fn cloud_mcp_asset_mark_sync_acked_from_payload(
     };
     let server_cursor = cloud_mcp_payload_text(
         response,
-        &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+        &[
+            "server_cursor",
+            "serverCursor",
+            "sync_cursor",
+            "syncCursor",
+            "revision",
+        ],
     )
     .unwrap_or_default();
     let conn = cloud_mcp_open_asset_library_conn()?;
@@ -26666,7 +27019,8 @@ fn cloud_mcp_asset_sync_decision(
                         return Ok(CloudMcpAssetDeviceSyncDecision::CurrentPending);
                     }
                     Some("acked") => {
-                        let _ = cloud_mcp_asset_mark_sync_acked_from_payload(Some(payload), payload);
+                        let _ =
+                            cloud_mcp_asset_mark_sync_acked_from_payload(Some(payload), payload);
                         return Ok(CloudMcpAssetDeviceSyncDecision::CurrentAcked);
                     }
                     _ => {}
@@ -26675,10 +27029,13 @@ fn cloud_mcp_asset_sync_decision(
         }
     }
     if let Some(acked_at_ms) = cloud_mcp_outbox_acked_at_for_idempotency(&idempotency_key) {
-        let _ = cloud_mcp_asset_mark_sync_acked_from_payload(Some(payload), &json!({
-            "acked_at_ms": acked_at_ms,
-            "ackedAtMs": acked_at_ms,
-        }));
+        let _ = cloud_mcp_asset_mark_sync_acked_from_payload(
+            Some(payload),
+            &json!({
+                "acked_at_ms": acked_at_ms,
+                "ackedAtMs": acked_at_ms,
+            }),
+        );
         return Ok(CloudMcpAssetDeviceSyncDecision::CurrentAcked);
     }
     Ok(CloudMcpAssetDeviceSyncDecision::Enqueue)
@@ -26730,8 +27087,14 @@ fn cloud_mcp_account_asset_inventory_payloads(reason: &str) -> Vec<Value> {
             if let Some(object) = payload.as_object_mut() {
                 object.insert("inventory_sync".to_string(), json!(true));
                 object.insert("inventorySync".to_string(), json!(true));
-                object.insert("fanout_contract".to_string(), json!("diffforge.account_assets.v1"));
-                object.insert("fanoutContract".to_string(), json!("diffforge.account_assets.v1"));
+                object.insert(
+                    "fanout_contract".to_string(),
+                    json!("diffforge.account_assets.v1"),
+                );
+                object.insert(
+                    "fanoutContract".to_string(),
+                    json!("diffforge.account_assets.v1"),
+                );
             }
             match cloud_mcp_asset_sync_decision(&payload) {
                 Ok(CloudMcpAssetDeviceSyncDecision::CurrentAcked)
@@ -26758,7 +27121,10 @@ fn cloud_mcp_spawn_account_asset_inventory_sync(state: &CloudMcpState, reason: &
                 &reason,
             )
             .await;
-            sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS)).await;
+            sleep(Duration::from_millis(
+                CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS,
+            ))
+            .await;
         }
     });
 }
@@ -27585,7 +27951,11 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
     ] {
         if let Some(items) = payload.get(key).and_then(Value::as_array) {
             for item in items {
-                if let Some(todo_id) = item.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+                if let Some(todo_id) = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
                     if !removed_todo_ids.iter().any(|existing| existing == todo_id) {
                         removed_todo_ids.push(todo_id.to_string());
                     }
@@ -27607,7 +27977,12 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
     for row in todo_rows {
         let row_workspace_id = cloud_mcp_payload_text(
             &row,
-            &["workspace_id", "workspaceId", "todo_workspace_id", "todoWorkspaceId"],
+            &[
+                "workspace_id",
+                "workspaceId",
+                "todo_workspace_id",
+                "todoWorkspaceId",
+            ],
         )
         .unwrap_or_else(|| workspace_id.clone());
         let deleted = cloud_mcp_payload_bool(&row, &["deleted", "tombstoned"], false)
@@ -27615,14 +27990,14 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
             || cloud_mcp_payload_text(&row, &["deleted_at", "deletedAt"])
                 .filter(|value| !value.trim().is_empty())
                 .is_some();
-        let todo = match cloud_mcp_normalize_workspace_todo_for_sync(&row_workspace_id, &row, deleted)
-        {
-            Ok(todo) => todo,
-            Err(error) => {
-                first_error.get_or_insert(error);
-                continue;
-            }
-        };
+        let todo =
+            match cloud_mcp_normalize_workspace_todo_for_sync(&row_workspace_id, &row, deleted) {
+                Ok(todo) => todo,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
         let Some(todo_id) = cloud_mcp_workspace_todo_id(&todo) else {
             continue;
         };
@@ -36184,7 +36559,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn device_limit_normalization_preserves_explicit_values() {
-        assert_eq!(cloud_mcp_device_limit_from_value(Some(11), "plus"), Some(11));
+        assert_eq!(
+            cloud_mcp_device_limit_from_value(Some(11), "plus"),
+            Some(11)
+        );
         assert_eq!(cloud_mcp_device_limit_from_value(Some(0), "ultra"), Some(0));
         assert_eq!(cloud_mcp_device_limit_from_value(None, "pro"), Some(7));
     }
@@ -36257,21 +36635,40 @@ mod cloud_mcp_tests {
 
         assert_eq!(items.len(), 2);
         assert!(items.iter().any(|item| {
-            item.get("display_name").and_then(Value::as_str)
-                == Some("Samsung Galaxy S23 Ultra")
+            item.get("display_name").and_then(Value::as_str) == Some("Samsung Galaxy S23 Ultra")
         }));
         assert_eq!(
-            registry.get("workspaces").and_then(Value::as_array).map(Vec::len),
+            registry
+                .get("workspaces")
+                .and_then(Value::as_array)
+                .map(Vec::len),
             Some(1)
         );
         assert_eq!(
-            registry.get("agents").and_then(Value::as_array).map(Vec::len),
+            registry
+                .get("agents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
             Some(1)
         );
-        assert_eq!(merged.get("registered_device_count").and_then(Value::as_u64), Some(2));
-        assert_eq!(merged.get("known_device_count").and_then(Value::as_u64), Some(2));
-        assert_eq!(merged.get("registeredDevices"), merged.get("registered_devices"));
-        assert_eq!(merged.get("deviceRegistry"), merged.get("registered_devices"));
+        assert_eq!(
+            merged
+                .get("registered_device_count")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            merged.get("known_device_count").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            merged.get("registeredDevices"),
+            merged.get("registered_devices")
+        );
+        assert_eq!(
+            merged.get("deviceRegistry"),
+            merged.get("registered_devices")
+        );
     }
 
     struct ScopedCloudMcpEnv {
@@ -37967,10 +38364,22 @@ mod cloud_mcp_tests {
 
         assert_eq!(buckets.len(), 2);
         assert_ne!(buckets[0].content_hash, buckets[1].content_hash);
-        assert_eq!(buckets[0].summary["hourly"].as_array().map(Vec::len), Some(1));
-        assert_eq!(buckets[1].summary["hourly"].as_array().map(Vec::len), Some(1));
-        assert_eq!(buckets[0].summary["limits"].as_array().map(Vec::len), Some(0));
-        assert_eq!(buckets[1].summary["limits"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            buckets[0].summary["hourly"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            buckets[1].summary["hourly"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            buckets[0].summary["limits"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            buckets[1].summary["limits"].as_array().map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -38205,9 +38614,7 @@ mod cloud_mcp_tests {
             }
         });
 
-        assert!(!cloud_mcp_tokenomics_strict_ingest_ack_response(
-            &response
-        ));
+        assert!(!cloud_mcp_tokenomics_strict_ingest_ack_response(&response));
         let ack = cloud_mcp_tokenomics_persist_ingest_ack(None, &response).unwrap();
         assert_eq!(ack["accepted"].as_bool(), Some(false));
         assert_eq!(ack["ignored"].as_bool(), Some(true));
@@ -38226,9 +38633,7 @@ mod cloud_mcp_tests {
             }
         });
 
-        assert!(cloud_mcp_tokenomics_strict_ingest_ack_response(
-            &response
-        ));
+        assert!(cloud_mcp_tokenomics_strict_ingest_ack_response(&response));
         assert_eq!(
             cloud_mcp_tokenomics_server_cursor_from_value(&response).as_deref(),
             Some("server-cursor-7")

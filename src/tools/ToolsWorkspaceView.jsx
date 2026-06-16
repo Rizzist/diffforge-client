@@ -25,6 +25,11 @@ const SECTIONS = [
 export const GLOBAL_MCP_DEFAULTS_SCOPE = "global-defaults";
 const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID = "account-global-mcp-defaults";
 
+function normalizedSectionId(value, fallback = "architectures") {
+  const normalized = text(value);
+  return SECTIONS.some((entry) => entry.id === normalized) ? normalized : fallback;
+}
+
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
   return normalized || fallback;
@@ -77,9 +82,12 @@ export default function ToolsWorkspaceView({
   initialSection = "",
   workspaces = [],
 }) {
-  const [section, setSection] = useState(() => (
-    SECTIONS.some((entry) => entry.id === text(initialSection)) ? text(initialSection) : "architectures"
-  ));
+  const [section, setSection] = useState(() => normalizedSectionId(initialSection));
+
+  useEffect(() => {
+    const nextSection = normalizedSectionId(initialSection);
+    setSection((current) => (current === nextSection ? current : nextSection));
+  }, [initialSection]);
 
   // ---- MCP scope (global defaults vs per-workspace) ----
   const [mcpScope, setMcpScope] = useState(GLOBAL_MCP_DEFAULTS_SCOPE);
@@ -569,14 +577,6 @@ export default function ToolsWorkspaceView({
   return (
     <ToolsHubShell aria-label="Global toolkit" data-section={section}>
       <ToolsHubHeader>
-        <div>
-          <ToolsKicker>Toolkit</ToolsKicker>
-          <ToolsHeading>Architectures, MCPs, Skills &amp; CLIs</ToolsHeading>
-          <ToolsHint>
-            Architectures and skills sync at the account level; CLIs live on this device.
-            MCPs have global defaults plus per-workspace settings.
-          </ToolsHint>
-        </div>
         <ToolsSectionNav aria-label="Tool sections" role="tablist">
           {SECTIONS.map((entry) => (
             <ToolsSectionButton
@@ -961,6 +961,8 @@ export default function ToolsWorkspaceView({
 }
 
 const ToolsHubShell = styled.section`
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
@@ -971,17 +973,22 @@ const ToolsHubShell = styled.section`
 `;
 
 const ToolsHubHeader = styled.header`
+  position: sticky;
+  top: 0;
+  z-index: 30;
   display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  align-items: center;
   min-width: 0;
-  padding: 14px 16px 10px;
+  min-height: 40px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  background: rgba(5, 8, 13, 0.96);
+  backdrop-filter: blur(12px);
 `;
 
 const ToolsHubFill = styled.div`
+  position: relative;
+  z-index: 0;
   display: grid;
   /* Explicit bounded row: without it the implicit auto row sizes to content,
      the child's height:100% resolves as auto, and the inner scroll pane gets
@@ -1024,45 +1031,32 @@ const ToolsLayout = styled.section`
   min-width: 0;
 `;
 
-const ToolsKicker = styled.span`
-  display: block;
-  color: var(--forge-text-muted, #7a8493);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-`;
-
-const ToolsHeading = styled.h2`
-  margin: 2px 0 4px;
-  font-size: 18px;
-  font-weight: 800;
-`;
-
-const ToolsHint = styled.p`
-  margin: 0;
-  color: var(--forge-text-muted, #7a8493);
-  font-size: 12px;
-`;
-
 const ToolsSectionNav = styled.nav`
   display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
   gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
   padding: 3px;
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
   border-radius: 9px;
-  background: rgba(7, 9, 13, 0.5);
+  background: rgba(7, 9, 13, 0.56);
 `;
 
 const ToolsSectionButton = styled.button`
-  padding: 6px 14px;
+  position: relative;
+  min-height: 26px;
+  padding: 0 12px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 6px;
   color: var(--forge-text-muted, #7a8493);
   background: transparent;
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 11px;
+  font-weight: 760;
   cursor: pointer;
+  white-space: nowrap;
 
   &[data-active="true"] {
     color: var(--forge-text, #f4f7fa);

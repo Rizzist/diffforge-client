@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
+import { availableMonitors, currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -28,6 +28,7 @@ import {
   AUDIO_WIDGET_THEME_LIGHT,
   AUDIO_WIDGET_THEME_STORAGE_KEY,
   AUDIO_PREFERENCES_CHANGED_EVENT,
+  DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT,
   MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS,
   applySyncedAudioPolishingPreferences,
   arrayBufferToBase64,
@@ -345,6 +346,8 @@ import {
   AudioWidgetShell,
   AudioWidgetCancelButton,
   AudioWidgetErrorPopover,
+  AudioWidgetErrorOverlayCard,
+  AudioWidgetErrorOverlayShell,
   AudioWidgetLockBadge,
   AudioBarShell,
   AudioBarSurface,
@@ -505,7 +508,10 @@ import { playNotificationSfx } from "../notifications/notificationSfx";
 
 export const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT = "forge-audio-model-download-progress";
 export const AUDIO_WIDGET_HASH = "#/audio-widget";
+export const AUDIO_WIDGET_ERROR_HASH = "#/audio-widget-error";
 export const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT = "forge-audio-widget-visibility-changed";
+const AUDIO_WIDGET_ERROR_OVERLAY_EVENT = "forge-audio-widget-error-overlay";
+const AUDIO_WIDGET_ERROR_OVERLAY_STORAGE_KEY = "diffforge.audio.widgetErrorOverlay.v1";
 const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
@@ -542,6 +548,10 @@ const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 const AUDIO_WIDGET_HISTORY_TRAY_SIZE = { width: 64, height: 98 };
 const AUDIO_WIDGET_BUBBLE_DRAG_DEBUG_SAMPLE_MS = 160;
+const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_SAMPLE_MS = 90;
+const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_STABLE_SAMPLES = 3;
+const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_MAX_MS = 1400;
+const AUDIO_WIDGET_BUBBLE_VISIBLE_MARGIN = 8;
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
@@ -561,6 +571,8 @@ const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 34;
 const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP = 14;
+const AUDIO_WIDGET_ERROR_OVERLAY_SIZE = { width: 432, height: 64 };
+const AUDIO_WIDGET_ERROR_OVERLAY_GAP = 6;
 // Extra window height for the small error card shown above the bubble; the
 // window shifts up by the same amount so the pill stays put on screen.
 const AUDIO_WIDGET_ERROR_POPOVER_HEIGHT = 62;
@@ -627,8 +639,8 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
   },
 ];
 
-function getAudioWidgetBarGeometry(cancelNoticeActive, errorFrameActive, barVisible) {
-  if (cancelNoticeActive || errorFrameActive) {
+function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible) {
+  if (cancelNoticeActive) {
     return {
       key: "notice",
       margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
@@ -767,6 +779,172 @@ function normalizeAudioWidgetBubblePlacement(value) {
     x: Math.round(x),
     y: Math.round(y),
   };
+}
+
+function normalizeAudioWidgetErrorOverlayPayload(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const message = String(value.message || "").trim();
+  if (!message) {
+    return null;
+  }
+
+  return {
+    id: String(value.id || `${Date.now()}`),
+    message,
+    theme: normalizeAudioWidgetTheme(value.theme),
+    visible: value.visible !== false,
+  };
+}
+
+function readAudioWidgetErrorOverlayPayload() {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+
+  try {
+    return normalizeAudioWidgetErrorOverlayPayload(JSON.parse(
+      window.localStorage.getItem(AUDIO_WIDGET_ERROR_OVERLAY_STORAGE_KEY) || "null",
+    ));
+  } catch {
+    return null;
+  }
+}
+
+function writeAudioWidgetErrorOverlayPayload(payload) {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return;
+  }
+
+  try {
+    if (!payload) {
+      window.localStorage.removeItem(AUDIO_WIDGET_ERROR_OVERLAY_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(AUDIO_WIDGET_ERROR_OVERLAY_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Best effort only; the Tauri event still carries the live payload.
+  }
+}
+
+function publishAudioWidgetErrorOverlay(payload) {
+  writeAudioWidgetErrorOverlayPayload(payload);
+  emit(AUDIO_WIDGET_ERROR_OVERLAY_EVENT, payload || { visible: false }).catch(() => {});
+}
+
+function audioWidgetBubblePhysicalSizeFromLogical(size, scale = 1) {
+  const width = Number(size?.width);
+  const height = Number(size?.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+
+  const normalizedScale = Number(scale || 1) || 1;
+  return {
+    width: Math.max(1, Math.round(width * normalizedScale)),
+    height: Math.max(1, Math.round(height * normalizedScale)),
+  };
+}
+
+function audioWidgetBubbleMonitorArea(monitor) {
+  if (!monitor) {
+    return null;
+  }
+
+  const area = monitor.workArea?.size?.width && monitor.workArea?.size?.height
+    ? monitor.workArea
+    : { position: monitor.position, size: monitor.size };
+  const position = audioWidgetBubblePositionPoint(area?.position);
+  const size = audioWidgetBubblePositionSize(area?.size);
+  if (!position || !size) {
+    return null;
+  }
+
+  return { position, size };
+}
+
+function clampAudioWidgetBubblePlacementToMonitor(
+  position,
+  monitor,
+  size,
+  fallbackLogicalSize = AUDIO_WIDGET_COMPACT_SIZE,
+) {
+  const normalized = normalizeAudioWidgetBubblePlacement(position);
+  const area = audioWidgetBubbleMonitorArea(monitor);
+  if (!normalized || !area) {
+    return normalized;
+  }
+
+  const scale = Number(monitor?.scaleFactor || 1) || 1;
+  const physicalSize = audioWidgetBubblePositionSize(size)
+    || audioWidgetBubblePhysicalSizeFromLogical(fallbackLogicalSize, scale)
+    || audioWidgetBubblePhysicalSizeFromLogical(AUDIO_WIDGET_COMPACT_SIZE, scale);
+  if (!physicalSize) {
+    return normalized;
+  }
+
+  const margin = Math.max(0, Math.round(AUDIO_WIDGET_BUBBLE_VISIBLE_MARGIN * scale));
+  const minX = area.position.x + margin;
+  const minY = area.position.y + margin;
+  const maxX = area.position.x + area.size.width - physicalSize.width - margin;
+  const maxY = area.position.y + area.size.height - physicalSize.height - margin;
+  const fallbackX = area.position.x + Math.max(0, Math.round((area.size.width - physicalSize.width) / 2));
+  const fallbackY = area.position.y + Math.max(0, Math.round((area.size.height - physicalSize.height) / 2));
+
+  return {
+    x: Math.round(maxX < minX ? fallbackX : Math.min(Math.max(normalized.x, minX), maxX)),
+    y: Math.round(maxY < minY ? fallbackY : Math.min(Math.max(normalized.y, minY), maxY)),
+  };
+}
+
+function audioWidgetBubblePlacementChanged(first, second) {
+  const left = normalizeAudioWidgetBubblePlacement(first);
+  const right = normalizeAudioWidgetBubblePlacement(second);
+  return Boolean(left && right && (left.x !== right.x || left.y !== right.y));
+}
+
+function audioWidgetBubbleMonitorDistance(position, monitor) {
+  const normalized = normalizeAudioWidgetBubblePlacement(position);
+  const area = audioWidgetBubbleMonitorArea(monitor);
+  if (!normalized || !area) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const maxX = area.position.x + area.size.width;
+  const maxY = area.position.y + area.size.height;
+  const dx = normalized.x < area.position.x
+    ? area.position.x - normalized.x
+    : Math.max(0, normalized.x - maxX);
+  const dy = normalized.y < area.position.y
+    ? area.position.y - normalized.y
+    : Math.max(0, normalized.y - maxY);
+  return Math.hypot(dx, dy);
+}
+
+async function resolveAudioWidgetBubbleClampMonitor(position) {
+  const monitor = await currentMonitor().catch(() => null);
+  if (monitor) {
+    return monitor;
+  }
+
+  const monitors = await availableMonitors().catch(() => []);
+  if (!Array.isArray(monitors) || monitors.length === 0) {
+    return null;
+  }
+
+  const normalized = normalizeAudioWidgetBubblePlacement(position);
+  if (!normalized) {
+    return monitors[0];
+  }
+
+  return monitors.reduce((best, candidate) => (
+    audioWidgetBubbleMonitorDistance(normalized, candidate)
+      < audioWidgetBubbleMonitorDistance(normalized, best)
+      ? candidate
+      : best
+  ), monitors[0]);
 }
 
 function readAudioWidgetBubblePlacement() {
@@ -1788,6 +1966,93 @@ function findAudioHistoryEntryForPolish(history, sourceText) {
   }) || null;
 }
 
+function buildAudioHistoryModel(history, selectedVariantIds) {
+  return {
+    insights: buildAudioHistoryInsights(history),
+    rows: buildAudioHistoryRows(history, selectedVariantIds),
+  };
+}
+
+function estimateAudioHistoryRowHeight(row) {
+  const text = String(row?.entryText || "");
+  const hardBreaks = text.split("\n").length;
+  const wrappedLines = Math.ceil(text.length / 92);
+  const visibleTextLines = row?.clampable
+    ? Math.min(3, Math.max(1, hardBreaks, wrappedLines))
+    : Math.max(1, Math.min(6, hardBreaks, wrappedLines));
+  const snippetRows = Array.isArray(row?.snippetChanges) ? row.snippetChanges.length : 0;
+  const variantControlAllowance = Array.isArray(row?.variants) && row.variants.length > 1 ? 8 : 0;
+
+  return Math.max(
+    AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT,
+    62 + (visibleTextLines * 19) + (snippetRows * 28) + variantControlAllowance,
+  );
+}
+
+function seedAudioHistoryEstimatedRowHeights(rows, rowHeights) {
+  if (!Array.isArray(rows) || !rowHeights) {
+    return false;
+  }
+
+  let changed = false;
+  rows.forEach((row) => {
+    if (!row?.entryKey || rowHeights.has(row.entryKey)) {
+      return;
+    }
+    rowHeights.set(row.entryKey, estimateAudioHistoryRowHeight(row));
+    changed = true;
+  });
+  return changed;
+}
+
+function scheduleAudioHistoryIdleTask(callback, { delayMs = 0, timeout = 900 } = {}) {
+  if (typeof window === "undefined") {
+    callback();
+    return () => {};
+  }
+
+  let cancelled = false;
+  let frame = 0;
+  let idle = 0;
+  let timer = 0;
+
+  const run = () => {
+    if (!cancelled) {
+      callback();
+    }
+  };
+
+  const scheduleIdle = () => {
+    if (cancelled) {
+      return;
+    }
+    if (typeof window.requestIdleCallback === "function") {
+      idle = window.requestIdleCallback(run, { timeout });
+      return;
+    }
+    timer = window.setTimeout(run, delayMs);
+  };
+
+  if (typeof window.requestAnimationFrame === "function") {
+    frame = window.requestAnimationFrame(scheduleIdle);
+  } else {
+    timer = window.setTimeout(scheduleIdle, delayMs);
+  }
+
+  return () => {
+    cancelled = true;
+    if (frame && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(frame);
+    }
+    if (idle && typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(idle);
+    }
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+  };
+}
+
 function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
   const items = Array.isArray(rows) ? rows : [];
   if (!items.length) {
@@ -2035,12 +2300,20 @@ export default function AudioWorkspaceView({
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [expandedAudioHistoryIds, setExpandedAudioHistoryIds] = useState(() => new Set());
   const [audioHistoryVariantIds, setAudioHistoryVariantIds] = useState(() => new Map());
+  const [audioHistoryModel, setAudioHistoryModel] = useState(() => (
+    buildAudioHistoryModel(audioHistory, audioHistoryVariantIds)
+  ));
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
   const [llmCleanupEngine, setLlmCleanupEngine] = useState(readAudioLlmCleanupEngine);
   const manualPolishingEnabled = readAudioManualPolishingEnabled();
   const [polishingSystemPrompt, setPolishingSystemPrompt] = useState(readAudioPolishingSystemPrompt);
+  const defaultPolishingSystemPrompt = useMemo(
+    () => normalizeAudioPolishingSystemPrompt(DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT),
+    [],
+  );
+  const polishingSystemPromptIsDefault = polishingSystemPrompt === defaultPolishingSystemPrompt;
   const [audioWidgetStyleSetting, setAudioWidgetStyleSetting] = useState(readAudioWidgetStyle);
   const [voiceRulesError, setVoiceRulesError] = useState("");
   const [voiceRuleEditor, setVoiceRuleEditor] = useState(null);
@@ -2056,6 +2329,7 @@ export default function AudioWorkspaceView({
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
   const copiedAudioHistoryTimerRef = useRef(0);
+  const audioHistoryModelRunRef = useRef(0);
   const audioHistoryViewportRef = useRef(null);
   const audioHistoryScrollFrameRef = useRef(0);
   const audioHistoryRowHeightsRef = useRef(new Map());
@@ -2204,11 +2478,8 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
-  const audioHistoryInsights = useMemo(() => buildAudioHistoryInsights(audioHistory), [audioHistory]);
-  const audioHistoryRows = useMemo(
-    () => buildAudioHistoryRows(audioHistory, audioHistoryVariantIds),
-    [audioHistory, audioHistoryVariantIds],
-  );
+  const audioHistoryInsights = audioHistoryModel.insights;
+  const audioHistoryRows = audioHistoryModel.rows;
   const audioHistoryVirtualWindow = useMemo(() => (
     buildAudioHistoryVirtualWindow(
       audioHistoryRows,
@@ -2327,6 +2598,27 @@ export default function AudioWorkspaceView({
     audioHistoryRowHeightsRef.current.set(entryKey, roundedHeight);
     setAudioHistoryMeasureVersion((version) => version + 1);
   }, []);
+
+  useEffect(() => {
+    const run = audioHistoryModelRunRef.current + 1;
+    audioHistoryModelRunRef.current = run;
+
+    return scheduleAudioHistoryIdleTask(() => {
+      if (audioHistoryModelRunRef.current !== run) {
+        return;
+      }
+
+      const nextModel = buildAudioHistoryModel(audioHistory, audioHistoryVariantIds);
+      const seeded = seedAudioHistoryEstimatedRowHeights(nextModel.rows, audioHistoryRowHeightsRef.current);
+      setAudioHistoryModel(nextModel);
+      if (seeded) {
+        setAudioHistoryMeasureVersion((version) => version + 1);
+      }
+    }, {
+      delayMs: 120,
+      timeout: 1200,
+    });
+  }, [audioHistory, audioHistoryVariantIds]);
 
   useEffect(() => {
     const validKeys = new Set(audioHistoryRows.map((row) => row.entryKey));
@@ -2969,6 +3261,14 @@ export default function AudioWorkspaceView({
     writeAudioPolishingSystemPrompt(nextPrompt);
     notifyAudioSettingsChanged("polishing-prompt");
   }, []);
+
+  const restoreDefaultPolishingSystemPrompt = useCallback(() => {
+    setPolishingSystemPrompt(defaultPolishingSystemPrompt);
+    writeAudioPolishingSystemPrompt(defaultPolishingSystemPrompt, {
+      reason: "polishing_prompt_restore_default",
+    });
+    notifyAudioSettingsChanged("polishing-prompt");
+  }, [defaultPolishingSystemPrompt]);
 
   const updateDeepgramApiKey = useCallback((event) => {
     const nextApiKey = event.target.value;
@@ -3988,9 +4288,20 @@ export default function AudioWorkspaceView({
               <AudioRulePanelTitle>
                 <strong>Polishing</strong>
               </AudioRulePanelTitle>
-              <AudioStatePill data-installed={polishingSystemPrompt.trim() ? "true" : undefined}>
-                {Array.from(polishingSystemPrompt).length}/{MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS}
-              </AudioStatePill>
+              <AudioRuleListActions>
+                <SecondaryButton
+                  disabled={polishingSystemPromptIsDefault}
+                  onClick={restoreDefaultPolishingSystemPrompt}
+                  title="Restore default polishing prompt"
+                  type="button"
+                >
+                  <ButtonRefreshIcon aria-hidden="true" />
+                  <span>Restore default</span>
+                </SecondaryButton>
+                <AudioStatePill data-installed={polishingSystemPrompt.trim() ? "true" : undefined}>
+                  {Array.from(polishingSystemPrompt).length}/{MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS}
+                </AudioStatePill>
+              </AudioRuleListActions>
             </AudioRulePanelHeader>
 
             <AudioRuleEditorPanel as="section">
@@ -4611,7 +4922,9 @@ export function AudioWidgetWindow() {
   const barIdleModeRef = useRef(false);
   const canUseBubbleHistoryTrayRef = useRef(false);
   const widgetDragSettleTimerRef = useRef(0);
+  const widgetDragSettleRunRef = useRef(0);
   const widgetDragPositionSampleTimerRef = useRef(0);
+  const widgetDragReleaseSeenRef = useRef(false);
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
   const polishStatusTimerRef = useRef(0);
@@ -5177,11 +5490,23 @@ export function AudioWidgetWindow() {
       return null;
     }
 
-    const position = await windowHandle.outerPosition().catch(() => null);
-    const saved = writeAudioWidgetBubblePlacement(position);
+    const [position, size] = await Promise.all([
+      windowHandle.outerPosition().catch(() => null),
+      windowHandle.outerSize?.().catch(() => null),
+    ]);
+    const monitor = await resolveAudioWidgetBubbleClampMonitor(position);
+    const clamped = clampAudioWidgetBubblePlacementToMonitor(position, monitor, size);
+    if (audioWidgetBubblePlacementChanged(position, clamped)) {
+      await windowHandle.setPosition(new PhysicalPosition(clamped.x, clamped.y)).catch(() => {});
+    }
+    const saved = writeAudioWidgetBubblePlacement(clamped);
     logAudioWidgetBubblePosition("audio.widget.bubble.placement.save_from_window", {
+      clamped,
+      monitor: audioWidgetBubblePositionMonitorPayload(monitor),
       nativePosition: audioWidgetBubblePositionPoint(position),
+      nativeSize: audioWidgetBubblePositionSize(size),
       saved,
+      wasClamped: audioWidgetBubblePlacementChanged(position, clamped),
       widgetState: widgetStateRef.current,
     });
     return saved;
@@ -5246,6 +5571,79 @@ export function AudioWidgetWindow() {
 
     sample();
   }, [clearWidgetDragPositionSample]);
+
+  const waitForWidgetDragStablePosition = useCallback(async (windowHandle, settleRun) => {
+    const startedAt = typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+    let previousPosition = null;
+    let stableSamples = 0;
+    let sampleIndex = 0;
+    let lastPosition = null;
+    let lastSize = null;
+
+    const now = () => (
+      typeof performance !== "undefined" && typeof performance.now === "function"
+        ? performance.now()
+        : Date.now()
+    );
+    const wait = (delayMs) => new Promise((resolve) => {
+      window.setTimeout(resolve, delayMs);
+    });
+
+    while (widgetDragSettleRunRef.current === settleRun) {
+      const [position, size] = await Promise.all([
+        windowHandle.outerPosition().catch(() => null),
+        windowHandle.outerSize?.().catch(() => null),
+      ]);
+      const normalizedPosition = audioWidgetBubblePositionPoint(position);
+      lastPosition = position;
+      lastSize = size;
+
+      if (
+        normalizedPosition
+        && previousPosition
+        && normalizedPosition.x === previousPosition.x
+        && normalizedPosition.y === previousPosition.y
+      ) {
+        stableSamples += 1;
+      } else {
+        stableSamples = normalizedPosition ? 1 : 0;
+      }
+
+      logAudioWidgetBubblePosition("audio.widget.bubble.drag.settle_sample", {
+        nativePosition: normalizedPosition,
+        nativeSize: audioWidgetBubblePositionSize(size),
+        sampleIndex,
+        settleRun,
+        stableSamples,
+      });
+
+      if (normalizedPosition && stableSamples >= AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_STABLE_SAMPLES) {
+        return {
+          position: lastPosition,
+          sampleIndex,
+          size: lastSize,
+          stable: true,
+        };
+      }
+
+      if (now() - startedAt >= AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_MAX_MS) {
+        return {
+          position: lastPosition,
+          sampleIndex,
+          size: lastSize,
+          stable: false,
+        };
+      }
+
+      previousPosition = normalizedPosition;
+      sampleIndex += 1;
+      await wait(AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_SAMPLE_MS);
+    }
+
+    return null;
+  }, []);
 
   const setAudioBarWindowPosition = useCallback(async (windowHandle, target, animate = true) => {
     const targetX = Math.round(target.x);
@@ -5327,37 +5725,62 @@ export function AudioWidgetWindow() {
       window.clearTimeout(widgetDragSettleTimerRef.current);
     }
 
+    const settleRun = widgetDragSettleRunRef.current + 1;
+    widgetDragSettleRunRef.current = settleRun;
     logAudioWidgetBubblePosition("audio.widget.bubble.drag.finish_scheduled", {
       delayMs,
+      releaseSeen: widgetDragReleaseSeenRef.current,
+      settleRun,
       widgetState: widgetStateRef.current,
       widgetStyle: widgetStyleRef.current,
     });
     widgetDragSettleTimerRef.current = window.setTimeout(() => {
       widgetDragSettleTimerRef.current = 0;
-      const closeHistoryTray = historyTrayCloseAfterDragRef.current;
-      historyTrayCloseAfterDragRef.current = false;
-      widgetDraggingRef.current = false;
-      setWidgetDragging(false);
-      clearWidgetDragPositionSample();
-      logAudioWidgetBubblePosition("audio.widget.bubble.drag.finish_settled", {
-        closeHistoryTray,
-        widgetState: widgetStateRef.current,
-        widgetStyle: widgetStyleRef.current,
-      });
-      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
-        runWidgetWindowAction(saveBubblePlacementFromWindow);
-      }
-      if (closeHistoryTray) {
-        setHistoryTrayOpen(false);
-        runWidgetWindowAction((windowHandle) => (
-          windowHandle.setSize(new LogicalSize(
+      runWidgetWindowAction(async (windowHandle) => {
+        const settle = await waitForWidgetDragStablePosition(windowHandle, settleRun);
+        if (widgetDragSettleRunRef.current !== settleRun) {
+          return;
+        }
+
+        const closeHistoryTray = historyTrayCloseAfterDragRef.current;
+        historyTrayCloseAfterDragRef.current = false;
+        widgetDragReleaseSeenRef.current = false;
+
+        if (closeHistoryTray) {
+          bubbleHistoryTrayHoverRef.current = false;
+          bubbleHistoryTrayActiveRef.current = false;
+          setHistoryTrayOpen(false);
+          await windowHandle.setSize(new LogicalSize(
             AUDIO_WIDGET_COMPACT_SIZE.width,
             AUDIO_WIDGET_COMPACT_SIZE.height,
-          ))
-        ));
-      }
+          )).catch(() => {});
+        }
+
+        const saved = widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR
+          ? await saveBubblePlacementFromWindow(windowHandle)
+          : null;
+
+        widgetDraggingRef.current = false;
+        setWidgetDragging(false);
+        clearWidgetDragPositionSample();
+        logAudioWidgetBubblePosition("audio.widget.bubble.drag.finish_settled", {
+          closeHistoryTray,
+          nativePosition: audioWidgetBubblePositionPoint(settle?.position),
+          nativeSize: audioWidgetBubblePositionSize(settle?.size),
+          saved,
+          settleRun,
+          stable: Boolean(settle?.stable),
+          widgetState: widgetStateRef.current,
+          widgetStyle: widgetStyleRef.current,
+        });
+      });
     }, delayMs);
-  }, [clearWidgetDragPositionSample, runWidgetWindowAction, saveBubblePlacementFromWindow]);
+  }, [
+    clearWidgetDragPositionSample,
+    runWidgetWindowAction,
+    saveBubblePlacementFromWindow,
+    waitForWidgetDragStablePosition,
+  ]);
 
   const widgetTargetMode = isFocusedAudioWidgetState(widgetState) ? "focus" : "compact";
   const widgetActive = widgetState === "arming"
@@ -5372,13 +5795,13 @@ export function AudioWidgetWindow() {
   const errorFrameActive = sharedErrorFrameActive && !usesBottomAnchoredStyle;
   const barErrorFrameActive = sharedErrorFrameActive && usesBottomAnchoredStyle;
   const barVisible = usesBottomAnchoredStyle
-    && (widgetActive || cancelNoticeActive || barErrorFrameActive);
+    && (widgetActive || cancelNoticeActive);
   const barIdleMode = usesBottomAnchoredStyle && !barVisible;
   const {
     key: barGeometryKey,
     margin: barGeometryMargin,
     size: barGeometrySize,
-  } = getAudioWidgetBarGeometry(cancelNoticeActive, barErrorFrameActive, barVisible);
+  } = getAudioWidgetBarGeometry(cancelNoticeActive, barVisible);
   const barGeometryReady = !usesBottomAnchoredStyle || barPlacementReadyKey === barGeometryKey;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.
@@ -5480,22 +5903,6 @@ export function AudioWidgetWindow() {
       releaseBubbleHistoryTrayPolishPin();
     }, delayMs);
   }, [releaseBubbleHistoryTrayPolishPin]);
-
-  const dismissWidgetErrorFrame = useCallback(() => {
-    if (polishStatusTimerRef.current) {
-      window.clearTimeout(polishStatusTimerRef.current);
-      polishStatusTimerRef.current = 0;
-    }
-    if (polishStatus.state === "error") {
-      setPolishStatus({ state: "idle", error: "" });
-      releaseBubbleHistoryTrayPolishPin();
-    }
-    if (widgetStateRef.current === "error") {
-      resetWidgetToStartState();
-      return;
-    }
-    setError("");
-  }, [polishStatus.state, releaseBubbleHistoryTrayPolishPin, resetWidgetToStartState]);
 
   const polishLatestTranscript = useCallback(async () => {
     if (polishStatus.state === "loading") {
@@ -5708,6 +6115,8 @@ export function AudioWidgetWindow() {
       window.clearTimeout(widgetDragSettleTimerRef.current);
       widgetDragSettleTimerRef.current = 0;
     }
+    widgetDragSettleRunRef.current += 1;
+    widgetDragReleaseSeenRef.current = false;
     if (widgetDragPositionSampleTimerRef.current) {
       window.clearTimeout(widgetDragPositionSampleTimerRef.current);
       widgetDragPositionSampleTimerRef.current = 0;
@@ -5728,6 +6137,7 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     const finishAfterRelease = () => {
       if (widgetDraggingRef.current) {
+        widgetDragReleaseSeenRef.current = true;
         scheduleWidgetDragFinish(60);
       }
     };
@@ -5743,7 +6153,7 @@ export function AudioWidgetWindow() {
     try {
       getCurrentWindow().onMoved(() => {
         if (widgetDraggingRef.current) {
-          scheduleWidgetDragFinish(700);
+          scheduleWidgetDragFinish(widgetDragReleaseSeenRef.current ? 700 : 5000);
         }
       })
         .then((nextUnlisten) => {
@@ -5888,6 +6298,8 @@ export function AudioWidgetWindow() {
       barPlacementReadyKeyRef.current = "";
       setBarPlacementReadyKey("");
       invoke("audio_widget_clear_bottom_bar_position").catch(() => {});
+      publishAudioWidgetErrorOverlay(null);
+      invoke("audio_widget_hide_error_overlay").catch(() => {});
       const saved = barSavedPlacementRef.current;
       const restoredPosition = readAudioWidgetBubblePlacement() || saved?.position || null;
       logAudioWidgetBubblePosition("audio.widget.bubble.restore_from_bar.request", {
@@ -5903,10 +6315,21 @@ export function AudioWidgetWindow() {
             new LogicalSize(AUDIO_WIDGET_COMPACT_SIZE.width, AUDIO_WIDGET_COMPACT_SIZE.height),
           );
           if (restoredPosition) {
-            await windowHandle.setPosition(new PhysicalPosition(restoredPosition.x, restoredPosition.y));
-            writeAudioWidgetBubblePlacement(restoredPosition);
+            const size = await windowHandle.outerSize?.().catch(() => null);
+            const monitor = await resolveAudioWidgetBubbleClampMonitor(restoredPosition);
+            const clampedPosition = clampAudioWidgetBubblePlacementToMonitor(
+              restoredPosition,
+              monitor,
+              size,
+            );
+            if (clampedPosition) {
+              await windowHandle.setPosition(new PhysicalPosition(clampedPosition.x, clampedPosition.y));
+              writeAudioWidgetBubblePlacement(clampedPosition);
+            }
             await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.restore_from_bar.done", {
+              clampedPosition: audioWidgetBubblePositionPoint(clampedPosition),
               restoredPosition: audioWidgetBubblePositionPoint(restoredPosition),
+              wasClamped: audioWidgetBubblePlacementChanged(restoredPosition, clampedPosition),
             });
           }
         });
@@ -5921,6 +6344,30 @@ export function AudioWidgetWindow() {
     runWidgetWindowAction,
     usesBottomAnchoredStyle,
   ]);
+
+  useEffect(() => {
+    if (!barErrorFrameActive) {
+      publishAudioWidgetErrorOverlay(null);
+      invoke("audio_widget_hide_error_overlay").catch(() => {});
+      return undefined;
+    }
+
+    publishAudioWidgetErrorOverlay({
+      id: `bottom-bar-error:${errorFrameText}`,
+      message: errorFrameText,
+      theme: audioWidgetTheme,
+      visible: true,
+    });
+    invoke("audio_widget_show_error_overlay", {
+      request: {
+        animate: true,
+        gap: AUDIO_WIDGET_ERROR_OVERLAY_GAP,
+        height: AUDIO_WIDGET_ERROR_OVERLAY_SIZE.height,
+        width: AUDIO_WIDGET_ERROR_OVERLAY_SIZE.width,
+      },
+    }).catch(() => {});
+    return undefined;
+  }, [audioWidgetTheme, barErrorFrameActive, errorFrameText]);
 
   useEffect(() => {
     if (!usesBottomAnchoredStyle || isMacPlatform()) {
@@ -6402,14 +6849,30 @@ export function AudioWidgetWindow() {
     }
 
     historyTrayCloseAfterDragRef.current = trayWasActive;
+    widgetDragReleaseSeenRef.current = false;
     widgetDraggingRef.current = true;
     setWidgetDragging(true);
-    if (!trayWasActive) {
-      setHistoryTrayOpen(false);
-    }
+    bubbleHistoryTrayHoverRef.current = false;
+    bubbleHistoryTrayCloseDeferredRef.current = false;
+    bubbleHistoryTrayActiveRef.current = false;
+    setHistoryTrayOpen(false);
     scheduleWidgetDragFinish(5000);
 
     runWidgetWindowAction(async (windowHandle) => {
+      if (trayWasActive) {
+        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.collapse_tray_before", {
+          pointer,
+          widgetState: widgetStateRef.current,
+        });
+        await windowHandle.setSize(new LogicalSize(
+          AUDIO_WIDGET_COMPACT_SIZE.width,
+          AUDIO_WIDGET_COMPACT_SIZE.height,
+        )).catch(() => {});
+        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.collapse_tray_after", {
+          pointer,
+          widgetState: widgetStateRef.current,
+        });
+      }
       await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.start", {
         pointer,
         trayWasActive,
@@ -8016,30 +8479,6 @@ export function AudioWidgetWindow() {
     </AudioBarSurface>
   ) : null;
 
-  const errorNoticeSurface = barErrorFrameActive ? (
-    <AudioBarSurface
-      role="alert"
-      title={errorFrameText}
-    >
-      <AudioBarCancelButton
-        aria-label="Dismiss audio error"
-        onClick={dismissWidgetErrorFrame}
-        title="Dismiss now"
-        type="button"
-      >
-        ×
-      </AudioBarCancelButton>
-      <AudioBarStatusText style={{ flex: 1 }} title={errorFrameText}>
-        {errorFrameText}
-      </AudioBarStatusText>
-      <AudioBarNoticeProgress
-        aria-hidden="true"
-        key={errorFrameText}
-        onAnimationEnd={dismissWidgetErrorFrame}
-      />
-    </AudioBarSurface>
-  ) : null;
-
   if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
     if (!barVisible) {
       const dictateShortcutLabel = formatShortcutLabel(widgetPushToTalkShortcut);
@@ -8089,11 +8528,11 @@ export function AudioWidgetWindow() {
         <AudioBarShell
           aria-label={widgetLabel}
           data-geometry-ready={barGeometryReady ? "true" : "false"}
-          data-mode={cancelNotice || barErrorFrameActive ? "notice" : "active"}
+          data-mode={cancelNotice ? "notice" : "active"}
           data-theme={audioWidgetTheme}
           data-visible={barVisible && barGeometryReady ? "true" : "false"}
         >
-          {cancelNotice ? cancelNoticeSurface : barErrorFrameActive ? errorNoticeSurface : (
+          {cancelNotice ? cancelNoticeSurface : (
             <AudioBarSurface
               key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
               onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
@@ -8246,6 +8685,89 @@ export function AudioWidgetWindow() {
           {renderPolishQuickButton(bubbleHistoryTrayVisible)}
         </AudioWidgetHistoryTray>
       </AudioWidgetShell>
+    </>
+  );
+}
+
+export function AudioWidgetErrorOverlayWindow() {
+  const [payload, setPayload] = useState(readAudioWidgetErrorOverlayPayload);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+    document.documentElement.dataset.audioWidgetError = "true";
+    document.body.dataset.audioWidgetError = "true";
+    document.documentElement.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(
+      payload?.theme || AUDIO_WIDGET_THEME_DARK,
+    );
+    document.body.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(
+      payload?.theme || AUDIO_WIDGET_THEME_DARK,
+    );
+
+    return () => {
+      delete document.documentElement.dataset.audioWidgetError;
+      delete document.body.dataset.audioWidgetError;
+      delete document.documentElement.dataset.audioWidgetTheme;
+      delete document.body.dataset.audioWidgetTheme;
+    };
+  }, [payload?.theme]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenOverlay = () => {};
+
+    const applyPayload = (value) => {
+      if (disposed) {
+        return;
+      }
+      setPayload(normalizeAudioWidgetErrorOverlayPayload(value));
+    };
+
+    const handleStorage = (event) => {
+      if (event.key === AUDIO_WIDGET_ERROR_OVERLAY_STORAGE_KEY) {
+        applyPayload(readAudioWidgetErrorOverlayPayload());
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    listen(AUDIO_WIDGET_ERROR_OVERLAY_EVENT, (event) => {
+      applyPayload(event?.payload);
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+        return;
+      }
+      unlistenOverlay = nextUnlisten;
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlistenOverlay();
+      window.removeEventListener("storage", handleStorage);
+    };
+  }, []);
+
+  const activePayload = payload?.visible && payload.message ? payload : null;
+
+  return (
+    <>
+      <GlobalStyle />
+      <AudioWidgetErrorOverlayShell
+        aria-hidden={activePayload ? undefined : "true"}
+        data-theme={activePayload?.theme || AUDIO_WIDGET_THEME_DARK}
+        data-visible={activePayload ? "true" : "false"}
+      >
+        {activePayload ? (
+          <AudioWidgetErrorOverlayCard
+            key={activePayload.id}
+            role="alert"
+            title={activePayload.message}
+          >
+            {activePayload.message}
+          </AudioWidgetErrorOverlayCard>
+        ) : null}
+      </AudioWidgetErrorOverlayShell>
     </>
   );
 }

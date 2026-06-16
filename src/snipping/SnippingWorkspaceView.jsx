@@ -38,6 +38,8 @@ const SNIPPING_SHORTCUTS_CHANGED_EVENT = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT = "forge-snipping-area-overlay-snapshot";
+const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED = true;
+const SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS = 120;
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
 
@@ -699,6 +701,7 @@ export function SnippingOverlayWindow() {
   const dragRef = useRef(null);
   const activePointerIdRef = useRef(null);
   const capturingRef = useRef(false);
+  const lastCursorMoveLogAtRef = useRef(0);
 
   const setCapturingState = useCallback((value) => {
     capturingRef.current = Boolean(value);
@@ -713,6 +716,73 @@ export function SnippingOverlayWindow() {
       return "";
     }
   }, []);
+
+  const readCursorStyle = useCallback((element) => {
+    try {
+      return element ? window.getComputedStyle(element).cursor : "";
+    } catch {
+      return "";
+    }
+  }, []);
+
+  const cursorDebugSnapshot = useCallback((event, extra = {}) => {
+    const rootElement = event?.currentTarget || document.getElementById("app");
+    const pointer = event ? {
+      type: event.type,
+      pointerType: event.pointerType,
+      pointerId: event.pointerId,
+      isPrimary: event.isPrimary,
+      button: event.button,
+      buttons: event.buttons,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      screenX: event.screenX,
+      screenY: event.screenY,
+      movementX: event.movementX,
+      movementY: event.movementY,
+      pressure: event.pressure,
+    } : null;
+    return {
+      windowLabel,
+      activePointerId: activePointerIdRef.current,
+      dragging: Boolean(dragRef.current),
+      capturing: capturingRef.current,
+      drag: dragRef.current,
+      pointer,
+      cssCursor: {
+        target: readCursorStyle(rootElement),
+        html: readCursorStyle(document.documentElement),
+        body: readCursorStyle(document.body),
+        app: readCursorStyle(document.getElementById("app")),
+      },
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+      },
+      ...extra,
+    };
+  }, [readCursorStyle, windowLabel]);
+
+  const logCursorDebug = useCallback((phase, fields = {}) => {
+    if (!SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED) return;
+    invoke("snipping_log_area_cursor_event", {
+      request: {
+        phase,
+        fields,
+      },
+    }).catch(() => {});
+  }, []);
+
+  const logCursorMoveDebug = useCallback((phase, event, fields = {}) => {
+    if (!SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED) return;
+    const now = window.performance?.now?.() ?? Date.now();
+    if (now - lastCursorMoveLogAtRef.current < SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS) {
+      return;
+    }
+    lastCursorMoveLogAtRef.current = now;
+    logCursorDebug(phase, cursorDebugSnapshot(event, fields));
+  }, [cursorDebugSnapshot, logCursorDebug]);
 
   const snapshotUrl = useMemo(() => {
     const snapshotPath = text(overlayMonitor?.snapshotPath || overlayMonitor?.snapshot_path);
@@ -735,7 +805,8 @@ export function SnippingOverlayWindow() {
     return { left, top, width, height };
   }, [drag]);
 
-  const closeOverlay = useCallback(async () => {
+  const closeOverlay = useCallback(async (reason = "request") => {
+    logCursorDebug("close_overlay", cursorDebugSnapshot(null, { reason }));
     setCapturingState(false);
     activePointerIdRef.current = null;
     dragRef.current = null;
@@ -750,7 +821,7 @@ export function SnippingOverlayWindow() {
         // Overlay close is best effort.
       }
     }
-  }, [setCapturingState]);
+  }, [cursorDebugSnapshot, logCursorDebug, setCapturingState]);
 
   const applyOverlayMonitor = useCallback((monitor) => {
     setOverlayMonitor(monitor && typeof monitor === "object" ? monitor : null);
@@ -766,17 +837,28 @@ export function SnippingOverlayWindow() {
     try {
       const status = await invoke("snipping_area_overlay_status");
       applyOverlayMonitor(status?.monitor || null);
+      logCursorDebug("status_loaded", cursorDebugSnapshot(null, {
+        overlayMonitor: status?.monitor || null,
+      }));
     } catch (statusError) {
       const message = getErrorMessage(statusError, "Unable to prepare snipping overlay.");
+      logCursorDebug("status_error", cursorDebugSnapshot(null, { message }));
       if (!message.includes("No active snipping overlay monitor")) {
         setError(message);
       }
     }
-  }, [applyOverlayMonitor]);
+  }, [applyOverlayMonitor, cursorDebugSnapshot, logCursorDebug]);
 
   useEffect(() => {
     loadOverlayStatus();
   }, [loadOverlayStatus]);
+
+  useEffect(() => {
+    logCursorDebug("overlay_mounted", cursorDebugSnapshot(null));
+    return () => {
+      logCursorDebug("overlay_unmounted", cursorDebugSnapshot(null));
+    };
+  }, [cursorDebugSnapshot, logCursorDebug]);
 
   useEffect(() => {
     let cancelled = false;
@@ -787,6 +869,10 @@ export function SnippingOverlayWindow() {
       if (cancelled) return;
       const targetLabel = text(event.payload?.overlayLabel || event.payload?.overlay_label);
       if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
+      logCursorDebug("overlay_started_event", cursorDebugSnapshot(null, {
+        targetLabel,
+        monitor: event.payload?.monitor || event.payload || null,
+      }));
       applyOverlayMonitor(clearOverlaySnapshotPath(event.payload?.monitor || event.payload || null));
     }).then((unlisten) => {
       if (cancelled) {
@@ -804,6 +890,10 @@ export function SnippingOverlayWindow() {
       if (targetLabel && windowLabel && targetLabel !== windowLabel) return;
       const snapshotPath = text(event.payload?.snapshotPath || event.payload?.snapshot_path);
       if (!snapshotPath) return;
+      logCursorDebug("overlay_snapshot_event", cursorDebugSnapshot(null, {
+        targetLabel,
+        snapshotPath,
+      }));
       setOverlayMonitor((current) => (
         current ? { ...current, snapshotPath, snapshot_path: snapshotPath } : current
       ));
@@ -820,13 +910,13 @@ export function SnippingOverlayWindow() {
       unlistenOverlayStarted?.();
       unlistenOverlaySnapshot?.();
     };
-  }, [applyOverlayMonitor, windowLabel]);
+  }, [applyOverlayMonitor, cursorDebugSnapshot, logCursorDebug, windowLabel]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        closeOverlay();
+        closeOverlay("escape_key");
       }
     };
     window.addEventListener("keydown", onKeyDown, true);
@@ -852,19 +942,27 @@ export function SnippingOverlayWindow() {
     activePointerIdRef.current = null;
   }, []);
 
-  const cancelActiveDrag = useCallback((event) => {
+  const cancelActiveDrag = useCallback((event, reason = event?.type || "pointer_cancel") => {
+    logCursorDebug("pointer_cancel", cursorDebugSnapshot(event, { reason }));
     releasePointerCapture(event);
     dragRef.current = null;
     setDrag(null);
-  }, [releasePointerCapture]);
+  }, [cursorDebugSnapshot, logCursorDebug, releasePointerCapture]);
 
   const beginDrag = useCallback((event) => {
-    if ((event.pointerType === "mouse" && event.button !== 0) || capturingRef.current) return;
+    if ((event.pointerType === "mouse" && event.button !== 0) || capturingRef.current) {
+      logCursorDebug("pointer_down_ignored", cursorDebugSnapshot(event, {
+        reason: capturingRef.current ? "capturing" : "non_primary_mouse_button",
+      }));
+      return;
+    }
     event.preventDefault();
     activePointerIdRef.current = event.pointerId;
+    let captureAcquired = true;
     try {
       event.currentTarget.setPointerCapture?.(event.pointerId);
     } catch {
+      captureAcquired = false;
       activePointerIdRef.current = null;
     }
     const point = overlayPoint(event);
@@ -876,11 +974,24 @@ export function SnippingOverlayWindow() {
     };
     dragRef.current = nextDrag;
     setDrag(nextDrag);
-  }, [overlayPoint]);
+    logCursorDebug("pointer_down", cursorDebugSnapshot(event, {
+      point,
+      captureAcquired,
+      drag: nextDrag,
+    }));
+  }, [cursorDebugSnapshot, logCursorDebug, overlayPoint]);
 
   const updateDrag = useCallback((event) => {
-    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
-    if (!dragRef.current || capturingRef.current) return;
+    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
+      logCursorMoveDebug("pointer_move_ignored", event, { reason: "pointer_id_mismatch" });
+      return;
+    }
+    if (!dragRef.current || capturingRef.current) {
+      logCursorMoveDebug("pointer_move_idle", event, {
+        reason: capturingRef.current ? "capturing" : "no_drag",
+      });
+      return;
+    }
     const point = overlayPoint(event);
     const nextDrag = {
       ...dragRef.current,
@@ -889,15 +1000,28 @@ export function SnippingOverlayWindow() {
     };
     dragRef.current = nextDrag;
     setDrag(nextDrag);
-  }, [overlayPoint]);
+    logCursorMoveDebug("pointer_move_drag", event, {
+      point,
+      drag: nextDrag,
+    });
+  }, [logCursorMoveDebug, overlayPoint]);
 
   const finishDrag = useCallback(async (event) => {
-    if (event && activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
+    if (event && activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
+      logCursorDebug("pointer_up_ignored", cursorDebugSnapshot(event, {
+        reason: "pointer_id_mismatch",
+      }));
+      return;
+    }
     event?.preventDefault?.();
     const currentDrag = dragRef.current;
+    logCursorDebug("pointer_up", cursorDebugSnapshot(event, { drag: currentDrag }));
     dragRef.current = null;
     releasePointerCapture(event);
     if (!currentDrag || capturingRef.current) {
+      logCursorDebug("pointer_up_no_capture", cursorDebugSnapshot(event, {
+        reason: capturingRef.current ? "capturing" : "no_drag",
+      }));
       setDrag(null);
       return;
     }
@@ -910,7 +1034,10 @@ export function SnippingOverlayWindow() {
     const height = Math.min(Math.abs(currentDrag.endY - currentDrag.startY), Math.max(0, viewportHeight - top));
 
     if (width < 4 || height < 4) {
-      closeOverlay();
+      logCursorDebug("finish_small_area", cursorDebugSnapshot(event, {
+        selection: { left, top, width, height },
+      }));
+      closeOverlay("small_area");
       return;
     }
 
@@ -918,6 +1045,9 @@ export function SnippingOverlayWindow() {
     setError("");
     const overlayWindow = getCurrentWindow();
     try {
+      logCursorDebug("finish_capture_request", cursorDebugSnapshot(event, {
+        selection: { left, top, width, height },
+      }));
       await invoke("snipping_finish_area_snip", {
         request: {
           x: left,
@@ -931,6 +1061,9 @@ export function SnippingOverlayWindow() {
       dragRef.current = null;
       setDrag(null);
       setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
+      logCursorDebug("finish_capture_success", cursorDebugSnapshot(event, {
+        selection: { left, top, width, height },
+      }));
       try {
         await overlayWindow.hide();
       } catch {
@@ -938,17 +1071,24 @@ export function SnippingOverlayWindow() {
       }
     } catch (captureError) {
       setCapturingState(false);
-      setError(getErrorMessage(captureError, "Unable to capture selected area."));
+      const message = getErrorMessage(captureError, "Unable to capture selected area.");
+      logCursorDebug("finish_capture_error", cursorDebugSnapshot(event, {
+        message,
+        selection: { left, top, width, height },
+      }));
+      setError(message);
     }
-  }, [closeOverlay, releasePointerCapture, setCapturingState]);
+  }, [closeOverlay, cursorDebugSnapshot, logCursorDebug, releasePointerCapture, setCapturingState]);
 
   return (
     <>
       <SnippingOverlayGlobalStyle />
       <SnippingOverlayRoot
-        onLostPointerCapture={cancelActiveDrag}
-        onPointerCancel={cancelActiveDrag}
+        onLostPointerCapture={(event) => cancelActiveDrag(event, "lost_pointer_capture")}
+        onPointerCancel={(event) => cancelActiveDrag(event, "pointer_cancel")}
         onPointerDown={beginDrag}
+        onPointerEnter={(event) => logCursorDebug("pointer_enter", cursorDebugSnapshot(event))}
+        onPointerLeave={(event) => logCursorDebug("pointer_leave", cursorDebugSnapshot(event))}
         onPointerMove={updateDrag}
         onPointerUp={finishDrag}
         style={snapshotUrl ? { "--snipping-overlay-snapshot": `url("${snapshotUrl}")` } : undefined}

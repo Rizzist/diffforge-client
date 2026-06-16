@@ -1164,17 +1164,6 @@ const ARCHITECTURE_KIND_OPTIONS = [
   { label: "Runtime", value: "runtime" },
 ];
 
-const ARCHITECTURE_GRAPH_TEMPLATE_OPTIONS = [
-  { label: "System graph", value: "system" },
-  { label: "Architecture", value: "architecture" },
-  { label: "API pathway", value: "api-pathway" },
-  { label: "Data flow", value: "data-flow" },
-  { label: "Control graph", value: "control-graph" },
-  { label: "State machine", value: "state-machine" },
-  { label: "Dependency graph", value: "dependency-graph" },
-  { label: "Deployment", value: "deployment" },
-];
-
 const ARCHITECTURE_NODE_ROLE_OPTIONS = [
   "actor",
   "service",
@@ -1306,138 +1295,6 @@ const ARCHITECTURE_EDGE_ROLE_KIND = {
   "fails-to": "fails-to",
   emits: "emits",
   "resolves-to": "resolves-to",
-};
-
-const ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES = {
-  architecture: {
-    title: "System Architecture",
-    intent: "architecture",
-    icon: "group",
-    color: "blue",
-    subtitle: "System-level components and boundaries",
-    nodes: [
-      { id: "user", title: "User", role: "actor", icon: "users", display: "compact", x: 58, y: 98 },
-      { id: "app", title: "App", role: "service", icon: "server", desc: "Primary application surface", x: 228, y: 92 },
-      { id: "api", title: "API", role: "api", icon: "api", desc: "Request handling boundary", x: 448, y: 92 },
-      { id: "store", title: "Store", role: "datastore", icon: "database", desc: "Durable state", x: 448, y: 214 },
-    ],
-    edges: [
-      { source: "user", target: "app", label: "use", role: "calls" },
-      { source: "app", target: "api", label: "request", role: "calls" },
-      { source: "api", target: "store", label: "read/write", role: "writes" },
-    ],
-  },
-  "api-pathway": {
-    title: "API Pathway",
-    intent: "api-pathway",
-    icon: "api",
-    color: "sky",
-    subtitle: "Request path from caller to effect",
-    nodes: [
-      { id: "client", title: "Client", role: "actor", icon: "users", display: "compact", x: 58, y: 98 },
-      { id: "endpoint", title: "Endpoint", role: "endpoint", icon: "api", desc: "Public route or handler", x: 220, y: 92 },
-      { id: "controller", title: "Controller", role: "controller", icon: "router", desc: "Validation and orchestration", x: 438, y: 92 },
-      { id: "effect", title: "Effect", role: "service", icon: "service", desc: "Domain operation", x: 438, y: 214 },
-    ],
-    edges: [
-      { source: "client", target: "endpoint", label: "request", role: "calls" },
-      { source: "endpoint", target: "controller", label: "route", role: "calls" },
-      { source: "controller", target: "effect", label: "execute", role: "calls" },
-    ],
-  },
-  "data-flow": {
-    title: "Data Flow",
-    intent: "data-flow",
-    icon: "flow",
-    color: "emerald",
-    subtitle: "Data movement and persistence",
-    nodes: [
-      { id: "producer", title: "Producer", role: "service", icon: "service", desc: "Creates data", x: 58, y: 92 },
-      { id: "queue", title: "Event Queue", role: "queue", icon: "queue", desc: "Buffers changes", x: 278, y: 92 },
-      { id: "worker", title: "Worker", role: "worker", icon: "worker", desc: "Processes events", x: 498, y: 92 },
-      { id: "store", title: "Data Store", role: "datastore", icon: "database", desc: "Persists records", x: 498, y: 214 },
-    ],
-    edges: [
-      { source: "producer", target: "queue", label: "publish", role: "publishes" },
-      { source: "queue", target: "worker", label: "consume", role: "subscribes" },
-      { source: "worker", target: "store", label: "write", role: "writes" },
-    ],
-  },
-  "control-graph": {
-    title: "Control Graph",
-    intent: "control-graph",
-    icon: "router",
-    color: "amber",
-    subtitle: "Branching decisions and control paths",
-    nodes: [
-      { id: "start", title: "Start", role: "state", lifecycle: "start", icon: "flow", desc: "Entry condition", x: 58, y: 102 },
-      { id: "decide", title: "Decision", role: "decision", icon: "router", desc: "Branch condition", x: 240, y: 96 },
-      { id: "action", title: "Action", role: "action", icon: "settings", desc: "Primary path", x: 454, y: 80 },
-      { id: "retry", title: "Retry", role: "action", lifecycle: "retry", icon: "worker", desc: "Recovery path", x: 454, y: 196 },
-      { id: "failed", title: "Failed", role: "terminal", lifecycle: "terminal", icon: "security", desc: "Stop condition", x: 454, y: 302 },
-    ],
-    edges: [
-      { source: "start", target: "decide", label: "evaluate", role: "transitions" },
-      { source: "decide", target: "action", label: "ok", role: "guards", condition: "valid" },
-      { source: "decide", target: "retry", label: "retry", role: "guards", condition: "recoverable" },
-      { source: "decide", target: "failed", label: "fail", role: "fails-to", condition: "invalid" },
-    ],
-  },
-  "state-machine": {
-    title: "State Machine",
-    intent: "state-machine",
-    icon: "flow",
-    color: "violet",
-    subtitle: "States, events, and terminal transitions",
-    nodes: [
-      { id: "idle", title: "Idle", role: "state", lifecycle: "start", icon: "flow", desc: "Waiting", x: 58, y: 96 },
-      { id: "active", title: "Active", role: "state", icon: "flow", desc: "Running", x: 260, y: 96 },
-      { id: "paused", title: "Paused", role: "state", icon: "flow", desc: "Suspended", x: 462, y: 196 },
-      { id: "done", title: "Done", role: "terminal", lifecycle: "terminal", icon: "security", desc: "Completed", x: 462, y: 80 },
-    ],
-    edges: [
-      { source: "idle", target: "active", label: "start", role: "transitions", event: "start" },
-      { source: "active", target: "paused", label: "pause", role: "transitions", event: "pause" },
-      { source: "paused", target: "active", label: "resume", role: "transitions", event: "resume" },
-      { source: "active", target: "done", label: "complete", role: "transitions", event: "complete" },
-    ],
-  },
-  "dependency-graph": {
-    title: "Dependency Graph",
-    intent: "dependency-graph",
-    icon: "schema",
-    color: "rose",
-    subtitle: "Packages, modules, and dependency direction",
-    nodes: [
-      { id: "app", title: "Application", role: "package", icon: "schema", desc: "Root package", x: 58, y: 96 },
-      { id: "sdk", title: "SDK", role: "dependency", icon: "schema", desc: "Shared client", x: 260, y: 72 },
-      { id: "runtime", title: "Runtime", role: "dependency", icon: "server", desc: "Execution layer", x: 260, y: 188 },
-      { id: "database", title: "Database Client", role: "dependency", icon: "database", desc: "Persistence adapter", x: 462, y: 72 },
-    ],
-    edges: [
-      { source: "app", target: "sdk", label: "imports", role: "depends-on" },
-      { source: "app", target: "runtime", label: "runs on", role: "depends-on" },
-      { source: "sdk", target: "database", label: "uses", role: "depends-on" },
-    ],
-  },
-  deployment: {
-    title: "Deployment Slice",
-    intent: "deployment",
-    icon: "cloud",
-    color: "cyan",
-    subtitle: "Runtime placement and external services",
-    nodes: [
-      { id: "browser", title: "Browser", role: "actor", icon: "browser", display: "compact", x: 58, y: 98 },
-      { id: "web", title: "Web Runtime", role: "service", icon: "cloud", desc: "Hosted frontend", x: 220, y: 92 },
-      { id: "api", title: "API Runtime", role: "api", icon: "server", desc: "Backend runtime", x: 438, y: 92 },
-      { id: "database", title: "Database", role: "datastore", icon: "database", desc: "Managed persistence", x: 438, y: 214 },
-    ],
-    edges: [
-      { source: "browser", target: "web", label: "load", role: "calls" },
-      { source: "web", target: "api", label: "https", role: "calls" },
-      { source: "api", target: "database", label: "query", role: "reads" },
-    ],
-  },
 };
 
 const ARCHITECTURE_LIKEC4_ICON_MODULES = import.meta.glob("/node_modules/@likec4/icons/{aws,azure,gcp,tech,bootstrap}/*.js");
@@ -3383,46 +3240,7 @@ function architectureParseDslGraph(graph) {
   return architectureLayoutGraph(parsed);
 }
 
-function architectureSliceTemplateLines(templateKey = "architecture") {
-  const template = ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES[templateKey]
-    || ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES.architecture;
-  const groupProps = {
-    icon: template.icon || ARCHITECTURE_GROUP_INTENT_ICONS[template.intent] || "group",
-    color: template.color || ARCHITECTURE_GROUP_INTENT_COLORS[template.intent],
-    intent: template.intent,
-    desc: template.subtitle,
-  };
-  const lines = [
-    `${architectureDslName(template.title)}${architectureDslPropsText(groupProps)} {`,
-  ];
-  template.nodes.forEach((node) => {
-    const props = {
-      icon: node.icon || ARCHITECTURE_NODE_ROLE_ICONS[node.role],
-      role: node.role,
-      ...(node.display ? { display: node.display } : {}),
-      ...(node.lifecycle ? { lifecycle: node.lifecycle } : {}),
-      ...(!node.display || node.display !== "compact" ? { desc: node.desc } : {}),
-    };
-    lines.push(`  ${architectureDslName(node.title)}${architectureDslPropsText(props)}`);
-  });
-  lines.push("}", "");
-  template.edges.forEach((edge) => {
-    const source = template.nodes.find((node) => node.id === edge.source)?.title || edge.source;
-    const target = template.nodes.find((node) => node.id === edge.target)?.title || edge.target;
-    const edgeProps = {
-      role: edge.role,
-      ...(edge.condition ? { condition: edge.condition } : {}),
-      ...(edge.event ? { event: edge.event } : {}),
-      ...(edge.criticality ? { criticality: edge.criticality } : {}),
-    };
-    const label = text(edge.label);
-    const labelWithProps = `${label}${architectureDslPropsText(edgeProps)}`;
-    lines.push(`${architectureDslName(source)} ${architectureEdgeConnectorForRole(edge.role)} ${architectureDslName(target)}: ${labelWithProps.trim()}`);
-  });
-  return lines;
-}
-
-function architectureStarterSource({ groupPath = "", template = "system", title = "" } = {}) {
+function architectureEmptyGraphSource({ groupPath = "", title = "" } = {}) {
   const cleanTitle = text(title, "Architecture graph");
   const groupParts = text(groupPath)
     .split(/[/>]/u)
@@ -3434,21 +3252,13 @@ function architectureStarterSource({ groupPath = "", template = "system", title 
     "direction right",
   ];
   if (groupParts.length) lines.push(`folder ${architectureDslString(groupParts.join(" / "))}`);
-  lines.push("");
-  const templateKeys = template === "system"
-    ? ["architecture", "api-pathway", "data-flow"]
-    : [template];
-  templateKeys.forEach((templateKey, index) => {
-    if (index) lines.push("");
-    lines.push(...architectureSliceTemplateLines(templateKey));
-  });
   return `${lines.join("\n")}\n`;
 }
 
-function architectureStarterGraph({ groupPath = "", template = "system", title = "" } = {}) {
+function architectureEmptyGraph({ groupPath = "", title = "" } = {}) {
   const cleanTitle = text(title, "Architecture graph");
   const id = `${architectureSlug(cleanTitle)}-${String(Date.now()).slice(-5)}`;
-  const source = architectureStarterSource({ groupPath, template, title: cleanTitle });
+  const source = architectureEmptyGraphSource({ groupPath, title: cleanTitle });
   return architectureParseDslGraph({
     id,
     title: cleanTitle,
@@ -4007,151 +3817,6 @@ function architectureGraphFromFlow(graph, nodes, edges) {
       engine: "manual",
     },
   };
-}
-
-function architectureExpandParentNodesForChild(nodes, parentId, childPosition, childSize, padding = 58) {
-  let nextNodes = nodes;
-  let currentParentId = text(parentId);
-  let requiredWidth = numberValue(childPosition?.x, 0) + numberValue(childSize?.width, 0) + padding;
-  let requiredHeight = numberValue(childPosition?.y, 0) + numberValue(childSize?.height, 0) + padding;
-
-  while (currentParentId) {
-    const parentNode = nextNodes.find((node) => node.id === currentParentId);
-    if (!parentNode) break;
-    const currentWidth = numberValue(parentNode.style?.width, 460);
-    const currentHeight = numberValue(parentNode.style?.height, 280);
-    const nextWidth = Math.max(currentWidth, requiredWidth);
-    const nextHeight = Math.max(currentHeight, requiredHeight);
-    if (nextWidth !== currentWidth || nextHeight !== currentHeight) {
-      nextNodes = nextNodes.map((node) => (
-        node.id === currentParentId
-          ? {
-            ...node,
-            style: {
-              ...(node.style || {}),
-              height: nextHeight,
-              width: nextWidth,
-            },
-          }
-          : node
-      ));
-    }
-
-    requiredWidth = numberValue(parentNode.position?.x, 0) + nextWidth + padding;
-    requiredHeight = numberValue(parentNode.position?.y, 0) + nextHeight + padding;
-    currentParentId = text(parentNode.parentId);
-  }
-
-  return nextNodes;
-}
-
-function architectureCreateSemanticSliceFlow(intentValue = "architecture", options = {}) {
-  const intent = architectureGroupIntent(intentValue);
-  const template = ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES[intent]
-    || ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES.architecture;
-  const index = numberValue(options.index, 0);
-  const groupId = architectureEntityId(`group-${intent}`);
-  const groupWidth = 650;
-  const groupHeight = intent === "control-graph" ? 430 : 340;
-  const rootPosition = {
-    x: 110 + (index % 3) * 48,
-    y: 90 + Math.floor(index / 3) * 44,
-  };
-  const nodeIdByTemplateId = new Map();
-  const nodes = [
-    {
-      id: groupId,
-      type: "architectureGroup",
-      position: rootPosition,
-      style: { height: groupHeight, width: groupWidth },
-      data: {
-        color: template.color || ARCHITECTURE_GROUP_INTENT_COLORS[intent],
-        icon: template.icon || ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "group",
-        intent,
-        kind: "group",
-        semanticProps: {
-          color: template.color || ARCHITECTURE_GROUP_INTENT_COLORS[intent],
-          desc: template.subtitle,
-          icon: template.icon || ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "group",
-          intent,
-        },
-        subtitle: template.subtitle,
-        title: template.title,
-      },
-    },
-  ];
-  template.nodes.forEach((templateNode) => {
-    const id = architectureEntityId(`${intent}-${templateNode.id}`);
-    const role = architectureNodeRole(templateNode.role);
-    const display = text(templateNode.display);
-    nodeIdByTemplateId.set(templateNode.id, id);
-    nodes.push({
-      id,
-      type: "architectureNode",
-      parentId: groupId,
-      extent: "parent",
-      position: {
-        x: numberValue(templateNode.x, 58),
-        y: numberValue(templateNode.y, 98),
-      },
-      style: display === "compact" ? {
-        height: ARCHITECTURE_NODE_COMPACT_HEIGHT,
-        width: ARCHITECTURE_NODE_COMPACT_WIDTH,
-      } : undefined,
-      data: {
-        display,
-        icon: templateNode.icon || ARCHITECTURE_NODE_ROLE_ICONS[role] || "service",
-        kind: architectureNodeKindFromRole(role, "service"),
-        lifecycle: text(templateNode.lifecycle),
-        role,
-        semanticProps: {
-          ...(templateNode.desc && display !== "compact" ? { desc: templateNode.desc } : {}),
-          ...(display ? { display } : {}),
-          icon: templateNode.icon || ARCHITECTURE_NODE_ROLE_ICONS[role] || "service",
-          ...(templateNode.lifecycle ? { lifecycle: templateNode.lifecycle } : {}),
-          role,
-        },
-        subtitle: display === "compact" ? "" : text(templateNode.desc),
-        title: templateNode.title,
-      },
-    });
-  });
-  const edges = template.edges
-    .map((templateEdge) => {
-      const source = nodeIdByTemplateId.get(templateEdge.source);
-      const target = nodeIdByTemplateId.get(templateEdge.target);
-      if (!source || !target) return null;
-      const role = architectureEdgeRole(templateEdge.role);
-      return {
-        id: architectureEntityId(`edge-${intent}`),
-        source,
-        target,
-        type: "architectureEdge",
-        zIndex: 0,
-        markerEnd: {
-          color: "rgba(125, 211, 252, 0.88)",
-          height: 18,
-          type: MarkerType.ArrowClosed,
-          width: 18,
-        },
-        data: {
-          condition: text(templateEdge.condition),
-          criticality: text(templateEdge.criticality),
-          event: text(templateEdge.event),
-          kind: architectureEdgeKindFromRole(role, "calls"),
-          label: text(templateEdge.label),
-          role,
-          semanticProps: {
-            ...(templateEdge.condition ? { condition: templateEdge.condition } : {}),
-            ...(templateEdge.event ? { event: templateEdge.event } : {}),
-            ...(templateEdge.criticality ? { criticality: templateEdge.criticality } : {}),
-            role,
-          },
-        },
-      };
-    })
-    .filter(Boolean);
-  return { edges, nodes };
 }
 
 function architectureGroupDescendantIds(groupId, nodes) {
@@ -5698,10 +5363,9 @@ function ArchitecturesPanel({
   const [selectedGraph, setSelectedGraph] = useState(null);
   const [error, setError] = useState("");
   const [creatingGraph, setCreatingGraph] = useState(false);
-  const [draftTitle, setDraftTitle] = useState("Architecture graph");
+  const [draftTitle, setDraftTitle] = useState("");
   const [draftLocationMode, setDraftLocationMode] = useState("root");
   const [draftFolderPath, setDraftFolderPath] = useState("");
-  const [draftGraphTemplate, setDraftGraphTemplate] = useState("system");
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [saveState, setSaveState] = useState("idle");
   const [agentEditMarkers, setAgentEditMarkers] = useState([]);
@@ -6114,7 +5778,6 @@ function ArchitecturesPanel({
     () => architectureAgentEditMarkerForGraph(selectedGraph, visibleAgentEditMarkers),
     [selectedGraph, visibleAgentEditMarkers],
   );
-  const isLoading = repoState === "loading" || graphState === "loading";
   const treeRows = useMemo(() => architectureGraphTreeRows(graphs, 0), [graphs]);
   const showEmptyGraphList = !graphs.length && (
     graphState === "ready"
@@ -6193,8 +5856,7 @@ function ArchitecturesPanel({
           setSelectedRepoPath(entryPath);
           setSelectedGraphId("");
           setSelectedGraph(null);
-          setDraftTitle("Architecture graph");
-          setDraftGraphTemplate("system");
+          setDraftTitle("");
           setDraftLocationMode(initialFolderPath ? "folder" : "root");
           setDraftFolderPath(initialFolderPath);
           setCreatingGraph(Boolean(initialFolderPath));
@@ -6208,8 +5870,7 @@ function ArchitecturesPanel({
 
   const beginCreateGraph = useCallback((folderPath = "") => {
     const nextFolderPath = text(folderPath);
-    setDraftTitle("Architecture graph");
-    setDraftGraphTemplate("system");
+    setDraftTitle("");
     setDraftLocationMode(nextFolderPath ? "folder" : "root");
     setDraftFolderPath(nextFolderPath);
     setCreatingFolder(false);
@@ -6231,10 +5892,8 @@ function ArchitecturesPanel({
   const createGraph = useCallback(() => {
     if (!selectedRepoPath) return;
     const groupPath = draftLocationMode === "folder" ? draftFolderPath : "";
-    const graph = architectureStarterGraph({
+    const graph = architectureEmptyGraph({
       groupPath,
-      kind: "architecture",
-      template: draftGraphTemplate,
       title: draftTitle,
     });
     setSaveState("saving");
@@ -6248,8 +5907,7 @@ function ArchitecturesPanel({
         setSelectedGraph(nextGraph);
         setSelectedGraphId(result?.graphId || graph.id);
         setCreatingGraph(false);
-        setDraftTitle("Architecture graph");
-        setDraftGraphTemplate("system");
+        setDraftTitle("");
         setDraftLocationMode("root");
         setDraftFolderPath("");
         setSaveState("idle");
@@ -6272,7 +5930,7 @@ function ArchitecturesPanel({
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
       });
-  }, [draftFolderPath, draftGraphTemplate, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
+  }, [draftFolderPath, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
 
   const saveGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -6676,19 +6334,14 @@ function ArchitecturesPanel({
             <ArchitectureCreateSurface
               canCancel={creatingGraph && Boolean(selectedGraph)}
               draftFolderPath={draftFolderPath}
-              draftGraphTemplate={draftGraphTemplate}
               draftLocationMode={draftLocationMode}
               draftTitle={draftTitle}
               folderSuggestions={folderSuggestions}
-              graphCount={graphs.length}
-              isLoading={isLoading}
               onCancel={() => setCreatingGraph(false)}
               onCreate={createGraph}
               onDraftFolderPathChange={setDraftFolderPath}
-              onDraftGraphTemplateChange={setDraftGraphTemplate}
               onDraftLocationModeChange={setDraftLocationMode}
               onDraftTitleChange={setDraftTitle}
-              repoLabel={repoLabel}
               saveState={saveState}
               selectedRepo={selectedRepo}
             />
@@ -6715,53 +6368,30 @@ function ArchitecturesPanel({
 function ArchitectureCreateSurface({
   canCancel,
   draftFolderPath,
-  draftGraphTemplate,
   draftLocationMode,
   draftTitle,
   folderSuggestions,
-  graphCount,
-  isLoading,
   onCancel,
   onCreate,
   onDraftFolderPathChange,
-  onDraftGraphTemplateChange,
   onDraftLocationModeChange,
   onDraftTitleChange,
-  repoLabel,
   saveState,
   selectedRepo,
 }) {
   const canCreate = Boolean(selectedRepo && text(draftTitle));
-  const title = isLoading
-    ? "Loading architectures..."
-    : graphCount ? "Create or select an architecture graph" : "Create architecture graph";
 
   return (
     <ArchitectureCreateSurfaceShell>
-      <ArchitectureCreateDialog>
-        <TimelineKicker>{selectedRepo?.name || repoLabel}</TimelineKicker>
-        <ArchitectureCreateTitle>{title}</ArchitectureCreateTitle>
-        <ArchitectureCreateText>
-          Graphs are stored under the selected repo in .agents/architectures.
-        </ArchitectureCreateText>
+      <ArchitectureCreateDialog aria-label="Create architecture graph">
         <ArchitectureField>
-          <span>Title</span>
+          <span>Name</span>
           <ArchitectureInput
+            autoFocus
             onChange={(event) => onDraftTitleChange(event.target.value)}
-            placeholder="Auth flow"
+            placeholder="Architecture graph name"
             value={draftTitle}
           />
-        </ArchitectureField>
-        <ArchitectureField>
-          <span>Starter</span>
-          <ArchitectureSelect
-            onChange={(event) => onDraftGraphTemplateChange(event.target.value)}
-            value={draftGraphTemplate}
-          >
-            {ARCHITECTURE_GRAPH_TEMPLATE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </ArchitectureSelect>
         </ArchitectureField>
         <ArchitectureField>
           <span>Location</span>
@@ -6771,7 +6401,7 @@ function ArchitectureCreateSurface({
               onClick={() => onDraftLocationModeChange("root")}
               type="button"
             >
-              Architecture root
+              Root
             </ArchitectureLocationButton>
             <ArchitectureLocationButton
               data-active={draftLocationMode === "folder" ? "true" : "false"}
@@ -6958,118 +6588,6 @@ function ArchitectureGraphEditor({
     }, currentEdges));
   }, [setEdges]);
 
-  const updateDraftGraph = useCallback((patch) => {
-    setDraftGraph((current) => ({
-      ...current,
-      ...patch,
-    }));
-    setDirty(true);
-  }, []);
-
-  const addGroup = useCallback(() => {
-    const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
-      || null;
-    const count = nodes.filter((node) => node.type === "architectureGroup").length;
-    const childSize = { height: 300, width: 460 };
-    const childPosition = selectedGroup?.id
-      ? { x: 58 + (count % 2) * 58, y: 98 + Math.floor(count / 2) * 48 }
-      : { x: 120 + count * 34, y: 90 + count * 28 };
-    setNodes((currentNodes) => {
-      const expandedNodes = selectedGroup?.id
-        ? architectureExpandParentNodesForChild(currentNodes, selectedGroup.id, childPosition, childSize)
-        : currentNodes;
-      return [
-        ...expandedNodes,
-        {
-          id: architectureEntityId("group"),
-          type: "architectureGroup",
-          parentId: selectedGroup?.id,
-          extent: selectedGroup?.id ? "parent" : undefined,
-          position: childPosition,
-          style: childSize,
-          data: {
-            icon: "box",
-            kind: "group",
-            subtitle: "Drag nodes into this area",
-            title: `Group ${count + 1}`,
-          },
-        },
-      ];
-    });
-    setDirty(true);
-  }, [nodes, selectedNodes, setNodes]);
-
-  const addSemanticSlice = useCallback((intent) => {
-    const slice = architectureCreateSemanticSliceFlow(intent, {
-      index: nodes.filter((node) => node.type === "architectureGroup").length,
-    });
-    setNodes((currentNodes) => [...currentNodes, ...slice.nodes]);
-    setEdges((currentEdges) => [...currentEdges, ...slice.edges]);
-    setDirty(true);
-  }, [nodes, setEdges, setNodes]);
-
-  const addNode = useCallback(() => {
-    const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
-      || null;
-    const nodeCount = nodes.filter((node) => node.type !== "architectureGroup").length;
-    const childSize = { height: 76, width: 184 };
-    const childPosition = selectedGroup?.id
-      ? { x: 58 + (nodeCount % 2) * 220, y: 98 + Math.floor(nodeCount / 2) * 116 }
-      : { x: 140 + (nodeCount % 3) * 220, y: 130 + Math.floor(nodeCount / 3) * 128 };
-    setNodes((currentNodes) => {
-      const expandedNodes = selectedGroup?.id
-        ? architectureExpandParentNodesForChild(currentNodes, selectedGroup.id, childPosition, childSize)
-        : currentNodes;
-      return [
-        ...expandedNodes,
-        {
-          id: architectureEntityId("node"),
-          type: "architectureNode",
-          parentId: selectedGroup?.id,
-          extent: selectedGroup?.id ? "parent" : undefined,
-          position: childPosition,
-          data: {
-            icon: "server",
-            kind: "service",
-            subtitle: "",
-            title: `Node ${nodeCount + 1}`,
-          },
-        },
-      ];
-    });
-    setDirty(true);
-  }, [nodes, selectedNodes, setNodes]);
-
-  const connectSelectedNodes = useCallback(() => {
-    const pair = selectedNodes.filter((node) => node.type !== "architectureGroup").slice(0, 2);
-    if (pair.length < 2) {
-      setLocalError("Select two non-group nodes to connect.");
-      return;
-    }
-    setLocalError("");
-    setEdges((currentEdges) => [
-      ...currentEdges,
-      {
-        id: architectureEntityId("edge"),
-        source: pair[0].id,
-        target: pair[1].id,
-        type: "architectureEdge",
-        zIndex: 0,
-        markerEnd: {
-          color: "rgba(125, 211, 252, 0.88)",
-          height: 18,
-          type: MarkerType.ArrowClosed,
-          width: 18,
-        },
-        data: {
-          kind: "calls",
-          label: "",
-        },
-      },
-    ]);
-    setDirty(true);
-  }, [selectedNodes, setEdges]);
-
   const deleteSelected = useCallback(() => {
     const nodeIds = new Set(selectedNodes.map((node) => node.id));
     const edgeIds = new Set(selectedEdges.map((edge) => edge.id));
@@ -7225,21 +6743,6 @@ function ArchitectureGraphEditor({
               <span>{agentEditBlurb}</span>
             </ArchitectureAgentEditStatus>
           )}
-          <ArchitectureSliceToolbar
-            aria-label="Add architecture slice"
-            data-has-agent-marker={agentEditMarker ? "true" : "false"}
-          >
-            {["api-pathway", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment"].map((intent) => (
-              <ArchitectureSliceButton
-                key={intent}
-                onClick={() => addSemanticSlice(intent)}
-                title={`Add ${architectureGroupIntentLabel(intent)}`}
-                type="button"
-              >
-                {architectureGroupIntentLabel(intent)}
-              </ArchitectureSliceButton>
-            ))}
-          </ArchitectureSliceToolbar>
           {semanticWarnings.length > 0 && (
             <ArchitectureValidationPanel title="Semantic graph warnings">
               <strong>{semanticWarnings.length} warning{semanticWarnings.length === 1 ? "" : "s"}</strong>
@@ -10963,26 +10466,6 @@ const ArchitectureInput = styled.input`
   }
 `;
 
-const ArchitectureSelect = styled.select`
-  width: 100%;
-  min-width: 0;
-  min-height: 30px;
-  padding: 0 8px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 7px;
-  color: var(--forge-text);
-  background: rgba(2, 6, 23, 0.42);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 760;
-  outline: none;
-
-  &:focus {
-    border-color: rgba(125, 211, 252, 0.52);
-    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.14);
-  }
-`;
-
 const ArchitecturePrimaryButton = styled.button`
   display: inline-flex;
   align-items: center;
@@ -11277,24 +10760,6 @@ const ArchitectureCreateDialog = styled.div`
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.46);
   box-shadow: 0 18px 46px rgba(0, 0, 0, 0.26);
-`;
-
-const ArchitectureCreateTitle = styled.strong`
-  min-width: 0;
-  overflow-wrap: anywhere;
-  color: rgba(248, 250, 252, 0.96);
-  font-size: 18px;
-  font-weight: 920;
-  line-height: 1.2;
-`;
-
-const ArchitectureCreateText = styled.p`
-  min-width: 0;
-  margin: -4px 0 2px;
-  color: rgba(148, 163, 184, 0.78);
-  font-size: 12px;
-  font-weight: 720;
-  line-height: 1.4;
 `;
 
 const ArchitectureLocationToggle = styled.div`
@@ -12166,34 +11631,6 @@ const ArchitectureApiCorridorStepChips = styled.div`
   }
 `;
 
-const ArchitectureSliceToolbar = styled.div`
-  position: absolute;
-  top: 12px;
-  left: 12px;
-  z-index: 8;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  max-width: min(620px, calc(100% - 220px));
-  pointer-events: auto;
-  opacity: 0.74;
-  transition: opacity 120ms ease;
-
-  &[data-has-agent-marker="true"] {
-    top: 48px;
-  }
-
-  ${ArchitectureCanvasViewport}:hover &,
-  &:focus-within {
-    opacity: 1;
-  }
-
-  @media (max-width: 900px) {
-    right: 12px;
-    max-width: calc(100% - 24px);
-  }
-`;
-
 const ArchitectureFloatingButton = styled.button`
   height: 32px;
   padding: 0 12px;
@@ -12213,15 +11650,6 @@ const ArchitectureFloatingButton = styled.button`
     cursor: default;
     opacity: 0.45;
   }
-`;
-
-const ArchitectureSliceButton = styled(ArchitectureFloatingButton)`
-  height: 28px;
-  padding: 0 9px;
-  border-color: rgba(125, 211, 252, 0.2);
-  color: rgba(224, 242, 254, 0.9);
-  background: rgba(15, 23, 42, 0.68);
-  font-size: 10px;
 `;
 
 const ArchitectureFloatingDangerButton = styled(ArchitectureFloatingButton)`

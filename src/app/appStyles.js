@@ -303,6 +303,20 @@ export const GlobalStyle = createGlobalStyle`
     -webkit-touch-callout: none;
   }
 
+  html[data-audio-widget-error="true"],
+  html[data-audio-widget-error="true"] body,
+  html[data-audio-widget-error="true"] #app,
+  body[data-audio-widget-error="true"],
+  body[data-audio-widget-error="true"] #app {
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    background: transparent !important;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+
   button {
     cursor: pointer;
     font: inherit;
@@ -9704,6 +9718,73 @@ export const AudioWidgetErrorPopover = styled.div`
     border-color: rgba(217, 72, 72, 0.45);
     color: #8c1d1d;
     background: rgba(255, 236, 236, 0.97);
+  }
+`;
+
+export const AudioWidgetErrorOverlayShell = styled.div`
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 3px 3px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(6px);
+  transition: opacity 150ms ease, transform 190ms cubic-bezier(0.3, 0, 0.2, 1);
+
+  &[data-visible="true"] {
+    opacity: 1;
+    transform: translateY(0);
+  }
+`;
+
+export const AudioWidgetErrorOverlayCard = styled.div`
+  display: -webkit-box;
+  box-sizing: border-box;
+  width: min(100%, 426px);
+  max-height: 58px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  padding: 8px 12px;
+  border: 1px solid rgba(239, 107, 107, 0.46);
+  border-radius: 14px;
+  color: #ffd9d9;
+  background: rgba(46, 14, 18, 0.96);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 12px 24px rgba(0, 0, 0, 0.3);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  animation: audioWidgetErrorOverlayIn 190ms cubic-bezier(0.3, 0, 0.2, 1) both;
+
+  ${AudioWidgetErrorOverlayShell}[data-theme="light"] & {
+    border-color: rgba(217, 72, 72, 0.45);
+    color: #8c1d1d;
+    background: rgba(255, 236, 236, 0.97);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.9) inset,
+      0 10px 22px rgba(120, 20, 20, 0.14);
+  }
+
+  @keyframes audioWidgetErrorOverlayIn {
+    from {
+      opacity: 0;
+      transform: translateY(7px) scale(0.98);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
   }
 `;
 

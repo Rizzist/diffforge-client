@@ -9,6 +9,7 @@ export const PLAN_FLAME_OPTIONS = [
 ];
 
 const PLAN_FLAME_KEYS = new Set(PLAN_FLAME_OPTIONS.map((option) => option.key));
+const PLAN_FLAME_REVEAL_DELAY_MS = 180;
 
 // quality.ratio caps the render pixel ratio, quality.octaves the noise depth,
 // and quality.detail gates the ridged-lick pass and second ember layer, so
@@ -315,12 +316,12 @@ export function normalizePlanFlameKey(plan, fallback = "") {
   return PLAN_FLAME_KEYS.has(key) ? key : fallback;
 }
 
-function FlameShaderCanvas({ preset, planKey, onReady }) {
+function FlameShaderCanvas({ active, preset, planKey, onReady }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || typeof window === "undefined") {
+    if (!active || !canvas || typeof window === "undefined") {
       return undefined;
     }
 
@@ -443,8 +444,35 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
           onReady(true);
         }
 
-        if (!reduceMotion) {
+        if (!reduceMotion && document.visibilityState !== "hidden") {
           frame = window.requestAnimationFrame(render);
+        } else {
+          frame = 0;
+        }
+      }
+
+      function startRendering() {
+        if (reduceMotion || frame || document.visibilityState === "hidden") {
+          return;
+        }
+        frame = window.requestAnimationFrame(render);
+      }
+
+      function stopRendering() {
+        if (!frame) {
+          return;
+        }
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+      }
+
+      function handleVisibilityChange() {
+        if (document.visibilityState === "hidden") {
+          stopRendering();
+        } else if (reportedReady) {
+          startRendering();
+        } else {
+          render(performance.now());
         }
       }
 
@@ -461,14 +489,16 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       } else {
         window.addEventListener("resize", measure);
       }
+      document.addEventListener("visibilitychange", handleVisibilityChange);
       measure();
 
-      render(startTime);
+      if (document.visibilityState !== "hidden") {
+        render(startTime);
+      }
 
       return () => {
-        if (frame) {
-          window.cancelAnimationFrame(frame);
-        }
+        stopRendering();
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
         if (resizeObserver) {
           resizeObserver.disconnect();
         } else {
@@ -483,30 +513,84 @@ function FlameShaderCanvas({ preset, planKey, onReady }) {
       onReady(false);
       return undefined;
     }
-  }, [onReady, planKey, preset]);
+  }, [active, onReady, planKey, preset]);
 
   return <FlameCanvas ref={canvasRef} />;
 }
 
-export function PlanFlame({ plan, showControls = false }) {
+export function PlanFlame({ active = true, plan, showControls = false }) {
   const planKey = normalizePlanFlameKey(plan);
   const [previewPlan, setPreviewPlan] = useState(planKey);
   const [shaderReady, setShaderReady] = useState(false);
+  const [flameMounted, setFlameMounted] = useState(false);
+  const [flameVisible, setFlameVisible] = useState(false);
+  const [pageVisible, setPageVisible] = useState(() => (
+    typeof document === "undefined" || document.visibilityState !== "hidden"
+  ));
 
   useEffect(() => {
     setPreviewPlan(planKey);
   }, [planKey]);
 
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+
+    const handleVisibilityChange = () => {
+      setPageVisible(document.visibilityState !== "hidden");
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    handleVisibilityChange();
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
   const activePlan = normalizePlanFlameKey(previewPlan, planKey);
   const preset = PLAN_FLAME_PRESETS[activePlan];
+  const flameActive = Boolean(active && pageVisible && preset);
+
+  useEffect(() => {
+    let revealTimer = 0;
+    let frame = 0;
+
+    if (!flameActive) {
+      setFlameVisible(false);
+      setFlameMounted(false);
+      setShaderReady(false);
+      return undefined;
+    }
+
+    setFlameVisible(false);
+    setFlameMounted(false);
+    setShaderReady(false);
+    revealTimer = window.setTimeout(() => {
+      setFlameMounted(true);
+      frame = window.requestAnimationFrame(() => {
+        setFlameVisible(true);
+      });
+    }, PLAN_FLAME_REVEAL_DELAY_MS);
+
+    return () => {
+      window.clearTimeout(revealTimer);
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+      }
+    };
+  }, [activePlan, flameActive]);
 
   if (!preset) return null;
+  if (!flameMounted) return null;
 
   return (
     <FlameStage
       aria-hidden={showControls ? undefined : true}
       data-plan={activePlan}
       data-ready={shaderReady ? "true" : "false"}
+      data-visible={flameVisible ? "true" : "false"}
       style={{
         "--flame-glow": preset.glow,
         "--flame-h": `${preset.height}px`,
@@ -515,6 +599,7 @@ export function PlanFlame({ plan, showControls = false }) {
     >
       <FlameBackdrop />
       <FlameShaderCanvas
+        active={flameVisible}
         key={activePlan}
         onReady={setShaderReady}
         planKey={activePlan}
@@ -559,10 +644,23 @@ const FlameStage = styled.div`
   bottom: 0;
   left: 0;
   z-index: 0;
-  height: min(48vh, var(--flame-h));
-  min-height: min(30vh, var(--flame-h));
+  height: 0;
   pointer-events: none;
   isolation: isolate;
+  overflow: hidden;
+  opacity: 0;
+  transform: translate3d(0, 24px, 0);
+  transition:
+    height 1.35s ease,
+    opacity 1.35s ease,
+    transform 1.35s ease;
+  will-change: height, opacity, transform;
+
+  &[data-visible="true"] {
+    height: min(48vh, var(--flame-h));
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
 
   &::after {
     content: "";

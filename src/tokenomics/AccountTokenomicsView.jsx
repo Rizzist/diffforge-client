@@ -65,6 +65,54 @@ const PROVIDER_ACCENTS = {
 
 const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
 
+function scheduleTokenomicsIdleTask(callback, { delayMs = 0, timeout = 1200 } = {}) {
+  if (typeof window === "undefined") {
+    callback();
+    return () => {};
+  }
+
+  let cancelled = false;
+  let frame = 0;
+  let idle = 0;
+  let timer = 0;
+
+  const run = () => {
+    if (!cancelled) {
+      callback();
+    }
+  };
+
+  const scheduleIdle = () => {
+    if (cancelled) {
+      return;
+    }
+    if (typeof window.requestIdleCallback === "function") {
+      idle = window.requestIdleCallback(run, { timeout });
+      return;
+    }
+    timer = window.setTimeout(run, delayMs);
+  };
+
+  if (typeof window.requestAnimationFrame === "function") {
+    frame = window.requestAnimationFrame(scheduleIdle);
+  } else {
+    timer = window.setTimeout(scheduleIdle, delayMs);
+  }
+
+  return () => {
+    cancelled = true;
+    if (frame && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(frame);
+    }
+    if (idle && typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(idle);
+    }
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+  };
+}
+
 const AgentAccountsSection = styled.section`
   display: flex;
   flex-direction: column;
@@ -1065,9 +1113,9 @@ function dedupeDeviceLabels(devices) {
 
 function deviceLabel(deviceId, currentDeviceId = "", identityMap = new Map()) {
   if (!deviceId) return "Unknown device";
-  if (currentDeviceId && deviceId === currentDeviceId) return "This Device";
   const identityLabel = tokenomicsDeviceIdentityLabel(identityMap.get(deviceId));
-  return identityLabel || genericDeviceLabel(deviceId);
+  if (identityLabel) return identityLabel;
+  return genericDeviceLabel(deviceId);
 }
 
 function filterRows(rows, selectedProvider, selectedAccountKey = "all", selectedDeviceId = "all", selectedScopeKey = "all") {
@@ -2165,6 +2213,7 @@ const tokenomicsStore = {
   liveLimitsPromise: null,
   pollInterval: null,
   pollSubscriberCount: 0,
+  warmScanEpoch: -1,
   limitPercentSignature: "",
   limitSyncInFlight: false,
   limitSyncPending: false,
@@ -2267,6 +2316,7 @@ function resetTokenomicsStoreForAccount(accountKey) {
   tokenomicsStore.liveLimitsPromise = null;
   tokenomicsStore.limitPercentSignature = "";
   tokenomicsStore.limitSyncPending = false;
+  tokenomicsStore.warmScanEpoch = -1;
   tokenomicsStore.state = createTokenomicsStoreState();
   notifyTokenomicsSubscribers();
 }
@@ -2336,7 +2386,13 @@ function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
   return tokenomicsStore.liveLimitsPromise;
 }
 
-function loadTokenomicsStore({ scan = false, force = false, resync = false } = {}) {
+function loadTokenomicsStore({
+  background = false,
+  force = false,
+  resync = false,
+  scan = false,
+  summaryOnly = false,
+} = {}) {
   const forceResync = Boolean(resync);
   if (forceResync) {
     tokenomicsStore.requestEpoch += 1;
@@ -2344,11 +2400,14 @@ function loadTokenomicsStore({ scan = false, force = false, resync = false } = {
     tokenomicsStore.liveLimitsPromise = null;
   }
   const hasSummary = Boolean(tokenomicsStore.state.summary);
-  const shouldScan = Boolean(scan || forceResync || !tokenomicsStore.loadedOnce);
+  const shouldScan = !summaryOnly && Boolean(scan || forceResync || !tokenomicsStore.loadedOnce);
   const requestEpoch = tokenomicsStore.requestEpoch;
 
   if (tokenomicsStore.loadPromise) {
     return tokenomicsStore.loadPromise;
+  }
+  if (!force && summaryOnly && hasSummary) {
+    return Promise.resolve(tokenomicsStore.state.summary);
   }
   if (!force && !shouldScan && tokenomicsStore.loadedOnce && hasSummary) {
     return Promise.resolve(tokenomicsStore.state.summary);
@@ -2357,7 +2416,11 @@ function loadTokenomicsStore({ scan = false, force = false, resync = false } = {
   updateTokenomicsStore((previous) => ({
     error: "",
     scanProgress: shouldScan ? null : previous.scanProgress,
-    status: shouldScan ? "scanning" : (previous.summary ? "ready" : "loading"),
+    status: background && previous.summary
+      ? "ready"
+      : shouldScan
+        ? "scanning"
+        : (previous.summary ? "ready" : "loading"),
   }));
 
   tokenomicsStore.loadPromise = (async () => {
@@ -2368,9 +2431,11 @@ function loadTokenomicsStore({ scan = false, force = false, resync = false } = {
 
       const next = forceResync
         ? await invoke("tokenomics_resync_last_30_days")
-        : shouldScan
-          ? await invoke("tokenomics_scan_usage")
-          : await invoke("tokenomics_get_summary");
+        : summaryOnly
+          ? await invoke("tokenomics_get_summary")
+          : shouldScan
+            ? await invoke("tokenomics_scan_usage")
+            : await invoke("tokenomics_get_summary");
       if (tokenomicsStore.requestEpoch !== requestEpoch) {
         return tokenomicsStore.state.summary;
       }
@@ -2403,11 +2468,43 @@ function loadTokenomicsStore({ scan = false, force = false, resync = false } = {
   return tokenomicsStore.loadPromise;
 }
 
+export function warmAccountTokenomics({ accountKey = "", scan = true } = {}) {
+  resetTokenomicsStoreForAccount(accountKey);
+  const requestEpoch = tokenomicsStore.requestEpoch;
+  const summaryPromise = loadTokenomicsStore({
+    background: true,
+    force: false,
+    summaryOnly: true,
+  });
+
+  if (scan && tokenomicsStore.warmScanEpoch !== requestEpoch) {
+    tokenomicsStore.warmScanEpoch = requestEpoch;
+    summaryPromise.finally(() => {
+      scheduleTokenomicsIdleTask(() => {
+        if (tokenomicsStore.requestEpoch !== requestEpoch) {
+          return;
+        }
+        void loadTokenomicsStore({
+          background: true,
+          force: true,
+          scan: true,
+        }).finally(() => {
+          if (tokenomicsStore.requestEpoch === requestEpoch) {
+            void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+          }
+        });
+      }, { delayMs: 120, timeout: 1500 });
+    });
+  }
+
+  return summaryPromise;
+}
+
 function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   ensureTokenomicsCloudListener();
   tokenomicsStore.pollSubscriberCount += 1;
-  void loadTokenomicsStore({ scan: true, force: true }).finally(() => {
+  void loadTokenomicsStore({ background: true, force: false, summaryOnly: true }).finally(() => {
     void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
   });
 
@@ -2542,8 +2639,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   useEffect(() => {
-    resetTokenomicsStoreForAccount(accountKey);
-    void loadTokenomicsStore({ scan: true, force: true });
+    warmAccountTokenomics({ accountKey, scan: true });
   }, [accountKey]);
 
   useEffect(() => {

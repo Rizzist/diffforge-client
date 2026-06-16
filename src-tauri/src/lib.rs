@@ -182,8 +182,10 @@ const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE: &str = "audio-widget-bottom-bar.jsonl";
-const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = true;
+const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE: &str = "audio-widget-bubble-position.jsonl";
+const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED: bool = true;
+const SNIPPING_AREA_CURSOR_DEBUG_LOG_FILE: &str = "snipping-area-cursor.jsonl";
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
@@ -200,6 +202,7 @@ const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const TERMINAL_TODO_PLAN_UPDATED_EVENT: &str = "forge-terminal-todo-plan-updated";
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
+const AUDIO_WIDGET_ERROR_WINDOW_LABEL: &str = "audio-widget-error";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
 const ACTIVITY_OVERLAY_WINDOW_LABEL: &str = "activity-overlay";
 const ACTIVITY_OVERLAY_VISIBILITY_CHANGED_EVENT: &str = "forge-activity-overlay-visibility-changed";
@@ -4724,6 +4727,7 @@ pub fn run() {
             snipping_capture_screenshot,
             snipping_begin_area_snip,
             snipping_area_overlay_status,
+            snipping_log_area_cursor_event,
             snipping_finish_area_snip,
             snipping_recent_capture_toasts,
             snipping_dismiss_capture_toast,
@@ -4757,6 +4761,8 @@ pub fn run() {
             audio_widget_log_bubble_position,
             audio_widget_position_bottom_bar,
             audio_widget_clear_bottom_bar_position,
+            audio_widget_show_error_overlay,
+            audio_widget_hide_error_overlay,
             audio_widget_release_keyboard_focus,
             show_audio_widget,
             hide_audio_widget,

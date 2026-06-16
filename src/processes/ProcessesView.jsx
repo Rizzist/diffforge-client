@@ -96,6 +96,14 @@ function formatEnergy(value) {
   return score >= 100 ? `${Math.round(score)}` : score.toFixed(1);
 }
 
+function formatPercent(value) {
+  const percent = Number(value || 0);
+  if (!Number.isFinite(percent) || percent <= 0) {
+    return "0.0%";
+  }
+  return percent >= 100 ? `${Math.round(percent)}%` : `${percent.toFixed(1)}%`;
+}
+
 function energyTone(value) {
   const score = Number(value || 0);
   if (score >= 20) {
@@ -809,10 +817,7 @@ function ProcessEnergySection({ energy }) {
   const visibleGroups = groups.filter((group) => (
     Number(group?.score || 0) > 0 || Number(group?.processCount || 0) > 0
   ));
-  const maxScore = Math.max(
-    1,
-    ...visibleGroups.map((group) => Number(group?.score || 0)),
-  );
+  const totalScore = Number(energy?.totalScore || 0);
   const totalTone = energyTone(energy?.totalScore);
 
   return (
@@ -823,7 +828,7 @@ function ProcessEnergySection({ energy }) {
           <span>
             {energy?.topLabel
               ? `${energy.topLabel}: ${energy.topCause || "largest current source"}`
-              : "Estimated from live app, helper, terminal, and workspace processes."}
+              : "Estimated from Diff Forge AI's own process, windows, terminals, and workspace services."}
           </span>
         </div>
         <ProcessEnergyTotal data-tone={totalTone}>
@@ -838,7 +843,12 @@ function ProcessEnergySection({ energy }) {
         <ProcessEnergyList role="list">
           {visibleGroups.map((group) => {
             const score = Number(group?.score || 0);
-            const width = `${Math.max(3, Math.min(100, (score / maxScore) * 100))}%`;
+            const sharePercent = Number.isFinite(Number(group?.sharePercent))
+              ? Number(group.sharePercent)
+              : totalScore > 0
+                ? (score / totalScore) * 100
+                : 0;
+            const width = `${Math.max(3, Math.min(100, sharePercent))}%`;
             return (
               <ProcessEnergyRow
                 data-tone={group?.intensity || energyTone(score)}
@@ -856,7 +866,8 @@ function ProcessEnergySection({ energy }) {
                 <ProcessEnergyNumbers>
                   <strong>{formatEnergy(score)}</strong>
                   <span>
-                    {formatCpu(group?.cpuPercent)}
+                    {formatPercent(sharePercent)}
+                    {" of Diff Forge"}
                     {" / "}
                     {formatBytes(group?.memoryBytes)}
                     {" / "}
@@ -870,7 +881,7 @@ function ProcessEnergySection({ energy }) {
       )}
 
       <ProcessEnergyNote>
-        Lightweight internal estimates; showing {visibleGroups.length} bucket{visibleGroups.length === 1 ? "" : "s"}.
+        Relative to Diff Forge AI activity; showing {visibleGroups.length} bucket{visibleGroups.length === 1 ? "" : "s"}.
       </ProcessEnergyNote>
     </ProcessEnergyPanel>
   );
@@ -1658,8 +1669,8 @@ export default function ProcessesView({
         </ProcessMessageStack>
       )}
 
-      <ProcessMainSplit>
-        <ProcessTopPane>
+      <ProcessMainSplit data-layout={deepScanSnapshot ? "balanced" : "energy"}>
+        <ProcessTopPane data-has-deep-scan={deepScanSnapshot ? "true" : undefined}>
           {showEnergyDiagnostics && <ProcessEnergySection energy={energy} />}
 
           {deepScanError && <FormMessage $state="error">{deepScanError}</FormMessage>}
@@ -1954,6 +1965,10 @@ const ProcessMainSplit = styled.div`
   gap: 10px;
   overflow: hidden;
 
+  &[data-layout="energy"] {
+    grid-template-rows: minmax(0, 1.75fr) minmax(160px, 0.75fr);
+  }
+
   @media (max-width: 760px) {
     grid-template-rows: minmax(260px, 1fr) minmax(240px, 1fr);
     overflow: auto;
@@ -1964,9 +1979,13 @@ const ProcessTopPane = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: minmax(128px, 0.46fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 8px;
   overflow: hidden;
+
+  &[data-has-deep-scan="true"] {
+    grid-template-rows: minmax(168px, 0.42fr) minmax(0, 1fr);
+  }
 `;
 
 const ProcessDockerPane = styled.section`

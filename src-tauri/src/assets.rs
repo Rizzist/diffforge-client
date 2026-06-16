@@ -363,7 +363,7 @@ fn diffforge_local_asset_file(path: &str) -> Result<PathBuf, String> {
 }
 
 fn diffforge_copy_image_file_to_clipboard(file: &Path) -> Result<Value, String> {
-    let image = xcap::image::open(file)
+    let image = image::open(file)
         .map_err(|error| format!("Unable to read image {}: {error}", file.display()))?
         .into_rgba8();
     let width = image.width() as usize;
@@ -395,7 +395,7 @@ fn diffforge_copy_image_data_url_to_clipboard_for(image_data_url: &str) -> Resul
     let bytes = general_purpose::STANDARD
         .decode(encoded)
         .map_err(|error| format!("Unable to decode clipboard image: {error}"))?;
-    let image = xcap::image::load_from_memory(&bytes)
+    let image = image::load_from_memory(&bytes)
         .map_err(|error| format!("Clipboard image is not a valid image: {error}"))?
         .into_rgba8();
     let width = image.width() as usize;

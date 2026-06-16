@@ -22,11 +22,13 @@
 
         try {
           const isAudioWidget = window.location.hash === "#/audio-widget";
+          const isAudioWidgetError = window.location.hash === "#/audio-widget-error";
           const isActivityOverlay = window.location.hash === "#/activity-overlay";
-          const rawSettings = isAudioWidget
+          const isSnippingEditor = window.location.hash.startsWith("#/snipping-editor");
+          const rawSettings = isAudioWidget || isAudioWidgetError
             ? window.localStorage.getItem(AUDIO_WIDGET_THEME_STORAGE_KEY)
             : window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
-          const settings = rawSettings && !isAudioWidget ? JSON.parse(rawSettings) : rawSettings;
+          const settings = rawSettings && !isAudioWidget && !isAudioWidgetError ? JSON.parse(rawSettings) : rawSettings;
           const theme = normalizeTheme(
             typeof settings === "string" ? settings : settings && settings.theme,
           );
@@ -40,8 +42,15 @@
             document.documentElement.dataset.audioWidget = "true";
             document.documentElement.dataset.audioWidgetTheme = theme;
           }
+          if (isAudioWidgetError) {
+            document.documentElement.dataset.audioWidgetError = "true";
+            document.documentElement.dataset.audioWidgetTheme = theme;
+          }
           if (isActivityOverlay) {
             document.documentElement.dataset.activityOverlay = "true";
+          }
+          if (isSnippingEditor) {
+            document.documentElement.dataset.snippingEditor = "true";
           }
           if (window.location.hash === "#/background-monitor") {
             document.documentElement.dataset.backgroundMonitor = "true";
@@ -52,8 +61,15 @@
             document.documentElement.dataset.audioWidget = "true";
             document.documentElement.dataset.audioWidgetTheme = THEME_DEFAULT;
           }
+          if (window.location.hash === "#/audio-widget-error") {
+            document.documentElement.dataset.audioWidgetError = "true";
+            document.documentElement.dataset.audioWidgetTheme = THEME_DEFAULT;
+          }
           if (window.location.hash === "#/activity-overlay") {
             document.documentElement.dataset.activityOverlay = "true";
+          }
+          if (window.location.hash.startsWith("#/snipping-editor")) {
+            document.documentElement.dataset.snippingEditor = "true";
           }
           if (window.location.hash === "#/background-monitor") {
             document.documentElement.dataset.backgroundMonitor = "true";
@@ -85,6 +101,15 @@
         background: transparent !important;
       }
 
+      html[data-audio-widget-error="true"],
+      html[data-audio-widget-error="true"] body,
+      html[data-audio-widget-error="true"] #app {
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+        background: transparent !important;
+      }
+
       html[data-activity-overlay="true"],
       html[data-activity-overlay="true"] body,
       html[data-activity-overlay="true"] #app {
@@ -102,6 +127,48 @@
         min-height: 0;
         overflow: hidden;
         background: transparent !important;
+      }
+
+      html[data-snipping-editor="true"],
+      html[data-snipping-editor="true"] body,
+      html[data-snipping-editor="true"] #app {
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+        background: transparent !important;
+      }
+
+      html[data-snipping-editor="true"] #app:empty::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        border: 1px solid rgba(230, 236, 245, 0.12);
+        border-radius: 18px;
+        background:
+          radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
+          #05070b;
+        box-shadow:
+          0 28px 90px rgba(0, 0, 0, 0.42),
+          inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      }
+
+      html[data-snipping-editor="true"] #app:empty::after {
+        content: "";
+        position: fixed;
+        left: calc(50% - 14px);
+        top: calc(50% - 14px);
+        width: 28px;
+        height: 28px;
+        border: 3px solid rgba(148, 163, 184, 0.28);
+        border-top-color: rgba(125, 176, 255, 0.95);
+        border-radius: 999px;
+        animation: snipping-editor-shell-spin 820ms linear infinite;
+      }
+
+      @keyframes snipping-editor-shell-spin {
+        to {
+          transform: rotate(360deg);
+        }
       }
     </style>
   </head>
