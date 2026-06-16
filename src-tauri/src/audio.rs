@@ -34,6 +34,7 @@ const CLOUD_DICTATION_WARM_RETRY_MAX_MS: u64 = 30_000;
 const CLOUD_DICTATION_CLEANED_WAIT_SECS: u64 = 6;
 const CLOUD_DICTATION_CLEANED_PROGRESS_EXTEND_SECS: u64 = 3;
 const CLOUD_DICTATION_CLEANED_WAIT_CAP_SECS: u64 = 15;
+const AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS: usize = 4_000;
 const AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS: u64 = 8;
 const AUDIO_WIDGET_MAIN_THREAD_ACTION_TIMEOUT_SECS: u64 = 5;
 const NATIVE_AUDIO_COMMAND_TIMEOUT_SECS: u64 = 12;
@@ -8912,6 +8913,10 @@ struct ForgeDictationStartRequest {
     language: Option<String>,
     history_id: Option<String>,
     history_created_at: Option<String>,
+    polishing_prompt: Option<String>,
+    cleanup_engine: Option<String>,
+    cleanup_provider: Option<String>,
+    cleanup_model: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -8957,6 +8962,10 @@ struct ForgeDictationRawResultEvent {
 struct AudioTranscriptionPolishRequest {
     text: String,
     fallback_text: String,
+    polishing_prompt: Option<String>,
+    cleanup_engine: Option<String>,
+    cleanup_provider: Option<String>,
+    cleanup_model: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -8986,10 +8995,10 @@ fn write_audio_transcription_polish_clipboard_text(text: &str) -> Result<(), Str
 }
 
 fn audio_transcription_polish_source_text(
-    request: AudioTranscriptionPolishRequest,
+    request: &AudioTranscriptionPolishRequest,
 ) -> Result<String, String> {
     if !request.text.trim().is_empty() {
-        return Ok(request.text);
+        return Ok(request.text.clone());
     }
 
     let fallback_text = request.fallback_text.trim().to_string();
@@ -9005,6 +9014,48 @@ fn audio_transcription_polish_source_text(
             "Clipboard does not contain text to polish, and there is no recent transcript."
                 .to_string(),
         ),
+    }
+}
+
+fn clean_audio_polishing_system_prompt(value: Option<&str>) -> String {
+    value
+        .unwrap_or_default()
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|character| *character != '\0')
+        .take(AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS)
+        .collect::<String>()
+}
+
+fn clean_audio_cleanup_selector_field(value: Option<&str>) -> Option<String> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(96).collect::<String>())
+}
+
+fn insert_audio_cleanup_selector_payload(
+    payload: &mut Value,
+    cleanup_engine: Option<&str>,
+    cleanup_provider: Option<&str>,
+    cleanup_model: Option<&str>,
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if let Some(value) = clean_audio_cleanup_selector_field(cleanup_engine) {
+        object.insert("cleanup_engine".to_string(), json!(value.clone()));
+        object.insert("cleanupEngine".to_string(), json!(value));
+    }
+    if let Some(value) = clean_audio_cleanup_selector_field(cleanup_provider) {
+        object.insert("cleanup_provider".to_string(), json!(value.clone()));
+        object.insert("cleanupProvider".to_string(), json!(value));
+    }
+    if let Some(value) = clean_audio_cleanup_selector_field(cleanup_model) {
+        object.insert("cleanup_model".to_string(), json!(value.clone()));
+        object.insert("cleanupModel".to_string(), json!(value));
     }
 }
 
@@ -9190,7 +9241,8 @@ async fn polish_audio_transcription(
     cloud_mcp_state: State<'_, CloudMcpState>,
     request: AudioTranscriptionPolishRequest,
 ) -> Result<AudioTranscriptionPolishResult, String> {
-    let source_text = audio_transcription_polish_source_text(request)?;
+    let polishing_prompt = clean_audio_polishing_system_prompt(request.polishing_prompt.as_deref());
+    let source_text = audio_transcription_polish_source_text(&request)?;
     let text = clean_deepgram_transcript_text(&source_text).map_err(|error| {
         if error.contains("did not produce any text") {
             "Clipboard does not contain text to polish.".to_string()
@@ -9202,10 +9254,25 @@ async fn polish_audio_transcription(
     let url =
         resolve_forge_voice_http_url(cloud_mcp_state.inner(), CLOUD_DICTATION_POLISH_PATH).await?;
     let headers = forge_audio_cloud_http_headers(cloud_mcp_state.inner()).await?;
-    let payload = json!({
+    let mut payload = json!({
         "text": text,
         "keyterms": keyterms,
     });
+    insert_audio_cleanup_selector_payload(
+        &mut payload,
+        request.cleanup_engine.as_deref(),
+        request.cleanup_provider.as_deref(),
+        request.cleanup_model.as_deref(),
+    );
+    if !polishing_prompt.trim().is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "polishing_system_prompt".to_string(),
+                json!(polishing_prompt.clone()),
+            );
+            object.insert("system_prompt".to_string(), json!(polishing_prompt));
+        }
+    }
     let response = http_client(Duration::from_secs(CLOUD_DICTATION_POLISH_TIMEOUT_SECS))?
         .post(url)
         .headers(headers)
@@ -9953,6 +10020,11 @@ async fn start_forge_dictation_transcription(
     let command_started_at = Instant::now();
     let llm_cleanup = request.llm_cleanup.unwrap_or(true);
     let language = clean_deepgram_language(request.language)?;
+    let polishing_prompt =
+        clean_audio_polishing_system_prompt(request.polishing_prompt.as_deref());
+    let cleanup_engine = clean_audio_cleanup_selector_field(request.cleanup_engine.as_deref());
+    let cleanup_provider = clean_audio_cleanup_selector_field(request.cleanup_provider.as_deref());
+    let cleanup_model = clean_audio_cleanup_selector_field(request.cleanup_model.as_deref());
     let history_id = request
         .history_id
         .as_deref()
@@ -9974,6 +10046,10 @@ async fn start_forge_dictation_transcription(
         json!({
             "language": language.clone(),
             "llm_cleanup": llm_cleanup,
+            "polishing_prompt_chars": polishing_prompt.chars().count(),
+            "cleanup_engine": &cleanup_engine,
+            "cleanup_provider": &cleanup_provider,
+            "cleanup_model": &cleanup_model,
         }),
     );
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
@@ -10090,7 +10166,7 @@ async fn start_forge_dictation_transcription(
     // vocabulary instead of leaning on post-hoc text correction alone.
     let keyterms = voice_dictionary_bias_terms(&app);
     let keyterm_count = keyterms.len();
-    let start_request = json!({
+    let mut start_request = json!({
         "kind": "start",
         "contract": CLOUD_DICTATION_CONTRACT,
         "voice_session_id": format!("dictation-{}", uuid::Uuid::new_v4()),
@@ -10102,6 +10178,21 @@ async fn start_forge_dictation_transcription(
         "raw_first": true,
         "keyterms": keyterms,
     });
+    insert_audio_cleanup_selector_payload(
+        &mut start_request,
+        cleanup_engine.as_deref(),
+        cleanup_provider.as_deref(),
+        cleanup_model.as_deref(),
+    );
+    if llm_cleanup && !polishing_prompt.trim().is_empty() {
+        if let Some(object) = start_request.as_object_mut() {
+            object.insert(
+                "polishing_system_prompt".to_string(),
+                json!(polishing_prompt.clone()),
+            );
+            object.insert("system_prompt".to_string(), json!(polishing_prompt));
+        }
+    }
 
     let stream_task = tauri::async_runtime::spawn(run_forge_dictation_stream(
         app,

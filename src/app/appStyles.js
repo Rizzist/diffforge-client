@@ -9808,58 +9808,6 @@ export const AudioBarShell = styled.div`
   }
 `;
 
-export const AudioBarErrorPopover = styled.div`
-  display: -webkit-box;
-  box-sizing: border-box;
-  width: min(calc(100% - 8px), 304px);
-  max-height: 58px;
-  flex: none;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  overflow: hidden;
-  margin: 0 0 8px;
-  padding: 9px 12px;
-  border: 1px solid rgba(239, 107, 107, 0.42);
-  border-radius: 13px;
-  color: #ffd9d9;
-  background: rgba(46, 14, 18, 0.96);
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.08) inset,
-    0 14px 32px rgba(0, 0, 0, 0.36);
-  font-size: 11.5px;
-  font-weight: 680;
-  line-height: 1.35;
-  pointer-events: none;
-  transform-origin: bottom center;
-  word-break: break-word;
-  animation: audioBarErrorPopoverIn 180ms cubic-bezier(0.3, 0, 0.2, 1) both;
-
-  @keyframes audioBarErrorPopoverIn {
-    from {
-      opacity: 0;
-      transform: translateY(8px) scale(0.96);
-    }
-
-    to {
-      opacity: 1;
-      transform: translateY(0) scale(1);
-    }
-  }
-
-  &[data-theme="light"] {
-    border-color: rgba(217, 72, 72, 0.45);
-    color: #8c1d1d;
-    background: rgba(255, 236, 236, 0.97);
-    box-shadow:
-      0 1px 0 rgba(255, 255, 255, 0.9) inset,
-      0 12px 28px rgba(120, 20, 20, 0.16);
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    animation: none;
-  }
-`;
-
 export const AudioBarSurface = styled.div`
   position: relative;
   display: flex;
@@ -16198,24 +16146,21 @@ export const WorkspaceCreateDirChip = styled.button`
 
 export const WorkspaceCreateAgentGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
   gap: 8px;
-
-  @media (max-width: 760px) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 `;
 
 export const WorkspaceCreateAgentCard = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   grid-template-areas:
-    "icon stepper"
-    "body stepper";
-  align-items: center;
-  gap: 7px 9px;
-  min-height: 86px;
+    "icon . status"
+    "body body body"
+    ". . stepper";
+  align-items: start;
+  gap: 8px 9px;
+  min-height: 116px;
   padding: 10px 11px;
   border: 1px solid ${({ $active }) => ($active ? "rgba(138, 216, 255, 0.34)" : "var(--forge-border)")};
   border-radius: 10px;
@@ -16291,13 +16236,12 @@ export const WorkspaceCreateAgentBody = styled.div`
   grid-area: body;
   display: grid;
   min-width: 0;
-  align-self: start;
+  align-self: end;
 `;
 
 export const WorkspaceCreateAgentLabel = styled.div`
   display: grid;
   min-width: 0;
-  gap: 2px;
 
   > strong {
     color: var(--forge-text);
@@ -16307,14 +16251,22 @@ export const WorkspaceCreateAgentLabel = styled.div`
     overflow-wrap: anywhere;
     white-space: normal;
   }
+`;
 
-  > span {
-    color: rgba(244, 247, 250, 0.5);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-  }
+export const WorkspaceCreateAgentStatus = styled.span`
+  grid-area: status;
+  justify-self: end;
+  align-self: start;
+  max-width: 100%;
+  overflow: hidden;
+  color: rgba(244, 247, 250, 0.58);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 `;
 
 export const WorkspaceCreateAgentStepper = styled.div`
@@ -16324,6 +16276,8 @@ export const WorkspaceCreateAgentStepper = styled.div`
   align-items: center;
   gap: 2px;
   justify-self: end;
+  align-self: end;
+  min-width: 82px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   background: var(--forge-bg-deep);

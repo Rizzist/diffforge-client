@@ -570,6 +570,7 @@ import {
   WorkspaceCreateAgentOpenCodeIcon,
   WorkspaceCreateAgentBody,
   WorkspaceCreateAgentLabel,
+  WorkspaceCreateAgentStatus,
   WorkspaceCreateAgentStepper,
   WorkspaceCreateAgentStepButton,
   WorkspaceCreateFooter,
@@ -587,7 +588,12 @@ import ActivityOverlayWindow, {
   ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY,
   ACTIVITY_OVERLAY_HASH,
 } from "../activity/ActivityOverlay.jsx";
-import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
+import AudioWorkspaceView, {
+  AudioWidgetWindow,
+  AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT,
+  AUDIO_WIDGET_HASH,
+  AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT,
+} from "../audio/AudioWorkspaceView.jsx";
 import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
@@ -4374,10 +4380,10 @@ function WorkspaceCreatePanel({
                   <WorkspaceCreateAgentIcon data-agent={option.id}>
                     <WorkspaceCreateAgentGlyph roleId={option.id} />
                   </WorkspaceCreateAgentIcon>
+                  <WorkspaceCreateAgentStatus>{agentState.statusLabel}</WorkspaceCreateAgentStatus>
                   <WorkspaceCreateAgentBody>
                     <WorkspaceCreateAgentLabel>
                       <strong>{option.label}</strong>
-                      <span>{agentState.statusLabel}</span>
                     </WorkspaceCreateAgentLabel>
                   </WorkspaceCreateAgentBody>
                   <WorkspaceCreateAgentStepper>

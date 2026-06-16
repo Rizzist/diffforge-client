@@ -667,11 +667,13 @@ fn desktop_auth_entitlements(snapshot: &Value) -> Value {
     let plan_name = desktop_auth_plan_name_from_snapshot(snapshot);
     let device_limit = desktop_auth_device_limit_from_snapshot(snapshot, &plan_name);
     let agent_entitlements = desktop_auth_agent_entitlements_for_plan(&plan_name);
+    let team_entitlements = desktop_auth_team_entitlements_for_plan(&plan_name);
     let paid = plan_status == "paid" || plan_name != "free";
     json!({
         "planName": plan_name,
         "planStatus": if paid { "paid" } else { "free" },
         "agents": agent_entitlements,
+        "teams": team_entitlements,
         "deviceLimit": device_limit,
         "isPaid": paid,
         "canUseCloudSync": paid,
@@ -693,6 +695,19 @@ fn desktop_auth_agent_entitlements_for_plan(plan_name: &str) -> Value {
         "shared_agent_limit": shared_agent_limit,
         "dedicatedAgentLimit": dedicated_agent_limit,
         "dedicated_agent_limit": dedicated_agent_limit,
+        "status": status,
+    })
+}
+
+fn desktop_auth_team_entitlements_for_plan(plan_name: &str) -> Value {
+    let (max_teams, status) = match plan_name.trim().to_ascii_lowercase().as_str() {
+        "ultra" => (3, "coming_soon"),
+        "pro" => (1, "coming_soon"),
+        _ => (0, "unavailable"),
+    };
+    json!({
+        "maxTeams": max_teams,
+        "max_teams": max_teams,
         "status": status,
     })
 }

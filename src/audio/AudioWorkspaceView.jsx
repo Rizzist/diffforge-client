@@ -20,12 +20,16 @@ import {
   AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
   AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
   AUDIO_TRANSCRIPTION_VARIANT_RAW,
+  AUDIO_LLM_CLEANUP_ENGINE_OPTIONS,
   AUDIO_WIDGET_STYLE_BAR,
   AUDIO_WIDGET_STYLE_BUBBLE,
   AUDIO_WIDGET_STYLE_HIDDEN,
   AUDIO_WIDGET_THEME_DARK,
   AUDIO_WIDGET_THEME_LIGHT,
   AUDIO_WIDGET_THEME_STORAGE_KEY,
+  AUDIO_PREFERENCES_CHANGED_EVENT,
+  MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS,
+  applySyncedAudioPolishingPreferences,
   arrayBufferToBase64,
   formatAudioPercent,
   getAudioInputErrorMessage,
@@ -35,8 +39,15 @@ import {
   normalizeAudioWidgetTheme,
   prepareWhisperModel,
   publishAudioTranscriptionResult,
+  readAudioManualPolishingEnabled,
+  readAudioLlmCleanupEngine,
+  readAudioLlmCleanupRequestOptions,
+  readAudioPolishingPreferences,
+  readAudioPolishingSystemPrompt,
   readAudioRecorderMode,
   readAudioWidgetStyle,
+  readAutomaticCleanupPolishingPrompt,
+  readManualPolishingPrompt,
   writeAudioWidgetStyle,
   readOrchestratorRealtimeEnabled,
   readOrchestratorVoiceSubmissionMode,
@@ -48,8 +59,11 @@ import {
   readDeepgramLanguage,
   readForgeLlmCleanup,
   writeForgeLlmCleanup,
+  writeAudioLlmCleanupEngine,
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
+  normalizeAudioPolishingSystemPrompt,
+  writeAudioPolishingSystemPrompt,
   writeAudioRecorderMode,
   writeOrchestratorRealtimeEnabled,
   writeOrchestratorVoiceSubmissionMode,
@@ -333,7 +347,6 @@ import {
   AudioWidgetErrorPopover,
   AudioWidgetLockBadge,
   AudioBarShell,
-  AudioBarErrorPopover,
   AudioBarSurface,
   AudioBarCancelButton,
   AudioBarMeter,
@@ -532,7 +545,6 @@ const AUDIO_WIDGET_BUBBLE_DRAG_DEBUG_SAMPLE_MS = 160;
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
-const AUDIO_WIDGET_BAR_ERROR_SIZE = { width: 320, height: 112 };
 // The cancel notice needs room for its label plus close/copy/undo/history
 // controls, so the pill widens while it is showing. The bubble style reuses
 // the same pill (the window morphs to it in place, then morphs back).
@@ -575,6 +587,7 @@ const AUDIO_SETTINGS_TABS = [
   { id: "dictionary", label: "Dictionary" },
   { id: "snippets", label: "Snippets" },
   { id: "transforms", label: "Transforms" },
+  { id: "polishing", label: "Polishing" },
   { id: "history", label: "History" },
 ];
 const VOICE_RULE_TAB_IDS = new Set(["dictionary", "snippets", "transforms"]);
@@ -615,19 +628,11 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
 ];
 
 function getAudioWidgetBarGeometry(cancelNoticeActive, errorFrameActive, barVisible) {
-  if (cancelNoticeActive) {
+  if (cancelNoticeActive || errorFrameActive) {
     return {
       key: "notice",
       margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
       size: AUDIO_WIDGET_BAR_NOTICE_SIZE,
-    };
-  }
-
-  if (errorFrameActive) {
-    return {
-      key: "error",
-      margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
-      size: AUDIO_WIDGET_BAR_ERROR_SIZE,
     };
   }
 
@@ -872,6 +877,13 @@ function getErrorMessage(error, fallback) {
   }
 
   return fallback;
+}
+
+function audioInputErrorRequiresFreshWarmBuffer(error) {
+  const message = getErrorMessage(error, "").toLowerCase();
+  return message.includes("audio input engine timed out")
+    || message.includes("native audio worker")
+    || message.includes("audio input buffering was canceled");
 }
 
 function releaseAudioWidgetKeyboardFocus() {
@@ -2026,6 +2038,9 @@ export default function AudioWorkspaceView({
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
+  const [llmCleanupEngine, setLlmCleanupEngine] = useState(readAudioLlmCleanupEngine);
+  const manualPolishingEnabled = readAudioManualPolishingEnabled();
+  const [polishingSystemPrompt, setPolishingSystemPrompt] = useState(readAudioPolishingSystemPrompt);
   const [audioWidgetStyleSetting, setAudioWidgetStyleSetting] = useState(readAudioWidgetStyle);
   const [voiceRulesError, setVoiceRulesError] = useState("");
   const [voiceRuleEditor, setVoiceRuleEditor] = useState(null);
@@ -2882,6 +2897,77 @@ export default function AudioWorkspaceView({
       notifyAudioSettingsChanged("forge-llm-cleanup");
       return nextValue;
     });
+  }, []);
+
+  const selectLlmCleanupEngine = useCallback((engine) => {
+    setLlmCleanupEngine(engine);
+    writeAudioLlmCleanupEngine(engine);
+    notifyAudioSettingsChanged("forge-llm-cleanup-engine");
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenPreferences = null;
+
+    const applyPreferences = (payload, reason) => {
+      if (cancelled) {
+        return null;
+      }
+      const preferences = applySyncedAudioPolishingPreferences(payload);
+      if (!preferences) {
+        return null;
+      }
+      setPolishingSystemPrompt(preferences.polishingSystemPrompt);
+      notifyAudioSettingsChanged(reason);
+      return preferences;
+    };
+
+    invoke("cloud_mcp_get_audio_preferences")
+      .then((preferences) => {
+        if (cancelled) {
+          return;
+        }
+        const applied = applyPreferences(preferences, "polishing-prompt-sync");
+        const localPreferences = readAudioPolishingPreferences();
+        if (!applied && localPreferences.polishingSystemPrompt) {
+          writeAudioPolishingSystemPrompt(localPreferences.polishingSystemPrompt, {
+            reason: "polishing_prompt_migrated",
+            updatedAtMs: localPreferences.updatedAtMs || Date.now(),
+          });
+        }
+      })
+      .catch(() => {
+        const localPreferences = readAudioPolishingPreferences();
+        if (localPreferences.polishingSystemPrompt && !localPreferences.updatedAtMs) {
+          writeAudioPolishingSystemPrompt(localPreferences.polishingSystemPrompt, {
+            reason: "polishing_prompt_migrated",
+          });
+        }
+      });
+
+    listen(AUDIO_PREFERENCES_CHANGED_EVENT, (event) => {
+      applyPreferences(event?.payload?.preferences || event?.payload, "polishing-prompt-sync");
+    }).then((nextUnlisten) => {
+      if (cancelled) {
+        nextUnlisten();
+        return;
+      }
+      unlistenPreferences = nextUnlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenPreferences) {
+        unlistenPreferences();
+      }
+    };
+  }, []);
+
+  const updatePolishingSystemPrompt = useCallback((event) => {
+    const nextPrompt = normalizeAudioPolishingSystemPrompt(event.target.value);
+    setPolishingSystemPrompt(nextPrompt);
+    writeAudioPolishingSystemPrompt(nextPrompt);
+    notifyAudioSettingsChanged("polishing-prompt");
   }, []);
 
   const updateDeepgramApiKey = useCallback((event) => {
@@ -3892,6 +3978,83 @@ export default function AudioWorkspaceView({
           </AudioTabPanel>
         )}
 
+        {activeAudioTab === "polishing" && (
+          <AudioDictionaryPanel
+            aria-labelledby="audio-tab-polishing"
+            id="audio-tabpanel-polishing"
+            role="tabpanel"
+          >
+            <AudioRulePanelHeader>
+              <AudioRulePanelTitle>
+                <strong>Polishing</strong>
+              </AudioRulePanelTitle>
+              <AudioStatePill data-installed={polishingSystemPrompt.trim() ? "true" : undefined}>
+                {Array.from(polishingSystemPrompt).length}/{MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS}
+              </AudioStatePill>
+            </AudioRulePanelHeader>
+
+            <AudioRuleEditorPanel as="section">
+              <AudioRuleEditorBody>
+                <AudioRuleFieldLabel>
+                  <span>System prompt</span>
+                  <AudioRuleTextarea
+                    aria-label="Polishing system prompt"
+                    maxLength={MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS}
+                    onChange={updatePolishingSystemPrompt}
+                    placeholder="Clean up dictated text while preserving the speaker's intent."
+                    value={polishingSystemPrompt}
+                  />
+                  <AudioRuleFieldCaption>
+                    {MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS - Array.from(polishingSystemPrompt).length} characters remaining
+                  </AudioRuleFieldCaption>
+                </AudioRuleFieldLabel>
+
+                <AudioRuleFieldLabel>
+                  <span>Cleanup model</span>
+                  <McpTransportTabs aria-label="LLM cleanup model" data-columns="2" role="radiogroup">
+                    {AUDIO_LLM_CLEANUP_ENGINE_OPTIONS.map((option) => (
+                      <McpTransportButton
+                        aria-checked={llmCleanupEngine === option.id}
+                        data-active={llmCleanupEngine === option.id ? "true" : undefined}
+                        key={option.id}
+                        onClick={() => selectLlmCleanupEngine(option.id)}
+                        role="radio"
+                        type="button"
+                      >
+                        {option.label}
+                      </McpTransportButton>
+                    ))}
+                  </McpTransportTabs>
+                </AudioRuleFieldLabel>
+
+                <AudioRuleStatusLine>
+                  <McpSwitchButton
+                    aria-checked={forgeLlmCleanup}
+                    aria-pressed={forgeLlmCleanup}
+                    onClick={toggleForgeLlmCleanup}
+                    role="switch"
+                    type="button"
+                  >
+                    <span aria-hidden="true" />
+                    LLM cleanup
+                  </McpSwitchButton>
+                  <McpSwitchButton
+                    aria-checked={manualPolishingEnabled}
+                    aria-pressed={manualPolishingEnabled}
+                    disabled
+                    role="switch"
+                    title="Manual polish is always enabled"
+                    type="button"
+                  >
+                    <span aria-hidden="true" />
+                    Manual polish
+                  </McpSwitchButton>
+                </AudioRuleStatusLine>
+              </AudioRuleEditorBody>
+            </AudioRuleEditorPanel>
+          </AudioDictionaryPanel>
+        )}
+
         {isVoiceRuleTab && (
           <AudioDictionaryPanel
             aria-labelledby={`audio-tab-${activeAudioTab}`}
@@ -4408,6 +4571,7 @@ export function AudioWidgetWindow() {
   const [widgetDragging, setWidgetDragging] = useState(false);
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
   const [polishStatus, setPolishStatus] = useState({ state: "idle", error: "" });
+  const widgetManualPolishingEnabled = readAudioManualPolishingEnabled();
   const [forgeCloudConnected, setForgeCloudConnected] = useState(false);
   const [barIdleHover, setBarIdleHover] = useState(false);
   const [barPlacementReadyKey, setBarPlacementReadyKey] = useState("");
@@ -4675,6 +4839,26 @@ export function AudioWidgetWindow() {
     await audioBuffer?.close?.().catch(() => {});
   }, []);
 
+  const releaseOrPreserveFailedAudioBuffer = useCallback(async (failedAudioBuffer, failure) => {
+    if (!failedAudioBuffer) {
+      return false;
+    }
+
+    const isCurrentWarmBuffer = audioBufferRef.current === failedAudioBuffer;
+    if (isCurrentWarmBuffer && !audioInputErrorRequiresFreshWarmBuffer(failure)) {
+      audioBufferReadyAtRef.current = Date.now();
+      return true;
+    }
+
+    if (isCurrentWarmBuffer) {
+      await closeWarmBuffer();
+    } else {
+      await failedAudioBuffer.close?.().catch(() => {});
+    }
+
+    return false;
+  }, [closeWarmBuffer]);
+
   const waitForWarmPrerollBuffer = useCallback(async () => {
     const audioBuffer = await startWarmBuffer();
     const bufferedMs = Date.now() - audioBufferReadyAtRef.current;
@@ -4805,6 +4989,8 @@ export function AudioWidgetWindow() {
             historyId: forgeHistory?.id || "",
             llmCleanup: readForgeLlmCleanup(),
             language: readDeepgramLanguage(),
+            polishingPrompt: readAutomaticCleanupPolishingPrompt(),
+            ...readAudioLlmCleanupRequestOptions(),
           },
         });
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
@@ -4873,12 +5059,7 @@ export function AudioWidgetWindow() {
         await failedAudioBuffer?.finishCapture?.().catch(() => null);
         playNotificationSfx("voice.off");
       }
-      if (failedAudioBuffer && audioBufferRef.current === failedAudioBuffer) {
-        await closeWarmBuffer();
-      } else {
-        audioBufferRef.current = null;
-        await failedAudioBuffer?.close?.().catch(() => {});
-      }
+      await releaseOrPreserveFailedAudioBuffer(failedAudioBuffer, recordingError);
       if (recordingRunRef.current !== recordingRunId) {
         return;
       }
@@ -4888,7 +5069,7 @@ export function AudioWidgetWindow() {
       setWidgetState("error");
       setError(getAudioInputErrorMessage(recordingError, "Choose and enable a microphone in the Audio tab before recording."));
     }
-  }, [closeWarmBuffer, modelStatus?.installed, resetForgeVoiceTtsPlayer, startWarmBuffer, waitForWarmPrerollBuffer]);
+  }, [modelStatus?.installed, releaseOrPreserveFailedAudioBuffer, resetForgeVoiceTtsPlayer, startWarmBuffer, waitForWarmPrerollBuffer]);
 
   const refreshStatus = useCallback(async () => {
     const currentProvider = readAudioTranscriptionProvider();
@@ -5327,6 +5508,13 @@ export function AudioWidgetWindow() {
       resetPolishStatusSoon(2200);
       return;
     }
+    if (!readAudioManualPolishingEnabled()) {
+      const messageText = "Manual polish is disabled in the Audio tab.";
+      setPolishStatus({ state: "error", error: messageText });
+      setMessage("Polish disabled");
+      resetPolishStatusSoon(2200);
+      return;
+    }
 
     const history = readAudioTranscriptionHistory();
     setWidgetHistory(history);
@@ -5345,6 +5533,8 @@ export function AudioWidgetWindow() {
       const result = await invoke("polish_audio_transcription", {
         request: {
           fallbackText,
+          polishingPrompt: readManualPolishingPrompt(),
+          ...readAudioLlmCleanupRequestOptions(),
         },
       });
       const polishedText = String(result?.text || "").trim();
@@ -5614,7 +5804,7 @@ export function AudioWidgetWindow() {
       const modeGeometryChanged = previousReadyKey !== targetKey;
       const shouldAnimatePlacement = options.animate !== false
         && (!modeGeometryChanged
-          || (Boolean(previousReadyKey) && (previousReadyKey === "error" || targetKey === "error")));
+          || (Boolean(previousReadyKey) && (previousReadyKey === "notice" || targetKey === "notice")));
       const nativeOwnsBarPlacement = isMacPlatform();
       const nativePlacement = await positionAudioBarWindowNatively({
         width: target.width,
@@ -6779,22 +6969,20 @@ export function AudioWidgetWindow() {
         forgeVoiceEventsActiveRef.current = false;
         await stopCloudVoiceAgentStream().catch(() => {});
       }
-      if (audioBufferRef.current === audioBuffer) {
-        await closeWarmBuffer();
-      } else {
-        await audioBuffer.close().catch(() => {});
-      }
+      const preservedWarmBuffer = await releaseOrPreserveFailedAudioBuffer(audioBuffer, recordingError);
       if (recordingRunRef.current !== recordingRunId) {
         return;
       }
-      setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
+      if (!preservedWarmBuffer) {
+        setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
+      }
       const messageText = getErrorMessage(recordingError, "Unable to transcribe audio.");
 
       widgetStateRef.current = "error";
       setWidgetState("error");
       setError(messageText);
     }
-  }, [closeWarmBuffer, publishCancelledTranscript, refreshWidgetHistory]);
+  }, [publishCancelledTranscript, refreshWidgetHistory, releaseOrPreserveFailedAudioBuffer]);
 
   /**
    * Salvages a locally captured recording that was cancelled mid-flight: the
@@ -7015,8 +7203,8 @@ export function AudioWidgetWindow() {
     }
   }, [widgetState]);
 
-  // Errors (cloud dictation failures included) show in the small card above
-  // the widget, then the widget returns to its resting state on its own.
+  // Errors (cloud dictation failures included) show briefly in the widget
+  // surface, then the widget returns to its resting state on its own.
   useEffect(() => {
     if (widgetState !== "error") {
       return undefined;
@@ -7073,19 +7261,19 @@ export function AudioWidgetWindow() {
   }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus]);
 
   useEffect(() => {
-    if (widgetState === "setup" || widgetState === "missing" || widgetState === "error") {
+    if (widgetState === "setup" || widgetState === "missing") {
       closeWarmBuffer();
     }
   }, [closeWarmBuffer, widgetState]);
 
   useEffect(() => {
-    if (widgetState !== "ready" || !hasAudioInputSetup()) {
+    if ((widgetState !== "ready" && widgetState !== "error") || !hasAudioInputSetup()) {
       return undefined;
     }
 
     let disposed = false;
     startWarmBuffer().catch(() => {
-      if (!disposed && widgetStateRef.current === "ready") {
+      if (!disposed && (widgetStateRef.current === "ready" || widgetStateRef.current === "error")) {
         setMessage("Audio input standby");
       }
     });
@@ -7695,7 +7883,7 @@ export function AudioWidgetWindow() {
   const polishState = polishStatus.state || "idle";
   const polishLoading = polishState === "loading";
   const polishCloudUnavailable = !forgeCloudConnected;
-  const polishDisabled = polishLoading || polishCloudUnavailable;
+  const polishDisabled = polishLoading || polishCloudUnavailable || !widgetManualPolishingEnabled;
   const renderHistoryQuickButton = (slot, label, available, focusable = true) => {
     const copied = copiedWidgetHistorySlot === slot;
     return (
@@ -7723,16 +7911,20 @@ export function AudioWidgetWindow() {
     );
   };
   const renderPolishQuickButton = (focusable = true) => {
-    const title = polishCloudUnavailable
+    const title = !widgetManualPolishingEnabled
+      ? "Manual polish is disabled in the Audio tab"
+      : polishCloudUnavailable
       ? "Connect to Diff Forge Cloud to polish text"
       : polishState === "error" && polishStatus.error
         ? polishStatus.error
         : "Polish clipboard or latest transcription";
     return (
       <AudioHistoryQuickButton
-        aria-label={polishCloudUnavailable
-          ? "Polish unavailable: Diff Forge Cloud disconnected"
-          : "Polish clipboard or latest transcription"}
+        aria-label={!widgetManualPolishingEnabled
+          ? "Polish unavailable: manual polish disabled"
+          : polishCloudUnavailable
+            ? "Polish unavailable: Diff Forge Cloud disconnected"
+            : "Polish clipboard or latest transcription"}
         data-polish-state={polishState !== "idle" ? polishState : undefined}
         data-slot="polish"
         disabled={polishDisabled}
@@ -7824,6 +8016,30 @@ export function AudioWidgetWindow() {
     </AudioBarSurface>
   ) : null;
 
+  const errorNoticeSurface = barErrorFrameActive ? (
+    <AudioBarSurface
+      role="alert"
+      title={errorFrameText}
+    >
+      <AudioBarCancelButton
+        aria-label="Dismiss audio error"
+        onClick={dismissWidgetErrorFrame}
+        title="Dismiss now"
+        type="button"
+      >
+        ×
+      </AudioBarCancelButton>
+      <AudioBarStatusText style={{ flex: 1 }} title={errorFrameText}>
+        {errorFrameText}
+      </AudioBarStatusText>
+      <AudioBarNoticeProgress
+        aria-hidden="true"
+        key={errorFrameText}
+        onAnimationEnd={dismissWidgetErrorFrame}
+      />
+    </AudioBarSurface>
+  ) : null;
+
   if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
     if (!barVisible) {
       const dictateShortcutLabel = formatShortcutLabel(widgetPushToTalkShortcut);
@@ -7873,72 +8089,53 @@ export function AudioWidgetWindow() {
         <AudioBarShell
           aria-label={widgetLabel}
           data-geometry-ready={barGeometryReady ? "true" : "false"}
-          data-mode={cancelNotice ? "notice" : barErrorFrameActive ? "error" : "active"}
+          data-mode={cancelNotice || barErrorFrameActive ? "notice" : "active"}
           data-theme={audioWidgetTheme}
           data-visible={barVisible && barGeometryReady ? "true" : "false"}
         >
-          {cancelNotice ? cancelNoticeSurface : (
-            <>
-              {barErrorFrameActive ? (
-                <AudioBarErrorPopover data-theme={audioWidgetTheme} role="alert" title={errorFrameText}>
-                  {errorFrameText}
-                </AudioBarErrorPopover>
-              ) : null}
-              <AudioBarSurface
-                key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
-                onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
-                role="status"
-                style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}
-                title={isRecordingFocus || widgetState === "arming"
-                  ? "Click to finish and paste, or press the shortcut again. X cancels."
-                  : undefined}
+          {cancelNotice ? cancelNoticeSurface : barErrorFrameActive ? errorNoticeSurface : (
+            <AudioBarSurface
+              key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
+              onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
+              role="status"
+              style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}
+              title={isRecordingFocus || widgetState === "arming"
+                ? "Click to finish and paste, or press the shortcut again. X cancels."
+                : undefined}
+            >
+              <AudioBarCancelButton
+                aria-label="Cancel dictation"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  cancelRecording();
+                }}
+                title="Cancel: stop without pasting. The transcript is still saved to History."
+                type="button"
               >
-                <AudioBarCancelButton
-                  aria-label={barErrorFrameActive ? "Dismiss audio error" : "Cancel dictation"}
+                ×
+              </AudioBarCancelButton>
+              <AudioBarMeter aria-hidden="true">
+                {Array.from({ length: AUDIO_BAR_METER_BARS }, (_, index) => (
+                  <span
+                    key={index}
+                    style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus, AUDIO_BAR_METER_BARS)}
+                  />
+                ))}
+              </AudioBarMeter>
+              {isProcessingFocus ? (
+                <AudioBarSpinner aria-label="Transcribing" role="status" />
+              ) : (isRecordingFocus || widgetState === "arming") && (
+                <AudioBarStopButton
+                  aria-label="Finish and paste"
                   onClick={(event) => {
                     event.stopPropagation();
-                    if (barErrorFrameActive) {
-                      dismissWidgetErrorFrame();
-                      return;
-                    }
-                    cancelRecording();
+                    finishFromBar();
                   }}
-                  title={barErrorFrameActive
-                    ? "Dismiss audio error"
-                    : "Cancel: stop without pasting. The transcript is still saved to History."}
+                  title="Finish recording and paste the transcript"
                   type="button"
-                >
-                  ×
-                </AudioBarCancelButton>
-                {barErrorFrameActive ? (
-                  <AudioBarStatusText title={errorFrameText}>
-                    Audio error
-                  </AudioBarStatusText>
-                ) : (
-                  <AudioBarMeter aria-hidden="true">
-                    {Array.from({ length: AUDIO_BAR_METER_BARS }, (_, index) => (
-                      <span
-                        key={index}
-                        style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus, AUDIO_BAR_METER_BARS)}
-                      />
-                    ))}
-                  </AudioBarMeter>
-                )}
-                {isProcessingFocus ? (
-                  <AudioBarSpinner aria-label="Transcribing" role="status" />
-                ) : (isRecordingFocus || widgetState === "arming") && (
-                  <AudioBarStopButton
-                    aria-label="Finish and paste"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      finishFromBar();
-                    }}
-                    title="Finish recording and paste the transcript"
-                    type="button"
-                  />
-                )}
-              </AudioBarSurface>
-            </>
+                />
+              )}
+            </AudioBarSurface>
           )}
         </AudioBarShell>
       </>

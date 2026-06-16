@@ -182,7 +182,7 @@ const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE: &str = "audio-widget-bottom-bar.jsonl";
-const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = false;
+const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = true;
 const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE: &str = "audio-widget-bubble-position.jsonl";
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
@@ -4804,6 +4804,8 @@ pub fn run() {
             cloud_mcp_workspace_catalog_upsert,
             cloud_mcp_workspace_catalog_delete,
             cloud_mcp_workspace_catalog_list,
+            cloud_mcp_get_audio_preferences,
+            cloud_mcp_set_audio_preferences,
             cloud_mcp_sync_device_live_state_snapshot,
             cloud_mcp_sync_device_live_app_context,
             cloud_mcp_record_voice_plan_task_status,

@@ -3591,10 +3591,6 @@ fn docker_command_duration_ms(started_at: Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn limit_docker_developer_output(value: &str) -> String {
-    limit_docker_developer_output_with(value, DOCKER_DEVELOPER_OUTPUT_LIMIT)
-}
-
 fn limit_docker_developer_output_with(value: &str, limit: usize) -> String {
     let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
     let mut output = normalized
