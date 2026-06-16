@@ -368,6 +368,30 @@ pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn agent_accounts_active_profile_id_for_tokenomics(kind: &str) -> String {
+    let registry = agent_accounts_registry_read();
+    let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+    if active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
+        return AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string();
+    }
+
+    let default_email = agent_accounts_default_email(kind);
+    if profiles.iter().any(|profile| {
+        agent_accounts_profile_id(profile).as_deref() == Some(active_id.as_str())
+            && agent_accounts_profile_is_duplicate_of_default(kind, profile, &default_email)
+    }) {
+        return AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string();
+    }
+
+    let canonical_ids =
+        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &active_id, &default_email);
+    if canonical_ids.contains(&active_id) {
+        active_id
+    } else {
+        AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string()
+    }
+}
+
 fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
     let (active_id, profiles) = agent_accounts_kind_entry(registry, kind);
     let default_identity = agent_accounts_profile_identity(kind, None);

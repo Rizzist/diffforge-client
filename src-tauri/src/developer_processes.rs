@@ -157,6 +157,7 @@ struct DeveloperEnergyInternalSignals {
     workspace_root_count: usize,
     visible_process_count: usize,
     docker_process_count: usize,
+    coordination_activity_count: usize,
     cloud: DeveloperEnergyCloudSignals,
 }
 
@@ -456,6 +457,8 @@ async fn collect_light_developer_energy_snapshot(
     let terminal_roots = developer_terminal_process_roots(terminal_state).await;
     let cloud_signals = developer_energy_cloud_signals(cloud_state).await;
     let workspace_roots = normalize_process_roots(workspace_roots, None);
+    let coordination_activity_count =
+        developer_energy_coordination_activity_count(&workspace_roots);
     let docker_container_count = developer_cached_docker_container_count(state);
 
     let (cpu_percent, memory_bytes) = {
@@ -493,6 +496,7 @@ async fn collect_light_developer_energy_snapshot(
         workspace_root_count: workspace_roots.len(),
         visible_process_count: 0,
         docker_process_count: docker_container_count,
+        coordination_activity_count,
         cloud: cloud_signals,
     }))
 }
@@ -531,6 +535,11 @@ async fn collect_developer_process_snapshot(
         developer_energy_cloud_signals(cloud_state).await
     } else {
         DeveloperEnergyCloudSignals::default()
+    };
+    let coordination_activity_count = if include_diagnostics {
+        developer_energy_coordination_activity_count(&workspace_roots)
+    } else {
+        0
     };
     let bound_ports_by_pid = if include_ports {
         developer_bound_ports_by_pid_cached(state, sampled_at_ms, force).await
@@ -751,6 +760,7 @@ async fn collect_developer_process_snapshot(
                 .iter()
                 .filter(|process| process.group_kind == "docker")
                 .count(),
+            coordination_activity_count,
             cloud: cloud_signals,
         };
 
@@ -3834,10 +3844,6 @@ impl DeveloperEnergyBuildContext {
         let mut weights = vec![
             ("terminalBackend", if has_terminals { 0.15 } else { 0.03 }),
             (
-                "workspaceFiles",
-                if has_workspaces { 0.10 } else { 0.04 },
-            ),
-            (
                 "dockerBridge",
                 if has_docker { 0.07 } else { 0.02 },
             ),
@@ -3845,6 +3851,9 @@ impl DeveloperEnergyBuildContext {
             ("audioNative", 0.02),
             ("snippingNative", 0.02),
         ];
+        if has_workspaces {
+            weights.push(("workspaceFiles", 0.10));
+        }
         if include_activity_monitor {
             weights.push((
                 "activityMonitor",
@@ -3855,6 +3864,7 @@ impl DeveloperEnergyBuildContext {
             signals.cloud,
             has_terminals,
             has_workspaces,
+            signals.coordination_activity_count,
         ));
         let total_weight = weights
             .iter()
@@ -3907,50 +3917,41 @@ fn developer_energy_coordination_cloud_weights(
     cloud: DeveloperEnergyCloudSignals,
     has_terminals: bool,
     has_workspaces: bool,
+    coordination_activity_count: usize,
 ) -> Vec<(&'static str, f64)> {
     const COORDINATION_CLOUD_BUDGET: f64 = 0.14;
 
     let outbox_depth =
         cloud.outbox_pending_count + cloud.outbox_retrying_count + cloud.outbox_dead_letter_count;
-    let mut relative = vec![
-        ("coordinationKernel", 0.22),
-        (
+    let mut relative = Vec::new();
+    if coordination_activity_count > 0 {
+        relative.push((
+            "coordinationKernel",
+            0.18 + (coordination_activity_count.min(12) as f64 / 12.0) * 0.12,
+        ));
+    }
+    if cloud.global_ws_connected || cloud.global_ws_retrying {
+        relative.push((
             "cloudWebSocket",
-            if cloud.global_ws_connected {
-                0.20
-            } else if cloud.global_ws_retrying {
-                0.24
-            } else {
-                0.12
-            },
-        ),
-        (
+            if cloud.global_ws_connected { 0.20 } else { 0.24 },
+        ));
+    }
+    if outbox_depth > 0 {
+        relative.push((
             "sqliteOutbox",
-            if outbox_depth > 0 {
-                0.22 + (outbox_depth.min(24) as f64 / 24.0) * 0.08
-            } else {
-                0.10
-            },
-        ),
-        (
-            "mcpBridge",
-            if has_terminals || cloud.terminal_context_count > 0 {
-                0.16
-            } else {
-                0.10
-            },
-        ),
-        (
-            "deviceLiveState",
-            if has_workspaces || cloud.registered_workspace_count > 0 {
-                0.15
-            } else {
-                0.08
-            },
-        ),
+            0.22 + (outbox_depth.min(24) as f64 / 24.0) * 0.08,
+        ));
+    }
+    if has_terminals || cloud.terminal_context_count > 0 {
+        relative.push(("mcpBridge", 0.16));
+    }
+    if has_workspaces || cloud.registered_workspace_count > 0 {
+        relative.push(("deviceLiveState", 0.15));
+    }
+    relative.extend([
         ("tokenomicsSync", 0.08),
         ("cloudBackgroundWatchers", 0.10),
-    ];
+    ]);
     let total = relative
         .iter()
         .map(|(_, weight)| *weight)
@@ -3961,6 +3962,83 @@ fn developer_energy_coordination_cloud_weights(
         .drain(..)
         .map(|(category, weight)| (category, COORDINATION_CLOUD_BUDGET * weight / total))
         .collect()
+}
+
+fn developer_energy_coordination_activity_count(workspace_roots: &[String]) -> usize {
+    let mut seen = HashSet::new();
+    workspace_roots
+        .iter()
+        .flat_map(|root| developer_energy_coordination_db_paths(root))
+        .filter(|path| seen.insert(process_path_display(path)))
+        .map(|path| developer_energy_coordination_db_activity_count(&path))
+        .sum()
+}
+
+fn developer_energy_coordination_db_paths(root: &str) -> Vec<PathBuf> {
+    let root = PathBuf::from(root);
+    vec![
+        root.join(".agents").join("kernel.sqlite"),
+        root.join(".agents").join("coordination.db"),
+        coordination::db::coordination_repo_state_root(&root).join("kernel.sqlite"),
+    ]
+}
+
+fn developer_energy_coordination_db_activity_count(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return 0;
+    };
+
+    [
+        (
+            "agent_sessions",
+            "status IN ('active', 'running')",
+        ),
+        (
+            "tasks",
+            "status IN ('ready', 'claimed', 'blocked')",
+        ),
+        ("leases", "status='lease_granted'"),
+        (
+            "task_resource_intents",
+            "status IN ('lease_granted', 'parked', 'parked_cycle_prevented', 'resume_ready', 'resume_requested')",
+        ),
+        ("submit_jobs", "status IN ('queued', 'running')"),
+        ("patches", "status='submitted'"),
+        ("file_watchers", "status NOT IN ('disabled', 'stopped')"),
+    ]
+        .iter()
+        .map(|(table, predicate)| {
+            developer_energy_coordination_table_count(&conn, table, predicate)
+        })
+        .sum()
+}
+
+fn developer_energy_coordination_table_count(
+    conn: &rusqlite::Connection,
+    table: &str,
+    predicate: &str,
+) -> usize {
+    let table_exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !table_exists {
+        return 0;
+    }
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
+    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        .max(0) as usize
 }
 
 #[allow(clippy::too_many_arguments)]

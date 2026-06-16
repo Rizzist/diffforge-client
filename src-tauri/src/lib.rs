@@ -886,11 +886,13 @@ enum CloudVoiceAgentControl {
 
 struct DeepgramRealtimeSession {
     finished_rx: oneshot::Receiver<Result<WhisperTranscriptionResult, String>>,
+    stream_task: tauri::async_runtime::JoinHandle<()>,
 }
 
 struct ForgeDictationSession {
     control_tx: mpsc::UnboundedSender<ForgeDictationControl>,
     finished_rx: oneshot::Receiver<Result<ForgeDictationResult, String>>,
+    stream_task: tauri::async_runtime::JoinHandle<()>,
 }
 
 enum ForgeDictationControl {
@@ -3259,6 +3261,9 @@ fn workspace_delete_known_metadata_paths(agents_root: &Path) -> Vec<PathBuf> {
         "kernel.sqlite",
         "kernel.sqlite-wal",
         "kernel.sqlite-shm",
+        "coordination.db",
+        "coordination.db-wal",
+        "coordination.db-shm",
         "diffforge_threads.sqlite3",
         "diffforge_threads.sqlite3-wal",
         "diffforge_threads.sqlite3-shm",
@@ -3436,15 +3441,18 @@ fn delete_workspace_local_metadata_for(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let private_state_root_removed =
                 workspace_delete_remove_private_state_root(&private_state_root, &root)?;
+            let remembered_kernel_entries_removed =
+                coordination::db::forget_initialized_kernel_storage_for_repo(&root)?;
             return Ok(json!({
                 "ok": true,
                 "repoPath": root.display().to_string(),
                 "agentsRoot": agents_root.display().to_string(),
                 "privateStateRoot": private_state_root.display().to_string(),
                 "removed": [],
-                "removedCount": if private_state_root_removed { 1 } else { 0 },
+                "removedCount": (if private_state_root_removed { 1 } else { 0 }) + remembered_kernel_entries_removed,
                 "agentsRootRemoved": false,
                 "privateStateRootRemoved": private_state_root_removed,
+                "rememberedKernelEntriesRemoved": remembered_kernel_entries_removed,
                 "skipped": true,
             }));
         }
@@ -3504,6 +3512,8 @@ fn delete_workspace_local_metadata_for(
     if private_state_root_removed {
         removed.push(private_state_root.display().to_string());
     }
+    let remembered_kernel_entries_removed =
+        coordination::db::forget_initialized_kernel_storage_for_repo(&root)?;
     let removed_count = removed.len();
 
     Ok(json!({
@@ -3512,10 +3522,11 @@ fn delete_workspace_local_metadata_for(
         "agentsRoot": agents_root.display().to_string(),
         "privateStateRoot": private_state_root.display().to_string(),
         "removed": removed,
-        "removedCount": removed_count,
+        "removedCount": removed_count + remembered_kernel_entries_removed,
         "dirtyWorktrees": dirty_worktrees,
         "agentsRootRemoved": agents_root_removed,
         "privateStateRootRemoved": private_state_root_removed,
+        "rememberedKernelEntriesRemoved": remembered_kernel_entries_removed,
         "skipped": false,
     }))
 }
@@ -3553,7 +3564,7 @@ fn local_workspace_scope_file_key(scope_key: &str) -> String {
     }
 }
 
-fn local_workspace_store_path(app: &AppHandle, scope_key: &str) -> Result<PathBuf, String> {
+fn local_workspace_store_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let store_dir = app
         .path()
         .app_data_dir()
@@ -3561,6 +3572,11 @@ fn local_workspace_store_path(app: &AppHandle, scope_key: &str) -> Result<PathBu
         .join("workspace-catalog");
     fs::create_dir_all(&store_dir)
         .map_err(|error| format!("Unable to create workspace catalog directory: {error}"))?;
+    Ok(store_dir)
+}
+
+fn local_workspace_store_path(app: &AppHandle, scope_key: &str) -> Result<PathBuf, String> {
+    let store_dir = local_workspace_store_dir(app)?;
     Ok(store_dir.join(format!(
         "{}.json",
         local_workspace_scope_file_key(scope_key)
@@ -3610,7 +3626,13 @@ async fn local_workspaces_store(
             .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
         fs::rename(&temp_path, &path)
             .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
-        Ok(json!({ "ok": true, "count": items.len() }))
+        let pruned_workspace_settings =
+            local_workspace_catalog_prune_orphan_workspace_settings(&app)?;
+        Ok(json!({
+            "ok": true,
+            "count": items.len(),
+            "prunedWorkspaceSettings": pruned_workspace_settings,
+        }))
     })
     .await
     .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
@@ -3634,12 +3656,7 @@ fn local_workspace_catalog_read_items(
         .unwrap_or_default())
 }
 
-fn local_workspace_catalog_write_items(
-    app: &AppHandle,
-    scope_key: &str,
-    items: &[Value],
-) -> Result<(), String> {
-    let path = local_workspace_store_path(app, scope_key)?;
+fn local_workspace_catalog_write_items_to_path(path: &Path, items: &[Value]) -> Result<(), String> {
     let payload = json!({
         "version": 1,
         "workspaces": items,
@@ -3649,8 +3666,19 @@ fn local_workspace_catalog_write_items(
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, serialized)
         .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
-    fs::rename(&temp_path, &path)
+    fs::rename(&temp_path, path)
         .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
+    Ok(())
+}
+
+fn local_workspace_catalog_write_items(
+    app: &AppHandle,
+    scope_key: &str,
+    items: &[Value],
+) -> Result<(), String> {
+    let path = local_workspace_store_path(app, scope_key)?;
+    local_workspace_catalog_write_items_to_path(&path, items)?;
+    local_workspace_catalog_prune_orphan_workspace_settings(app)?;
     Ok(())
 }
 
@@ -3707,31 +3735,124 @@ pub(crate) fn local_workspace_catalog_apply_upsert(
     local_workspace_catalog_write_items(app, scope_key, &items)
 }
 
-/// Rust-owned local catalog delete: pure row removal, never a tombstone. The
-/// durable cloud delete rides the sync outbox, so no local marker is needed.
-pub(crate) fn local_workspace_catalog_apply_delete(
+pub(crate) fn local_workspace_catalog_apply_delete_all_scopes(
     app: &AppHandle,
-    scope_key: &str,
     workspace_id: &str,
 ) -> Result<usize, String> {
     let workspace_id = workspace_id.trim();
     if workspace_id.is_empty() {
         return Err("Workspace delete requires a workspace id.".to_string());
     }
-    let mut items = local_workspace_catalog_read_items(app, scope_key)?;
-    let before = items.len();
-    items.retain(|item| {
-        local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]).as_deref()
-            != Some(workspace_id)
-    });
-    let removed = before.saturating_sub(items.len());
+    let store_dir = local_workspace_store_dir(app)?;
+    let mut removed_total = 0usize;
+    let entries = match fs::read_dir(&store_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            local_workspace_catalog_prune_orphan_workspace_settings(app)?;
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format!(
+                "Unable to read local workspace catalog directory: {error}"
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Unable to read workspace catalog entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
+        let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+        let mut items = value
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let before = items.len();
+        items.retain(|item| {
+            local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]).as_deref()
+                != Some(workspace_id)
+        });
+        let removed = before.saturating_sub(items.len());
+        if removed > 0 {
+            local_workspace_catalog_write_items_to_path(&path, &items)?;
+            removed_total = removed_total.saturating_add(removed);
+        }
+    }
+    local_workspace_catalog_prune_orphan_workspace_settings(app)?;
+    Ok(removed_total)
+}
+
+fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<String>, String> {
+    let store_dir = local_workspace_store_dir(app)?;
+    let mut ids = HashSet::new();
+    let entries = match fs::read_dir(&store_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read local workspace catalog directory: {error}"
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Unable to read workspace catalog entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
+        let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+        if let Some(items) = value.get("workspaces").and_then(Value::as_array) {
+            for item in items {
+                if local_workspace_catalog_entry_is_deleted(item) {
+                    continue;
+                }
+                if let Some(id) =
+                    local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"])
+                {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn local_workspace_catalog_prune_orphan_workspace_settings(
+    app: &AppHandle,
+) -> Result<usize, String> {
+    let workspace_ids = local_workspace_catalog_all_workspace_ids(app)?;
+    let current = app_local_state_read(app, "workspace-settings");
+    let Some(current_object) = current.as_object() else {
+        return Ok(0);
+    };
+
+    let mut next_object = serde_json::Map::new();
+    for (workspace_id, settings) in current_object {
+        if workspace_ids.contains(workspace_id) {
+            next_object.insert(workspace_id.clone(), settings.clone());
+        }
+    }
+    let removed = current_object.len().saturating_sub(next_object.len());
     if removed > 0 {
-        local_workspace_catalog_write_items(app, scope_key, &items)?;
+        app_local_state_write(app, "workspace-settings", &Value::Object(next_object))?;
     }
     Ok(removed)
 }
 
 fn local_workspace_catalog_normalize_cloud_entry(entry: &Value) -> Option<Value> {
+    if local_workspace_catalog_entry_is_deleted(entry) {
+        return None;
+    }
     let id = local_workspace_catalog_text(entry, &["workspace_id", "workspaceId", "id"])?;
     let name = local_workspace_catalog_text(entry, &["workspace_name", "workspaceName", "name"])
         .unwrap_or_else(|| "Workspace".to_string());
@@ -3757,6 +3878,23 @@ fn local_workspace_catalog_normalize_cloud_entry(entry: &Value) -> Option<Value>
         "originDeviceId": origin_device_id,
         "syncState": "synced",
     }))
+}
+
+fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
+    if entry
+        .get("pendingDelete")
+        .or_else(|| entry.get("pending_delete"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if local_workspace_catalog_text(entry, &["deletedAt", "deleted_at"]).is_some() {
+        return true;
+    }
+    local_workspace_catalog_text(entry, &["status", "workspace_status"])
+        .map(|status| matches!(status.as_str(), "deleted" | "archived" | "removed"))
+        .unwrap_or(false)
 }
 
 /// Headless catalog down-sync: applies a server-authoritative catalog

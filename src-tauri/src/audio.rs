@@ -35,6 +35,7 @@ const CLOUD_DICTATION_CLEANED_WAIT_SECS: u64 = 6;
 const CLOUD_DICTATION_CLEANED_PROGRESS_EXTEND_SECS: u64 = 3;
 const CLOUD_DICTATION_CLEANED_WAIT_CAP_SECS: u64 = 15;
 const AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS: u64 = 8;
+const AUDIO_WIDGET_MAIN_THREAD_ACTION_TIMEOUT_SECS: u64 = 5;
 const NATIVE_AUDIO_COMMAND_TIMEOUT_SECS: u64 = 12;
 const NATIVE_AUDIO_FINISH_TIMEOUT_SECS: u64 = 30;
 // Cold-connect route cache, keyed by websocket path: every successful voice
@@ -142,7 +143,15 @@ async fn realtime_dictation_release_mic(
         return;
     }
     realtime_mic_holder_set(audio_state, RealtimeMicHolder::None);
-    let _ = audio_state.input_worker.detach_realtime_stream();
+    if let Err(error) = audio_state.input_worker.detach_realtime_stream() {
+        log_audio_diagnostic_event(
+            "audio.dictation.mic.detach_error",
+            json!({
+                "holder": format!("{holder:?}"),
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        );
+    }
     if !borrowed {
         return;
     }
@@ -3286,7 +3295,9 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
                 || APP_SHUTDOWN_PHASE.load(Ordering::SeqCst) != APP_SHUTDOWN_PHASE_RUNNING
             {
                 #[cfg(target_os = "macos")]
-                snipping_restore_window_class_for_close_now(&window_for_events);
+                snipping_catch_objc("audio_widget_restore_window_class_for_close", || {
+                    snipping_restore_window_class_for_close_now(&window_for_events);
+                });
                 return;
             }
             api.prevent_close();
@@ -4266,6 +4277,43 @@ fn audio_widget_emit_open_reassert(app: &AppHandle, _make_key: bool) {
 #[cfg(not(target_os = "macos"))]
 fn audio_widget_emit_open_reassert(_app: &AppHandle, _make_key: bool) {}
 
+#[cfg(target_os = "macos")]
+fn audio_widget_run_action_catching_objc<T, F>(
+    action_name: &'static str,
+    action: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    match objc2::exception::catch(std::panic::AssertUnwindSafe(action)) {
+        Ok(result) => result,
+        Err(exception) => {
+            let exception = exception
+                .map(|error| format!("{error:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            log_audio_diagnostic_event(
+                "audio.widget.main_thread.objc_exception",
+                json!({
+                    "action": action_name,
+                    "exception": clean_whisper_local_audio_log_text(&exception),
+                }),
+            );
+            Err(format!("Audio widget action failed on macOS: {action_name}"))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_run_action_catching_objc<T, F>(
+    _action_name: &'static str,
+    action: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    action()
+}
+
 fn run_audio_widget_action_on_main_thread<T, F>(
     app: &AppHandle,
     action_name: &'static str,
@@ -4275,8 +4323,21 @@ where
     T: Send + 'static,
     F: FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,
 {
+    #[cfg(target_os = "macos")]
+    if objc2::MainThreadMarker::new().is_some() {
+        log_audio_diagnostic_event(
+            "audio.widget.main_thread.direct",
+            json!({
+                "action": action_name,
+            }),
+        );
+        return audio_widget_run_action_catching_objc(action_name, || action(app));
+    }
+
     let started_at = Instant::now();
     let app_for_task = app.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_task = cancelled.clone();
     let (response_tx, response_rx) = std::sync::mpsc::channel();
 
     log_audio_diagnostic_event(
@@ -4287,13 +4348,25 @@ where
     );
 
     app.run_on_main_thread(move || {
+        if cancelled_for_task.load(Ordering::SeqCst) {
+            log_audio_diagnostic_event(
+                "audio.widget.main_thread.action_skipped",
+                json!({
+                    "action": action_name,
+                    "reason": "caller_timed_out",
+                }),
+            );
+            let _ = response_tx.send(Err("Audio widget action was canceled.".to_string()));
+            return;
+        }
         log_audio_diagnostic_event(
             "audio.widget.main_thread.action_start",
             json!({
                 "action": action_name,
             }),
         );
-        let result = action(&app_for_task);
+        let result =
+            audio_widget_run_action_catching_objc(action_name, || action(&app_for_task));
         match &result {
             Ok(_) => log_audio_diagnostic_event(
                 "audio.widget.main_thread.action_done",
@@ -4330,18 +4403,30 @@ where
         }),
     );
 
-    let result = response_rx.recv().map_err(|_| {
-        let message = "Audio widget action did not complete.".to_string();
-        log_audio_diagnostic_event(
-            "audio.widget.main_thread.wait_error",
-            json!({
-                "action": action_name,
-                "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
-                "error": clean_whisper_local_audio_log_text(&message),
-            }),
-        );
-        message
-    })?;
+    let result = response_rx
+        .recv_timeout(Duration::from_secs(
+            AUDIO_WIDGET_MAIN_THREAD_ACTION_TIMEOUT_SECS,
+        ))
+        .map_err(|error| {
+            let message = match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    "Audio widget action timed out on the main thread.".to_string()
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "Audio widget action did not complete.".to_string()
+                }
+            };
+            log_audio_diagnostic_event(
+                "audio.widget.main_thread.wait_error",
+                json!({
+                    "action": action_name,
+                    "elapsed_ms": started_at.elapsed().as_secs_f64() * 1000.0,
+                    "error": clean_whisper_local_audio_log_text(&message),
+                }),
+            );
+            message
+        })?;
 
     log_audio_diagnostic_event(
         "audio.widget.main_thread.wait_done",
@@ -8484,8 +8569,9 @@ async fn start_deepgram_realtime_transcription(
         // dropped websocket) instead of refusing the new start.
         match session.finished_rx.try_recv() {
             Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                session.stream_task.abort();
                 *session_guard = None;
-                let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+                deepgram_release_mic(&app, &audio_state).await;
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
@@ -8498,8 +8584,9 @@ async fn start_deepgram_realtime_transcription(
         if let Some(session) = dictation_guard.as_mut() {
             match session.finished_rx.try_recv() {
                 Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    session.stream_task.abort();
                     *dictation_guard = None;
-                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Dictation);
+                    forge_dictation_release_mic(&app, &audio_state).await;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
@@ -8546,7 +8633,7 @@ async fn start_deepgram_realtime_transcription(
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
 
-    tauri::async_runtime::spawn(run_deepgram_realtime_stream(
+    let stream_task = tauri::async_runtime::spawn(run_deepgram_realtime_stream(
         app.clone(),
         api_key,
         language.clone(),
@@ -8559,20 +8646,26 @@ async fn start_deepgram_realtime_transcription(
     match timeout(Duration::from_secs(DEEPGRAM_CONNECT_TIMEOUT_SECS), ready_rx).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
+            stream_task.abort();
             deepgram_release_mic(&app, &audio_state).await;
             return Err(error);
         }
         Ok(Err(_closed)) => {
+            stream_task.abort();
             deepgram_release_mic(&app, &audio_state).await;
             return Err("Deepgram realtime stream closed before it was ready.".to_string());
         }
         Err(_elapsed) => {
+            stream_task.abort();
             deepgram_release_mic(&app, &audio_state).await;
             return Err("Deepgram realtime stream timed out while connecting.".to_string());
         }
     }
 
-    *session_guard = Some(DeepgramRealtimeSession { finished_rx });
+    *session_guard = Some(DeepgramRealtimeSession {
+        finished_rx,
+        stream_task,
+    });
 
     log_audio_diagnostic_event(
         "audio.deepgram.start.done",
@@ -8613,15 +8706,47 @@ async fn stop_deepgram_realtime_transcription(
     // Detach and hand the mic back when a live voice agent session lent it.
     deepgram_release_mic(&app, &audio_state).await;
 
-    let result = timeout(
+    let result = match timeout(
         Duration::from_secs(DEEPGRAM_TRANSCRIBE_TIMEOUT_SECS),
         session.finished_rx,
     )
     .await
-    .map_err(|_| "Deepgram realtime transcription timed out.".to_string())?
-    .map_err(|_| {
-        "Deepgram realtime transcription stopped before a result was returned.".to_string()
-    })??;
+    {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(error))) => {
+            session.stream_task.abort();
+            log_audio_diagnostic_event(
+                "audio.deepgram.stop.error",
+                json!({
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+        Ok(Err(_closed)) => {
+            let message = "Deepgram realtime transcription stopped before a result was returned."
+                .to_string();
+            session.stream_task.abort();
+            log_audio_diagnostic_event(
+                "audio.deepgram.stop.error",
+                json!({
+                    "error": message,
+                }),
+            );
+            return Err(message);
+        }
+        Err(_elapsed) => {
+            let message = "Deepgram realtime transcription timed out.".to_string();
+            session.stream_task.abort();
+            log_audio_diagnostic_event(
+                "audio.deepgram.stop.error",
+                json!({
+                    "error": message,
+                }),
+            );
+            return Err(message);
+        }
+    };
     log_audio_diagnostic_event(
         "audio.deepgram.stop.done",
         json!({
@@ -9000,8 +9125,63 @@ async fn polish_audio_transcription(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn send_forge_dictation_control_frame<W>(
+    write: &mut W,
+    audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    audio_open: &mut bool,
+    control_kind: &'static str,
+    cancel_requested: bool,
+) -> Result<(), String>
+where
+    W: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    // Forward the captured tail before declaring the turn over: select! races
+    // control against audio, and the stop command detaches the mic before
+    // sending Finish, so queued frames are the end of the utterance.
+    if !cancel_requested {
+        let mut tail_frames: u64 = 0;
+        loop {
+            match audio_rx.try_recv() {
+                Ok(audio_bytes) => {
+                    if audio_bytes.is_empty() {
+                        continue;
+                    }
+                    tail_frames += 1;
+                    if let Err(error) = write.send(Message::Binary(audio_bytes.into())).await {
+                        return Err(format!(
+                            "Unable to stream audio to Diff Forge Cloud: {error}"
+                        ));
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    *audio_open = false;
+                    break;
+                }
+            }
+        }
+        if tail_frames > 0 {
+            log_audio_diagnostic_event(
+                "audio.forge_dictation.tail_flushed",
+                json!({ "frames": tail_frames }),
+            );
+        }
+    }
+
+    let frame = json!({
+        "kind": control_kind,
+        "contract": CLOUD_DICTATION_CONTRACT,
+    });
+    write
+        .send(Message::Text(frame.to_string().into()))
+        .await
+        .map_err(|error| format!("Unable to finish cloud dictation: {error}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_forge_dictation_stream(
     app: AppHandle,
+    audio_state: AudioState,
     connection: ForgeDictationConnection,
     start_request: Value,
     history_id: String,
@@ -9065,12 +9245,6 @@ async fn run_forge_dictation_stream(
         );
         return;
     }
-
-    // The start frame is on the wire, so report ready immediately instead of
-    // blocking on the cloud credits gate and the Deepgram handshake. Audio is
-    // forwarded right away and queues on the server socket until the stream
-    // goes live, so no speech is lost; a start failure (for example missing
-    // credits) surfaces as a "voice_dictation_error" through `finished_tx`.
     if let Some(ready_tx) = ready_tx.take() {
         let _ = ready_tx.send(Ok(()));
     }
@@ -9080,9 +9254,10 @@ async fn run_forge_dictation_stream(
     let mut finish_sent = false;
     let mut cancel_requested = false;
     let mut started = false;
+    let mut pending_control: Option<(&'static str, bool)> = None;
     let start_deadline = sleep(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS));
     tokio::pin!(start_deadline);
-    let result: Result<ForgeDictationResult, String> = 'stream: loop {
+    let result: Result<ForgeDictationResult, String> = loop {
         tokio::select! {
             _ = &mut start_deadline, if !started => {
                 break Err("Cloud dictation timed out while starting the audio stream.".to_string());
@@ -9098,46 +9273,30 @@ async fn run_forge_dictation_stream(
                 };
                 cancel_requested = cancel_requested || cancel;
                 if !finish_sent {
-                    // Forward the captured tail before declaring the turn
-                    // over: select! races this branch against the audio one,
-                    // and the stop command detaches the mic before sending
-                    // Finish, so frames still queued here are the end of the
-                    // utterance — dropping them clipped trailing words.
-                    if !cancel_requested {
-                        let mut tail_frames: u64 = 0;
-                        loop {
-                            match audio_rx.try_recv() {
-                                Ok(audio_bytes) => {
-                                    if audio_bytes.is_empty() {
-                                        continue;
-                                    }
-                                    tail_frames += 1;
-                                    if let Err(error) = write.send(Message::Binary(audio_bytes.into())).await {
-                                        break 'stream Err(format!("Unable to stream audio to Diff Forge Cloud: {error}"));
-                                    }
-                                }
-                                Err(mpsc::error::TryRecvError::Empty) => break,
-                                Err(mpsc::error::TryRecvError::Disconnected) => {
-                                    audio_open = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if tail_frames > 0 {
-                            log_audio_diagnostic_event(
-                                "audio.forge_dictation.tail_flushed",
-                                json!({ "frames": tail_frames }),
-                            );
-                        }
+                    if !started {
+                        let pending_kind = if cancel_requested { "cancel" } else { control_kind };
+                        pending_control = Some((pending_kind, cancel_requested));
+                        log_audio_diagnostic_event(
+                            "audio.forge_dictation.finish_deferred",
+                            json!({
+                                "control": pending_kind,
+                                "cancelled": cancel_requested,
+                            }),
+                        );
+                        continue;
+                    }
+                    if let Err(error) = send_forge_dictation_control_frame(
+                        &mut write,
+                        &mut audio_rx,
+                        &mut audio_open,
+                        control_kind,
+                        cancel_requested,
+                    )
+                    .await
+                    {
+                        break Err(error);
                     }
                     finish_sent = true;
-                    let frame = json!({
-                        "kind": control_kind,
-                        "contract": CLOUD_DICTATION_CONTRACT,
-                    });
-                    if let Err(error) = write.send(Message::Text(frame.to_string().into())).await {
-                        break Err(format!("Unable to finish cloud dictation: {error}"));
-                    }
                 }
             }
             maybe_audio = audio_rx.recv(), if audio_open => {
@@ -9166,9 +9325,41 @@ async fn run_forge_dictation_stream(
                         match payload.get("kind").and_then(Value::as_str).unwrap_or_default() {
                             "voice_dictation_started" => {
                                 started = true;
+                                if let Some((pending_kind, pending_cancel)) = pending_control.take() {
+                                    if !finish_sent {
+                                        if let Err(error) = send_forge_dictation_control_frame(
+                                            &mut write,
+                                            &mut audio_rx,
+                                            &mut audio_open,
+                                            pending_kind,
+                                            pending_cancel,
+                                        )
+                                        .await
+                                        {
+                                            break Err(error);
+                                        }
+                                        finish_sent = true;
+                                    }
+                                }
                             }
                             "voice_dictation_transcript" => {
                                 started = true;
+                                if let Some((pending_kind, pending_cancel)) = pending_control.take() {
+                                    if !finish_sent {
+                                        if let Err(error) = send_forge_dictation_control_frame(
+                                            &mut write,
+                                            &mut audio_rx,
+                                            &mut audio_open,
+                                            pending_kind,
+                                            pending_cancel,
+                                        )
+                                        .await
+                                        {
+                                            break Err(error);
+                                        }
+                                        finish_sent = true;
+                                    }
+                                }
                                 let transcript = payload
                                     .get("text")
                                     .and_then(Value::as_str)
@@ -9335,14 +9526,28 @@ async fn run_forge_dictation_stream(
         }
     };
 
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = match &result {
+            Ok(_) => ready_tx.send(Ok(())),
+            Err(error) => ready_tx.send(Err(error.clone())),
+        };
+    }
+
+    let stream_error = result.as_ref().err().cloned();
     log_audio_diagnostic_event(
         "audio.forge_dictation.finished",
         json!({
             "ok": result.is_ok(),
             "cancelled": cancel_requested,
+            "error": stream_error
+                .as_ref()
+                .map(|error| clean_whisper_local_audio_log_text(error)),
         }),
     );
     let _ = finished_tx.send(result);
+    if stream_error.is_some() {
+        forge_dictation_release_mic(&app, &audio_state).await;
+    }
 }
 
 /// Opens a fresh dictation websocket and waits for the cloud ready frame so a
@@ -9632,8 +9837,9 @@ async fn start_forge_dictation_transcription(
         // example a dropped websocket) instead of refusing the new start.
         match session.finished_rx.try_recv() {
             Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                session.stream_task.abort();
                 *session_guard = None;
-                let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Dictation);
+                forge_dictation_release_mic(&app, &audio_state).await;
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
@@ -9648,8 +9854,9 @@ async fn start_forge_dictation_transcription(
             // switch mid-take, dropped websocket).
             match session.finished_rx.try_recv() {
                 Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    session.stream_task.abort();
                     *deepgram_guard = None;
-                    let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::Deepgram);
+                    deepgram_release_mic(&app, &audio_state).await;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
@@ -9749,8 +9956,9 @@ async fn start_forge_dictation_transcription(
         "keyterms": keyterms,
     });
 
-    tauri::async_runtime::spawn(run_forge_dictation_stream(
+    let stream_task = tauri::async_runtime::spawn(run_forge_dictation_stream(
         app,
+        audio_state.inner().clone(),
         connection,
         start_request,
         history_id,
@@ -9769,14 +9977,17 @@ async fn start_forge_dictation_transcription(
     {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
+            stream_task.abort();
             forge_dictation_release_mic(&app_handle, &audio_state).await;
             return Err(error);
         }
         Ok(Err(_closed)) => {
+            stream_task.abort();
             forge_dictation_release_mic(&app_handle, &audio_state).await;
             return Err("Cloud dictation closed before it was ready.".to_string());
         }
         Err(_elapsed) => {
+            stream_task.abort();
             forge_dictation_release_mic(&app_handle, &audio_state).await;
             return Err("Cloud dictation timed out while connecting.".to_string());
         }
@@ -9785,6 +9996,7 @@ async fn start_forge_dictation_transcription(
     *session_guard = Some(ForgeDictationSession {
         control_tx,
         finished_rx,
+        stream_task,
     });
 
     log_audio_diagnostic_event(
@@ -9853,13 +10065,52 @@ async fn stop_forge_dictation_transcription(
         ForgeDictationControl::Finish
     });
 
-    let result = timeout(
+    let result = match timeout(
         Duration::from_secs(CLOUD_DICTATION_RESULT_TIMEOUT_SECS),
         session.finished_rx,
     )
     .await
-    .map_err(|_| "Cloud dictation timed out while finishing.".to_string())?
-    .map_err(|_| "Cloud dictation stopped before returning a transcript.".to_string())??;
+    {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(error))) => {
+            session.stream_task.abort();
+            log_audio_diagnostic_event(
+                "audio.forge_dictation.stop.error",
+                json!({
+                    "cancelled": cancel,
+                    "elapsed_ms": stop_started_at.elapsed().as_millis() as u64,
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+        Ok(Err(_closed)) => {
+            let message = "Cloud dictation stopped before returning a transcript.".to_string();
+            session.stream_task.abort();
+            log_audio_diagnostic_event(
+                "audio.forge_dictation.stop.error",
+                json!({
+                    "cancelled": cancel,
+                    "elapsed_ms": stop_started_at.elapsed().as_millis() as u64,
+                    "error": message,
+                }),
+            );
+            return Err(message);
+        }
+        Err(_elapsed) => {
+            let message = "Cloud dictation timed out while finishing.".to_string();
+            session.stream_task.abort();
+            log_audio_diagnostic_event(
+                "audio.forge_dictation.stop.error",
+                json!({
+                    "cancelled": cancel,
+                    "elapsed_ms": stop_started_at.elapsed().as_millis() as u64,
+                    "error": message,
+                }),
+            );
+            return Err(message);
+        }
+    };
 
     log_audio_diagnostic_event(
         "audio.forge_dictation.stop.done",

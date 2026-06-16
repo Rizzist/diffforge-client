@@ -438,6 +438,57 @@ pub fn remember_initialized_kernel_storage(paths: &StoragePaths) -> Result<(), S
     Ok(())
 }
 
+fn initialized_kernel_registry_entry_matches_repo(entry: &Value, repo_path: &Path) -> bool {
+    let target_repo_path = process_path_text(repo_path);
+    if entry
+        .get("repo_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value == target_repo_path)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let Some(db_path) = entry
+        .get("db_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return false;
+    };
+    let visible_root = coordination_visible_state_root(repo_path);
+    let private_root = coordination_repo_state_root(repo_path);
+    db_path.starts_with(&visible_root) || db_path.starts_with(&private_root)
+}
+
+pub fn forget_initialized_kernel_storage_for_repo(repo_path: &Path) -> Result<usize, String> {
+    let registry_path = initialized_kernels_registry_path();
+    if !registry_path.exists() {
+        return Ok(0);
+    }
+    let mut entries = read_initialized_kernel_registry_entries(&registry_path)?;
+    let before = entries.len();
+    entries.retain(|entry| !initialized_kernel_registry_entry_matches_repo(entry, repo_path));
+    let removed = before.saturating_sub(entries.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    let text = serde_json::to_string_pretty(&entries)
+        .map_err(|error| format!("Unable to serialize initialized kernel registry: {error}"))?;
+    fs::write(&registry_path, text).map_err(|error| {
+        format!(
+            "Unable to write initialized kernel registry {}: {error}",
+            registry_path.display()
+        )
+    })?;
+    Ok(removed)
+}
+
 pub fn remembered_initialized_kernel_storages() -> Result<Vec<RememberedKernelStorage>, String> {
     let registry_path = initialized_kernels_registry_path();
     let entries = read_initialized_kernel_registry_entries(&registry_path)?;

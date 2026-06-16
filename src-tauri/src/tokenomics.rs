@@ -12,7 +12,7 @@ const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/
 const TOKENOMICS_CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v6-device-aware-30d";
 const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v4-device-aware-30d";
-const TOKENOMICS_ROLLUP_ID_VERSION: &str = "tokenomics-v2-utc-hour-rollups-v1";
+const TOKENOMICS_ROLLUP_ID_VERSION: &str = "tokenomics-v2-utc-hour-rollups-v2";
 const TOKENOMICS_PROVIDER_API_PRICING_VERSION: &str = "claude-api-pricing-v1";
 const TOKENOMICS_INITIAL_BACKFILL_DAYS: u64 = 30;
 const TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX: u64 = i64::MAX as u64;
@@ -1303,6 +1303,92 @@ fn tokenomics_provider_account_from_auth(
     }
 }
 
+fn tokenomics_tag_limit_agent_profile(
+    limits: &mut [Value],
+    profile_id: &str,
+    active_profile_id: &str,
+) {
+    let active = profile_id == active_profile_id;
+    for limit in limits {
+        let Some(object) = limit.as_object_mut() else {
+            continue;
+        };
+        object.insert("agent_profile_id".to_string(), json!(profile_id));
+        object.insert("agentProfileId".to_string(), json!(profile_id));
+        object.insert("active_agent_profile".to_string(), json!(active));
+        object.insert("activeAgentProfile".to_string(), json!(active));
+        object.insert("active_provider_account".to_string(), json!(active));
+        object.insert("activeProviderAccount".to_string(), json!(active));
+    }
+}
+
+fn tokenomics_active_provider_account_key_map(limits: &[Value]) -> HashMap<String, String> {
+    let mut keys = HashMap::new();
+    for limit in limits {
+        let active = limit
+            .get("active_provider_account")
+            .or_else(|| limit.get("activeProviderAccount"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !active {
+            continue;
+        }
+        let provider =
+            tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+        let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+            .unwrap_or_else(|| provider.clone());
+        let account_key = tokenomics_value_string(
+            limit,
+            &[
+                "provider_account_key",
+                "providerAccountKey",
+                "subscription_key",
+                "subscriptionKey",
+            ],
+        )
+        .unwrap_or_default();
+        if provider == "unknown" || account_key.is_empty() {
+            continue;
+        }
+        keys.insert(format!("{provider}\u{1f}{agent_kind}"), account_key);
+    }
+    keys
+}
+
+fn tokenomics_retag_active_provider_accounts(
+    limits: &mut [Value],
+    active_account_keys: &HashMap<String, String>,
+) {
+    if active_account_keys.is_empty() {
+        return;
+    }
+    for limit in limits {
+        let provider =
+            tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+        let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+            .unwrap_or_else(|| provider.clone());
+        let account_key = tokenomics_value_string(
+            limit,
+            &[
+                "provider_account_key",
+                "providerAccountKey",
+                "subscription_key",
+                "subscriptionKey",
+            ],
+        )
+        .unwrap_or_default();
+        let active = active_account_keys
+            .get(&format!("{provider}\u{1f}{agent_kind}"))
+            .map(|active_key| active_key == &account_key)
+            .unwrap_or(false);
+        let Some(object) = limit.as_object_mut() else {
+            continue;
+        };
+        object.insert("active_provider_account".to_string(), json!(active));
+        object.insert("activeProviderAccount".to_string(), json!(active));
+    }
+}
+
 fn tokenomics_provider_account_base_label(provider: &str, agent_kind: &str) -> String {
     match agent_kind {
         "codex" => "Codex account".to_string(),
@@ -2494,6 +2580,71 @@ fn tokenomics_migrate_provider_account_key(
     .map_err(|error| format!("Unable to migrate Tokenomics account limit samples: {error}"))?;
 
     conn.execute(
+        "UPDATE tokenomics_latest_windows
+         SET provider_account_key=?1, provider_account_label=?2, updated_at=?6, updated_at_unix=?7
+         WHERE provider=?3 AND agent_kind=?4 AND provider_account_key=?5",
+        rusqlite::params![
+            provider_account.key.as_str(),
+            provider_account.label.as_str(),
+            provider,
+            agent_kind,
+            old_key,
+            now.as_str(),
+            now_unix
+        ],
+    )
+    .map_err(|error| format!("Unable to migrate Tokenomics account live windows: {error}"))?;
+
+    let mut account_statement = conn
+        .prepare(
+            "SELECT device_id,
+                    COALESCE(NULLIF(billing_scope_type, ''), 'unknown') AS billing_scope_type,
+                    NULLIF(billing_team_id, '') AS billing_team_id,
+                    COALESCE(NULLIF(billing_scope_source, ''), 'unknown') AS billing_scope_source,
+                    COALESCE(NULLIF(attribution_source, ''), 'account_migration') AS attribution_source
+             FROM tokenomics_provider_accounts
+             WHERE provider=?1 AND agent_kind=?2 AND provider_account_key=?3",
+        )
+        .map_err(|error| format!("Unable to inspect Tokenomics account badges: {error}"))?;
+    let account_rows = account_statement
+        .query_map(rusqlite::params![provider, agent_kind, old_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                TokenomicsBillingScope {
+                    scope_type: row.get::<_, String>(1)?,
+                    team_id: row.get::<_, Option<String>>(2)?,
+                    source: row.get::<_, String>(3)?,
+                },
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query Tokenomics account badges: {error}"))?;
+    let mut migrated_account_rows = Vec::new();
+    for row in account_rows {
+        migrated_account_rows
+            .push(row.map_err(|error| format!("Unable to read Tokenomics account badge: {error}"))?);
+    }
+    drop(account_statement);
+    for (device_id, scope, attribution_source) in migrated_account_rows {
+        tokenomics_upsert_provider_account(
+            conn,
+            &device_id,
+            provider,
+            agent_kind,
+            &provider_account.key,
+            Some(&provider_account.label),
+            &scope,
+            &attribution_source,
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM tokenomics_provider_accounts
+         WHERE provider=?1 AND agent_kind=?2 AND provider_account_key=?3",
+        rusqlite::params![provider, agent_kind, old_key],
+    )
+    .map_err(|error| format!("Unable to remove stale Tokenomics account badges: {error}"))?;
+
+    conn.execute(
         "UPDATE tokenomics_cloud_rollups
          SET subscription_key=CASE WHEN subscription_key=?5 THEN ?1 ELSE subscription_key END,
              provider_account_key=CASE WHEN provider_account_key=?5 THEN ?1 ELSE provider_account_key END,
@@ -2533,6 +2684,453 @@ fn tokenomics_provider_account_label_is_profile(label: &str) -> bool {
 fn tokenomics_clean_non_profile_provider_account_label(label: &str) -> Option<String> {
     tokenomics_account_label_text(label.to_string())
         .filter(|clean| !tokenomics_provider_account_label_is_profile(clean))
+}
+
+fn tokenomics_normalized_provider_account_identity_label(
+    provider: &str,
+    agent_kind: &str,
+    label: &str,
+) -> Option<String> {
+    let clean = tokenomics_clean_non_profile_provider_account_label(label)?;
+    if clean.chars().count() <= 1 {
+        return None;
+    }
+    let normalized = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized_lower = normalized.to_lowercase();
+    let base_lower = tokenomics_provider_account_base_label(provider, agent_kind).to_lowercase();
+    if normalized_lower == base_lower || normalized_lower.starts_with(&format!("{base_lower} ")) {
+        return None;
+    }
+    Some(normalized_lower)
+}
+
+#[derive(Clone, Debug)]
+struct TokenomicsProviderAccountIdentityCandidate {
+    provider: String,
+    agent_kind: String,
+    provider_account_key: String,
+    provider_account_label: String,
+    normalized_label: String,
+    usage_total: i64,
+    rollup_total: i64,
+    cloud_total: i64,
+    limit_rows: i64,
+    latest_rows: i64,
+    account_rows: i64,
+    updated_at_unix: i64,
+}
+
+impl TokenomicsProviderAccountIdentityCandidate {
+    fn authoritative_rows(&self) -> i64 {
+        self.limit_rows + self.latest_rows
+    }
+
+    fn authoritative_tokens(&self) -> i64 {
+        self.usage_total + self.rollup_total + self.cloud_total
+    }
+
+    fn has_authoritative_data(&self) -> bool {
+        self.authoritative_tokens() > 0 || self.authoritative_rows() > 0
+    }
+}
+
+fn tokenomics_provider_account_identity_candidates(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<TokenomicsProviderAccountIdentityCandidate>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT
+               provider,
+               agent_kind,
+               provider_account_key,
+               provider_account_label,
+               SUM(usage_total) AS usage_total,
+               SUM(rollup_total) AS rollup_total,
+               SUM(cloud_total) AS cloud_total,
+               SUM(limit_rows) AS limit_rows,
+               SUM(latest_rows) AS latest_rows,
+               SUM(account_rows) AS account_rows,
+               MAX(updated_at_unix) AS updated_at_unix
+             FROM (
+               SELECT
+                 provider,
+                 agent_kind,
+                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
+                 provider_account_label,
+                 COALESCE(SUM(total_tokens), 0) AS usage_total,
+                 0 AS rollup_total,
+                 0 AS cloud_total,
+                 0 AS limit_rows,
+                 0 AS latest_rows,
+                 0 AS account_rows,
+                 0 AS updated_at_unix
+               FROM tokenomics_usage_events
+               WHERE COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
+                 AND COALESCE(provider_account_label, '') != ''
+               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
+               UNION ALL
+               SELECT
+                 provider,
+                 agent_kind,
+                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
+                 provider_account_label,
+                 0 AS usage_total,
+                 COALESCE(SUM(total_tokens), 0) AS rollup_total,
+                 0 AS cloud_total,
+                 0 AS limit_rows,
+                 0 AS latest_rows,
+                 0 AS account_rows,
+                 0 AS updated_at_unix
+               FROM tokenomics_rollups
+               WHERE bucket_width='hour'
+                 AND COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
+                 AND COALESCE(provider_account_label, '') != ''
+               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
+               UNION ALL
+               SELECT
+                 provider,
+                 agent_kind,
+                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
+                 provider_account_label,
+                 0 AS usage_total,
+                 0 AS rollup_total,
+                 COALESCE(SUM(total_tokens), 0) AS cloud_total,
+                 0 AS limit_rows,
+                 0 AS latest_rows,
+                 0 AS account_rows,
+                 0 AS updated_at_unix
+               FROM tokenomics_cloud_rollups
+               WHERE bucket_width='hour'
+                 AND COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
+                 AND COALESCE(provider_account_label, '') != ''
+               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
+               UNION ALL
+               SELECT
+                 provider,
+                 agent_kind,
+                 provider_account_key,
+                 provider_account_label,
+                 0 AS usage_total,
+                 0 AS rollup_total,
+                 0 AS cloud_total,
+                 COUNT(*) AS limit_rows,
+                 0 AS latest_rows,
+                 0 AS account_rows,
+                 MAX(updated_at_unix) AS updated_at_unix
+               FROM tokenomics_provider_limit_samples
+               WHERE COALESCE(provider_account_key, '') != ''
+                 AND COALESCE(provider_account_label, '') != ''
+               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
+               UNION ALL
+               SELECT
+                 provider,
+                 agent_kind,
+                 provider_account_key,
+                 provider_account_label,
+                 0 AS usage_total,
+                 0 AS rollup_total,
+                 0 AS cloud_total,
+                 0 AS limit_rows,
+                 COUNT(*) AS latest_rows,
+                 0 AS account_rows,
+                 MAX(updated_at_unix) AS updated_at_unix
+               FROM tokenomics_latest_windows
+               WHERE COALESCE(provider_account_key, '') != ''
+                 AND COALESCE(provider_account_label, '') != ''
+               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
+               UNION ALL
+               SELECT
+                 provider,
+                 agent_kind,
+                 provider_account_key,
+                 provider_account_label,
+                 0 AS usage_total,
+                 0 AS rollup_total,
+                 0 AS cloud_total,
+                 0 AS limit_rows,
+                 0 AS latest_rows,
+                 COUNT(*) AS account_rows,
+                 MAX(updated_at_unix) AS updated_at_unix
+               FROM tokenomics_provider_accounts
+               WHERE COALESCE(provider_account_key, '') != ''
+                 AND COALESCE(provider_account_label, '') != ''
+               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
+             )
+             GROUP BY provider, agent_kind, provider_account_key, provider_account_label",
+        )
+        .map_err(|error| {
+            format!("Unable to prepare Tokenomics provider account identity query: {error}")
+        })?;
+    let mapped = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })
+        .map_err(|error| {
+            format!("Unable to query Tokenomics provider account identities: {error}")
+        })?;
+    let mut candidates_by_key =
+        HashMap::<(String, String, String, String), TokenomicsProviderAccountIdentityCandidate>::new();
+    for row in mapped {
+        let (
+            provider,
+            agent_kind,
+            provider_account_key,
+            provider_account_label,
+            usage_total,
+            rollup_total,
+            cloud_total,
+            limit_rows,
+            latest_rows,
+            account_rows,
+            updated_at_unix,
+        ) = row.map_err(|error| {
+            format!("Unable to read Tokenomics provider account identity row: {error}")
+        })?;
+        let provider = provider.trim().to_ascii_lowercase();
+        let agent_kind = agent_kind.trim().to_ascii_lowercase();
+        let provider_account_key = provider_account_key.trim().to_string();
+        if provider.is_empty()
+            || agent_kind.is_empty()
+            || provider_account_key.is_empty()
+            || provider_account_key.ends_with(":unknown")
+        {
+            continue;
+        }
+        let Some(provider_account_label) =
+            tokenomics_clean_non_profile_provider_account_label(&provider_account_label)
+        else {
+            continue;
+        };
+        let Some(normalized_label) = tokenomics_normalized_provider_account_identity_label(
+            &provider,
+            &agent_kind,
+            &provider_account_label,
+        ) else {
+            continue;
+        };
+        let key = (
+            provider.clone(),
+            agent_kind.clone(),
+            normalized_label.clone(),
+            provider_account_key.clone(),
+        );
+        let entry =
+            candidates_by_key
+                .entry(key)
+                .or_insert_with(|| TokenomicsProviderAccountIdentityCandidate {
+                    provider,
+                    agent_kind,
+                    provider_account_key,
+                    provider_account_label,
+                    normalized_label,
+                    usage_total: 0,
+                    rollup_total: 0,
+                    cloud_total: 0,
+                    limit_rows: 0,
+                    latest_rows: 0,
+                    account_rows: 0,
+                    updated_at_unix: 0,
+                });
+        entry.usage_total += usage_total;
+        entry.rollup_total += rollup_total;
+        entry.cloud_total += cloud_total;
+        entry.limit_rows += limit_rows;
+        entry.latest_rows += latest_rows;
+        entry.account_rows += account_rows;
+        entry.updated_at_unix = entry.updated_at_unix.max(updated_at_unix);
+    }
+    Ok(candidates_by_key.into_values().collect())
+}
+
+fn tokenomics_compact_provider_account_rows(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM tokenomics_provider_accounts
+         WHERE NOT EXISTS (
+           SELECT 1 FROM tokenomics_usage_events events
+           WHERE events.provider=tokenomics_provider_accounts.provider
+             AND events.agent_kind=tokenomics_provider_accounts.agent_kind
+             AND (events.provider_account_key=tokenomics_provider_accounts.provider_account_key
+               OR events.subscription_key=tokenomics_provider_accounts.provider_account_key)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM tokenomics_rollups rollups
+           WHERE rollups.provider=tokenomics_provider_accounts.provider
+             AND rollups.agent_kind=tokenomics_provider_accounts.agent_kind
+             AND (rollups.provider_account_key=tokenomics_provider_accounts.provider_account_key
+               OR rollups.subscription_key=tokenomics_provider_accounts.provider_account_key)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM tokenomics_cloud_rollups cloud_rollups
+           WHERE cloud_rollups.provider=tokenomics_provider_accounts.provider
+             AND cloud_rollups.agent_kind=tokenomics_provider_accounts.agent_kind
+             AND (cloud_rollups.provider_account_key=tokenomics_provider_accounts.provider_account_key
+               OR cloud_rollups.subscription_key=tokenomics_provider_accounts.provider_account_key)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM tokenomics_provider_limit_samples samples
+           WHERE samples.provider=tokenomics_provider_accounts.provider
+             AND samples.agent_kind=tokenomics_provider_accounts.agent_kind
+             AND samples.provider_account_key=tokenomics_provider_accounts.provider_account_key
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM tokenomics_latest_windows windows
+           WHERE windows.provider=tokenomics_provider_accounts.provider
+             AND windows.agent_kind=tokenomics_provider_accounts.agent_kind
+             AND windows.provider_account_key=tokenomics_provider_accounts.provider_account_key
+         )",
+        [],
+    )
+    .map_err(|error| format!("Unable to prune stale Tokenomics account badges: {error}"))?;
+    conn.execute(
+        "DELETE FROM tokenomics_provider_accounts
+         WHERE EXISTS (
+           SELECT 1 FROM tokenomics_provider_accounts newer
+           WHERE newer.device_id=tokenomics_provider_accounts.device_id
+             AND newer.provider=tokenomics_provider_accounts.provider
+             AND newer.agent_kind=tokenomics_provider_accounts.agent_kind
+             AND newer.provider_account_key=tokenomics_provider_accounts.provider_account_key
+             AND COALESCE(newer.billing_scope_type, 'unknown')=COALESCE(tokenomics_provider_accounts.billing_scope_type, 'unknown')
+             AND COALESCE(newer.billing_team_id, '')=COALESCE(tokenomics_provider_accounts.billing_team_id, '')
+             AND (
+               COALESCE(newer.updated_at_unix, 0) > COALESCE(tokenomics_provider_accounts.updated_at_unix, 0)
+               OR (
+                 COALESCE(newer.updated_at_unix, 0)=COALESCE(tokenomics_provider_accounts.updated_at_unix, 0)
+                 AND newer.rowid > tokenomics_provider_accounts.rowid
+               )
+             )
+         )",
+        [],
+    )
+    .map_err(|error| format!("Unable to compact Tokenomics account badges: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_compact_provider_account_fact_rows(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM tokenomics_latest_windows
+         WHERE EXISTS (
+           SELECT 1 FROM tokenomics_latest_windows newer
+           WHERE newer.device_id=tokenomics_latest_windows.device_id
+             AND newer.provider=tokenomics_latest_windows.provider
+             AND newer.agent_kind=tokenomics_latest_windows.agent_kind
+             AND newer.provider_account_key=tokenomics_latest_windows.provider_account_key
+             AND COALESCE(newer.billing_scope_type, 'unknown')=COALESCE(tokenomics_latest_windows.billing_scope_type, 'unknown')
+             AND COALESCE(newer.billing_team_id, '')=COALESCE(tokenomics_latest_windows.billing_team_id, '')
+             AND newer.window_kind=tokenomics_latest_windows.window_kind
+             AND (
+               COALESCE(newer.sample_at_unix, 0) > COALESCE(tokenomics_latest_windows.sample_at_unix, 0)
+               OR (
+                 COALESCE(newer.sample_at_unix, 0)=COALESCE(tokenomics_latest_windows.sample_at_unix, 0)
+                 AND newer.rowid > tokenomics_latest_windows.rowid
+               )
+             )
+         )",
+        [],
+    )
+    .map_err(|error| format!("Unable to compact Tokenomics account windows: {error}"))?;
+    conn.execute(
+        "DELETE FROM tokenomics_provider_limit_samples
+         WHERE EXISTS (
+           SELECT 1 FROM tokenomics_provider_limit_samples newer
+           WHERE newer.device_id=tokenomics_provider_limit_samples.device_id
+             AND newer.provider=tokenomics_provider_limit_samples.provider
+             AND newer.agent_kind=tokenomics_provider_limit_samples.agent_kind
+             AND newer.provider_account_key=tokenomics_provider_limit_samples.provider_account_key
+             AND COALESCE(newer.billing_scope_type, 'unknown')=COALESCE(tokenomics_provider_limit_samples.billing_scope_type, 'unknown')
+             AND COALESCE(newer.billing_team_id, '')=COALESCE(tokenomics_provider_limit_samples.billing_team_id, '')
+             AND newer.window_kind=tokenomics_provider_limit_samples.window_kind
+             AND newer.sample_bucket_unix=tokenomics_provider_limit_samples.sample_bucket_unix
+             AND (
+               COALESCE(newer.sample_at_unix, 0) > COALESCE(tokenomics_provider_limit_samples.sample_at_unix, 0)
+               OR (
+                 COALESCE(newer.sample_at_unix, 0)=COALESCE(tokenomics_provider_limit_samples.sample_at_unix, 0)
+                 AND newer.rowid > tokenomics_provider_limit_samples.rowid
+               )
+             )
+         )",
+        [],
+    )
+    .map_err(|error| format!("Unable to compact Tokenomics account limit samples: {error}"))?;
+    tokenomics_compact_provider_account_rows(conn)?;
+    Ok(())
+}
+
+fn tokenomics_reconcile_duplicate_provider_account_identities(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    let candidates = tokenomics_provider_account_identity_candidates(conn)?;
+    let mut groups =
+        HashMap::<(String, String, String), Vec<TokenomicsProviderAccountIdentityCandidate>>::new();
+    for candidate in candidates {
+        groups
+            .entry((
+                candidate.provider.clone(),
+                candidate.agent_kind.clone(),
+                candidate.normalized_label.clone(),
+            ))
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut changed = false;
+    for ((provider, agent_kind, _label), mut accounts) in groups {
+        accounts.sort_by(|left, right| {
+            right
+                .usage_total
+                .cmp(&left.usage_total)
+                .then_with(|| right.rollup_total.cmp(&left.rollup_total))
+                .then_with(|| right.cloud_total.cmp(&left.cloud_total))
+                .then_with(|| right.authoritative_rows().cmp(&left.authoritative_rows()))
+                .then_with(|| right.account_rows.cmp(&left.account_rows))
+                .then_with(|| right.updated_at_unix.cmp(&left.updated_at_unix))
+                .then_with(|| left.provider_account_key.cmp(&right.provider_account_key))
+        });
+        accounts.dedup_by(|left, right| left.provider_account_key == right.provider_account_key);
+        if accounts.len() < 2 || !accounts.iter().any(|account| account.has_authoritative_data()) {
+            continue;
+        }
+        let canonical = accounts[0].clone();
+        if !canonical.has_authoritative_data() {
+            continue;
+        }
+        let canonical_account = TokenomicsProviderAccount {
+            key: canonical.provider_account_key.clone(),
+            label: canonical.provider_account_label.clone(),
+        };
+        for alias in accounts.iter().skip(1) {
+            if alias.provider_account_key == canonical_account.key {
+                continue;
+            }
+            tokenomics_migrate_provider_account_key(
+                conn,
+                &provider,
+                &agent_kind,
+                &alias.provider_account_key,
+                &canonical_account,
+            )?;
+            changed = true;
+        }
+    }
+
+    if changed {
+        tokenomics_compact_provider_account_fact_rows(conn)?;
+    }
+    tokenomics_compact_provider_account_rows(conn)?;
+    Ok(())
 }
 
 fn tokenomics_existing_provider_account_label_for_key(
@@ -2956,6 +3554,7 @@ fn tokenomics_reconcile_current_provider_accounts(
 ) -> Result<(), String> {
     tokenomics_reconcile_current_codex_account_label(conn)?;
     tokenomics_reconcile_current_claude_account_identity(conn)?;
+    tokenomics_reconcile_duplicate_provider_account_identities(conn)?;
     Ok(())
 }
 
@@ -3189,15 +3788,25 @@ fn tokenomics_timestamp_unix(timestamp: &str) -> Option<u64> {
 
 fn tokenomics_iso_timestamp_unix(timestamp: &str) -> Option<u64> {
     let clean = timestamp.trim();
-    if clean.len() < 19 {
+    if clean.len() < 13 {
         return None;
     }
     let year = clean.get(0..4)?.parse::<i64>().ok()?;
     let month = clean.get(5..7)?.parse::<i64>().ok()?;
     let day = clean.get(8..10)?.parse::<i64>().ok()?;
     let hour = clean.get(11..13)?.parse::<i64>().ok()?;
-    let minute = clean.get(14..16)?.parse::<i64>().ok()?;
-    let second = clean.get(17..19)?.parse::<i64>().ok()?;
+    let (minute, second) = if clean.len() >= 19 {
+        (
+            clean.get(14..16)?.parse::<i64>().ok()?,
+            clean.get(17..19)?.parse::<i64>().ok()?,
+        )
+    } else if clean.len() == 16 {
+        (clean.get(14..16)?.parse::<i64>().ok()?, 0)
+    } else if clean.len() == 13 {
+        (0, 0)
+    } else {
+        return None;
+    };
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || !(0..=23).contains(&hour)
@@ -5002,7 +5611,58 @@ fn tokenomics_rebuild_provider_rollups_from_events(
     Ok(())
 }
 
+fn tokenomics_normalize_usage_event_buckets(conn: &rusqlite::Connection) -> Result<(), String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, bucket_day, bucket_hour, created_at
+             FROM tokenomics_usage_events
+             WHERE bucket_hour NOT GLOB '????-??-??T??:00:00Z'
+                OR bucket_day NOT GLOB '????-??-??'",
+        )
+        .map_err(|error| format!("Unable to prepare Tokenomics bucket normalization: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query Tokenomics bucket normalization: {error}"))?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (id, bucket_day, bucket_hour, created_at) =
+            row.map_err(|error| format!("Unable to read Tokenomics bucket row: {error}"))?;
+        let source = if tokenomics_utc_hour_bucket_start_unix(&bucket_hour).is_some() {
+            bucket_hour.as_str()
+        } else {
+            created_at.as_deref().unwrap_or(bucket_hour.as_str())
+        };
+        let Some(seconds) = tokenomics_utc_hour_bucket_start_unix(source) else {
+            continue;
+        };
+        let (canonical_day, canonical_hour) = tokenomics_utc_hour_bucket_from_unix(seconds);
+        if canonical_day != bucket_day || canonical_hour != bucket_hour {
+            updates.push((id, canonical_day, canonical_hour));
+        }
+    }
+    drop(statement);
+
+    for (id, bucket_day, bucket_hour) in updates {
+        conn.execute(
+            "UPDATE tokenomics_usage_events
+             SET bucket_day=?1, bucket_hour=?2
+             WHERE id=?3",
+            rusqlite::params![bucket_day, bucket_hour, id],
+        )
+        .map_err(|error| format!("Unable to normalize Tokenomics event bucket: {error}"))?;
+    }
+    Ok(())
+}
+
 fn tokenomics_rebuild_all_rollups_from_events(conn: &rusqlite::Connection) -> Result<(), String> {
+    tokenomics_normalize_usage_event_buckets(conn)?;
     conn.execute("DELETE FROM tokenomics_rollups", [])
         .map_err(|error| format!("Unable to clear Tokenomics rollups: {error}"))?;
     let mut statement = conn
@@ -5158,23 +5818,29 @@ fn tokenomics_rebuild_provider_rollups_for_width(
 ) -> Result<(), String> {
     let query = format!(
         "SELECT
-	           device_id, provider, agent_kind, model, subscription_key, provider_account_key,
-	           MAX(provider_account_label) AS provider_account_label,
-	           COALESCE(NULLIF(billing_scope_type, ''), 'unknown') AS billing_scope_type,
-	           NULLIF(billing_team_id, '') AS billing_team_id,
-	           MAX(COALESCE(NULLIF(billing_scope_source, ''), 'unknown')) AS billing_scope_source,
-	           workspace_id, MAX(repo_path) AS repo_path, {bucket_column} AS bucket_start,
-	           COALESCE(SUM(input_tokens), 0) AS input_tokens,
-           COALESCE(SUM(output_tokens), 0) AS output_tokens,
-           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+		           device_id, provider, agent_kind,
+		           NULLIF(model, '') AS model,
+		           NULLIF(subscription_key, '') AS subscription_key,
+		           NULLIF(provider_account_key, '') AS provider_account_key,
+		           MAX(provider_account_label) AS provider_account_label,
+		           COALESCE(NULLIF(billing_scope_type, ''), 'unknown') AS billing_scope_type,
+		           NULLIF(billing_team_id, '') AS billing_team_id,
+		           MAX(COALESCE(NULLIF(billing_scope_source, ''), 'unknown')) AS billing_scope_source,
+		           NULLIF(workspace_id, '') AS workspace_id,
+		           MAX(repo_path) AS repo_path, {bucket_column} AS bucket_start,
+		           COALESCE(SUM(input_tokens), 0) AS input_tokens,
+	           COALESCE(SUM(output_tokens), 0) AS output_tokens,
+	           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
            COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
            COALESCE(SUM(total_tokens), 0) AS total_tokens,
            COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
            COUNT(*) AS event_count
-	         FROM tokenomics_usage_events
-	         WHERE provider=?1 AND agent_kind=?2
-	         GROUP BY device_id, provider, agent_kind, model, subscription_key, provider_account_key,
-	                  billing_scope_type, billing_team_id, workspace_id, {bucket_column}"
+		         FROM tokenomics_usage_events
+		         WHERE provider=?1 AND agent_kind=?2
+		         GROUP BY device_id, provider, agent_kind,
+		                  NULLIF(model, ''), NULLIF(subscription_key, ''), NULLIF(provider_account_key, ''),
+		                  COALESCE(NULLIF(billing_scope_type, ''), 'unknown'),
+		                  NULLIF(billing_team_id, ''), NULLIF(workspace_id, ''), {bucket_column}"
     );
     let mut statement = conn
         .prepare(&query)
@@ -5257,7 +5923,20 @@ fn tokenomics_rebuild_provider_rollups_for_width(
 	               workspace_id, repo_path,
 	               bucket_width, bucket_start, input_tokens, output_tokens, cache_read_tokens,
 	               cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
-	             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+		             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+		             ON CONFLICT(id)
+		             DO UPDATE SET
+		               input_tokens=tokenomics_rollups.input_tokens+excluded.input_tokens,
+		               output_tokens=tokenomics_rollups.output_tokens+excluded.output_tokens,
+		               cache_read_tokens=tokenomics_rollups.cache_read_tokens+excluded.cache_read_tokens,
+		               cache_write_tokens=tokenomics_rollups.cache_write_tokens+excluded.cache_write_tokens,
+		               total_tokens=tokenomics_rollups.total_tokens+excluded.total_tokens,
+		               estimated_cost_microusd=tokenomics_rollups.estimated_cost_microusd+excluded.estimated_cost_microusd,
+		               event_count=tokenomics_rollups.event_count+excluded.event_count,
+		               provider_account_label=COALESCE(excluded.provider_account_label, tokenomics_rollups.provider_account_label),
+		               billing_scope_source=COALESCE(excluded.billing_scope_source, tokenomics_rollups.billing_scope_source),
+		               repo_path=COALESCE(excluded.repo_path, tokenomics_rollups.repo_path),
+		               updated_at=excluded.updated_at",
 	            rusqlite::params![
 	                rollup_id,
 	                device_id,
@@ -5464,6 +6143,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     include_cloud: bool,
     scope_filter: Option<&TokenomicsBillingScope>,
 ) -> Result<Value, String> {
+    tokenomics_reconcile_duplicate_provider_account_identities(conn)?;
     tokenomics_refresh_provider_accounts_from_usage(conn)?;
     let scope_filter_sql = tokenomics_billing_scope_filter_sql(scope_filter, true);
     let total = tokenomics_query_one(
@@ -5760,6 +6440,7 @@ fn tokenomics_refresh_provider_accounts_from_usage(
             "usage_hour",
         )?;
     }
+    tokenomics_compact_provider_account_rows(conn)?;
     Ok(())
 }
 
@@ -7684,6 +8365,10 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
     }
     let summary = event
         .get("summary")
+        .or_else(|| event.get("tokenomics_delta"))
+        .or_else(|| event.get("tokenomicsDelta"))
+        .or_else(|| event.get("snapshot"))
+        .or_else(|| event.get("delta").filter(|value| value.is_object()))
         .or_else(|| {
             event
                 .get("payload")
@@ -7691,8 +8376,50 @@ fn tokenomics_cloud_summary_payload(event: &Value) -> Value {
         })
         .or_else(|| {
             event
+                .get("payload")
+                .and_then(|payload| payload.get("tokenomics_delta"))
+        })
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|payload| payload.get("tokenomicsDelta"))
+        })
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|payload| payload.get("snapshot"))
+        })
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|payload| payload.get("delta"))
+                .filter(|value| value.is_object())
+        })
+        .or_else(|| {
+            event
                 .get("data")
                 .and_then(|data| data.get("summary"))
+        })
+        .or_else(|| {
+            event
+                .get("data")
+                .and_then(|data| data.get("tokenomics_delta"))
+        })
+        .or_else(|| {
+            event
+                .get("data")
+                .and_then(|data| data.get("tokenomicsDelta"))
+        })
+        .or_else(|| {
+            event
+                .get("data")
+                .and_then(|data| data.get("snapshot"))
+        })
+        .or_else(|| {
+            event
+                .get("data")
+                .and_then(|data| data.get("delta"))
+                .filter(|value| value.is_object())
         })
         .or_else(|| event.get("payload").filter(|payload| tokenomics_cloud_relay_summary_like(payload)))
         .or_else(|| event.get("data").filter(|data| tokenomics_cloud_relay_summary_like(data)))
@@ -7988,6 +8715,20 @@ fn tokenomics_cloud_relay_hourly_group_row(
             .saturating_add(cache_read_tokens)
             .saturating_add(cache_write_tokens)
     };
+    let estimated_cost_microusd = tokenomics_value_i64(
+        row,
+        &[
+            "estimated_cost_microusd",
+            "estimatedCostMicrousd",
+            "provider_cost_microusd",
+            "providerCostMicrousd",
+            "cost_microusd",
+            "costMicrousd",
+            "cost",
+        ],
+    )
+    .unwrap_or(0)
+    .max(0);
     let model = tokenomics_value_string(row, &["model"]).unwrap_or_else(|| agent_kind.clone());
     Some(json!({
         "device_id": device_id.clone(),
@@ -8016,6 +8757,11 @@ fn tokenomics_cloud_relay_hourly_group_row(
         "cacheWriteTokens": cache_write_tokens,
         "total_tokens": total_tokens,
         "totalTokens": total_tokens,
+        "estimated_cost_microusd": estimated_cost_microusd,
+        "estimatedCostMicrousd": estimated_cost_microusd,
+        "provider_cost_microusd": estimated_cost_microusd,
+        "providerCostMicrousd": estimated_cost_microusd,
+        "cost": estimated_cost_microusd,
         "event_count": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
         "eventCount": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
         "updated_at": updated_at,
@@ -8709,6 +9455,20 @@ fn tokenomics_v2_hourly_row(
                 .saturating_add(cache_write_tokens)
         })
         .max(0);
+    let estimated_cost_microusd = tokenomics_value_i64(
+        row,
+        &[
+            "estimated_cost_microusd",
+            "estimatedCostMicrousd",
+            "provider_cost_microusd",
+            "providerCostMicrousd",
+            "cost_microusd",
+            "costMicrousd",
+            "cost",
+        ],
+    )
+    .unwrap_or(0)
+    .max(0);
     let updated_at = tokenomics_v2_ms_value_to_iso(
         row,
         &["server_seq", "serverSeq", "observed_at_ms", "observedAtMs"],
@@ -8741,6 +9501,11 @@ fn tokenomics_v2_hourly_row(
         "cacheWriteTokens": cache_write_tokens,
         "total_tokens": total_tokens,
         "totalTokens": total_tokens,
+        "estimated_cost_microusd": estimated_cost_microusd,
+        "estimatedCostMicrousd": estimated_cost_microusd,
+        "provider_cost_microusd": estimated_cost_microusd,
+        "providerCostMicrousd": estimated_cost_microusd,
+        "cost": estimated_cost_microusd,
         "event_count": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
         "eventCount": tokenomics_value_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0).max(0),
         "attribution_kind": tokenomics_value_string(row, &["attribution", "attribution_kind", "attributionKind"]).unwrap_or_else(|| "token_based".to_string()),
@@ -9185,6 +9950,7 @@ fn tokenomics_provider_limits(
 ) -> Result<Vec<Value>, String> {
     let mut limits = Vec::new();
 
+    let codex_active_profile_id = agent_accounts_active_profile_id_for_tokenomics("codex");
     let codex_plan = tokenomics_codex_plan_state();
     let codex_account = tokenomics_provider_account("openai", "codex");
     if let Some(codex_usage) = tokenomics_codex_live_usage(
@@ -9198,28 +9964,42 @@ fn tokenomics_provider_limits(
             &codex_account,
             &codex_usage,
         )?;
-        limits.extend(tokenomics_codex_live_limit_snapshots(
+        let mut codex_limits = tokenomics_codex_live_limit_snapshots(
             &codex_plan,
             &codex_usage,
             &codex_account,
-        ));
+        );
+        tokenomics_tag_limit_agent_profile(
+            &mut codex_limits,
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            &codex_active_profile_id,
+        );
+        limits.extend(codex_limits);
     } else {
-        limits.push(tokenomics_unknown_limit_snapshot(
-            "openai",
-            "codex",
-            &codex_account,
-            &codex_plan,
-            "5_hour",
-            "5-Hour Session",
-        ));
-        limits.push(tokenomics_unknown_limit_snapshot(
-            "openai",
-            "codex",
-            &codex_account,
-            &codex_plan,
-            "weekly",
-            "Weekly Limit",
-        ));
+        let mut codex_limits = vec![
+            tokenomics_unknown_limit_snapshot(
+                "openai",
+                "codex",
+                &codex_account,
+                &codex_plan,
+                "5_hour",
+                "5-Hour Session",
+            ),
+            tokenomics_unknown_limit_snapshot(
+                "openai",
+                "codex",
+                &codex_account,
+                &codex_plan,
+                "weekly",
+                "Weekly Limit",
+            ),
+        ];
+        tokenomics_tag_limit_agent_profile(
+            &mut codex_limits,
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            &codex_active_profile_id,
+        );
+        limits.extend(codex_limits);
     }
 
     // Codex agent-account profiles: each profile dir carries its own
@@ -9263,46 +10043,73 @@ fn tokenomics_provider_limits(
                 &profile_account,
                 &profile_usage,
             )?;
-            limits.extend(tokenomics_codex_live_limit_snapshots(
+            let mut profile_limits = tokenomics_codex_live_limit_snapshots(
                 &profile_plan,
                 &profile_usage,
                 &profile_account,
-            ));
+            );
+            tokenomics_tag_limit_agent_profile(
+                &mut profile_limits,
+                &profile_id,
+                &codex_active_profile_id,
+            );
+            limits.extend(profile_limits);
         }
     }
 
+    let claude_active_profile_id = agent_accounts_active_profile_id_for_tokenomics("claude");
     let claude_plan = tokenomics_claude_plan_state();
     let claude_account = tokenomics_provider_account("anthropic", "claude");
     let _ = tokenomics_ensure_claude_statusline_collector(&claude_plan);
     if let Some(claude_usage) =
         tokenomics_claude_live_usage(conn, &claude_account, include_stale_provider_cache)
     {
-        limits.extend(tokenomics_claude_live_limit_snapshots(
+        let mut claude_limits = tokenomics_claude_live_limit_snapshots(
             &claude_plan,
             &claude_usage,
             &claude_account,
-        ));
+        );
+        tokenomics_tag_limit_agent_profile(
+            &mut claude_limits,
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            &claude_active_profile_id,
+        );
+        limits.extend(claude_limits);
     } else if let Some(claude_limits) =
         tokenomics_claude_statusline_limits(&claude_plan, &claude_account)
     {
+        let mut claude_limits = claude_limits;
+        tokenomics_tag_limit_agent_profile(
+            &mut claude_limits,
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            &claude_active_profile_id,
+        );
         limits.extend(claude_limits);
     } else {
-        limits.push(tokenomics_unknown_limit_snapshot(
-            "anthropic",
-            "claude",
-            &claude_account,
-            &claude_plan,
-            "5_hour",
-            "5-Hour Session",
-        ));
-        limits.push(tokenomics_unknown_limit_snapshot(
-            "anthropic",
-            "claude",
-            &claude_account,
-            &claude_plan,
-            "weekly",
-            "Weekly Limit",
-        ));
+        let mut claude_limits = vec![
+            tokenomics_unknown_limit_snapshot(
+                "anthropic",
+                "claude",
+                &claude_account,
+                &claude_plan,
+                "5_hour",
+                "5-Hour Session",
+            ),
+            tokenomics_unknown_limit_snapshot(
+                "anthropic",
+                "claude",
+                &claude_account,
+                &claude_plan,
+                "weekly",
+                "Weekly Limit",
+            ),
+        ];
+        tokenomics_tag_limit_agent_profile(
+            &mut claude_limits,
+            AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+            &claude_active_profile_id,
+        );
+        limits.extend(claude_limits);
     }
 
     // Claude agent-account profiles: live window limits per account when the
@@ -9330,20 +10137,29 @@ fn tokenomics_provider_limits(
             &profile_account,
             include_stale_provider_cache,
         ) {
-            limits.extend(tokenomics_claude_live_limit_snapshots(
+            let mut profile_limits = tokenomics_claude_live_limit_snapshots(
                 &profile_plan,
                 &profile_usage,
                 &profile_account,
-            ));
+            );
+            tokenomics_tag_limit_agent_profile(
+                &mut profile_limits,
+                &profile_id,
+                &claude_active_profile_id,
+            );
+            limits.extend(profile_limits);
         }
     }
 
     let local_device_id = tokenomics_local_device_id();
     tokenomics_tag_provider_limit_devices(&mut limits, &local_device_id);
+    let active_account_keys = tokenomics_active_provider_account_key_map(&limits);
     limits = tokenomics_merge_provider_limits(Vec::new(), limits);
+    tokenomics_retag_active_provider_accounts(&mut limits, &active_account_keys);
 
     if include_cloud_last_known {
         limits = tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, limits);
+        tokenomics_retag_active_provider_accounts(&mut limits, &active_account_keys);
     }
 
     // Suppressed duplicate-of-default profile accounts: drop their rows from
@@ -10862,6 +11678,90 @@ mod tokenomics_tests {
     }
 
     #[test]
+    fn tokenomics_buckets_parse_legacy_hour_only_timestamp() {
+        let (day, hour) = tokenomics_buckets("2026-05-17T05");
+        assert_eq!(day, "2026-05-17");
+        assert_eq!(hour, "2026-05-17T05:00:00Z");
+    }
+
+    #[test]
+    fn tokenomics_rollup_rebuild_normalizes_legacy_event_buckets() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_usage_events(
+               id, provider, agent_kind, model, subscription_key,
+               provider_account_key, source_kind, source_path, bucket_day, bucket_hour,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               total_tokens, estimated_cost_microusd, created_at, observed_at
+             ) VALUES(
+               'legacy-hour-event', 'openai', 'codex', 'gpt-5.4', 'openai:codex:test',
+               'openai:codex:test', 'test', '/tmp/session.jsonl', '2026-05-17',
+               '2026-05-17T05', 10, 2, 3, 0, 12, 0,
+               '2026-05-17T05:42:00Z', '2026-05-17T05:42:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        tokenomics_rebuild_all_rollups_from_events(&conn).unwrap();
+
+        let event = tokenomics_query_one(
+            &conn,
+            "SELECT bucket_day, bucket_hour FROM tokenomics_usage_events WHERE id='legacy-hour-event'",
+        )
+        .unwrap();
+        assert_eq!(event["bucket_day"], json!("2026-05-17"));
+        assert_eq!(event["bucket_hour"], json!("2026-05-17T05:00:00Z"));
+
+        let rollup = tokenomics_query_one(
+            &conn,
+            "SELECT bucket_start, total_tokens FROM tokenomics_rollups WHERE id IS NOT NULL",
+        )
+        .unwrap();
+        assert_eq!(rollup["bucket_start"], json!("2026-05-17T05:00:00Z"));
+        assert_eq!(rollup["total_tokens"], json!(12));
+    }
+
+    #[test]
+    fn tokenomics_rollup_rebuild_coalesces_legacy_identity_duplicates() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tokenomics_usage_events(
+               id, device_id, provider, agent_kind, model, subscription_key,
+               provider_account_key, billing_scope_type, billing_team_id, workspace_id,
+               source_kind, bucket_day, bucket_hour,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               total_tokens, estimated_cost_microusd, observed_at
+             ) VALUES
+             (
+               'legacy-empty-identity', 'desktop-primary', 'openai', 'codex', '', '',
+               '', '', '', '', 'test', '2026-05-17', '2026-05-17T05:00:00Z',
+               10, 2, 3, 0, 15, 0, '2026-05-17T05:42:00Z'
+             ),
+             (
+               'legacy-null-identity', 'desktop-primary', 'openai', 'codex', NULL, NULL,
+               NULL, 'unknown', NULL, NULL, 'test', '2026-05-17', '2026-05-17T05:00:00Z',
+               20, 4, 6, 0, 30, 0, '2026-05-17T05:43:00Z'
+             )",
+        )
+        .unwrap();
+
+        tokenomics_rebuild_all_rollups_from_events(&conn).unwrap();
+
+        let rollup = tokenomics_query_one(
+            &conn,
+            "SELECT COUNT(*) AS count, SUM(total_tokens) AS total_tokens
+             FROM tokenomics_rollups
+             WHERE provider='openai' AND agent_kind='codex'",
+        )
+        .unwrap();
+        assert_eq!(rollup["count"], json!(1));
+        assert_eq!(rollup["total_tokens"], json!(45));
+    }
+
+    #[test]
     fn tokenomics_prepare_db_migrates_legacy_cloud_rollups_before_indexes() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -12314,6 +13214,174 @@ mod tokenomics_tests {
 
         assert_eq!(event_label, "Syed Rizvi");
         assert_eq!(rollup_label, "Syed Rizvi");
+    }
+
+    #[test]
+    fn tokenomics_reconcile_duplicate_provider_account_identities_migrates_badge_windows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let canonical_key = "openai:codex:canonical-agency";
+        let old_key = "openai:codex:old-agency";
+        conn.execute(
+            "INSERT INTO tokenomics_usage_events(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, source_kind, source_path, bucket_day, bucket_hour,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               total_tokens, estimated_cost_microusd, created_at, observed_at
+             ) VALUES(
+               'agency-event-canonical', 'openai', 'codex', 'gpt-5.4', ?1, ?1,
+               'Digital Agency', 'codex_token_count_jsonl', '/tmp/session.jsonl',
+               '2026-06-16', '2026-06-16T10:00:00Z', 100, 20, 5, 0,
+               120, 0, '2026-06-16T10:00:00Z', '2026-06-16T10:00:00Z'
+             )",
+            rusqlite::params![canonical_key],
+        )
+        .unwrap();
+        let scope = TokenomicsBillingScope {
+            scope_type: "personal".to_string(),
+            team_id: None,
+            source: "test".to_string(),
+        };
+        tokenomics_upsert_latest_window(
+            &conn,
+            &json!({
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": old_key,
+                "provider_account_label": "Digital Agency",
+                "window_kind": "weekly",
+                "sample_at": "2026-06-16T10:05:00Z",
+                "used_percent": 42
+            }),
+            &scope,
+            "device-a",
+            Some("test"),
+        )
+        .unwrap();
+
+        tokenomics_reconcile_duplicate_provider_account_identities(&conn).unwrap();
+
+        let old_badges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_provider_accounts WHERE provider_account_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_windows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_latest_windows WHERE provider_account_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let distinct_badge_keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT provider_account_key)
+                 FROM tokenomics_provider_accounts
+                 WHERE provider='openai' AND agent_kind='codex'
+                   AND provider_account_label='Digital Agency'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated_windows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_latest_windows
+                 WHERE provider_account_key=?1 AND provider_account_label='Digital Agency'",
+                rusqlite::params![canonical_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(old_badges, 0);
+        assert_eq!(old_windows, 0);
+        assert_eq!(distinct_badge_keys, 1);
+        assert_eq!(migrated_windows, 1);
+    }
+
+    #[test]
+    fn tokenomics_reconcile_duplicate_provider_account_identities_merges_usage_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let canonical_key = "openai:codex:canonical-rizzist";
+        let old_key = "openai:codex:old-rizzist";
+        for (id, key, input_tokens, output_tokens) in [
+            ("rizzist-event-canonical", canonical_key, 90, 10),
+            ("rizzist-event-old", old_key, 9, 1),
+        ] {
+            conn.execute(
+                "INSERT INTO tokenomics_usage_events(
+                   id, provider, agent_kind, model, subscription_key, provider_account_key,
+                   provider_account_label, source_kind, source_path, bucket_day, bucket_hour,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   total_tokens, estimated_cost_microusd, created_at, observed_at
+                 ) VALUES(
+                   ?1, 'openai', 'codex', 'gpt-5.4', ?2, ?2,
+                   'Rizzist', 'codex_token_count_jsonl', '/tmp/session.jsonl',
+                   '2026-06-16', '2026-06-16T11:00:00Z', ?3, ?4, 0, 0,
+                   ?5, 0, '2026-06-16T11:00:00Z', '2026-06-16T11:00:00Z'
+                 )",
+                rusqlite::params![id, key, input_tokens, output_tokens, input_tokens + output_tokens],
+            )
+            .unwrap();
+            tokenomics_upsert_provider_account(
+                &conn,
+                "device-a",
+                "openai",
+                "codex",
+                key,
+                Some("Rizzist"),
+                &TokenomicsBillingScope {
+                    scope_type: "personal".to_string(),
+                    team_id: None,
+                    source: "test".to_string(),
+                },
+                "test",
+            )
+            .unwrap();
+        }
+
+        tokenomics_reconcile_duplicate_provider_account_identities(&conn).unwrap();
+
+        let old_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_usage_events WHERE provider_account_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let distinct_event_keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT provider_account_key)
+                 FROM tokenomics_usage_events
+                 WHERE provider='openai' AND agent_kind='codex' AND provider_account_label='Rizzist'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollup_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_tokens), 0)
+                 FROM tokenomics_rollups
+                 WHERE provider='openai' AND agent_kind='codex'
+                   AND provider_account_key=?1 AND bucket_width='hour'",
+                rusqlite::params![canonical_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_badges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_provider_accounts WHERE provider_account_key=?1",
+                rusqlite::params![old_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(old_events, 0);
+        assert_eq!(distinct_event_keys, 1);
+        assert_eq!(rollup_total, 110);
+        assert_eq!(old_badges, 0);
     }
 
     #[test]

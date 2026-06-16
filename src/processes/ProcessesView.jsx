@@ -836,7 +836,7 @@ function ProcessEnergySection({ energy }) {
         <ProcessEnergyEmpty>No notable Diff Forge energy activity detected.</ProcessEnergyEmpty>
       ) : (
         <ProcessEnergyList role="list">
-          {visibleGroups.slice(0, 8).map((group) => {
+          {visibleGroups.map((group) => {
             const score = Number(group?.score || 0);
             const width = `${Math.max(3, Math.min(100, (score / maxScore) * 100))}%`;
             return (
@@ -870,7 +870,7 @@ function ProcessEnergySection({ energy }) {
       )}
 
       <ProcessEnergyNote>
-        Lightweight internal estimates; process-level details are collected only by Deep scan.
+        Lightweight internal estimates; showing {visibleGroups.length} bucket{visibleGroups.length === 1 ? "" : "s"}.
       </ProcessEnergyNote>
     </ProcessEnergyPanel>
   );
@@ -1642,152 +1642,175 @@ export default function ProcessesView({
         </ProcessHeaderActions>
       </ProcessHeader>
 
-      {error && <FormMessage $state="error">{error}</FormMessage>}
-      {killState.message && (
-        <ProcessInlineMessage data-state={killState.state}>
-          {killState.message}
-        </ProcessInlineMessage>
-      )}
-      {dockerActionState.message && (
-        <ProcessInlineMessage data-state={dockerActionState.state}>
-          {dockerActionState.message}
-        </ProcessInlineMessage>
-      )}
-      {dockerActionState.result && (
-        <ProcessDockerActionLog result={dockerActionState.result} />
-      )}
-
-      {showEnergyDiagnostics && <ProcessEnergySection energy={energy} />}
-
-      {containersSnapshot && containersSnapshot.state !== "cli_missing" && (
-        <ProcessContainersPanel aria-label="Docker containers">
-          <ProcessContainersHeader>
-            <strong>Containers</strong>
-            <span data-tone={containersSnapshot.daemonRunning ? "ok" : "warn"}>
-              {containersSnapshot.daemonRunning
-                ? `${containers.length} total / ${runningContainerCount} running`
-                : "Docker daemon offline"}
-            </span>
-          </ProcessContainersHeader>
-          {containersError && <FormMessage $state="error">{containersError}</FormMessage>}
-          {containerFeedback?.message && (
-            <ProcessInlineMessage data-state={containerFeedback.state}>
-              {containerFeedback.message}
+      {(error || killState.message || dockerActionState.message) && (
+        <ProcessMessageStack>
+          {error && <FormMessage $state="error">{error}</FormMessage>}
+          {killState.message && (
+            <ProcessInlineMessage data-state={killState.state}>
+              {killState.message}
             </ProcessInlineMessage>
           )}
-          {!containersSnapshot.daemonRunning ? (
-            <ProcessContainersNotice>
-              The docker CLI is installed but the daemon is not reachable.
-              {containersSnapshot.message ? ` ${containersSnapshot.message}` : ""}
-            </ProcessContainersNotice>
-          ) : containerGroups.length === 0 ? (
-            <ProcessContainersNotice>No containers yet.</ProcessContainersNotice>
-          ) : (
-            <ProcessContainersList role="list">
-              {containerGroups.map((group) => (
-                <Fragment key={group.id}>
-                  {group.label && (
-                    <ProcessContainersGroupLabel>{group.label}</ProcessContainersGroupLabel>
-                  )}
-                  {group.containers.map((container) => (
-                    <DockerContainerRow
-                      busyAction={containerBusy[container.id] || ""}
-                      container={container}
-                      disabled={false}
-                      key={container.id}
-                      logsOpen={containerLogs?.id === container.id}
-                      onAction={beginContainerAction}
-                      onToggleLogs={toggleContainerLogs}
-                    />
-                  ))}
-                </Fragment>
-              ))}
-            </ProcessContainersList>
+          {dockerActionState.message && (
+            <ProcessInlineMessage data-state={dockerActionState.state}>
+              {dockerActionState.message}
+            </ProcessInlineMessage>
           )}
-          {containerLogs && (
-            <ProcessContainerLogsPanel>
-              <ProcessContainerLogsHeader>
-                <strong>{containerLogs.name}</strong>
-                <span>
-                  {containerLogs.loading
-                    ? "Loading logs..."
-                    : `last 200 lines${containerLogs.truncated ? " (truncated)" : ""}`}
-                </span>
-                <ProcessDockerActionButton
-                  aria-label="Refresh logs"
-                  disabled={containerLogs.loading}
+        </ProcessMessageStack>
+      )}
+
+      <ProcessMainSplit>
+        <ProcessTopPane>
+          {showEnergyDiagnostics && <ProcessEnergySection energy={energy} />}
+
+          {deepScanError && <FormMessage $state="error">{deepScanError}</FormMessage>}
+          {deepScanSnapshot && (
+            <ProcessDeepScanPanel aria-label="Deep process scan results">
+              <ProcessDeepScanHeader>
+                <div>
+                  <strong>Deep scan</strong>
+                  <span>
+                    {visibleProcesses.length} shown / {formatCpu(totalCpuPercent)} / {formatBytes(totalMemoryBytes)}
+                    {highActivityCount ? ` / ${highActivityCount} hot` : ""}
+                  </span>
+                </div>
+                <SecondaryButton
                   onClick={() => {
-                    const container = (containersSnapshot.containers || [])
-                      .find((candidate) => candidate.id === containerLogs.id);
-                    void fetchContainerLogs(container || { id: containerLogs.id, name: containerLogs.name });
+                    setDeepScanSnapshot(null);
+                    setDeepScanError("");
                   }}
-                  title="Refresh logs"
-                  type="button"
-                >
-                  <ButtonRefreshIcon aria-hidden="true" />
-                </ProcessDockerActionButton>
-                <ProcessDockerActionButton
-                  aria-label="Close logs"
-                  onClick={() => setContainerLogs(null)}
-                  title="Close logs"
                   type="button"
                 >
                   <ButtonDeleteIcon aria-hidden="true" />
-                </ProcessDockerActionButton>
-              </ProcessContainerLogsHeader>
-              {containerLogs.error ? (
-                <FormMessage $state="error">{containerLogs.error}</FormMessage>
+                  <span>Clear</span>
+                </SecondaryButton>
+              </ProcessDeepScanHeader>
+              {visibleProcesses.length === 0 ? (
+                <ProcessContainersNotice>No process rows found.</ProcessContainersNotice>
               ) : (
-                <ProcessDockerOutput>
-                  {containerLogs.loading
-                    ? "..."
-                    : containerLogs.output || "No log output."}
-                </ProcessDockerOutput>
+                <ProcessBucketsGrid>
+                  {buckets.filter((bucket) => bucket.processes.length).map((bucket) => (
+                    <ProcessBucket
+                      bucket={bucket}
+                      dockerActionState={dockerActionState}
+                      key={bucket.id}
+                      onDockerAction={beginDockerAction}
+                      onStopProcess={beginStopProcess}
+                    />
+                  ))}
+                </ProcessBucketsGrid>
               )}
-            </ProcessContainerLogsPanel>
+            </ProcessDeepScanPanel>
           )}
-        </ProcessContainersPanel>
-      )}
+        </ProcessTopPane>
 
-      {deepScanError && <FormMessage $state="error">{deepScanError}</FormMessage>}
-      {deepScanSnapshot && (
-        <ProcessDeepScanPanel aria-label="Deep process scan results">
-          <ProcessDeepScanHeader>
-            <div>
-              <strong>Deep scan</strong>
-              <span>
-                {visibleProcesses.length} shown / {formatCpu(totalCpuPercent)} / {formatBytes(totalMemoryBytes)}
-                {highActivityCount ? ` / ${highActivityCount} hot` : ""}
-              </span>
-            </div>
-            <SecondaryButton
-              onClick={() => {
-                setDeepScanSnapshot(null);
-                setDeepScanError("");
-              }}
-              type="button"
-            >
-              <ButtonDeleteIcon aria-hidden="true" />
-              <span>Clear</span>
-            </SecondaryButton>
-          </ProcessDeepScanHeader>
-          {visibleProcesses.length === 0 ? (
-            <ProcessContainersNotice>No process rows found.</ProcessContainersNotice>
-          ) : (
-            <ProcessBucketsGrid>
-              {buckets.filter((bucket) => bucket.processes.length).map((bucket) => (
-                <ProcessBucket
-                  bucket={bucket}
-                  dockerActionState={dockerActionState}
-                  key={bucket.id}
-                  onDockerAction={beginDockerAction}
-                  onStopProcess={beginStopProcess}
-                />
-              ))}
-            </ProcessBucketsGrid>
+        <ProcessDockerPane>
+          {dockerActionState.result && (
+            <ProcessDockerActionLog result={dockerActionState.result} />
           )}
-        </ProcessDeepScanPanel>
-      )}
+
+          <ProcessContainersPanel aria-label="Docker containers">
+            <ProcessContainersHeader>
+              <strong>Containers</strong>
+              <span data-tone={containersSnapshot?.daemonRunning ? "ok" : "warn"}>
+                {!containersSnapshot
+                  ? "Loading Docker state"
+                  : containersSnapshot.state === "cli_missing"
+                    ? "Docker CLI missing"
+                    : containersSnapshot.daemonRunning
+                      ? `${containers.length} total / ${runningContainerCount} running`
+                      : "Docker daemon offline"}
+              </span>
+            </ProcessContainersHeader>
+            <ProcessContainersMessages>
+              {containersError && <FormMessage $state="error">{containersError}</FormMessage>}
+              {containerFeedback?.message && (
+                <ProcessInlineMessage data-state={containerFeedback.state}>
+                  {containerFeedback.message}
+                </ProcessInlineMessage>
+              )}
+            </ProcessContainersMessages>
+            <ProcessContainersBody>
+              {!containersSnapshot ? (
+                <ProcessContainersNotice>Loading Docker containers...</ProcessContainersNotice>
+              ) : containersSnapshot.state === "cli_missing" ? (
+                <ProcessContainersNotice>
+                  {containersSnapshot.message || "Docker CLI is not available."}
+                </ProcessContainersNotice>
+              ) : !containersSnapshot.daemonRunning ? (
+                <ProcessContainersNotice>
+                  The docker CLI is installed but the daemon is not reachable.
+                  {containersSnapshot.message ? ` ${containersSnapshot.message}` : ""}
+                </ProcessContainersNotice>
+              ) : containerGroups.length === 0 ? (
+                <ProcessContainersNotice>No containers yet.</ProcessContainersNotice>
+              ) : (
+                <ProcessContainersList role="list">
+                  {containerGroups.map((group) => (
+                    <Fragment key={group.id}>
+                      {group.label && (
+                        <ProcessContainersGroupLabel>{group.label}</ProcessContainersGroupLabel>
+                      )}
+                      {group.containers.map((container) => (
+                        <DockerContainerRow
+                          busyAction={containerBusy[container.id] || ""}
+                          container={container}
+                          disabled={false}
+                          key={container.id}
+                          logsOpen={containerLogs?.id === container.id}
+                          onAction={beginContainerAction}
+                          onToggleLogs={toggleContainerLogs}
+                        />
+                      ))}
+                    </Fragment>
+                  ))}
+                </ProcessContainersList>
+              )}
+            </ProcessContainersBody>
+            {containerLogs && containersSnapshot?.state !== "cli_missing" && (
+              <ProcessContainerLogsPanel>
+                <ProcessContainerLogsHeader>
+                  <strong>{containerLogs.name}</strong>
+                  <span>
+                    {containerLogs.loading
+                      ? "Loading logs..."
+                      : `last 200 lines${containerLogs.truncated ? " (truncated)" : ""}`}
+                  </span>
+                  <ProcessDockerActionButton
+                    aria-label="Refresh logs"
+                    disabled={containerLogs.loading}
+                    onClick={() => {
+                      const container = (containersSnapshot?.containers || [])
+                        .find((candidate) => candidate.id === containerLogs.id);
+                      void fetchContainerLogs(container || { id: containerLogs.id, name: containerLogs.name });
+                    }}
+                    title="Refresh logs"
+                    type="button"
+                  >
+                    <ButtonRefreshIcon aria-hidden="true" />
+                  </ProcessDockerActionButton>
+                  <ProcessDockerActionButton
+                    aria-label="Close logs"
+                    onClick={() => setContainerLogs(null)}
+                    title="Close logs"
+                    type="button"
+                  >
+                    <ButtonDeleteIcon aria-hidden="true" />
+                  </ProcessDockerActionButton>
+                </ProcessContainerLogsHeader>
+                {containerLogs.error ? (
+                  <FormMessage $state="error">{containerLogs.error}</FormMessage>
+                ) : (
+                  <ProcessDockerOutput>
+                    {containerLogs.loading
+                      ? "..."
+                      : containerLogs.output || "No log output."}
+                  </ProcessDockerOutput>
+                )}
+              </ProcessContainerLogsPanel>
+            )}
+          </ProcessContainersPanel>
+        </ProcessDockerPane>
+      </ProcessMainSplit>
 
       {confirmAction && (
         <ProcessConfirmOverlay role="presentation">
@@ -1891,15 +1914,14 @@ export default function ProcessesView({
 
 const ProcessSurface = styled.section`
   position: relative;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
-  align-content: start;
-  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px;
-  overflow: auto;
+  overflow: hidden;
   padding: 16px;
   background:
     linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
@@ -1916,9 +1938,54 @@ const ProcessSurface = styled.section`
   }
 `;
 
+const ProcessMessageStack = styled.div`
+  display: grid;
+  min-width: 0;
+  flex: 0 0 auto;
+  gap: 8px;
+`;
+
+const ProcessMainSplit = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+
+  @media (max-width: 760px) {
+    grid-template-rows: minmax(260px, 1fr) minmax(240px, 1fr);
+    overflow: auto;
+  }
+`;
+
+const ProcessTopPane = styled.section`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: minmax(128px, 0.46fr) minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+`;
+
+const ProcessDockerPane = styled.section`
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+
+  > section[aria-label="Docker containers"] {
+    flex: 1 1 auto;
+  }
+`;
+
 const ProcessHeader = styled.header`
   display: flex;
   min-width: 0;
+  flex: 0 0 auto;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
@@ -2058,7 +2125,10 @@ const ProcessInlineMessage = styled.p`
 const ProcessEnergyPanel = styled.section`
   display: grid;
   min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
+  overflow: hidden;
   padding: 10px;
   border: 1px solid rgba(230, 236, 245, 0.08);
   border-radius: 10px;
@@ -2150,9 +2220,9 @@ const ProcessEnergyTotal = styled.span`
 const ProcessEnergyList = styled.div`
   display: grid;
   min-width: 0;
-  max-height: 108px;
+  min-height: 0;
   gap: 3px;
-  overflow-y: auto;
+  overflow: auto;
   padding-right: 2px;
 `;
 
@@ -2467,6 +2537,7 @@ const ProcessDeepScanPanel = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 8px;
   overflow: hidden;
   padding: 8px 10px;
@@ -2904,10 +2975,11 @@ const ProcessConfirmActions = styled.div`
 const ProcessContainersPanel = styled.section`
   display: grid;
   min-width: 0;
-  max-height: 42vh;
-  align-content: start;
+  min-height: 0;
+  height: 100%;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 6px;
-  overflow: auto;
+  overflow: hidden;
   padding: 8px 10px;
   border: 1px solid rgba(230, 236, 245, 0.08);
   border-radius: 10px;
@@ -2917,6 +2989,23 @@ const ProcessContainersPanel = styled.section`
     border-color: var(--forge-border);
     background: var(--forge-surface);
   }
+`;
+
+const ProcessContainersMessages = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+
+  &:empty {
+    display: none;
+  }
+`;
+
+const ProcessContainersBody = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 `;
 
 const ProcessContainersHeader = styled.header`
@@ -2968,8 +3057,11 @@ const ProcessContainersNotice = styled.p`
 const ProcessContainersList = styled.div`
   display: grid;
   min-width: 0;
+  min-height: 0;
   align-content: start;
   gap: 2px;
+  overflow: auto;
+  padding-right: 2px;
 `;
 
 const ProcessContainersGroupLabel = styled.div`

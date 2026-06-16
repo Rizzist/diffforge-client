@@ -4520,8 +4520,7 @@ export function AudioWidgetWindow() {
       }
       setRecordingStartedAt(Date.now());
       setElapsedMs(0);
-      const waitsForCloudStart = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-        || currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
+      const waitsForCloudStart = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
       if (!waitsForCloudStart) {
         widgetStateRef.current = "recording";
         setWidgetState("recording");
@@ -4530,7 +4529,7 @@ export function AudioWidgetWindow() {
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "Opening Deepgram stream"
         : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-          ? "Connecting Diff Forge Cloud"
+          ? "Recording"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
             ? "Forge voice listening"
             : "Recording");
@@ -4543,7 +4542,7 @@ export function AudioWidgetWindow() {
           },
         });
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
-        setMessage("Connecting Diff Forge Cloud");
+        setMessage("Recording");
         const forgeHistory = forgeDictationHistoryRef.current;
         await invoke("start_forge_dictation_transcription", {
           request: {
@@ -4593,7 +4592,7 @@ export function AudioWidgetWindow() {
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "Deepgram listening"
         : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-          ? "Forge cloud listening"
+          ? "Recording"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
             ? "Forge voice listening"
           : "Recording");
@@ -4866,6 +4865,7 @@ export function AudioWidgetWindow() {
     || widgetState === "error";
   const usesBottomAnchoredStyle = widgetStyle === AUDIO_WIDGET_STYLE_BAR;
   const cancelNoticeActive = Boolean(cancelNotice);
+  const barErrorFrameText = error || message || "Audio error";
   const barVisible = usesBottomAnchoredStyle
     && (widgetActive || cancelNoticeActive);
   const barIdleMode = usesBottomAnchoredStyle && !barVisible;
@@ -5266,13 +5266,17 @@ export function AudioWidgetWindow() {
       if (!isCurrentPlacement()) {
         return;
       }
-      const modeGeometryChanged = barPlacementReadyKeyRef.current !== targetKey;
+      const previousReadyKey = barPlacementReadyKeyRef.current;
+      const modeGeometryChanged = previousReadyKey !== targetKey;
+      const shouldAnimatePlacement = options.animate !== false
+        && (!modeGeometryChanged
+          || (Boolean(previousReadyKey) && (previousReadyKey === "error" || targetKey === "error")));
       const nativeOwnsBarPlacement = isMacPlatform();
       const nativePlacement = await positionAudioBarWindowNatively({
         width: target.width,
         height: target.height,
         margin,
-        animate: options.animate !== false && !modeGeometryChanged,
+        animate: shouldAnimatePlacement,
       });
       if (!isCurrentPlacement()) {
         return;
@@ -5316,7 +5320,7 @@ export function AudioWidgetWindow() {
         await setAudioBarWindowPosition(
           windowHandle,
           { x, y },
-          options.animate !== false && !modeGeometryChanged,
+          shouldAnimatePlacement,
         );
         if (!isCurrentPlacement()) {
           return;
@@ -7467,19 +7471,25 @@ export function AudioWidgetWindow() {
                 : undefined}
             >
               <AudioBarCancelButton
-                aria-label="Cancel dictation"
+                aria-label={widgetState === "error" ? "Dismiss audio error" : "Cancel dictation"}
                 onClick={(event) => {
                   event.stopPropagation();
+                  if (widgetState === "error") {
+                    resetWidgetToStartState();
+                    return;
+                  }
                   cancelRecording();
                 }}
-                title="Cancel: stop without pasting. The transcript is still saved to History."
+                title={widgetState === "error"
+                  ? "Dismiss audio error"
+                  : "Cancel: stop without pasting. The transcript is still saved to History."}
                 type="button"
               >
                 ×
               </AudioBarCancelButton>
               {widgetState === "error" ? (
-                <AudioBarStatusText title={error || message}>
-                  {error || message || "Audio error"}
+                <AudioBarStatusText title={barErrorFrameText}>
+                  Audio error
                 </AudioBarStatusText>
               ) : (
                 <AudioBarMeter aria-hidden="true">

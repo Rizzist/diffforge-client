@@ -9687,6 +9687,58 @@ export const AudioBarShell = styled.div`
   }
 `;
 
+export const AudioBarErrorPopover = styled.div`
+  display: -webkit-box;
+  box-sizing: border-box;
+  width: min(calc(100% - 8px), 304px);
+  max-height: 58px;
+  flex: none;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  margin: 0 0 8px;
+  padding: 9px 12px;
+  border: 1px solid rgba(239, 107, 107, 0.42);
+  border-radius: 13px;
+  color: #ffd9d9;
+  background: rgba(46, 14, 18, 0.96);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 14px 32px rgba(0, 0, 0, 0.36);
+  font-size: 11.5px;
+  font-weight: 680;
+  line-height: 1.35;
+  pointer-events: none;
+  transform-origin: bottom center;
+  word-break: break-word;
+  animation: audioBarErrorPopoverIn 180ms cubic-bezier(0.3, 0, 0.2, 1) both;
+
+  @keyframes audioBarErrorPopoverIn {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.96);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  &[data-theme="light"] {
+    border-color: rgba(217, 72, 72, 0.45);
+    color: #8c1d1d;
+    background: rgba(255, 236, 236, 0.97);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.9) inset,
+      0 12px 28px rgba(120, 20, 20, 0.16);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+
 export const AudioBarSurface = styled.div`
   position: relative;
   display: flex;
@@ -9718,6 +9770,11 @@ export const AudioBarSurface = styled.div`
     animation: audioBarSurfaceGrow 190ms cubic-bezier(0.3, 0, 0.2, 1) both;
   }
 
+  ${AudioBarShell}[data-mode="error"] & {
+    transform-origin: bottom center;
+    animation: audioBarSurfaceGrow 190ms cubic-bezier(0.3, 0, 0.2, 1) both;
+  }
+
   @keyframes audioBarSurfaceGrow {
     from {
       width: 64px;
@@ -9735,7 +9792,8 @@ export const AudioBarSurface = styled.div`
   }
 
   @media (prefers-reduced-motion: reduce) {
-    ${AudioBarShell}[data-mode="active"] & {
+    ${AudioBarShell}[data-mode="active"] &,
+    ${AudioBarShell}[data-mode="error"] & {
       animation: none;
     }
   }

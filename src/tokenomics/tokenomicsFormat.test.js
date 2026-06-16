@@ -3,10 +3,14 @@ import test from "node:test";
 import {
   dailyUsageTitle,
   dailyUsageValue,
+  creditRemainingWithReserved,
+  creditSnapshotHasMeaningfulData,
+  formatCredits,
   formatCost,
   formatCostTitle,
   formatTokenTitle,
   formatTokens,
+  normalizeCreditWallet,
   rowActivityTokens,
   rowCache,
   rowInput,
@@ -76,4 +80,98 @@ test("provider account helpers prefer explicit account identity", () => {
   assert.equal(rowProviderAccountKey(row), "openai:codex:abc123");
   assert.equal(rowProviderAccountLabel(row), "Codex account abc123");
   assert.equal(rowProviderAccountKey({ subscriptionKey: "anthropic:claude" }), "anthropic:claude");
+});
+
+test("credit wallet normalization prefers the freshest larger used total", () => {
+  const normalized = normalizeCreditWallet({
+    planName: "plus",
+    termUsedCredits: 1363,
+    termRemainingCredits: 0,
+    total: {
+      total_credits: 10000,
+      used_credits: 9820,
+      remaining_credits: 180,
+      reserved_credits: 0,
+    },
+  });
+
+  assert.equal(creditSnapshotHasMeaningfulData(normalized), true);
+  assert.equal(normalized.termUsedCredits, 9820);
+  assert.equal(normalized.termRemainingCredits, 180);
+  assert.equal(normalized.termReservedCredits, 0);
+  assert.equal(formatCredits(normalized.termUsedCredits), "9,820");
+});
+
+test("credit wallet normalization reads term and top-level aliases", () => {
+  const normalized = normalizeCreditWallet({
+    term: {
+      totalCredits: 10000,
+      usedCredits: 9840,
+      reservedCredits: 20,
+    },
+    remainingCredits: 140,
+  });
+
+  assert.equal(normalized.termUsedCredits, 9840);
+  assert.equal(normalized.termRemainingCredits, 140);
+  assert.equal(normalized.termReservedCredits, 20);
+  assert.equal(creditRemainingWithReserved(normalized), 160);
+});
+
+test("credit wallet normalization derives remaining when partial aliases are stale zeroes", () => {
+  const normalized = normalizeCreditWallet({
+    termUsedCredits: 1363,
+    termRemainingCredits: 0,
+    termReservedCredits: 0,
+    termTotalCredits: 10000,
+    localMeteredUsedCredits: 9840,
+  });
+
+  assert.equal(normalized.termUsedCredits, 9840);
+  assert.equal(normalized.termRemainingCredits, 160);
+  assert.equal(normalized.termReservedCredits, 0);
+});
+
+test("credit wallet normalization does not carry larger used total across term resets", () => {
+  const normalized = normalizeCreditWallet({
+    term: {
+      id: "term-next",
+      total_credits: 10000,
+      used_credits: 20,
+      remaining_credits: 9980,
+      reserved_credits: 0,
+    },
+  }, {
+    termId: "term-previous",
+    termUsedCredits: 9840,
+    termRemainingCredits: 160,
+    termReservedCredits: 0,
+    termTotalCredits: 10000,
+  });
+
+  assert.equal(normalized.termId, "term-next");
+  assert.equal(normalized.termUsedCredits, 20);
+  assert.equal(normalized.termRemainingCredits, 9980);
+});
+
+test("credit wallet normalization does not let unknown zero snapshots wipe same-term paid usage", () => {
+  const normalized = normalizeCreditWallet({
+    known: false,
+    termTotalCredits: 0,
+    termUsedCredits: 0,
+    termRemainingCredits: 0,
+    termReservedCredits: 0,
+  }, {
+    planName: "plus",
+    termId: "term-current",
+    termTotalCredits: 10000,
+    termUsedCredits: 9700,
+    termRemainingCredits: 300,
+    termReservedCredits: 0,
+  });
+
+  assert.equal(normalized.planName, "plus");
+  assert.equal(normalized.termTotalCredits, 10000);
+  assert.equal(normalized.termUsedCredits, 9700);
+  assert.equal(normalized.termRemainingCredits, 300);
 });

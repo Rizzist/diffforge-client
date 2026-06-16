@@ -2681,6 +2681,26 @@ fn snipping_emit_untracked_image_saved(
 /// the capture toast appearing instantly and appearing after a long pause.
 fn snipping_write_png_fast(image: &xcap::image::RgbaImage, path: &Path) -> Result<(), String> {
     use xcap::image::ImageEncoder;
+    let width = image.width();
+    let height = image.height();
+    let raw = image.as_raw();
+    let expected_len = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            format!(
+                "Unable to encode snip image {}: image dimensions are too large ({width}x{height})",
+                path.display()
+            )
+        })?;
+    if expected_len != raw.len() as u64 {
+        return Err(format!(
+            "Unable to encode snip image {}: invalid RGBA buffer length for {width}x{height} image, expected {expected_len} bytes but got {}",
+            path.display(),
+            raw.len()
+        ));
+    }
+
     let file = fs::File::create(path)
         .map_err(|error| format!("Unable to create snip image {}: {error}", path.display()))?;
     let writer = std::io::BufWriter::new(file);
@@ -2689,14 +2709,11 @@ fn snipping_write_png_fast(image: &xcap::image::RgbaImage, path: &Path) -> Resul
         xcap::image::codecs::png::CompressionType::Fast,
         xcap::image::codecs::png::FilterType::Adaptive,
     );
-    encoder
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            xcap::image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|error| format!("Unable to encode snip image {}: {error}", path.display()))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encoder.write_image(raw, width, height, xcap::image::ExtendedColorType::Rgba8)
+    }))
+    .map_err(|_| format!("Unable to encode snip image {}: PNG encoder panicked", path.display()))?
+    .map_err(|error| format!("Unable to encode snip image {}: {error}", path.display()))
 }
 
 fn snipping_save_image(
@@ -2709,7 +2726,10 @@ fn snipping_save_image(
     let (target, tmp) = snipping_prepare_capture_path(mode)?;
     let width = image.width();
     let height = image.height();
-    snipping_write_png_fast(&image, &tmp)?;
+    if let Err(error) = snipping_write_png_fast(&image, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
     fs::rename(&tmp, &target).map_err(|error| {
         let _ = fs::remove_file(&tmp);
         format!(

@@ -33,6 +33,11 @@ import {
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "../terminals/terminalPromptSubmission.js";
 import {
+  creditRemainingWithReserved,
+  creditSnapshotHasMeaningfulData,
+  normalizeCreditWallet,
+} from "../tokenomics/tokenomicsFormat.js";
+import {
   TERMINAL_ACTIVITY_HOOK_EVENT,
   TERMINAL_ARCHITECTURE_ACTIVITY_EVENT,
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
@@ -797,18 +802,13 @@ function creditResetLabel(resetAt) {
 
 function creditUsagePercent(credits) {
   const total = Number(credits?.termTotalCredits || 0);
-  const remaining = Number(credits?.termRemainingCredits || 0);
+  const remaining = creditRemainingWithReserved(credits);
 
   if (!Number.isFinite(total) || total <= 0) {
     return 0;
   }
 
   return Math.min(100, Math.max(0, Math.round((remaining / total) * 100)));
-}
-
-function liveCreditNumber(value, fallback = null) {
-  const numericValue = Number(value);
-  return Number.isFinite(numericValue) ? numericValue : fallback;
 }
 
 function liveCreditText(value, fallback = "") {
@@ -820,78 +820,12 @@ function liveCreditObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
-function liveCreditHasValue(value, keys = []) {
-  const object = liveCreditObject(value);
-  if (!object) return false;
-  return keys.some((key) => object[key] != null && object[key] !== "");
-}
-
 function liveCreditHasMeaningfulSnapshot(credits) {
-  const object = liveCreditObject(credits);
-  if (!object) return false;
-  const term = liveCreditObject(object.term);
-  const total = liveCreditObject(object.total) || liveCreditObject(object.totalCredits);
-  return Boolean(
-    object.known === true
-      || object.live === true
-      || liveCreditText(object.planName || object.plan_name)
-      || liveCreditText(term?.plan_name || term?.planName || term?.id)
-      || liveCreditHasValue(object, [
-        "termTotalCredits",
-        "term_total_credits",
-        "termRemainingCredits",
-        "term_remaining_credits",
-        "termReservedCredits",
-        "term_reserved_credits",
-        "termUsedCredits",
-        "term_used_credits",
-      ])
-      || liveCreditHasValue(total, [
-        "total_credits",
-        "totalCredits",
-        "remaining_credits",
-        "remainingCredits",
-        "reserved_credits",
-        "reservedCredits",
-        "used_credits",
-        "usedCredits",
-      ])
-  );
+  return creditSnapshotHasMeaningfulData(credits);
 }
 
 function normalizeLiveCreditWallet(wallet, previous = {}) {
-  const credits = wallet?.credits || wallet?.wallet || wallet || {};
-  if (!liveCreditHasMeaningfulSnapshot(credits)) {
-    return previous && liveCreditHasMeaningfulSnapshot(previous) ? previous : null;
-  }
-  const total = credits.total || credits.totalCredits || {};
-  const term = credits.term || {};
-  const termEnd = liveCreditText(term.term_end || term.termEnd, previous.resetAt || "");
-  return {
-    ...(previous || {}),
-    known: credits.known ?? previous?.known ?? true,
-    live: credits.live ?? previous?.live ?? true,
-    source: liveCreditText(credits.source, previous?.source || "diff_forge_hot_credit_wallet"),
-    walletVersion: liveCreditNumber(credits.wallet_version ?? credits.walletVersion, previous?.walletVersion || 0),
-    pendingEventCount: liveCreditNumber(credits.pending_event_count ?? credits.pendingEventCount, previous?.pendingEventCount || 0),
-    planName: liveCreditText(term.plan_name || term.planName, previous?.planName || ""),
-    resetAt: termEnd || null,
-    termEnd: termEnd || null,
-    termId: liveCreditText(term.id, previous?.termId || ""),
-    termRemainingCredits: liveCreditNumber(total.remaining_credits ?? total.remainingCredits, previous?.termRemainingCredits || 0),
-    termReservedCredits: liveCreditNumber(total.reserved_credits ?? total.reservedCredits, previous?.termReservedCredits || 0),
-    termTotalCredits: liveCreditNumber(total.total_credits ?? total.totalCredits, previous?.termTotalCredits || 0),
-    termUsedCredits: liveCreditNumber(total.used_credits ?? total.usedCredits, previous?.termUsedCredits || 0),
-    providerCostMicrousd: liveCreditNumber(total.provider_cost_microusd ?? total.providerCostMicrousd, previous?.providerCostMicrousd || 0),
-    inputTokens: liveCreditNumber(total.input_tokens ?? total.inputTokens, previous?.inputTokens || 0),
-    cachedInputTokens: liveCreditNumber(total.cached_input_tokens ?? total.cachedInputTokens, previous?.cachedInputTokens || 0),
-    outputTokens: liveCreditNumber(total.output_tokens ?? total.outputTokens, previous?.outputTokens || 0),
-    audioSeconds: liveCreditNumber(total.audio_seconds ?? total.audioSeconds, previous?.audioSeconds || 0),
-    ttsCharacters: liveCreditNumber(total.tts_characters ?? total.ttsCharacters, previous?.ttsCharacters || 0),
-    webSearchCalls: liveCreditNumber(total.web_search_calls ?? total.webSearchCalls, previous?.webSearchCalls || 0),
-    eventCount: liveCreditNumber(total.event_count ?? total.eventCount, previous?.eventCount || 0),
-    updatedAt: liveCreditText(credits.updated_at || credits.updatedAt, new Date().toISOString()),
-  };
+  return normalizeCreditWallet(wallet, previous);
 }
 
 function billingStatusHasMeaningfulData(status) {
@@ -920,10 +854,7 @@ function mergeBillingStatusSnapshot(previous, incoming) {
     ...(incoming || {}),
   };
   if (incomingCredits) {
-    next.credits = {
-      ...(previousCredits && liveCreditHasMeaningfulSnapshot(previousCredits) ? previousCredits : {}),
-      ...incomingCredits,
-    };
+    next.credits = normalizeLiveCreditWallet(incomingCredits, previousCredits) || incomingCredits;
   } else if (previousCredits && liveCreditHasMeaningfulSnapshot(previousCredits)) {
     next.credits = previousCredits;
   }
@@ -944,7 +875,7 @@ function lowCreditWarningKey(credits) {
   return [
     credits.termId || credits.resetAt || "current",
     credits.lowCreditState || "unknown",
-    credits.termRemainingCredits ?? "unknown",
+    String(creditRemainingWithReserved(credits)),
   ].join(":");
 }
 
@@ -954,7 +885,7 @@ function shouldShowLowCreditWarning(credits, dismissedKey) {
   }
 
   const state = String(credits.lowCreditState || "").toLowerCase();
-  const remaining = Number(credits.termRemainingCredits || 0);
+  const remaining = creditRemainingWithReserved(credits);
   const isLow = ["low", "critical", "exhausted", "missing_term"].includes(state)
     || (Number.isFinite(remaining) && remaining <= LOW_CREDIT_WARNING_THRESHOLD);
   const warningKey = lowCreditWarningKey(credits);
@@ -1239,7 +1170,6 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT = "cloud-mcp-workspace-catalog-changed";
-const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT = "cloud-mcp-account-usage";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
@@ -2384,7 +2314,6 @@ const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
-const WORKSPACE_MCP_SYNC_INTERVAL_MS = 120000;
 const WORKSPACE_MCP_SYNC_TOOL_NAME_LIMIT = 32;
 const WORKSPACE_MCP_SYNC_TEXT_LIMIT = 96;
 const WORKSPACE_MCP_BACKGROUND_JOB_EVENT = "workspace-mcp-background-job";
@@ -5420,6 +5349,53 @@ function networkItemErrorText(item) {
   );
 }
 
+function networkSyncLogStage(entry) {
+  const stage = networkString(entry?.stage || entry?.phase, "sync");
+  const state = networkString(entry?.state || entry?.status);
+  return state ? `${stage} - ${state}` : stage;
+}
+
+function networkSyncLogTone(entry) {
+  const state = networkString(entry?.state || entry?.status).toLowerCase();
+  const error = networkItemErrorText(entry) || networkItemErrorText(entry?.details);
+  if (error || ["error", "failed", "dead_letter"].includes(state)) return "red";
+  if (state === "retrying") return "orange";
+  if (["synced", "sent", "skipped", "complete", "completed"].includes(state)) return "green";
+  return "blue";
+}
+
+function networkSyncLogDetail(entry, nowMs) {
+  const details = entry?.details && typeof entry.details === "object" ? entry.details : {};
+  const error = networkItemErrorText(entry) || networkItemErrorText(details);
+  const eventKind = networkString(
+    entry?.tokenomics_event_kind
+      || entry?.event_kind
+      || details?.tokenomics_event_kind
+      || details?.event_kind,
+  );
+  const deviceSeq = networkNumber(entry?.device_seq ?? details?.device_seq);
+  const changeCount = networkNumber(entry?.change_count ?? details?.change_count);
+  const hourlyCount = networkNumber(entry?.hourly_count ?? details?.hourly_count);
+  const limitSampleCount = networkNumber(entry?.limit_sample_count ?? details?.limit_sample_count);
+  const insertedEvents = networkNumber(entry?.inserted_events ?? details?.inserted_events);
+  const reason = networkString(entry?.reason || details?.reason);
+  const elapsedMs = networkNumber(details?.elapsed_ms ?? details?.elapsedMs);
+  const updatedAtMs = networkNumber(entry?.tsMs ?? entry?.ts_ms);
+  const parts = [
+    error ? `error: ${error}` : "",
+    reason ? `reason ${reason}` : "",
+    eventKind,
+    deviceSeq > 0 ? `seq ${deviceSeq}` : "",
+    changeCount > 0 ? `${changeCount} changes` : "",
+    hourlyCount > 0 ? `${hourlyCount} hourly` : "",
+    limitSampleCount > 0 ? `${limitSampleCount} limits` : "",
+    insertedEvents > 0 ? `${insertedEvents} inserted` : "",
+    elapsedMs > 0 ? `${formatNetworkDuration(elapsedMs)} elapsed` : "",
+    updatedAtMs > 0 && nowMs > updatedAtMs ? `${formatNetworkDuration(nowMs - updatedAtMs)} ago` : "",
+  ].filter(Boolean);
+  return parts.join(" - ") || "Tokenomics sync stage recorded.";
+}
+
 function networkPayloadArrayCount(summary) {
   if (!summary || typeof summary !== "object") {
     return 0;
@@ -5575,6 +5551,8 @@ function networkSourceLabel(item, fallback) {
   if (source === "websocket") return "sent";
   if (source === "inbox") return "received";
   if (source === "outbox") return "queued";
+  if (source === "tokenomics:day_buckets") return "changed day buckets";
+  if (source === "tokenomics:background") return "tokenomics scanner";
   return source;
 }
 
@@ -5592,6 +5570,9 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
         bytes: 0,
         completeCount: 0,
         latestAgeMs: 0,
+        progressBasis: "",
+        progressDone: 0,
+        progressTotal: 0,
         progressWeight: 0,
         progressWeightedPercent: 0,
         states: new Set(),
@@ -5616,6 +5597,13 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
     group.bytes += networkItemBytes(item);
     group.progressWeight += Math.max(1, count);
     group.progressWeightedPercent += progress.percent * Math.max(1, count);
+    if (progress.total > 0) {
+      group.progressDone += Math.max(0, progress.done);
+      group.progressTotal += Math.max(0, progress.total);
+      if (!group.progressBasis && progress.basis) {
+        group.progressBasis = progress.basis;
+      }
+    }
     if (progress.complete) {
       group.completeCount += count;
     }
@@ -5668,6 +5656,9 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
       ...group,
       count,
       progressPercent: Math.max(0, Math.min(100, progressPercent)),
+      progressBasis: group.progressBasis,
+      progressDone: group.progressDone,
+      progressTotal: group.progressTotal,
       details: Array.from(group.details).slice(0, 2),
       sources: Array.from(group.sources).slice(0, 3),
       states: Array.from(group.states).slice(0, 3),
@@ -5691,6 +5682,29 @@ function networkCategoryTotal(rows) {
 }
 
 function networkCategorySummaryText(row, bucket) {
+  if (row.domain === "tokenomics" && row.progressBasis === "day_buckets") {
+    const pendingCount = Math.max(0, Math.round(networkNumber(row.count)));
+    const syncedCount = Math.max(0, Math.round(networkNumber(row.progressDone)));
+    const totalCount = Math.max(0, Math.round(networkNumber(row.progressTotal)));
+    const unit = pendingCount === 1 ? "bucket" : "buckets";
+    const states = Array.isArray(row.states)
+      ? row.states.map((state) => networkString(state).toLowerCase())
+      : [];
+    const stateLabel = states.includes("retrying")
+      ? "retrying"
+      : states.includes("active") || states.includes("in_flight")
+        ? "syncing"
+        : states.includes("failed") || states.includes("dead_letter")
+          ? "blocked"
+          : "pending";
+    const windowText = totalCount > 0
+      ? `${syncedCount}/${totalCount} day-window ${totalCount === 1 ? "bucket" : "buckets"} synced`
+      : `${networkProgressPercentLabel(row.progressPercent)} synced`;
+    if (pendingCount <= 0) {
+      return `Tokenomics day buckets current - ${windowText}`;
+    }
+    return `${pendingCount} changed Tokenomics day ${unit} ${stateLabel} - ${windowText}`;
+  }
   const unit = bucket === "down"
     ? row.count === 1 ? "update" : "updates"
     : row.count === 1 ? "change" : "changes";
@@ -5734,6 +5748,7 @@ function normalizeNetworkingDiagnostics(payload, syncStatus = null) {
   const outbox = payload?.outbox && typeof payload.outbox === "object" ? payload.outbox : {};
   const inbox = payload?.inbox && typeof payload.inbox === "object" ? payload.inbox : {};
   const outbound = payload?.outbound && typeof payload.outbound === "object" ? payload.outbound : {};
+  const tokenomics = payload?.tokenomics && typeof payload.tokenomics === "object" ? payload.tokenomics : {};
   const nowMs = networkNumber(payload?.nowMs ?? payload?.now_ms, Date.now());
   return {
     activities: networkList(syncActivity.activities),
@@ -5754,6 +5769,7 @@ function normalizeNetworkingDiagnostics(payload, syncStatus = null) {
     retryingCount: networkNumber(outbox.retryingCount ?? outbox.retrying_count ?? status.outboxRetryingCount ?? status.outbox_retrying_count),
     deadLetterCount: networkNumber(outbox.deadLetterCount ?? outbox.dead_letter_count ?? status.outboxDeadLetterCount ?? status.outbox_dead_letter_count),
     syncActivity,
+    tokenomicsSyncLog: networkList(tokenomics.syncLog || tokenomics.sync_log || payload?.tokenomicsSyncLog || payload?.tokenomics_sync_log),
     upCount: networkNumber(syncActivity.upCount ?? syncActivity.up_count ?? status.syncUpCount ?? status.sync_up_count ?? syncStatus?.upCount),
     downCount: networkNumber(syncActivity.downCount ?? syncActivity.down_count ?? status.syncDownCount ?? status.sync_down_count ?? syncStatus?.downCount),
     controlCount: networkNumber(syncActivity.controlCount ?? syncActivity.control_count ?? status.syncControlCount ?? status.sync_control_count ?? syncStatus?.controlCount),
@@ -6804,6 +6820,8 @@ function NetworkingInspector({
     ...normalized.inboxRecent.map(networkItemErrorText),
     ...normalized.outboundRecent.map(networkItemErrorText),
   ].filter(Boolean))).slice(0, 10);
+  const tokenomicsLogRows = normalized.tokenomicsSyncLog.slice(0, 12);
+  const bottomLogCount = errorRows.length + tokenomicsLogRows.length;
 
   const renderNetworkCategoryRows = (items, emptyLabel, bucket = "up") => (
     items.length ? (
@@ -6839,7 +6857,11 @@ function NetworkingInspector({
                 />
                 <NetworkingMeta>
                   <span>{row.eventCount} {row.eventCount === 1 ? "event" : "events"}</span>
-                  {row.completeCount > 0 && <span>{row.completeCount}/{row.count} synced</span>}
+                  {row.progressBasis === "day_buckets" && row.progressTotal > 0 ? (
+                    <span>{Math.round(row.progressDone)}/{Math.round(row.progressTotal)} day-window buckets synced</span>
+                  ) : row.completeCount > 0 ? (
+                    <span>{row.completeCount}/{row.count} synced</span>
+                  ) : null}
                   {row.bytes > 0 && <span>{formatNetworkBytes(row.bytes)}</span>}
                   {row.states.map((state) => (
                     <span key={`${row.domain}:state:${state}`}>{state}</span>
@@ -6932,10 +6954,10 @@ function NetworkingInspector({
 
         <NetworkingSection data-role="errors">
           <NetworkingSectionHeader>
-            <strong>Errors</strong>
-            <span>{errorRows.length ? `${errorRows.length} current` : "clear"}</span>
+            <strong>Errors & Sync Log</strong>
+            <span>{bottomLogCount ? `${bottomLogCount} current` : "clear"}</span>
           </NetworkingSectionHeader>
-          {errorRows.length ? (
+          {bottomLogCount ? (
             <NetworkingList>
               {errorRows.map((message, index) => (
                 <NetworkingRow key={`${message}:${index}`} data-tone="error">
@@ -6946,9 +6968,26 @@ function NetworkingInspector({
                   </NetworkingRowMain>
                 </NetworkingRow>
               ))}
+              {tokenomicsLogRows.map((entry, index) => {
+                const tone = networkSyncLogTone(entry);
+                const stage = networkSyncLogStage(entry);
+                const detail = networkSyncLogDetail(entry, normalized.nowMs);
+                return (
+                  <NetworkingRow
+                    key={`tokenomics:${entry?.tsMs || entry?.ts_ms || index}:${stage}`}
+                    data-tone={tone === "red" ? "error" : undefined}
+                  >
+                    <NetworkingStatusDot data-tone={tone} />
+                    <NetworkingRowMain>
+                      <strong title={stage}>Tokenomics: {stage}</strong>
+                      <p title={detail}>{detail}</p>
+                    </NetworkingRowMain>
+                  </NetworkingRow>
+                );
+              })}
             </NetworkingList>
           ) : (
-            <NetworkingEmpty>No errors recorded.</NetworkingEmpty>
+            <NetworkingEmpty>No errors or sync logs recorded.</NetworkingEmpty>
           )}
         </NetworkingSection>
       </NetworkingDialog>
@@ -7020,23 +7059,42 @@ function readWorkspaceSettings() {
   }
 }
 
-function persistWorkspaceSettings(settings) {
+function persistWorkspaceSettings(settings, options = {}) {
   const normalized = normalizeWorkspaceSettings(settings);
+  const reportWriteThroughError = Boolean(options?.reportWriteThroughError);
+  let localStorageError = null;
   try {
     window.localStorage.setItem(
       WORKSPACE_SETTINGS_STORAGE_KEY,
       JSON.stringify(normalized),
     );
-  } catch {
+  } catch (error) {
+    localStorageError = error;
     // Workspace root settings are convenience state; the app can still run without persistence.
   }
   // Write-through to the Rust app-state store so headless flows (background
   // architecture watcher, remote workspace levers) can read workspace roots
   // and terminal layouts without the webview.
-  void invoke("app_local_state_store", {
+  const writeThrough = invoke("app_local_state_store", {
     key: "workspace-settings",
     value: normalized,
-  }).catch(() => {});
+  }).catch((error) => {
+    if (reportWriteThroughError) {
+      throw error;
+    }
+    return null;
+  });
+  if (reportWriteThroughError && localStorageError) {
+    return writeThrough.then(
+      () => {
+        throw localStorageError;
+      },
+      (error) => {
+        throw error;
+      },
+    );
+  }
+  return writeThrough;
 }
 
 function normalizeEnabledWorkspaceIds(value) {
@@ -7213,9 +7271,22 @@ function normalizeCatalogWorkspaceEntry(entry) {
     originDeviceId: String(entry?.originDeviceId || entry?.origin_device_id || entry?.device_id || ""),
     deviceIds: Array.isArray(deviceIds) ? deviceIds.map((value) => String(value)).filter(Boolean) : [],
     deletedAt: String(entry?.deletedAt || entry?.deleted_at || ""),
-    pendingDelete: Boolean(entry?.pendingDelete),
+    pendingDelete: catalogWorkspaceEntryIsDeleted(entry),
     syncState: entry?.syncState === "pending" || entry?.syncState === "error" ? entry.syncState : "synced",
   };
+}
+
+function catalogWorkspaceEntryIsDeleted(entry) {
+  const deletedAt = String(entry?.deletedAt || entry?.deleted_at || "").trim();
+  const status = String(entry?.status || entry?.workspace_status || entry?.workspaceStatus || "")
+    .trim()
+    .toLowerCase();
+  return Boolean(
+    entry?.pendingDelete
+      || entry?.pending_delete
+      || deletedAt
+      || ["deleted", "archived", "removed"].includes(status),
+  );
 }
 
 // Server-authoritative reconcile: the cloud catalog is the full set of live
@@ -7225,7 +7296,7 @@ function normalizeCatalogWorkspaceEntry(entry) {
 function reconcileWorkspaceCatalog(localItems, cloudItems) {
   const cloudById = new Map();
   cloudItems.forEach((entry) => {
-    if (entry?.id) {
+    if (entry?.id && !entry.pendingDelete) {
       cloudById.set(entry.id, entry);
     }
   });
@@ -7241,6 +7312,7 @@ function reconcileWorkspaceCatalog(localItems, cloudItems) {
     seen.add(local.id);
     const cloud = cloudById.get(local.id);
     if (local.pendingDelete) {
+      cloudById.delete(local.id);
       pendingDeletes.push(local.id);
       return;
     }
@@ -10767,14 +10839,6 @@ export default function App() {
   }, [updateCloudWorkspaceProgress]);
 
   const showView = useCallback((nextView, options = {}) => {
-    if (DEVICE_LEVEL_APP_VIEW_IDS.has(nextView)) {
-      setWorkspaceToolPaneMode((currentMode) => (
-        currentMode === TODO_QUEUE_PANE_MODE_MINIMIZED
-          ? currentMode
-          : TODO_QUEUE_PANE_MODE_MINIMIZED
-      ));
-    }
-
     if (nextView === activeView && nextView === visibleView) {
       return;
     }
@@ -11691,15 +11755,17 @@ export default function App() {
     setWorkspaces(nextWorkspaces);
 
     const deleteScopeKey = activeAccountScopeKey;
-    void invoke("local_workspaces_store", {
+    const localCatalogStorePromise = invoke("local_workspaces_store", {
       scopeKey: deleteScopeKey,
       workspaces: nextWorkspaces,
-    }).catch(() => {});
+    });
 
     const nextSettings = { ...(workspaceSettingsRef.current || {}) };
     delete nextSettings[targetWorkspaceId];
     workspaceSettingsRef.current = nextSettings;
-    persistWorkspaceSettings(nextSettings);
+    const workspaceSettingsPersistPromise = persistWorkspaceSettings(nextSettings, {
+      reportWriteThroughError: true,
+    });
     setWorkspaceSettings(nextSettings);
 
     const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
@@ -11740,6 +11806,24 @@ export default function App() {
       Object.entries(current || {}).filter(([key]) => !key.startsWith(`${targetWorkspaceId}::`)),
     ));
     purgeWorkspaceTodoQueueLocalStorage(targetWorkspaceId);
+    workspaceTerminalIdentityCacheRef.current.delete(targetWorkspaceId);
+    workspaceTerminalExplicitEmptyRef.current.delete(targetWorkspaceId);
+    workspaceCoordinationBootstrapKeysRef.current.forEach((key) => {
+      if (key.startsWith(`${targetWorkspaceId}:`)) {
+        workspaceCoordinationBootstrapKeysRef.current.delete(key);
+      }
+    });
+    workspaceMcpStartupIndexKeysRef.current.forEach((key) => {
+      if (key.startsWith(`${targetWorkspaceId}:`)) {
+        workspaceMcpStartupIndexKeysRef.current.delete(key);
+      }
+    });
+    workspaceMcpStartupIndexJobsRef.current.forEach((job, jobKey) => {
+      if (String(job?.targetKey || "").startsWith(`${targetWorkspaceId}:`)) {
+        workspaceMcpStartupIndexJobsRef.current.delete(jobKey);
+      }
+    });
+    workspaceMcpStartupIndexEmptyKeyRef.current = "";
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
@@ -11766,6 +11850,18 @@ export default function App() {
 
     void (async () => {
       const warnings = [];
+
+      try {
+        await localCatalogStorePromise;
+      } catch (error) {
+        warnings.push(`Local catalog cleanup warning: ${getErrorMessage(error, "Unable to persist local workspace catalog.")}`);
+      }
+
+      try {
+        await workspaceSettingsPersistPromise;
+      } catch (error) {
+        warnings.push(`Workspace settings cleanup warning: ${getErrorMessage(error, "Unable to persist workspace settings cleanup.")}`);
+      }
 
       try {
         // Durable cloud delete: hard-deletes the catalog rows, writes the
@@ -12133,7 +12229,6 @@ export default function App() {
 
     const syncKey = JSON.stringify({
       scope: "connected-device-agent-installations",
-      cloudLiveSyncEpoch: cloudLiveSyncEpochRef.current,
       agents: codingAgents,
     });
     if (agentInstallationSyncKeyRef.current === syncKey) {
@@ -15286,9 +15381,7 @@ export default function App() {
       const nextEpoch = Number(cloudSyncStatus?.updatedAtMs || 0) || Date.now();
       cloudLiveSyncEpochRef.current = nextEpoch;
       setCloudLiveSyncEpoch(nextEpoch);
-      agentInstallationSyncKeyRef.current = "";
       workspaceTerminalsSyncKeyRef.current = "";
-      workspaceMcpSyncKeyRef.current = "";
       workspaceCatalogSyncKeyRef.current = "";
       window.dispatchEvent(new CustomEvent("diffforge:cloud-device-live-initial-sync", {
         detail: { epoch: nextEpoch },
@@ -17643,7 +17736,7 @@ export default function App() {
       if (disposed) {
         return;
       }
-      const syncKey = `${workspaceMcpSyncTargetKey}:${reason}:${cloudLiveSyncEpoch}`;
+      const syncKey = `${workspaceMcpSyncTargetKey}:${reason}`;
       if (reason === "device_live_state_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
         return;
       }
@@ -17733,11 +17826,6 @@ export default function App() {
       WORKSPACE_MCP_REGISTRY_UPDATED_EVENT,
       handleWorkspaceMcpRegistryUpdated,
     );
-    const intervalId = window.setInterval(
-      () => scheduleWorkspaceMcpSync("workspace_mcp_heartbeat"),
-      WORKSPACE_MCP_SYNC_INTERVAL_MS,
-    );
-
     return () => {
       disposed = true;
       if (syncTimer) {
@@ -17747,7 +17835,6 @@ export default function App() {
         WORKSPACE_MCP_REGISTRY_UPDATED_EVENT,
         handleWorkspaceMcpRegistryUpdated,
       );
-      window.clearInterval(intervalId);
     };
   }, [
     authState,
@@ -17757,7 +17844,6 @@ export default function App() {
     workspaceMcpSyncTargets,
     workspaceHydrationReady,
     workspaceActivationDeferred,
-    cloudLiveSyncEpoch,
     workspaceSyncState,
   ]);
 
@@ -18320,18 +18406,18 @@ export default function App() {
       roots.push(value);
     };
 
-    if (activatedWorkspaceRootDirectory || defaultWorkingDirectory) {
-      addRoot(activatedWorkspaceRootDirectory || defaultWorkingDirectory);
+    if (activatedWorkspaceId && activatedWorkspaceRootDirectory) {
+      addRoot(activatedWorkspaceRootDirectory);
     }
 
     workspaces.forEach((workspace) => {
-      addRoot(getWorkspaceRootDirectory(workspaceSettings, workspace.id) || defaultWorkingDirectory);
+      addRoot(getWorkspaceRootDirectory(workspaceSettings, workspace.id));
     });
 
     return roots;
   }, [
+    activatedWorkspaceId,
     activatedWorkspaceRootDirectory,
-    defaultWorkingDirectory,
     workspaceSettings,
     workspaces,
   ]);
@@ -18372,7 +18458,6 @@ export default function App() {
   const workspaceToolPaneAllowedOnView = !DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
   const workspaceToolPaneVisible = workspaceToolPaneHasWidth && workspaceToolPaneAllowedOnView;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
-  const workspaceToolPaneExpanded = !workspaceToolPaneMinimized;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
   const deviceLevelViewActive = DEVICE_LEVEL_APP_VIEW_IDS.has(activeView)
     || DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
@@ -18513,19 +18598,6 @@ export default function App() {
       setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
     }
   }, [workspaceToolPaneHasWidth, workspaceToolPaneMode]);
-
-  useEffect(() => {
-    if (!deviceLevelViewActive || !workspaceToolPaneHasWidth || !workspaceToolPaneExpanded) {
-      return;
-    }
-
-    showNoWorkspaceSelectedFromWorkspaceTool("workspace_tool_expanded_device_view");
-  }, [
-    deviceLevelViewActive,
-    showNoWorkspaceSelectedFromWorkspaceTool,
-    workspaceToolPaneExpanded,
-    workspaceToolPaneHasWidth,
-  ]);
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
@@ -19916,7 +19988,6 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlistenRemoteCommand = null;
-    let unlistenCreditWallet = null;
     let unlistenDeviceDeleted = null;
 
     const remoteCommandText = (event) => {
@@ -21235,25 +21306,6 @@ export default function App() {
     const startRemoteCommandListener = async () => {
       try {
         await invoke("cloud_mcp_start_remote_command_listener");
-        unlistenCreditWallet = await listen(CLOUD_MCP_CREDIT_WALLET_EVENT, (creditEvent) => {
-          if (disposed) return;
-          const event = creditEvent?.payload || {};
-          const payload = event.payload && typeof event.payload === "object" ? event.payload : event;
-          const wallet = payload.credits || payload.wallet || payload;
-          const normalizedCredits = normalizeLiveCreditWallet(wallet, billingStatusRef.current?.credits);
-          if (!normalizedCredits) {
-            return;
-          }
-          setBillingStatus((current) => mergeBillingStatusSnapshot(current, {
-            credits: normalizedCredits,
-            planName: normalizedCredits.planName || current?.planName || current?.plan_name,
-            plan_name: normalizedCredits.planName || current?.plan_name || current?.planName,
-            planStatus: current?.planStatus || current?.plan_status || "paid",
-            plan_status: current?.plan_status || current?.planStatus || "paid",
-          }));
-          setBillingStatusState("ready");
-          setBillingStatusError("");
-        });
         unlistenDeviceDeleted = await listen(CLOUD_MCP_DEVICE_DELETED_EVENT, async () => {
           if (disposed) return;
           await logout();
@@ -21596,9 +21648,6 @@ export default function App() {
       disposed = true;
       if (typeof unlistenRemoteCommand === "function") {
         unlistenRemoteCommand();
-      }
-      if (typeof unlistenCreditWallet === "function") {
-        unlistenCreditWallet();
       }
       if (typeof unlistenDeviceDeleted === "function") {
         unlistenDeviceDeleted();

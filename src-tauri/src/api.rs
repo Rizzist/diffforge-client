@@ -105,6 +105,32 @@ fn desktop_auth_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     current.as_u64()
 }
 
+fn desktop_auth_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    let mut current = value;
+    for key in keys {
+        current = current.get(*key)?;
+    }
+    if let Some(number) = current.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = current.as_u64() {
+        return Some(number.min(i64::MAX as u64) as i64);
+    }
+    if let Some(number) = current.as_f64() {
+        if number.is_finite() && number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+            return Some(number.round() as i64);
+        }
+    }
+    current.as_str().and_then(|text| {
+        let number = text.trim().parse::<f64>().ok()?;
+        if number.is_finite() && number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+            Some(number.round() as i64)
+        } else {
+            None
+        }
+    })
+}
+
 fn desktop_auth_safe_text(value: &Value, keys: &[&str]) -> String {
     desktop_auth_text(value, keys).unwrap_or_default()
 }
@@ -255,6 +281,8 @@ fn desktop_auth_credit_snapshot_has_meaningful_data(credits: &Value) -> bool {
         &["term_reserved_credits"][..],
         &["termUsedCredits"][..],
         &["term_used_credits"][..],
+        &["localMeteredUsedCredits"][..],
+        &["local_metered_used_credits"][..],
         &["total", "totalCredits"][..],
         &["total", "total_credits"][..],
         &["total", "remainingCredits"][..],
@@ -266,6 +294,301 @@ fn desktop_auth_credit_snapshot_has_meaningful_data(credits: &Value) -> bool {
     ]
     .iter()
     .any(|path| desktop_auth_u64(credits, path).is_some())
+}
+
+fn desktop_auth_first_i64(value: &Value, paths: &[&[&str]]) -> Option<i64> {
+    paths.iter().find_map(|path| desktop_auth_i64(value, path))
+}
+
+fn desktop_auth_max_i64(value: &Value, paths: &[&[&str]]) -> Option<i64> {
+    paths
+        .iter()
+        .filter_map(|path| desktop_auth_i64(value, path))
+        .max()
+}
+
+fn desktop_auth_first_text(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| desktop_auth_text(value, path))
+}
+
+fn desktop_auth_credit_same_term(incoming: Option<&Value>, previous: Option<&Value>) -> bool {
+    let Some(incoming) = incoming else {
+        return true;
+    };
+    let Some(previous) = previous else {
+        return true;
+    };
+    let incoming_plan = desktop_auth_first_text(
+        incoming,
+        &[
+            &["planName"][..],
+            &["plan_name"][..],
+            &["planStatus"][..],
+            &["plan_status"][..],
+            &["status"][..],
+        ],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let previous_plan = desktop_auth_first_text(
+        previous,
+        &[
+            &["planName"][..],
+            &["plan_name"][..],
+            &["planStatus"][..],
+            &["plan_status"][..],
+            &["status"][..],
+        ],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    if incoming_plan == "free" && previous_plan != "free" && !previous_plan.is_empty() {
+        return false;
+    }
+    let incoming_term_id = desktop_auth_first_text(
+        incoming,
+        &[&["term", "id"][..], &["termId"][..], &["term_id"][..]],
+    );
+    let previous_term_id = desktop_auth_first_text(
+        previous,
+        &[&["term", "id"][..], &["termId"][..], &["term_id"][..]],
+    );
+    if let (Some(incoming_term_id), Some(previous_term_id)) = (incoming_term_id, previous_term_id) {
+        return incoming_term_id == previous_term_id;
+    }
+    let incoming_term_end = desktop_auth_first_text(
+        incoming,
+        &[
+            &["term", "termEnd"][..],
+            &["term", "term_end"][..],
+            &["termEnd"][..],
+            &["term_end"][..],
+            &["resetAt"][..],
+            &["reset_at"][..],
+        ],
+    );
+    let previous_term_end = desktop_auth_first_text(
+        previous,
+        &[
+            &["term", "termEnd"][..],
+            &["term", "term_end"][..],
+            &["termEnd"][..],
+            &["term_end"][..],
+            &["resetAt"][..],
+            &["reset_at"][..],
+        ],
+    );
+    match (incoming_term_end, previous_term_end) {
+        (Some(incoming_term_end), Some(previous_term_end)) => incoming_term_end == previous_term_end,
+        _ => true,
+    }
+}
+
+fn desktop_auth_normalize_credit_wallet(
+    credits: Value,
+    incoming_credits: Option<&Value>,
+    previous_credits: Option<&Value>,
+) -> Value {
+    if !desktop_auth_credit_snapshot_has_meaningful_data(&credits) {
+        return credits;
+    }
+
+    let same_term = desktop_auth_credit_same_term(incoming_credits, previous_credits);
+    let source = if same_term {
+        &credits
+    } else {
+        incoming_credits.unwrap_or(&credits)
+    };
+    let empty = Value::Null;
+    let previous_source = if same_term {
+        previous_credits.unwrap_or(&empty)
+    } else {
+        &empty
+    };
+
+    let used = [
+        desktop_auth_max_i64(
+            source,
+            &[
+                &["total", "used_credits"][..],
+                &["total", "usedCredits"][..],
+                &["termUsedCredits"][..],
+                &["term_used_credits"][..],
+                &["usedCredits"][..],
+                &["used_credits"][..],
+                &["term", "used_credits"][..],
+                &["term", "usedCredits"][..],
+                &["localMeteredUsedCredits"][..],
+                &["local_metered_used_credits"][..],
+            ],
+        ),
+        desktop_auth_max_i64(
+            previous_source,
+            &[
+                &["termUsedCredits"][..],
+                &["term_used_credits"][..],
+                &["usedCredits"][..],
+                &["used_credits"][..],
+                &["total", "used_credits"][..],
+                &["total", "usedCredits"][..],
+            ],
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
+    let reserved = desktop_auth_first_i64(
+        source,
+        &[
+            &["total", "reserved_credits"][..],
+            &["total", "reservedCredits"][..],
+            &["termReservedCredits"][..],
+            &["term_reserved_credits"][..],
+            &["reservedCredits"][..],
+            &["reserved_credits"][..],
+            &["term", "reserved_credits"][..],
+            &["term", "reservedCredits"][..],
+        ],
+    )
+    .or_else(|| {
+        desktop_auth_first_i64(
+            previous_source,
+            &[
+                &["termReservedCredits"][..],
+                &["term_reserved_credits"][..],
+                &["reservedCredits"][..],
+                &["reserved_credits"][..],
+            ],
+        )
+    })
+    .unwrap_or(0);
+    let total = [
+        desktop_auth_max_i64(
+            source,
+            &[
+                &["total", "total_credits"][..],
+                &["total", "totalCredits"][..],
+                &["termTotalCredits"][..],
+                &["term_total_credits"][..],
+                &["totalCredits"][..],
+                &["total_credits"][..],
+                &["term", "total_credits"][..],
+                &["term", "totalCredits"][..],
+            ],
+        ),
+        desktop_auth_max_i64(
+            previous_source,
+            &[
+                &["termTotalCredits"][..],
+                &["term_total_credits"][..],
+                &["totalCredits"][..],
+                &["total_credits"][..],
+                &["total", "total_credits"][..],
+                &["total", "totalCredits"][..],
+            ],
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
+    let direct_remaining = desktop_auth_first_i64(
+        source,
+        &[
+            &["total", "remaining_credits"][..],
+            &["total", "remainingCredits"][..],
+            &["termRemainingCredits"][..],
+            &["term_remaining_credits"][..],
+            &["remainingCredits"][..],
+            &["remaining_credits"][..],
+            &["term", "remaining_credits"][..],
+            &["term", "remainingCredits"][..],
+        ],
+    )
+    .or_else(|| {
+        desktop_auth_first_i64(
+            previous_source,
+            &[
+                &["termRemainingCredits"][..],
+                &["term_remaining_credits"][..],
+                &["remainingCredits"][..],
+                &["remaining_credits"][..],
+            ],
+        )
+    });
+    let computed_remaining = (total > 0).then(|| total.saturating_sub(used).saturating_sub(reserved).max(0));
+    let remaining = match (direct_remaining, computed_remaining) {
+        (Some(direct), Some(_computed)) if direct > 0 => direct,
+        (Some(_), Some(computed)) => computed,
+        (Some(direct), None) => direct.max(0),
+        (None, Some(computed)) => computed,
+        (None, None) => 0,
+    };
+
+    let mut object = credits
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    object.insert("termUsedCredits".to_string(), json!(used));
+    object.insert("term_used_credits".to_string(), json!(used));
+    object.insert("usedCredits".to_string(), json!(used));
+    object.insert("used_credits".to_string(), json!(used));
+    object.insert("termRemainingCredits".to_string(), json!(remaining));
+    object.insert("term_remaining_credits".to_string(), json!(remaining));
+    object.insert("remainingCredits".to_string(), json!(remaining));
+    object.insert("remaining_credits".to_string(), json!(remaining));
+    object.insert("termReservedCredits".to_string(), json!(reserved));
+    object.insert("term_reserved_credits".to_string(), json!(reserved));
+    object.insert("reservedCredits".to_string(), json!(reserved));
+    object.insert("reserved_credits".to_string(), json!(reserved));
+    object.insert("termTotalCredits".to_string(), json!(total));
+    object.insert("term_total_credits".to_string(), json!(total));
+    object.insert("totalCredits".to_string(), json!(total));
+    object.insert("total_credits".to_string(), json!(total));
+    if let Some(term_id) = desktop_auth_first_text(
+        source,
+        &[&["term", "id"][..], &["termId"][..], &["term_id"][..]],
+    )
+    .or_else(|| {
+        desktop_auth_first_text(
+            previous_source,
+            &[&["term", "id"][..], &["termId"][..], &["term_id"][..]],
+        )
+    }) {
+        object.insert("termId".to_string(), json!(term_id.clone()));
+        object.insert("term_id".to_string(), json!(term_id));
+    }
+    if let Some(term_end) = desktop_auth_first_text(
+        source,
+        &[
+            &["term", "termEnd"][..],
+            &["term", "term_end"][..],
+            &["termEnd"][..],
+            &["term_end"][..],
+            &["resetAt"][..],
+            &["reset_at"][..],
+        ],
+    )
+    .or_else(|| {
+        desktop_auth_first_text(
+            previous_source,
+            &[
+                &["term", "termEnd"][..],
+                &["term", "term_end"][..],
+                &["termEnd"][..],
+                &["term_end"][..],
+                &["resetAt"][..],
+                &["reset_at"][..],
+            ],
+        )
+    }) {
+        object.insert("termEnd".to_string(), json!(term_end.clone()));
+        object.insert("term_end".to_string(), json!(term_end.clone()));
+        object.insert("resetAt".to_string(), json!(term_end.clone()));
+        object.insert("reset_at".to_string(), json!(term_end));
+    }
+    Value::Object(object)
 }
 
 fn desktop_auth_billing_status_has_meaningful_data(billing_status: &Value) -> bool {
@@ -321,9 +644,14 @@ fn desktop_auth_merge_billing_status(previous: &Value, incoming: Value) -> Value
                 credits.insert(key.clone(), value.clone());
             }
         }
-        merged.insert("credits".to_string(), Value::Object(credits.clone()));
+        let credits = desktop_auth_normalize_credit_wallet(
+            Value::Object(credits),
+            Some(incoming_credits),
+            previous.get("credits"),
+        );
+        merged.insert("credits".to_string(), credits.clone());
         if let Some(user) = merged.get_mut("user").and_then(Value::as_object_mut) {
-            user.insert("credits".to_string(), Value::Object(credits));
+            user.insert("credits".to_string(), credits);
         }
     } else if let Some(previous_credits) = previous.get("credits") {
         if desktop_auth_credit_snapshot_has_meaningful_data(previous_credits) {
@@ -1140,6 +1468,144 @@ mod desktop_auth_tests {
         );
         assert_eq!(unknown.get("id").and_then(Value::as_str), Some("personal"));
         assert!(unknown.get("teamId").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn billing_status_merge_prefers_runtime_credit_totals_over_stale_aliases() {
+        let merged = desktop_auth_merge_billing_status(
+            &json!({
+                "credits": {
+                    "planName": "plus",
+                    "termUsedCredits": 1363,
+                    "termRemainingCredits": 0,
+                    "termTotalCredits": 10000
+                }
+            }),
+            json!({
+                "planName": "plus",
+                "credits": {
+                    "planName": "plus",
+                    "termUsedCredits": 1363,
+                    "termRemainingCredits": 0,
+                    "termTotalCredits": 10000,
+                    "total": {
+                        "total_credits": 10000,
+                        "used_credits": 9820,
+                        "remaining_credits": 180,
+                        "reserved_credits": 0
+                    }
+                },
+                "user": {
+                    "credits": {
+                        "planName": "plus",
+                        "total": {
+                            "total_credits": 10000,
+                            "used_credits": 9820,
+                            "remaining_credits": 180,
+                            "reserved_credits": 0
+                        }
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(9820));
+        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(180));
+        assert_eq!(merged["credits"]["termReservedCredits"].as_i64(), Some(0));
+        assert_eq!(
+            merged["user"]["credits"]["termUsedCredits"].as_i64(),
+            Some(9820)
+        );
+    }
+
+    #[test]
+    fn billing_status_merge_derives_remaining_from_local_metered_same_term_usage() {
+        let merged = desktop_auth_merge_billing_status(
+            &json!({
+                "credits": {
+                    "planName": "plus",
+                    "termId": "term-current",
+                    "termUsedCredits": 1363,
+                    "termRemainingCredits": 0,
+                    "termReservedCredits": 0,
+                    "termTotalCredits": 10000
+                }
+            }),
+            json!({
+                "credits": {
+                    "planName": "plus",
+                    "termId": "term-current",
+                    "termUsedCredits": 1363,
+                    "termRemainingCredits": 0,
+                    "termReservedCredits": 0,
+                    "termTotalCredits": 10000,
+                    "localMeteredUsedCredits": 9840
+                }
+            }),
+        );
+
+        assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(9840));
+        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(160));
+    }
+
+    #[test]
+    fn billing_status_merge_does_not_carry_usage_across_credit_term_reset() {
+        let merged = desktop_auth_merge_billing_status(
+            &json!({
+                "credits": {
+                    "termId": "term-previous",
+                    "termUsedCredits": 9840,
+                    "termRemainingCredits": 160,
+                    "termReservedCredits": 0,
+                    "termTotalCredits": 10000
+                }
+            }),
+            json!({
+                "credits": {
+                    "term": {
+                        "id": "term-next",
+                        "total_credits": 10000,
+                        "used_credits": 20,
+                        "remaining_credits": 9980,
+                        "reserved_credits": 0
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(20));
+        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(9980));
+        assert_eq!(merged["credits"]["termId"].as_str(), Some("term-next"));
+    }
+
+    #[test]
+    fn billing_status_merge_preserves_paid_usage_from_unknown_zero_credit_snapshot() {
+        let merged = desktop_auth_merge_billing_status(
+            &json!({
+                "credits": {
+                    "planName": "plus",
+                    "termId": "term-current",
+                    "termUsedCredits": 9700,
+                    "termRemainingCredits": 300,
+                    "termReservedCredits": 0,
+                    "termTotalCredits": 10000
+                }
+            }),
+            json!({
+                "credits": {
+                    "known": false,
+                    "termUsedCredits": 0,
+                    "termRemainingCredits": 0,
+                    "termReservedCredits": 0,
+                    "termTotalCredits": 0
+                }
+            }),
+        );
+
+        assert_eq!(merged["credits"]["planName"].as_str(), Some("plus"));
+        assert_eq!(merged["credits"]["termTotalCredits"].as_i64(), Some(10000));
+        assert_eq!(merged["credits"]["termUsedCredits"].as_i64(), Some(9700));
+        assert_eq!(merged["credits"]["termRemainingCredits"].as_i64(), Some(300));
     }
 }
 

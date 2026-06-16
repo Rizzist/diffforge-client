@@ -6,10 +6,13 @@ import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import {
   dailyUsageTitle,
   dailyUsageValue,
+  creditSnapshotHasMeaningfulData,
+  formatCredits,
   formatCost,
   formatCostTitle,
   formatTokenTitle,
   formatTokens,
+  normalizeCreditWallet,
   numeric,
   rowActivityTokens,
   rowCache,
@@ -652,17 +655,6 @@ function providerAccent(provider) {
   return PROVIDER_ACCENTS[provider] || "#60a5fa";
 }
 
-function formatCredits(value) {
-  if (value == null || value === "") return "0";
-  const raw = typeof value === "string" ? value.trim() : String(value);
-  if (!raw || raw === "NaN") return "0";
-  const [whole, decimal] = raw.split(".");
-  const sign = whole.startsWith("-") ? "-" : "";
-  const digits = sign ? whole.slice(1) : whole;
-  const grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `${sign}${grouped}${decimal != null ? `.${decimal}` : ""}`;
-}
-
 function formatCreditBytes(value) {
   const bytes = numeric(value);
   if (!bytes) return "";
@@ -689,41 +681,6 @@ function tokenomicsObjectHasAny(value, keys = []) {
   const object = tokenomicsObject(value);
   if (!object) return false;
   return keys.some((key) => object[key] != null && object[key] !== "");
-}
-
-function creditSnapshotHasMeaningfulData(credits) {
-  const object = tokenomicsObject(credits);
-  if (!object) return false;
-  const term = tokenomicsObject(object.term);
-  const total = tokenomicsObject(object.total) || tokenomicsObject(object.totalCredits);
-  return Boolean(
-    object.known === true
-      || object.live === true
-      || String(object.planName || object.plan_name || "").trim()
-      || String(term?.plan_name || term?.planName || term?.id || "").trim()
-      || tokenomicsObjectHasAny(object, [
-        "termTotalCredits",
-        "term_total_credits",
-        "termRemainingCredits",
-        "term_remaining_credits",
-        "termReservedCredits",
-        "term_reserved_credits",
-        "termUsedCredits",
-        "term_used_credits",
-        "localMeteredUsedCredits",
-        "local_metered_used_credits",
-      ])
-      || tokenomicsObjectHasAny(total, [
-        "total_credits",
-        "totalCredits",
-        "remaining_credits",
-        "remainingCredits",
-        "reserved_credits",
-        "reservedCredits",
-        "used_credits",
-        "usedCredits",
-      ])
-  );
 }
 
 function storageUsageHasMeaningfulData(storageUsage) {
@@ -975,6 +932,10 @@ function summaryArray(summary = {}, ...keys) {
   return fallback;
 }
 
+function summaryIsTokenomicsV2(summary = {}) {
+  return String(summary?.schema_version || summary?.schemaVersion || "").toLowerCase() === "tokenomics_v2";
+}
+
 function hourlyRowsForDisplay(summary = {}) {
   return summaryArray(summary, "hourly");
 }
@@ -990,8 +951,10 @@ function accountRowsForDisplay(summary = {}) {
 }
 
 function modelRowsForDisplay(summary = {}) {
+  const hourly = hourlyRowsForDisplay(summary);
+  if (summaryIsTokenomicsV2(summary)) return hourly;
   const legacy = summaryArray(summary, "by_device_model");
-  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+  return legacy.length ? legacy : hourly;
 }
 
 function dailyDisplayMergeKey(row = {}) {
@@ -1239,19 +1202,25 @@ function directDailyWeeklyLimitPercents(limitSamples, selectedProvider, selected
   const byDay = new Map();
   for (const series of bySeries.values()) {
     series.sort((left, right) => left.time - right.time);
-    let previous = null;
+    let windowEntries = [];
+    const flushWindow = () => {
+      const latest = windowEntries[windowEntries.length - 1];
+      if (latest?.used > 0) {
+        byDay.set(latest.day, Math.max(byDay.get(latest.day) || 0, latest.used));
+      }
+      windowEntries = [];
+    };
     for (const entry of series) {
+      const previous = windowEntries[windowEntries.length - 1] || null;
       const sameWindow = previous
         ? (!entry.resetKey || !previous.resetKey || entry.resetKey === previous.resetKey)
         : true;
-      const delta = previous && sameWindow && entry.used >= previous.used
-        ? entry.used - previous.used
-        : entry.used;
-      if (delta > 0) {
-        byDay.set(entry.day, Math.max(byDay.get(entry.day) || 0, delta));
+      if (previous && (!sameWindow || entry.used < previous.used)) {
+        flushWindow();
       }
-      previous = entry;
+      windowEntries.push(entry);
     }
+    flushWindow();
   }
   return byDay;
 }
@@ -1447,6 +1416,31 @@ function filterLimits(limits, selectedProvider, selectedAccountKey = "all", sele
       && (selectedDeviceId === "all" || !rowDeviceId(limit) || rowDeviceId(limit) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(limit) === selectedScopeKey)
   )), selectedDeviceId);
+}
+
+function providerLimitUsesActiveAccount(row = {}) {
+  return row?.active_provider_account === true
+    || row?.activeProviderAccount === true
+    || row?.active_agent_profile === true
+    || row?.activeAgentProfile === true;
+}
+
+function activeProviderAccountKeyForLimits(limits, selectedProvider, selectedScopeKey = "all", selectedDeviceId = "all") {
+  if (selectedProvider === "all") return "";
+  const rows = (Array.isArray(limits) ? limits : []).filter((row) => (
+    providerKey(row) === selectedProvider
+      && providerLimitUsesActiveAccount(row)
+      && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
+      && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
+  ));
+  return rowProviderAccountKey(rows[0]) || "";
+}
+
+function limitAccountKeyForDisplay(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all", selectedDeviceId = "all") {
+  if (selectedAccountKey && selectedAccountKey !== "all") {
+    return selectedAccountKey;
+  }
+  return activeProviderAccountKeyForLimits(limits, selectedProvider, selectedScopeKey, selectedDeviceId) || "all";
 }
 
 function limitResetDate(limit = {}) {
@@ -1907,7 +1901,7 @@ function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selecte
     const label = rawModel && rawModel !== agentKind ? rawModel : providerLabel(row);
     const key = label || "Unknown model";
     const current = byModel.get(key) || { label: key, total: 0 };
-    current.total += rowActivityTokens(row);
+    current.total += rowInput(row) + rowOutput(row) + rowCache(row);
     byModel.set(key, current);
   }
   const total = [...byModel.values()].reduce((sum, row) => sum + row.total, 0);
@@ -2140,16 +2134,18 @@ function mergeTokenomicsSummary(previous, next) {
   if (!previous) return next || {};
   if (!next) return previous;
   const nextIsV2 = String(next.schema_version || next.schemaVersion || "").toLowerCase() === "tokenomics_v2";
+  const previousIsV2 = summaryIsTokenomicsV2(previous);
+  const clearLegacyRows = nextIsV2 || previousIsV2;
   return {
     ...previous,
     ...next,
     total: next.total || previous.total,
-    by_device: next.by_device || (nextIsV2 ? undefined : previous.by_device),
-    by_device_provider: next.by_device_provider || (nextIsV2 ? undefined : previous.by_device_provider),
-    by_device_account: next.by_device_account || (nextIsV2 ? undefined : previous.by_device_account),
-    by_device_model: next.by_device_model || (nextIsV2 ? undefined : previous.by_device_model),
-    daily_by_device_provider: next.daily_by_device_provider || (nextIsV2 ? undefined : previous.daily_by_device_provider),
-    monthly_by_device_provider: next.monthly_by_device_provider || (nextIsV2 ? undefined : previous.monthly_by_device_provider),
+    by_device: next.by_device || (clearLegacyRows ? undefined : previous.by_device),
+    by_device_provider: next.by_device_provider || (clearLegacyRows ? undefined : previous.by_device_provider),
+    by_device_account: next.by_device_account || (clearLegacyRows ? undefined : previous.by_device_account),
+    by_device_model: next.by_device_model || (clearLegacyRows ? undefined : previous.by_device_model),
+    daily_by_device_provider: next.daily_by_device_provider || (clearLegacyRows ? undefined : previous.daily_by_device_provider),
+    monthly_by_device_provider: next.monthly_by_device_provider || (clearLegacyRows ? undefined : previous.monthly_by_device_provider),
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
     limits: mergeProviderLimits(previous.limits, next.limits),
@@ -2303,7 +2299,7 @@ function ensureTokenomicsCloudListener() {
 
   const refreshFromCloud = () => {
     void loadTokenomicsStore({ force: true }).finally(() => {
-      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+      void refreshTokenomicsLiveLimits();
     });
   };
 
@@ -2626,9 +2622,13 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     () => aggregateRows(filterRows(totalRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey)),
     [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, totalRows],
   );
-  const limits = useMemo(
-    () => filterLimits(limitRowsRaw, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
+  const selectedLimitAccountKey = useMemo(
+    () => limitAccountKeyForDisplay(limitRowsRaw, selectedProvider, selectedAccountKey, selectedScopeKey, selectedDeviceId),
     [limitRowsRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
+  );
+  const limits = useMemo(
+    () => filterLimits(limitRowsRaw, selectedProvider, selectedLimitAccountKey, selectedScopeKey, selectedDeviceId),
+    [limitRowsRaw, selectedDeviceId, selectedLimitAccountKey, selectedProvider, selectedScopeKey],
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
@@ -2648,11 +2648,12 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const credits = creditSnapshotHasMeaningfulData(billingStatus?.credits)
-    ? billingStatus.credits
+    ? normalizeCreditWallet(billingStatus.credits) || {}
     : {};
   const providerLimitGroups = useMemo(() => (
     ["codex", "claude"].map((providerId) => {
-      const providerLimits = filterLimits(limitRowsRaw, providerId, "all", selectedScopeKey, selectedDeviceId);
+      const providerAccountKey = limitAccountKeyForDisplay(limitRowsRaw, providerId, "all", selectedScopeKey, selectedDeviceId);
+      const providerLimits = filterLimits(limitRowsRaw, providerId, providerAccountKey, selectedScopeKey, selectedDeviceId);
       return {
         providerId,
         fiveHour: mergeLimits(providerLimits, "5_hour"),
@@ -2903,20 +2904,20 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
         <CreditsCard>
           <CreditsTitle>
             <span>Diff Forge Credits</span>
-            <strong>{credits?.planName || credits?.term?.plan_name || "Plan"}</strong>
+            <strong>{credits?.planName || "Plan"}</strong>
           </CreditsTitle>
           <CreditsGrid>
             <CreditMetric>
               <span>Used</span>
-              <strong>{formatCredits(credits.termUsedCredits ?? credits.used_credits ?? credits.total?.used_credits ?? credits.localMeteredUsedCredits ?? credits.local_metered_used_credits)}</strong>
+              <strong>{formatCredits(credits.termUsedCredits)}</strong>
             </CreditMetric>
             <CreditMetric>
               <span>Remaining</span>
-              <strong>{formatCredits(credits.termRemainingCredits ?? credits.remaining_credits ?? credits.total?.remaining_credits)}</strong>
+              <strong>{formatCredits(credits.termRemainingCredits)}</strong>
             </CreditMetric>
             <CreditMetric>
               <span>Reserved</span>
-              <strong>{formatCredits(credits.termReservedCredits ?? credits.reserved_credits ?? credits.total?.reserved_credits)}</strong>
+              <strong>{formatCredits(credits.termReservedCredits)}</strong>
             </CreditMetric>
           </CreditsGrid>
         </CreditsCard>
