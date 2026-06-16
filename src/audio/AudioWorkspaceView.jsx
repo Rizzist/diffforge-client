@@ -21,6 +21,7 @@ import {
   AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
   AUDIO_TRANSCRIPTION_VARIANT_RAW,
   AUDIO_LLM_CLEANUP_ENGINE_OPTIONS,
+  AUDIO_LLM_CLEANUP_ENGINE_OPENAI_GPT_5_NANO,
   AUDIO_WIDGET_STYLE_BAR,
   AUDIO_WIDGET_STYLE_BUBBLE,
   AUDIO_WIDGET_STYLE_HIDDEN,
@@ -31,6 +32,7 @@ import {
   DEFAULT_AUDIO_POLISHING_SYSTEM_PROMPT,
   MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS,
   applySyncedAudioPolishingPreferences,
+  audioLlmCleanupEngineOption,
   arrayBufferToBase64,
   formatAudioPercent,
   getAudioInputErrorMessage,
@@ -552,6 +554,7 @@ const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_SAMPLE_MS = 90;
 const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_STABLE_SAMPLES = 3;
 const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_MAX_MS = 1400;
 const AUDIO_WIDGET_BUBBLE_VISIBLE_MARGIN = 8;
+const SHOW_OWN_KEY_DEEPGRAM_PROVIDER = false;
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
@@ -1551,6 +1554,170 @@ function formatAudioProviderLabel(provider) {
   return "Whisper";
 }
 
+function normalizeHistoryTimingMs(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : 0;
+}
+
+function readHistoryTimingMs(value, keys) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+
+  return keys
+    .map((key) => normalizeHistoryTimingMs(value[key]))
+    .find((duration) => duration > 0) || 0;
+}
+
+function normalizeAudioHistoryTimings(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const timings = value.timings && typeof value.timings === "object" ? value.timings : {};
+  const sttMs = readHistoryTimingMs(value, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"])
+    || readHistoryTimingMs(timings, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"]);
+  const cleanupMs = readHistoryTimingMs(value, ["cleanupMs", "cleanup_ms"])
+    || readHistoryTimingMs(timings, ["cleanupMs", "cleanup_ms"]);
+  const llmMs = readHistoryTimingMs(value, ["llmMs", "llm_ms"])
+    || readHistoryTimingMs(timings, ["llmMs", "llm_ms"])
+    || cleanupMs;
+  const totalMs = readHistoryTimingMs(value, ["totalMs", "total_ms"])
+    || readHistoryTimingMs(timings, ["totalMs", "total_ms"])
+    || (sttMs || llmMs ? sttMs + llmMs : 0);
+
+  const result = {};
+  if (sttMs > 0) result.sttMs = sttMs;
+  if (llmMs > 0) result.llmMs = llmMs;
+  if (totalMs > 0) result.totalMs = totalMs;
+  if (cleanupMs > 0) result.cleanupMs = cleanupMs;
+  return Object.keys(result).length ? result : null;
+}
+
+function mergeAudioHistoryTimings(primary, fallback) {
+  if (!primary && !fallback) {
+    return null;
+  }
+
+  return {
+    ...(fallback || {}),
+    ...(primary || {}),
+  };
+}
+
+function formatAudioHistoryTimingBreakdown(timings) {
+  if (!timings) {
+    return "";
+  }
+
+  const stt = timings.sttMs > 0 ? formatHistoryDuration(timings.sttMs) : "--";
+  const llm = timings.llmMs > 0 ? formatHistoryDuration(timings.llmMs) : "--";
+  const total = timings.totalMs > 0 ? formatHistoryDuration(timings.totalMs) : "--";
+  return `STT Time ${stt} / LLM Time ${llm} / Total Time ${total}`;
+}
+
+function cleanAudioHistoryPolishMetadata(value, { allowLabel = true } = {}) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const provider = String(value.provider || value.cleanupProvider || value.cleanup_provider || "").trim();
+  const model = String(value.model || value.cleanupModel || value.cleanup_model || "").trim();
+  const engine = String(value.engine || value.cleanupEngine || value.cleanup_engine || "").trim();
+  const label = String((allowLabel ? value.label : "") || value.modelLabel || value.polishLabel || "").trim();
+  const polishedAt = String(value.polishedAt || value.updatedAt || "").trim();
+  const timings = normalizeAudioHistoryTimings(value);
+  const result = {};
+  if (provider) result.provider = provider;
+  if (model) result.model = model;
+  if (engine) result.engine = engine;
+  if (label) result.label = label;
+  if (polishedAt) result.polishedAt = polishedAt;
+  if (timings) result.timings = timings;
+  return Object.keys(result).length ? result : null;
+}
+
+function formatAudioCleanupModelLabel(provider, model, fallback = "") {
+  const normalizedProvider = String(provider || "").trim().toLowerCase();
+  const normalizedModel = String(model || "").trim().toLowerCase();
+  const option = AUDIO_LLM_CLEANUP_ENGINE_OPTIONS.find((candidate) => (
+    candidate.provider === normalizedProvider
+    && candidate.model.toLowerCase() === normalizedModel
+  )) || AUDIO_LLM_CLEANUP_ENGINE_OPTIONS.find((candidate) => (
+    candidate.model.toLowerCase() === normalizedModel
+  ));
+
+  if (option?.label) {
+    return option.label;
+  }
+
+  if (model) {
+    return String(model)
+      .replace(/-/g, " ")
+      .replace(/\bgpt\b/i, "GPT")
+      .replace(/\bllama\b/i, "Llama")
+      .replace(/\bnano\b/i, "nano")
+      .trim();
+  }
+
+  return fallback;
+}
+
+function legacyAudioPolishModelLabel() {
+  return audioLlmCleanupEngineOption(AUDIO_LLM_CLEANUP_ENGINE_OPENAI_GPT_5_NANO).label;
+}
+
+function audioHistoryVariantModelLabel(variant) {
+  const polish = cleanAudioHistoryPolishMetadata(variant?.polish);
+  if (polish?.label) {
+    return polish.label;
+  }
+
+  const label = formatAudioCleanupModelLabel(polish?.provider, polish?.model);
+  if (label) {
+    return label;
+  }
+
+  return variant?.id === AUDIO_TRANSCRIPTION_VARIANT_POLISHED ? legacyAudioPolishModelLabel() : "";
+}
+
+function audioHistoryVariantDisplayLabel(variant) {
+  const label = audioHistoryVariantLabel(variant?.id, String(variant?.label || "").trim());
+  const modelLabel = audioHistoryVariantModelLabel(variant);
+  if (
+    modelLabel
+    && (
+      variant?.id === AUDIO_TRANSCRIPTION_VARIANT_CLEANED
+      || variant?.id === AUDIO_TRANSCRIPTION_VARIANT_POLISHED
+    )
+  ) {
+    return `${label} · ${modelLabel}`;
+  }
+  return label;
+}
+
+function audioHistoryTimingBreakdown(entry, variant) {
+  const entryTimings = normalizeAudioHistoryTimings(entry?.timings)
+    || normalizeAudioHistoryTimings(entry);
+  const polish = cleanAudioHistoryPolishMetadata(variant?.polish);
+  const variantTimings = normalizeAudioHistoryTimings(polish?.timings)
+    || normalizeAudioHistoryTimings(polish)
+    || normalizeAudioHistoryTimings(variant);
+  const hasLlmTiming = Boolean(
+    polish
+    || entry?.llmCleaned
+    || entry?.llm_cleaned
+    || entry?.cleanupProvider
+    || entry?.cleanupModel,
+  );
+
+  if (!hasLlmTiming) {
+    return null;
+  }
+
+  return mergeAudioHistoryTimings(variantTimings, entryTimings);
+}
+
 const LOCAL_WHISPER_MODEL_FALLBACKS = [
   {
     modelId: "tiny.en",
@@ -1656,13 +1823,15 @@ function extractRemainingForgeCredits(billing) {
   return null;
 }
 
-function formatAudioHistoryMeta(entry) {
+function formatAudioHistoryMeta(entry, variant) {
   const pieces = [];
   const source = String(entry?.source || "").trim();
-  // Time shown = turnaround since releasing the record button (request
-  // submitted) to the transcript landing. Older entries only stored the
-  // audio length, so they fall back to it.
-  const duration = formatHistoryDuration(
+  const timingBreakdown = formatAudioHistoryTimingBreakdown(
+    audioHistoryTimingBreakdown(entry, variant),
+  );
+  // Fallback for older entries: turnaround since releasing the record button
+  // to transcript landing, or audio length if that was all the entry stored.
+  const duration = timingBreakdown || formatHistoryDuration(
     Number(entry?.latencyMs || 0) > 0 ? entry.latencyMs : entry?.audioMs,
   );
   const wordCount = Number(entry?.wordCount || 0);
@@ -1853,10 +2022,13 @@ function audioHistoryVariants(entry) {
       if (!id || !text) {
         return null;
       }
+      const polish = cleanAudioHistoryPolishMetadata(variant?.polish)
+        || cleanAudioHistoryPolishMetadata(variant, { allowLabel: false });
       return {
         id,
         label: audioHistoryVariantLabel(id, String(variant?.label || "").trim()),
         text,
+        ...(polish ? { polish } : {}),
       };
     })
     .filter(Boolean);
@@ -1888,7 +2060,7 @@ function buildAudioHistoryRows(history, selectedVariantIds) {
       entryKey,
       entryText,
       index,
-      meta: formatAudioHistoryMeta(entry),
+      meta: formatAudioHistoryMeta(entry, variant),
       providerLabel: formatAudioProviderLabel(entry?.provider),
       snippetChanges,
       timestamp: formatHistoryTimestamp(entry?.createdAt),
@@ -1911,7 +2083,54 @@ function audioHistoryEntryPolishText(entry) {
   return String(preferred?.text || "").trim();
 }
 
-function buildPolishedAudioHistoryVariants(entry, sourceText, polishedText) {
+function buildAudioPolishMetadata(result = {}, overrides = {}) {
+  const timingSource = {
+    ...(result || {}),
+    ...(overrides || {}),
+    timings: {
+      ...((result && typeof result.timings === "object" && result.timings) || {}),
+      ...((overrides && typeof overrides.timings === "object" && overrides.timings) || {}),
+    },
+  };
+  const provider = String(
+    result?.provider
+    || result?.cleanupProvider
+    || result?.cleanup_provider
+    || overrides?.provider
+    || overrides?.cleanupProvider
+    || "",
+  ).trim();
+  const model = String(
+    result?.model
+    || result?.cleanupModel
+    || result?.cleanup_model
+    || overrides?.model
+    || overrides?.cleanupModel
+    || "",
+  ).trim();
+  const engine = String(
+    result?.engine
+    || result?.cleanupEngine
+    || result?.cleanup_engine
+    || overrides?.engine
+    || overrides?.cleanupEngine
+    || "",
+  ).trim();
+  const timings = normalizeAudioHistoryTimings(timingSource);
+  const label = formatAudioCleanupModelLabel(provider, model);
+  const metadata = {};
+
+  if (provider) metadata.provider = provider;
+  if (model) metadata.model = model;
+  if (engine) metadata.engine = engine;
+  if (label) metadata.label = label;
+  if (timings) metadata.timings = timings;
+  metadata.polishedAt = new Date().toISOString();
+
+  return cleanAudioHistoryPolishMetadata(metadata);
+}
+
+function buildPolishedAudioHistoryVariants(entry, sourceText, polishedText, polishMetadata = null) {
   const nextVariants = [];
   const seen = new Set();
   const pushVariant = (variant) => {
@@ -1921,10 +2140,13 @@ function buildPolishedAudioHistoryVariants(entry, sourceText, polishedText) {
       return;
     }
     seen.add(id);
+    const polish = cleanAudioHistoryPolishMetadata(variant?.polish)
+      || cleanAudioHistoryPolishMetadata(variant, { allowLabel: false });
     nextVariants.push({
       id,
       label: audioHistoryVariantLabel(id, String(variant?.label || "").trim()),
       text,
+      ...(polish ? { polish } : {}),
     });
   };
 
@@ -1943,6 +2165,7 @@ function buildPolishedAudioHistoryVariants(entry, sourceText, polishedText) {
   pushVariant({
     id: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
     label: "Polished",
+    polish: polishMetadata,
     text: polishedText,
   });
 
@@ -2193,8 +2416,8 @@ function AudioHistoryVirtualRow({
               >
                 <ButtonBackIcon aria-hidden="true" />
               </AudioHistoryVariantButton>
-              <AudioHistoryVariantLabel>
-                {row.variant?.label || "Version"}
+              <AudioHistoryVariantLabel title={audioHistoryVariantDisplayLabel(row.variant)}>
+                {audioHistoryVariantDisplayLabel(row.variant) || "Version"}
               </AudioHistoryVariantLabel>
               <AudioHistoryVariantButton
                 aria-label="Show next transcript version"
@@ -3660,28 +3883,6 @@ export default function AudioWorkspaceView({
             </AudioDeviceHeader>
             <AudioModeList role="group" aria-label="Transcription mode">
               <AudioModeButton
-                aria-pressed={!isCloudMode && !isForgeMode && !isForgeAgentMode}
-                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
-                type="button"
-              >
-                <ButtonMicIcon aria-hidden="true" />
-                <span>
-                  <strong>Local</strong>
-                  <span>Whisper on this device</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={isCloudMode}
-                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_CLOUD)}
-                type="button"
-              >
-                <ButtonHubIcon aria-hidden="true" />
-                <span>
-                  <strong>Cloud</strong>
-                  <span>Your Deepgram key</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
                 aria-pressed={isForgeMode}
                 onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_FORGE)}
                 type="button"
@@ -3692,6 +3893,30 @@ export default function AudioWorkspaceView({
                   <span>Nova-3 + LLM cleanup</span>
                 </span>
               </AudioModeButton>
+              <AudioModeButton
+                aria-pressed={!isCloudMode && !isForgeMode && !isForgeAgentMode}
+                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
+                type="button"
+              >
+                <ButtonMicIcon aria-hidden="true" />
+                <span>
+                  <strong>Local</strong>
+                  <span>Whisper on this device</span>
+                </span>
+              </AudioModeButton>
+              {SHOW_OWN_KEY_DEEPGRAM_PROVIDER && (
+                <AudioModeButton
+                  aria-pressed={isCloudMode}
+                  onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_CLOUD)}
+                  type="button"
+                >
+                  <ButtonHubIcon aria-hidden="true" />
+                  <span>
+                    <strong>Cloud</strong>
+                    <span>Your Deepgram key</span>
+                  </span>
+                </AudioModeButton>
+              )}
             </AudioModeList>
             {!isCloudMode && !isForgeMode && !isForgeAgentMode && (
               <AudioLocalModelList aria-label="Local Whisper model">
@@ -5937,6 +6162,7 @@ export function AudioWidgetWindow() {
     setMessage("Polishing text");
 
     try {
+      const polishStartedAt = Date.now();
       const result = await invoke("polish_audio_transcription", {
         request: {
           fallbackText,
@@ -5950,18 +6176,33 @@ export function AudioWidgetWindow() {
       }
       const sourceText = String(result?.rawText || result?.raw_text || polishedText).trim();
       const entry = findAudioHistoryEntryForPolish(history, sourceText);
+      const polishTotalMs = Math.max(0, Date.now() - polishStartedAt);
+      const polishMetadata = buildAudioPolishMetadata(result, {
+        totalMs: polishTotalMs,
+      });
 
-      const nextVariants = buildPolishedAudioHistoryVariants(entry, sourceText, polishedText);
+      const nextVariants = buildPolishedAudioHistoryVariants(
+        entry,
+        sourceText,
+        polishedText,
+        polishMetadata,
+      );
       await publishAudioTranscriptionResult({
         ...(entry || {}),
+        cleanupEngine: result?.cleanupEngine || result?.cleanup_engine || entry?.cleanupEngine || "",
+        cleanupModel: result?.model || result?.cleanupModel || result?.cleanup_model || entry?.cleanupModel || "",
+        cleanupProvider: result?.provider || result?.cleanupProvider || result?.cleanup_provider || entry?.cleanupProvider || "",
         defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_POLISHED,
         id: entry?.id || `polish-${Date.now()}`,
+        latencyMs: Number(entry?.latencyMs || 0) > 0 ? entry.latencyMs : polishTotalMs,
+        llmCleaned: Boolean(result?.llmCleaned ?? result?.llm_cleaned ?? true),
         provider: entry?.provider || readAudioTranscriptionProvider(),
         rawText: sourceText,
         source: entry?.source || "audio-llm-polished-clipboard",
         sourceText: sourceText !== polishedText ? sourceText : String(entry?.sourceText || ""),
         status: entry?.status || AUDIO_TRANSCRIPTION_STATUS_INSERTED,
         text: polishedText,
+        timings: entry?.timings || polishMetadata?.timings || null,
         variants: nextVariants,
       });
       refreshWidgetHistory();
@@ -7355,12 +7596,19 @@ export function AudioWidgetWindow() {
 
       const pipeline = applyVoiceTextPipeline(rawTranscript, peekVoiceTextRules());
       const nextTranscript = (pipeline.text || "").trim() || rawTranscript;
+      const resultLatencyMs = Math.max(0, Date.now() - submittedAt);
       const forgeHistory = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         ? forgeDictationHistoryRef.current
         : null;
       const forgeRawTranscript = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         ? String(result?.rawText || "").trim()
         : "";
+      const forgeCleanupMetadata = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+        && result?.llmCleaned
+        ? buildAudioPolishMetadata(result, {
+          totalMs: resultLatencyMs,
+        })
+        : null;
       const forgeHistoryVariants = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         && result?.llmCleaned
         && forgeRawTranscript
@@ -7373,6 +7621,7 @@ export function AudioWidgetWindow() {
           {
             id: AUDIO_TRANSCRIPTION_VARIANT_CLEANED,
             label: "Cleaned",
+            polish: forgeCleanupMetadata,
             text: nextTranscript,
           },
         ]
@@ -7380,11 +7629,14 @@ export function AudioWidgetWindow() {
 
       await publishAudioTranscriptionResult({
         audioMs: Number(result?.audioMs || 0),
+        cleanupModel: result?.cleanupModel || "",
+        cleanupProvider: result?.cleanupProvider || "",
         createdAt: forgeHistory?.createdAt || new Date().toISOString(),
         defaultVariantId: forgeHistoryVariants.length > 1 ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED : "",
         id: forgeHistory?.id || `${Date.now()}`,
-        latencyMs: Math.max(0, Date.now() - submittedAt),
+        latencyMs: resultLatencyMs,
         language: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
+        llmCleaned: Boolean(result?.llmCleaned),
         provider: currentProvider,
         rawText: forgeHistoryVariants.length > 1 ? forgeRawTranscript : "",
         snippetChanges: pipeline.changes?.snippets || [],
@@ -7397,6 +7649,9 @@ export function AudioWidgetWindow() {
             : "whisper-local",
         sourceText: pipeline.changed ? rawTranscript : "",
         text: nextTranscript,
+        timings: forgeCleanupMetadata?.timings
+          || normalizeAudioHistoryTimings({ ...result, totalMs: resultLatencyMs })
+          || null,
         variants: forgeHistoryVariants,
       });
       refreshWidgetHistory();
@@ -7874,17 +8129,22 @@ export function AudioWidgetWindow() {
       }
 
       const createdAt = String(event.payload?.createdAt || "").trim() || new Date().toISOString();
+      const timings = normalizeAudioHistoryTimings(event.payload);
       await publishAudioTranscriptionResult({
         audioMs: Math.max(0, Number(event.payload?.audioSeconds || 0) * 1000),
+        cleanupModel: event.payload?.cleanupModel || "",
+        cleanupProvider: event.payload?.cleanupProvider || "",
         createdAt,
         defaultVariantId: AUDIO_TRANSCRIPTION_VARIANT_RAW,
         id: historyId,
         language: readDeepgramLanguage(),
         latencyMs: Math.max(0, Date.now() - new Date(createdAt).getTime()),
+        llmCleaned: false,
         provider: AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
         rawText,
         source: "forge-nova3-dictation-raw",
         text: rawText,
+        timings,
         variants: [
           {
             id: AUDIO_TRANSCRIPTION_VARIANT_RAW,

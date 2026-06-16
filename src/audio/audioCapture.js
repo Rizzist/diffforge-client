@@ -285,6 +285,83 @@ function normalizeTranscriptionVariantId(value) {
   return "";
 }
 
+function normalizeTimingMs(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : 0;
+}
+
+function readObjectText(value, keys) {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  return keys
+    .map((key) => (typeof value[key] === "string" ? value[key].trim() : ""))
+    .find(Boolean) || "";
+}
+
+function readObjectTimingMs(value, keys) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  return keys
+    .map((key) => normalizeTimingMs(value[key]))
+    .find((duration) => duration > 0) || 0;
+}
+
+function normalizeTranscriptionTimingBreakdown(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const timings = value.timings && typeof value.timings === "object" ? value.timings : {};
+  const sttMs = readObjectTimingMs(value, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"])
+    || readObjectTimingMs(timings, ["sttMs", "stt_ms", "finishToRawMs", "finish_to_raw_ms"]);
+  const cleanupMs = readObjectTimingMs(value, ["cleanupMs", "cleanup_ms"])
+    || readObjectTimingMs(timings, ["cleanupMs", "cleanup_ms"]);
+  const llmMs = readObjectTimingMs(value, ["llmMs", "llm_ms"])
+    || readObjectTimingMs(timings, ["llmMs", "llm_ms"])
+    || cleanupMs;
+  const totalMs = readObjectTimingMs(value, ["totalMs", "total_ms"])
+    || readObjectTimingMs(timings, ["totalMs", "total_ms"])
+    || (sttMs || llmMs ? sttMs + llmMs : 0);
+
+  const result = {};
+  if (sttMs > 0) result.sttMs = sttMs;
+  if (llmMs > 0) result.llmMs = llmMs;
+  if (totalMs > 0) result.totalMs = totalMs;
+  if (cleanupMs > 0) result.cleanupMs = cleanupMs;
+  return Object.keys(result).length ? result : null;
+}
+
+function normalizeTranscriptionPolishMetadata(variant) {
+  if (!variant || typeof variant !== "object") {
+    return null;
+  }
+
+  const polish = variant.polish && typeof variant.polish === "object" ? variant.polish : {};
+  const provider = readObjectText(polish, ["provider", "cleanupProvider", "cleanup_provider"])
+    || readObjectText(variant, ["polishProvider", "cleanupProvider", "cleanup_provider", "provider"]);
+  const model = readObjectText(polish, ["model", "cleanupModel", "cleanup_model"])
+    || readObjectText(variant, ["polishModel", "cleanupModel", "cleanup_model", "model"]);
+  const engine = readObjectText(polish, ["engine", "cleanupEngine", "cleanup_engine"])
+    || readObjectText(variant, ["polishEngine", "cleanupEngine", "cleanup_engine", "engine"]);
+  const label = readObjectText(polish, ["label", "modelLabel"])
+    || readObjectText(variant, ["polishLabel", "modelLabel"]);
+  const timings = normalizeTranscriptionTimingBreakdown(polish)
+    || normalizeTranscriptionTimingBreakdown(variant);
+  const polishedAt = readObjectText(polish, ["polishedAt", "updatedAt"])
+    || readObjectText(variant, ["polishedAt"]);
+
+  const result = {};
+  if (provider) result.provider = provider.slice(0, 48);
+  if (model) result.model = model.slice(0, 96);
+  if (engine) result.engine = engine.slice(0, 96);
+  if (label) result.label = label.slice(0, 64);
+  if (timings) result.timings = timings;
+  if (polishedAt) result.polishedAt = polishedAt.slice(0, 64);
+  return Object.keys(result).length ? result : null;
+}
+
 function normalizeTranscriptionVariants(value, text) {
   const variants = [];
   const seenIds = new Set();
@@ -303,8 +380,14 @@ function normalizeTranscriptionVariants(value, text) {
     const label = typeof variant?.label === "string" && variant.label.trim()
       ? variant.label.trim().slice(0, 32)
       : fallbackLabel;
+    const polish = normalizeTranscriptionPolishMetadata(variant);
     seenIds.add(id);
-    variants.push({ id, label, text: variantText });
+    variants.push({
+      id,
+      label,
+      text: variantText,
+      ...(polish ? { polish } : {}),
+    });
   };
 
   if (Array.isArray(value?.variants)) {
@@ -449,21 +532,28 @@ export function writeAudioWidgetTheme(theme) {
 // Orchestrator voice button. Legacy stored "forge-agent" values migrate to
 // "forge"; the constant stays only so history rows keep their labels.
 function normalizeAudioTranscriptionProviderSetting(value) {
-  if (value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+  const provider = String(value || "").trim();
+  if (!provider) {
     return AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
   }
+  if (provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
+  }
+  if (provider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
+  }
   if (
-    value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-    || value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+    provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+    || provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
   ) {
-    return value;
+    return provider;
   }
   return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
 }
 
 export function readAudioTranscriptionProvider() {
   if (!canUseStorage()) {
-    return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
+    return AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
   }
 
   return normalizeAudioTranscriptionProviderSetting(
@@ -806,6 +896,25 @@ function normalizeTranscriptionResult(value) {
     value.snippetChanges || value.changes?.snippets,
   );
   const variants = normalizeTranscriptionVariants(value, text);
+  const timings = normalizeTranscriptionTimingBreakdown(value);
+  const cleanupProvider = readObjectText(value, [
+    "cleanupProvider",
+    "cleanup_provider",
+    "llmCleanupProvider",
+    "llm_cleanup_provider",
+  ]);
+  const cleanupModel = readObjectText(value, [
+    "cleanupModel",
+    "cleanup_model",
+    "llmCleanupModel",
+    "llm_cleanup_model",
+  ]);
+  const cleanupEngine = readObjectText(value, [
+    "cleanupEngine",
+    "cleanup_engine",
+    "llmCleanupEngine",
+    "llm_cleanup_engine",
+  ]);
   const defaultVariantId = normalizeTranscriptionVariantId(value.defaultVariantId)
     || (variants.some((variant) => variant.id === AUDIO_TRANSCRIPTION_VARIANT_CLEANED)
       ? AUDIO_TRANSCRIPTION_VARIANT_CLEANED
@@ -817,6 +926,11 @@ function normalizeTranscriptionResult(value) {
     audioMs: Number.isFinite(audioMs) && audioMs > 0 ? Math.round(audioMs) : 0,
     language: rawLanguage ? normalizeDeepgramLanguage(rawLanguage) : "",
     latencyMs: Number.isFinite(latencyMs) && latencyMs > 0 ? Math.round(latencyMs) : 0,
+    llmCleaned: Boolean(value.llmCleaned || value.llm_cleaned),
+    ...(cleanupProvider ? { cleanupProvider } : {}),
+    ...(cleanupModel ? { cleanupModel } : {}),
+    ...(cleanupEngine ? { cleanupEngine } : {}),
+    ...(timings ? { timings } : {}),
     provider,
     source,
     sourceText,

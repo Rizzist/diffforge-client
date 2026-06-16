@@ -20,6 +20,8 @@ import { HorizontalRule } from "@styled-icons/material-rounded/HorizontalRule";
 import { Link } from "@styled-icons/material-rounded/Link";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { Numbers } from "@styled-icons/material-rounded/Numbers";
+import { Pause } from "@styled-icons/material-rounded/Pause";
+import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { Public } from "@styled-icons/material-rounded/Public";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
@@ -417,6 +419,10 @@ function assetLocalPath(asset) {
   return text(asset?.localPath || asset?.local_path || asset?.path);
 }
 
+function assetIsVideoPath(localPath) {
+  return /\.(mp4|mov|m4v|webm)$/iu.test(text(localPath).split(/[?#]/u)[0]);
+}
+
 function assetName(asset) {
   const localPath = assetLocalPath(asset);
   return text(asset?.name || asset?.filename || localPath.split(/[\\/]/u).pop(), "snip.png");
@@ -501,6 +507,7 @@ function useStripTilePreviewUrl(localPath, imageVersion = 0, options = true) {
     : (options || {});
   const assetFallback = normalizedOptions.assetFallback !== false;
   const queued = normalizedOptions.queued === true;
+  const readDataUrl = normalizedOptions.readDataUrl !== false && !assetIsVideoPath(localPath);
   const assetUrl = useMemo(
     () => (assetFallback ? versionedAssetPreviewUrl(localPath, imageVersion) : ""),
     [assetFallback, imageVersion, localPath],
@@ -516,6 +523,7 @@ function useStripTilePreviewUrl(localPath, imageVersion = 0, options = true) {
     setLoading(false);
     setAssetUrlFailed(false);
     if (!path) return undefined;
+    if (!readDataUrl) return undefined;
 
     let cancelled = false;
     const requestId = requestRef.current + 1;
@@ -552,7 +560,7 @@ function useStripTilePreviewUrl(localPath, imageVersion = 0, options = true) {
     return () => {
       cancelled = true;
     };
-  }, [imageVersion, localPath, queued]);
+  }, [imageVersion, localPath, queued, readDataUrl]);
 
   const onImageError = useCallback(() => {
     if (dataUrl) {
@@ -628,6 +636,14 @@ async function renderAnnotatedImageDataUrl(localPath, annotations = []) {
 }
 
 async function copySnipToClipboard(snip) {
+  if (assetIsVideoPath(snip.localPath)) {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(snip.localPath);
+      return "Copied recording path";
+    }
+    throw new Error("Clipboard is not available in this webview.");
+  }
+
   try {
     await invoke("diffforge_copy_asset_to_clipboard", {
       path: snip.localPath,
@@ -1000,12 +1016,17 @@ export function SnippingFloatWindow() {
   const [closing, setClosing] = useState(false);
   const localPathRef = useRef(initialPath);
   const closingRef = useRef(false);
-  const { previewUrl: filePreviewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion);
+  const isVideo = useMemo(() => assetIsVideoPath(localPath), [localPath]);
+  const videoRef = useRef(null);
+  const [videoPlaying, setVideoPlaying] = useState(false);
+  const { previewUrl: filePreviewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion, {
+    readDataUrl: !isVideo,
+  });
   const previewUrl = useMemo(() => {
     if (closing) return "";
-    if (liveFrameUrl) return liveFrameUrl;
+    if (liveFrameUrl && !isVideo) return liveFrameUrl;
     return filePreviewUrl;
-  }, [closing, filePreviewUrl, liveFrameUrl]);
+  }, [closing, filePreviewUrl, isVideo, liveFrameUrl]);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
@@ -1206,6 +1227,7 @@ export function SnippingFloatWindow() {
 
   useEffect(() => {
     localPathRef.current = localPath;
+    setVideoPlaying(false);
   }, [localPath]);
 
   useEffect(() => {
@@ -1378,12 +1400,28 @@ export function SnippingFloatWindow() {
     uploadToCloud,
   ]);
 
+  const toggleVideoPlayback = useCallback(async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      if (video.paused) {
+        await video.play();
+        setVideoPlaying(true);
+      } else {
+        video.pause();
+        setVideoPlaying(false);
+      }
+    } catch (error) {
+      showStatus(error?.message || String(error || "Unable to play recording."));
+    }
+  }, [showStatus]);
+
   // Manual double-press detection: the native window drag begins on the
   // first press, so a synthetic dblclick event is not reliable here.
   const lastPressAtRef = useRef(0);
   const beginDrag = useCallback((event) => {
     if (closing) return;
-    if (event.button !== 0 || event.target.closest("button")) return;
+    if (event.button !== 0 || event.target.closest("button, video")) return;
     // Stop WebKit from starting a selection highlight while the native
     // window drag takes over.
     event.preventDefault();
@@ -1435,7 +1473,20 @@ export function SnippingFloatWindow() {
         title={`${name} — drag anywhere, double-click to annotate`}
       >
         {previewUrl ? (
-          <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
+          isVideo ? (
+            <video
+              aria-label={name}
+              draggable={false}
+              onEnded={() => setVideoPlaying(false)}
+              onPause={() => setVideoPlaying(false)}
+              onPlay={() => setVideoPlaying(true)}
+              playsInline
+              ref={videoRef}
+              src={previewUrl}
+            />
+          ) : (
+            <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
+          )
         ) : (
           <span data-empty="true">Preview unavailable</span>
         )}
@@ -1450,6 +1501,18 @@ export function SnippingFloatWindow() {
           <Close aria-hidden="true" />
         </FloatCloseButton>
         <FloatUploadControls data-state={uploadState}>
+          {isVideo && (
+            <FloatUploadSideButton
+              aria-label={videoPlaying ? `Pause ${name}` : `Play ${name}`}
+              disabled={busy || closing || !previewUrl}
+              {...hoverControlProps("play")}
+              onClick={toggleVideoPlayback}
+              title={videoPlaying ? "Pause" : "Play"}
+              type="button"
+            >
+              {videoPlaying ? <Pause aria-hidden="true" /> : <PlayArrow aria-hidden="true" />}
+            </FloatUploadSideButton>
+          )}
           {uploadState === "done" && (
             <FloatUploadSideButton
               aria-label={`Remove Cloud upload of ${name}`}
@@ -1503,17 +1566,17 @@ export function SnippingFloatWindow() {
             disabled={busy || closing}
             {...hoverControlProps("copy")}
             onClick={() => runAction("copy")}
-            title="Copy image"
+            title={isVideo ? "Copy recording" : "Copy image"}
             type="button"
           >
             <ContentCopy aria-hidden="true" />
           </FloatActionButton>
           <FloatActionButton
-            aria-label={`Annotate ${name}`}
+            aria-label={isVideo ? `Open ${name}` : `Annotate ${name}`}
             disabled={busy || closing}
             {...hoverControlProps("edit")}
             onClick={() => runAction("edit")}
-            title="Annotate copy"
+            title={isVideo ? "Open recording" : "Annotate copy"}
             type="button"
           >
             <ModeEdit aria-hidden="true" />
@@ -1555,7 +1618,8 @@ const FloatWindowRoot = styled.main`
     cursor: grabbing;
   }
 
-  img {
+  img,
+  video {
     /* Absolutely pinned to the window box: percentage sizes on in-flow
        children of auto grid/flex tracks don't resolve reliably in WebKit
        (the img lays out at the capture's intrinsic size and the overflow
@@ -1573,6 +1637,10 @@ const FloatWindowRoot = styled.main`
     user-select: none;
     -webkit-user-select: none;
     -webkit-user-drag: none;
+  }
+
+  video {
+    background: #05070b;
   }
 
   > span[data-empty="true"] {
@@ -3512,6 +3580,8 @@ export function SnippingAnnotationEditorWindow() {
   const [activePath, setActivePath] = useState(() => localPaths[0] || "");
   const previewUrl = useMemo(() => assetPreviewUrl({ localPath: activePath }), [activePath]);
   const name = useMemo(() => assetName({ localPath: activePath }), [activePath]);
+  const activeIsVideo = useMemo(() => assetIsVideoPath(activePath), [activePath]);
+  const containsVideo = useMemo(() => localPaths.some((path) => assetIsVideoPath(path)), [localPaths]);
   const activeIndex = Math.max(0, localPaths.indexOf(activePath));
   const multiImage = localPaths.length > 1;
   const canvasRef = useRef(null);
@@ -3573,10 +3643,12 @@ export function SnippingAnnotationEditorWindow() {
   const [floatOpen, setFloatOpen] = useState(false);
   const annotations = annotationsByPath[activePath] || [];
   const hasCrop = annotations.some((annotation) => annotation.type === "crop");
-  const imageReady = imageLoadState === "ready" && canvasSize.width > 0 && canvasSize.height > 0;
+  const imageReady = !activeIsVideo && imageLoadState === "ready" && canvasSize.width > 0 && canvasSize.height > 0;
+  const mediaReady = activeIsVideo ? imageLoadState === "ready" : imageReady;
   const imageLoading = imageLoadState === "loading";
   const imageLoadFailed = imageLoadState === "error";
   const hasDispatchTargets = dispatchTargets.length > 0;
+  const canSendToComposer = hasDispatchTargets && !containsVideo;
 
   const applyDispatchTargets = useCallback((targets) => {
     const nextTargets = normalizeSnippingDispatchTargets(targets);
@@ -3782,6 +3854,16 @@ export function SnippingAnnotationEditorWindow() {
       setStatus("No snip selected.");
       return undefined;
     }
+    if (activeIsVideo) {
+      imageRef.current = null;
+      draftRef.current = null;
+      drawingRef.current = false;
+      setDraft(null);
+      setCanvasSize({ width: 0, height: 0 });
+      setImageLoadState("ready");
+      setStatus(multiImage ? `Ready ${activeIndex + 1}/${localPaths.length}` : "Ready");
+      return undefined;
+    }
     let disposed = false;
     let objectUrl = "";
     const image = new window.Image();
@@ -3827,7 +3909,7 @@ export function SnippingAnnotationEditorWindow() {
       image.src = "";
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [activeIndex, activePath, localPaths.length, multiImage, previewUrl]);
+  }, [activeIndex, activeIsVideo, activePath, localPaths.length, multiImage, previewUrl]);
 
   // Stage size drives the fit scale; track it live so window resizes keep
   // the image filling the available area.
@@ -3906,6 +3988,7 @@ export function SnippingAnnotationEditorWindow() {
   // (preventDefault dropped), and trackpad pinches arrive as gesture events,
   // not ctrl-wheels.
   useEffect(() => {
+    if (activeIsVideo) return undefined;
     const viewport = viewportRef.current;
     if (!viewport) return undefined;
     const handleWheel = (event) => {
@@ -3930,9 +4013,10 @@ export function SnippingAnnotationEditorWindow() {
       viewport.removeEventListener("gesturestart", handleGestureStart);
       viewport.removeEventListener("gesturechange", handleGestureChange);
     };
-  }, [setZoomAnchored]);
+  }, [activeIsVideo, setZoomAnchored]);
 
   const drawCanvas = useCallback(() => {
+    if (activeIsVideo) return;
     const canvas = canvasRef.current;
     const image = imageRef.current;
     if (!canvas || !image || !canvasSize.width || !canvasSize.height) return;
@@ -3944,7 +4028,7 @@ export function SnippingAnnotationEditorWindow() {
     if (!draft && hoverIndex >= 0 && hoverIndex < annotations.length) {
       drawHoverOutline(context, annotations[hoverIndex]);
     }
-  }, [annotations, canvasSize.height, canvasSize.width, draft, hoverIndex]);
+  }, [activeIsVideo, annotations, canvasSize.height, canvasSize.width, draft, hoverIndex]);
 
   useEffect(() => {
     drawCanvas();
@@ -4170,6 +4254,7 @@ export function SnippingAnnotationEditorWindow() {
   // staggered next to the original when the cursor is off the canvas). The
   // clipboard survives image switches, so annotations copy across snips.
   useEffect(() => {
+    if (activeIsVideo) return undefined;
     const onKeyDown = (event) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
       const key = event.key.toLowerCase();
@@ -4231,7 +4316,7 @@ export function SnippingAnnotationEditorWindow() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [annotations, updateActiveAnnotations]);
+  }, [activeIsVideo, annotations, updateActiveAnnotations]);
 
   const undo = useCallback(() => {
     updateActiveAnnotations((current) => current.slice(0, -1));
@@ -4248,6 +4333,15 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath, annotationsByPath]);
 
   const copyCanvas = useCallback(async () => {
+    if (activeIsVideo) {
+      try {
+        const copyStatus = await copySnipToClipboard({ localPath: activePath, name, previewUrl });
+        setStatus(copyStatus);
+      } catch (error) {
+        setStatus(error?.message || String(error || "Unable to copy recording."));
+      }
+      return;
+    }
     if (!imageReady) {
       setStatus(imageLoadFailed ? "Unable to copy until the image loads." : "Image is still loading...");
       return;
@@ -4263,12 +4357,13 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to copy image."));
     }
-  }, [exportActiveDataUrl, imageLoadFailed, imageReady]);
+  }, [activeIsVideo, activePath, exportActiveDataUrl, imageLoadFailed, imageReady, name, previewUrl]);
 
   // Streams the composited canvas to the snip preview window while drawing,
   // so edits are visible there live (downscaled JPEG frames, throttled).
   const emitLivePreviewFrame = useCallback(() => {
     if (editorClosingRef.current) return;
+    if (activeIsVideo) return;
     const canvas = canvasRef.current;
     if (!canvas || !activePath || !canvas.width || !canvas.height) return;
 
@@ -4309,10 +4404,11 @@ export function SnippingAnnotationEditorWindow() {
       targetPath: autosaveTargetsRef.current[activePath] || "",
       dataUrl,
     }).catch(() => {});
-  }, [activePath]);
+  }, [activeIsVideo, activePath]);
 
   useEffect(() => {
     if (editorClosingRef.current) return undefined;
+    if (activeIsVideo) return undefined;
     if (!canvasSize.width || !canvasSize.height) return undefined;
     if (!draft && !(annotationsByPath[activePath] || []).length) return undefined;
 
@@ -4331,7 +4427,7 @@ export function SnippingAnnotationEditorWindow() {
     // Intentionally no cleanup on dependency change: the trailing frame must
     // still fire after the last stroke update settles.
     return undefined;
-  }, [activePath, annotationsByPath, canvasSize.height, canvasSize.width, draft, emitLivePreviewFrame]);
+  }, [activeIsVideo, activePath, annotationsByPath, canvasSize.height, canvasSize.width, draft, emitLivePreviewFrame]);
 
   useEffect(() => () => {
     editorClosingRef.current = true;
@@ -4346,6 +4442,7 @@ export function SnippingAnnotationEditorWindow() {
   }, []);
   const persistAnnotatedImage = useCallback(async () => {
     if (editorClosingRef.current) return;
+    if (activeIsVideo) return;
     if (!imageRef.current || !activePath) return;
     if (!(annotationsByPath[activePath] || []).length) return;
     setStatus("Saving…");
@@ -4369,10 +4466,11 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to save annotated image."));
     }
-  }, [activePath, annotationsByPath, exportActiveDataUrl]);
+  }, [activeIsVideo, activePath, annotationsByPath, exportActiveDataUrl]);
 
   useEffect(() => {
     if (editorClosingRef.current) return undefined;
+    if (activeIsVideo) return undefined;
     if (!(annotationsByPath[activePath] || []).length) return undefined;
     window.clearTimeout(autosaveTimerRef.current);
     autosaveTimerRef.current = window.setTimeout(() => {
@@ -4380,10 +4478,14 @@ export function SnippingAnnotationEditorWindow() {
       void persistAnnotatedImage();
     }, 900);
     return () => window.clearTimeout(autosaveTimerRef.current);
-  }, [activePath, annotationsByPath, persistAnnotatedImage]);
+  }, [activeIsVideo, activePath, annotationsByPath, persistAnnotatedImage]);
 
   const queueTodo = useCallback(async (event) => {
     event.preventDefault();
+    if (containsVideo) {
+      setStatus("Recordings cannot be sent to terminals.");
+      return;
+    }
     const text = todoDraft.trim();
     if (!text) {
       setStatus("Describe the todo first");
@@ -4435,7 +4537,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to queue todo."));
     }
-  }, [activePath, annotationsByPath, exportActiveDataUrl, hasDispatchTargets, imageLoadFailed, imageReady, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
+  }, [activePath, annotationsByPath, containsVideo, exportActiveDataUrl, hasDispatchTargets, imageLoadFailed, imageReady, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
 
   const closeEditor = useCallback(() => {
     beginEditorDispose();
@@ -4478,6 +4580,7 @@ export function SnippingAnnotationEditorWindow() {
               {localPaths.map((path, index) => {
                 const itemName = assetName({ localPath: path });
                 const itemPreviewUrl = assetPreviewUrl({ localPath: path });
+                const itemIsVideo = assetIsVideoPath(path);
                 const annotationCount = (annotationsByPath[path] || []).length;
                 const active = path === activePath;
                 return (
@@ -4489,7 +4592,13 @@ export function SnippingAnnotationEditorWindow() {
                     title={itemName}
                     type="button"
                   >
-                    {itemPreviewUrl ? <img alt="" draggable={false} src={itemPreviewUrl} /> : <span>{index + 1}</span>}
+                    {itemPreviewUrl ? (
+                      itemIsVideo ? (
+                        <video aria-hidden="true" draggable={false} muted playsInline src={itemPreviewUrl} />
+                      ) : (
+                        <img alt="" draggable={false} src={itemPreviewUrl} />
+                      )
+                    ) : <span>{index + 1}</span>}
                     <strong>{index + 1}</strong>
                     {annotationCount > 0 && <small>{annotationCount}</small>}
                   </EditorThumbButton>
@@ -4499,97 +4608,107 @@ export function SnippingAnnotationEditorWindow() {
           )}
 
           <EditorBody>
-          <EditorStage data-image-state={imageLoadState} ref={stageRef}>
-            {imageLoading && previewUrl ? (
-              <EditorLoadingPreviewImage alt="" aria-hidden="true" draggable={false} src={previewUrl} />
-            ) : null}
-            <EditorCanvasViewport aria-busy={!imageReady} ref={viewportRef}>
-              <EditorCanvasSizer>
-                <canvas
-                  aria-label="Snip annotation canvas"
-                  data-ready={imageReady ? "true" : "false"}
-                  onMouseDown={beginDraw}
-                  onMouseLeave={handleCanvasMouseLeave}
-                  onMouseMove={handleCanvasMouseMove}
-                  onMouseUp={finishDraw}
-                  ref={canvasRef}
-                  style={canvasSize.width > 0 ? { width: displayWidth, height: displayHeight } : undefined}
-                />
-              </EditorCanvasSizer>
-            </EditorCanvasViewport>
-            {!imageReady && !editorClosing ? (
-              <EditorImageLoadingOverlay
-                aria-live="polite"
-                data-state={imageLoadState}
-                role="status"
-              >
-                {imageLoading ? <EditorImageLoadingSpinner aria-hidden="true" /> : null}
-                <strong>
-                  {imageLoadFailed ? "Unable to load image" : imageLoadState === "empty" ? "No image selected" : "Loading image"}
-                </strong>
-                <span>{imageLoadFailed || imageLoadState === "empty" ? status : name}</span>
-              </EditorImageLoadingOverlay>
-            ) : null}
-            {textEditor && (() => {
-              const card = resolveTextCardStyle(textBg, color);
-              return (
-                <EditorTextOverlayInput
-                  autoFocus
-                  aria-label="Text annotation"
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setTextEditor((current) => (current ? { ...current, value } : current));
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      commitTextEditor();
-                    } else if (event.key === "Escape") {
-                      setTextEditor(null);
-                    }
-                  }}
-                  placeholder="Type…"
-                  rows={textEditor.value.split("\n").length}
-                  style={{
-                    left: textEditor.left,
-                    top: textEditor.top,
-                    fontSize: Math.max(11, textFontPx * textEditor.scale),
-                    color: card.textColor,
-                    background: card.bg || "transparent",
-                    width: `${Math.min(48, Math.max(8, textEditor.value.split("\n")
-                      .reduce((max, line) => Math.max(max, line.length), 0) + 3))}ch`,
-                  }}
-                  value={textEditor.value}
-                />
-              );
-            })()}
+          <EditorStage data-image-state={imageLoadState} data-media={activeIsVideo ? "video" : "image"} ref={stageRef}>
+            {activeIsVideo ? (
+              <EditorVideoPlayer controls playsInline src={previewUrl} />
+            ) : (
+              <>
+                {imageLoading && previewUrl ? (
+                  <EditorLoadingPreviewImage alt="" aria-hidden="true" draggable={false} src={previewUrl} />
+                ) : null}
+                <EditorCanvasViewport aria-busy={!imageReady} ref={viewportRef}>
+                  <EditorCanvasSizer>
+                    <canvas
+                      aria-label="Snip annotation canvas"
+                      data-ready={imageReady ? "true" : "false"}
+                      onMouseDown={beginDraw}
+                      onMouseLeave={handleCanvasMouseLeave}
+                      onMouseMove={handleCanvasMouseMove}
+                      onMouseUp={finishDraw}
+                      ref={canvasRef}
+                      style={canvasSize.width > 0 ? { width: displayWidth, height: displayHeight } : undefined}
+                    />
+                  </EditorCanvasSizer>
+                </EditorCanvasViewport>
+                {!imageReady && !editorClosing ? (
+                  <EditorImageLoadingOverlay
+                    aria-live="polite"
+                    data-state={imageLoadState}
+                    role="status"
+                  >
+                    {imageLoading ? <EditorImageLoadingSpinner aria-hidden="true" /> : null}
+                    <strong>
+                      {imageLoadFailed ? "Unable to load image" : imageLoadState === "empty" ? "No image selected" : "Loading image"}
+                    </strong>
+                    <span>{imageLoadFailed || imageLoadState === "empty" ? status : name}</span>
+                  </EditorImageLoadingOverlay>
+                ) : null}
+                {textEditor && (() => {
+                  const card = resolveTextCardStyle(textBg, color);
+                  return (
+                    <EditorTextOverlayInput
+                      autoFocus
+                      aria-label="Text annotation"
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setTextEditor((current) => (current ? { ...current, value } : current));
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && !event.shiftKey) {
+                          event.preventDefault();
+                          commitTextEditor();
+                        } else if (event.key === "Escape") {
+                          setTextEditor(null);
+                        }
+                      }}
+                      placeholder="Type…"
+                      rows={textEditor.value.split("\n").length}
+                      style={{
+                        left: textEditor.left,
+                        top: textEditor.top,
+                        fontSize: Math.max(11, textFontPx * textEditor.scale),
+                        color: card.textColor,
+                        background: card.bg || "transparent",
+                        width: `${Math.min(48, Math.max(8, textEditor.value.split("\n")
+                          .reduce((max, line) => Math.max(max, line.length), 0) + 3))}ch`,
+                      }}
+                      value={textEditor.value}
+                    />
+                  );
+                })()}
+              </>
+            )}
             {/* Creation tools stay on the left rail; the act-on-the-result
                 buttons live top-right (under the batch strip when several
                 images are selected) where they are quickest to reach. */}
             <EditorActionCluster aria-label="Annotation actions">
-              <EditorToolButton aria-label="Zoom out" disabled={!imageReady} onClick={() => setZoomAnchored(zoom / 1.25)} title="Zoom out" type="button">
-                <ZoomOut aria-hidden="true" />
-              </EditorToolButton>
-              <EditorZoomReadout
-                aria-label="Reset zoom to fit"
-                disabled={!imageReady}
-                onClick={() => setZoom(1)}
-                title="Reset zoom to fit"
-                type="button"
-              >
-                {Math.round(fitScale * zoom * 100)}%
-              </EditorZoomReadout>
-              <EditorToolButton aria-label="Zoom in" disabled={!imageReady} onClick={() => setZoomAnchored(zoom * 1.25)} title="Zoom in" type="button">
-                <ZoomIn aria-hidden="true" />
-              </EditorToolButton>
-              <EditorBarDivider aria-hidden="true" />
-              <EditorToolButton aria-label="Undo" disabled={!imageReady || !annotations.length} onClick={undo} title="Undo" type="button">
-                <Undo aria-hidden="true" />
-              </EditorToolButton>
-              <EditorToolButton aria-label="Clear annotations" disabled={!imageReady || !annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
-                <Delete aria-hidden="true" />
-              </EditorToolButton>
-              <EditorToolButton aria-label="Copy annotated image" disabled={!imageReady} onClick={copyCanvas} title="Copy image" type="button">
+              {!activeIsVideo && (
+                <>
+                  <EditorToolButton aria-label="Zoom out" disabled={!imageReady} onClick={() => setZoomAnchored(zoom / 1.25)} title="Zoom out" type="button">
+                    <ZoomOut aria-hidden="true" />
+                  </EditorToolButton>
+                  <EditorZoomReadout
+                    aria-label="Reset zoom to fit"
+                    disabled={!imageReady}
+                    onClick={() => setZoom(1)}
+                    title="Reset zoom to fit"
+                    type="button"
+                  >
+                    {Math.round(fitScale * zoom * 100)}%
+                  </EditorZoomReadout>
+                  <EditorToolButton aria-label="Zoom in" disabled={!imageReady} onClick={() => setZoomAnchored(zoom * 1.25)} title="Zoom in" type="button">
+                    <ZoomIn aria-hidden="true" />
+                  </EditorToolButton>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorToolButton aria-label="Undo" disabled={!imageReady || !annotations.length} onClick={undo} title="Undo" type="button">
+                    <Undo aria-hidden="true" />
+                  </EditorToolButton>
+                  <EditorToolButton aria-label="Clear annotations" disabled={!imageReady || !annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
+                    <Delete aria-hidden="true" />
+                  </EditorToolButton>
+                </>
+              )}
+              <EditorToolButton aria-label={activeIsVideo ? "Copy recording" : "Copy annotated image"} disabled={!mediaReady} onClick={copyCanvas} title={activeIsVideo ? "Copy recording" : "Copy image"} type="button">
                 <ContentCopy aria-hidden="true" />
               </EditorToolButton>
               <EditorToolButton
@@ -4612,6 +4731,7 @@ export function SnippingAnnotationEditorWindow() {
                 appends its own controls (shape kind/fill, blur strategy and
                 power, text card background, crop reset) instead of cramming
                 everything into the rail. */}
+            {!activeIsVideo && (
             <EditorOptionsBar aria-label="Style and tool options">
               <EditorToolGroup data-compact="true" data-row="true">
                 {COLOR_OPTIONS.map((option) => (
@@ -4743,12 +4863,14 @@ export function SnippingAnnotationEditorWindow() {
                 </>
               )}
             </EditorOptionsBar>
+            )}
           </EditorStage>
 
           {/* The rail lives beside both the stage and the composer (the body
               is its positioning context), so it can use the editor's full
               height; auto margins inside center the tool stack when there is
               extra room. */}
+          {!activeIsVideo && (
           <EditorFloatingRail aria-label="Annotation tools">
             {TOOL_GROUPS.map((group, groupIndex) => (
               <Fragment key={group[0].id}>
@@ -4771,14 +4893,17 @@ export function SnippingAnnotationEditorWindow() {
               </Fragment>
             ))}
           </EditorFloatingRail>
+          )}
 
           <EditorComposer onSubmit={queueTodo}>
-            <EditorComposerInner data-disabled={!hasDispatchTargets ? "true" : "false"}>
+            <EditorComposerInner data-disabled={!canSendToComposer ? "true" : "false"}>
               <input
                 aria-label="Todo for coding agent"
-                disabled={!hasDispatchTargets}
+                disabled={!canSendToComposer}
                 onChange={(event) => setTodoDraft(event.target.value)}
-                placeholder={hasDispatchTargets
+                placeholder={containsVideo
+                  ? "Recordings cannot be sent to terminals."
+                  : hasDispatchTargets
                   ? "Circle an area, describe the fix, send it to an agent…"
                   : "Open an active coding-agent terminal to send a todo…"}
                 value={todoDraft}
@@ -4787,7 +4912,7 @@ export function SnippingAnnotationEditorWindow() {
                 <Select
                   aria-label="Target workspace"
                   formatOptionLabel={workspaceOptionLabelRenderer}
-                  isDisabled={!hasDispatchTargets}
+                  isDisabled={!canSendToComposer}
                   isSearchable={false}
                   menuPlacement="top"
                   onChange={(option) => setTargetWorkspaceId(option?.value || "")}
@@ -4799,7 +4924,7 @@ export function SnippingAnnotationEditorWindow() {
                 <Select
                   aria-label="Target terminal"
                   formatOptionLabel={terminalOptionLabelRenderer}
-                  isDisabled={!hasDispatchTargets || !(targetWorkspace?.threads || []).length}
+                  isDisabled={!canSendToComposer || !(targetWorkspace?.threads || []).length}
                   isSearchable={false}
                   menuPlacement="top"
                   onChange={(option) => setTargetThreadId(option?.value || "")}
@@ -4808,7 +4933,7 @@ export function SnippingAnnotationEditorWindow() {
                   styles={TARGET_SELECT_STYLES}
                   value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
                 />
-                <EditorSendButton aria-label="Queue todo with this image" disabled={!imageReady || !hasDispatchTargets || !todoDraft.trim()} title="Queue todo with this image" type="submit">
+                <EditorSendButton aria-label="Queue todo with this image" disabled={!imageReady || !canSendToComposer || !todoDraft.trim()} title="Queue todo with this image" type="submit">
                   <Send aria-hidden="true" />
                 </EditorSendButton>
               </EditorComposerControls>
@@ -5558,7 +5683,8 @@ const EditorThumbButton = styled.button`
   background: rgba(255, 255, 255, 0.055);
   cursor: pointer;
 
-  img {
+  img,
+  video {
     display: block;
     width: 100%;
     height: 100%;
@@ -5648,6 +5774,10 @@ const EditorStage = styled.section`
     radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
     #05070b;
 
+  &[data-media="video"] {
+    padding: 52px 14px 18px;
+  }
+
   canvas {
     display: block;
     border-radius: 8px;
@@ -5665,6 +5795,20 @@ const EditorStage = styled.section`
     pointer-events: none;
     box-shadow: none;
   }
+`;
+
+const EditorVideoPlayer = styled.video`
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 8px;
+  background: #02040a;
+  box-shadow:
+    0 0 0 1px rgba(230, 236, 245, 0.25),
+    0 0 0 2px rgba(2, 4, 8, 0.95),
+    0 18px 54px rgba(0, 0, 0, 0.55);
+  object-fit: contain;
 `;
 
 const EditorLoadingPreviewImage = styled.img`

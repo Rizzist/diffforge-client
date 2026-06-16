@@ -425,6 +425,10 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "diffforge-open" => {
+                if snipping_recording_active(app) {
+                    let _ = snipping_stop_recording_for(app, "tray-menu");
+                    return;
+                }
                 if app_is_in_background_mode() {
                     app_exit_background_internal(app);
                 } else {
@@ -432,9 +436,17 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
                 }
             }
             "diffforge-monitor" => {
+                if snipping_recording_active(app) {
+                    let _ = snipping_stop_recording_for(app, "tray-menu");
+                    return;
+                }
                 background_monitor_show_near_tray_corner(app);
             }
             "diffforge-snips" => {
+                if snipping_recording_active(app) {
+                    let _ = snipping_stop_recording_for(app, "tray-menu");
+                    return;
+                }
                 snipping_strip_toggle(app);
             }
             "diffforge-quit" => {
@@ -461,6 +473,10 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
             } = event
             {
                 let app = tray.app_handle();
+                if snipping_recording_active(app) {
+                    let _ = snipping_stop_recording_for(app, "tray-click");
+                    return;
+                }
                 if app_is_in_background_mode() {
                     background_monitor_toggle_at(app, Some((position.x, position.y)));
                 } else {
@@ -483,4 +499,3 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
     // lost, which showed as an invisible-but-clickable bar.
     let _ = snipping_strip_window(app);
 }
-

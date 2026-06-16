@@ -9281,6 +9281,12 @@ struct ForgeDictationResult {
     cancelled: bool,
     llm_cleaned: bool,
     audio_seconds: i64,
+    cleanup_provider: String,
+    cleanup_model: String,
+    cleanup_ms: u64,
+    stt_ms: u64,
+    llm_ms: u64,
+    total_ms: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -9293,6 +9299,12 @@ struct ForgeDictationRawResultEvent {
     cleanup_pending: bool,
     llm_cleanup_requested: bool,
     audio_seconds: i64,
+    cleanup_provider: String,
+    cleanup_model: String,
+    cleanup_ms: u64,
+    stt_ms: u64,
+    llm_ms: u64,
+    total_ms: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -9313,6 +9325,10 @@ struct AudioTranscriptionPolishResult {
     raw_text: String,
     llm_cleaned: bool,
     cleanup_ms: u64,
+    stt_ms: u64,
+    llm_ms: u64,
+    total_ms: u64,
+    provider: String,
     model: String,
 }
 
@@ -9404,6 +9420,39 @@ fn cloud_audio_response_snippet(value: &str) -> String {
         .collect::<String>()
 }
 
+fn audio_payload_text(payload: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn audio_payload_u64(payload: &Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        if let Some(value) = value.as_u64() {
+            return Some(value);
+        }
+        if let Some(value) = value.as_f64() {
+            if value.is_finite() && value >= 0.0 {
+                return Some(value.round() as u64);
+            }
+        }
+        if let Some(value) = value.as_str().and_then(|value| value.trim().parse::<u64>().ok()) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn audio_payload_timing_u64(payload: &Value, keys: &[&str]) -> Option<u64> {
+    audio_payload_u64(payload, keys)
+        .or_else(|| payload.get("timings").and_then(|timings| audio_payload_u64(timings, keys)))
+}
+
 fn forge_dictation_result_from_payload(
     payload: &Value,
     cancel_requested: bool,
@@ -9432,6 +9481,41 @@ fn forge_dictation_result_from_payload(
         }
     }
 
+    let cleanup = payload.get("cleanup").unwrap_or(&Value::Null);
+    let cleanup_provider = {
+        let provider = audio_payload_text(
+            payload,
+            &["cleanup_provider", "cleanupProvider", "llm_cleanup_provider", "llmCleanupProvider"],
+        );
+        if provider.is_empty() {
+            audio_payload_text(cleanup, &["provider"])
+        } else {
+            provider
+        }
+    };
+    let cleanup_model = {
+        let model = audio_payload_text(
+            payload,
+            &["cleanup_model", "cleanupModel", "llm_cleanup_model", "llmCleanupModel"],
+        );
+        if model.is_empty() {
+            audio_payload_text(cleanup, &["model"])
+        } else {
+            model
+        }
+    };
+    let cleanup_ms =
+        audio_payload_timing_u64(payload, &["cleanup_ms", "cleanupMs"]).unwrap_or(0);
+    let stt_ms = audio_payload_timing_u64(
+        payload,
+        &["stt_ms", "sttMs", "finish_to_raw_ms", "finishToRawMs"],
+    )
+    .unwrap_or(0);
+    let llm_ms =
+        audio_payload_timing_u64(payload, &["llm_ms", "llmMs"]).unwrap_or(cleanup_ms);
+    let total_ms = audio_payload_timing_u64(payload, &["total_ms", "totalMs"])
+        .unwrap_or_else(|| stt_ms.saturating_add(llm_ms));
+
     Ok(ForgeDictationResult {
         text: if text.is_empty() {
             raw_text.clone()
@@ -9451,6 +9535,12 @@ fn forge_dictation_result_from_payload(
             .get("audio_seconds")
             .and_then(Value::as_i64)
             .unwrap_or(0),
+        cleanup_provider,
+        cleanup_model,
+        cleanup_ms,
+        stt_ms,
+        llm_ms,
+        total_ms,
     })
 }
 
@@ -9680,6 +9770,42 @@ async fn polish_audio_transcription(
     }
     write_audio_transcription_polish_clipboard_text(&polished_text)?;
 
+    let cleanup_ms = audio_payload_timing_u64(data, &["cleanup_ms", "cleanupMs"]).unwrap_or(0);
+    let stt_ms = audio_payload_timing_u64(
+        data,
+        &["stt_ms", "sttMs", "finish_to_raw_ms", "finishToRawMs"],
+    )
+    .unwrap_or(0);
+    let llm_ms = audio_payload_timing_u64(data, &["llm_ms", "llmMs"]).unwrap_or(cleanup_ms);
+    let total_ms = audio_payload_timing_u64(data, &["total_ms", "totalMs"])
+        .unwrap_or_else(|| {
+            let total = stt_ms.saturating_add(llm_ms);
+            if total > 0 { total } else { cleanup_ms }
+        });
+    let provider = {
+        let provider = audio_payload_text(
+            data,
+            &["provider", "cleanup_provider", "cleanupProvider", "llm_cleanup_provider", "llmCleanupProvider"],
+        );
+        if provider.is_empty() {
+            clean_audio_cleanup_selector_field(request.cleanup_provider.as_deref())
+                .unwrap_or_default()
+        } else {
+            provider
+        }
+    };
+    let model = {
+        let model = audio_payload_text(
+            data,
+            &["model", "cleanup_model", "cleanupModel", "llm_cleanup_model", "llmCleanupModel"],
+        );
+        if model.is_empty() {
+            clean_audio_cleanup_selector_field(request.cleanup_model.as_deref()).unwrap_or_default()
+        } else {
+            model
+        }
+    };
+
     Ok(AudioTranscriptionPolishResult {
         text: polished_text,
         raw_text: data
@@ -9694,17 +9820,12 @@ async fn polish_audio_transcription(
             .or_else(|| data.get("llmCleaned"))
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        cleanup_ms: data
-            .get("cleanup_ms")
-            .or_else(|| data.get("cleanupMs"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        model: data
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
+        cleanup_ms,
+        stt_ms,
+        llm_ms,
+        total_ms,
+        provider,
+        model,
     })
 }
 
@@ -9995,6 +10116,14 @@ async fn run_forge_dictation_stream(
                                                         .and_then(Value::as_bool)
                                                         .unwrap_or(false),
                                                     audio_seconds: result.audio_seconds,
+                                                    cleanup_provider: result
+                                                        .cleanup_provider
+                                                        .clone(),
+                                                    cleanup_model: result.cleanup_model.clone(),
+                                                    cleanup_ms: result.cleanup_ms,
+                                                    stt_ms: result.stt_ms,
+                                                    llm_ms: result.llm_ms,
+                                                    total_ms: result.total_ms,
                                                 },
                                             );
                                         }
@@ -10066,6 +10195,74 @@ async fn run_forge_dictation_stream(
                                                         .get("llm_cleaned")
                                                         .and_then(Value::as_bool)
                                                         .unwrap_or(false);
+                                                    if let Some(provider) = [
+                                                        "cleanup_provider",
+                                                        "cleanupProvider",
+                                                        "llm_cleanup_provider",
+                                                        "llmCleanupProvider",
+                                                    ]
+                                                    .iter()
+                                                    .find_map(|key| {
+                                                        frame
+                                                            .get(*key)
+                                                            .and_then(Value::as_str)
+                                                            .map(str::trim)
+                                                            .filter(|value| !value.is_empty())
+                                                    }) {
+                                                        result.cleanup_provider =
+                                                            provider.to_string();
+                                                    }
+                                                    if let Some(model) = [
+                                                        "cleanup_model",
+                                                        "cleanupModel",
+                                                        "llm_cleanup_model",
+                                                        "llmCleanupModel",
+                                                    ]
+                                                    .iter()
+                                                    .find_map(|key| {
+                                                        frame
+                                                            .get(*key)
+                                                            .and_then(Value::as_str)
+                                                            .map(str::trim)
+                                                            .filter(|value| !value.is_empty())
+                                                    }) {
+                                                        result.cleanup_model = model.to_string();
+                                                    }
+                                                    result.cleanup_ms = audio_payload_timing_u64(
+                                                        &frame,
+                                                        &["cleanup_ms", "cleanupMs"],
+                                                    )
+                                                    .unwrap_or(result.cleanup_ms);
+                                                    result.stt_ms = audio_payload_timing_u64(
+                                                        &frame,
+                                                        &[
+                                                            "stt_ms",
+                                                            "sttMs",
+                                                            "finish_to_raw_ms",
+                                                            "finishToRawMs",
+                                                        ],
+                                                    )
+                                                    .unwrap_or(result.stt_ms);
+                                                    result.llm_ms = audio_payload_timing_u64(
+                                                        &frame,
+                                                        &["llm_ms", "llmMs"],
+                                                    )
+                                                    .unwrap_or_else(|| {
+                                                        if result.cleanup_ms > 0 {
+                                                            result.cleanup_ms
+                                                        } else {
+                                                            result.llm_ms
+                                                        }
+                                                    });
+                                                    result.total_ms = audio_payload_timing_u64(
+                                                        &frame,
+                                                        &["total_ms", "totalMs"],
+                                                    )
+                                                    .unwrap_or_else(|| {
+                                                        result
+                                                            .stt_ms
+                                                            .saturating_add(result.llm_ms)
+                                                    });
                                                     log_audio_diagnostic_event(
                                                         "audio.forge_dictation.cleaned_received",
                                                         json!({
@@ -10073,7 +10270,10 @@ async fn run_forge_dictation_stream(
                                                                 .elapsed()
                                                                 .as_millis() as u64,
                                                             "llm_cleaned": result.llm_cleaned,
-                                                            "cleanup_ms": frame.get("cleanup_ms"),
+                                                            "cleanup_ms": result.cleanup_ms,
+                                                            "stt_ms": result.stt_ms,
+                                                            "llm_ms": result.llm_ms,
+                                                            "total_ms": result.total_ms,
                                                         }),
                                                     );
                                                     break;
@@ -10651,6 +10851,12 @@ async fn stop_forge_dictation_transcription(
             cancelled: cancel,
             llm_cleaned: false,
             audio_seconds: 0,
+            cleanup_provider: String::new(),
+            cleanup_model: String::new(),
+            cleanup_ms: 0,
+            stt_ms: 0,
+            llm_ms: 0,
+            total_ms: 0,
         });
     };
 

@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { CropFree } from "@styled-icons/material-rounded/CropFree";
 import { ScreenshotMonitor } from "@styled-icons/material-rounded/ScreenshotMonitor";
+import { Videocam } from "@styled-icons/material-rounded/Videocam";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { createGlobalStyle } from "styled-components";
 
@@ -42,6 +43,7 @@ const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED = true;
 const SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS = 120;
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
+const SNIPPING_ACTION_RECORDING = "area-recording";
 
 function clearOverlaySnapshotPath(monitor) {
   if (!monitor || typeof monitor !== "object") return monitor || null;
@@ -92,6 +94,10 @@ function defaultAreaShortcut() {
   return isMacPlatform() ? "Command+Shift+Digit4" : "Control+Shift+Digit4";
 }
 
+function defaultRecordingShortcut() {
+  return isMacPlatform() ? "Command+Shift+Digit5" : "Control+Shift+Digit5";
+}
+
 function fallbackPermissions() {
   return {
     platform: isMacPlatform() ? "macos" : "other",
@@ -109,6 +115,7 @@ function fallbackPermissions() {
 function fallbackSnippingStatus() {
   const full = defaultFullShortcut();
   const area = defaultAreaShortcut();
+  const recording = defaultRecordingShortcut();
 
   return {
     enabled: true,
@@ -123,6 +130,12 @@ function fallbackSnippingStatus() {
     areaSnip: {
       shortcut: area,
       defaultShortcut: area,
+      registered: false,
+      error: "",
+    },
+    areaRecording: {
+      shortcut: recording,
+      defaultShortcut: recording,
       registered: false,
       error: "",
     },
@@ -209,6 +222,17 @@ function shortcutConflict(left, right) {
   return Boolean(left && right && normalize(left) === normalize(right));
 }
 
+function shortcutConflictMessage(entries) {
+  for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
+      if (shortcutConflict(entries[leftIndex].shortcut, entries[rightIndex].shortcut)) {
+        return `${entries[leftIndex].label} and ${entries[rightIndex].label} need different shortcuts.`;
+      }
+    }
+  }
+  return "";
+}
+
 function assetItems(library) {
   if (Array.isArray(library?.items)) return library.items;
   if (Array.isArray(library?.assets)) return library.assets;
@@ -281,11 +305,15 @@ export default function SnippingWorkspaceView({
   const permissions = status?.permissions || fallbackPermissions();
   const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
   const areaShortcut = status?.areaSnip?.shortcut || defaultAreaShortcut();
+  const recordingShortcut = status?.areaRecording?.shortcut || defaultRecordingShortcut();
   const fullError = status?.fullScreenshot?.error || "";
   const areaError = status?.areaSnip?.error || "";
-  const shortcutConflictError = shortcutConflict(fullShortcut, areaShortcut)
-    ? "Full screenshot and area snip need different shortcuts."
-    : "";
+  const recordingError = status?.areaRecording?.error || "";
+  const shortcutConflictError = shortcutConflictMessage([
+    { label: "Full screenshot", shortcut: fullShortcut },
+    { label: "Area snip", shortcut: areaShortcut },
+    { label: "Area recording", shortcut: recordingShortcut },
+  ]);
   const permissionMissing = Boolean(
     permissions.screenCaptureRequired && !permissions.screenCaptureGranted,
   );
@@ -293,17 +321,20 @@ export default function SnippingWorkspaceView({
     && !permissionMissing
     && !fullError
     && !areaError
+    && !recordingError
     && !shortcutConflictError
     && Boolean(status?.fullScreenshot?.registered)
-    && Boolean(status?.areaSnip?.registered);
+    && Boolean(status?.areaSnip?.registered)
+    && Boolean(status?.areaRecording?.registered);
   const savingShortcut = actionState === "saving";
   const togglingSnipping = actionState === "toggling";
   const togglingDesktopIcons = actionState === "toggling-desktop-icons";
   const togglingUploadPublic = actionState === "toggling-upload-public";
   const capturingFull = actionState === "capturing-full";
   const capturingArea = actionState === "capturing-area";
+  const capturingRecording = actionState === "capturing-recording";
   const openingPermissions = actionState === "opening-permissions";
-  const captureDisabled = !snippingEnabled || capturingFull || capturingArea || togglingSnipping;
+  const captureDisabled = !snippingEnabled || capturingFull || capturingArea || capturingRecording || togglingSnipping;
 
   const snips = useMemo(() => (
     assetItems(untrackedLibrary)
@@ -442,6 +473,19 @@ export default function SnippingWorkspaceView({
     }
   }, [snippingEnabled]);
 
+  const captureRecording = useCallback(async () => {
+    if (!snippingEnabled) return;
+    setActionState("capturing-recording");
+    setError("");
+    try {
+      await invoke("snipping_begin_area_recording");
+    } catch (captureError) {
+      setError(getErrorMessage(captureError, "Unable to start area recording."));
+    } finally {
+      setActionState("idle");
+    }
+  }, [snippingEnabled]);
+
   const openSnip = useCallback(async (asset) => {
     const localPath = assetLocalPath(asset);
     if (!localPath) return;
@@ -523,7 +567,7 @@ export default function SnippingWorkspaceView({
           </VaultPlaceholderIcon>
           <div>
             <h2>Snipping</h2>
-            <p>Screenshot and area snip straight into local-only untracked assets.</p>
+            <p>Screenshots, area snips, and recordings straight into local-only untracked assets.</p>
           </div>
           <SnippingHeaderActions>
             <McpSwitchButton
@@ -551,8 +595,8 @@ export default function SnippingWorkspaceView({
                   : "Turn on Snipping before taking screenshots."}
                 </SettingsHint>
               </div>
-              <AudioStatePill data-installed={snippingEnabled && !capturingFull && !capturingArea}>
-                {!snippingEnabled ? "Disabled" : capturingFull || capturingArea ? "Capturing" : "Local only"}
+              <AudioStatePill data-installed={snippingEnabled && !capturingFull && !capturingArea && !capturingRecording}>
+                {!snippingEnabled ? "Disabled" : capturingFull || capturingArea || capturingRecording ? "Capturing" : "Local only"}
               </AudioStatePill>
             </AudioDeviceHeader>
             <SnippingButtonGrid>
@@ -563,6 +607,10 @@ export default function SnippingWorkspaceView({
               <SecondaryButton disabled={captureDisabled} onClick={captureArea} type="button">
                 <CropFree aria-hidden="true" />
                 <span>{capturingArea ? "Opening..." : "Select area"}</span>
+              </SecondaryButton>
+              <SecondaryButton disabled={captureDisabled} onClick={captureRecording} type="button">
+                <Videocam aria-hidden="true" />
+                <span>{capturingRecording ? "Opening..." : "Record area"}</span>
               </SecondaryButton>
             </SnippingButtonGrid>
             <SettingsHint>
@@ -620,7 +668,7 @@ export default function SnippingWorkspaceView({
               </SnippingInfoTile>
               <SnippingInfoTile>
                 <span>Shortcuts</span>
-                <strong>{!snippingEnabled ? "Disabled" : status?.fullScreenshot?.registered && status?.areaSnip?.registered ? "Registered" : "Unavailable"}</strong>
+                <strong>{!snippingEnabled ? "Disabled" : status?.fullScreenshot?.registered && status?.areaSnip?.registered && status?.areaRecording?.registered ? "Registered" : "Unavailable"}</strong>
               </SnippingInfoTile>
             </SnippingPermissionGrid>
             {permissionMissing && (
@@ -641,8 +689,8 @@ export default function SnippingWorkspaceView({
               <SettingsLabel>Bindings</SettingsLabel>
               <SettingsHint>Global hotkeys are registered only while Snipping is on.</SettingsHint>
             </div>
-            <AudioStatePill data-installed={snippingEnabled && !fullError && !areaError && !shortcutConflictError}>
-              {!snippingEnabled ? "Disabled" : savingShortcut ? "Saving" : fullError || areaError || shortcutConflictError ? "Conflict" : "Ready"}
+            <AudioStatePill data-installed={snippingEnabled && !fullError && !areaError && !recordingError && !shortcutConflictError}>
+              {!snippingEnabled ? "Disabled" : savingShortcut ? "Saving" : fullError || areaError || recordingError || shortcutConflictError ? "Conflict" : "Ready"}
             </AudioStatePill>
           </AudioDeviceHeader>
 
@@ -674,11 +722,25 @@ export default function SnippingWorkspaceView({
               </AudioShortcutActions>
               {(areaError || shortcutConflictError) && <AudioInputMeta>{areaError || shortcutConflictError}</AudioInputMeta>}
             </AudioShortcutCard>
+
+            <AudioShortcutCard data-error={Boolean(recordingError || shortcutConflictError)}>
+              <span>Area recording</span>
+              <AudioShortcutKey data-capturing={capturingShortcut === SNIPPING_ACTION_RECORDING}>
+                {capturingShortcut === SNIPPING_ACTION_RECORDING ? "Press key" : formatShortcutLabel(recordingShortcut)}
+              </AudioShortcutKey>
+              <AudioShortcutActions>
+                <SecondaryButton disabled={savingShortcut} onClick={() => setCapturingShortcut(SNIPPING_ACTION_RECORDING)} type="button">
+                  <ButtonKeyIcon aria-hidden="true" />
+                  <span>{capturingShortcut === SNIPPING_ACTION_RECORDING ? "Listening..." : "Change"}</span>
+                </SecondaryButton>
+              </AudioShortcutActions>
+              {(recordingError || shortcutConflictError) && <AudioInputMeta>{recordingError || shortcutConflictError}</AudioInputMeta>}
+            </AudioShortcutCard>
           </AudioShortcutGrid>
 
           <AudioRecorderOptionRow>
             <SettingsHint>
-              Defaults: {formatShortcutLabel(status?.fullScreenshot?.defaultShortcut || defaultFullShortcut())} / {formatShortcutLabel(status?.areaSnip?.defaultShortcut || defaultAreaShortcut())}
+              Defaults: {formatShortcutLabel(status?.fullScreenshot?.defaultShortcut || defaultFullShortcut())} / {formatShortcutLabel(status?.areaSnip?.defaultShortcut || defaultAreaShortcut())} / {formatShortcutLabel(status?.areaRecording?.defaultShortcut || defaultRecordingShortcut())}
             </SettingsHint>
             <SecondaryButton disabled={savingShortcut} onClick={resetShortcuts} type="button">
               <ButtonRefreshIcon aria-hidden="true" />
@@ -698,6 +760,8 @@ export function SnippingOverlayWindow() {
   const [error, setError] = useState("");
   const [capturing, setCapturing] = useState(false);
   const [overlayMonitor, setOverlayMonitor] = useState(null);
+  const [overlayMode, setOverlayMode] = useState("image");
+  const [pendingRecordingSelection, setPendingRecordingSelection] = useState(null);
   const dragRef = useRef(null);
   const activePointerIdRef = useRef(null);
   const capturingRef = useRef(false);
@@ -795,6 +859,7 @@ export function SnippingOverlayWindow() {
   }, [overlayMonitor]);
 
   const selection = useMemo(() => {
+    if (pendingRecordingSelection) return pendingRecordingSelection;
     if (!drag) return null;
     const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
     const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
@@ -803,7 +868,7 @@ export function SnippingOverlayWindow() {
     const width = Math.min(Math.abs(drag.endX - drag.startX), Math.max(0, viewportWidth - left));
     const height = Math.min(Math.abs(drag.endY - drag.startY), Math.max(0, viewportHeight - top));
     return { left, top, width, height };
-  }, [drag]);
+  }, [drag, pendingRecordingSelection]);
 
   const closeOverlay = useCallback(async (reason = "request") => {
     logCursorDebug("close_overlay", cursorDebugSnapshot(null, { reason }));
@@ -811,6 +876,7 @@ export function SnippingOverlayWindow() {
     activePointerIdRef.current = null;
     dragRef.current = null;
     setDrag(null);
+    setPendingRecordingSelection(null);
     setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
     try {
       await invoke("snipping_cancel_area_snip");
@@ -823,22 +889,25 @@ export function SnippingOverlayWindow() {
     }
   }, [cursorDebugSnapshot, logCursorDebug, setCapturingState]);
 
-  const applyOverlayMonitor = useCallback((monitor) => {
+  const applyOverlayMonitor = useCallback((monitor, mode = "image") => {
     setOverlayMonitor(monitor && typeof monitor === "object" ? monitor : null);
+    setOverlayMode(mode === "recording" ? "recording" : "image");
     setError("");
     if (dragRef.current || activePointerIdRef.current !== null || capturingRef.current) {
       return;
     }
     setCapturingState(false);
     setDrag(null);
+    setPendingRecordingSelection(null);
   }, [setCapturingState]);
 
   const loadOverlayStatus = useCallback(async () => {
     try {
       const status = await invoke("snipping_area_overlay_status");
-      applyOverlayMonitor(status?.monitor || null);
+      applyOverlayMonitor(status?.monitor || null, status?.mode);
       logCursorDebug("status_loaded", cursorDebugSnapshot(null, {
         overlayMonitor: status?.monitor || null,
+        mode: status?.mode,
       }));
     } catch (statusError) {
       const message = getErrorMessage(statusError, "Unable to prepare snipping overlay.");
@@ -872,8 +941,12 @@ export function SnippingOverlayWindow() {
       logCursorDebug("overlay_started_event", cursorDebugSnapshot(null, {
         targetLabel,
         monitor: event.payload?.monitor || event.payload || null,
+        mode: event.payload?.mode,
       }));
-      applyOverlayMonitor(clearOverlaySnapshotPath(event.payload?.monitor || event.payload || null));
+      applyOverlayMonitor(
+        clearOverlaySnapshotPath(event.payload?.monitor || event.payload || null),
+        event.payload?.mode,
+      );
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -950,6 +1023,9 @@ export function SnippingOverlayWindow() {
   }, [cursorDebugSnapshot, logCursorDebug, releasePointerCapture]);
 
   const beginDrag = useCallback((event) => {
+    if (event.target?.closest?.("button")) {
+      return;
+    }
     if ((event.pointerType === "mouse" && event.button !== 0) || capturingRef.current) {
       logCursorDebug("pointer_down_ignored", cursorDebugSnapshot(event, {
         reason: capturingRef.current ? "capturing" : "non_primary_mouse_button",
@@ -966,6 +1042,7 @@ export function SnippingOverlayWindow() {
       activePointerIdRef.current = null;
     }
     const point = overlayPoint(event);
+    setPendingRecordingSelection(null);
     const nextDrag = {
       startX: point.x,
       startY: point.y,
@@ -1041,6 +1118,18 @@ export function SnippingOverlayWindow() {
       return;
     }
 
+    if (overlayMode === "recording") {
+      const nextSelection = { left, top, width, height };
+      setPendingRecordingSelection(nextSelection);
+      setDrag(null);
+      setCapturingState(false);
+      setError("");
+      logCursorDebug("finish_recording_selection_ready", cursorDebugSnapshot(event, {
+        selection: nextSelection,
+      }));
+      return;
+    }
+
     setCapturingState(true);
     setError("");
     const overlayWindow = getCurrentWindow();
@@ -1078,7 +1167,55 @@ export function SnippingOverlayWindow() {
       }));
       setError(message);
     }
-  }, [closeOverlay, cursorDebugSnapshot, logCursorDebug, releasePointerCapture, setCapturingState]);
+  }, [closeOverlay, cursorDebugSnapshot, logCursorDebug, overlayMode, releasePointerCapture, setCapturingState]);
+
+  const startRecording = useCallback(async (event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!pendingRecordingSelection || capturingRef.current) return;
+    setCapturingState(true);
+    setError("");
+    const overlayWindow = getCurrentWindow();
+    try {
+      logCursorDebug("recording_start_request", cursorDebugSnapshot(event, {
+        selection: pendingRecordingSelection,
+      }));
+      await invoke("snipping_start_area_recording", {
+        request: {
+          x: pendingRecordingSelection.left,
+          y: pendingRecordingSelection.top,
+          width: pendingRecordingSelection.width,
+          height: pendingRecordingSelection.height,
+          scaleFactor: window.devicePixelRatio || 1,
+        },
+      });
+      setPendingRecordingSelection(null);
+      setCapturingState(false);
+      setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
+      try {
+        await overlayWindow.hide();
+      } catch {
+        // Rust also hides the overlay after recording starts.
+      }
+    } catch (recordingError) {
+      setCapturingState(false);
+      const message = getErrorMessage(recordingError, "Unable to start recording.");
+      logCursorDebug("recording_start_error", cursorDebugSnapshot(event, {
+        message,
+        selection: pendingRecordingSelection,
+      }));
+      setError(message);
+    }
+  }, [cursorDebugSnapshot, logCursorDebug, pendingRecordingSelection, setCapturingState]);
+
+  const cancelRecordingSelection = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setPendingRecordingSelection(null);
+    setDrag(null);
+    dragRef.current = null;
+    setError("");
+  }, []);
 
   return (
     <>
@@ -1095,12 +1232,13 @@ export function SnippingOverlayWindow() {
       >
         {!selection && !capturing && (
           <SnippingOverlayHint aria-hidden="true">
-            Drag to snip · Esc to cancel
+            {overlayMode === "recording" ? "Drag to record · Esc to cancel" : "Drag to snip · Esc to cancel"}
           </SnippingOverlayHint>
         )}
         {selection && (
           <SnippingSelectionBox
-            aria-hidden="true"
+            aria-hidden={overlayMode === "recording" && pendingRecordingSelection && !capturing ? undefined : "true"}
+            data-controls={overlayMode === "recording" && pendingRecordingSelection && !capturing ? "true" : "false"}
             style={{
               left: `${selection.left}px`,
               top: `${selection.top}px`,
@@ -1109,6 +1247,17 @@ export function SnippingOverlayWindow() {
             }}
           >
             <span>{Math.round(selection.width)} × {Math.round(selection.height)}</span>
+            {overlayMode === "recording" && pendingRecordingSelection && !capturing && (
+              <SnippingRecordingControls aria-hidden="false">
+                <button onClick={startRecording} onPointerDown={(event) => event.stopPropagation()} type="button">
+                  <Videocam aria-hidden="true" />
+                  Record
+                </button>
+                <button onClick={cancelRecordingSelection} onPointerDown={(event) => event.stopPropagation()} type="button">
+                  Cancel
+                </button>
+              </SnippingRecordingControls>
+            )}
           </SnippingSelectionBox>
         )}
         {error && <SnippingOverlayError>{error}</SnippingOverlayError>}
@@ -1157,12 +1306,16 @@ const SnippingHeaderActions = styled.div`
 
 const SnippingButtonGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 
   button {
     min-height: 42px;
     justify-content: center;
+  }
+
+  @media (max-width: 760px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   @media (max-width: 580px) {
@@ -1366,6 +1519,10 @@ const SnippingSelectionBox = styled.div`
     0 0 0 100000px rgba(8, 10, 14, 0.14);
   pointer-events: none;
 
+  &[data-controls="true"] {
+    pointer-events: auto;
+  }
+
   span {
     position: absolute;
     left: 50%;
@@ -1384,6 +1541,47 @@ const SnippingSelectionBox = styled.div`
     line-height: 1;
     white-space: nowrap;
     transform: translateX(-50%);
+  }
+`;
+
+const SnippingRecordingControls = styled.div`
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: auto;
+
+  button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-width: 78px;
+    height: 30px;
+    padding: 0 11px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 7px;
+    color: rgba(248, 250, 252, 0.9);
+    background: rgba(10, 12, 16, 0.88);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    font-size: 12px;
+    font-weight: 760;
+    line-height: 1;
+    cursor: pointer !important;
+    backdrop-filter: blur(12px);
+  }
+
+  button:first-child {
+    border-color: rgba(248, 113, 113, 0.38);
+    background: rgba(185, 28, 28, 0.86);
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
   }
 `;
 

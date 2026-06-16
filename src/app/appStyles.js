@@ -9261,11 +9261,14 @@ export const AudioHistoryVariantButton = styled.button`
 
 export const AudioHistoryVariantLabel = styled.span`
   min-width: 52px;
+  max-width: 148px;
+  overflow: hidden;
   color: var(--forge-text-soft);
   font-size: 10px;
   font-weight: 820;
   line-height: 1;
   text-align: center;
+  text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
 
