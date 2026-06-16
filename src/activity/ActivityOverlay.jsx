@@ -10,6 +10,7 @@ export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.c
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT = "cloud-mcp-account-assets-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
+const CLOUD_MCP_SYNC_STATUS_EVENT = "cloud-mcp-sync-status";
 // Dictation history: written by the audio widget window, shared via the
 // app-wide localStorage; every publish also broadcasts this event.
 const AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY = "diffforge.audio.transcriptionHistory";
@@ -342,7 +343,7 @@ function statusKey(value, fallback = "active") {
   if (["complete", "completed", "done", "success", "succeeded", "accepted", "merged", "synced", "ready", "uploaded", "downloaded", "cloud-available", "local-available"].includes(normalized)) {
     return "done";
   }
-  if (["running", "active", "processing", "submitting", "validating", "syncing", "uploading", "downloading", "transferring", "checking", "diffing", "applying", "sending", "started", "in-flight", "in-progress"].includes(normalized)) {
+  if (["running", "active", "processing", "submitting", "validating", "syncing", "uploading", "downloading", "transferring", "checking", "diffing", "applying", "hydrating", "streaming", "verifying", "committing", "receiving", "sending", "started", "in-flight", "in-progress"].includes(normalized)) {
     return "active";
   }
   if (["queued", "pending", "requested", "prepared", "preparing", "waiting"].includes(normalized)) {
@@ -1056,6 +1057,377 @@ function transferUpdatedAt(transfer) {
   );
 }
 
+const SYNC_ACTIVITY_DOMAIN_LABELS = {
+  architectures: "Architectures",
+  assets: "Assets",
+  catalog: "Catalog",
+  live_state: "Live state",
+  remote_commands: "Remote commands",
+  system: "Sync",
+  tasks: "Tasks",
+  tokenomics: "Tokenomics",
+  todos: "Todos",
+  tools: "Tools",
+  voice: "Voice",
+};
+
+const ACTIVITY_SYNC_BLOCKED_STATUSES = [
+  "device_limit_reached",
+  "device_limit_exceeded",
+  "blocked",
+  "websocket_auth_missing",
+];
+const ACTIVITY_SYNC_LOCAL_STATUSES = [
+  "starting",
+  "idle",
+  "local",
+  "auth_missing",
+];
+const ACTIVITY_SYNC_PROVISIONING_STATUSES = [
+  "route_provisioning",
+  "assignment_booting",
+  "dns_propagating",
+];
+const ACTIVITY_SYNC_CONNECTING_STATUSES = [
+  "desktop_registering",
+  "handshaking",
+  "websocket_handshaking",
+];
+const ACTIVITY_SYNC_OFFLINE_STATUSES = [
+  "offline",
+  "retrying",
+  "websocket_retrying",
+];
+
+function syncActivityDomainLabel(domain) {
+  const normalized = text(domain, "system").toLowerCase();
+  return SYNC_ACTIVITY_DOMAIN_LABELS[normalized] || normalized
+    .split(/[_\s-]+/u)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || "Sync";
+}
+
+function syncActivityItems(status) {
+  const data = dataValue(status);
+  const activity = jsonObject(data.syncActivity || data.sync_activity) || {};
+  return jsonArray(activity.activities);
+}
+
+function syncActivityLane(item) {
+  return text(item?.syncLane || item?.sync_lane || item?.lane, "sync").toLowerCase();
+}
+
+function syncActivityProgress(item) {
+  const metadata = jsonObject(item?.metadata) || {};
+  const done = numberValue(
+    item?.progressDone
+      ?? item?.progress_done
+      ?? metadata.progressDone
+      ?? metadata.progress_done,
+    0,
+  );
+  const total = numberValue(
+    item?.progressTotal
+      ?? item?.progress_total
+      ?? metadata.progressTotal
+      ?? metadata.progress_total,
+    0,
+  );
+  const explicit = item?.progressPercent
+    ?? item?.progress_percent
+    ?? metadata.progressPercent
+    ?? metadata.progress_percent;
+  const basis = text(
+    item?.progressBasis
+      || item?.progress_basis
+      || metadata.progressBasis
+      || metadata.progress_basis,
+    "phase",
+  ).toLowerCase();
+  const percent = total > 0 && basis !== "phase"
+    ? (Math.min(done, total) / total) * 100
+    : Number.isFinite(Number(explicit))
+      ? Number(explicit)
+      : statusProgress(item?.state || item?.status, 46);
+  return {
+    basis,
+    done: Math.max(0, done),
+    percent: clampPercent(percent),
+    total: Math.max(0, total),
+  };
+}
+
+function syncActivityProgressMeta(progress) {
+  if (progress.total > 0 && progress.basis !== "phase") {
+    const done = Math.max(0, Math.min(Math.round(progress.done), Math.round(progress.total)));
+    const total = Math.max(0, Math.round(progress.total));
+    if (progress.basis === "bytes") {
+      return `${formatBytes(done)} / ${formatBytes(total)}`;
+    }
+    const label = progress.basis === "day_buckets"
+      ? total === 1 ? "bucket" : "buckets"
+      : ["sync_unit", "sync_units", "durable_unit", "durable_units"].includes(progress.basis)
+        ? total === 1 ? "unit" : "units"
+        : total === 1 ? "item" : "items";
+    return `${done}/${total} ${label}`;
+  }
+  return `${progress.percent}%`;
+}
+
+function syncActivityDirectionLabel(direction) {
+  const normalized = text(direction, "up").toLowerCase();
+  if (normalized === "down") return "incoming";
+  if (normalized === "both") return "sync";
+  if (normalized === "control") return "control";
+  return "outgoing";
+}
+
+function syncActivityDirection(item) {
+  const direction = text(item?.direction).toLowerCase();
+  if (direction === "down") return "down";
+  if (direction === "both") return "both";
+  if (direction && direction !== "up") return "control";
+  return "up";
+}
+
+function syncActivityUnitCount(item = {}) {
+  const metadata = jsonObject(item?.metadata) || {};
+  return Math.max(0, Math.floor(numberValue(
+    item.syncUnitCount
+      ?? item.sync_unit_count
+      ?? item.unitCount
+      ?? item.unit_count
+      ?? item.durableUnitCount
+      ?? item.durable_unit_count
+      ?? item.durableCount
+      ?? item.durable_count
+      ?? metadata.syncUnitCount
+      ?? metadata.sync_unit_count
+      ?? metadata.unitCount
+      ?? metadata.unit_count
+      ?? metadata.durableUnitCount
+      ?? metadata.durable_unit_count,
+    0,
+  )));
+}
+
+function syncActivityUnitSummary(status) {
+  const summary = {
+    controlCount: 0,
+    downCount: 0,
+    hasUnitCounts: false,
+    pendingCount: 0,
+    upCount: 0,
+  };
+  syncActivityItems(status).forEach((item) => {
+    if (!item || typeof item !== "object" || syncActivityLane(item) !== "sync") {
+      return;
+    }
+    const count = syncActivityUnitCount(item);
+    if (count <= 0) {
+      return;
+    }
+    summary.hasUnitCounts = true;
+    const direction = syncActivityDirection(item);
+    if (direction === "down") {
+      summary.downCount += count;
+    } else if (direction === "both") {
+      summary.upCount += count;
+      summary.downCount += count;
+    } else if (direction === "up") {
+      summary.upCount += count;
+    } else {
+      summary.controlCount += count;
+    }
+    const state = statusKey(item.state || item.status, "");
+    const complete = Boolean(item.syncComplete ?? item.sync_complete)
+      || ["complete", "completed", "synced", "acked", "sent", "received"].includes(state);
+    if (!complete) {
+      summary.pendingCount += count;
+    }
+  });
+  return summary;
+}
+
+function syncBadgeCount(value) {
+  const count = Number(value);
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+}
+
+function syncBadgeBoolean(value) {
+  if (value === true || value === 1) {
+    return true;
+  }
+  const normalized = text(value).toLowerCase();
+  return normalized === "true" || normalized === "1";
+}
+
+function normalizeActivitySyncBadge(status) {
+  const data = dataValue(status);
+  if (!Object.keys(data).length) {
+    return null;
+  }
+  const rawConnection = text(data.connection).toLowerCase();
+  const rawStatus = text(data.status).toLowerCase();
+  const globalStatus = text(data.globalWsStatus || data.global_ws_status).toLowerCase();
+  const connectionStatus = globalStatus || rawStatus;
+  const connected = rawConnection === "connected"
+    || (syncBadgeBoolean(data.connected) && syncBadgeBoolean(data.globalWsConnected ?? data.global_ws_connected));
+  const unitSummary = syncActivityUnitSummary(data);
+  const pendingCount = syncBadgeCount(
+    unitSummary.hasUnitCounts
+      ? unitSummary.pendingCount
+      : data.pendingCount
+        ?? data.pending_count
+        ?? data.outboxPendingCount
+        ?? data.outbox_pending_count,
+  );
+  const upCount = syncBadgeCount(
+    unitSummary.hasUnitCounts
+      ? unitSummary.upCount
+      : data.upCount
+        ?? data.up_count
+        ?? data.syncUpCount
+        ?? data.sync_up_count
+        ?? pendingCount,
+  );
+  const downCount = syncBadgeCount(
+    unitSummary.hasUnitCounts
+      ? unitSummary.downCount
+      : data.downCount
+        ?? data.down_count
+        ?? data.syncDownCount
+        ?? data.sync_down_count,
+  );
+  const controlCount = syncBadgeCount(
+    unitSummary.hasUnitCounts
+      ? unitSummary.controlCount
+      : data.controlCount
+        ?? data.control_count
+        ?? data.syncControlCount
+        ?? data.sync_control_count,
+  );
+  const sizeClass = text(
+    data.sizeClass
+      || data.size_class
+      || data.syncSizeClass
+      || data.sync_size_class,
+    "live",
+  ).toLowerCase() === "large"
+    ? "large"
+    : "live";
+  const hasLargeActivity = syncBadgeBoolean(data.syncing) || sizeClass === "large";
+  const explicitConnection = [
+    "blocked",
+    "connected",
+    "connecting",
+    "local",
+    "offline",
+    "provisioning",
+    "syncing",
+  ].includes(rawConnection)
+    ? rawConnection
+    : "";
+  const connection = explicitConnection || (connected
+    ? "connected"
+    : ACTIVITY_SYNC_BLOCKED_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_BLOCKED_STATUSES.includes(rawStatus)
+      ? "blocked"
+      : ACTIVITY_SYNC_PROVISIONING_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_PROVISIONING_STATUSES.includes(rawStatus)
+        ? "provisioning"
+        : ACTIVITY_SYNC_CONNECTING_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_CONNECTING_STATUSES.includes(rawStatus)
+          ? "connecting"
+          : ACTIVITY_SYNC_OFFLINE_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_OFFLINE_STATUSES.includes(rawStatus)
+            ? "offline"
+            : ACTIVITY_SYNC_LOCAL_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_LOCAL_STATUSES.includes(rawStatus)
+              ? "local"
+              : "connecting");
+  const state = connection === "connected"
+    ? hasLargeActivity ? "syncing" : "live"
+    : connection === "syncing"
+      ? "syncing"
+      : connection;
+  const directionParts = [
+    upCount > 0 ? `${upCount} outgoing ${upCount === 1 ? "change" : "changes"}` : "",
+    downCount > 0 ? `${downCount} incoming ${downCount === 1 ? "update" : "updates"}` : "",
+  ].filter(Boolean);
+  const directionSummary = directionParts.join(" and ");
+  const label = {
+    blocked: "Blocked",
+    connecting: "Connecting",
+    live: "Live Sync",
+    local: "Local",
+    offline: "Offline",
+    provisioning: "Provisioning",
+    syncing: "Syncing",
+  }[state] || "Connecting";
+  const title = {
+    blocked: "Cloud sync needs attention before it can connect.",
+    connecting: "Establishing the live cloud connection.",
+    live: directionSummary
+      ? `Connected. Live Sync is handling ${directionSummary}.`
+      : "Connected. Changes sync live to your account.",
+    local: "Local workspace activity is available. Cloud sync has not connected yet.",
+    offline: "Cloud sync is unavailable right now.",
+    provisioning: "Your cloud workspace is starting.",
+    syncing: directionSummary
+      ? `Syncing ${directionSummary}.`
+      : controlCount > 0
+        ? `Syncing ${controlCount} control ${controlCount === 1 ? "operation" : "operations"}.`
+        : "Syncing cloud activity.",
+  }[state] || label;
+  return {
+    downCount,
+    indicator: ["connecting", "provisioning", "syncing"].includes(state) ? "spinner" : "dot",
+    label,
+    state,
+    title,
+    upCount,
+  };
+}
+
+function syncActivityUpdatedAt(item) {
+  return recentTimestamp(
+    item?.updatedAtMs,
+    item?.updated_at_ms,
+    item?.updatedAt,
+    item?.updated_at,
+  );
+}
+
+function normalizeLiveSyncCards(status) {
+  return syncActivityItems(status)
+    .map((item, index) => {
+      const object = jsonObject(item) || {};
+      if (syncActivityLane(object) !== "sync" || object.durable === false || object.durable === "false") {
+        return null;
+      }
+      const state = statusKey(object.state || object.status, "active");
+      if (isTerminalTransferStatus(state)) {
+        const updatedAt = syncActivityUpdatedAt(object);
+        if (!updatedAt || Date.now() - updatedAt > OVERVIEW_FINISHED_WINDOW_MS) {
+          return null;
+        }
+      }
+      const domain = text(object.domain || object.category, "system").toLowerCase();
+      const direction = text(object.direction, "up").toLowerCase();
+      const progress = syncActivityProgress(object);
+      const directionLabel = syncActivityDirectionLabel(direction);
+      return {
+        id: `sync-${domain}-${direction}-${firstText(object.source, object.id, index)}`,
+        eyebrow: directionLabel,
+        lane: "sync",
+        meta: syncActivityProgressMeta(progress),
+        progress: progress.percent,
+        status: state,
+        title: `${syncActivityDomainLabel(domain)} sync`,
+        tone: state === "done" ? "good" : state === "failed" ? "danger" : direction === "down" ? "hot" : "warn",
+        updatedAt: syncActivityUpdatedAt(object),
+      };
+    })
+    .filter(Boolean);
+}
+
 function isOpenTransferStatus(transfer) {
   const status = statusKey(transfer?.status || transfer?.transferStatus || transfer?.transfer_status, "active");
   return (
@@ -1161,16 +1533,18 @@ function normalizeTransferCards(library) {
   return uniqueCards([...openCards, ...terminalCards]);
 }
 
-function summaryStats(todoCards, transferCards) {
-  const cards = [...todoCards, ...transferCards];
-  const active = transferCards.length;
+function summaryStats(todoCards, transferCards, syncCards = []) {
+  const cards = [...todoCards, ...transferCards, ...syncCards];
+  const active = transferCards.length + syncCards.length;
   const queued = todoCards.filter((card) => statusKey(card.status) === "queued").length
-    + transferCards.filter((card) => statusKey(card.status) === "queued").length;
+    + transferCards.filter((card) => statusKey(card.status) === "queued").length
+    + syncCards.filter((card) => statusKey(card.status) === "queued").length;
   const failed = cards.filter((card) => statusKey(card.status) === "failed").length;
   return {
     active,
     failed,
     queued,
+    syncs: syncCards.length,
     todos: todoCards.length,
     transfers: transferCards.length,
   };
@@ -1182,6 +1556,7 @@ function hudCardKind(card) {
   const group = text(card?.group).toLowerCase();
   if (eyebrow.includes("upload")) return "upload";
   if (eyebrow.includes("download")) return "download";
+  if (lane === "sync") return "transfer";
   if (lane === "transfers" || group === "asset") return "transfer";
   return "todo";
 }
@@ -1395,12 +1770,12 @@ function useActivityOverlayData(context) {
     const unlisteners = [];
     const addListener = async (eventName, options = {}) => {
       try {
-        const unlisten = await listen(eventName, () => {
+        const unlisten = await listen(eventName, (event) => {
           if (cancelled) {
             return;
           }
           if (options.onEvent) {
-            void options.onEvent();
+            void options.onEvent(event);
           }
           scheduleRefresh(options.refreshOptions || {});
         });
@@ -1421,6 +1796,28 @@ function useActivityOverlayData(context) {
     void addListener("todo-store-changed", { onEvent: refreshTodoOverview });
     void addListener(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: true } });
     void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
+    void addListener(CLOUD_MCP_SYNC_STATUS_EVENT, {
+      onEvent: (event) => {
+        const payload = jsonObject(event?.payload);
+        if (!payload) {
+          return;
+        }
+        setState((current) => {
+          const previous = jsonObject(current.cloudStatus) || {};
+          return {
+            ...current,
+            cloudStatus: {
+              ...previous,
+              ...payload,
+              syncActivity: payload.syncActivity ?? payload.sync_activity ?? previous.syncActivity,
+              sync_activity: payload.sync_activity ?? payload.syncActivity ?? previous.sync_activity,
+            },
+            updatedAt: Date.now(),
+          };
+        });
+      },
+      refreshOptions: { localOnly: true },
+    });
     // The pre-created window keeps this panel mounted while hidden; the
     // moment Rust shows it, converge immediately instead of riding the poll.
     void addListener("forge-activity-overlay-visibility-changed", {
@@ -1465,6 +1862,9 @@ function summaryLabel(stats) {
   const parts = [];
   if (stats.todos) {
     parts.push(`${stats.todos} ${stats.todos === 1 ? "todo" : "todos"}`);
+  }
+  if (stats.syncs) {
+    parts.push(`${stats.syncs} ${stats.syncs === 1 ? "sync" : "syncs"}`);
   }
   if (stats.transfers) {
     parts.push(`${stats.transfers} ${stats.transfers === 1 ? "asset" : "assets"}`);
@@ -1582,13 +1982,25 @@ export function ActivityOverlayPanel({ embedded = false }) {
     () => normalizeTransferCards(data.library),
     [data.library],
   );
+  const syncCards = useMemo(
+    () => normalizeLiveSyncCards(data.cloudStatus),
+    [data.cloudStatus],
+  );
+  const syncBadge = useMemo(
+    () => normalizeActivitySyncBadge(data.cloudStatus),
+    [data.cloudStatus],
+  );
+  const progressCards = useMemo(
+    () => [...syncCards, ...transferCards],
+    [syncCards, transferCards],
+  );
   // Just-finished cards stay pinned with the active work for a few seconds,
   // then settle into history. A UI-only tick re-renders exactly when the
   // soonest pin expires (no backend polling).
   const [pinTick, setPinTick] = useState(0);
   const stats = useMemo(
-    () => summaryStats(todoCards, transferCards),
-    [todoCards, transferCards],
+    () => summaryStats(todoCards, transferCards, syncCards),
+    [syncCards, todoCards, transferCards],
   );
 
   // Recent dictation inputs, timestamped, with one-tap copy. The audio
@@ -1755,7 +2167,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
   }, [beginExit, terminalTodoStates, todoCards]);
 
   useEffect(() => {
-    const nextMap = new Map(transferCards.map((card) => [card.id, card]));
+    const nextMap = new Map(progressCards.map((card) => [card.id, card]));
     prevTransferMapRef.current.forEach((card, id) => {
       if (!nextMap.has(id)) {
         const state = statusKey(card.status);
@@ -1763,7 +2175,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
       }
     });
     prevTransferMapRef.current = nextMap;
-  }, [beginExit, transferCards]);
+  }, [beginExit, progressCards]);
 
   // One unified, tier-ordered list: active work first (running todos, live
   // transfers, just-finished pins), then queued todos, then the mixed
@@ -1772,7 +2184,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
   const unifiedItems = useMemo(() => {
     void pinTick;
     const now = Date.now();
-    const items = [...todoCards, ...transferCards].map((card) => ({
+    const items = [...todoCards, ...progressCards].map((card) => ({
       card,
       key: card.id,
       sortTime: numberValue(card.updatedAt, 0),
@@ -1791,7 +2203,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
     return items.sort((left, right) => (
       (left.tier - right.tier) || (right.sortTime - left.sortTime)
     ));
-  }, [dictationEntries, pinTick, todoCards, transferCards]);
+  }, [dictationEntries, pinTick, progressCards, todoCards]);
   const activeItems = useMemo(
     () => unifiedItems.filter((item) => item.tier === 0),
     [unifiedItems],
@@ -1825,7 +2237,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
   const hasWork = hasActive || hasHistory || hasLiveDictation;
   const statusToneName = data.errors.length
     ? "warn"
-    : stats.transfers > 0
+    : stats.transfers > 0 || stats.syncs > 0
       ? "hot"
       : stats.queued > 0
         ? "warn"
@@ -1849,12 +2261,12 @@ export function ActivityOverlayPanel({ embedded = false }) {
       : isListedTodo
         ? "dot"
         : card.tone || statusTone(card.status);
-    const isTransfer = card.lane === "transfers";
+    const showsProgress = card.lane === "transfers" || card.lane === "sync";
     const progress = clampPercent(card.progress ?? statusProgress(card.status));
-    const detail = isTransfer ? "" : text(card.detail);
+    const detail = showsProgress ? "" : text(card.detail);
     const statusLabel = exit
       ? exit.exitState === "done" ? "done" : exit.exitState === "failed" ? "failed" : "stopped"
-      : isTransfer
+      : showsProgress
         ? isTerminalTransferStatus(state) ? state : firstText(card.meta, `${progress}%`)
         : text(card.eyebrow, "listed");
     return (
@@ -1876,7 +2288,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
             {detail ? <RowDetail>{detail}</RowDetail> : null}
             {!isListedTodo && <RowStatus data-tone={tone}>{statusLabel}</RowStatus>}
           </RowLine>
-          {!exit && isTransfer && !isTerminalTransferStatus(state) ? (
+          {!exit && showsProgress && !isTerminalTransferStatus(state) ? (
             <RowTrack aria-hidden="true">
               <RowTrackFill data-tone={tone} style={{ width: `${progress}%` }} />
             </RowTrack>
@@ -1945,6 +2357,34 @@ export function ActivityOverlayPanel({ embedded = false }) {
       <OverlayHeader data-tauri-drag-region={embedded ? undefined : true}>
         <HeaderDot data-live={hasWork ? "true" : "false"} data-tone={statusToneName} />
         <HeaderTitle>Activity</HeaderTitle>
+        {syncBadge ? (
+          <ActivitySyncBadge
+            aria-label={syncBadge.title}
+            data-state={syncBadge.state}
+            data-tauri-drag-region={embedded ? undefined : true}
+            role="status"
+            title={syncBadge.title}
+          >
+            <ActivitySyncIndicator aria-hidden="true" data-variant={syncBadge.indicator} />
+            <span>{syncBadge.label}</span>
+            {syncBadge.upCount > 0 || syncBadge.downCount > 0 ? (
+              <ActivitySyncDirectionCounts aria-hidden="true">
+                {syncBadge.upCount > 0 ? (
+                  <ActivitySyncDirectionCount data-direction="up">
+                    <span>↑</span>
+                    <b>{syncBadge.upCount}</b>
+                  </ActivitySyncDirectionCount>
+                ) : null}
+                {syncBadge.downCount > 0 ? (
+                  <ActivitySyncDirectionCount data-direction="down">
+                    <span>↓</span>
+                    <b>{syncBadge.downCount}</b>
+                  </ActivitySyncDirectionCount>
+                ) : null}
+              </ActivitySyncDirectionCounts>
+            ) : null}
+          </ActivitySyncBadge>
+        ) : null}
         <HeaderSummary>{summaryLabel(stats)}</HeaderSummary>
       </OverlayHeader>
 
@@ -2197,6 +2637,122 @@ const HeaderSummary = styled.span`
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
+`;
+
+const ActivitySyncBadge = styled.span`
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: min(142px, 46%);
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.88);
+  background: rgba(100, 116, 139, 0.12);
+  font-size: 9.5px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: grab;
+  -webkit-app-region: drag;
+
+  > span:not(:first-child) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-state="live"] {
+    border-color: rgba(74, 222, 128, 0.34);
+    color: rgba(187, 247, 208, 0.95);
+    background: rgba(34, 197, 94, 0.12);
+  }
+
+  &[data-state="syncing"] {
+    border-color: rgba(125, 176, 255, 0.34);
+    color: rgba(200, 222, 255, 0.92);
+    background: rgba(59, 130, 246, 0.12);
+  }
+
+  &[data-state="provisioning"] {
+    border-color: rgba(255, 170, 92, 0.4);
+    color: rgba(255, 214, 170, 0.95);
+    background: rgba(255, 122, 24, 0.14);
+  }
+
+  &[data-state="offline"],
+  &[data-state="blocked"] {
+    border-color: rgba(248, 113, 113, 0.4);
+    color: rgba(254, 202, 202, 0.95);
+    background: rgba(239, 68, 68, 0.12);
+  }
+
+  @container (max-width: 300px) {
+    max-width: 96px;
+    padding-inline: 6px;
+  }
+`;
+
+const ActivitySyncIndicator = styled.span`
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1.4px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: ${spin} 0.8s linear infinite;
+  will-change: transform;
+
+  &[data-variant="dot"] {
+    width: 5px;
+    height: 5px;
+    border: none;
+    background: currentColor;
+  }
+`;
+
+const ActivitySyncDirectionCounts = styled.span`
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 1px;
+
+  @container (max-width: 300px) {
+    display: none;
+  }
+`;
+
+const ActivitySyncDirectionCount = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 18px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: currentColor;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+
+  span {
+    font-size: 8.5px;
+    line-height: 1;
+  }
+
+  b {
+    font: inherit;
+  }
 `;
 
 const OverlayBody = styled.div`

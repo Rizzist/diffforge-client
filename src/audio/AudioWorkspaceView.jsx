@@ -231,6 +231,12 @@ import {
   AudioModeGrid,
   AudioModeList,
   AudioModeButton,
+  AudioLocalModelList,
+  AudioLocalModelRow,
+  AudioLocalModelCopy,
+  AudioLocalModelMeta,
+  AudioLocalModelPill,
+  AudioLocalModelActions,
   AudioGeneralToolbar,
   AudioGeneralColumn,
   AudioProviderPanel,
@@ -327,6 +333,7 @@ import {
   AudioWidgetErrorPopover,
   AudioWidgetLockBadge,
   AudioBarShell,
+  AudioBarErrorPopover,
   AudioBarSurface,
   AudioBarCancelButton,
   AudioBarMeter,
@@ -521,9 +528,11 @@ const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 const AUDIO_WIDGET_HISTORY_TRAY_SIZE = { width: 64, height: 98 };
+const AUDIO_WIDGET_BUBBLE_DRAG_DEBUG_SAMPLE_MS = 160;
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
+const AUDIO_WIDGET_BAR_ERROR_SIZE = { width: 320, height: 112 };
 // The cancel notice needs room for its label plus close/copy/undo/history
 // controls, so the pill widens while it is showing. The bubble style reuses
 // the same pill (the window morphs to it in place, then morphs back).
@@ -605,12 +614,20 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
   },
 ];
 
-function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible) {
+function getAudioWidgetBarGeometry(cancelNoticeActive, errorFrameActive, barVisible) {
   if (cancelNoticeActive) {
     return {
       key: "notice",
       margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
       size: AUDIO_WIDGET_BAR_NOTICE_SIZE,
+    };
+  }
+
+  if (errorFrameActive) {
+    return {
+      key: "error",
+      margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
+      size: AUDIO_WIDGET_BAR_ERROR_SIZE,
     };
   }
 
@@ -657,6 +674,83 @@ function forgeCloudStatusIsConnected(status) {
   return Boolean(status.connected && (status.globalWsConnected ?? status.global_ws_connected));
 }
 
+function audioWidgetBubblePositionPoint(value) {
+  if (!value) {
+    return null;
+  }
+
+  const x = Number(value.x);
+  const y = Number(value.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+function audioWidgetBubblePositionSize(value) {
+  if (!value) {
+    return null;
+  }
+
+  const width = Number(value.width);
+  const height = Number(value.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+
+  return { width: Math.round(width), height: Math.round(height) };
+}
+
+function audioWidgetBubblePositionRect(value) {
+  if (!value) {
+    return null;
+  }
+
+  return {
+    position: audioWidgetBubblePositionPoint(value.position),
+    size: audioWidgetBubblePositionSize(value.size),
+  };
+}
+
+function audioWidgetBubblePositionMonitorPayload(monitor) {
+  if (!monitor) {
+    return null;
+  }
+
+  return {
+    name: monitor.name || "",
+    position: audioWidgetBubblePositionPoint(monitor.position),
+    scaleFactor: Number(monitor.scaleFactor || 1) || 1,
+    size: audioWidgetBubblePositionSize(monitor.size),
+    workArea: audioWidgetBubblePositionRect(monitor.workArea),
+  };
+}
+
+function logAudioWidgetBubblePosition(phase, fields = {}) {
+  invoke("audio_widget_log_bubble_position", {
+    request: {
+      fields,
+      phase,
+    },
+  }).catch(() => {});
+}
+
+async function logAudioWidgetBubbleWindowSnapshot(windowHandle, phase, fields = {}) {
+  const [position, size, monitor] = await Promise.all([
+    windowHandle?.outerPosition?.().catch(() => null),
+    windowHandle?.outerSize?.().catch(() => null),
+    currentMonitor().catch(() => null),
+  ]);
+
+  logAudioWidgetBubblePosition(phase, {
+    ...fields,
+    monitor: audioWidgetBubblePositionMonitorPayload(monitor),
+    nativePosition: audioWidgetBubblePositionPoint(position),
+    nativeSize: audioWidgetBubblePositionSize(size),
+  });
+}
+
 function normalizeAudioWidgetBubblePlacement(value) {
   const x = Number(value?.x);
   const y = Number(value?.y);
@@ -672,14 +766,22 @@ function normalizeAudioWidgetBubblePlacement(value) {
 
 function readAudioWidgetBubblePlacement() {
   if (typeof window === "undefined" || !window.localStorage) {
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.read.unavailable", {});
     return null;
   }
 
   try {
-    return normalizeAudioWidgetBubblePlacement(
-      JSON.parse(window.localStorage.getItem(AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY) || "null"),
-    );
-  } catch {
+    const raw = window.localStorage.getItem(AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY) || "null";
+    const normalized = normalizeAudioWidgetBubblePlacement(JSON.parse(raw));
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.read", {
+      hasValue: raw !== "null",
+      placement: normalized,
+    });
+    return normalized;
+  } catch (error) {
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.read.error", {
+      error: String(error?.message || error || "Unable to read bubble placement"),
+    });
     return null;
   }
 }
@@ -687,12 +789,23 @@ function readAudioWidgetBubblePlacement() {
 function writeAudioWidgetBubblePlacement(position) {
   const normalized = normalizeAudioWidgetBubblePlacement(position);
   if (!normalized || typeof window === "undefined" || !window.localStorage) {
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.write.skipped", {
+      input: audioWidgetBubblePositionPoint(position),
+      storageAvailable: Boolean(typeof window !== "undefined" && window.localStorage),
+    });
     return null;
   }
 
   try {
     window.localStorage.setItem(AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY, JSON.stringify(normalized));
-  } catch {
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.write", {
+      placement: normalized,
+    });
+  } catch (error) {
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.write.error", {
+      error: String(error?.message || error || "Unable to write bubble placement"),
+      placement: normalized,
+    });
     // Placement persistence is best-effort.
   }
 
@@ -1246,6 +1359,62 @@ function formatAudioProviderLabel(provider) {
     return "Forge";
   }
   return "Whisper";
+}
+
+const LOCAL_WHISPER_MODEL_FALLBACKS = [
+  {
+    modelId: "tiny.en",
+    modelName: "Whisper tiny.en",
+    approximateDiskMb: 74,
+    approximateMemoryMb: 260,
+    bytes: 0,
+    description: "Lowest footprint",
+    installed: false,
+    selected: false,
+    tier: "Fastest",
+  },
+  {
+    modelId: "base.en",
+    modelName: "Whisper base.en",
+    approximateDiskMb: 142,
+    approximateMemoryMb: 500,
+    bytes: 0,
+    description: "Current default",
+    installed: false,
+    selected: true,
+    tier: "Balanced",
+  },
+  {
+    modelId: "small.en",
+    modelName: "Whisper small.en",
+    approximateDiskMb: 465,
+    approximateMemoryMb: 1100,
+    bytes: 0,
+    description: "Larger local model",
+    installed: false,
+    selected: false,
+    tier: "Higher accuracy",
+  },
+];
+
+function formatWhisperModelTitle(model) {
+  return String(model?.modelName || model?.modelId || "Whisper").replace(/^Whisper\s+/i, "");
+}
+
+function formatWhisperModelMeta(model) {
+  const diskMb = Number(model?.approximateDiskMb || 0);
+  const memoryMb = Number(model?.approximateMemoryMb || 0);
+  const parts = [];
+  if (model?.tier) {
+    parts.push(model.tier);
+  }
+  if (diskMb > 0) {
+    parts.push(`${formatInteger(diskMb)} MB`);
+  }
+  if (memoryMb > 0) {
+    parts.push(`${formatInteger(memoryMb)} MB RAM`);
+  }
+  return parts.join(" / ");
 }
 
 function findNumberByKeys(value, keys, depth = 0) {
@@ -1832,6 +2001,7 @@ export default function AudioWorkspaceView({
   onOpenWidget,
   onRefreshBillingStatus,
   onRefreshStatus,
+  onSelectModel,
   onUninstallModel,
   workspace,
 }) {
@@ -1884,6 +2054,20 @@ export default function AudioWorkspaceView({
   const isForgeAgentMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
   const deepgramReady = Boolean(deepgramApiKey.trim());
   const installed = Boolean(audioModelStatus?.installed);
+  const localWhisperModels = Array.isArray(audioModelStatus?.models) && audioModelStatus.models.length
+    ? audioModelStatus.models
+    : LOCAL_WHISPER_MODEL_FALLBACKS;
+  const selectedWhisperModelId = audioModelStatus?.selectedModelId
+    || audioModelStatus?.modelId
+    || LOCAL_WHISPER_MODEL_FALLBACKS.find((model) => model.selected)?.modelId
+    || "base.en";
+  const selectedWhisperModel = localWhisperModels.find((model) => model.modelId === selectedWhisperModelId)
+    || localWhisperModels[0]
+    || null;
+  const selectedWhisperModelTitle = selectedWhisperModel
+    ? formatWhisperModelTitle(selectedWhisperModel)
+    : "Whisper";
+  const downloadingModelId = audioDownloadProgress?.modelId || "";
   const forgeBilling = useMemo(() => {
     if (authState !== "authenticated") {
       return {
@@ -1946,7 +2130,6 @@ export default function AudioWorkspaceView({
   const audioWidgetThemeLabel = audioWidgetTheme === AUDIO_WIDGET_THEME_LIGHT ? "Light" : "Dark";
   const canUninstall = Boolean(audioModelStatus?.managedAssetsInstalled || audioModelStatus?.modelInstalled);
   const downloadPercent = audioDownloadProgress?.percent;
-  const installLabel = audioModelStatus?.runtimeInstallable === false ? "Install model" : "Install Whisper";
   const missingLabel = audioModelStatus?.modelInstalled
     ? "Runtime missing"
     : audioModelStatus?.runtimeInstalled
@@ -1961,7 +2144,7 @@ export default function AudioWorkspaceView({
           ? "Billing unavailable"
         : forgeCreditsExhausted
           ? "No credits"
-          : "Forge ready")
+          : "Diff Forge ready")
     : isForgeAgentMode
       ? (forgeBilling.state === "loading"
         ? "Starting.."
@@ -1974,7 +2157,7 @@ export default function AudioWorkspaceView({
             : "Voice ready")
     : isCloudMode
       ? (deepgramReady ? "Cloud ready" : "API key needed")
-      : (installed ? "Local ready" : audioActionState === "downloading" ? "Downloading" : missingLabel);
+    : (installed ? `${selectedWhisperModelTitle} ready` : audioActionState === "downloading" ? "Downloading" : missingLabel);
   const isUninstalling = audioActionState === "uninstalling";
   const selectedAudioInput = audioInputDevices.find((device) => device.deviceId === audioInputDeviceId);
   const selectedAudioInputLabel = selectedAudioInput?.label || "Default microphone";
@@ -2658,6 +2841,14 @@ export default function AudioWorkspaceView({
     notifyAudioSettingsChanged("provider");
   }, []);
 
+  const installLocalWhisperModel = useCallback((modelId) => {
+    onDownloadModel?.(modelId);
+  }, [onDownloadModel]);
+
+  const selectLocalWhisperModel = useCallback((modelId) => {
+    onSelectModel?.(modelId);
+  }, [onSelectModel]);
+
   const refreshForgeBilling = useCallback(async () => {
     await onRefreshBillingStatus?.({ quiet: false });
   }, [onRefreshBillingStatus]);
@@ -3070,7 +3261,7 @@ export default function AudioWorkspaceView({
               <div>
                 <SettingsLabel>Provider</SettingsLabel>
                 <SettingsHint>{isForgeMode
-                  ? "Diff Forge AI cloud"
+                  ? "Diff Forge Cloud"
                   : isForgeAgentMode
                     ? "Diff Forge AI voice"
                     : isCloudMode
@@ -3111,11 +3302,80 @@ export default function AudioWorkspaceView({
               >
                 <ButtonHubIcon aria-hidden="true" />
                 <span>
-                  <strong>Diff Forge AI</strong>
+                  <strong>Diff Forge Cloud</strong>
                   <span>Nova-3 + LLM cleanup</span>
                 </span>
               </AudioModeButton>
             </AudioModeList>
+            {!isCloudMode && !isForgeMode && !isForgeAgentMode && (
+              <AudioLocalModelList aria-label="Local Whisper model">
+                {localWhisperModels.map((model) => {
+                  const modelId = model.modelId || model.model_id || "";
+                  const modelInstalled = Boolean(model.installed);
+                  const modelSelected = model.selected || modelId === selectedWhisperModelId;
+                  const modelDownloading = audioActionState === "downloading"
+                    && (!downloadingModelId || downloadingModelId === modelId);
+                  const otherModelDownloading = audioActionState === "downloading"
+                    && downloadingModelId
+                    && downloadingModelId !== modelId;
+                  const modelActionDisabled = audioActionState === "uninstalling"
+                    || audioActionState === "opening"
+                    || audioActionState === "closing"
+                    || modelDownloading
+                    || otherModelDownloading
+                    || (modelInstalled && modelSelected);
+                  const ModelActionButton = modelInstalled ? SecondaryButton : PrimaryButton;
+
+                  return (
+                    <AudioLocalModelRow
+                      data-installed={modelInstalled ? "true" : "false"}
+                      data-selected={modelSelected ? "true" : "false"}
+                      key={modelId || model.modelName}
+                    >
+                      <AudioLocalModelCopy>
+                        <strong>{formatWhisperModelTitle(model)}</strong>
+                        <span>{model.description || formatWhisperModelMeta(model)}</span>
+                        <AudioLocalModelMeta>
+                          <AudioLocalModelPill>{formatWhisperModelMeta(model)}</AudioLocalModelPill>
+                          <AudioLocalModelPill data-tone={modelInstalled ? "ready" : undefined}>
+                            {modelInstalled ? (modelSelected ? "Selected" : "Downloaded") : "Not installed"}
+                          </AudioLocalModelPill>
+                        </AudioLocalModelMeta>
+                      </AudioLocalModelCopy>
+                      <AudioLocalModelActions>
+                        <ModelActionButton
+                          disabled={modelActionDisabled}
+                          onClick={() => {
+                            if (!modelId) {
+                              return;
+                            }
+                            if (modelInstalled) {
+                              selectLocalWhisperModel(modelId);
+                            } else {
+                              installLocalWhisperModel(modelId);
+                            }
+                          }}
+                          type="button"
+                        >
+                          {modelInstalled && modelSelected ? (
+                            <ButtonCheckIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonMicIcon aria-hidden="true" />
+                          )}
+                          <span>
+                            {modelDownloading
+                              ? "Downloading..."
+                              : modelInstalled
+                                ? (modelSelected ? "Selected" : "Use")
+                                : "Install"}
+                          </span>
+                        </ModelActionButton>
+                      </AudioLocalModelActions>
+                    </AudioLocalModelRow>
+                  );
+                })}
+              </AudioLocalModelList>
+            )}
             {(isCloudMode || isForgeMode) && (
               <AudioCloudField>
                 Language
@@ -3159,11 +3419,11 @@ export default function AudioWorkspaceView({
                 <AudioRecorderOptionRow>
                   <SettingsHint>
                     {forgeBilling.state === "loading"
-                      ? (isForgeAgentMode ? "Working.." : "Checking Diff Forge AI credits...")
+                      ? (isForgeAgentMode ? "Working.." : "Checking Diff Forge Cloud credits...")
                       : forgeBilling.state === "auth_required" || forgeBilling.state === "billing_error"
                         ? forgeBilling.error
                         : forgeCreditsExhausted
-                          ? "No Diff Forge AI credits remaining. Top up to use cloud audio."
+                          ? "No Diff Forge Cloud credits remaining. Top up to use cloud audio."
                           : isForgeAgentMode
                             ? "Streams mic audio to Diff Forge Cloud, runs the voice agent, and plays the response back here."
                             : "Realtime Nova-3 in Diff Forge Cloud. Billed from your credits: audio input, LLM cleanup, and transfer per MB."}
@@ -3617,12 +3877,6 @@ export default function AudioWorkspaceView({
 
         {!isCloudMode && (
           <AudioActionRow>
-            {!installed && (
-              <PrimaryButton disabled={isBusy} onClick={onDownloadModel} type="button">
-                <ButtonMicIcon aria-hidden="true" />
-                <span>{audioActionState === "downloading" ? "Downloading..." : installLabel}</span>
-              </PrimaryButton>
-            )}
             <SecondaryButton disabled={isBusy} onClick={onRefreshStatus} type="button">
               <ButtonRefreshIcon aria-hidden="true" />
               <span>{audioStatusState === "checking" ? "Checking..." : "Recheck"}</span>
@@ -4193,6 +4447,7 @@ export function AudioWidgetWindow() {
   const barIdleModeRef = useRef(false);
   const canUseBubbleHistoryTrayRef = useRef(false);
   const widgetDragSettleTimerRef = useRef(0);
+  const widgetDragPositionSampleTimerRef = useRef(0);
   const historyTrayCloseAfterDragRef = useRef(false);
   const copiedWidgetHistoryTimerRef = useRef(0);
   const polishStatusTimerRef = useRef(0);
@@ -4357,7 +4612,7 @@ export function AudioWidgetWindow() {
     if (!modelStatus?.installed) {
       widgetStateRef.current = "missing";
       setWidgetState("missing");
-      setMessage("Install Whisper from the Audio tab.");
+      setMessage("Install a local Whisper model from the Audio tab.");
       return;
     }
 
@@ -4470,7 +4725,7 @@ export function AudioWidgetWindow() {
       && currentProvider !== AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
       && !modelStatus?.installed
     ) {
-      setError("Install Whisper from the Audio tab before recording.");
+      setError("Install a local Whisper model from the Audio tab before recording.");
       return;
     }
 
@@ -4709,7 +4964,7 @@ export function AudioWidgetWindow() {
         setWidgetState("missing");
       }
       if (!status.installed) {
-        setMessage("Install Whisper from the Audio tab.");
+        setMessage("Install a local Whisper model from the Audio tab.");
       }
     } catch (statusError) {
       widgetStateRef.current = "error";
@@ -4737,11 +4992,18 @@ export function AudioWidgetWindow() {
 
   const saveBubblePlacementFromWindow = useCallback(async (windowHandle) => {
     if (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+      logAudioWidgetBubblePosition("audio.widget.bubble.placement.save.skipped_bar", {});
       return null;
     }
 
     const position = await windowHandle.outerPosition().catch(() => null);
-    return writeAudioWidgetBubblePlacement(position);
+    const saved = writeAudioWidgetBubblePlacement(position);
+    logAudioWidgetBubblePosition("audio.widget.bubble.placement.save_from_window", {
+      nativePosition: audioWidgetBubblePositionPoint(position),
+      saved,
+      widgetState: widgetStateRef.current,
+    });
+    return saved;
   }, []);
 
   const cancelBarPositionAnimation = useCallback(() => {
@@ -4756,6 +5018,53 @@ export function AudioWidgetWindow() {
     }
     animation.frame = 0;
   }, []);
+
+  const clearWidgetDragPositionSample = useCallback(() => {
+    if (
+      widgetDragPositionSampleTimerRef.current
+      && typeof window !== "undefined"
+      && typeof window.clearTimeout === "function"
+    ) {
+      window.clearTimeout(widgetDragPositionSampleTimerRef.current);
+    }
+    widgetDragPositionSampleTimerRef.current = 0;
+  }, []);
+
+  const startWidgetDragPositionSample = useCallback((windowHandle, pointer) => {
+    clearWidgetDragPositionSample();
+    let sampleIndex = 0;
+
+    const sample = async () => {
+      if (!widgetDraggingRef.current || widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+        widgetDragPositionSampleTimerRef.current = 0;
+        return;
+      }
+
+      const position = await windowHandle.outerPosition().catch(() => null);
+      const size = await windowHandle.outerSize?.().catch(() => null);
+      logAudioWidgetBubblePosition("audio.widget.bubble.drag.position_sample", {
+        nativePosition: audioWidgetBubblePositionPoint(position),
+        nativeSize: audioWidgetBubblePositionSize(size),
+        pointer,
+        sampleIndex,
+        widgetState: widgetStateRef.current,
+      });
+      sampleIndex += 1;
+
+      if (
+        widgetDraggingRef.current
+        && typeof window !== "undefined"
+        && typeof window.setTimeout === "function"
+      ) {
+        widgetDragPositionSampleTimerRef.current = window.setTimeout(
+          sample,
+          AUDIO_WIDGET_BUBBLE_DRAG_DEBUG_SAMPLE_MS,
+        );
+      }
+    };
+
+    sample();
+  }, [clearWidgetDragPositionSample]);
 
   const setAudioBarWindowPosition = useCallback(async (windowHandle, target, animate = true) => {
     const targetX = Math.round(target.x);
@@ -4837,12 +5146,23 @@ export function AudioWidgetWindow() {
       window.clearTimeout(widgetDragSettleTimerRef.current);
     }
 
+    logAudioWidgetBubblePosition("audio.widget.bubble.drag.finish_scheduled", {
+      delayMs,
+      widgetState: widgetStateRef.current,
+      widgetStyle: widgetStyleRef.current,
+    });
     widgetDragSettleTimerRef.current = window.setTimeout(() => {
       widgetDragSettleTimerRef.current = 0;
       const closeHistoryTray = historyTrayCloseAfterDragRef.current;
       historyTrayCloseAfterDragRef.current = false;
       widgetDraggingRef.current = false;
       setWidgetDragging(false);
+      clearWidgetDragPositionSample();
+      logAudioWidgetBubblePosition("audio.widget.bubble.drag.finish_settled", {
+        closeHistoryTray,
+        widgetState: widgetStateRef.current,
+        widgetStyle: widgetStyleRef.current,
+      });
       if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
         runWidgetWindowAction(saveBubblePlacementFromWindow);
       }
@@ -4856,7 +5176,7 @@ export function AudioWidgetWindow() {
         ));
       }
     }, delayMs);
-  }, [runWidgetWindowAction, saveBubblePlacementFromWindow]);
+  }, [clearWidgetDragPositionSample, runWidgetWindowAction, saveBubblePlacementFromWindow]);
 
   const widgetTargetMode = isFocusedAudioWidgetState(widgetState) ? "focus" : "compact";
   const widgetActive = widgetState === "arming"
@@ -4865,15 +5185,19 @@ export function AudioWidgetWindow() {
     || widgetState === "error";
   const usesBottomAnchoredStyle = widgetStyle === AUDIO_WIDGET_STYLE_BAR;
   const cancelNoticeActive = Boolean(cancelNotice);
-  const barErrorFrameText = error || message || "Audio error";
+  const polishErrorFrameActive = polishStatus.state === "error" && Boolean(polishStatus.error);
+  const errorFrameText = polishErrorFrameActive ? polishStatus.error : error;
+  const sharedErrorFrameActive = Boolean(errorFrameText);
+  const errorFrameActive = sharedErrorFrameActive && !usesBottomAnchoredStyle;
+  const barErrorFrameActive = sharedErrorFrameActive && usesBottomAnchoredStyle;
   const barVisible = usesBottomAnchoredStyle
-    && (widgetActive || cancelNoticeActive);
+    && (widgetActive || cancelNoticeActive || barErrorFrameActive);
   const barIdleMode = usesBottomAnchoredStyle && !barVisible;
   const {
     key: barGeometryKey,
     margin: barGeometryMargin,
     size: barGeometrySize,
-  } = getAudioWidgetBarGeometry(cancelNoticeActive, barVisible);
+  } = getAudioWidgetBarGeometry(cancelNoticeActive, barErrorFrameActive, barVisible);
   const barGeometryReady = !usesBottomAnchoredStyle || barPlacementReadyKey === barGeometryKey;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.
@@ -4975,6 +5299,22 @@ export function AudioWidgetWindow() {
       releaseBubbleHistoryTrayPolishPin();
     }, delayMs);
   }, [releaseBubbleHistoryTrayPolishPin]);
+
+  const dismissWidgetErrorFrame = useCallback(() => {
+    if (polishStatusTimerRef.current) {
+      window.clearTimeout(polishStatusTimerRef.current);
+      polishStatusTimerRef.current = 0;
+    }
+    if (polishStatus.state === "error") {
+      setPolishStatus({ state: "idle", error: "" });
+      releaseBubbleHistoryTrayPolishPin();
+    }
+    if (widgetStateRef.current === "error") {
+      resetWidgetToStartState();
+      return;
+    }
+    setError("");
+  }, [polishStatus.state, releaseBubbleHistoryTrayPolishPin, resetWidgetToStartState]);
 
   const polishLatestTranscript = useCallback(async () => {
     if (polishStatus.state === "loading") {
@@ -5178,6 +5518,10 @@ export function AudioWidgetWindow() {
       window.clearTimeout(widgetDragSettleTimerRef.current);
       widgetDragSettleTimerRef.current = 0;
     }
+    if (widgetDragPositionSampleTimerRef.current) {
+      window.clearTimeout(widgetDragPositionSampleTimerRef.current);
+      widgetDragPositionSampleTimerRef.current = 0;
+    }
     historyTrayCloseAfterDragRef.current = false;
 
     if (copiedWidgetHistoryTimerRef.current) {
@@ -5356,6 +5700,10 @@ export function AudioWidgetWindow() {
       invoke("audio_widget_clear_bottom_bar_position").catch(() => {});
       const saved = barSavedPlacementRef.current;
       const restoredPosition = readAudioWidgetBubblePlacement() || saved?.position || null;
+      logAudioWidgetBubblePosition("audio.widget.bubble.restore_from_bar.request", {
+        hasSavedBarPlacement: Boolean(saved?.position),
+        restoredPosition: audioWidgetBubblePositionPoint(restoredPosition),
+      });
       if (saved || restoredPosition) {
         barSavedPlacementRef.current = null;
         barPlacementGenerationRef.current += 1;
@@ -5367,6 +5715,9 @@ export function AudioWidgetWindow() {
           if (restoredPosition) {
             await windowHandle.setPosition(new PhysicalPosition(restoredPosition.x, restoredPosition.y));
             writeAudioWidgetBubblePlacement(restoredPosition);
+            await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.restore_from_bar.done", {
+              restoredPosition: audioWidgetBubblePositionPoint(restoredPosition),
+            });
           }
         });
       }
@@ -5581,15 +5932,21 @@ export function AudioWidgetWindow() {
     }
 
     let disposed = false;
-    runWidgetWindowAction((windowHandle) => {
+    runWidgetWindowAction(async (windowHandle) => {
       if (disposed || widgetDraggingRef.current) {
         return undefined;
       }
 
-      return windowHandle.setSize(new LogicalSize(
+      await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.history_tray.expand_before", {
+        targetSize: AUDIO_WIDGET_HISTORY_TRAY_SIZE,
+      });
+      await windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_HISTORY_TRAY_SIZE.width,
         AUDIO_WIDGET_HISTORY_TRAY_SIZE.height,
       ));
+      await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.history_tray.expand_after", {
+        targetSize: AUDIO_WIDGET_HISTORY_TRAY_SIZE,
+      });
     });
 
     return () => {
@@ -5598,12 +5955,18 @@ export function AudioWidgetWindow() {
         return;
       }
 
-      runWidgetWindowAction((windowHandle) => (
-        windowHandle.setSize(new LogicalSize(
+      runWidgetWindowAction(async (windowHandle) => {
+        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.history_tray.restore_before", {
+          targetSize: AUDIO_WIDGET_COMPACT_SIZE,
+        });
+        await windowHandle.setSize(new LogicalSize(
           AUDIO_WIDGET_COMPACT_SIZE.width,
           AUDIO_WIDGET_COMPACT_SIZE.height,
-        ))
-      ));
+        ));
+        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.history_tray.restore_after", {
+          targetSize: AUDIO_WIDGET_COMPACT_SIZE,
+        });
+      });
     };
   }, [bubbleHistoryTrayActive, runWidgetWindowAction, widgetDragging]);
 
@@ -5611,13 +5974,6 @@ export function AudioWidgetWindow() {
   // upward by the card height while the error shows, and the pill stays at
   // its original spot on screen. (The resize effect itself is declared after
   // the frame-mode effect below so its size wins within the same commit.)
-  const polishErrorFrameActive = polishStatus.state === "error"
-    && Boolean(polishStatus.error)
-    && !usesBottomAnchoredStyle;
-  const errorFrameText = polishErrorFrameActive ? polishStatus.error : error;
-  const errorFrameActive = ((widgetState === "error" && Boolean(error)) || polishErrorFrameActive)
-    && !usesBottomAnchoredStyle;
-
   useEffect(() => {
     if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetDragging) {
       return undefined;
@@ -5730,6 +6086,10 @@ export function AudioWidgetWindow() {
       if (widgetDraggingRef.current) {
         return;
       }
+      logAudioWidgetBubblePosition("audio.widget.bubble.error_frame.expand", {
+        savedPosition: audioWidgetBubblePositionPoint(savedPosition),
+        scale: Number(scale || 1) || 1,
+      });
       await windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_FOCUS_SIZE.width,
         AUDIO_WIDGET_FOCUS_SIZE.height + AUDIO_WIDGET_ERROR_POPOVER_HEIGHT,
@@ -5738,6 +6098,9 @@ export function AudioWidgetWindow() {
         savedPosition.x,
         savedPosition.y - Math.round(AUDIO_WIDGET_ERROR_POPOVER_HEIGHT * (scale || 1)),
       ));
+      await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.error_frame.expanded", {
+        savedPosition: audioWidgetBubblePositionPoint(savedPosition),
+      });
     });
     return () => {
       runWidgetWindowAction(async (windowHandle) => {
@@ -5750,6 +6113,9 @@ export function AudioWidgetWindow() {
         ));
         if (savedPosition && !widgetDraggingRef.current) {
           await windowHandle.setPosition(savedPosition);
+          await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.error_frame.restored", {
+            restoredPosition: audioWidgetBubblePositionPoint(savedPosition),
+          });
         }
       });
     };
@@ -5772,6 +6138,10 @@ export function AudioWidgetWindow() {
       if (widgetDraggingRef.current) {
         return;
       }
+      logAudioWidgetBubblePosition("audio.widget.bubble.cancel_notice.expand", {
+        savedPosition: audioWidgetBubblePositionPoint(savedPosition),
+        scale: Number(scale || 1) || 1,
+      });
       await windowHandle.setSize(new LogicalSize(
         AUDIO_WIDGET_BAR_NOTICE_SIZE.width,
         AUDIO_WIDGET_BAR_NOTICE_SIZE.height,
@@ -5786,6 +6156,11 @@ export function AudioWidgetWindow() {
           - Math.round(AUDIO_WIDGET_BAR_NOTICE_SIZE.width * scale);
         const x = Math.max(area.position.x, Math.min(savedPosition.x, maxX));
         await windowHandle.setPosition(new PhysicalPosition(x, savedPosition.y));
+        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.cancel_notice.nudged", {
+          clampedX: Math.round(x),
+          maxX: Math.round(maxX),
+          savedPosition: audioWidgetBubblePositionPoint(savedPosition),
+        });
       }
     });
     return () => {
@@ -5799,6 +6174,9 @@ export function AudioWidgetWindow() {
         ));
         if (savedPosition && !widgetDraggingRef.current) {
           await windowHandle.setPosition(savedPosition);
+          await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.cancel_notice.restored", {
+            restoredPosition: audioWidgetBubblePositionPoint(savedPosition),
+          });
         }
       });
     };
@@ -5821,6 +6199,12 @@ export function AudioWidgetWindow() {
     event.stopPropagation();
 
     const trayWasActive = bubbleHistoryTrayActiveRef.current;
+    const pointer = {
+      clientX: Math.round(Number(event.clientX || 0)),
+      clientY: Math.round(Number(event.clientY || 0)),
+      screenX: Math.round(Number(event.screenX || 0)),
+      screenY: Math.round(Number(event.screenY || 0)),
+    };
 
     if (historyTrayCloseTimerRef.current) {
       window.clearTimeout(historyTrayCloseTimerRef.current);
@@ -5836,9 +6220,29 @@ export function AudioWidgetWindow() {
     scheduleWidgetDragFinish(5000);
 
     runWidgetWindowAction(async (windowHandle) => {
-      await windowHandle.startDragging();
+      await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.start", {
+        pointer,
+        trayWasActive,
+        widgetState: widgetStateRef.current,
+      });
+      startWidgetDragPositionSample(windowHandle, pointer);
+      try {
+        await windowHandle.startDragging();
+        await logAudioWidgetBubbleWindowSnapshot(windowHandle, "audio.widget.bubble.drag.start_done", {
+          pointer,
+          trayWasActive,
+          widgetState: widgetStateRef.current,
+        });
+      } catch (error) {
+        logAudioWidgetBubblePosition("audio.widget.bubble.drag.start_error", {
+          error: String(error?.message || error || "Unable to start dragging bubble"),
+          pointer,
+          trayWasActive,
+          widgetState: widgetStateRef.current,
+        });
+      }
     });
-  }, [runWidgetWindowAction, scheduleWidgetDragFinish]);
+  }, [runWidgetWindowAction, scheduleWidgetDragFinish, startWidgetDragPositionSample]);
 
   const minimizeWidget = useCallback(() => {
     runWidgetWindowAction((windowHandle) => windowHandle.minimize());
@@ -6624,6 +7028,19 @@ export function AudioWidgetWindow() {
     }, AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS);
     return () => window.clearTimeout(timer);
   }, [resetWidgetToStartState, widgetState]);
+
+  useEffect(() => {
+    if (!error || widgetState === "error") {
+      return undefined;
+    }
+    const errorText = error;
+    const timer = window.setTimeout(() => {
+      if (widgetStateRef.current !== "error") {
+        setError((currentError) => (currentError === errorText ? "" : currentError));
+      }
+    }, AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS);
+    return () => window.clearTimeout(timer);
+  }, [error, widgetState]);
 
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
@@ -7456,65 +7873,72 @@ export function AudioWidgetWindow() {
         <AudioBarShell
           aria-label={widgetLabel}
           data-geometry-ready={barGeometryReady ? "true" : "false"}
-          data-mode={cancelNotice ? "notice" : "active"}
+          data-mode={cancelNotice ? "notice" : barErrorFrameActive ? "error" : "active"}
           data-theme={audioWidgetTheme}
           data-visible={barVisible && barGeometryReady ? "true" : "false"}
         >
           {cancelNotice ? cancelNoticeSurface : (
-            <AudioBarSurface
-              key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
-              onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
-              role="status"
-              style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}
-              title={isRecordingFocus || widgetState === "arming"
-                ? "Click to finish and paste, or press the shortcut again. X cancels."
-                : undefined}
-            >
-              <AudioBarCancelButton
-                aria-label={widgetState === "error" ? "Dismiss audio error" : "Cancel dictation"}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  if (widgetState === "error") {
-                    resetWidgetToStartState();
-                    return;
-                  }
-                  cancelRecording();
-                }}
-                title={widgetState === "error"
-                  ? "Dismiss audio error"
-                  : "Cancel: stop without pasting. The transcript is still saved to History."}
-                type="button"
+            <>
+              {barErrorFrameActive ? (
+                <AudioBarErrorPopover data-theme={audioWidgetTheme} role="alert" title={errorFrameText}>
+                  {errorFrameText}
+                </AudioBarErrorPopover>
+              ) : null}
+              <AudioBarSurface
+                key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
+                onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
+                role="status"
+                style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}
+                title={isRecordingFocus || widgetState === "arming"
+                  ? "Click to finish and paste, or press the shortcut again. X cancels."
+                  : undefined}
               >
-                ×
-              </AudioBarCancelButton>
-              {widgetState === "error" ? (
-                <AudioBarStatusText title={barErrorFrameText}>
-                  Audio error
-                </AudioBarStatusText>
-              ) : (
-                <AudioBarMeter aria-hidden="true">
-                  {Array.from({ length: AUDIO_BAR_METER_BARS }, (_, index) => (
-                    <span
-                      key={index}
-                      style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus, AUDIO_BAR_METER_BARS)}
-                    />
-                  ))}
-                </AudioBarMeter>
-              )}
-              {isProcessingFocus ? (
-                <AudioBarSpinner aria-label="Transcribing" role="status" />
-              ) : (isRecordingFocus || widgetState === "arming") && (
-                <AudioBarStopButton
-                  aria-label="Finish and paste"
+                <AudioBarCancelButton
+                  aria-label={barErrorFrameActive ? "Dismiss audio error" : "Cancel dictation"}
                   onClick={(event) => {
                     event.stopPropagation();
-                    finishFromBar();
+                    if (barErrorFrameActive) {
+                      dismissWidgetErrorFrame();
+                      return;
+                    }
+                    cancelRecording();
                   }}
-                  title="Finish recording and paste the transcript"
+                  title={barErrorFrameActive
+                    ? "Dismiss audio error"
+                    : "Cancel: stop without pasting. The transcript is still saved to History."}
                   type="button"
-                />
-              )}
-            </AudioBarSurface>
+                >
+                  ×
+                </AudioBarCancelButton>
+                {barErrorFrameActive ? (
+                  <AudioBarStatusText title={errorFrameText}>
+                    Audio error
+                  </AudioBarStatusText>
+                ) : (
+                  <AudioBarMeter aria-hidden="true">
+                    {Array.from({ length: AUDIO_BAR_METER_BARS }, (_, index) => (
+                      <span
+                        key={index}
+                        style={buildWidgetMeterBarStyle(index, widgetLevel, isProcessingFocus, AUDIO_BAR_METER_BARS)}
+                      />
+                    ))}
+                  </AudioBarMeter>
+                )}
+                {isProcessingFocus ? (
+                  <AudioBarSpinner aria-label="Transcribing" role="status" />
+                ) : (isRecordingFocus || widgetState === "arming") && (
+                  <AudioBarStopButton
+                    aria-label="Finish and paste"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      finishFromBar();
+                    }}
+                    title="Finish recording and paste the transcript"
+                    type="button"
+                  />
+                )}
+              </AudioBarSurface>
+            </>
           )}
         </AudioBarShell>
       </>

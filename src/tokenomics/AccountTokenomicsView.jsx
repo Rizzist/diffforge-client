@@ -723,13 +723,13 @@ function formatStorageBytes(value) {
 function storageLimitsForPlan(planName) {
   const normalized = String(planName || "").trim().toLowerCase();
   if (normalized === "ultra") {
-    return { totalBytes: 15 * 1024 ** 3, sqliteBytes: 6 * 1024 ** 3, assetsBytes: 9 * 1024 ** 3 };
+    return { totalBytes: 100 * 1024 ** 3, sqliteBytes: 10 * 1024 ** 3, assetsBytes: 90 * 1024 ** 3 };
   }
   if (normalized === "pro") {
-    return { totalBytes: 5 * 1024 ** 3, sqliteBytes: 3 * 1024 ** 3, assetsBytes: 2 * 1024 ** 3 };
+    return { totalBytes: 15 * 1024 ** 3, sqliteBytes: 5 * 1024 ** 3, assetsBytes: 10 * 1024 ** 3 };
   }
   if (normalized === "plus") {
-    return { totalBytes: 2 * 1024 ** 3, sqliteBytes: 1.5 * 1024 ** 3, assetsBytes: 0.5 * 1024 ** 3 };
+    return { totalBytes: 3 * 1024 ** 3, sqliteBytes: 1.5 * 1024 ** 3, assetsBytes: 1.5 * 1024 ** 3 };
   }
   return { totalBytes: 0, sqliteBytes: 0, assetsBytes: 0 };
 }

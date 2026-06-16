@@ -46,9 +46,20 @@ const EMPTY_CAPTURE_STATS = {
   rms: 0,
   timeDomainSamples: [],
 };
+let audioInputOwnerSequence = 0;
 
 function canUseStorage() {
   return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
+
+function createAudioInputMonitorOwner(owner) {
+  const prefix = String(owner || "audio")
+    .replace(/[^a-zA-Z0-9_-]+/g, "")
+    .slice(0, 28)
+    || "audio";
+  audioInputOwnerSequence = (audioInputOwnerSequence + 1) % 1_000_000;
+  const suffix = `${Date.now().toString(36)}-${audioInputOwnerSequence.toString(36)}`;
+  return `${prefix}-${suffix}`;
 }
 
 function normalizeAudioTranscriptionProvider(value) {
@@ -396,7 +407,7 @@ export function writeAudioWidgetTheme(theme) {
 }
 
 // The dictation provider setting has exactly three values: local Whisper,
-// Deepgram cloud (your key), and Diff Forge AI (Nova-3 + LLM cleanup). The
+// Deepgram cloud (your key), and Diff Forge Cloud (Nova-3 + LLM cleanup). The
 // voice-agent pathway is not a dictation provider — it lives behind the
 // Orchestrator voice button. Legacy stored "forge-agent" values migrate to
 // "forge"; the constant stays only so history rows keep their labels.
@@ -677,6 +688,7 @@ export async function startLowPowerAudioBuffer({
 } = {}) {
   let closed = false;
   let latestStats = { ...EMPTY_CAPTURE_STATS };
+  const monitorOwner = createAudioInputMonitorOwner(owner);
   const unlisten = onStats
     ? await listen(AUDIO_INPUT_STATS_EVENT, (event) => {
       latestStats = {
@@ -690,7 +702,7 @@ export async function startLowPowerAudioBuffer({
   const status = await invoke("start_audio_input_monitor", {
     request: {
       deviceId,
-      owner,
+      owner: monitorOwner,
     },
   });
 
@@ -727,7 +739,7 @@ export async function startLowPowerAudioBuffer({
       }
       await invoke("stop_audio_input_monitor", {
         request: {
-          owner,
+          owner: monitorOwner,
         },
       }).catch(() => {});
     },

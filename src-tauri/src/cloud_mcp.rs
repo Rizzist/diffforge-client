@@ -25,6 +25,7 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT: &str = "cloud-mcp-device-deleted";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT: &str = "cloud-mcp-account-device-live-state";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
+const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT: &str = "cloud-mcp-workspace-catalog-changed";
@@ -71,6 +72,7 @@ const CLOUD_MCP_CREDIT_METER_RENAMES: &[(&str, &str)] = &[
 const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
 const CLOUD_MCP_OUTBOX_TABLE: &str = "cloud_sync_outbox";
 const CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE: &str = "architecture_graph_sync_state";
+const CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE: &str = "device_live_state_sync_state";
 const CLOUD_MCP_ASSET_LIBRARY_DB_FILE: &str = "account-asset-library.sqlite";
 const CLOUD_MCP_LEGACY_ASSET_LIBRARY_DB_FILE: &str = "workspace-asset-library.sqlite";
 const CLOUD_MCP_ASSET_DEVICE_SYNC_STATE_TABLE: &str = "account_asset_device_sync_state";
@@ -209,6 +211,17 @@ struct CloudMcpOutboxActivityRow {
 
 #[derive(Clone, Default)]
 struct CloudMcpTokenomicsBucketSyncActivity {
+    remaining_count: usize,
+    progress_done: u64,
+    progress_total: u64,
+    bytes: u64,
+    state: &'static str,
+    updated_at_ms: u64,
+}
+
+#[derive(Clone, Default)]
+struct CloudMcpDeviceLiveUnitSyncActivity {
+    domain: &'static str,
     remaining_count: usize,
     progress_done: u64,
     progress_total: u64,
@@ -358,6 +371,13 @@ enum CloudMcpAssetDeviceSyncDecision {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloudMcpArchitectureGraphSyncDecision {
+    Enqueue,
+    CurrentAcked,
+    CurrentPending,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloudMcpDeviceLiveSyncDecision {
     Enqueue,
     CurrentAcked,
     CurrentPending,
@@ -1937,6 +1957,38 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
                WHERE o.idempotency_key={CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}.idempotency_key
                  AND o.status='acked'
            );
+         UPDATE {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}
+         SET acked_at_ms=(
+                 SELECT CASE
+                     WHEN o.acked_at_ms>0 THEN o.acked_at_ms
+                     ELSE o.updated_at_ms
+                 END
+                 FROM {CLOUD_MCP_OUTBOX_TABLE} o
+                 WHERE o.idempotency_key={CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}.idempotency_key
+                   AND o.status='acked'
+                 LIMIT 1
+             ),
+             updated_at_ms=MAX(
+                 updated_at_ms,
+                 (
+                     SELECT CASE
+                         WHEN o.acked_at_ms>0 THEN o.acked_at_ms
+                         ELSE o.updated_at_ms
+                     END
+                     FROM {CLOUD_MCP_OUTBOX_TABLE} o
+                     WHERE o.idempotency_key={CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}.idempotency_key
+                       AND o.status='acked'
+                     LIMIT 1
+                 )
+             )
+         WHERE acked_at_ms=0
+           AND idempotency_key<>''
+           AND EXISTS (
+               SELECT 1
+               FROM {CLOUD_MCP_OUTBOX_TABLE} o
+               WHERE o.idempotency_key={CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}.idempotency_key
+                 AND o.status='acked'
+           );
          {prune_sql}"
     );
     conn.execute_batch(&format!(
@@ -2008,6 +2060,20 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
         );
         CREATE INDEX IF NOT EXISTS idx_architecture_graph_sync_state_pending
             ON {CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}(scope_key, device_id, acked_at_ms, updated_at_ms);
+        CREATE TABLE IF NOT EXISTS {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}(
+            scope_key TEXT NOT NULL DEFAULT '',
+            device_id TEXT NOT NULL DEFAULT '',
+            sync_unit TEXT NOT NULL DEFAULT 'device_live_state_snapshot',
+            content_hash TEXT NOT NULL DEFAULT '',
+            payload_hash TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT NOT NULL DEFAULT '',
+            server_cursor TEXT NOT NULL DEFAULT '',
+            acked_at_ms INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(scope_key, device_id, sync_unit)
+        );
+        CREATE INDEX IF NOT EXISTS idx_device_live_sync_state_pending
+            ON {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}(scope_key, device_id, acked_at_ms, updated_at_ms);
         {maintenance_sql}
         "
     ))
@@ -3072,14 +3138,15 @@ fn cloud_mcp_outbox_stable_snapshot_hash_value(event_kind: &str, value: &Value) 
     }
 
     let normalized_kind = event_kind.trim().to_ascii_lowercase();
-    let stable_todo_snapshot = matches!(
+    let stable_snapshot = matches!(
         normalized_kind.as_str(),
         "workspace_todo_snapshot"
             | "workspace_todos_snapshot"
             | "todo_queue_snapshot"
             | "todo_queue_state"
+            | "device_live_state_snapshot"
     );
-    if !stable_todo_snapshot {
+    if !stable_snapshot {
         return value.clone();
     }
     match value {
@@ -3112,6 +3179,23 @@ fn cloud_mcp_outbox_stable_snapshot_hash_value(event_kind: &str, value: &Value) 
 
 fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> Option<String> {
     let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    if cloud_mcp_device_live_unit_event_kind(&normalized_kind) {
+        let scope_key = cloud_mcp_payload_scope_key(payload)
+            .unwrap_or_else(cloud_mcp_process_account_scope_key);
+        let device_id = cloud_mcp_payload_text(
+            payload,
+            &["device_id", "deviceId", "machine_id", "machineId"],
+        )
+        .unwrap_or_default();
+        let sync_unit = cloud_mcp_payload_text(payload, &["sync_unit", "syncUnit"])
+            .unwrap_or_default();
+        if device_id.is_empty() || sync_unit.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "device-live-unit:{scope_key}:{device_id}:{sync_unit}"
+        ));
+    }
     // Catalog mutations coalesce per workspace id with latest-wins semantics:
     // an offline rename storm collapses to one upsert, and a delete supersedes
     // any queued upsert for the same workspace (ids are never reused, so the
@@ -3766,13 +3850,22 @@ fn cloud_mcp_sync_activity_domain(raw: &str) -> &'static str {
         "architectures"
     } else if raw.contains("asset") {
         "assets"
-    } else if raw.contains("tokenomic") || raw.contains("billing") || raw.contains("usage") {
+    } else if raw.contains("tokenomic")
+        || raw.contains("billing")
+        || raw.contains("usage")
+        || raw.contains("provider_account")
+    {
         "tokenomics"
     } else if raw.contains("catalog") || raw.contains("workspace_deleted") {
         "catalog"
     } else if raw.contains("remote_command") {
         "remote_commands"
-    } else if raw.contains("tool") || raw.contains("skill") || raw.contains("cli") {
+    } else if raw.contains("tool")
+        || raw.contains("skill")
+        || raw.contains("cli")
+        || raw.contains("agent_installation")
+        || raw.contains("mcp")
+    {
         "tools"
     } else if raw.contains("voice") {
         "voice"
@@ -4395,6 +4488,156 @@ fn cloud_mcp_tokenomics_bucket_sync_activity(
     Some(activity)
 }
 
+fn cloud_mcp_device_live_unit_domain(sync_unit: &str) -> Option<&'static str> {
+    let sync_unit = sync_unit.trim().to_ascii_lowercase();
+    if sync_unit.starts_with("provider_account:") {
+        Some("tokenomics")
+    } else if sync_unit.starts_with("agent_installation:")
+        || sync_unit.starts_with("workspace_mcp_server:")
+    {
+        Some("tools")
+    } else {
+        None
+    }
+}
+
+fn cloud_mcp_device_live_unit_sync_activities(
+    now: u64,
+) -> Vec<CloudMcpDeviceLiveUnitSyncActivity> {
+    #[derive(Clone)]
+    struct UnitRow {
+        acked_at_ms: i64,
+        updated_at_ms: i64,
+        status: String,
+        bytes: u64,
+        created_at_ms: i64,
+    }
+
+    #[derive(Default)]
+    struct UnitGroup {
+        rows: Vec<UnitRow>,
+    }
+
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return Vec::new();
+    };
+    let mut statement = match conn.prepare(&format!(
+        "SELECT d.sync_unit,
+                d.acked_at_ms,
+                d.updated_at_ms,
+                COALESCE(o.status, ''),
+                COALESCE(LENGTH(o.payload_json), 0),
+                COALESCE(o.created_at_ms, d.updated_at_ms)
+         FROM {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE} d
+         LEFT JOIN {CLOUD_MCP_OUTBOX_TABLE} o
+           ON o.idempotency_key=d.idempotency_key
+         WHERE d.content_hash<>''
+           AND d.idempotency_key<>''
+           AND (
+             d.sync_unit LIKE 'agent_installation:%'
+             OR d.sync_unit LIKE 'workspace_mcp_server:%'
+             OR d.sync_unit LIKE 'provider_account:%'
+           )"
+    )) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match statement.query_map([], |row| {
+        let sync_unit: String = row.get(0)?;
+        Ok((
+            sync_unit,
+            UnitRow {
+                acked_at_ms: row.get::<_, i64>(1).unwrap_or(0).max(0),
+                updated_at_ms: row.get::<_, i64>(2).unwrap_or(0).max(0),
+                status: row.get::<_, String>(3).unwrap_or_default(),
+                bytes: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                created_at_ms: row.get::<_, i64>(5).unwrap_or(0).max(0),
+            },
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut groups: HashMap<&'static str, UnitGroup> = HashMap::new();
+    for row in rows.flatten() {
+        let Some(domain) = cloud_mcp_device_live_unit_domain(&row.0) else {
+            continue;
+        };
+        groups.entry(domain).or_default().rows.push(row.1);
+    }
+
+    let mut activities = Vec::new();
+    for (domain, group) in groups {
+        let mut activity = CloudMcpDeviceLiveUnitSyncActivity {
+            domain,
+            ..CloudMcpDeviceLiveUnitSyncActivity::default()
+        };
+        let mut saw_dead_letter = false;
+        let mut saw_retrying = false;
+        let mut saw_in_flight = false;
+        let mut active_min_updated_ms: Option<i64> = None;
+        let mut latest_updated_ms = 0i64;
+
+        for row in &group.rows {
+            let active = cloud_mcp_tokenomics_bucket_status_active(row.acked_at_ms, &row.status);
+            if active {
+                activity.remaining_count = activity.remaining_count.saturating_add(1);
+                activity.bytes = activity.bytes.saturating_add(row.bytes);
+                let active_at_ms = if row.created_at_ms > 0 {
+                    row.created_at_ms
+                } else {
+                    row.updated_at_ms
+                };
+                active_min_updated_ms = Some(
+                    active_min_updated_ms
+                        .map(|current| current.min(active_at_ms))
+                        .unwrap_or(active_at_ms),
+                );
+                match row.status.trim().to_ascii_lowercase().as_str() {
+                    "dead_letter" => saw_dead_letter = true,
+                    "retrying" => saw_retrying = true,
+                    "in_flight" => saw_in_flight = true,
+                    _ => {}
+                }
+            }
+            latest_updated_ms = latest_updated_ms.max(row.updated_at_ms);
+        }
+        if activity.remaining_count == 0 {
+            continue;
+        }
+        let recent_ack_floor = active_min_updated_ms
+            .unwrap_or_default()
+            .saturating_sub(CLOUD_MCP_TOKENOMICS_BUCKET_ACK_WINDOW_GRACE_MS);
+        for row in &group.rows {
+            let active = cloud_mcp_tokenomics_bucket_status_active(row.acked_at_ms, &row.status);
+            if !active && row.acked_at_ms > 0 && row.acked_at_ms >= recent_ack_floor {
+                activity.progress_done = activity.progress_done.saturating_add(1);
+                latest_updated_ms = latest_updated_ms.max(row.acked_at_ms);
+            }
+        }
+        activity.progress_total = activity
+            .progress_done
+            .saturating_add(activity.remaining_count as u64);
+        activity.state = if saw_dead_letter {
+            "failed"
+        } else if saw_retrying {
+            "retrying"
+        } else if saw_in_flight {
+            "active"
+        } else {
+            "queued"
+        };
+        activity.updated_at_ms = if latest_updated_ms > 0 {
+            latest_updated_ms as u64
+        } else {
+            now
+        };
+        activities.push(activity);
+    }
+    activities
+}
+
 fn cloud_mcp_push_sync_activity_json(
     aggregate: &mut CloudMcpSyncActivityAggregate,
     domain: &str,
@@ -4530,6 +4773,8 @@ fn cloud_mcp_sync_activity_aggregate() -> CloudMcpSyncActivityAggregate {
     };
     let tokenomics_bucket_activity = cloud_mcp_tokenomics_bucket_sync_activity(now);
     let tokenomics_bucket_activity_active = tokenomics_bucket_activity.is_some();
+    let device_live_unit_activities = cloud_mcp_device_live_unit_sync_activities(now);
+    let device_live_unit_activity_active = !device_live_unit_activities.is_empty();
     let outbox_rows = cloud_mcp_outbox_activity_rows();
     for row in outbox_rows {
         let state = cloud_mcp_activity_state_from_outbox_status(&row.status);
@@ -4558,6 +4803,10 @@ fn cloud_mcp_sync_activity_aggregate() -> CloudMcpSyncActivityAggregate {
         {
             continue;
         }
+        if device_live_unit_activity_active && cloud_mcp_device_live_unit_event_kind(&row.event_kind)
+        {
+            continue;
+        }
         let size_class = cloud_mcp_sync_activity_size_class(state, row.count, row.bytes, domain);
         let progress = cloud_mcp_sync_activity_progress(state, row.count, None, None, None);
         cloud_mcp_push_sync_activity_json(
@@ -4576,6 +4825,38 @@ fn cloud_mcp_sync_activity_aggregate() -> CloudMcpSyncActivityAggregate {
             &progress.basis,
             progress.complete,
             now,
+        );
+    }
+
+    for unit_activity in device_live_unit_activities {
+        let progress = cloud_mcp_sync_activity_progress(
+            unit_activity.state,
+            unit_activity.remaining_count,
+            Some(unit_activity.progress_done),
+            Some(unit_activity.progress_total),
+            Some("sync_units"),
+        );
+        cloud_mcp_push_sync_activity_json(
+            &mut aggregate,
+            unit_activity.domain,
+            "up",
+            unit_activity.state,
+            unit_activity.remaining_count,
+            unit_activity.bytes,
+            true,
+            cloud_mcp_sync_activity_size_class(
+                unit_activity.state,
+                unit_activity.remaining_count,
+                unit_activity.bytes,
+                unit_activity.domain,
+            ),
+            &format!("unit-ledger:{}", unit_activity.domain),
+            progress.done,
+            progress.total,
+            progress.percent,
+            &progress.basis,
+            progress.complete,
+            unit_activity.updated_at_ms,
         );
     }
 
@@ -5146,6 +5427,13 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
             let _ = cloud_mcp_architecture_mark_sync_acked_from_payload(Some(&payload), response);
         }
     }
+    if row.event_kind == "device_live_state_snapshot"
+        || cloud_mcp_device_live_unit_event_kind(&row.event_kind)
+    {
+        if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
+            let _ = cloud_mcp_device_live_mark_sync_acked_from_payload(Some(&payload), response);
+        }
+    }
     let conn = cloud_mcp_open_outbox_conn()?;
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
@@ -5325,7 +5613,10 @@ fn cloud_mcp_outbox_priority_for_event(event_kind: &str) -> u8 {
         | "workspace_catalog_upsert"
         | "workspace_catalog_delete"
         | "asset_library_register"
-        | "asset_library_report_transfer_progress" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        | "asset_library_report_transfer_progress"
+        | "device_agent_installation_status"
+        | "workspace_mcp_server_status"
+        | "provider_account_identity" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
         "device_live_state_snapshot" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
         "checkpoint" | "checkpoint_recorded" | "subtask_checkpoint" => {
             CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
@@ -6662,7 +6953,15 @@ fn cloud_mcp_tokenomics_provider_accounts(summary: &Value, now_ms: u64) -> Vec<V
                 "agent_kind": agent_kind,
                 "agentKind": agent_kind,
                 "label": cloud_mcp_payload_text(row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+                "provider_account_label": cloud_mcp_payload_text(row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+                "providerAccountLabel": cloud_mcp_payload_text(row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
                 "confidence": cloud_mcp_payload_text(row, &["identity_confidence", "identityConfidence", "confidence"]).unwrap_or_else(|| "usage".to_string()),
+                "attribution_source": cloud_mcp_payload_text(row, &["attribution_source", "attributionSource", "source"]).unwrap_or_default(),
+                "attributionSource": cloud_mcp_payload_text(row, &["attribution_source", "attributionSource", "source"]).unwrap_or_default(),
+                "first_seen_at": cloud_mcp_payload_text(row, &["first_seen_at", "firstSeenAt"]).unwrap_or_default(),
+                "firstSeenAt": cloud_mcp_payload_text(row, &["first_seen_at", "firstSeenAt"]).unwrap_or_default(),
+                "last_seen_at": cloud_mcp_payload_text(row, &["last_seen_at", "lastSeenAt", "updated_at", "updatedAt"]).unwrap_or_default(),
+                "lastSeenAt": cloud_mcp_payload_text(row, &["last_seen_at", "lastSeenAt", "updated_at", "updatedAt"]).unwrap_or_default(),
                 "updated_at_ms": now_ms,
                 "updatedAtMs": now_ms
             })
@@ -6676,6 +6975,90 @@ fn cloud_mcp_tokenomics_provider_accounts(summary: &Value, now_ms: u64) -> Vec<V
         }
     }
     accounts.into_values().collect()
+}
+
+fn cloud_mcp_provider_account_identity_content_hash(account: &Value) -> String {
+    let provider = cloud_mcp_payload_text(account, &["provider"]).unwrap_or_default();
+    let agent_kind =
+        cloud_mcp_payload_text(account, &["agent_kind", "agentKind"]).unwrap_or_else(|| provider.clone());
+    let account_key = cloud_mcp_tokenomics_provider_account_key(account);
+    cloud_mcp_outbox_payload_hash(&json!({
+        "provider": provider,
+        "agent_kind": agent_kind,
+        "provider_account_key": account_key,
+        "label": cloud_mcp_payload_text(account, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+        "subscription_key": cloud_mcp_payload_text(account, &["subscription_key", "subscriptionKey", "key"]).unwrap_or_else(|| account_key.clone()),
+        "billing_scope_source": cloud_mcp_payload_text(account, &["billing_scope_source", "billingScopeSource", "billing_scope", "billingScope"]).unwrap_or_default(),
+        "attribution_source": cloud_mcp_payload_text(account, &["attribution_source", "attributionSource", "source"]).unwrap_or_default(),
+        "confidence": cloud_mcp_payload_text(account, &["confidence", "identity_confidence", "identityConfidence"]).unwrap_or_default(),
+    }))
+}
+
+async fn cloud_mcp_sync_provider_account_identity_units(
+    state: &CloudMcpState,
+    device_profile: &Value,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    scope_key: &str,
+    provider_accounts: &[Value],
+    reason: &str,
+) -> Result<(usize, usize), String> {
+    let device_id = cloud_mcp_payload_text(device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop".to_string());
+    let mut sent_count = 0usize;
+    let mut skipped_count = 0usize;
+    for account in provider_accounts.iter().take(256) {
+        let account_key = cloud_mcp_tokenomics_provider_account_key(account);
+        if account_key.trim().is_empty() {
+            continue;
+        }
+        let provider = cloud_mcp_payload_text(account, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+        let agent_kind =
+            cloud_mcp_payload_text(account, &["agent_kind", "agentKind"]).unwrap_or_else(|| provider.clone());
+        let content_hash = cloud_mcp_provider_account_identity_content_hash(account);
+        let sync_unit = format!("provider_account:{provider}:{agent_kind}:{account_key}");
+        let unit_payload = json!({
+            "source": "rust-diffforge-provider-account-identity-unit",
+            "event_kind": "provider_account_identity",
+            "device_id": device_id,
+            "deviceId": device_id,
+            "device": device_profile,
+            "billing_scope_type": billing_scope_type,
+            "billingScopeType": billing_scope_type,
+            "team_id": team_id,
+            "teamId": team_id,
+            "scope_key": scope_key,
+            "scopeKey": scope_key,
+            "provider": provider,
+            "agent_kind": agent_kind,
+            "agentKind": agent_kind,
+            "provider_account_key": account_key,
+            "providerAccountKey": account_key,
+            "provider_account": account,
+            "providerAccount": account,
+            "provider_accounts": [account],
+            "providerAccounts": [account],
+            "sync_unit": sync_unit,
+            "syncUnit": sync_unit,
+            "sync_content_hash": content_hash,
+            "syncContentHash": content_hash,
+            "reason": reason,
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        let response =
+            cloud_mcp_sync_device_live_unit_event(state, "provider_account_identity", unit_payload)
+                .await?;
+        if response
+            .get("skipped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            skipped_count = skipped_count.saturating_add(1);
+        } else {
+            sent_count = sent_count.saturating_add(1);
+        }
+    }
+    Ok((sent_count, skipped_count))
 }
 
 fn cloud_mcp_tokenomics_hourly_groups(summary: &Value, now_ms: u64) -> Vec<Value> {
@@ -7163,6 +7546,41 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "empty_non_full_delta": empty_non_full_delta,
         }),
     );
+    let provider_accounts_for_identity =
+        cloud_mcp_tokenomics_provider_accounts(&summary, cloud_mcp_now_ms());
+    let provider_identity_counts = match cloud_mcp_sync_provider_account_identity_units(
+        &worker_state,
+        &device_profile,
+        &billing_scope_type,
+        team_id.as_deref(),
+        &tokenomics_scope_key,
+        &provider_accounts_for_identity,
+        &reason_for_worker,
+    )
+    .await
+    {
+        Ok(counts) => counts,
+        Err(error) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "provider_identity_error",
+                &reason_for_worker,
+                &error,
+            );
+            (0, 0)
+        }
+    };
+    if !provider_accounts_for_identity.is_empty() {
+        cloud_mcp_record_tokenomics_sync_log(
+            "provider_identity_units",
+            "active",
+            &reason_for_worker,
+            json!({
+                "provider_account_count": provider_accounts_for_identity.len(),
+                "sent_count": provider_identity_counts.0,
+                "skipped_count": provider_identity_counts.1,
+            }),
+        );
+    }
     if source_changed_without_usage || empty_non_full_delta {
         cloud_mcp_clear_sync_activity_key(CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY);
         cloud_mcp_record_tokenomics_sync_log(
@@ -10295,6 +10713,35 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             )
             .await;
         }
+        if let Some(initial_account_architectures) = message
+            .get("initial_account_architectures")
+            .or_else(|| message.get("initialAccountArchitectures"))
+            .or_else(|| message.get("initial_architecture_catalog"))
+            .or_else(|| message.get("initialArchitectureCatalog"))
+            .cloned()
+            .filter(|value| !value.is_null())
+        {
+            let state_for_hydration = state.clone();
+            tauri::async_runtime::spawn(async move {
+                let hydrated = cloud_mcp_hydrate_account_architecture_refs(
+                    &state_for_hydration,
+                    initial_account_architectures.clone(),
+                )
+                .await
+                .unwrap_or_else(|_| initial_account_architectures.clone());
+                let _ = state_for_hydration.global_ws_events.send(json!({
+                    "kind": "workspace_architectures_snapshot",
+                    "event_kind": "workspace_architectures_snapshot",
+                    "eventKind": "workspace_architectures_snapshot",
+                    "contract": "diffforge.architectures.v1",
+                    "reason": "global_ws_ready",
+                    "payload": hydrated.clone(),
+                    "architectures": hydrated.clone(),
+                    "account_architectures": hydrated.clone(),
+                    "accountArchitectures": hydrated,
+                }));
+            });
+        }
         cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_ready");
         cloud_mcp_record_signin_diagnostic(
             state,
@@ -11644,6 +12091,10 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             if event_kind == "account_device_live_state_snapshot" {
                 let _ = app.emit(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, event.clone());
+                continue;
+            }
+            if contract == "diffforge.account_tools.v1" || event_kind == "account_tools_changed" {
+                let _ = app.emit(CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT, event.clone());
                 continue;
             }
             if event_kind == "tokenomics_refresh_requested" {
@@ -14710,6 +15161,329 @@ fn cloud_mcp_sanitize_live_contract_in_place(value: &mut Value) {
     }
 }
 
+fn cloud_mcp_device_live_unit_event_kind(event_kind: &str) -> bool {
+    matches!(
+        event_kind.trim().to_ascii_lowercase().as_str(),
+        "device_agent_installation_status"
+            | "workspace_mcp_server_status"
+            | "provider_account_identity"
+    )
+}
+
+fn cloud_mcp_device_live_sync_identity_from_payload(
+    payload: &Value,
+) -> Option<(String, String, String, String, String, String)> {
+    let scope_key =
+        cloud_mcp_payload_scope_key(payload).unwrap_or_else(cloud_mcp_process_account_scope_key);
+    let device = payload.get("device").filter(|value| value.is_object());
+    let device_id = cloud_mcp_payload_text(
+        payload,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    )
+    .or_else(|| {
+        device.and_then(|device| {
+            cloud_mcp_payload_text(
+                device,
+                &["device_id", "deviceId", "machine_id", "machineId", "id"],
+            )
+        })
+    })?;
+    let sync_unit = cloud_mcp_payload_text(payload, &["sync_unit", "syncUnit"])
+        .unwrap_or_else(|| "device_live_state_snapshot".to_string());
+    let hash_seed = cloud_mcp_outbox_stable_snapshot_hash_value("device_live_state_snapshot", payload);
+    let content_hash = cloud_mcp_payload_text(
+        payload,
+        &["sync_content_hash", "syncContentHash", "content_hash", "contentHash"],
+    )
+    .unwrap_or_else(|| cloud_mcp_outbox_payload_hash(&hash_seed));
+    let payload_hash = cloud_mcp_payload_text(payload, &["payload_hash", "payloadHash"])
+        .unwrap_or_else(|| content_hash.clone());
+    let idempotency_key = cloud_mcp_payload_text(payload, &["idempotency_key", "idempotencyKey"])
+        .unwrap_or_else(|| {
+            format!("device-live-state:{scope_key}:{device_id}:{sync_unit}:{content_hash}")
+        });
+    Some((
+        scope_key,
+        device_id,
+        sync_unit,
+        content_hash,
+        payload_hash,
+        idempotency_key,
+    ))
+}
+
+fn cloud_mcp_device_live_payload_with_sync_identity(mut payload: Value) -> Value {
+    let Some((scope_key, device_id, sync_unit, content_hash, payload_hash, idempotency_key)) =
+        cloud_mcp_device_live_sync_identity_from_payload(&payload)
+    else {
+        return payload;
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("device_id".to_string())
+            .or_insert_with(|| json!(device_id.clone()));
+        object
+            .entry("deviceId".to_string())
+            .or_insert_with(|| json!(device_id.clone()));
+        object
+            .entry("scope_key".to_string())
+            .or_insert_with(|| json!(scope_key.clone()));
+        object
+            .entry("scopeKey".to_string())
+            .or_insert_with(|| json!(scope_key.clone()));
+        object
+            .entry("sync_unit".to_string())
+            .or_insert_with(|| json!(sync_unit.clone()));
+        object
+            .entry("syncUnit".to_string())
+            .or_insert_with(|| json!(sync_unit.clone()));
+        object
+            .entry("sync_content_hash".to_string())
+            .or_insert_with(|| json!(content_hash.clone()));
+        object
+            .entry("syncContentHash".to_string())
+            .or_insert_with(|| json!(content_hash.clone()));
+        object
+            .entry("content_hash".to_string())
+            .or_insert_with(|| json!(content_hash.clone()));
+        object
+            .entry("contentHash".to_string())
+            .or_insert_with(|| json!(content_hash.clone()));
+        object
+            .entry("payload_hash".to_string())
+            .or_insert_with(|| json!(payload_hash.clone()));
+        object
+            .entry("payloadHash".to_string())
+            .or_insert_with(|| json!(payload_hash.clone()));
+        object
+            .entry("idempotency_key".to_string())
+            .or_insert_with(|| json!(idempotency_key.clone()));
+        object
+            .entry("idempotencyKey".to_string())
+            .or_insert_with(|| json!(idempotency_key));
+    }
+    payload
+}
+
+fn cloud_mcp_device_live_mark_sync_pending(payload: &Value) -> Result<(), String> {
+    let Some((scope_key, device_id, sync_unit, content_hash, payload_hash, idempotency_key)) =
+        cloud_mcp_device_live_sync_identity_from_payload(payload)
+    else {
+        return Ok(());
+    };
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "INSERT INTO {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}(
+                scope_key, device_id, sync_unit, content_hash, payload_hash,
+                idempotency_key, server_cursor, acked_at_ms, updated_at_ms
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, '', 0, ?7)
+             ON CONFLICT(scope_key, device_id, sync_unit) DO UPDATE SET
+                content_hash=excluded.content_hash,
+                payload_hash=excluded.payload_hash,
+                idempotency_key=excluded.idempotency_key,
+                acked_at_ms=0,
+                updated_at_ms=excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            scope_key,
+            device_id,
+            sync_unit,
+            content_hash,
+            payload_hash,
+            idempotency_key,
+            now,
+        ],
+    )
+    .map_err(|error| format!("Unable to mark device live-state sync pending: {error}"))?;
+    Ok(())
+}
+
+fn cloud_mcp_device_live_mark_sync_acked_from_payload(
+    source_payload: Option<&Value>,
+    response: &Value,
+) -> Result<bool, String> {
+    let identity_source = source_payload.unwrap_or(response);
+    let Some((scope_key, device_id, sync_unit, content_hash, payload_hash, idempotency_key)) =
+        cloud_mcp_device_live_sync_identity_from_payload(identity_source)
+            .or_else(|| cloud_mcp_device_live_sync_identity_from_payload(response))
+    else {
+        return Ok(false);
+    };
+    let response_data = response.get("data").filter(|value| value.is_object());
+    let server_cursor = cloud_mcp_payload_text(
+        response,
+        &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+    )
+    .or_else(|| {
+        response_data.and_then(|data| {
+            cloud_mcp_payload_text(
+                data,
+                &["server_cursor", "serverCursor", "sync_cursor", "syncCursor", "revision"],
+            )
+        })
+    })
+    .unwrap_or_default();
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "INSERT INTO {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}(
+                scope_key, device_id, sync_unit, content_hash, payload_hash,
+                idempotency_key, server_cursor, acked_at_ms, updated_at_ms
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(scope_key, device_id, sync_unit) DO UPDATE SET
+                content_hash=excluded.content_hash,
+                payload_hash=excluded.payload_hash,
+                idempotency_key=excluded.idempotency_key,
+                server_cursor=excluded.server_cursor,
+                acked_at_ms=excluded.acked_at_ms,
+                updated_at_ms=excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            scope_key,
+            device_id,
+            sync_unit,
+            content_hash,
+            payload_hash,
+            idempotency_key,
+            server_cursor,
+            now,
+        ],
+    )
+    .map_err(|error| format!("Unable to mark device live-state sync acked: {error}"))?;
+    Ok(true)
+}
+
+fn cloud_mcp_device_live_sync_decision(
+    payload: &Value,
+) -> Result<CloudMcpDeviceLiveSyncDecision, String> {
+    let Some((scope_key, device_id, sync_unit, content_hash, _payload_hash, idempotency_key)) =
+        cloud_mcp_device_live_sync_identity_from_payload(payload)
+    else {
+        return Ok(CloudMcpDeviceLiveSyncDecision::Enqueue);
+    };
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let state = conn
+        .query_row(
+            &format!(
+                "SELECT content_hash, idempotency_key, acked_at_ms
+                 FROM {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}
+                 WHERE scope_key=?1 AND device_id=?2 AND sync_unit=?3"
+            ),
+            rusqlite::params![scope_key, device_id, sync_unit],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, i64>(2).unwrap_or(0).max(0),
+                ))
+            },
+        )
+        .ok();
+    if let Some((state_content_hash, state_idempotency_key, acked_at_ms)) = state {
+        if state_content_hash == content_hash {
+            if acked_at_ms > 0 {
+                return Ok(CloudMcpDeviceLiveSyncDecision::CurrentAcked);
+            }
+            if !state_idempotency_key.trim().is_empty() {
+                match cloud_mcp_outbox_status_for_idempotency(&state_idempotency_key).as_deref() {
+                    Some("queued" | "retrying" | "in_flight") => {
+                        return Ok(CloudMcpDeviceLiveSyncDecision::CurrentPending);
+                    }
+                    Some("acked") => {
+                        let _ = cloud_mcp_device_live_mark_sync_acked_from_payload(
+                            Some(payload),
+                            payload,
+                        );
+                        return Ok(CloudMcpDeviceLiveSyncDecision::CurrentAcked);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(acked_at_ms) = cloud_mcp_outbox_acked_at_for_idempotency(&idempotency_key) {
+        let _ = cloud_mcp_device_live_mark_sync_acked_from_payload(
+            Some(payload),
+            &json!({
+                "acked_at_ms": acked_at_ms,
+                "ackedAtMs": acked_at_ms,
+            }),
+        );
+        return Ok(CloudMcpDeviceLiveSyncDecision::CurrentAcked);
+    }
+    Ok(CloudMcpDeviceLiveSyncDecision::Enqueue)
+}
+
+fn cloud_mcp_device_live_known_sync_units(
+    device_id: &str,
+    sync_unit_prefix: &str,
+) -> Result<Vec<String>, String> {
+    let device_id = device_id.trim();
+    let sync_unit_prefix = sync_unit_prefix.trim();
+    if device_id.is_empty() || sync_unit_prefix.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let like_prefix = format!("{sync_unit_prefix}%");
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT sync_unit
+             FROM {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}
+             WHERE scope_key=?1 AND device_id=?2 AND sync_unit LIKE ?3"
+        ))
+        .map_err(|error| format!("Unable to prepare device live-state sync unit query: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![scope_key, device_id, like_prefix], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| format!("Unable to query device live-state sync units: {error}"))?;
+    Ok(rows.flatten().collect())
+}
+
+async fn cloud_mcp_sync_device_live_unit_event(
+    state: &CloudMcpState,
+    event_kind: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    let payload = cloud_mcp_device_live_payload_with_sync_identity(payload);
+    let sync_unit = cloud_mcp_payload_text(&payload, &["sync_unit", "syncUnit"])
+        .unwrap_or_else(|| event_kind.to_string());
+    match cloud_mcp_device_live_sync_decision(&payload)? {
+        CloudMcpDeviceLiveSyncDecision::CurrentAcked => {
+            return Ok(json!({
+                "ok": true,
+                "skipped": true,
+                "reason": "sync_unit_current",
+                "event_kind": event_kind,
+                "eventKind": event_kind,
+                "sync_unit": sync_unit,
+                "syncUnit": sync_unit,
+            }));
+        }
+        CloudMcpDeviceLiveSyncDecision::CurrentPending => {
+            return Ok(json!({
+                "ok": true,
+                "queued": true,
+                "skipped": true,
+                "reason": "sync_unit_pending",
+                "event_kind": event_kind,
+                "eventKind": event_kind,
+                "sync_unit": sync_unit,
+                "syncUnit": sync_unit,
+            }));
+        }
+        CloudMcpDeviceLiveSyncDecision::Enqueue => {}
+    }
+    cloud_mcp_device_live_mark_sync_pending(&payload)?;
+    cloud_mcp_post_event_endpoint(state, event_kind, &payload).await
+}
+
 async fn cloud_mcp_device_live_state_snapshot_payload(
     state: &CloudMcpState,
     reason: &str,
@@ -14721,7 +15495,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
     let mut app_context = Value::Null;
     let mut has_app_context = false;
     let mut has_workspace_state = false;
-    let mut coding_agents = Vec::new();
     let mut cli_states = Value::Null;
     let mut has_cli_state = false;
 
@@ -14745,7 +15518,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
         for snapshot in [
             snapshots.workspace_catalog.as_ref(),
             snapshots.workspace_terminals.as_ref(),
-            snapshots.workspace_servers.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -14765,16 +15537,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
                 let existing = workspaces.entry(workspace_key).or_insert_with(|| json!({}));
                 cloud_mcp_live_state_merge_object(existing, workspace_value);
             }
-        }
-        if let Some(snapshot) = snapshots.agent_installations.as_ref() {
-            coding_agents = cloud_mcp_live_state_values(
-                snapshot
-                    .get("coding_agents")
-                    .or_else(|| snapshot.get("codingAgents"))
-                    .or_else(|| snapshot.get("installed_agents"))
-                    .or_else(|| snapshot.get("installedAgents"))
-                    .or_else(|| snapshot.get("agents")),
-            );
         }
         if let Some(snapshot) = snapshots.cli_states.as_ref() {
             if let Some(clis) = snapshot
@@ -14821,9 +15583,6 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
                 Value::Array(workspaces.values().cloned().collect()),
             );
         }
-        if !coding_agents.is_empty() {
-            object.insert("coding_agents".to_string(), Value::Array(coding_agents));
-        }
         if has_cli_state {
             object.insert("cli_states".to_string(), cli_states);
         }
@@ -14832,7 +15591,42 @@ async fn cloud_mcp_device_live_state_snapshot_payload(
 }
 
 async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, reason: &str) {
-    let payload = cloud_mcp_device_live_state_snapshot_payload(state, reason).await;
+    let payload = cloud_mcp_device_live_payload_with_sync_identity(
+        cloud_mcp_device_live_state_snapshot_payload(state, reason).await,
+    );
+    match cloud_mcp_device_live_sync_decision(&payload) {
+        Ok(CloudMcpDeviceLiveSyncDecision::CurrentAcked) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.device_live_state.ws.skip",
+                json!({
+                    "reason": reason,
+                    "status": "current_acked",
+                }),
+            );
+            return;
+        }
+        Ok(CloudMcpDeviceLiveSyncDecision::CurrentPending) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.device_live_state.ws.skip",
+                json!({
+                    "reason": reason,
+                    "status": "current_pending",
+                }),
+            );
+            return;
+        }
+        Ok(CloudMcpDeviceLiveSyncDecision::Enqueue) => {}
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.device_live_state.sync_decision_failed",
+                json!({
+                    "reason": reason,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+        }
+    }
+    let _ = cloud_mcp_device_live_mark_sync_pending(&payload);
     let state = state.clone();
     let reason = reason.to_string();
     tauri::async_runtime::spawn(async move {
@@ -14845,6 +15639,7 @@ async fn cloud_mcp_publish_device_live_state_snapshot(state: &CloudMcpState, rea
         .await
         {
             Ok(response) => {
+                let _ = cloud_mcp_device_live_mark_sync_acked_from_payload(Some(&payload), &response);
                 log_terminal_status_event(
                     "backend.cloud_mcp.device_live_state.ws.sent",
                     json!({
@@ -15911,39 +16706,17 @@ fn cloud_mcp_direct_target_from_route(
 
 async fn cloud_mcp_replay_runtime_snapshots(
     state: &CloudMcpState,
-    connection_id: &str,
-    message_token: &str,
+    _connection_id: &str,
+    _message_token: &str,
 ) {
-    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-        return;
-    };
-    let payload =
-        cloud_mcp_device_live_state_snapshot_payload(state, "websocket_ready_replay").await;
-    let request = cloud_mcp_event_envelope("device_live_state_snapshot", &payload);
-    let envelope = json!({
-        "kind": "event",
-        "id": format!("device-live-state-replay-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
-        "contract": "diffforge.app_ws.v1",
-        "auth": {
-            "connection_id": connection_id,
-            "message_token": message_token,
-        },
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": cloud_mcp_payload_text(&request, &["repo_id"])
-            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
-        "workspace_id": cloud_mcp_payload_text(&request, &["workspace_id"])
-            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
-        "request": request,
-    });
-    let _ = tx.send(envelope);
-
+    cloud_mcp_publish_device_live_state_snapshot(state, "websocket_ready_replay").await;
     cloud_mcp_record_connection_diagnostic(
         state,
         "rust.cloud_mcp.device_live_state.replay",
         "ok",
         "Rust client replayed the unified device live-state snapshot after websocket reconnect.",
         json!({
-            "workspaceCount": payload["workspace_count"].clone(),
+            "reason": "websocket_ready_replay",
         }),
     )
     .await;
@@ -20493,18 +21266,75 @@ pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
         let mut snapshots = state.runtime_snapshots.lock().await;
         snapshots.agent_installations = Some(payload.clone());
     }
-    cloud_mcp_publish_device_live_state_snapshot(state, &reason).await;
+    let mut sent_count = 0usize;
+    let mut skipped_count = 0usize;
+    for agent in &coding_agents {
+        let Some(agent_id) = cloud_mcp_payload_text(agent, &["id", "agent_id", "agentId"]) else {
+            continue;
+        };
+        let sync_unit = format!("agent_installation:{agent_id}");
+        let content_hash = cloud_mcp_outbox_payload_hash(&json!({
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "agent": agent,
+        }));
+        let unit_payload = json!({
+            "source": "rust-diffforge-agent-installation-unit",
+            "event_kind": "device_agent_installation_status",
+            "device_id": device_profile["device_id"].clone(),
+            "deviceId": device_profile["device_id"].clone(),
+            "device_name": device_profile["device_name"].clone(),
+            "deviceName": device_profile["device_name"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machineId": device_profile["device_id"].clone(),
+            "machine_name": device_profile["machine_name"].clone(),
+            "machineName": device_profile["machine_name"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "form_factor": device_profile["form_factor"].clone(),
+            "client_kind": device_profile["client_kind"].clone(),
+            "workspace_id": workspace_id,
+            "workspaceId": workspace_id,
+            "workspace_name": workspace_name,
+            "workspaceName": workspace_name,
+            "agent_id": agent_id,
+            "agentId": agent_id,
+            "agent": agent,
+            "coding_agents": [agent],
+            "sync_unit": sync_unit,
+            "syncUnit": sync_unit,
+            "sync_content_hash": content_hash,
+            "syncContentHash": content_hash,
+            "reason": reason,
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        let response =
+            cloud_mcp_sync_device_live_unit_event(state, "device_agent_installation_status", unit_payload)
+                .await?;
+        if response
+            .get("skipped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            skipped_count = skipped_count.saturating_add(1);
+        } else {
+            sent_count = sent_count.saturating_add(1);
+        }
+    }
     Ok(cloud_mcp_background_sync_ack(
-        "device_live_state_snapshot",
-        "device_live_state_snapshot",
+        "device_agent_installation_status",
+        "device_agent_installation_status",
         &reason,
         json!({
             "stored": {
                 "stored_count": agent_count,
                 "agent_count": agent_count,
+                "sent_count": sent_count,
+                "skipped_count": skipped_count,
             },
             "stored_count": agent_count,
             "agent_count": agent_count,
+            "sent_count": sent_count,
+            "skipped_count": skipped_count,
         }),
     ))
 }
@@ -22095,11 +22925,188 @@ async fn cloud_mcp_sync_device_live_workspace_servers(
         let mut snapshots = state.inner().runtime_snapshots.lock().await;
         snapshots.workspace_servers = Some(payload.clone());
     }
-    cloud_mcp_publish_device_live_state_snapshot(state.inner(), &reason_for_ack).await;
 
-    let sync_key = "device_live_state_snapshot".to_string();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop".to_string());
+    let mut sent_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut tombstone_count = 0usize;
+    for workspace in &normalized_workspaces {
+        let Some(workspace_id_for_unit) =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+        else {
+            continue;
+        };
+        let mut seen_units = HashSet::new();
+        let workspace_servers = workspace
+            .get("servers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for server in workspace_servers {
+            let Some(server_key) =
+                cloud_mcp_payload_text(&server, &["server_key", "serverKey", "key", "id", "name"])
+            else {
+                continue;
+            };
+            let sync_unit = format!("workspace_mcp_server:{workspace_id_for_unit}:{server_key}");
+            seen_units.insert(sync_unit.clone());
+            let content_hash = cloud_mcp_outbox_payload_hash(&json!({
+                "workspace": workspace,
+                "server": server,
+                "current": true,
+            }));
+            let unit_workspace = json!({
+                "device_id": device_profile["device_id"].clone(),
+                "workspace_id": workspace_id_for_unit,
+                "workspaceId": workspace_id_for_unit,
+                "workspace_active": workspace.get("workspace_active").cloned().unwrap_or_else(|| json!(false)),
+                "workspaceActive": workspace.get("workspace_active").cloned().unwrap_or_else(|| json!(false)),
+                "workspace_name": workspace.get("workspace_name").cloned().unwrap_or_else(|| json!("")),
+                "workspaceName": workspace.get("workspace_name").cloned().unwrap_or_else(|| json!("")),
+                "workspace_status": workspace.get("workspace_status").cloned().unwrap_or_else(|| json!("registered")),
+                "workspaceStatus": workspace.get("workspace_status").cloned().unwrap_or_else(|| json!("registered")),
+                "servers": [server],
+            });
+            let unit_payload = json!({
+                "source": "rust-diffforge-workspace-mcp-server-unit",
+                "event_kind": "workspace_mcp_server_status",
+                "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+                "device_id": device_profile["device_id"].clone(),
+                "deviceId": device_profile["device_id"].clone(),
+                "device_name": device_profile["device_name"].clone(),
+                "deviceName": device_profile["device_name"].clone(),
+                "machine_id": device_profile["device_id"].clone(),
+                "machineId": device_profile["device_id"].clone(),
+                "machine_name": device_profile["machine_name"].clone(),
+                "machineName": device_profile["machine_name"].clone(),
+                "platform": device_profile["platform"].clone(),
+                "form_factor": device_profile["form_factor"].clone(),
+                "client_kind": device_profile["client_kind"].clone(),
+                "workspace_id": workspace_id_for_unit,
+                "workspaceId": workspace_id_for_unit,
+                "server_key": server_key,
+                "serverKey": server_key,
+                "server": unit_workspace["servers"][0].clone(),
+                "workspaces": [unit_workspace],
+                "prune_missing": false,
+                "pruneMissing": false,
+                "sync_unit": sync_unit,
+                "syncUnit": sync_unit,
+                "sync_content_hash": content_hash,
+                "syncContentHash": content_hash,
+                "reason": reason_for_ack,
+                "ts_ms": cloud_mcp_now_ms(),
+            });
+            let response = cloud_mcp_sync_device_live_unit_event(
+                state.inner(),
+                "workspace_mcp_server_status",
+                unit_payload,
+            )
+            .await?;
+            if response
+                .get("skipped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                skipped_count = skipped_count.saturating_add(1);
+            } else {
+                sent_count = sent_count.saturating_add(1);
+            }
+        }
+
+        let known_prefix = format!("workspace_mcp_server:{workspace_id_for_unit}:");
+        for known_unit in cloud_mcp_device_live_known_sync_units(&device_id, &known_prefix)? {
+            if seen_units.contains(&known_unit) {
+                continue;
+            }
+            let server_key = known_unit
+                .strip_prefix(&known_prefix)
+                .unwrap_or_default()
+                .to_string();
+            if server_key.trim().is_empty() {
+                continue;
+            }
+            let tombstone_hash = cloud_mcp_outbox_payload_hash(&json!({
+                "workspace_id": workspace_id_for_unit,
+                "server_key": server_key,
+                "current": false,
+            }));
+            let tombstone_server = json!({
+                "server_key": server_key,
+                "serverKey": server_key,
+                "name": server_key,
+                "current": false,
+                "tombstoned": true,
+                "workspace_enabled": false,
+                "workspaceEnabled": false,
+                "tools": [],
+                "tool_count": 0,
+            });
+            let tombstone_workspace = json!({
+                "device_id": device_profile["device_id"].clone(),
+                "workspace_id": workspace_id_for_unit,
+                "workspaceId": workspace_id_for_unit,
+                "workspace_name": workspace.get("workspace_name").cloned().unwrap_or_else(|| json!("")),
+                "workspaceName": workspace.get("workspace_name").cloned().unwrap_or_else(|| json!("")),
+                "workspace_active": workspace.get("workspace_active").cloned().unwrap_or_else(|| json!(false)),
+                "workspaceActive": workspace.get("workspace_active").cloned().unwrap_or_else(|| json!(false)),
+                "workspace_status": workspace.get("workspace_status").cloned().unwrap_or_else(|| json!("registered")),
+                "workspaceStatus": workspace.get("workspace_status").cloned().unwrap_or_else(|| json!("registered")),
+                "servers": [tombstone_server],
+            });
+            let tombstone_payload = json!({
+                "source": "rust-diffforge-workspace-mcp-server-tombstone",
+                "event_kind": "workspace_mcp_server_status",
+                "device_id": device_profile["device_id"].clone(),
+                "deviceId": device_profile["device_id"].clone(),
+                "device_name": device_profile["device_name"].clone(),
+                "deviceName": device_profile["device_name"].clone(),
+                "machine_id": device_profile["device_id"].clone(),
+                "machineId": device_profile["device_id"].clone(),
+                "machine_name": device_profile["machine_name"].clone(),
+                "machineName": device_profile["machine_name"].clone(),
+                "platform": device_profile["platform"].clone(),
+                "form_factor": device_profile["form_factor"].clone(),
+                "client_kind": device_profile["client_kind"].clone(),
+                "workspace_id": workspace_id_for_unit,
+                "workspaceId": workspace_id_for_unit,
+                "server_key": server_key,
+                "serverKey": server_key,
+                "current": false,
+                "tombstoned": true,
+                "workspaces": [tombstone_workspace],
+                "prune_missing": false,
+                "pruneMissing": false,
+                "sync_unit": known_unit,
+                "syncUnit": known_unit,
+                "sync_content_hash": tombstone_hash,
+                "syncContentHash": tombstone_hash,
+                "reason": reason_for_ack,
+                "ts_ms": cloud_mcp_now_ms(),
+            });
+            let response = cloud_mcp_sync_device_live_unit_event(
+                state.inner(),
+                "workspace_mcp_server_status",
+                tombstone_payload,
+            )
+            .await?;
+            tombstone_count = tombstone_count.saturating_add(1);
+            if response
+                .get("skipped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                skipped_count = skipped_count.saturating_add(1);
+            } else {
+                sent_count = sent_count.saturating_add(1);
+            }
+        }
+    }
+
+    let sync_key = "workspace_mcp_server_status".to_string();
     Ok(cloud_mcp_background_sync_ack(
-        "device_live_state_snapshot",
+        "workspace_mcp_server_status",
         &sync_key,
         &reason_for_ack,
         json!({
@@ -22107,10 +23114,16 @@ async fn cloud_mcp_sync_device_live_workspace_servers(
                 "stored_count": server_count,
                 "server_count": server_count,
                 "workspace_count": workspace_count,
+                "sent_count": sent_count,
+                "skipped_count": skipped_count,
+                "tombstone_count": tombstone_count,
             },
             "stored_count": server_count,
             "server_count": server_count,
             "workspace_count": workspace_count,
+            "sent_count": sent_count,
+            "skipped_count": skipped_count,
+            "tombstone_count": tombstone_count,
         }),
     ))
 }
@@ -22953,13 +23966,47 @@ async fn cloud_mcp_report_cli_snapshot(
     let mut payload = cloud_mcp_tools_base_payload("rust-diffforge-cli-snapshot");
     if let Some(object) = payload.as_object_mut() {
         object.insert("clis".to_string(), clis);
+        object.insert("sync_unit".to_string(), json!("cli_states"));
+        object.insert("syncUnit".to_string(), json!("cli_states"));
     }
+    let payload = cloud_mcp_device_live_payload_with_sync_identity(payload);
+    match cloud_mcp_device_live_sync_decision(&payload) {
+        Ok(CloudMcpDeviceLiveSyncDecision::CurrentAcked) => {
+            let mut snapshots = state.inner().runtime_snapshots.lock().await;
+            snapshots.cli_states = Some(payload.clone());
+            return Ok(json!({
+                "kind": "cli_snapshot_ack",
+                "duplicate": true,
+                "skipped": true,
+                "reason": "current_acked",
+            }));
+        }
+        Ok(CloudMcpDeviceLiveSyncDecision::CurrentPending) => {
+            let mut snapshots = state.inner().runtime_snapshots.lock().await;
+            snapshots.cli_states = Some(payload.clone());
+            return Ok(json!({
+                "kind": "cli_snapshot_ack",
+                "duplicate": true,
+                "skipped": true,
+                "reason": "current_pending",
+            }));
+        }
+        Ok(CloudMcpDeviceLiveSyncDecision::Enqueue) => {}
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.cli_snapshot.sync_decision_failed",
+                json!({ "error": clean_terminal_telemetry_text(&error) }),
+            );
+        }
+    }
+    let _ = cloud_mcp_device_live_mark_sync_pending(&payload);
     {
         let mut snapshots = state.inner().runtime_snapshots.lock().await;
         snapshots.cli_states = Some(payload.clone());
     }
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/tools/cli-snapshot", &payload).await?;
+    let _ = cloud_mcp_device_live_mark_sync_acked_from_payload(Some(&payload), &response);
     Ok(cloud_mcp_response_data(&response))
 }
 
@@ -23755,6 +24802,71 @@ fn cloud_mcp_architecture_hydrated_graph(mut item: Value) -> Option<Value> {
     Some(item)
 }
 
+async fn cloud_mcp_hydrate_account_architecture_refs(
+    state: &CloudMcpState,
+    refs: Value,
+) -> Result<Value, String> {
+    let refs_array = cloud_mcp_architecture_refs_array(&refs);
+    if refs_array.is_empty() {
+        return Ok(json!({
+            "kind": "workspace_architecture_hydration",
+            "items": [],
+            "missing": [],
+            "hydratedCount": 0,
+            "hydrated_count": 0,
+        }));
+    }
+    let req = cloud_mcp_repo_request(
+        String::new(),
+        Some(ARCHITECTURE_GLOBAL_WORKSPACE_ID.to_string()),
+        Some("Global".to_string()),
+    );
+    let mut payload = cloud_mcp_architecture_payload_base(
+        &req,
+        ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        Some("Global"),
+        "architecture_content_hydrate",
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("refs".to_string(), json!(refs_array));
+    }
+    let response =
+        cloud_mcp_post_json_endpoint(state, "/v1/workspace/architectures/hydrate", &payload)
+            .await?;
+    let mut data = response.get("data").cloned().unwrap_or(response);
+    let hydrated_items = data
+        .get("items")
+        .or_else(|| data.get("graphs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut saved_items = Vec::new();
+    for item in hydrated_items {
+        let Some(graph) = cloud_mcp_architecture_hydrated_graph(item.clone()) else {
+            saved_items.push(item);
+            continue;
+        };
+        let repo_for_write = tauri::async_runtime::spawn_blocking(architecture_global_root_dir)
+            .await
+            .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
+        let repo_for_write = workspace_path_display(&repo_for_write);
+        let saved = tauri::async_runtime::spawn_blocking(move || {
+            architecture_graph_write_cloud_arch_blocking(repo_for_write, graph)
+        })
+        .await
+        .map_err(|error| format!("Architecture hydration worker failed: {error}"))??;
+        saved_items.push(saved.graph);
+    }
+    if let Some(object) = data.as_object_mut() {
+        let saved_count = saved_items.len();
+        object.insert("items".to_string(), json!(saved_items.clone()));
+        object.insert("graphs".to_string(), json!(saved_items));
+        object.insert("hydrated_count".to_string(), json!(saved_count));
+        object.insert("hydratedCount".to_string(), json!(saved_count));
+    }
+    Ok(data)
+}
+
 #[tauri::command]
 async fn cloud_mcp_get_workspace_architectures(
     state: State<'_, CloudMcpState>,
@@ -23984,74 +25096,14 @@ async fn cloud_mcp_hydrate_workspace_architecture(
     scope_repo_id: Option<String>,
     scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(
-        repo_path.clone(),
-        workspace_id.clone(),
-        workspace_name.clone(),
-    );
-    let refs_array = cloud_mcp_architecture_refs_array(&refs);
-    if refs_array.is_empty() {
-        return Ok(json!({
-            "kind": "workspace_architecture_hydration",
-            "items": [],
-            "missing": [],
-            "hydratedCount": 0,
-            "hydrated_count": 0,
-        }));
-    }
-    let mut payload = cloud_mcp_architecture_payload_base(
-        &req,
-        ARCHITECTURE_GLOBAL_WORKSPACE_ID,
-        Some("Global"),
-        "architecture_content_hydrate",
-    );
     let _ = (
+        repo_path,
         workspace_id,
         workspace_name,
         scope_repo_id,
         scope_git_repo_identity_id,
     );
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("refs".to_string(), json!(refs_array));
-    }
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/workspace/architectures/hydrate",
-        &payload,
-    )
-    .await?;
-    let mut data = response.get("data").cloned().unwrap_or(response);
-    let hydrated_items = data
-        .get("items")
-        .or_else(|| data.get("graphs"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut saved_items = Vec::new();
-    for item in hydrated_items {
-        let Some(graph) = cloud_mcp_architecture_hydrated_graph(item.clone()) else {
-            saved_items.push(item);
-            continue;
-        };
-        let repo_for_write = tauri::async_runtime::spawn_blocking(architecture_global_root_dir)
-            .await
-            .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
-        let repo_for_write = workspace_path_display(&repo_for_write);
-        let saved = tauri::async_runtime::spawn_blocking(move || {
-            architecture_graph_write_cloud_arch_blocking(repo_for_write, graph)
-        })
-        .await
-        .map_err(|error| format!("Architecture hydration worker failed: {error}"))??;
-        saved_items.push(saved.graph);
-    }
-    if let Some(object) = data.as_object_mut() {
-        let saved_count = saved_items.len();
-        object.insert("items".to_string(), json!(saved_items.clone()));
-        object.insert("graphs".to_string(), json!(saved_items));
-        object.insert("hydrated_count".to_string(), json!(saved_count));
-        object.insert("hydratedCount".to_string(), json!(saved_count));
-    }
-    Ok(data)
+    cloud_mcp_hydrate_account_architecture_refs(state.inner(), refs).await
 }
 
 #[tauri::command]
@@ -26316,7 +27368,154 @@ pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
                 .unwrap_or(0),
         }),
     );
-    let result = cloud_mcp_post_event_endpoint(state, "workspace_todo_snapshot", &payload).await;
+    let mut todo_rows = Vec::new();
+    cloud_mcp_todo_mirror_collect_workspace_todo_rows(&payload, &mut todo_rows);
+    let mut removed_todo_ids = Vec::<String>::new();
+    for key in [
+        "removed_todo_ids",
+        "removedTodoIds",
+        "deleted_todo_ids",
+        "deletedTodoIds",
+        "tombstoned_todo_ids",
+        "tombstonedTodoIds",
+    ] {
+        if let Some(items) = payload.get(key).and_then(Value::as_array) {
+            for item in items {
+                if let Some(todo_id) = item.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+                    if !removed_todo_ids.iter().any(|existing| existing == todo_id) {
+                        removed_todo_ids.push(todo_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sent_count = 0usize;
+    let mut delete_count = 0usize;
+    let mut last_response = json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "no_workspace_todo_units",
+        "event_kind": "workspace_todo_snapshot",
+        "workspace_id": workspace_id,
+    });
+    let mut first_error: Option<String> = None;
+    for row in todo_rows {
+        let row_workspace_id = cloud_mcp_payload_text(
+            &row,
+            &["workspace_id", "workspaceId", "todo_workspace_id", "todoWorkspaceId"],
+        )
+        .unwrap_or_else(|| workspace_id.clone());
+        let deleted = cloud_mcp_payload_bool(&row, &["deleted", "tombstoned"], false)
+            || !cloud_mcp_payload_bool(&row, &["current"], true)
+            || cloud_mcp_payload_text(&row, &["deleted_at", "deletedAt"])
+                .filter(|value| !value.trim().is_empty())
+                .is_some();
+        let todo = match cloud_mcp_normalize_workspace_todo_for_sync(&row_workspace_id, &row, deleted)
+        {
+            Ok(todo) => todo,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let Some(todo_id) = cloud_mcp_workspace_todo_id(&todo) else {
+            continue;
+        };
+        let event_kind = if deleted {
+            "workspace_todo_deleted"
+        } else {
+            "workspace_todo_upserted"
+        };
+        if deleted {
+            delete_count = delete_count.saturating_add(1);
+        }
+        let unit_payload = json!({
+            "event_kind": event_kind,
+            "source": "rust-diffforge-todo-unit-sync",
+            "reason": sync_reason,
+            "workspace_id": row_workspace_id,
+            "workspaceId": row_workspace_id,
+            "workspace_name": workspace_name_value,
+            "workspaceName": workspace_name_value,
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "deviceId": device_profile["device_id"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machineId": device_profile["device_id"].clone(),
+            "todo_id": todo_id,
+            "todoId": todo_id,
+            "todo": todo,
+            "todos": [todo],
+            "body_transport": "inline",
+            "bodyTransport": "inline",
+        });
+        match cloud_mcp_post_event_endpoint(state, event_kind, &unit_payload).await {
+            Ok(value) => {
+                sent_count = sent_count.saturating_add(1);
+                last_response = value;
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    for todo_id in removed_todo_ids {
+        let item = json!({ "id": todo_id, "session_id": Value::Null });
+        let todo = match cloud_mcp_normalize_workspace_todo_for_sync(&workspace_id, &item, true) {
+            Ok(todo) => todo,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let unit_payload = json!({
+            "event_kind": "workspace_todo_deleted",
+            "source": "rust-diffforge-todo-unit-delete-sync",
+            "reason": sync_reason,
+            "delete_reason": sync_reason,
+            "deleteReason": sync_reason,
+            "workspace_id": workspace_id,
+            "workspaceId": workspace_id,
+            "workspace_name": workspace_name_value,
+            "workspaceName": workspace_name_value,
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "deviceId": device_profile["device_id"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machineId": device_profile["device_id"].clone(),
+            "todo_id": todo_id,
+            "todoId": todo_id,
+            "todo": todo,
+            "todos": [todo],
+            "removed_todo_ids": [todo_id],
+            "removedTodoIds": [todo_id],
+        });
+        match cloud_mcp_post_event_endpoint(state, "workspace_todo_deleted", &unit_payload).await {
+            Ok(value) => {
+                sent_count = sent_count.saturating_add(1);
+                delete_count = delete_count.saturating_add(1);
+                last_response = value;
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    let result = if sent_count > 0 || first_error.is_none() {
+        if let Some(object) = last_response.as_object_mut() {
+            object.insert("unit_sync".to_string(), json!(true));
+            object.insert("sent_count".to_string(), json!(sent_count));
+            object.insert("sentCount".to_string(), json!(sent_count));
+            object.insert("delete_count".to_string(), json!(delete_count));
+            object.insert("deleteCount".to_string(), json!(delete_count));
+        }
+        Ok(last_response)
+    } else {
+        Err(first_error.unwrap_or_else(|| "Workspace todo unit sync failed.".to_string()))
+    };
     match &result {
         Ok(value) => log_terminal_status_event(
             "backend.workspace_todos.sync_result",

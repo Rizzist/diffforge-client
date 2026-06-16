@@ -5015,49 +5015,181 @@ function normalizeCloudSyncPercent(value, fallback = 100) {
   return Math.max(0, Math.min(100, percent));
 }
 
+function cloudSyncFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function cloudSyncActivityItems(activity = {}) {
+  return Array.isArray(activity.activities) ? activity.activities : [];
+}
+
+function cloudSyncActivityLane(item) {
+  const lane = String(item?.syncLane ?? item?.sync_lane ?? item?.lane ?? "sync").trim().toLowerCase();
+  return lane || "sync";
+}
+
+function cloudSyncActivityDirection(item) {
+  const direction = String(item?.direction || "").trim().toLowerCase();
+  if (direction === "down") return "down";
+  if (direction === "both") return "both";
+  if (direction && direction !== "up") return "control";
+  return "up";
+}
+
+function cloudSyncActivityProgress(item = {}) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const done = cloudSyncFiniteNumber(
+    item.progressDone
+      ?? item.progress_done
+      ?? metadata.progressDone
+      ?? metadata.progress_done,
+  );
+  const total = cloudSyncFiniteNumber(
+    item.progressTotal
+      ?? item.progress_total
+      ?? metadata.progressTotal
+      ?? metadata.progress_total,
+  );
+  const basis = String(
+    item.progressBasis
+      ?? item.progress_basis
+      ?? metadata.progressBasis
+      ?? metadata.progress_basis
+      ?? "phase",
+  ).trim().toLowerCase();
+  return {
+    basis: basis || "phase",
+    done: done == null ? 0 : Math.max(0, done),
+    total: total == null ? 0 : Math.max(0, total),
+  };
+}
+
+function cloudSyncActivityHasDurableProgress(progress) {
+  return progress.total > 0 && progress.basis !== "phase";
+}
+
+function cloudSyncActivityUnitCount(item = {}) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const count = normalizeCloudSyncCount(
+    item.syncUnitCount
+      ?? item.sync_unit_count
+      ?? item.unitCount
+      ?? item.unit_count
+      ?? item.durableUnitCount
+      ?? item.durable_unit_count
+      ?? item.durableCount
+      ?? item.durable_count
+      ?? metadata.syncUnitCount
+      ?? metadata.sync_unit_count
+      ?? metadata.unitCount
+      ?? metadata.unit_count
+      ?? metadata.durableUnitCount
+      ?? metadata.durable_unit_count,
+  );
+  return count > 0 ? count : 0;
+}
+
+function cloudSyncActivityUnitSummary(activity = {}) {
+  const summary = {
+    controlCount: 0,
+    downCount: 0,
+    hasUnitCounts: false,
+    hasUnitProgress: false,
+    pendingCount: 0,
+    progressDone: 0,
+    progressTotal: 0,
+    upCount: 0,
+  };
+  cloudSyncActivityItems(activity).forEach((item) => {
+    if (!item || typeof item !== "object" || cloudSyncActivityLane(item) !== "sync") {
+      return;
+    }
+    const count = cloudSyncActivityUnitCount(item);
+    const direction = cloudSyncActivityDirection(item);
+    if (count > 0) {
+      summary.hasUnitCounts = true;
+      if (direction === "down") {
+        summary.downCount += count;
+      } else if (direction === "both") {
+        summary.upCount += count;
+        summary.downCount += count;
+      } else if (direction === "up") {
+        summary.upCount += count;
+      } else {
+        summary.controlCount += count;
+      }
+      const state = String(item.state || item.status || "").trim().toLowerCase();
+      const complete = Boolean(item.syncComplete ?? item.sync_complete)
+        || ["complete", "completed", "synced", "acked", "sent", "received"].includes(state);
+      if (!complete) {
+        summary.pendingCount += count;
+      }
+    }
+    const progress = cloudSyncActivityProgress(item);
+    if (cloudSyncActivityHasDurableProgress(progress)) {
+      summary.hasUnitProgress = true;
+      summary.progressDone += Math.min(progress.done, progress.total);
+      summary.progressTotal += progress.total;
+    }
+  });
+  return summary;
+}
+
 function normalizeCloudSyncActivity(payload = {}) {
   const activity = payload?.syncActivity || payload?.sync_activity || {};
+  const unitSummary = cloudSyncActivityUnitSummary(activity);
   const pendingCount = normalizeCloudSyncCount(
-    payload.pendingCount
-      ?? payload.pending_count
-      ?? payload.outboxPendingCount
-      ?? payload.outbox_pending_count
-      ?? activity.pendingCount
-      ?? activity.pending_count,
+    unitSummary.hasUnitCounts
+      ? unitSummary.pendingCount
+      : payload.pendingCount
+        ?? payload.pending_count
+        ?? payload.outboxPendingCount
+        ?? payload.outbox_pending_count
+        ?? activity.pendingCount
+        ?? activity.pending_count,
   );
   const upCount = normalizeCloudSyncCount(
-    payload.upCount
-      ?? payload.up_count
-      ?? payload.syncUpCount
-      ?? payload.sync_up_count
-      ?? activity.upCount
-      ?? activity.up_count
-      ?? pendingCount,
+    unitSummary.hasUnitCounts
+      ? unitSummary.upCount
+      : payload.upCount
+        ?? payload.up_count
+        ?? payload.syncUpCount
+        ?? payload.sync_up_count
+        ?? activity.upCount
+        ?? activity.up_count
+        ?? pendingCount,
   );
   const downCount = normalizeCloudSyncCount(
-    payload.downCount
-      ?? payload.down_count
-      ?? payload.syncDownCount
-      ?? payload.sync_down_count
-      ?? activity.downCount
-      ?? activity.down_count,
+    unitSummary.hasUnitCounts
+      ? unitSummary.downCount
+      : payload.downCount
+        ?? payload.down_count
+        ?? payload.syncDownCount
+        ?? payload.sync_down_count
+        ?? activity.downCount
+        ?? activity.down_count,
   );
   const controlCount = normalizeCloudSyncCount(
-    payload.controlCount
-      ?? payload.control_count
-      ?? payload.syncControlCount
-      ?? payload.sync_control_count
-      ?? activity.controlCount
-      ?? activity.control_count,
+    unitSummary.hasUnitCounts
+      ? unitSummary.controlCount
+      : payload.controlCount
+        ?? payload.control_count
+        ?? payload.syncControlCount
+        ?? payload.sync_control_count
+        ?? activity.controlCount
+        ?? activity.control_count,
   );
   const activityCount = normalizeCloudSyncCount(
-    payload.activityCount
-      ?? payload.activity_count
-      ?? payload.syncActivityCount
-      ?? payload.sync_activity_count
-      ?? activity.activityCount
-      ?? activity.activity_count
-      ?? upCount + downCount + controlCount,
+    unitSummary.hasUnitCounts
+      ? upCount + downCount + controlCount
+      : payload.activityCount
+        ?? payload.activity_count
+        ?? payload.syncActivityCount
+        ?? payload.sync_activity_count
+        ?? activity.activityCount
+        ?? activity.activity_count
+        ?? upCount + downCount + controlCount,
   );
   const sizeClass = String(
     payload.sizeClass
@@ -5071,10 +5203,12 @@ function normalizeCloudSyncActivity(payload = {}) {
     ? "large"
     : "live";
   const progressPercent = normalizeCloudSyncPercent(
-    payload.progressPercent
-      ?? payload.progress_percent
-      ?? activity.progressPercent
-      ?? activity.progress_percent,
+    unitSummary.hasUnitProgress && unitSummary.progressTotal > 0
+      ? (unitSummary.progressDone / unitSummary.progressTotal) * 100
+      : payload.progressPercent
+        ?? payload.progress_percent
+        ?? activity.progressPercent
+        ?? activity.progress_percent,
     activityCount > 0 ? 0 : 100,
   );
 
@@ -5489,6 +5623,43 @@ function networkItemProgress(item) {
   };
 }
 
+function networkProgressHasDurableUnits(progress) {
+  return progress?.total > 0 && networkString(progress?.basis, "phase").toLowerCase() !== "phase";
+}
+
+function networkItemExplicitUnitCount(item) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const count = networkNumber(
+    item?.syncUnitCount
+      ?? item?.sync_unit_count
+      ?? item?.unitCount
+      ?? item?.unit_count
+      ?? item?.durableUnitCount
+      ?? item?.durable_unit_count
+      ?? item?.durableCount
+      ?? item?.durable_count
+      ?? metadata?.syncUnitCount
+      ?? metadata?.sync_unit_count
+      ?? metadata?.unitCount
+      ?? metadata?.unit_count
+      ?? metadata?.durableUnitCount
+      ?? metadata?.durable_unit_count,
+  );
+  return count > 0 ? Math.floor(count) : 0;
+}
+
+function networkItemDisplayCount(item, progress) {
+  const unitCount = networkItemExplicitUnitCount(item);
+  return unitCount > 0 ? unitCount : networkItemSyncCount(item);
+}
+
+function networkItemProgressWeight(progress, count) {
+  if (networkProgressHasDurableUnits(progress)) {
+    return Math.max(1, progress.total);
+  }
+  return Math.max(1, count);
+}
+
 function networkItemAgeMs(item, nowMs) {
   const explicit = networkNumber(item?.ageMs ?? item?.age_ms);
   if (explicit > 0) {
@@ -5586,8 +5757,9 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
   const addItem = (item, { primary = false, source = "" } = {}) => {
     const domain = networkDomainFromItem(item);
     const group = ensureGroup(domain);
-    const count = networkItemSyncCount(item);
     const progress = networkItemProgress(item);
+    const count = networkItemDisplayCount(item, progress);
+    const progressWeight = networkItemProgressWeight(progress, count);
     if (primary) {
       group.primaryCount += count;
     } else {
@@ -5595,10 +5767,11 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
     }
     group.eventCount += 1;
     group.bytes += networkItemBytes(item);
-    group.progressWeight += Math.max(1, count);
-    group.progressWeightedPercent += progress.percent * Math.max(1, count);
-    if (progress.total > 0) {
-      group.progressDone += Math.max(0, progress.done);
+    group.progressWeight += progressWeight;
+    group.progressWeightedPercent += progress.percent * progressWeight;
+    if (networkProgressHasDurableUnits(progress)) {
+      const progressDone = Math.max(0, Math.min(progress.done, progress.total));
+      group.progressDone += progressDone;
       group.progressTotal += Math.max(0, progress.total);
       if (!group.progressBasis && progress.basis) {
         group.progressBasis = progress.basis;
@@ -5649,9 +5822,14 @@ function aggregateNetworkCategoryRows(normalized, bucket) {
 
   const rows = Array.from(groups.values()).map((group) => {
     const count = Math.max(group.primaryCount, group.fallbackCount);
-    const progressPercent = group.progressWeight > 0
-      ? group.progressWeightedPercent / group.progressWeight
-      : 100;
+    const unitProgressPercent = group.progressTotal > 0
+      ? (group.progressDone / group.progressTotal) * 100
+      : null;
+    const progressPercent = unitProgressPercent != null
+      ? unitProgressPercent
+      : group.progressWeight > 0
+        ? group.progressWeightedPercent / group.progressWeight
+        : 100;
     return {
       ...group,
       count,
@@ -5710,6 +5888,35 @@ function networkCategorySummaryText(row, bucket) {
     : row.count === 1 ? "change" : "changes";
   const direction = bucket === "down" ? "from server" : "to server";
   return `${row.count} ${unit} ${direction} - ${networkProgressPercentLabel(row.progressPercent)} synced`;
+}
+
+function networkProgressBasisUnitLabel(basis, total) {
+  const normalized = networkString(basis).toLowerCase().replace(/[-\s]+/g, "_");
+  if (normalized === "day_buckets") {
+    return total === 1 ? "day-window bucket" : "day-window buckets";
+  }
+  if (["sync_unit", "sync_units", "durable_unit", "durable_units", "unit", "units"].includes(normalized)) {
+    return total === 1 ? "sync unit" : "sync units";
+  }
+  if (["item", "items"].includes(normalized)) {
+    return total === 1 ? "item" : "items";
+  }
+  return normalized
+    ? normalized.replace(/_/g, " ")
+    : total === 1 ? "unit" : "units";
+}
+
+function networkProgressUnitsText(row) {
+  const total = Math.max(0, Math.round(networkNumber(row.progressTotal)));
+  if (total <= 0) {
+    return "";
+  }
+  const done = Math.max(0, Math.min(total, Math.round(networkNumber(row.progressDone))));
+  const basis = networkString(row.progressBasis).toLowerCase();
+  if (basis === "bytes") {
+    return `${formatNetworkBytes(done)} / ${formatNetworkBytes(total)} synced`;
+  }
+  return `${done}/${total} ${networkProgressBasisUnitLabel(basis, total)} synced`;
 }
 
 function networkPacketLossLabel(normalized) {
@@ -6830,6 +7037,7 @@ function NetworkingInspector({
           const progressValue = Math.round(Math.max(0, Math.min(100, row.progressPercent)));
           const tone = row.hasError ? "red" : progressValue >= 100 ? "green" : bucket === "down" ? "green" : "blue";
           const summaryText = networkCategorySummaryText(row, bucket);
+          const progressUnitsText = networkProgressUnitsText(row);
           return (
             <NetworkingRow key={`${bucket}:${row.domain}`} data-role="category">
               <NetworkingStatusDot data-tone={tone} />
@@ -6857,8 +7065,8 @@ function NetworkingInspector({
                 />
                 <NetworkingMeta>
                   <span>{row.eventCount} {row.eventCount === 1 ? "event" : "events"}</span>
-                  {row.progressBasis === "day_buckets" && row.progressTotal > 0 ? (
-                    <span>{Math.round(row.progressDone)}/{Math.round(row.progressTotal)} day-window buckets synced</span>
+                  {progressUnitsText ? (
+                    <span>{progressUnitsText}</span>
                   ) : row.completeCount > 0 ? (
                     <span>{row.completeCount}/{row.count} synced</span>
                   ) : null}
@@ -12371,12 +12579,14 @@ export default function App() {
     }
   }, []);
 
-  const downloadAudioModel = useCallback(async () => {
+  const downloadAudioModel = useCallback(async (modelId = "base.en") => {
     setAudioActionState("downloading");
     setAudioError("");
 
     try {
-      const status = await invoke("download_whisper_model");
+      const status = await invoke("download_whisper_model", {
+        request: { modelId },
+      });
       setAudioModelStatus(status);
       setAudioActionState("idle");
       if (status?.installed) {
@@ -12391,6 +12601,25 @@ export default function App() {
       }
       setAudioActionState("error");
       setAudioError(getErrorMessage(error, "Unable to install Whisper."));
+    }
+  }, []);
+
+  const selectAudioModel = useCallback(async (modelId = "base.en") => {
+    setAudioStatusState("checking");
+    setAudioError("");
+
+    try {
+      const status = await invoke("select_whisper_model", {
+        request: { modelId },
+      });
+      setAudioModelStatus(status);
+      setAudioStatusState("idle");
+      if (status?.installed) {
+        setAudioDownloadProgress(null);
+      }
+    } catch (error) {
+      setAudioStatusState("error");
+      setAudioError(getErrorMessage(error, "Unable to select Whisper model."));
     }
   }, []);
 
@@ -15382,7 +15611,6 @@ export default function App() {
       cloudLiveSyncEpochRef.current = nextEpoch;
       setCloudLiveSyncEpoch(nextEpoch);
       workspaceTerminalsSyncKeyRef.current = "";
-      workspaceCatalogSyncKeyRef.current = "";
       window.dispatchEvent(new CustomEvent("diffforge:cloud-device-live-initial-sync", {
         detail: { epoch: nextEpoch },
       }));
@@ -17452,7 +17680,6 @@ export default function App() {
     const syncKey = JSON.stringify({
       accountKey,
       scopeKey: activeAccountScopeKey,
-      cloudLiveSyncEpoch,
       targets: targets.map((target) => ({
         active: Boolean(target.workspaceActive),
         terminals: Array.isArray(target.terminals) ? target.terminals : [],
@@ -17556,7 +17783,6 @@ export default function App() {
     user,
     workspaceCatalogSyncKey,
     workspaceCatalogSyncTargets,
-    cloudLiveSyncEpoch,
     workspaceHydrationReady,
     workspaceActivationDeferred,
     workspaceSyncState,
@@ -27538,6 +27764,7 @@ export default function App() {
                     onOpenWidget={openAudioWidget}
                     onRefreshBillingStatus={refreshBillingStatus}
                     onRefreshStatus={refreshAudioModelStatus}
+                    onSelectModel={selectAudioModel}
                     onUninstallModel={uninstallAudioModel}
                     workspace={selectedWorkspace}
                   />

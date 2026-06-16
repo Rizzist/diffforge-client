@@ -272,13 +272,6 @@ fn log_whisper_local_audio_event(phase: &str, elapsed: Option<Duration>, fields:
         "elapsed_ms": elapsed.map(|duration| duration.as_secs_f64() * 1000.0),
         "fields": fields,
     });
-    // Capture-session starts always log: they record which capture engine
-    // (voice-processing vs raw cpal) the mic is on, the one fact needed to
-    // debug echo-cancellation reports from the field.
-    if phase.starts_with("audio.monitor.start") {
-        write_whisper_local_audio_log_entry(entry);
-        return;
-    }
     write_whisper_local_audio_log(entry);
 }
 
@@ -290,17 +283,63 @@ fn audio_debug_thread_label() -> String {
 }
 
 fn log_audio_diagnostic_event(phase: &str, fields: Value) {
-    // Cloud dictation breadcrumbs stay on even in production builds: they are
-    // a handful of one-line events per session and the only field telemetry
-    // for press-to-talk latency. Everything else honors the debug flag.
-    let forced = phase.starts_with("audio.forge_dictation.");
-    if !WHISPER_LOCAL_AUDIO_LOGGING_ENABLED && !forced {
+    if !WHISPER_LOCAL_AUDIO_LOGGING_ENABLED {
         return;
     }
     write_whisper_local_audio_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_whisper_local_audio_log_text(phase),
         "elapsed_ms": Value::Null,
+        "fields": {
+            "app_pid": std::process::id(),
+            "thread": audio_debug_thread_label(),
+            "fields": fields,
+        },
+    }));
+}
+
+fn audio_widget_bubble_position_debug_log_path() -> PathBuf {
+    diagnostic_log_path(AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE)
+}
+
+fn write_audio_widget_bubble_position_debug_log_entry(entry: Value) {
+    if !AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED {
+        return;
+    }
+
+    let log_path = audio_widget_bubble_position_debug_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
+fn log_audio_widget_bubble_position_debug_event(phase: &str, fields: Value) {
+    if !AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED {
+        return;
+    }
+
+    write_audio_widget_bubble_position_debug_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_whisper_local_audio_log_text(phase),
         "fields": {
             "app_pid": std::process::id(),
             "thread": audio_debug_thread_label(),
@@ -2181,8 +2220,64 @@ fn whisper_model_directory(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir.join("whisper"))
 }
 
+fn whisper_model_definition(model_id: &str) -> Option<&'static WhisperModelDefinition> {
+    WHISPER_MODEL_OPTIONS
+        .iter()
+        .find(|definition| definition.id.eq_ignore_ascii_case(model_id.trim()))
+}
+
+fn whisper_default_model_definition() -> &'static WhisperModelDefinition {
+    whisper_model_definition(WHISPER_DEFAULT_MODEL_ID)
+        .unwrap_or_else(|| &WHISPER_MODEL_OPTIONS[0])
+}
+
+fn whisper_selected_model_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(whisper_model_directory(app)?.join(WHISPER_SELECTED_MODEL_FILE))
+}
+
+fn read_whisper_selected_model_definition(
+    app: &AppHandle,
+) -> Result<&'static WhisperModelDefinition, String> {
+    let selected_path = whisper_selected_model_file_path(app)?;
+    let selected_id = fs::read_to_string(&selected_path)
+        .ok()
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .and_then(|value| whisper_model_definition(&value));
+
+    Ok(selected_id.unwrap_or_else(whisper_default_model_definition))
+}
+
+fn write_whisper_selected_model_definition(
+    app: &AppHandle,
+    definition: &WhisperModelDefinition,
+) -> Result<(), String> {
+    let model_directory = whisper_model_directory(app)?;
+    fs::create_dir_all(&model_directory)
+        .map_err(|error| format!("Unable to prepare Whisper model directory: {error}"))?;
+    fs::write(
+        model_directory.join(WHISPER_SELECTED_MODEL_FILE),
+        definition.id.as_bytes(),
+    )
+    .map_err(|error| format!("Unable to save selected Whisper model: {error}"))
+}
+
+fn whisper_model_path_for(
+    app: &AppHandle,
+    definition: &WhisperModelDefinition,
+) -> Result<PathBuf, String> {
+    Ok(whisper_model_directory(app)?.join(definition.file))
+}
+
 fn whisper_model_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(whisper_model_directory(app)?.join(WHISPER_MODEL_FILE))
+    let definition = read_whisper_selected_model_definition(app)?;
+    whisper_model_path_for(app, definition)
 }
 
 fn whisper_runtime_directory(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2327,12 +2422,16 @@ fn homebrew_executable_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_whisper_runtime_with_homebrew(app: &AppHandle) -> Result<bool, String> {
+fn install_whisper_runtime_with_homebrew(
+    app: &AppHandle,
+    model_id: Option<&str>,
+) -> Result<bool, String> {
     let Some(brew_path) = homebrew_executable_path() else {
         emit_audio_download_progress(
             app,
             WhisperModelDownloadProgress {
                 state: "runtime-missing".to_string(),
+                model_id: model_id.map(ToString::to_string),
                 downloaded_bytes: 0,
                 total_bytes: None,
                 percent: Some(100.0),
@@ -2347,6 +2446,7 @@ fn install_whisper_runtime_with_homebrew(app: &AppHandle) -> Result<bool, String
         app,
         WhisperModelDownloadProgress {
             state: "runtime".to_string(),
+            model_id: model_id.map(ToString::to_string),
             downloaded_bytes: 0,
             total_bytes: None,
             percent: None,
@@ -2371,6 +2471,7 @@ fn install_whisper_runtime_with_homebrew(app: &AppHandle) -> Result<bool, String
             app,
             WhisperModelDownloadProgress {
                 state: "runtime-missing".to_string(),
+                model_id: model_id.map(ToString::to_string),
                 downloaded_bytes: 0,
                 total_bytes: None,
                 percent: Some(100.0),
@@ -2389,6 +2490,7 @@ fn install_whisper_runtime_with_homebrew(app: &AppHandle) -> Result<bool, String
         app,
         WhisperModelDownloadProgress {
             state: "runtime".to_string(),
+            model_id: model_id.map(ToString::to_string),
             downloaded_bytes: 0,
             total_bytes: None,
             percent: Some(100.0),
@@ -2400,20 +2502,46 @@ fn install_whisper_runtime_with_homebrew(app: &AppHandle) -> Result<bool, String
 }
 
 fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, String> {
-    let model_path = whisper_model_path(app)?;
+    let selected_definition = read_whisper_selected_model_definition(app)?;
+    let model_path = whisper_model_path_for(app, selected_definition)?;
     let runtime_directory = whisper_runtime_directory(app)?;
     let runtime_zip_path = whisper_runtime_zip_path(app)?;
     let managed_runtime_path = find_whisper_runtime_executable(&runtime_directory);
     let runtime_path = managed_runtime_path
         .clone()
         .or_else(external_whisper_runtime_executable_path);
+    let models = WHISPER_MODEL_OPTIONS
+        .iter()
+        .map(|definition| {
+            let model_path = whisper_model_path_for(app, definition)?;
+            let bytes = fs::metadata(&model_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            Ok(WhisperModelOptionStatus {
+                model_id: definition.id,
+                model_name: definition.name,
+                model_file: definition.file,
+                model_path: model_path.display().to_string(),
+                download_url: definition.url,
+                expected_sha256: definition.sha256,
+                approximate_disk_mb: definition.approximate_disk_mb,
+                approximate_memory_mb: definition.approximate_memory_mb,
+                bytes,
+                installed: bytes > 0,
+                selected: definition.id == selected_definition.id,
+                tier: definition.tier,
+                description: definition.description,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let bytes = fs::metadata(&model_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let model_installed = bytes > 0;
+    let any_model_installed = models.iter().any(|model| model.installed);
     let runtime_installed = runtime_path.is_some();
     let managed_runtime_installed = managed_runtime_path.is_some();
-    let managed_assets_installed = model_installed
+    let managed_assets_installed = any_model_installed
         || managed_runtime_installed
         || runtime_directory.exists()
         || runtime_zip_path.exists();
@@ -2422,9 +2550,11 @@ fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, Strin
         installed: model_installed && runtime_installed,
         model_installed,
         runtime_installed,
-        model_id: WHISPER_MODEL_ID,
-        model_name: WHISPER_MODEL_NAME,
-        model_file: WHISPER_MODEL_FILE,
+        selected_model_id: selected_definition.id,
+        default_model_id: WHISPER_DEFAULT_MODEL_ID,
+        model_id: selected_definition.id,
+        model_name: selected_definition.name,
+        model_file: selected_definition.file,
         model_path: model_path.display().to_string(),
         runtime_name: WHISPER_RUNTIME_NAME,
         runtime_package_name: WHISPER_RUNTIME_PACKAGE_NAME,
@@ -2435,11 +2565,12 @@ fn whisper_model_status_for(app: &AppHandle) -> Result<WhisperModelStatus, Strin
         managed_runtime_installed,
         managed_assets_installed,
         runtime_install_hint: WHISPER_RUNTIME_INSTALL_HINT,
-        download_url: WHISPER_MODEL_URL,
-        expected_sha1: WHISPER_MODEL_SHA1,
-        approximate_disk_mb: WHISPER_MODEL_DISK_MB,
-        approximate_memory_mb: WHISPER_MODEL_MEMORY_MB,
+        download_url: selected_definition.url,
+        expected_sha256: selected_definition.sha256,
+        approximate_disk_mb: selected_definition.approximate_disk_mb,
+        approximate_memory_mb: selected_definition.approximate_memory_mb,
         bytes,
+        models,
         shortcut: audio_push_to_talk_shortcut_for(app),
         shortcuts: audio_shortcuts_status_for(app),
     })
@@ -2449,37 +2580,16 @@ fn emit_audio_download_progress(app: &AppHandle, progress: WhisperModelDownloadP
     let _ = app.emit(AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, progress);
 }
 
-fn sha1_file(path: &Path) -> Result<String, String> {
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("Unable to verify Whisper model: {error}"))?;
-    let mut hasher = Sha1::new();
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("Unable to verify Whisper model: {error}"))?;
-
-        if read == 0 {
-            break;
-        }
-
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path)
-        .map_err(|error| format!("Unable to verify Whisper runtime: {error}"))?;
+        .map_err(|error| format!("Unable to verify Whisper asset: {error}"))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|error| format!("Unable to verify Whisper runtime: {error}"))?;
+            .map_err(|error| format!("Unable to verify Whisper asset: {error}"))?;
 
         if read == 0 {
             break;
@@ -3854,6 +3964,8 @@ fn audio_widget_set_bubble_hover_enabled(app: &AppHandle, enabled: bool) {
 
 const AUDIO_WIDGET_BAR_ACTIVE_WIDTH: f64 = 124.0;
 const AUDIO_WIDGET_BAR_ACTIVE_HEIGHT: f64 = 44.0;
+const AUDIO_WIDGET_BAR_ERROR_WIDTH: f64 = 320.0;
+const AUDIO_WIDGET_BAR_ERROR_HEIGHT: f64 = 112.0;
 const AUDIO_WIDGET_BAR_NOTICE_WIDTH: f64 = 392.0;
 const AUDIO_WIDGET_BAR_NOTICE_HEIGHT: f64 = 52.0;
 const AUDIO_WIDGET_BAR_IDLE_WIDTH: f64 = 200.0;
@@ -3889,6 +4001,11 @@ fn audio_widget_bar_frame_is_whole_hover_size(width: f64, height: f64) -> bool {
         height,
         AUDIO_WIDGET_BAR_ACTIVE_WIDTH,
         AUDIO_WIDGET_BAR_ACTIVE_HEIGHT,
+    ) || audio_widget_bar_frame_matches_size(
+        width,
+        height,
+        AUDIO_WIDGET_BAR_ERROR_WIDTH,
+        AUDIO_WIDGET_BAR_ERROR_HEIGHT,
     ) || audio_widget_bar_frame_matches_size(
         width,
         height,
@@ -4666,6 +4783,22 @@ impl Default for AudioWidgetBarHoverSnapshotRequest {
 #[serde(rename_all = "camelCase")]
 struct AudioWidgetBarHoverSnapshot {
     hovering: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AudioWidgetBubblePositionLogRequest {
+    phase: String,
+    fields: Value,
+}
+
+impl Default for AudioWidgetBubblePositionLogRequest {
+    fn default() -> Self {
+        Self {
+            phase: String::new(),
+            fields: Value::Null,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -5954,46 +6087,38 @@ async fn finish_audio_input_capture(
 async fn download_whisper_model(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
+    request: Option<WhisperModelRequest>,
 ) -> Result<WhisperModelStatus, String> {
     let _download_guard = audio_state.download_lock.lock().await;
+    let requested_model_id = request
+        .as_ref()
+        .and_then(|request| request.model_id.as_deref())
+        .unwrap_or(WHISPER_DEFAULT_MODEL_ID);
+    let definition = whisper_model_definition(requested_model_id)
+        .ok_or_else(|| format!("Unknown Whisper model: {requested_model_id}"))?;
     let model_directory = whisper_model_directory(&app)?;
-    let model_path = model_directory.join(WHISPER_MODEL_FILE);
-    let temp_path = model_directory.join(format!("{WHISPER_MODEL_FILE}.download"));
+    let model_path = model_directory.join(definition.file);
+    let temp_path = model_directory.join(format!("{}.download", definition.file));
 
     fs::create_dir_all(&model_directory)
         .map_err(|error| format!("Unable to create Whisper model directory: {error}"))?;
-
-    #[cfg(target_os = "macos")]
-    if whisper_runtime_executable_path(&app)?.is_none() && homebrew_executable_path().is_none() {
-        emit_audio_download_progress(
-            &app,
-            WhisperModelDownloadProgress {
-                state: "runtime-missing".to_string(),
-                downloaded_bytes: 0,
-                total_bytes: None,
-                percent: Some(100.0),
-                message: WHISPER_HOMEBREW_MISSING_HINT.to_string(),
-            },
-        );
-
-        return whisper_model_status_for(&app);
-    }
 
     if !model_path.exists() {
         emit_audio_download_progress(
             &app,
             WhisperModelDownloadProgress {
                 state: "starting".to_string(),
+                model_id: Some(definition.id.to_string()),
                 downloaded_bytes: 0,
                 total_bytes: None,
                 percent: None,
-                message: format!("Downloading {WHISPER_MODEL_NAME}."),
+                message: format!("Downloading {}.", definition.name),
             },
         );
 
         let client = http_client(Duration::from_secs(WHISPER_DOWNLOAD_TIMEOUT_SECS))?;
         let mut response = client
-            .get(WHISPER_MODEL_URL)
+            .get(definition.url)
             .send()
             .await
             .map_err(|error| format!("Unable to download Whisper model: {error}"))?;
@@ -6026,19 +6151,20 @@ async fn download_whisper_model(
                 &app,
                 WhisperModelDownloadProgress {
                     state: "downloading".to_string(),
+                    model_id: Some(definition.id.to_string()),
                     downloaded_bytes,
                     total_bytes,
                     percent,
-                    message: "Downloading local Whisper weights.".to_string(),
+                    message: format!("Downloading {}.", definition.name),
                 },
             );
         }
 
         file.flush()
             .map_err(|error| format!("Unable to finish Whisper model write: {error}"))?;
-        let downloaded_sha1 = sha1_file(&temp_path)?;
+        let downloaded_sha256 = sha256_file(&temp_path)?;
 
-        if downloaded_sha1 != WHISPER_MODEL_SHA1 {
+        if downloaded_sha256 != definition.sha256 {
             let _ = fs::remove_file(&temp_path);
             return Err("Downloaded Whisper model failed checksum verification.".to_string());
         }
@@ -6047,9 +6173,11 @@ async fn download_whisper_model(
             .map_err(|error| format!("Unable to install Whisper model: {error}"))?;
     }
 
+    write_whisper_selected_model_definition(&app, definition)?;
+
     #[cfg(target_os = "macos")]
     if whisper_runtime_executable_path(&app)?.is_none()
-        && !install_whisper_runtime_with_homebrew(&app)?
+        && !install_whisper_runtime_with_homebrew(&app, Some(definition.id))?
     {
         return whisper_model_status_for(&app);
     }
@@ -6060,6 +6188,7 @@ async fn download_whisper_model(
                 &app,
                 WhisperModelDownloadProgress {
                     state: "runtime-missing".to_string(),
+                    model_id: Some(definition.id.to_string()),
                     downloaded_bytes: 0,
                     total_bytes: None,
                     percent: Some(100.0),
@@ -6080,6 +6209,7 @@ async fn download_whisper_model(
             &app,
             WhisperModelDownloadProgress {
                 state: "runtime".to_string(),
+                model_id: Some(definition.id.to_string()),
                 downloaded_bytes: 0,
                 total_bytes: None,
                 percent: None,
@@ -6122,6 +6252,7 @@ async fn download_whisper_model(
                 &app,
                 WhisperModelDownloadProgress {
                     state: "runtime".to_string(),
+                    model_id: Some(definition.id.to_string()),
                     downloaded_bytes,
                     total_bytes,
                     percent,
@@ -6148,13 +6279,29 @@ async fn download_whisper_model(
         &app,
         WhisperModelDownloadProgress {
             state: "done".to_string(),
+            model_id: Some(definition.id.to_string()),
             downloaded_bytes: 0,
             total_bytes: None,
             percent: Some(100.0),
-            message: "Whisper is installed locally.".to_string(),
+            message: format!("{} is installed locally.", definition.name),
         },
     );
 
+    whisper_model_status_for(&app)
+}
+
+#[tauri::command]
+async fn select_whisper_model(
+    app: AppHandle,
+    request: WhisperModelRequest,
+) -> Result<WhisperModelStatus, String> {
+    let requested_model_id = request
+        .model_id
+        .as_deref()
+        .unwrap_or(WHISPER_DEFAULT_MODEL_ID);
+    let definition = whisper_model_definition(requested_model_id)
+        .ok_or_else(|| format!("Unknown Whisper model: {requested_model_id}"))?;
+    write_whisper_selected_model_definition(&app, definition)?;
     whisper_model_status_for(&app)
 }
 
@@ -10136,6 +10283,19 @@ async fn audio_widget_bar_hover_snapshot(
     request: AudioWidgetBarHoverSnapshotRequest,
 ) -> Result<AudioWidgetBarHoverSnapshot, String> {
     Ok(audio_widget_bar_hover_snapshot_for(&app, &request))
+}
+
+#[tauri::command]
+async fn audio_widget_log_bubble_position(
+    request: AudioWidgetBubblePositionLogRequest,
+) -> Result<(), String> {
+    let phase = request.phase.trim();
+    if phase.is_empty() {
+        return Ok(());
+    }
+
+    log_audio_widget_bubble_position_debug_event(phase, request.fields);
+    Ok(())
 }
 
 #[tauri::command]

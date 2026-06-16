@@ -3525,6 +3525,7 @@ export function SnippingAnnotationEditorWindow() {
   const [annotationsByPath, setAnnotationsByPath] = useState({});
   const [draft, setDraft] = useState(null);
   const [status, setStatus] = useState("Loading image...");
+  const [imageLoadState, setImageLoadState] = useState(() => (activePath ? "loading" : "empty"));
   const [editorClosing, setEditorClosing] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   // Zoom is relative to "fit the stage" (1 = the image fills the available
@@ -3545,6 +3546,9 @@ export function SnippingAnnotationEditorWindow() {
   const [floatOpen, setFloatOpen] = useState(false);
   const annotations = annotationsByPath[activePath] || [];
   const hasCrop = annotations.some((annotation) => annotation.type === "crop");
+  const imageReady = imageLoadState === "ready" && canvasSize.width > 0 && canvasSize.height > 0;
+  const imageLoading = imageLoadState === "loading";
+  const imageLoadFailed = imageLoadState === "error";
 
   useEffect(() => {
     if (!activePath) {
@@ -3654,6 +3658,7 @@ export function SnippingAnnotationEditorWindow() {
     setTextEditor(null);
     setHoverIndex(-1);
     setStatus("");
+    setImageLoadState("closing");
     if (autosaveTimerRef.current) {
       window.clearTimeout(autosaveTimerRef.current);
       autosaveTimerRef.current = 0;
@@ -3726,6 +3731,7 @@ export function SnippingAnnotationEditorWindow() {
   useEffect(() => {
     if (editorClosingRef.current) return undefined;
     if (!previewUrl) {
+      setImageLoadState("empty");
       setStatus("No snip selected.");
       return undefined;
     }
@@ -3737,15 +3743,20 @@ export function SnippingAnnotationEditorWindow() {
     drawingRef.current = false;
     setDraft(null);
     setCanvasSize({ width: 0, height: 0 });
+    setImageLoadState("loading");
     setStatus("Loading image...");
     image.onload = () => {
       if (disposed || editorClosingRef.current) return;
       imageRef.current = image;
       setCanvasSize({ width: image.naturalWidth || image.width, height: image.naturalHeight || image.height });
+      setImageLoadState("ready");
       setStatus(multiImage ? `Ready ${activeIndex + 1}/${localPaths.length}` : "Ready");
     };
     image.onerror = () => {
-      if (!disposed && !editorClosingRef.current) setStatus("Unable to load snip.");
+      if (!disposed && !editorClosingRef.current) {
+        setImageLoadState("error");
+        setStatus("Unable to load snip.");
+      }
     };
 
     // WebKit blocks fetch() on asset: URLs ("Load failed"); read the bytes
@@ -3757,6 +3768,7 @@ export function SnippingAnnotationEditorWindow() {
       })
       .catch((error) => {
         if (!disposed && !editorClosingRef.current) {
+          setImageLoadState("error");
           setStatus(error?.message || String(error || "Unable to load snip."));
         }
       });
@@ -3768,7 +3780,7 @@ export function SnippingAnnotationEditorWindow() {
       image.src = "";
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [activeIndex, localPaths.length, multiImage, previewUrl]);
+  }, [activeIndex, activePath, localPaths.length, multiImage, previewUrl]);
 
   // Stage size drives the fit scale; track it live so window resizes keep
   // the image filling the available area.
@@ -3987,7 +3999,7 @@ export function SnippingAnnotationEditorWindow() {
   }, [updateActiveAnnotations]);
 
   const beginDraw = useCallback((event) => {
-    if (event.button !== 0 || !canvasSize.width || !canvasSize.height) return;
+    if (event.button !== 0 || !imageReady || !canvasSize.width || !canvasSize.height) return;
     event.preventDefault();
     const point = pointFromEvent(event);
     const hadTextEditor = Boolean(textEditorRef.current);
@@ -4042,7 +4054,7 @@ export function SnippingAnnotationEditorWindow() {
     draftRef.current = annotation;
     drawingRef.current = true;
     setDraft(annotation);
-  }, [blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, eraseAtPoint, numberRadiusPx, openTextEditor, pointFromEvent, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations]);
+  }, [blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, eraseAtPoint, imageReady, numberRadiusPx, openTextEditor, pointFromEvent, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations]);
 
   const updateDraw = useCallback((event) => {
     if (!drawingRef.current || !draftRef.current) return;
@@ -4189,6 +4201,10 @@ export function SnippingAnnotationEditorWindow() {
   }, [activePath, annotationsByPath]);
 
   const copyCanvas = useCallback(async () => {
+    if (!imageReady) {
+      setStatus(imageLoadFailed ? "Unable to copy until the image loads." : "Image is still loading...");
+      return;
+    }
     setStatus("Copying image...");
     try {
       const imageDataUrl = exportActiveDataUrl();
@@ -4200,7 +4216,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to copy image."));
     }
-  }, [exportActiveDataUrl]);
+  }, [exportActiveDataUrl, imageLoadFailed, imageReady]);
 
   // Streams the composited canvas to the snip preview window while drawing,
   // so edits are visible there live (downscaled JPEG frames, throttled).
@@ -4330,6 +4346,10 @@ export function SnippingAnnotationEditorWindow() {
       setStatus("No images are ready yet");
       return;
     }
+    if (!imageReady) {
+      setStatus(imageLoadFailed ? "Unable to queue until the image loads." : "Image is still loading...");
+      return;
+    }
     if (!targetWorkspaceId) {
       setStatus("Pick a workspace first");
       return;
@@ -4364,7 +4384,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to queue todo."));
     }
-  }, [activePath, annotationsByPath, exportActiveDataUrl, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
+  }, [activePath, annotationsByPath, exportActiveDataUrl, imageLoadFailed, imageReady, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
 
   const closeEditor = useCallback(() => {
     beginEditorDispose();
@@ -4428,11 +4448,15 @@ export function SnippingAnnotationEditorWindow() {
           )}
 
           <EditorBody>
-          <EditorStage ref={stageRef}>
-            <EditorCanvasViewport ref={viewportRef}>
+          <EditorStage data-image-state={imageLoadState} ref={stageRef}>
+            {imageLoading && previewUrl ? (
+              <EditorLoadingPreviewImage alt="" aria-hidden="true" draggable={false} src={previewUrl} />
+            ) : null}
+            <EditorCanvasViewport aria-busy={!imageReady} ref={viewportRef}>
               <EditorCanvasSizer>
                 <canvas
                   aria-label="Snip annotation canvas"
+                  data-ready={imageReady ? "true" : "false"}
                   onMouseDown={beginDraw}
                   onMouseLeave={handleCanvasMouseLeave}
                   onMouseMove={handleCanvasMouseMove}
@@ -4442,6 +4466,19 @@ export function SnippingAnnotationEditorWindow() {
                 />
               </EditorCanvasSizer>
             </EditorCanvasViewport>
+            {!imageReady && !editorClosing ? (
+              <EditorImageLoadingOverlay
+                aria-live="polite"
+                data-state={imageLoadState}
+                role="status"
+              >
+                {imageLoading ? <EditorImageLoadingSpinner aria-hidden="true" /> : null}
+                <strong>
+                  {imageLoadFailed ? "Unable to load image" : imageLoadState === "empty" ? "No image selected" : "Loading image"}
+                </strong>
+                <span>{imageLoadFailed || imageLoadState === "empty" ? status : name}</span>
+              </EditorImageLoadingOverlay>
+            ) : null}
             {textEditor && (() => {
               const card = resolveTextCardStyle(textBg, color);
               return (
@@ -4479,28 +4516,29 @@ export function SnippingAnnotationEditorWindow() {
                 buttons live top-right (under the batch strip when several
                 images are selected) where they are quickest to reach. */}
             <EditorActionCluster aria-label="Annotation actions">
-              <EditorToolButton aria-label="Zoom out" onClick={() => setZoomAnchored(zoom / 1.25)} title="Zoom out" type="button">
+              <EditorToolButton aria-label="Zoom out" disabled={!imageReady} onClick={() => setZoomAnchored(zoom / 1.25)} title="Zoom out" type="button">
                 <ZoomOut aria-hidden="true" />
               </EditorToolButton>
               <EditorZoomReadout
                 aria-label="Reset zoom to fit"
+                disabled={!imageReady}
                 onClick={() => setZoom(1)}
                 title="Reset zoom to fit"
                 type="button"
               >
                 {Math.round(fitScale * zoom * 100)}%
               </EditorZoomReadout>
-              <EditorToolButton aria-label="Zoom in" onClick={() => setZoomAnchored(zoom * 1.25)} title="Zoom in" type="button">
+              <EditorToolButton aria-label="Zoom in" disabled={!imageReady} onClick={() => setZoomAnchored(zoom * 1.25)} title="Zoom in" type="button">
                 <ZoomIn aria-hidden="true" />
               </EditorToolButton>
               <EditorBarDivider aria-hidden="true" />
-              <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
+              <EditorToolButton aria-label="Undo" disabled={!imageReady || !annotations.length} onClick={undo} title="Undo" type="button">
                 <Undo aria-hidden="true" />
               </EditorToolButton>
-              <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
+              <EditorToolButton aria-label="Clear annotations" disabled={!imageReady || !annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
                 <Delete aria-hidden="true" />
               </EditorToolButton>
-              <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
+              <EditorToolButton aria-label="Copy annotated image" disabled={!imageReady} onClick={copyCanvas} title="Copy image" type="button">
                 <ContentCopy aria-hidden="true" />
               </EditorToolButton>
               <EditorToolButton
@@ -4669,6 +4707,7 @@ export function SnippingAnnotationEditorWindow() {
                     <EditorToolButton
                       aria-label={option.label}
                       data-active={isToolOptionActive(option)}
+                      disabled={!imageReady}
                       key={option.id}
                       onClick={() => selectTool(option)}
                       title={option.label}
@@ -4715,7 +4754,7 @@ export function SnippingAnnotationEditorWindow() {
                   styles={TARGET_SELECT_STYLES}
                   value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
                 />
-                <EditorSendButton aria-label="Queue todo with this image" disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
+                <EditorSendButton aria-label="Queue todo with this image" disabled={!imageReady || !todoDraft.trim()} title="Queue todo with this image" type="submit">
                   <Send aria-hidden="true" />
                 </EditorSendButton>
               </EditorComposerControls>
@@ -5357,6 +5396,15 @@ const EditorWindowRoot = styled.main`
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
+  transition:
+    opacity 80ms ease,
+    transform 80ms ease;
+
+  &[data-closing="true"] {
+    opacity: 0;
+    pointer-events: none;
+    transform: scale(0.985);
+  }
 `;
 
 const EditorTitleBar = styled.header`
@@ -5557,6 +5605,81 @@ const EditorStage = styled.section`
       0 18px 54px rgba(0, 0, 0, 0.55);
     cursor: crosshair;
   }
+
+  canvas[data-ready="false"] {
+    opacity: 0;
+    pointer-events: none;
+    box-shadow: none;
+  }
+`;
+
+const EditorLoadingPreviewImage = styled.img`
+  position: absolute;
+  left: 52px;
+  top: 52px;
+  z-index: 0;
+  width: calc(100% - 64px);
+  height: calc(100% - 108px);
+  object-fit: contain;
+  opacity: 0.22;
+  filter: saturate(0.75);
+  pointer-events: none;
+`;
+
+const EditorImageLoadingOverlay = styled.div`
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 3;
+  min-width: min(260px, calc(100% - 96px));
+  max-width: min(360px, calc(100% - 72px));
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 16px 18px;
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: 10px;
+  color: rgba(248, 250, 252, 0.84);
+  background: rgba(8, 11, 17, 0.82);
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.38);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+
+  strong,
+  span {
+    max-width: 100%;
+    overflow: hidden;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-size: 12px;
+    font-weight: 820;
+    letter-spacing: 0.01em;
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.62);
+    font-size: 10.5px;
+    font-weight: 650;
+  }
+
+  &[data-state="error"] {
+    border-color: rgba(248, 113, 113, 0.32);
+    color: rgba(254, 202, 202, 0.95);
+    background: rgba(32, 10, 12, 0.86);
+  }
+`;
+
+const EditorImageLoadingSpinner = styled.span`
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(147, 197, 253, 0.28);
+  border-top-color: rgba(147, 197, 253, 0.95);
+  border-radius: 999px;
+  animation: ${floatUploadSpin} 0.72s linear infinite;
 `;
 
 // Scrollable zoom viewport: the canvas's display size is set inline (image
@@ -5600,9 +5723,14 @@ const EditorZoomReadout = styled.button`
   line-height: 24px;
   cursor: pointer;
 
-  &:hover {
+  &:hover:not(:disabled) {
     color: #f8fafc;
     background: rgba(255, 255, 255, 0.08);
+  }
+
+  &:disabled {
+    color: rgba(248, 250, 252, 0.32);
+    cursor: default;
   }
 `;
 

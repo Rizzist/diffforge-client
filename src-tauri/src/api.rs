@@ -666,15 +666,34 @@ fn desktop_auth_entitlements(snapshot: &Value) -> Value {
     let plan_status = desktop_auth_user_plan_status(user);
     let plan_name = desktop_auth_plan_name_from_snapshot(snapshot);
     let device_limit = desktop_auth_device_limit_from_snapshot(snapshot, &plan_name);
+    let agent_entitlements = desktop_auth_agent_entitlements_for_plan(&plan_name);
     let paid = plan_status == "paid" || plan_name != "free";
     json!({
         "planName": plan_name,
         "planStatus": if paid { "paid" } else { "free" },
+        "agents": agent_entitlements,
         "deviceLimit": device_limit,
         "isPaid": paid,
         "canUseCloudSync": paid,
         "canUseForgeAudio": paid,
         "canUseTokenomicsCloud": paid,
+    })
+}
+
+fn desktop_auth_agent_entitlements_for_plan(plan_name: &str) -> Value {
+    let (shared_agent_limit, dedicated_agent_limit, status) =
+        match plan_name.trim().to_ascii_lowercase().as_str() {
+            "ultra" => (5, 1, "coming_soon"),
+            "pro" => (3, 0, "coming_soon"),
+            "plus" => (1, 0, "coming_soon"),
+            _ => (0, 0, "unavailable"),
+        };
+    json!({
+        "sharedAgentLimit": shared_agent_limit,
+        "shared_agent_limit": shared_agent_limit,
+        "dedicatedAgentLimit": dedicated_agent_limit,
+        "dedicated_agent_limit": dedicated_agent_limit,
+        "status": status,
     })
 }
 

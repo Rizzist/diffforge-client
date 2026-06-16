@@ -182,6 +182,8 @@ const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE: &str = "audio-widget-bottom-bar.jsonl";
+const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = false;
+const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE: &str = "audio-widget-bubble-position.jsonl";
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
@@ -210,12 +212,56 @@ const MAIN_WINDOW_RESTORE_RETRY_DELAYS_MS: [u64; 2] = [160, 240];
 const MAIN_WINDOW_RESTORE_COALESCE_RELEASE_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const MAIN_WINDOW_MINIMIZE_RESTORE_SUPPRESS_MS: u64 = 1_000;
-const WHISPER_MODEL_ID: &str = "base.en";
-const WHISPER_MODEL_NAME: &str = "Whisper base.en";
-const WHISPER_MODEL_FILE: &str = "ggml-base.en.bin";
-const WHISPER_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
-const WHISPER_MODEL_SHA1: &str = "137c40403d78fd54d454da0f9bd998f78703390c";
+#[derive(Clone, Copy)]
+struct WhisperModelDefinition {
+    id: &'static str,
+    name: &'static str,
+    file: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+    approximate_disk_mb: u64,
+    approximate_memory_mb: u64,
+    tier: &'static str,
+    description: &'static str,
+}
+
+const WHISPER_DEFAULT_MODEL_ID: &str = "base.en";
+const WHISPER_SELECTED_MODEL_FILE: &str = "selected-model.txt";
+const WHISPER_MODEL_OPTIONS: &[WhisperModelDefinition] = &[
+    WhisperModelDefinition {
+        id: "tiny.en",
+        name: "Whisper tiny.en",
+        file: "ggml-tiny.en.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+        sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+        approximate_disk_mb: 74,
+        approximate_memory_mb: 260,
+        tier: "Fastest",
+        description: "Lowest footprint",
+    },
+    WhisperModelDefinition {
+        id: "base.en",
+        name: "Whisper base.en",
+        file: "ggml-base.en.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+        sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        approximate_disk_mb: 142,
+        approximate_memory_mb: 500,
+        tier: "Balanced",
+        description: "Current default",
+    },
+    WhisperModelDefinition {
+        id: "small.en",
+        name: "Whisper small.en",
+        file: "ggml-small.en.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+        sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+        approximate_disk_mb: 465,
+        approximate_memory_mb: 1100,
+        tier: "Higher accuracy",
+        description: "Larger local model",
+    },
+];
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
@@ -260,8 +306,6 @@ const WHISPER_RUNTIME_INSTALL_HINT: &str =
 #[cfg(windows)]
 const WHISPER_RUNTIME_INSTALL_HINT: &str =
     "Diff Forge can download the official whisper.cpp x64 runtime automatically.";
-const WHISPER_MODEL_DISK_MB: u64 = 142;
-const WHISPER_MODEL_MEMORY_MB: u64 = 500;
 const WHISPER_DOWNLOAD_TIMEOUT_SECS: u64 = 900;
 const WHISPER_MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 const WHISPER_TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
@@ -299,6 +343,7 @@ static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Ve
 static LOGIN_TERMINAL_CHILDREN: OnceLock<StdMutex<Vec<std::process::Child>>> = OnceLock::new();
 static WHISPER_LOCAL_AUDIO_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MAIN_WINDOW_RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
@@ -2075,6 +2120,8 @@ struct WhisperModelStatus {
     installed: bool,
     model_installed: bool,
     runtime_installed: bool,
+    selected_model_id: &'static str,
+    default_model_id: &'static str,
     model_id: &'static str,
     model_name: &'static str,
     model_file: &'static str,
@@ -2087,18 +2134,44 @@ struct WhisperModelStatus {
     managed_assets_installed: bool,
     runtime_install_hint: &'static str,
     download_url: &'static str,
-    expected_sha1: &'static str,
+    expected_sha256: &'static str,
     approximate_disk_mb: u64,
     approximate_memory_mb: u64,
     bytes: u64,
+    models: Vec<WhisperModelOptionStatus>,
     shortcut: String,
     shortcuts: AudioShortcutSettingsStatus,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct WhisperModelOptionStatus {
+    model_id: &'static str,
+    model_name: &'static str,
+    model_file: &'static str,
+    model_path: String,
+    download_url: &'static str,
+    expected_sha256: &'static str,
+    approximate_disk_mb: u64,
+    approximate_memory_mb: u64,
+    bytes: u64,
+    installed: bool,
+    selected: bool,
+    tier: &'static str,
+    description: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WhisperModelRequest {
+    model_id: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct WhisperModelDownloadProgress {
     state: String,
+    model_id: Option<String>,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
     percent: Option<f64>,
@@ -4607,6 +4680,7 @@ pub fn run() {
             save_todo_text_attachment,
             whisper_model_status,
             download_whisper_model,
+            select_whisper_model,
             uninstall_whisper_model,
             audio_input_devices,
             start_audio_input_monitor,
@@ -4680,6 +4754,7 @@ pub fn run() {
             snipping_cancel_area_snip,
             audio_widget_status,
             audio_widget_bar_hover_snapshot,
+            audio_widget_log_bubble_position,
             audio_widget_position_bottom_bar,
             audio_widget_clear_bottom_bar_position,
             audio_widget_release_keyboard_focus,

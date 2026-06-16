@@ -237,6 +237,29 @@ export default function ToolsWorkspaceView({
     void refreshCliStatuses();
   }, [refreshCliStatuses]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen("cloud-mcp-account-tools-updated", () => {
+      if (disposed) {
+        return;
+      }
+      void loadAccountTools();
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, [loadAccountTools]);
+
   // The Rust inventory watcher reports CLI installs/updates made outside the
   // app (terminals, remote levers, background mode); apply them live.
   useEffect(() => {

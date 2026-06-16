@@ -6764,6 +6764,127 @@ export const AudioModeList = styled.div`
   min-width: 0;
 `;
 
+export const AudioLocalModelList = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+export const AudioLocalModelRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.42);
+
+  &[data-selected="true"] {
+    border-color: rgba(125, 160, 205, 0.42);
+    background: rgba(125, 160, 205, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    border-color: rgba(0, 102, 204, 0.22);
+    background: rgba(0, 102, 204, 0.07);
+  }
+
+  @media (max-width: 520px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const AudioLocalModelCopy = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12px;
+    font-weight: 780;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const AudioLocalModelMeta = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+`;
+
+export const AudioLocalModelPill = styled.span`
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  padding: 0 7px;
+  border: 1px solid rgba(125, 160, 205, 0.2);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: rgba(125, 160, 205, 0.06);
+  font-size: 10px;
+  font-weight: 760;
+  white-space: nowrap;
+
+  &[data-tone="ready"] {
+    border-color: rgba(71, 178, 127, 0.28);
+    color: #8ee0b5;
+    background: rgba(71, 178, 127, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="ready"] {
+    color: var(--forge-green);
+    background: rgba(12, 132, 78, 0.07);
+  }
+`;
+
+export const AudioLocalModelActions = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+
+  button {
+    min-height: 32px;
+    min-width: 92px;
+    padding: 0 10px;
+  }
+
+  @media (max-width: 520px) {
+    justify-content: stretch;
+
+    button {
+      width: 100%;
+    }
+  }
+`;
+
 export const AudioProviderPanel = styled.section`
   display: grid;
   align-content: start;

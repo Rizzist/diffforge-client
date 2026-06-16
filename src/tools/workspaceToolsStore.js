@@ -13,6 +13,9 @@ const ARCHITECTURE_CHANGE_EVENTS = [
   "architecture-store-changed",
   "cloud-mcp-workspace-architectures-updated",
 ];
+const ACCOUNT_TOOLS_CHANGE_EVENTS = [
+  "cloud-mcp-account-tools-updated",
+];
 
 const workspaceToolsStore = {
   architecturesByRepo: new Map(), // repoPath -> [{ graphId, repoLabel, repoPath, title }]
@@ -29,7 +32,9 @@ const workspaceToolsListeners = new Set();
 const inFlightArchitectureLoads = new Map(); // repoPath -> Promise
 let inFlightSkillsLoad = null;
 let architectureEventsWired = false;
+let accountToolsEventsWired = false;
 let architectureEventTimer = 0;
+let accountToolsEventTimer = 0;
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -183,9 +188,26 @@ function wireArchitectureChangeEvents() {
   });
 }
 
+function wireAccountToolsChangeEvents() {
+  if (accountToolsEventsWired) return;
+  accountToolsEventsWired = true;
+  ACCOUNT_TOOLS_CHANGE_EVENTS.forEach((eventName) => {
+    void listen(eventName, () => {
+      if (accountToolsEventTimer) window.clearTimeout(accountToolsEventTimer);
+      accountToolsEventTimer = window.setTimeout(() => {
+        accountToolsEventTimer = 0;
+        void loadAccountSkills({ force: true });
+      }, ARCHITECTURE_EVENT_DEBOUNCE_MS);
+    }).catch(() => {
+      // Event wiring is best-effort; mount revalidation still keeps data fresh.
+    });
+  });
+}
+
 /** Serve-from-cache plus silent revalidate for the given workspace repos. */
 export function ensureWorkspaceToolsFresh(repoDescriptors) {
   wireArchitectureChangeEvents();
+  wireAccountToolsChangeEvents();
   const descriptors = Array.isArray(repoDescriptors) ? repoDescriptors : [];
   const activeRepos = new Set();
   descriptors.forEach(({ repoPath, label }) => {
@@ -218,6 +240,7 @@ export function noteAccountSkillsMarkdown(skillsMd) {
 export function subscribeWorkspaceTools(listener) {
   workspaceToolsListeners.add(listener);
   wireArchitectureChangeEvents();
+  wireAccountToolsChangeEvents();
   return () => {
     workspaceToolsListeners.delete(listener);
   };
