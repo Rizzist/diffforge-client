@@ -25,6 +25,7 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT: &str = "cloud-mcp-device-deleted";
 const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT: &str = "cloud-mcp-account-device-live-state";
+const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT: &str = "cloud-mcp-workspace-catalog-changed";
@@ -1567,6 +1568,16 @@ fn cloud_mcp_diffforge_credit_ledger_summary(limit: usize) -> Value {
 }
 
 fn cloud_mcp_merge_diffforge_credit_ledger(mut billing: Value, ledger: Value) -> Value {
+    let ledger_has_usage = ledger
+        .get("known")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || ledger
+            .get("total_credits")
+            .or_else(|| ledger.get("totalCredits"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            > 0;
     let history = ledger
         .get("items")
         .cloned()
@@ -1587,10 +1598,11 @@ fn cloud_mcp_merge_diffforge_credit_ledger(mut billing: Value, ledger: Value) ->
         object.insert("creditLedger".to_string(), ledger.clone());
         object.insert("billing_history".to_string(), history.clone());
         object.insert("billingHistory".to_string(), history.clone());
-        let credits = object
-            .entry("credits".to_string())
-            .or_insert_with(|| json!({}));
-        if let Some(credits_object) = credits.as_object_mut() {
+        if let Some(credits_object) = object
+            .get_mut("credits")
+            .and_then(Value::as_object_mut)
+            .filter(|_| ledger_has_usage)
+        {
             credits_object.insert("usage_history".to_string(), history.clone());
             credits_object.insert("usageHistory".to_string(), history);
             credits_object.insert("usage_by_meter".to_string(), by_meter.clone());
@@ -8465,6 +8477,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         }
         cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_live_state_reconcile(state, "websocket_hello_ack");
+        cloud_mcp_spawn_account_usage_request(state, "websocket_hello_ack");
         cloud_mcp_spawn_tokenomics_cursor_request(state, "websocket_hello_ack");
         cloud_mcp_spawn_tokenomics_account_delta_request(state, "websocket_hello_ack", false);
         return;
@@ -8994,6 +9007,91 @@ fn cloud_mcp_spawn_tokenomics_account_delta_request(
     });
 }
 
+fn cloud_mcp_account_usage_payload_from_value(value: &Value) -> Option<Value> {
+    let data = cloud_mcp_response_data(value);
+    let account_usage = data
+        .get("account_usage")
+        .or_else(|| data.get("accountUsage"))
+        .cloned()
+        .filter(Value::is_object)
+        .or_else(|| data.get("status").cloned().filter(Value::is_object))
+        .or_else(|| data.get("data").cloned().filter(Value::is_object))
+        .unwrap_or_else(|| data.clone());
+    if value
+        .get("contract")
+        .or_else(|| account_usage.get("contract"))
+        .and_then(Value::as_str)
+        .is_some_and(|contract| contract == "diffforge.account_usage.v1")
+        || account_usage
+            .get("storage_usage")
+            .or_else(|| account_usage.get("storageUsage"))
+            .is_some()
+        || account_usage.get("credits").is_some()
+    {
+        return Some(account_usage);
+    }
+    None
+}
+
+fn cloud_mcp_spawn_account_usage_request(state: &CloudMcpState, reason: &'static str) {
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let payload = json!({
+            "kind": "account_usage_status",
+            "reason": reason,
+            "source": "rust-diffforge-desktop",
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        match cloud_mcp_ws_request_once_with_timeout(
+            &state,
+            "account_usage_status",
+            &payload,
+            Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
+        )
+        .await
+        {
+            Ok(response) => {
+                if let Some(account_usage) = cloud_mcp_account_usage_payload_from_value(&response) {
+                    let _ = state.global_ws_events.send(json!({
+                        "kind": "account_usage_snapshot",
+                        "event_kind": "account_usage_snapshot",
+                        "eventKind": "account_usage_snapshot",
+                        "contract": "diffforge.account_usage.v1",
+                        "reason": reason,
+                        "payload": account_usage.clone(),
+                        "account_usage": account_usage.clone(),
+                        "accountUsage": account_usage,
+                    }));
+                    log_cloud_sync_event(
+                        "account_usage.request_ok",
+                        json!({
+                            "reason": reason,
+                            "has_account_usage": true,
+                        }),
+                    );
+                } else {
+                    log_cloud_sync_event(
+                        "account_usage.request_empty",
+                        json!({
+                            "reason": reason,
+                            "response_kind": response.get("kind").and_then(Value::as_str).unwrap_or("response"),
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                log_cloud_sync_event(
+                    "account_usage.request_error",
+                    json!({
+                        "reason": reason,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
+            }
+        }
+    });
+}
+
 async fn cloud_mcp_send_lifecycle_event(
     state: &CloudMcpState,
     event_kind: &str,
@@ -9420,6 +9518,14 @@ async fn cloud_mcp_start_remote_command_listener(
                 .or_else(|| cloud_mcp_payload_text(&event, &["eventKind"]))
                 .or_else(|| cloud_mcp_payload_text(&event, &["kind"]))
                 .unwrap_or_default();
+            let contract = cloud_mcp_payload_text(&event, &["contract"]).unwrap_or_default();
+            if contract == "diffforge.account_usage.v1" || event_kind == "account_usage_snapshot" {
+                let _ = app.emit(CLOUD_MCP_ACCOUNT_USAGE_EVENT, event.clone());
+                if event_kind.starts_with("credit_wallet_") {
+                    let _ = app.emit(CLOUD_MCP_CREDIT_WALLET_EVENT, event.clone());
+                }
+                continue;
+            }
             if event_kind.starts_with("credit_wallet_") {
                 let _ = app.emit(CLOUD_MCP_CREDIT_WALLET_EVENT, event.clone());
                 continue;

@@ -180,6 +180,8 @@ const WINDOWS_TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "windows-terminal-diagnostics
 const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
+const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED: bool = false;
+const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE: &str = "audio-widget-bottom-bar.jsonl";
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
@@ -296,6 +298,7 @@ static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Ve
     OnceLock::new();
 static LOGIN_TERMINAL_CHILDREN: OnceLock<StdMutex<Vec<std::process::Child>>> = OnceLock::new();
 static WHISPER_LOCAL_AUDIO_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static MAIN_WINDOW_RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]

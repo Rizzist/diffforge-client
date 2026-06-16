@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
+import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import {
   dailyUsageTitle,
   dailyUsageValue,
@@ -109,17 +110,32 @@ const AgentAccountsHeader = styled.div`
 
 const AgentAccountsRow = styled.div`
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+`;
+
+const AgentAccountsKindRow = styled.div`
+  display: inline-flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
 `;
 
 const AgentAccountsKindLabel = styled.span`
-  min-width: 56px;
   color: rgba(148, 163, 184, 0.85);
   font-size: 11.5px;
   font-weight: 750;
+`;
+
+const AgentAccountsPillsRow = styled.div`
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
 `;
 
 const AgentAccountAddButton = styled.button`
@@ -475,111 +491,115 @@ function AgentAccountsManager() {
         return (
           <Fragment key={kind}>
             <AgentAccountsRow>
-              <AgentAccountsKindLabel>
-                {kind === "claude" ? "Claude" : "Codex"}
-              </AgentAccountsKindLabel>
-              <AgentAccountAddButton
-                aria-label={`Add ${kind === "claude" ? "Claude" : "Codex"} account`}
-                onClick={() => beginLogin(kind)}
-                title={`Open the ${kind === "claude" ? "Claude Code" : "Codex"} login in a terminal to add another account`}
-                type="button"
-              >
-                +
-              </AgentAccountAddButton>
-              {profiles.map((profile) => {
-                const email = profile.identity?.email || "";
-                const alias = String(profile.alias || "").trim();
-                // The alias HIDES the email (streaming privacy): captured
-                // pills show the alias as their name, the default pill keeps
-                // "Default" and shows the alias where the email was.
-                const name = profile.isDefault
-                  ? (profile.label || "Default")
-                  : (alias || profile.label || "Account");
-                const detail = profile.isDefault ? (alias || email) : (alias ? "" : email);
-                const authStatus = profile.authStatus || {};
-                const needsLogin = Boolean(authStatus.needsLogin || (!profile.identity?.authReady && !profile.isDefault));
-                const canEdit = Boolean(email);
-                const canDelete = !profile.isDefault && !profile.isActive;
-                const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
-                return (
-                  <AgentAccountPill
-                    data-active={profile.isActive && !needsLogin ? "true" : "false"}
-                    key={profile.id}
-                    onClick={() => {
-                      if (needsLogin) {
-                        beginProfileLogin(kind, profile.id);
-                        return;
-                      }
-                      if (!profile.isActive) {
-                        setActive(kind, profile.id);
-                      }
-                    }}
-                    title={needsLogin
-                      ? (authStatus.message || "Sign in again for this account")
-                      : profile.isActive
-                      ? `Active: new ${kind} terminals use this account`
-                      : `Use this account for new ${kind} terminals`}
-                    type="button"
-                  >
-                    <i
-                      aria-hidden="true"
-                      data-state={needsLogin ? "needs-login" : profile.isActive ? "active" : "none"}
-                    />
-                    <span>{name}</span>
-                    {detail ? <em>{detail}</em> : null}
-                    {needsLogin ? <em>needs login</em> : null}
-                    {needsLogin && (
-                      <AgentAccountIconButton
-                        aria-label={`Sign in again for ${name}`}
-                        as="span"
-                        onClick={(event) => {
-                          event.stopPropagation();
+              <AgentAccountsKindRow>
+                <AgentAccountsKindLabel>
+                  {kind === "claude" ? "Claude" : "Codex"}
+                </AgentAccountsKindLabel>
+                <AgentAccountAddButton
+                  aria-label={`Add ${kind === "claude" ? "Claude" : "Codex"} account`}
+                  onClick={() => beginLogin(kind)}
+                  title={`Open the ${kind === "claude" ? "Claude Code" : "Codex"} login in a terminal to add another account`}
+                  type="button"
+                >
+                  +
+                </AgentAccountAddButton>
+              </AgentAccountsKindRow>
+              <AgentAccountsPillsRow>
+                {profiles.map((profile) => {
+                  const email = profile.identity?.email || "";
+                  const alias = String(profile.alias || "").trim();
+                  // The alias HIDES the email (streaming privacy): captured
+                  // pills show the alias as their name, the default pill keeps
+                  // "Default" and shows the alias where the email was.
+                  const name = profile.isDefault
+                    ? (profile.label || "Default")
+                    : (alias || profile.label || "Account");
+                  const detail = profile.isDefault ? (alias || email) : (alias ? "" : email);
+                  const authStatus = profile.authStatus || {};
+                  const needsLogin = Boolean(authStatus.needsLogin || (!profile.identity?.authReady && !profile.isDefault));
+                  const canEdit = Boolean(email);
+                  const canDelete = !profile.isDefault && !profile.isActive;
+                  const deleteArmed = confirmDeleteKey === `${kind}:${profile.id}`;
+                  return (
+                    <AgentAccountPill
+                      data-active={profile.isActive && !needsLogin ? "true" : "false"}
+                      key={profile.id}
+                      onClick={() => {
+                        if (needsLogin) {
                           beginProfileLogin(kind, profile.id);
-                        }}
-                        role="button"
-                        title={authStatus.message || "Sign in again for this account"}
-                      >
-                        ↻
-                      </AgentAccountIconButton>
-                    )}
-                    {canEdit && (
-                      <AgentAccountIconButton
-                        aria-label={`Edit ${name}`}
-                        as="span"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setEditing({
-                            kind,
-                            profileId: profile.id,
-                            name,
-                            alias,
-                          });
-                        }}
-                        role="button"
-                        title="Set an alias to show instead of the email"
-                      >
-                        ✎
-                      </AgentAccountIconButton>
-                    )}
-                    {canDelete && (
-                      <AgentAccountIconButton
-                        aria-label={`Delete ${name}`}
-                        as="span"
-                        data-armed={deleteArmed ? "true" : "false"}
-                        data-danger="true"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          requestDelete(kind, profile.id);
-                        }}
-                        role="button"
-                        title="Delete this account profile and its saved login"
-                      >
-                        {deleteArmed ? "sure?" : "×"}
-                      </AgentAccountIconButton>
-                    )}
-                  </AgentAccountPill>
-                );
-              })}
+                          return;
+                        }
+                        if (!profile.isActive) {
+                          setActive(kind, profile.id);
+                        }
+                      }}
+                      title={needsLogin
+                        ? (authStatus.message || "Sign in again for this account")
+                        : profile.isActive
+                        ? `Active: new ${kind} terminals use this account`
+                        : `Use this account for new ${kind} terminals`}
+                      type="button"
+                    >
+                      <i
+                        aria-hidden="true"
+                        data-state={needsLogin ? "needs-login" : profile.isActive ? "active" : "none"}
+                      />
+                      <span>{name}</span>
+                      {detail ? <em>{detail}</em> : null}
+                      {needsLogin ? <em>needs login</em> : null}
+                      {needsLogin && (
+                        <AgentAccountIconButton
+                          aria-label={`Sign in again for ${name}`}
+                          as="span"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            beginProfileLogin(kind, profile.id);
+                          }}
+                          role="button"
+                          title={authStatus.message || "Sign in again for this account"}
+                        >
+                          ↻
+                        </AgentAccountIconButton>
+                      )}
+                      {canEdit && (
+                        <AgentAccountIconButton
+                          aria-label={`Edit ${name}`}
+                          as="span"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setEditing({
+                              kind,
+                              profileId: profile.id,
+                              name,
+                              alias,
+                            });
+                          }}
+                          role="button"
+                          title="Set an alias to show instead of the email"
+                        >
+                          ✎
+                        </AgentAccountIconButton>
+                      )}
+                      {canDelete && (
+                        <AgentAccountIconButton
+                          aria-label={`Delete ${name}`}
+                          as="span"
+                          data-armed={deleteArmed ? "true" : "false"}
+                          data-danger="true"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            requestDelete(kind, profile.id);
+                          }}
+                          role="button"
+                          title="Delete this account profile and its saved login"
+                        >
+                          {deleteArmed ? "sure?" : "×"}
+                        </AgentAccountIconButton>
+                      )}
+                    </AgentAccountPill>
+                  );
+                })}
+              </AgentAccountsPillsRow>
             </AgentAccountsRow>
             {editing?.kind === kind ? (
               <AgentAccountEditorForm onSubmit={submitEdit}>
@@ -661,6 +681,75 @@ function storageByteValue(...values) {
   return 0;
 }
 
+function tokenomicsObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function tokenomicsObjectHasAny(value, keys = []) {
+  const object = tokenomicsObject(value);
+  if (!object) return false;
+  return keys.some((key) => object[key] != null && object[key] !== "");
+}
+
+function creditSnapshotHasMeaningfulData(credits) {
+  const object = tokenomicsObject(credits);
+  if (!object) return false;
+  const term = tokenomicsObject(object.term);
+  const total = tokenomicsObject(object.total) || tokenomicsObject(object.totalCredits);
+  return Boolean(
+    object.known === true
+      || object.live === true
+      || String(object.planName || object.plan_name || "").trim()
+      || String(term?.plan_name || term?.planName || term?.id || "").trim()
+      || tokenomicsObjectHasAny(object, [
+        "termTotalCredits",
+        "term_total_credits",
+        "termRemainingCredits",
+        "term_remaining_credits",
+        "termReservedCredits",
+        "term_reserved_credits",
+        "termUsedCredits",
+        "term_used_credits",
+        "localMeteredUsedCredits",
+        "local_metered_used_credits",
+      ])
+      || tokenomicsObjectHasAny(total, [
+        "total_credits",
+        "totalCredits",
+        "remaining_credits",
+        "remainingCredits",
+        "reserved_credits",
+        "reservedCredits",
+        "used_credits",
+        "usedCredits",
+      ])
+  );
+}
+
+function storageUsageHasMeaningfulData(storageUsage) {
+  const raw = tokenomicsObject(storageUsage);
+  if (!raw) return false;
+  const usage = tokenomicsObject(raw.usage);
+  return Boolean(
+    raw.known === true
+      || usage
+      || tokenomicsObjectHasAny(raw, [
+        "totalBytes",
+        "total_bytes",
+        "totalUsedBytes",
+        "total_used_bytes",
+        "sqliteBytes",
+        "sqlite_bytes",
+        "sqliteUsedBytes",
+        "sqlite_used_bytes",
+        "assetsBytes",
+        "assets_bytes",
+        "assetsUsedBytes",
+        "assets_used_bytes",
+      ])
+  );
+}
+
 function formatStorageBytes(value) {
   const bytes = storageByteValue(value);
   const mib = 1024 ** 2;
@@ -688,7 +777,7 @@ function storageLimitsForPlan(planName) {
   return { totalBytes: 0, sqliteBytes: 0, assetsBytes: 0 };
 }
 
-function storageUsageModel(billingStatus = {}, summary = {}, liveStorageUsage = null) {
+function storageUsageModel(billingStatus = {}, liveStorageUsage = null) {
   const planName = String(
     billingStatus?.planName
       || billingStatus?.credits?.planName
@@ -697,8 +786,6 @@ function storageUsageModel(billingStatus = {}, summary = {}, liveStorageUsage = 
       || "free",
   ).trim().toLowerCase();
   const raw = liveStorageUsage
-    || summary?.storageUsage
-    || summary?.storage_usage
     || billingStatus?.storage?.usage
     || {};
   const usage = raw?.usage || raw || {};
@@ -715,15 +802,30 @@ function storageUsageModel(billingStatus = {}, summary = {}, liveStorageUsage = 
     assetsBytes: storageByteValue(explicitLimits.assetsBytes, explicitLimits.assets_bytes, fallback.assetsBytes),
   };
   const rows = [
-    { key: "total", label: "Total", used: storageByteValue(usage.totalBytes, usage.total_bytes), limit: limits.totalBytes },
-    { key: "sqlite", label: "SQLite", used: storageByteValue(usage.sqliteBytes, usage.sqlite_bytes), limit: limits.sqliteBytes },
-    { key: "assets", label: "Assets", used: storageByteValue(usage.assetsBytes, usage.assets_bytes), limit: limits.assetsBytes },
+    {
+      key: "total",
+      label: "Total",
+      used: storageByteValue(usage.totalBytes, usage.total_bytes, raw.totalUsedBytes, raw.total_used_bytes),
+      limit: limits.totalBytes,
+    },
+    {
+      key: "sqlite",
+      label: "SQLite",
+      used: storageByteValue(usage.sqliteBytes, usage.sqlite_bytes, raw.sqliteUsedBytes, raw.sqlite_used_bytes),
+      limit: limits.sqliteBytes,
+    },
+    {
+      key: "assets",
+      label: "Assets",
+      used: storageByteValue(usage.assetsBytes, usage.assets_bytes, raw.assetsUsedBytes, raw.assets_used_bytes),
+      limit: limits.assetsBytes,
+    },
   ].map((row) => ({
     ...row,
     percent: row.limit > 0 ? Math.min(100, Math.max(0, Math.round((row.used / row.limit) * 100))) : 0,
   }));
   return {
-    known: Boolean(raw?.known || raw?.usage || billingStatus?.storage?.usage),
+    known: Boolean(storageUsageHasMeaningfulData(raw) || storageUsageHasMeaningfulData(billingStatus?.storage?.usage)),
     rows,
   };
 }
@@ -892,9 +994,26 @@ function modelRowsForDisplay(summary = {}) {
   return legacy.length ? legacy : hourlyRowsForDisplay(summary);
 }
 
+function dailyDisplayMergeKey(row = {}) {
+  return [
+    bucketDayKey(row),
+    rowDeviceId(row) || "unknown-device",
+    rowScopeKey(row),
+    providerKey(row),
+    rowProviderAccountKey(row) || "unknown-account",
+  ].join("\u001f");
+}
+
 function dailyRowsForDisplay(summary = {}) {
-  const legacy = summaryArray(summary, "daily_by_device_provider");
-  return legacy.length ? legacy : hourlyRowsForDisplay(summary);
+  const daily = summaryArray(summary, "daily_by_device_provider", "dailyByDeviceProvider", "daily");
+  const hourly = hourlyRowsForDisplay(summary);
+  if (!daily.length) return hourly;
+  if (!hourly.length) return daily;
+  const dailyKeys = new Set(daily.map(dailyDisplayMergeKey).filter(Boolean));
+  return [
+    ...daily,
+    ...hourly.filter((row) => !dailyKeys.has(dailyDisplayMergeKey(row))),
+  ];
 }
 
 function usageRowsForDisplay(summary = {}) {
@@ -903,7 +1022,7 @@ function usageRowsForDisplay(summary = {}) {
     ...summaryArray(summary, "by_device_provider"),
     ...summaryArray(summary, "by_device_account"),
     ...summaryArray(summary, "by_device_model"),
-    ...summaryArray(summary, "daily_by_device_provider"),
+    ...dailyRowsForDisplay(summary),
   ];
   return legacy.length ? legacy : hourlyRowsForDisplay(summary);
 }
@@ -1518,7 +1637,6 @@ function mergeLimits(limits, windowKind) {
     ratePoints,
     limitWindowSeconds: numeric(rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds),
     resetAfterSeconds: numeric(rows[0]?.reset_after_seconds, rows[0]?.resetAfterSeconds),
-    credits: rows.find((row) => row?.credits)?.credits || null,
   };
 }
 
@@ -1724,14 +1842,6 @@ function planStatusTitle(limit, selectedProvider) {
     return "Claude account signed in";
   }
   return name || (selectedProvider === "claude" ? "Claude account signed in" : "Provider plan detected");
-}
-
-function codexCreditBalance(limits) {
-  const match = limits.find((limit) => {
-    const credits = limit?.credits;
-    return credits && (credits.balance != null || credits.has_credits || credits.hasCredits);
-  });
-  return match?.credits || null;
 }
 
 function statusTone(remainingPercent, paceDelta = 0, paceStatus = "unknown") {
@@ -2047,9 +2157,6 @@ function mergeTokenomicsSummary(previous, next) {
     limitSamples: mergeProviderLimitSamples(previous.limitSamples || previous.limit_samples, next.limitSamples || next.limit_samples),
     device_identities: next.device_identities || previous.device_identities,
     deviceIdentities: next.deviceIdentities || previous.deviceIdentities,
-    credits: next.credits || previous.credits,
-    storage_usage: next.storage_usage || previous.storage_usage,
-    storageUsage: next.storageUsage || previous.storageUsage,
   };
 }
 
@@ -2233,9 +2340,15 @@ function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
   return tokenomicsStore.liveLimitsPromise;
 }
 
-function loadTokenomicsStore({ scan = false, force = false } = {}) {
+function loadTokenomicsStore({ scan = false, force = false, resync = false } = {}) {
+  const forceResync = Boolean(resync);
+  if (forceResync) {
+    tokenomicsStore.requestEpoch += 1;
+    tokenomicsStore.loadPromise = null;
+    tokenomicsStore.liveLimitsPromise = null;
+  }
   const hasSummary = Boolean(tokenomicsStore.state.summary);
-  const shouldScan = Boolean(scan || !tokenomicsStore.loadedOnce);
+  const shouldScan = Boolean(scan || forceResync || !tokenomicsStore.loadedOnce);
   const requestEpoch = tokenomicsStore.requestEpoch;
 
   if (tokenomicsStore.loadPromise) {
@@ -2257,9 +2370,11 @@ function loadTokenomicsStore({ scan = false, force = false } = {}) {
         void refreshTokenomicsLiveLimits();
       }
 
-      const next = shouldScan
-        ? await invoke("tokenomics_scan_usage")
-        : await invoke("tokenomics_get_summary");
+      const next = forceResync
+        ? await invoke("tokenomics_resync_last_30_days")
+        : shouldScan
+          ? await invoke("tokenomics_scan_usage")
+          : await invoke("tokenomics_get_summary");
       if (tokenomicsStore.requestEpoch !== requestEpoch) {
         return tokenomicsStore.state.summary;
       }
@@ -2409,9 +2524,10 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
 
-  const refresh = useCallback(async ({ scan = false } = {}) => {
-    await loadTokenomicsStore({ scan, force: true });
+  const refresh = useCallback(async ({ scan = false, resync = false } = {}) => {
+    await loadTokenomicsStore({ scan, force: true, resync });
   }, []);
+  const isScanning = status === "scanning";
 
   const setSelectedProvider = useCallback((provider) => {
     updateTokenomicsStore({ selectedProvider: provider, selectedAccountKey: "all" });
@@ -2526,13 +2642,14 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const maxSessionUsage = Math.max(1, ...sessionUsageRows.map((row) => row.total));
   const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
   const averageSessionUsage = activeSessionRows.reduce((sum, row) => sum + row.total, 0) / Math.max(1, activeSessionRows.length);
-  const openAiCredits = useMemo(() => selectedProvider === "codex" ? codexCreditBalance(limits) : null, [limits, selectedProvider]);
   const maxDaily = Math.max(1, ...dailyRows.map((row) => dailyUsageValue(row)));
   const breakdown = useMemo(
     () => modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
     [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
-  const credits = billingStatus?.credits || visibleSummary?.credits || {};
+  const credits = creditSnapshotHasMeaningfulData(billingStatus?.credits)
+    ? billingStatus.credits
+    : {};
   const providerLimitGroups = useMemo(() => (
     ["codex", "claude"].map((providerId) => {
       const providerLimits = filterLimits(limitRowsRaw, providerId, "all", selectedScopeKey, selectedDeviceId);
@@ -2544,8 +2661,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     })
   ), [limitRowsRaw, selectedDeviceId, selectedScopeKey]);
   const storage = useMemo(
-    () => storageUsageModel(billingStatus, visibleSummary, storageUsage),
-    [billingStatus, storageUsage, visibleSummary],
+    () => storageUsageModel(billingStatus, storageUsage),
+    [billingStatus, storageUsage],
   );
 
   return (
@@ -2644,14 +2761,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
               <strong>{planStatusTitle(fiveHour, selectedProvider)}</strong>
               <span>{limitSourceText(fiveHour)}</span>
             </PlanStatusLine>
-            {openAiCredits ? (
-              <ProviderCreditsLine>
-                <span>OpenAI credits</span>
-                <strong>
-                  {openAiCredits.unlimited ? "Unlimited" : formatCredits(openAiCredits.balance)}
-                </strong>
-              </ProviderCreditsLine>
-            ) : null}
             <LimitMetricCard icon={ClockIcon} limit={fiveHour} title="5-Hour Session" />
             <LimitMetricCard icon={CalendarIcon} limit={weekly} title="Weekly Limit" />
           </>
@@ -2836,6 +2945,17 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>
+          <TokenomicsRescanButton
+            disabled={isScanning}
+            onClick={() => {
+              void refresh({ resync: true });
+            }}
+            title="Rescan token usage"
+            type="button"
+          >
+            <TokenomicsRescanIcon aria-hidden="true" data-spinning={isScanning ? "true" : undefined} />
+            <span>{isScanning ? "Scanning" : "Rescan"}</span>
+          </TokenomicsRescanButton>
         </TokenomicsFooter>
       </TokenomicsPanel>
     </TokenomicsShell>
@@ -3141,42 +3261,6 @@ const PlanStatusLine = styled.div`
   }
 `;
 
-const ProviderCreditsLine = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-  padding: 7px 9px;
-  border: 1px solid rgba(251, 146, 60, 0.2);
-  border-radius: 8px;
-  color: #aab6c8;
-  background: rgba(251, 146, 60, 0.07);
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-
-  span,
-  strong {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  strong {
-    color: #fb923c;
-    text-align: right;
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(249, 115, 22, 0.2);
-    color: #64748b;
-    background: rgba(249, 115, 22, 0.08);
-  }
-`;
-
 const LimitCard = styled.div`
   display: grid;
   gap: 7px;
@@ -3304,7 +3388,7 @@ const ProgressFill = styled.div`
 
 const MetricFoot = styled.div`
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
@@ -3319,19 +3403,23 @@ const MetricFoot = styled.div`
   }
 
   span {
+    flex: 1 1 auto;
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    max-width: 100%;
+    overflow: visible;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
   }
 
   strong {
-    flex: 0 1 auto;
-    min-width: 0;
-    overflow: hidden;
+    flex: 0 0 auto;
+    min-width: max-content;
+    overflow: visible;
     color: var(--tone);
     font-weight: 900;
+    line-height: 1.15;
     text-align: right;
-    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   html[data-forge-theme="light"] & {
@@ -3826,6 +3914,12 @@ const StorageFill = styled.div`
   box-shadow: 0 0 16px rgba(96, 165, 250, 0.28);
 `;
 
+const tokenomicsRescanSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
 const TokenomicsFooter = styled.footer`
   display: flex;
   align-items: center;
@@ -3839,6 +3933,67 @@ const TokenomicsFooter = styled.footer`
 
   html[data-forge-theme="light"] & {
     color: #64748b;
+  }
+`;
+
+const TokenomicsRescanButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 4px 9px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 999px;
+  color: rgba(191, 219, 254, 0.9);
+  background: rgba(59, 130, 246, 0.1);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 176, 255, 0.52);
+    color: #e5eefb;
+    background: rgba(59, 130, 246, 0.18);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(96, 165, 250, 0.72);
+    outline-offset: 2px;
+  }
+
+  &:disabled {
+    opacity: 0.72;
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.25);
+    color: rgba(29, 78, 216, 0.88);
+    background: rgba(59, 130, 246, 0.08);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled) {
+    color: rgba(30, 64, 175, 0.95);
+    background: rgba(59, 130, 246, 0.15);
+  }
+`;
+
+const TokenomicsRescanIcon = styled(Refresh)`
+  width: 13px;
+  height: 13px;
+  flex: none;
+
+  &[data-spinning="true"] {
+    animation: ${tokenomicsRescanSpin} 850ms linear infinite;
   }
 `;
 

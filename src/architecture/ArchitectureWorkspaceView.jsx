@@ -66,6 +66,26 @@ import { Redis } from "@styled-icons/simple-icons/Redis";
 import { Stripe } from "@styled-icons/simple-icons/Stripe";
 import { Supabase } from "@styled-icons/simple-icons/Supabase";
 import Select from "react-select";
+import {
+  FilesWorkspaceSurface,
+  FileExplorerPane,
+  FileExplorerHeader,
+  FileExplorerActions,
+  FileIconButton,
+  FileRootPath,
+  FileTree,
+  FileTreeItem,
+  FileTreeButton,
+  FileContextMenu,
+  FileContextMenuItem,
+  FileDisclosure,
+  FileKindIcon,
+  FileTreeName,
+  FileGitStatusMark,
+  FileTreeMessage,
+  FileTreeEmpty,
+  PanelKicker,
+} from "../app/appStyles.js";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 
 function text(value, fallback = "") {
@@ -2458,6 +2478,19 @@ function architectureFolderPathParts(value) {
 
 function architectureFolderPathText(value) {
   return architectureFolderPathParts(value).join(" / ");
+}
+
+function architectureFileNameFromPath(value) {
+  const parts = text(value).replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+function architectureGraphFileName(graph) {
+  const pathName = architectureFileNameFromPath(graph?.filePath || graph?.file_path);
+  if (pathName) return pathName;
+  const graphId = text(graph?.id, architectureSlug(graph?.title || "architecture"));
+  if (/\.(arch|json)$/iu.test(graphId)) return graphId;
+  return `${graphId || "architecture"}.arch`;
 }
 
 function createArchitectureTreeNode(name = "", path = []) {
@@ -5648,7 +5681,6 @@ function ArchitecturesPanel({
   queueWorkspaceName = "",
   repoLabel,
   repoPath,
-  repositoryGroups = null,
   repositoryScan = null,
   repositoryScanError = "",
   repositoryScanState = "idle",
@@ -5675,10 +5707,12 @@ function ArchitecturesPanel({
   const [agentEditMarkers, setAgentEditMarkers] = useState([]);
   const [selectedGraphDirty, setSelectedGraphDirty] = useState(false);
   const [revisionBrowser, setRevisionBrowser] = useState({ graphId: "", open: false });
-  const [dragGraph, setDragGraph] = useState(null);
+  const [, setDragGraph] = useState(null);
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [draftFolderName, setDraftFolderName] = useState("");
   const [folderCreateState, setFolderCreateState] = useState("idle");
+  const [navContextMenu, setNavContextMenu] = useState(null);
+  const navPaneRef = useRef(null);
   const selectedGraphDirtyRef = useRef(false);
   const selectedGraphLoadedKeyRef = useRef("");
   const hydratedListRefreshKeysRef = useRef(new Set());
@@ -6081,8 +6115,7 @@ function ArchitecturesPanel({
     [selectedGraph, visibleAgentEditMarkers],
   );
   const isLoading = repoState === "loading" || graphState === "loading";
-  const singleRepository = repositories.length <= 1;
-  const treeRows = useMemo(() => architectureGraphTreeRows(graphs, singleRepository ? 0 : 1), [graphs, singleRepository]);
+  const treeRows = useMemo(() => architectureGraphTreeRows(graphs, 0), [graphs]);
   const showEmptyGraphList = !graphs.length && (
     graphState === "ready"
     || (graphState === "loading" && Boolean(selectedGraphListCacheEntry))
@@ -6179,10 +6212,21 @@ function ArchitecturesPanel({
     setDraftGraphTemplate("system");
     setDraftLocationMode(nextFolderPath ? "folder" : "root");
     setDraftFolderPath(nextFolderPath);
+    setCreatingFolder(false);
+    setDraftFolderName("");
     setRevisionBrowser((current) => ({ ...current, open: false }));
     setCreatingGraph(true);
     setError("");
   }, []);
+
+  const beginCreateFolder = useCallback(() => {
+    if (typeof onCreateNamedFolder !== "function") return;
+    setCreatingFolder(true);
+    setDraftFolderName("");
+    setCreatingGraph(false);
+    setRevisionBrowser((current) => ({ ...current, open: false }));
+    setError("");
+  }, [onCreateNamedFolder]);
 
   const createGraph = useCallback(() => {
     if (!selectedRepoPath) return;
@@ -6294,74 +6338,95 @@ function ArchitecturesPanel({
       {treeRows.map((row) => {
         if (row.kind === "folder") {
           return (
-            <ArchitectureTreeRow
-              data-kind="folder"
-              key={`folder-${row.id}`}
-              onClick={() => beginCreateGraph(row.path.join(" / "))}
-              style={{ "--tree-depth": row.depth }}
-              title={row.path.join(" / ")}
-              type="button"
-            >
-              <ArchitectureTreeGlyph data-kind="folder" aria-hidden="true" />
-              <span>{row.name}</span>
-            </ArchitectureTreeRow>
+            <FileTreeItem key={`folder-${row.id}`}>
+              <ArchitectureFileTreeButton
+                $depth={row.depth}
+                data-architecture-row="folder"
+                onClick={() => beginCreateGraph(row.path.join(" / "))}
+                title={row.path.join(" / ")}
+                type="button"
+              >
+                <FileDisclosure aria-hidden="true">
+                  <span className="codicon codicon-chevron-down" />
+                </FileDisclosure>
+                <ArchitectureFileKindIcon
+                  aria-hidden="true"
+                  data-file-tone="folder"
+                  title="Architecture folder"
+                >
+                  <span className="codicon codicon-folder-opened" />
+                </ArchitectureFileKindIcon>
+                <FileTreeName>{row.name}</FileTreeName>
+                <FileGitStatusMark aria-hidden="true" />
+              </ArchitectureFileTreeButton>
+            </FileTreeItem>
           );
         }
 
         const rowMarker = architectureAgentEditMarkerForGraph(row.graph, visibleAgentEditMarkers);
         const rowMarkerTitle = architectureAgentEditMarkerTitle(rowMarker);
+        const graphFileName = architectureGraphFileName(row.graph);
         const draggable = typeof onCopyGraph === "function";
         return (
-          <ArchitectureTreeRow
-            data-active={row.graph.id === selectedGraphId && !creatingGraph ? "true" : "false"}
-            data-agent-edit={rowMarker ? rowMarker.status : undefined}
-            data-kind="graph"
-            draggable={draggable || undefined}
-            key={`graph-${row.graph.id}`}
-            onClick={() => {
-              setSelectedGraphId(row.graph.id);
-              setCreatingGraph(false);
-              setRevisionBrowser((current) => ({ ...current, open: false }));
-            }}
-            onDragEnd={draggable ? () => setDragGraph(null) : undefined}
-            onDragStart={draggable ? (event) => {
-              const payload = { graphId: row.graph.id, sourceRepoPath: selectedRepoPath };
-              setDragGraph(payload);
-              try {
-                event.dataTransfer.setData("application/x-diffforge-architecture-graph", JSON.stringify(payload));
-                event.dataTransfer.effectAllowed = "copy";
-              } catch {
-                // dataTransfer can be unavailable in some webviews; state carries the payload.
-              }
-            } : undefined}
-            style={{ "--tree-depth": row.depth }}
-            title={[row.graph.filePath, rowMarkerTitle, draggable ? "Drag onto a repo or Global to copy" : ""].filter(Boolean).join("\n")}
-            type="button"
-          >
-            <ArchitectureTreeGlyph data-kind="graph" aria-hidden="true" />
-            <span>{row.graph.title}</span>
-            {rowMarker && (
-              <ArchitectureTreeAgentMarker
+          <FileTreeItem key={`graph-${row.graph.id}`}>
+            <ArchitectureFileTreeButton
+              $depth={row.depth}
+              data-agent-edit={rowMarker ? rowMarker.status : undefined}
+              data-architecture-row="graph"
+              data-selected={row.graph.id === selectedGraphId && !creatingGraph ? "true" : undefined}
+              draggable={draggable || undefined}
+              onClick={() => {
+                setSelectedGraphId(row.graph.id);
+                setCreatingGraph(false);
+                setRevisionBrowser((current) => ({ ...current, open: false }));
+              }}
+              onDragEnd={draggable ? () => setDragGraph(null) : undefined}
+              onDragStart={draggable ? (event) => {
+                const payload = { graphId: row.graph.id, sourceRepoPath: selectedRepoPath };
+                setDragGraph(payload);
+                try {
+                  event.dataTransfer.setData("application/x-diffforge-architecture-graph", JSON.stringify(payload));
+                  event.dataTransfer.effectAllowed = "copy";
+                } catch {
+                  // dataTransfer can be unavailable in some webviews; state carries the payload.
+                }
+              } : undefined}
+              title={[
+                graphFileName,
+                row.graph.title && row.graph.title !== graphFileName ? row.graph.title : "",
+                row.graph.filePath,
+                rowMarkerTitle,
+              ].filter(Boolean).join("\n")}
+              type="button"
+            >
+              <FileDisclosure aria-hidden="true" />
+              <ArchitectureFileKindIcon
                 aria-hidden="true"
-                style={{ "--agent-edit-color": rowMarker.agentColor }}
-                title={rowMarkerTitle}
+                data-file-tone="architecture"
+                title="Architecture graph"
               >
-                <i />
-                <strong>{rowMarker.status === "editing" ? "editing" : "queued"}</strong>
-              </ArchitectureTreeAgentMarker>
-            )}
-            <em>{row.graph.nodeCount}</em>
-          </ArchitectureTreeRow>
+                <ArchitectureGraphFileIcon aria-hidden="true" />
+              </ArchitectureFileKindIcon>
+              <FileTreeName>{graphFileName}</FileTreeName>
+              <ArchitectureFileStatusMark
+                aria-hidden={!rowMarker}
+                data-agent-edit={rowMarker ? rowMarker.status : undefined}
+                style={rowMarker ? { "--agent-edit-color": rowMarker.agentColor } : undefined}
+                title={rowMarkerTitle || undefined}
+              >
+                {rowMarker ? <i /> : null}
+              </ArchitectureFileStatusMark>
+            </ArchitectureFileTreeButton>
+          </FileTreeItem>
         );
       })}
       {showEmptyGraphList && (
-        <ArchitectureTreeEmpty style={{ "--tree-depth": emptyDepth }}>No graphs yet</ArchitectureTreeEmpty>
+        <FileTreeMessage $depth={emptyDepth}>No architecture files yet</FileTreeMessage>
       )}
     </>
   ), [
     beginCreateGraph,
     creatingGraph,
-    graphs.length,
     onCopyGraph,
     selectedGraphId,
     selectedRepoPath,
@@ -6370,125 +6435,81 @@ function ArchitecturesPanel({
     visibleAgentEditMarkers,
   ]);
 
-  const repositoryGroupList = useMemo(() => (
-    (Array.isArray(repositoryGroups) ? repositoryGroups : [])
-      .map((group) => ({
-        id: text(group?.id) || text(group?.label) || "group",
-        label: text(group?.label) || "Repositories",
-        kind: text(group?.kind) || "workspace",
-        repositories: jsonArray(group?.repositories),
-      }))
-      .filter((group) => group.repositories.length || group.kind === "global")
-  ), [repositoryGroups]);
+  const handleRepoSelection = useCallback((repoPathValue) => {
+    const nextRepoPath = text(repoPathValue);
+    if (!nextRepoPath || architectureRepoPathKey(nextRepoPath) === architectureRepoPathKey(selectedRepoPath)) return;
+    setSelectedRepoPath(nextRepoPath);
+    setSelectedGraphId("");
+    setSelectedGraph(null);
+    setCreatingGraph(false);
+    setRevisionBrowser((current) => ({ ...current, open: false }));
+  }, [selectedRepoPath]);
 
-  const handleRepoGraphDrop = useCallback((repo) => (event) => {
-    if (typeof onCopyGraph !== "function") return;
+  const closeNavContextMenu = useCallback(() => {
+    setNavContextMenu(null);
+  }, []);
+
+  const openNavContextMenu = useCallback((event) => {
     event.preventDefault();
-    const targetRepoPath = architectureRepoPathFromEntry(repo);
-    let payload = dragGraph;
-    try {
-      const raw = event.dataTransfer.getData("application/x-diffforge-architecture-graph");
-      if (raw) payload = JSON.parse(raw);
-    } catch {
-      // fall back to in-memory drag payload
-    }
-    setDragGraph(null);
-    const graphId = text(payload?.graphId);
-    const sourceRepoPath = text(payload?.sourceRepoPath);
-    if (!graphId || !sourceRepoPath || !targetRepoPath) return;
-    if (architectureRepoPathKey(sourceRepoPath) === architectureRepoPathKey(targetRepoPath)) return;
-    Promise.resolve(onCopyGraph({ graphId, sourceRepoPath, targetRepoPath }))
-      .then(() => {
-        if (architectureRepoPathKey(targetRepoPath) === architectureRepoPathKey(selectedRepoPath)) {
-          void loadGraphList(targetRepoPath, { refresh: true, silent: true });
-        }
-      })
-      .catch((nextError) => {
-        setError(nextError?.message || String(nextError || "Unable to copy architecture graph."));
-      });
-  }, [dragGraph, loadGraphList, onCopyGraph, selectedRepoPath]);
+    event.stopPropagation();
+    const menuWidth = 190;
+    const menuHeight = 64;
+    const paneRect = navPaneRef.current?.getBoundingClientRect?.();
+    const leftBoundary = paneRect?.left ?? 0;
+    const topBoundary = paneRect?.top ?? 0;
+    const paneWidth = paneRect?.width ?? window.innerWidth;
+    const paneHeight = paneRect?.height ?? window.innerHeight;
+    const clickX = event.clientX - leftBoundary;
+    const clickY = event.clientY - topBoundary;
+    setNavContextMenu({
+      x: clampNumber(clickX, 8, Math.max(8, paneWidth - menuWidth - 8)),
+      y: clampNumber(clickY, 8, Math.max(8, paneHeight - menuHeight - 8)),
+    });
+  }, []);
 
-  const renderRepoRow = useCallback((repo) => {
-    const repoKind = scannedResultGraphKind(repo);
-    const architectureRepoPath = architectureRepoPathFromEntry(repo);
-    const dropEnabled = typeof onCopyGraph === "function"
-      && dragGraph
-      && architectureRepoPathKey(text(dragGraph.sourceRepoPath)) !== architectureRepoPathKey(architectureRepoPath);
-    const scopeKind = text(repo?.scopeKind);
-    const glyphKind = scopeKind === "global" || scopeKind === "folder"
-      ? "folder"
-      : repoKind === "git" ? "repo" : "folder";
-    const repoActive = architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath);
-    return (
-      <ArchitectureTreeRepoGroup key={repo.id}>
-        <ArchitectureTreeRow
-          data-active={repoActive ? "true" : "false"}
-          data-drop-enabled={dropEnabled ? "true" : undefined}
-          data-kind={glyphKind}
-          onClick={() => {
-            if (repoActive) return;
-            setSelectedRepoPath(architectureRepoPath);
-            setSelectedGraphId("");
-            setSelectedGraph(null);
-            setCreatingGraph(false);
-            setRevisionBrowser((current) => ({ ...current, open: false }));
-          }}
-          onDragOver={dropEnabled ? (event) => {
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "copy";
-          } : undefined}
-          onDrop={dropEnabled ? handleRepoGraphDrop(repo) : undefined}
-          style={{ "--tree-depth": 0 }}
-          title={[architectureRepoPath, dropEnabled ? "Drop to copy graph here" : ""].filter(Boolean).join("\n")}
-          type="button"
-        >
-          <ArchitectureTreeGlyph data-kind={glyphKind} aria-hidden="true" />
-          <span>{repo.name}</span>
-          <em>{scopeKind === "global" ? "global" : scopeKind === "folder" ? "folder" : scopeKind === "orphan" ? "synced" : scannedResultEntryKindLabel(repo)}</em>
-          <em>{repo.graphCount}</em>
-        </ArchitectureTreeRow>
-        {repoActive && (
-          <ArchitectureTreeBranch>
-            {renderTreeRows(1)}
-          </ArchitectureTreeBranch>
-        )}
-      </ArchitectureTreeRepoGroup>
-    );
-  }, [dragGraph, handleRepoGraphDrop, onCopyGraph, renderTreeRows, selectedRepoPath]);
+  useEffect(() => {
+    if (!navContextMenu) return undefined;
+    const closeMenu = (event) => {
+      if (event?.target?.closest?.("[data-architecture-context-menu='true']")) return;
+      closeNavContextMenu();
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") closeNavContextMenu();
+    };
+    window.addEventListener("pointerdown", closeMenu, true);
+    window.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("resize", closeMenu);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu, true);
+      window.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("resize", closeMenu);
+    };
+  }, [closeNavContextMenu, navContextMenu]);
+
+  const beginContextCreateGraph = useCallback(() => {
+    closeNavContextMenu();
+    beginCreateGraph("");
+  }, [beginCreateGraph, closeNavContextMenu]);
+
+  const beginContextCreateFolder = useCallback(() => {
+    closeNavContextMenu();
+    beginCreateFolder();
+  }, [beginCreateFolder, closeNavContextMenu]);
 
   return (
     <ArchitecturesShell data-nav-collapsed={navCollapsed ? "true" : "false"}>
       {!navCollapsed && (
-        <ArchitectureNavRail aria-label="Architecture repositories">
-          <ArchitectureNavHeader>
-            <ArchitectureNavTitle>
-              <strong>Architectures</strong>
-            </ArchitectureNavTitle>
-            <ArchitectureNavHeaderActions>
-              {typeof onCreateNamedFolder === "function" && (
-                <ArchitectureCreateGraphButton
-                  aria-label="Create named architecture folder"
-                  onClick={() => {
-                    setCreatingFolder((open) => !open);
-                    setDraftFolderName("");
-                    setCreatingGraph(false);
-                  }}
-                  title="Create a named architecture folder (not tied to any git repo; synced by name)"
-                  type="button"
-                >
-                  <CreateNewFolder aria-hidden="true" />
-                </ArchitectureCreateGraphButton>
-              )}
-              <ArchitectureCreateGraphButton
-                aria-label="Create architecture graph"
-                disabled={!selectedRepoPath || saveState === "saving"}
-                onClick={() => beginCreateGraph()}
-                title="Create architecture graph"
-                type="button"
-              >
-                <Add aria-hidden="true" />
-              </ArchitectureCreateGraphButton>
-              <ArchitectureCreateGraphButton
+        <ArchitectureFilesNavPane
+          aria-label="Architecture files"
+          onContextMenu={openNavContextMenu}
+          ref={navPaneRef}
+        >
+          <FileExplorerHeader>
+            <div>
+              <PanelKicker>Architectures</PanelKicker>
+            </div>
+            <FileExplorerActions>
+              <FileIconButton
                 aria-label="Open architecture revision history"
                 disabled={!selectedRepoPath}
                 onClick={() => openRevisionBrowser("")}
@@ -6496,73 +6517,137 @@ function ArchitecturesPanel({
                 type="button"
               >
                 <Cached aria-hidden="true" />
-              </ArchitectureCreateGraphButton>
-              <ArchitectureNavToggleButton
+              </FileIconButton>
+              <FileIconButton
                 aria-label="Hide architecture navigation"
                 onClick={() => setNavCollapsed(true)}
                 title="Hide architecture navigation"
                 type="button"
               >
                 <KeyboardDoubleArrowLeft aria-hidden="true" />
-              </ArchitectureNavToggleButton>
-            </ArchitectureNavHeaderActions>
-          </ArchitectureNavHeader>
-          {creatingFolder && (
-            <ArchitectureFolderCreateForm
-              onSubmit={(event) => {
-                event.preventDefault();
-                submitNamedFolder();
-              }}
-            >
-              <input
-                aria-label="Architecture folder name"
-                autoFocus
-                disabled={folderCreateState === "saving"}
-                onChange={(event) => setDraftFolderName(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") {
-                    setCreatingFolder(false);
-                    setDraftFolderName("");
-                  }
-                }}
-                placeholder="Folder name (synced by name)"
-                value={draftFolderName}
-              />
-              <button
-                disabled={!draftFolderName.trim() || folderCreateState === "saving"}
-                type="submit"
+              </FileIconButton>
+            </FileExplorerActions>
+          </FileExplorerHeader>
+          <FileRootPath title={selectedRepo?.architectureRoot || selectedRepoPath || "No architecture root"}>
+            {selectedRepo?.architectureRoot || selectedRepoPath || "No architecture root"}
+          </FileRootPath>
+          <ArchitectureNavControls>
+            {repositories.length > 1 && (
+              <ArchitectureRootPicker
+                aria-label="Architecture root"
+                onChange={(event) => handleRepoSelection(event.target.value)}
+                value={selectedRepoPath}
               >
-                {folderCreateState === "saving" ? "…" : "Add"}
-              </button>
-            </ArchitectureFolderCreateForm>
-          )}
-          <ArchitectureTree>
-            {repositoryGroupList.length ? (
-              <>
-                {repositoryGroupList.map((group) => (
-                  <ArchitectureTreeRepoGroup key={`group-${group.id}`}>
-                    <ArchitectureTreeGroupLabel title={group.label}>
-                      <span>{group.label}</span>
-                      <em>{group.repositories.length}</em>
-                    </ArchitectureTreeGroupLabel>
-                    {group.repositories.map((repo) => renderRepoRow(repo))}
-                    {!group.repositories.length && (
-                      <ArchitectureTreeEmpty style={{ "--tree-depth": 0 }}>Empty</ArchitectureTreeEmpty>
-                    )}
-                  </ArchitectureTreeRepoGroup>
-                ))}
-              </>
-            ) : singleRepository ? renderTreeRows(0) : repositories.map((repo) => renderRepoRow(repo))}
-            {repoState === "ready" && !repositories.length && (
-              <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
+                {repositories.map((repo, index) => {
+                  const repoPathValue = architectureRepoPathFromEntry(repo);
+                  return (
+                    <option key={repo.id || repoPathValue || `repo-${index}`} value={repoPathValue}>
+                      {repo.name || architectureFileNameFromPath(repoPathValue) || repoPathValue}
+                    </option>
+                  );
+                })}
+              </ArchitectureRootPicker>
             )}
-          </ArchitectureTree>
-          {selectedRepo && (
-            <ArchitectureNavStoragePath title={selectedRepo.architectureRoot}>
-              .agents/architectures
-            </ArchitectureNavStoragePath>
+            {creatingFolder && (
+              <ArchitectureFolderCreateForm
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  submitNamedFolder();
+                }}
+              >
+                <input
+                  aria-label="Architecture folder name"
+                  autoFocus
+                  disabled={folderCreateState === "saving"}
+                  onChange={(event) => setDraftFolderName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      setCreatingFolder(false);
+                      setDraftFolderName("");
+                    }
+                  }}
+                  placeholder="Folder name"
+                  value={draftFolderName}
+                />
+                <button
+                  disabled={!draftFolderName.trim() || folderCreateState === "saving"}
+                  type="submit"
+                >
+                  {folderCreateState === "saving" ? "..." : "Add"}
+                </button>
+              </ArchitectureFolderCreateForm>
+            )}
+          </ArchitectureNavControls>
+          <FileTree aria-label="Architecture file explorer">
+            {repoState === "ready" && !repositories.length ? (
+              <FileTreeEmpty>No architecture root detected.</FileTreeEmpty>
+            ) : (
+              <>
+                {repoState === "loading" && !graphs.length && (
+                  <FileTreeMessage $depth={0}>Loading...</FileTreeMessage>
+                )}
+                {graphState === "error" && !graphs.length && (
+                  <FileTreeMessage $depth={0} data-tone="error">
+                    Unable to load architecture files
+                  </FileTreeMessage>
+                )}
+                {renderTreeRows(0)}
+              </>
+            )}
+          </FileTree>
+          <ArchitectureNavBottomActions>
+            <ArchitectureNavBottomButton
+              disabled={!selectedRepoPath || saveState === "saving"}
+              onClick={() => beginCreateGraph("")}
+              title="Add new architecture"
+              type="button"
+            >
+              <Add aria-hidden="true" />
+              <span>Add new Architecture</span>
+            </ArchitectureNavBottomButton>
+            <ArchitectureNavBottomButton
+              disabled={typeof onCreateNamedFolder !== "function"}
+              onClick={beginCreateFolder}
+              title="Add new folder"
+              type="button"
+            >
+              <CreateNewFolder aria-hidden="true" />
+              <span>Add new folder</span>
+            </ArchitectureNavBottomButton>
+          </ArchitectureNavBottomActions>
+          {navContextMenu && (
+            <FileContextMenu
+              data-architecture-context-menu="true"
+              role="menu"
+              style={{
+                left: navContextMenu.x,
+                top: navContextMenu.y,
+              }}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              <FileContextMenuItem
+                disabled={!selectedRepoPath || saveState === "saving"}
+                onClick={beginContextCreateGraph}
+                role="menuitem"
+                type="button"
+              >
+                Add new Architecture
+              </FileContextMenuItem>
+              <FileContextMenuItem
+                disabled={typeof onCreateNamedFolder !== "function"}
+                onClick={beginContextCreateFolder}
+                role="menuitem"
+                type="button"
+              >
+                Add new folder
+              </FileContextMenuItem>
+            </FileContextMenu>
           )}
-        </ArchitectureNavRail>
+        </ArchitectureFilesNavPane>
       )}
 
       <ArchitectureEditorRegion>
@@ -10239,9 +10324,10 @@ const ArchitectureErrorToast = styled.div`
   }
 `;
 
-const ArchitecturesShell = styled.div`
+const ArchitecturesShell = styled(FilesWorkspaceSurface)`
   display: grid;
   grid-template-columns: clamp(176px, 15vw, 232px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -10253,6 +10339,126 @@ const ArchitecturesShell = styled.div`
   @media (max-width: 760px) {
     grid-template-columns: 1fr;
     overflow: auto;
+  }
+`;
+
+const ArchitectureFilesNavPane = styled(FileExplorerPane)`
+  position: relative;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+`;
+
+const ArchitectureNavControls = styled.div`
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  background: var(--files-vscode-sidebar);
+`;
+
+const ArchitectureRootPicker = styled.select`
+  width: calc(100% - 16px);
+  min-width: 0;
+  height: 24px;
+  margin: 4px 8px 6px;
+  padding: 0 22px 0 8px;
+  border: 1px solid var(--files-vscode-border);
+  border-radius: 4px;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-editor);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+
+  &:focus {
+    border-color: var(--files-vscode-focus);
+  }
+`;
+
+const ArchitectureNavBottomActions = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  border-top: 1px solid var(--files-vscode-border-subtle);
+  background: var(--files-vscode-sidebar);
+`;
+
+const ArchitectureNavBottomButton = styled.button`
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--files-vscode-border);
+  border-radius: 4px;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-editor);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    background: var(--files-vscode-hover);
+    outline: none;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.48;
+  }
+`;
+
+const ArchitectureFileTreeButton = styled(FileTreeButton)`
+  &[data-agent-edit] {
+    color: var(--files-vscode-text);
+  }
+`;
+
+const ArchitectureFileKindIcon = styled(FileKindIcon)`
+  &[data-file-tone="architecture"] {
+    color: #4ec9b0;
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+`;
+
+const ArchitectureGraphFileIcon = styled(AccountTree)`
+  display: block;
+`;
+
+const ArchitectureFileStatusMark = styled(FileGitStatusMark)`
+  color: transparent;
+
+  &[data-agent-edit] {
+    color: var(--agent-edit-color, #60a5fa);
+  }
+
+  i {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 18%, transparent);
   }
 `;
 

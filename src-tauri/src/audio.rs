@@ -300,6 +300,56 @@ fn log_audio_diagnostic_event(phase: &str, fields: Value) {
     }));
 }
 
+fn audio_widget_bottom_bar_debug_log_path() -> PathBuf {
+    diagnostic_log_path(AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE)
+}
+
+fn write_audio_widget_bottom_bar_debug_log_entry(entry: Value) {
+    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+        return;
+    }
+
+    let log_path = audio_widget_bottom_bar_debug_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
+fn log_audio_widget_bottom_bar_debug_event(phase: &str, fields: Value) {
+    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+        return;
+    }
+
+    write_audio_widget_bottom_bar_debug_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_whisper_local_audio_log_text(phase),
+        "fields": {
+            "app_pid": std::process::id(),
+            "thread": audio_debug_thread_label(),
+            "fields": fields,
+        },
+    }));
+}
+
 struct WhisperCliWarmCacheState {
     model_bytes: u64,
     model_path: Option<PathBuf>,
@@ -3345,7 +3395,11 @@ const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
 #[cfg(target_os = "macos")]
-const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 5] = [0, 150, 350, 800, 1_600];
+const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 6] = [0, 150, 350, 800, 1_600, 3_000];
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS: u64 = 500;
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON: f64 = 0.5;
 #[cfg(target_os = "macos")]
 const MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS: u64 = 2_500;
 
@@ -3365,22 +3419,294 @@ static MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS: AtomicBool = AtomicBool::new
 static MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn audio_widget_rect_debug_value(rect: &objc2_core_foundation::CGRect) -> Value {
+    json!({
+        "x": rect.origin.x,
+        "y": rect.origin.y,
+        "width": rect.size.width,
+        "height": rect.size.height,
+        "max_x": rect.origin.x + rect.size.width,
+        "max_y": rect.origin.y + rect.size.height,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_rect_nearly_matches(
+    current: &objc2_core_foundation::CGRect,
+    target: &objc2_core_foundation::CGRect,
+) -> bool {
+    (current.origin.x - target.origin.x).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
+        && (current.origin.y - target.origin.y).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
+        && (current.size.width - target.size.width).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
+        && (current.size.height - target.size.height).abs()
+            <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_point_debug_value(point: objc2_core_foundation::CGPoint) -> Value {
+    json!({
+        "x": point.x,
+        "y": point.y,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_screen_debug_value(
+    index: Option<usize>,
+    screen: &objc2_app_kit::NSScreen,
+    mouse_location: objc2_core_foundation::CGPoint,
+) -> Value {
+    let frame = screen.frame();
+    let visible_frame = screen.visibleFrame();
+    json!({
+        "index": index,
+        "name": screen.localizedName().to_string(),
+        "frame": audio_widget_rect_debug_value(&frame),
+        "visible_frame": audio_widget_rect_debug_value(&visible_frame),
+        "backing_scale_factor": screen.backingScaleFactor(),
+        "visible_bottom_gap": visible_frame.origin.y - frame.origin.y,
+        "visible_top_gap": (frame.origin.y + frame.size.height)
+            - (visible_frame.origin.y + visible_frame.size.height),
+        "visible_left_gap": visible_frame.origin.x - frame.origin.x,
+        "visible_right_gap": (frame.origin.x + frame.size.width)
+            - (visible_frame.origin.x + visible_frame.size.width),
+        "contains_mouse": audio_widget_macos_rect_contains_point(&frame, mouse_location),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_running_application_debug_value(
+    application: &objc2_app_kit::NSRunningApplication,
+) -> Value {
+    json!({
+        "pid": application.processIdentifier(),
+        "localized_name": application
+            .localizedName()
+            .map(|name| name.to_string()),
+        "bundle_identifier": application
+            .bundleIdentifier()
+            .map(|identifier| identifier.to_string()),
+        "activation_policy": format!("{:?}", application.activationPolicy()),
+        "owns_menu_bar": application.ownsMenuBar(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_ns_window_debug_value(
+    ns_window: &NSWindow,
+    mouse_location: objc2_core_foundation::CGPoint,
+) -> Value {
+    let frame = ns_window.frame();
+    json!({
+        "frame": audio_widget_rect_debug_value(&frame),
+        "visible": ns_window.isVisible(),
+        "key": ns_window.isKeyWindow(),
+        "miniaturized": ns_window.isMiniaturized(),
+        "level": ns_window.level(),
+        "style_mask": format!("{:?}", ns_window.styleMask()),
+        "collection_behavior": format!("{:?}", ns_window.collectionBehavior()),
+        "screen": ns_window
+            .screen()
+            .map(|screen| audio_widget_screen_debug_value(None, screen.as_ref(), mouse_location)),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_bottom_bar_layout_debug_value() -> Value {
+    match audio_widget_last_bottom_bar_layout() {
+        Some(layout) => json!({
+            "stored": true,
+            "width": layout.width,
+            "height": layout.height,
+            "margin": layout.margin,
+        }),
+        None => json!({ "stored": false }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_bottom_bar_debug_context_on_main_thread(
+    app: &AppHandle,
+    ns_window: Option<&NSWindow>,
+    target_screen: Option<&objc2_app_kit::NSScreen>,
+    extra: Value,
+) -> Value {
+    let mouse_location = objc2_app_kit::NSEvent::mouseLocation();
+    let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+    let frontmost_application = workspace.frontmostApplication();
+    let current_application = objc2_app_kit::NSRunningApplication::currentApplication();
+    let current_pid = current_application.processIdentifier();
+    let frontmost_ax_fullscreen_probe = macos_frontmost_ax_fullscreen_probe(current_pid);
+    let cached_full_monitor_bounds =
+        MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS.load(Ordering::Acquire);
+    let sticky_until_ms = MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.load(Ordering::Acquire);
+    let now_ms = current_time_ms();
+
+    let main_thread_context = objc2::MainThreadMarker::new().map(|main_thread_marker| {
+        let application = objc2_app_kit::NSApplication::sharedApplication(main_thread_marker);
+        let presentation_options = application.currentSystemPresentationOptions();
+        let screens = objc2_app_kit::NSScreen::screens(main_thread_marker);
+        let screen_values: Vec<Value> = (0..screens.count())
+            .map(|screen_index| {
+                let screen = screens.objectAtIndex(screen_index);
+                audio_widget_screen_debug_value(Some(screen_index), screen.as_ref(), mouse_location)
+            })
+            .collect();
+        json!({
+            "presentation_options": format!("{:?}", presentation_options),
+            "presentation_fullscreen": presentation_options
+                .contains(objc2_app_kit::NSApplicationPresentationOptions::FullScreen),
+            "screen_count": screen_values.len(),
+            "screens": screen_values,
+        })
+    });
+
+    let target_screen_value =
+        target_screen.map(|screen| audio_widget_screen_debug_value(None, screen, mouse_location));
+    let target_screen_fullscreen_cover = target_screen.map(|screen| {
+        let frame = screen.frame();
+        macos_other_visible_app_has_fullscreen_window(current_pid, Some(&frame))
+    });
+
+    json!({
+        "extra": extra,
+        "log_path": audio_widget_bottom_bar_debug_log_path().display().to_string(),
+        "mouse_location": audio_widget_point_debug_value(mouse_location),
+        "layout": audio_widget_bottom_bar_layout_debug_value(),
+        "appkit": main_thread_context,
+        "frontmost_application": frontmost_application
+            .as_ref()
+            .map(|application| audio_widget_running_application_debug_value(application.as_ref())),
+        "frontmost_ax_fullscreen_probe": macos_ax_fullscreen_probe_debug_value(
+            &frontmost_ax_fullscreen_probe,
+        ),
+        "current_application": audio_widget_running_application_debug_value(current_application.as_ref()),
+        "cached_full_monitor_bounds": cached_full_monitor_bounds,
+        "sticky_until_ms": sticky_until_ms,
+        "sticky_remaining_ms": sticky_until_ms.saturating_sub(now_ms),
+        "target_screen": target_screen_value,
+        "target_screen_cg_fullscreen_cover": target_screen_fullscreen_cover,
+        "audio_window": ns_window.map(|window| {
+            audio_widget_ns_window_debug_value(window, mouse_location)
+        }),
+        "tauri_window_visible": app
+            .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+            .and_then(|window| window.is_visible().ok()),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+    app: &AppHandle,
+    phase: &str,
+    ns_window: Option<&NSWindow>,
+    target_screen: Option<&objc2_app_kit::NSScreen>,
+    extra: Value,
+) {
+    let fields =
+        audio_widget_bottom_bar_debug_context_on_main_thread(app, ns_window, target_screen, extra);
+    log_audio_widget_bottom_bar_debug_event(phase, fields);
+}
+
+#[cfg(target_os = "macos")]
+fn log_audio_widget_bottom_bar_debug_snapshot_for(
+    app: &AppHandle,
+    phase: &'static str,
+    extra: Value,
+) {
+    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+        return;
+    }
+
+    let app_for_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let ns_window = app_for_main
+            .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+            .and_then(|window| {
+                let ns_ptr = window.ns_window().ok()?;
+                if ns_ptr.is_null() {
+                    return None;
+                }
+                Some(unsafe { &*ns_ptr.cast::<NSWindow>() })
+            });
+        log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+            &app_for_main,
+            phase,
+            ns_window,
+            None,
+            extra,
+        );
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_start_bottom_bar_debug_sampler(app: &AppHandle) {
+    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+        return;
+    }
+    if AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    log_audio_widget_bottom_bar_debug_event(
+        "audio.widget.bottom_bar.debug_sampler.started",
+        json!({
+            "log_path": audio_widget_bottom_bar_debug_log_path().display().to_string(),
+            "sample_ms": AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS,
+        }),
+    );
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            sleep(Duration::from_millis(
+                AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS,
+            ))
+            .await;
+            if audio_widget_last_bottom_bar_layout().is_none() {
+                continue;
+            }
+            if app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL).is_none() {
+                continue;
+            }
+            log_audio_widget_bottom_bar_debug_snapshot_for(
+                &app,
+                "audio.widget.bottom_bar.debug_sampler.sample",
+                json!({}),
+            );
+        }
+    });
+}
 
 #[cfg(target_os = "macos")]
 fn register_audio_widget_space_change_observer(app: &AppHandle) {
     if AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    audio_widget_start_bottom_bar_debug_sampler(app);
 
     let app_handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         snipping_catch_objc("register_audio_widget_space_change_observer", || {
             let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
             let center = workspace.notificationCenter();
+            let callback_app = app_handle.clone();
             let block = block2::RcBlock::new(
-                move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                move |notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("audio_widget_space_change_observer_callback", || {
-                        audio_widget_schedule_stored_bottom_bar_reposition(&app_handle);
+                        let notification_name = unsafe { notification.as_ref() }.name().to_string();
+                        log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+                            &callback_app,
+                            "audio.widget.bottom_bar.macos_notification",
+                            None,
+                            None,
+                            json!({ "notification": notification_name }),
+                        );
+                        audio_widget_schedule_stored_bottom_bar_reposition(&callback_app);
                     });
                 },
             );
@@ -3400,6 +3726,46 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                     &block,
                 )
             };
+            let deactive_app_token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidDeactivateApplicationNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
+            let hide_app_token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidHideApplicationNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
+            let unhide_app_token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidUnhideApplicationNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
+            let launch_app_token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidLaunchApplicationNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
+            let terminate_app_token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidTerminateApplicationNotification),
+                    None,
+                    None,
+                    &block,
+                )
+            };
             let app_center = objc2_foundation::NSNotificationCenter::defaultCenter();
             let screen_parameters_token = unsafe {
                 app_center.addObserverForName_object_queue_usingBlock(
@@ -3412,7 +3778,31 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
             // The observer lives for the app's lifetime.
             std::mem::forget(active_space_token);
             std::mem::forget(active_app_token);
+            std::mem::forget(deactive_app_token);
+            std::mem::forget(hide_app_token);
+            std::mem::forget(unhide_app_token);
+            std::mem::forget(launch_app_token);
+            std::mem::forget(terminate_app_token);
             std::mem::forget(screen_parameters_token);
+            log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+                &app_handle,
+                "audio.widget.bottom_bar.observer.registered",
+                None,
+                None,
+                json!({
+                    "notifications": [
+                        "NSWorkspaceActiveSpaceDidChangeNotification",
+                        "NSWorkspaceDidActivateApplicationNotification",
+                        "NSWorkspaceDidDeactivateApplicationNotification",
+                        "NSWorkspaceDidHideApplicationNotification",
+                        "NSWorkspaceDidUnhideApplicationNotification",
+                        "NSWorkspaceDidLaunchApplicationNotification",
+                        "NSWorkspaceDidTerminateApplicationNotification",
+                        "NSApplicationDidChangeScreenParametersNotification",
+                    ],
+                    "log_path": audio_widget_bottom_bar_debug_log_path().display().to_string(),
+                }),
+            );
         });
     });
 }
@@ -3741,9 +4131,24 @@ fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
 #[cfg(target_os = "macos")]
 fn audio_widget_reposition_stored_bottom_bar_for(app: &AppHandle, animate: bool) -> bool {
     let Some(layout) = audio_widget_last_bottom_bar_layout() else {
+        log_audio_widget_bottom_bar_debug_event(
+            "audio.widget.bottom_bar.reposition_stored.skipped",
+            json!({ "reason": "no_stored_layout", "animate": animate }),
+        );
         return false;
     };
     let request = layout.into_request(animate);
+    log_audio_widget_bottom_bar_debug_snapshot_for(
+        app,
+        "audio.widget.bottom_bar.reposition_stored.request",
+        json!({
+            "width": request.width,
+            "height": request.height,
+            "margin": request.margin,
+            "animate": request.animate,
+            "caller_on_main_thread": objc2::MainThreadMarker::new().is_some(),
+        }),
+    );
     if objc2::MainThreadMarker::new().is_some() {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -3755,18 +4160,37 @@ fn audio_widget_reposition_stored_bottom_bar_for(app: &AppHandle, animate: bool)
 }
 
 #[cfg(target_os = "macos")]
-fn audio_widget_reassert_open_state(app: &AppHandle, _make_key: bool) -> bool {
+fn audio_widget_reassert_open_state(app: &AppHandle, animate_bottom_bar: bool) -> bool {
     let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+        log_audio_widget_bottom_bar_debug_event(
+            "audio.widget.bottom_bar.reassert_open.skipped",
+            json!({ "reason": "window_missing" }),
+        );
         return false;
     };
     if !window.is_visible().unwrap_or(false) {
+        log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.reassert_open.skipped",
+            json!({ "reason": "window_not_visible" }),
+        );
         return false;
     }
-    if audio_widget_reposition_stored_bottom_bar_for(app, false) {
+    if audio_widget_reposition_stored_bottom_bar_for(app, animate_bottom_bar) {
+        log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.reassert_open.repositioned",
+            json!({ "animate": animate_bottom_bar }),
+        );
         return true;
     }
     audio_widget_apply_macos_space_style(&window);
     audio_widget_order_front_regardless(&window);
+    log_audio_widget_bottom_bar_debug_snapshot_for(
+        app,
+        "audio.widget.bottom_bar.reassert_open.style_only",
+        json!({}),
+    );
     true
 }
 
@@ -3775,6 +4199,14 @@ fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
     let generation = AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
+    log_audio_widget_bottom_bar_debug_snapshot_for(
+        app,
+        "audio.widget.bottom_bar.reposition_schedule",
+        json!({
+            "generation": generation,
+            "delays_ms": AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS,
+        }),
+    );
     for delay_ms in AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -3782,26 +4214,52 @@ fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
                 sleep(Duration::from_millis(delay_ms)).await;
             }
             if AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION.load(Ordering::Acquire) != generation {
+                log_audio_widget_bottom_bar_debug_event(
+                    "audio.widget.bottom_bar.reposition_schedule.skipped_stale",
+                    json!({
+                        "generation": generation,
+                        "delay_ms": delay_ms,
+                        "current_generation": AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION
+                            .load(Ordering::Acquire),
+                    }),
+                );
                 return;
             }
-            let _ = audio_widget_reassert_open_state(&app, false);
+            log_audio_widget_bottom_bar_debug_snapshot_for(
+                &app,
+                "audio.widget.bottom_bar.reposition_schedule.fire",
+                json!({
+                    "generation": generation,
+                    "delay_ms": delay_ms,
+                }),
+            );
+            let repositioned = audio_widget_reassert_open_state(&app, true);
+            log_audio_widget_bottom_bar_debug_snapshot_for(
+                &app,
+                "audio.widget.bottom_bar.reposition_schedule.done",
+                json!({
+                    "generation": generation,
+                    "delay_ms": delay_ms,
+                    "repositioned": repositioned,
+                }),
+            );
         });
     }
 }
 
 #[cfg(target_os = "macos")]
-fn audio_widget_emit_open_reassert(app: &AppHandle, make_key: bool) {
+fn audio_widget_emit_open_reassert(app: &AppHandle, _make_key: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_millis(AUDIO_WIDGET_REASSERT_SHOW_MS)).await;
-        if !audio_widget_reassert_open_state(&app, make_key) {
+        if !audio_widget_reassert_open_state(&app, false) {
             return;
         }
         sleep(Duration::from_millis(
             AUDIO_WIDGET_COLD_BOOT_REASSERT_MS.saturating_sub(AUDIO_WIDGET_REASSERT_SHOW_MS),
         ))
         .await;
-        let _ = audio_widget_reassert_open_state(&app, make_key);
+        let _ = audio_widget_reassert_open_state(&app, false);
     });
 }
 
@@ -3938,20 +4396,41 @@ fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Resu
         audio_widget_apply_macos_space_style(&window);
         #[cfg(target_os = "macos")]
         {
+            log_audio_widget_bottom_bar_debug_snapshot_for(
+                app,
+                "audio.widget.bottom_bar.show.before_native_show",
+                json!({
+                    "focus": focus,
+                    "has_stored_layout": audio_widget_last_bottom_bar_layout().is_some(),
+                }),
+            );
             let _ = window.unminimize();
+            let mut prepositioned = false;
             if let Some(layout) = audio_widget_last_bottom_bar_layout() {
                 let _ = audio_widget_position_bottom_bar_on_main_thread(
                     app,
                     &window,
                     layout.into_request(false),
                 );
+                prepositioned = true;
             }
+            log_audio_widget_bottom_bar_debug_snapshot_for(
+                app,
+                "audio.widget.bottom_bar.show.after_preposition",
+                json!({ "prepositioned": prepositioned }),
+            );
         }
         window
             .show()
             .map_err(|error| format!("Unable to show audio widget: {error}"))?;
         #[cfg(target_os = "macos")]
         audio_widget_order_front_regardless(&window);
+        #[cfg(target_os = "macos")]
+        log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.show.after_order_front",
+            json!({ "focus": focus }),
+        );
         #[cfg(target_os = "macos")]
         let released_keyboard = audio_widget_resign_key_window_if_needed(
             &window,
@@ -3984,6 +4463,12 @@ fn hide_audio_widget_window_on_main_thread(app: &AppHandle) -> Result<(), String
     log_audio_diagnostic_event("audio.widget.hide_window.request", json!({}));
 
     run_audio_widget_action_on_main_thread(app, "hide", |app| {
+        #[cfg(target_os = "macos")]
+        log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.hide.before",
+            json!({}),
+        );
         if let Some(window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
             #[cfg(target_os = "macos")]
             {
@@ -3996,6 +4481,12 @@ fn hide_audio_widget_window_on_main_thread(app: &AppHandle) -> Result<(), String
                 .hide()
                 .map_err(|error| format!("Unable to hide audio widget: {error}"))?;
         }
+        #[cfg(target_os = "macos")]
+        log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.hide.after",
+            json!({}),
+        );
 
         Ok(())
     })
@@ -4149,6 +4640,15 @@ fn audio_widget_store_bottom_bar_layout(request: &AudioWidgetBottomBarPositionRe
     if let Ok(mut current) = audio_widget_bottom_bar_layout_slot().lock() {
         *current = Some(AudioWidgetBottomBarLayout::from_request(request));
     }
+    log_audio_widget_bottom_bar_debug_event(
+        "audio.widget.bottom_bar.layout.store",
+        json!({
+            "width": request.width,
+            "height": request.height,
+            "margin": request.margin,
+            "animate": request.animate,
+        }),
+    );
 }
 
 fn audio_widget_clear_bottom_bar_position_request() {
@@ -4157,6 +4657,7 @@ fn audio_widget_clear_bottom_bar_position_request() {
     if let Ok(mut current) = audio_widget_bottom_bar_layout_slot().lock() {
         *current = None;
     }
+    log_audio_widget_bottom_bar_debug_event("audio.widget.bottom_bar.layout.clear", json!({}));
 }
 
 fn audio_widget_last_bottom_bar_layout() -> Option<AudioWidgetBottomBarLayout> {
@@ -4292,6 +4793,271 @@ const MACOS_FULLSCREEN_WINDOW_SIZE_TOLERANCE: f64 = 32.0;
 const MACOS_FULLSCREEN_WINDOW_MIN_DIMENSION_RATIO: f64 = 0.965;
 #[cfg(target_os = "macos")]
 const MACOS_FULLSCREEN_WINDOW_MIN_AREA_RATIO: f64 = 0.94;
+#[cfg(target_os = "macos")]
+const MACOS_AX_ERROR_SUCCESS: i32 = 0;
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    #[link_name = "AXIsProcessTrusted"]
+    fn audio_widget_ax_is_process_trusted() -> std::os::raw::c_uchar;
+    #[link_name = "AXUIElementCreateApplication"]
+    fn audio_widget_ax_ui_element_create_application(
+        pid: i32,
+    ) -> *const std::ffi::c_void;
+    #[link_name = "AXUIElementCopyAttributeValue"]
+    fn audio_widget_ax_ui_element_copy_attribute_value(
+        element: *const std::ffi::c_void,
+        attribute: *const std::ffi::c_void,
+        value: *mut *const std::ffi::c_void,
+    ) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    #[link_name = "CFRelease"]
+    fn audio_widget_cf_release_raw(value: *const std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_cf_release(value: *const std::ffi::c_void) {
+    if !value.is_null() {
+        unsafe { audio_widget_cf_release_raw(value) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct MacosAxFullscreenProbe {
+    trusted: bool,
+    frontmost_pid: Option<i32>,
+    frontmost_bundle_identifier: Option<String>,
+    frontmost_is_current_app: bool,
+    window_attribute: Option<&'static str>,
+    fullscreen: Option<bool>,
+    error: Option<i32>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosAxFullscreenProbe {
+    fn unavailable(reason: i32) -> Self {
+        Self {
+            trusted: unsafe { audio_widget_ax_is_process_trusted() != 0 },
+            frontmost_pid: None,
+            frontmost_bundle_identifier: None,
+            frontmost_is_current_app: false,
+            window_attribute: None,
+            fullscreen: None,
+            error: Some(reason),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct MacosFullMonitorBoundsResolution {
+    use_full_monitor_bounds: bool,
+    source: &'static str,
+    presentation_fullscreen: bool,
+    cg_fullscreen_cover: bool,
+    sticky_applied: bool,
+    sticky_until_ms: u64,
+    ax_probe: MacosAxFullscreenProbe,
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_ax_copy_attribute_value(
+    element: *const std::ffi::c_void,
+    attribute: &'static str,
+) -> Result<*const std::ffi::c_void, i32> {
+    if element.is_null() {
+        return Err(-1);
+    }
+
+    let attribute_string = objc2_core_foundation::CFString::from_static_str(attribute);
+    let attribute_ref =
+        attribute_string.as_ref() as *const objc2_core_foundation::CFString;
+    let mut value: *const std::ffi::c_void = std::ptr::null();
+    let error = unsafe {
+        audio_widget_ax_ui_element_copy_attribute_value(
+            element,
+            attribute_ref.cast(),
+            &mut value,
+        )
+    };
+    if error == MACOS_AX_ERROR_SUCCESS && !value.is_null() {
+        Ok(value)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_ax_bool_attribute(
+    element: *const std::ffi::c_void,
+    attribute: &'static str,
+) -> Result<Option<bool>, i32> {
+    let value = audio_widget_ax_copy_attribute_value(element, attribute)?;
+    let cf_value = unsafe { &*value.cast::<objc2_core_foundation::CFType>() };
+    let result = cf_value
+        .downcast_ref::<objc2_core_foundation::CFBoolean>()
+        .map(|boolean| boolean.value());
+    audio_widget_cf_release(value);
+    Ok(result)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_frontmost_ax_fullscreen_probe(current_pid: i32) -> MacosAxFullscreenProbe {
+    let trusted = unsafe { audio_widget_ax_is_process_trusted() != 0 };
+    let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+    let Some(frontmost) = workspace.frontmostApplication() else {
+        return MacosAxFullscreenProbe {
+            trusted,
+            frontmost_pid: None,
+            frontmost_bundle_identifier: None,
+            frontmost_is_current_app: false,
+            window_attribute: None,
+            fullscreen: None,
+            error: Some(-2),
+        };
+    };
+
+    let frontmost_pid = frontmost.processIdentifier();
+    let frontmost_is_current_app = frontmost_pid <= 0 || frontmost_pid == current_pid;
+    let mut probe = MacosAxFullscreenProbe {
+        trusted,
+        frontmost_pid: (frontmost_pid > 0).then_some(frontmost_pid),
+        frontmost_bundle_identifier: frontmost
+            .bundleIdentifier()
+            .map(|identifier| identifier.to_string()),
+        frontmost_is_current_app,
+        window_attribute: None,
+        fullscreen: None,
+        error: None,
+    };
+    if frontmost_is_current_app {
+        probe.error = Some(-3);
+        return probe;
+    }
+    if !trusted {
+        probe.error = Some(-4);
+        return probe;
+    }
+
+    let application = unsafe { audio_widget_ax_ui_element_create_application(frontmost_pid) };
+    if application.is_null() {
+        probe.error = Some(-5);
+        return probe;
+    }
+
+    let window_attributes = ["AXFocusedWindow", "AXMainWindow"];
+    for window_attribute in window_attributes {
+        match audio_widget_ax_copy_attribute_value(application, window_attribute) {
+            Ok(window) => {
+                match audio_widget_ax_bool_attribute(window, "AXFullScreen") {
+                    Ok(fullscreen) => {
+                        probe.window_attribute = Some(window_attribute);
+                        probe.fullscreen = fullscreen;
+                        audio_widget_cf_release(window);
+                        audio_widget_cf_release(application);
+                        return probe;
+                    }
+                    Err(error) => {
+                        probe.window_attribute = Some(window_attribute);
+                        probe.error = Some(error);
+                    }
+                }
+                audio_widget_cf_release(window);
+            }
+            Err(error) => {
+                probe.window_attribute = Some(window_attribute);
+                probe.error = Some(error);
+            }
+        }
+    }
+
+    match audio_widget_ax_copy_attribute_value(application, "AXWindows") {
+        Ok(windows) => {
+            let cf_value = unsafe { &*windows.cast::<objc2_core_foundation::CFType>() };
+            if let Some(array) = cf_value.downcast_ref::<objc2_core_foundation::CFArray>() {
+                let typed_array =
+                    unsafe { array.cast_unchecked::<objc2_core_foundation::CFType>() };
+                let mut first_explicit_value: Option<bool> = None;
+                for window_index in 0..typed_array.len() {
+                    let window = unsafe {
+                        typed_array.get_unchecked(window_index as objc2_core_foundation::CFIndex)
+                    };
+                    let window_ref =
+                        window as *const objc2_core_foundation::CFType as *const std::ffi::c_void;
+                    match audio_widget_ax_bool_attribute(window_ref, "AXFullScreen") {
+                        Ok(Some(true)) => {
+                            probe.window_attribute = Some("AXWindows");
+                            probe.fullscreen = Some(true);
+                            audio_widget_cf_release(windows);
+                            audio_widget_cf_release(application);
+                            return probe;
+                        }
+                        Ok(Some(false)) => {
+                            first_explicit_value.get_or_insert(false);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            probe.window_attribute = Some("AXWindows");
+                            probe.error = Some(error);
+                        }
+                    }
+                }
+                if let Some(fullscreen) = first_explicit_value {
+                    probe.window_attribute = Some("AXWindows");
+                    probe.fullscreen = Some(fullscreen);
+                    audio_widget_cf_release(windows);
+                    audio_widget_cf_release(application);
+                    return probe;
+                }
+            } else {
+                probe.window_attribute = Some("AXWindows");
+                probe.error = Some(-6);
+            }
+            audio_widget_cf_release(windows);
+        }
+        Err(error) => {
+            probe.window_attribute = Some("AXWindows");
+            probe.error = Some(error);
+        }
+    }
+
+    audio_widget_cf_release(application);
+    probe
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ax_fullscreen_probe_debug_value(probe: &MacosAxFullscreenProbe) -> Value {
+    json!({
+        "trusted": probe.trusted,
+        "frontmost_pid": probe.frontmost_pid,
+        "frontmost_bundle_identifier": probe.frontmost_bundle_identifier,
+        "frontmost_is_current_app": probe.frontmost_is_current_app,
+        "window_attribute": probe.window_attribute,
+        "fullscreen": probe.fullscreen,
+        "error": probe.error,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_full_monitor_bounds_resolution_debug_value(
+    resolution: &MacosFullMonitorBoundsResolution,
+) -> Value {
+    json!({
+        "use_full_monitor_bounds": resolution.use_full_monitor_bounds,
+        "source": resolution.source,
+        "presentation_fullscreen": resolution.presentation_fullscreen,
+        "cg_fullscreen_cover": resolution.cg_fullscreen_cover,
+        "sticky_applied": resolution.sticky_applied,
+        "sticky_until_ms": resolution.sticky_until_ms,
+        "ax_probe": macos_ax_fullscreen_probe_debug_value(&resolution.ax_probe),
+    })
+}
 
 #[cfg(target_os = "macos")]
 fn macos_window_bounds_cover_screen(
@@ -4414,25 +5180,44 @@ fn macos_active_space_uses_full_monitor_bounds_cached() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(
+fn macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(
     target_screen: Option<&objc2_app_kit::NSScreen>,
-) -> bool {
+) -> MacosFullMonitorBoundsResolution {
     let mut use_full_monitor_bounds = false;
+    let mut source = "visible_frame";
+    let mut presentation_fullscreen = false;
+    let mut cg_fullscreen_cover = false;
+    let mut ax_probe = MacosAxFullscreenProbe::unavailable(-10);
+    let mut sticky_applied = false;
+
     snipping_catch_objc("macos_active_space_full_monitor_bounds", || {
         if let Some(main_thread_marker) = objc2::MainThreadMarker::new() {
             let application = objc2_app_kit::NSApplication::sharedApplication(main_thread_marker);
             let presentation_options = application.currentSystemPresentationOptions();
-            if presentation_options
-                .contains(objc2_app_kit::NSApplicationPresentationOptions::FullScreen)
-            {
-                use_full_monitor_bounds = true;
-                return;
-            }
+            presentation_fullscreen = presentation_options
+                .contains(objc2_app_kit::NSApplicationPresentationOptions::FullScreen);
         }
 
         let current_app = objc2_app_kit::NSRunningApplication::currentApplication();
         let current_pid = current_app.processIdentifier();
         if current_pid <= 0 {
+            return;
+        }
+
+        ax_probe = macos_frontmost_ax_fullscreen_probe(current_pid);
+        if let Some(fullscreen) = ax_probe.fullscreen {
+            use_full_monitor_bounds = fullscreen;
+            source = if fullscreen {
+                "frontmost_ax_fullscreen"
+            } else {
+                "frontmost_ax_not_fullscreen"
+            };
+            return;
+        }
+
+        if presentation_fullscreen {
+            use_full_monitor_bounds = true;
+            source = "appkit_presentation_fullscreen";
             return;
         }
 
@@ -4442,8 +5227,12 @@ fn macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread
         // auxiliary Diff Forge window itself can become frontmost while still
         // floating above that fullscreen Space.
         let target_frame = target_screen.map(|screen| screen.frame());
-        use_full_monitor_bounds =
+        cg_fullscreen_cover =
             macos_other_visible_app_has_fullscreen_window(current_pid, target_frame.as_ref());
+        if cg_fullscreen_cover {
+            use_full_monitor_bounds = true;
+            source = "cg_fullscreen_cover";
+        }
     });
     if use_full_monitor_bounds {
         MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(
@@ -4451,13 +5240,34 @@ fn macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread
             Ordering::Release,
         );
     } else {
+        if matches!(ax_probe.fullscreen, Some(false)) {
+            MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(0, Ordering::Release);
+        }
         let sticky_until = MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.load(Ordering::Acquire);
         if sticky_until > current_time_ms() {
             use_full_monitor_bounds = true;
+            source = "sticky_full_monitor";
+            sticky_applied = true;
         }
     }
     MACOS_ACTIVE_SPACE_USES_FULL_MONITOR_BOUNDS.store(use_full_monitor_bounds, Ordering::Release);
-    use_full_monitor_bounds
+    MacosFullMonitorBoundsResolution {
+        use_full_monitor_bounds,
+        source,
+        presentation_fullscreen,
+        cg_fullscreen_cover,
+        sticky_applied,
+        sticky_until_ms: MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.load(Ordering::Acquire),
+        ax_probe,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(
+    target_screen: Option<&objc2_app_kit::NSScreen>,
+) -> bool {
+    macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(target_screen)
+        .use_full_monitor_bounds
 }
 
 #[cfg(target_os = "macos")]
@@ -4496,38 +5306,154 @@ fn audio_widget_position_bottom_bar_on_main_thread(
         } else {
             0.0
         };
+        log_audio_widget_bottom_bar_debug_event(
+            "audio.widget.bottom_bar.position.request",
+            json!({
+                "width": request.width,
+                "height": request.height,
+                "margin": request.margin,
+                "animate": request.animate,
+                "normalized_width": width,
+                "normalized_height": height,
+                "normalized_margin": margin,
+            }),
+        );
         let Ok(ns_ptr) = window.ns_window() else {
+            log_audio_widget_bottom_bar_debug_event(
+                "audio.widget.bottom_bar.position.error",
+                json!({ "error": "ns_window_unavailable" }),
+            );
             return Err("Unable to access audio widget native window.".to_string());
         };
         if ns_ptr.is_null() {
+            log_audio_widget_bottom_bar_debug_event(
+                "audio.widget.bottom_bar.position.error",
+                json!({ "error": "ns_window_null" }),
+            );
             return Err("Audio widget native window is unavailable.".to_string());
         }
 
         let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
         audio_widget_apply_macos_space_style_to_ns_window(ns_window);
+        let frame_before = ns_window.frame();
 
         let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
+            log_audio_widget_bottom_bar_debug_event(
+                "audio.widget.bottom_bar.position.error",
+                json!({ "error": "not_main_thread" }),
+            );
             return Err("Audio widget AppKit placement must run on the main thread.".to_string());
         };
         let Some(screen) =
             audio_widget_macos_target_screen_for_bottom_bar(app, ns_window, main_thread_marker)
         else {
+            log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+                app,
+                "audio.widget.bottom_bar.position.error",
+                Some(ns_window),
+                None,
+                json!({ "error": "target_screen_unavailable" }),
+            );
             return Err("Unable to resolve the audio widget screen.".to_string());
         };
 
-        let anchor_frame = screen.frame();
+        let screen_frame = screen.frame();
         let visible_frame = screen.visibleFrame();
+        let bounds_resolution =
+            macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(Some(
+                screen.as_ref(),
+            ));
+        let anchor_frame = if bounds_resolution.use_full_monitor_bounds {
+            screen_frame
+        } else {
+            visible_frame
+        };
+        let chosen_target = if bounds_resolution.use_full_monitor_bounds {
+            "screen_frame"
+        } else {
+            "visible_frame"
+        };
+        let source = if bounds_resolution.use_full_monitor_bounds {
+            "appkit-screen-frame"
+        } else {
+            "appkit-visible-frame"
+        };
 
-        let x =
-            (anchor_frame.origin.x + ((anchor_frame.size.width - width) / 2.0).max(0.0)).round();
-        let y = (anchor_frame.origin.y + margin).round();
+        let screen_x =
+            (screen_frame.origin.x + ((screen_frame.size.width - width) / 2.0).max(0.0)).round();
+        let screen_y = (screen_frame.origin.y + margin).round();
+        let visible_x =
+            (visible_frame.origin.x + ((visible_frame.size.width - width) / 2.0).max(0.0)).round();
+        let visible_y = (visible_frame.origin.y + margin).round();
+        let (x, y) = if bounds_resolution.use_full_monitor_bounds {
+            (screen_x, screen_y)
+        } else {
+            (visible_x, visible_y)
+        };
         let target_frame = objc2_core_foundation::CGRect::new(
             objc2_core_foundation::CGPoint::new(x, y),
             objc2_core_foundation::CGSize::new(width, height),
         );
 
-        let animate = request.animate;
-        ns_window.setFrame_display_animate(target_frame, true, animate);
+        let frame_matches_target =
+            audio_widget_rect_nearly_matches(&frame_before, &target_frame);
+        let requested_animate = request.animate;
+        let animate = requested_animate && !frame_matches_target;
+        log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+            app,
+            "audio.widget.bottom_bar.position.before_set_frame",
+            Some(ns_window),
+            Some(screen.as_ref()),
+            json!({
+                "request": {
+                    "width": request.width,
+                    "height": request.height,
+                    "margin": request.margin,
+                    "animate": request.animate,
+                },
+                "normalized": {
+                    "width": width,
+                    "height": height,
+                    "margin": margin,
+                },
+                "frame_before": audio_widget_rect_debug_value(&frame_before),
+                "screen_frame_target": {
+                    "x": screen_x,
+                    "y": screen_y,
+                    "delta_y_from_current": screen_y - frame_before.origin.y,
+                },
+                "visible_frame_target": {
+                    "x": visible_x,
+                    "y": visible_y,
+                    "delta_y_from_current": visible_y - frame_before.origin.y,
+                    "delta_y_from_screen_target": visible_y - screen_y,
+                },
+                "target_frame": {
+                    "x": x,
+                    "y": y,
+                    "delta_y_from_current": y - frame_before.origin.y,
+                },
+                "frame_matches_target": frame_matches_target,
+                "frame_update_skipped": frame_matches_target,
+                "dock_or_menu_gap": {
+                    "bottom": visible_frame.origin.y - screen_frame.origin.y,
+                    "top": (screen_frame.origin.y + screen_frame.size.height)
+                        - (visible_frame.origin.y + visible_frame.size.height),
+                    "left": visible_frame.origin.x - screen_frame.origin.x,
+                    "right": (screen_frame.origin.x + screen_frame.size.width)
+                        - (visible_frame.origin.x + visible_frame.size.width),
+                },
+                "chosen_target": chosen_target,
+                "bounds_resolution": macos_full_monitor_bounds_resolution_debug_value(
+                    &bounds_resolution,
+                ),
+                "requested_animate": requested_animate,
+                "animate": animate,
+            }),
+        );
+        if !frame_matches_target {
+            ns_window.setFrame_display_animate(target_frame, true, animate);
+        }
         ns_window.orderFrontRegardless();
 
         let frame = ns_window.frame();
@@ -4541,8 +5467,8 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             anchor_width: anchor_frame.size.width,
             anchor_height: anchor_frame.size.height,
             scale_factor: screen.backingScaleFactor(),
-            source: "appkit-screen-frame".to_string(),
-            use_full_monitor_bounds: true,
+            source: source.to_string(),
+            use_full_monitor_bounds: bounds_resolution.use_full_monitor_bounds,
         };
 
         log_audio_diagnostic_event(
@@ -4556,10 +5482,10 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                 "anchor_y": result.anchor_y,
                 "anchor_width": result.anchor_width,
                 "anchor_height": result.anchor_height,
-                "screen_x": anchor_frame.origin.x,
-                "screen_y": anchor_frame.origin.y,
-                "screen_width": anchor_frame.size.width,
-                "screen_height": anchor_frame.size.height,
+                "screen_x": screen_frame.origin.x,
+                "screen_y": screen_frame.origin.y,
+                "screen_width": screen_frame.size.width,
+                "screen_height": screen_frame.size.height,
                 "visible_x": visible_frame.origin.x,
                 "visible_y": visible_frame.origin.y,
                 "visible_width": visible_frame.size.width,
@@ -4567,6 +5493,46 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                 "scale_factor": result.scale_factor,
                 "source": result.source,
                 "use_full_monitor_bounds": result.use_full_monitor_bounds,
+                "bounds_resolution": macos_full_monitor_bounds_resolution_debug_value(
+                    &bounds_resolution,
+                ),
+            }),
+        );
+        log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+            app,
+            "audio.widget.bottom_bar.position.after_set_frame",
+            Some(ns_window),
+            Some(screen.as_ref()),
+            json!({
+                "result": {
+                    "x": result.x,
+                    "y": result.y,
+                    "width": result.width,
+                    "height": result.height,
+                    "source": result.source,
+                    "use_full_monitor_bounds": result.use_full_monitor_bounds,
+                },
+                "screen_frame_target": {
+                    "x": screen_x,
+                    "y": screen_y,
+                },
+                "visible_frame_target": {
+                    "x": visible_x,
+                    "y": visible_y,
+                    "delta_y_from_screen_target": visible_y - screen_y,
+                },
+                "target_frame": {
+                    "x": x,
+                    "y": y,
+                },
+                "frame_matches_target": frame_matches_target,
+                "frame_update_skipped": frame_matches_target,
+                "chosen_target": chosen_target,
+                "bounds_resolution": macos_full_monitor_bounds_resolution_debug_value(
+                    &bounds_resolution,
+                ),
+                "requested_animate": requested_animate,
+                "animate": animate,
             }),
         );
 
@@ -4580,10 +5546,39 @@ fn audio_widget_position_bottom_bar_for(
     app: &AppHandle,
     request: AudioWidgetBottomBarPositionRequest,
 ) -> Result<AudioWidgetBottomBarPositionResult, String> {
-    run_audio_widget_action_on_main_thread(app, "position_bottom_bar", move |app| {
+    log_audio_widget_bottom_bar_debug_snapshot_for(
+        app,
+        "audio.widget.bottom_bar.position.command",
+        json!({
+            "width": request.width,
+            "height": request.height,
+            "margin": request.margin,
+            "animate": request.animate,
+        }),
+    );
+    let result = run_audio_widget_action_on_main_thread(app, "position_bottom_bar", move |app| {
         let window = ensure_audio_widget_window(app)?;
         audio_widget_position_bottom_bar_on_main_thread(app, &window, request)
-    })
+    });
+    match &result {
+        Ok(position) => log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.position.command.done",
+            json!({
+                "x": position.x,
+                "y": position.y,
+                "width": position.width,
+                "height": position.height,
+                "source": position.source,
+            }),
+        ),
+        Err(error) => log_audio_widget_bottom_bar_debug_snapshot_for(
+            app,
+            "audio.widget.bottom_bar.position.command.error",
+            json!({ "error": clean_whisper_local_audio_log_text(error) }),
+        ),
+    }
+    result
 }
 
 #[cfg(not(target_os = "macos"))]

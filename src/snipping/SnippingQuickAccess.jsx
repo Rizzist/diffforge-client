@@ -62,6 +62,15 @@ const SNIPPING_STRIP_ANIM_EVENT = "forge-snip-strip-anim";
 const SNIPPING_STRIP_PAGE_SIZE = 64;
 const SNIPPING_FLOATS_CHANGED_EVENT = "forge-snip-floats-changed";
 const SNIPPING_STRIP_DRAG_EVENT = "forge-snip-strip-drag";
+const SNIPPING_STRIP_INITIAL_PLACEHOLDER_COUNT = 8;
+const SNIPPING_STRIP_LOADING_MORE_PLACEHOLDER_COUNT = 3;
+const STRIP_THUMBNAIL_CACHE_LIMIT = 48;
+const STRIP_THUMBNAIL_MAX_CONCURRENT_READS = 3;
+
+const stripThumbnailCache = new Map();
+const stripThumbnailInflight = new Map();
+const stripThumbnailQueue = [];
+let stripThumbnailActiveReads = 0;
 
 
 // Quick-access tools. Closed shapes (rect/oval) are one abstract "shape" tool
@@ -400,25 +409,101 @@ function versionedAssetPreviewUrl(localPath, imageVersion = 0) {
   return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
 }
 
-function useStripTilePreviewUrl(localPath, imageVersion = 0, assetFallback = true) {
+function stripThumbnailCacheKey(localPath, imageVersion = 0) {
+  return `${Number(imageVersion) || 0}:${text(localPath)}`;
+}
+
+function trimStripThumbnailCache() {
+  while (stripThumbnailCache.size > STRIP_THUMBNAIL_CACHE_LIMIT) {
+    const oldestKey = stripThumbnailCache.keys().next().value;
+    if (!oldestKey) return;
+    stripThumbnailCache.delete(oldestKey);
+  }
+}
+
+function runNextStripThumbnailRead() {
+  if (stripThumbnailActiveReads >= STRIP_THUMBNAIL_MAX_CONCURRENT_READS) return;
+  const task = stripThumbnailQueue.shift();
+  if (!task) return;
+  stripThumbnailActiveReads += 1;
+  task()
+    .catch(() => {})
+    .finally(() => {
+      stripThumbnailActiveReads = Math.max(0, stripThumbnailActiveReads - 1);
+      runNextStripThumbnailRead();
+    });
+  runNextStripThumbnailRead();
+}
+
+function readQueuedStripThumbnailDataUrl(localPath, imageVersion = 0) {
+  const path = text(localPath);
+  if (!path) return Promise.resolve("");
+  const cacheKey = stripThumbnailCacheKey(path, imageVersion);
+  const cached = stripThumbnailCache.get(cacheKey);
+  if (cached) return Promise.resolve(cached);
+  const inflight = stripThumbnailInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = new Promise((resolve, reject) => {
+    stripThumbnailQueue.push(() => (
+      invoke("snipping_read_asset_data_url", { path })
+        .then((nextDataUrl) => {
+          const normalized = text(nextDataUrl);
+          if (normalized) {
+            stripThumbnailCache.set(cacheKey, normalized);
+            trimStripThumbnailCache();
+          }
+          resolve(normalized);
+        })
+        .catch(reject)
+        .finally(() => {
+          stripThumbnailInflight.delete(cacheKey);
+        })
+    ));
+    runNextStripThumbnailRead();
+  });
+  stripThumbnailInflight.set(cacheKey, promise);
+  return promise;
+}
+
+function useStripTilePreviewUrl(localPath, imageVersion = 0, options = true) {
+  const normalizedOptions = typeof options === "boolean"
+    ? { assetFallback: options }
+    : (options || {});
+  const assetFallback = normalizedOptions.assetFallback !== false;
+  const queued = normalizedOptions.queued === true;
   const assetUrl = useMemo(
     () => (assetFallback ? versionedAssetPreviewUrl(localPath, imageVersion) : ""),
     [assetFallback, imageVersion, localPath],
   );
   const [dataUrl, setDataUrl] = useState("");
+  const [loading, setLoading] = useState(false);
   const [assetUrlFailed, setAssetUrlFailed] = useState(false);
   const requestRef = useRef(0);
 
   useEffect(() => {
     const path = text(localPath);
     setDataUrl("");
+    setLoading(false);
     setAssetUrlFailed(false);
     if (!path) return undefined;
 
     let cancelled = false;
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
-    invoke("snipping_read_asset_data_url", { path })
+    const cached = queued ? stripThumbnailCache.get(stripThumbnailCacheKey(path, imageVersion)) : "";
+    if (cached) {
+      setDataUrl(cached);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setLoading(true);
+    const loader = queued
+      ? readQueuedStripThumbnailDataUrl(path, imageVersion)
+      : invoke("snipping_read_asset_data_url", { path });
+    loader
       .then((nextDataUrl) => {
         if (cancelled || requestRef.current !== requestId) return;
         const normalized = text(nextDataUrl);
@@ -428,12 +513,17 @@ function useStripTilePreviewUrl(localPath, imageVersion = 0, assetFallback = tru
       })
       .catch(() => {
         // Keep the asset:-URL fallback below; the file may still paint fine.
+      })
+      .finally(() => {
+        if (!cancelled && requestRef.current === requestId) {
+          setLoading(false);
+        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [imageVersion, localPath]);
+  }, [imageVersion, localPath, queued]);
 
   const onImageError = useCallback(() => {
     if (dataUrl) {
@@ -445,6 +535,7 @@ function useStripTilePreviewUrl(localPath, imageVersion = 0, assetFallback = tru
   }, [dataUrl]);
 
   return {
+    loading,
     previewUrl: dataUrl || (assetFallback && !assetUrlFailed ? assetUrl : ""),
     onImageError,
   };
@@ -1880,7 +1971,14 @@ function StripSnipTile({
   const localPath = assetLocalPath(item);
   const name = useMemo(() => assetName(item), [item]);
   const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
-  const { previewUrl, onImageError } = useStripTilePreviewUrl(localPath, imageVersion);
+  const {
+    loading: thumbnailLoading,
+    previewUrl,
+    onImageError,
+  } = useStripTilePreviewUrl(localPath, imageVersion, {
+    assetFallback: false,
+    queued: true,
+  });
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [launching, setLaunching] = useState(false);
@@ -2109,6 +2207,7 @@ function StripSnipTile({
       data-busy={busy ? "true" : "false"}
       data-launching={launching ? "true" : "false"}
       data-panning={panning ? "true" : "false"}
+      data-thumbnail={previewUrl ? "ready" : thumbnailLoading ? "loading" : "pending"}
       onPointerCancel={clearDrag}
       onPointerDown={startDrag}
       onPointerMove={continueDrag}
@@ -2118,7 +2217,7 @@ function StripSnipTile({
       {previewUrl ? (
         <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
       ) : (
-        <span data-empty="true">Preview unavailable</span>
+        <StripTileThumbnailPlaceholder aria-hidden="true" data-loading={thumbnailLoading ? "true" : "false"} />
       )}
       <StripTilePinButton
         aria-label={`Pin ${name} on screen`}
@@ -2221,7 +2320,6 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
   const [hasMore, setHasMore] = useState(true);
-  const [totalCount, setTotalCount] = useState(0);
   const [nativeDrag, setNativeDrag] = useState(null);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 0 });
   const railRef = useRef(null);
@@ -2309,7 +2407,6 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
           : null;
         hasMoreRef.current = nextHasMore;
         setHasMore(nextHasMore);
-        setTotalCount(Number(result?.totalCount || result?.total_count || 0) || 0);
         setError("");
       })
       .catch((nextError) => {
@@ -2512,8 +2609,16 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
         type: "slot",
       });
     }
+    if (loadingMore && hasMore) {
+      Array.from({ length: SNIPPING_STRIP_LOADING_MORE_PLACEHOLDER_COUNT }).forEach((_, index) => {
+        entries.push({
+          key: `loading-more-placeholder:${index}`,
+          type: "placeholder",
+        });
+      });
+    }
     return entries;
-  }, [items, nativeDrag]);
+  }, [hasMore, items, loadingMore, nativeDrag]);
 
   const virtualEntries = useMemo(() => {
     const total = renderEntries.length;
@@ -2541,6 +2646,11 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
       width: (total * STRIP_TILE_WIDTH_PX) + Math.max(0, total - 1) * STRIP_TILE_GAP_PX,
     };
   }, [renderEntries, viewport]);
+  const showInitialPlaceholders = loading && !items.length && !nativeDrag && !error;
+  const initialPlaceholderWidth = useMemo(() => {
+    const count = SNIPPING_STRIP_INITIAL_PLACEHOLDER_COUNT;
+    return (count * STRIP_TILE_WIDTH_PX) + Math.max(0, count - 1) * STRIP_TILE_GAP_PX;
+  }, []);
 
   return (
     <StripRail
@@ -2567,6 +2677,10 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
               >
                 {entry.type === "slot" ? (
                   <StripDropSlot data-docking={nativeDrag?.docking ? "true" : "false"} />
+                ) : entry.type === "placeholder" ? (
+                  <StripTile data-placeholder="true" data-thumbnail="loading">
+                    <StripTileThumbnailPlaceholder data-loading="true" />
+                  </StripTile>
                 ) : (
                   <StripSnipTile
                     item={entry.item}
@@ -2584,18 +2698,34 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
           })}
         </StripVirtualCanvas>
       ) : null}
-      {!items.length && !nativeDrag ? (
+      {showInitialPlaceholders ? (
+        <StripVirtualCanvas
+          aria-hidden="true"
+          style={{
+            width: `${initialPlaceholderWidth}px`,
+          }}
+        >
+          {Array.from({ length: SNIPPING_STRIP_INITIAL_PLACEHOLDER_COUNT }).map((_, index) => (
+            <StripVirtualItem
+              key={`initial-placeholder:${index}`}
+              style={{
+                transform: `translateX(${index * STRIP_TILE_STEP_PX}px)`,
+              }}
+            >
+              <StripTile data-placeholder="true" data-thumbnail="loading">
+                <StripTileThumbnailPlaceholder data-loading="true" />
+              </StripTile>
+            </StripVirtualItem>
+          ))}
+        </StripVirtualCanvas>
+      ) : null}
+      {!items.length && !nativeDrag && !showInitialPlaceholders ? (
         <StripRailStatus>
-          {loading ? "Loading..." : error || "No snips yet"}
+          {error || "No snips yet"}
         </StripRailStatus>
       ) : null}
       {items.length && error ? (
         <StripRailStatus data-floating="true">{error}</StripRailStatus>
-      ) : null}
-      {items.length && loadingMore && hasMore ? (
-        <StripRailStatus data-floating="true">
-          {totalCount > items.length ? `Loading ${Math.max(0, totalCount - items.length)} more...` : "Loading more..."}
-        </StripRailStatus>
       ) : null}
     </StripRail>
   );
@@ -2926,6 +3056,22 @@ const StripVirtualItem = styled.div`
   will-change: transform;
 `;
 
+const stripThumbnailPulse = keyframes`
+  0% {
+    opacity: 0.36;
+    transform: translateX(-28%);
+  }
+
+  50% {
+    opacity: 0.78;
+  }
+
+  100% {
+    opacity: 0.36;
+    transform: translateX(28%);
+  }
+`;
+
 const StripTile = styled.div`
   position: relative;
   flex: 0 0 120px;
@@ -2971,6 +3117,11 @@ const StripTile = styled.div`
     transform: scale(0.985);
   }
 
+  &[data-placeholder="true"] {
+    cursor: default;
+    pointer-events: none;
+  }
+
   img {
     position: absolute;
     inset: 0;
@@ -2984,18 +3135,6 @@ const StripTile = styled.div`
     -webkit-user-drag: none;
   }
 
-  > span[data-empty="true"] {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    place-items: center;
-    padding: 8px;
-    color: rgba(248, 250, 252, 0.58);
-    font-size: 10px;
-    font-weight: 700;
-    text-align: center;
-  }
-
   ${FloatStatusPill} {
     top: 6px;
     min-height: 21px;
@@ -3003,6 +3142,44 @@ const StripTile = styled.div`
     padding: 4px 8px 4px 6px;
     font-size: 10px;
     z-index: 5;
+  }
+`;
+
+const StripTileThumbnailPlaceholder = styled.div`
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 24% 28%, rgba(125, 176, 255, 0.2), transparent 26%),
+    linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 41, 59, 0.72));
+  pointer-events: none;
+
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 8px 10px;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 5px;
+    background:
+      linear-gradient(90deg, rgba(148, 163, 184, 0.08), rgba(226, 232, 240, 0.14), rgba(148, 163, 184, 0.08)),
+      rgba(8, 13, 21, 0.28);
+  }
+
+  &::after {
+    content: "";
+    position: absolute;
+    top: 11px;
+    bottom: 11px;
+    left: 8px;
+    width: 74%;
+    border-radius: 6px;
+    background: linear-gradient(90deg, transparent, rgba(226, 232, 240, 0.18), transparent);
+    opacity: 0.42;
+    transform: translateX(-28%);
+  }
+
+  &[data-loading="true"]::after {
+    animation: ${stripThumbnailPulse} 1050ms ease-in-out infinite;
   }
 `;
 

@@ -63,7 +63,7 @@ const SNIPPING_MACOS_KEY_3: i64 = 20;
 #[cfg(target_os = "macos")]
 const SNIPPING_MACOS_KEY_4: i64 = 21;
 #[cfg(target_os = "macos")]
-const SNIPPING_AREA_CURSOR_GUARD_POLL_MS: u64 = 40;
+const SNIPPING_AREA_REASSERT_DELAYS_MS: [u64; 6] = [0, 120, 280, 700, 1_600, 3_000];
 
 #[cfg(target_os = "macos")]
 static SNIPPING_MACOS_EVENT_TAP_STARTED: AtomicBool = AtomicBool::new(false);
@@ -3213,13 +3213,13 @@ fn ensure_snipping_overlay_window(
 
 /// Window style that lets the selection overlay appear over OTHER apps'
 /// fullscreen Spaces (a fullscreen Chrome window, for example) the way the
-/// system screenshot UI does. Two things are required beyond what tao sets:
-/// CanJoinAllSpaces alone does not join full-screen Spaces — the overlay
-/// needs FullScreenAuxiliary — and tao's always-on-top floating level (3) is
-/// not reliably above a fullscreen Space's window, so the overlay runs at
-/// screen-saver level for the duration of the snip. Applied on the AppKit
-/// main thread, and re-asserted on every snip start since both values are
-/// plain NSWindow state that other window calls may rewrite.
+/// system screenshot UI does. CanJoinAllSpaces alone does not join other apps'
+/// fullscreen Spaces: the overlay also needs CanJoinAllApplications and
+/// FullScreenAuxiliary. Tao's always-on-top floating level (3) is not reliably
+/// above a fullscreen Space's window, so the overlay runs at screen-saver level
+/// for the duration of the snip. Applied on the AppKit main thread, and
+/// re-asserted on every snip start since both values are plain NSWindow state
+/// that other window calls may rewrite.
 #[cfg(target_os = "macos")]
 fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow) {
     let window_for_main = window.clone();
@@ -3232,14 +3232,7 @@ fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow)
                 return;
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
-                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
-            );
-            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
-            snipping_force_area_crosshair_for_ns_window(ns_window);
+            snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
         });
     });
 }
@@ -3256,6 +3249,22 @@ fn snipping_restore_default_cursor_now() {
     snipping_catch_objc("restore_default_cursor", || {
         NSCursor::arrowCursor().set();
     });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window: &NSWindow) {
+    ns_window.setCollectionBehavior(
+        objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+            | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+            | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+            | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+            | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+    );
+    ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    ns_window.setAcceptsMouseMovedEvents(true);
+    if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+        snipping_force_area_crosshair_for_ns_window(ns_window);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3289,6 +3298,8 @@ fn snipping_force_area_crosshair_for_visible_overlays(app: &AppHandle) {
             if !ns_window.isVisible() {
                 continue;
             }
+            snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
+            ns_window.orderFrontRegardless();
             let frame = ns_window.frame();
             let inside = location.x >= frame.origin.x
                 && location.x < frame.origin.x + frame.size.width
@@ -3302,7 +3313,6 @@ fn snipping_force_area_crosshair_for_visible_overlays(app: &AppHandle) {
             }
             snipping_force_area_crosshair_for_ns_window(ns_window);
             forced_cursor_window = true;
-            break;
         }
 
         if !forced_cursor_window {
@@ -3317,20 +3327,14 @@ fn snipping_force_area_crosshair_for_visible_overlays(app: &AppHandle) {
                 if !ns_window.isVisible() {
                     continue;
                 }
+                snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
+                ns_window.orderFrontRegardless();
                 snipping_force_area_crosshair_for_ns_window(ns_window);
                 break;
             }
         }
 
         NSCursor::crosshairCursor().set();
-    });
-}
-
-#[cfg(target_os = "macos")]
-fn snipping_request_area_crosshair_reassertion(app: &AppHandle) {
-    let app_for_main = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        snipping_force_area_crosshair_for_visible_overlays(&app_for_main);
     });
 }
 
@@ -3650,38 +3654,40 @@ static SNIPPING_OVERLAY_MOUSE_MONITORS_STARTED: AtomicBool = AtomicBool::new(fal
 #[cfg(target_os = "macos")]
 static SNIPPING_AREA_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
-static SNIPPING_AREA_CURSOR_GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SNIPPING_AREA_REASSERT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// WebKit/AppKit can emit cursor updates after the overlay is shown, and a
-/// transparent non-activating panel does not always get a fresh mouse move
-/// immediately. While an area snip is ready, keep the native cursor pinned to
-/// the crosshair on the AppKit main thread.
+/// A Space swipe can finish before AppKit/WebKit are done restoring cursor
+/// ownership. Reassert from the event that changed the Space, then a few more
+/// one-shot ticks during the transition window. This is event-triggered, not a
+/// continuous cursor poll.
 #[cfg(target_os = "macos")]
-fn snipping_start_area_cursor_guard(app: &AppHandle) {
-    snipping_request_area_crosshair_reassertion(app);
-    if SNIPPING_AREA_CURSOR_GUARD_ACTIVE.swap(true, Ordering::AcqRel) {
+fn snipping_schedule_area_overlay_reassertions(app: &AppHandle, _reason: &'static str) {
+    if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
         return;
     }
 
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
-                SNIPPING_AREA_CURSOR_GUARD_ACTIVE.store(false, Ordering::Release);
-                if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire)
-                    || SNIPPING_AREA_CURSOR_GUARD_ACTIVE.swap(true, Ordering::AcqRel)
-                {
-                    return;
-                }
-            }
+    let generation = SNIPPING_AREA_REASSERT_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
 
+    for delay_ms in SNIPPING_AREA_REASSERT_DELAYS_MS {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                return;
+            }
+            if SNIPPING_AREA_REASSERT_GENERATION.load(Ordering::Acquire) != generation {
+                return;
+            }
             let app_for_main = app.clone();
             let _ = app.run_on_main_thread(move || {
                 snipping_force_area_crosshair_for_visible_overlays(&app_for_main);
             });
-            sleep(Duration::from_millis(SNIPPING_AREA_CURSOR_GUARD_POLL_MS)).await;
-        }
-    });
+        });
+    }
 }
 
 /// AppKit routes mouseMoved events to the key window only, so with one
@@ -3979,7 +3985,6 @@ fn snipping_begin_area_snip_for(
     #[cfg(target_os = "macos")]
     {
         SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
-        snipping_start_area_cursor_guard(app);
     }
 
     // Overlay windows left over from a display that disappeared since the
@@ -4061,7 +4066,10 @@ fn snipping_begin_area_snip_for(
     }
     snipping_register_escape_cancel(app);
     #[cfg(target_os = "macos")]
-    register_snipping_overlay_mouse_monitors(app);
+    {
+        register_snipping_overlay_mouse_monitors(app);
+        snipping_schedule_area_overlay_reassertions(app, "begin_area");
+    }
 
     // The frozen-frame JPEGs are only visual backdrops; write them off the
     // hot path so the selection overlays appear instantly, then announce
@@ -4230,6 +4238,7 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
                                 }),
                             );
                             snipping_refreeze_area_snapshot_for_space_change(&app);
+                            snipping_schedule_area_overlay_reassertions(&app, "macos_space");
                             snipping_reflow_preview_stack_for_space_change(&app);
                         }
                     });
@@ -4277,7 +4286,10 @@ fn snipping_cancel_area_snip_for(app: &AppHandle) -> Result<Value, String> {
 
 fn snipping_hide_area_overlay(app: &AppHandle) {
     #[cfg(target_os = "macos")]
-    SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
+    {
+        SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
+        SNIPPING_AREA_REASSERT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
     snipping_unregister_escape_cancel(app);
     for (_, window) in snipping_overlay_windows(app) {
         #[cfg(target_os = "macos")]

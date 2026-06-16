@@ -232,6 +232,107 @@ fn desktop_auth_device_limit_from_snapshot(snapshot: &Value, plan_name: &str) ->
         .unwrap_or_else(|| cloud_mcp_device_limit_for_plan(plan_name))
 }
 
+fn desktop_auth_credit_snapshot_has_meaningful_data(credits: &Value) -> bool {
+    if !credits.is_object() {
+        return false;
+    }
+    if credits.get("known").and_then(Value::as_bool) == Some(true)
+        || credits.get("live").and_then(Value::as_bool) == Some(true)
+        || desktop_auth_text(credits, &["planName"]).is_some()
+        || desktop_auth_text(credits, &["plan_name"]).is_some()
+        || desktop_auth_text(credits, &["term", "planName"]).is_some()
+        || desktop_auth_text(credits, &["term", "plan_name"]).is_some()
+        || desktop_auth_text(credits, &["term", "id"]).is_some()
+    {
+        return true;
+    }
+    [
+        &["termTotalCredits"][..],
+        &["term_total_credits"][..],
+        &["termRemainingCredits"][..],
+        &["term_remaining_credits"][..],
+        &["termReservedCredits"][..],
+        &["term_reserved_credits"][..],
+        &["termUsedCredits"][..],
+        &["term_used_credits"][..],
+        &["total", "totalCredits"][..],
+        &["total", "total_credits"][..],
+        &["total", "remainingCredits"][..],
+        &["total", "remaining_credits"][..],
+        &["total", "reservedCredits"][..],
+        &["total", "reserved_credits"][..],
+        &["total", "usedCredits"][..],
+        &["total", "used_credits"][..],
+    ]
+    .iter()
+    .any(|path| desktop_auth_u64(credits, path).is_some())
+}
+
+fn desktop_auth_billing_status_has_meaningful_data(billing_status: &Value) -> bool {
+    if !billing_status.is_object() {
+        return false;
+    }
+    desktop_auth_text(billing_status, &["planName"]).is_some()
+        || desktop_auth_text(billing_status, &["plan_name"]).is_some()
+        || desktop_auth_text(billing_status, &["planStatus"]).is_some()
+        || desktop_auth_text(billing_status, &["plan_status"]).is_some()
+        || desktop_auth_credit_snapshot_has_meaningful_data(
+            billing_status.get("credits").unwrap_or(&Value::Null),
+        )
+        || desktop_auth_credit_snapshot_has_meaningful_data(
+            billing_status
+                .get("user")
+                .and_then(|user| user.get("credits"))
+                .unwrap_or(&Value::Null),
+        )
+}
+
+fn desktop_auth_merge_billing_status(previous: &Value, incoming: Value) -> Value {
+    if !desktop_auth_billing_status_has_meaningful_data(&incoming) {
+        return previous.clone();
+    }
+    let Some(incoming_object) = incoming.as_object() else {
+        return previous.clone();
+    };
+    let mut merged = previous
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    for (key, value) in incoming_object {
+        merged.insert(key.clone(), value.clone());
+    }
+    let incoming_credits = incoming
+        .get("credits")
+        .filter(|credits| desktop_auth_credit_snapshot_has_meaningful_data(credits))
+        .or_else(|| {
+            incoming
+                .get("user")
+                .and_then(|user| user.get("credits"))
+                .filter(|credits| desktop_auth_credit_snapshot_has_meaningful_data(credits))
+        });
+    if let Some(incoming_credits) = incoming_credits {
+        let mut credits = previous
+            .get("credits")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        if let Some(incoming_credits_object) = incoming_credits.as_object() {
+            for (key, value) in incoming_credits_object {
+                credits.insert(key.clone(), value.clone());
+            }
+        }
+        merged.insert("credits".to_string(), Value::Object(credits.clone()));
+        if let Some(user) = merged.get_mut("user").and_then(Value::as_object_mut) {
+            user.insert("credits".to_string(), Value::Object(credits));
+        }
+    } else if let Some(previous_credits) = previous.get("credits") {
+        if desktop_auth_credit_snapshot_has_meaningful_data(previous_credits) {
+            merged.insert("credits".to_string(), previous_credits.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
 fn desktop_auth_entitlements(snapshot: &Value) -> Value {
     let user = snapshot.get("user");
     let plan_status = desktop_auth_user_plan_status(user);
@@ -899,10 +1000,14 @@ async fn desktop_auth_apply_billing_status(
     billing_status: Value,
 ) -> Result<Value, String> {
     let mut snapshot = desktop_auth_snapshot(&app);
-    if snapshot.get("billingStatus") == Some(&billing_status) {
+    let next_billing_status = desktop_auth_merge_billing_status(
+        snapshot.get("billingStatus").unwrap_or(&Value::Null),
+        billing_status,
+    );
+    if snapshot.get("billingStatus") == Some(&next_billing_status) {
         return Ok(desktop_auth_public_snapshot(&snapshot));
     }
-    snapshot["billingStatus"] = billing_status;
+    snapshot["billingStatus"] = next_billing_status;
     let snapshot = desktop_auth_persist_snapshot(&app, snapshot)?;
     desktop_auth_sync_cloud_state_background(&app, cloud_mcp_state.inner(), &snapshot);
     Ok(desktop_auth_public_snapshot(&snapshot))

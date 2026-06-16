@@ -816,8 +816,54 @@ function liveCreditText(value, fallback = "") {
   return text || fallback;
 }
 
+function liveCreditObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function liveCreditHasValue(value, keys = []) {
+  const object = liveCreditObject(value);
+  if (!object) return false;
+  return keys.some((key) => object[key] != null && object[key] !== "");
+}
+
+function liveCreditHasMeaningfulSnapshot(credits) {
+  const object = liveCreditObject(credits);
+  if (!object) return false;
+  const term = liveCreditObject(object.term);
+  const total = liveCreditObject(object.total) || liveCreditObject(object.totalCredits);
+  return Boolean(
+    object.known === true
+      || object.live === true
+      || liveCreditText(object.planName || object.plan_name)
+      || liveCreditText(term?.plan_name || term?.planName || term?.id)
+      || liveCreditHasValue(object, [
+        "termTotalCredits",
+        "term_total_credits",
+        "termRemainingCredits",
+        "term_remaining_credits",
+        "termReservedCredits",
+        "term_reserved_credits",
+        "termUsedCredits",
+        "term_used_credits",
+      ])
+      || liveCreditHasValue(total, [
+        "total_credits",
+        "totalCredits",
+        "remaining_credits",
+        "remainingCredits",
+        "reserved_credits",
+        "reservedCredits",
+        "used_credits",
+        "usedCredits",
+      ])
+  );
+}
+
 function normalizeLiveCreditWallet(wallet, previous = {}) {
   const credits = wallet?.credits || wallet?.wallet || wallet || {};
+  if (!liveCreditHasMeaningfulSnapshot(credits)) {
+    return previous && liveCreditHasMeaningfulSnapshot(previous) ? previous : null;
+  }
   const total = credits.total || credits.totalCredits || {};
   const term = credits.term || {};
   const termEnd = liveCreditText(term.term_end || term.termEnd, previous.resetAt || "");
@@ -846,6 +892,48 @@ function normalizeLiveCreditWallet(wallet, previous = {}) {
     eventCount: liveCreditNumber(total.event_count ?? total.eventCount, previous?.eventCount || 0),
     updatedAt: liveCreditText(credits.updated_at || credits.updatedAt, new Date().toISOString()),
   };
+}
+
+function billingStatusHasMeaningfulData(status) {
+  const object = liveCreditObject(status);
+  if (!object) return false;
+  return Boolean(
+    liveCreditText(object.planName || object.plan_name)
+      || liveCreditText(object.planStatus || object.plan_status)
+      || liveCreditHasMeaningfulSnapshot(object.credits)
+      || liveCreditHasMeaningfulSnapshot(object.user?.credits)
+  );
+}
+
+function mergeBillingStatusSnapshot(previous, incoming) {
+  if (!billingStatusHasMeaningfulData(incoming)) {
+    return previous || null;
+  }
+  const previousCredits = previous?.credits;
+  const incomingCredits = liveCreditHasMeaningfulSnapshot(incoming?.credits)
+    ? incoming.credits
+    : liveCreditHasMeaningfulSnapshot(incoming?.user?.credits)
+      ? incoming.user.credits
+      : null;
+  const next = {
+    ...(previous || {}),
+    ...(incoming || {}),
+  };
+  if (incomingCredits) {
+    next.credits = {
+      ...(previousCredits && liveCreditHasMeaningfulSnapshot(previousCredits) ? previousCredits : {}),
+      ...incomingCredits,
+    };
+  } else if (previousCredits && liveCreditHasMeaningfulSnapshot(previousCredits)) {
+    next.credits = previousCredits;
+  }
+  if (next.user && typeof next.user === "object" && !Array.isArray(next.user)) {
+    next.user = {
+      ...next.user,
+      credits: next.credits || next.user.credits,
+    };
+  }
+  return next;
 }
 
 function lowCreditWarningKey(credits) {
@@ -1152,6 +1240,7 @@ const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
+const CLOUD_MCP_ACCOUNT_USAGE_EVENT = "cloud-mcp-account-usage";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
@@ -3297,10 +3386,36 @@ function cloudStorageUsageFromRuntimeStatus(status) {
     || status?.storage_usage
     || liveRuntime?.storageUsage
     || liveRuntime?.storage_usage
-    || liveRuntime?.tokenomics?.storageUsage
-    || liveRuntime?.tokenomics?.storage_usage
     || null;
   return storageUsage && typeof storageUsage === "object" ? storageUsage : null;
+}
+
+function cloudAccountUsageSnapshotFromEventPayload(payload) {
+  const envelope = payload && typeof payload === "object" ? payload : {};
+  const direct = envelope.accountUsage
+    || envelope.account_usage
+    || envelope.data
+    || (String(envelope.kind || envelope.event_kind || envelope.eventKind || "") === "account_usage_snapshot"
+      ? envelope.payload
+      : null)
+    || envelope;
+  const snapshot = direct && typeof direct === "object" ? direct : {};
+  const nestedPayload = snapshot.payload && typeof snapshot.payload === "object" ? snapshot.payload : {};
+  const credits = snapshot.credits
+    || snapshot.wallet
+    || nestedPayload.credits
+    || nestedPayload.wallet
+    || null;
+  const storageUsage = snapshot.storageUsage
+    || snapshot.storage_usage
+    || nestedPayload.storageUsage
+    || nestedPayload.storage_usage
+    || null;
+  return {
+    snapshot,
+    credits: credits && typeof credits === "object" ? credits : null,
+    storageUsage: storageUsage && typeof storageUsage === "object" ? storageUsage : null,
+  };
 }
 
 function sanitizeWorkspaceMcpServerForCloud(server) {
@@ -11949,14 +12064,22 @@ export default function App() {
 
     try {
       const nextBillingStatus = await invoke("cloud_mcp_get_billing_status");
-      await authStore.applyBillingStatus(nextBillingStatus).catch(() => {});
-      setBillingStatus(nextBillingStatus);
+      const mergedBillingStatus = mergeBillingStatusSnapshot(
+        billingStatusRef.current,
+        nextBillingStatus,
+      );
+      if (mergedBillingStatus) {
+        await authStore.applyBillingStatus(mergedBillingStatus).catch(() => {});
+        setBillingStatus(mergedBillingStatus);
+      }
       setBillingStatusState("ready");
       setBillingStatusError("");
-      return nextBillingStatus;
+      return mergedBillingStatus;
     } catch (error) {
       const message = getErrorMessage(error, "Unable to load credit status.");
-      setBillingStatusState("error");
+      setBillingStatusState((current) => (
+        billingStatusRef.current ? "ready" : current === "ready" ? "ready" : "error"
+      ));
       setBillingStatusError(message);
       return null;
     }
@@ -19677,6 +19800,7 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     let unlistenAccountLiveState = null;
+    let unlistenAccountUsage = null;
     let unlistenWorkspaceTodos = null;
     let workspaceTodoRefreshTimer = 0;
 
@@ -19729,6 +19853,38 @@ export default function App() {
       unlistenAccountLiveState = unlisten;
     }).catch(() => {});
 
+    listen(CLOUD_MCP_ACCOUNT_USAGE_EVENT, (event) => {
+      if (cancelled) {
+        return;
+      }
+      const { snapshot, credits, storageUsage } = cloudAccountUsageSnapshotFromEventPayload(event?.payload);
+      if (storageUsage) {
+        setCloudWorkspaceProgress((current) => ({
+          ...current,
+          storageUsage,
+          updatedAt: Date.now(),
+        }));
+      }
+      const normalizedCredits = normalizeLiveCreditWallet(credits || snapshot?.credits, billingStatusRef.current?.credits);
+      if (normalizedCredits) {
+        setBillingStatus((current) => mergeBillingStatusSnapshot(current, {
+          credits: normalizedCredits,
+          planName: normalizedCredits.planName || snapshot?.planName || snapshot?.plan_name || current?.planName || current?.plan_name,
+          plan_name: normalizedCredits.planName || snapshot?.plan_name || snapshot?.planName || current?.plan_name || current?.planName,
+          planStatus: current?.planStatus || current?.plan_status || "paid",
+          plan_status: current?.plan_status || current?.planStatus || "paid",
+        }));
+        setBillingStatusState("ready");
+        setBillingStatusError("");
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenAccountUsage = unlisten;
+    }).catch(() => {});
+
     listen(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, () => {
       refreshCloudWorkspaceTodos();
     }).then((unlisten) => {
@@ -19747,6 +19903,9 @@ export default function App() {
       }
       if (unlistenAccountLiveState) {
         unlistenAccountLiveState();
+      }
+      if (unlistenAccountUsage) {
+        unlistenAccountUsage();
       }
       if (unlistenWorkspaceTodos) {
         unlistenWorkspaceTodos();
@@ -21081,9 +21240,16 @@ export default function App() {
           const event = creditEvent?.payload || {};
           const payload = event.payload && typeof event.payload === "object" ? event.payload : event;
           const wallet = payload.credits || payload.wallet || payload;
-          setBillingStatus((current) => ({
-            ...(current || {}),
-            credits: normalizeLiveCreditWallet(wallet, current?.credits),
+          const normalizedCredits = normalizeLiveCreditWallet(wallet, billingStatusRef.current?.credits);
+          if (!normalizedCredits) {
+            return;
+          }
+          setBillingStatus((current) => mergeBillingStatusSnapshot(current, {
+            credits: normalizedCredits,
+            planName: normalizedCredits.planName || current?.planName || current?.plan_name,
+            plan_name: normalizedCredits.planName || current?.plan_name || current?.planName,
+            planStatus: current?.planStatus || current?.plan_status || "paid",
+            plan_status: current?.plan_status || current?.planStatus || "paid",
           }));
           setBillingStatusState("ready");
           setBillingStatusError("");
