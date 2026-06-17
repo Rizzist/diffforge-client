@@ -3245,10 +3245,4 @@ const OverlayGlobalStyle = createGlobalStyle`
     -webkit-user-drag: none;
   }
 
-  html:not([data-forge-continuous-motion="true"]) *,
-  html:not([data-forge-continuous-motion="true"]) *::before,
-  html:not([data-forge-continuous-motion="true"]) *::after {
-    animation: none !important;
-    transition-duration: 0.001ms !important;
-  }
 `;

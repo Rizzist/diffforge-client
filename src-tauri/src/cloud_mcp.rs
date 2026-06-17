@@ -16382,11 +16382,9 @@ async fn cloud_mcp_send_device_heartbeat_async(
         "deviceType": cloud_mcp_payload_text(device_profile, &["device_type", "deviceType"]),
         "status": status,
     });
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
-        .build()
-        .map_err(|error| format!("Unable to create device heartbeat client: {error}"))?
+    let response = shared_async_http_client()
         .post(url)
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .header("Authorization", format!("Bearer {bearer}"))
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
@@ -16504,11 +16502,9 @@ async fn cloud_mcp_fetch_direct_route_async(
         "waitForReady": false,
         "waitMs": 0,
     });
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
-        .build()
-        .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
+    let response = shared_async_http_client()
         .post(url)
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .header("Authorization", format!("Bearer {bearer}"))
         .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
@@ -42952,11 +42948,9 @@ fn cloud_mcp_fetch_direct_route_blocking(
         "waitForReady": true,
         "waitMs": 8_000,
     });
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
-        .build()
-        .map_err(|error| format!("Unable to create Cloud MCP route client: {error}"))?
+    let response = shared_blocking_http_client()
         .post(url)
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .header("Authorization", format!("Bearer {bearer}"))
         .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)

@@ -3560,7 +3560,7 @@ const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
 #[cfg(target_os = "macos")]
-const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 3] = [0, 350, 1_200];
+const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 6] = [0, 150, 350, 800, 1_600, 3_000];
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS: u64 = 500;
 #[cfg(target_os = "macos")]
@@ -3772,10 +3772,6 @@ fn log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
     target_screen: Option<&objc2_app_kit::NSScreen>,
     extra: Value,
 ) {
-    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
-        return;
-    }
-
     let fields =
         audio_widget_bottom_bar_debug_context_on_main_thread(app, ns_window, target_screen, extra);
     log_audio_widget_bottom_bar_debug_event(phase, fields);
@@ -4372,7 +4368,6 @@ fn audio_widget_reassert_open_state(app: &AppHandle, animate_bottom_bar: bool) -
 
 #[cfg(target_os = "macos")]
 fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
-    audio_widget_clear_bottom_bar_position_result();
     let generation = AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
@@ -4945,19 +4940,11 @@ impl AudioWidgetBottomBarLayout {
 
 static AUDIO_WIDGET_BOTTOM_BAR_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetBottomBarLayout>>> =
     OnceLock::new();
-static AUDIO_WIDGET_BOTTOM_BAR_POSITION_RESULT: OnceLock<
-    StdMutex<Option<AudioWidgetBottomBarPositionResult>>,
-> = OnceLock::new();
 static AUDIO_WIDGET_ERROR_OVERLAY_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetErrorOverlayLayout>>> =
     OnceLock::new();
 
 fn audio_widget_bottom_bar_layout_slot() -> &'static StdMutex<Option<AudioWidgetBottomBarLayout>> {
     AUDIO_WIDGET_BOTTOM_BAR_LAYOUT.get_or_init(|| StdMutex::new(None))
-}
-
-fn audio_widget_bottom_bar_position_result_slot(
-) -> &'static StdMutex<Option<AudioWidgetBottomBarPositionResult>> {
-    AUDIO_WIDGET_BOTTOM_BAR_POSITION_RESULT.get_or_init(|| StdMutex::new(None))
 }
 
 fn audio_widget_error_overlay_layout_slot(
@@ -4978,18 +4965,6 @@ fn audio_widget_store_bottom_bar_layout(request: &AudioWidgetBottomBarPositionRe
             "animate": request.animate,
         }),
     );
-}
-
-fn audio_widget_store_bottom_bar_position_result(result: &AudioWidgetBottomBarPositionResult) {
-    if let Ok(mut current) = audio_widget_bottom_bar_position_result_slot().lock() {
-        *current = Some(result.clone());
-    }
-}
-
-fn audio_widget_clear_bottom_bar_position_result() {
-    if let Ok(mut current) = audio_widget_bottom_bar_position_result_slot().lock() {
-        *current = None;
-    }
 }
 
 fn audio_widget_store_error_overlay_layout(request: &AudioWidgetErrorOverlayRequest) {
@@ -5027,7 +5002,6 @@ fn audio_widget_clear_bottom_bar_position_request() {
     if let Ok(mut current) = audio_widget_bottom_bar_layout_slot().lock() {
         *current = None;
     }
-    audio_widget_clear_bottom_bar_position_result();
     log_audio_widget_bottom_bar_debug_event("audio.widget.bottom_bar.layout.clear", json!({}));
 }
 
@@ -5038,30 +5012,7 @@ fn audio_widget_last_bottom_bar_layout() -> Option<AudioWidgetBottomBarLayout> {
         .and_then(|current| current.clone())
 }
 
-fn audio_widget_bottom_bar_layout_matches_request(
-    layout: &AudioWidgetBottomBarLayout,
-    request: &AudioWidgetBottomBarPositionRequest,
-) -> bool {
-    const LAYOUT_EPSILON: f64 = 0.5;
-    (layout.width - request.width).abs() <= LAYOUT_EPSILON
-        && (layout.height - request.height).abs() <= LAYOUT_EPSILON
-        && (layout.margin - request.margin).abs() <= LAYOUT_EPSILON
-}
-
-fn audio_widget_cached_bottom_bar_position_result_for(
-    request: &AudioWidgetBottomBarPositionRequest,
-) -> Option<AudioWidgetBottomBarPositionResult> {
-    let layout = audio_widget_last_bottom_bar_layout()?;
-    if !audio_widget_bottom_bar_layout_matches_request(&layout, request) {
-        return None;
-    }
-    audio_widget_bottom_bar_position_result_slot()
-        .lock()
-        .ok()
-        .and_then(|current| current.clone())
-}
-
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioWidgetBottomBarPositionResult {
     x: f64,
@@ -6136,7 +6087,6 @@ fn audio_widget_position_bottom_bar_on_main_thread(
         );
 
         audio_widget_store_bottom_bar_layout(&request);
-        audio_widget_store_bottom_bar_position_result(&result);
         Ok(result)
     })
 }
@@ -6147,21 +6097,6 @@ fn audio_widget_position_bottom_bar_for(
     request: AudioWidgetBottomBarPositionRequest,
 ) -> Result<AudioWidgetBottomBarPositionResult, String> {
     let reposition_error_overlay = request.animate;
-    if let Some(cached) = audio_widget_cached_bottom_bar_position_result_for(&request) {
-        log_audio_widget_bottom_bar_debug_event(
-            "audio.widget.bottom_bar.position.cached",
-            json!({
-                "width": request.width,
-                "height": request.height,
-                "margin": request.margin,
-                "animate": request.animate,
-            }),
-        );
-        if reposition_error_overlay {
-            audio_widget_reposition_error_overlay_for(app, false);
-        }
-        return Ok(cached);
-    }
     log_audio_widget_bottom_bar_debug_snapshot_for(
         app,
         "audio.widget.bottom_bar.position.command",
@@ -6247,7 +6182,6 @@ fn audio_widget_position_bottom_bar_for(
         source: "tauri-work-area".to_string(),
         use_full_monitor_bounds: false,
     };
-    audio_widget_store_bottom_bar_position_result(&result);
     audio_widget_reposition_error_overlay_for(app, reposition_error_overlay);
     Ok(result)
 }

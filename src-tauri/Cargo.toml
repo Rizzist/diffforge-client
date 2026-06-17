@@ -67,3 +67,15 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 [patch.crates-io]
 cidre = { path = "vendor/cidre" }
 portable-pty = { path = "vendor/portable-pty" }
+
+# Production build is tuned for runtime energy: thin LTO inlines across crate
+# boundaries (hot paths here are serde_json IPC (de)serialization and rusqlite
+# queries), and stripping shrinks the binary. panic stays "unwind" on purpose:
+# objc2's "exception" feature and our main-thread catch_unwind boundary require
+# unwinding — "abort" would turn caught NSExceptions into hard process aborts
+# (see the objc2 dependency note above).
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "unwind"

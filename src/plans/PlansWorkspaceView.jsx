@@ -644,17 +644,21 @@ const stepSpinnerSpin = keyframes`
   }
 `;
 
+// Reuse one formatter so the 15s todo-history refresh doesn't rebuild an ICU
+// formatter (udat_open) per item on every re-render.
+const TIMESTAMP_LABEL_FORMATTER = new Intl.DateTimeFormat([], {
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  month: "short",
+});
+
 function timestampLabel(value) {
   const date = new Date(value || "");
   if (Number.isNaN(date.getTime())) {
     return "";
   }
-  return date.toLocaleString([], {
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "short",
-  });
+  return TIMESTAMP_LABEL_FORMATTER.format(date);
 }
 
 export default function PlansWorkspaceView({

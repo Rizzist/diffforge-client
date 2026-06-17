@@ -10604,12 +10604,9 @@ fn tokenomics_codex_live_usage(
 }
 
 fn tokenomics_fetch_codex_live_usage(access_token: &str) -> Option<Value> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .ok()?;
-    let response = client
+    let response = shared_blocking_http_client()
         .get(TOKENOMICS_CODEX_USAGE_URL)
+        .timeout(Duration::from_secs(8))
         .bearer_auth(access_token)
         .header("User-Agent", "DiffForge/0.1 tokenomics")
         .send()
@@ -10728,12 +10725,9 @@ fn tokenomics_claude_live_usage_with_token(
 }
 
 fn tokenomics_fetch_claude_live_usage(access_token: &str) -> Option<Value> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .ok()?;
-    let response = client
+    let response = shared_blocking_http_client()
         .get(TOKENOMICS_CLAUDE_USAGE_URL)
+        .timeout(Duration::from_secs(8))
         .bearer_auth(access_token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", tokenomics_claude_code_user_agent())

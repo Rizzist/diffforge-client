@@ -561,10 +561,13 @@ async fn collect_developer_process_snapshot(
             .system
             .lock()
             .map_err(|_| "Process monitor state is unavailable.".to_string())?;
+        // Phase 1: a cheap, tree-only enumeration (no per-process CPU/memory
+        // syscalls) so we can build the parent/child maps and figure out which
+        // processes actually matter.
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            developer_process_refresh_kind(include_diagnostics),
+            ProcessRefreshKind::nothing().without_tasks(),
         );
 
         let parent_map = developer_parent_map(&system);
@@ -578,6 +581,30 @@ async fn collect_developer_process_snapshot(
             .iter()
             .map(|root| (root.root_pid, root))
             .collect::<HashMap<_, _>>();
+
+        // Phase 2: per-process CPU/memory sampling is the expensive part on
+        // macOS (a syscall per process), so restrict it to the processes we
+        // actually report — the terminal process trees — instead of every
+        // process on the machine. The legacy deep scan still samples all.
+        let detail_pids: Vec<SysPid> = if include_diagnostics {
+            system.processes().keys().copied().collect()
+        } else {
+            let mut pids: HashSet<u32> = HashSet::new();
+            for root in &terminal_roots {
+                for descendant in developer_process_tree_child_first(root.root_pid, &child_map) {
+                    pids.insert(descendant);
+                }
+            }
+            pids.into_iter().map(SysPid::from_u32).collect()
+        };
+        if !detail_pids.is_empty() {
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&detail_pids),
+                false,
+                developer_process_refresh_kind(include_diagnostics),
+            );
+        }
+
         let mut energy = DeveloperEnergyBuildContext::new(sampled_at_ms);
         let mut processes = Vec::new();
 
@@ -586,6 +613,12 @@ async fn collect_developer_process_snapshot(
             let parent_pid = process.parent().map(|value| value.as_u32());
             let terminal_link =
                 developer_terminal_link_for_process(pid_u32, &terminal_roots_by_pid, &parent_map);
+            // Terminal activity only reports terminal-owned processes; skip the
+            // rest so we never build entries (or sample detail) for every
+            // process on the system. The deep scan still reports everything.
+            if !include_diagnostics && terminal_link.is_none() {
+                continue;
+            }
             let name = clean_process_text(&process.name().to_string_lossy());
             let command = if include_diagnostics {
                 process_command_text(process.cmd())

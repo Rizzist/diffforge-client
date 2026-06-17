@@ -327,8 +327,19 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
 
     onReady(false);
 
+    // Cap the flame to ~30fps. The fragment shader is expensive, and on
+    // ProMotion/120Hz displays an uncapped rAF loop renders 2-4x more frames
+    // than a soft organic flame needs, which dominates GPU energy. Motion
+    // stays correct because the time uniform uses real elapsed time, not
+    // frame count.
+    const TARGET_FPS = 30;
+    const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
     let frame = 0;
+    let frameTimer = 0;
+    let isIntersecting = true;
+    let windowFocused = typeof document.hasFocus === "function" ? document.hasFocus() : true;
     let resizeObserver = null;
+    let intersectionObserver = null;
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     const gl = canvas.getContext("webgl", {
       alpha: true,
@@ -421,6 +432,7 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       }
 
       function render(now) {
+        frame = 0;
         applyResize();
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
@@ -444,26 +456,49 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
           onReady(true);
         }
 
-        if (!reduceMotion && document.visibilityState !== "hidden") {
-          frame = window.requestAnimationFrame(render);
-        } else {
-          frame = 0;
+        scheduleNext();
+      }
+
+      // Only paint when the flame can actually be seen: reduced-motion off,
+      // page visible, window focused, and the canvas intersecting the
+      // viewport. This keeps the animation faithful while never burning the
+      // GPU on a flame nobody is looking at.
+      function shouldRender() {
+        return (
+          !reduceMotion
+          && document.visibilityState !== "hidden"
+          && isIntersecting
+        );
+      }
+
+      // Throttle the loop to TARGET_FPS via setTimeout -> rAF so the CPU
+      // actually sleeps between frames instead of waking on every vsync.
+      function scheduleNext() {
+        if (frame || frameTimer || !shouldRender()) {
+          return;
         }
+        frameTimer = window.setTimeout(() => {
+          frameTimer = 0;
+          frame = window.requestAnimationFrame(render);
+        }, FRAME_INTERVAL_MS);
       }
 
       function startRendering() {
-        if (reduceMotion || frame || document.visibilityState === "hidden") {
+        if (frame || frameTimer || !shouldRender()) {
           return;
         }
         frame = window.requestAnimationFrame(render);
       }
 
       function stopRendering() {
-        if (!frame) {
-          return;
+        if (frame) {
+          window.cancelAnimationFrame(frame);
+          frame = 0;
         }
-        window.cancelAnimationFrame(frame);
-        frame = 0;
+        if (frameTimer) {
+          window.clearTimeout(frameTimer);
+          frameTimer = 0;
+        }
       }
 
       function handleVisibilityChange() {
@@ -474,6 +509,18 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
         } else {
           render(performance.now());
         }
+      }
+
+      function handleWindowFocus() {
+        windowFocused = true;
+        if (reportedReady) {
+          startRendering();
+        }
+      }
+
+      function handleWindowBlur() {
+        windowFocused = false;
+        stopRendering();
       }
 
       if (typeof ResizeObserver !== "undefined") {
@@ -489,6 +536,24 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       } else {
         window.addEventListener("resize", measure);
       }
+      if (typeof IntersectionObserver !== "undefined") {
+        intersectionObserver = new IntersectionObserver((entries) => {
+          const entry = entries[entries.length - 1];
+          const nextVisible = entry ? entry.isIntersecting : true;
+          if (nextVisible === isIntersecting) {
+            return;
+          }
+          isIntersecting = nextVisible;
+          if (!isIntersecting) {
+            stopRendering();
+          } else if (reportedReady) {
+            startRendering();
+          }
+        });
+        intersectionObserver.observe(canvas);
+      }
+      window.addEventListener("focus", handleWindowFocus);
+      window.addEventListener("blur", handleWindowBlur);
       document.addEventListener("visibilitychange", handleVisibilityChange);
       measure();
 
@@ -499,6 +564,11 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       return () => {
         stopRendering();
         document.removeEventListener("visibilitychange", handleVisibilityChange);
+        window.removeEventListener("focus", handleWindowFocus);
+        window.removeEventListener("blur", handleWindowBlur);
+        if (intersectionObserver) {
+          intersectionObserver.disconnect();
+        }
         if (resizeObserver) {
           resizeObserver.disconnect();
         } else {
@@ -726,6 +796,8 @@ const FlameFallback = styled.div`
 
   &[data-ready="true"] {
     opacity: 0.08;
+    /* The WebGL flame is up; stop compositing the fallback flicker forever. */
+    animation: none;
   }
 `;
 

@@ -1,9 +1,55 @@
+// Building a reqwest client reloads the entire macOS root-certificate store via
+// securityd (SecTrustSettingsCopyCertificates) — an expensive keychain
+// enumeration. Periodic callers (device heartbeat, polling) used to rebuild a
+// client per request, which pegged a CPU core every cycle. These helpers build
+// each client once and reuse it; reqwest clients are cheap to clone (Arc) and
+// share the loaded trust store plus the connection pool.
+fn shared_async_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("Diff Forge AI Desktop/0.1.0")
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
+fn shared_blocking_http_client() -> reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .user_agent("Diff Forge AI Desktop/0.1.0")
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        })
+        .clone()
+}
+
 fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    // Cache one client per distinct timeout so the trust store is loaded once
+    // per timeout value instead of on every call. Timeouts come from a small,
+    // fixed set of constants, so the cache stays tiny.
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, reqwest::Client>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = timeout.as_millis() as u64;
+    if let Ok(map) = cache.lock() {
+        if let Some(client) = map.get(&key) {
+            return Ok(client.clone());
+        }
+    }
+    let client = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent("Diff Forge AI Desktop/0.1.0")
         .build()
-        .map_err(|error| format!("Unable to prepare backend request: {error}"))
+        .map_err(|error| format!("Unable to prepare backend request: {error}"))?;
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, client.clone());
+    }
+    Ok(client)
 }
 
 fn non_json_api_response_message(

@@ -539,7 +539,6 @@ import {
   ButtonTerminalIcon,
   ButtonKeyIcon,
   ButtonMicIcon,
-  ButtonProcessIcon,
   ButtonSnippingIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
@@ -612,7 +611,6 @@ import SnippingQuickAccess, {
   SNIPPING_STRIP_HASH,
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
-import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 
 const BRAND_NAME = "Diff Forge AI";
@@ -653,7 +651,7 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
-const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "processes", "snipping", "audio", "tokenomics", "settings"]);
+const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps"]);
 const REMOTE_NAVIGATION_COMMANDS = new Set([
   "workspace_select",
@@ -713,9 +711,6 @@ function normalizeAccountAppViewId(value) {
   }
   if (normalized === "asset") {
     return "assets";
-  }
-  if (normalized === "process") {
-    return "processes";
   }
   if (normalized === "snippet" || normalized === "snippets" || normalized === "voice_snippets") {
     return "audio";
@@ -15572,7 +15567,15 @@ export default function App() {
     };
 
     refresh(false);
-    refreshTimer = window.setInterval(() => refresh(true), 1000);
+    // Skip the 1s poll while the window is hidden/backgrounded — the
+    // cloud-mcp-sync-status listener below still refreshes on real changes,
+    // so there's nothing to gain from polling diagnostics nobody can see.
+    refreshTimer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      refresh(true);
+    }, 1000);
 
     listen("cloud-mcp-sync-status", () => refresh(true)).then((unlisten) => {
       if (cancelled) {
@@ -26445,17 +26448,6 @@ export default function App() {
                       <span>Assets</span>
                     </RailActionButton>
                     <RailActionButton
-                      aria-label="Processes"
-                      data-active={activeView === "processes"}
-                      data-scope="global"
-                      onClick={() => showView("processes")}
-                      title="Processes"
-                      type="button"
-                    >
-                      <ButtonProcessIcon aria-hidden="true" />
-                      <span>Processes</span>
-                    </RailActionButton>
-                    <RailActionButton
                       aria-label="Snipping"
                       data-active={activeView === "snipping"}
                       data-scope="global"
@@ -27749,13 +27741,6 @@ export default function App() {
                     accountKey={authAccountKey || user?.id || user?.email || ""}
                     billingStatus={billingStatus}
                     storageUsage={cloudWorkspaceProgress.storageUsage}
-                  />
-                </ForgeWorkspace>
-              ) : visibleView === "processes" ? (
-                <ForgeWorkspace aria-label="Processes" data-motion={viewMotion}>
-                  <ProcessesView
-                    onCloseTrackedTerminal={closeTrackedProcessTerminal}
-                    workspaceRoots={processKnownRoots}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "snipping" ? (

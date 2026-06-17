@@ -181,13 +181,6 @@ const MonitorGlobalStyle = createGlobalStyle`
   *::after {
     box-sizing: border-box;
   }
-
-  html:not([data-forge-continuous-motion="true"]) *,
-  html:not([data-forge-continuous-motion="true"]) *::before,
-  html:not([data-forge-continuous-motion="true"]) *::after {
-    animation: none !important;
-    transition-duration: 0.001ms !important;
-  }
 `;
 
 const MonitorViewport = styled.div`

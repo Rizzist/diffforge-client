@@ -203,8 +203,8 @@ const TERMINAL_BREAKOUT_RESIZE_HANDLES = Object.freeze([
 const TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT = "forge-terminal-todo-plan-updated";
 const TERMINAL_BREAKOUT_PLAN_CACHE_LIMIT = 80;
 const TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS = 5000;
-const TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS = 1100;
-const TERMINAL_BREAKOUT_ACTIVITY_CACHE_FRESH_MS = 900;
+const TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS = 3000;
+const TERMINAL_BREAKOUT_ACTIVITY_CACHE_FRESH_MS = 2500;
 const TERMINAL_BREAKOUT_ACTIVITY_CACHE_LIMIT = 96;
 const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT = Object.freeze({
   height: 360,
@@ -8802,16 +8802,21 @@ function normalizeVoiceHistoryText(value, maxLength = TODO_QUEUE_MAX_TEXT_LENGTH
     .slice(0, maxLength);
 }
 
+// Reuse one formatter instead of rebuilding an ICU formatter (udat_open) on
+// every call. List re-renders format a timestamp per item, which otherwise
+// shows up as a CPU burst in CoreText/ICU during periodic refreshes.
+const VOICE_HISTORY_TIME_FORMATTER = new Intl.DateTimeFormat([], {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
 function formatVoiceHistoryMessageTime(value) {
   const timestamp = Number(value || 0);
   if (!Number.isFinite(timestamp) || timestamp <= 0) {
     return "";
   }
 
-  return new Date(timestamp).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  return VOICE_HISTORY_TIME_FORMATTER.format(timestamp);
 }
 
 async function copyTextToClipboard(text) {
@@ -18458,7 +18463,13 @@ function TerminalView({
 
     let cancelled = false;
     const load = (silent = false) => {
-      if (cancelled || document.visibilityState === "hidden") {
+      // Skip the poll when nobody is looking: cancelled, hidden window, or the
+      // app isn't focused (user is in another app). It resumes on the next tick.
+      if (
+        cancelled
+        || document.visibilityState === "hidden"
+        || (typeof document.hasFocus === "function" && !document.hasFocus())
+      ) {
         return;
       }
       void loadTerminalBreakoutActivitySnapshots(terminalBreakoutActivityTargets, { silent });
