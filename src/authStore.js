@@ -18,37 +18,16 @@ function personalScope() {
   };
 }
 
-function normalizeAccountScope(scope) {
-  const raw = scope && typeof scope === "object" ? scope : {};
-  const type = String(raw.type || raw.scopeType || "personal").trim().toLowerCase();
-  const teamId = typeof raw.teamId === "string" ? raw.teamId.trim() : "";
-
-  if (type === "team" && teamId) {
-    return {
-      id: raw.id || `team:${teamId}`,
-      type: "team",
-      label: String(raw.label || raw.team?.name || "Team").trim() || "Team",
-      teamId,
-      team: raw.team || null,
-    };
-  }
-
+function normalizeAccountScope() {
   return personalScope();
 }
 
-function accountScopeKey(scope) {
-  const normalized = normalizeAccountScope(scope);
-  return normalized.type === "team" && normalized.teamId
-    ? `team:${normalized.teamId}`
-    : "personal";
+function accountScopeKey() {
+  return "personal";
 }
 
-function normalizeAccountScopes(scopes) {
-  const byId = new Map();
-  [personalScope(), ...(Array.isArray(scopes) ? scopes : [])]
-    .map(normalizeAccountScope)
-    .forEach((scope) => byId.set(scope.id, scope));
-  return Array.from(byId.values());
+function normalizeAccountScopes() {
+  return [personalScope()];
 }
 
 function normalizeAuthStatus(status, user) {
@@ -89,6 +68,51 @@ let snapshot = normalizeSnapshot();
 let nativeStarted = false;
 let nativeStartPromise = null;
 let nativeUnlisten = null;
+// While true, the user explicitly chose "Continue Offline": keep the restored
+// account authenticated and ignore the native bridge's offline signedOut churn
+// until a real authenticated snapshot (a successful reconnect) arrives.
+let offlineModeActive = false;
+
+const OFFLINE_SESSION_STORAGE_KEY = "diffforge:auth:last-authenticated";
+
+function persistAuthenticatedSnapshot(snap) {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return;
+  }
+  try {
+    if (snap && snap.status === "authenticated" && snap.user) {
+      window.localStorage.setItem(
+        OFFLINE_SESSION_STORAGE_KEY,
+        JSON.stringify({
+          user: snap.user,
+          accountScopes: snap.accountScopes,
+          activeScope: snap.activeScope,
+          accountKey: snap.accountKey,
+          entitlements: snap.entitlements,
+          billingStatus: snap.billingStatus,
+        }),
+      );
+    }
+  } catch {
+    // Best effort; offline restore just won't be available.
+  }
+}
+
+function readPersistedAuthenticatedSnapshot() {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(OFFLINE_SESSION_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    return parsed && parsed.user ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 function emitAuthChange(partial) {
   snapshot = normalizeSnapshot({
@@ -96,6 +120,7 @@ function emitAuthChange(partial) {
     ...partial,
     version: Number(snapshot.version || 0) + 1,
   });
+  persistAuthenticatedSnapshot(snapshot);
   listeners.forEach((listener) => listener());
 }
 
@@ -105,7 +130,19 @@ function applyNativeSnapshot(nextSnapshot) {
   if (nextUpdatedAtMs > 0 && currentUpdatedAtMs > 0 && nextUpdatedAtMs < currentUpdatedAtMs) {
     return snapshot;
   }
-  snapshot = normalizeSnapshot(nextSnapshot);
+  const normalized = normalizeSnapshot(nextSnapshot);
+  // Honor an explicit "Continue Offline": don't let the native bridge's offline
+  // session-check churn knock the user back to the sign-in screen. A genuine
+  // authenticated snapshot (reconnect succeeded) clears offline mode and wins.
+  if (offlineModeActive) {
+    if (normalized.status === "authenticated") {
+      offlineModeActive = false;
+    } else {
+      return snapshot;
+    }
+  }
+  snapshot = normalized;
+  persistAuthenticatedSnapshot(snapshot);
   listeners.forEach((listener) => listener());
   return snapshot;
 }
@@ -228,6 +265,33 @@ export const authStore = {
   getAccountScopes() {
     return snapshot.accountScopes || [personalScope()];
   },
+  // True only after at least one successful sign-in on this device (a saved
+  // account snapshot exists) — gates the muted "Continue Offline" button.
+  hasSavedOfflineSession() {
+    return Boolean(readPersistedAuthenticatedSnapshot());
+  },
+  // Enter the app offline using the last signed-in account, ignoring the native
+  // bridge's offline session-check until a real reconnect authenticates.
+  continueOffline() {
+    const saved = readPersistedAuthenticatedSnapshot();
+    if (!saved) {
+      return snapshot;
+    }
+    offlineModeActive = true;
+    emitAuthChange({
+      status: "authenticated",
+      stage: "offline",
+      message: "Offline mode. Using your last signed-in account; cloud sync is paused.",
+      error: "",
+      user: saved.user,
+      accountScopes: saved.accountScopes,
+      activeScope: saved.activeScope,
+      accountKey: saved.accountKey,
+      entitlements: saved.entitlements,
+      billingStatus: saved.billingStatus,
+    });
+    return snapshot;
+  },
   setChecking(message) {
     emitAuthChange({
       status: "checking",
@@ -278,6 +342,12 @@ export const authStore = {
       billingStatus: clearNativeSession ? null : snapshot.billingStatus,
     });
     if (clearNativeSession) {
+      offlineModeActive = false;
+      try {
+        window.localStorage?.removeItem(OFFLINE_SESSION_STORAGE_KEY);
+      } catch {
+        // ignore
+      }
       void applyNativeCommand("desktop_auth_sign_out").catch(() => {});
     }
   },

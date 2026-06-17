@@ -9834,7 +9834,7 @@ async fn forge_audio_cloud_http_headers(
         );
     }
 
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope(cloud_mcp_state).await;
+    let (billing_scope_type, _team_id) = cloud_mcp_account_scope(cloud_mcp_state).await;
     headers.insert(
         "x-diffforge-billing-scope-type",
         reqwest::header::HeaderValue::from_str(&billing_scope_type)
@@ -9845,13 +9845,6 @@ async fn forge_audio_cloud_http_headers(
         reqwest::header::HeaderValue::from_str(&billing_scope_type)
             .map_err(|error| format!("Invalid cloud polish scope header: {error}"))?,
     );
-    if let Some(team_id) = team_id {
-        headers.insert(
-            "x-diffforge-team-id",
-            reqwest::header::HeaderValue::from_str(&team_id)
-                .map_err(|error| format!("Invalid cloud polish team header: {error}"))?,
-        );
-    }
 
     let (plan_name, device_limit) = cloud_mcp_account_plan(cloud_mcp_state).await;
     headers.insert(

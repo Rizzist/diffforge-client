@@ -77,6 +77,20 @@ const SNIPPING_MACOS_KEY_5: i64 = 23;
 #[cfg(target_os = "macos")]
 const SNIPPING_AREA_REASSERT_DELAYS_MS: [u64; 6] = [0, 120, 280, 700, 1_600, 3_000];
 
+// CGPreflightScreenCaptureAccess caches its result per process and is known to
+// keep reporting false after the user grants Screen Recording while the app is
+// running. Once we have actually obtained capture access this session — a real
+// snip succeeded, the request API resolved to granted, or the prewarm session
+// established — we trust this flag instead of the stale preflight value so the
+// permissions panel stops showing "Needs access".
+#[cfg(target_os = "macos")]
+static SNIPPING_SCREEN_CAPTURE_CONFIRMED: AtomicBool = AtomicBool::new(false);
+// The first scap capture in a process makes macOS set up its screen-capture
+// pipeline, which briefly flickers the display. We establish that session once,
+// off the interactive path, so the user's first real area snip is flicker-free.
+#[cfg(target_os = "macos")]
+static SNIPPING_CAPTURE_SESSION_PREWARMED: AtomicBool = AtomicBool::new(false);
+
 #[cfg(target_os = "macos")]
 static SNIPPING_MACOS_EVENT_TAP_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
@@ -1408,12 +1422,31 @@ fn snipping_restore_desktop_icons_from_marker_on_startup(app: &AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn macos_screen_capture_permission_granted() -> bool {
-    unsafe { CGPreflightScreenCaptureAccess() }
+    if SNIPPING_SCREEN_CAPTURE_CONFIRMED.load(Ordering::Acquire) {
+        return true;
+    }
+    let granted = unsafe { CGPreflightScreenCaptureAccess() };
+    if granted {
+        SNIPPING_SCREEN_CAPTURE_CONFIRMED.store(true, Ordering::Release);
+    }
+    granted
 }
 
 #[cfg(target_os = "macos")]
 fn macos_request_screen_capture_permission() -> bool {
-    unsafe { CGRequestScreenCaptureAccess() }
+    let granted = unsafe { CGRequestScreenCaptureAccess() };
+    if granted {
+        SNIPPING_SCREEN_CAPTURE_CONFIRMED.store(true, Ordering::Release);
+    }
+    granted
+}
+
+/// Record that real screen-capture access has been observed this session. Used
+/// to override the stale `CGPreflightScreenCaptureAccess` cache once a snip (or
+/// the prewarm session) has actually captured. No-op off macOS.
+fn snipping_mark_screen_capture_confirmed() {
+    #[cfg(target_os = "macos")]
+    SNIPPING_SCREEN_CAPTURE_CONFIRMED.store(true, Ordering::Release);
 }
 
 #[cfg(target_os = "macos")]
@@ -1861,6 +1894,9 @@ fn register_snipping_shortcuts(app: &AppHandle) {
         snipping_warm_preview_pool(app);
         snipping_start_warm_capture_if_ready(app);
     }
+    if settings.enabled {
+        snipping_prewarm_capture_session(app);
+    }
     emit_snipping_shortcuts_changed(app);
 }
 
@@ -1922,6 +1958,9 @@ fn set_snipping_enabled_for(
     manager.replace(next_state);
     if request.enabled && SNIPPING_STARTUP_PREWARM_ENABLED {
         snipping_start_warm_capture_if_ready(app);
+    }
+    if request.enabled {
+        snipping_prewarm_capture_session(app);
     }
     emit_snipping_shortcuts_changed(app);
     snipping_status_for(app)
@@ -2577,15 +2616,103 @@ fn snipping_ensure_scap_ready() -> Result<(), String> {
 
     let has_permission = std::panic::catch_unwind(scap::has_permission).unwrap_or(false);
     if has_permission {
+        snipping_mark_screen_capture_confirmed();
         return Ok(());
     }
 
     let granted = std::panic::catch_unwind(scap::request_permission).unwrap_or(false);
     let has_permission = std::panic::catch_unwind(scap::has_permission).unwrap_or(false);
     if granted || has_permission {
+        snipping_mark_screen_capture_confirmed();
         Ok(())
     } else {
         Err("Screen capture permission was not granted.".to_string())
+    }
+}
+
+/// Build, start, grab one frame from, and release a scap capturer. The point is
+/// the side effect: the first capture in a process makes macOS stand up its
+/// screen-capture pipeline (a brief display flicker). Returns whether the
+/// session was established.
+#[cfg(target_os = "macos")]
+fn snipping_prewarm_capture_session_blocking() -> bool {
+    let supported = std::panic::catch_unwind(scap::is_supported).unwrap_or(false);
+    if !supported {
+        return false;
+    }
+    // Prefer a concrete display target like the real capture paths do; fall back
+    // to the scap default if enumeration comes up empty.
+    let target = snipping_scap_display_targets().into_iter().next();
+    let options = scap::capturer::Options {
+        fps: 1,
+        show_cursor: false,
+        show_highlight: false,
+        target,
+        crop_area: None,
+        output_type: scap::frame::FrameType::BGRAFrame,
+        output_resolution: scap::capturer::Resolution::Captured,
+        excluded_targets: None,
+        captures_audio: false,
+        exclude_current_process_audio: true,
+    };
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scap::capturer::Capturer::build(options)
+    }));
+    let Ok(Ok(mut capturer)) = built else {
+        return false;
+    };
+    let established = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capturer.start_capture();
+        // Pull a single frame so the OS fully establishes the session, then stop.
+        let _ = capturer.get_next_frame();
+        capturer.stop_capture();
+    }))
+    .is_ok();
+    if established {
+        snipping_mark_screen_capture_confirmed();
+    }
+    established
+}
+
+/// Warm the macOS screen-capture session once per process, deferred and off the
+/// interactive path, so the user's first real area snip does not flash the
+/// display. No continuous capture loop, so it adds no steady-state cost. No-op
+/// off macOS, when snipping is disabled, or before capture access exists (this
+/// never prompts).
+fn snipping_prewarm_capture_session(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if !app
+            .state::<SnippingState>()
+            .shortcut_manager
+            .snapshot()
+            .enabled
+        {
+            return;
+        }
+        if !macos_screen_capture_permission_granted() {
+            return;
+        }
+        if SNIPPING_CAPTURE_SESSION_PREWARMED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        thread::spawn(move || {
+            // Let launch / the enable toggle settle first so the one-time flicker
+            // lands during idle rather than under the user's hands.
+            thread::sleep(Duration::from_millis(1_200));
+            let established = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                snipping_prewarm_capture_session_blocking,
+            ))
+            .unwrap_or(false);
+            if !established {
+                // Allow a later trigger to retry if this one-shot did not land.
+                SNIPPING_CAPTURE_SESSION_PREWARMED.store(false, Ordering::Release);
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
     }
 }
 
@@ -6537,6 +6664,9 @@ fn open_snipping_permissions(app: AppHandle) -> Result<SnippingSettingsStatus, S
         let _ = macos_open_screen_capture_settings();
     }
 
+    // If access just resolved, warm the capture session so the next snip is
+    // flicker-free (no-op when access still isn't granted).
+    snipping_prewarm_capture_session(&app);
     snipping_status_for(&app)
 }
 

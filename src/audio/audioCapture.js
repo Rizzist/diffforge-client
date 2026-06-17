@@ -1033,6 +1033,21 @@ export async function publishAudioTranscriptionResult(value) {
     window.localStorage.setItem(AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY, JSON.stringify(nextHistory));
   }
 
+  // Mirror to the durable, paginated backend store. The History tab reads from
+  // there (and gets an `audio-history-appended` event); the localStorage write
+  // above stays as the dictation widget's small recent cache. Best effort so a
+  // backend hiccup never blocks the transcript landing.
+  try {
+    const createdAtMs = typeof result.createdAt === "number"
+      ? result.createdAt
+      : Number.isFinite(Date.parse(result.createdAt))
+        ? Date.parse(result.createdAt)
+        : Date.now();
+    invoke("audio_history_append", { entry: { ...result, createdAtMs } }).catch(() => {});
+  } catch {
+    // Ignore: localStorage cache already updated; backend retries on next result.
+  }
+
   await emit(AUDIO_TRANSCRIPTION_RESULT_EVENT, result).catch(() => {});
 
   return result;

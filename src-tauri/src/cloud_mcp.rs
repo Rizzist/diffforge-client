@@ -430,6 +430,13 @@ struct CloudMcpState {
     global_ws_registration_blocked: Arc<AtomicBool>,
     global_ws_epoch: Arc<AtomicU64>,
     global_ws_reconnect: Arc<tokio::sync::Notify>,
+    // Reconnect schedule + permanent-offline state. The window clock starts at
+    // app launch and on a manual retry out of perma-offline; while it runs the
+    // loop retries every 10s for the first minute, every 30s until three
+    // minutes, then parks in perma-offline until a manual retry. A drop after a
+    // successful connection re-arms the same cycle from the drop.
+    global_ws_perma_offline: Arc<AtomicBool>,
+    global_ws_window_start: Arc<StdMutex<Instant>>,
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
@@ -683,6 +690,8 @@ impl CloudMcpState {
             global_ws_registration_blocked: Arc::new(AtomicBool::new(false)),
             global_ws_epoch: Arc::new(AtomicU64::new(0)),
             global_ws_reconnect: Arc::new(tokio::sync::Notify::new()),
+            global_ws_perma_offline: Arc::new(AtomicBool::new(false)),
+            global_ws_window_start: Arc::new(StdMutex::new(Instant::now())),
             global_ws_tx: Arc::new(Mutex::new(None)),
             global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
             global_ws_events,
@@ -1055,24 +1064,7 @@ fn cloud_mcp_credit_ledger_db_path() -> Option<PathBuf> {
 }
 
 fn cloud_mcp_credit_scope_parts() -> (String, Option<String>, String) {
-    let (scope_type, team_id) = cloud_mcp_process_account_scope();
-    let scope_type = scope_type.trim().to_ascii_lowercase();
-    let scope_type = if scope_type.is_empty() {
-        "unknown".to_string()
-    } else {
-        scope_type
-    };
-    let team_id = team_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let scope_key = if scope_type == "team" {
-        format!("team:{}", team_id.as_deref().unwrap_or("unknown"))
-    } else if scope_type == "personal" {
-        "personal".to_string()
-    } else {
-        "unknown".to_string()
-    };
-    (scope_type, team_id, scope_key)
+    ("personal".to_string(), None, "personal".to_string())
 }
 
 fn cloud_mcp_credit_ledger_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -8133,60 +8125,21 @@ fn cloud_mcp_update_process_auth_cache(
 }
 
 fn cloud_mcp_account_scope_from_values(
-    scope_type: Option<String>,
-    team_id: Option<String>,
+    _scope_type: Option<String>,
+    _team_id: Option<String>,
 ) -> (String, Option<String>) {
-    let scope_type = scope_type
-        .unwrap_or_else(|| "personal".to_string())
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', ' '], "_");
-    let team_id = team_id
-        .map(|value| {
-            value
-                .replace(|character: char| character.is_control(), "")
-                .trim()
-                .to_string()
-        })
-        .filter(|value| !value.is_empty());
-
-    if scope_type == "team" {
-        if let Some(team_id) = team_id {
-            return ("team".to_string(), Some(team_id));
-        }
-    }
-
     ("personal".to_string(), None)
 }
 
-fn cloud_mcp_account_scope_key_from_parts(scope_type: &str, team_id: Option<&str>) -> String {
-    let scope_type = scope_type
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', ' '], "_");
-    if scope_type == "team" {
-        if let Some(team_id) = team_id.map(str::trim).filter(|value| !value.is_empty()) {
-            return format!("team:{team_id}");
-        }
-    }
+fn cloud_mcp_account_scope_key_from_parts(_scope_type: &str, _team_id: Option<&str>) -> String {
     "personal".to_string()
 }
 
-fn cloud_mcp_account_scope_payload_from_parts(scope_type: &str, team_id: Option<&str>) -> Value {
-    let team_id = team_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let scope_type = if scope_type.trim().eq_ignore_ascii_case("team") && team_id.is_some() {
-        "team".to_string()
-    } else {
-        "personal".to_string()
-    };
-    let scope_key = cloud_mcp_account_scope_key_from_parts(&scope_type, team_id.as_deref());
+fn cloud_mcp_account_scope_payload_from_parts(_scope_type: &str, _team_id: Option<&str>) -> Value {
     json!({
-        "billing_scope_type": scope_type,
-        "team_id": team_id,
-        "scope_key": scope_key,
+        "billing_scope_type": "personal",
+        "team_id": Value::Null,
+        "scope_key": "personal",
     })
 }
 
@@ -8201,7 +8154,7 @@ fn cloud_mcp_process_account_scope_payload() -> Value {
 }
 
 fn cloud_mcp_payload_scope_key(value: &Value) -> Option<String> {
-    cloud_mcp_payload_text(
+    let has_scope_key = cloud_mcp_payload_text(
         value,
         &[
             "scope_key",
@@ -8210,47 +8163,8 @@ fn cloud_mcp_payload_scope_key(value: &Value) -> Option<String> {
             "billingScopeKey",
         ],
     )
-    .map(|scope_key| scope_key.trim().to_string())
-    .filter(|scope_key| !scope_key.is_empty())
-    .or_else(|| {
-        let scope_type = cloud_mcp_payload_text(
-            value,
-            &[
-                "billing_scope_type",
-                "billingScopeType",
-                "scope_type",
-                "scopeType",
-            ],
-        )?;
-        let team_id = cloud_mcp_payload_text(value, &["team_id", "teamId"]);
-        let normalized_scope_type = scope_type
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_");
-        if normalized_scope_type == "team"
-            && team_id.as_deref().map(str::trim).unwrap_or("").is_empty()
-        {
-            return None;
-        }
-        Some(cloud_mcp_account_scope_key_from_parts(
-            &normalized_scope_type,
-            team_id.as_deref(),
-        ))
-    })
-}
-
-fn cloud_mcp_payload_account_scope_payload(value: &Value) -> Option<Value> {
-    let scope_key = cloud_mcp_payload_scope_key(value)?;
-    if let Some(rest) = scope_key.strip_prefix("team:") {
-        return Some(cloud_mcp_account_scope_payload_from_parts(
-            "team",
-            Some(rest),
-        ));
-    }
-    if scope_key == "personal" {
-        return Some(cloud_mcp_account_scope_payload_from_parts("personal", None));
-    }
-    let scope_type = cloud_mcp_payload_text(
+    .is_some();
+    let has_scope_type = cloud_mcp_payload_text(
         value,
         &[
             "billing_scope_type",
@@ -8258,12 +8172,25 @@ fn cloud_mcp_payload_account_scope_payload(value: &Value) -> Option<Value> {
             "scope_type",
             "scopeType",
         ],
-    )?;
-    let team_id = cloud_mcp_payload_text(value, &["team_id", "teamId"]);
-    Some(cloud_mcp_account_scope_payload_from_parts(
-        &scope_type,
-        team_id.as_deref(),
-    ))
+    )
+    .is_some();
+    (has_scope_key || has_scope_type).then(|| "personal".to_string())
+}
+
+fn cloud_mcp_payload_account_scope_payload(value: &Value) -> Option<Value> {
+    let has_scope_key = cloud_mcp_payload_scope_key(value).is_some();
+    let has_scope_type = cloud_mcp_payload_text(
+        value,
+        &[
+            "billing_scope_type",
+            "billingScopeType",
+            "scope_type",
+            "scopeType",
+        ],
+    )
+    .is_some();
+    (has_scope_key || has_scope_type)
+        .then(|| cloud_mcp_account_scope_payload_from_parts("personal", None))
 }
 
 fn cloud_mcp_plan_name_from_value(value: Option<String>) -> String {
@@ -9125,6 +9052,47 @@ pub(crate) fn cloud_mcp_send_shutdown_goodbye_blocking() {
     }
 }
 
+const CLOUD_MCP_RECONNECT_FAST_INTERVAL_SECS: u64 = 10;
+const CLOUD_MCP_RECONNECT_FAST_WINDOW_SECS: u64 = 60;
+const CLOUD_MCP_RECONNECT_SLOW_INTERVAL_SECS: u64 = 30;
+const CLOUD_MCP_RECONNECT_PERMA_OFFLINE_SECS: u64 = 180;
+
+fn cloud_mcp_reconnect_window_elapsed(state: &CloudMcpState) -> Duration {
+    state
+        .global_ws_window_start
+        .lock()
+        .map(|start| start.elapsed())
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_reconnect_window_reset(state: &CloudMcpState) {
+    if let Ok(mut start) = state.global_ws_window_start.lock() {
+        *start = Instant::now();
+    }
+}
+
+/// Reconnect backoff after a failed attempt: 10s for the first minute, 30s
+/// until three minutes, then flips perma-offline so the loop parks until a
+/// manual retry. A pending reconnect notify (manual retry / event wake) cuts
+/// the wait short. Returns true once perma-offline is engaged.
+async fn cloud_mcp_reconnect_backoff_wait(state: &CloudMcpState) -> bool {
+    let elapsed = cloud_mcp_reconnect_window_elapsed(state);
+    if elapsed >= Duration::from_secs(CLOUD_MCP_RECONNECT_PERMA_OFFLINE_SECS) {
+        state.global_ws_perma_offline.store(true, Ordering::SeqCst);
+        return true;
+    }
+    let delay = if elapsed < Duration::from_secs(CLOUD_MCP_RECONNECT_FAST_WINDOW_SECS) {
+        CLOUD_MCP_RECONNECT_FAST_INTERVAL_SECS
+    } else {
+        CLOUD_MCP_RECONNECT_SLOW_INTERVAL_SECS
+    };
+    tokio::select! {
+        _ = sleep(Duration::from_secs(delay)) => {}
+        _ = state.global_ws_reconnect.notified() => {}
+    }
+    false
+}
+
 async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
     cloud_mcp_log_voice_shared_ws(
         "voice_agent.shared_ws.manager_started",
@@ -9155,6 +9123,28 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                 json!({ "iteration": loop_iteration, "reason": "registration_blocked" }),
             );
             return;
+        }
+        if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+            // Parked in permanent offline mode: stop retrying and wait for a
+            // manual retry (or "continue offline" toggling back on). The wake
+            // resets the reconnect window so the full 10s/30s/3min cycle runs
+            // again from scratch.
+            {
+                let mut runtime = state.inner.lock().await;
+                runtime.connected = false;
+                runtime.status = "offline_permanent".to_string();
+                runtime.global_ws_connected = false;
+                runtime.global_ws_status = "offline_permanent".to_string();
+            }
+            cloud_mcp_note_sync_connection(false, "offline_permanent");
+            log_cloud_sync_event(
+                "ws.perma_offline_parked",
+                json!({ "iteration": loop_iteration }),
+            );
+            state.global_ws_reconnect.notified().await;
+            state.global_ws_perma_offline.store(false, Ordering::SeqCst);
+            cloud_mcp_reconnect_window_reset(&state);
+            continue;
         }
         let base_url = cloud_mcp_refresh_runtime_base_url(&state).await;
         log_cloud_sync_event(
@@ -9215,10 +9205,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                     false,
                     cloud_mcp_route_error_runtime_status(&error).unwrap_or("websocket_retrying"),
                 );
-                tokio::select! {
-                    _ = sleep(Duration::from_secs(2)) => {}
-                    _ = state.global_ws_reconnect.notified() => {}
-                }
+                cloud_mcp_reconnect_backoff_wait(&state).await;
                 continue;
             }
         };
@@ -9248,6 +9235,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                         "session_ms": open_started.elapsed().as_millis() as u64,
                     }),
                 );
+                // A live session dropped: re-arm the 10s/30s/3min cycle from
+                // this moment so a post-uptime disconnect isn't instantly
+                // perma-offline.
+                cloud_mcp_reconnect_window_reset(&state);
             }
             Err(error) => {
                 log_cloud_sync_event(
@@ -9284,10 +9275,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             }
         }
 
-        tokio::select! {
-            _ = sleep(Duration::from_secs(2)) => {}
-            _ = state.global_ws_reconnect.notified() => {}
-        }
+        cloud_mcp_reconnect_backoff_wait(&state).await;
     }
 }
 
@@ -9407,7 +9395,7 @@ async fn cloud_mcp_open_global_ws(
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let (billing_scope_type, _team_id) = cloud_mcp_account_scope(state).await;
     let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
@@ -9456,15 +9444,6 @@ async fn cloud_mcp_open_global_ws(
                 HeaderValue::from_str(&device_limit.to_string())
                     .map_err(|error| format!("Invalid Cloud MCP device limit header: {error}"))?,
             );
-        }
-        if billing_scope_type == "team" {
-            if let Some(team_id) = team_id.as_deref() {
-                request.headers_mut().insert(
-                    "x-diffforge-team-id",
-                    HeaderValue::from_str(team_id)
-                        .map_err(|error| format!("Invalid Cloud MCP team id header: {error}"))?,
-                );
-            }
         }
         cloud_mcp_apply_ws_auth_headers(
             &mut request,
@@ -16500,13 +16479,6 @@ async fn cloud_mcp_send_device_heartbeat_async(
             if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_id) {
                 headers.insert("x-diffforge-device-id", value);
             }
-            if billing_scope_type == "team" {
-                if let Some(team_id) = team_id {
-                    if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
-                        headers.insert("x-diffforge-team-id", value);
-                    }
-                }
-            }
             headers
         })
         .json(&body)
@@ -16628,13 +16600,6 @@ async fn cloud_mcp_fetch_direct_route_async(
                     "x-diffforge-region-hint",
                     reqwest::header::HeaderValue::from_static(region_hint),
                 );
-            }
-            if billing_scope_type == "team" {
-                if let Some(team_id) = team_id {
-                    if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
-                        headers.insert("x-diffforge-team-id", value);
-                    }
-                }
             }
             headers
         })
@@ -20597,6 +20562,39 @@ async fn require_cloud_mcp_terminal_gate_for_path(
 #[tauri::command]
 async fn cloud_mcp_connect(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
     cloud_mcp_connect_state(state.inner()).await
+}
+
+/// Manual retry. Clears perma-offline, resets the reconnect window so the full
+/// 10s/30s/3min cycle runs again, wakes the loop (whether parked in perma or
+/// sleeping in backoff), and ensures the loop is running.
+#[tauri::command]
+async fn cloud_mcp_reconnect_now(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
+    let state = state.inner();
+    state.global_ws_perma_offline.store(false, Ordering::SeqCst);
+    cloud_mcp_reconnect_window_reset(state);
+    state.global_ws_reconnect.notify_waiters();
+    cloud_mcp_connect_state(state).await
+}
+
+/// Enter permanent offline mode immediately (e.g. the "Continue Offline" button
+/// or a user choosing to stop retrying). The loop parks at the top until a
+/// manual retry.
+#[tauri::command]
+async fn cloud_mcp_enter_offline_mode(
+    state: State<'_, CloudMcpState>,
+) -> Result<CloudMcpStatus, String> {
+    let state = state.inner();
+    state.global_ws_perma_offline.store(true, Ordering::SeqCst);
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = false;
+        runtime.status = "offline_permanent".to_string();
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = "offline_permanent".to_string();
+    }
+    cloud_mcp_note_sync_connection(false, "offline_permanent");
+    state.global_ws_reconnect.notify_waiters();
+    Ok(cloud_mcp_status_snapshot(state).await)
 }
 
 async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Result<Value, String> {
@@ -26101,7 +26099,7 @@ fn cloud_mcp_asset_http_headers(
                 .map_err(|error| format!("Invalid asset transfer device header: {error}"))?,
         );
     }
-    let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
+    let (billing_scope_type, _team_id) = cloud_mcp_process_account_scope();
     headers.insert(
         "x-diffforge-billing-scope-type",
         reqwest::header::HeaderValue::from_str(&billing_scope_type)
@@ -26112,13 +26110,6 @@ fn cloud_mcp_asset_http_headers(
         reqwest::header::HeaderValue::from_str(&billing_scope_type)
             .map_err(|error| format!("Invalid asset transfer scope header: {error}"))?,
     );
-    if let Some(team_id) = team_id {
-        headers.insert(
-            "x-diffforge-team-id",
-            reqwest::header::HeaderValue::from_str(&team_id)
-                .map_err(|error| format!("Invalid asset transfer team header: {error}"))?,
-        );
-    }
     let (plan_name, device_limit) = cloud_mcp_process_account_plan();
     headers.insert(
         "x-diffforge-plan-name",
@@ -29824,18 +29815,11 @@ fn cloud_mcp_account_todo_seq_i64(seq: u64) -> i64 {
     i64::try_from(seq).unwrap_or(i64::MAX)
 }
 
-fn cloud_mcp_account_todo_scope_key_from_parts(scope_type: &str, team_id: Option<&str>) -> String {
-    let scope_type = scope_type.trim().to_ascii_lowercase();
-    if scope_type == "team" {
-        let team_id = team_id.unwrap_or_default().trim();
-        if !team_id.is_empty() {
-            return format!("team:{team_id}");
-        }
-    }
-    if scope_type == "personal" {
-        return "personal".to_string();
-    }
-    "unknown".to_string()
+fn cloud_mcp_account_todo_scope_key_from_parts(
+    _scope_type: &str,
+    _team_id: Option<&str>,
+) -> String {
+    "personal".to_string()
 }
 
 fn cloud_mcp_current_account_todo_scope_key() -> String {
@@ -42865,15 +42849,6 @@ fn cloud_mcp_proxy_post_json_endpoint(
                     .map_err(|error| format!("Invalid Cloud MCP device limit header: {error}"))?,
             );
         }
-        if billing_scope_type == "team" {
-            if let Some(team_id) = team_id.as_deref() {
-                request.headers_mut().insert(
-                    "x-diffforge-team-id",
-                    HeaderValue::from_str(team_id)
-                        .map_err(|error| format!("Invalid Cloud MCP team id header: {error}"))?,
-                );
-            }
-        }
         if let Some(workspace_id) = workspace_id.as_deref() {
             request.headers_mut().insert(
                 "x-diffforge-workspace-id",
@@ -43078,13 +43053,6 @@ fn cloud_mcp_fetch_direct_route_blocking(
                     "x-diffforge-region-hint",
                     reqwest::header::HeaderValue::from_static(region_hint),
                 );
-            }
-            if billing_scope_type == "team" {
-                if let Some(team_id) = team_id {
-                    if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
-                        headers.insert("x-diffforge-team-id", value);
-                    }
-                }
             }
             headers
         })

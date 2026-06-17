@@ -78,6 +78,13 @@ import {
   writeSelectedAudioInputDeviceId,
 } from "./audioCapture";
 import {
+  AUDIO_HISTORY_APPENDED_EVENT,
+  AUDIO_HISTORY_CHANGED_EVENT,
+  audioHistoryFetchPage,
+  audioHistoryFetchSummary,
+  migrateLocalAudioHistoryToBackend,
+} from "./audioHistoryStore";
+import {
   cloudVoiceAgentEventKind,
   createCloudVoiceAgentTtsPlayer,
   finishCloudVoiceAgentInput,
@@ -672,6 +679,18 @@ const AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT = 124;
 const AUDIO_HISTORY_ROW_GAP = 8;
 const AUDIO_HISTORY_VIRTUAL_OVERSCAN_ROWS = 4;
 const AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT = 420;
+// Slightly longer than the row enter animation (260ms in appStyles) so the
+// `data-entering` flag is cleared only after the fade-in has finished, and a
+// row scrolled out and back in does not replay the animation.
+const AUDIO_HISTORY_ROW_ENTER_CLEAR_MS = 420;
+// Pagination: the History tab pulls only the visible window from the backend in
+// fixed-size pages, so the IPC payload stays tiny no matter how large the store
+// grows. The virtual layout maps scroll position with a uniform row stride
+// (O(1)) and uses measured heights only to stack rows within the window, which
+// scales to hundreds of thousands of rows.
+const AUDIO_HISTORY_PAGE_SIZE = 60;
+const AUDIO_HISTORY_ROW_STRIDE = AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT + AUDIO_HISTORY_ROW_GAP;
+const AUDIO_HISTORY_MAX_CACHED_PAGES = 16;
 
 function isMacPlatform() {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
@@ -2276,6 +2295,114 @@ function scheduleAudioHistoryIdleTask(callback, { delayMs = 0, timeout = 900 } =
   };
 }
 
+function formatLocalDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+const EMPTY_AUDIO_HISTORY_INSIGHTS = {
+  audioMs: 0,
+  averageWpm: 0,
+  totalDictations: 0,
+  totalWords: 0,
+  weeks: [],
+};
+
+// Insights come from SQL aggregates (totals + a words-per-day map for the
+// heatmap window), so the frontend never scans the full history to render the
+// stat chips and grid. The heatmap grid itself is cheap to build from the map.
+function buildAudioHistoryInsightsFromSummary(summary) {
+  const safe = summary && typeof summary === "object" ? summary : {};
+  const wordsByDay = safe.wordsByDay && typeof safe.wordsByDay === "object" ? safe.wordsByDay : {};
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - start.getDay() - (AUDIO_HEATMAP_WEEKS - 1) * 7);
+
+  let maxDayWords = 0;
+  Object.values(wordsByDay).forEach((value) => {
+    maxDayWords = Math.max(maxDayWords, Number(value) || 0);
+  });
+
+  const weeks = [];
+  for (let week = 0; week < AUDIO_HEATMAP_WEEKS; week += 1) {
+    const column = [];
+    for (let weekday = 0; weekday < 7; weekday += 1) {
+      const day = new Date(start);
+      day.setDate(start.getDate() + week * 7 + weekday);
+      if (day > today) {
+        column.push(null);
+        continue;
+      }
+      const key = formatLocalDateKey(day);
+      const words = Number(wordsByDay[key]) || 0;
+      const level = words <= 0 || maxDayWords <= 0
+        ? 0
+        : Math.max(1, Math.min(4, Math.ceil((words / maxDayWords) * 4)));
+      column.push({
+        key,
+        label: `${day.toLocaleDateString([], { month: "short", day: "numeric" })} — ${formatInteger(words)} word${words === 1 ? "" : "s"}`,
+        level,
+        words,
+      });
+    }
+    weeks.push(column);
+  }
+
+  return {
+    audioMs: Math.max(0, Number(safe.audioMs) || 0),
+    averageWpm: Math.max(0, Number(safe.averageWpm) || 0),
+    totalDictations: Math.max(0, Number(safe.totalDictations) || 0),
+    totalWords: Math.max(0, Number(safe.totalWords) || 0),
+    weeks,
+  };
+}
+
+// Builds the visible window for the paginated list. Scroll position maps to a
+// row index via a uniform stride (O(1)); loaded entries render as rows (stacked
+// by their measured height for accuracy within the window) and not-yet-loaded
+// indices render as skeletons until their page arrives.
+function buildAudioHistoryPaginatedWindow(total, viewport, getEntry, rowHeights, variantIds) {
+  const safeTotal = Math.max(0, Number(total) || 0);
+  if (safeTotal === 0) {
+    return { items: [], totalHeight: 0, startIndex: 0, endIndex: 0 };
+  }
+
+  const totalHeight = Math.max(1, safeTotal * AUDIO_HISTORY_ROW_STRIDE - AUDIO_HISTORY_ROW_GAP);
+  const viewportHeight = Math.max(
+    1,
+    Number(viewport?.height || AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT),
+  );
+  const scrollTop = Math.max(0, Number(viewport?.scrollTop || 0));
+  const overscanRows = AUDIO_HISTORY_VIRTUAL_OVERSCAN_ROWS;
+  const firstVisible = Math.floor(scrollTop / AUDIO_HISTORY_ROW_STRIDE);
+  const visibleRows = Math.ceil(viewportHeight / AUDIO_HISTORY_ROW_STRIDE);
+  const startIndex = Math.max(0, firstVisible - overscanRows);
+  const endIndex = Math.min(safeTotal, firstVisible + visibleRows + overscanRows + 1);
+
+  const items = [];
+  let top = startIndex * AUDIO_HISTORY_ROW_STRIDE;
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const entry = typeof getEntry === "function" ? getEntry(index) : null;
+    const row = entry ? buildAudioHistoryRows([entry], variantIds)[0] : null;
+    if (row) {
+      row.index = index;
+      const measured = Number(rowHeights?.get?.(row.entryKey) || 0);
+      const height = measured > 0 ? measured : estimateAudioHistoryRowHeight(row);
+      items.push({ kind: "row", key: row.entryKey, row, top });
+      top += height + AUDIO_HISTORY_ROW_GAP;
+    } else {
+      items.push({ kind: "placeholder", key: `audio-history-skeleton-${index}`, index, top });
+      top += AUDIO_HISTORY_ROW_STRIDE;
+    }
+  }
+
+  return { items, totalHeight, startIndex, endIndex };
+}
+
 function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
   const items = Array.isArray(rows) ? rows : [];
   if (!items.length) {
@@ -2333,6 +2460,7 @@ function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
 
 function AudioHistoryVirtualRow({
   copied,
+  entering,
   expanded,
   onCopy,
   onMeasure,
@@ -2392,6 +2520,7 @@ function AudioHistoryVirtualRow({
     <AudioHistoryRow
       aria-posinset={row.index + 1}
       aria-setsize={totalCount}
+      data-entering={entering ? "true" : undefined}
       data-expanded={expanded ? "true" : "false"}
       ref={rowRef}
       role="listitem"
@@ -2520,12 +2649,17 @@ export default function AudioWorkspaceView({
   const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [orchestratorRealtimeEnabled, setOrchestratorRealtimeEnabled] = useState(readOrchestratorRealtimeEnabled);
   const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
-  const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [expandedAudioHistoryIds, setExpandedAudioHistoryIds] = useState(() => new Set());
   const [audioHistoryVariantIds, setAudioHistoryVariantIds] = useState(() => new Map());
-  const [audioHistoryModel, setAudioHistoryModel] = useState(() => (
-    buildAudioHistoryModel(audioHistory, audioHistoryVariantIds)
-  ));
+  // Paginated, SQLite-backed history: hold only the loaded window of entries
+  // (keyed by absolute index) plus the total count and SQL-derived insights,
+  // never the full list.
+  const [audioHistoryTotal, setAudioHistoryTotal] = useState(0);
+  const [audioHistoryReady, setAudioHistoryReady] = useState(false);
+  const [audioHistoryInsights, setAudioHistoryInsights] = useState(EMPTY_AUDIO_HISTORY_INSIGHTS);
+  const [audioHistoryCacheVersion, setAudioHistoryCacheVersion] = useState(0);
+  const audioHistoryEntriesRef = useRef(new Map());
+  const audioHistoryInflightPagesRef = useRef(new Set());
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
@@ -2552,10 +2686,16 @@ export default function AudioWorkspaceView({
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
   const copiedAudioHistoryTimerRef = useRef(0);
-  const audioHistoryModelRunRef = useRef(0);
+  const audioHistorySummaryRunRef = useRef(0);
+  // Set when an append/changed event arrives while the History tab is not the
+  // active/visible view, so we refresh once on the next open instead of doing
+  // work in the background.
+  const audioHistoryRefreshPendingRef = useRef(false);
   const audioHistoryViewportRef = useRef(null);
   const audioHistoryScrollFrameRef = useRef(0);
   const audioHistoryRowHeightsRef = useRef(new Map());
+  const audioHistoryEnteringTimersRef = useRef(new Map());
+  const [enteringAudioHistoryKeys, setEnteringAudioHistoryKeys] = useState(() => new Set());
   const [audioHistoryViewport, setAudioHistoryViewport] = useState({
     height: AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT,
     scrollTop: 0,
@@ -2701,15 +2841,21 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
-  const audioHistoryInsights = audioHistoryModel.insights;
-  const audioHistoryRows = audioHistoryModel.rows;
-  const audioHistoryVirtualWindow = useMemo(() => (
-    buildAudioHistoryVirtualWindow(
-      audioHistoryRows,
+  const audioHistoryWindow = useMemo(() => (
+    buildAudioHistoryPaginatedWindow(
+      audioHistoryTotal,
       audioHistoryViewport,
+      (index) => audioHistoryEntriesRef.current.get(index) || null,
       audioHistoryRowHeightsRef.current,
+      audioHistoryVariantIds,
     )
-  ), [audioHistoryRows, audioHistoryViewport, audioHistoryMeasureVersion]);
+  ), [
+    audioHistoryTotal,
+    audioHistoryViewport,
+    audioHistoryMeasureVersion,
+    audioHistoryCacheVersion,
+    audioHistoryVariantIds,
+  ]);
   const dictionaryLists = useMemo(() => (
     Array.isArray(voiceRules.dictionary) ? voiceRules.dictionary : []
   ), [voiceRules.dictionary]);
@@ -2822,42 +2968,283 @@ export default function AudioWorkspaceView({
     setAudioHistoryMeasureVersion((version) => version + 1);
   }, []);
 
+  const activeAudioTabRef = useRef(activeAudioTab);
   useEffect(() => {
-    const run = audioHistoryModelRunRef.current + 1;
-    audioHistoryModelRunRef.current = run;
+    activeAudioTabRef.current = activeAudioTab;
+  }, [activeAudioTab]);
 
-    return scheduleAudioHistoryIdleTask(() => {
-      if (audioHistoryModelRunRef.current !== run) {
+  // Mark a single newly-appended entry as entering so it fades in. Driven by the
+  // backend append event (not an array diff), so it is O(1) and only the genuine
+  // new item animates. Auto-cleared after the fade so a row scrolled out and
+  // back in does not replay it.
+  const markAudioHistoryEntering = useCallback((entryKey) => {
+    if (!entryKey) {
+      return;
+    }
+    setEnteringAudioHistoryKeys((current) => {
+      if (current.has(entryKey)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.add(entryKey);
+      return next;
+    });
+    const timers = audioHistoryEnteringTimersRef.current;
+    if (timers.has(entryKey)) {
+      window.clearTimeout(timers.get(entryKey));
+    }
+    timers.set(entryKey, window.setTimeout(() => {
+      timers.delete(entryKey);
+      setEnteringAudioHistoryKeys((current) => {
+        if (!current.has(entryKey)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(entryKey);
+        return next;
+      });
+    }, AUDIO_HISTORY_ROW_ENTER_CLEAR_MS));
+  }, []);
+
+  const resetAudioHistoryPageCache = useCallback(() => {
+    audioHistoryEntriesRef.current.clear();
+    audioHistoryInflightPagesRef.current.clear();
+    setAudioHistoryCacheVersion((version) => version + 1);
+  }, []);
+
+  // Optimistically place a freshly-appended entry at the top instead of clearing
+  // and refetching, so existing rows stay mounted (their keys are unchanged) and
+  // simply glide down via the transform transition while the new row fades in --
+  // no skeleton flash. Returns false if the entry is already cached (deduped).
+  const prependAudioHistoryEntry = useCallback((entry) => {
+    const entryId = entry?.id ? String(entry.id) : "";
+    const entries = audioHistoryEntriesRef.current;
+    if (entryId) {
+      for (const value of entries.values()) {
+        if (value?.id && String(value.id) === entryId) {
+          return false;
+        }
+      }
+    }
+    const shifted = new Map();
+    entries.forEach((value, index) => {
+      shifted.set(index + 1, value);
+    });
+    shifted.set(0, entry);
+    audioHistoryEntriesRef.current = shifted;
+    // Page offsets no longer align to the shifted cache; let the fetch effect
+    // refill any gap the user scrolls into (backend stays consistent post-insert).
+    audioHistoryInflightPagesRef.current.clear();
+    setAudioHistoryTotal((current) => current + 1);
+    setAudioHistoryCacheVersion((version) => version + 1);
+    return true;
+  }, []);
+
+  const refreshAudioHistorySummary = useCallback(async () => {
+    const run = audioHistorySummaryRunRef.current + 1;
+    audioHistorySummaryRunRef.current = run;
+    try {
+      const summary = await audioHistoryFetchSummary();
+      if (audioHistorySummaryRunRef.current !== run) {
         return;
       }
-
-      const nextModel = buildAudioHistoryModel(audioHistory, audioHistoryVariantIds);
-      const seeded = seedAudioHistoryEstimatedRowHeights(nextModel.rows, audioHistoryRowHeightsRef.current);
-      setAudioHistoryModel(nextModel);
-      if (seeded) {
-        setAudioHistoryMeasureVersion((version) => version + 1);
+      setAudioHistoryTotal(Math.max(0, Number(summary?.totalDictations) || 0));
+      setAudioHistoryInsights(buildAudioHistoryInsightsFromSummary(summary));
+      setAudioHistoryReady(true);
+    } catch {
+      if (audioHistorySummaryRunRef.current === run) {
+        setAudioHistoryReady(true);
       }
-    }, {
-      delayMs: 120,
-      timeout: 1200,
-    });
-  }, [audioHistory, audioHistoryVariantIds]);
+    }
+  }, []);
 
+  // One-time import of any pre-existing localStorage history into the backend.
+  // After the first launch this is a no-op (flagged), and it never fetches the
+  // summary unless the History tab is already open -- all history IPC stays
+  // bound to the tab being up.
   useEffect(() => {
-    const validKeys = new Set(audioHistoryRows.map((row) => row.entryKey));
-    let changed = false;
+    let cancelled = false;
+    (async () => {
+      await migrateLocalAudioHistoryToBackend(readAudioTranscriptionHistory());
+      if (!cancelled && activeAudioTabRef.current === "history") {
+        resetAudioHistoryPageCache();
+        refreshAudioHistorySummary();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshAudioHistorySummary, resetAudioHistoryPageCache]);
 
+  // Energy gating: only do summary/window work while the History tab is the
+  // active view. Opening it (or returning after background appends) refreshes
+  // the count/insights and reloads the visible window from the durable store.
+  useEffect(() => {
+    if (activeAudioTab !== "history") {
+      return;
+    }
+    if (audioHistoryRefreshPendingRef.current) {
+      audioHistoryRefreshPendingRef.current = false;
+      resetAudioHistoryPageCache();
+    }
+    refreshAudioHistorySummary();
+  }, [activeAudioTab, refreshAudioHistorySummary, resetAudioHistoryPageCache]);
+
+  // Fetch only the pages covering the visible window, in fixed-size pages, so
+  // the IPC payload stays tiny. Loaded entries are cached by absolute index and
+  // far pages are evicted to bound memory.
+  useEffect(() => {
+    if (activeAudioTab !== "history" || audioHistoryTotal <= 0) {
+      return;
+    }
+    const { startIndex, endIndex } = audioHistoryWindow;
+    if (endIndex <= startIndex) {
+      return;
+    }
+    const entries = audioHistoryEntriesRef.current;
+    const inflight = audioHistoryInflightPagesRef.current;
+
+    // Fetch is keyed on per-index presence (not a "page loaded" flag) so that a
+    // head insertion, which shifts every cached index, never leaves stale page
+    // bookkeeping or gaps: any missing index in the window pulls its aligned page.
+    const neededOffsets = new Set();
+    for (let index = startIndex; index < endIndex; index += 1) {
+      if (!entries.has(index)) {
+        neededOffsets.add(Math.floor(index / AUDIO_HISTORY_PAGE_SIZE) * AUDIO_HISTORY_PAGE_SIZE);
+      }
+    }
+
+    neededOffsets.forEach((offset) => {
+      if (inflight.has(offset)) {
+        return;
+      }
+      inflight.add(offset);
+      audioHistoryFetchPage({ offset, limit: AUDIO_HISTORY_PAGE_SIZE })
+        .then((result) => {
+          const items = Array.isArray(result?.items) ? result.items : [];
+          items.forEach((item, itemIndex) => {
+            entries.set(offset + itemIndex, item);
+          });
+          inflight.delete(offset);
+          // Bound memory: drop entries far from the page we just loaded.
+          const keepRadius = AUDIO_HISTORY_MAX_CACHED_PAGES * AUDIO_HISTORY_PAGE_SIZE;
+          if (entries.size > keepRadius) {
+            Array.from(entries.keys()).forEach((cachedIndex) => {
+              if (Math.abs(cachedIndex - offset) > keepRadius) {
+                entries.delete(cachedIndex);
+              }
+            });
+          }
+          setAudioHistoryCacheVersion((version) => version + 1);
+        })
+        .catch(() => {
+          inflight.delete(offset);
+        });
+    });
+  }, [activeAudioTab, audioHistoryTotal, audioHistoryWindow]);
+
+  // New/changed entries arrive via backend events. Handle them only while the
+  // History tab is active; otherwise note a pending refresh for the next open.
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners = [];
+
+    const handleAppended = (event) => {
+      if (activeAudioTabRef.current !== "history") {
+        audioHistoryRefreshPendingRef.current = true;
+        return;
+      }
+      const entry = event?.payload && typeof event.payload === "object" ? event.payload : null;
+      if (!entry) {
+        resetAudioHistoryPageCache();
+        refreshAudioHistorySummary();
+        return;
+      }
+      const entryKey = entry.id ? String(entry.id) : "";
+      if (entryKey) {
+        markAudioHistoryEntering(entryKey);
+      }
+      // Optimistic prepend keeps existing rows mounted (smooth slide + fade);
+      // the summary refresh reconciles the total/insights with the store.
+      prependAudioHistoryEntry(entry);
+      refreshAudioHistorySummary();
+    };
+
+    const handleChanged = () => {
+      if (activeAudioTabRef.current !== "history") {
+        audioHistoryRefreshPendingRef.current = true;
+        return;
+      }
+      resetAudioHistoryPageCache();
+      refreshAudioHistorySummary();
+    };
+
+    listen(AUDIO_HISTORY_APPENDED_EVENT, (event) => {
+      if (!disposed) {
+        handleAppended(event);
+      }
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlisteners.push(unlisten);
+        }
+      })
+      .catch(() => {});
+
+    listen(AUDIO_HISTORY_CHANGED_EVENT, () => {
+      if (!disposed) {
+        handleChanged();
+      }
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlisteners.push(unlisten);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => {
+        try {
+          unlisten();
+        } catch {
+          // ignore
+        }
+      });
+    };
+  }, [
+    markAudioHistoryEntering,
+    prependAudioHistoryEntry,
+    refreshAudioHistorySummary,
+    resetAudioHistoryPageCache,
+  ]);
+
+  useEffect(() => () => {
+    audioHistoryEnteringTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    audioHistoryEnteringTimersRef.current.clear();
+  }, []);
+
+  // Drop measured heights for entries that have been evicted from the page cache
+  // so the heights map stays bounded as the user scrolls through a huge history.
+  useEffect(() => {
+    const validKeys = new Set();
+    audioHistoryEntriesRef.current.forEach((entry) => {
+      const key = entry?.id ? String(entry.id) : "";
+      if (key) {
+        validKeys.add(key);
+      }
+    });
     audioHistoryRowHeightsRef.current.forEach((_height, entryKey) => {
       if (!validKeys.has(entryKey)) {
         audioHistoryRowHeightsRef.current.delete(entryKey);
-        changed = true;
       }
     });
-
-    if (changed) {
-      setAudioHistoryMeasureVersion((version) => version + 1);
-    }
-  }, [audioHistoryRows]);
+  }, [audioHistoryCacheVersion]);
 
   useEffect(() => {
     if (activeAudioTab !== "history") {
@@ -3682,8 +4069,11 @@ export default function AudioWorkspaceView({
     let unlisten = () => {};
 
     listen(AUDIO_TRANSCRIPTION_RESULT_EVENT, (event) => {
+      // The durable backend append drives the History tab via
+      // AUDIO_HISTORY_APPENDED_EVENT; flag a fallback refresh in case that write
+      // lagged behind this UI event so the tab self-corrects on next open.
       if (!disposed && event.payload?.text) {
-        setAudioHistory(readAudioTranscriptionHistory());
+        audioHistoryRefreshPendingRef.current = true;
       }
     })
       .then((nextUnlisten) => {
@@ -3698,7 +4088,6 @@ export default function AudioWorkspaceView({
 
     const handleStorage = (event) => {
       if (event.key?.startsWith?.("diffforge.audio.")) {
-        setAudioHistory(readAudioTranscriptionHistory());
         setRecorderMode(readAudioRecorderMode());
         setAudioWidgetTheme(readAudioWidgetTheme());
         setOrchestratorSubmissionMode(readOrchestratorVoiceSubmissionMode());
@@ -4986,7 +5375,9 @@ export default function AudioWorkspaceView({
               </AudioInsightCard>
             </AudioHistoryStats>
 
-            {audioHistory.length ? (
+            {!audioHistoryReady ? (
+              <SettingsHint>Loading speech to text history…</SettingsHint>
+            ) : audioHistoryTotal > 0 ? (
               <AudioHistoryVirtualList
                 aria-label="Speech to text history"
                 onScroll={handleAudioHistoryScroll}
@@ -4995,16 +5386,38 @@ export default function AudioWorkspaceView({
               >
                 <AudioHistoryList
                   style={{
-                    height: `${Math.max(audioHistoryVirtualWindow.totalHeight, 1)}px`,
+                    height: `${Math.max(audioHistoryWindow.totalHeight, 1)}px`,
                   }}
                 >
-                  {audioHistoryVirtualWindow.items.map(({ row, top }) => {
+                  {audioHistoryWindow.items.map((item) => {
+                    if (item.kind === "placeholder") {
+                      return (
+                        <AudioHistoryRow
+                          aria-hidden="true"
+                          data-skeleton="true"
+                          key={item.key}
+                          role="presentation"
+                          style={{
+                            height: `${AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT}px`,
+                            left: 0,
+                            position: "absolute",
+                            right: 0,
+                            top: 0,
+                            transform: `translateY(${item.top}px)`,
+                          }}
+                        />
+                      );
+                    }
+
+                    const { row, top } = item;
                     const copied = copiedAudioHistoryId === row.entryKey;
                     const expanded = expandedAudioHistoryIds.has(row.entryKey);
+                    const entering = enteringAudioHistoryKeys.has(row.entryKey);
 
                     return (
                       <AudioHistoryVirtualRow
                         copied={copied}
+                        entering={entering}
                         expanded={expanded}
                         key={row.entryKey}
                         onCopy={copyAudioHistoryPrompt}
@@ -5013,7 +5426,7 @@ export default function AudioWorkspaceView({
                         onVariantStep={stepAudioHistoryVariant}
                         row={row}
                         top={top}
-                        totalCount={audioHistoryRows.length}
+                        totalCount={audioHistoryTotal}
                       />
                     );
                   })}

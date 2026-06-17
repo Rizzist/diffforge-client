@@ -177,10 +177,6 @@ fn desktop_auth_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     })
 }
 
-fn desktop_auth_safe_text(value: &Value, keys: &[&str]) -> String {
-    desktop_auth_text(value, keys).unwrap_or_default()
-}
-
 fn desktop_auth_personal_scope() -> Value {
     json!({
         "id": "personal",
@@ -190,85 +186,12 @@ fn desktop_auth_personal_scope() -> Value {
     })
 }
 
-fn desktop_auth_scope_key(scope_type: &str, team_id: Option<&str>) -> String {
-    let scope_type = scope_type
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', ' '], "_");
-    if scope_type == "team" {
-        if let Some(team_id) = team_id.map(str::trim).filter(|value| !value.is_empty()) {
-            return format!("team:{team_id}");
-        }
-    }
-    "personal".to_string()
-}
-
-fn desktop_auth_normalize_scope(scope: &Value, user: Option<&Value>) -> Value {
-    let scope_type = desktop_auth_text(scope, &["type"])
-        .or_else(|| desktop_auth_text(scope, &["scopeType"]))
-        .unwrap_or_else(|| "personal".to_string())
-        .to_ascii_lowercase()
-        .replace(['-', ' '], "_");
-    let team_id = desktop_auth_text(scope, &["teamId"])
-        .or_else(|| desktop_auth_text(scope, &["team_id"]));
-    if scope_type == "team" {
-        if let Some(team_id) = team_id.as_deref().filter(|value| !value.trim().is_empty()) {
-            let scopes = desktop_auth_account_scopes(user);
-            let key = desktop_auth_scope_key("team", Some(team_id));
-            if let Some(scope) = scopes
-                .as_array()
-                .and_then(|items| items.iter().find(|item| desktop_auth_safe_text(item, &["id"]) == key))
-            {
-                return scope.clone();
-            }
-        }
-    }
+fn desktop_auth_normalize_scope(_scope: &Value, _user: Option<&Value>) -> Value {
     desktop_auth_personal_scope()
 }
 
-fn desktop_auth_account_scopes(user: Option<&Value>) -> Value {
-    let mut scopes = vec![desktop_auth_personal_scope()];
-    let candidates = user
-        .and_then(|user| {
-            user.get("accountScopes")
-                .or_else(|| user.get("scopes"))
-                .and_then(Value::as_array)
-        })
-        .cloned()
-        .unwrap_or_default();
-
-    for scope in candidates {
-        let scope_type = desktop_auth_text(&scope, &["type"])
-            .or_else(|| desktop_auth_text(&scope, &["scopeType"]))
-            .unwrap_or_else(|| "personal".to_string())
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_");
-        let team_id = desktop_auth_text(&scope, &["teamId"])
-            .or_else(|| desktop_auth_text(&scope, &["team_id"]));
-        if scope_type == "team" {
-            if let Some(team_id) = team_id.as_deref().filter(|value| !value.trim().is_empty()) {
-                scopes.push(json!({
-                    "id": desktop_auth_scope_key("team", Some(team_id)),
-                    "type": "team",
-                    "label": desktop_auth_text(&scope, &["label"])
-                        .or_else(|| desktop_auth_text(&scope, &["team", "name"]))
-                        .unwrap_or_else(|| "Team".to_string()),
-                    "teamId": team_id,
-                    "team": scope.get("team").cloned().unwrap_or(Value::Null),
-                }));
-            }
-        }
-    }
-
-    let mut deduped = Vec::new();
-    let mut seen = HashSet::new();
-    for scope in scopes {
-        let id = desktop_auth_safe_text(&scope, &["id"]);
-        if seen.insert(id) {
-            deduped.push(scope);
-        }
-    }
-    json!(deduped)
+fn desktop_auth_account_scopes(_user: Option<&Value>) -> Value {
+    json!([desktop_auth_personal_scope()])
 }
 
 fn desktop_auth_user_plan_status(user: Option<&Value>) -> String {
@@ -713,13 +636,11 @@ fn desktop_auth_entitlements(snapshot: &Value) -> Value {
     let plan_name = desktop_auth_plan_name_from_snapshot(snapshot);
     let device_limit = desktop_auth_device_limit_from_snapshot(snapshot, &plan_name);
     let agent_entitlements = desktop_auth_agent_entitlements_for_plan(&plan_name);
-    let team_entitlements = desktop_auth_team_entitlements_for_plan(&plan_name);
     let paid = plan_status == "paid" || plan_name != "free";
     json!({
         "planName": plan_name,
         "planStatus": if paid { "paid" } else { "free" },
         "agents": agent_entitlements,
-        "teams": team_entitlements,
         "deviceLimit": device_limit,
         "isPaid": paid,
         "canUseCloudSync": paid,
@@ -741,19 +662,6 @@ fn desktop_auth_agent_entitlements_for_plan(plan_name: &str) -> Value {
         "shared_agent_limit": shared_agent_limit,
         "dedicatedAgentLimit": dedicated_agent_limit,
         "dedicated_agent_limit": dedicated_agent_limit,
-        "status": status,
-    })
-}
-
-fn desktop_auth_team_entitlements_for_plan(plan_name: &str) -> Value {
-    let (max_teams, status) = match plan_name.trim().to_ascii_lowercase().as_str() {
-        "ultra" => (3, "coming_soon"),
-        "pro" => (1, "coming_soon"),
-        _ => (0, "unavailable"),
-    };
-    json!({
-        "maxTeams": max_teams,
-        "max_teams": max_teams,
         "status": status,
     })
 }
@@ -925,19 +833,8 @@ fn desktop_auth_signed_out_snapshot(message: &str, error: &str, clear_pending: b
     })
 }
 
-fn desktop_auth_scope_payload(scope: &Value) -> (String, Option<String>) {
-    let scope_type = desktop_auth_text(scope, &["type"])
-        .or_else(|| desktop_auth_text(scope, &["scopeType"]))
-        .unwrap_or_else(|| "personal".to_string())
-        .to_ascii_lowercase()
-        .replace(['-', ' '], "_");
-    let team_id = desktop_auth_text(scope, &["teamId"])
-        .or_else(|| desktop_auth_text(scope, &["team_id"]));
-    if scope_type == "team" && team_id.is_some() {
-        ("team".to_string(), team_id)
-    } else {
-        ("personal".to_string(), None)
-    }
+fn desktop_auth_scope_payload(_scope: &Value) -> (String, Option<String>) {
+    ("personal".to_string(), None)
 }
 
 async fn desktop_auth_sync_cloud_state(
@@ -1600,7 +1497,7 @@ mod desktop_auth_tests {
     }
 
     #[test]
-    fn team_scope_normalization_uses_only_account_scopes() {
+    fn team_scope_normalization_is_disabled_for_now() {
         let user = json!({
             "id": "user-1",
             "accountScopes": [
@@ -1616,8 +1513,8 @@ mod desktop_auth_tests {
             &json!({ "type": "team", "teamId": "known-team" }),
             Some(&user),
         );
-        assert_eq!(known.get("id").and_then(Value::as_str), Some("team:known-team"));
-        assert_eq!(known.get("label").and_then(Value::as_str), Some("Known Team"));
+        assert_eq!(known.get("id").and_then(Value::as_str), Some("personal"));
+        assert!(known.get("teamId").is_some_and(Value::is_null));
 
         let unknown = desktop_auth_normalize_scope(
             &json!({ "type": "team", "teamId": "unknown-team", "label": "Fabricated" }),

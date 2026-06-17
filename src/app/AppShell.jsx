@@ -237,9 +237,6 @@ import {
   RailSectionTitle,
   RailCollapseButton,
   RailCreateWorkspaceButton,
-  RailAccountScopeShell,
-  RailAccountScopeSelect,
-  RailAccountScopeIcon,
   WorkspaceList,
   WorkspaceRow,
   WorkspaceButton,
@@ -507,6 +504,7 @@ import {
   AuthStep,
   PrimaryButton,
   SecondaryButton,
+  SignInOfflineButton,
   PrimaryDangerButton,
   FormMessage,
   buttonIconSize,
@@ -4437,70 +4435,26 @@ function isPaidUser(sessionUser) {
   return sessionUser?.planStatus === "paid";
 }
 
-function accountScopeOptionsFromUser(sessionUser) {
-  const scopes = Array.isArray(sessionUser?.accountScopes)
-    ? sessionUser.accountScopes
-    : Array.isArray(sessionUser?.scopes)
-      ? sessionUser.scopes
-    : [];
-  const normalized = scopes
-    .map((scope) => {
-      const type = String(scope?.type || scope?.scopeType || "personal").trim().toLowerCase();
-      const teamId = String(scope?.teamId || "").trim();
-
-      if (type === "team" && teamId) {
-        return {
-          id: `team:${teamId}`,
-          type: "team",
-          label: String(scope?.label || scope?.team?.name || "Team").trim() || "Team",
-          teamId,
-        };
-      }
-
-      return {
-        id: "personal",
-        type: "personal",
-        label: "Personal",
-        teamId: null,
-      };
-    });
-  const byId = new Map();
-
-  [
+function accountScopeOptionsFromUser() {
+  return [
     {
       id: "personal",
       type: "personal",
       label: "Personal",
       teamId: null,
     },
-    ...normalized,
-  ].forEach((scope) => {
-    byId.set(scope.id, scope);
-  });
-
-  return Array.from(byId.values());
+  ];
 }
 
-function accountScopeInvokePayload(scope) {
-  const type = String(scope?.type || "personal").trim().toLowerCase();
-  const teamId = String(scope?.teamId || "").trim();
-
-  if (type === "team" && teamId) {
-    return {
-      scopeType: "team",
-      teamId,
-    };
-  }
-
+function accountScopeInvokePayload() {
   return {
     scopeType: "personal",
     teamId: null,
   };
 }
 
-function accountScopeKey(scope) {
-  const payload = accountScopeInvokePayload(scope);
-  return payload.scopeType === "team" ? `team:${payload.teamId}` : "personal";
+function accountScopeKey() {
+  return "personal";
 }
 
 function billingPlanNameFromStatus(billingStatus, sessionUser) {
@@ -4720,7 +4674,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   if (statusKey === "resolving_route") {
     return {
       connectedDevices,
-      detail: "Finding the personal or team backend assigned to this account.",
+      detail: "Finding the personal backend assigned to this account.",
       deviceLiveState,
       knownDevices,
       stage: "cloud_route",
@@ -7012,7 +6966,10 @@ function NetworkingInspector({
   onClose,
   onReconnect,
   onRefresh,
+  onToggleUpgradePreview,
+  reconnectBusy = false,
   syncStatus,
+  upgradePreviewActive = false,
 }) {
   const normalized = normalizeNetworkingDiagnostics(diagnostics || {}, syncStatus);
   const connectionState = normalized.connection.connected
@@ -7121,14 +7078,39 @@ function NetworkingInspector({
             </WorkspaceSettingsHeaderMeta>
           </WorkspaceSettingsHeaderMain>
           <NetworkingToolbar>
-            <SecondaryButton disabled={loading} onClick={onReconnect} type="button">
-              {loading ? <PendingIcon aria-hidden="true" /> : <ConnectedIcon aria-hidden="true" />}
-              <span>Reconnect</span>
-            </SecondaryButton>
+            {connectionState === "connected" ? (
+              <SecondaryButton data-tone="connected" disabled type="button">
+                <ConnectedIcon aria-hidden="true" />
+                <span>Connected</span>
+              </SecondaryButton>
+            ) : (
+              <SecondaryButton
+                disabled={loading || reconnectBusy}
+                onClick={onReconnect}
+                type="button"
+              >
+                {loading || reconnectBusy ? (
+                  <PendingIcon aria-hidden="true" />
+                ) : (
+                  <ButtonRefreshIcon aria-hidden="true" />
+                )}
+                <span>{loading || reconnectBusy ? "Reconnecting…" : "Reconnect"}</span>
+              </SecondaryButton>
+            )}
             <SecondaryButton disabled={loading} onClick={onRefresh} type="button">
               {loading ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
               <span>{loading ? "Refreshing..." : "Refresh"}</span>
             </SecondaryButton>
+            {onToggleUpgradePreview ? (
+              <SecondaryButton
+                data-active={upgradePreviewActive ? "true" : undefined}
+                onClick={onToggleUpgradePreview}
+                title="Developer: preview the free-user Upgrade pill treatment"
+                type="button"
+              >
+                <span>{upgradePreviewActive ? "Upgrade preview: on" : "Upgrade preview"}</span>
+              </SecondaryButton>
+            ) : null}
             <WorkspaceModalCloseButton aria-label="Close networking diagnostics" onClick={onClose} title="Close" type="button">
               <ButtonCloseIcon aria-hidden="true" />
             </WorkspaceModalCloseButton>
@@ -8393,7 +8375,6 @@ export default function App() {
     error: authError,
     user,
     activeScope,
-    accountScopes: authAccountScopes,
     accountKey: authAccountKey,
     entitlements: authEntitlements,
   } = useAuthSnapshot();
@@ -8522,6 +8503,12 @@ export default function App() {
   const [networkingDiagnostics, setNetworkingDiagnostics] = useState(null);
   const [networkingDiagnosticsState, setNetworkingDiagnosticsState] = useState("idle");
   const [networkingDiagnosticsError, setNetworkingDiagnosticsError] = useState("");
+  // Reconnect button: disabled while a retry is in flight and for 5s after the
+  // result, so it can't be hammered.
+  const [reconnectCooldown, setReconnectCooldown] = useState(false);
+  const reconnectCooldownTimerRef = useRef(0);
+  // Dev/test: force the free-user "Upgrade" pill treatment regardless of plan.
+  const [forceUpgradePillPreview, setForceUpgradePillPreview] = useState(false);
   const [cloudLiveSyncEpoch, setCloudLiveSyncEpoch] = useState(0);
   const cloudSyncConnectionRef = useRef("");
   const cloudLiveSyncEpochRef = useRef(0);
@@ -8659,11 +8646,7 @@ export default function App() {
     workspaceTerminalRoleOptions,
     activeAgent,
   );
-  const accountScopes = useMemo(() => (
-    Array.isArray(authAccountScopes) && authAccountScopes.length
-      ? authAccountScopes
-      : accountScopeOptionsFromUser(user)
-  ), [authAccountScopes, user]);
+  const accountScopes = useMemo(() => accountScopeOptionsFromUser(), []);
   const accountIsPaid = Boolean(authEntitlements?.isPaid)
     || Boolean(authEntitlements?.canUseCloudSync)
     || isPaidUser(user)
@@ -8910,7 +8893,6 @@ export default function App() {
     () => accountScopeInvokePayload(activeAccountScope),
     [activeAccountScope],
   );
-  const shouldShowAccountScopePicker = accountScopes.some((scope) => scope.type === "team");
   useEffect(() => {
     if (authState !== "authenticated") {
       return;
@@ -11198,20 +11180,6 @@ export default function App() {
     persistWorkspaceRailCollapsed();
     setWorkspaceRailCollapsed(nextCollapsed);
   }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
-
-  const handleAccountScopeChange = useCallback((event) => {
-    const nextKey = event.target.value;
-    const nextScope = accountScopes.find((scope) => accountScopeKey(scope) === nextKey);
-
-    if (!nextScope || accountScopeKey(nextScope) === activeAccountScopeKey) {
-      return;
-    }
-
-    void authStore.setActiveScope(nextScope)
-      .catch((error) => {
-        authStore.setError(getErrorMessage(error, "Unable to switch account scope."));
-      });
-  }, [accountScopes, activeAccountScopeKey]);
 
   useEffect(() => {
     const platform = getWindowControlPlatform();
@@ -18791,17 +18759,42 @@ export default function App() {
     setNetworkingOverlayOpen(false);
   }, []);
   const reconnectNetworkingOverlay = useCallback(async () => {
+    if (reconnectCooldown) {
+      return;
+    }
+    setReconnectCooldown(true);
+    if (reconnectCooldownTimerRef.current) {
+      window.clearTimeout(reconnectCooldownTimerRef.current);
+    }
     setNetworkingDiagnosticsState("loading");
     setNetworkingDiagnosticsError("");
     try {
-      const status = await invoke("cloud_mcp_connect");
+      // reconnect_now clears perma-offline and restarts the full 10s/30s/3min
+      // cycle from scratch, even if we were parked in permanent offline mode.
+      const status = await invoke("cloud_mcp_reconnect_now");
       setCloudSyncStatus(cloudSyncStatusFromRuntimeStatus(status));
       await refreshNetworkingDiagnostics({ quiet: true });
     } catch (error) {
       setNetworkingDiagnosticsState("error");
       setNetworkingDiagnosticsError(getErrorMessage(error, "Unable to reconnect Cloud Sync."));
+    } finally {
+      // Hold the button disabled 5s after the result.
+      reconnectCooldownTimerRef.current = window.setTimeout(() => {
+        setReconnectCooldown(false);
+        reconnectCooldownTimerRef.current = 0;
+      }, 5000);
     }
-  }, [refreshNetworkingDiagnostics]);
+  }, [reconnectCooldown, refreshNetworkingDiagnostics]);
+  // "Continue Offline" from the sign-in screen: park the cloud connection in
+  // permanent offline mode and enter the app with the last signed-in account.
+  const continueOfflineFromSignIn = useCallback(async () => {
+    try {
+      await invoke("cloud_mcp_enter_offline_mode");
+    } catch {
+      // Still proceed offline even if the backend toggle fails.
+    }
+    authStore.continueOffline();
+  }, []);
   const minimizeWorkspaceToolPane = useCallback(() => {
     setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
   }, []);
@@ -25992,8 +25985,8 @@ export default function App() {
   const cloudSyncHasLargeActivity = Boolean(cloudSyncStatus?.syncing) || cloudSyncSizeClass === "large";
   const cloudSyncPillState = authState !== "authenticated"
     ? null
-    : !isPaidPlanUser
-      ? "local"
+    : forceUpgradePillPreview || !isPaidPlanUser
+      ? "upgrade"
       : cloudSyncConnection === "connected"
         ? cloudSyncHasLargeActivity
           ? "syncing"
@@ -26003,6 +25996,7 @@ export default function App() {
             "connecting",
             "local",
             "offline",
+            "offline_permanent",
             "provisioning",
             "syncing",
           ].includes(cloudSyncConnection)
@@ -26023,8 +26017,10 @@ export default function App() {
     local: "Local",
     live: "Live Sync",
     offline: "Offline",
+    offline_permanent: "Offline",
     provisioning: "Provisioning",
     syncing: "Syncing",
+    upgrade: "Upgrade",
   }[cloudSyncPillState] || "";
   const cloudSyncPillTitle = {
     blocked: "Cloud sync needs account attention before it can connect.",
@@ -26036,12 +26032,15 @@ export default function App() {
       ? `Connected. Live Sync is handling ${cloudSyncDirectionSummary}.`
       : "Connected. Changes sync live to your account.",
     offline: "Cloud sync is unavailable right now. Local workspace features remain available.",
+    offline_permanent:
+      "Offline mode. Auto-reconnect has stopped — click to retry connecting.",
     provisioning: "Your cloud workspace is starting. Local workspace features remain available.",
     syncing: cloudSyncDirectionSummary
       ? `Syncing ${cloudSyncDirectionSummary}.`
       : cloudSyncControlCount > 0
         ? `Syncing ${cloudSyncControlCount} control ${cloudSyncControlCount === 1 ? "operation" : "operations"}.`
         : "Syncing cloud activity.",
+    upgrade: "Upgrade to a paid plan to unlock cloud sync and Live Sync.",
   }[cloudSyncPillState] || "";
   const shouldShowStartupPhases = !hasEnteredWorkspaceShell;
   const shouldShowLaunchScreen = shouldShowStartupPhases && (
@@ -26152,18 +26151,35 @@ export default function App() {
             </WindowBackgroundPill>
             {cloudSyncPillState ? (
               <WindowSyncPill
-                aria-label={`Open networking diagnostics. ${cloudSyncPillTitle}`}
+                aria-label={
+                  cloudSyncPillState === "upgrade"
+                    ? cloudSyncPillTitle
+                    : `Open networking diagnostics. ${cloudSyncPillTitle}`
+                }
                 data-platform={windowControlPlatform}
                 data-state={cloudSyncPillState}
                 data-window-control
-                onClick={openNetworkingOverlay}
+                onClick={
+                  cloudSyncPillState === "upgrade"
+                    ? forceUpgradePillPreview
+                      // In test-preview mode keep the modal reachable so the
+                      // toggle can be turned back off.
+                      ? openNetworkingOverlay
+                      : () => {
+                          // Open the pricing/upgrade page in the system default browser.
+                          openUrl("https://diffforge.ai/pricing").catch(() => {});
+                        }
+                    : openNetworkingOverlay
+                }
                 title={cloudSyncPillTitle}
                 type="button"
               >
-                <WindowSyncPillIndicator
-                  aria-hidden="true"
-                  data-variant={["connecting", "provisioning", "syncing"].includes(cloudSyncPillState) ? "spinner" : "dot"}
-                />
+                {cloudSyncPillState === "upgrade" ? null : (
+                  <WindowSyncPillIndicator
+                    aria-hidden="true"
+                    data-variant={["connecting", "provisioning", "syncing"].includes(cloudSyncPillState) ? "spinner" : "dot"}
+                  />
+                )}
                 <span>{cloudSyncPillLabel}</span>
                 {cloudSyncUpCount > 0 || cloudSyncDownCount > 0 ? (
                   <WindowSyncDirectionCounts aria-hidden="true">
@@ -26323,22 +26339,6 @@ export default function App() {
                       )}
                     </RailCollapseButton>
                   </RailHeader>
-                  {shouldShowAccountScopePicker && !workspaceRailCollapsed && (
-                    <RailAccountScopeShell data-rail-selection-preserve="true">
-                      <RailAccountScopeSelect
-                        aria-label="Account scope"
-                        onChange={handleAccountScopeChange}
-                        value={activeAccountScopeKey}
-                      >
-                        {accountScopes.map((scope) => (
-                          <option key={accountScopeKey(scope)} value={accountScopeKey(scope)}>
-                            {scope.label}
-                          </option>
-                        ))}
-                      </RailAccountScopeSelect>
-                      <RailAccountScopeIcon aria-hidden="true" />
-                    </RailAccountScopeShell>
-                  )}
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
@@ -27996,7 +27996,10 @@ export default function App() {
                   onClose={closeNetworkingOverlay}
                   onReconnect={reconnectNetworkingOverlay}
                   onRefresh={() => refreshNetworkingDiagnostics({ quiet: false })}
+                  onToggleUpgradePreview={() => setForceUpgradePillPreview((value) => !value)}
+                  reconnectBusy={reconnectCooldown}
                   syncStatus={cloudSyncStatus}
+                  upgradePreviewActive={forceUpgradePillPreview}
                 />
               )}
               {lowCreditToastVisible && (
@@ -28190,6 +28193,11 @@ export default function App() {
                       <ButtonBrowserIcon aria-hidden="true" />
                       <span>{authButtonLabel}</span>
                     </PrimaryButton>
+                    {authStore.hasSavedOfflineSession() ? (
+                      <SignInOfflineButton onClick={continueOfflineFromSignIn} type="button">
+                        Continue offline
+                      </SignInOfflineButton>
+                    ) : null}
                   </LoginPanel>
                 </LoginCard>
               </LoginLayout>

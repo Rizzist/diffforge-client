@@ -2303,7 +2303,7 @@ function StripSnipTile({
 
     if (horizontalIntent && !outsideRailY) {
       drag.mode = "reorder";
-      onReorderStart?.(localPath);
+      onReorderStart?.(localPath, event.clientX);
       nudgeStripRailForClientX(rail, event.clientX);
       onReorderMove?.(localPath, event.clientX);
       setPanning(true);
@@ -2473,6 +2473,9 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
   const [error, setError] = useState("");
   const [hasMore, setHasMore] = useState(true);
   const [nativeDrag, setNativeDrag] = useState(null);
+  const [draggingPath, setDraggingPath] = useState("");
+  const [dragX, setDragX] = useState(0);
+  const dragGrabRef = useRef(0);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 0 });
   const railRef = useRef(null);
   const orderRef = useRef([]);
@@ -2756,18 +2759,40 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
     setItems((current) => current.filter((item) => assetLocalPath(item) !== path));
   }, []);
 
+  // Canvas-space X (matching each tile's translateX) for a pointer position.
+  const dragContentXForClient = useCallback((clientX) => {
+    const rail = railRef.current;
+    if (!rail) return 0;
+    const rect = rail.getBoundingClientRect();
+    return clientX - rect.left + rail.scrollLeft - STRIP_RAIL_PADDING_LEFT_PX;
+  }, []);
+
+  const startReorder = useCallback((path, clientX) => {
+    const pointerContentX = dragContentXForClient(clientX);
+    // Snap the grab anchor to the tile's slot so the floating tile keeps the
+    // same grab offset under the cursor instead of jumping.
+    const slotX = Math.round(pointerContentX / STRIP_TILE_STEP_PX) * STRIP_TILE_STEP_PX;
+    dragGrabRef.current = pointerContentX - slotX;
+    setDragX(slotX);
+    setDraggingPath(path);
+  }, [dragContentXForClient]);
+
   const reorderPath = useCallback((path, clientX) => {
     const rail = railRef.current;
     nudgeStripRailForClientX(rail, clientX);
+    setDragX(dragContentXForClient(clientX) - dragGrabRef.current);
     setItems((current) => {
       const targetIndex = stripIndexForClientX(rail, clientX, current.length);
       const next = moveStripItemToIndex(current, path, targetIndex);
       orderRef.current = orderPathsForItems(next);
       return next;
     });
-  }, []);
+  }, [dragContentXForClient]);
 
   const endReorder = useCallback(() => {
+    // Clearing the dragging flag lets the tile transition from its live cursor
+    // position into its committed slot.
+    setDraggingPath("");
     setItems((current) => {
       orderRef.current = orderPathsForItems(current);
       return current;
@@ -2844,11 +2869,14 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
         >
           {virtualEntries.entries.map((entry, offset) => {
             const index = virtualEntries.startIndex + offset;
+            const isDragging = entry.type === "item" && assetLocalPath(entry.item) === draggingPath;
+            const tileX = isDragging ? dragX : index * STRIP_TILE_STEP_PX;
             return (
               <StripVirtualItem
                 key={entry.key}
+                data-dragging={isDragging ? "true" : "false"}
                 style={{
-                  transform: `translateX(${index * STRIP_TILE_STEP_PX}px)`,
+                  transform: `translateX(${tileX}px)`,
                 }}
               >
                 {entry.type === "slot" ? (
@@ -2865,7 +2893,7 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
                     onOpened={removePath}
                     onReorderEnd={endReorder}
                     onReorderMove={reorderPath}
-                    onReorderStart={() => {}}
+                    onReorderStart={startReorder}
                     railRef={railRef}
                   />
                 )}
@@ -3236,12 +3264,16 @@ const StripRail = styled.div`
   overflow-y: hidden;
   padding: 7px 14px 9px;
   overscroll-behavior-x: contain;
-  scrollbar-color: rgba(148, 163, 184, 0.5) rgba(15, 23, 42, 0.22);
-  scrollbar-width: thin;
   -webkit-overflow-scrolling: touch;
   contain: layout paint;
 
+  /* Custom WebKit scrollbar only. Deliberately NOT setting the standard
+     scrollbar-width / scrollbar-color: recent WKWebView prioritizes those and
+     drops ::-webkit-scrollbar styling, which surfaces the native (big, white)
+     macOS scrollbar whenever the OS is set to always-show scrollbars. Keeping
+     just the pseudo-elements pins the thin custom bar in every mode. */
   &::-webkit-scrollbar {
+    width: 7px;
     height: 7px;
   }
 
@@ -3254,6 +3286,10 @@ const StripRail = styled.div`
     border: 2px solid rgba(15, 23, 42, 0.15);
     border-radius: 999px;
     background: rgba(148, 163, 184, 0.56);
+  }
+
+  &::-webkit-scrollbar-corner {
+    background: transparent;
   }
 `;
 
@@ -3270,6 +3306,17 @@ const StripVirtualItem = styled.div`
   width: ${STRIP_TILE_WIDTH_PX}px;
   height: ${STRIP_TILE_HEIGHT_PX}px;
   will-change: transform;
+  /* Items slide to their new slot as a reorder shifts the order, so the strip
+     reorganizes fluidly along X instead of snapping. The Y slot is fixed. */
+  transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* The tile being dragged tracks the pointer with no easing (glued to the
+     cursor) and floats above the rest; on drop it loses this flag and the
+     transition above eases it into its final slot. */
+  &[data-dragging="true"] {
+    z-index: 5;
+    transition: none;
+  }
 `;
 
 const stripThumbnailPulse = keyframes`

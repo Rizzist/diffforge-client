@@ -2345,6 +2345,7 @@ include!("todo_dispatch.rs");
 include!("agent_accounts.rs");
 include!("background_mode.rs");
 include!("audio.rs");
+include!("audio_history.rs");
 include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
 include!("snipping.rs");
@@ -4785,6 +4786,8 @@ pub fn run() {
             note_main_window_minimize_requested,
             terminal_recover_crashed_sessions,
             cloud_mcp_connect,
+            cloud_mcp_reconnect_now,
+            cloud_mcp_enter_offline_mode,
             cloud_mcp_get_desktop_device_profile,
             cloud_mcp_get_status,
             cloud_mcp_get_network_diagnostics,
@@ -4881,6 +4884,11 @@ pub fn run() {
             hyperframe_save_media_transcript,
             hyperframe_media_transcript_status,
             polish_audio_transcription,
+            audio_history_append,
+            audio_history_import,
+            audio_history_page,
+            audio_history_summary,
+            audio_history_clear,
             diffforge_copy_asset_to_clipboard,
             diffforge_copy_image_data_url_to_clipboard,
             diffforge_untrack_account_asset,

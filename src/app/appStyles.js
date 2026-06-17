@@ -2490,116 +2490,6 @@ export const RailCreateWorkspaceButton = styled(RailCollapseButton)`
   }
 `;
 
-export const RailAccountScopeShell = styled.div`
-  position: relative;
-  display: grid;
-  width: 100%;
-  min-width: 0;
-  opacity: 0;
-  animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 115ms both;
-`;
-
-export const RailAccountScopeSelect = styled.select`
-  display: block;
-  width: 100%;
-  min-width: 0;
-  height: 30px;
-  padding: 0 28px 0 10px;
-  border: 1px solid rgba(230, 236, 245, 0.08);
-  border-radius: 7px;
-  box-sizing: border-box;
-  color: #d6deea;
-  background: rgba(230, 236, 245, 0.035);
-  box-shadow: none;
-  color-scheme: dark;
-  cursor: pointer;
-  font-size: 11px;
-  font-weight: 760;
-  letter-spacing: 0;
-  line-height: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  appearance: none;
-  -webkit-appearance: none;
-  transition:
-    background 150ms ease,
-    border-color 150ms ease,
-    color 150ms ease;
-
-  &::-ms-expand {
-    display: none;
-  }
-
-  &:hover {
-    border-color: rgba(125, 160, 205, 0.18);
-    color: #eef3fb;
-    background: rgba(230, 236, 245, 0.055);
-  }
-
-  &:focus {
-    border-color: rgba(125, 160, 205, 0.32);
-    outline: none;
-    background: rgba(230, 236, 245, 0.065);
-  }
-
-  option,
-  optgroup {
-    color: #f4f7fa;
-    background: #0d1117;
-    background-image: none;
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.08);
-    color: #3f4650;
-    background: rgba(0, 0, 0, 0.025);
-    color-scheme: light;
-  }
-
-  html[data-forge-theme="light"] &:hover {
-    border-color: rgba(0, 102, 204, 0.18);
-    color: #1d1d1f;
-    background: rgba(0, 102, 204, 0.045);
-  }
-
-  html[data-forge-theme="light"] &:focus {
-    border-color: rgba(0, 102, 204, 0.28);
-    background: rgba(0, 102, 204, 0.055);
-  }
-
-  html[data-forge-theme="light"] option,
-  html[data-forge-theme="light"] optgroup {
-    color: #1d1d1f;
-    background: #ffffff;
-    background-image: none;
-  }
-`;
-
-export const RailAccountScopeIcon = styled(ExpandMore)`
-  position: absolute;
-  top: 50%;
-  right: 8px;
-  width: 16px;
-  height: 16px;
-  color: #8e99a8;
-  pointer-events: none;
-  transform: translateY(-50%);
-  transition: color 150ms ease;
-
-  ${RailAccountScopeShell}:hover & {
-    color: #c4ccd8;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: #6e7681;
-  }
-
-  html[data-forge-theme="light"] ${RailAccountScopeShell}:hover & {
-    color: #0066cc;
-  }
-`;
-
 export const WorkspaceList = styled.div`
   display: grid;
   min-width: 0;
@@ -8940,6 +8830,27 @@ export const AudioHistoryStatChip = styled.div`
   }
 `;
 
+export const audioHistoryRowEnter = keyframes`
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+`;
+
+export const audioHistoryRowSkeletonPulse = keyframes`
+  0% {
+    opacity: 0.32;
+  }
+  50% {
+    opacity: 0.58;
+  }
+  100% {
+    opacity: 0.32;
+  }
+`;
+
 export const AudioHistoryVirtualList = styled.div`
   height: 420px;
   min-width: 0;
@@ -8969,6 +8880,46 @@ export const AudioHistoryRow = styled.div`
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.5);
+
+  /* The row's translateY is its absolute position in the virtual list. It only
+     changes when an item is inserted/removed above it or a measured height
+     settles -- never during scroll -- so transitioning transform makes those
+     shifts glide instead of snapping (the flicker), while staying cheap because
+     transform is GPU-composited and never alters the box size (no re-measure). */
+  will-change: transform;
+  transition: transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  /* Freshly added entries fade in. Opacity only: transform is reserved for the
+     virtual positioning above and animating it here would fight that layout. */
+  &[data-entering="true"] {
+    animation: ${audioHistoryRowEnter} 260ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+
+  /* Placeholder for a row whose backend page is still loading: a quiet pulsing
+     card so the virtual list never blocks on IPC while scrolling a huge history. */
+  &[data-skeleton="true"] {
+    border-style: dashed;
+    background: rgba(255, 255, 255, 0.03);
+    animation: ${audioHistoryRowSkeletonPulse} 1.4s ease-in-out infinite;
+    pointer-events: none;
+
+    html[data-forge-theme="light"] & {
+      background: rgba(15, 23, 42, 0.03);
+      box-shadow: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+
+    &[data-entering="true"] {
+      animation: none;
+    }
+
+    &[data-skeleton="true"] {
+      animation: none;
+    }
+  }
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -15604,6 +15555,43 @@ export const SecondaryButton = styled(PrimaryButton)`
   }
 `;
 
+/* Deliberately understated: a quiet escape hatch under the primary sign-in
+   action, only shown to returning users. */
+export const SignInOfflineButton = styled.button`
+  margin-top: 12px;
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  opacity: 0.55;
+  transition:
+    opacity 150ms ease,
+    color 150ms ease,
+    background 150ms ease;
+
+  &:hover:not(:disabled) {
+    opacity: 0.9;
+    color: var(--forge-text-soft);
+    background: rgba(148, 163, 184, 0.08);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(96, 165, 250, 0.55);
+    outline-offset: 2px;
+    opacity: 0.9;
+  }
+`;
+
 export const PrimaryDangerButton = styled(SecondaryButton)`
   border-color: rgba(239, 107, 107, 0.28);
   color: #ffc8c8;
@@ -15703,6 +15691,12 @@ export const WindowBackgroundPill = styled.button`
   }
 `;
 
+const windowSyncRainbowSpin = keyframes`
+  to {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+`;
+
 export const WindowSyncPill = styled.button`
   display: inline-flex;
   align-items: center;
@@ -15739,6 +15733,60 @@ export const WindowSyncPill = styled.button`
     border-color: rgba(74, 222, 128, 0.34);
     color: rgba(187, 247, 208, 0.95);
     background: rgba(34, 197, 94, 0.12);
+  }
+
+  /* Free + authenticated → "Upgrade" pill with an animated rainbow ring. The
+     ring is a single rotating conic-gradient layer (compositor-only transform,
+     promoted with will-change), clipped to the pill, with a solid inner fill
+     leaving a ~1.5px rainbow border — so it stays cheap despite being lively. */
+  &[data-state="upgrade"] {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    border-color: transparent;
+    color: #ffffff;
+    background: rgba(13, 17, 23, 0.92);
+  }
+
+  &[data-state="upgrade"]::before {
+    content: "";
+    position: absolute;
+    z-index: -2;
+    top: 50%;
+    left: 50%;
+    width: 240%;
+    aspect-ratio: 1;
+    transform: translate(-50%, -50%);
+    background: conic-gradient(
+      from 0deg,
+      #ff5d5d,
+      #ffd35d,
+      #74ff9e,
+      #5dd4ff,
+      #9a5dff,
+      #ff5dce,
+      #ff5d5d
+    );
+    animation: ${windowSyncRainbowSpin} 4s linear infinite;
+    will-change: transform;
+  }
+
+  &[data-state="upgrade"]::after {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    inset: 1.5px;
+    border-radius: inherit;
+    background: rgba(13, 17, 23, 0.92);
+  }
+
+  &[data-state="upgrade"]:hover {
+    border-color: transparent;
+    background: rgba(13, 17, 23, 0.92);
+  }
+
+  &[data-state="upgrade"]:hover::after {
+    background: rgba(24, 30, 40, 0.92);
   }
 
   &[data-state="syncing"] {
