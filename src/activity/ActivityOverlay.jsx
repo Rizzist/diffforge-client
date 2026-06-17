@@ -1829,9 +1829,15 @@ function useActivityOverlayData(context) {
     // before listeners attach or miss an event entirely; the interval keeps
     // them converging on the Rust store regardless.
     const intervalId = window.setInterval(() => {
-      if (!cancelled) {
-        scheduleRefresh({});
+      // Listeners above converge on real changes (and on window-show); this
+      // safety-net poll can pause while the overlay window is hidden/unfocused.
+      if (cancelled
+        || (typeof document !== "undefined"
+          && (document.visibilityState === "hidden"
+            || (typeof document.hasFocus === "function" && !document.hasFocus())))) {
+        return;
       }
+      scheduleRefresh({});
     }, OVERVIEW_REFRESH_INTERVAL_MS);
 
     return () => {

@@ -1,0 +1,251 @@
+const BACKEND_CPU_ATTRIBUTION_ENABLED: bool = true;
+const BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED: bool = true;
+const BACKEND_CPU_ATTRIBUTION_DUMP_INTERVAL_MS: u64 = 5_000;
+const BACKEND_CPU_ATTRIBUTION_FILE_NAME: &str = "diffforge-backend-cpu-attribution.json";
+
+#[derive(Clone, Default)]
+struct BackendCpuAttributionMetric {
+    count: u64,
+    wall_total_ns: u128,
+    cpu_total_ns: u128,
+    cpu_sample_count: u64,
+    wall_max_ns: u128,
+    cpu_max_ns: u128,
+    wall_last_ns: u128,
+    cpu_last_ns: Option<u128>,
+    last_finished_ms: u64,
+}
+
+struct BackendCpuAttributionState {
+    started_at_ms: u64,
+    last_dump_ms: u64,
+    metrics: HashMap<&'static str, BackendCpuAttributionMetric>,
+}
+
+impl BackendCpuAttributionState {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            started_at_ms: now_ms,
+            last_dump_ms: 0,
+            metrics: HashMap::new(),
+        }
+    }
+}
+
+struct BackendCpuSpan {
+    tag: &'static str,
+    wall_started: Instant,
+    cpu_started_ns: Option<u128>,
+    thread_id: std::thread::ThreadId,
+}
+
+impl BackendCpuSpan {
+    fn new(tag: &'static str) -> Self {
+        let cpu_started_ns = if backend_cpu_attribution_enabled() {
+            backend_thread_cpu_time_ns()
+        } else {
+            None
+        };
+        Self {
+            tag,
+            wall_started: Instant::now(),
+            cpu_started_ns,
+            thread_id: std::thread::current().id(),
+        }
+    }
+}
+
+impl Drop for BackendCpuSpan {
+    fn drop(&mut self) {
+        if !backend_cpu_attribution_enabled() {
+            return;
+        }
+        let wall_ns = self.wall_started.elapsed().as_nanos();
+        let cpu_ns = if self.thread_id == std::thread::current().id() {
+            self.cpu_started_ns.and_then(|started| {
+                backend_thread_cpu_time_ns().map(|finished| finished.saturating_sub(started))
+            })
+        } else {
+            None
+        };
+        backend_cpu_attribution_record(self.tag, wall_ns, cpu_ns);
+    }
+}
+
+static BACKEND_CPU_ATTRIBUTION_STATE: OnceLock<StdMutex<BackendCpuAttributionState>> =
+    OnceLock::new();
+
+fn backend_cpu_attribution_enabled() -> bool {
+    if !BACKEND_CPU_ATTRIBUTION_ENABLED {
+        return false;
+    }
+    env::var("DIFFFORGE_BACKEND_CPU_ATTRIBUTION")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
+}
+
+fn backend_cpu_attribution_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn backend_thread_cpu_time_ns() -> Option<u128> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+
+    let usage = unsafe { usage.assume_init() };
+    let user_ns = (usage.ru_utime.tv_sec as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usage.ru_utime.tv_usec as i128).saturating_mul(1_000));
+    let system_ns = (usage.ru_stime.tv_sec as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usage.ru_stime.tv_usec as i128).saturating_mul(1_000));
+    let total = user_ns.saturating_add(system_ns);
+    (total >= 0).then_some(total as u128)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn backend_thread_cpu_time_ns() -> Option<u128> {
+    None
+}
+
+fn backend_cpu_attribution_record(tag: &'static str, wall_ns: u128, cpu_ns: Option<u128>) {
+    let now_ms = backend_cpu_attribution_now_ms();
+    let state = BACKEND_CPU_ATTRIBUTION_STATE
+        .get_or_init(|| StdMutex::new(BackendCpuAttributionState::new(now_ms)));
+    let should_dump = {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        let metric = state.metrics.entry(tag).or_default();
+        metric.count = metric.count.saturating_add(1);
+        metric.wall_total_ns = metric.wall_total_ns.saturating_add(wall_ns);
+        metric.wall_max_ns = metric.wall_max_ns.max(wall_ns);
+        metric.wall_last_ns = wall_ns;
+        metric.last_finished_ms = now_ms;
+        if let Some(cpu_ns) = cpu_ns {
+            metric.cpu_sample_count = metric.cpu_sample_count.saturating_add(1);
+            metric.cpu_total_ns = metric.cpu_total_ns.saturating_add(cpu_ns);
+            metric.cpu_max_ns = metric.cpu_max_ns.max(cpu_ns);
+            metric.cpu_last_ns = Some(cpu_ns);
+        }
+
+        BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED
+            && now_ms.saturating_sub(state.last_dump_ms) >= BACKEND_CPU_ATTRIBUTION_DUMP_INTERVAL_MS
+            && {
+                state.last_dump_ms = now_ms;
+                true
+            }
+    };
+
+    if should_dump {
+        backend_cpu_attribution_dump_snapshot("interval");
+    }
+}
+
+fn backend_cpu_ns_to_ms(value: u128) -> f64 {
+    value as f64 / 1_000_000.0
+}
+
+fn backend_cpu_attribution_snapshot_value(reset: bool) -> Value {
+    let now_ms = backend_cpu_attribution_now_ms();
+    let state = BACKEND_CPU_ATTRIBUTION_STATE
+        .get_or_init(|| StdMutex::new(BackendCpuAttributionState::new(now_ms)));
+    let Ok(mut state) = state.lock() else {
+        return json!({
+            "enabled": backend_cpu_attribution_enabled(),
+            "error": "Backend CPU attribution state is unavailable.",
+        });
+    };
+
+    let mut metrics = state
+        .metrics
+        .iter()
+        .map(|(tag, metric)| {
+            json!({
+                "tag": tag,
+                "count": metric.count,
+                "cpuSampleCount": metric.cpu_sample_count,
+                "totalCpuMs": backend_cpu_ns_to_ms(metric.cpu_total_ns),
+                "totalWallMs": backend_cpu_ns_to_ms(metric.wall_total_ns),
+                "maxCpuMs": backend_cpu_ns_to_ms(metric.cpu_max_ns),
+                "maxWallMs": backend_cpu_ns_to_ms(metric.wall_max_ns),
+                "lastCpuMs": metric.cpu_last_ns.map(backend_cpu_ns_to_ms),
+                "lastWallMs": backend_cpu_ns_to_ms(metric.wall_last_ns),
+                "avgCpuMs": if metric.cpu_sample_count > 0 {
+                    backend_cpu_ns_to_ms(metric.cpu_total_ns / u128::from(metric.cpu_sample_count))
+                } else {
+                    0.0
+                },
+                "avgWallMs": if metric.count > 0 {
+                    backend_cpu_ns_to_ms(metric.wall_total_ns / u128::from(metric.count))
+                } else {
+                    0.0
+                },
+                "lastFinishedMs": metric.last_finished_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    metrics.sort_by(|left, right| {
+        let left_cpu = left
+            .get("totalCpuMs")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let right_cpu = right
+            .get("totalCpuMs")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        right_cpu
+            .partial_cmp(&left_cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let payload = json!({
+        "enabled": backend_cpu_attribution_enabled(),
+        "sampledAtMs": now_ms,
+        "startedAtMs": state.started_at_ms,
+        "pid": std::process::id(),
+        "threadCpuSupported": backend_thread_cpu_time_ns().is_some(),
+        "dumpPath": backend_cpu_attribution_dump_path().to_string_lossy().to_string(),
+        "metrics": metrics,
+    });
+
+    if reset {
+        state.metrics.clear();
+        state.started_at_ms = now_ms;
+        state.last_dump_ms = now_ms;
+    }
+
+    payload
+}
+
+fn backend_cpu_attribution_dump_path() -> PathBuf {
+    env::temp_dir().join(BACKEND_CPU_ATTRIBUTION_FILE_NAME)
+}
+
+fn backend_cpu_attribution_dump_snapshot(reason: &str) {
+    if !backend_cpu_attribution_enabled() || !BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED {
+        return;
+    }
+    let mut payload = backend_cpu_attribution_snapshot_value(false);
+    payload["reason"] = json!(reason);
+    let _ = fs::write(
+        backend_cpu_attribution_dump_path(),
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    );
+}
+
+#[tauri::command]
+async fn backend_cpu_attribution_snapshot(reset: Option<bool>) -> Result<Value, String> {
+    Ok(backend_cpu_attribution_snapshot_value(reset.unwrap_or(false)))
+}

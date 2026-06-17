@@ -1089,6 +1089,10 @@ fn desktop_auth_percent_encode_query_component(value: &str) -> String {
 
 fn desktop_auth_login_url(state: &str) -> String {
     let mut pairs = vec![("state".to_string(), state.to_string())];
+    pairs.push((
+        "desktopCallbackScheme".to_string(),
+        desktop_auth_callback_scheme().to_string(),
+    ));
     let device_profile = cloud_mcp_desktop_device_profile();
     for (key, path) in [
         ("desktopDeviceId", &["device_id", "deviceId"][..]),
@@ -1138,7 +1142,7 @@ fn desktop_auth_query_value(url_value: &str, key: &str) -> Option<String> {
 fn desktop_auth_parse_callback(url_value: &str) -> Option<(String, String)> {
     let url = url_value.trim();
     let callback_base = url.split_once('?')?.0;
-    if callback_base != "diffforge://auth/callback" {
+    if callback_base != desktop_auth_callback_base() {
         return None;
     }
     let code = desktop_auth_query_value(url, "code")?;
@@ -1178,6 +1182,79 @@ fn desktop_auth_network_restore_error(message: &str) -> bool {
         || lower.contains("returned 504")
         || lower.contains("unable to prepare backend request")
         || lower.contains("timed out")
+}
+
+const DESKTOP_AUTH_CALLBACK_SCHEME_ENV: &str = "RUST_DIFFFORGE_DESKTOP_CALLBACK_SCHEME";
+const DESKTOP_AUTH_PROD_CALLBACK_SCHEME: &str = "diffforge";
+const DESKTOP_AUTH_DEV_CALLBACK_SCHEME: &str = "diffforge-dev";
+const DESKTOP_AUTH_CALLBACK_PATH: &str = "auth/callback";
+
+fn desktop_auth_normalize_callback_scheme(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        DESKTOP_AUTH_PROD_CALLBACK_SCHEME => Some(DESKTOP_AUTH_PROD_CALLBACK_SCHEME),
+        DESKTOP_AUTH_DEV_CALLBACK_SCHEME => Some(DESKTOP_AUTH_DEV_CALLBACK_SCHEME),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_auth_macos_bundle_looks_dev() -> bool {
+    let Ok(executable) = env::current_exe() else {
+        return false;
+    };
+
+    for ancestor in executable.ancestors() {
+        let is_app_bundle = ancestor
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+        if !is_app_bundle {
+            continue;
+        }
+
+        let bundle_name = ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if bundle_name.contains(" Dev.") || bundle_name.contains(" Dev.app") {
+            return true;
+        }
+
+        let info_plist = ancestor.join("Contents").join("Info.plist");
+        if let Ok(bytes) = fs::read(info_plist) {
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains("ai.diffforge.desktop.dev")
+                || text.contains("Diff Forge AI Dev")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn desktop_auth_callback_scheme() -> &'static str {
+    if let Ok(value) = env::var(DESKTOP_AUTH_CALLBACK_SCHEME_ENV) {
+        if let Some(scheme) = desktop_auth_normalize_callback_scheme(&value) {
+            return scheme;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if desktop_auth_macos_bundle_looks_dev() {
+        return DESKTOP_AUTH_DEV_CALLBACK_SCHEME;
+    }
+
+    DESKTOP_AUTH_PROD_CALLBACK_SCHEME
+}
+
+fn desktop_auth_callback_base() -> String {
+    format!(
+        "{}://{}",
+        desktop_auth_callback_scheme(),
+        DESKTOP_AUTH_CALLBACK_PATH
+    )
 }
 
 #[tauri::command]

@@ -10352,6 +10352,13 @@ export default function App() {
       const nextFocused = Boolean(focused)
         && (typeof document === "undefined" || document.visibilityState !== "hidden");
       mainWindowFocusedRef.current = nextFocused;
+      // Broadcast idle state so a single global CSS rule pauses every animation
+      // when the window is unfocused or hidden — exactly the state macOS Energy
+      // Impact samples. Cheap (one attribute) and reuses the focus/visibility
+      // logic already wired below.
+      if (typeof document !== "undefined") {
+        document.documentElement.dataset.appIdle = nextFocused ? "false" : "true";
+      }
       if (!cancelled) {
         setMainWindowFocused(nextFocused);
       }

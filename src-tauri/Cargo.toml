@@ -20,6 +20,7 @@ cpal = "0.15"
 enigo = "0.6"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
 mp4e = "1.0.5"
 notify = "6"
 openh264 = "0.9.3"

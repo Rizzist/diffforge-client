@@ -4140,6 +4140,7 @@ dependencies = [
  "enigo",
  "futures-util",
  "image",
+ "libc",
  "mp4e",
  "notify",
  "objc2",

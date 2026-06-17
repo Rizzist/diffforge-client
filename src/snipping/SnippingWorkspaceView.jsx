@@ -1485,7 +1485,7 @@ export function SnippingRecordingControlsWindow() {
   useEffect(() => {
     loadStatus();
     const statusTimer = window.setInterval(loadStatus, 800);
-    const clockTimer = window.setInterval(() => setNowMs(Date.now()), 250);
+    const clockTimer = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => {
       window.clearInterval(statusTimer);
       window.clearInterval(clockTimer);

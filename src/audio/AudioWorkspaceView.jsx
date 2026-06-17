@@ -5225,7 +5225,16 @@ export function AudioWidgetWindow() {
     };
 
     refresh();
-    const timer = window.setInterval(refresh, AUDIO_WIDGET_CLOUD_STATUS_POLL_MS);
+    const timer = window.setInterval(() => {
+      // The sync-status event below updates this on real changes, so skip the
+      // poll while the widget window is hidden or unfocused (idle energy).
+      if (typeof document !== "undefined"
+        && (document.visibilityState === "hidden"
+          || (typeof document.hasFocus === "function" && !document.hasFocus()))) {
+        return;
+      }
+      refresh();
+    }, AUDIO_WIDGET_CLOUD_STATUS_POLL_MS);
     listen(CLOUD_MCP_SYNC_STATUS_EVENT, (event) => {
       applyStatus(event?.payload);
     })

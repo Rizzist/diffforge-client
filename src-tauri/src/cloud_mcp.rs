@@ -11,7 +11,7 @@ const CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
 const CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 15;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
-const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS: u64 = 45;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
 const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
@@ -99,7 +99,9 @@ const CLOUD_MCP_GIT_REPO_IDENTITY_CACHE_TTL_MS: u64 = 30_000;
 const CLOUD_MCP_GIT_REPO_IDENTITY_CACHE_MAX: usize = 512;
 const CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS: u64 = 180;
 const CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS: u64 = 20;
-const CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS: u64 = 15_000;
+// Backstop sweep only — the notify_one() path handles real work immediately,
+// so this timed wake can be infrequent. 15s was 4 idle CPU wakes/min forever.
+const CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS: u64 = 60_000;
 const CLOUD_MCP_OUTBOX_STALE_IN_FLIGHT_MS: u64 = 120_000;
 const CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS: u64 = 10_000;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
@@ -5855,7 +5857,11 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                 break;
             }
             let mut drained_any = false;
-            match cloud_mcp_outbox_claim_due_rows(CLOUD_MCP_OUTBOX_DRAIN_LIMIT) {
+            let claimed_rows = {
+                let _span = BackendCpuSpan::new("cloud_mcp.background_sync.claim_due_rows");
+                cloud_mcp_outbox_claim_due_rows(CLOUD_MCP_OUTBOX_DRAIN_LIMIT)
+            };
+            match claimed_rows {
                 Ok(rows) => {
                     if !rows.is_empty() {
                         drained_any = true;
@@ -7283,6 +7289,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         }
     };
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_sync.summary_worker");
         if force_resync {
             tokenomics_scan_usage_for(&app, false, true)?;
         } else if force_full {
@@ -8816,7 +8823,10 @@ fn cloud_mcp_status_cache_fingerprint(runtime: &CloudMcpRuntime) -> String {
 async fn cloud_mcp_status_snapshot_cached(state: &CloudMcpState) -> CloudMcpStatus {
     let now = cloud_mcp_now_ms();
     let runtime = state.inner.lock().await;
-    let fingerprint = cloud_mcp_status_cache_fingerprint(&runtime);
+    let fingerprint = {
+        let _span = BackendCpuSpan::new("cloud_mcp.status.cache_fingerprint");
+        cloud_mcp_status_cache_fingerprint(&runtime)
+    };
     drop(runtime);
 
     let cache = CLOUD_MCP_STATUS_SNAPSHOT_CACHE.get_or_init(|| StdMutex::new(None));
@@ -12133,6 +12143,7 @@ pub(crate) fn cloud_mcp_start_architecture_headless_watcher(_app: AppHandle, sta
                 continue;
             }
             let graphs = tauri::async_runtime::spawn_blocking(move || {
+                let _span = BackendCpuSpan::new("cloud_mcp.architecture_headless.collect_graphs");
                 cloud_mcp_collect_account_architecture_graphs(Value::Null)
             })
             .await
@@ -20640,6 +20651,7 @@ async fn cloud_mcp_apply_desktop_auth_session(
 
 #[tauri::command]
 async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
+    let _span = BackendCpuSpan::new("cloud_mcp.command.get_status");
     Ok(cloud_mcp_status_snapshot_cached(state.inner()).await)
 }
 
@@ -20647,6 +20659,7 @@ async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMc
 async fn cloud_mcp_get_network_diagnostics(
     state: State<'_, CloudMcpState>,
 ) -> Result<Value, String> {
+    let _span = BackendCpuSpan::new("cloud_mcp.command.get_network_diagnostics");
     let now = cloud_mcp_now_ms();
     let status = cloud_mcp_status_snapshot(state.inner()).await;
     let status_value = serde_json::to_value(&status).unwrap_or_else(|_| json!({}));
@@ -20807,6 +20820,7 @@ async fn cloud_mcp_register_workspace(
     workspace_name: Option<String>,
 ) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
     let prepared = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("cloud_mcp.command.register_workspace.prepare_bundle");
         cloud_mcp_prepare_workspace_bundle(repo_path, workspace_id, workspace_name)
     })
     .await
@@ -21124,6 +21138,7 @@ async fn cloud_mcp_sync_workspace(
     workspace_name: Option<String>,
 ) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
     let prepared = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("cloud_mcp.command.sync_workspace.prepare_bundle");
         cloud_mcp_prepare_workspace_bundle(repo_path, workspace_id, workspace_name)
     })
     .await

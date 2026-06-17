@@ -975,6 +975,7 @@ fn agent_accounts_copy_if_newer(source: &Path, destination: &Path) -> bool {
 /// SAME account the profile is pinned to, so refreshed tokens keep
 /// propagating into the snapshot without ever mixing identities.
 fn agent_accounts_snapshot_refresh(kind: &str, dir: &Path) {
+    let _span = BackendCpuSpan::new("agent_accounts.snapshot_refresh");
     let Some(default_home) = agent_accounts_default_home(kind) else {
         return;
     };
@@ -1040,6 +1041,7 @@ fn agent_accounts_ensure_kind_entry(registry: &mut Value, kind: &str) {
 /// One capture pass for one agent kind. Returns true when the registry
 /// changed (a new account was pinned or a stale suppression was cleared).
 fn agent_accounts_capture_kind(kind: &'static str) -> bool {
+    let _span = BackendCpuSpan::new("agent_accounts.capture_kind");
     let identity = agent_accounts_profile_identity(kind, None);
     let email = identity
         .get("email")
@@ -1131,16 +1133,61 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
 pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("agent-accounts-capture".to_string())
-        .spawn(move || loop {
-            for kind in ["claude", "codex"] {
-                if agent_accounts_capture_kind(kind) {
-                    let _ = app.emit(
-                        AGENT_ACCOUNTS_CHANGED_EVENT,
-                        json!({ "kind": kind, "captured": true }),
-                    );
+        .spawn(move || {
+            let capture_all = || {
+                let _span = BackendCpuSpan::new("agent_accounts.capture_all");
+                for kind in ["claude", "codex"] {
+                    if agent_accounts_capture_kind(kind) {
+                        let _ = app.emit(
+                            AGENT_ACCOUNTS_CHANGED_EVENT,
+                            json!({ "kind": kind, "captured": true }),
+                        );
+                    }
+                }
+            };
+
+            // Capture whatever is already on disk once at startup.
+            capture_all();
+
+            // Event-driven instead of a fixed poll: watch the CLI auth dirs and
+            // re-capture only when their files actually change (login / logout /
+            // token refresh). At idle this thread makes ~zero CPU wake-ups; the
+            // old 4s poll was 15 wakes/min forever. `capture_all` still only
+            // emits when the credential signature changed, and a 5-min backstop
+            // covers missed events or dirs that didn't exist at startup.
+            let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+            let mut watcher = notify::recommended_watcher(tx).ok();
+            if let Some(watcher) = watcher.as_mut() {
+                for kind in ["claude", "codex"] {
+                    if let Some(dir) = agent_accounts_default_home(kind) {
+                        let _ = notify::Watcher::watch(
+                            watcher,
+                            &dir,
+                            notify::RecursiveMode::NonRecursive,
+                        );
+                    }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(4));
+
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+                    Ok(_) => {
+                        // A login writes several files in a burst; drain the
+                        // burst (quiet for 400ms) and capture once.
+                        while rx
+                            .recv_timeout(std::time::Duration::from_millis(400))
+                            .is_ok()
+                        {}
+                        capture_all();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => capture_all(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // Watcher unavailable: degrade to a slow safety poll.
+                        std::thread::sleep(std::time::Duration::from_secs(300));
+                        capture_all();
+                    }
+                }
+            }
         });
 }
 
@@ -1392,6 +1439,7 @@ fn agent_accounts_launch_profile_login_terminal(
 #[tauri::command]
 async fn agent_accounts_state() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("agent_accounts.command.state");
         let registry = agent_accounts_registry_read_resolved();
         Ok(json!({
             "agents": {

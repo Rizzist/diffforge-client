@@ -5725,12 +5725,15 @@ function ArchitecturesPanel({
     if (!selectedRepoPath || !selectedGraphId || creatingGraph || saveState === "saving") {
       return undefined;
     }
-    const interval = window.setInterval(() => {
+    let cancelled = false;
+    let unlisten = null;
+    const rereadSelectedGraph = () => {
       invoke("architecture_graph_read", {
         graphId: selectedGraphId,
         repoPath: selectedRepoPath,
       })
         .then((graph) => {
+          if (cancelled) return;
           setSelectedGraph((current) => {
             const currentSource = text(current?.source);
             const nextSource = text(graph?.source);
@@ -5746,8 +5749,28 @@ function ArchitecturesPanel({
           });
         })
         .catch(() => {});
-    }, ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS);
-    return () => window.clearInterval(interval);
+    };
+    // Event-driven instead of a 450ms poll: the backend file-watcher emits
+    // "architecture-store-changed" (debounced) on any graph file write —
+    // including server-synced architectures — so re-read only then. The open
+    // graph also loads on selection elsewhere. Zero idle wake-ups while idle.
+    listen("architecture-store-changed", () => {
+      if (!cancelled) {
+        rereadSelectedGraph();
+      }
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
   }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
 
   const selectedRepo = repositories.find((repo) => (

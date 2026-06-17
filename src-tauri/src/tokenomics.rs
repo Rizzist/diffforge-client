@@ -53,6 +53,7 @@ async fn tokenomics_scan_usage(
 ) -> Result<Value, String> {
     let scan_app = app.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.scan_usage");
         tokenomics_scan_usage_for(&scan_app, true, false)
     })
     .await
@@ -69,6 +70,7 @@ async fn tokenomics_scan_usage_silent(
 ) -> Result<Value, String> {
     let scan_app = app.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.scan_usage_silent");
         tokenomics_scan_usage_for(&scan_app, false, false)
     })
     .await
@@ -85,6 +87,7 @@ async fn tokenomics_scan_realtime_usage(
 ) -> Result<Value, String> {
     let scan_app = app.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.scan_realtime_usage");
         tokenomics_scan_realtime_usage_for(&scan_app)
     })
     .await
@@ -101,6 +104,7 @@ async fn tokenomics_resync_last_30_days(
 ) -> Result<Value, String> {
     let scan_app = app.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.resync_last_30_days");
         tokenomics_scan_usage_for(&scan_app, true, true)
     })
     .await
@@ -113,6 +117,7 @@ async fn tokenomics_resync_last_30_days(
 #[tauri::command]
 async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.get_summary");
         tokenomics_cached_read_only_summary_for(&app, false, true)
     })
     .await
@@ -122,6 +127,7 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
 #[tauri::command]
 async fn tokenomics_get_live_limits(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.get_live_limits");
         let conn = tokenomics_open_db(&app)?;
         tokenomics_live_limits_snapshot_from_conn(&conn)
     })
@@ -131,7 +137,10 @@ async fn tokenomics_get_live_limits(app: AppHandle) -> Result<Value, String> {
 
 #[tauri::command]
 async fn tokenomics_get_sync_payload(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || tokenomics_summary_for(&app, true, false))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.get_sync_payload");
+        tokenomics_summary_for(&app, true, false)
+    })
         .await
         .map_err(|error| format!("Unable to join Tokenomics sync payload: {error}"))?
 }
@@ -142,6 +151,7 @@ async fn tokenomics_get_sync_delta(
     since_updated_at: Option<String>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("tokenomics.command.get_sync_delta");
         let conn = tokenomics_open_db(&app)?;
         tokenomics_reconcile_current_provider_accounts(&conn)?;
         let scope = tokenomics_current_billing_scope();
@@ -768,6 +778,10 @@ fn tokenomics_scan_usage_for_mode(
     force_resync_last_30_days: bool,
     scan_mode: TokenomicsScanMode,
 ) -> Result<Value, String> {
+    let _span = BackendCpuSpan::new(match scan_mode {
+        TokenomicsScanMode::Backfill => "tokenomics.scan.backfill_worker",
+        TokenomicsScanMode::Realtime => "tokenomics.scan.realtime_worker",
+    });
     let scan_lock = scan_mode.lock();
     let _scan_guard = match scan_lock.try_lock() {
         Ok(guard) => guard,
@@ -7978,6 +7992,13 @@ fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, sa
                 .map(|seconds| (seconds as u64).min(window_seconds))
         });
     let now_unix = tokenomics_unix_now();
+    if reset_at_unix
+        .map(|reset_at| reset_at <= now_unix)
+        .unwrap_or(false)
+        || remaining_seconds_at_sample == Some(0)
+    {
+        return;
+    }
     let live_updated_at_unix = tokenomics_value_string(
         limit,
         &["updated_at", "updatedAt", "last_known_at", "lastKnownAt"],
@@ -10322,6 +10343,18 @@ fn tokenomics_merge_provider_limits(first: Vec<Value>, second: Vec<Value>) -> Ve
 }
 
 fn tokenomics_should_replace_provider_limit(existing: &Value, incoming: &Value) -> bool {
+    let incoming_updated_at = tokenomics_provider_limit_updated_at_unix(incoming);
+    let existing_updated_at = tokenomics_provider_limit_updated_at_unix(existing);
+    if tokenomics_provider_limit_is_authoritative_no_data(incoming)
+        && incoming_updated_at >= existing_updated_at
+    {
+        return true;
+    }
+    if tokenomics_provider_limit_is_authoritative_no_data(existing)
+        && existing_updated_at >= incoming_updated_at
+    {
+        return false;
+    }
     let existing_unknown = tokenomics_provider_limit_is_unknown(existing);
     let incoming_unknown = tokenomics_provider_limit_is_unknown(incoming);
     if existing_unknown && !incoming_unknown {
@@ -10330,8 +10363,7 @@ fn tokenomics_should_replace_provider_limit(existing: &Value, incoming: &Value) 
     if !existing_unknown && incoming_unknown {
         return false;
     }
-    tokenomics_provider_limit_updated_at_unix(incoming)
-        >= tokenomics_provider_limit_updated_at_unix(existing)
+    incoming_updated_at >= existing_updated_at
 }
 
 fn tokenomics_provider_limit_key(limit: &Value) -> String {
@@ -10387,7 +10419,17 @@ fn tokenomics_provider_limit_is_unknown(limit: &Value) -> bool {
     let status = tokenomics_value_string(limit, &["status_label", "statusLabel"])
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let has_percent = tokenomics_value_i64(
+    let has_percent = tokenomics_provider_limit_has_percent(limit);
+    source == "not_exposed"
+        || source == "claude_statusline_unavailable"
+        || confidence == "unknown"
+        || status.contains("not exposed")
+        || status.contains("unavailable")
+        || !has_percent
+}
+
+fn tokenomics_provider_limit_has_percent(limit: &Value) -> bool {
+    tokenomics_value_i64(
         limit,
         &[
             "remaining_percent",
@@ -10398,13 +10440,23 @@ fn tokenomics_provider_limit_is_unknown(limit: &Value) -> bool {
             "limitUsedPercent",
         ],
     )
-    .is_some();
-    source == "not_exposed"
-        || source == "claude_statusline_unavailable"
-        || confidence == "unknown"
-        || status.contains("not exposed")
-        || status.contains("unavailable")
-        || !has_percent
+    .is_some()
+}
+
+fn tokenomics_provider_limit_is_authoritative_no_data(limit: &Value) -> bool {
+    if tokenomics_provider_limit_has_percent(limit) {
+        return false;
+    }
+    let confidence = tokenomics_value_string(limit, &["confidence"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if confidence != "live" {
+        return false;
+    }
+    let source = tokenomics_value_string(limit, &["limit_source", "limitSource"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    source.contains("usage_api") || source == "claude_statusline"
 }
 
 fn tokenomics_provider_limit_updated_at_unix(limit: &Value) -> u64 {
@@ -10918,12 +10970,15 @@ fn tokenomics_limit_display_percent(
 }
 
 fn tokenomics_limit_pace_snapshot(
-    used_percent: i64,
+    used_percent: Option<i64>,
     limit_window_seconds: i64,
     reset_after_seconds: Option<i64>,
     reset_at_unix: Option<u64>,
     updated_at: &str,
 ) -> Value {
+    let Some(used_percent) = used_percent else {
+        return tokenomics_unknown_pace_snapshot();
+    };
     let window_seconds = limit_window_seconds.max(0) as u64;
     if window_seconds == 0 {
         return tokenomics_unknown_pace_snapshot();
@@ -10938,6 +10993,9 @@ fn tokenomics_limit_pace_snapshot(
     };
 
     let remaining_seconds = remaining_seconds.min(window_seconds);
+    if remaining_seconds == 0 {
+        return tokenomics_unknown_pace_snapshot();
+    }
     let elapsed_seconds = window_seconds.saturating_sub(remaining_seconds);
     let elapsed_for_rate = elapsed_seconds.max(1) as f64;
     let used_percent = used_percent.clamp(0, 100) as f64;
@@ -11000,8 +11058,8 @@ fn tokenomics_limit_pace_snapshot(
 
 fn tokenomics_unknown_pace_snapshot() -> Value {
     json!({
-        "pace_delta_percent": 0,
-        "paceDeltaPercent": 0,
+        "pace_delta_percent": Value::Null,
+        "paceDeltaPercent": Value::Null,
         "pace_status": "unknown",
         "paceStatus": "unknown",
         "pace_exhausts_before_reset": false,
@@ -11045,18 +11103,19 @@ fn tokenomics_codex_window_snapshot(
     provider_account: &TokenomicsProviderAccount,
 ) -> Value {
     let used_percent = tokenomics_value_i64(window, &["used_percent", "usedPercent"])
-        .unwrap_or(0)
-        .clamp(0, 100);
-    let remaining_percent = (100 - used_percent).clamp(0, 100);
+        .map(|value| value.clamp(0, 100));
+    let remaining_percent = used_percent.map(|value| (100 - value).clamp(0, 100));
     let display_percent_kind =
         tokenomics_limit_display_percent_kind("openai", "codex", window_kind);
-    let display_percent = tokenomics_limit_display_percent(
-        "openai",
-        "codex",
-        window_kind,
-        used_percent,
-        remaining_percent,
-    );
+    let display_percent = used_percent.map(|used_percent| {
+        tokenomics_limit_display_percent(
+            "openai",
+            "codex",
+            window_kind,
+            used_percent,
+            remaining_percent.unwrap_or_else(|| (100 - used_percent).clamp(0, 100)),
+        )
+    });
     let reset_after_seconds_value =
         tokenomics_value_i64(window, &["reset_after_seconds", "resetAfterSeconds"]);
     let reset_after_seconds = reset_after_seconds_value.unwrap_or(0);
@@ -11076,11 +11135,17 @@ fn tokenomics_codex_window_snapshot(
         .get("limit_reached")
         .or_else(|| rate_limit.get("limitReached"))
         .and_then(Value::as_bool)
-        .unwrap_or(remaining_percent <= 0);
+        .unwrap_or_else(|| remaining_percent.map(|value| value <= 0).unwrap_or(false));
     let allowed = rate_limit
         .get("allowed")
         .and_then(Value::as_bool)
         .unwrap_or(!limit_reached);
+    let allowance = used_percent.map(|_| 100);
+    let allowance_unit = if used_percent.is_some() {
+        "percent"
+    } else {
+        "unknown"
+    };
     tokenomics_with_pace_fields(
         json!({
             "provider": "openai",
@@ -11095,9 +11160,9 @@ fn tokenomics_codex_window_snapshot(
             "plan_source": plan_source,
             "limit_source": "codex_usage_api",
             "confidence": "live",
-            "allowance_unit": "percent",
+            "allowance_unit": allowance_unit,
             "used": used_percent,
-            "allowance": 100,
+            "allowance": allowance,
             "remaining": remaining_percent,
             "used_percent": used_percent,
             "remaining_percent": remaining_percent,
@@ -11331,19 +11396,20 @@ fn tokenomics_claude_window_snapshot(
             "usedPercent",
         ],
     )
-    .unwrap_or(0)
-    .clamp(0, 100);
+    .map(|value| value.clamp(0, 100));
     let used_percent = provider_reported_percent;
-    let remaining_percent = (100 - used_percent).clamp(0, 100);
+    let remaining_percent = used_percent.map(|value| (100 - value).clamp(0, 100));
     let display_percent_kind =
         tokenomics_limit_display_percent_kind("anthropic", "claude", window_kind);
-    let display_percent = tokenomics_limit_display_percent(
-        "anthropic",
-        "claude",
-        window_kind,
-        used_percent,
-        remaining_percent,
-    );
+    let display_percent = used_percent.map(|used_percent| {
+        tokenomics_limit_display_percent(
+            "anthropic",
+            "claude",
+            window_kind,
+            used_percent,
+            remaining_percent.unwrap_or_else(|| (100 - used_percent).clamp(0, 100)),
+        )
+    });
     let reset_at = tokenomics_value_string(
         window,
         &[
@@ -11379,6 +11445,13 @@ fn tokenomics_claude_window_snapshot(
         reset_at_unix,
         updated_at,
     );
+    let allowance = used_percent.map(|_| 100);
+    let allowance_unit = if used_percent.is_some() {
+        "percent"
+    } else {
+        "unknown"
+    };
+    let provider_reported_direction = provider_reported_percent.map(|_| "used");
     tokenomics_with_pace_fields(
         json!({
             "provider": "anthropic",
@@ -11393,9 +11466,9 @@ fn tokenomics_claude_window_snapshot(
             "plan_source": "claude_credentials_file",
             "limit_source": limit_source,
             "confidence": "live",
-            "allowance_unit": "percent",
+            "allowance_unit": allowance_unit,
             "used": used_percent,
-            "allowance": 100,
+            "allowance": allowance,
             "remaining": remaining_percent,
             "used_percent": used_percent,
             "remaining_percent": remaining_percent,
@@ -11408,7 +11481,7 @@ fn tokenomics_claude_window_snapshot(
             "limit_display_percent_kind": display_percent_kind,
             "limitDisplayPercentKind": display_percent_kind,
             "provider_reported_percent": provider_reported_percent,
-            "provider_reported_direction": "used",
+            "provider_reported_direction": provider_reported_direction,
             "status_label": tokenomics_claude_status_label(remaining_percent),
             "reset_label": reset_label,
             "reset_after_seconds": reset_after_seconds,
@@ -11424,7 +11497,10 @@ fn tokenomics_claude_window_snapshot(
     )
 }
 
-fn tokenomics_claude_status_label(remaining_percent: i64) -> &'static str {
+fn tokenomics_claude_status_label(remaining_percent: Option<i64>) -> &'static str {
+    let Some(remaining_percent) = remaining_percent else {
+        return "Usage data unavailable";
+    };
     if remaining_percent <= 0 {
         "Limit reached"
     } else if remaining_percent < 18 {
@@ -11501,10 +11577,16 @@ fn tokenomics_unknown_limit_snapshot(
 }
 
 fn tokenomics_codex_status_label(
-    remaining_percent: i64,
+    remaining_percent: Option<i64>,
     limit_reached: bool,
     allowed: bool,
 ) -> &'static str {
+    let Some(remaining_percent) = remaining_percent else {
+        if limit_reached || !allowed {
+            return "Limit reached";
+        }
+        return "Usage data unavailable";
+    };
     if limit_reached || !allowed || remaining_percent <= 0 {
         "Limit reached"
     } else if remaining_percent < 18 {
@@ -14091,6 +14173,52 @@ mod tokenomics_tests {
     }
 
     #[test]
+    fn tokenomics_provider_limit_merge_prefers_live_no_data_over_stale_known() {
+        let cloud_known = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:personal",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": 84,
+            "remaining_percent": 16,
+            "pace_status": "over_pace",
+            "pace_delta_percent": 497,
+            "updated_at": "unix:1000"
+        });
+        let live_no_data = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:personal",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": Value::Null,
+            "remaining_percent": Value::Null,
+            "pace_status": "unknown",
+            "pace_delta_percent": Value::Null,
+            "updated_at": "unix:1010"
+        });
+
+        let merged = tokenomics_merge_provider_limits(vec![cloud_known.clone()], vec![live_no_data.clone()]);
+
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0]["used_percent"].is_null());
+        assert!(merged[0]["remaining_percent"].is_null());
+        assert_eq!(merged[0]["pace_status"], json!("unknown"));
+        assert!(merged[0]["pace_delta_percent"].is_null());
+
+        let reversed = tokenomics_merge_provider_limits(vec![live_no_data], vec![cloud_known]);
+
+        assert_eq!(reversed.len(), 1);
+        assert!(reversed[0]["used_percent"].is_null());
+        assert!(reversed[0]["remaining_percent"].is_null());
+        assert_eq!(reversed[0]["pace_status"], json!("unknown"));
+        assert!(reversed[0]["pace_delta_percent"].is_null());
+    }
+
+    #[test]
     fn tokenomics_provider_limit_merge_prefers_fresher_local_live_snapshot() {
         let cloud_known = json!({
             "provider": "anthropic",
@@ -14156,8 +14284,13 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_limit_pace_marks_projected_early_exhaustion() {
-        let pace =
-            tokenomics_limit_pace_snapshot(50, 5 * 60 * 60, Some(4 * 60 * 60), None, "unix:1000");
+        let pace = tokenomics_limit_pace_snapshot(
+            Some(50),
+            5 * 60 * 60,
+            Some(4 * 60 * 60),
+            None,
+            "unix:1000",
+        );
 
         assert_eq!(pace["pace_status"], json!("over_pace"));
         assert_eq!(pace["pace_exhausts_before_reset"], json!(true));
@@ -14169,7 +14302,7 @@ mod tokenomics_tests {
     #[test]
     fn tokenomics_limit_pace_keeps_safe_weekly_projection_on_pace() {
         let pace = tokenomics_limit_pace_snapshot(
-            10,
+            Some(10),
             7 * 24 * 60 * 60,
             Some(3 * 24 * 60 * 60 + 12 * 60 * 60),
             None,
@@ -14180,6 +14313,56 @@ mod tokenomics_tests {
         assert_eq!(pace["pace_exhausts_before_reset"], json!(false));
         assert_eq!(pace["pace_projected_used_percent"], json!(20));
         assert_eq!(pace["pace_delta_percent"], json!(-80));
+    }
+
+    #[test]
+    fn tokenomics_limit_pace_keeps_missing_percent_unknown() {
+        let pace =
+            tokenomics_limit_pace_snapshot(None, 5 * 60 * 60, Some(4 * 60 * 60), None, "unix:1000");
+
+        assert_eq!(pace["pace_status"], json!("unknown"));
+        assert_eq!(pace["pace_exhausts_before_reset"], json!(false));
+        assert!(pace["pace_delta_percent"].is_null());
+        assert!(pace["pace_projected_used_percent"].is_null());
+    }
+
+    #[test]
+    fn tokenomics_limit_pace_keeps_reset_window_unknown() {
+        let pace =
+            tokenomics_limit_pace_snapshot(Some(100), 5 * 60 * 60, Some(0), None, "unix:1000");
+
+        assert_eq!(pace["pace_status"], json!("unknown"));
+        assert_eq!(pace["pace_exhausts_before_reset"], json!(false));
+        assert!(pace["pace_delta_percent"].is_null());
+    }
+
+    #[test]
+    fn tokenomics_limit_sample_pacing_ignores_samples_after_reset() {
+        let mut limit = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:test",
+            "window_kind": "5_hour",
+            "limit_window_seconds": 5 * 60 * 60,
+        });
+        let samples = vec![json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:test",
+            "window_kind": "5_hour",
+            "used_percent": 90,
+            "remaining_percent": 10,
+            "sample_at": "unix:1",
+            "sample_at_unix": 1,
+            "reset_at": "unix:2",
+            "limit_window_seconds": 5 * 60 * 60,
+        })];
+
+        tokenomics_apply_provider_limit_sample_pacing_from_rows(&mut limit, &samples);
+
+        assert!(limit["used_percent"].is_null());
+        assert!(limit["pace_strategy"].is_null());
+        assert!(limit["pace_status"].is_null());
     }
 
     #[test]
@@ -14240,5 +14423,35 @@ mod tokenomics_tests {
         assert_eq!(snapshot["display_percent"], json!(38));
         assert_eq!(snapshot["display_percent_kind"], json!("remaining"));
         assert_eq!(snapshot["pace_status"], json!("over_pace"));
+    }
+
+    #[test]
+    fn tokenomics_codex_limit_snapshot_keeps_missing_percent_unknown() {
+        let account = TokenomicsProviderAccount {
+            key: "openai:codex:test".to_string(),
+            label: "Codex account test".to_string(),
+        };
+        let snapshot = tokenomics_codex_window_snapshot(
+            "5_hour",
+            "5-Hour Session",
+            "ChatGPT Pro",
+            "codex_usage_api",
+            &json!({
+                "reset_after_seconds": 60,
+            }),
+            &json!({
+                "allowed": true,
+                "limit_reached": false,
+            }),
+            "unix:2010",
+            &account,
+        );
+
+        assert!(snapshot["used_percent"].is_null());
+        assert!(snapshot["remaining_percent"].is_null());
+        assert!(snapshot["display_percent"].is_null());
+        assert_eq!(snapshot["status_label"], json!("Usage data unavailable"));
+        assert_eq!(snapshot["pace_status"], json!("unknown"));
+        assert!(snapshot["pace_delta_percent"].is_null());
     }
 }

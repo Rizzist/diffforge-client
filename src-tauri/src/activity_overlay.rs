@@ -20,6 +20,7 @@ fn position_activity_overlay_window(window: &tauri::WebviewWindow) {
 }
 
 fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    let _span = BackendCpuSpan::new("activity_overlay.ensure_window");
     if let Some(window) = app.get_webview_window(ACTIVITY_OVERLAY_WINDOW_LABEL) {
         size_activity_overlay_window(&window);
         return Ok(window);
@@ -51,6 +52,7 @@ fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindo
 }
 
 fn activity_overlay_status_for(app: &AppHandle) -> ActivityOverlayVisibility {
+    let _span = BackendCpuSpan::new("activity_overlay.status");
     let visible = app
         .get_webview_window(ACTIVITY_OVERLAY_WINDOW_LABEL)
         .and_then(|window| window.is_visible().ok())

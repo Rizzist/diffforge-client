@@ -2,12 +2,14 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-app_path="$repo_root/src-tauri/target/debug/bundle/macos/Diff Forge AI.app"
-legacy_app_path="$repo_root/src-tauri/target/debug/bundle/macos/Diff Forge AI Dev.app"
+app_path="$repo_root/src-tauri/target/debug/bundle/macos/Diff Forge AI Dev.app"
+legacy_conflicting_app_path="$repo_root/src-tauri/target/debug/bundle/macos/Diff Forge AI.app"
 signing_identity="${APPLE_SIGNING_IDENTITY:-Diff Forge AI Local Development}"
 dev_keychain="$HOME/Library/Keychains/diffforge-dev.keychain-db"
 dev_keychain_password="${DIFFFORGE_DEV_KEYCHAIN_PASSWORD:-diffforge-dev-keychain}"
 lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+dev_bundle_identifier="ai.diffforge.desktop.dev"
+dev_deeplink_scheme="diffforge-dev"
 
 cd "$repo_root"
 
@@ -156,17 +158,24 @@ if ! security find-identity -v -p codesigning | grep -Fq "\"$signing_identity\""
   exit 1
 fi
 
-if [[ -d "$legacy_app_path" ]]; then
-  "$lsregister" -u "$legacy_app_path" 2>/dev/null || true
-  rm -rf "$legacy_app_path"
+if [[ -d "$legacy_conflicting_app_path" ]]; then
+  "$lsregister" -u "$legacy_conflicting_app_path" 2>/dev/null || true
+  rm -rf "$legacy_conflicting_app_path"
 fi
 
-APPLE_SIGNING_IDENTITY="$signing_identity" npx tauri build --debug --bundles app --config '{"bundle":{"targets":["app"]}}'
+RUST_DIFFFORGE_DESKTOP_CALLBACK_SCHEME="$dev_deeplink_scheme" \
+  APPLE_SIGNING_IDENTITY="$signing_identity" \
+  npx tauri build --debug --bundles app --config src-tauri/tauri.dev.conf.json
 "$lsregister" -f "$app_path"
 codesign --verify --deep --strict --verbose=4 "$app_path"
 signature_details="$(codesign -dv --verbose=4 "$app_path" 2>&1)"
 if ! grep -Fq "Authority=$signing_identity" <<<"$signature_details"; then
   echo "Built app was not signed by $signing_identity." >&2
+  echo "$signature_details" >&2
+  exit 1
+fi
+if ! grep -Fq "Identifier=$dev_bundle_identifier" <<<"$signature_details"; then
+  echo "Built app did not use the development bundle identifier $dev_bundle_identifier." >&2
   echo "$signature_details" >&2
   exit 1
 fi
@@ -182,5 +191,6 @@ open -n "$app_path"
 
 echo "Launched $app_path"
 echo "Signed with $signing_identity"
+echo "Bundle identifier: $dev_bundle_identifier"
 echo "Microphone entitlement present"
-echo "macOS should now route diffforge:// URLs to Diff Forge AI."
+echo "macOS should now route $dev_deeplink_scheme:// URLs to Diff Forge AI Dev."

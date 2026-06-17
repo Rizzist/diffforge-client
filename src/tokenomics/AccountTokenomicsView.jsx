@@ -1434,12 +1434,24 @@ function providerLimitSourceRank(row = {}) {
 }
 
 function shouldReplaceProviderLimit(existing = {}, incoming = {}) {
+  const incomingMs = limitTimestampMs(incoming);
+  const existingMs = limitTimestampMs(existing);
+  if (
+    providerLimitIsAuthoritativeNoData(incoming)
+    && incomingMs >= existingMs
+  ) {
+    return true;
+  }
+  if (
+    providerLimitIsAuthoritativeNoData(existing)
+    && existingMs >= incomingMs
+  ) {
+    return false;
+  }
   const existingUnknown = providerLimitIsUnknown(existing);
   const incomingUnknown = providerLimitIsUnknown(incoming);
   if (existingUnknown && !incomingUnknown) return true;
   if (!existingUnknown && incomingUnknown) return false;
-  const incomingMs = limitTimestampMs(incoming);
-  const existingMs = limitTimestampMs(existing);
   if (incomingMs !== existingMs) return incomingMs > existingMs;
   return providerLimitSourceRank(incoming) >= providerLimitSourceRank(existing);
 }
@@ -1585,6 +1597,18 @@ function clientProjectedLimit(limit = {}) {
     displayPercent: resetDisplayPercent,
     display_percent_kind: resetDisplayKind,
     displayPercentKind: resetDisplayKind,
+    pace_delta_percent: null,
+    paceDeltaPercent: null,
+    pace_status: "unknown",
+    paceStatus: "unknown",
+    pace_exhausts_before_reset: false,
+    paceExhaustsBeforeReset: false,
+    pace_projected_used_percent: null,
+    paceProjectedUsedPercent: null,
+    pace_projected_exhaustion_seconds: null,
+    paceProjectedExhaustionSeconds: null,
+    pace_projected_exhaustion_at: null,
+    paceProjectedExhaustionAt: null,
     reset_after_seconds: 0,
     resetAfterSeconds: 0,
     status_label: "Available",
@@ -1613,7 +1637,7 @@ function mergeLimits(limits, windowKind) {
       usedPercent: null,
       displayPercent: null,
       displayPercentKind: limitDisplayPercentKind({}, windowKind),
-      paceDelta: 0,
+      paceDelta: null,
       paceStatus: "unknown",
       overPace: false,
       statusLabel: "Plan limit not exposed",
@@ -1649,16 +1673,18 @@ function mergeLimits(limits, windowKind) {
     ? (displayPercentKind === "remaining" ? 100 : 0)
     : limitDisplayPercent(rows[0], usedPercent, remainingPercent, normalizedWindowKind);
   const paceDelta = resetEstimated
-    ? 0
-    : Math.round(rows.reduce((sum, row) => sum + numeric(row?.pace_delta_percent, row?.paceDeltaPercent), 0) / rows.length);
+    ? null
+    : averagePercent(rows
+      .map((row) => limitNumberOrNull(row?.pace_delta_percent, row?.paceDeltaPercent))
+      .filter((value) => value != null));
   const plans = [...new Set(rows.map((row) => row?.plan_name || row?.planName).filter(Boolean))];
   const confidences = [...new Set(rows.map((row) => row?.confidence).filter(Boolean))];
   const ratePoints = rows.flatMap((row) => Array.isArray(row?.rate_points || row?.ratePoints) ? (row.rate_points || row.ratePoints) : []);
   const limitSource = rows.find((row) => row?.limit_source || row?.limitSource)?.limit_source || rows.find((row) => row?.limitSource)?.limitSource || "";
   const providerKeys = [...new Set(rows.map(providerKey).filter(Boolean))];
   const claudeUnavailable = isClaudeLimitUnavailable(rows);
-  const paceStatus = resetEstimated ? "on_pace" : limitPaceStatus(rows);
-  const overPace = paceStatus === "over_pace" || paceDelta > 0;
+  const paceStatus = resetEstimated ? "unknown" : limitPaceStatus(rows);
+  const overPace = paceStatus === "over_pace" || (paceDelta != null && paceDelta > 0);
   return {
     windowKind: normalizedWindowKind,
     label: rows[0]?.label || (normalizedWindowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
@@ -1734,9 +1760,9 @@ function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable =
     return rows.find((row) => row?.status_label || row?.statusLabel)?.status_label || "Plan limit not exposed";
   }
   if (remainingPercent <= 0) return "Limit exhausted";
-  if (paceStatus === "over_pace" || paceDelta > 0) return "Pace will exhaust before reset";
+  if (paceStatus === "over_pace" || (paceDelta != null && paceDelta > 0)) return "Pace will exhaust before reset";
   if (remainingPercent < 18) return "Pace is running hot";
-  if (remainingPercent < 38 || paceDelta > 8) return "Watch current pace";
+  if (remainingPercent < 38 || (paceDelta != null && paceDelta > 8)) return "Watch current pace";
   return "Safe at current pace";
 }
 
@@ -1886,10 +1912,11 @@ function planStatusTitle(limit, selectedProvider) {
   return name || (selectedProvider === "claude" ? "Claude account signed in" : "Provider plan detected");
 }
 
-function statusTone(remainingPercent, paceDelta = 0, paceStatus = "unknown") {
+function statusTone(remainingPercent, paceDelta = null, paceStatus = "unknown") {
+  const paceDeltaValue = limitNumberOrNull(paceDelta);
   if (remainingPercent == null) return "unknown";
-  if (remainingPercent <= 15 || paceStatus === "over_pace" || paceDelta > 0) return "danger";
-  if (remainingPercent <= 38 || paceDelta > 8) return "warn";
+  if (remainingPercent <= 15 || paceStatus === "over_pace" || (paceDeltaValue != null && paceDeltaValue > 0)) return "danger";
+  if (remainingPercent <= 38 || (paceDeltaValue != null && paceDeltaValue > 8)) return "warn";
   return "good";
 }
 
@@ -2097,14 +2124,19 @@ function providerLimitIsUnknown(row = {}) {
   const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
   const confidence = String(row?.confidence || "").toLowerCase();
   const status = String(row?.status_label || row?.statusLabel || "").toLowerCase();
-  const hasPercent = row?.remaining_percent != null
-    || row?.remainingPercent != null
-    || row?.used_percent != null
-    || row?.usedPercent != null;
+  const hasPercent = hasKnownLimitPercent(row);
   return source === "not_exposed"
     || confidence === "unknown"
     || status.includes("not exposed")
     || (!hasPercent && row?.allowance == null && row?.used == null);
+}
+
+function providerLimitIsAuthoritativeNoData(row = {}) {
+  if (hasKnownLimitPercent(row)) return false;
+  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
+  const confidence = String(row?.confidence || "").toLowerCase();
+  return confidence === "live"
+    && (source.includes("usage_api") || source === "claude_statusline");
 }
 
 function mergeProviderLimits(previousLimits, nextLimits) {
@@ -2554,6 +2586,10 @@ function CostCell({ value }) {
 function LimitMetricCard({ icon: Icon, limit, title }) {
   const displayPercent = limit.displayPercent;
   const displayKind = limit.displayPercentKind || "used";
+  const paceDelta = limitNumberOrNull(limit.paceDelta);
+  const paceText = paceDelta == null
+    ? "No data"
+    : `${paceDelta > 0 ? "▲" : "▼"}${Math.abs(paceDelta)}%`;
   const progressLabel = displayKind === "remaining" ? `${title} remaining` : `${title} used`;
   return (
     <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta, limit.paceStatus)}>
@@ -2564,11 +2600,12 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
         </MetricName>
         <MetricScore>
           <strong>{displayPercent == null ? "—" : `${displayPercent}%`}</strong>
-          <span>{limit.paceDelta > 0 ? "▲" : "▼"}{Math.abs(limit.paceDelta)}%</span>
+          <span>{paceText}</span>
         </MetricScore>
       </MetricHeading>
       <ProgressTrack aria-label={progressLabel}>
         <ProgressFill
+          $empty={displayPercent == null}
           $tone={limitPercentTone(displayPercent, displayKind)}
           style={{ width: `${displayPercent ?? 0}%` }}
         />
@@ -3470,7 +3507,7 @@ const ProgressTrack = styled.div`
 
 const ProgressFill = styled.div`
   height: 100%;
-  min-width: 7px;
+  min-width: ${({ $empty }) => ($empty ? "0" : "7px")};
   border-radius: inherit;
   --bar-tone: ${({ $tone }) => toneColor($tone)};
   background: var(--bar-tone);

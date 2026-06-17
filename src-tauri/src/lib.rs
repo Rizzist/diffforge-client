@@ -2319,6 +2319,7 @@ struct PreparedPromptImages {
 include!("validation.rs");
 include!("platform.rs");
 include!("process.rs");
+include!("backend_cpu.rs");
 include!("workspace_files.rs");
 include!("workspace_threads_store.rs");
 include!("architectures.rs");
@@ -4621,6 +4622,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend_ping,
+            backend_cpu_attribution_snapshot,
             desktop_auth_snapshot_command,
             desktop_auth_start_login,
             desktop_auth_validate_session,

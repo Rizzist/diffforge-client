@@ -417,6 +417,7 @@ async fn list_developer_processes(
     include_diagnostics: Option<bool>,
     include_ports: Option<bool>,
 ) -> Result<DeveloperProcessSnapshot, String> {
+    let _span = BackendCpuSpan::new("developer_processes.command.list");
     collect_developer_process_snapshot(
         state.inner(),
         Some(cloud_state.inner()),
@@ -437,6 +438,7 @@ async fn developer_energy_snapshot(
     terminal_state: State<'_, TerminalState>,
     workspace_roots: Vec<String>,
 ) -> Result<DeveloperEnergySnapshot, String> {
+    let _span = BackendCpuSpan::new("developer_processes.command.energy_snapshot");
     collect_light_developer_energy_snapshot(
         state.inner(),
         Some(cloud_state.inner()),
@@ -459,10 +461,17 @@ async fn collect_light_developer_energy_snapshot(
     let cloud_signals = developer_energy_cloud_signals(cloud_state).await;
     let workspace_roots = normalize_process_roots(workspace_roots, None);
     let coordination_activity_count =
-        developer_energy_coordination_activity_count(&workspace_roots);
-    let docker_container_count = developer_cached_docker_container_count(state);
+        {
+            let _span = BackendCpuSpan::new("developer_processes.energy.coordination_activity");
+            developer_energy_coordination_activity_count(&workspace_roots)
+        };
+    let docker_container_count = {
+        let _span = BackendCpuSpan::new("developer_processes.energy.docker_count");
+        developer_cached_docker_container_count(state)
+    };
 
     let (cpu_percent, memory_bytes) = {
+        let _span = BackendCpuSpan::new("developer_processes.energy.sysinfo_refresh");
         let mut system = state
             .system
             .lock()
@@ -524,6 +533,7 @@ async fn collect_developer_process_snapshot(
         include_ports,
     );
     if !force {
+        let _span = BackendCpuSpan::new("developer_processes.snapshot.cache_lookup");
         if let Some(snapshot) =
             developer_cached_process_snapshot(state, &cache_key, sampled_at_ms)
         {
@@ -538,6 +548,7 @@ async fn collect_developer_process_snapshot(
         DeveloperEnergyCloudSignals::default()
     };
     let coordination_activity_count = if include_diagnostics {
+        let _span = BackendCpuSpan::new("developer_processes.snapshot.coordination_activity");
         developer_energy_coordination_activity_count(&workspace_roots)
     } else {
         0
@@ -557,6 +568,7 @@ async fn collect_developer_process_snapshot(
         protected_count,
         energy,
     ) = {
+        let _span = BackendCpuSpan::new("developer_processes.snapshot.sysinfo_and_build");
         let mut system = state
             .system
             .lock()
