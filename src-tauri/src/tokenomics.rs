@@ -1382,6 +1382,61 @@ fn tokenomics_cached_live_limits_for(app: &AppHandle) -> Result<Value, String> {
     Ok(summary)
 }
 
+/// One periodic Tokenomics refresh cycle. Scans the current-day token tail so
+/// totals keep advancing, then stamps the freshly observed 5h/weekly limit
+/// percentages into the sample-history and latest-window tables so usage over
+/// time is retained. The database is opened only for the duration of the cycle
+/// — the idle gap between cycles holds no SQLite handle, which keeps the loop
+/// energy-cheap. Cloud last-known limits are intentionally excluded: inbound
+/// server tokenomics is ignored for now, so only locally observed usage is
+/// recorded.
+fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String> {
+    let token_scan = match tokenomics_scan_realtime_usage_for(app) {
+        Ok(_) => "ok",
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.tokenomics.periodic_token_scan_failed",
+                json!({ "error": error }),
+            );
+            "error"
+        }
+    };
+
+    let conn = tokenomics_open_db(app)?;
+    tokenomics_reconcile_current_provider_accounts(&conn)?;
+    // include_cloud_last_known = false  -> ignore inbound server tokenomics.
+    // include_stale_provider_cache = false -> only stamp freshly observed %s
+    //   (failed fetches yield unknown rows that the recorders skip).
+    // reconcile_accounts = true -> keep provider-account identity current.
+    let mut limits = tokenomics_provider_limits(&conn, false, false, true)?;
+    let recorded_samples = tokenomics_record_provider_limit_samples(&conn, &limits)?;
+    tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
+    let recorded_windows = tokenomics_record_latest_windows(&conn, &limits)?;
+    // Drop the stored summary snapshot so the next UI read regenerates from the
+    // freshly stamped windows instead of returning a stale cached payload.
+    tokenomics_invalidate_summary_snapshots(&conn)?;
+    drop(conn);
+    tokenomics_clear_summary_cache();
+
+    Ok(json!({
+        "token_scan": token_scan,
+        "recorded_samples": recorded_samples,
+        "recorded_windows": recorded_windows,
+        "limit_count": limits.len(),
+    }))
+}
+
+/// Removes the persisted read-only summary snapshots so the next summary read
+/// rebuilds from current tables after a fresh stamp cycle.
+fn tokenomics_invalidate_summary_snapshots(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM tokenomics_meta WHERE key LIKE ?1",
+        rusqlite::params![format!("{TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX}%")],
+    )
+    .map_err(|error| format!("Unable to invalidate Tokenomics summary snapshot: {error}"))?;
+    Ok(())
+}
+
 async fn tokenomics_enqueue_usage_sync_if_inserted(
     _app: AppHandle,
     _state: &CloudMcpState,

@@ -200,6 +200,7 @@ struct CloudMcpBackgroundSync {
     tokenomics_pending: Arc<Mutex<Option<CloudMcpTokenomicsSyncJob>>>,
     tokenomics_notify: Arc<tokio::sync::Notify>,
     tokenomics_started: Arc<AtomicBool>,
+    tokenomics_scheduler_started: Arc<AtomicBool>,
     tokenomics_draining: Arc<AtomicBool>,
     tokenomics_cursor: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -697,6 +698,7 @@ impl CloudMcpState {
                 tokenomics_pending: Arc::new(Mutex::new(None)),
                 tokenomics_notify: Arc::new(tokio::sync::Notify::new()),
                 tokenomics_started: Arc::new(AtomicBool::new(false)),
+                tokenomics_scheduler_started: Arc::new(AtomicBool::new(false)),
                 tokenomics_draining: Arc::new(AtomicBool::new(false)),
                 tokenomics_cursor: Arc::new(Mutex::new(HashMap::new())),
             },
@@ -723,9 +725,93 @@ fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Val
 
 /// Tokenomics cloud sync is client-owned: the UI can request a sync after an
 /// explicit scan or limit update, but cloud/server events do not start scans.
-pub(crate) fn cloud_mcp_start_tokenomics_scheduler(_app: AppHandle, _state: CloudMcpState) {
-    // Intentionally inert. Tokenomics source observation belongs to the
-    // Tokenomics client surface, not Cloud MCP startup or server events.
+/// Reason tag for the every-minute background stamp/sync. Kept off the visible
+/// activity surface so the periodic sync does not flash a spinner each minute.
+const CLOUD_MCP_TOKENOMICS_PERIODIC_REASON: &str = "tokenomics_periodic";
+/// Idle gap between the end of one stamp cycle and the start of the next. The
+/// SQLite handle is closed while we wait so the loop stays energy-cheap.
+const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 60;
+/// Short settle delay before the first cycle so app startup isn't contended.
+const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 15;
+
+/// Drives the always-on Tokenomics refresh while the app is running: every
+/// minute it stamps the current usage percentages into the local history,
+/// re-scans the current-day token tail, then best-effort pushes the delta to
+/// the server. Inbound server tokenomics is ignored for now. The database is
+/// only opened for the duration of each cycle.
+pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudMcpState) {
+    if state
+        .background_sync
+        .tokenomics_scheduler_started
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_secs(
+            CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS,
+        ))
+        .await;
+
+        loop {
+            if app_shutdown_requested() {
+                break;
+            }
+
+            // Stamp/scan runs off the async runtime: it opens SQLite and may
+            // issue blocking HTTP for the live provider limits.
+            let cycle_app = app.clone();
+            match tauri::async_runtime::spawn_blocking(move || {
+                tokenomics_run_periodic_sample_cycle(&cycle_app)
+            })
+            .await
+            {
+                Ok(Ok(_status)) => {}
+                Ok(Err(error)) => {
+                    log_terminal_status_event(
+                        "backend.cloud_mcp.tokenomics_scheduler.cycle_error",
+                        json!({ "error": clean_terminal_telemetry_text(&error) }),
+                    );
+                }
+                Err(error) => {
+                    log_terminal_status_event(
+                        "backend.cloud_mcp.tokenomics_scheduler.join_error",
+                        json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
+                    );
+                }
+            }
+
+            if app_shutdown_requested() {
+                break;
+            }
+
+            // Best-effort outbound sync. Only attempt while a live connection
+            // exists; offline cycles keep stamping locally and the next online
+            // cycle flushes the accumulated delta since the sync cursor.
+            if CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
+                let _ = cloud_mcp_enqueue_tokenomics_sync(
+                    app.clone(),
+                    &state,
+                    CLOUD_MCP_TOKENOMICS_PERIODIC_REASON.to_string(),
+                    false,
+                    false,
+                )
+                .await;
+            }
+
+            // Gap measured from the end of this cycle to the start of the next.
+            sleep(Duration::from_secs(
+                CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS,
+            ))
+            .await;
+        }
+
+        state
+            .background_sync
+            .tokenomics_scheduler_started
+            .store(false, Ordering::SeqCst);
+    });
 }
 
 fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
@@ -6181,11 +6267,13 @@ fn cloud_mcp_merge_tokenomics_sync_jobs(
 }
 
 fn cloud_mcp_tokenomics_sync_reason_visible(
-    _reason: &str,
+    reason: &str,
     _force_full: bool,
     _force_resync: bool,
 ) -> bool {
-    true
+    // The every-minute background stamp/sync stays off the activity surface;
+    // user- and event-triggered syncs remain visible.
+    reason != CLOUD_MCP_TOKENOMICS_PERIODIC_REASON
 }
 
 async fn cloud_mcp_enqueue_tokenomics_sync(

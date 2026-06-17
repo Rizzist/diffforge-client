@@ -5351,7 +5351,14 @@ export function AudioWidgetWindow() {
       const audioBuffer = await startLowPowerAudioBuffer({
         deviceId: readSelectedAudioInputDeviceId(),
         owner: "audio-widget",
-        onStats: setWidgetAudioStats,
+        // The idle widget never displays the live level (widgetLevel is only
+        // read while recording), so applying every stats event just re-renders
+        // the widget for nothing. Only feed the meter while actually recording.
+        onStats: (stats) => {
+          if (widgetStateRef.current === "recording") {
+            setWidgetAudioStats(stats);
+          }
+        },
       });
 
       if (audioBufferGenerationRef.current !== bufferGeneration) {
@@ -8910,6 +8917,11 @@ export function AudioWidgetWindow() {
           />
           <AudioWidgetMeter
             data-active="true"
+            data-animate={
+              isRecordingFocus || isProcessingFocus || widgetState === "arming"
+                ? "true"
+                : undefined
+            }
             data-processing={isProcessingFocus ? "true" : undefined}
             data-prominent="true"
             data-ready={widgetChromeReady && !isClosingFocus ? "true" : "false"}

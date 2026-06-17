@@ -3837,20 +3837,85 @@ fn choose_terminal_command_path(command_candidates: &[String]) -> Option<String>
         .cloned()
 }
 
+// Long agent launch commands (Codex/Claude with many `-c`/MCP overrides) can
+// exceed the PTY line-discipline canonical limit (~1 KB on macOS, ~4 KB on
+// Linux; POSIX `MAX_CANON`). When such a command is injected into a prewarmed
+// login shell before its line editor switches the tty into raw mode, the kernel
+// truncates the line mid-token and the shell drops to a `quote>` continuation
+// prompt, so the agent never starts. The documented workaround for long
+// terminal input is to read it from a file: stage the full launch sequence in a
+// 0600 temp script and inject only a short `. <script>` line, which is immune to
+// both the canonical-length limit and the shell-startup timing race.
+#[cfg(not(windows))]
+fn stage_agent_launch_input_as_source_command(input: &str) -> Option<String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if input.trim().is_empty() {
+        return None;
+    }
+
+    static LAUNCH_SCRIPT_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let counter = LAUNCH_SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "difflaunch-{}-{}-{}.sh",
+        std::process::id(),
+        nanos,
+        counter
+    ));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+
+    let quoted_path = quote_shell_literal(&path.to_string_lossy());
+    // Self-delete first: on Unix the shell keeps its already-open source fd valid
+    // after the path is unlinked, so the script still runs to completion and the
+    // file never lingers on disk (even if the agent runs for hours).
+    let script = format!("command rm -f -- {quoted_path}\n{input}");
+    file.write_all(script.as_bytes()).ok()?;
+    file.flush().ok()?;
+    drop(file);
+
+    Some(format!(". {quoted_path}\n"))
+}
+
+#[cfg(windows)]
+fn stage_agent_launch_input_as_source_command(_input: &str) -> Option<String> {
+    None
+}
+
 fn write_agent_start_input_to_writer(
     writer: &mut dyn Write,
     input: &str,
     context: &str,
 ) -> Result<(), String> {
+    let staged_source_command = stage_agent_launch_input_as_source_command(input);
+    let payload = staged_source_command.as_deref().unwrap_or(input);
+    let delivery = if staged_source_command.is_some() {
+        "source_script"
+    } else {
+        "inline"
+    };
     log_terminal_crash_forensics_event(
         "backend.agent_start_input.write.begin",
         json!({
             "bytes": input.len(),
+            "payloadBytes": payload.len(),
+            "delivery": delivery,
             "context": clean_terminal_diagnostic_log_text(context),
             "input_kind": terminal_input_forensics_kind(input),
         }),
     );
-    if let Err(error) = writer.write_all(input.as_bytes()) {
+    if let Err(error) = writer.write_all(payload.as_bytes()) {
         log_terminal_crash_forensics_event(
             "backend.agent_start_input.write.error",
             json!({

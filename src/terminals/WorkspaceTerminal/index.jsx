@@ -6397,7 +6397,13 @@ function WorkspaceTerminal({
           buffer: bufferDiagnostics,
         };
 
+        // The screen is genuinely blank here. A bare renderer refresh cannot
+        // recover an agent that simply never painted (e.g. a TUI that came up
+        // before it got a usable terminal size), so force a real resize first:
+        // that rebuilds the texture atlas and TIOCSWINSZ-nudges the PTY into a
+        // repaint. Refresh afterwards to flush whatever lands in the buffer.
         if (!previousProbe) {
+          void resizeController?.resizeNow("blank_startup_probe", { force: true });
           refreshTerminalRenderer("blank_startup_probe", {
             outputBytes,
             outputChunks,
@@ -6411,11 +6417,7 @@ function WorkspaceTerminal({
           return;
         }
 
-        const outputChanged = outputBytes !== previousProbe.outputBytes
-          || outputChunks !== previousProbe.outputChunks
-          || visibleOutputBytes !== previousProbe.visibleOutputBytes
-          || visibleOutputChunks !== previousProbe.visibleOutputChunks;
-
+        void resizeController?.resizeNow("blank_startup_watch", { force: true });
         refreshTerminalRenderer("blank_startup_watch", {
           outputBytes,
           outputChunks,
@@ -9469,26 +9471,51 @@ function WorkspaceTerminal({
     // Reveal path: terminal slots hide with `visibility: hidden`, which keeps
     // their layout box, so the ResizeObserver does NOT fire when a slot goes
     // from hidden -> visible (e.g. when the workspace opens and the layout rect
-    // finally arrives). Without an explicit reschedule the mount/activation
+    // finally arrives). Without an explicit recovery the mount/activation
     // resizes that ran while the slot was hidden were skipped as
     // "surface_hidden" and the terminal never painted until a full reload.
-    // Watch the slot's hidden attributes and, on reveal, schedule a fresh resize
-    // + renderer refresh so the terminal paints immediately.
+    //
+    // A plain refresh + non-forced resize is not enough on its own: when the
+    // grid size was already applied during launch, the reveal resize is dropped
+    // as a "duplicate_size" no-op, so no SIGWINCH reaches the agent and the
+    // WebGL texture atlas is never rebuilt. A TUI agent (Claude/Codex) only
+    // repaints on SIGWINCH, and a renderer whose atlas/backing store was built
+    // while the slot was hidden stays blank until it is rebuilt -- which is the
+    // intermittent "one pane is black until I restart it" bug. So the reveal
+    // recovery forces a real resize (rebuilds the atlas + TIOCSWINSZ-nudges the
+    // PTY into a repaint + syncs xterm's renderer dimensions), clears the
+    // texture atlas directly as a belt-and-suspenders for the DOM/WebGL
+    // renderer, does a full refresh, and re-paints once more shortly after in
+    // case the render service was still settling visibility at the exact reveal
+    // instant. This mirrors the manual "restart pane" cure without remounting.
     const revealSlot = container.closest?.('[data-terminal-surface-slot="true"]');
     if (revealSlot && typeof MutationObserver === "function") {
       const isSlotVisible = () => (
         revealSlot.getAttribute("data-terminal-tab-hidden") !== "true"
         && revealSlot.getAttribute("data-terminal-hidden") !== "true"
       );
+      const recoverRevealedTerminalPaint = (reason) => {
+        if (isDisposed) {
+          return;
+        }
+        try {
+          terminal.clearTextureAtlas?.();
+        } catch (_error) {
+          // Best effort: the DOM renderer has no atlas and older builds may not
+          // expose this; the forced resize/refresh below still recovers paint.
+        }
+        void resizeController?.resizeNow(reason, { force: true });
+        refreshTerminalRenderer(reason);
+        if (terminalActiveRef.current === true) {
+          attachDeferredWebglRef.current?.(reason);
+        }
+        scheduleVisibleOutputRefresh(`${reason}_retry`, {}, 48);
+      };
       let slotWasVisible = isSlotVisible();
       const slotRevealObserver = new MutationObserver(() => {
         const slotVisibleNow = isSlotVisible();
         if (slotVisibleNow && !slotWasVisible) {
-          resizeController?.schedule("slot_revealed", 0);
-          refreshTerminalRenderer("slot_revealed");
-          if (terminalActiveRef.current === true) {
-            attachDeferredWebglRef.current?.("slot_revealed");
-          }
+          recoverRevealedTerminalPaint("slot_revealed");
         }
         slotWasVisible = slotVisibleNow;
       });

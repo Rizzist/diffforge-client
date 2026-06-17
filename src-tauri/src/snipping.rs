@@ -8864,7 +8864,13 @@ const SNIPPING_STRIP_DEFAULT_LOGICAL_WIDTH: f64 = 1280.0;
 const SNIPPING_STRIP_RECENT_PAGE_LIMIT: usize = 64;
 const SNIPPING_STRIP_RECENT_PAGE_LIMIT_MAX: usize = 200;
 const SNIPPING_STRIP_POSITION_ANIMATE_MS: f64 = 180.0;
-const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 170;
+const SNIPPING_STRIP_CLOSE_ANIM_MS: u64 = 200;
+// Steps for the native backdrop alpha fade on close. The whole frosted bar is
+// faded out over SNIPPING_STRIP_CLOSE_ANIM_MS in lockstep with the webview's
+// CSS content fade, so the glass eases away instead of snapping out from under
+// the fading tiles. Each step re-checks the visibility generation, so a
+// re-open mid-close cancels the fade cleanly.
+const SNIPPING_STRIP_CLOSE_FADE_STEPS: u64 = 14;
 const SNIPPING_STRIP_REASSERT_SHOW_MS: u64 = 120;
 const SNIPPING_STRIP_COLD_BOOT_REASSERT_MS: u64 = 300;
 const SNIPPING_STRIP_INTERACTION_GUARD_ACTIVE_MS: u64 = 30_000;
@@ -9534,7 +9540,9 @@ fn snipping_strip_hide_animated(
     snipping_strip_emit_anim(app, "close", None);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_millis(SNIPPING_STRIP_CLOSE_ANIM_MS)).await;
+        // Dissolve the native frosted backdrop alongside the webview's CSS
+        // content fade so the whole bar eases out together.
+        snipping_strip_animate_alpha_out(&app, &window, &generation_state, generation).await;
         if generation_state.load(Ordering::SeqCst) != generation {
             return;
         }
@@ -9545,6 +9553,63 @@ fn snipping_strip_hide_animated(
             }
             snipping_strip_force_hide_now(&window);
         });
+    });
+}
+
+/// Steps the native strip window's alpha from fully visible to transparent
+/// over SNIPPING_STRIP_CLOSE_ANIM_MS. Every step re-checks the visibility
+/// generation so a re-open mid-close aborts the fade (the next show snaps the
+/// alpha back to 1.0), and since each step is a plain `setAlphaValue` there is
+/// no lingering implicit animation to fight that restore.
+#[cfg(target_os = "macos")]
+async fn snipping_strip_animate_alpha_out(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    generation_state: &Arc<AtomicU64>,
+    generation: u64,
+) {
+    let steps = SNIPPING_STRIP_CLOSE_FADE_STEPS.max(1);
+    let step_ms = (SNIPPING_STRIP_CLOSE_ANIM_MS / steps).max(1);
+    for step in 1..=steps {
+        sleep(Duration::from_millis(step_ms)).await;
+        if generation_state.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let alpha = (1.0 - (step as f64 / steps as f64)).max(0.0);
+        let window = window.clone();
+        let generation_state = generation_state.clone();
+        let _ = app.run_on_main_thread(move || {
+            if generation_state.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            snipping_strip_set_window_alpha(&window, alpha);
+        });
+    }
+}
+
+/// Non-macOS strip windows have no native vibrancy backdrop, so the CSS fade is
+/// the whole close animation — just wait it out before ordering the window out.
+#[cfg(not(target_os = "macos"))]
+async fn snipping_strip_animate_alpha_out(
+    _app: &AppHandle,
+    _window: &tauri::WebviewWindow,
+    _generation_state: &Arc<AtomicU64>,
+    _generation: u64,
+) {
+    sleep(Duration::from_millis(SNIPPING_STRIP_CLOSE_ANIM_MS)).await;
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_strip_set_window_alpha(window: &tauri::WebviewWindow, alpha: f64) {
+    snipping_catch_objc("strip_fade_alpha", || {
+        let Ok(ns_window) = window.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setAlphaValue(alpha);
     });
 }
 

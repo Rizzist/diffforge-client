@@ -2046,6 +2046,11 @@ const STRIP_RAIL_PADDING_LEFT_PX = 14;
 const STRIP_VIRTUAL_OVERSCAN = 4;
 const STRIP_PAGE_PREFETCH_PX = 420;
 const SNIPPING_STRIP_DRAG_GUARD_RELEASE_MS = 220;
+// Upper bound on how long the entrance fade waits for the strip's first
+// content before opening anyway. Keeps a fast cold open from flashing the
+// skeleton→content rebuild while never stranding the shell at opacity 0 if a
+// load is slow or rAF stalls in an unfocused overlay webview.
+const SNIPPING_STRIP_OPEN_CONTENT_BACKSTOP_MS = 220;
 
 function clampIndex(index, min, max) {
   return Math.max(min, Math.min(max, index));
@@ -2461,7 +2466,7 @@ function wheelUnit(event) {
   return 1;
 }
 
-export function SnippingRecentStrip({ onDragActivityChange }) {
+export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refreshSignal }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -2587,6 +2592,30 @@ export function SnippingRecentStrip({ onDragActivityChange }) {
   useEffect(() => {
     refresh(true);
   }, [refresh]);
+
+  // Each open bumps refreshSignal. Rather than remounting (which would drop the
+  // rendered tiles and replay skeleton→content, the source of the open
+  // flicker), pull fresh snips in place with no skeleton. The first signal
+  // value arrives during the initial mount, where the effect above already
+  // loads, so skip it.
+  const refreshSignalSeenRef = useRef(false);
+  useEffect(() => {
+    if (!refreshSignalSeenRef.current) {
+      refreshSignalSeenRef.current = true;
+      return;
+    }
+    refresh(false);
+  }, [refresh, refreshSignal]);
+
+  // Signal the window once the first page settles (loaded, empty, or errored)
+  // so a cold open can hold its fade until real content is ready. Fires once;
+  // later opens keep their content mounted, so the window opens immediately.
+  const contentReadyNotifiedRef = useRef(false);
+  useEffect(() => {
+    if (contentReadyNotifiedRef.current || loading) return;
+    contentReadyNotifiedRef.current = true;
+    onContentReady?.();
+  }, [loading, onContentReady]);
 
   useLayoutEffect(() => {
     updateViewport();
@@ -2893,8 +2922,30 @@ export function SnippingStripWindow() {
   const stripDragGuardTimerRef = useRef(0);
   const closeFallbackTimerRef = useRef(0);
   const closeRequestTokenRef = useRef(0);
+  const contentReadyRef = useRef(false);
+  const pendingOpenRef = useRef(false);
 
   useFloatingWindowBody("strip");
+
+  // Two-frame the open so the closed state paints first, then fade in.
+  const commitOpenAnimation = useCallback(() => {
+    pendingOpenRef.current = false;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => setAnimPhase("open"));
+    });
+  }, []);
+
+  // The strip reports when its first page of content is committed. The very
+  // first (cold) open waits for this so the skeleton→content rebuild happens
+  // behind opacity 0; every later open already has content mounted (the list
+  // is no longer remounted), so contentReadyRef is already true and the
+  // entrance plays immediately.
+  const handleContentReady = useCallback(() => {
+    contentReadyRef.current = true;
+    if (pendingOpenRef.current) {
+      commitOpenAnimation();
+    }
+  }, [commitOpenAnimation]);
 
   useEffect(() => {
     animPhaseRef.current = animPhase;
@@ -2989,21 +3040,27 @@ export function SnippingStripWindow() {
       }, 360);
     };
     const playOpen = () => {
-      // Re-mount the strip on every open so it always shows fresh snips,
-      // and two-frame the transition so the closed state paints first. The
-      // timeout backstop matters: rAF can stall in an unfocused overlay
-      // webview, which used to strand the shell at opacity 0 — a frosted
-      // bar with invisible (but still draggable) tiles.
+      // Bump the refresh signal so the (persistent) strip pulls fresh snips
+      // in place — no remount, so the previously rendered tiles and their
+      // loaded thumbnails survive the open instead of rebuilding from a
+      // skeleton, which is what caused the open flicker. Paint the closed
+      // state first, then fade in once content is ready. The timeout backstop
+      // matters: rAF can stall in an unfocused overlay webview, and a cold
+      // load can be slow — either used to strand the shell at opacity 0, a
+      // frosted bar with invisible (but still draggable) tiles.
       setOpenNonce((nonce) => nonce + 1);
       setAnimPhase("closed");
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => setAnimPhase("open"));
-      });
+      if (contentReadyRef.current) {
+        commitOpenAnimation();
+      } else {
+        pendingOpenRef.current = true;
+      }
       window.setTimeout(() => {
         if (!cancelled && animPhaseRef.current !== "open") {
+          pendingOpenRef.current = false;
           setAnimPhase("open");
         }
-      }, 90);
+      }, SNIPPING_STRIP_OPEN_CONTENT_BACKSTOP_MS);
     };
     listen(SNIPPING_STRIP_ANIM_EVENT, (event) => {
       if (cancelled) return;
@@ -3081,7 +3138,11 @@ export function SnippingStripWindow() {
         >
           <Close aria-hidden="true" />
         </StripCloseButton>
-        <SnippingRecentStrip key={openNonce} onDragActivityChange={setStripDragGuard} />
+        <SnippingRecentStrip
+          onContentReady={handleContentReady}
+          onDragActivityChange={setStripDragGuard}
+          refreshSignal={openNonce}
+        />
       </StripWindowShell>
     </>
   );
@@ -3099,15 +3160,19 @@ const StripWindowShell = styled.main`
   overflow: hidden;
   background: transparent;
   opacity: 0;
-  transform: translateY(-10px) scale(0.98);
+  transform: translateY(-14px) scale(0.965);
   transform-origin: top center;
+  /* Closing transition (settling into the closed state): the bar eases up and
+     dissolves. Timed to match the native backdrop alpha fade
+     (SNIPPING_STRIP_CLOSE_ANIM_MS) so the glass and the content leave together
+     instead of the frosted bar snapping out from under the fading tiles. */
   transition:
-    opacity 150ms ease,
-    transform 180ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
+    opacity 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    transform 200ms cubic-bezier(0.4, 0, 0.2, 1);
   will-change: opacity, transform;
 
   &[data-origin="bottom"] {
-    transform: translateY(10px) scale(0.98);
+    transform: translateY(14px) scale(0.965);
     transform-origin: bottom center;
   }
 
@@ -3115,6 +3180,10 @@ const StripWindowShell = styled.main`
   &[data-anim="open"][data-origin="bottom"] {
     opacity: 1;
     transform: translateY(0) scale(1);
+    /* Opening transition: springy entrance with a touch of overshoot. */
+    transition:
+      opacity 150ms ease,
+      transform 180ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
   }
 `;
 

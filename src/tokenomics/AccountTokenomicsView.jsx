@@ -2662,7 +2662,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 	    selectedProvider,
 	    selectedScopeKey = "all",
 	    selectedAccountKey,
-	    selectedDeviceId,
     scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
@@ -2685,10 +2684,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     updateTokenomicsStore({ selectedAccountKey: nextAccountKey || "all" });
   }, []);
 
-  const setSelectedDeviceId = useCallback((nextDeviceId) => {
-    updateTokenomicsStore({ selectedDeviceId: nextDeviceId || "all", selectedAccountKey: "all" });
-  }, []);
-
   useEffect(() => {
     resetTokenomicsStoreForAccount(accountKey);
     void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
@@ -2704,12 +2699,19 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   const visibleSummary = useMemo(() => summaryForMappedNativeDevices(summary), [summary]);
+  // Cloud sync is intentionally ignored on this client, so Tokenomics always
+  // renders the local device only. There is no device picker: the device filter
+  // is pinned to this machine's id (falling back to "all" before the current
+  // device id is known, which is local-only data anyway).
+  const localDeviceId = String(
+    visibleSummary?.current_device_id || visibleSummary?.currentDeviceId || "",
+  ).trim();
+  const selectedDeviceId = localDeviceId || "all";
   const providers = providerRowsForDisplay(visibleSummary);
   const deviceFiltered = selectedDeviceId !== "all";
   const modelRows = modelRowsForDisplay(visibleSummary);
   const providerRows = providers;
   const scopes = useMemo(() => scopeOptions(visibleSummary), [visibleSummary]);
-  const devices = useMemo(() => deviceOptions(visibleSummary, selectedScopeKey), [visibleSummary, selectedScopeKey]);
   const accountOptions = useMemo(
     () => providerAccountOptions(visibleSummary, selectedProvider, selectedDeviceId, selectedScopeKey),
     [visibleSummary, selectedDeviceId, selectedProvider, selectedScopeKey],
@@ -2722,14 +2724,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
       updateTokenomicsStore({ selectedScopeKey: "all", selectedAccountKey: "all", selectedDeviceId: "all" });
     }
   }, [scopes, selectedScopeKey]);
-  useEffect(() => {
-    if (
-      selectedDeviceId !== "all"
-      && !devices.some((option) => option.key === selectedDeviceId)
-    ) {
-      updateTokenomicsStore({ selectedDeviceId: "all", selectedAccountKey: "all" });
-    }
-  }, [devices, selectedDeviceId]);
   useEffect(() => {
     if (selectedProvider === "all") {
       if (selectedAccountKey !== "all") {
@@ -2861,23 +2855,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 type="button"
               >
                 {account.label}
-              </AccountTab>
-            ))}
-          </AccountTabs>
-        ) : null}
-        {devices.length > 1 ? (
-          <AccountTabs role="tablist" aria-label="Tokenomics device filter">
-            {devices.map((device) => (
-              <AccountTab
-                key={device.key}
-                $active={selectedDeviceId === device.key}
-                $provider={selectedProvider}
-                onClick={() => setSelectedDeviceId(device.key)}
-                role="tab"
-                title={device.label}
-                type="button"
-              >
-                {device.label}
               </AccountTab>
             ))}
           </AccountTabs>

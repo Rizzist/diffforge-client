@@ -785,10 +785,11 @@ fn inactive_native_audio_status() -> AudioInputMonitorStatus {
 }
 
 /// Lazy AEC: the VoiceProcessingIO echo-cancel + noise-suppression DSP only
-/// needs to run while audio is actually flowing to a consumer. We park it on
-/// standby (bypassed) whenever there is no active push-to-talk capture and no
-/// attached realtime/agent stream, and engage it the instant either begins —
-/// keeping the warm buffer instant while dropping idle CPU from ~30% to ~1-2%.
+/// needs to run while audio is actually flowing to a consumer. The unit is kept
+/// warm at all times (so the mic is held continuously — no re-acquire flicker —
+/// and AEC engages on an instant property toggle), but its DSP is bypassed and
+/// its IO buffer widened whenever there is no active capture or realtime/agent
+/// stream, dropping idle CPU from ~30% to ~1-2% with no record-start latency.
 fn apply_voice_processing_bypass(
     session: &mut Option<NativeAudioSession>,
     capture_active: bool,
@@ -848,8 +849,8 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 response,
             } => {
                 let result = start_native_audio_session(&mut session, app, request);
-                // A freshly built unit starts bypassed; re-apply in case a
-                // consumer is already active (e.g. device hot-swap mid-capture).
+                // The warm unit starts bypassed; re-apply in case a consumer is
+                // already active (e.g. device hot-swap mid-capture).
                 apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 let _ = response.send(result);
             }
@@ -1223,8 +1224,18 @@ fn process_native_audio_samples(
             shared.capture_rms = shared.capture_rms.max(rms);
         }
 
-        if now.duration_since(shared.last_stats_at) < Duration::from_millis(AUDIO_STATS_INTERVAL_MS)
-        {
+        // Full-rate stats only while a consumer actually needs the live
+        // waveform (recording or an attached realtime/agent stream). On bare
+        // standby the warm buffer still emits a slow level so the widget shows
+        // the mic is live, without re-rendering the meter ~17x/second for a
+        // preview no one is watching.
+        let stats_interval_ms =
+            if shared.capture_started_at.is_some() || shared.realtime_audio_tx.is_some() {
+                AUDIO_STATS_INTERVAL_MS
+            } else {
+                AUDIO_STATS_STANDBY_INTERVAL_MS
+            };
+        if now.duration_since(shared.last_stats_at) < Duration::from_millis(stats_interval_ms) {
             None
         } else {
             shared.last_stats_at = now;
@@ -1277,6 +1288,15 @@ fn log_native_audio_stream_error(device_id: &str, error: cpal::StreamError) {
 /// (Whisper to 16 kHz, the cloud agents from the advertised session rate).
 #[cfg(target_os = "macos")]
 const MACOS_VOICE_PROCESSING_SAMPLE_RATE: u32 = 48_000;
+
+/// IO buffer the VoiceProcessingIO unit runs while on standby (no active
+/// capture and no realtime/agent consumer). A wide buffer means the audio IO
+/// thread wakes far less often — idle wakeups are the dominant battery cost —
+/// and it does proportionally less per-callback sample-rate conversion, while
+/// the mic still stays warm and pre-roll keeps filling. On the first recording
+/// or realtime attach we restore the device's natural buffer for low latency.
+#[cfg(target_os = "macos")]
+const MACOS_VOICE_STANDBY_BUFFER_FRAMES: u32 = 4096;
 
 /// True while a VoiceProcessingIO capture session is live. The cloud voice
 /// agent checks it to route TTS playback through the unit's own output
@@ -1411,6 +1431,10 @@ fn configure_macos_voice_processing_no_ducking(
 struct MacosVoiceProcessingCapture {
     unit: coreaudio::audio_unit::AudioUnit,
     bypassed: bool,
+    input_device: coreaudio::sys::AudioDeviceID,
+    /// The device's IO buffer size before we touched it; restored on teardown
+    /// and used as the low-latency size while a consumer is active.
+    default_buffer_frames: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -1433,6 +1457,14 @@ impl MacosVoiceProcessingCapture {
                 Some(&value),
             )
             .map_err(|error| format!("Unable to toggle voice-processing bypass: {error}"))?;
+        // Widen the IO buffer on standby to cut idle wakeups; restore the
+        // device's natural buffer the moment a consumer needs low latency.
+        let frames = if bypass {
+            MACOS_VOICE_STANDBY_BUFFER_FRAMES.max(self.default_buffer_frames)
+        } else {
+            self.default_buffer_frames
+        };
+        let _ = macos_set_device_buffer_frame_size(self.input_device, frames);
         self.bypassed = bypass;
         Ok(())
     }
@@ -1443,6 +1475,9 @@ impl Drop for MacosVoiceProcessingCapture {
     fn drop(&mut self) {
         MACOS_VOICE_PROCESSING_ACTIVE.store(false, Ordering::Release);
         macos_voice_playback_clear();
+        // Hand the device back at its original buffer size so nothing else on
+        // the system inherits our wide standby buffer.
+        let _ = macos_set_device_buffer_frame_size(self.input_device, self.default_buffer_frames);
         // AudioUnit's own Drop uninitializes and disposes; stopping first
         // keeps CoreAudio from rendering into a half-torn-down unit.
         let _ = self.unit.stop();
@@ -1463,6 +1498,68 @@ fn macos_voice_processing_core_device(
     }
     get_device_id_from_name(label, true)
         .ok_or_else(|| format!("Input device {label} was not found for voice processing capture."))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_device_buffer_frame_size_address() -> coreaudio::sys::AudioObjectPropertyAddress {
+    coreaudio::sys::AudioObjectPropertyAddress {
+        mSelector: coreaudio::sys::kAudioDevicePropertyBufferFrameSize,
+        mScope: coreaudio::sys::kAudioObjectPropertyScopeGlobal,
+        mElement: coreaudio::sys::kAudioObjectPropertyElementMain,
+    }
+}
+
+/// Reads the device's current IO buffer frame size so we can restore it after
+/// standby/teardown instead of leaving the mic stuck at a wide buffer.
+#[cfg(target_os = "macos")]
+fn macos_get_device_buffer_frame_size(device: coreaudio::sys::AudioDeviceID) -> Option<u32> {
+    let address = macos_device_buffer_frame_size_address();
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        coreaudio::sys::AudioObjectGetPropertyData(
+            device,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut value as *mut u32 as *mut _,
+        )
+    };
+    if status == 0 && value > 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Best-effort: requests an IO buffer frame size on the capture device. macOS
+/// clamps to the device's allowed range and arbitrates across clients, so a
+/// failure just leaves the current cadence in place (never breaks capture).
+#[cfg(target_os = "macos")]
+fn macos_set_device_buffer_frame_size(
+    device: coreaudio::sys::AudioDeviceID,
+    frames: u32,
+) -> Result<(), String> {
+    let address = macos_device_buffer_frame_size_address();
+    let value: u32 = frames;
+    let status = unsafe {
+        coreaudio::sys::AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            std::ptr::null(),
+            std::mem::size_of::<u32>() as u32,
+            &value as *const u32 as *const _,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unable to set audio device buffer frame size: OSStatus {status}"
+        ))
+    }
 }
 
 /// Builds a mic capture stream through macOS's VoiceProcessingIO audio unit,
@@ -1592,11 +1689,17 @@ fn build_macos_voice_processing_capture(
     unit.start().map_err(|error| describe("start", error))?;
     MACOS_VOICE_PROCESSING_ACTIVE.store(true, Ordering::Release);
 
-    // Park the new unit on standby (DSP bypassed). The worker loop re-enables
-    // processing immediately if a capture/realtime consumer is already active.
+    // Park the new unit on standby (DSP bypassed + wide IO buffer). The worker
+    // loop re-engages processing and low-latency buffering instantly via a
+    // property toggle the moment a capture/realtime consumer begins — no stream
+    // rebuild, so the mic is never re-acquired (no orange-icon flicker) and
+    // there is no record-start latency.
+    let default_buffer_frames = macos_get_device_buffer_frame_size(core_device).unwrap_or(512);
     let mut capture = MacosVoiceProcessingCapture {
         unit,
         bypassed: false,
+        input_device: core_device,
+        default_buffer_frames,
     };
     let _ = capture.set_bypass(true);
 
@@ -2016,9 +2119,11 @@ fn start_native_audio_session(
     *session = None;
     let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
 
-    // macOS: capture through the system voice-processing unit so the OS
-    // echo canceller strips played-back agent speech from the mic signal.
-    // Any failure (virtual devices, odd aggregates) falls back to cpal.
+    // macOS: capture through the system VoiceProcessingIO unit (echo cancel +
+    // noise suppression). The unit is kept warm for the session lifetime and
+    // its DSP is bypassed while idle, so recording engages instantly with no
+    // mic re-acquire. Any failure (virtual devices, odd aggregates) falls back
+    // to cpal.
     #[cfg(target_os = "macos")]
     match build_macos_voice_processing_capture(app.clone(), device_id.clone(), &label) {
         Ok((capture, shared, sample_rate)) => {

@@ -10803,6 +10803,13 @@ export const AudioWidgetMeter = styled.div`
         hsl(var(--bar-hue, 208) 92% 62% / 0.82) 54%,
         rgba(217, 121, 53, 0.78)
       );
+  }
+
+  /* Run the 26 bar animations only while actually recording/processing. The
+     idle widget keeps the identical look but stays static, so it isn't driving
+     26 infinite compositor animations (re-evaluated + recomposited every frame)
+     the whole time it floats on screen. */
+  &[data-active="true"][data-animate="true"] span {
     animation: ${audioWidgetBarPulse} var(--duration, 860ms) cubic-bezier(0.5, 0, 0.2, 1) infinite;
     animation-delay: var(--delay, 0ms);
   }
@@ -15855,11 +15862,14 @@ export const WindowSyncDirectionCount = styled.span`
   }
 `;
 
-/* One element for every pill state: the spin animation is never added,
-   removed, or re-mounted on state changes, so it can never visibly reset.
-   The dot variant is a uniform circle, so its (still running) rotation is
-   invisible. will-change keeps the rotation on its own compositor layer so
-   a busy webview main thread cannot freeze it mid-spin. */
+/* Only the spinner variant animates. The dot variant (steady states: live,
+   local, blocked, offline) is a uniform filled circle whose rotation is
+   invisible anyway — leaving it static means that when nothing else is
+   animating, the whole webview rendering pipeline can idle (no per-frame
+   compositor commit, display-link tick, or animation-timeline evaluation),
+   instead of being kept awake 24/7 by an invisible spin. The spinner restarts
+   cleanly from 0deg when sync actually starts (connecting/provisioning/
+   syncing), which is imperceptible since the dot showed no motion. */
 export const WindowSyncPillIndicator = styled.span`
   width: 10px;
   height: 10px;
@@ -15867,8 +15877,11 @@ export const WindowSyncPillIndicator = styled.span`
   border: 1.5px solid currentColor;
   border-top-color: transparent;
   border-radius: 50%;
-  animation: ${workspaceCloseSpin} 0.8s linear infinite;
-  will-change: transform;
+
+  &[data-variant="spinner"] {
+    animation: ${workspaceCloseSpin} 0.8s linear infinite;
+    will-change: transform;
+  }
 
   &[data-variant="dot"] {
     width: 6px;

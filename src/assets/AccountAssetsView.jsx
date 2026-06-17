@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openPath } from "@tauri-apps/plugin-opener";
@@ -1550,8 +1550,10 @@ function AssetsPanel({
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : "No assets registered yet."}</AssetEmptyState>
       ) : (
-        <AssetGrid aria-label="Asset library grid">
-          {filteredItems.map((asset, index) => {
+        <VirtualAssetGrid
+          ariaLabel="Asset library grid"
+          items={filteredItems}
+          renderItem={(asset, index) => {
             const id = assetId(asset, `asset-${index}`);
             const name = assetName(asset, `Asset ${index + 1}`);
             const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel, currentDeviceId);
@@ -1641,13 +1643,10 @@ function AssetsPanel({
                   type="button"
                 >
                   {shouldShowImagePreview ? (
-                    <AssetPreviewImage
+                    <AssetCardImage
                       alt={name}
-                      decoding="async"
-                      draggable={false}
-                      loading={index < 20 ? "eager" : "lazy"}
-                      onError={(event) => {
-                        event.currentTarget.hidden = true;
+                      eager={index < 20}
+                      onError={() => {
                         setFailedPreviewKeys((current) => {
                           const next = new Set(current);
                           next.add(previewKey);
@@ -1838,8 +1837,8 @@ function AssetsPanel({
                 </AssetCardCaption>
               </AssetCard>
             );
-          })}
-        </AssetGrid>
+          }}
+        />
       )}
       {infoAsset && (
         <AssetInfoSheet
@@ -2586,8 +2585,10 @@ function UntrackedAssetsPanel({
           {loading ? "Loading untracked assets..." : "No untracked scratch files yet. Snips and edits will appear here before you track them."}
         </AssetEmptyState>
       ) : (
-        <AssetGrid aria-label="Untracked asset scratch grid">
-          {items.map((asset, index) => {
+        <VirtualAssetGrid
+          ariaLabel="Untracked asset scratch grid"
+          items={items}
+          renderItem={(asset, index) => {
             const id = assetId(asset, `untracked-${index}`);
             const name = assetName(asset, `Scratch ${index + 1}`);
             const localPath = assetLocalPath(asset);
@@ -2617,13 +2618,10 @@ function UntrackedAssetsPanel({
                   type="button"
                 >
                   {shouldShowImagePreview ? (
-                    <AssetPreviewImage
+                    <AssetCardImage
                       alt={name}
-                      decoding="async"
-                      draggable={false}
-                      loading={index < 20 ? "eager" : "lazy"}
-                      onError={(event) => {
-                        event.currentTarget.hidden = true;
+                      eager={index < 20}
+                      onError={() => {
                         setFailedPreviewKeys((current) => {
                           const next = new Set(current);
                           next.add(previewKey);
@@ -2731,8 +2729,8 @@ function UntrackedAssetsPanel({
                 </AssetCardCaption>
               </AssetCard>
             );
-          })}
-        </AssetGrid>
+          }}
+        />
       )}
     </AssetsPane>
   );
@@ -3409,27 +3407,176 @@ const AssetBatchButton = styled.button`
   }
 `;
 
-const AssetGrid = styled.div`
-  display: grid;
+// Asset grid geometry. The grid is virtualized (see VirtualAssetGrid) so a
+// 10k+ library only ever mounts the cards inside the viewport plus a small
+// overscan band. These mirror the CSS column/gap/padding the layout used to
+// express directly so the windowed math stays faithful to the visual grid.
+const ASSET_GRID_GAP = 12;
+const ASSET_GRID_MIN_COL = 220;
+const ASSET_GRID_MAX_COL = 240;
+const ASSET_GRID_PAD_TOP = 14;
+const ASSET_GRID_PAD_BOTTOM = 72;
+const ASSET_GRID_PAD_X = 4;
+const ASSET_GRID_OVERSCAN_ROWS = 4;
+const ASSET_GRID_SMALL_BREAKPOINT = 520;
+const ASSET_GRID_CAPTION_ESTIMATE = 64;
+const ASSET_GRID_DEFAULT_CARD_HEIGHT = 196;
+const ASSET_CARD_MEDIA_ASPECT = 1.618;
+
+// Columns matching `repeat(auto-fill, minmax(220px, 240px))`: pack as many
+// 220px-min columns as fit, with the small-screen two-column fallback.
+function assetGridColumnCount(width) {
+  if (!width || width <= 0) return 1;
+  if (width <= ASSET_GRID_SMALL_BREAKPOINT) return 2;
+  const inner = width - ASSET_GRID_PAD_X * 2;
+  const columns = Math.floor((inner + ASSET_GRID_GAP) / (ASSET_GRID_MIN_COL + ASSET_GRID_GAP));
+  return Math.max(1, columns);
+}
+
+// First-paint card-height estimate (media is a fixed 1.618 aspect of the
+// column width). Real heights replace this after the first measured layout.
+function assetGridEstimatedCardHeight(width, columns) {
+  if (!width || !columns) return ASSET_GRID_DEFAULT_CARD_HEIGHT;
+  const inner = width - ASSET_GRID_PAD_X * 2 - (columns - 1) * ASSET_GRID_GAP;
+  const rawColumnWidth = inner / columns;
+  const columnWidth = width <= ASSET_GRID_SMALL_BREAKPOINT
+    ? rawColumnWidth
+    : Math.min(ASSET_GRID_MAX_COL, Math.max(ASSET_GRID_MIN_COL, rawColumnWidth));
+  const mediaHeight = columnWidth / ASSET_CARD_MEDIA_ASPECT;
+  return Math.round(mediaHeight + ASSET_GRID_CAPTION_ESTIMATE);
+}
+
+const AssetGridScroller = styled.div`
   flex: 1 1 0;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 240px));
-  grid-auto-rows: max-content;
-  gap: 12px;
-  align-items: start;
-  align-content: start;
   min-width: 0;
   min-height: 120px;
   overflow: auto;
-  padding: 14px 4px 72px;
+  padding: 0 ${ASSET_GRID_PAD_X}px;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   scrollbar-width: thin;
-
-  @media (max-width: 520px) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 `;
+
+const AssetGridSpacer = styled.div`
+  width: 100%;
+  flex: 0 0 auto;
+`;
+
+const AssetGridWindow = styled.div`
+  display: grid;
+  gap: ${ASSET_GRID_GAP}px;
+  align-items: start;
+  align-content: start;
+  min-width: 0;
+`;
+
+// Windowed asset grid: renders only the rows intersecting the viewport (plus
+// an overscan band) so the DOM stays bounded no matter how large the library
+// grows. Card markup and styling are unchanged — callers pass the same
+// per-item render they used inside `items.map(...)`, and the absolute item
+// index is preserved so fallbacks/keys keep working.
+function VirtualAssetGrid({ items, renderItem, ariaLabel }) {
+  const scrollerRef = useRef(null);
+  const windowRef = useRef(null);
+  const measureRef = useRef({ columns: 0, cardHeight: 0 });
+  const [viewport, setViewport] = useState({ width: 0, height: 0, scrollTop: 0 });
+  const [cardHeight, setCardHeight] = useState(ASSET_GRID_DEFAULT_CARD_HEIGHT);
+
+  useEffect(() => {
+    const element = scrollerRef.current;
+    if (!element) return undefined;
+    let frame = 0;
+    const read = () => {
+      frame = 0;
+      setViewport((previous) => {
+        const width = element.clientWidth;
+        const height = element.clientHeight;
+        const scrollTop = element.scrollTop;
+        if (previous.width === width && previous.height === height && previous.scrollTop === scrollTop) {
+          return previous;
+        }
+        return { width, height, scrollTop };
+      });
+    };
+    const schedule = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(read);
+    };
+    read();
+    element.addEventListener("scroll", schedule, { passive: true });
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null;
+    if (observer) observer.observe(element);
+    return () => {
+      element.removeEventListener("scroll", schedule);
+      if (observer) observer.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  const columns = assetGridColumnCount(viewport.width);
+  const itemCount = items.length;
+  const totalRows = columns > 0 ? Math.ceil(itemCount / columns) : 0;
+  const rowStride = Math.max(1, cardHeight + ASSET_GRID_GAP);
+
+  const viewportTop = Math.max(0, viewport.scrollTop - ASSET_GRID_PAD_TOP);
+  const startRow = Math.max(0, Math.floor(viewportTop / rowStride) - ASSET_GRID_OVERSCAN_ROWS);
+  const rowsInView = Math.ceil((viewport.height || rowStride) / rowStride) + ASSET_GRID_OVERSCAN_ROWS * 2 + 1;
+  const endRow = Math.min(totalRows, startRow + rowsInView);
+
+  const startIndex = startRow * columns;
+  const endIndex = Math.min(itemCount, endRow * columns);
+  const visibleItems = startIndex < endIndex ? items.slice(startIndex, endIndex) : [];
+
+  const topSpacer = ASSET_GRID_PAD_TOP + startRow * rowStride;
+  const bottomSpacer = Math.max(0, (totalRows - endRow) * rowStride) + ASSET_GRID_PAD_BOTTOM;
+
+  // Keep the row height honest by measuring the tallest mounted card. Reset the
+  // running max whenever the column count changes (cards get narrower/shorter),
+  // otherwise grow monotonically so a fixed `grid-auto-rows` never clips a card.
+  useLayoutEffect(() => {
+    const node = windowRef.current;
+    if (!node) return;
+    let max = 0;
+    for (const child of node.children) {
+      const height = child.offsetHeight;
+      if (height > max) max = height;
+    }
+    if (max <= 0) return;
+    const columnsChanged = measureRef.current.columns !== columns;
+    const nextHeight = columnsChanged ? max : Math.max(max, measureRef.current.cardHeight);
+    if (columnsChanged || nextHeight !== measureRef.current.cardHeight) {
+      measureRef.current = { columns, cardHeight: nextHeight };
+      setCardHeight((previous) => (previous === nextHeight ? previous : nextHeight));
+    }
+  });
+
+  // Seed an estimate as soon as the width is known so the first paint isn't
+  // wildly off before the measured height lands.
+  useEffect(() => {
+    if (viewport.width <= 0) return;
+    if (measureRef.current.columns === columns && measureRef.current.cardHeight > 0) return;
+    const estimate = assetGridEstimatedCardHeight(viewport.width, columns);
+    setCardHeight((previous) => (Math.abs(previous - estimate) > 1 ? estimate : previous));
+  }, [viewport.width, columns]);
+
+  const template = viewport.width > 0 && viewport.width <= ASSET_GRID_SMALL_BREAKPOINT
+    ? "repeat(2, minmax(0, 1fr))"
+    : `repeat(${columns}, minmax(${ASSET_GRID_MIN_COL}px, ${ASSET_GRID_MAX_COL}px))`;
+
+  return (
+    <AssetGridScroller ref={scrollerRef} aria-label={ariaLabel}>
+      <AssetGridSpacer style={{ height: `${topSpacer}px` }} aria-hidden="true" />
+      <AssetGridWindow
+        ref={windowRef}
+        style={{ gridTemplateColumns: template, gridAutoRows: `${cardHeight}px` }}
+      >
+        {visibleItems.map((asset, localIndex) => renderItem(asset, startIndex + localIndex))}
+      </AssetGridWindow>
+      <AssetGridSpacer style={{ height: `${bottomSpacer}px` }} aria-hidden="true" />
+    </AssetGridScroller>
+  );
+}
 
 const AssetCard = styled.article`
   position: relative;
@@ -3593,7 +3740,82 @@ const AssetPreviewImage = styled.img`
   object-fit: contain;
   object-position: center;
   background: rgba(2, 6, 23, 0.7);
+  opacity: 0;
+  transition: opacity 160ms ease;
+
+  &[data-loaded="true"] {
+    opacity: 1;
+  }
 `;
+
+// Shimmer skeleton shown under the preview until the image decodes, mirroring
+// the snip-tile lazy-load placeholder so cards paint instantly and never sit
+// blank while their asset loads.
+const assetThumbnailPulse = keyframes`
+  0% { transform: translateX(-28%); opacity: 0.25; }
+  50% { transform: translateX(28%); opacity: 0.5; }
+  100% { transform: translateX(-28%); opacity: 0.25; }
+`;
+
+const AssetPreviewPlaceholder = styled.div`
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 24% 28%, rgba(125, 176, 255, 0.16), transparent 30%),
+    linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 41, 59, 0.7));
+
+  &::after {
+    content: "";
+    position: absolute;
+    top: 16px;
+    bottom: 16px;
+    left: 10px;
+    width: 70%;
+    border-radius: 8px;
+    background: linear-gradient(90deg, transparent, rgba(226, 232, 240, 0.18), transparent);
+    opacity: 0.4;
+    transform: translateX(-28%);
+  }
+
+  &[data-loading="true"]::after {
+    animation: ${assetThumbnailPulse} 1050ms ease-in-out infinite;
+  }
+`;
+
+// Lazy preview image: the card renders immediately with the shimmer
+// placeholder, and the image fades in once it (or a cached copy) finishes
+// loading. Resets its loaded state when the source changes.
+function AssetCardImage({ alt, eager, onError, src }) {
+  const imageRef = useRef(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    setLoaded(false);
+    const node = imageRef.current;
+    if (node && node.complete && node.naturalWidth > 0) {
+      setLoaded(true);
+    }
+  }, [src]);
+
+  return (
+    <>
+      {!loaded && <AssetPreviewPlaceholder aria-hidden="true" data-loading="true" />}
+      <AssetPreviewImage
+        ref={imageRef}
+        alt={alt}
+        data-loaded={loaded ? "true" : "false"}
+        decoding="async"
+        draggable={false}
+        loading={eager ? "eager" : "lazy"}
+        onError={onError}
+        onLoad={() => setLoaded(true)}
+        src={src}
+      />
+    </>
+  );
+}
 
 const AssetCardStatus = styled.span`
   position: absolute;

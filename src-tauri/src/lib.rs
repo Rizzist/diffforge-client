@@ -331,7 +331,14 @@ const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_BUFFER_MAX_SECONDS: f64 = 3.0;
 const AUDIO_CAPTURE_MAX_SECONDS: f64 = 90.0;
 const AUDIO_CAPTURE_PREROLL_MS: u64 = 500;
+/// Live input-stats emit cadence while actively recording or feeding an agent
+/// stream — a smooth ~17 fps meter/waveform.
 const AUDIO_STATS_INTERVAL_MS: u64 = 60;
+/// Cadence while the mic is only warm on standby (no recording, no realtime
+/// consumer). The always-open audio widget re-renders its meter on every emit,
+/// so a 17 fps stream of FFT/waveform updates burns the renderer for a preview
+/// nobody is watching. ~5 fps keeps a live level indicator without the storm.
+const AUDIO_STATS_STANDBY_INTERVAL_MS: u64 = 200;
 const AUDIO_INPUT_FREQUENCY_BAND_COUNT: usize = 24;
 const AUDIO_INPUT_FREQUENCY_WINDOW_SAMPLES: usize = 2048;
 const AUDIO_INPUT_FREQUENCY_MIN_HZ: f32 = 90.0;
