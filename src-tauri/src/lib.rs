@@ -4732,6 +4732,7 @@ pub fn run() {
             snipping_finish_area_snip,
             snipping_start_area_recording,
             snipping_stop_recording,
+            snipping_recording_status,
             snipping_recent_capture_toasts,
             snipping_dismiss_capture_toast,
             snipping_upload_untracked_asset,

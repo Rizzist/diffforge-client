@@ -597,7 +597,12 @@ import AudioWorkspaceView, {
   AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT,
 } from "../audio/AudioWorkspaceView.jsx";
 import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
-import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
+import SnippingWorkspaceView, {
+  SnippingOverlayWindow,
+  SnippingRecordingControlsWindow,
+  SNIPPING_OVERLAY_HASH,
+  SNIPPING_RECORDING_CONTROLS_HASH,
+} from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
   SnippingAnnotationEditorWindow,
   SnippingFloatWindow,
@@ -8348,6 +8353,10 @@ export default function App() {
 
   if (window.location.hash === SNIPPING_OVERLAY_HASH) {
     return <SnippingOverlayWindow />;
+  }
+
+  if (window.location.hash === SNIPPING_RECORDING_CONTROLS_HASH) {
+    return <SnippingRecordingControlsWindow />;
   }
 
   if (window.location.hash.startsWith(SNIPPING_EDITOR_HASH)) {

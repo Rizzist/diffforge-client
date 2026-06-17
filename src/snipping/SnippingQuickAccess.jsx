@@ -1459,6 +1459,7 @@ export function SnippingFloatWindow() {
         data-busy={busy ? "true" : "false"}
         data-closing={closing ? "true" : "false"}
         data-hovered={hoverArmed ? "true" : "false"}
+        data-media={isVideo ? "video" : "image"}
         onMouseLeave={() => {
           if (syntheticHoverFrameRef.current) {
             window.cancelAnimationFrame(syntheticHoverFrameRef.current);
@@ -1489,6 +1490,18 @@ export function SnippingFloatWindow() {
           )
         ) : (
           <span data-empty="true">Preview unavailable</span>
+        )}
+        {isVideo && previewUrl && (
+          <FloatVideoPlayButton
+            aria-label={videoPlaying ? `Pause ${name}` : `Play ${name}`}
+            data-video-play="true"
+            disabled={busy || closing}
+            onClick={toggleVideoPlayback}
+            title={videoPlaying ? "Pause" : "Play"}
+            type="button"
+          >
+            {videoPlaying ? <Pause aria-hidden="true" /> : <PlayArrow aria-hidden="true" />}
+          </FloatVideoPlayButton>
         )}
         <FloatCloseButton
           aria-label={`Dismiss ${name}`}
@@ -1668,6 +1681,40 @@ const FloatWindowRoot = styled.main`
     pointer-events: auto;
   }
 
+  &[data-media="video"] > button[data-video-play="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+`;
+
+const FloatVideoPlayButton = styled.button`
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 3;
+  display: inline-grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.94);
+  background: rgba(7, 10, 15, 0.68);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.34);
+  transform: translate(-50%, -50%);
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+
+  svg {
+    width: 24px;
+    height: 24px;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
 `;
 
 const FloatCloseButton = styled.button`
@@ -2067,12 +2114,13 @@ function StripSnipTile({
   const localPath = assetLocalPath(item);
   const name = useMemo(() => assetName(item), [item]);
   const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
+  const isVideo = useMemo(() => assetIsVideoPath(localPath), [localPath]);
   const {
     loading: thumbnailLoading,
     previewUrl,
     onImageError,
   } = useStripTilePreviewUrl(localPath, imageVersion, {
-    assetFallback: false,
+    assetFallback: isVideo,
     queued: true,
   });
   const [busy, setBusy] = useState(false);
@@ -2310,7 +2358,11 @@ function StripSnipTile({
       title={name}
     >
       {previewUrl ? (
-        <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
+        isVideo ? (
+          <video aria-label={name} draggable={false} muted playsInline preload="metadata" src={previewUrl} />
+        ) : (
+          <img alt={name} draggable={false} onError={onImageError} src={previewUrl} />
+        )
       ) : (
         <StripTileThumbnailPlaceholder aria-hidden="true" data-loading={thumbnailLoading ? "true" : "false"} />
       )}
@@ -2373,16 +2425,16 @@ function StripSnipTile({
           aria-label={`Copy ${name}`}
           disabled={busy}
           onClick={() => runAction("copy")}
-          title="Copy image"
+          title={isVideo ? "Copy recording" : "Copy image"}
           type="button"
         >
           <ContentCopy aria-hidden="true" />
         </StripTileActionButton>
         <StripTileActionButton
-          aria-label={`Annotate ${name}`}
+          aria-label={isVideo ? `Open ${name}` : `Annotate ${name}`}
           disabled={busy}
           onClick={() => runAction("edit")}
-          title="Annotate copy"
+          title={isVideo ? "Open recording" : "Annotate copy"}
           type="button"
         >
           <ModeEdit aria-hidden="true" />
@@ -3217,7 +3269,8 @@ const StripTile = styled.div`
     pointer-events: none;
   }
 
-  img {
+  img,
+  video {
     position: absolute;
     inset: 0;
     width: 100%;
@@ -3228,6 +3281,10 @@ const StripTile = styled.div`
     user-select: none;
     -webkit-user-select: none;
     -webkit-user-drag: none;
+  }
+
+  video {
+    background: #05070b;
   }
 
   ${FloatStatusPill} {

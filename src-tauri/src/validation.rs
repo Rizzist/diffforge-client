@@ -39,6 +39,7 @@ unsafe extern "system" {
     ) -> WindowsHandle;
     fn SendMessageW(hwnd: WindowsHandle, message: u32, wparam: usize, lparam: isize) -> isize;
     fn SetClassLongPtrW(hwnd: WindowsHandle, index: i32, value: isize) -> isize;
+    fn SetWindowDisplayAffinity(hwnd: WindowsHandle, affinity: u32) -> i32;
 }
 
 fn is_safe_terminal_pane_id(value: &str) -> bool {

@@ -13,7 +13,9 @@ window.addEventListener("unhandledrejection", (event) => {
 // dock) boot from the small snipping chunk instead of evaluating the entire
 // AppShell bundle, so they open near-instantly.
 const hash = window.location.hash || "";
-const loadRootComponent = hash.startsWith("#/snipping-editor")
+const loadRootComponent = hash === "#/snipping-recording-controls"
+  ? import("./snipping/SnippingWorkspaceView.jsx").then((module) => module.SnippingRecordingControlsWindow)
+  : hash.startsWith("#/snipping-editor")
   || hash.startsWith("#/snipping-float")
   || hash.startsWith("#/snipping-strip")
   || hash === "#/snipping-toasts"

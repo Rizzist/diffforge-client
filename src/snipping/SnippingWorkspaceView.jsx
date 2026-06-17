@@ -34,6 +34,7 @@ import {
 } from "../app/appStyles";
 
 export const SNIPPING_OVERLAY_HASH = "#/snipping-overlay";
+export const SNIPPING_RECORDING_CONTROLS_HASH = "#/snipping-recording-controls";
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
@@ -44,6 +45,8 @@ const SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS = 120;
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
 const SNIPPING_ACTION_RECORDING = "area-recording";
+const RECORDING_MIN_SELECTION_SIZE = 36;
+const RECORDING_RESIZE_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 
 function clearOverlaySnapshotPath(monitor) {
   if (!monitor || typeof monitor !== "object") return monitor || null;
@@ -67,6 +70,108 @@ const SNIPPING_MODIFIER_CODES = new Set([
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
   return normalized || fallback;
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function viewportBounds() {
+  if (typeof window === "undefined") {
+    return { width: RECORDING_MIN_SELECTION_SIZE, height: RECORDING_MIN_SELECTION_SIZE };
+  }
+  return {
+    width: Math.max(RECORDING_MIN_SELECTION_SIZE, window.innerWidth || 0),
+    height: Math.max(RECORDING_MIN_SELECTION_SIZE, window.innerHeight || 0),
+  };
+}
+
+function fullViewportSelection() {
+  const viewport = viewportBounds();
+  return {
+    left: 0,
+    top: 0,
+    width: viewport.width,
+    height: viewport.height,
+  };
+}
+
+function normalizeRecordingSelection(selection) {
+  const viewport = viewportBounds();
+  const width = clampNumber(
+    Number(selection?.width),
+    RECORDING_MIN_SELECTION_SIZE,
+    viewport.width,
+  );
+  const height = clampNumber(
+    Number(selection?.height),
+    RECORDING_MIN_SELECTION_SIZE,
+    viewport.height,
+  );
+  return {
+    left: clampNumber(Number(selection?.left), 0, Math.max(0, viewport.width - width)),
+    top: clampNumber(Number(selection?.top), 0, Math.max(0, viewport.height - height)),
+    width,
+    height,
+  };
+}
+
+function recordingSelectionFromDrag({ startX, startY, endX, endY }) {
+  const viewport = viewportBounds();
+  const left = clampNumber(Math.min(startX, endX), 0, viewport.width);
+  const top = clampNumber(Math.min(startY, endY), 0, viewport.height);
+  const right = clampNumber(Math.max(startX, endX), 0, viewport.width);
+  const bottom = clampNumber(Math.max(startY, endY), 0, viewport.height);
+  return normalizeRecordingSelection({
+    left,
+    top,
+    width: Math.max(RECORDING_MIN_SELECTION_SIZE, right - left),
+    height: Math.max(RECORDING_MIN_SELECTION_SIZE, bottom - top),
+  });
+}
+
+function resizeRecordingSelection(selection, handle, dx, dy) {
+  const current = normalizeRecordingSelection(selection);
+  let left = current.left;
+  let top = current.top;
+  let right = current.left + current.width;
+  let bottom = current.top + current.height;
+
+  if (handle?.includes("w")) left += dx;
+  if (handle?.includes("e")) right += dx;
+  if (handle?.includes("n")) top += dy;
+  if (handle?.includes("s")) bottom += dy;
+
+  if (right - left < RECORDING_MIN_SELECTION_SIZE) {
+    if (handle?.includes("w")) {
+      left = right - RECORDING_MIN_SELECTION_SIZE;
+    } else {
+      right = left + RECORDING_MIN_SELECTION_SIZE;
+    }
+  }
+  if (bottom - top < RECORDING_MIN_SELECTION_SIZE) {
+    if (handle?.includes("n")) {
+      top = bottom - RECORDING_MIN_SELECTION_SIZE;
+    } else {
+      bottom = top + RECORDING_MIN_SELECTION_SIZE;
+    }
+  }
+
+  return normalizeRecordingSelection({
+    left,
+    top,
+    width: right - left,
+    height: bottom - top,
+  });
+}
+
+function formatRecordingElapsed(startedAtMs, nowMs) {
+  const elapsedMs = Math.max(0, Number(nowMs || Date.now()) - Number(startedAtMs || Date.now()));
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function getErrorMessage(error, fallback) {
@@ -761,8 +866,9 @@ export function SnippingOverlayWindow() {
   const [capturing, setCapturing] = useState(false);
   const [overlayMonitor, setOverlayMonitor] = useState(null);
   const [overlayMode, setOverlayMode] = useState("image");
-  const [pendingRecordingSelection, setPendingRecordingSelection] = useState(null);
+  const [recordingSelection, setRecordingSelection] = useState(null);
   const dragRef = useRef(null);
+  const recordingDragRef = useRef(null);
   const activePointerIdRef = useRef(null);
   const capturingRef = useRef(false);
   const lastCursorMoveLogAtRef = useRef(0);
@@ -859,7 +965,9 @@ export function SnippingOverlayWindow() {
   }, [overlayMonitor]);
 
   const selection = useMemo(() => {
-    if (pendingRecordingSelection) return pendingRecordingSelection;
+    if (overlayMode === "recording") {
+      return recordingSelection ? normalizeRecordingSelection(recordingSelection) : null;
+    }
     if (!drag) return null;
     const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
     const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
@@ -868,15 +976,16 @@ export function SnippingOverlayWindow() {
     const width = Math.min(Math.abs(drag.endX - drag.startX), Math.max(0, viewportWidth - left));
     const height = Math.min(Math.abs(drag.endY - drag.startY), Math.max(0, viewportHeight - top));
     return { left, top, width, height };
-  }, [drag, pendingRecordingSelection]);
+  }, [drag, overlayMode, recordingSelection]);
 
   const closeOverlay = useCallback(async (reason = "request") => {
     logCursorDebug("close_overlay", cursorDebugSnapshot(null, { reason }));
     setCapturingState(false);
     activePointerIdRef.current = null;
     dragRef.current = null;
+    recordingDragRef.current = null;
     setDrag(null);
-    setPendingRecordingSelection(null);
+    setRecordingSelection(null);
     setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
     try {
       await invoke("snipping_cancel_area_snip");
@@ -890,15 +999,16 @@ export function SnippingOverlayWindow() {
   }, [cursorDebugSnapshot, logCursorDebug, setCapturingState]);
 
   const applyOverlayMonitor = useCallback((monitor, mode = "image") => {
+    const nextMode = mode === "recording" ? "recording" : "image";
     setOverlayMonitor(monitor && typeof monitor === "object" ? monitor : null);
-    setOverlayMode(mode === "recording" ? "recording" : "image");
+    setOverlayMode(nextMode);
     setError("");
     if (dragRef.current || activePointerIdRef.current !== null || capturingRef.current) {
       return;
     }
     setCapturingState(false);
     setDrag(null);
-    setPendingRecordingSelection(null);
+    setRecordingSelection(nextMode === "recording" ? fullViewportSelection() : null);
   }, [setCapturingState]);
 
   const loadOverlayStatus = useCallback(async () => {
@@ -996,6 +1106,16 @@ export function SnippingOverlayWindow() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [closeOverlay]);
 
+  useEffect(() => {
+    if (overlayMode !== "recording") return undefined;
+    setRecordingSelection((current) => normalizeRecordingSelection(current || fullViewportSelection()));
+    const onResize = () => {
+      setRecordingSelection((current) => normalizeRecordingSelection(current || fullViewportSelection()));
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [overlayMode, overlayMonitor]);
+
   const overlayPoint = useCallback((event) => {
     const rect = event.currentTarget.getBoundingClientRect();
     return {
@@ -1019,6 +1139,7 @@ export function SnippingOverlayWindow() {
     logCursorDebug("pointer_cancel", cursorDebugSnapshot(event, { reason }));
     releasePointerCapture(event);
     dragRef.current = null;
+    recordingDragRef.current = null;
     setDrag(null);
   }, [cursorDebugSnapshot, logCursorDebug, releasePointerCapture]);
 
@@ -1042,7 +1163,29 @@ export function SnippingOverlayWindow() {
       activePointerIdRef.current = null;
     }
     const point = overlayPoint(event);
-    setPendingRecordingSelection(null);
+    if (overlayMode === "recording") {
+      const currentSelection = normalizeRecordingSelection(recordingSelection || fullViewportSelection());
+      const handle = text(event.target?.closest?.("[data-recording-resize-handle]")?.getAttribute("data-recording-resize-handle"));
+      const insideSelection = point.x >= currentSelection.left
+        && point.x <= currentSelection.left + currentSelection.width
+        && point.y >= currentSelection.top
+        && point.y <= currentSelection.top + currentSelection.height;
+      recordingDragRef.current = {
+        mode: handle ? "resize" : insideSelection ? "move" : "new",
+        handle,
+        startX: point.x,
+        startY: point.y,
+        initialSelection: currentSelection,
+      };
+      setRecordingSelection(currentSelection);
+      setDrag(null);
+      logCursorDebug("recording_pointer_down", cursorDebugSnapshot(event, {
+        point,
+        captureAcquired,
+        recordingDrag: recordingDragRef.current,
+      }));
+      return;
+    }
     const nextDrag = {
       startX: point.x,
       startY: point.y,
@@ -1056,11 +1199,52 @@ export function SnippingOverlayWindow() {
       captureAcquired,
       drag: nextDrag,
     }));
-  }, [cursorDebugSnapshot, logCursorDebug, overlayPoint]);
+  }, [cursorDebugSnapshot, logCursorDebug, overlayMode, overlayPoint, recordingSelection]);
 
   const updateDrag = useCallback((event) => {
     if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
       logCursorMoveDebug("pointer_move_ignored", event, { reason: "pointer_id_mismatch" });
+      return;
+    }
+    if (overlayMode === "recording") {
+      const recordingDrag = recordingDragRef.current;
+      if (!recordingDrag || capturingRef.current) {
+        logCursorMoveDebug("recording_pointer_move_idle", event, {
+          reason: capturingRef.current ? "capturing" : "no_drag",
+        });
+        return;
+      }
+      const point = overlayPoint(event);
+      const dx = point.x - recordingDrag.startX;
+      const dy = point.y - recordingDrag.startY;
+      let nextSelection = recordingDrag.initialSelection;
+      if (recordingDrag.mode === "move") {
+        nextSelection = normalizeRecordingSelection({
+          ...recordingDrag.initialSelection,
+          left: recordingDrag.initialSelection.left + dx,
+          top: recordingDrag.initialSelection.top + dy,
+        });
+      } else if (recordingDrag.mode === "resize") {
+        nextSelection = resizeRecordingSelection(
+          recordingDrag.initialSelection,
+          recordingDrag.handle,
+          dx,
+          dy,
+        );
+      } else {
+        nextSelection = recordingSelectionFromDrag({
+          startX: recordingDrag.startX,
+          startY: recordingDrag.startY,
+          endX: point.x,
+          endY: point.y,
+        });
+      }
+      setRecordingSelection(nextSelection);
+      logCursorMoveDebug("recording_pointer_move_drag", event, {
+        point,
+        recordingDrag,
+        selection: nextSelection,
+      });
       return;
     }
     if (!dragRef.current || capturingRef.current) {
@@ -1081,7 +1265,7 @@ export function SnippingOverlayWindow() {
       point,
       drag: nextDrag,
     });
-  }, [logCursorMoveDebug, overlayPoint]);
+  }, [logCursorMoveDebug, overlayMode, overlayPoint]);
 
   const finishDrag = useCallback(async (event) => {
     if (event && activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
@@ -1092,9 +1276,19 @@ export function SnippingOverlayWindow() {
     }
     event?.preventDefault?.();
     const currentDrag = dragRef.current;
-    logCursorDebug("pointer_up", cursorDebugSnapshot(event, { drag: currentDrag }));
+    const currentRecordingDrag = recordingDragRef.current;
+    logCursorDebug("pointer_up", cursorDebugSnapshot(event, {
+      drag: currentDrag,
+      recordingDrag: currentRecordingDrag,
+    }));
     dragRef.current = null;
+    recordingDragRef.current = null;
     releasePointerCapture(event);
+    if (overlayMode === "recording") {
+      setRecordingSelection((current) => normalizeRecordingSelection(current || fullViewportSelection()));
+      setDrag(null);
+      return;
+    }
     if (!currentDrag || capturingRef.current) {
       logCursorDebug("pointer_up_no_capture", cursorDebugSnapshot(event, {
         reason: capturingRef.current ? "capturing" : "no_drag",
@@ -1115,18 +1309,6 @@ export function SnippingOverlayWindow() {
         selection: { left, top, width, height },
       }));
       closeOverlay("small_area");
-      return;
-    }
-
-    if (overlayMode === "recording") {
-      const nextSelection = { left, top, width, height };
-      setPendingRecordingSelection(nextSelection);
-      setDrag(null);
-      setCapturingState(false);
-      setError("");
-      logCursorDebug("finish_recording_selection_ready", cursorDebugSnapshot(event, {
-        selection: nextSelection,
-      }));
       return;
     }
 
@@ -1172,24 +1354,25 @@ export function SnippingOverlayWindow() {
   const startRecording = useCallback(async (event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
-    if (!pendingRecordingSelection || capturingRef.current) return;
+    const activeSelection = normalizeRecordingSelection(recordingSelection || fullViewportSelection());
+    if (!activeSelection || capturingRef.current) return;
     setCapturingState(true);
     setError("");
     const overlayWindow = getCurrentWindow();
     try {
       logCursorDebug("recording_start_request", cursorDebugSnapshot(event, {
-        selection: pendingRecordingSelection,
+        selection: activeSelection,
       }));
       await invoke("snipping_start_area_recording", {
         request: {
-          x: pendingRecordingSelection.left,
-          y: pendingRecordingSelection.top,
-          width: pendingRecordingSelection.width,
-          height: pendingRecordingSelection.height,
+          x: activeSelection.left,
+          y: activeSelection.top,
+          width: activeSelection.width,
+          height: activeSelection.height,
           scaleFactor: window.devicePixelRatio || 1,
         },
       });
-      setPendingRecordingSelection(null);
+      setRecordingSelection(null);
       setCapturingState(false);
       setOverlayMonitor((current) => (current ? clearOverlaySnapshotPath(current) : current));
       try {
@@ -1202,25 +1385,23 @@ export function SnippingOverlayWindow() {
       const message = getErrorMessage(recordingError, "Unable to start recording.");
       logCursorDebug("recording_start_error", cursorDebugSnapshot(event, {
         message,
-        selection: pendingRecordingSelection,
+        selection: activeSelection,
       }));
       setError(message);
     }
-  }, [cursorDebugSnapshot, logCursorDebug, pendingRecordingSelection, setCapturingState]);
+  }, [cursorDebugSnapshot, logCursorDebug, recordingSelection, setCapturingState]);
 
   const cancelRecordingSelection = useCallback((event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
-    setPendingRecordingSelection(null);
-    setDrag(null);
-    dragRef.current = null;
-    setError("");
-  }, []);
+    closeOverlay("recording_cancel_button");
+  }, [closeOverlay]);
 
   return (
     <>
       <SnippingOverlayGlobalStyle />
       <SnippingOverlayRoot
+        data-snipping-mode={overlayMode}
         onLostPointerCapture={(event) => cancelActiveDrag(event, "lost_pointer_capture")}
         onPointerCancel={(event) => cancelActiveDrag(event, "pointer_cancel")}
         onPointerDown={beginDrag}
@@ -1237,8 +1418,8 @@ export function SnippingOverlayWindow() {
         )}
         {selection && (
           <SnippingSelectionBox
-            aria-hidden={overlayMode === "recording" && pendingRecordingSelection && !capturing ? undefined : "true"}
-            data-controls={overlayMode === "recording" && pendingRecordingSelection && !capturing ? "true" : "false"}
+            aria-hidden="true"
+            data-mode={overlayMode}
             style={{
               left: `${selection.left}px`,
               top: `${selection.top}px`,
@@ -1247,24 +1428,170 @@ export function SnippingOverlayWindow() {
             }}
           >
             <span>{Math.round(selection.width)} × {Math.round(selection.height)}</span>
-            {overlayMode === "recording" && pendingRecordingSelection && !capturing && (
-              <SnippingRecordingControls aria-hidden="false">
-                <button onClick={startRecording} onPointerDown={(event) => event.stopPropagation()} type="button">
-                  <Videocam aria-hidden="true" />
-                  Record
-                </button>
-                <button onClick={cancelRecordingSelection} onPointerDown={(event) => event.stopPropagation()} type="button">
-                  Cancel
-                </button>
-              </SnippingRecordingControls>
+            {overlayMode === "recording" && !capturing && (
+              RECORDING_RESIZE_HANDLES.map((handle) => (
+                <SnippingRecordingResizeHandle
+                  aria-hidden="true"
+                  data-recording-resize-handle={handle}
+                  data-side={handle}
+                  key={handle}
+                />
+              ))
             )}
           </SnippingSelectionBox>
+        )}
+        {overlayMode === "recording" && selection && !capturing && (
+          <SnippingRecordingControlDock onPointerDown={(event) => event.stopPropagation()}>
+            <span>{Math.round(selection.width)} × {Math.round(selection.height)}</span>
+            <button onClick={startRecording} type="button">
+              <Videocam aria-hidden="true" />
+              Record
+            </button>
+            <button onClick={cancelRecordingSelection} type="button">
+              Cancel
+            </button>
+          </SnippingRecordingControlDock>
         )}
         {error && <SnippingOverlayError>{error}</SnippingOverlayError>}
       </SnippingOverlayRoot>
     </>
   );
 }
+
+export function SnippingRecordingControlsWindow() {
+  const [status, setStatus] = useState(null);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const [stopping, setStopping] = useState(false);
+  const active = Boolean(status?.active);
+  const elapsed = formatRecordingElapsed(status?.startedAtMs || status?.started_at_ms, nowMs);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      const nextStatus = await invoke("snipping_recording_status");
+      setStatus(nextStatus || { active: false });
+      if (nextStatus?.active) {
+        setStopping(false);
+      }
+      if (!nextStatus?.active && !stopping) {
+        window.setTimeout(() => {
+          getCurrentWindow().hide().catch(() => {});
+        }, 160);
+      }
+    } catch {
+      setStatus({ active: false });
+    }
+  }, [stopping]);
+
+  useEffect(() => {
+    loadStatus();
+    const statusTimer = window.setInterval(loadStatus, 800);
+    const clockTimer = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => {
+      window.clearInterval(statusTimer);
+      window.clearInterval(clockTimer);
+    };
+  }, [loadStatus]);
+
+  const stopRecording = useCallback(async () => {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      await invoke("snipping_stop_recording");
+      await getCurrentWindow().hide();
+    } catch {
+      setStopping(false);
+    }
+  }, [stopping]);
+
+  return (
+    <>
+      <RecordingControlsGlobalStyle />
+      <RecordingControlsRoot data-active={active ? "true" : "false"}>
+        <RecordingPulse aria-hidden="true" />
+        <RecordingTime>{active ? elapsed : "0:00"}</RecordingTime>
+        <button disabled={!active || stopping} onClick={stopRecording} type="button">
+          {stopping ? "Stopping" : "Stop"}
+        </button>
+      </RecordingControlsRoot>
+    </>
+  );
+}
+
+const RecordingControlsGlobalStyle = createGlobalStyle`
+  html,
+  body,
+  #app {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: transparent !important;
+    user-select: none;
+  }
+`;
+
+const RecordingControlsRoot = styled.main`
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: 16px minmax(58px, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px 7px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  color: rgba(248, 250, 252, 0.94);
+  background: rgba(8, 11, 16, 0.9);
+  box-shadow:
+    0 18px 44px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  backdrop-filter: blur(16px);
+
+  button {
+    height: 34px;
+    min-width: 72px;
+    padding: 0 13px;
+    border: 1px solid rgba(248, 113, 113, 0.42);
+    border-radius: 10px;
+    color: #fff;
+    background: rgba(185, 28, 28, 0.92);
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: default;
+    opacity: 0.66;
+  }
+`;
+
+const RecordingPulse = styled.span`
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: #ef4444;
+  box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.18);
+`;
+
+const RecordingTime = styled.strong`
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  font-weight: 820;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
 
 const SnippingPanel = styled.section`
   display: grid;
@@ -1463,8 +1790,19 @@ const SnippingOverlayGlobalStyle = createGlobalStyle`
   }
 
   #app,
-  #app * {
+  #app [data-snipping-mode="image"],
+  #app [data-snipping-mode="image"] * {
     cursor: crosshair !important;
+  }
+
+  @keyframes recordingSelectionMarch {
+    to {
+      background-position:
+        12px 0,
+        -12px 100%,
+        0 -12px,
+        100% 12px;
+    }
   }
 `;
 
@@ -1519,8 +1857,26 @@ const SnippingSelectionBox = styled.div`
     0 0 0 100000px rgba(8, 10, 14, 0.14);
   pointer-events: none;
 
-  &[data-controls="true"] {
+  &[data-mode="recording"] {
+    border: 0;
+    box-shadow:
+      0 0 0 100000px rgba(8, 10, 14, 0.14);
     pointer-events: auto;
+  }
+
+  &[data-mode="recording"]::before {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border: 2px dashed rgba(248, 250, 252, 0.92);
+    border-radius: 4px;
+    background:
+      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 0 / 12px 2px repeat-x,
+      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 100% / 12px 2px repeat-x,
+      linear-gradient(0deg, #0f172a 50%, transparent 0) 0 0 / 2px 12px repeat-y,
+      linear-gradient(0deg, #0f172a 50%, transparent 0) 100% 0 / 2px 12px repeat-y;
+    animation: recordingSelectionMarch 720ms linear infinite;
+    pointer-events: none;
   }
 
   span {
@@ -1544,22 +1900,106 @@ const SnippingSelectionBox = styled.div`
   }
 `;
 
-const SnippingRecordingControls = styled.div`
+const SnippingRecordingResizeHandle = styled.i`
   position: absolute;
-  right: 8px;
-  bottom: 8px;
+  z-index: 3;
+  display: block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(248, 250, 252, 0.96);
+  border-radius: 999px;
+  background: rgba(13, 17, 23, 0.88);
+  box-shadow:
+    0 0 0 1px rgba(15, 23, 42, 0.72),
+    0 6px 18px rgba(0, 0, 0, 0.28);
+
+  &[data-side="nw"] {
+    left: -8px;
+    top: -8px;
+    cursor: nwse-resize !important;
+  }
+
+  &[data-side="n"] {
+    left: calc(50% - 8px);
+    top: -8px;
+    cursor: ns-resize !important;
+  }
+
+  &[data-side="ne"] {
+    right: -8px;
+    top: -8px;
+    cursor: nesw-resize !important;
+  }
+
+  &[data-side="e"] {
+    right: -8px;
+    top: calc(50% - 8px);
+    cursor: ew-resize !important;
+  }
+
+  &[data-side="se"] {
+    right: -8px;
+    bottom: -8px;
+    cursor: nwse-resize !important;
+  }
+
+  &[data-side="s"] {
+    left: calc(50% - 8px);
+    bottom: -8px;
+    cursor: ns-resize !important;
+  }
+
+  &[data-side="sw"] {
+    left: -8px;
+    bottom: -8px;
+    cursor: nesw-resize !important;
+  }
+
+  &[data-side="w"] {
+    left: -8px;
+    top: calc(50% - 8px);
+    cursor: ew-resize !important;
+  }
+`;
+
+const SnippingRecordingControlDock = styled.div`
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
   z-index: 2;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-height: 42px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 12px;
+  background: rgba(9, 12, 18, 0.86);
+  box-shadow:
+    0 18px 46px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transform: translateX(-50%);
   pointer-events: auto;
+  backdrop-filter: blur(16px);
+
+  > span {
+    min-width: 84px;
+    padding: 0 8px;
+    color: rgba(226, 232, 240, 0.82);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    font-weight: 760;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    white-space: nowrap;
+  }
 
   button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    min-width: 78px;
+    min-width: 82px;
     height: 30px;
     padding: 0 11px;
     border: 1px solid rgba(255, 255, 255, 0.14);
@@ -1571,10 +2011,9 @@ const SnippingRecordingControls = styled.div`
     font-weight: 760;
     line-height: 1;
     cursor: pointer !important;
-    backdrop-filter: blur(12px);
   }
 
-  button:first-child {
+  button:first-of-type {
     border-color: rgba(248, 113, 113, 0.38);
     background: rgba(185, 28, 28, 0.86);
   }

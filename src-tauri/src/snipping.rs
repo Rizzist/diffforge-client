@@ -13,6 +13,8 @@ const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-
 const SNIPPING_DISPATCH_TARGETS_CHANGED_EVENT: &str =
     "diffforge:snipping-dispatch-targets-changed";
 const SNIPPING_AREA_OVERLAY_WINDOW_PREFIX: &str = "snipping-overlay";
+const SNIPPING_RECORDING_CONTROLS_WINDOW_LABEL: &str = "snipping-recording-controls";
+const SNIPPING_RECORDING_CONTROLS_TITLE: &str = "Diff Forge Recording Controls";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_EDITOR_DISPOSE_EVENT: &str = "forge-snip-editor-dispose";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
@@ -3621,6 +3623,33 @@ fn snipping_recording_active(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+fn snipping_recording_status_for(app: &AppHandle) -> Value {
+    let session = app
+        .state::<SnippingState>()
+        .recording
+        .active
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    match session {
+        Some(session) => json!({
+            "kind": "snipping_recording_status",
+            "active": true,
+            "path": session.target_path.display().to_string(),
+            "local_path": session.target_path.display().to_string(),
+            "localPath": session.target_path.display().to_string(),
+            "started_at_ms": session.started_at_ms,
+            "startedAtMs": session.started_at_ms,
+            "width": session.width,
+            "height": session.height,
+        }),
+        None => json!({
+            "kind": "snipping_recording_status",
+            "active": false,
+        }),
+    }
+}
+
 fn snipping_clear_recording_if_current(app: &AppHandle, id: &str) {
     let state = app.state::<SnippingState>().recording.clone();
     if let Ok(mut guard) = state.active.lock() {
@@ -3628,6 +3657,182 @@ fn snipping_clear_recording_if_current(app: &AppHandle, id: &str) {
             *guard = None;
         }
     };
+}
+
+#[cfg(windows)]
+fn snipping_set_recording_controls_capture_exclusion(
+    window: &tauri::WebviewWindow,
+    enabled: bool,
+) {
+    const WDA_NONE: u32 = 0x0000_0000;
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let affinity = if enabled {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
+    unsafe {
+        let _ = SetWindowDisplayAffinity(hwnd.0, affinity);
+    }
+}
+
+#[cfg(not(windows))]
+fn snipping_set_recording_controls_capture_exclusion(
+    _window: &tauri::WebviewWindow,
+    _enabled: bool,
+) {
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_recording_controls_apply_macos_style(window: &tauri::WebviewWindow) {
+    snipping_convert_overlay_window_to_panel(window);
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("recording_controls_apply_macos_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+            ns_window.setAcceptsMouseMovedEvents(true);
+        });
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_recording_controls_apply_macos_style(_window: &tauri::WebviewWindow) {}
+
+fn snipping_recording_controls_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window(SNIPPING_RECORDING_CONTROLS_WINDOW_LABEL) {
+        snipping_set_recording_controls_capture_exclusion(&window, true);
+        #[cfg(target_os = "macos")]
+        snipping_recording_controls_apply_macos_style(&window);
+        return Ok(window);
+    }
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        SNIPPING_RECORDING_CONTROLS_WINDOW_LABEL,
+        WebviewUrl::App("index.html#/snipping-recording-controls".into()),
+    )
+    .title(SNIPPING_RECORDING_CONTROLS_TITLE)
+    .inner_size(250.0, 54.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .focused(false)
+    .accept_first_mouse(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
+    .visible(false)
+    .shadow(true)
+    .build()
+    .map_err(|error| format!("Unable to create recording controls: {error}"))?;
+
+    snipping_set_recording_controls_capture_exclusion(&window, true);
+    #[cfg(target_os = "macos")]
+    snipping_recording_controls_apply_macos_style(&window);
+    {
+        let app_for_close = app.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = snipping_stop_recording_for(&app_for_close, "recording-controls-close");
+            }
+        });
+    }
+    Ok(window)
+}
+
+fn snipping_position_recording_controls(
+    window: &tauri::WebviewWindow,
+    monitor: &SnippingAreaMonitor,
+    request: &SnippingAreaSelectionRequest,
+) {
+    const CONTROLS_WIDTH: f64 = 250.0;
+    const CONTROLS_HEIGHT: f64 = 54.0;
+    const CONTROLS_MARGIN: f64 = 14.0;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let (screen_x, screen_y, screen_width, screen_height) = (
+        f64::from(monitor.capture_x),
+        f64::from(monitor.capture_y),
+        f64::from(monitor.capture_width),
+        f64::from(monitor.capture_height),
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (screen_x, screen_y, screen_width, screen_height) = (
+        f64::from(monitor.x),
+        f64::from(monitor.y),
+        f64::from(monitor.width),
+        f64::from(monitor.height),
+    );
+
+    let selection_left = screen_x + request.x.max(0.0);
+    let selection_top = screen_y + request.y.max(0.0);
+    let selection_width = request.width.max(1.0);
+    let selection_height = request.height.max(1.0);
+    let min_x = screen_x + CONTROLS_MARGIN;
+    let max_x = screen_x + screen_width - CONTROLS_WIDTH - CONTROLS_MARGIN;
+    let min_y = screen_y + CONTROLS_MARGIN;
+    let max_y = screen_y + screen_height - CONTROLS_HEIGHT - CONTROLS_MARGIN;
+    let mut x = selection_left + selection_width * 0.5 - CONTROLS_WIDTH * 0.5;
+    let mut y = selection_top + selection_height + CONTROLS_MARGIN;
+    if y > max_y {
+        y = selection_top + selection_height - CONTROLS_HEIGHT - CONTROLS_MARGIN;
+    }
+    x = x.clamp(min_x, max_x.max(min_x));
+    y = y.clamp(min_y, max_y.max(min_y));
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = window.set_position(tauri::PhysicalPosition::new(
+            x.round() as i32,
+            y.round() as i32,
+        ));
+    }
+}
+
+fn snipping_show_recording_controls(
+    app: &AppHandle,
+    monitor: &SnippingAreaMonitor,
+    request: &SnippingAreaSelectionRequest,
+) -> Result<(), String> {
+    let window = snipping_recording_controls_window(app)?;
+    snipping_position_recording_controls(&window, monitor, request);
+    snipping_set_recording_controls_capture_exclusion(&window, true);
+    #[cfg(target_os = "macos")]
+    snipping_recording_controls_apply_macos_style(&window);
+    snipping_show_window_now(&window, "recording_controls_show");
+    #[cfg(target_os = "macos")]
+    snipping_preview_order_front_regardless(&window);
+    Ok(())
+}
+
+fn snipping_hide_recording_controls(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(SNIPPING_RECORDING_CONTROLS_WINDOW_LABEL) {
+        snipping_hide_window_now(&window, "recording_controls_hide");
+        snipping_set_recording_controls_capture_exclusion(&window, false);
+    }
 }
 
 fn snipping_stop_recording_for(app: &AppHandle, reason: &str) -> Result<Value, String> {
@@ -3639,6 +3844,7 @@ fn snipping_stop_recording_for(app: &AppHandle, reason: &str) -> Result<Value, S
         .clone();
     if let Some(session) = session {
         session.stop.store(true, Ordering::Release);
+        snipping_hide_recording_controls(app);
         return Ok(json!({
             "kind": "snipping_recording_stopping",
             "active": true,
@@ -3650,6 +3856,7 @@ fn snipping_stop_recording_for(app: &AppHandle, reason: &str) -> Result<Value, S
             "height": session.height,
         }));
     }
+    snipping_hide_recording_controls(app);
     Ok(json!({
         "kind": "snipping_recording_stopping",
         "active": false,
@@ -3696,7 +3903,28 @@ fn snipping_recording_loop(
         );
     }
     snipping_clear_recording_if_current(&app, &session_id);
+    snipping_hide_recording_controls(&app);
     snipping_start_warm_capture_if_ready(&app);
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_recording_excluded_targets() -> Option<Vec<scap::Target>> {
+    let targets = std::panic::catch_unwind(scap::get_all_targets)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|target| match target {
+            scap::Target::Window(window) => {
+                window.title.trim() == SNIPPING_RECORDING_CONTROLS_TITLE
+            }
+            scap::Target::Display(_) => false,
+        })
+        .collect::<Vec<_>>();
+    (!targets.is_empty()).then_some(targets)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_recording_excluded_targets() -> Option<Vec<scap::Target>> {
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3722,7 +3950,7 @@ fn snipping_recording_loop_inner(
         crop_area,
         output_type: scap::frame::FrameType::BGRAFrame,
         output_resolution: scap::capturer::Resolution::Captured,
-        excluded_targets: None,
+        excluded_targets: snipping_recording_excluded_targets(),
         captures_audio: false,
         exclude_current_process_audio: true,
     };
@@ -3988,6 +4216,11 @@ fn snipping_start_area_recording_for(
     snipping_clear_area_sessions(app)?;
     snipping_hide_area_overlay(app);
     thread::sleep(Duration::from_millis(SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS));
+    if let Err(error) = snipping_show_recording_controls(app, &monitor, &request) {
+        snipping_clear_recording_if_current(app, &session.id);
+        snipping_start_warm_capture_if_ready(app);
+        return Err(error);
+    }
 
     let app_for_thread = app.clone();
     let session_for_thread = session.clone();
@@ -6396,6 +6629,11 @@ fn snipping_start_area_recording(
 #[tauri::command]
 fn snipping_stop_recording(app: AppHandle) -> Result<Value, String> {
     snipping_stop_recording_for(&app, "manual")
+}
+
+#[tauri::command]
+fn snipping_recording_status(app: AppHandle) -> Result<Value, String> {
+    Ok(snipping_recording_status_for(&app))
 }
 
 #[tauri::command]
