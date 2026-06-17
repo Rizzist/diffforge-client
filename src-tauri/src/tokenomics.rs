@@ -1,5 +1,8 @@
 const TOKENOMICS_DB_FILE: &str = "tokenomics.sqlite3";
 const TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER: usize = 120;
+const TOKENOMICS_REALTIME_LOOKBACK_SECS: u64 = 60 * 60;
+const TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES: usize = 24;
+const TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER: usize = 24;
 const TOKENOMICS_SCAN_MAX_LINE_BYTES: usize = 256 * 1024;
 const TOKENOMICS_SCAN_MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const TOKENOMICS_SYNC_ROLLUP_LIMIT: usize = 5000;
@@ -22,6 +25,7 @@ const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_KEY_PREFIX: &str = "claude_usage_api_cache:";
 const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 180;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS: u64 = 30 * 60;
+const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 15_000;
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
 const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
@@ -29,6 +33,16 @@ const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
 const TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX: &str = "cloud_account_sync_cursor:";
 static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_REALTIME_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static TOKENOMICS_SUMMARY_CACHE: OnceLock<StdMutex<Option<TokenomicsSummaryCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Clone)]
+struct TokenomicsSummaryCacheEntry {
+    include_rollups: bool,
+    include_cloud: bool,
+    cached_at: Instant,
+    summary: Value,
+}
 
 use std::io::BufRead as _;
 
@@ -43,6 +57,7 @@ async fn tokenomics_scan_usage(
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
+    tokenomics_clear_summary_cache();
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -58,6 +73,23 @@ async fn tokenomics_scan_usage_silent(
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
+    tokenomics_clear_summary_cache();
+    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn tokenomics_scan_realtime_usage(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let scan_app = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        tokenomics_scan_realtime_usage_for(&scan_app)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics realtime scan: {error}"))??;
+    tokenomics_clear_summary_cache();
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -73,15 +105,18 @@ async fn tokenomics_resync_last_30_days(
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics resync: {error}"))??;
+    tokenomics_clear_summary_cache();
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
 
 #[tauri::command]
 async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || tokenomics_summary_for(&app, false, true))
-        .await
-        .map_err(|error| format!("Unable to join Tokenomics summary: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        tokenomics_cached_read_only_summary_for(&app, false, true)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics summary: {error}"))?
 }
 
 #[tauri::command]
@@ -130,6 +165,7 @@ async fn tokenomics_record_usage(
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics record: {error}"))??;
+    tokenomics_clear_summary_cache();
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -639,13 +675,19 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_width_start ON tokenomics_rollups(bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_workspace ON tokenomics_rollups(workspace_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_account ON tokenomics_rollups(provider, agent_kind, provider_account_key, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_account_label ON tokenomics_rollups(provider, agent_kind, provider_account_key, provider_account_label);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_subscription_label ON tokenomics_rollups(provider, agent_kind, subscription_key, provider_account_label);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device ON tokenomics_rollups(device_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device_account ON tokenomics_rollups(device_id, provider, agent_kind, provider_account_key, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_scope ON tokenomics_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_device ON tokenomics_cloud_rollups(device_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_account ON tokenomics_cloud_rollups(provider, agent_kind, provider_account_key, device_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_account_label ON tokenomics_cloud_rollups(provider, agent_kind, provider_account_key, provider_account_label);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_subscription_label ON tokenomics_cloud_rollups(provider, agent_kind, subscription_key, provider_account_label);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_scope ON tokenomics_cloud_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_observed ON tokenomics_usage_events(observed_at);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_account_label ON tokenomics_usage_events(provider, agent_kind, provider_account_key, provider_account_label);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_subscription_label ON tokenomics_usage_events(provider, agent_kind, subscription_key, provider_account_label);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_source_offsets_provider ON tokenomics_source_offsets(provider, agent_kind, updated_at);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);
          PRAGMA user_version={TOKENOMICS_VIEW_SCHEMA_VERSION};
@@ -683,24 +725,23 @@ fn tokenomics_ensure_column(
 }
 
 fn tokenomics_live_limits_snapshot_from_conn(conn: &rusqlite::Connection) -> Result<Value, String> {
-    let mut limits = tokenomics_provider_limits(conn, false, false)?;
-    let sample_count = tokenomics_record_provider_limit_samples(conn, &limits)?;
+    let mut limits = tokenomics_provider_limits(conn, false, false, false)?;
     tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
-    let latest_window_count = tokenomics_record_latest_windows(conn, &limits)?;
-    let limit_samples = tokenomics_provider_limit_sample_sync_rows(conn, None, None)?;
-    let latest_windows = tokenomics_latest_window_rows(conn, None, None)?;
+    let scan_index = tokenomics_scan_index_status(conn)?;
     Ok(json!({
         "known": false,
         "source": "rust_live_provider_limits",
         "updated_at": tokenomics_now_iso_like(),
-        "limit_sample_count": sample_count,
-        "latest_window_count": latest_window_count,
-        "latestWindowCount": latest_window_count,
-        "limit_samples": limit_samples.clone(),
-        "limitSamples": limit_samples,
-        "latest_windows": latest_windows.clone(),
-        "latestWindows": latest_windows,
+        "limit_sample_count": 0,
+        "latest_window_count": 0,
+        "latestWindowCount": 0,
+        "limit_samples": [],
+        "limitSamples": [],
+        "latest_windows": [],
+        "latestWindows": [],
         "limits": limits,
+        "scan_index": scan_index.clone(),
+        "scanIndex": scan_index,
     }))
 }
 
@@ -755,21 +796,23 @@ fn tokenomics_scan_usage_for_mode(
         tokenomics_reset_scan_caches_for_resync(&conn)?;
     }
     tokenomics_reconcile_codex_provider_before_scan(&conn)?;
-    if let Ok(limits_summary) = tokenomics_live_limits_snapshot_from_conn(&conn) {
-        tokenomics_emit_scan_progress(
-            app,
-            emit_progress,
-            json!({
-                "phase": "limits_ready",
-                "day_index": 0,
-                "day_total": if scan_mode.is_realtime() { 1 } else { TOKENOMICS_INITIAL_BACKFILL_DAYS },
-                "day_label": "latest limits",
-                "files_scanned": 0,
-                "inserted_events": 0,
-                "mode": scan_mode.label(),
-                "summary": limits_summary,
-            }),
-        );
+    if !scan_mode.is_realtime() {
+        if let Ok(limits_summary) = tokenomics_live_limits_snapshot_from_conn(&conn) {
+            tokenomics_emit_scan_progress(
+                app,
+                emit_progress,
+                json!({
+                    "phase": "limits_ready",
+                    "day_index": 0,
+                    "day_total": TOKENOMICS_INITIAL_BACKFILL_DAYS,
+                    "day_label": "latest limits",
+                    "files_scanned": 0,
+                    "inserted_events": 0,
+                    "mode": scan_mode.label(),
+                    "summary": limits_summary,
+                }),
+            );
+        }
     }
     let codex_result = tokenomics_scan_codex_state_db(app, &conn, emit_progress, scan_mode)?;
     scanned_files += codex_result.files_scanned;
@@ -809,17 +852,20 @@ fn tokenomics_scan_usage_for_mode(
         let mut found_roots = 0usize;
         let source_now_unix = tokenomics_unix_now();
         let realtime_day_start = tokenomics_utc_day_start_unix(source_now_unix);
+        let realtime_hot_tail_start = source_now_unix
+            .saturating_sub(TOKENOMICS_REALTIME_LOOKBACK_SECS)
+            .max(realtime_day_start);
         let source_last_event =
             tokenomics_latest_source_offset_timestamp(&conn, source.provider, source.agent_kind)?;
         let source_region_kind = if scan_mode.is_realtime() {
-            "realtime_current_day"
+            "realtime_hot_tail"
         } else if source_last_event > 0 && !force_resync_last_30_days {
             "catch_up"
         } else {
             "initial_backfill"
         };
         let source_region_start = if scan_mode.is_realtime() {
-            realtime_day_start
+            realtime_hot_tail_start
         } else if source_region_kind == "catch_up" {
             source_last_event.saturating_sub(3_600)
         } else {
@@ -849,15 +895,25 @@ fn tokenomics_scan_usage_for_mode(
                 TOKENOMICS_INITIAL_BACKFILL_DAYS
             };
             let scan_file_limit = TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER
-                .saturating_mul(source_day_total.max(1) as usize);
+                .saturating_mul(source_day_total.max(1) as usize)
+                .min(if scan_mode.is_realtime() {
+                    TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER
+                } else {
+                    usize::MAX
+                });
             let files = tokenomics_collect_candidate_files_with_min_mtime(
                 &root,
                 scan_file_limit,
-                scan_mode.is_realtime().then_some(realtime_day_start),
+                scan_mode.is_realtime().then_some(realtime_hot_tail_start),
             );
             for day_offset in 0..source_day_total {
                 let day_start_unix =
                     tokenomics_scan_day_start_from_offset(source_now_unix, day_offset);
+                let required_coverage_start = if scan_mode.is_realtime() {
+                    realtime_hot_tail_start
+                } else {
+                    day_start_unix
+                };
                 let day_files = files
                     .iter()
                     .filter(|file| {
@@ -868,14 +924,15 @@ fn tokenomics_scan_usage_for_mode(
                 let day_candidate_count = day_files.len();
                 let day_index = day_offset + 1;
                 let day_label = tokenomics_scan_day_label_from_offset(day_offset);
-                let day_complete = tokenomics_scan_day_is_complete(
-                    &conn,
-                    source.provider,
-                    source.agent_kind,
-                    &source_id,
-                    TOKENOMICS_GENERIC_SCANNER_VERSION,
-                    day_start_unix,
-                )?;
+                let day_complete = !scan_mode.is_realtime()
+                    && tokenomics_scan_day_is_complete(
+                        &conn,
+                        source.provider,
+                        source.agent_kind,
+                        &source_id,
+                        TOKENOMICS_GENERIC_SCANNER_VERSION,
+                        day_start_unix,
+                    )?;
                 let day_offsets_current = day_files.iter().try_fold(true, |current, file| {
                     if !current {
                         return Ok::<bool, String>(false);
@@ -893,7 +950,7 @@ fn tokenomics_scan_usage_for_mode(
                         &offset,
                         file,
                         TOKENOMICS_GENERIC_SCANNER_VERSION,
-                        day_start_unix,
+                        required_coverage_start,
                     ))
                 })?;
                 if day_complete && day_offsets_current {
@@ -929,7 +986,7 @@ fn tokenomics_scan_usage_for_mode(
                         "agent_kind": source.agent_kind,
                         "provider_account_key": provider_account.key.as_str(),
                         "provider_account_label": provider_account.label.as_str(),
-                        "phase": if scan_mode.is_realtime() { "realtime_current_day" } else { "day_start" },
+                        "phase": if scan_mode.is_realtime() { "realtime_hot_tail" } else { "day_start" },
                         "day_index": day_index,
                         "day_total": source_day_total,
                         "day_label": day_label.as_str(),
@@ -953,7 +1010,7 @@ fn tokenomics_scan_usage_for_mode(
                             &offset,
                             file,
                             TOKENOMICS_GENERIC_SCANNER_VERSION,
-                            day_start_unix,
+                            required_coverage_start,
                         ) {
                             continue;
                         }
@@ -977,23 +1034,25 @@ fn tokenomics_scan_usage_for_mode(
                         TOKENOMICS_GENERIC_SCANNER_VERSION,
                         scan.last_line_index,
                         scan.last_event_timestamp,
-                        day_start_unix,
+                        required_coverage_start,
                     )?;
                 }
                 let day_files_scanned = scanned_files.saturating_sub(day_files_before);
                 let day_inserted_events =
                     (inserted_events + source_inserted).saturating_sub(day_inserted_before);
-                tokenomics_upsert_scan_day(
-                    &conn,
-                    source.provider,
-                    source.agent_kind,
-                    &source_id,
-                    TOKENOMICS_GENERIC_SCANNER_VERSION,
-                    day_start_unix,
-                    day_candidate_count,
-                    day_files_scanned,
-                    day_inserted_events,
-                )?;
+                if !scan_mode.is_realtime() {
+                    tokenomics_upsert_scan_day(
+                        &conn,
+                        source.provider,
+                        source.agent_kind,
+                        &source_id,
+                        TOKENOMICS_GENERIC_SCANNER_VERSION,
+                        day_start_unix,
+                        day_candidate_count,
+                        day_files_scanned,
+                        day_inserted_events,
+                    )?;
+                }
                 let mut progress = json!({
                     "provider": source.provider,
                     "agent_kind": source.agent_kind,
@@ -1011,7 +1070,10 @@ fn tokenomics_scan_usage_for_mode(
                     "day_candidate_count": day_candidate_count,
                     "mode": scan_mode.label(),
                 });
-                if day_files_scanned > 0 || day_inserted_events > 0 {
+                if emit_progress
+                    && !scan_mode.is_realtime()
+                    && (day_files_scanned > 0 || day_inserted_events > 0)
+                {
                     if let Ok(summary) = tokenomics_summary_from_conn(
                         &conn,
                         true,
@@ -1046,14 +1108,46 @@ fn tokenomics_scan_usage_for_mode(
         }));
     }
 
-    let mut summary = tokenomics_summary_from_conn(&conn, true, Some(inserted_events))?;
-    summary["scan"] = json!({
+    let scan = json!({
         "files_scanned": scanned_files,
         "inserted_events": inserted_events,
         "sources": sources,
         "forced_resync": force_resync_last_30_days,
         "mode": scan_mode.label(),
+        "approximate": scan_mode.is_realtime(),
+        "hot_tail_lookback_seconds": if scan_mode.is_realtime() {
+            TOKENOMICS_REALTIME_LOOKBACK_SECS
+        } else {
+            0
+        },
+        "hot_tail_max_codex_candidates": if scan_mode.is_realtime() {
+            TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES
+        } else {
+            0
+        },
+        "hot_tail_max_files_per_provider": if scan_mode.is_realtime() {
+            TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER
+        } else {
+            0
+        },
     });
+    if scan_mode.is_realtime() {
+        let scan_index = tokenomics_scan_index_status(&conn)?;
+        return Ok(json!({
+            "known": true,
+            "source": "rust_local_tokenomics_sqlite_v2",
+            "schema_version": "tokenomics_v2",
+            "updated_at": tokenomics_now_iso_like(),
+            "current_device_id": tokenomics_local_device_id(),
+            "current_device_name": tokenomics_local_device_name(),
+            "inserted_events": inserted_events,
+            "scan": scan,
+            "scan_index": scan_index.clone(),
+            "scanIndex": scan_index,
+        }));
+    }
+    let mut summary = tokenomics_summary_from_conn(&conn, true, Some(inserted_events))?;
+    summary["scan"] = scan;
     if force_resync_last_30_days {
         summary["forced_resync"] = json!(true);
     }
@@ -1101,30 +1195,67 @@ fn tokenomics_summary_inserted_events(summary: &Value) -> usize {
         .unwrap_or_default()
 }
 
+fn tokenomics_summary_cache() -> &'static StdMutex<Option<TokenomicsSummaryCacheEntry>> {
+    TOKENOMICS_SUMMARY_CACHE.get_or_init(|| StdMutex::new(None))
+}
+
+fn tokenomics_clear_summary_cache() {
+    if let Ok(mut cache) = tokenomics_summary_cache().lock() {
+        *cache = None;
+    }
+}
+
+fn tokenomics_cached_read_only_summary_for(
+    app: &AppHandle,
+    include_rollups: bool,
+    include_cloud: bool,
+) -> Result<Value, String> {
+    if let Ok(cache) = tokenomics_summary_cache().lock() {
+        if let Some(entry) = cache.as_ref() {
+            if entry.include_rollups == include_rollups
+                && entry.include_cloud == include_cloud
+                && entry.cached_at.elapsed()
+                    < Duration::from_millis(TOKENOMICS_SUMMARY_CACHE_TTL_MS)
+            {
+                return Ok(entry.summary.clone());
+            }
+        }
+    }
+
+    let conn = tokenomics_open_db(app)?;
+    let summary = tokenomics_summary_from_conn_with_cloud_read_only(
+        &conn,
+        include_rollups,
+        None,
+        include_cloud,
+    )?;
+    if let Ok(mut cache) = tokenomics_summary_cache().lock() {
+        *cache = Some(TokenomicsSummaryCacheEntry {
+            include_rollups,
+            include_cloud,
+            cached_at: Instant::now(),
+            summary: summary.clone(),
+        });
+    }
+    Ok(summary)
+}
+
 async fn tokenomics_enqueue_usage_sync_if_inserted(
-    app: AppHandle,
-    state: &CloudMcpState,
+    _app: AppHandle,
+    _state: &CloudMcpState,
     summary: &Value,
 ) {
-    if tokenomics_summary_inserted_events(summary) == 0 {
+    let inserted_events = tokenomics_summary_inserted_events(summary);
+    if inserted_events == 0 {
         return;
     }
-    let signed_in = cloud_mcp_authorization_bearer(state)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    if !signed_in {
-        return;
-    }
-    let _ = cloud_mcp_enqueue_tokenomics_sync(
-        app,
-        state,
-        "tokenomics_usage_changed".to_string(),
-        false,
-        false,
-    )
-    .await;
+    log_terminal_status_event(
+        "backend.tokenomics.sync_skipped",
+        json!({
+            "reason": "local_only_client_owned",
+            "inserted_events": inserted_events,
+        }),
+    );
 }
 
 struct TokenomicsSource {
@@ -3285,6 +3416,19 @@ fn tokenomics_codex_canonical_provider_account_from_usage(
     }
 }
 
+fn tokenomics_codex_light_provider_account_from_usage(
+    usage: &Value,
+    fallback_account: &TokenomicsProviderAccount,
+) -> TokenomicsProviderAccount {
+    let Some(account_id) = tokenomics_codex_usage_account_id(usage) else {
+        return fallback_account.clone();
+    };
+    let key = tokenomics_codex_provider_account_key_from_usage_account_id(&account_id);
+    let label = tokenomics_clean_non_profile_provider_account_label(&fallback_account.label)
+        .unwrap_or_else(|| fallback_account.label.clone());
+    TokenomicsProviderAccount { key, label }
+}
+
 fn tokenomics_rewrite_cloud_provider_limits_for_account_key(
     conn: &rusqlite::Connection,
     provider: &str,
@@ -4251,14 +4395,17 @@ fn tokenomics_scan_codex_state_db(
         .unwrap_or(false);
     let now_unix = tokenomics_unix_now();
     let realtime_day_start = tokenomics_utc_day_start_unix(now_unix);
+    let realtime_hot_tail_start = now_unix
+        .saturating_sub(TOKENOMICS_REALTIME_LOOKBACK_SECS)
+        .max(realtime_day_start);
     let backfill_cutoff = now_unix.saturating_sub(TOKENOMICS_INITIAL_BACKFILL_DAYS * 86_400);
     let min_thread_updated_at = if scan_mode.is_realtime() {
-        realtime_day_start
+        realtime_hot_tail_start
     } else {
         backfill_cutoff
     };
     let scan_region_kind = if scan_mode.is_realtime() {
-        "realtime_current_day"
+        "realtime_hot_tail"
     } else if initial_backfill_done {
         "catch_up"
     } else {
@@ -4302,10 +4449,10 @@ fn tokenomics_scan_codex_state_db(
             "agent_kind": "codex",
             "provider_account_key": provider_account.key.as_str(),
             "provider_account_label": provider_account.label.as_str(),
-            "phase": if scan_mode.is_realtime() { "realtime_current_day" } else if initial_backfill_done { "catch_up" } else { "backfill_start" },
+            "phase": if scan_mode.is_realtime() { "realtime_hot_tail" } else if initial_backfill_done { "catch_up" } else { "backfill_start" },
             "day_index": 0,
             "day_total": scan_day_total,
-            "day_label": if scan_mode.is_realtime() { "today" } else if initial_backfill_done { "latest usage" } else { "preparing 30-day scan" },
+            "day_label": if scan_mode.is_realtime() { "recent usage" } else if initial_backfill_done { "latest usage" } else { "preparing 30-day scan" },
             "files_scanned": 0,
             "inserted_events": 0,
             "mode": scan_mode.label(),
@@ -4323,6 +4470,11 @@ fn tokenomics_scan_codex_state_db(
                 db_path.display()
             )
         })?;
+        let candidate_limit = if scan_mode.is_realtime() {
+            TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES as i64
+        } else {
+            -1
+        };
         let mut statement = codex_conn
             .prepare(
                 "SELECT
@@ -4336,13 +4488,15 @@ fn tokenomics_scan_codex_state_db(
                  FROM threads
                  WHERE COALESCE(rollout_path, '') != ''
                    AND (?1 = 0 OR updated_at >= ?1 OR updated_at >= ?2)
-                 ORDER BY updated_at DESC",
+                 ORDER BY updated_at DESC
+                 LIMIT ?3",
             )
             .map_err(|error| format!("Unable to prepare Codex Tokenomics query: {error}"))?;
         let mut rows = statement
             .query(rusqlite::params![
                 min_thread_updated_at as i64,
-                (min_thread_updated_at as i64).saturating_mul(1000)
+                (min_thread_updated_at as i64).saturating_mul(1000),
+                candidate_limit
             ])
             .map_err(|error| format!("Unable to query Codex Tokenomics database: {error}"))?;
         let mut candidates = Vec::new();
@@ -4391,18 +4545,19 @@ fn tokenomics_scan_codex_state_db(
         let day_index = day_offset + 1;
         let day_label = tokenomics_scan_day_label_from_offset(day_offset);
         let required_coverage_start = if scan_mode.is_realtime() {
-            realtime_day_start
+            realtime_hot_tail_start
         } else {
             backfill_cutoff
         };
-        let day_complete = tokenomics_scan_day_is_complete(
-            conn,
-            "openai",
-            "codex",
-            &source_id,
-            TOKENOMICS_CODEX_SCANNER_VERSION,
-            day_start_unix,
-        )?;
+        let day_complete = !scan_mode.is_realtime()
+            && tokenomics_scan_day_is_complete(
+                conn,
+                "openai",
+                "codex",
+                &source_id,
+                TOKENOMICS_CODEX_SCANNER_VERSION,
+                day_start_unix,
+            )?;
         let day_offsets_current = day_candidates.iter().try_fold(true, |current, candidate| {
             if !current {
                 return Ok::<bool, String>(false);
@@ -4452,7 +4607,7 @@ fn tokenomics_scan_codex_state_db(
                 "agent_kind": "codex",
                 "provider_account_key": provider_account.key.as_str(),
                 "provider_account_label": provider_account.label.as_str(),
-                "phase": if scan_mode.is_realtime() { "realtime_current_day" } else if initial_backfill_done { "catch_up" } else { "day_start" },
+                "phase": if scan_mode.is_realtime() { "realtime_hot_tail" } else if initial_backfill_done { "catch_up" } else { "day_start" },
                 "day_index": day_index,
                 "day_total": scan_day_total,
                 "day_label": day_label.as_str(),
@@ -4539,17 +4694,19 @@ fn tokenomics_scan_codex_state_db(
 
         let day_files_scanned = files_scanned.saturating_sub(day_files_before);
         let day_inserted_events = inserted_events.saturating_sub(day_inserted_before);
-        tokenomics_upsert_scan_day(
-            conn,
-            "openai",
-            "codex",
-            &source_id,
-            TOKENOMICS_CODEX_SCANNER_VERSION,
-            day_start_unix,
-            day_candidate_count,
-            day_files_scanned,
-            day_inserted_events,
-        )?;
+        if !scan_mode.is_realtime() {
+            tokenomics_upsert_scan_day(
+                conn,
+                "openai",
+                "codex",
+                &source_id,
+                TOKENOMICS_CODEX_SCANNER_VERSION,
+                day_start_unix,
+                day_candidate_count,
+                day_files_scanned,
+                day_inserted_events,
+            )?;
+        }
         let mut progress = json!({
             "provider": "openai",
             "agent_kind": "codex",
@@ -4567,7 +4724,10 @@ fn tokenomics_scan_codex_state_db(
             "day_candidate_count": day_candidate_count,
             "mode": scan_mode.label(),
         });
-        if day_files_scanned > 0 || day_inserted_events > 0 {
+        if emit_progress
+            && !scan_mode.is_realtime()
+            && (day_files_scanned > 0 || day_inserted_events > 0)
+        {
             if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
                 progress["summary"] = summary;
             }
@@ -4589,8 +4749,10 @@ fn tokenomics_scan_codex_state_db(
         "candidate_count": candidates.len(),
         "mode": scan_mode.label(),
     });
-    if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
+    if emit_progress && !scan_mode.is_realtime() {
+        if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
         complete_progress["summary"] = summary;
+        }
     }
     tokenomics_emit_scan_progress(app, emit_progress, complete_progress);
 
@@ -6132,6 +6294,23 @@ fn tokenomics_summary_from_conn_with_cloud(
         inserted_events,
         include_cloud,
         None,
+        true,
+    )
+}
+
+fn tokenomics_summary_from_conn_with_cloud_read_only(
+    conn: &rusqlite::Connection,
+    include_rollups: bool,
+    inserted_events: Option<usize>,
+    include_cloud: bool,
+) -> Result<Value, String> {
+    tokenomics_summary_from_conn_with_cloud_for_scope(
+        conn,
+        include_rollups,
+        inserted_events,
+        include_cloud,
+        None,
+        false,
     )
 }
 
@@ -6141,9 +6320,12 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     inserted_events: Option<usize>,
     include_cloud: bool,
     scope_filter: Option<&TokenomicsBillingScope>,
+    refresh_account_rows: bool,
 ) -> Result<Value, String> {
-    tokenomics_reconcile_duplicate_provider_account_identities(conn)?;
-    tokenomics_refresh_provider_accounts_from_usage(conn)?;
+    if refresh_account_rows {
+        tokenomics_reconcile_duplicate_provider_account_identities(conn)?;
+        tokenomics_refresh_provider_accounts_from_usage(conn)?;
+    }
     let scope_filter_sql = tokenomics_billing_scope_filter_sql(scope_filter, true);
     let total = tokenomics_query_one(
         conn,
@@ -6151,24 +6333,23 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
             "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM tokenomics_rollups WHERE bucket_width='hour' {scope_filter_sql}"
         ),
     )?;
-    let mut local_limits = tokenomics_provider_limits(conn, false, false)?;
-    tokenomics_apply_provider_limit_sample_pacing(conn, &mut local_limits)?;
-    tokenomics_record_latest_windows(conn, &local_limits)?;
-    tokenomics_refresh_provider_accounts_from_usage(conn)?;
+    if refresh_account_rows {
+        tokenomics_refresh_provider_accounts_from_usage(conn)?;
+    }
     let retired_account_keys = tokenomics_retired_provider_account_keys();
+    let mut provider_accounts = tokenomics_provider_account_rows(conn, None, scope_filter)?;
+    tokenomics_retain_active_account_rows(&mut provider_accounts, &retired_account_keys);
+    let mut latest_windows = tokenomics_latest_window_rows(conn, None, scope_filter)?;
+    tokenomics_retain_active_account_rows(&mut latest_windows, &retired_account_keys);
     let mut limits = if include_cloud {
-        tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, local_limits)
+        tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, latest_windows.clone())
     } else {
-        local_limits
+        latest_windows.clone()
     };
     if include_cloud {
         tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
     }
     tokenomics_retain_active_account_rows(&mut limits, &retired_account_keys);
-    let mut provider_accounts = tokenomics_provider_account_rows(conn, None, scope_filter)?;
-    tokenomics_retain_active_account_rows(&mut provider_accounts, &retired_account_keys);
-    let mut latest_windows = tokenomics_latest_window_rows(conn, None, scope_filter)?;
-    tokenomics_retain_active_account_rows(&mut latest_windows, &retired_account_keys);
     let hourly = if include_rollups {
         tokenomics_account_hourly_display_rollups(conn, None, scope_filter, include_cloud)?
     } else {
@@ -6180,6 +6361,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
         tokenomics_provider_limit_sample_rows(conn, None, scope_filter, include_cloud)?;
     tokenomics_retain_active_account_rows(&mut limit_samples, &retired_account_keys);
     let device_identities = tokenomics_summary_device_identities(conn, include_cloud)?;
+    let scan_index = tokenomics_scan_index_status(conn)?;
     Ok(json!({
     "known": total.get("total_tokens").and_then(Value::as_i64).unwrap_or(0) > 0 || !hourly.is_empty() || !daily_by_device_provider.is_empty(),
     "source": "rust_local_tokenomics_sqlite_v2",
@@ -6213,6 +6395,8 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
         {"provider": "opencode", "agent_kind": "opencode", "label": "OpenCode"}
     ],
     "limits": limits,
+    "scan_index": scan_index.clone(),
+    "scanIndex": scan_index,
     "retired_account_keys": retired_account_keys.clone(),
     "retiredAccountKeys": retired_account_keys,
     "device_identities": device_identities.clone(),
@@ -6222,6 +6406,116 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
 
 fn tokenomics_sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn tokenomics_scan_index_status(conn: &rusqlite::Connection) -> Result<Value, String> {
+    let scanner_versions = format!(
+        "{}, {}",
+        tokenomics_sql_string_literal(TOKENOMICS_CODEX_SCANNER_VERSION),
+        tokenomics_sql_string_literal(TOKENOMICS_GENERIC_SCANNER_VERSION)
+    );
+    let count_query = |sql: &str| -> Result<i64, String> {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("Unable to read Tokenomics scan index: {error}"))
+    };
+    let text_query = |sql: &str| -> Result<String, String> {
+        conn.query_row(sql, [], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Unable to read Tokenomics scan index text: {error}"))
+    };
+
+    let scan_state_count = count_query(&format!(
+        "SELECT COUNT(*) FROM tokenomics_scan_state WHERE scanner_version IN ({scanner_versions})"
+    ))?;
+    let complete_scan_state_count = count_query(&format!(
+        "SELECT COUNT(*) FROM tokenomics_scan_state WHERE initial_backfill_done != 0 AND scanner_version IN ({scanner_versions})"
+    ))?;
+    let source_offset_count = count_query(&format!(
+        "SELECT COUNT(*) FROM tokenomics_source_offsets WHERE scanner_version IN ({scanner_versions})"
+    ))?;
+    let complete_scan_day_count = count_query(&format!(
+        "SELECT COUNT(*) FROM tokenomics_scan_days WHERE status='complete' AND scanner_version IN ({scanner_versions})"
+    ))?;
+    let last_event_timestamp = count_query(&format!(
+        "SELECT COALESCE(MAX(last_event_timestamp), 0) FROM (
+           SELECT last_event_timestamp FROM tokenomics_scan_state WHERE scanner_version IN ({scanner_versions})
+           UNION ALL
+           SELECT last_event_timestamp FROM tokenomics_source_offsets WHERE scanner_version IN ({scanner_versions})
+         )"
+    ))?;
+    let covered_since_unix = count_query(&format!(
+        "SELECT COALESCE(MIN(NULLIF(coverage_start_unix, {TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX})), 0)
+         FROM tokenomics_source_offsets
+         WHERE scanner_version IN ({scanner_versions})"
+    ))?;
+    let last_indexed_at = text_query(&format!(
+        "SELECT COALESCE(MAX(updated_at), '') FROM (
+           SELECT updated_at FROM tokenomics_scan_state WHERE scanner_version IN ({scanner_versions})
+           UNION ALL
+           SELECT updated_at FROM tokenomics_source_offsets WHERE scanner_version IN ({scanner_versions})
+           UNION ALL
+           SELECT updated_at FROM tokenomics_scan_days WHERE scanner_version IN ({scanner_versions})
+         )"
+    ))?;
+    let status = if scan_state_count == 0 && source_offset_count == 0 && complete_scan_day_count == 0
+    {
+        "not_started"
+    } else if scan_state_count > 0 && complete_scan_state_count >= scan_state_count {
+        "indexed"
+    } else {
+        "partial"
+    };
+    let covered_since_value = if covered_since_unix > 0 {
+        json!(covered_since_unix)
+    } else {
+        Value::Null
+    };
+    let last_event_value = if last_event_timestamp > 0 {
+        json!(last_event_timestamp)
+    } else {
+        Value::Null
+    };
+
+    Ok(json!({
+        "status": status,
+        "cache": "sqlite_rollups_and_source_offsets",
+        "historical_scan": {
+            "status": status,
+            "initial_backfill_done": complete_scan_state_count > 0,
+            "initialBackfillDone": complete_scan_state_count > 0,
+            "scan_state_count": scan_state_count,
+            "scanStateCount": scan_state_count,
+            "complete_scan_state_count": complete_scan_state_count,
+            "completeScanStateCount": complete_scan_state_count,
+            "source_offset_count": source_offset_count,
+            "sourceOffsetCount": source_offset_count,
+            "complete_scan_day_count": complete_scan_day_count,
+            "completeScanDayCount": complete_scan_day_count,
+            "covered_since_unix": covered_since_value.clone(),
+            "coveredSinceUnix": covered_since_value,
+            "last_event_timestamp": last_event_value.clone(),
+            "lastEventTimestamp": last_event_value,
+            "last_indexed_at": last_indexed_at,
+            "lastIndexedAt": last_indexed_at,
+        },
+        "live_tail": {
+            "status": "approximate",
+            "approximate": true,
+            "lookback_seconds": TOKENOMICS_REALTIME_LOOKBACK_SECS,
+            "lookbackSeconds": TOKENOMICS_REALTIME_LOOKBACK_SECS,
+            "max_codex_candidates": TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES,
+            "maxCodexCandidates": TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES,
+            "max_files_per_provider": TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER,
+            "maxFilesPerProvider": TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER,
+        },
+        "scanner_versions": {
+            "codex": TOKENOMICS_CODEX_SCANNER_VERSION,
+            "generic": TOKENOMICS_GENERIC_SCANNER_VERSION,
+        },
+        "scannerVersions": {
+            "codex": TOKENOMICS_CODEX_SCANNER_VERSION,
+            "generic": TOKENOMICS_GENERIC_SCANNER_VERSION,
+        },
+    }))
 }
 
 fn tokenomics_billing_scope_filter_sql(
@@ -7962,7 +8256,7 @@ fn tokenomics_sync_delta_from_conn_with_limit_sampling(
         .filter(|value| !value.is_empty());
     tokenomics_refresh_provider_accounts_from_usage(conn)?;
     let hourly = tokenomics_account_hourly_sync_rollups(conn, clean_since, scope_filter)?;
-    let mut limits = tokenomics_provider_limits(conn, false, false)?;
+    let mut limits = tokenomics_provider_limits(conn, false, false, true)?;
     if record_limit_samples {
         let _ = tokenomics_record_provider_limit_samples(conn, &limits);
     }
@@ -8007,247 +8301,6 @@ fn tokenomics_sync_delta_from_conn_with_limit_sampling(
         "latest_windows": latest_windows.clone(),
         "latestWindows": latest_windows,
         "limits": limits,
-    }))
-}
-
-fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Result<Value, String> {
-    let conn = tokenomics_open_db(app)?;
-    let local_device_ids = tokenomics_local_device_id_set(&conn)?;
-    let inherited_device_id =
-        tokenomics_text_field(event, &["device_id", "deviceId", "machine_id", "machineId"])
-            .or_else(|| {
-                event.get("payload").and_then(|payload| {
-                    tokenomics_text_field(
-                        payload,
-                        &["device_id", "deviceId", "machine_id", "machineId"],
-                    )
-                })
-            });
-    let event_kind = tokenomics_text_field(event, &["event_kind", "eventKind", "kind"])
-        .unwrap_or_else(|| "tokenomics_cloud_update".to_string());
-    let inherited_billing_scope =
-        tokenomics_billing_scope_from_value(event, &tokenomics_unknown_billing_scope());
-    let summary = tokenomics_cloud_summary_payload(event);
-    let account_scope_key =
-        tokenomics_cloud_account_scope_key(event, &summary, &inherited_billing_scope);
-    let sync_cursor = tokenomics_cloud_summary_sync_cursor(event, &summary);
-    if let Some(cursor) = sync_cursor.as_deref() {
-        tokenomics_store_cloud_account_sync_cursor(&conn, &account_scope_key, cursor)?;
-    }
-    let tombstoned_devices =
-        tokenomics_tombstoned_cloud_account_device_ids(event, &local_device_ids);
-    for device_id in &tombstoned_devices {
-        tokenomics_delete_cloud_device_facts(&conn, device_id)?;
-    }
-    let stored_limit_count = tokenomics_store_cloud_provider_limits(
-        &conn,
-        &summary,
-        &inherited_billing_scope,
-        inherited_device_id.as_deref(),
-        &local_device_ids,
-    )?;
-    let stored_limit_sample_count = tokenomics_store_cloud_provider_limit_samples(
-        &conn,
-        &summary,
-        &inherited_billing_scope,
-        inherited_device_id.as_deref(),
-        &local_device_ids,
-    )?;
-    let stored_device_identity_count = tokenomics_store_cloud_device_identities(&conn, &summary)?;
-    let hourly = summary
-        .get("hourly")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let hourly_group_replacements = summary
-        .get("hourly_group_replacements")
-        .or_else(|| summary.get("hourlyGroupReplacements"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut replacement_count = 0usize;
-    for replacement in &hourly_group_replacements {
-        let Some(device_id) = tokenomics_remote_cloud_device_id_from_value(
-            replacement,
-            inherited_device_id.as_deref(),
-            &local_device_ids,
-        ) else {
-            continue;
-        };
-        let bucket_start = tokenomics_value_string(replacement, &["bucket_start", "bucketStart"])
-            .or_else(|| {
-                tokenomics_value_i64(replacement, &["bucket_start_ms", "bucketStartMs"])
-                    .and_then(tokenomics_hour_bucket_from_ms)
-            })
-            .unwrap_or_default();
-        if bucket_start.is_empty() {
-            continue;
-        }
-        replacement_count += conn
-            .execute(
-                "DELETE FROM tokenomics_cloud_rollups
-                 WHERE device_id=?1 AND bucket_width='hour' AND bucket_start=?2",
-                rusqlite::params![device_id.as_str(), bucket_start.as_str()],
-            )
-            .map_err(|error| {
-                format!("Unable to replace cached cloud Tokenomics hour group: {error}")
-            })?;
-    }
-    if hourly.is_empty() && hourly_group_replacements.is_empty() {
-        return Ok(json!({
-            "ok": true,
-            "stored_count": 0,
-            "stored_replacement_count": replacement_count,
-            "stored_limit_count": stored_limit_count,
-            "stored_limit_sample_count": stored_limit_sample_count,
-            "stored_device_identity_count": stored_device_identity_count,
-            "event_kind": event_kind,
-        }));
-    }
-
-    let now = tokenomics_now_iso_like();
-    let is_snapshot =
-        event_kind.ends_with("_snapshot") || event_kind == "tokenomics_account_snapshot";
-    let mut incoming_devices = HashSet::<String>::new();
-    for rollup in &hourly {
-        if let Some(device_id) = tokenomics_remote_cloud_device_id_from_value(
-            rollup,
-            inherited_device_id.as_deref(),
-            &local_device_ids,
-        ) {
-            incoming_devices.insert(device_id);
-        }
-    }
-    if is_snapshot {
-        for device_id in &incoming_devices {
-            conn.execute(
-                "DELETE FROM tokenomics_cloud_rollups WHERE device_id=?1",
-                rusqlite::params![device_id.as_str()],
-            )
-            .map_err(|error| format!("Unable to clear cached cloud Tokenomics rows: {error}"))?;
-        }
-    }
-
-    let mut stored_count = 0usize;
-    for rollup in hourly.iter().take(TOKENOMICS_SYNC_ROLLUP_LIMIT) {
-        let Some(device_id) = tokenomics_remote_cloud_device_id_from_value(
-            rollup,
-            inherited_device_id.as_deref(),
-            &local_device_ids,
-        ) else {
-            continue;
-        };
-        let provider =
-            tokenomics_value_string(rollup, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent_kind = tokenomics_value_string(rollup, &["agent_kind", "agentKind"])
-            .unwrap_or_else(|| provider.clone());
-        let fallback_account = tokenomics_provider_account(&provider, &agent_kind);
-        let provider_account_key = tokenomics_value_string(
-            rollup,
-            &[
-                "provider_account_key",
-                "providerAccountKey",
-                "subscription_key",
-                "subscriptionKey",
-            ],
-        )
-        .unwrap_or_else(|| fallback_account.key.clone());
-        let provider_account_label =
-            tokenomics_value_string(rollup, &["provider_account_label", "providerAccountLabel"])
-                .unwrap_or_else(|| fallback_account.label.clone());
-        let billing_scope = tokenomics_billing_scope_from_value(rollup, &inherited_billing_scope);
-        let subscription_key = Some(provider_account_key.clone());
-        let model = tokenomics_value_string(rollup, &["model"]);
-        let bucket_width = tokenomics_value_string(rollup, &["bucket_width", "bucketWidth"])
-            .unwrap_or_else(|| "hour".to_string());
-        let bucket_start = tokenomics_value_string(rollup, &["bucket_start", "bucketStart"])
-            .unwrap_or_else(tokenomics_now_iso_like);
-        let updated_at = tokenomics_value_string(rollup, &["updated_at", "updatedAt"])
-            .unwrap_or_else(|| now.clone());
-        let input_tokens = tokenomics_value_i64(rollup, &["input_tokens", "inputTokens"])
-            .unwrap_or(0)
-            .max(0);
-        let output_tokens = tokenomics_value_i64(rollup, &["output_tokens", "outputTokens"])
-            .unwrap_or(0)
-            .max(0);
-        let cache_read_tokens =
-            tokenomics_value_i64(rollup, &["cache_read_tokens", "cacheReadTokens"])
-                .unwrap_or(0)
-                .max(0);
-        let cache_write_tokens =
-            tokenomics_value_i64(rollup, &["cache_write_tokens", "cacheWriteTokens"])
-                .unwrap_or(0)
-                .max(0);
-        let reported_total_tokens = tokenomics_value_i64(rollup, &["total_tokens", "totalTokens"])
-            .unwrap_or(0)
-            .max(0);
-        let total_tokens = if reported_total_tokens > 0 {
-            reported_total_tokens
-        } else {
-            input_tokens
-                .saturating_add(output_tokens)
-                .saturating_add(cache_read_tokens)
-                .saturating_add(cache_write_tokens)
-        };
-        let id = tokenomics_cloud_rollup_id(
-            &device_id,
-            &provider,
-            &agent_kind,
-            model.as_deref(),
-            &provider_account_key,
-            billing_scope.scope_type.as_str(),
-            billing_scope.team_id.as_deref(),
-            &bucket_width,
-            &bucket_start,
-        );
-        conn.execute(
-	            "INSERT OR REPLACE INTO tokenomics_cloud_rollups(
-	               id, device_id, provider, agent_kind, model, subscription_key,
-	               provider_account_key, provider_account_label,
-	               billing_scope_type, billing_team_id, billing_scope_source,
-	               workspace_id, repo_path,
-	               bucket_width, bucket_start, input_tokens, output_tokens,
-	               cache_read_tokens, cache_write_tokens, total_tokens,
-	               estimated_cost_microusd, event_count, updated_at, received_at
-	             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
-	            rusqlite::params![
-	                id,
-	                device_id,
-                provider,
-                agent_kind,
-                model.as_deref(),
-	                subscription_key.as_deref(),
-	                provider_account_key,
-	                provider_account_label,
-	                billing_scope.scope_type.as_str(),
-	                billing_scope.team_id.as_deref(),
-	                billing_scope.source.as_str(),
-	                bucket_width,
-                bucket_start,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                total_tokens,
-                tokenomics_value_i64(rollup, &["estimated_cost_microusd", "estimatedCostMicrousd"]).unwrap_or(0).max(0),
-                tokenomics_value_i64(rollup, &["event_count", "eventCount"]).unwrap_or(0).max(0),
-                updated_at,
-                now.as_str(),
-            ],
-        )
-        .map_err(|error| format!("Unable to cache cloud Tokenomics row: {error}"))?;
-        stored_count += 1;
-    }
-    tokenomics_refresh_cloud_daily_rollups(&conn)?;
-    Ok(json!({
-        "ok": true,
-        "stored_count": stored_count,
-        "stored_replacement_count": replacement_count,
-        "stored_limit_count": stored_limit_count,
-        "stored_limit_sample_count": stored_limit_sample_count,
-        "stored_device_identity_count": stored_device_identity_count,
-        "event_kind": event_kind,
-        "device_count": incoming_devices.len(),
     }))
 }
 
@@ -8936,26 +8989,6 @@ fn tokenomics_store_cloud_account_sync_cursor(
     )
     .map_err(|error| format!("Unable to store cloud Tokenomics sync cursor: {error}"))?;
     Ok(())
-}
-
-fn tokenomics_cloud_account_sync_cursor(
-    app: &AppHandle,
-    scope_type: &str,
-    team_id: Option<&str>,
-) -> Result<Option<String>, String> {
-    let conn = tokenomics_open_db(app)?;
-    let scope_key = tokenomics_billing_scope_key(scope_type, team_id);
-    match conn.query_row(
-        "SELECT value FROM tokenomics_meta WHERE key=?1",
-        rusqlite::params![tokenomics_cloud_account_sync_cursor_key(&scope_key)],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(value) => Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty())),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(error) => Err(format!(
-            "Unable to read cloud Tokenomics sync cursor: {error}"
-        )),
-    }
 }
 
 fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value> {
@@ -9983,6 +10016,7 @@ fn tokenomics_provider_limits(
     conn: &rusqlite::Connection,
     include_cloud_last_known: bool,
     include_stale_provider_cache: bool,
+    reconcile_accounts: bool,
 ) -> Result<Vec<Value>, String> {
     let mut limits = Vec::new();
 
@@ -9995,11 +10029,15 @@ fn tokenomics_provider_limits(
         &codex_account,
         include_stale_provider_cache,
     ) {
-        let codex_account = tokenomics_reconcile_codex_provider_account_from_usage(
-            conn,
-            &codex_account,
-            &codex_usage,
-        )?;
+        let codex_account = if reconcile_accounts {
+            tokenomics_reconcile_codex_provider_account_from_usage(
+                conn,
+                &codex_account,
+                &codex_usage,
+            )?
+        } else {
+            tokenomics_codex_light_provider_account_from_usage(&codex_usage, &codex_account)
+        };
         let mut codex_limits =
             tokenomics_codex_live_limit_snapshots(&codex_plan, &codex_usage, &codex_account);
         tokenomics_tag_limit_agent_profile(
@@ -10071,11 +10109,15 @@ fn tokenomics_provider_limits(
             &profile_account,
             include_stale_provider_cache,
         ) {
-            let profile_account = tokenomics_reconcile_codex_provider_account_from_usage(
-                conn,
-                &profile_account,
-                &profile_usage,
-            )?;
+            let profile_account = if reconcile_accounts {
+                tokenomics_reconcile_codex_provider_account_from_usage(
+                    conn,
+                    &profile_account,
+                    &profile_usage,
+                )?
+            } else {
+                tokenomics_codex_light_provider_account_from_usage(&profile_usage, &profile_account)
+            };
             let mut profile_limits = tokenomics_codex_live_limit_snapshots(
                 &profile_plan,
                 &profile_usage,

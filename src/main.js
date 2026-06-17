@@ -9,9 +9,9 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 
-// Snipping floating windows (annotation editor, snip previews, legacy toast
-// dock) boot from the small snipping chunk instead of evaluating the entire
-// AppShell bundle, so they open near-instantly.
+// Utility windows boot from narrow chunks instead of evaluating the entire
+// AppShell bundle. Besides startup latency, this keeps AppShell's background
+// listeners/pollers out of small always-on surfaces.
 const hash = window.location.hash || "";
 const loadRootComponent = hash === "#/snipping-recording-controls"
   ? import("./snipping/SnippingWorkspaceView.jsx").then((module) => module.SnippingRecordingControlsWindow)
@@ -25,6 +25,16 @@ const loadRootComponent = hash === "#/snipping-recording-controls"
     if (hash.startsWith("#/snipping-strip")) return module.SnippingStripWindow;
     return module.default;
   })
+  : hash === "#/activity-overlay"
+  ? import("./activity/ActivityOverlay.jsx").then((module) => module.default)
+  : hash === "#/audio-widget"
+  ? import("./audio/AudioWorkspaceView.jsx").then((module) => module.AudioWidgetWindow)
+  : hash === "#/audio-widget-error"
+  ? import("./audio/AudioWorkspaceView.jsx").then((module) => module.AudioWidgetErrorOverlayWindow)
+  : hash === "#/background-monitor"
+  ? import("./background/BackgroundMonitorWindow.jsx").then((module) => module.default)
+  : hash.startsWith("#/terminal-window")
+  ? import("./terminals/TerminalWindowHost.jsx").then((module) => module.default)
   : import("./App.jsx").then((module) => module.default);
 
 loadRootComponent.then((RootComponent) => {

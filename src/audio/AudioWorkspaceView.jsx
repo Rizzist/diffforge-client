@@ -7979,27 +7979,10 @@ export function AudioWidgetWindow() {
   }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus]);
 
   useEffect(() => {
-    if (widgetState === "setup" || widgetState === "missing") {
+    if (!["arming", "recording", "transcribing"].includes(widgetState)) {
       closeWarmBuffer();
     }
   }, [closeWarmBuffer, widgetState]);
-
-  useEffect(() => {
-    if ((widgetState !== "ready" && widgetState !== "error") || !hasAudioInputSetup()) {
-      return undefined;
-    }
-
-    let disposed = false;
-    startWarmBuffer().catch(() => {
-      if (!disposed && (widgetStateRef.current === "ready" || widgetStateRef.current === "error")) {
-        setMessage("Audio input standby");
-      }
-    });
-
-    return () => {
-      disposed = true;
-    };
-  }, [startWarmBuffer, widgetState]);
 
   useEffect(() => {
     if (

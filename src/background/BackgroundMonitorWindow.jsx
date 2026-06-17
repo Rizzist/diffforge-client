@@ -19,9 +19,9 @@ function text(value, fallback = "") {
 function readLastTab() {
   try {
     const stored = text(window.localStorage.getItem(LAST_TAB_STORAGE_KEY));
-    return stored === "activity" ? stored : "tokenomics";
+    return stored === "tokenomics" ? stored : "activity";
   } catch {
-    return "tokenomics";
+    return "activity";
   }
 }
 
@@ -180,6 +180,13 @@ const MonitorGlobalStyle = createGlobalStyle`
   *::before,
   *::after {
     box-sizing: border-box;
+  }
+
+  html:not([data-forge-continuous-motion="true"]) *,
+  html:not([data-forge-continuous-motion="true"]) *::before,
+  html:not([data-forge-continuous-motion="true"]) *::after {
+    animation: none !important;
+    transition-duration: 0.001ms !important;
   }
 `;
 

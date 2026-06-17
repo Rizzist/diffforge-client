@@ -13129,6 +13129,7 @@ function OrchestratorVoiceCanvasRing({
 }) {
   const canvasRef = useRef(null);
   const animationFrameRef = useRef(0);
+  const animationTimerRef = useRef(0);
   const currentWaveformRef = useRef(Array.from({ length: ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT }, () => 0));
   const smoothedEnvelopeRef = useRef(Array.from({ length: ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT }, () => 0));
   const noiseFloorBandsRef = useRef([]);
@@ -13268,7 +13269,21 @@ function OrchestratorVoiceCanvasRing({
         });
       }
 
-      animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+      const shouldAnimateContinuously = renderStateRef.current.active
+        || renderStateRef.current.level > 0
+        || breathRef.current > 0.001
+        || currentWaveformRef.current.some((value) => Math.abs(value || 0) > 0.001)
+        || smoothedEnvelopeRef.current.some((value) => Math.abs(value || 0) > 0.001);
+      if (shouldAnimateContinuously) {
+        animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+        return;
+      }
+
+      animationFrameRef.current = 0;
+      animationTimerRef.current = window.setTimeout(() => {
+        animationTimerRef.current = 0;
+        renderFrame(window.performance?.now?.() ?? Date.now());
+      }, 1000);
     };
 
     animationFrameRef.current = window.requestAnimationFrame(renderFrame);
@@ -13277,6 +13292,9 @@ function OrchestratorVoiceCanvasRing({
       disposed = true;
       if (animationFrameRef.current) {
         window.cancelAnimationFrame(animationFrameRef.current);
+      }
+      if (animationTimerRef.current) {
+        window.clearTimeout(animationTimerRef.current);
       }
     };
   }, []);
@@ -13377,7 +13395,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [coordinationTargets, rootDirectory]);
 
   useEffect(() => {
-    warmAccountTokenomics({ accountKey, scan: true });
+    warmAccountTokenomics({ accountKey, scan: false });
   }, [accountKey]);
 
   useEffect(() => {

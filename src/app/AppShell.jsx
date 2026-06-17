@@ -8652,7 +8652,6 @@ export default function App() {
   // timestamp. Catalog broadcasts and list responses must not re-add these
   // unless the cloud entry is newer than the delete (an intentional revive);
   // stale ghosts are filtered out and the tombstone is re-sent to the cloud.
-  const tokenomicsForceResyncRef = useRef(null);
   const cloudMcpStartupWarmupKeyRef = useRef("");
   useEffect(() => {
     agentStatusesRef.current = agentStatuses;
@@ -10995,7 +10994,6 @@ export default function App() {
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
     workspaceAppContextSyncKeyRef.current = "";
-    tokenomicsForceResyncRef.current = null;
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
     setStartupAgentGateState("idle");
@@ -11039,7 +11037,6 @@ export default function App() {
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
     workspaceAppContextSyncKeyRef.current = "";
-    tokenomicsForceResyncRef.current = null;
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
@@ -15669,7 +15666,6 @@ export default function App() {
           });
         });
       }
-      tokenomicsForceResyncRef.current?.();
     }
     if (connection !== "connected" || previous === "connected" || !previous) {
       return;
@@ -18097,33 +18093,6 @@ export default function App() {
     workspaceActivationDeferred,
     workspaceSyncState,
   ]);
-
-  useEffect(() => {
-    if (authState !== "authenticated" || !accountIsPaid) {
-      return undefined;
-    }
-
-    // Tokenomics sync scheduling (startup scan, 60s heartbeat, server-refresh
-    // triggers) now runs in Rust (cloud_mcp_start_tokenomics_scheduler), so it
-    // keeps syncing with no visible window. The webview keeps only the manual
-    // force-resync hook used by the Tokenomics settings actions.
-    tokenomicsForceResyncRef.current = () => {
-      void invoke("cloud_mcp_schedule_tokenomics_sync", {
-        full: true,
-        reason: "tokenomics_server_refresh",
-        resyncLast30Days: true,
-      }).catch((error) => {
-        logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_sync.failed", {
-          message: getErrorMessage(error, "Unable to sync Tokenomics."),
-          reason: "tokenomics_server_refresh",
-        });
-      });
-    };
-
-    return () => {
-      tokenomicsForceResyncRef.current = null;
-    };
-  }, [activeAccountScopeKey, authState, user]);
 
   useEffect(() => {
     if (

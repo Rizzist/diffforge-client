@@ -3,6 +3,7 @@ const DEFAULT_VOLUME = 0.32;
 const DING_SOUND_PATH = "/ding.mp3";
 const DING_SOUND_MIN_INTERVAL_MS = 1200;
 const TONE_MIN_INTERVAL_MS = 180;
+const TONE_CONTEXT_IDLE_CLOSE_MS = 420;
 
 // Each tone is a named recipe of oscillator notes. Tones marked `preferDing`
 // keep the legacy ding.mp3 behavior; everything else gets a distinct synth
@@ -187,6 +188,7 @@ function playSequence(context, notes, volume, type = "sine") {
       // The node may already be disconnected if the context was closed.
     }
   }, Math.ceil((endAt - context.currentTime) * 1000) + 60);
+  return Math.ceil((endAt - context.currentTime) * 1000) + 80;
 }
 
 export function createWorkspaceNotificationSfx() {
@@ -196,6 +198,34 @@ export function createWorkspaceNotificationSfx() {
   let lastDingPlayedAtMs = 0;
   let lastTonePlayedAtMs = {};
   let unlocked = false;
+  let contextCloseTimer = 0;
+
+  const clearContextCloseTimer = () => {
+    if (!contextCloseTimer || typeof window === "undefined") {
+      return;
+    }
+    window.clearTimeout(contextCloseTimer);
+    contextCloseTimer = 0;
+  };
+
+  const closeContextSoon = (delayMs = TONE_CONTEXT_IDLE_CLOSE_MS) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    clearContextCloseTimer();
+    if (!context) {
+      return;
+    }
+    contextCloseTimer = window.setTimeout(() => {
+      contextCloseTimer = 0;
+      const closingContext = context;
+      context = null;
+      unlocked = false;
+      if (closingContext && closingContext.state !== "closed") {
+        closingContext.close().catch(() => {});
+      }
+    }, Math.max(0, delayMs));
+  };
 
   const ensureDingAudio = () => {
     if (typeof window === "undefined" || typeof window.Audio !== "function") {
@@ -211,6 +241,10 @@ export function createWorkspaceNotificationSfx() {
   const ensureContext = async () => {
     const AudioContextConstructor = getAudioContextConstructor();
     if (!AudioContextConstructor) return null;
+    clearContextCloseTimer();
+    if (context?.state === "closed") {
+      context = null;
+    }
     if (!context) {
       context = new AudioContextConstructor();
     }
@@ -253,12 +287,14 @@ export function createWorkspaceNotificationSfx() {
     const activeContext = await ensureContext();
     if (!activeContext) return false;
     lastTonePlayedAtMs[toneKey] = nowMs;
-    playSequence(activeContext, recipe.notes, volume * recipe.gain, recipe.type);
+    const closeDelayMs = playSequence(activeContext, recipe.notes, volume * recipe.gain, recipe.type);
+    closeContextSoon(closeDelayMs + TONE_CONTEXT_IDLE_CLOSE_MS);
     return true;
   };
 
   return {
     dispose() {
+      clearContextCloseTimer();
       if (dingAudio) {
         try {
           dingAudio.pause();
@@ -315,7 +351,6 @@ export function createWorkspaceNotificationSfx() {
           // Loading the MP3 is opportunistic; the oscillator fallback still works.
         }
       }
-      await ensureContext();
     },
   };
 }

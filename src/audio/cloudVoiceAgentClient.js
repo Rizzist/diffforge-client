@@ -243,13 +243,44 @@ function normalizeTtsSampleRate(value) {
 export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
   let audioContext = null;
   let closed = false;
+  let closeTimer = 0;
   let nextStartTime = 0;
   let trailingByte = new Uint8Array(0);
+
+  const clearCloseTimer = () => {
+    if (!closeTimer || typeof window === "undefined") {
+      return;
+    }
+    window.clearTimeout(closeTimer);
+    closeTimer = 0;
+  };
+
+  const closeWhenIdle = (settleMs = 450) => {
+    if (closed || typeof window === "undefined") {
+      return;
+    }
+    clearCloseTimer();
+    const context = audioContext;
+    if (!context || context.state === "closed") {
+      return;
+    }
+    const scheduledAudioMs = Math.max(0, (nextStartTime - context.currentTime) * 1000);
+    closeTimer = window.setTimeout(() => {
+      closeTimer = 0;
+      const closingContext = audioContext;
+      audioContext = null;
+      nextStartTime = 0;
+      if (closingContext && closingContext.state !== "closed") {
+        closingContext.close().catch(() => {});
+      }
+    }, Math.ceil(scheduledAudioMs) + Math.max(0, settleMs));
+  };
 
   const ensureAudioContext = async () => {
     if (closed) {
       return null;
     }
+    clearCloseTimer();
     if (!audioContext) {
       const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextCtor) {
@@ -303,15 +334,12 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
     const startAt = Math.max(context.currentTime + 0.035, nextStartTime);
     source.start(startAt);
     nextStartTime = startAt + buffer.duration;
+    closeWhenIdle(700);
   };
 
   return {
     async prime() {
-      try {
-        await ensureAudioContext();
-      } catch (error) {
-        onError?.(error);
-      }
+      return true;
     },
     async handleEvent(event) {
       if (closed) {
@@ -320,7 +348,6 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
       const kind = cloudVoiceAgentEventKind(event);
       try {
         if (kind === "voice_agent_tts_start") {
-          await ensureAudioContext();
           logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.tts.start", {
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
             sampleRate: event?.audio?.sample_rate || event?.audio?.sampleRate || null,
@@ -354,6 +381,7 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
             utteranceId: cleanVoiceOrchestratorDiagnosticText(event?.utterance_id || event?.utteranceId || ""),
           });
+          closeWhenIdle(450);
           return;
         }
         if (kind === "voice_agent_tts_error") {
@@ -362,6 +390,7 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
             message: cleanVoiceOrchestratorDiagnosticText(event?.error?.message || event?.message || ""),
             phase: cleanVoiceOrchestratorDiagnosticText(event?.phase || ""),
           });
+          closeWhenIdle(0);
         }
       } catch (error) {
         onError?.(error);
@@ -369,6 +398,7 @@ export function createCloudVoiceAgentTtsPlayer({ onError } = {}) {
     },
     async close() {
       closed = true;
+      clearCloseTimer();
       trailingByte = new Uint8Array(0);
       const context = audioContext;
       audioContext = null;

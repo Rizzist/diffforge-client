@@ -25,8 +25,8 @@ import {
 } from "./tokenomicsFormat.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
-const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
+const TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = TOKENOMICS_DAILY_WINDOW_DAYS;
 const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
@@ -2211,14 +2211,14 @@ const tokenomicsStore = {
   loadedOnce: false,
   loadPromise: null,
   liveLimitsPromise: null,
+  hotTailPromise: null,
+  hotTailLastAt: 0,
   pollInterval: null,
   pollSubscriberCount: 0,
   warmScanEpoch: -1,
   limitPercentSignature: "",
   limitSyncInFlight: false,
   limitSyncPending: false,
-  cloudListenerPromise: null,
-  cloudUnlistens: [],
   progressListenerPromise: null,
   progressUnlisten: null,
   subscribers: new Set(),
@@ -2263,24 +2263,8 @@ function rememberTokenomicsLimitSignature(summary) {
 }
 
 function scheduleTokenomicsLimitCloudSync() {
-  if (tokenomicsStore.limitSyncInFlight) {
-    tokenomicsStore.limitSyncPending = true;
-    return;
-  }
-  tokenomicsStore.limitSyncInFlight = true;
-  invoke("cloud_mcp_schedule_tokenomics_sync", {
-    reason: "tokenomics_limits_changed",
-    full: false,
-    resyncLast30Days: false,
-  })
-    .catch(() => {})
-    .finally(() => {
-      tokenomicsStore.limitSyncInFlight = false;
-      if (tokenomicsStore.limitSyncPending) {
-        tokenomicsStore.limitSyncPending = false;
-        scheduleTokenomicsLimitCloudSync();
-      }
-    });
+  tokenomicsStore.limitSyncPending = false;
+  tokenomicsStore.limitSyncInFlight = false;
 }
 
 function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}) {
@@ -2314,6 +2298,8 @@ function resetTokenomicsStoreForAccount(accountKey) {
   tokenomicsStore.loadedOnce = false;
   tokenomicsStore.loadPromise = null;
   tokenomicsStore.liveLimitsPromise = null;
+  tokenomicsStore.hotTailPromise = null;
+  tokenomicsStore.hotTailLastAt = 0;
   tokenomicsStore.limitPercentSignature = "";
   tokenomicsStore.limitSyncPending = false;
   tokenomicsStore.warmScanEpoch = -1;
@@ -2342,29 +2328,6 @@ function ensureTokenomicsProgressListener() {
     });
 }
 
-function ensureTokenomicsCloudListener() {
-  if (tokenomicsStore.cloudUnlistens.length || tokenomicsStore.cloudListenerPromise) {
-    return;
-  }
-
-  const refreshFromCloud = () => {
-    void loadTokenomicsStore({ force: true }).finally(() => {
-      void refreshTokenomicsLiveLimits();
-    });
-  };
-
-  tokenomicsStore.cloudListenerPromise = Promise.all([
-    listen(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, refreshFromCloud),
-  ])
-    .then((handlers) => {
-      tokenomicsStore.cloudUnlistens = handlers;
-    })
-    .catch(() => {})
-    .finally(() => {
-      tokenomicsStore.cloudListenerPromise = null;
-    });
-}
-
 function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
   const requestEpoch = tokenomicsStore.requestEpoch;
   if (tokenomicsStore.liveLimitsPromise) {
@@ -2384,6 +2347,33 @@ function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
       }
     });
   return tokenomicsStore.liveLimitsPromise;
+}
+
+function refreshTokenomicsHotTail({ force = false } = {}) {
+  const now = Date.now();
+  const requestEpoch = tokenomicsStore.requestEpoch;
+  if (tokenomicsStore.hotTailPromise) {
+    return tokenomicsStore.hotTailPromise;
+  }
+  if (!force && now - tokenomicsStore.hotTailLastAt < TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS) {
+    return Promise.resolve(tokenomicsStore.state.summary);
+  }
+
+  tokenomicsStore.hotTailLastAt = now;
+  tokenomicsStore.hotTailPromise = invoke("tokenomics_scan_realtime_usage")
+    .then((next) => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        mergeSummaryIntoTokenomicsStore(next || {});
+      }
+      return tokenomicsStore.state.summary;
+    })
+    .catch(() => tokenomicsStore.state.summary)
+    .finally(() => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        tokenomicsStore.hotTailPromise = null;
+      }
+    });
+  return tokenomicsStore.hotTailPromise;
 }
 
 function loadTokenomicsStore({
@@ -2468,7 +2458,7 @@ function loadTokenomicsStore({
   return tokenomicsStore.loadPromise;
 }
 
-export function warmAccountTokenomics({ accountKey = "", scan = true } = {}) {
+export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
   resetTokenomicsStoreForAccount(accountKey);
   const requestEpoch = tokenomicsStore.requestEpoch;
   const summaryPromise = loadTokenomicsStore({
@@ -2502,16 +2492,20 @@ export function warmAccountTokenomics({ accountKey = "", scan = true } = {}) {
 
 function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
-  ensureTokenomicsCloudListener();
   tokenomicsStore.pollSubscriberCount += 1;
   void loadTokenomicsStore({ background: true, force: false, summaryOnly: true }).finally(() => {
-    void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+    void refreshTokenomicsHotTail({ force: true }).finally(() => {
+      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+      void loadTokenomicsStore({ force: true, summaryOnly: true });
+    });
   });
 
   if (!tokenomicsStore.pollInterval) {
     tokenomicsStore.pollInterval = window.setInterval(() => {
-      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
-      void loadTokenomicsStore({ force: true });
+      void refreshTokenomicsHotTail().finally(() => {
+        void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+        void loadTokenomicsStore({ force: true, summaryOnly: true });
+      });
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
 
@@ -2639,7 +2633,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   useEffect(() => {
-    warmAccountTokenomics({ accountKey, scan: true });
+    warmAccountTokenomics({ accountKey, scan: false });
   }, [accountKey]);
 
   useEffect(() => {

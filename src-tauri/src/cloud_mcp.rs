@@ -28,7 +28,6 @@ const CLOUD_MCP_AUDIO_PREFERENCES_CHANGED_EVENT: &str = "forge-audio-preferences
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
 const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions-updated";
-const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT: &str = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT: &str =
@@ -107,7 +106,6 @@ const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM: u8 = 1;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW: u8 = 2;
 const CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS: u64 = 350;
-const CLOUD_MCP_TOKENOMICS_SOURCE_EVENT_DEBOUNCE_MS: u64 = 2_000;
 const CLOUD_MCP_TOKENOMICS_BACKGROUND_JOB_TIMEOUT_SECS: u64 = 45;
 const CLOUD_MCP_TOKENOMICS_BUCKET_ACK_WINDOW_GRACE_MS: i64 = 10_000;
 const CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE: &str = "tokenomics_v2_sync_state";
@@ -116,14 +114,11 @@ const CLOUD_MCP_TOKENOMICS_DAY_MS: i64 = 86_400_000;
 const CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS: i64 = 30;
 const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.v2";
 const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 2;
-const CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT: &str = "tokenomics_cursor_request";
-const CLOUD_MCP_TOKENOMICS_DELTA_REQUEST_EVENT: &str = "tokenomics_delta_request";
 const CLOUD_MCP_TOKENOMICS_DELTA_AVAILABLE_EVENT: &str = "tokenomics_delta_available";
 const CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT: &str = "tokenomics_device_delta";
 const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snapshot";
 const CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT: &str = "tokenomics_ingest_ack";
 const CLOUD_MCP_TOKENOMICS_DELIVERY_ACK_EVENT: &str = "tokenomics_delivery_ack";
-const CLOUD_MCP_TOKENOMICS_CLIENT_STATE_EVENT: &str = "tokenomics_client_state";
 const CLOUD_MCP_WORKSPACE_MCP_TOOL_NAME_LIMIT: usize = 32;
 const CLOUD_MCP_AUDIO_PREFERENCES_STATE_KEY: &str = "audio-preferences";
 const CLOUD_MCP_AUDIO_POLISHING_SYSTEM_PROMPT_MAX_CHARS: usize = 4_000;
@@ -158,6 +153,8 @@ const CLOUD_MCP_SYNC_ACTIVITY_FAILED_TTL_MS: u64 = 10_000;
 const CLOUD_MCP_NETWORK_RECENT_FRAME_MAX: usize = 80;
 const CLOUD_MCP_NETWORK_DIAGNOSTIC_OUTBOX_LIMIT: usize = 64;
 const CLOUD_MCP_TOKENOMICS_SYNC_LOG_LIMIT: usize = 40;
+const CLOUD_MCP_SYNC_ACTIVITY_AGGREGATE_CACHE_MS: u64 = 2_000;
+const CLOUD_MCP_STATUS_SNAPSHOT_CACHE_MS: u64 = 2_000;
 
 static CLOUD_MCP_SYNC_STATUS_APP: OnceLock<AppHandle> = OnceLock::new();
 static CLOUD_MCP_SYNC_STATUS_CONNECTION: std::sync::Mutex<Option<&'static str>> =
@@ -166,6 +163,12 @@ static CLOUD_MCP_SYNC_STATUS_LAST: std::sync::Mutex<Option<(String, u64)>> =
     std::sync::Mutex::new(None);
 static CLOUD_MCP_SYNC_ACTIVITIES: OnceLock<StdMutex<HashMap<String, CloudMcpSyncActivity>>> =
     OnceLock::new();
+static CLOUD_MCP_SYNC_ACTIVITY_AGGREGATE_CACHE: OnceLock<
+    StdMutex<Option<CloudMcpCachedSyncActivityAggregate>>,
+> = OnceLock::new();
+static CLOUD_MCP_STATUS_SNAPSHOT_CACHE: OnceLock<
+    StdMutex<Option<CloudMcpCachedStatusSnapshot>>,
+> = OnceLock::new();
 static CLOUD_MCP_WS_LAST_INBOUND_MS: AtomicU64 = AtomicU64::new(0);
 static CLOUD_MCP_WS_LAST_OUTBOUND_MS: AtomicU64 = AtomicU64::new(0);
 static CLOUD_MCP_WS_LAST_PING_SENT_MS: AtomicU64 = AtomicU64::new(0);
@@ -183,10 +186,6 @@ static CLOUD_MCP_GIT_REPO_IDENTITY_CACHE: OnceLock<
 > = OnceLock::new();
 static CLOUD_MCP_ASSET_LOCAL_EVENT_SENDER: OnceLock<tokio::sync::broadcast::Sender<Value>> =
     OnceLock::new();
-static CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
-    OnceLock::new();
-static CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
-
 const CLOUD_MCP_TOKENOMICS_ACTIVITY_SOURCE: &str = "tokenomics:background";
 const CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY: &str = "tokenomics:up:tokenomics:background";
 const CLOUD_MCP_TOKENOMICS_ACTIVITY_TOTAL: u64 = 4;
@@ -301,7 +300,7 @@ struct CloudMcpSyncActivity {
     expires_at_ms: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CloudMcpSyncActivityAggregate {
     pending_count: usize,
     retrying_count: usize,
@@ -323,6 +322,12 @@ struct CloudMcpSyncActivityAggregate {
     size_class: &'static str,
     syncing: bool,
     activities: Vec<Value>,
+}
+
+#[derive(Clone)]
+struct CloudMcpCachedSyncActivityAggregate {
+    aggregate: CloudMcpSyncActivityAggregate,
+    computed_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -594,6 +599,13 @@ struct CloudMcpStatus {
     registered_workspaces: Vec<CloudMcpWorkspaceStatus>,
 }
 
+#[derive(Clone)]
+struct CloudMcpCachedStatusSnapshot {
+    fingerprint: String,
+    snapshot: CloudMcpStatus,
+    computed_at_ms: u64,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct CloudMcpWorkspaceStatus {
@@ -707,172 +719,11 @@ fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Val
     Value::Object(object)
 }
 
-/// Tokenomics cloud sync is source-event driven: transcript/source writes wake
-/// the scanner, and only scans that insert real usage rows publish cloud deltas.
-pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudMcpState) {
-    cloud_mcp_tokenomics_sync_ensure_started(app.clone(), &state);
-    cloud_mcp_start_tokenomics_source_watcher(app, state);
-}
-
-fn cloud_mcp_tokenomics_source_watcher_slot(
-) -> &'static StdMutex<Option<notify::RecommendedWatcher>> {
-    CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER.get_or_init(|| StdMutex::new(None))
-}
-
-fn cloud_mcp_tokenomics_watch_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(home) = tokenomics_home_dir() {
-        let codex_root = home.join(".codex");
-        if codex_root.exists() {
-            paths.push(codex_root);
-        }
-    }
-    for source in tokenomics_sources() {
-        for root in source.roots {
-            if root.exists() {
-                paths.push(root);
-            }
-        }
-    }
-    let mut normalized = paths
-        .into_iter()
-        .map(|path| fs::canonicalize(&path).unwrap_or(path))
-        .collect::<Vec<_>>();
-    normalized.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
-    normalized.dedup();
-    normalized
-}
-
-fn cloud_mcp_tokenomics_watch_event_kind_relevant(kind: &notify::event::EventKind) -> bool {
-    matches!(
-        kind,
-        notify::event::EventKind::Any
-            | notify::event::EventKind::Create(_)
-            | notify::event::EventKind::Modify(_)
-    )
-}
-
-fn cloud_mcp_tokenomics_watch_path_relevant(path: &Path) -> bool {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if file_name == "state_5.sqlite"
-        || file_name == "state_5.sqlite-wal"
-        || file_name == "state_5.sqlite-shm"
-    {
-        return true;
-    }
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "json" | "jsonl" | "ndjson"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn cloud_mcp_tokenomics_watch_event_relevant(event: &notify::Event) -> bool {
-    cloud_mcp_tokenomics_watch_event_kind_relevant(&event.kind)
-        && event
-            .paths
-            .iter()
-            .any(|path| cloud_mcp_tokenomics_watch_path_relevant(path))
-}
-
-fn cloud_mcp_start_tokenomics_source_watcher(app: AppHandle, state: CloudMcpState) {
-    if CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let watch_paths = cloud_mcp_tokenomics_watch_paths();
-    if watch_paths.is_empty() {
-        CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER_STARTED.store(false, Ordering::SeqCst);
-        log_terminal_status_event(
-            "backend.cloud_mcp.tokenomics_source_watcher.skipped",
-            json!({ "reason": "no_tokenomics_source_roots" }),
-        );
-        return;
-    }
-
-    let event_app = app.clone();
-    let event_state = state.clone();
-    let mut watcher =
-        match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let Ok(event) = event else {
-                return;
-            };
-            if !cloud_mcp_tokenomics_watch_event_relevant(&event) {
-                return;
-            }
-            let trigger_app = event_app.clone();
-            let trigger_state = event_state.clone();
-            tauri::async_runtime::spawn(async move {
-                let signed_in = cloud_mcp_authorization_bearer(&trigger_state)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !signed_in {
-                    return;
-                }
-                let _ = cloud_mcp_enqueue_tokenomics_sync(
-                    trigger_app,
-                    &trigger_state,
-                    "tokenomics_source_changed".to_string(),
-                    false,
-                    false,
-                )
-                .await;
-            });
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER_STARTED.store(false, Ordering::SeqCst);
-                log_terminal_status_event(
-                    "backend.cloud_mcp.tokenomics_source_watcher.error",
-                    json!({
-                        "error": clean_terminal_telemetry_text(&format!("{error}")),
-                        "stage": "create",
-                    }),
-                );
-                return;
-            }
-        };
-
-    let mut watched_paths = Vec::new();
-    for path in &watch_paths {
-        if let Err(error) =
-            notify::Watcher::watch(&mut watcher, path, notify::RecursiveMode::Recursive)
-        {
-            log_terminal_status_event(
-                "backend.cloud_mcp.tokenomics_source_watcher.error",
-                json!({
-                    "error": clean_terminal_telemetry_text(&format!("{error}")),
-                    "stage": "watch",
-                    "path": path.display().to_string(),
-                }),
-            );
-            continue;
-        }
-        watched_paths.push(path.display().to_string());
-    }
-
-    if watched_paths.is_empty() {
-        CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER_STARTED.store(false, Ordering::SeqCst);
-        return;
-    }
-
-    if let Ok(mut slot) = cloud_mcp_tokenomics_source_watcher_slot().lock() {
-        *slot = Some(watcher);
-    }
-    log_terminal_status_event(
-        "backend.cloud_mcp.tokenomics_source_watcher.started",
-        json!({ "watched_paths": watched_paths }),
-    );
+/// Tokenomics cloud sync is client-owned: the UI can request a sync after an
+/// explicit scan or limit update, but cloud/server events do not start scans.
+pub(crate) fn cloud_mcp_start_tokenomics_scheduler(_app: AppHandle, _state: CloudMcpState) {
+    // Intentionally inert. Tokenomics source observation belongs to the
+    // Tokenomics client surface, not Cloud MCP startup or server events.
 }
 
 fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
@@ -2998,36 +2849,6 @@ fn cloud_mcp_tokenomics_response_kind_matches(value: &Value, accepted: &[&str]) 
     false
 }
 
-fn cloud_mcp_tokenomics_response_request_kind_matches(value: &Value, accepted: &[&str]) -> bool {
-    let candidates = [
-        Some(value),
-        value.get("data"),
-        value.get("payload"),
-        value.get("ack"),
-        value.get("result"),
-        value.get("stored"),
-        value.get("data").and_then(|data| data.get("payload")),
-        value.get("data").and_then(|data| data.get("ack")),
-        value.get("payload").and_then(|payload| payload.get("data")),
-        value.get("payload").and_then(|payload| payload.get("ack")),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        for keys in [
-            &["request_kind", "requestKind"][..],
-            &["response_kind", "responseKind"][..],
-            &["kind"][..],
-        ] {
-            if let Some(kind) = cloud_mcp_payload_text(candidate, keys) {
-                let normalized = kind.trim().to_ascii_lowercase();
-                if accepted.iter().any(|value| normalized == *value) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 fn cloud_mcp_tokenomics_cursor_response_has_state(value: &Value) -> bool {
     cloud_mcp_tokenomics_server_cursor_from_value(value).is_some()
         || cloud_mcp_tokenomics_device_seq_from_value(value).is_some()
@@ -3044,10 +2865,6 @@ fn cloud_mcp_tokenomics_strict_ingest_ack_response(value: &Value) -> bool {
                 "tokenomics_cursor_ack",
                 "tokenomics_cursor_request_ack",
             ],
-        ) && cloud_mcp_tokenomics_cursor_response_has_state(value))
-        || (cloud_mcp_tokenomics_response_request_kind_matches(
-            value,
-            &[CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT],
         ) && cloud_mcp_tokenomics_cursor_response_has_state(value))
 }
 
@@ -5043,6 +4860,29 @@ fn cloud_mcp_sync_activity_aggregate() -> CloudMcpSyncActivityAggregate {
     aggregate
 }
 
+fn cloud_mcp_sync_activity_aggregate_cached() -> CloudMcpSyncActivityAggregate {
+    let now = cloud_mcp_now_ms();
+    let cache = CLOUD_MCP_SYNC_ACTIVITY_AGGREGATE_CACHE.get_or_init(|| StdMutex::new(None));
+    if let Ok(cached) = cache.lock() {
+        if let Some(entry) = cached.as_ref() {
+            if now.saturating_sub(entry.computed_at_ms)
+                <= CLOUD_MCP_SYNC_ACTIVITY_AGGREGATE_CACHE_MS
+            {
+                return entry.aggregate.clone();
+            }
+        }
+    }
+
+    let aggregate = cloud_mcp_sync_activity_aggregate();
+    if let Ok(mut cached) = cache.lock() {
+        *cached = Some(CloudMcpCachedSyncActivityAggregate {
+            aggregate: aggregate.clone(),
+            computed_at_ms: now,
+        });
+    }
+    aggregate
+}
+
 fn cloud_mcp_sync_activity_payload(aggregate: &CloudMcpSyncActivityAggregate) -> Value {
     let progress_percent = if aggregate.progress_weight > 0.0 {
         (aggregate.progress_weighted_percent / aggregate.progress_weight).clamp(0.0, 100.0)
@@ -5310,7 +5150,7 @@ fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
         .ok()
         .and_then(|value| *value)
         .unwrap_or("local");
-    let aggregate = cloud_mcp_sync_activity_aggregate();
+    let aggregate = cloud_mcp_sync_activity_aggregate_cached();
     let pending = aggregate.pending_count;
     let retrying = aggregate.retrying_count;
     let dead_letter = aggregate.dead_letter_count;
@@ -6335,11 +6175,11 @@ fn cloud_mcp_merge_tokenomics_sync_jobs(
 }
 
 fn cloud_mcp_tokenomics_sync_reason_visible(
-    reason: &str,
-    force_full: bool,
-    force_resync: bool,
+    _reason: &str,
+    _force_full: bool,
+    _force_resync: bool,
 ) -> bool {
-    force_full || force_resync || !matches!(reason.trim(), "tokenomics_source_changed")
+    true
 }
 
 async fn cloud_mcp_enqueue_tokenomics_sync(
@@ -6409,12 +6249,7 @@ async fn cloud_mcp_enqueue_tokenomics_sync(
             );
         }
     }
-    let debounce_ms = if queued_job.reason == "tokenomics_source_changed" {
-        CLOUD_MCP_TOKENOMICS_SOURCE_EVENT_DEBOUNCE_MS
-    } else {
-        CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS
-    };
-    cloud_mcp_tokenomics_sync_spawn_drain(app, state, debounce_ms);
+    cloud_mcp_tokenomics_sync_spawn_drain(app, state, CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS);
     state.background_sync.tokenomics_notify.notify_one();
     queued_job
 }
@@ -6564,50 +6399,6 @@ fn cloud_mcp_tokenomics_payload_with_identity(
         object.insert("idempotency_key".to_string(), json!(idempotency_key));
     }
     payload
-}
-
-fn cloud_mcp_tokenomics_cursor_request_payload(
-    device_profile: &Value,
-    billing_scope_type: &str,
-    team_id: Option<&str>,
-    billing_scope_key: &str,
-    reason: &str,
-) -> Result<Value, String> {
-    let device_id = cloud_mcp_tokenomics_device_id_from_profile(device_profile)?;
-    let sync_state = cloud_mcp_tokenomics_sync_state(&device_id, billing_scope_key)?;
-    let now_ms = cloud_mcp_now_ms();
-    let payload = json!({
-        "source": "rust-diffforge-tokenomics-v2",
-        "event_kind": CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT,
-        "tokenomics_event_kind": CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT,
-        "sync_protocol": CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL,
-        "schema_version": CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION,
-        "scope": "account",
-        "billing_scope_type": billing_scope_type,
-        "billing_scope_key": billing_scope_key,
-        "team_id": team_id,
-        "account_scoped": true,
-        "device": device_profile.clone(),
-        "device_id": device_id.clone(),
-        "device_name": device_profile["device_name"].clone(),
-        "machine_id": device_id.clone(),
-        "machine_name": device_profile["machine_name"].clone(),
-        "platform": device_profile["platform"].clone(),
-        "form_factor": device_profile["form_factor"].clone(),
-        "client_kind": device_profile["client_kind"].clone(),
-        "agent_id": "rust-diffforge",
-        "agent_label": "Diff Forge Desktop",
-        "reason": reason,
-        "server_cursor": sync_state.server_cursor.clone(),
-        "local_sync_cursor": sync_state.local_cursor.clone(),
-        "acked_device_seq": sync_state.acked_device_seq,
-        "next_device_seq": sync_state.next_device_seq,
-        "ts_ms": now_ms,
-    });
-    Ok(cloud_mcp_tokenomics_payload_with_hash(
-        payload,
-        format!("tokenomics:v2:{billing_scope_key}:{device_id}:cursor_request"),
-    ))
 }
 
 fn cloud_mcp_tokenomics_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -7387,7 +7178,6 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let force_resync = job.force_resync;
     let force_full = job.force_full;
     let reason_for_worker = job.reason.clone();
-    let reason_for_summary = reason_for_worker.clone();
     let visible_activity = job.visible;
     let job_started_ms = cloud_mcp_now_ms();
     cloud_mcp_record_tokenomics_sync_log(
@@ -7493,21 +7283,11 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         }
     };
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
-        let scan_summary = if force_resync {
+        if force_resync {
             tokenomics_scan_usage_for(&app, false, true)?;
-            None
         } else if force_full {
             tokenomics_scan_usage_for(&app, false, false)?;
-            None
-        } else if reason_for_summary == "tokenomics_source_changed" {
-            let scan_summary = tokenomics_scan_realtime_usage_for(&app)?;
-            if tokenomics_summary_inserted_events(&scan_summary) == 0 {
-                return Ok(scan_summary);
-            }
-            Some(scan_summary)
-        } else {
-            None
-        };
+        }
         let conn = tokenomics_open_db(&app)?;
         tokenomics_reconcile_current_provider_accounts(&conn)?;
         if limits_only {
@@ -7518,24 +7298,12 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 true,
             );
         }
-        let mut summary = tokenomics_sync_delta_from_conn_with_limit_sampling(
+        tokenomics_sync_delta_from_conn_with_limit_sampling(
             &conn,
             summary_since_cursor.as_deref(),
             Some(&tokenomics_scope),
             true,
-        )?;
-        if let Some(scan_summary) = scan_summary {
-            if let Some(object) = summary.as_object_mut() {
-                if let Some(scan) = scan_summary.get("scan") {
-                    object.insert("scan".to_string(), scan.clone());
-                }
-                object.insert(
-                    "inserted_events".to_string(),
-                    json!(tokenomics_summary_inserted_events(&scan_summary)),
-                );
-            }
-        }
-        Ok(summary)
+        )
     });
     let summary_result = match timeout(
         Duration::from_secs(CLOUD_MCP_TOKENOMICS_BACKGROUND_JOB_TIMEOUT_SECS),
@@ -7571,8 +7339,6 @@ async fn cloud_mcp_run_tokenomics_sync_job(
 
     let tokenomics_change_count = cloud_mcp_tokenomics_summary_change_count(&summary);
     let inserted_events = tokenomics_summary_inserted_events(&summary);
-    let source_changed_without_usage =
-        reason_for_worker == "tokenomics_source_changed" && inserted_events == 0;
     let empty_non_full_delta = !force_full && !force_resync && tokenomics_change_count == 0;
     cloud_mcp_record_tokenomics_sync_log(
         "summary_ready",
@@ -7582,7 +7348,6 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "elapsed_ms": cloud_mcp_now_ms().saturating_sub(job_started_ms),
             "inserted_events": inserted_events,
             "change_count": tokenomics_change_count,
-            "source_changed_without_usage": source_changed_without_usage,
             "empty_non_full_delta": empty_non_full_delta,
         }),
     );
@@ -7621,18 +7386,14 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             }),
         );
     }
-    if source_changed_without_usage || empty_non_full_delta {
+    if empty_non_full_delta {
         cloud_mcp_clear_sync_activity_key(CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY);
         cloud_mcp_record_tokenomics_sync_log(
             "skipped",
             "skipped",
             &reason_for_worker,
             json!({
-                "skipped": if source_changed_without_usage {
-                    "source_changed_without_inserted_usage"
-                } else {
-                    "no_tokenomics_delta"
-                },
+                "skipped": "no_tokenomics_delta",
                 "inserted_events": inserted_events,
                 "change_count": tokenomics_change_count,
             }),
@@ -7641,11 +7402,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "backend.cloud_mcp.tokenomics_background.skipped",
             json!({
                 "reason": reason_for_worker,
-                "skipped": if source_changed_without_usage {
-                    "source_changed_without_inserted_usage"
-                } else {
-                    "no_tokenomics_delta"
-                },
+                "skipped": "no_tokenomics_delta",
                 "inserted_events": inserted_events,
                 "change_count": tokenomics_change_count,
             }),
@@ -8976,7 +8733,7 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         .cloned()
         .collect::<Vec<_>>();
     registered_workspaces.sort_by(|left, right| left.root.cmp(&right.root));
-    let sync_activity = cloud_mcp_sync_activity_aggregate();
+    let sync_activity = cloud_mcp_sync_activity_aggregate_cached();
     let sync_activity_payload = cloud_mcp_sync_activity_payload(&sync_activity);
     CloudMcpStatus {
         base_url: runtime.base_url.clone(),
@@ -9017,6 +8774,69 @@ async fn cloud_mcp_status_snapshot(state: &CloudMcpState) -> CloudMcpStatus {
     }
     if snapshot.workspace_todos.is_none() {
         snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos_from_store(None, None);
+    }
+    snapshot
+}
+
+fn cloud_mcp_status_cache_fingerprint(runtime: &CloudMcpRuntime) -> String {
+    let mut registered_workspace_bits = runtime
+        .registered_workspaces
+        .values()
+        .map(|workspace| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                workspace.root,
+                workspace.workspace_id,
+                workspace.workspace_name,
+                workspace.last_registered_ms.unwrap_or_default(),
+                workspace.last_synced_ms.unwrap_or_default(),
+                workspace.last_error,
+                workspace.policy_graph_detected,
+                workspace.policy_graph_path,
+            )
+        })
+        .collect::<Vec<_>>();
+    registered_workspace_bits.sort();
+    format!(
+        "{}:{}:{}:{}:{}:{:?}:{}:{}:{:?}:{}:{}",
+        runtime.base_url,
+        runtime.connected,
+        runtime.status,
+        runtime.last_error,
+        runtime.last_connected_ms.unwrap_or_default(),
+        runtime.global_ws_connected,
+        runtime.global_ws_status,
+        runtime.global_ws_last_error,
+        runtime.global_ws_last_connected_ms,
+        runtime.account_device_live_state_snapshot.is_some(),
+        registered_workspace_bits.join("|"),
+    )
+}
+
+async fn cloud_mcp_status_snapshot_cached(state: &CloudMcpState) -> CloudMcpStatus {
+    let now = cloud_mcp_now_ms();
+    let runtime = state.inner.lock().await;
+    let fingerprint = cloud_mcp_status_cache_fingerprint(&runtime);
+    drop(runtime);
+
+    let cache = CLOUD_MCP_STATUS_SNAPSHOT_CACHE.get_or_init(|| StdMutex::new(None));
+    if let Ok(cached) = cache.lock() {
+        if let Some(entry) = cached.as_ref() {
+            if entry.fingerprint == fingerprint
+                && now.saturating_sub(entry.computed_at_ms) <= CLOUD_MCP_STATUS_SNAPSHOT_CACHE_MS
+            {
+                return entry.snapshot.clone();
+            }
+        }
+    }
+
+    let snapshot = cloud_mcp_status_snapshot(state).await;
+    if let Ok(mut cached) = cache.lock() {
+        *cached = Some(CloudMcpCachedStatusSnapshot {
+            fingerprint,
+            snapshot: snapshot.clone(),
+            computed_at_ms: now,
+        });
     }
     snapshot
 }
@@ -11011,8 +10831,6 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         }
         cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_live_state_reconcile(state, "websocket_hello_ack");
-        cloud_mcp_spawn_tokenomics_cursor_request(state, "websocket_hello_ack");
-        cloud_mcp_spawn_tokenomics_account_delta_request(state, "websocket_hello_ack", false);
         cloud_mcp_spawn_account_asset_inventory_sync(state, "websocket_hello_ack");
         return;
     }
@@ -11335,14 +11153,7 @@ async fn cloud_mcp_send_liveness_pong_event(
         .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())
 }
 
-async fn cloud_mcp_enqueue_tokenomics_snapshot_from_ack(state: &CloudMcpState, reason: &str) {
-    let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() else {
-        return;
-    };
-    let _ = cloud_mcp_enqueue_tokenomics_sync(app, state, reason.to_string(), true, false).await;
-}
-
-async fn cloud_mcp_handle_tokenomics_ingest_ack(state: &CloudMcpState, ack: &Value, source: &str) {
+async fn cloud_mcp_handle_tokenomics_ingest_ack(_state: &CloudMcpState, ack: &Value, source: &str) {
     match cloud_mcp_tokenomics_persist_ingest_ack(None, ack) {
         Ok(result) => {
             let requires_snapshot = result
@@ -11353,7 +11164,7 @@ async fn cloud_mcp_handle_tokenomics_ingest_ack(state: &CloudMcpState, ack: &Val
             cloud_mcp_record_tokenomics_sync_log(
                 "ingest_ack",
                 if requires_snapshot {
-                    "queued"
+                    "snapshot_ignored_client_owned"
                 } else {
                     "synced"
                 },
@@ -11379,14 +11190,21 @@ async fn cloud_mcp_handle_tokenomics_ingest_ack(state: &CloudMcpState, ack: &Val
                     "device_seq": result.get("acked_device_seq").or_else(|| result.get("ackedDeviceSeq")).cloned().unwrap_or(Value::Null),
                     "server_cursor": result.get("server_cursor").or_else(|| result.get("serverCursor")).cloned().unwrap_or(Value::Null),
                     "requires_snapshot": requires_snapshot,
+                    "snapshot_action": if requires_snapshot {
+                        "ignored_client_owned"
+                    } else {
+                        "not_requested"
+                    },
                 }),
             );
             if requires_snapshot {
-                cloud_mcp_enqueue_tokenomics_snapshot_from_ack(
-                    state,
-                    "tokenomics_ingest_ack_requires_snapshot",
-                )
-                .await;
+                log_cloud_sync_event(
+                    "tokenomics.ingest_ack_snapshot_ignored",
+                    json!({
+                        "source": source,
+                        "reason": "client_owned_tokenomics",
+                    }),
+                );
             }
         }
         Err(error) => {
@@ -11400,49 +11218,6 @@ async fn cloud_mcp_handle_tokenomics_ingest_ack(state: &CloudMcpState, ack: &Val
             );
         }
     }
-}
-
-async fn cloud_mcp_send_tokenomics_cursor_request(
-    state: &CloudMcpState,
-    reason: &str,
-) -> Result<Value, String> {
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
-    let billing_scope_key =
-        tokenomics_billing_scope_key(billing_scope_type.as_str(), team_id.as_deref());
-    let payload = cloud_mcp_tokenomics_cursor_request_payload(
-        &device_profile,
-        &billing_scope_type,
-        team_id.as_deref(),
-        &billing_scope_key,
-        reason,
-    )?;
-    let response = cloud_mcp_ws_request_with_timeout(
-        state,
-        CLOUD_MCP_TOKENOMICS_CURSOR_REQUEST_EVENT,
-        &payload,
-        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
-    )
-    .await?;
-    let ack = cloud_mcp_tokenomics_persist_ingest_ack(Some(&payload), &response)?;
-    if ack.get("ignored").and_then(Value::as_bool) == Some(true) {
-        return Err(
-            "Tokenomics cursor request did not return a tokenomics cursor response.".to_string(),
-        );
-    }
-    if ack
-        .get("requires_snapshot")
-        .or_else(|| ack.get("requiresSnapshot"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        cloud_mcp_enqueue_tokenomics_snapshot_from_ack(
-            state,
-            "tokenomics_cursor_request_requires_snapshot",
-        )
-        .await;
-    }
-    Ok(response)
 }
 
 async fn cloud_mcp_send_tokenomics_delivery_ack(
@@ -11543,183 +11318,6 @@ async fn cloud_mcp_send_tokenomics_delivery_ack(
         }),
     );
     Ok(response)
-}
-
-async fn cloud_mcp_send_tokenomics_account_delta_request(
-    app: &AppHandle,
-    state: &CloudMcpState,
-    reason: &str,
-    full: bool,
-    origin_delivery_event: Option<Value>,
-) -> Result<Value, String> {
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
-    let scope_key = cloud_mcp_account_scope_key_from_parts(&billing_scope_type, team_id.as_deref());
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = cloud_mcp_tokenomics_device_id_from_profile(&device_profile)?;
-    let cursor = if full {
-        None
-    } else {
-        let app = app.clone();
-        let cursor_scope_type = billing_scope_type.clone();
-        let cursor_team_id = team_id.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            tokenomics_cloud_account_sync_cursor(
-                &app,
-                &cursor_scope_type,
-                cursor_team_id.as_deref(),
-            )
-        })
-        .await
-        .map_err(|error| format!("Unable to join Tokenomics cursor read: {error}"))??
-    };
-    {
-        let mut tokenomics_cursor = state.background_sync.tokenomics_cursor.lock().await;
-        if let Some(cursor) = cursor.as_deref() {
-            tokenomics_cursor.insert(scope_key.clone(), cursor.to_string());
-        } else {
-            tokenomics_cursor.remove(&scope_key);
-        }
-    }
-    let client_store_empty = cursor.is_none();
-    let scope_payload =
-        cloud_mcp_account_scope_payload_from_parts(&billing_scope_type, team_id.as_deref());
-    let mut payload = json!({
-        "kind": CLOUD_MCP_TOKENOMICS_DELTA_REQUEST_EVENT,
-        "reason": reason,
-        "source": "rust-diffforge-desktop",
-        "delta": cursor.is_some(),
-        "client_store_empty": client_store_empty,
-        "clientStoreEmpty": client_store_empty,
-        "client_state_kind": CLOUD_MCP_TOKENOMICS_CLIENT_STATE_EVENT,
-        "clientStateKind": CLOUD_MCP_TOKENOMICS_CLIENT_STATE_EVENT,
-        "consumer_client_kind": "rust_desktop",
-        "consumerClientKind": "rust_desktop",
-        "consumer_device_id": device_id.clone(),
-        "consumerDeviceId": device_id.clone(),
-        "device_id": device_id.clone(),
-        "deviceId": device_id,
-        "device": device_profile,
-        "since_sync_cursor": cursor.clone(),
-        "sinceSyncCursor": cursor.clone(),
-        "sync_cursor": cursor.clone(),
-        "syncCursor": cursor,
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    if let Some(object) = payload.as_object_mut() {
-        if let Some(scope_object) = scope_payload.as_object() {
-            for (key, value) in scope_object {
-                object.insert(key.clone(), value.clone());
-            }
-        }
-        object.retain(|_, value| !value.is_null());
-    }
-    let response = cloud_mcp_ws_request_with_timeout(
-        state,
-        CLOUD_MCP_TOKENOMICS_DELTA_REQUEST_EVENT,
-        &payload,
-        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
-    )
-    .await?;
-    let data = cloud_mcp_response_data(&response);
-    let recorded = tokenomics_record_cloud_account_state(app, &data)?;
-    let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, data.clone());
-    if let Some(origin_delivery_event) = origin_delivery_event.as_ref() {
-        if let Err(error) = cloud_mcp_send_tokenomics_delivery_ack(
-            state,
-            origin_delivery_event,
-            Some(&recorded),
-            "applied_after_delta",
-            reason,
-        )
-        .await
-        {
-            log_cloud_sync_event(
-                "tokenomics.delivery_ack_error",
-                json!({
-                    "reason": reason,
-                    "error": clean_terminal_telemetry_text(&error),
-                    "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(origin_delivery_event),
-                }),
-            );
-        }
-    }
-    log_cloud_sync_event(
-        "tokenomics.account_delta_request_ok",
-        json!({
-            "reason": reason,
-            "full": full,
-            "scope_key": scope_key,
-            "response_kind": data.get("kind").and_then(Value::as_str).unwrap_or("response"),
-            "stored_count": recorded.get("stored_count").cloned().unwrap_or(Value::Null),
-        }),
-    );
-    Ok(response)
-}
-
-fn cloud_mcp_spawn_tokenomics_cursor_request(state: &CloudMcpState, reason: &'static str) {
-    let state = state.clone();
-    tauri::async_runtime::spawn(async move {
-        match cloud_mcp_send_tokenomics_cursor_request(&state, reason).await {
-            Ok(response) => {
-                log_cloud_sync_event(
-                    "tokenomics.cursor_request_ok",
-                    json!({
-                        "reason": reason,
-                        "response_kind": response.get("kind").and_then(Value::as_str).unwrap_or("response"),
-                    }),
-                );
-            }
-            Err(error) => {
-                log_cloud_sync_event(
-                    "tokenomics.cursor_request_error",
-                    json!({
-                        "reason": reason,
-                        "error": clean_terminal_telemetry_text(&error),
-                    }),
-                );
-            }
-        }
-    });
-}
-
-fn cloud_mcp_spawn_tokenomics_account_delta_request(
-    state: &CloudMcpState,
-    reason: &'static str,
-    full: bool,
-) {
-    cloud_mcp_spawn_tokenomics_account_delta_request_with_origin(state, reason, full, None);
-}
-
-fn cloud_mcp_spawn_tokenomics_account_delta_request_with_origin(
-    state: &CloudMcpState,
-    reason: &'static str,
-    full: bool,
-    origin_delivery_event: Option<Value>,
-) {
-    let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() else {
-        return;
-    };
-    let state = state.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = cloud_mcp_send_tokenomics_account_delta_request(
-            &app,
-            &state,
-            reason,
-            full,
-            origin_delivery_event,
-        )
-        .await
-        {
-            log_cloud_sync_event(
-                "tokenomics.account_delta_request_error",
-                json!({
-                    "reason": reason,
-                    "full": full,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-        }
-    });
 }
 
 async fn cloud_mcp_send_lifecycle_event(
@@ -12250,11 +11848,12 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if event_kind == "tokenomics_refresh_requested" {
-                let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
-                cloud_mcp_spawn_tokenomics_account_delta_request(
-                    &state_clone,
-                    "tokenomics_refresh_requested",
-                    false,
+                log_cloud_sync_event(
+                    "tokenomics.server_refresh_ignored",
+                    json!({
+                        "reason": "client_owned_tokenomics",
+                        "eventKind": event_kind,
+                    }),
                 );
                 continue;
             }
@@ -12288,207 +11887,29 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             if cloud_mcp_is_tokenomics_delta_signal_event(&event_kind) {
                 let has_summary = cloud_mcp_tokenomics_event_has_summary(&event);
-                if cloud_mcp_event_originated_from_this_device(&event) {
-                    log_cloud_sync_event(
-                        "tokenomics.delta_wake_self_ignored",
-                        json!({
-                            "event_kind": event_kind,
-                            "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                            "server_cursor": cloud_mcp_tokenomics_server_cursor_from_value(&event),
-                        }),
-                    );
-                    if let Err(error) = cloud_mcp_send_tokenomics_delivery_ack(
-                        &state_clone,
-                        &event,
-                        None,
-                        "received_self",
-                        "tokenomics_delta_available_self",
-                    )
-                    .await
-                    {
-                        log_cloud_sync_event(
-                            "tokenomics.delivery_ack_error",
-                            json!({
-                                "reason": "tokenomics_delta_available_self",
-                                "error": clean_terminal_telemetry_text(&error),
-                                "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                            }),
-                        );
-                    }
-                    continue;
-                }
-                if !cloud_mcp_claim_tokenomics_wake_receipt(&state_clone, &event).await {
-                    log_cloud_sync_event(
-                        "tokenomics.delta_wake_duplicate_ignored",
-                        json!({
-                            "event_kind": event_kind,
-                            "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                            "packet_id": cloud_mcp_tokenomics_response_text(&event, &["packet_id", "packetId"]),
-                            "sync_day_start_ms": cloud_mcp_tokenomics_day_start_from_value(&event),
-                            "sync_content_hash": cloud_mcp_tokenomics_day_content_hash_from_value(&event),
-                            "server_cursor": cloud_mcp_tokenomics_server_cursor_from_value(&event),
-                        }),
-                    );
-                    if let Err(error) = cloud_mcp_send_tokenomics_delivery_ack(
-                        &state_clone,
-                        &event,
-                        None,
-                        "received_duplicate",
-                        "tokenomics_delta_available_duplicate",
-                    )
-                    .await
-                    {
-                        log_cloud_sync_event(
-                            "tokenomics.delivery_ack_error",
-                            json!({
-                                "reason": "tokenomics_delta_available_duplicate",
-                                "error": clean_terminal_telemetry_text(&error),
-                                "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                            }),
-                        );
-                    }
-                    continue;
-                }
-                if has_summary {
-                    match tokenomics_record_cloud_account_state(&app, &event) {
-                        Ok(recorded) => {
-                            let stored_count = recorded
-                                .get("stored_count")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let stored_limit_count = recorded
-                                .get("stored_limit_count")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let stored_limit_sample_count = recorded
-                                .get("stored_limit_sample_count")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            if stored_count > 0
-                                || stored_limit_count > 0
-                                || stored_limit_sample_count > 0
-                            {
-                                let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
-                            }
-                            let status = if stored_count > 0
-                                || stored_limit_count > 0
-                                || stored_limit_sample_count > 0
-                            {
-                                "applied"
-                            } else {
-                                "applied_noop"
-                            };
-                            if let Err(error) = cloud_mcp_send_tokenomics_delivery_ack(
-                                &state_clone,
-                                &event,
-                                Some(&recorded),
-                                status,
-                                "tokenomics_delta_available",
-                            )
-                            .await
-                            {
-                                log_cloud_sync_event(
-                                    "tokenomics.delivery_ack_error",
-                                    json!({
-                                        "reason": "tokenomics_delta_available",
-                                        "error": clean_terminal_telemetry_text(&error),
-                                        "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                                    }),
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("Unable to cache cloud Tokenomics relay event: {error}");
-                            if let Err(ack_error) = cloud_mcp_send_tokenomics_delivery_ack(
-                                &state_clone,
-                                &event,
-                                None,
-                                "apply_error",
-                                "tokenomics_delta_available",
-                            )
-                            .await
-                            {
-                                log_cloud_sync_event(
-                                    "tokenomics.delivery_ack_error",
-                                    json!({
-                                        "reason": "tokenomics_delta_available_apply_error",
-                                        "error": clean_terminal_telemetry_text(&ack_error),
-                                        "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                    continue;
-                } else {
-                    log_cloud_sync_event(
-                        "tokenomics.delta_wake_received",
-                        json!({
-                            "event_kind": event_kind,
-                            "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                            "server_cursor": cloud_mcp_tokenomics_server_cursor_from_value(&event),
-                        }),
-                    );
-                }
-                let origin_delivery_event =
-                    if cloud_mcp_tokenomics_delivery_id_from_value(&event).is_some() {
-                        Some(event.clone())
-                    } else {
-                        None
-                    };
-                cloud_mcp_spawn_tokenomics_account_delta_request_with_origin(
-                    &state_clone,
-                    "tokenomics_delta_available",
-                    false,
-                    origin_delivery_event,
+                log_cloud_sync_event(
+                    "tokenomics.server_delta_ignored",
+                    json!({
+                        "event_kind": event_kind,
+                        "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
+                        "has_summary": has_summary,
+                        "originated_from_this_device": cloud_mcp_event_originated_from_this_device(&event),
+                        "server_cursor": cloud_mcp_tokenomics_server_cursor_from_value(&event),
+                        "reason": "client_owned_tokenomics",
+                    }),
                 );
                 continue;
             }
             if cloud_mcp_is_tokenomics_state_event(&event_kind) {
-                match tokenomics_record_cloud_account_state(&app, &event) {
-                    Ok(recorded) => {
-                        if let Err(error) = cloud_mcp_send_tokenomics_delivery_ack(
-                            &state_clone,
-                            &event,
-                            Some(&recorded),
-                            "applied",
-                            "tokenomics_status",
-                        )
-                        .await
-                        {
-                            log_cloud_sync_event(
-                                "tokenomics.delivery_ack_error",
-                                json!({
-                                    "reason": "tokenomics_status",
-                                    "error": clean_terminal_telemetry_text(&error),
-                                    "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                                }),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Unable to cache cloud Tokenomics state: {error}");
-                        if let Err(ack_error) = cloud_mcp_send_tokenomics_delivery_ack(
-                            &state_clone,
-                            &event,
-                            None,
-                            "apply_error",
-                            "tokenomics_status",
-                        )
-                        .await
-                        {
-                            log_cloud_sync_event(
-                                "tokenomics.delivery_ack_error",
-                                json!({
-                                    "reason": "tokenomics_status_apply_error",
-                                    "error": clean_terminal_telemetry_text(&ack_error),
-                                    "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
-                                }),
-                            );
-                        }
-                    }
-                }
-                let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
+                log_cloud_sync_event(
+                    "tokenomics.server_state_ignored",
+                    json!({
+                        "event_kind": event_kind,
+                        "delivery_id": cloud_mcp_tokenomics_delivery_id_from_value(&event),
+                        "server_cursor": cloud_mcp_tokenomics_server_cursor_from_value(&event),
+                        "reason": "client_owned_tokenomics",
+                    }),
+                );
                 continue;
             }
             if cloud_mcp_is_workspace_todo_wake_event(&event_kind, &event) {
@@ -21223,7 +20644,7 @@ async fn cloud_mcp_apply_desktop_auth_session(
 
 #[tauri::command]
 async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
-    Ok(cloud_mcp_status_snapshot(state.inner()).await)
+    Ok(cloud_mcp_status_snapshot_cached(state.inner()).await)
 }
 
 #[tauri::command]
@@ -24070,8 +23491,8 @@ async fn cloud_mcp_delete_workspace(
 
 #[tauri::command]
 async fn cloud_mcp_sync_tokenomics_state(
-    app: AppHandle,
-    state: State<'_, CloudMcpState>,
+    _app: AppHandle,
+    _state: State<'_, CloudMcpState>,
     _summary: Value,
     reason: Option<String>,
     delta: Option<bool>,
@@ -24087,22 +23508,16 @@ async fn cloud_mcp_sync_tokenomics_state(
                 CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT.to_string()
             }
         });
-    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
-        app,
-        state.inner(),
-        clean_reason.clone(),
-        !is_delta,
-        false,
-    )
-    .await;
     Ok(cloud_mcp_background_sync_ack(
         "tokenomics_sync",
         "tokenomics:scan",
         &clean_reason,
         json!({
             "delta": is_delta,
-            "full": queued_job.force_full,
-            "queued_reason": queued_job.reason,
+            "full": false,
+            "queued_reason": clean_reason,
+            "queued": false,
+            "local_only": true,
             "sync_protocol": CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL,
             "syncProtocol": CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL,
             "tokenomics_event_kind": if is_delta {
@@ -24116,8 +23531,8 @@ async fn cloud_mcp_sync_tokenomics_state(
 
 #[tauri::command]
 async fn cloud_mcp_schedule_tokenomics_sync(
-    app: AppHandle,
-    state: State<'_, CloudMcpState>,
+    _app: AppHandle,
+    _state: State<'_, CloudMcpState>,
     reason: Option<String>,
     full: Option<bool>,
     resync_last_30_days: Option<bool>,
@@ -24128,31 +23543,23 @@ async fn cloud_mcp_schedule_tokenomics_sync(
         .unwrap_or_else(|| CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT.to_string());
     let force_full = full.unwrap_or(false);
     let force_resync = resync_last_30_days.unwrap_or(false);
-    cloud_mcp_background_sync_ensure_started(state.inner());
-    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
-        app,
-        state.inner(),
-        clean_reason.clone(),
-        force_full,
-        force_resync,
-    )
-    .await;
 
     Ok(cloud_mcp_background_sync_ack(
         "tokenomics_sync",
         "tokenomics:scan",
         &clean_reason,
         json!({
-            "full": queued_job.force_full,
-            "resync_last_30_days": queued_job.force_resync,
-            "queued_reason": queued_job.reason,
+            "full": force_full,
+            "resync_last_30_days": force_resync,
+            "queued_reason": clean_reason,
+            "queued": false,
+            "local_only": true,
         }),
     ))
 }
 
 #[tauri::command]
 async fn cloud_mcp_reset_device_tokenomics(
-    app: AppHandle,
     state: State<'_, CloudMcpState>,
 ) -> Result<Value, String> {
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -24166,61 +23573,32 @@ async fn cloud_mcp_reset_device_tokenomics(
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
     let billing_scope_key =
         tokenomics_billing_scope_key(billing_scope_type.as_str(), team_id.as_deref());
-    let payload = json!({
-        "source": "rust-diffforge-tokenomics-device-reset",
-        "scope": "device",
-        "billing_scope_type": billing_scope_type,
-        "billing_scope_key": billing_scope_key.clone(),
-        "team_id": team_id.clone(),
-        "account_scoped": true,
-        "confirm": "reset_device_tokenomics",
-        "device": device_profile.clone(),
-        "device_id": device_id.clone(),
-        "device_name": device_profile["device_name"].clone(),
-        "machine_id": device_profile["device_id"].clone(),
-        "machine_name": device_profile["machine_name"].clone(),
-        "platform": device_profile["platform"].clone(),
-        "form_factor": device_profile["form_factor"].clone(),
-        "client_kind": device_profile["client_kind"].clone(),
-        "agent_id": "rust-diffforge",
-        "agent_label": "Diff Forge Desktop",
-        "reason": "tokenomics_device_cloud_reset",
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/tokenomics/reset-device", &payload)
-            .await?;
     {
         let mut tokenomics_cursor = state.background_sync.tokenomics_cursor.lock().await;
-        tokenomics_cursor.remove(payload["billing_scope_key"].as_str().unwrap_or("personal"));
+        tokenomics_cursor.remove(&billing_scope_key);
     }
     let _ = cloud_mcp_tokenomics_clear_sync_state(&device_id, &billing_scope_key);
-    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
-        app,
-        state.inner(),
-        "tokenomics_device_cloud_reset".to_string(),
-        true,
-        true,
-    )
-    .await;
-    let mut data = cloud_mcp_response_data(&response);
-    if let Some(object) = data.as_object_mut() {
-        object.insert("sync_queued".to_string(), json!(true));
-        object.insert(
-            "sync".to_string(),
-            cloud_mcp_background_sync_ack(
-                "tokenomics_sync",
-                "tokenomics:scan",
-                "tokenomics_device_cloud_reset",
-                json!({
-                    "full": queued_job.force_full,
-                    "resync_last_30_days": queued_job.force_resync,
-                    "queued_reason": queued_job.reason,
-                }),
-            ),
-        );
-    }
-    Ok(data)
+    Ok(json!({
+        "ok": true,
+        "local_only": true,
+        "sync_queued": false,
+        "device_id": device_id,
+        "billing_scope_type": billing_scope_type,
+        "billing_scope_key": billing_scope_key,
+        "team_id": team_id,
+        "sync": cloud_mcp_background_sync_ack(
+            "tokenomics_sync",
+            "tokenomics:scan",
+            "tokenomics_device_local_reset",
+            json!({
+                "full": false,
+                "resync_last_30_days": false,
+                "queued": false,
+                "local_only": true,
+                "queued_reason": "tokenomics_device_local_reset",
+            }),
+        ),
+    }))
 }
 
 fn cloud_mcp_tokenomics_cursor_from_summary(summary: &Value) -> Option<String> {

@@ -22,7 +22,7 @@
         "decorations": false,
         "acceptFirstMouse": true,
         "backgroundColor": "#000000",
-        "backgroundThrottling": "disabled",
+        "backgroundThrottling": "throttle",
         "shadow": true
       }
     ],
