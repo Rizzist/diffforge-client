@@ -32,6 +32,8 @@ static SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS: AtomicU64 = AtomicU64::new(
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_SCAP_CAPTURE_FPS: u32 = 60;
 const SNIPPING_SCAP_WARM_CAPTURE_FPS: u32 = 30;
+const SNIPPING_STARTUP_PREWARM_ENABLED: bool = false;
+const SNIPPING_WARM_CAPTURE_ENABLED: bool = false;
 const SNIPPING_RECORDING_FPS: u32 = 30;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
@@ -1854,7 +1856,7 @@ fn register_snipping_shortcuts(app: &AppHandle) {
     }
 
     app.state::<SnippingState>().shortcut_manager.replace(state);
-    if settings.enabled {
+    if settings.enabled && SNIPPING_STARTUP_PREWARM_ENABLED {
         prewarm_snipping_overlay_window(app);
         snipping_warm_preview_pool(app);
         snipping_start_warm_capture_if_ready(app);
@@ -1905,8 +1907,10 @@ fn set_snipping_enabled_for(
             SnippingShortcutAction::AreaRecording,
             settings.area_recording,
         );
-        prewarm_snipping_overlay_window(app);
-        snipping_warm_preview_pool(app);
+        if SNIPPING_STARTUP_PREWARM_ENABLED {
+            prewarm_snipping_overlay_window(app);
+            snipping_warm_preview_pool(app);
+        }
     } else {
         let _ = snipping_stop_recording_for(app, "snipping-disabled");
         snipping_stop_warm_capture(app);
@@ -1916,7 +1920,7 @@ fn set_snipping_enabled_for(
     }
 
     manager.replace(next_state);
-    if request.enabled {
+    if request.enabled && SNIPPING_STARTUP_PREWARM_ENABLED {
         snipping_start_warm_capture_if_ready(app);
     }
     emit_snipping_shortcuts_changed(app);
@@ -2289,6 +2293,10 @@ fn snipping_warm_capture_frame_for_monitor(
     monitor: &SnippingAreaMonitor,
     min_captured_at_ms: u64,
 ) -> Option<image::RgbaImage> {
+    if !SNIPPING_WARM_CAPTURE_ENABLED {
+        return None;
+    }
+
     let state = app.state::<SnippingState>().warm_capture.clone();
     let key = snipping_warm_capture_key(monitor);
     let now = current_time_ms();
@@ -2379,6 +2387,10 @@ fn snipping_warm_capture_loop(
 }
 
 fn snipping_start_warm_capture_if_ready(app: &AppHandle) {
+    if !SNIPPING_WARM_CAPTURE_ENABLED {
+        return;
+    }
+
     if !app
         .state::<SnippingState>()
         .shortcut_manager

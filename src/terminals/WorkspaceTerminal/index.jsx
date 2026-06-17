@@ -9466,6 +9466,39 @@ function WorkspaceTerminal({
     resizeControllerRef.current = resizeController;
     resizeController?.schedule("mount");
 
+    // Reveal path: terminal slots hide with `visibility: hidden`, which keeps
+    // their layout box, so the ResizeObserver does NOT fire when a slot goes
+    // from hidden -> visible (e.g. when the workspace opens and the layout rect
+    // finally arrives). Without an explicit reschedule the mount/activation
+    // resizes that ran while the slot was hidden were skipped as
+    // "surface_hidden" and the terminal never painted until a full reload.
+    // Watch the slot's hidden attributes and, on reveal, schedule a fresh resize
+    // + renderer refresh so the terminal paints immediately.
+    const revealSlot = container.closest?.('[data-terminal-surface-slot="true"]');
+    if (revealSlot && typeof MutationObserver === "function") {
+      const isSlotVisible = () => (
+        revealSlot.getAttribute("data-terminal-tab-hidden") !== "true"
+        && revealSlot.getAttribute("data-terminal-hidden") !== "true"
+      );
+      let slotWasVisible = isSlotVisible();
+      const slotRevealObserver = new MutationObserver(() => {
+        const slotVisibleNow = isSlotVisible();
+        if (slotVisibleNow && !slotWasVisible) {
+          resizeController?.schedule("slot_revealed", 0);
+          refreshTerminalRenderer("slot_revealed");
+          if (terminalActiveRef.current === true) {
+            attachDeferredWebglRef.current?.("slot_revealed");
+          }
+        }
+        slotWasVisible = slotVisibleNow;
+      });
+      slotRevealObserver.observe(revealSlot, {
+        attributes: true,
+        attributeFilter: ["data-terminal-hidden", "data-terminal-tab-hidden"],
+      });
+      disposables.push(() => slotRevealObserver.disconnect());
+    }
+
     async function startTerminal() {
       try {
         setPaneStage("starting", "Preparing Terminal", "Creating terminal session.");

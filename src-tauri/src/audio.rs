@@ -562,6 +562,21 @@ enum NativeAudioStreamHandle {
     VoiceProcessing(MacosVoiceProcessingCapture),
 }
 
+impl NativeAudioStreamHandle {
+    /// On macOS, park/engage the VoiceProcessingIO DSP. No-op for the cpal
+    /// fallback (and on non-macos), which has no echo canceller to gate.
+    fn set_voice_processing_bypass(&mut self, bypass: bool) -> Result<(), String> {
+        match self {
+            #[cfg(target_os = "macos")]
+            NativeAudioStreamHandle::VoiceProcessing(capture) => capture.set_bypass(bypass),
+            _ => {
+                let _ = bypass;
+                Ok(())
+            }
+        }
+    }
+}
+
 struct NativeAudioSession {
     device_id: String,
     label: String,
@@ -569,6 +584,12 @@ struct NativeAudioSession {
     sample_rate: u32,
     shared: Arc<StdMutex<NativeAudioShared>>,
     _stream: NativeAudioStreamHandle,
+}
+
+impl NativeAudioSession {
+    fn set_voice_processing_bypass(&mut self, bypass: bool) -> Result<(), String> {
+        self._stream.set_voice_processing_bypass(bypass)
+    }
 }
 
 enum NativeAudioCommand {
@@ -763,8 +784,25 @@ fn inactive_native_audio_status() -> AudioInputMonitorStatus {
     }
 }
 
+/// Lazy AEC: the VoiceProcessingIO echo-cancel + noise-suppression DSP only
+/// needs to run while audio is actually flowing to a consumer. We park it on
+/// standby (bypassed) whenever there is no active push-to-talk capture and no
+/// attached realtime/agent stream, and engage it the instant either begins —
+/// keeping the warm buffer instant while dropping idle CPU from ~30% to ~1-2%.
+fn apply_voice_processing_bypass(
+    session: &mut Option<NativeAudioSession>,
+    capture_active: bool,
+    realtime_attached: bool,
+) {
+    if let Some(active) = session.as_mut() {
+        let _ = active.set_voice_processing_bypass(!(capture_active || realtime_attached));
+    }
+}
+
 fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCommand>) {
     let mut session: Option<NativeAudioSession> = None;
+    let mut capture_active = false;
+    let mut realtime_attached = false;
 
     while let Ok(command) = command_rx.recv() {
         match command {
@@ -778,18 +816,30 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                     audio_tx,
                     replay_buffered,
                 );
+                if result.is_ok() {
+                    realtime_attached = true;
+                    apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                }
                 let _ = response.send(result);
             }
             NativeAudioCommand::Begin { response } => {
                 let result = begin_native_audio_capture_for_session(session.as_ref());
+                if result.is_ok() {
+                    capture_active = true;
+                    apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                }
                 let _ = response.send(result);
             }
             NativeAudioCommand::DetachRealtime { response } => {
                 let result = detach_native_audio_realtime_stream(session.as_ref());
+                realtime_attached = false;
+                apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 let _ = response.send(result);
             }
             NativeAudioCommand::Finish { response } => {
                 let result = finish_native_audio_capture_for_session(session.as_ref());
+                capture_active = false;
+                apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 let _ = response.send(result);
             }
             NativeAudioCommand::Start {
@@ -798,10 +848,17 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 response,
             } => {
                 let result = start_native_audio_session(&mut session, app, request);
+                // A freshly built unit starts bypassed; re-apply in case a
+                // consumer is already active (e.g. device hot-swap mid-capture).
+                apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 let _ = response.send(result);
             }
             NativeAudioCommand::Stop { request, response } => {
                 let result = stop_native_audio_session(&mut session, request);
+                if session.is_none() {
+                    capture_active = false;
+                    realtime_attached = false;
+                }
                 let _ = response.send(result);
             }
         }
@@ -1241,6 +1298,14 @@ const MACOS_VOICE_PLAYBACK_MAX_SAMPLES: usize = (MACOS_VOICE_PROCESSING_SAMPLE_R
 const MACOS_AU_VOICE_IO_PROPERTY_DUCK_NON_VOICE_AUDIO: u32 = 2102;
 #[cfg(target_os = "macos")]
 const MACOS_AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION: u32 = 2108;
+/// `kAUVoiceIOProperty_BypassVoiceProcessing`. When set to 1 the unit skips the
+/// echo canceller + (ML) noise suppression DSP — the BNNS/vDSP work that
+/// otherwise burns ~30% of a core continuously. We keep the unit running so the
+/// mic stays genuinely warm/instant, but bypass the processing while the session
+/// is only on standby (no active capture and no realtime/agent consumer), then
+/// re-enable it the moment recording or a realtime stream begins.
+#[cfg(target_os = "macos")]
+const MACOS_AU_VOICE_IO_PROPERTY_BYPASS_VOICE_PROCESSING: u32 = 2100;
 #[cfg(target_os = "macos")]
 const MACOS_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN: u32 = 10;
 
@@ -1345,6 +1410,32 @@ fn configure_macos_voice_processing_no_ducking(
 #[cfg(target_os = "macos")]
 struct MacosVoiceProcessingCapture {
     unit: coreaudio::audio_unit::AudioUnit,
+    bypassed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosVoiceProcessingCapture {
+    /// Toggle the VoiceProcessingIO DSP. `bypass = true` parks the unit in a
+    /// cheap pass-through (standby); `false` engages echo-cancel + noise
+    /// suppression for an active recording/realtime consumer. Toggling a
+    /// running VoiceProcessingIO unit is supported and glitch-free.
+    fn set_bypass(&mut self, bypass: bool) -> Result<(), String> {
+        use coreaudio::audio_unit::{Element, Scope};
+        if self.bypassed == bypass {
+            return Ok(());
+        }
+        let value: u32 = u32::from(bypass);
+        self.unit
+            .set_property(
+                MACOS_AU_VOICE_IO_PROPERTY_BYPASS_VOICE_PROCESSING,
+                Scope::Global,
+                Element::Output,
+                Some(&value),
+            )
+            .map_err(|error| format!("Unable to toggle voice-processing bypass: {error}"))?;
+        self.bypassed = bypass;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1501,11 +1592,15 @@ fn build_macos_voice_processing_capture(
     unit.start().map_err(|error| describe("start", error))?;
     MACOS_VOICE_PROCESSING_ACTIVE.store(true, Ordering::Release);
 
-    Ok((
-        MacosVoiceProcessingCapture { unit },
-        shared,
-        MACOS_VOICE_PROCESSING_SAMPLE_RATE,
-    ))
+    // Park the new unit on standby (DSP bypassed). The worker loop re-enables
+    // processing immediately if a capture/realtime consumer is already active.
+    let mut capture = MacosVoiceProcessingCapture {
+        unit,
+        bypassed: false,
+    };
+    let _ = capture.set_bypass(true);
+
+    Ok((capture, shared, MACOS_VOICE_PROCESSING_SAMPLE_RATE))
 }
 
 fn build_native_audio_stream(

@@ -11082,6 +11082,12 @@ export default function App() {
     setWorkspaceSettingsModalId("");
     if (nextView === DEFAULT_WORKSPACE_VIEW && telemetryWorkspaceId) {
     }
+    // Navigating between views (workspace tabs ↔ device/account-level views such
+    // as audio/tokenomics/settings) must NOT clear the selected workspace: the
+    // workspace stays selected so its tabs remain reachable and the user can
+    // freely switch back and forth. Clearing the selection is reserved for the
+    // explicit rail deselect click (clearWorkspaceSelectionFromRail), which also
+    // drops the active device/account-level view.
     setActiveView(nextView);
     activeViewRef.current = nextView;
 
@@ -12985,10 +12991,18 @@ export default function App() {
       workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId((currentSelectedId) => {
-        const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId)
-          || nextActivated;
-
-        return nextSelected?.id || "";
+        const stillSelected = findWorkspaceById(nextWorkspaces, currentSelectedId);
+        if (stillSelected) {
+          return stillSelected.id;
+        }
+        // Only auto-select the activated workspace on the very first hydration
+        // (nothing activated yet). On a reconnect/reconcile after the user
+        // cleared the selection, leave it empty instead of ghost-reselecting,
+        // and if the selected workspace was deleted just clear it.
+        if (currentSelectedId || currentActivatedId) {
+          return "";
+        }
+        return nextActivated?.id || "";
       });
       const nextActivatedWorkspaceId = nextActivated?.id || "";
       activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
@@ -13141,9 +13155,16 @@ export default function App() {
         activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
         setActivatedWorkspaceId(nextActivatedWorkspaceId);
       }
-      setSelectedWorkspaceId((currentSelectedId) => (
-        findWorkspaceById(merged, currentSelectedId) ? currentSelectedId : (merged[0]?.id || "")
-      ));
+      setSelectedWorkspaceId((currentSelectedId) => {
+        // A cross-device catalog broadcast must never ghost-reselect a
+        // workspace: preserve an intentional deselection, and if the selected
+        // workspace was deleted elsewhere just clear it rather than jumping to
+        // the first row.
+        if (!currentSelectedId) {
+          return "";
+        }
+        return findWorkspaceById(merged, currentSelectedId) ? currentSelectedId : "";
+      });
       void invoke("local_workspaces_store", { scopeKey, workspaces: merged }).catch(() => {});
     }).then((dispose) => {
       if (disposed) {
@@ -16976,7 +16997,7 @@ export default function App() {
           threadId: String(terminal?.threadId || terminal?.thread_id || "").trim(),
         };
       })
-      .filter((target) => target && target.threads.length > 0);
+      .filter(Boolean);
   }, [selectedWorkspaceId, workspaceTerminalsWorkspaces]);
   useEffect(() => {
     workspaceTerminalsWorkspacesRef.current = workspaceTerminalsWorkspaces;

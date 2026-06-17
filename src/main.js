@@ -9,31 +9,6 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 
-// Pause all CSS animations whenever a window is unfocused or hidden — exactly
-// the state macOS samples for Energy Impact. Done here in the shared entry so
-// it covers EVERY window (main app, audio widget, overlays, snipping,
-// background monitor), independent of whether each renders the GlobalStyle.
-(() => {
-  if (typeof document === "undefined") {
-    return;
-  }
-  const idleStyle = document.createElement("style");
-  idleStyle.textContent =
-    'html[data-app-idle="true"] *,'
-    + 'html[data-app-idle="true"] *::before,'
-    + 'html[data-app-idle="true"] *::after{animation-play-state:paused !important;}';
-  (document.head || document.documentElement).appendChild(idleStyle);
-  const syncIdle = () => {
-    const active = document.visibilityState !== "hidden"
-      && (typeof document.hasFocus !== "function" || document.hasFocus());
-    document.documentElement.dataset.appIdle = active ? "false" : "true";
-  };
-  window.addEventListener("focus", syncIdle);
-  window.addEventListener("blur", syncIdle);
-  document.addEventListener("visibilitychange", syncIdle);
-  syncIdle();
-})();
-
 // Utility windows boot from narrow chunks instead of evaluating the entire
 // AppShell bundle. Besides startup latency, this keeps AppShell's background
 // listeners/pollers out of small always-on surfaces.

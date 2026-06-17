@@ -86,7 +86,7 @@ import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
 import WorkspaceToolsDragPanel from "../tools/WorkspaceToolsDragPanel.jsx";
 import { warmWorkspaceTools } from "../tools/workspaceToolsStore.js";
-import AccountTokenomicsView, { warmAccountTokenomics } from "../tokenomics/AccountTokenomicsView.jsx";
+import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
   terminalActivityStatusIsBusy,
@@ -13400,10 +13400,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [coordinationTargets, rootDirectory]);
 
   useEffect(() => {
-    warmAccountTokenomics({ accountKey, scan: false });
-  }, [accountKey]);
-
-  useEffect(() => {
     prewarmCloudVoiceAgentStream().catch(() => {});
   }, [orchestratorPanelWorkspaceId]);
 
@@ -16741,13 +16737,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorContent>
         </OrchestratorView>
       ) : null}
-      <WorkspaceToolSurface data-tool="tokenomics" hidden={activeWorkspaceTool !== "tokenomics"}>
-        <AccountTokenomicsView
-          accountKey={accountKey}
-          billingStatus={billingStatus}
-          storageUsage={storageUsage}
-        />
-      </WorkspaceToolSurface>
+      {activeWorkspaceTool === "tokenomics" ? (
+        <WorkspaceToolSurface data-tool="tokenomics">
+          <AccountTokenomicsView
+            accountKey={accountKey}
+            billingStatus={billingStatus}
+            storageUsage={storageUsage}
+          />
+        </WorkspaceToolSurface>
+      ) : null}
     </TodoQueueSurface>
   );
 });

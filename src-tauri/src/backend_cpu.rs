@@ -113,7 +113,47 @@ fn backend_thread_cpu_time_ns() -> Option<u128> {
     (total >= 0).then_some(total as u128)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+}
+
+#[cfg(target_os = "macos")]
+fn backend_thread_cpu_time_ns() -> Option<u128> {
+    let thread = unsafe { libc::mach_thread_self() };
+    if thread == 0 {
+        return None;
+    }
+
+    let mut info = std::mem::MaybeUninit::<libc::thread_basic_info_data_t>::uninit();
+    let mut count = libc::THREAD_BASIC_INFO_COUNT;
+    let result = unsafe {
+        libc::thread_info(
+            thread,
+            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+            info.as_mut_ptr() as libc::thread_info_t,
+            &mut count,
+        )
+    };
+    let _ = unsafe { mach_port_deallocate(libc::mach_task_self(), thread) };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+
+    let info = unsafe { info.assume_init() };
+    let time_value_ns = |time: libc::time_value_t| {
+        (time.seconds as i128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((time.microseconds as i128).saturating_mul(1_000))
+    };
+    let total = time_value_ns(info.user_time).saturating_add(time_value_ns(info.system_time));
+    (total >= 0).then_some(total as u128)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn backend_thread_cpu_time_ns() -> Option<u128> {
     None
 }

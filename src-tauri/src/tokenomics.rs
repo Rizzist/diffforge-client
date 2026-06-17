@@ -3,6 +3,7 @@ const TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER: usize = 120;
 const TOKENOMICS_REALTIME_LOOKBACK_SECS: u64 = 60 * 60;
 const TOKENOMICS_REALTIME_MAX_CODEX_CANDIDATES: usize = 24;
 const TOKENOMICS_REALTIME_MAX_FILES_PER_PROVIDER: usize = 24;
+const TOKENOMICS_REALTIME_HOT_TAIL_SCAN_ENABLED: bool = false;
 const TOKENOMICS_SCAN_MAX_LINE_BYTES: usize = 256 * 1024;
 const TOKENOMICS_SCAN_MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const TOKENOMICS_SYNC_ROLLUP_LIMIT: usize = 5000;
@@ -25,7 +26,9 @@ const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_KEY_PREFIX: &str = "claude_usage_api_cache:";
 const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 180;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS: u64 = 30 * 60;
-const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 15_000;
+const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+const TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS: u64 = 60_000;
+const TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX: &str = "summary_snapshot_cache:";
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
 const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
@@ -35,11 +38,19 @@ static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_REALTIME_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_SUMMARY_CACHE: OnceLock<StdMutex<Option<TokenomicsSummaryCacheEntry>>> =
     OnceLock::new();
+static TOKENOMICS_LIVE_LIMITS_CACHE: OnceLock<StdMutex<Option<TokenomicsLiveLimitsCacheEntry>>> =
+    OnceLock::new();
 
 #[derive(Clone)]
 struct TokenomicsSummaryCacheEntry {
     include_rollups: bool,
     include_cloud: bool,
+    cached_at: Instant,
+    summary: Value,
+}
+
+#[derive(Clone)]
+struct TokenomicsLiveLimitsCacheEntry {
     cached_at: Instant,
     summary: Value,
 }
@@ -59,6 +70,7 @@ async fn tokenomics_scan_usage(
     .await
     .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
     tokenomics_clear_summary_cache();
+    tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -76,6 +88,7 @@ async fn tokenomics_scan_usage_silent(
     .await
     .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
     tokenomics_clear_summary_cache();
+    tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -88,11 +101,23 @@ async fn tokenomics_scan_realtime_usage(
     let scan_app = app.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("tokenomics.command.scan_realtime_usage");
+        if !TOKENOMICS_REALTIME_HOT_TAIL_SCAN_ENABLED {
+            let mut summary = tokenomics_cached_read_only_summary_for(&scan_app, false, true)?;
+            summary["scan"] = json!({
+                "status": "cached",
+                "mode": "realtime",
+                "reason": "hot_tail_scan_disabled",
+            });
+            return Ok(summary);
+        }
         tokenomics_scan_realtime_usage_for(&scan_app)
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics realtime scan: {error}"))??;
-    tokenomics_clear_summary_cache();
+    if tokenomics_summary_inserted_events(&summary) > 0 {
+        tokenomics_clear_summary_cache();
+        tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
+    }
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -110,6 +135,7 @@ async fn tokenomics_resync_last_30_days(
     .await
     .map_err(|error| format!("Unable to join Tokenomics resync: {error}"))??;
     tokenomics_clear_summary_cache();
+    tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -128,8 +154,7 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
 async fn tokenomics_get_live_limits(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("tokenomics.command.get_live_limits");
-        let conn = tokenomics_open_db(&app)?;
-        tokenomics_live_limits_snapshot_from_conn(&conn)
+        tokenomics_cached_live_limits_for(&app)
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics live limits: {error}"))?
@@ -176,6 +201,7 @@ async fn tokenomics_record_usage(
     .await
     .map_err(|error| format!("Unable to join Tokenomics record: {error}"))??;
     tokenomics_clear_summary_cache();
+    tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
     tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
     Ok(summary)
 }
@@ -1213,9 +1239,75 @@ fn tokenomics_summary_cache() -> &'static StdMutex<Option<TokenomicsSummaryCache
     TOKENOMICS_SUMMARY_CACHE.get_or_init(|| StdMutex::new(None))
 }
 
+fn tokenomics_live_limits_cache() -> &'static StdMutex<Option<TokenomicsLiveLimitsCacheEntry>> {
+    TOKENOMICS_LIVE_LIMITS_CACHE.get_or_init(|| StdMutex::new(None))
+}
+
 fn tokenomics_clear_summary_cache() {
     if let Ok(mut cache) = tokenomics_summary_cache().lock() {
         *cache = None;
+    }
+    if let Ok(mut cache) = tokenomics_live_limits_cache().lock() {
+        *cache = None;
+    }
+}
+
+fn tokenomics_summary_snapshot_cache_key(include_rollups: bool, include_cloud: bool) -> String {
+    format!(
+        "{TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX}rollups={}:cloud={}",
+        include_rollups as u8, include_cloud as u8
+    )
+}
+
+fn tokenomics_read_summary_snapshot(
+    conn: &rusqlite::Connection,
+    include_rollups: bool,
+    include_cloud: bool,
+) -> Option<Value> {
+    let key = tokenomics_summary_snapshot_cache_key(include_rollups, include_cloud);
+    let text: String = conn
+        .query_row(
+            "SELECT value FROM tokenomics_meta WHERE key=?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let payload = serde_json::from_str::<Value>(&text).ok()?;
+    payload
+        .get("summary")
+        .filter(|summary| summary.is_object())
+        .cloned()
+}
+
+fn tokenomics_store_summary_snapshot(
+    conn: &rusqlite::Connection,
+    include_rollups: bool,
+    include_cloud: bool,
+    summary: &Value,
+) -> Result<(), String> {
+    let key = tokenomics_summary_snapshot_cache_key(include_rollups, include_cloud);
+    let payload = json!({
+        "cached_at": tokenomics_now_iso_like(),
+        "include_rollups": include_rollups,
+        "include_cloud": include_cloud,
+        "summary": summary,
+    });
+    conn.execute(
+        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![key, payload.to_string()],
+    )
+    .map_err(|error| format!("Unable to store Tokenomics summary snapshot: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_store_summary_snapshot_for_app(
+    app: &AppHandle,
+    include_rollups: bool,
+    include_cloud: bool,
+    summary: &Value,
+) {
+    if let Ok(conn) = tokenomics_open_db(app) {
+        let _ = tokenomics_store_summary_snapshot(&conn, include_rollups, include_cloud, summary);
     }
 }
 
@@ -1237,16 +1329,52 @@ fn tokenomics_cached_read_only_summary_for(
     }
 
     let conn = tokenomics_open_db(app)?;
+    if let Some(summary) = tokenomics_read_summary_snapshot(&conn, include_rollups, include_cloud)
+    {
+        if let Ok(mut cache) = tokenomics_summary_cache().lock() {
+            *cache = Some(TokenomicsSummaryCacheEntry {
+                include_rollups,
+                include_cloud,
+                cached_at: Instant::now(),
+                summary: summary.clone(),
+            });
+        }
+        return Ok(summary);
+    }
+
     let summary = tokenomics_summary_from_conn_with_cloud_read_only(
         &conn,
         include_rollups,
         None,
         include_cloud,
     )?;
+    let _ = tokenomics_store_summary_snapshot(&conn, include_rollups, include_cloud, &summary);
     if let Ok(mut cache) = tokenomics_summary_cache().lock() {
         *cache = Some(TokenomicsSummaryCacheEntry {
             include_rollups,
             include_cloud,
+            cached_at: Instant::now(),
+            summary: summary.clone(),
+        });
+    }
+    Ok(summary)
+}
+
+fn tokenomics_cached_live_limits_for(app: &AppHandle) -> Result<Value, String> {
+    if let Ok(cache) = tokenomics_live_limits_cache().lock() {
+        if let Some(entry) = cache.as_ref() {
+            if entry.cached_at.elapsed()
+                < Duration::from_millis(TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS)
+            {
+                return Ok(entry.summary.clone());
+            }
+        }
+    }
+
+    let conn = tokenomics_open_db(app)?;
+    let summary = tokenomics_live_limits_snapshot_from_conn(&conn)?;
+    if let Ok(mut cache) = tokenomics_live_limits_cache().lock() {
+        *cache = Some(TokenomicsLiveLimitsCacheEntry {
             cached_at: Instant::now(),
             summary: summary.clone(),
         });

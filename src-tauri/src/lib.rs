@@ -4594,7 +4594,9 @@ pub fn run() {
 
             register_audio_shortcuts(app.handle());
             register_snipping_shortcuts(app.handle());
-            prewarm_snipping_overlay_window(app.handle());
+            if SNIPPING_STARTUP_PREWARM_ENABLED {
+                prewarm_snipping_overlay_window(app.handle());
+            }
             register_activity_overlay_shortcut(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]

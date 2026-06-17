@@ -25,8 +25,10 @@ import {
 } from "./tokenomicsFormat.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
-const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
+const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 60_000;
 const TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS = 60_000;
+const TOKENOMICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = TOKENOMICS_DAILY_WINDOW_DAYS;
 const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
@@ -2243,8 +2245,10 @@ const tokenomicsStore = {
   loadedOnce: false,
   loadPromise: null,
   liveLimitsPromise: null,
+  liveLimitsLastAt: 0,
   hotTailPromise: null,
   hotTailLastAt: 0,
+  summaryRefreshLastAt: 0,
   pollInterval: null,
   pollSubscriberCount: 0,
   warmScanEpoch: -1,
@@ -2330,8 +2334,10 @@ function resetTokenomicsStoreForAccount(accountKey) {
   tokenomicsStore.loadedOnce = false;
   tokenomicsStore.loadPromise = null;
   tokenomicsStore.liveLimitsPromise = null;
+  tokenomicsStore.liveLimitsLastAt = 0;
   tokenomicsStore.hotTailPromise = null;
   tokenomicsStore.hotTailLastAt = 0;
+  tokenomicsStore.summaryRefreshLastAt = 0;
   tokenomicsStore.limitPercentSignature = "";
   tokenomicsStore.limitSyncPending = false;
   tokenomicsStore.warmScanEpoch = -1;
@@ -2360,11 +2366,17 @@ function ensureTokenomicsProgressListener() {
     });
 }
 
-function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
+function refreshTokenomicsLiveLimits({ force = false, syncLimitChanges = false } = {}) {
+  const now = Date.now();
   const requestEpoch = tokenomicsStore.requestEpoch;
   if (tokenomicsStore.liveLimitsPromise) {
     return tokenomicsStore.liveLimitsPromise;
   }
+  if (!force && now - tokenomicsStore.liveLimitsLastAt < TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS) {
+    return Promise.resolve(tokenomicsStore.state.summary);
+  }
+
+  tokenomicsStore.liveLimitsLastAt = now;
   tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits")
     .then((limitsSummary) => {
       if (tokenomicsStore.requestEpoch === requestEpoch) {
@@ -2379,6 +2391,15 @@ function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
       }
     });
   return tokenomicsStore.liveLimitsPromise;
+}
+
+function refreshTokenomicsSummaryIfStale({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - tokenomicsStore.summaryRefreshLastAt < TOKENOMICS_SUMMARY_REFRESH_INTERVAL_MS) {
+    return Promise.resolve(tokenomicsStore.state.summary);
+  }
+  tokenomicsStore.summaryRefreshLastAt = now;
+  return loadTokenomicsStore({ force: true, summaryOnly: true });
 }
 
 function refreshTokenomicsHotTail({ force = false } = {}) {
@@ -2462,6 +2483,9 @@ function loadTokenomicsStore({
         return tokenomicsStore.state.summary;
       }
       tokenomicsStore.loadedOnce = true;
+      if (summaryOnly) {
+        tokenomicsStore.summaryRefreshLastAt = Date.now();
+      }
       updateTokenomicsStore((previous) => ({
         error: "",
         status: "ready",
@@ -2512,7 +2536,7 @@ export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
           scan: true,
         }).finally(() => {
           if (tokenomicsStore.requestEpoch === requestEpoch) {
-            void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+            void refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
           }
         });
       }, { delayMs: 120, timeout: 1500 });
@@ -2526,17 +2550,13 @@ function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   tokenomicsStore.pollSubscriberCount += 1;
   void loadTokenomicsStore({ background: true, force: false, summaryOnly: true }).finally(() => {
-    void refreshTokenomicsHotTail({ force: true }).finally(() => {
-      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
-      void loadTokenomicsStore({ force: true, summaryOnly: true });
-    });
+    void refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
   });
 
   if (!tokenomicsStore.pollInterval) {
     tokenomicsStore.pollInterval = window.setInterval(() => {
-      void refreshTokenomicsHotTail().finally(() => {
-        void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
-        void loadTokenomicsStore({ force: true, summaryOnly: true });
+      void refreshTokenomicsLiveLimits({ syncLimitChanges: true }).finally(() => {
+        void refreshTokenomicsSummaryIfStale();
       });
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
@@ -2670,7 +2690,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   useEffect(() => {
-    warmAccountTokenomics({ accountKey, scan: false });
+    resetTokenomicsStoreForAccount(accountKey);
+    void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
   }, [accountKey]);
 
   useEffect(() => {
