@@ -636,11 +636,13 @@ fn desktop_auth_entitlements(snapshot: &Value) -> Value {
     let plan_name = desktop_auth_plan_name_from_snapshot(snapshot);
     let device_limit = desktop_auth_device_limit_from_snapshot(snapshot, &plan_name);
     let agent_entitlements = desktop_auth_agent_entitlements_for_plan(&plan_name);
+    let team_entitlements = desktop_auth_team_entitlements_for_plan(&plan_name);
     let paid = plan_status == "paid" || plan_name != "free";
     json!({
         "planName": plan_name,
         "planStatus": if paid { "paid" } else { "free" },
         "agents": agent_entitlements,
+        "teams": team_entitlements,
         "deviceLimit": device_limit,
         "isPaid": paid,
         "canUseCloudSync": paid,
@@ -650,18 +652,50 @@ fn desktop_auth_entitlements(snapshot: &Value) -> Value {
 }
 
 fn desktop_auth_agent_entitlements_for_plan(plan_name: &str) -> Value {
-    let (shared_agent_limit, dedicated_agent_limit, status) =
+    let (shared_agent_compute_credits, dedicated_agent_limit, status) =
         match plan_name.trim().to_ascii_lowercase().as_str() {
-            "ultra" => (5, 1, "coming_soon"),
-            "pro" => (3, 0, "coming_soon"),
+            "ultra" => (12, 1, "coming_soon"),
+            "pro" => (5, 0, "coming_soon"),
             "plus" => (1, 0, "coming_soon"),
             _ => (0, 0, "unavailable"),
         };
+    let shared_agent_small_credit_cost = 1;
+    let shared_agent_big_credit_cost = 4;
+    let shared_agent_limit = shared_agent_compute_credits / shared_agent_small_credit_cost;
+    let shared_agent_big_limit = shared_agent_compute_credits / shared_agent_big_credit_cost;
     json!({
         "sharedAgentLimit": shared_agent_limit,
         "shared_agent_limit": shared_agent_limit,
+        "sharedAgentComputeCredits": shared_agent_compute_credits,
+        "shared_agent_compute_credits": shared_agent_compute_credits,
+        "sharedAgentSmallCreditCost": shared_agent_small_credit_cost,
+        "shared_agent_small_credit_cost": shared_agent_small_credit_cost,
+        "sharedAgentBigCreditCost": shared_agent_big_credit_cost,
+        "shared_agent_big_credit_cost": shared_agent_big_credit_cost,
+        "sharedAgentSmallLimit": shared_agent_limit,
+        "shared_agent_small_limit": shared_agent_limit,
+        "sharedAgentBigLimit": shared_agent_big_limit,
+        "shared_agent_big_limit": shared_agent_big_limit,
         "dedicatedAgentLimit": dedicated_agent_limit,
         "dedicated_agent_limit": dedicated_agent_limit,
+        "status": status,
+    })
+}
+
+fn desktop_auth_team_entitlements_for_plan(plan_name: &str) -> Value {
+    let (team_limit, team_member_limit, team_device_limit, status) =
+        match plan_name.trim().to_ascii_lowercase().as_str() {
+            "ultra" => (1, 25, 150, "coming_soon"),
+            "pro" => (1, 10, 50, "coming_soon"),
+            _ => (0, 0, 0, "unavailable"),
+        };
+    json!({
+        "teamLimit": team_limit,
+        "team_limit": team_limit,
+        "teamMemberLimit": team_member_limit,
+        "team_member_limit": team_member_limit,
+        "teamDeviceLimit": team_device_limit,
+        "team_device_limit": team_device_limit,
         "status": status,
     })
 }

@@ -8209,8 +8209,8 @@ fn cloud_mcp_plan_name_from_value(value: Option<String>) -> String {
 fn cloud_mcp_device_limit_for_plan(plan_name: &str) -> u64 {
     match plan_name {
         "free" => 0,
-        "pro" => 7,
-        "ultra" => 20,
+        "pro" => 15,
+        "ultra" => 50,
         _ => 3,
     }
 }
@@ -36025,7 +36025,7 @@ mod cloud_mcp_tests {
             Some(11)
         );
         assert_eq!(cloud_mcp_device_limit_from_value(Some(0), "ultra"), Some(0));
-        assert_eq!(cloud_mcp_device_limit_from_value(None, "pro"), Some(7));
+        assert_eq!(cloud_mcp_device_limit_from_value(None, "pro"), Some(15));
     }
 
     #[test]

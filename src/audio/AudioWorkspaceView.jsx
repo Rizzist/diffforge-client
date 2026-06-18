@@ -33,7 +33,6 @@ import {
   MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS,
   applySyncedAudioPolishingPreferences,
   audioLlmCleanupEngineOption,
-  arrayBufferToBase64,
   formatAudioPercent,
   getAudioInputErrorMessage,
   hasAudioInputSetup,
@@ -5916,7 +5915,7 @@ export function AudioWidgetWindow() {
       await audioBuffer.beginCapture();
       captureBegan = true;
       if (recordingRunRef.current !== recordingRunId) {
-        await audioBuffer.finishCapture().catch(() => null);
+        await audioBuffer.finishCapture({ decode: false }).catch(() => null);
         if (audioBufferRef.current === audioBuffer) {
           await closeWarmBuffer();
         } else {
@@ -5987,7 +5986,7 @@ export function AudioWidgetWindow() {
           forgeVoiceEventsActiveRef.current = false;
           await stopCloudVoiceAgentStream().catch(() => {});
         }
-        await audioBuffer.finishCapture().catch(() => null);
+        await audioBuffer.finishCapture({ decode: false }).catch(() => null);
         if (audioBufferRef.current === audioBuffer) {
           await closeWarmBuffer();
         } else {
@@ -6021,9 +6020,9 @@ export function AudioWidgetWindow() {
         forgeVoiceEventsActiveRef.current = false;
         await stopCloudVoiceAgentStream().catch(() => {});
       }
-      const failedAudioBuffer = audioBufferRef.current || audioBuffer;
+      const failedAudioBuffer = audioBuffer;
       if (captureBegan) {
-        await failedAudioBuffer?.finishCapture?.().catch(() => null);
+        await failedAudioBuffer?.finishCapture?.({ decode: false }).catch(() => null);
         playNotificationSfx("voice.off");
       }
       await releaseOrPreserveFailedAudioBuffer(failedAudioBuffer, recordingError);
@@ -7934,7 +7933,7 @@ export function AudioWidgetWindow() {
         }
         setMessage("Finishing voice input");
         await finishCloudVoiceAgentInput();
-        await audioBuffer.finishCapture().catch(() => null);
+        await audioBuffer.finishCapture({ decode: false }).catch(() => null);
         if (recordingRunRef.current !== recordingRunId) {
           return;
         }
@@ -7951,7 +7950,7 @@ export function AudioWidgetWindow() {
           }
           setMessage("Closing Deepgram stream");
           const realtimeResult = await invoke("stop_deepgram_realtime_transcription");
-          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           return {
             ...(realtimeResult || {}),
             audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
@@ -7968,7 +7967,7 @@ export function AudioWidgetWindow() {
           const dictationResult = await invoke("stop_forge_dictation_transcription", {
             request: { cancel: false },
           });
-          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           return {
             ...(dictationResult || {}),
             audioMs: Number(
@@ -7979,9 +7978,8 @@ export function AudioWidgetWindow() {
           };
         })()
         : await (async () => {
-          const { wavBuffer, audioMs } = await audioBuffer.finishCapture();
+          const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
           const { peak, rms } = audioBuffer.getCaptureStats();
-          const audioBase64 = arrayBufferToBase64(wavBuffer);
           setMessage("Transcribing locally");
           const transcriptionResult = await invoke("transcribe_whisper_audio", {
             request: {
@@ -8138,12 +8136,12 @@ export function AudioWidgetWindow() {
    */
   const salvageLocalCancelledCapture = useCallback((captureResult, captureStats) => {
     const audioMs = Number(captureResult?.audioMs || 0);
+    const audioBase64 = String(captureResult?.audioBase64 || "");
 
-    if (!captureResult?.wavBuffer || audioMs < AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS) {
+    if (!audioBase64 || audioMs < AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS) {
       return;
     }
 
-    const audioBase64 = arrayBufferToBase64(captureResult.wavBuffer);
     const submittedAt = Date.now();
 
     invoke("transcribe_whisper_audio", {
@@ -8248,7 +8246,7 @@ export function AudioWidgetWindow() {
       void (async () => {
         if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
           const realtimeResult = await invoke("stop_deepgram_realtime_transcription").catch(() => null);
-          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           publishCancelledTranscript(
             {
               ...(realtimeResult || {}),
@@ -8262,7 +8260,7 @@ export function AudioWidgetWindow() {
           const dictationResult = await invoke("stop_forge_dictation_transcription", {
             request: { cancel: true },
           }).catch(() => null);
-          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           publishCancelledTranscript(
             {
               ...(dictationResult || {}),
@@ -8277,11 +8275,11 @@ export function AudioWidgetWindow() {
           );
         } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
           await stopCloudVoiceAgentStream().catch(() => {});
-          await audioBuffer.finishCapture().catch(() => null);
+          await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
           forgeVoiceTtsPlayerRef.current = null;
         } else {
-          const captureResult = await audioBuffer.finishCapture().catch(() => null);
+          const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
           salvageLocalCancelledCapture(captureResult, captureStats);
         }
 

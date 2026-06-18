@@ -19,6 +19,7 @@ import { HighlightAlt } from "@styled-icons/material-rounded/HighlightAlt";
 import { HorizontalRule } from "@styled-icons/material-rounded/HorizontalRule";
 import { Link } from "@styled-icons/material-rounded/Link";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
+import { NearMe } from "@styled-icons/material-rounded/NearMe";
 import { Numbers } from "@styled-icons/material-rounded/Numbers";
 import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
@@ -81,6 +82,9 @@ let stripThumbnailActiveReads = 0;
 // the rail exposes the common combos directly and the bottom options bar
 // unlocks every combination when a shape tool is active.
 const TOOL_GROUPS = [
+  [
+    { id: "select", label: "Select / move (Esc)", Icon: NearMe, tool: "select" },
+  ],
   [
     { id: "pen", label: "Pen", Icon: Gesture, tool: "pen" },
     { id: "line", label: "Line", Icon: HorizontalRule, tool: "line" },
@@ -3790,6 +3794,10 @@ export function SnippingAnnotationEditorWindow() {
   const erasingRef = useRef(false);
   const erasedCountRef = useRef(0);
   const [hoverIndex, setHoverIndex] = useState(-1);
+  // Select / move tool: which annotation is selected, and the in-progress
+  // move/resize gesture ({ mode, index, handleId, startPoint, base }).
+  const [selectedIndex, setSelectedIndex] = useState(-1);
+  const selectDragRef = useRef(null);
   const [color, setColor] = useState("#ef4444");
   const [strokeWidth, setStrokeWidth] = useState(5);
   const [annotationsByPath, setAnnotationsByPath] = useState({});
@@ -4201,11 +4209,51 @@ export function SnippingAnnotationEditorWindow() {
     if (!draft && hoverIndex >= 0 && hoverIndex < annotations.length) {
       drawHoverOutline(context, annotations[hoverIndex]);
     }
-  }, [activeIsVideo, annotations, canvasSize.height, canvasSize.width, draft, hoverIndex]);
+    if (tool === "select" && !draft && selectedIndex >= 0 && selectedIndex < annotations.length
+      && annotationIsSelectable(annotations[selectedIndex])) {
+      drawSelectionOverlay(context, annotations[selectedIndex], (fitScale * zoom) || 1);
+    }
+  }, [activeIsVideo, annotations, canvasSize.height, canvasSize.width, draft, fitScale, hoverIndex, selectedIndex, tool, zoom]);
 
   useEffect(() => {
     drawCanvas();
   }, [drawCanvas]);
+
+  // Escape always returns to the select tool (and clears any selection), from
+  // any drawing tool. Typing in the text-label editor keeps its own Escape.
+  useEffect(() => {
+    if (activeIsVideo) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      const target = event.target;
+      const tag = String(target?.tagName || "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) return;
+      setTool("select");
+      setSelectedIndex(-1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeIsVideo]);
+
+  // Leaving the select tool clears the selection and the move/resize cursor.
+  useEffect(() => {
+    if (tool !== "select") {
+      setSelectedIndex(-1);
+      const canvas = canvasRef.current;
+      if (canvas) canvas.style.cursor = "";
+    }
+  }, [tool]);
+
+  // Switching images drops the selection (indices are per-image).
+  useEffect(() => {
+    setSelectedIndex(-1);
+    selectDragRef.current = null;
+  }, [activePath]);
+
+  // Keep the selection in range when annotations are removed (undo / erase).
+  useEffect(() => {
+    setSelectedIndex((current) => (current >= annotations.length ? -1 : current));
+  }, [annotations.length]);
 
   const pointFromEvent = useCallback((event) => {
     const canvas = canvasRef.current;
@@ -4308,6 +4356,40 @@ export function SnippingAnnotationEditorWindow() {
     const point = pointFromEvent(event);
     const hadTextEditor = Boolean(textEditorRef.current);
     if (hadTextEditor) commitTextEditor();
+    if (tool === "select") {
+      const context = canvasRef.current?.getContext("2d");
+      const scale = (fitScale * zoom) || 1;
+      const tolerance = SELECT_HANDLE_HIT_SCREEN_PX / scale;
+      // 1) A resize/endpoint grip on the currently selected annotation wins.
+      if (selectedIndex >= 0 && selectedIndex < annotations.length) {
+        const handleId = selectHandleAtPoint(annotations[selectedIndex], point, tolerance);
+        if (handleId) {
+          selectDragRef.current = {
+            mode: "resize",
+            index: selectedIndex,
+            handleId,
+            startPoint: point,
+            base: annotations[selectedIndex],
+          };
+          return;
+        }
+      }
+      // 2) Otherwise select the topmost annotation under the cursor and move it.
+      const hitIndex = context ? annotationAtPoint(annotations, point, context) : -1;
+      if (hitIndex >= 0 && annotationIsSelectable(annotations[hitIndex])) {
+        setSelectedIndex(hitIndex);
+        selectDragRef.current = {
+          mode: "move",
+          index: hitIndex,
+          startPoint: point,
+          base: annotations[hitIndex],
+        };
+        return;
+      }
+      // 3) Empty space clears the selection.
+      setSelectedIndex(-1);
+      return;
+    }
     if (tool === "eraser") {
       erasingRef.current = true;
       erasedCountRef.current = 0;
@@ -4358,7 +4440,7 @@ export function SnippingAnnotationEditorWindow() {
     draftRef.current = annotation;
     drawingRef.current = true;
     setDraft(annotation);
-  }, [blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, eraseAtPoint, imageReady, numberRadiusPx, openTextEditor, pointFromEvent, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations]);
+  }, [annotations, blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, eraseAtPoint, fitScale, imageReady, numberRadiusPx, openTextEditor, pointFromEvent, selectedIndex, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations, zoom]);
 
   const updateDraw = useCallback((event) => {
     if (!drawingRef.current || !draftRef.current) return;
@@ -4371,6 +4453,13 @@ export function SnippingAnnotationEditorWindow() {
   }, [pointFromEvent]);
 
   const finishDraw = useCallback(() => {
+    if (selectDragRef.current) {
+      selectDragRef.current = null;
+      const canvas = canvasRef.current;
+      if (canvas) canvas.style.cursor = "grab";
+      setStatus("Moved");
+      return;
+    }
     if (erasingRef.current) {
       erasingRef.current = false;
       setStatus(erasedCountRef.current
@@ -4396,13 +4485,50 @@ export function SnippingAnnotationEditorWindow() {
       setStatus("Crop set — saves and sends use the cropped area");
       return;
     }
+    const newIndex = annotations.length;
     updateActiveAnnotations((current) => [...current, annotation]);
     setStatus("Annotation added");
-  }, [updateActiveAnnotations]);
+    // After completing a draw, hand off to the select tool so the shape can be
+    // immediately dragged/resized — except the number badge, which is placed
+    // repeatedly (it returns earlier and never reaches here). Text/eraser also
+    // never reach this path.
+    if (["pen", "line", "arrow", "shape", "blur"].includes(annotation.type)) {
+      setTool("select");
+      setSelectedIndex(newIndex);
+    }
+  }, [annotations, updateActiveAnnotations]);
 
   const handleCanvasMouseMove = useCallback((event) => {
     const point = pointFromEvent(event);
     cursorRef.current = { x: point.x, y: point.y, inside: true };
+    if (tool === "select") {
+      const canvas = canvasRef.current;
+      const drag = selectDragRef.current;
+      if (drag) {
+        const updated = drag.mode === "resize"
+          ? applyAnnotationHandleDrag(drag.base, drag.handleId, point)
+          : applyAnnotationTranslate(drag.base, point.x - drag.startPoint.x, point.y - drag.startPoint.y);
+        updateActiveAnnotations((current) => current.map((item, index) => (index === drag.index ? updated : item)));
+        if (canvas) canvas.style.cursor = drag.mode === "resize" ? "nwse-resize" : "grabbing";
+        return;
+      }
+      if (canvas) {
+        const scale = (fitScale * zoom) || 1;
+        const tolerance = SELECT_HANDLE_HIT_SCREEN_PX / scale;
+        const context = canvas.getContext("2d");
+        let cursor = "default";
+        if (selectedIndex >= 0 && selectedIndex < annotations.length
+          && selectHandleAtPoint(annotations[selectedIndex], point, tolerance)) {
+          cursor = "nwse-resize";
+        } else {
+          const hit = context ? annotationAtPoint(annotations, point, context) : -1;
+          if (hit >= 0 && annotationIsSelectable(annotations[hit])) cursor = "grab";
+        }
+        canvas.style.cursor = cursor;
+      }
+      setHoverIndex(-1);
+      return;
+    }
     if (erasingRef.current) {
       eraseAtPoint(point);
       return;
@@ -4414,7 +4540,7 @@ export function SnippingAnnotationEditorWindow() {
     }
     const context = canvasRef.current?.getContext("2d");
     setHoverIndex(context ? annotationAtPoint(annotations, point, context) : -1);
-  }, [annotations, eraseAtPoint, pointFromEvent, updateDraw]);
+  }, [annotations, eraseAtPoint, fitScale, pointFromEvent, selectedIndex, tool, updateActiveAnnotations, updateDraw, zoom]);
 
   const handleCanvasMouseLeave = useCallback(() => {
     cursorRef.current = { ...cursorRef.current, inside: false };
@@ -5365,6 +5491,111 @@ function drawHoverOutline(context, annotation) {
   context.restore();
 }
 
+// --- Select / move tool geometry ----------------------------------------
+// Handle sizes are expressed in on-screen pixels and converted to image-space
+// when drawn/hit-tested, so the grips stay a constant size regardless of zoom.
+const SELECT_HANDLE_SCREEN_PX = 5;
+const SELECT_HANDLE_HIT_SCREEN_PX = 10;
+
+function annotationIsSelectable(annotation) {
+  return Boolean(annotation) && annotation.type !== "crop";
+}
+
+// Resize/reshape grips for an annotation: line/arrow expose their two
+// endpoints; rectangle-like areas (shapes, blur) expose four corners; freehand,
+// text and number badges are move-only (no grips, just a drag body).
+function annotationSelectHandles(annotation) {
+  if (!annotation) return [];
+  if (annotation.type === "line" || annotation.type === "arrow") {
+    return [
+      { id: "p0", x: annotation.startX, y: annotation.startY },
+      { id: "p1", x: annotation.endX, y: annotation.endY },
+    ];
+  }
+  if (annotation.type === "shape" || annotation.type === "blur") {
+    const box = normalizedBox(annotation);
+    return [
+      { id: "nw", x: box.x, y: box.y },
+      { id: "ne", x: box.x + box.width, y: box.y },
+      { id: "se", x: box.x + box.width, y: box.y + box.height },
+      { id: "sw", x: box.x, y: box.y + box.height },
+    ];
+  }
+  return [];
+}
+
+function applyAnnotationTranslate(annotation, dx, dy) {
+  const next = { ...annotation };
+  ["startX", "endX", "x"].forEach((key) => {
+    if (typeof next[key] === "number") next[key] += dx;
+  });
+  ["startY", "endY", "y"].forEach((key) => {
+    if (typeof next[key] === "number") next[key] += dy;
+  });
+  if (Array.isArray(annotation.points)) {
+    next.points = annotation.points.map((point) => ({ ...point, x: point.x + dx, y: point.y + dy }));
+  }
+  return next;
+}
+
+function applyAnnotationHandleDrag(annotation, handleId, point) {
+  if (annotation.type === "line" || annotation.type === "arrow") {
+    return handleId === "p0"
+      ? { ...annotation, startX: point.x, startY: point.y }
+      : { ...annotation, endX: point.x, endY: point.y };
+  }
+  const box = normalizedBox(annotation);
+  let x0 = box.x;
+  let y0 = box.y;
+  let x1 = box.x + box.width;
+  let y1 = box.y + box.height;
+  if (handleId === "nw") { x0 = point.x; y0 = point.y; }
+  else if (handleId === "ne") { x1 = point.x; y0 = point.y; }
+  else if (handleId === "se") { x1 = point.x; y1 = point.y; }
+  else if (handleId === "sw") { x0 = point.x; y1 = point.y; }
+  return { ...annotation, startX: x0, startY: y0, endX: x1, endY: y1 };
+}
+
+function selectHandleAtPoint(annotation, point, tolImagePx) {
+  const handles = annotationSelectHandles(annotation);
+  for (const handle of handles) {
+    if (Math.hypot(handle.x - point.x, handle.y - point.y) <= tolImagePx) {
+      return handle.id;
+    }
+  }
+  return null;
+}
+
+// scale = on-screen pixels per image pixel (fitScale * zoom).
+function drawSelectionOverlay(context, annotation, scale) {
+  const bounds = annotationDisplayBounds(annotation, context);
+  if (!bounds) return;
+  const px = (value) => value / Math.max(0.0001, scale);
+  const pad = px(3);
+  context.save();
+  context.setLineDash([px(5), px(4)]);
+  context.lineWidth = px(1.25);
+  context.strokeStyle = "rgba(96, 165, 250, 0.95)";
+  context.strokeRect(bounds.x - pad, bounds.y - pad, bounds.width + pad * 2, bounds.height + pad * 2);
+  context.setLineDash([]);
+  const radius = px(SELECT_HANDLE_SCREEN_PX);
+  const isLine = annotation.type === "line" || annotation.type === "arrow";
+  annotationSelectHandles(annotation).forEach((handle) => {
+    context.beginPath();
+    context.fillStyle = "#60a5fa";
+    context.strokeStyle = "#ffffff";
+    context.lineWidth = px(1.5);
+    if (isLine) {
+      context.arc(handle.x, handle.y, radius, 0, Math.PI * 2);
+    } else {
+      context.rect(handle.x - radius, handle.y - radius, radius * 2, radius * 2);
+    }
+    context.fill();
+    context.stroke();
+  });
+  context.restore();
+}
+
 /// Normalized start/end box clamped to the canvas.
 function annotationBounds(annotation, canvas) {
   const left = Math.max(0, Math.min(annotation.startX, annotation.endX));
@@ -5764,8 +5995,17 @@ const EditorTitleBar = styled.header`
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
-  min-height: 34px;
-  padding: 4px 8px 4px 12px;
+  /* The editor window is frameless on every platform (decorations off), so this
+     custom bar is the only title bar / window control. Two things keep it
+     cross-platform-consistent: (1) horizontal padding >= the card's 14px corner
+     radius so the close button never gets clipped by the rounded top corners
+     (the card uses overflow: hidden), and (2) box-sizing + a min-height that
+     matches the 28px button plus symmetric vertical padding, so the X stays
+     vertically centered identically on macOS / Windows / Linux instead of being
+     squeezed by a bar shorter than the control. */
+  box-sizing: border-box;
+  min-height: 40px;
+  padding: 6px 14px;
   cursor: grab;
 
   &:active {

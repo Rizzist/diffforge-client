@@ -1684,24 +1684,34 @@ fn build_macos_voice_processing_capture(
         Ok(())
     })
     .map_err(|error| describe("install render callback", error))?;
+    let default_buffer_frames = macos_get_device_buffer_frame_size(core_device).unwrap_or(512);
+    let standby_buffer_frames = MACOS_VOICE_STANDBY_BUFFER_FRAMES.max(default_buffer_frames);
+    let standby_bypass_value: u32 = 1;
+    let standby_bypass_applied = unit
+        .set_property(
+            MACOS_AU_VOICE_IO_PROPERTY_BYPASS_VOICE_PROCESSING,
+            Scope::Global,
+            Element::Output,
+            Some(&standby_bypass_value),
+        )
+        .is_ok();
+    let _ = macos_set_device_buffer_frame_size(core_device, standby_buffer_frames);
     unit.initialize()
         .map_err(|error| describe("initialize", error))?;
     unit.start().map_err(|error| describe("start", error))?;
     MACOS_VOICE_PROCESSING_ACTIVE.store(true, Ordering::Release);
 
-    // Park the new unit on standby (DSP bypassed + wide IO buffer). The worker
-    // loop re-engages processing and low-latency buffering instantly via a
-    // property toggle the moment a capture/realtime consumer begins — no stream
-    // rebuild, so the mic is never re-acquired (no orange-icon flicker) and
-    // there is no record-start latency.
-    let default_buffer_frames = macos_get_device_buffer_frame_size(core_device).unwrap_or(512);
-    let mut capture = MacosVoiceProcessingCapture {
+    // Park the new unit on standby before the AudioUnit starts. Starting first
+    // and then immediately bypassing/widening the unit can make macOS pulse
+    // the privacy mic indicator on-off-on before an actual recording begins.
+    // The worker loop re-engages processing and low-latency buffering via a
+    // property toggle the moment a capture/realtime consumer begins.
+    let capture = MacosVoiceProcessingCapture {
         unit,
-        bypassed: false,
+        bypassed: standby_bypass_applied,
         input_device: core_device,
         default_buffer_frames,
     };
-    let _ = capture.set_bypass(true);
 
     Ok((capture, shared, MACOS_VOICE_PROCESSING_SAMPLE_RATE))
 }
