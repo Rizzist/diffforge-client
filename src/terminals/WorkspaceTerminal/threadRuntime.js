@@ -1296,6 +1296,7 @@ export function createTerminalPromptSubmittedWaiter({
   const safePaneId = String(paneId || "").trim();
   const safeThreadId = String(threadId || "").trim();
   const safeExpectedPrompt = String(expectedPrompt || "").trim();
+  const normalizedAgentId = getTerminalAgentKind(agentId);
   const hookManagedAgent = terminalAgentUsesActivityHooks(agentId);
   let settled = false;
   let timeoutId = 0;
@@ -1342,7 +1343,7 @@ export function createTerminalPromptSubmittedWaiter({
     const promptMatches = !safePromptId || eventPromptId === safePromptId;
     const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
     const workspaceMatches = !workspaceId || eventWorkspaceId === workspaceId;
-    const agentMatches = !agentId || eventAgentId === getTerminalAgentKind(agentId);
+    const agentMatches = !agentId || eventAgentId === normalizedAgentId;
 
     if (!hookManagedAgent || !promptMatches || !threadMatches || !workspaceMatches || !agentMatches || settled) {
       return;
@@ -1390,10 +1391,7 @@ export function createTerminalPromptSubmittedWaiter({
       || promptSource === "cli_hook_user_prompt_submit";
     const terminalSubmitEventCanConfirmHookManagedSubmit = Boolean(
       allowObservedInputGateForHookManaged
-        && (
-          promptSource === "observed_input_gate"
-          || promptSource === "prompt_event_submit_metadata"
-        )
+        && promptSource === "observed_input_gate"
         && submittedPromptIsAuthoritative
         && submittedPromptMatchesExpected,
     );
@@ -1981,9 +1979,13 @@ export function isTerminalSessionMissingError(error) {
 
 let nextWorkspaceTerminalInstanceId = 1;
 
-export function getTerminalSubmitSequence(_agentKind, isGenericTerminal = false) {
+export function getTerminalSubmitSequence(agentKind, isGenericTerminal = false) {
   if (isGenericTerminal) {
     return "";
+  }
+
+  if (getTerminalAgentKind(agentKind) === "codex") {
+    return TERMINAL_ENTER_SEQUENCE;
   }
 
   return "\r";

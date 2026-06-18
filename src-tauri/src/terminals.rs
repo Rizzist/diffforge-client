@@ -94,6 +94,417 @@ fn terminal_launch_provider(kind: &str, provider: Option<&str>) -> Result<AgentP
     })
 }
 
+fn terminal_clean_provider_session_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn terminal_provider_resume_args(
+    provider: AgentProvider,
+    provider_session_id: Option<&str>,
+) -> Vec<String> {
+    let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) else {
+        return Vec::new();
+    };
+
+    match provider {
+        AgentProvider::Codex => vec!["resume".to_string(), session_id],
+        AgentProvider::Claude => vec!["--resume".to_string(), session_id],
+        AgentProvider::OpenCode => vec!["--session".to_string(), session_id],
+    }
+}
+
+fn terminal_uuid_session_id_from_text(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    for window in bytes.windows(36) {
+        let Ok(text) = std::str::from_utf8(window) else {
+            continue;
+        };
+        let hyphenated = text
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_hexdigit(),
+            });
+        if hyphenated {
+            if let Ok(uuid) = uuid::Uuid::parse_str(text) {
+                return Some(uuid.to_string());
+            }
+        }
+    }
+    for window in bytes.windows(32) {
+        let Ok(text) = std::str::from_utf8(window) else {
+            continue;
+        };
+        if text.chars().all(|character| character.is_ascii_hexdigit()) {
+            if let Ok(uuid) = uuid::Uuid::parse_str(text) {
+                return Some(uuid.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn terminal_provider_session_id_from_transcript_path(event: &Value) -> Option<String> {
+    terminal_activity_hook_string(
+        event,
+        &[
+            "transcriptPath",
+            "transcript_path",
+            "agentTranscriptPath",
+            "agent_transcript_path",
+        ],
+    )
+    .and_then(|path| terminal_uuid_session_id_from_text(&path))
+}
+
+fn terminal_runtime_snapshot(instance: &TerminalInstance) -> TerminalRuntimeSnapshot {
+    instance
+        .runtime
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .unwrap_or_else(|_| TerminalRuntimeSnapshot::opened_idle(None))
+}
+
+fn terminal_runtime_apply_opened(
+    instance: &TerminalInstance,
+    provider_session_id: Option<&str>,
+    source: &str,
+) -> TerminalRuntimeSnapshot {
+    let mut snapshot = TerminalRuntimeSnapshot::opened_idle(terminal_clean_provider_session_id(
+        provider_session_id,
+    ));
+    snapshot.source = source.to_string();
+    if let Ok(mut runtime) = instance.runtime.lock() {
+        *runtime = snapshot.clone();
+    }
+    snapshot
+}
+
+fn terminal_runtime_apply_provider_session_id(
+    instance: &TerminalInstance,
+    provider_session_id: &str,
+    source: &str,
+) -> Option<TerminalRuntimeSnapshot> {
+    let provider_session_id = terminal_clean_provider_session_id(Some(provider_session_id))?;
+    let mut runtime = instance.runtime.lock().ok()?;
+    runtime.provider_session_id = Some(provider_session_id);
+    runtime.native_session_id = runtime.provider_session_id.clone();
+    runtime.source = source.to_string();
+    runtime.updated_at_ms = terminal_now_ms();
+    Some(runtime.clone())
+}
+
+fn terminal_runtime_apply_activity_payload(
+    instance: &TerminalInstance,
+    payload: &TerminalActivityHookPayload,
+) -> TerminalRuntimeSnapshot {
+    let previous = terminal_runtime_snapshot(instance);
+    let provider_session_id = payload
+        .provider_session_id
+        .clone()
+        .or(previous.provider_session_id.clone());
+    let native_session_id = payload
+        .native_session_id
+        .clone()
+        .or(provider_session_id.clone())
+        .or(previous.native_session_id.clone());
+    let snapshot = TerminalRuntimeSnapshot {
+        status: payload.status.clone(),
+        activity_status: payload.activity_status.clone(),
+        command_phase: payload.command_phase.clone(),
+        input_ready: payload.input_ready,
+        input_ready_at: payload.input_ready_at.clone(),
+        prompt_ready_at: payload.prompt_ready_at.clone(),
+        completed_at: payload.completed_at.clone(),
+        provider_session_id,
+        native_session_id,
+        provider_turn_id: payload
+            .provider_turn_id
+            .clone()
+            .or(previous.provider_turn_id),
+        turn_id: payload.turn_id.clone().or(previous.turn_id),
+        source: payload.source.clone(),
+        event_type: payload.event_type.clone(),
+        hook_event_name: payload.hook_event_name.clone(),
+        updated_at_ms: payload.observed_at_ms,
+    };
+    if let Ok(mut runtime) = instance.runtime.lock() {
+        *runtime = snapshot.clone();
+    }
+    snapshot
+}
+
+fn terminal_record_coordination_provider_session_id(
+    coordination: TerminalCoordinationSession,
+    provider_session_id: String,
+    source: impl Into<String>,
+) {
+    let source = source.into();
+    tauri::async_runtime::spawn_blocking(
+        move || match crate::coordination::CoordinationKernel::open(
+            &coordination.repo_path,
+            Some(PathBuf::from(&coordination.db_path)),
+        ) {
+            Ok(kernel) => {
+                if let Err(error) = kernel.record_session_provider_session_id(
+                    &coordination.session_id,
+                    &provider_session_id,
+                ) {
+                    log_terminal_status_event(
+                        "backend.terminal_provider_session.record_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "source": source.clone(),
+                        }),
+                    );
+                }
+            }
+            Err(error) => log_terminal_status_event(
+                "backend.terminal_provider_session.kernel_open_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "source": source.clone(),
+                }),
+            ),
+        },
+    );
+}
+
+fn terminal_provider_session_binding_root(instance: &TerminalInstance) -> String {
+    instance
+        .coordination
+        .as_ref()
+        .map(|coordination| coordination.repo_path.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| instance.working_directory.to_string_lossy().to_string())
+}
+
+fn terminal_provider_session_binding_payload(
+    instance: &TerminalInstance,
+    provider_session_id: &str,
+    source: &str,
+) -> Option<WorkspaceThreadProviderSessionBinding> {
+    let provider_session_id = terminal_clean_provider_session_id(Some(provider_session_id))?;
+    let metadata = instance.metadata.clone();
+    Some(WorkspaceThreadProviderSessionBinding {
+        workspace_id: metadata.workspace_id,
+        thread_id: metadata.thread_id,
+        agent_id: metadata.agent_id,
+        provider_session_id: provider_session_id.clone(),
+        native_session_id: provider_session_id,
+        native_session_kind: "session".to_string(),
+        native_session_source: source.to_string(),
+        pane_id: metadata.pane_id,
+        instance_id: Some(instance.id),
+        terminal_index: metadata.terminal_index.map(i64::from),
+        provider: metadata.agent_kind,
+        session_title: String::new(),
+        model_id: String::new(),
+        source: source.to_string(),
+        cwd: instance.working_directory.to_string_lossy().to_string(),
+        observed_at_ms: terminal_now_ms(),
+    })
+}
+
+fn terminal_emit_provider_session_binding(
+    app: &AppHandle,
+    binding: &WorkspaceThreadProviderSessionBinding,
+    recorded: Option<bool>,
+) {
+    let mut payload = serde_json::to_value(binding).unwrap_or_else(|_| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("type".to_string(), json!("provider-session"));
+        object.insert("recorded".to_string(), json!(recorded));
+        object.insert(
+            "sessionId".to_string(),
+            json!(binding.provider_session_id.clone()),
+        );
+        object.insert(
+            "providerSessionId".to_string(),
+            json!(binding.provider_session_id.clone()),
+        );
+        object.insert(
+            "nativeSessionId".to_string(),
+            json!(binding.native_session_id.clone()),
+        );
+        object.insert(
+            "nativeSessionKind".to_string(),
+            json!(binding.native_session_kind.clone()),
+        );
+        object.insert(
+            "nativeSessionSource".to_string(),
+            json!(binding.native_session_source.clone()),
+        );
+    }
+    let _ = app.emit(TERMINAL_PROVIDER_SESSION_BOUND_EVENT, payload);
+}
+
+fn terminal_record_workspace_provider_session_binding(
+    app: Option<AppHandle>,
+    instance: &TerminalInstance,
+    provider_session_id: String,
+    source: impl Into<String>,
+) {
+    let source = source.into();
+    let Some(binding) =
+        terminal_provider_session_binding_payload(instance, &provider_session_id, &source)
+    else {
+        return;
+    };
+    if let Some(app) = app.as_ref() {
+        terminal_emit_provider_session_binding(app, &binding, None);
+    }
+    let root_directory = terminal_provider_session_binding_root(instance);
+    let emit_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        match workspace_threads_record_provider_session_binding(
+            Some(root_directory.as_str()),
+            binding.clone(),
+        ) {
+            Ok(recorded) => {
+                if let Some(app) = emit_app.as_ref() {
+                    terminal_emit_provider_session_binding(app, &binding, Some(recorded));
+                }
+            }
+            Err(error) => log_terminal_status_event(
+                "backend.terminal_provider_session.binding_record_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "source": source,
+                }),
+            ),
+        }
+    });
+}
+
+const TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS: [u64; 6] =
+    [700, 1_500, 3_000, 6_000, 12_000, 20_000];
+
+fn terminal_runtime_has_provider_session(instance: &TerminalInstance) -> bool {
+    terminal_runtime_snapshot(instance)
+        .provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn spawn_terminal_codex_session_discovery(
+    app: AppHandle,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pane_id: String,
+    instance_id: u64,
+    launched_at_ms: u64,
+    source: impl Into<String>,
+) {
+    let source = source.into();
+    tauri::async_runtime::spawn(async move {
+        for delay_ms in TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS {
+            sleep(Duration::from_millis(delay_ms)).await;
+
+            let Some(instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                break;
+            };
+            if !terminal_metadata_is_codex(&instance.metadata) {
+                break;
+            }
+            if terminal_runtime_has_provider_session(&instance) {
+                break;
+            }
+
+            let cwd = instance.working_directory.to_string_lossy().to_string();
+            let discovered = match tauri::async_runtime::spawn_blocking(move || {
+                discover_latest_codex_session_for_cwd(&cwd, launched_at_ms)
+            })
+            .await
+            {
+                Ok(Ok(discovered)) => discovered,
+                Ok(Err(error)) => {
+                    log_terminal_status_event(
+                        "backend.terminal_provider_session.codex_discovery_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "source": source.clone(),
+                        }),
+                    );
+                    None
+                }
+                Err(error) => {
+                    log_terminal_status_event(
+                        "backend.terminal_provider_session.codex_discovery_join_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "source": source.clone(),
+                        }),
+                    );
+                    None
+                }
+            };
+
+            let Some(discovered) = discovered else {
+                continue;
+            };
+            let provider_session_id =
+                match terminal_clean_provider_session_id(Some(&discovered.session_id)) {
+                    Some(provider_session_id) => provider_session_id,
+                    None => continue,
+                };
+
+            let Some(current_instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                break;
+            };
+            if terminal_runtime_has_provider_session(&current_instance) {
+                break;
+            }
+
+            terminal_runtime_apply_provider_session_id(
+                &current_instance,
+                &provider_session_id,
+                "codex-transcript-discovery",
+            );
+            terminal_record_workspace_provider_session_binding(
+                Some(app.clone()),
+                &current_instance,
+                provider_session_id.clone(),
+                "codex-transcript-discovery",
+            );
+            if let Some(coordination) = current_instance.coordination.clone() {
+                terminal_record_coordination_provider_session_id(
+                    coordination,
+                    provider_session_id.clone(),
+                    "codex-transcript-discovery",
+                );
+            }
+            log_terminal_status_event(
+                "backend.terminal_provider_session.codex_discovered",
+                json!({
+                    "cwd": clean_terminal_diagnostic_log_text(&discovered.cwd),
+                    "instance_id": instance_id,
+                    "latest_timestamp": discovered.latest_timestamp,
+                    "modified_at_ms": discovered.modified_at_ms,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "provider_session_id_present": true,
+                    "rollout_path": clean_terminal_diagnostic_log_text(&discovered.rollout_path),
+                    "session_title_present": !discovered.session_title.trim().is_empty(),
+                    "source": source.clone(),
+                }),
+            );
+            break;
+        }
+    });
+}
+
 fn terminal_launch(
     kind: &str,
     provider: Option<String>,
@@ -102,28 +513,10 @@ fn terminal_launch(
 ) -> Result<(Vec<String>, Vec<String>, String), String> {
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
-    let mut args = Vec::new();
+    let mut args = terminal_provider_resume_args(provider, provider_session_id.as_deref());
     let resume_session_id = provider_session_id
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    if let Some(session_id) = resume_session_id.as_deref() {
-        match provider {
-            AgentProvider::Codex => {
-                args.push("resume".to_string());
-                args.push(session_id.to_string());
-            }
-            AgentProvider::Claude => {
-                args.push("--resume".to_string());
-                args.push(session_id.to_string());
-            }
-            AgentProvider::OpenCode => {
-                args.push("--session".to_string());
-                args.push(session_id.to_string());
-            }
-        }
-    }
+        .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
 
     // When resuming, the session transcript knows the exact model that was
     // active when the session closed — including in-session `/model`
@@ -631,6 +1024,13 @@ fn terminal_metadata_is_opencode(metadata: &TerminalInstanceMetadata) -> bool {
     agent_id.contains("opencode") || agent_kind.contains("opencode")
 }
 
+fn terminal_metadata_is_codex(metadata: &TerminalInstanceMetadata) -> bool {
+    let agent_id = metadata.agent_id.trim().to_ascii_lowercase();
+    let agent_kind = metadata.agent_kind.trim().to_ascii_lowercase();
+
+    agent_id.contains("codex") || agent_kind.contains("codex")
+}
+
 #[cfg(not(windows))]
 fn terminal_process_matches_opencode(process: &sysinfo::Process) -> bool {
     let name = clean_process_text(&process.name().to_string_lossy()).to_ascii_lowercase();
@@ -939,6 +1339,7 @@ fn cleanup_terminal_instance_with_context(
         coordination,
         session_mode: _,
         metadata,
+        runtime: _,
     } = instance;
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
     log_terminal_crash_forensics_event(
@@ -1231,6 +1632,21 @@ struct TerminalLiveSessionSummary {
     thread_id: String,
     agent_id: String,
     agent_kind: String,
+    status: String,
+    activity_status: String,
+    command_phase: String,
+    input_ready: bool,
+    input_ready_at: Option<String>,
+    prompt_ready_at: Option<String>,
+    completed_at: Option<String>,
+    provider_session_id: Option<String>,
+    native_session_id: Option<String>,
+    provider_turn_id: Option<String>,
+    turn_id: Option<String>,
+    runtime_source: String,
+    runtime_event_type: String,
+    runtime_hook_event_name: String,
+    runtime_updated_at_ms: u64,
     working_directory: String,
     session_mode: String,
     file_authority: String,
@@ -2518,8 +2934,8 @@ fn terminal_coordination_launch_target_with_mounts(
     let git_worktrees_enabled = has_git
         && agent_session_mode
             == crate::coordination::kernel::AGENT_SESSION_MODE_WORKTREE_COORDINATION;
-    let direct_unmanaged_workspace = agent_session_mode
-        == crate::coordination::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED;
+    let direct_unmanaged_workspace =
+        agent_session_mode == crate::coordination::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED;
     let enforcement_mode = match session_mode {
         TerminalSessionMode::ManagedPatch if git_worktrees_enabled => "worktree_required",
         TerminalSessionMode::ManagedPatch if direct_unmanaged_workspace => "direct_unmanaged",
@@ -4020,6 +4436,8 @@ async fn terminal_open(
     let provider = request.provider;
     let provider_for_coordination = provider.clone();
     let provider_session_id = request.provider_session_id;
+    let requested_provider_session_id =
+        terminal_clean_provider_session_id(provider_session_id.as_deref());
     let model = request.model;
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
@@ -4074,6 +4492,7 @@ async fn terminal_open(
                 .map(clean_terminal_diagnostic_log_text),
             "workspace_root_was_empty_at_selection": workspace_root_was_empty_at_selection,
             "output_transport": prefer_output_transport,
+            "provider_session_id_present": requested_provider_session_id.is_some(),
         }),
     );
 
@@ -4131,11 +4550,7 @@ async fn terminal_open(
     if !is_prewarm_pty && !plain_shell {
         let launch_provider = terminal_launch_provider(&kind, provider.as_deref())?;
         if matches!(launch_provider, AgentProvider::Codex) {
-            if let Some(provider_session_id) = provider_session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(provider_session_id) = requested_provider_session_id.as_deref() {
                 let _ = prepare_codex_rollout_for_resume(
                     provider_session_id,
                     &working_directory.to_string_lossy(),
@@ -4152,7 +4567,12 @@ async fn terminal_open(
     let (command_candidates, args, label) = if is_prewarm_pty || plain_shell {
         (Vec::new(), Vec::new(), "Prepared PTY".to_string())
     } else {
-        terminal_launch(&kind, provider, model, provider_session_id)?
+        terminal_launch(
+            &kind,
+            provider,
+            model,
+            requested_provider_session_id.clone(),
+        )?
     };
     let instance_id = request.instance_id.filter(|id| *id > 0).unwrap_or_else(|| {
         state
@@ -4160,28 +4580,27 @@ async fn terminal_open(
             .fetch_add(1, Ordering::Relaxed)
     });
     clear_terminal_activity_hook_files(&pane_id, instance_id);
-    let activity_transport =
-        match terminal_activity_transport_for_terminal(
-            app.clone(),
-            state.inner(),
-            &pane_id,
-            instance_id,
-        )
-        .await
-        {
-            Ok(endpoint) => Some(endpoint),
-            Err(error) => {
-                log_terminal_status_event(
-                    "backend.terminal_activity_transport.start_error",
-                    json!({
-                        "error": clean_terminal_diagnostic_log_text(&error),
-                        "instance_id": instance_id,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    }),
-                );
-                None
-            }
-        };
+    let activity_transport = match terminal_activity_transport_for_terminal(
+        app.clone(),
+        state.inner(),
+        &pane_id,
+        instance_id,
+    )
+    .await
+    {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.terminal_activity_transport.start_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                }),
+            );
+            None
+        }
+    };
     let activity_hook_poll_ms = if activity_transport.is_some() {
         TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS
     } else {
@@ -4238,6 +4657,7 @@ async fn terminal_open(
         .as_ref()
         .map(|context| terminal_session_mode_from_context(context, session_mode))
         .unwrap_or(session_mode);
+    let provider_session_discovery_started_at_ms = terminal_now_ms();
 
     let shell_pty = is_prewarm_pty || plain_shell;
     let warm_pty = if shell_pty {
@@ -4391,6 +4811,27 @@ async fn terminal_open(
         effective_session_mode,
         terminal_metadata,
     );
+    let runtime_snapshot = terminal_runtime_apply_opened(
+        &instance,
+        requested_provider_session_id.as_deref(),
+        "terminal-open",
+    );
+    if let (Some(coordination), Some(provider_session_id)) = (
+        terminal_coordination.clone(),
+        requested_provider_session_id.clone(),
+    ) {
+        terminal_record_coordination_provider_session_id(
+            coordination,
+            provider_session_id.clone(),
+            "terminal_open",
+        );
+        terminal_record_workspace_provider_session_binding(
+            Some(app.clone()),
+            &instance,
+            provider_session_id,
+            "terminal_open",
+        );
+    }
     let headless_output = Arc::clone(&instance.headless_output);
 
     let displaced_instance = state
@@ -4453,6 +4894,14 @@ async fn terminal_open(
         instance_id,
         activity_hook_poll_ms,
     );
+    spawn_terminal_codex_session_discovery(
+        app.clone(),
+        Arc::clone(&state.terminals),
+        pane_id.clone(),
+        instance_id,
+        provider_session_discovery_started_at_ms,
+        "terminal_open",
+    );
 
     log_terminal_crash_forensics_event(
         "backend.terminal_open.done",
@@ -4469,6 +4918,7 @@ async fn terminal_open(
             "requested_session_mode": session_mode.as_str(),
             "session_mode": effective_session_mode.as_str(),
             "shell_pty": shell_pty,
+            "provider_session_id_present": runtime_snapshot.provider_session_id.is_some(),
         }),
     );
     log_terminal_diagnostic_event(
@@ -4487,6 +4937,7 @@ async fn terminal_open(
             "requested_session_mode": session_mode.as_str(),
             "session_mode": effective_session_mode.as_str(),
             "shell_pty": shell_pty,
+            "provider_session_id_present": runtime_snapshot.provider_session_id.is_some(),
         }),
     );
     log_windows_terminal_diagnostic_event(
@@ -4510,6 +4961,7 @@ async fn terminal_open(
             "term": TERMINAL_EMULATION_TERM,
             "term_program": TERMINAL_EMULATION_PROGRAM,
             "windows_build_number": terminal_windows_build_number(),
+            "provider_session_id_present": runtime_snapshot.provider_session_id.is_some(),
         }),
     );
 
@@ -4570,6 +5022,78 @@ async fn terminal_open(
             .as_ref()
             .map(|context| context.file_authority().to_string())
             .unwrap_or_else(|| effective_session_mode.file_authority().to_string()),
+        provider_session_id: runtime_snapshot.provider_session_id.clone(),
+        native_session_id: runtime_snapshot.native_session_id.clone(),
+        requested_provider_session_id,
+        activity_status: runtime_snapshot.activity_status,
+        command_phase: runtime_snapshot.command_phase,
+        input_ready: runtime_snapshot.input_ready,
+        input_ready_at: runtime_snapshot.input_ready_at,
+        terminal_work_state: "complete".to_string(),
+    })
+}
+
+#[tauri::command]
+async fn terminal_record_provider_session(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    request: TerminalProviderSessionRecordRequest,
+) -> Result<TerminalProviderSessionRecordResult, String> {
+    validate_terminal_pane_id(&request.pane_id)?;
+    let provider_session_id =
+        terminal_clean_provider_session_id(Some(&request.provider_session_id))
+            .ok_or_else(|| "Provider session id is required.".to_string())?;
+    let source = request
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("provider-session-record")
+        .to_string();
+
+    let Some(instance) = ({
+        let terminals = state.terminals.read().await;
+        terminals.get(&request.pane_id).cloned()
+    }) else {
+        return Err("Terminal session is not running.".to_string());
+    };
+    if request
+        .instance_id
+        .is_some_and(|expected_id| expected_id != instance.id)
+    {
+        return Err("Terminal session was replaced before provider session record.".to_string());
+    }
+
+    terminal_runtime_apply_provider_session_id(&instance, &provider_session_id, &source);
+    terminal_record_workspace_provider_session_binding(
+        Some(app),
+        &instance,
+        provider_session_id.clone(),
+        source.clone(),
+    );
+    if let Some(coordination) = instance.coordination.clone() {
+        terminal_record_coordination_provider_session_id(
+            coordination,
+            provider_session_id.clone(),
+            source.clone(),
+        );
+    }
+    log_terminal_status_event(
+        "backend.terminal_provider_session.recorded",
+        json!({
+            "instance_id": instance.id,
+            "pane_id": clean_terminal_diagnostic_log_text(&request.pane_id),
+            "provider_session_id_present": true,
+            "source": source.clone(),
+        }),
+    );
+
+    Ok(TerminalProviderSessionRecordResult {
+        pane_id: request.pane_id,
+        instance_id: instance.id,
+        provider_session_id,
+        recorded: true,
+        source,
     })
 }
 
@@ -4837,28 +5361,27 @@ async fn terminal_start_agent(
         None,
     )
     .await?;
-    let activity_transport =
-        match terminal_activity_transport_for_terminal(
-            app.clone(),
-            state.inner(),
-            &pane_id,
-            instance.id,
-        )
-        .await
-        {
-            Ok(endpoint) => Some(endpoint),
-            Err(error) => {
-                log_terminal_status_event(
-                    "backend.terminal_activity_transport.start_error",
-                    json!({
-                        "error": clean_terminal_diagnostic_log_text(&error),
-                        "instance_id": instance.id,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    }),
-                );
-                None
-            }
-        };
+    let activity_transport = match terminal_activity_transport_for_terminal(
+        app.clone(),
+        state.inner(),
+        &pane_id,
+        instance.id,
+    )
+    .await
+    {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.terminal_activity_transport.start_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "instance_id": instance.id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                }),
+            );
+            None
+        }
+    };
     refresh_codex_activity_hook_profile_for_launch(
         instance.coordination.as_ref(),
         definition.id,
@@ -4960,29 +5483,11 @@ async fn start_terminal_agent_in_prepared_pty(
         }
     };
     let definition = agent_definition(provider);
-    let mut args = Vec::new();
     let resume_session_id = request
         .provider_session_id
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    if let Some(session_id) = resume_session_id.as_deref() {
-        match provider {
-            AgentProvider::Codex => {
-                args.push("resume".to_string());
-                args.push(session_id.to_string());
-            }
-            AgentProvider::Claude => {
-                args.push("--resume".to_string());
-                args.push(session_id.to_string());
-            }
-            AgentProvider::OpenCode => {
-                args.push("--session".to_string());
-                args.push(session_id.to_string());
-            }
-        }
-    }
+        .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
 
     // Resumed sessions continue on the exact model they last used; the
     // transcript outranks the caller's default (it sees `/model` switches).
@@ -5025,12 +5530,7 @@ async fn start_terminal_agent_in_prepared_pty(
         };
     };
     if matches!(provider, AgentProvider::Codex) {
-        if let Some(provider_session_id) = request
-            .provider_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
+        if let Some(provider_session_id) = resume_session_id.as_deref() {
             let _ = prepare_codex_rollout_for_resume(
                 provider_session_id,
                 &instance.working_directory.to_string_lossy(),
@@ -5196,10 +5696,39 @@ async fn start_terminal_agent_in_prepared_pty(
 
         drop(child_guard);
         let mut writer = instance.writer.lock().await;
+        let provider_session_discovery_started_at_ms = terminal_now_ms();
 
         match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
             Ok(()) => {
                 *agent_started_guard = true;
+                terminal_runtime_apply_opened(
+                    &instance,
+                    resume_session_id.as_deref(),
+                    "terminal-start-agent",
+                );
+                if let (Some(coordination), Some(provider_session_id)) =
+                    (instance.coordination.clone(), resume_session_id.clone())
+                {
+                    terminal_record_coordination_provider_session_id(
+                        coordination,
+                        provider_session_id.clone(),
+                        "terminal_start_agent",
+                    );
+                    terminal_record_workspace_provider_session_binding(
+                        Some(app.clone()),
+                        &instance,
+                        provider_session_id,
+                        "terminal_start_agent",
+                    );
+                }
+                spawn_terminal_codex_session_discovery(
+                    app.clone(),
+                    Arc::clone(&terminals),
+                    pane_id.clone(),
+                    instance.id,
+                    provider_session_discovery_started_at_ms,
+                    "terminal_start_agent",
+                );
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
@@ -5888,12 +6417,9 @@ fn is_terminal_color_reply_prompt(prompt: &str) -> bool {
 }
 
 fn normalize_terminal_enter_sequences_for_pty(data: String) -> String {
-    if data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1) {
-        return data
-            .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
-            .replace(TERMINAL_ENTER_SEQUENCE, "\r");
-    }
-
+    // Codex relies on the enhanced-enter escape sequence at the PTY boundary.
+    // The input-gate observer normalizes this sequence separately when it
+    // decides whether a submitted prompt was really observed.
     data
 }
 
@@ -8089,6 +8615,108 @@ fn emit_terminal_input_error(
     );
 }
 
+fn terminal_prompt_submitted_should_emit_synthetic_activity(
+    metadata: &TerminalInstanceMetadata,
+    prompt_source: &str,
+) -> bool {
+    if matches!(
+        prompt_source,
+        "activity_hook_user_prompt_submit" | "cli_hook_user_prompt_submit"
+    ) {
+        return false;
+    }
+    cloud_mcp_agent_uses_activity_hooks(&metadata.agent_id)
+        || cloud_mcp_agent_uses_activity_hooks(&metadata.agent_kind)
+}
+
+fn emit_terminal_prompt_submitted_activity_started(
+    app: &AppHandle,
+    instance: &TerminalInstance,
+    prompt: &str,
+    prompt_event_id: Option<&str>,
+    prompt_event_submitted_at: Option<&str>,
+    prompt_source: &str,
+    thread_id_override: Option<&str>,
+) {
+    let metadata = instance.metadata.clone();
+    if !terminal_prompt_submitted_should_emit_synthetic_activity(&metadata, prompt_source) {
+        return;
+    }
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return;
+    }
+    let now_ms = terminal_now_ms();
+    let event_time = prompt_event_submitted_at
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::coordination::kernel::now_rfc3339);
+    let prompt_event_id = prompt_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let thread_id = thread_id_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(metadata.thread_id.as_str())
+        .to_string();
+    let payload = TerminalActivityHookPayload {
+        pane_id: metadata.pane_id.clone(),
+        instance_id: instance.id,
+        workspace_id: metadata.workspace_id.clone(),
+        workspace_name: metadata.workspace_name.clone(),
+        terminal_index: metadata.terminal_index,
+        thread_id,
+        agent_id: metadata.agent_id.clone(),
+        agent_kind: metadata.agent_kind.clone(),
+        agent_type: String::new(),
+        agent_display_name: String::new(),
+        provider: metadata.agent_kind.clone(),
+        event_type: "provider-turn-started".to_string(),
+        hook_event_name: "BackendPromptSubmit".to_string(),
+        source: "backend:prompt-submitted".to_string(),
+        status: "active".to_string(),
+        activity_status: "thinking".to_string(),
+        command_phase: "running".to_string(),
+        input_ready: false,
+        input_ready_at: None,
+        prompt_ready_at: Some(event_time),
+        completed_at: None,
+        provider_session_id: None,
+        native_session_id: None,
+        provider_turn_id: prompt_event_id.clone(),
+        turn_id: prompt_event_id,
+        transcript_path: None,
+        cwd: Some(instance.working_directory.display().to_string()),
+        user_message: Some(prompt.to_string()),
+        message: Some(prompt.to_string()),
+        tool_name: None,
+        tool_use_id: None,
+        approval_id: None,
+        permission_prompt_id: None,
+        permission_request_id: None,
+        permission_mode: None,
+        manual_prompt_source: None,
+        manual_approval_required: false,
+        provider_blocked_for_user: false,
+        terminal_is_prompting_user: false,
+        prompting_user_kind: None,
+        prompting_user_source: None,
+        prompting_user_confidence: None,
+        prompting_user_text: None,
+        hook_health_status: "ok".to_string(),
+        hook_health_event: "backend_prompt_submit".to_string(),
+        hook_health_observed_at_ms: now_ms,
+        hook_timestamp_ms: now_ms,
+        observed_at_ms: now_ms,
+        completion_evidence: "backend_prompt_submit".to_string(),
+    };
+    terminal_runtime_apply_activity_payload(instance, &payload);
+    todo_dispatch_observe_activity_hook(app, &payload);
+    let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
+}
+
 fn emit_terminal_prompt_submitted(
     app: &AppHandle,
     instance: &TerminalInstance,
@@ -8170,6 +8798,31 @@ fn emit_terminal_prompt_submitted(
                 .unwrap_or(metadata.thread_id.as_str()),
             "workspace_id": metadata.workspace_id.clone(),
         }),
+    );
+    todo_dispatch_observe_prompt_submitted(
+        &metadata.workspace_id,
+        &metadata.workspace_name,
+        &metadata.pane_id,
+        metadata.terminal_index,
+        thread_id_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(metadata.thread_id.as_str()),
+        &metadata.agent_id,
+        &metadata.agent_kind,
+        instance.id,
+        prompt_event_id,
+        prompt_event_submitted_at,
+        prompt_source,
+    );
+    emit_terminal_prompt_submitted_activity_started(
+        app,
+        instance,
+        prompt,
+        prompt_event_id,
+        prompt_event_submitted_at,
+        prompt_source,
+        thread_id_override,
     );
     // Prompts typed directly into a coding-agent terminal (no queue todo
     // attached) are captured Rust-side as running todos, so terminal-first
@@ -8643,6 +9296,14 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_tool_complete",
         )),
+        "permissionrequest" => Some((
+            "provider-permission-requested",
+            "paused",
+            "active",
+            "awaiting_permission",
+            false,
+            "cli_hook_permission_request",
+        )),
         "subagentstart" => Some((
             "provider-subagent-started",
             "subagent_running",
@@ -8924,7 +9585,8 @@ fn terminal_activity_hook_payload(
         &provider,
         &metadata.agent_kind,
     );
-    let provider_session_id = terminal_activity_hook_string(event, &["sessionId", "session_id"]);
+    let provider_session_id = terminal_activity_hook_string(event, &["sessionId", "session_id"])
+        .or_else(|| terminal_provider_session_id_from_transcript_path(event));
     let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
     let user_message = terminal_activity_hook_string(
         event,
@@ -8998,7 +9660,7 @@ fn terminal_activity_hook_payload(
         prompt_ready_at,
         completed_at,
         provider_session_id: provider_session_id.clone(),
-        native_session_id: None,
+        native_session_id: provider_session_id.clone(),
         provider_turn_id: provider_turn_id.clone(),
         turn_id: provider_turn_id,
         transcript_path: terminal_activity_hook_string(
@@ -9126,8 +9788,7 @@ fn terminal_direct_prompt_registry_apply(pane_id: &str, prompt: &str, record: bo
     if key.is_empty() {
         return true;
     }
-    let registry =
-        TERMINAL_RECENT_SUBMITTED_PROMPTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let registry = TERMINAL_RECENT_SUBMITTED_PROMPTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut map) = registry.lock() else {
         return false;
     };
@@ -9168,9 +9829,7 @@ fn terminal_prompt_synthetic_direct_todo_id(
     todo_dispatch_id: Option<&str>,
     todo_command_id: Option<&str>,
 ) -> Option<String> {
-    let todo_id = todo_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let todo_id = todo_id.map(str::trim).filter(|value| !value.is_empty())?;
     if !todo_id.starts_with("terminal-direct-")
         || todo_id.starts_with("terminal-direct-dispatch-")
         || todo_id.starts_with("terminal-direct-command-")
@@ -9445,6 +10104,7 @@ async fn process_terminal_activity_hook_event(
         );
         return;
     };
+    let runtime_snapshot = terminal_runtime_apply_activity_payload(instance, &payload);
     log_terminal_status_event(
         "backend.terminal_activity_hook.lifecycle",
         json!({
@@ -9456,6 +10116,7 @@ async fn process_terminal_activity_hook_event(
             "instance_id": payload.instance_id,
             "pane_id": payload.pane_id.clone(),
             "provider_session_id_present": payload.provider_session_id.is_some(),
+            "runtime_provider_session_id_present": runtime_snapshot.provider_session_id.is_some(),
             "source": source,
             "thread_id": payload.thread_id.clone(),
             "workspace_id": payload.workspace_id.clone(),
@@ -9473,26 +10134,18 @@ async fn process_terminal_activity_hook_event(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
     {
+        terminal_record_workspace_provider_session_binding(
+            Some(app.clone()),
+            instance,
+            provider_session_id.clone(),
+            "terminal_activity_hook",
+        );
         if let Some(coordination) = instance.coordination.clone() {
-            tauri::async_runtime::spawn_blocking(move || {
-                match crate::coordination::CoordinationKernel::open(
-                    &coordination.repo_path,
-                    Some(PathBuf::from(&coordination.db_path)),
-                ) {
-                    Ok(kernel) => {
-                        let _ = kernel.record_session_provider_session_id(
-                            &coordination.session_id,
-                            &provider_session_id,
-                        );
-                    }
-                    Err(error) => log_terminal_status_event(
-                        "backend.terminal_activity_hook.provider_session_record_error",
-                        json!({
-                            "error": clean_terminal_diagnostic_log_text(&error),
-                        }),
-                    ),
-                }
-            });
+            terminal_record_coordination_provider_session_id(
+                coordination,
+                provider_session_id,
+                "terminal_activity_hook",
+            );
         }
     }
     let resume_app = app.clone();
@@ -9684,12 +10337,35 @@ fn terminal_prompt_submitted_source_is_authoritative(
         "observed_input_gate" => observed_prompt
             .map(str::trim)
             .is_some_and(|value| !value.is_empty()),
-        "prompt_event_submit_metadata" => true,
         "parked_resume_backend_submit"
         | "crash_todo_resume_backend_submit"
         | "todo_queue_backend_submit" => true,
         _ => false,
     }
+}
+
+fn terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(
+    prompt_event_source: Option<&str>,
+) -> bool {
+    let source = prompt_event_source
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+
+    matches!(
+        source.as_str(),
+        "tui-terminal-direct-input"
+            | "terminal-direct-input"
+            | "tui-manual-input"
+            | "observed-terminal-prompt"
+            | "terminal-prompt-submitted"
+            | "terminal-view-drop"
+            | "todo-auto-queue"
+            | "voice-agent-queue"
+            | "voice-plan-queue"
+            | "remote-control"
+    ) || source.starts_with("tui-manual-input:")
 }
 
 fn terminal_input_queue_key(pane_id: &str, instance_id: Option<u64>) -> String {
@@ -10058,10 +10734,7 @@ fn spawn_terminal_output_transport_listener(
     });
 }
 
-fn spawn_terminal_activity_transport_listener(
-    app: AppHandle,
-    listener: TcpListener,
-) {
+fn spawn_terminal_activity_transport_listener(app: AppHandle, listener: TcpListener) {
     tauri::async_runtime::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -10243,10 +10916,7 @@ async fn handle_terminal_output_transport_connection(
     remove_terminal_output_transport_subscriber(&state, &key, subscriber_id);
 }
 
-async fn handle_terminal_activity_transport_connection(
-    app: AppHandle,
-    mut stream: TcpStream,
-) {
+async fn handle_terminal_activity_transport_connection(app: AppHandle, mut stream: TcpStream) {
     let result = match read_terminal_activity_transport_message(&mut stream).await {
         Ok(text) => handle_terminal_activity_transport_message(&app, &text).await,
         Err(error) => Err(error),
@@ -10263,7 +10933,9 @@ async fn handle_terminal_activity_transport_connection(
     let _ = stream.write_all(response_line.as_bytes()).await;
 }
 
-async fn read_terminal_activity_transport_message(stream: &mut TcpStream) -> Result<String, String> {
+async fn read_terminal_activity_transport_message(
+    stream: &mut TcpStream,
+) -> Result<String, String> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -11002,41 +11674,81 @@ async fn terminal_write_inner(
             .map(str::to_string)
         {
             if observer_reason == "submit_with_empty_input_gate" {
-                log_terminal_status_event(
-                    "backend.terminal_write.prompt_event_text_empty_gate_skip",
-                    json!({
-                        "data_len": data.len(),
-                        "instance_id": instance.id,
-                        "observer_reason": observer_reason,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                        "prompt_text_len": event_prompt.len(),
-                        "thread_id": thread_id.as_deref().unwrap_or_default(),
-                    }),
-                );
-                write_thread_bridge_diagnostic_log_entry(json!({
-                    "ts_ms": current_time_ms(),
-                    "phase": "backend.bridge.prompt_event_text_empty_gate_skip",
-                    "source": "backend",
-                    "app_pid": std::process::id(),
-                    "thread": terminal_diagnostic_thread_label(),
-                    "fields": {
-                        "data_len": data.len(),
-                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                        "has_prompt_event_text": true,
-                        "instance_id": instance.id,
-                        "normalized_data": normalized_data_diagnostic.clone(),
-                        "observer_reason": observer_reason,
-                        "original_data": original_data_diagnostic.clone(),
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                        "prompt_text_len": event_prompt.len(),
-                        "thread_id": thread_id.as_deref().unwrap_or_default(),
-                    },
-                }));
-                return Ok(());
+                if terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(
+                    prompt_event_source.as_deref(),
+                ) {
+                    log_terminal_status_event(
+                        "backend.terminal_write.prompt_event_text_empty_gate_diagnostic",
+                        json!({
+                            "data_len": data.len(),
+                            "instance_id": instance.id,
+                            "observer_reason": observer_reason,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                            "prompt_text_len": event_prompt.len(),
+                            "thread_id": thread_id.as_deref().unwrap_or_default(),
+                        }),
+                    );
+                    write_thread_bridge_diagnostic_log_entry(json!({
+                        "ts_ms": current_time_ms(),
+                        "phase": "backend.bridge.prompt_event_text_empty_gate_diagnostic",
+                        "source": "backend",
+                        "app_pid": std::process::id(),
+                        "thread": terminal_diagnostic_thread_label(),
+                        "fields": {
+                            "data_len": data.len(),
+                            "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                            "has_prompt_event_text": true,
+                            "instance_id": instance.id,
+                            "normalized_data": normalized_data_diagnostic.clone(),
+                            "observer_reason": observer_reason,
+                            "original_data": original_data_diagnostic.clone(),
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                            "prompt_text_len": event_prompt.len(),
+                            "thread_id": thread_id.as_deref().unwrap_or_default(),
+                        },
+                    }));
+                } else {
+                    log_terminal_status_event(
+                        "backend.terminal_write.prompt_event_text_empty_gate_skip",
+                        json!({
+                            "data_len": data.len(),
+                            "instance_id": instance.id,
+                            "observer_reason": observer_reason,
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                            "prompt_text_len": event_prompt.len(),
+                            "status_truth": "prompt_submit_not_authoritative",
+                            "thread_id": thread_id.as_deref().unwrap_or_default(),
+                        }),
+                    );
+                    write_thread_bridge_diagnostic_log_entry(json!({
+                        "ts_ms": current_time_ms(),
+                        "phase": "backend.bridge.prompt_event_text_empty_gate_skip",
+                        "source": "backend",
+                        "app_pid": std::process::id(),
+                        "thread": terminal_diagnostic_thread_label(),
+                        "fields": {
+                            "data_len": data.len(),
+                            "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                            "has_prompt_event_text": true,
+                            "instance_id": instance.id,
+                            "normalized_data": normalized_data_diagnostic.clone(),
+                            "observer_reason": observer_reason,
+                            "original_data": original_data_diagnostic.clone(),
+                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                            "prompt_text_len": event_prompt.len(),
+                            "thread_id": thread_id.as_deref().unwrap_or_default(),
+                        },
+                    }));
+                    return Ok(());
+                }
             }
             if is_terminal_control_prompt(&event_prompt) {
                 write_thread_bridge_diagnostic_log_entry(json!({
@@ -11060,27 +11772,8 @@ async fn terminal_write_inner(
                 return Ok(());
             }
             if data.contains('\r') || data.contains('\n') {
-                emit_terminal_prompt_submitted(
-                    &app,
-                    &instance,
-                    &event_prompt,
-                    prompt_event_id.as_deref(),
-                    prompt_event_revision,
-                    prompt_event_source.as_deref(),
-                    prompt_event_submitted_at.as_deref(),
-                    todo_id.as_deref(),
-                    todo_dispatch_id.as_deref(),
-                    todo_command_id.as_deref(),
-                    todo_action.as_deref(),
-                    todo_resume_requested.unwrap_or(false),
-                    Some(&event_prompt),
-                    None,
-                    true,
-                    "prompt_event_submit_metadata",
-                    thread_id.as_deref(),
-                );
                 log_terminal_status_event(
-                    "backend.terminal_write.prompt_event_submit_metadata",
+                    "backend.terminal_write.prompt_event_submit_metadata_skip",
                     json!({
                         "data_len": data.len(),
                         "instance_id": instance.id,
@@ -11089,13 +11782,13 @@ async fn terminal_write_inner(
                         "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
                         "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
                         "prompt_text_len": event_prompt.len(),
-                        "status_truth": "processing_request_submitted",
+                        "status_truth": "prompt_submit_not_observed",
                         "thread_id": thread_id.as_deref().unwrap_or_default(),
                     }),
                 );
                 write_thread_bridge_diagnostic_log_entry(json!({
                     "ts_ms": current_time_ms(),
-                    "phase": "backend.bridge.prompt_event_submit_metadata",
+                    "phase": "backend.bridge.prompt_event_submit_metadata_skip",
                     "source": "backend",
                     "app_pid": std::process::id(),
                     "thread": terminal_diagnostic_thread_label(),
@@ -12142,7 +12835,10 @@ async fn terminal_window_open(
         if trimmed.is_empty() {
             continue;
         }
-        url.push_str(&format!("&{key}={}", percent_encode_query_component(&trimmed)));
+        url.push_str(&format!(
+            "&{key}={}",
+            percent_encode_query_component(&trimmed)
+        ));
     }
 
     // Open at the pane's current grid size so the terminal carries its exact
@@ -12304,6 +13000,7 @@ async fn terminal_live_sessions(
                     terminal_launch_epoch: coordination.terminal_launch_epoch.clone(),
                 });
         let metadata = instance.metadata.clone();
+        let runtime = terminal_runtime_snapshot(&instance);
         let has_active_task = active_task.is_some();
         let parked = parked_prompt.is_some();
 
@@ -12316,6 +13013,21 @@ async fn terminal_live_sessions(
             thread_id: metadata.thread_id,
             agent_id: metadata.agent_id,
             agent_kind: metadata.agent_kind,
+            status: runtime.status,
+            activity_status: runtime.activity_status,
+            command_phase: runtime.command_phase,
+            input_ready: runtime.input_ready,
+            input_ready_at: runtime.input_ready_at,
+            prompt_ready_at: runtime.prompt_ready_at,
+            completed_at: runtime.completed_at,
+            provider_session_id: runtime.provider_session_id,
+            native_session_id: runtime.native_session_id,
+            provider_turn_id: runtime.provider_turn_id,
+            turn_id: runtime.turn_id,
+            runtime_source: runtime.source,
+            runtime_event_type: runtime.event_type,
+            runtime_hook_event_name: runtime.hook_event_name,
+            runtime_updated_at_ms: runtime.updated_at_ms,
             working_directory: instance.working_directory.to_string_lossy().to_string(),
             session_mode: instance.session_mode.as_str().to_string(),
             file_authority: instance.session_mode.file_authority().to_string(),
@@ -12353,6 +13065,36 @@ async fn terminal_live_sessions(
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+
+    #[test]
+    fn provider_resume_args_are_provider_specific() {
+        assert_eq!(
+            terminal_provider_resume_args(AgentProvider::Codex, Some("codex-session-1")),
+            vec!["resume".to_string(), "codex-session-1".to_string()]
+        );
+        assert_eq!(
+            terminal_provider_resume_args(AgentProvider::Claude, Some("claude-session-1")),
+            vec!["--resume".to_string(), "claude-session-1".to_string()]
+        );
+        assert_eq!(
+            terminal_provider_resume_args(AgentProvider::OpenCode, Some("opencode-session-1")),
+            vec!["--session".to_string(), "opencode-session-1".to_string()]
+        );
+        assert!(terminal_provider_resume_args(AgentProvider::Codex, Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn transcript_path_session_fallback_extracts_uuid() {
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let event = json!({
+            "transcriptPath": format!("/tmp/codex/rollout-{session_id}.jsonl"),
+        });
+
+        assert_eq!(
+            terminal_provider_session_id_from_transcript_path(&event).as_deref(),
+            Some(session_id),
+        );
+    }
 
     #[test]
     fn provider_turn_completion_reconciliation_requires_explicit_opt_in() {
@@ -12940,8 +13682,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_uses_workspace_root_until_project_selected(
-    ) {
+    fn general_terminal_launch_target_uses_workspace_root_until_project_selected() {
         let container = terminal_test_directory("general_multi_repo_container");
         let frontend = container.join("frontend");
         let backend = container.join("backend");
@@ -13008,10 +13749,10 @@ mod terminal_tests {
             .unwrap();
         let first = runtime
             .block_on(terminal_workspace_topology_scan_for_launch_from_cache(
-            &cache,
-            &container,
-            1_000,
-            Some(1_000),
+                &cache,
+                &container,
+                1_000,
+                Some(1_000),
             ))
             .mounts;
         assert_eq!(first.len(), 1);
@@ -13028,10 +13769,10 @@ mod terminal_tests {
 
         let burst = runtime
             .block_on(terminal_workspace_topology_scan_for_launch_from_cache(
-            &cache,
-            &container,
-            1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1,
-            Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1),
+                &cache,
+                &container,
+                1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1,
+                Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1),
             ))
             .mounts;
         assert_eq!(burst.len(), 1);
@@ -13039,10 +13780,10 @@ mod terminal_tests {
 
         let later = runtime
             .block_on(terminal_workspace_topology_scan_for_launch_from_cache(
-            &cache,
-            &container,
-            1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1,
-            Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1),
+                &cache,
+                &container,
+                1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1,
+                Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1),
             ))
             .mounts;
         let mount_paths = later
@@ -13297,6 +14038,11 @@ mod terminal_tests {
             None,
         ));
         assert!(terminal_prompt_submitted_source_is_authoritative(
+            "cli_hook_user_prompt_submit",
+            true,
+            None,
+        ));
+        assert!(terminal_prompt_submitted_source_is_authoritative(
             "parked_resume_backend_submit",
             true,
             None,
@@ -13307,6 +14053,11 @@ mod terminal_tests {
             None,
         ));
         assert!(terminal_prompt_submitted_source_is_authoritative(
+            "todo_queue_backend_submit",
+            true,
+            None,
+        ));
+        assert!(!terminal_prompt_submitted_source_is_authoritative(
             "prompt_event_submit_metadata",
             true,
             None,
@@ -13331,6 +14082,72 @@ mod terminal_tests {
             true,
             Some("what else is there"),
         ));
+    }
+
+    #[test]
+    fn empty_gate_prompt_metadata_diagnostic_allows_known_local_submit_sources() {
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "tui-terminal-direct-input"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "terminal-direct-input"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "tui-manual-input"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "tui-manual-input:terminal-screen-reconciled"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "observed_terminal_prompt"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "terminal-prompt-submitted"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "terminal-view-drop"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "todo-auto-queue"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "voice-agent-queue"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "voice-plan-queue"
+            ),)
+        );
+        assert!(
+            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "remote-control"
+            ),)
+        );
+
+        assert!(
+            !terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
+                "pending-prompt"
+            ),)
+        );
+        assert!(!terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(None));
     }
 
     #[test]
@@ -13359,6 +14176,17 @@ mod terminal_tests {
             terminal_activity_hook_lifecycle_kind("StopFailure"),
             Some(("provider-turn-error", "error", "error", "failed", true))
         );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PermissionRequest", &json!({})),
+            Some((
+                "provider-permission-requested",
+                "paused",
+                "active",
+                "awaiting_permission",
+                false,
+                "cli_hook_permission_request"
+            ))
+        );
     }
 
     #[test]
@@ -13367,23 +14195,44 @@ mod terminal_tests {
 
         // First observer wins; the echo (hook after gate, or gate after hook)
         // is suppressed.
-        assert!(terminal_direct_prompt_should_capture(&pane, "fix the login bug"));
-        assert!(!terminal_direct_prompt_should_capture(&pane, "fix the login bug"));
-        assert!(terminal_direct_prompt_recently_seen(&pane, "  fix   the login bug "));
+        assert!(terminal_direct_prompt_should_capture(
+            &pane,
+            "fix the login bug"
+        ));
+        assert!(!terminal_direct_prompt_should_capture(
+            &pane,
+            "fix the login bug"
+        ));
+        assert!(terminal_direct_prompt_recently_seen(
+            &pane,
+            "  fix   the login bug "
+        ));
 
         // A different prompt on the same pane still captures.
-        assert!(terminal_direct_prompt_should_capture(&pane, "now run the tests"));
+        assert!(terminal_direct_prompt_should_capture(
+            &pane,
+            "now run the tests"
+        ));
 
         // Queue-dispatched prompts mark the registry up front so the
         // UserPromptSubmit hook echo never creates a duplicate todo.
         let queue_pane = format!("{pane}-queue");
         terminal_direct_prompt_mark_seen(&queue_pane, "queued todo prompt");
-        assert!(terminal_direct_prompt_recently_seen(&queue_pane, "queued todo prompt"));
-        assert!(!terminal_direct_prompt_should_capture(&queue_pane, "queued todo prompt"));
+        assert!(terminal_direct_prompt_recently_seen(
+            &queue_pane,
+            "queued todo prompt"
+        ));
+        assert!(!terminal_direct_prompt_should_capture(
+            &queue_pane,
+            "queued todo prompt"
+        ));
 
         // Other panes are independent.
         let other_pane = format!("{pane}-other");
-        assert!(!terminal_direct_prompt_recently_seen(&other_pane, "fix the login bug"));
+        assert!(!terminal_direct_prompt_recently_seen(
+            &other_pane,
+            "fix the login bug"
+        ));
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("Interrupt"),
             Some((
@@ -13441,7 +14290,10 @@ mod terminal_tests {
             ),
             None
         );
-        assert_eq!(terminal_prompt_synthetic_direct_todo_id(None, None, None), None);
+        assert_eq!(
+            terminal_prompt_synthetic_direct_todo_id(None, None, None),
+            None
+        );
     }
 
     #[test]
@@ -13633,18 +14485,18 @@ mod terminal_tests {
     }
 
     #[test]
-    fn enhanced_enter_sequence_is_normalized_before_pty_write() {
+    fn enhanced_enter_sequence_is_preserved_before_pty_write() {
         assert_eq!(
             normalize_terminal_enter_sequences_for_pty(format!(
                 "send from overlay{TERMINAL_ENTER_SEQUENCE}"
             )),
-            "send from overlay\r"
+            format!("send from overlay{TERMINAL_ENTER_SEQUENCE}")
         );
         assert_eq!(
             normalize_terminal_enter_sequences_for_pty(format!(
                 "send from overlay{TERMINAL_ENTER_SEQUENCE_MOD1}"
             )),
-            "send from overlay\r"
+            format!("send from overlay{TERMINAL_ENTER_SEQUENCE_MOD1}")
         );
         assert_eq!(
             normalize_terminal_enter_sequences_for_pty(format!(
@@ -13946,10 +14798,9 @@ mod terminal_tests {
         assert!(hooks.contains("--diff-forge-activity-hook"));
         assert!(hooks.contains("UserPromptSubmit"));
         assert!(hooks.contains("Stop"));
-        assert!(hooks.contains("Error"));
-        assert!(hooks.contains("Interrupt"));
         assert!(hooks.contains("PreToolUse"));
         assert!(hooks.contains("PostToolUse"));
+        assert!(hooks.contains("PermissionRequest"));
         assert!(hooks.contains("SubagentStart"));
         assert!(hooks.contains("SubagentStop"));
         assert!(hooks.contains("--pane-id"));
@@ -13961,23 +14812,62 @@ mod terminal_tests {
         assert!(hooks.contains("--terminal-index"));
         assert!(hooks.contains("--events-path"));
         assert!(hooks.contains("--debug-path"));
-        assert!(hooks.contains("--diff-forge-write-guard"));
-        assert_eq!(hooks.matches("--pane-id").count(), 8);
+        assert!(!hooks.contains("--diff-forge-write-guard"));
+        assert_eq!(hooks.matches("--pane-id").count(), 7);
         let profile_config = fs::read_to_string(&profile_path).unwrap();
         assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
         assert!(profile_config.contains("[[hooks.Stop]]"));
-        assert!(profile_config.contains("[[hooks.Error]]"));
-        assert!(profile_config.contains("[[hooks.Interrupt]]"));
         assert!(profile_config.contains("[[hooks.PreToolUse]]"));
         assert!(profile_config.contains("[[hooks.PostToolUse]]"));
+        assert!(profile_config.contains("[[hooks.PermissionRequest]]"));
         assert!(profile_config.contains("[[hooks.SubagentStart]]"));
         assert!(profile_config.contains("[[hooks.SubagentStop]]"));
         assert!(profile_config.contains("--diff-forge-activity-hook"));
         assert!(profile_config.contains("--pane-id"));
         assert!(profile_config.contains("workspace-terminal/workspace-1-0-codex"));
         assert!(profile_config.contains("--debug-path"));
-        assert!(profile_config.contains("--diff-forge-write-guard"));
+        assert!(!profile_config.contains("--diff-forge-write-guard"));
         assert!(!profile_config.contains("hooksPath ="));
+    }
+
+    #[test]
+    fn coordinated_codex_activity_hook_profile_refresh_creates_missing_hooks_file() {
+        let mut coordination = terminal_test_coordination("codex_hook_profile_create");
+        let home = terminal_test_directory("codex_hook_profile_create_home");
+        let profile = "diffforge-test-profile";
+        let hooks_path = home.join(format!("{profile}.hooks.json"));
+        let profile_path = home.join(format!("{profile}.config.toml"));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            &profile_path,
+            "default_permissions = \"diffforge-coordinated\"\n",
+        )
+        .unwrap();
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_HOME".to_string(),
+            home.to_string_lossy().to_string(),
+        ));
+        coordination
+            .env_vars
+            .push(("DIFFFORGE_CODEX_PROFILE".to_string(), profile.to_string()));
+
+        let updated = refresh_codex_activity_hook_profile_for_terminal(
+            Some(&coordination),
+            "codex",
+            "workspace-terminal/workspace-1-0-codex",
+            42,
+            Some("workspace-1"),
+            Some(2),
+        )
+        .unwrap();
+
+        assert!(updated);
+        let hooks = fs::read_to_string(&hooks_path).unwrap();
+        assert!(hooks.contains("UserPromptSubmit"));
+        assert!(hooks.contains("--diff-forge-activity-hook"));
+        let profile_config = fs::read_to_string(&profile_path).unwrap();
+        assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
+        assert!(profile_config.contains("--diff-forge-activity-hook"));
     }
 
     #[test]
@@ -14076,10 +14966,11 @@ mod terminal_tests {
             42,
         );
 
-        assert!(args
+        assert!(args.windows(2).any(|pair| pair == ["--add-dir", "/"]));
+        assert!(!args
             .windows(2)
             .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()]));
-        assert!(args
+        assert!(!args
             .windows(2)
             .any(|pair| pair == ["--add-dir", worktree_path.as_str()]));
         assert!(!args
@@ -14108,7 +14999,13 @@ mod terminal_tests {
         }
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
+            .any(|allowed| allowed == "Edit(//**)"));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed == "Write(//**)"));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed == "NotebookEdit(//**)"));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Write"));
         let mcp_config = args
@@ -14151,17 +15048,19 @@ mod terminal_tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
+            .any(|hook| hook["hooks"]
+                .as_array()
+                .is_some_and(|hooks| !hooks.is_empty())));
         assert_eq!(settings["sandbox"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             settings["sandbox"]["allowUnsandboxedCommands"].as_bool(),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
-            Some(worktree_path.as_str())
+            Some("/")
         );
-        let guard_command = settings["hooks"]["PreToolUse"]
+        let hook_commands = settings["hooks"]["PreToolUse"]
             .as_array()
             .unwrap()
             .iter()
@@ -14172,15 +15071,21 @@ mod terminal_tests {
                     .flatten()
                     .filter_map(|hook| hook["command"].as_str())
             })
-            .find(|command| command.contains("--diff-forge-write-guard"))
-            .unwrap_or_default();
-        assert!(guard_command.contains("--diff-forge-write-guard"));
-        assert!(!guard_command.contains("--claude-worktree-guard"));
+            .collect::<Vec<_>>();
+        assert!(hook_commands
+            .iter()
+            .any(|command| command.contains("--diff-forge-activity-hook")));
+        assert!(!hook_commands
+            .iter()
+            .any(|command| command.contains("--diff-forge-write-guard")));
+        assert!(!hook_commands
+            .iter()
+            .any(|command| command.contains("--claude-worktree-guard")));
         assert!(!args.iter().any(|arg| arg == "--no-alt-screen"));
     }
 
     #[test]
-    fn coordinated_claude_direct_edit_adds_git_route_guard_for_bounded_root() {
+    fn coordinated_claude_direct_edit_allows_full_filesystem_edits() {
         let direct_root = terminal_test_directory("claude_direct_edit_args");
         let direct_root_text = direct_root.display().to_string();
         let mut coordination = terminal_test_coordination("claude_direct_edit_kernel");
@@ -14209,7 +15114,8 @@ mod terminal_tests {
             43,
         );
 
-        assert!(args
+        assert!(args.windows(2).any(|pair| pair == ["--add-dir", "/"]));
+        assert!(!args
             .windows(2)
             .any(|pair| pair == ["--add-dir", direct_root_text.as_str()]));
         assert!(args
@@ -14227,8 +15133,14 @@ mod terminal_tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
-        assert!(settings_arg.contains("--diff-forge-write-guard"));
+            .any(|hook| hook["hooks"]
+                .as_array()
+                .is_some_and(|hooks| !hooks.is_empty())));
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
+            Some("/")
+        );
+        assert!(!settings_arg.contains("--diff-forge-write-guard"));
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| {
@@ -14238,15 +15150,18 @@ mod terminal_tests {
             .unwrap();
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
+            .any(|allowed| allowed == "Edit(//**)"));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed.starts_with("Write(//") && allowed.ends_with("/**)")));
+            .any(|allowed| allowed == "Write(//**)"));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed == "NotebookEdit(//**)"));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
     }
 
     #[test]
-    fn coordinated_claude_general_worker_starts_in_repo_without_raw_worktree_write() {
+    fn coordinated_claude_general_worker_allows_full_filesystem_edits() {
         let mut coordination = terminal_test_coordination("claude_general_worker_args");
         let repo = PathBuf::from(&coordination.repo_path);
         fs::write(repo.join("README.md"), "initial\n").unwrap();
@@ -14292,7 +15207,8 @@ mod terminal_tests {
             44,
         );
 
-        assert!(args
+        assert!(args.windows(2).any(|pair| pair == ["--add-dir", "/"]));
+        assert!(!args
             .windows(2)
             .any(|pair| pair == ["--add-dir", repo_text.as_str()]));
         assert!(!args
@@ -14304,7 +15220,16 @@ mod terminal_tests {
         assert!(!args
             .windows(2)
             .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
-        assert!(!args.windows(2).any(|pair| pair[0] == "--settings"));
+        let settings_arg = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
+            .unwrap();
+        assert!(!settings_arg.contains("--diff-forge-write-guard"));
+        let settings: Value = serde_json::from_str(settings_arg).unwrap();
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
+            Some("/")
+        );
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| {
@@ -14312,16 +15237,22 @@ mod terminal_tests {
                     .then(|| pair[1].as_str())
             })
             .unwrap();
-        assert!(!allowed_tools
+        assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") || allowed.starts_with("Write(//")));
+            .any(|allowed| allowed == "Edit(//**)"));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed == "Write(//**)"));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed == "NotebookEdit(//**)"));
         assert!(!allowed_tools
             .split(',')
             .any(|allowed| allowed.contains(&format!("{}/**", repo_text))));
     }
 
     #[test]
-    fn claude_worktree_guard_denies_root_file_edit() {
+    fn claude_worktree_guard_allows_root_file_edit() {
         let repo = terminal_test_repo_with_commit("claude_guard_root_edit");
         let (identity, worktree) =
             terminal_test_task_guard_identity(&repo, "1", Some("file:pricing.html"));
@@ -14336,10 +15267,9 @@ mod terminal_tests {
         });
 
         let reason =
-            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity)
-                .unwrap();
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity);
 
-        assert!(reason.contains("outside terminal slot"));
+        assert!(reason.is_none());
     }
 
     #[test]
@@ -14374,7 +15304,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn claude_worktree_guard_denies_assigned_worktree_edit_without_task() {
+    fn claude_worktree_guard_allows_assigned_worktree_edit_without_task() {
         let repo = terminal_test_repo_with_commit("claude_guard_worktree_no_task");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
@@ -14393,10 +15323,9 @@ mod terminal_tests {
             &worktree,
             "1",
             &DiffForgeWriteGuardIdentity::default(),
-        )
-        .unwrap();
+        );
 
-        assert!(reason.contains("no active task-owned file authority"));
+        assert!(reason.is_none());
     }
 
     #[test]
@@ -14420,7 +15349,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn claude_worktree_guard_denies_other_slot_worktree_edit() {
+    fn claude_worktree_guard_allows_other_slot_worktree_edit() {
         let repo = terminal_test_repo_with_commit("claude_guard_cross_slot_edit");
         let (identity, worktree) =
             terminal_test_task_guard_identity(&repo, "1", Some("file:pricing.html"));
@@ -14436,14 +15365,13 @@ mod terminal_tests {
         });
 
         let reason =
-            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity)
-                .unwrap();
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity);
 
-        assert!(reason.contains("outside terminal slot"));
+        assert!(reason.is_none());
     }
 
     #[test]
-    fn claude_worktree_guard_denies_unsandboxed_shell_escape() {
+    fn claude_worktree_guard_allows_unsandboxed_shell_escape() {
         let repo = terminal_test_directory("claude_guard_unsandboxed_shell");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
@@ -14463,14 +15391,13 @@ mod terminal_tests {
             &worktree,
             "1",
             &DiffForgeWriteGuardIdentity::default(),
-        )
-        .unwrap();
+        );
 
-        assert!(reason.contains("unsandboxed"));
+        assert!(reason.is_none());
     }
 
     #[test]
-    fn claude_worktree_guard_denies_mutating_shell_without_lease() {
+    fn claude_worktree_guard_allows_mutating_shell_without_lease() {
         let repo = terminal_test_repo_with_commit("claude_guard_shell_no_lease");
         let (identity, worktree) = terminal_test_task_guard_identity(&repo, "1", None);
         let hook_input = json!({
@@ -14483,10 +15410,9 @@ mod terminal_tests {
         });
 
         let reason =
-            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity)
-                .unwrap();
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity);
 
-        assert!(reason.contains("no active write lease"));
+        assert!(reason.is_none());
     }
 
     #[test]
@@ -14510,7 +15436,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn diff_forge_apply_patch_guard_denies_git_root_paths() {
+    fn diff_forge_apply_patch_guard_allows_git_root_paths() {
         let repo = terminal_test_repo_with_commit("codex_apply_patch_route");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -14529,7 +15455,7 @@ mod terminal_tests {
                 "command": patch
             }
         });
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -14537,15 +15463,13 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("direct Git repository edit"));
-        assert!(error
-            .contains("apply_patch must target this terminal's assigned worktree path explicitly"));
+        assert!(decision.is_none());
     }
 
     #[test]
-    fn diff_forge_apply_patch_guard_denies_visible_root_relative_paths() {
+    fn diff_forge_apply_patch_guard_allows_visible_root_relative_paths() {
         let repo = terminal_test_repo_with_commit("codex_apply_patch_relative_root");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -14560,7 +15484,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -14568,10 +15492,9 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("direct Git repository edit"));
-        assert!(error.contains(".agents/worktrees/slot1"));
+        assert!(decision.is_none());
     }
 
     #[test]
@@ -14607,7 +15530,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_shell_apply_patch_in_git_root() {
+    fn diff_forge_write_guard_allows_shell_apply_patch_in_git_root() {
         let repo = terminal_test_repo_with_commit("write_guard_shell_apply_patch_root");
         let (identity, _worktree) =
             terminal_test_task_guard_identity(&repo, "slot1", Some("file:index.html"));
@@ -14620,7 +15543,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -14628,10 +15551,9 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("direct Git repository edit"));
-        assert!(error.contains("Shell commands that mutate Git repositories"));
+        assert!(decision.is_none());
     }
 
     #[test]
@@ -14804,7 +15726,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_real_git_root_edit_with_worktree_path() {
+    fn diff_forge_write_guard_allows_real_git_root_edit_with_worktree_path() {
         let repo = terminal_test_repo_with_commit("write_guard_git_root");
         fs::write(repo.join("pricing.html"), "<h1>Root</h1>\n").unwrap();
         let hook_input = json!({
@@ -14816,7 +15738,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "claude",
             &hook_input,
             &repo,
@@ -14824,15 +15746,13 @@ mod terminal_tests {
             "claude",
             &DiffForgeWriteGuardIdentity::default(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        if !error.contains("no active task-owned file authority") {
-            panic!("nested guard error: {error}");
-        }
+        assert!(decision.is_none());
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_worktree_edit_without_active_lease() {
+    fn diff_forge_write_guard_allows_worktree_edit_without_active_lease() {
         let repo = terminal_test_repo_with_commit("write_guard_worktree_no_lease");
         let (identity, worktree) = terminal_test_task_guard_identity(&repo, "slot1", None);
         let hook_input = json!({
@@ -14844,7 +15764,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -14852,9 +15772,9 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("no active write lease"));
+        assert!(decision.is_none());
     }
 
     #[test]
@@ -14885,7 +15805,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_real_git_root_edit_with_active_task_route() {
+    fn diff_forge_write_guard_allows_real_git_root_edit_with_active_task_route() {
         let repo = terminal_test_repo_with_commit("write_guard_git_root_active");
         fs::write(repo.join("pricing.html"), "<h1>Root</h1>\n").unwrap();
         let (identity, _worktree) =
@@ -14899,7 +15819,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "claude",
             &hook_input,
             &repo,
@@ -14907,14 +15827,13 @@ mod terminal_tests {
             "claude",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("direct Git repository edit"));
-        assert!(error.contains(".agents/worktrees/slot1"));
+        assert!(decision.is_none());
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_nested_git_edit_from_direct_container() {
+    fn diff_forge_write_guard_allows_nested_git_edit_from_direct_container() {
         let root = terminal_test_directory("write_guard_nested_git_container");
         let repo = root.join("packages").join("nested-app");
         fs::create_dir_all(&repo).unwrap();
@@ -14933,7 +15852,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "claude",
             &hook_input,
             &root,
@@ -14941,15 +15860,13 @@ mod terminal_tests {
             "claude",
             &DiffForgeWriteGuardIdentity::default(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        if !error.contains("no active task-owned file authority") {
-            panic!("nested guard error: {error}");
-        }
+        assert!(decision.is_none());
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_nested_git_inside_outer_slot_without_child_task() {
+    fn diff_forge_write_guard_allows_nested_git_inside_outer_slot_without_child_task() {
         let root = terminal_test_directory("write_guard_nested_git_inside_slot");
         terminal_test_git(&root, &["init"]);
         fs::write(root.join("README.md"), "root\n").unwrap();
@@ -14971,22 +15888,20 @@ mod terminal_tests {
         terminal_test_git(&repo, &["add", "pricing.html"]);
         terminal_test_git(&repo, &["commit", "-m", "init"]);
 
-        let error = diff_forge_git_write_route(
+        let route = diff_forge_git_write_route(
             &repo.join("pricing.html"),
             "slot1",
             "codex",
             &identity,
             true,
         )
-        .unwrap_err();
+        .unwrap();
 
-        if !error.contains("no active task-owned file authority") {
-            panic!("nested guard error: {error}");
-        }
+        assert!(route.is_none());
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_mutating_shell_in_git_root() {
+    fn diff_forge_write_guard_allows_mutating_shell_in_git_root() {
         let repo = terminal_test_repo_with_commit("write_guard_shell_git_root");
         let hook_input = json!({
             "hook_event_name": "PreToolUse",
@@ -14999,7 +15914,7 @@ mod terminal_tests {
 
         let (identity, _worktree) =
             terminal_test_task_guard_identity(&repo, "slot1", Some("file:pricing.html"));
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -15007,14 +15922,13 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("direct Git repository edit"));
-        assert!(error.contains("Shell commands that mutate Git repositories"));
+        assert!(decision.is_none());
     }
 
     #[test]
-    fn diff_forge_write_guard_denies_mutating_shell_in_worktree_without_lease() {
+    fn diff_forge_write_guard_allows_mutating_shell_in_worktree_without_lease() {
         let repo = terminal_test_repo_with_commit("write_guard_shell_worktree_no_lease");
         let (identity, worktree) = terminal_test_task_guard_identity(&repo, "slot1", None);
         let hook_input = json!({
@@ -15026,7 +15940,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -15034,9 +15948,9 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("no active write lease"));
+        assert!(decision.is_none());
     }
 
     #[cfg(windows)]
@@ -15218,7 +16132,7 @@ mod terminal_tests {
             args.iter()
                 .filter(|arg| arg.as_str() == "--sandbox")
                 .count(),
-            0
+            1
         );
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cd").count(), 0);
         assert_eq!(
@@ -15240,14 +16154,16 @@ mod terminal_tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
-        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "danger-full-access"]));
         assert!(!args
             .windows(2)
             .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
     }
 
     #[test]
-    fn coordinated_codex_activity_launch_is_read_only() {
+    fn coordinated_codex_activity_launch_uses_full_filesystem_access() {
         let mut coordination = terminal_test_coordination("codex_activity_args");
         coordination.env_vars.push((
             "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
@@ -15281,6 +16197,8 @@ mod terminal_tests {
             .windows(2)
             .any(|pair| pair == ["--profile", "diffforge-activity-profile"]));
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
-        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "danger-full-access"]));
     }
 }

@@ -413,6 +413,72 @@ const AgentAccountEditorForm = styled.form`
    in a terminal — signing into another account in any terminal is captured
    automatically by the Rust watcher. Switching only affects NEW terminal
    spawns; running panes show a restart chip instead (never forced). */
+function useAgentAccountsState() {
+  const [accounts, setAccounts] = useState(null);
+  const refresh = useCallback(() => {
+    invoke("agent_accounts_state").then((state) => {
+      setAccounts(state?.agents || null);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten = null;
+    refresh();
+    const interval = window.setInterval(refresh, 6000);
+    listen(AGENT_ACCOUNTS_CHANGED_EVENT, () => {
+      if (!cancelled) refresh();
+    }).then((next) => {
+      if (cancelled) {
+        next();
+        return;
+      }
+      unlisten = next;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      if (unlisten) unlisten();
+    };
+  }, [refresh]);
+
+  return { accounts, refresh };
+}
+
+function collapseAgentProfilesByEmail(profiles = []) {
+  const byEmail = new Map();
+  const visible = [];
+  for (const profile of Array.isArray(profiles) ? profiles : []) {
+    const email = normalizeTokenomicsEmail(profile?.identity?.email || profile?.email);
+    if (!email) {
+      visible.push(profile);
+      continue;
+    }
+    const existing = byEmail.get(email);
+    if (!existing) {
+      byEmail.set(email, profile);
+      visible.push(profile);
+      continue;
+    }
+    if (
+      profile?.isActive
+      && !existing.isDefault
+      && !existing.isActive
+    ) {
+      const index = visible.indexOf(existing);
+      const merged = { ...profile, alias: profile.alias || existing.alias };
+      if (index >= 0) visible[index] = merged;
+      byEmail.set(email, merged);
+    } else if (profile?.isActive && existing.isDefault && !existing.isActive) {
+      const index = visible.indexOf(existing);
+      const merged = { ...existing, isActive: true, alias: existing.alias || profile.alias };
+      if (index >= 0) visible[index] = merged;
+      byEmail.set(email, merged);
+    }
+  }
+  return visible;
+}
+
 function AgentAccountsManager() {
   const [accounts, setAccounts] = useState(null);
   const [editing, setEditing] = useState(null);
@@ -544,7 +610,7 @@ function AgentAccountsManager() {
         if (!entry) {
           return null;
         }
-        const profiles = Array.isArray(entry.profiles) ? entry.profiles : [];
+        const profiles = collapseAgentProfilesByEmail(entry.profiles);
         return (
           <Fragment key={kind}>
             <AgentAccountsRow>
@@ -709,6 +775,108 @@ function createDefaultProviderAccountKeys() {
 
 function normalizeProviderAccountKey(value) {
   return String(value || "all").trim() || "all";
+}
+
+function providerAccountKeyIsUnknown(value) {
+  const key = String(value || "").trim().toLowerCase();
+  return !key || key.endsWith(":unknown");
+}
+
+function normalizeProviderAccountLabel(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function normalizeTokenomicsEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function tokenomicsEmailLocalPart(value) {
+  return normalizeTokenomicsEmail(value).split("@")[0] || "";
+}
+
+function tokenomicsProviderProfileAccountKey(providerId, profileId) {
+  const cleanProfileId = String(profileId || "").trim();
+  if (!cleanProfileId || cleanProfileId === "default") return "";
+  if (providerId === "claude") return `anthropic:claude:profile:${cleanProfileId}`;
+  if (providerId === "codex") return `openai:codex:profile:${cleanProfileId}`;
+  return "";
+}
+
+function normalizeTokenomicsAliasLabel(value, providerId = "") {
+  let label = normalizeProviderAccountLabel(value)
+    .replace(/[·•]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const providerWords = providerId === "claude"
+    ? ["claude code", "claude", "anthropic"]
+    : providerId === "codex"
+      ? ["codex", "openai"]
+      : [];
+  for (const word of providerWords) {
+    if (label === word) return "";
+    if (label.startsWith(`${word} `)) {
+      label = label.slice(word.length).trim();
+      break;
+    }
+  }
+  return label;
+}
+
+function tokenomicsProfileLabelCandidates(profile = {}, providerId = "") {
+  const email = normalizeTokenomicsEmail(profile?.identity?.email || profile?.email);
+  const local = tokenomicsEmailLocalPart(email);
+  const raw = [
+    profile?.alias,
+    profile?.label,
+    profile?.name,
+    email,
+    local,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  const labels = new Set();
+  for (const value of raw) {
+    labels.add(normalizeProviderAccountLabel(value));
+    labels.add(normalizeTokenomicsAliasLabel(value, providerId));
+    if (providerId === "claude") {
+      labels.add(normalizeTokenomicsAliasLabel(`Claude ${value}`, providerId));
+      labels.add(normalizeTokenomicsAliasLabel(`Claude Code ${value}`, providerId));
+    } else if (providerId === "codex") {
+      labels.add(normalizeTokenomicsAliasLabel(`Codex ${value}`, providerId));
+    }
+  }
+  labels.delete("");
+  labels.delete("default");
+  return [...labels];
+}
+
+function tokenomicsAccountLabelScore(label, providerId = "") {
+  const raw = String(label || "").trim();
+  const clean = normalizeTokenomicsAliasLabel(label, providerId);
+  if (!clean || clean === "default" || clean === "account") return 0;
+  if (clean.includes("@")) return 1;
+  if (/[A-Z]/u.test(raw) && /[a-z]/u.test(raw)) return 5;
+  if (/[\s-]/u.test(clean) && /[a-z]/iu.test(clean) && !/\d/u.test(clean)) return 4;
+  if (/^[a-z0-9._-]+$/iu.test(clean)) return 2;
+  return 4;
+}
+
+function preferredTokenomicsAccountLabel(nextLabel, currentLabel, providerId = "") {
+  const next = String(nextLabel || "").trim();
+  const current = String(currentLabel || "").trim();
+  if (!current) return next;
+  if (!next) return current;
+  const nextScore = tokenomicsAccountLabelScore(next, providerId);
+  const currentScore = tokenomicsAccountLabelScore(current, providerId);
+  if (nextScore !== currentScore) return nextScore > currentScore ? next : current;
+  return next.length < current.length ? next : current;
+}
+
+function preferProviderAccountOption(next, current) {
+  if (!current) return true;
+  if ((next.total || 0) !== (current.total || 0)) return (next.total || 0) > (current.total || 0);
+  const nextProfile = String(next.key || "").includes(":profile:");
+  const currentProfile = String(current.key || "").includes(":profile:");
+  if (nextProfile !== currentProfile) return !nextProfile;
+  return String(next.key || "").localeCompare(String(current.key || "")) < 0;
 }
 
 function normalizeProviderAccountKeys(value, fallbackKey = "all") {
@@ -901,6 +1069,12 @@ function providerDisplayName(providerId) {
   return PROVIDERS.find((provider) => provider.id === providerId)?.label || providerId || "Provider";
 }
 
+function providerAccountHeading(providerId) {
+  if (providerId === "codex") return "Codex";
+  if (providerId === "claude") return "Claude";
+  return providerDisplayName(providerId);
+}
+
 function rowDeviceId(row) {
   return String(row?.device_id || row?.deviceId || row?.machine_id || row?.machineId || "").trim();
 }
@@ -954,6 +1128,194 @@ function tokenomicsDeviceIdentityIds(identity = {}) {
     identity?.target_device_id,
     identity?.targetDeviceId,
   ].map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function tokenomicsIndexKey(providerId, value) {
+  const clean = String(value || "").trim();
+  return clean ? `${providerId}\u0000${clean}` : "";
+}
+
+function tokenomicsEmailGroupId(providerId, email) {
+  return `${providerId}:email:${email}`;
+}
+
+function tokenomicsEnsureAccountGroup(groups, providerId, email) {
+  const groupId = tokenomicsEmailGroupId(providerId, email);
+  let group = groups.get(groupId);
+  if (!group) {
+    group = {
+      id: groupId,
+      providerId,
+      email,
+      label: tokenomicsEmailLocalPart(email) || email,
+      keys: new Set(),
+      keyTotals: new Map(),
+    };
+    groups.set(groupId, group);
+  }
+  return group;
+}
+
+function tokenomicsAccountRowIsActive(row = {}) {
+  return row?.active_provider_account === true
+    || row?.activeProviderAccount === true
+    || row?.active_agent_profile === true
+    || row?.activeAgentProfile === true;
+}
+
+function tokenomicsAddGroupKey(index, group, key, total = 0) {
+  const clean = String(key || "").trim();
+  if (!clean || providerAccountKeyIsUnknown(clean)) return;
+  group.keys.add(clean);
+  group.keyTotals.set(clean, (group.keyTotals.get(clean) || 0) + Math.max(0, numeric(total)));
+  index.byKey.set(tokenomicsIndexKey(group.providerId, clean), group);
+}
+
+function tokenomicsAddGroupLabel(index, group, label) {
+  const normalized = normalizeProviderAccountLabel(label);
+  const stripped = normalizeTokenomicsAliasLabel(label, group.providerId);
+  [normalized, stripped].filter(Boolean).forEach((candidate) => {
+    index.byLabel.set(tokenomicsIndexKey(group.providerId, candidate), group);
+  });
+}
+
+function tokenomicsAccountRowsFromSummary(summary = {}) {
+  const rows = [];
+  if (!summary || typeof summary !== "object") return rows;
+  Object.values(summary).forEach((value) => {
+    if (!Array.isArray(value)) return;
+    value.forEach((row) => {
+      if (row && typeof row === "object" && !Array.isArray(row)) {
+        if (
+          rowProviderAccountKey(row)
+          || row?.provider_account_label
+          || row?.providerAccountLabel
+          || row?.subscription_key
+          || row?.subscriptionKey
+        ) {
+          rows.push(row);
+        }
+      }
+    });
+  });
+  return rows;
+}
+
+function buildTokenomicsAccountIdentityIndex(agentAccounts) {
+  const groups = new Map();
+  const index = {
+    groups,
+    byKey: new Map(),
+    byLabel: new Map(),
+    activeByProvider: new Map(),
+    providerGroupCount: new Map(),
+  };
+  for (const providerId of PROVIDER_ACCOUNT_FILTER_PROVIDERS) {
+    const entry = agentAccounts?.[providerId];
+    const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
+    for (const profile of profiles) {
+      const email = normalizeTokenomicsEmail(profile?.identity?.email || profile?.email);
+      if (!email) continue;
+      const group = tokenomicsEnsureAccountGroup(groups, providerId, email);
+      const label = profile?.alias || (!profile?.isDefault ? profile?.label : "") || tokenomicsEmailLocalPart(email) || email;
+      group.label = preferredTokenomicsAccountLabel(label, group.label, providerId);
+      tokenomicsAddGroupKey(index, group, tokenomicsProviderProfileAccountKey(providerId, profile?.id));
+      tokenomicsProfileLabelCandidates(profile, providerId).forEach((candidate) => {
+        tokenomicsAddGroupLabel(index, group, candidate);
+      });
+      if (profile?.isActive) {
+        index.activeByProvider.set(providerId, group);
+      }
+    }
+  }
+  for (const group of groups.values()) {
+    index.providerGroupCount.set(group.providerId, (index.providerGroupCount.get(group.providerId) || 0) + 1);
+  }
+  return groups.size ? index : null;
+}
+
+function tokenomicsResolveAccountGroup(row, index) {
+  if (!index) return null;
+  const providerId = providerKey(row);
+  if (!PROVIDER_ACCOUNT_FILTER_PROVIDERS.includes(providerId)) return null;
+  const key = rowProviderAccountKey(row);
+  const byKey = index.byKey.get(tokenomicsIndexKey(providerId, key));
+  if (byKey) return byKey;
+  if (tokenomicsAccountRowIsActive(row)) {
+    const active = index.activeByProvider.get(providerId);
+    if (active) return active;
+  }
+  const rawLabel = rowProviderAccountLabel(row);
+  const labels = [
+    normalizeProviderAccountLabel(rawLabel),
+    normalizeTokenomicsAliasLabel(rawLabel, providerId),
+  ].filter(Boolean);
+  for (const label of labels) {
+    const byLabel = index.byLabel.get(tokenomicsIndexKey(providerId, label));
+    if (byLabel) return byLabel;
+  }
+  const labelEmail = normalizeTokenomicsEmail(String(rawLabel || "").match(/[^\s<>]+@[^\s<>]+/u)?.[0]);
+  if (labelEmail) {
+    const byEmail = index.groups.get(tokenomicsEmailGroupId(providerId, labelEmail));
+    if (byEmail) return byEmail;
+  }
+  if (index.providerGroupCount.get(providerId) === 1) {
+    return [...index.groups.values()].find((group) => group.providerId === providerId) || null;
+  }
+  return null;
+}
+
+function tokenomicsCanonicalAccountKey(group) {
+  if (!group) return "";
+  const keys = [...group.keys].filter((key) => !providerAccountKeyIsUnknown(key));
+  if (!keys.length) return "";
+  return keys.sort((left, right) => {
+    const leftProfile = left.includes(":profile:");
+    const rightProfile = right.includes(":profile:");
+    if (leftProfile !== rightProfile) return leftProfile ? 1 : -1;
+    const totalDelta = (group.keyTotals.get(right) || 0) - (group.keyTotals.get(left) || 0);
+    if (totalDelta) return totalDelta;
+    return left.localeCompare(right);
+  })[0];
+}
+
+function tokenomicsCanonicalizeAccountRow(row, index) {
+  const group = tokenomicsResolveAccountGroup(row, index);
+  if (!group) return row;
+  const canonicalKey = tokenomicsCanonicalAccountKey(group);
+  if (!canonicalKey) return row;
+  const label = group.label || rowProviderAccountLabel(row);
+  return {
+    ...row,
+    provider_account_key: canonicalKey,
+    providerAccountKey: canonicalKey,
+    provider_account_label: label,
+    providerAccountLabel: label,
+  };
+}
+
+function canonicalizeTokenomicsAccountSummary(summary = {}, agentAccounts = null) {
+  const index = buildTokenomicsAccountIdentityIndex(agentAccounts);
+  if (!index || !summary || typeof summary !== "object") return summary;
+  const rows = tokenomicsAccountRowsFromSummary(summary);
+  for (let pass = 0; pass < 2; pass += 1) {
+    rows.forEach((row) => {
+      const group = tokenomicsResolveAccountGroup(row, index);
+      if (!group) return;
+      const key = rowProviderAccountKey(row);
+      tokenomicsAddGroupKey(index, group, key, rowTotal(row));
+      group.label = preferredTokenomicsAccountLabel(rowProviderAccountLabel(row), group.label, group.providerId);
+      tokenomicsAddGroupLabel(index, group, rowProviderAccountLabel(row));
+    });
+  }
+  return Object.fromEntries(Object.entries(summary).map(([key, value]) => {
+    if (!Array.isArray(value)) return [key, value];
+    return [key, value.map((row) => (
+      row && typeof row === "object" && !Array.isArray(row)
+        ? tokenomicsCanonicalizeAccountRow(row, index)
+        : row
+    ))];
+  }));
 }
 
 function tokenomicsIdentityLooksNative(identity = {}) {
@@ -2046,7 +2408,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
   const byKey = new Map();
   for (const row of rows) {
     const key = rowProviderAccountKey(row);
-    if (!key) continue;
+    if (providerAccountKeyIsUnknown(key)) continue;
     const current = byKey.get(key) || {
       key,
       label: rowProviderAccountLabel(row),
@@ -2058,7 +2420,15 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
     }
     byKey.set(key, current);
   }
-  const accounts = [...byKey.values()].sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
+  const byLabel = new Map();
+  for (const account of byKey.values()) {
+    const labelKey = normalizeProviderAccountLabel(account.label);
+    const current = byLabel.get(labelKey);
+    if (preferProviderAccountOption(account, current)) {
+      byLabel.set(labelKey, account);
+    }
+  }
+  const accounts = [...byLabel.values()].sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
   if (!accounts.length) return [];
   return [{ key: "all", label: "All" }, ...accounts];
 }
@@ -2081,9 +2451,10 @@ function providerAccountOptionGroups(optionsByProvider, selectedProvider) {
       const visibleOptions = options.length ? options : (selectedProvider === "all" ? [{ key: "all", label: "All" }] : []);
       if (!visibleOptions.length) return null;
       const displayName = providerDisplayName(providerId);
+      const heading = providerAccountHeading(providerId);
       return {
         providerId,
-        label: `${displayName} accounts`,
+        label: heading,
         options: selectedProvider === "all"
           ? [
             ...visibleOptions,
@@ -2677,6 +3048,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
+  const { accounts: agentAccounts } = useAgentAccountsState();
 
   const refresh = useCallback(async ({ scan = false, resync = false } = {}) => {
     await loadTokenomicsStore({ scan, force: true, resync });
@@ -2711,7 +3083,10 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     };
   }, []);
 
-  const visibleSummary = useMemo(() => summaryForMappedNativeDevices(summary), [summary]);
+  const visibleSummary = useMemo(
+    () => canonicalizeTokenomicsAccountSummary(summaryForMappedNativeDevices(summary), agentAccounts),
+    [agentAccounts, summary],
+  );
   // Cloud sync is intentionally ignored on this client, so Tokenomics always
   // renders the local device only. There is no device picker: the device filter
   // is pinned to this machine's id (falling back to "all" before the current
@@ -2873,9 +3248,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
           <ProviderAccountRows aria-label="Provider account filters">
             {accountOptionGroups.map((group) => (
               <ProviderAccountRow key={group.providerId}>
-                <ProviderAccountLabel $provider={group.providerId}>
-                  {group.label}
-                </ProviderAccountLabel>
                 <AccountTabs role="tablist" aria-label={`${group.label} filter`}>
                   {group.options.map((account) => {
                     const active = accountKeyForProvider(providerAccountKeys, group.providerId) === account.key;
@@ -3270,27 +3642,8 @@ const ProviderAccountRows = styled.div`
 `;
 
 const ProviderAccountRow = styled.div`
-  display: grid;
-  grid-template-columns: minmax(96px, max-content) minmax(0, 1fr);
-  align-items: center;
-  gap: 7px;
+  display: block;
   min-width: 0;
-
-  @media (max-width: 520px) {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 3px;
-  }
-`;
-
-const ProviderAccountLabel = styled.span`
-  min-width: 0;
-  color: ${({ $provider }) => providerAccent($provider)};
-  font-size: 10.5px;
-  font-weight: 900;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
 `;
 
 const AccountTabs = styled.div`

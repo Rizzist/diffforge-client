@@ -6,6 +6,7 @@ use image::ImageFormat as SnippingImageFormat;
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
+const SNIPPING_PERMISSION_ATTENTION_EVENT: &str = "forge-snipping-permission-attention";
 const SNIPPING_SOURCE_UPDATED_EVENT: &str = "forge-snip-source-updated";
 const SNIPPING_CLOUD_UPLOAD_EVENT: &str = "forge-snip-cloud-upload";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
@@ -41,6 +42,8 @@ const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_MIN_RECORDING_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
 const SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS: u64 = 120;
+const SNIPPING_AREA_OVERLAY_READY_WAIT_MS: u64 = 650;
+const SNIPPING_AREA_OVERLAY_READY_POLL_MS: u64 = 8;
 #[cfg(target_os = "macos")]
 const MACOS_SCREEN_CAPTURE_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
@@ -466,6 +469,7 @@ impl SnippingRecordingState {
 struct SnippingState {
     shortcut_manager: SnippingShortcutManager,
     active_area_sessions: Arc<StdMutex<HashMap<String, SnippingAreaSession>>>,
+    area_overlay_ready_labels: Arc<StdMutex<HashSet<String>>>,
     warm_capture: Arc<SnippingWarmCaptureState>,
     recording: Arc<SnippingRecordingState>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
@@ -542,6 +546,7 @@ impl SnippingState {
         Self {
             shortcut_manager: SnippingShortcutManager::new(),
             active_area_sessions: Arc::new(StdMutex::new(HashMap::new())),
+            area_overlay_ready_labels: Arc::new(StdMutex::new(HashSet::new())),
             warm_capture: Arc::new(SnippingWarmCaptureState::new()),
             recording: Arc::new(SnippingRecordingState::new()),
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
@@ -1547,6 +1552,54 @@ fn emit_snipping_shortcuts_changed(app: &AppHandle) {
     }
 }
 
+fn snipping_reason_is_hotkey(reason: &str) -> bool {
+    matches!(reason, "shortcut" | "macos-default-override")
+}
+
+fn snipping_error_is_screen_capture_permission(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("screen capture permission")
+        || lower.contains("screen recording")
+        || lower.contains("permission was not granted")
+}
+
+fn focus_main_window_for_snipping_permission(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn emit_snipping_permission_attention(
+    app: &AppHandle,
+    reason: &str,
+    shortcut: &str,
+    error: &str,
+) {
+    if !snipping_reason_is_hotkey(reason) || !snipping_error_is_screen_capture_permission(error) {
+        return;
+    }
+
+    focus_main_window_for_snipping_permission(app);
+    emit_snipping_shortcuts_changed(app);
+    let _ = app.emit_to(
+        "main",
+        SNIPPING_PERMISSION_ATTENTION_EVENT,
+        json!({
+            "id": current_time_ms(),
+            "reason": reason,
+            "shortcut": shortcut,
+            "message": error,
+        }),
+    );
+}
+
 fn register_snipping_shortcut_handler(
     app: &AppHandle,
     action: SnippingShortcutAction,
@@ -2200,6 +2253,43 @@ fn snipping_overlay_label(index: usize) -> String {
 
 fn snipping_is_overlay_label(label: &str) -> bool {
     label.starts_with(SNIPPING_AREA_OVERLAY_WINDOW_PREFIX)
+}
+
+fn snipping_mark_area_overlay_ready(app: &AppHandle, label: &str) {
+    if !snipping_is_overlay_label(label) {
+        return;
+    }
+    if let Ok(mut labels) = app.state::<SnippingState>().area_overlay_ready_labels.lock() {
+        labels.insert(label.to_string());
+    }
+}
+
+fn snipping_forget_area_overlay_ready(app: &AppHandle, label: &str) {
+    if let Ok(mut labels) = app.state::<SnippingState>().area_overlay_ready_labels.lock() {
+        labels.remove(label);
+    }
+}
+
+fn snipping_area_overlay_is_ready(app: &AppHandle, label: &str) -> bool {
+    app.state::<SnippingState>()
+        .area_overlay_ready_labels
+        .lock()
+        .map(|labels| labels.contains(label))
+        .unwrap_or(false)
+}
+
+fn snipping_wait_for_area_overlay_ready(app: &AppHandle, label: &str) {
+    if snipping_area_overlay_is_ready(app, label) {
+        return;
+    }
+
+    let started_at = Instant::now();
+    while started_at.elapsed() < Duration::from_millis(SNIPPING_AREA_OVERLAY_READY_WAIT_MS) {
+        if snipping_area_overlay_is_ready(app, label) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(SNIPPING_AREA_OVERLAY_READY_POLL_MS));
+    }
 }
 
 fn snipping_overlay_windows(app: &AppHandle) -> Vec<(String, tauri::WebviewWindow)> {
@@ -3708,9 +3798,6 @@ fn snipping_h264_annexb_from_bitstream(
         let Some(layer) = bitstream.layer(layer_index) else {
             continue;
         };
-        if !layer.is_video() {
-            continue;
-        }
         for nal_index in 0..layer.nal_count() {
             let Some(nal) = layer.nal_unit(nal_index) else {
                 continue;
@@ -3729,6 +3816,129 @@ fn snipping_h264_annexb_from_bitstream(
         }
     }
     has_video_slice
+}
+
+#[derive(Default)]
+struct SnippingMp4RecordingSummary {
+    mdat_payload_bytes: u64,
+    sample_count: u64,
+}
+
+fn snipping_mp4_box_is_container(kind: [u8; 4]) -> bool {
+    matches!(
+        kind,
+        [b'm', b'o', b'o', b'v']
+            | [b't', b'r', b'a', b'k']
+            | [b'm', b'd', b'i', b'a']
+            | [b'm', b'i', b'n', b'f']
+            | [b's', b't', b'b', b'l']
+    )
+}
+
+fn snipping_read_mp4_bytes(
+    file: &mut fs::File,
+    offset: u64,
+    bytes: &mut [u8],
+) -> Result<(), String> {
+    use std::io::{Read as _, Seek as _};
+    file.seek(std::io::SeekFrom::Start(offset))
+        .map_err(|error| format!("Unable to read recording MP4: {error}"))?;
+    file.read_exact(bytes)
+        .map_err(|error| format!("Unable to read recording MP4: {error}"))
+}
+
+fn snipping_read_mp4_u32(file: &mut fs::File, offset: u64) -> Result<u32, String> {
+    let mut bytes = [0u8; 4];
+    snipping_read_mp4_bytes(file, offset, &mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn snipping_read_mp4_u64(file: &mut fs::File, offset: u64) -> Result<u64, String> {
+    let mut bytes = [0u8; 8];
+    snipping_read_mp4_bytes(file, offset, &mut bytes)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn snipping_scan_mp4_recording_boxes(
+    file: &mut fs::File,
+    start: u64,
+    end: u64,
+    depth: u8,
+    summary: &mut SnippingMp4RecordingSummary,
+) -> Result<(), String> {
+    if depth > 8 {
+        return Ok(());
+    }
+    let mut offset = start;
+    while offset < end {
+        if end.saturating_sub(offset) < 8 {
+            return Err("Recording file has a truncated MP4 box.".to_string());
+        }
+
+        let size32 = snipping_read_mp4_u32(file, offset)?;
+        let mut kind = [0u8; 4];
+        snipping_read_mp4_bytes(file, offset.saturating_add(4), &mut kind)?;
+
+        let mut header_size = 8_u64;
+        let box_size = match size32 {
+            0 => end.saturating_sub(offset),
+            1 => {
+                header_size = 16;
+                snipping_read_mp4_u64(file, offset.saturating_add(8))?
+            }
+            value => u64::from(value),
+        };
+
+        if box_size < header_size {
+            return Err("Recording file has an invalid MP4 box size.".to_string());
+        }
+        let Some(box_end) = offset.checked_add(box_size) else {
+            return Err("Recording file has an invalid MP4 box size.".to_string());
+        };
+        if box_end > end {
+            return Err("Recording file has an invalid MP4 box size.".to_string());
+        }
+
+        let payload_start = offset.saturating_add(header_size);
+        if kind == *b"mdat" {
+            summary.mdat_payload_bytes = summary
+                .mdat_payload_bytes
+                .saturating_add(box_size.saturating_sub(header_size));
+        } else if kind == *b"stsz" {
+            if box_end.saturating_sub(payload_start) < 12 {
+                return Err("Recording file has a truncated MP4 sample table.".to_string());
+            }
+            let sample_count = u64::from(snipping_read_mp4_u32(
+                file,
+                payload_start.saturating_add(8),
+            )?);
+            summary.sample_count = summary.sample_count.saturating_add(sample_count);
+        } else if snipping_mp4_box_is_container(kind) {
+            snipping_scan_mp4_recording_boxes(file, payload_start, box_end, depth + 1, summary)?;
+        }
+
+        offset = box_end;
+    }
+    Ok(())
+}
+
+fn snipping_validate_recording_mp4(path: &Path) -> Result<(), String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("Unable to open recording file {}: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("Unable to read recording file {}: {error}", path.display()))?
+        .len();
+    if file_len == 0 {
+        return Err("Recording file is empty.".to_string());
+    }
+
+    let mut summary = SnippingMp4RecordingSummary::default();
+    snipping_scan_mp4_recording_boxes(&mut file, 0, file_len, 0, &mut summary)?;
+    if summary.mdat_payload_bytes == 0 || summary.sample_count == 0 {
+        return Err("Recording file contains no playable video frames.".to_string());
+    }
+    Ok(())
 }
 
 fn snipping_recording_encoder_config(
@@ -4007,10 +4217,12 @@ fn snipping_recording_loop(
     app: AppHandle,
     session: SnippingRecordingSession,
     monitor: SnippingAreaMonitor,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    frame_x: u32,
+    frame_y: u32,
     reason: String,
     shortcut: String,
 ) {
@@ -4020,10 +4232,12 @@ fn snipping_recording_loop(
             &app,
             &session,
             monitor,
-            x,
-            y,
-            width,
-            height,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            frame_x,
+            frame_y,
             reason,
             shortcut,
         )
@@ -4071,16 +4285,23 @@ fn snipping_recording_loop_inner(
     app: &AppHandle,
     session: &SnippingRecordingSession,
     monitor: SnippingAreaMonitor,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    frame_x: u32,
+    frame_y: u32,
     reason: String,
     shortcut: String,
 ) -> Result<(), String> {
     snipping_ensure_scap_ready()?;
     let target = snipping_scap_display_target_for_area_monitor(&monitor);
-    let crop_area = Some(snipping_scap_capture_area(x, y, width, height));
+    let crop_area = Some(snipping_scap_capture_area(
+        source_x,
+        source_y,
+        source_width,
+        source_height,
+    ));
     let options = scap::capturer::Options {
         fps: SNIPPING_RECORDING_FPS,
         show_cursor: true,
@@ -4133,15 +4354,15 @@ fn snipping_recording_loop_inner(
                     let frame_bytes =
                         if frame_width == session.width && frame_height == session.height {
                             bytes
-                        } else if frame_width >= x.saturating_add(session.width)
-                            && frame_height >= y.saturating_add(session.height)
+                        } else if frame_width >= frame_x.saturating_add(session.width)
+                            && frame_height >= frame_y.saturating_add(session.height)
                         {
                             snipping_crop_bgra_bytes(
                                 &bytes,
                                 frame_width,
                                 frame_height,
-                                x,
-                                y,
+                                frame_x,
+                                frame_y,
                                 session.width,
                                 session.height,
                             )
@@ -4203,7 +4424,11 @@ fn snipping_recording_loop_inner(
                     if h264_frame.is_empty() {
                         continue;
                     }
-                    let duration_ms = snipping_recording_frame_duration_ms(frame_count);
+                    let duration_ms = if has_video_slice {
+                        snipping_recording_frame_duration_ms(frame_count)
+                    } else {
+                        0
+                    };
                     muxer
                         .encode_video(&h264_frame, duration_ms)
                         .map_err(|error| format!("Unable to write recording frame: {error}"))?;
@@ -4239,6 +4464,10 @@ fn snipping_recording_loop_inner(
         let _ = fs::remove_file(&session.tmp_path);
         return Err("Recording file is empty.".to_string());
     }
+    if let Err(error) = snipping_validate_recording_mp4(&session.tmp_path) {
+        let _ = fs::remove_file(&session.tmp_path);
+        return Err(error);
+    }
     fs::rename(&session.tmp_path, &session.target_path).map_err(|error| {
         let _ = fs::remove_file(&session.tmp_path);
         format!(
@@ -4265,22 +4494,15 @@ fn snipping_recording_loop_inner(
 }
 
 fn snipping_even_recording_rect(
-    monitor: &SnippingAreaMonitor,
+    frame_width: u32,
+    frame_height: u32,
     selection_x: u32,
     selection_y: u32,
     selection_width: u32,
     selection_height: u32,
 ) -> (u32, u32, u32, u32) {
-    let frame_width = monitor
-        .snapshot_width
-        .max(monitor.width)
-        .max(monitor.capture_width)
-        .max(1);
-    let frame_height = monitor
-        .snapshot_height
-        .max(monitor.height)
-        .max(monitor.capture_height)
-        .max(1);
+    let frame_width = frame_width.max(1);
+    let frame_height = frame_height.max(1);
     let mut x = selection_x.min(frame_width.saturating_sub(1));
     let mut y = selection_y.min(frame_height.saturating_sub(1));
     let mut width = selection_width.min(frame_width.saturating_sub(x));
@@ -4302,6 +4524,101 @@ fn snipping_even_recording_rect(
     (x, y, width, height)
 }
 
+#[derive(Clone, Copy)]
+struct SnippingRecordingArea {
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    frame_x: u32,
+    frame_y: u32,
+    frame_width: u32,
+    frame_height: u32,
+}
+
+fn snipping_recording_capture_scale(monitor: &SnippingAreaMonitor) -> f64 {
+    if monitor.snapshot_width > 0 && monitor.capture_width > 0 {
+        return (f64::from(monitor.snapshot_width) / f64::from(monitor.capture_width)).max(0.1);
+    }
+    monitor.scale_factor.max(0.1)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn snipping_recording_area_from_selection(
+    monitor: &SnippingAreaMonitor,
+    request: &SnippingAreaSelectionRequest,
+) -> SnippingRecordingArea {
+    let source_x = request.x.max(0.0).round() as u32;
+    let source_y = request.y.max(0.0).round() as u32;
+    let source_width = request.width.max(0.0).round() as u32;
+    let source_height = request.height.max(0.0).round() as u32;
+    let (source_x, source_y, source_width, source_height) = snipping_even_recording_rect(
+        monitor.capture_width,
+        monitor.capture_height,
+        source_x,
+        source_y,
+        source_width,
+        source_height,
+    );
+
+    let scale = snipping_recording_capture_scale(monitor);
+    let frame_x = (f64::from(source_x) * scale).round() as u32;
+    let frame_y = (f64::from(source_y) * scale).round() as u32;
+    let frame_width = ((f64::from(source_width) * scale).round() as u32).max(1);
+    let frame_height = ((f64::from(source_height) * scale).round() as u32).max(1);
+    let (_, _, frame_width, frame_height) =
+        snipping_even_recording_rect(u32::MAX, u32::MAX, 0, 0, frame_width, frame_height);
+
+    SnippingRecordingArea {
+        source_x,
+        source_y,
+        source_width,
+        source_height,
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn snipping_recording_area_from_selection(
+    monitor: &SnippingAreaMonitor,
+    selection_x: u32,
+    selection_y: u32,
+    selection_width: u32,
+    selection_height: u32,
+) -> SnippingRecordingArea {
+    let frame_width = monitor
+        .snapshot_width
+        .max(monitor.width)
+        .max(monitor.capture_width)
+        .max(1);
+    let frame_height = monitor
+        .snapshot_height
+        .max(monitor.height)
+        .max(monitor.capture_height)
+        .max(1);
+    let (x, y, width, height) = snipping_even_recording_rect(
+        frame_width,
+        frame_height,
+        selection_x,
+        selection_y,
+        selection_width,
+        selection_height,
+    );
+    SnippingRecordingArea {
+        source_x: x,
+        source_y: y,
+        source_width: width,
+        source_height: height,
+        frame_x: x,
+        frame_y: y,
+        frame_width: width,
+        frame_height: height,
+    }
+}
+
 fn snipping_start_area_recording_for(
     app: &AppHandle,
     overlay_label: &str,
@@ -4312,7 +4629,7 @@ fn snipping_start_area_recording_for(
     if mode != SnippingAreaMode::Recording {
         return Err("Start recording from the recording area picker.".to_string());
     }
-    let (monitor, selection_x, selection_y, selection_width, selection_height) =
+    let (monitor, _selection_x, _selection_y, selection_width, selection_height) =
         snipping_scaled_area_selection(app, overlay_label, &request)?;
     if selection_width < SNIPPING_MIN_RECORDING_PIXELS
         || selection_height < SNIPPING_MIN_RECORDING_PIXELS
@@ -4321,9 +4638,19 @@ fn snipping_start_area_recording_for(
         snipping_hide_area_overlay(app);
         return Err("Recording area is too small.".to_string());
     }
-    let (x, y, width, height) =
-        snipping_even_recording_rect(&monitor, selection_x, selection_y, selection_width, selection_height);
-    if width < SNIPPING_MIN_RECORDING_PIXELS || height < SNIPPING_MIN_RECORDING_PIXELS {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let recording_area = snipping_recording_area_from_selection(&monitor, &request);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let recording_area = snipping_recording_area_from_selection(
+        &monitor,
+        _selection_x,
+        _selection_y,
+        selection_width,
+        selection_height,
+    );
+    if recording_area.frame_width < SNIPPING_MIN_RECORDING_PIXELS
+        || recording_area.frame_height < SNIPPING_MIN_RECORDING_PIXELS
+    {
         snipping_clear_area_sessions(app)?;
         snipping_hide_area_overlay(app);
         return Err("Recording area is too small.".to_string());
@@ -4336,8 +4663,8 @@ fn snipping_start_area_recording_for(
         target_path,
         tmp_path,
         started_at_ms: current_time_ms(),
-        width,
-        height,
+        width: recording_area.frame_width,
+        height: recording_area.frame_height,
     };
     {
         let state = app.state::<SnippingState>().recording.clone();
@@ -4368,10 +4695,12 @@ fn snipping_start_area_recording_for(
             app_for_thread,
             session_for_thread,
             monitor,
-            x,
-            y,
-            width,
-            height,
+            recording_area.source_x,
+            recording_area.source_y,
+            recording_area.source_width,
+            recording_area.source_height,
+            recording_area.frame_x,
+            recording_area.frame_y,
             "area-recording".to_string(),
             String::new(),
         );
@@ -4384,8 +4713,8 @@ fn snipping_start_area_recording_for(
         "localPath": session.target_path.display().to_string(),
         "started_at_ms": session.started_at_ms,
         "startedAtMs": session.started_at_ms,
-        "width": width,
-        "height": height,
+        "width": recording_area.frame_width,
+        "height": recording_area.frame_height,
     }))
 }
 
@@ -4825,7 +5154,14 @@ fn snipping_capture_full_for(
             .map_err(|error| format!("Unable to capture screenshot: {error}"))
     });
     snipping_restore_desktop_icons_after_capture(app);
-    snipping_save_image(app, image_result?, "full", reason, shortcut)
+    let image = match image_result {
+        Ok(image) => image,
+        Err(error) => {
+            emit_snipping_permission_attention(app, reason, &shortcut, &error);
+            return Err(error);
+        }
+    };
+    snipping_save_image(app, image, "full", reason, shortcut)
 }
 
 fn size_snipping_overlay_window(window: &tauri::WebviewWindow, monitor: &SnippingAreaMonitor) {
@@ -4863,6 +5199,7 @@ fn ensure_snipping_overlay_window(
 
     let logical_width = f64::from(monitor.width) / monitor.scale_factor.max(1.0);
     let logical_height = f64::from(monitor.height) / monitor.scale_factor.max(1.0);
+    snipping_forget_area_overlay_ready(app, label);
     let window = WebviewWindowBuilder::new(
         app,
         label,
@@ -4884,6 +5221,15 @@ fn ensure_snipping_overlay_window(
     .build()
     .map_err(|error| format!("Unable to create snipping overlay: {error}"))?;
 
+    {
+        let app_for_destroy = app.clone();
+        let label_for_destroy = label.to_string();
+        window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::Destroyed) {
+                snipping_forget_area_overlay_ready(&app_for_destroy, &label_for_destroy);
+            }
+        });
+    }
     size_snipping_overlay_window(&window, monitor);
     #[cfg(target_os = "macos")]
     {
@@ -6016,9 +6362,10 @@ fn snipping_begin_area_for(
             }),
         );
         snipping_restore_desktop_icons_after_capture(app);
-        return Err(
-            first_error.unwrap_or_else(|| "Unable to capture screen for area snip.".to_string())
-        );
+        let error = first_error
+            .unwrap_or_else(|| "Unable to capture screen for area snip.".to_string());
+        emit_snipping_permission_attention(app, reason, &shortcut, &error);
+        return Err(error);
     }
 
     snipping_replace_area_sessions(app, sessions)?;
@@ -6069,6 +6416,7 @@ fn snipping_begin_area_for(
             );
             continue;
         };
+        snipping_wait_for_area_overlay_ready(app, label);
         #[cfg(target_os = "macos")]
         {
             if !snipping_show_area_overlay_window_for_session(app, &window, label) {
@@ -6720,6 +7068,22 @@ fn snipping_area_overlay_status(
         "mode": mode.as_str(),
         "overlayLabel": label,
         "monitor": monitor,
+    }))
+}
+
+#[tauri::command]
+fn snipping_area_overlay_ready(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Value, String> {
+    let label = window.label().to_string();
+    if !snipping_is_overlay_label(&label) {
+        return Err("Not a snipping overlay window.".to_string());
+    }
+    snipping_mark_area_overlay_ready(&app, &label);
+    Ok(json!({
+        "kind": "snipping_area_overlay_ready",
+        "overlayLabel": label,
     }))
 }
 
@@ -10093,4 +10457,136 @@ fn snipping_copy_untracked_asset_to_clipboard(path: String) -> Result<Value, Str
 #[tauri::command]
 fn snipping_cancel_area_snip(app: AppHandle) -> Result<Value, String> {
     snipping_cancel_area_snip_for(&app)
+}
+
+#[cfg(test)]
+mod snipping_recording_mp4_tests {
+    use super::*;
+
+    fn recording_test_monitor(
+        scale_factor: f64,
+        capture_width: u32,
+        capture_height: u32,
+        snapshot_width: u32,
+        snapshot_height: u32,
+    ) -> SnippingAreaMonitor {
+        SnippingAreaMonitor {
+            name: Some("test".to_string()),
+            primary: true,
+            x: 0,
+            y: 0,
+            width: ((f64::from(capture_width) * scale_factor).round() as u32).max(1),
+            height: ((f64::from(capture_height) * scale_factor).round() as u32).max(1),
+            scale_factor,
+            capture_x: 0,
+            capture_y: 0,
+            capture_width,
+            capture_height,
+            snapshot_path: None,
+            snapshot_width,
+            snapshot_height,
+        }
+    }
+
+    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8_usize.saturating_add(payload.len())).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn sample_table_box(sample_count: u32) -> Vec<u8> {
+        let mut stsz_payload = Vec::new();
+        stsz_payload.extend_from_slice(&[0, 0, 0, 0]);
+        stsz_payload.extend_from_slice(&0_u32.to_be_bytes());
+        stsz_payload.extend_from_slice(&sample_count.to_be_bytes());
+        for _ in 0..sample_count {
+            stsz_payload.extend_from_slice(&4_u32.to_be_bytes());
+        }
+
+        let stsz = mp4_box(b"stsz", &stsz_payload);
+        let stbl = mp4_box(b"stbl", &stsz);
+        let minf = mp4_box(b"minf", &stbl);
+        let mdia = mp4_box(b"mdia", &minf);
+        let trak = mp4_box(b"trak", &mdia);
+        mp4_box(b"moov", &trak)
+    }
+
+    fn recording_mp4_bytes(sample_count: u32, mdat_payload: &[u8]) -> Vec<u8> {
+        let mut ftyp_payload = Vec::new();
+        ftyp_payload.extend_from_slice(b"isom");
+        ftyp_payload.extend_from_slice(&0_u32.to_be_bytes());
+        ftyp_payload.extend_from_slice(b"isom");
+
+        let mut bytes = mp4_box(b"ftyp", &ftyp_payload);
+        bytes.extend_from_slice(&mp4_box(b"mdat", mdat_payload));
+        bytes.extend_from_slice(&sample_table_box(sample_count));
+        bytes
+    }
+
+    fn write_test_recording(name: &str, bytes: &[u8]) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "diffforge-{name}-{}-{nanos}.mp4",
+            std::process::id()
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn recording_mp4_validation_rejects_header_only_file() {
+        let bytes = recording_mp4_bytes(0, &[]);
+        let path = write_test_recording("empty-recording", &bytes);
+
+        let result = snipping_validate_recording_mp4(&path);
+
+        let _ = fs::remove_file(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn recording_mp4_validation_accepts_file_with_media_samples() {
+        let bytes = recording_mp4_bytes(1, &[0, 0, 0, 1]);
+        let path = write_test_recording("sampled-recording", &bytes);
+
+        let result = snipping_validate_recording_mp4(&path);
+
+        let _ = fs::remove_file(path);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn recording_area_uses_overlay_points_for_source_rect() {
+        let monitor = recording_test_monitor(2.0, 800, 600, 1600, 1200);
+        let request = SnippingAreaSelectionRequest {
+            x: 100.0,
+            y: 50.0,
+            width: 400.0,
+            height: 300.0,
+            scale_factor: Some(2.0),
+        };
+
+        let area = snipping_recording_area_from_selection(&monitor, &request);
+
+        assert_eq!(
+            (
+                area.source_x,
+                area.source_y,
+                area.source_width,
+                area.source_height
+            ),
+            (100, 50, 400, 300)
+        );
+        assert_eq!(
+            (area.frame_x, area.frame_y, area.frame_width, area.frame_height),
+            (200, 100, 800, 600)
+        );
+    }
 }

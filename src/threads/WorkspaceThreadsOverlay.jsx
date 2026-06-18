@@ -10,6 +10,7 @@ import styled, { keyframes } from "styled-components";
 
 import { terminalActivityStatusIsBusy } from "../terminals/terminalActivityState.js";
 import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
+import { getThreadTerminalGroundTruth } from "./threadTerminalGroundTruth.js";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
   getWorkspaceThreadAgentLabel,
@@ -1263,6 +1264,12 @@ function getThreadState(thread, entry) {
       && ["active", "starting"].includes(String(mappedTerminal?.status || "").toLowerCase())
       && ["active", "starting"].includes(String(thread?.status || "").toLowerCase()),
   );
+  const terminalGroundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: isTerminalMappedToThread ? mappedTerminal : null,
+    providerBinding,
+    targetRole: thread?.currentAgent || "",
+    thread,
+  });
   let threadViewState = THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
   if (isActiveTerminal) {
     threadViewState = hasProviderSession
@@ -1273,24 +1280,30 @@ function getThreadState(thread, entry) {
   }
 
   const inactiveNoSession = threadViewState === THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
+  const groundTruthWorkState = String(terminalGroundTruth?.terminalWorkState || "").toLowerCase();
   const isWorking = inactiveNoSession
     ? false
-    : getThreadIsWorking({
-      isActiveTerminal,
-      mappedTerminal,
-      providerBinding,
-      thread,
-      turnState,
-    });
+    : groundTruthWorkState === "complete"
+      ? false
+      : groundTruthWorkState === "running" || groundTruthWorkState === "prompting_user"
+        ? true
+        : getThreadIsWorking({
+          isActiveTerminal,
+          mappedTerminal,
+          providerBinding,
+          thread,
+          turnState: terminalGroundTruth?.effectiveLatestTurnState || turnState,
+        });
+  const effectiveTurnState = terminalGroundTruth?.effectiveLatestTurnState || turnState;
   const dotState = isActiveTerminal
     ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()
     : inactiveNoSession
       ? "idle"
-      : turnState === "error"
+      : effectiveTurnState === "error"
       ? "error"
-      : isWorking && turnState === "running"
+      : isWorking && effectiveTurnState === "running"
         ? "running"
-        : turnState === "interrupted"
+        : effectiveTurnState === "interrupted"
           ? "interrupted"
           : "idle";
 

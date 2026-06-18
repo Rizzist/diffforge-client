@@ -1,7 +1,7 @@
 import {
   logTerminalDiagnosticEvent,
   logThreadBridgeDiagnosticEvent,
-} from "../terminalDiagnostics";
+} from "../terminalDiagnostics.js";
 import { stripLiveViewControlSequences } from "../liveViewSanitizer.js";
 
 export const TERMINAL_THEME_BACKGROUND = "#020304";
@@ -70,6 +70,7 @@ export const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 export const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 export const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 export const TERMINAL_ACTIVITY_HOOK_EVENT = "forge-terminal-activity-hook";
+export const TERMINAL_PROVIDER_SESSION_BOUND_EVENT = "forge-terminal-provider-session-bound";
 export const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT = "diffforge:terminal-architecture-activity";
 export const TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT = "diffforge:terminal-submit-diagnostic-snapshot-request";
 export const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
@@ -490,6 +491,11 @@ export function extractNativeSessionIdFromOutput(agentId, text) {
     ? [
       /\bcodex(?:\.cmd|\.exe)?\s+resume\s+([0-9a-fA-F-]{8,}|[^\s"'`]+)/i,
       /\bresume\s+([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b/i,
+      /\bsession\s+id\s*[:=]\s*([0-9a-zA-Z_-]{8,})/i,
+      /\bsession[_-]?id\s*["']?\s*[:=]\s*["']?([0-9a-zA-Z_-]{8,})/i,
+      /"type"\s*:\s*"session_meta"[\s\S]{0,240}?"payload"\s*:\s*\{[\s\S]{0,240}?"id"\s*:\s*"([^"]{8,})"/i,
+      /"session_id"\s*:\s*"([^"]{8,})"/i,
+      /"sessionId"\s*:\s*"([^"]{8,})"/i,
     ]
     : agentId === "claude"
       ? [

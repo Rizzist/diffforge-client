@@ -284,6 +284,9 @@ fn agent_accounts_canonical_profile_ids_by_email(
             continue;
         }
         if !default_email.is_empty() && email == default_email {
+            if id == active_id {
+                ids.insert(id);
+            }
             continue;
         }
         match by_email.entry(email) {
@@ -299,6 +302,37 @@ fn agent_accounts_canonical_profile_ids_by_email(
     }
     ids.extend(by_email.into_values());
     ids
+}
+
+fn agent_accounts_profile_id_for_email(
+    kind: &str,
+    profiles: &[Value],
+    email: &str,
+) -> Option<String> {
+    if email.is_empty() {
+        return None;
+    }
+    profiles.iter().find_map(|profile| {
+        let id = agent_accounts_profile_id(profile)?;
+        (agent_accounts_profile_email(kind, profile) == email).then_some(id)
+    })
+}
+
+fn agent_accounts_effective_active_profile_id(
+    kind: &str,
+    active_id: &str,
+    profiles: &[Value],
+    default_email: &str,
+) -> String {
+    if active_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
+        && profiles.iter().any(|profile| {
+            agent_accounts_profile_id(profile).as_deref() == Some(active_id)
+        })
+    {
+        return active_id.to_string();
+    }
+    agent_accounts_profile_id_for_email(kind, profiles, default_email)
+        .unwrap_or_else(|| AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string())
 }
 
 fn agent_accounts_default_alias_for_state(
@@ -352,8 +386,10 @@ pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
     let default_email = agent_accounts_default_email(kind);
+    let effective_active_id =
+        agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
     let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &active_id, &default_email);
+        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
     profiles
         .iter()
         .filter_map(|profile| {
@@ -371,22 +407,13 @@ pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
 pub(crate) fn agent_accounts_active_profile_id_for_tokenomics(kind: &str) -> String {
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
-    if active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
-        return AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string();
-    }
-
     let default_email = agent_accounts_default_email(kind);
-    if profiles.iter().any(|profile| {
-        agent_accounts_profile_id(profile).as_deref() == Some(active_id.as_str())
-            && agent_accounts_profile_is_duplicate_of_default(kind, profile, &default_email)
-    }) {
-        return AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string();
-    }
-
+    let effective_active_id =
+        agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
     let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &active_id, &default_email);
-    if canonical_ids.contains(&active_id) {
-        active_id
+        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
+    if canonical_ids.contains(&effective_active_id) {
+        effective_active_id
     } else {
         AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string()
     }
@@ -400,12 +427,10 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         .and_then(Value::as_str)
         .map(agent_accounts_email_key)
         .unwrap_or_default();
+    let effective_active_id =
+        agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
     let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &active_id, &default_email);
-    let active_duplicates_default = profiles.iter().any(|profile| {
-        agent_accounts_profile_id(profile).as_deref() == Some(active_id.as_str())
-            && agent_accounts_profile_is_duplicate_of_default(kind, profile, &default_email)
-    });
+        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
     let default_alias =
         agent_accounts_default_alias_for_state(registry, kind, &profiles, &active_id, &default_email);
     let default_issue = registry
@@ -430,7 +455,7 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         "identity": default_identity,
         "authStatus": default_auth_status,
         "isDefault": true,
-        "isActive": active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID || active_duplicates_default,
+        "isActive": effective_active_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
         "loginCommand": "",
     })];
     for profile in &profiles {
@@ -440,9 +465,9 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         if !canonical_ids.contains(&id) {
             continue;
         }
-        views.push(agent_accounts_profile_view(kind, profile, &active_id));
+        views.push(agent_accounts_profile_view(kind, profile, &effective_active_id));
     }
-    json!({ "activeProfileId": active_id, "profiles": views })
+    json!({ "activeProfileId": effective_active_id, "profiles": views })
 }
 
 fn agent_accounts_kind_auth_statuses(registry: &Value, kind: &str) -> Value {
@@ -786,8 +811,10 @@ pub(crate) fn agent_accounts_profiles_for_tokenomics(kind: &str) -> Vec<(String,
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
     let default_email = agent_accounts_default_email(kind);
+    let effective_active_id =
+        agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
     let canonical_ids =
-        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &active_id, &default_email);
+        agent_accounts_canonical_profile_ids_by_email(kind, &profiles, &effective_active_id, &default_email);
     profiles
         .iter()
         .filter_map(|profile| {
@@ -1069,7 +1096,7 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
         registry["agents"][kind]["capturedSuppressed"] = json!([]);
         registry_changed = true;
     }
-    let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
+    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
     let existing = profiles
         .iter()
         .find(|profile| agent_accounts_profile_email(kind, profile) == email)
@@ -1086,11 +1113,6 @@ fn agent_accounts_capture_kind(kind: &'static str) -> bool {
             {
                 agent_accounts_snapshot_refresh(kind, Path::new(dir));
             }
-        }
-        if agent_accounts_profile_id(&existing).as_deref() == Some(active_id.as_str()) {
-            agent_accounts_ensure_kind_entry(&mut registry, kind);
-            registry["agents"][kind]["activeProfileId"] = json!(AGENT_ACCOUNTS_DEFAULT_PROFILE_ID);
-            registry_changed = true;
         }
         if registry_changed {
             agent_accounts_registry_write(&registry);
@@ -1569,31 +1591,18 @@ async fn agent_accounts_set_active(
     tauri::async_runtime::spawn_blocking(move || {
         let mut registry = agent_accounts_registry_read();
         let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
-        let selected_profile = if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
-            None
-        } else {
-            Some(
-                profiles
-                    .iter()
-                    .find(|profile| {
-                        profile
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            == profile_id
-                    })
-                    .cloned()
-                    .ok_or_else(|| format!("Unknown {kind} account profile: {profile_id}"))?,
-            )
-        };
-        let active_profile_id = selected_profile
-            .as_ref()
-            .filter(|profile| {
-                let default_email = agent_accounts_default_email(kind);
-                agent_accounts_profile_is_duplicate_of_default(kind, profile, &default_email)
+        if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
+            && !profiles.iter().any(|profile| {
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == profile_id
             })
-            .map(|_| AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string())
-            .unwrap_or_else(|| profile_id.clone());
+        {
+            return Err(format!("Unknown {kind} account profile: {profile_id}"));
+        }
+        let active_profile_id = profile_id.clone();
         if !registry.get("agents").is_some_and(Value::is_object) {
             registry["agents"] = json!({});
         }
@@ -1863,7 +1872,7 @@ mod agent_accounts_tests {
     }
 
     #[test]
-    fn active_duplicate_email_maps_to_default_for_state_and_tokenomics() {
+    fn active_duplicate_email_stays_on_selected_profile() {
         let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -1935,24 +1944,104 @@ mod agent_accounts_tests {
             .iter()
             .filter_map(|profile| profile["id"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(visible_ids, vec!["default", "cap-work"]);
-        assert_eq!(profiles[0]["isActive"].as_bool(), Some(true));
+        assert_eq!(visible_ids, vec!["default", "cap-admin", "cap-work"]);
+        assert_eq!(profiles[0]["isActive"].as_bool(), Some(false));
+        assert_eq!(profiles[1]["isActive"].as_bool(), Some(true));
         assert_eq!(profiles[0]["alias"].as_str(), Some("Admin"));
-        assert_eq!(
-            agent_accounts_duplicate_profile_ids("codex"),
-            vec!["cap-admin".to_string()]
-        );
+        assert!(agent_accounts_duplicate_profile_ids("codex").is_empty());
         let tokenomics_ids = agent_accounts_profiles_for_tokenomics("codex")
             .into_iter()
             .map(|(id, _, _)| id)
             .collect::<Vec<_>>();
-        assert_eq!(tokenomics_ids, vec!["cap-work".to_string()]);
+        assert_eq!(tokenomics_ids, vec!["cap-admin".to_string(), "cap-work".to_string()]);
 
-        assert!(agent_accounts_capture_kind("codex"));
+        assert!(!agent_accounts_capture_kind("codex"));
         let registry_after = agent_accounts_registry_read();
         assert_eq!(
             registry_after["agents"]["codex"]["activeProfileId"].as_str(),
-            Some(AGENT_ACCOUNTS_DEFAULT_PROFILE_ID)
+            Some("cap-admin")
+        );
+    }
+
+    #[test]
+    fn default_active_resolves_to_current_device_codex_profile() {
+        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = env::temp_dir().join(format!(
+            "agent_accounts_default_device_active_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let data = root.join("data");
+        let default_codex_home = home.join(".codex");
+        let device_dir = data
+            .join(AGENT_ACCOUNTS_PROFILE_DIR)
+            .join("codex")
+            .join("cap-device");
+        let other_dir = data
+            .join(AGENT_ACCOUNTS_PROFILE_DIR)
+            .join("codex")
+            .join("cap-other");
+        fs::create_dir_all(&default_codex_home).unwrap();
+        fs::create_dir_all(&device_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(
+            default_codex_home.join("auth.json"),
+            test_codex_auth_for_email("device@example.com"),
+        )
+        .unwrap();
+        fs::write(
+            device_dir.join("auth.json"),
+            test_codex_auth_for_email("device@example.com"),
+        )
+        .unwrap();
+        fs::write(
+            other_dir.join("auth.json"),
+            test_codex_auth_for_email("other@example.com"),
+        )
+        .unwrap();
+        let _home_env = ScopedAgentAccountsEnv::set("HOME", &home);
+        let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
+        agent_accounts_registry_write(&json!({
+            "agents": {
+                "codex": {
+                    "activeProfileId": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+                    "profiles": [
+                        {
+                            "id": "cap-device",
+                            "email": "device@example.com",
+                            "alias": "Device",
+                            "label": "device",
+                            "source": "captured",
+                            "dir": device_dir.to_string_lossy().to_string(),
+                        },
+                        {
+                            "id": "cap-other",
+                            "email": "other@example.com",
+                            "label": "other",
+                            "source": "captured",
+                            "dir": other_dir.to_string_lossy().to_string(),
+                        }
+                    ],
+                }
+            }
+        }));
+
+        let registry = agent_accounts_registry_read();
+        let state = agent_accounts_kind_state(&registry, "codex");
+        assert_eq!(state["activeProfileId"].as_str(), Some("cap-device"));
+        let profiles = state["profiles"].as_array().unwrap();
+        let active_ids = profiles
+            .iter()
+            .filter(|profile| profile["isActive"].as_bool() == Some(true))
+            .filter_map(|profile| profile["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(active_ids, vec!["cap-device"]);
+        assert_eq!(
+            agent_accounts_active_profile_id_for_tokenomics("codex"),
+            "cap-device".to_string()
         );
     }
 

@@ -6,7 +6,7 @@ import { CropFree } from "@styled-icons/material-rounded/CropFree";
 import { ScreenshotMonitor } from "@styled-icons/material-rounded/ScreenshotMonitor";
 import { Videocam } from "@styled-icons/material-rounded/Videocam";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import styled, { createGlobalStyle } from "styled-components";
+import styled, { createGlobalStyle, keyframes } from "styled-components";
 
 import {
   AudioDeviceHeader,
@@ -38,6 +38,7 @@ export const SNIPPING_RECORDING_CONTROLS_HASH = "#/snipping-recording-controls";
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
+export const SNIPPING_PERMISSION_ATTENTION_EVENT = "forge-snipping-permission-attention";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED = true;
@@ -45,6 +46,7 @@ const SNIPPING_AREA_CURSOR_DEBUG_MOUSE_SAMPLE_MS = 120;
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
 const SNIPPING_ACTION_RECORDING = "area-recording";
+const SNIPPING_PERMISSION_HIGHLIGHT_MS = 4200;
 const RECORDING_MIN_SELECTION_SIZE = 36;
 const RECORDING_RESIZE_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 
@@ -397,12 +399,15 @@ export default function SnippingWorkspaceView({
   untrackedLibrary = null,
   untrackedLoading = false,
   onUntrackedRefresh = null,
+  permissionAttentionId = 0,
 }) {
   const [status, setStatus] = useState(fallbackSnippingStatus);
   const [error, setError] = useState("");
   const [actionState, setActionState] = useState("idle");
   const [capturingShortcut, setCapturingShortcut] = useState("");
   const [lastCapture, setLastCapture] = useState(null);
+  const [permissionHighlightId, setPermissionHighlightId] = useState(0);
+  const permissionPanelRef = useRef(null);
 
   const snippingEnabled = Boolean(status?.enabled);
   const hideDesktopIcons = status?.hideDesktopIcons !== false;
@@ -606,6 +611,29 @@ export default function SnippingWorkspaceView({
   }, [loadStatus]);
 
   useEffect(() => {
+    const attentionId = Number(permissionAttentionId || 0);
+    if (!attentionId) return undefined;
+
+    setPermissionHighlightId(attentionId);
+    loadStatus();
+
+    const scrollFrame = window.requestAnimationFrame(() => {
+      permissionPanelRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    });
+    const clearTimer = window.setTimeout(() => {
+      setPermissionHighlightId((current) => (current === attentionId ? 0 : current));
+    }, SNIPPING_PERMISSION_HIGHLIGHT_MS);
+
+    return () => {
+      window.cancelAnimationFrame(scrollFrame);
+      window.clearTimeout(clearTimer);
+    };
+  }, [loadStatus, permissionAttentionId]);
+
+  useEffect(() => {
     let cancelled = false;
     let unlistenShortcuts = null;
     let unlistenCaptures = null;
@@ -756,7 +784,13 @@ export default function SnippingWorkspaceView({
             )}
           </AudioDevicePanel>
 
-          <AudioDevicePanel>
+          <SnippingPermissionsPanel ref={permissionPanelRef}>
+            {permissionHighlightId ? (
+              <SnippingPermissionHighlightFlash
+                aria-hidden="true"
+                key={`snipping-permission-highlight-${permissionHighlightId}`}
+              />
+            ) : null}
             <AudioDeviceHeader>
               <div>
                 <SettingsLabel>Permissions</SettingsLabel>
@@ -785,7 +819,7 @@ export default function SnippingWorkspaceView({
                 </SecondaryButton>
               </AudioRecorderOptionRow>
             )}
-          </AudioDevicePanel>
+          </SnippingPermissionsPanel>
         </SnippingActionGrid>
 
         <AudioDevicePanel aria-label="Snipping shortcut settings">
@@ -1038,6 +1072,41 @@ export function SnippingOverlayWindow() {
       logCursorDebug("overlay_unmounted", cursorDebugSnapshot(null));
     };
   }, [cursorDebugSnapshot, logCursorDebug]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let readySent = false;
+    let firstFrame = 0;
+    let secondFrame = 0;
+    let fallbackTimer = 0;
+    const markReady = () => {
+      if (cancelled || readySent) {
+        return;
+      }
+      readySent = true;
+      invoke("snipping_area_overlay_ready").catch(() => {});
+    };
+
+    if (typeof window.requestAnimationFrame === "function") {
+      firstFrame = window.requestAnimationFrame(() => {
+        secondFrame = window.requestAnimationFrame(markReady);
+      });
+    }
+    fallbackTimer = window.setTimeout(markReady, 120);
+
+    return () => {
+      cancelled = true;
+      if (firstFrame) {
+        window.cancelAnimationFrame(firstFrame);
+      }
+      if (secondFrame) {
+        window.cancelAnimationFrame(secondFrame);
+      }
+      if (fallbackTimer) {
+        window.clearTimeout(fallbackTimer);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1647,6 +1716,43 @@ const SnippingButtonGrid = styled.div`
 
   @media (max-width: 580px) {
     grid-template-columns: 1fr;
+  }
+`;
+
+const snippingPermissionHighlightPulse = keyframes`
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  42% { opacity: 0.66; }
+  62% { opacity: 1; }
+  100% { opacity: 0; }
+`;
+
+const SnippingPermissionsPanel = styled(AudioDevicePanel)`
+  position: relative;
+  align-self: start;
+  overflow: visible;
+`;
+
+const SnippingPermissionHighlightFlash = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  border: 2px solid rgba(250, 204, 21, 0.98);
+  border-radius: inherit;
+  box-shadow:
+    0 0 15px 4px rgba(250, 204, 21, 0.62),
+    0 0 38px 10px rgba(250, 204, 21, 0.34),
+    inset 0 0 20px rgba(250, 204, 21, 0.26);
+  opacity: 0;
+  animation: ${snippingPermissionHighlightPulse} 2s ease-in-out infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(202, 138, 4, 0.92);
+    box-shadow:
+      0 0 15px 4px rgba(202, 138, 4, 0.42),
+      0 0 34px 9px rgba(202, 138, 4, 0.24),
+      inset 0 0 18px rgba(202, 138, 4, 0.16);
   }
 `;
 

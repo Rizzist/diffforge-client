@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { availableMonitors, currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import styled, { keyframes } from "styled-components";
 
 import {
   AUDIO_TRANSCRIPTION_RESULT_EVENT,
@@ -33,12 +34,16 @@ import {
   MAX_AUDIO_POLISHING_SYSTEM_PROMPT_CHARS,
   applySyncedAudioPolishingPreferences,
   audioLlmCleanupEngineOption,
+  audioInputPermissionNeedsAttention,
+  clearAudioInputSetupReady,
   formatAudioPercent,
   getAudioInputErrorMessage,
+  getAudioInputPermissionStatus,
   hasAudioInputSetup,
   listAudioInputDevices,
   markAudioInputSetupReady,
   normalizeAudioWidgetTheme,
+  openAudioInputPermissions,
   prepareWhisperModel,
   publishAudioTranscriptionResult,
   readAudioManualPolishingEnabled,
@@ -288,7 +293,6 @@ import {
   AudioTabButton,
   AudioTabPanel,
   AudioDictionaryPanel,
-  AudioDictionaryTermTools,
   AudioDictionaryWordDeleteButton,
   AudioDictionaryWordEmpty,
   AudioDictionaryWordList,
@@ -518,6 +522,7 @@ export const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT = "forge-audio-model-download-p
 export const AUDIO_WIDGET_HASH = "#/audio-widget";
 export const AUDIO_WIDGET_ERROR_HASH = "#/audio-widget-error";
 export const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT = "forge-audio-widget-visibility-changed";
+export const AUDIO_HOTKEY_ATTENTION_EVENT = "forge-audio-hotkey-attention";
 const AUDIO_WIDGET_ERROR_OVERLAY_EVENT = "forge-audio-widget-error-overlay";
 const AUDIO_WIDGET_ERROR_OVERLAY_STORAGE_KEY = "diffforge.audio.widgetErrorOverlay.v1";
 const AUDIO_PUSH_TO_TALK_EVENT = "forge-audio-push-to-talk";
@@ -540,6 +545,8 @@ const AUDIO_HYBRID_TAP_MAX_MS = 280;
 const AUDIO_HYBRID_DOUBLE_TAP_MS = 360;
 const AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS = 600;
 const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
+const AUDIO_HOTKEY_ATTENTION_HIGHLIGHT_MS = 4200;
+const AUDIO_HOTKEY_ATTENTION_TARGETS = new Set(["permissions", "recorder", "input", "microphone"]);
 // Forge cloud dictation streams audio continuously through the native
 // worker, so only a short tail is needed to flush in-flight chunks before
 // the finish frame; this keeps release-to-transcript latency low.
@@ -647,6 +654,185 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
     label: "Bottom bar",
   },
 ];
+
+function normalizeAudioHotkeyAttentionTargets(payload) {
+  const rawTargets = Array.isArray(payload?.targets)
+    ? payload.targets
+    : [payload?.target || payload?.reason || "input"];
+  const targets = rawTargets
+    .map((target) => String(target || "").trim().toLowerCase())
+    .filter((target) => AUDIO_HOTKEY_ATTENTION_TARGETS.has(target));
+  return targets.length ? Array.from(new Set(targets)) : ["input"];
+}
+
+function emitAudioHotkeyAttention(reason, targets, message = "") {
+  emit(AUDIO_HOTKEY_ATTENTION_EVENT, {
+    id: Date.now(),
+    reason,
+    targets: Array.isArray(targets) ? targets : [targets],
+    message,
+  }).catch(() => {});
+}
+
+const audioHotkeyAttentionPulse = keyframes`
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  42% { opacity: 0.66; }
+  62% { opacity: 1; }
+  100% { opacity: 0; }
+`;
+
+const AudioInputSourcePanel = styled(AudioDevicePanel)`
+  position: relative;
+  align-self: start;
+  overflow: visible;
+`;
+
+const AudioShortcutSettingsPanel = styled(AudioDevicePanel)`
+  position: relative;
+  overflow: visible;
+`;
+
+const AudioRecorderAttentionPanel = styled(AudioRecorderPanel)`
+  position: relative;
+  overflow: visible;
+`;
+
+const AudioAttentionFlash = styled.span`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  border: 2px solid rgba(250, 204, 21, 0.98);
+  border-radius: inherit;
+  box-shadow:
+    0 0 15px 4px rgba(250, 204, 21, 0.62),
+    0 0 38px 10px rgba(250, 204, 21, 0.34),
+    inset 0 0 20px rgba(250, 204, 21, 0.26);
+  opacity: 0;
+  animation: ${audioHotkeyAttentionPulse} 2s ease-in-out infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(202, 138, 4, 0.92);
+    box-shadow:
+      0 0 15px 4px rgba(202, 138, 4, 0.42),
+      0 0 34px 9px rgba(202, 138, 4, 0.24),
+      inset 0 0 18px rgba(202, 138, 4, 0.16);
+  }
+`;
+
+const AudioButtonAttentionFlash = styled(AudioAttentionFlash)`
+  inset: -4px;
+  border-radius: 10px;
+`;
+
+const AudioInputInitializeButton = styled(AudioInputMuteButton)`
+  position: relative;
+  display: inline-flex;
+  width: auto;
+  min-width: 92px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  overflow: visible;
+  font-size: 11px;
+  font-weight: 780;
+  line-height: 1;
+  white-space: nowrap;
+
+  > span {
+    line-height: 1;
+  }
+`;
+
+const AudioDictionaryNameSearchRow = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.58fr);
+  align-items: end;
+  gap: 10px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const AudioDictionaryWordListFrame = styled.div`
+  position: relative;
+  min-width: 0;
+`;
+
+const AudioDictionaryWordComposerRow = styled(AudioDictionaryWordRow)`
+  min-height: 38px;
+`;
+
+const AudioDictionaryWordInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: 12px/var(--audio-word-text-line-height) "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0;
+  outline: none;
+
+  &::placeholder {
+    color: var(--forge-text-muted);
+    opacity: 0.88;
+  }
+`;
+
+const AudioDictionaryBottomJumpButton = styled.button`
+  position: absolute;
+  right: 50%;
+  bottom: 10px;
+  z-index: 4;
+  display: grid;
+  width: 34px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(125, 160, 205, 0.28);
+  border-radius: 999px;
+  color: #d9e7ff;
+  background: rgba(11, 15, 21, 0.88);
+  box-shadow:
+    0 8px 22px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  transform: translateX(50%);
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+
+  &:hover {
+    border-color: rgba(125, 160, 205, 0.46);
+    color: #ffffff;
+    background: rgba(47, 128, 255, 0.22);
+    transform: translateX(50%) translateY(-1px);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(139, 184, 255, 0.58);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0056b3;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: #003f82;
+    background: rgba(0, 102, 204, 0.1);
+  }
+`;
 
 function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible) {
   if (cancelNoticeActive) {
@@ -2617,6 +2803,7 @@ export default function AudioWorkspaceView({
   audioActionState,
   audioDownloadProgress,
   audioError,
+  audioHotkeyAttention = null,
   audioModelStatus,
   audioStatusState,
   audioWidgetVisible,
@@ -2637,7 +2824,9 @@ export default function AudioWorkspaceView({
   const [activeAudioTab, setActiveAudioTab] = useState("general");
   const [audioInputDevices, setAudioInputDevices] = useState([]);
   const [audioInputDeviceId, setAudioInputDeviceId] = useState(readSelectedAudioInputDeviceId);
-  const [audioInputState, setAudioInputState] = useState(hasAudioInputSetup() ? "ready" : "needs-access");
+  const [audioInputState, setAudioInputState] = useState("checking");
+  const [audioInputPermissionStatus, setAudioInputPermissionStatus] = useState(null);
+  const [audioInputPermissionActionState, setAudioInputPermissionActionState] = useState("idle");
   const [audioInputMessage, setAudioInputMessage] = useState("Choose an input source, then enable it for local dictation.");
   const [audioInputStats, setAudioInputStats] = useState(EMPTY_AUDIO_INPUT_STATS);
   const [audioMode, setAudioMode] = useState(readAudioTranscriptionProvider);
@@ -2674,16 +2863,22 @@ export default function AudioWorkspaceView({
   const [voiceRulesError, setVoiceRulesError] = useState("");
   const [voiceRuleEditor, setVoiceRuleEditor] = useState(null);
   const [voiceRuleSaveState, setVoiceRuleSaveState] = useState("idle");
+  const [dictionaryWordListNeedsBottomJump, setDictionaryWordListNeedsBottomJump] = useState(false);
   const voiceRulesSaveTimerRef = useRef(0);
   const [audioShortcutStatus, setAudioShortcutStatus] = useState(() => audioModelStatus?.shortcuts || fallbackShortcutStatus());
   const [audioShortcutError, setAudioShortcutError] = useState("");
   const [audioShortcutActionState, setAudioShortcutActionState] = useState("idle");
   const [capturingAudioShortcut, setCapturingAudioShortcut] = useState("");
+  const [audioHotkeyHighlight, setAudioHotkeyHighlight] = useState({ id: 0, targets: [] });
   const audioInputPreviewRef = useRef(null);
   const audioInputRunRef = useRef(0);
   const audioInputLoadRunRef = useRef(0);
   const audioInputDeviceIdRef = useRef(audioInputDeviceId);
   const audioInputStateRef = useRef(audioInputState);
+  const audioInputSourcePanelRef = useRef(null);
+  const audioRecorderPanelRef = useRef(null);
+  const audioShortcutSettingsPanelRef = useRef(null);
+  const dictionaryWordListRef = useRef(null);
   const copiedAudioHistoryTimerRef = useRef(0);
   const audioHistorySummaryRunRef = useRef(0);
   // Set when an append/changed event arrives while the History tab is not the
@@ -2814,6 +3009,9 @@ export default function AudioWorkspaceView({
   const selectedAudioInputLabel = selectedAudioInput?.label || "Default microphone";
   const audioInputLevel = Math.round(clampAudioLevel(Math.max(audioInputStats.rms * 2600, audioInputStats.peak * 120)));
   const audioInputHasSignal = audioInputLevel >= 6;
+  const audioInputPermissionMissing = audioInputPermissionNeedsAttention(audioInputPermissionStatus);
+  const audioInputPermissionPromptable = Boolean(audioInputPermissionStatus?.microphonePromptable);
+  const isOpeningAudioInputPermissions = audioInputPermissionActionState === "opening";
   const audioInputStatusLabel = {
     checking: "Checking",
     "needs-access": "Setup needed",
@@ -2822,6 +3020,23 @@ export default function AudioWorkspaceView({
     previewing: "Monitoring",
     error: "Input issue",
   }[audioInputState] || "Input";
+  const audioInputDisplayStatusLabel = audioInputPermissionMissing
+    ? "Needs access"
+    : audioInputStatusLabel;
+  const audioInputPrimaryActionLabel = audioInputPermissionMissing
+    ? isOpeningAudioInputPermissions
+      ? (audioInputPermissionPromptable ? "Requesting..." : "Opening...")
+      : audioInputPermissionPromptable
+        ? "Allow Mic"
+        : "Open Settings"
+    : audioInputState === "previewing"
+      ? "Mute"
+      : "Initialize";
+  const audioInputPrimaryActionTitle = audioInputPermissionMissing
+    ? audioInputPermissionStatus?.message || "Enable Microphone access for Diff Forge AI in System Settings."
+    : audioInputState === "previewing"
+      ? "Mute (stop monitoring)"
+      : "Initialize input";
   const effectiveShortcutStatus = audioShortcutStatus || audioModelStatus?.shortcuts || fallbackShortcutStatus();
   const pushToTalkShortcut = effectiveShortcutStatus.pushToTalk?.shortcut
     || audioModelStatus?.shortcut
@@ -2840,6 +3055,14 @@ export default function AudioWorkspaceView({
     && !cancelShortcutError
     && !shortcutPermissionMissing
     && !shortcutQuarantineDetected;
+  const audioHotkeyHighlightTargets = useMemo(
+    () => new Set(audioHotkeyHighlight.targets || []),
+    [audioHotkeyHighlight],
+  );
+  const shouldHighlightAudioPermissions = audioHotkeyHighlightTargets.has("permissions");
+  const shouldHighlightAudioRecorder = audioHotkeyHighlightTargets.has("recorder");
+  const shouldHighlightAudioInput = audioHotkeyHighlightTargets.has("input")
+    || audioHotkeyHighlightTargets.has("microphone");
   const audioHistoryWindow = useMemo(() => (
     buildAudioHistoryPaginatedWindow(
       audioHistoryTotal,
@@ -3314,6 +3537,28 @@ export default function AudioWorkspaceView({
     }
 
     try {
+      const permissionStatus = await getAudioInputPermissionStatus().catch(() => null);
+      if (audioInputLoadRunRef.current !== loadRunId) {
+        return;
+      }
+      if (permissionStatus) {
+        setAudioInputPermissionStatus(permissionStatus);
+        if (audioInputPermissionNeedsAttention(permissionStatus)) {
+          clearAudioInputSetupReady();
+          audioInputRunRef.current += 1;
+          const existingPreview = audioInputPreviewRef.current;
+          audioInputPreviewRef.current = null;
+          if (existingPreview) {
+            await existingPreview.close().catch(() => {});
+          }
+          setAudioInputStats(EMPTY_AUDIO_INPUT_STATS);
+          audioInputStateRef.current = "needs-access";
+          setAudioInputState("needs-access");
+          setAudioInputMessage(permissionStatus.message || "Enable Microphone access for Diff Forge AI in System Settings.");
+          return;
+        }
+      }
+
       const devices = await listAudioInputDevices();
       if (audioInputLoadRunRef.current !== loadRunId) {
         return;
@@ -3338,14 +3583,17 @@ export default function AudioWorkspaceView({
       }
 
       if (currentState !== "previewing") {
-        const inputSetupReady = hasAudioInputSetup();
+        const permissionMissing = audioInputPermissionNeedsAttention(permissionStatus);
+        const inputSetupReady = hasAudioInputSetup() && !permissionMissing;
         const canAutoStartInput = !isMacPlatform() || inputSetupReady;
-        const nextState = canAutoStartInput ? "ready" : "needs-access";
+        const nextState = permissionMissing ? "needs-access" : canAutoStartInput ? "ready" : "needs-access";
         audioInputStateRef.current = nextState;
         setAudioInputState(nextState);
-        setAudioInputMessage(canAutoStartInput
-          ? "Start monitoring to preview levels from the selected source."
-          : "Enable input to open a native stream from the selected source.");
+        setAudioInputMessage(permissionMissing
+          ? (permissionStatus?.message || "Enable Microphone access for Diff Forge AI in System Settings.")
+          : canAutoStartInput
+            ? "Start monitoring to preview levels from the selected source."
+            : "Enable input to open a native stream from the selected source.");
       }
     } catch (deviceError) {
       if (audioInputLoadRunRef.current !== loadRunId) {
@@ -3377,6 +3625,21 @@ export default function AudioWorkspaceView({
     setAudioInputMessage("Opening selected input stream.");
 
     try {
+      const permissionStatus = await getAudioInputPermissionStatus().catch(() => null);
+      if (audioInputRunRef.current !== runId) {
+        return;
+      }
+      if (permissionStatus) {
+        setAudioInputPermissionStatus(permissionStatus);
+        if (audioInputPermissionNeedsAttention(permissionStatus)) {
+          clearAudioInputSetupReady();
+          audioInputStateRef.current = "needs-access";
+          setAudioInputState("needs-access");
+          setAudioInputMessage(permissionStatus.message || "Enable Microphone access for Diff Forge AI in System Settings.");
+          return;
+        }
+      }
+
       const audioInputPreview = await startLowPowerAudioBuffer({
         deviceId,
         owner: "audio-tab",
@@ -3408,6 +3671,10 @@ export default function AudioWorkspaceView({
       }
 
       setAudioInputStats(EMPTY_AUDIO_INPUT_STATS);
+      if (String(inputError?.message || inputError || "").toLowerCase().includes("permission")
+        || String(inputError?.message || inputError || "").toLowerCase().includes("denied")) {
+        clearAudioInputSetupReady();
+      }
       audioInputStateRef.current = "error";
       setAudioInputState("error");
       setAudioInputMessage(getAudioInputErrorMessage(inputError, "Unable to open the selected input source."));
@@ -3428,12 +3695,45 @@ export default function AudioWorkspaceView({
       return;
     }
 
-    setAudioInputMessage(hasAudioInputSetup()
-      ? "Start monitoring to preview levels from the selected source."
-      : "Enable input to open a native stream from the selected source.");
-  }, [startAudioInputPreview]);
+    setAudioInputMessage(audioInputPermissionMissing
+      ? (audioInputPermissionStatus?.message || "Enable Microphone access for Diff Forge AI in System Settings.")
+      : hasAudioInputSetup()
+        ? "Start monitoring to preview levels from the selected source."
+        : "Enable input to open a native stream from the selected source.");
+  }, [audioInputPermissionMissing, audioInputPermissionStatus, startAudioInputPreview]);
+
+  const openAudioInputPermissionSettings = useCallback(async () => {
+    setAudioInputPermissionActionState("opening");
+    setAudioInputMessage(audioInputPermissionPromptable
+      ? "Requesting microphone access."
+      : "Opening macOS Microphone settings.");
+    try {
+      const permissionStatus = await openAudioInputPermissions();
+      setAudioInputPermissionStatus(permissionStatus);
+      if (audioInputPermissionNeedsAttention(permissionStatus)) {
+        clearAudioInputSetupReady();
+        audioInputStateRef.current = "needs-access";
+        setAudioInputState("needs-access");
+        setAudioInputMessage(permissionStatus?.message || "Enable Microphone access for Diff Forge AI in System Settings.");
+      } else {
+        setAudioInputMessage("Microphone access is enabled. Initialize input to preview levels.");
+        loadAudioInputDevices();
+      }
+    } catch (permissionError) {
+      audioInputStateRef.current = "error";
+      setAudioInputState("error");
+      setAudioInputMessage(getErrorMessage(permissionError, "Unable to open microphone permission settings."));
+    } finally {
+      setAudioInputPermissionActionState("idle");
+    }
+  }, [audioInputPermissionPromptable, loadAudioInputDevices]);
 
   const toggleAudioInputPreview = useCallback(() => {
+    if (audioInputPermissionMissing) {
+      openAudioInputPermissionSettings();
+      return;
+    }
+
     if (audioInputStateRef.current === "previewing") {
       stopAudioInputPreview();
       audioInputStateRef.current = "ready";
@@ -3444,7 +3744,7 @@ export default function AudioWorkspaceView({
     }
 
     startAudioInputPreview();
-  }, [startAudioInputPreview, stopAudioInputPreview]);
+  }, [audioInputPermissionMissing, openAudioInputPermissionSettings, startAudioInputPreview, stopAudioInputPreview]);
 
   const toggleAutoOpenRecorder = useCallback(() => {
     setAutoOpenRecorder((currentValue) => {
@@ -3582,6 +3882,33 @@ export default function AudioWorkspaceView({
     });
   }, [updateVoiceRuleEditorDraft]);
 
+  const updateDictionaryWordListBottomState = useCallback(() => {
+    const node = dictionaryWordListRef.current;
+    if (!node) {
+      setDictionaryWordListNeedsBottomJump(false);
+      return;
+    }
+
+    const overflow = node.scrollHeight > node.clientHeight + 12;
+    const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 12;
+    setDictionaryWordListNeedsBottomJump(overflow && !atBottom);
+  }, []);
+
+  const scrollDictionaryWordListToBottom = useCallback((behavior = "smooth") => {
+    const node = dictionaryWordListRef.current;
+    if (!node) {
+      return;
+    }
+
+    node.scrollTo({
+      behavior,
+      top: node.scrollHeight,
+    });
+    if (typeof window !== "undefined") {
+      window.setTimeout(updateDictionaryWordListBottomState, 180);
+    }
+  }, [updateDictionaryWordListBottomState]);
+
   const addDictionaryEditorTerms = useCallback(() => {
     if (voiceRuleEditor?.kind !== "dictionary") {
       return;
@@ -3594,7 +3921,10 @@ export default function AudioWorkspaceView({
     }
 
     updateDictionaryEditorTerms([...voiceRuleEditorTerms, ...incomingTerms], { termInput: "" });
-  }, [updateDictionaryEditorTerms, voiceRuleEditor, voiceRuleEditorTerms]);
+    if (typeof window !== "undefined") {
+      window.setTimeout(() => scrollDictionaryWordListToBottom("smooth"), 0);
+    }
+  }, [scrollDictionaryWordListToBottom, updateDictionaryEditorTerms, voiceRuleEditor, voiceRuleEditorTerms]);
 
   const removeDictionaryEditorTerm = useCallback((termToRemove) => {
     updateDictionaryEditorTerms(
@@ -3603,13 +3933,32 @@ export default function AudioWorkspaceView({
   }, [updateDictionaryEditorTerms, voiceRuleEditorTerms]);
 
   const handleDictionaryTermInputKeyDown = useCallback((event) => {
-    if (event.key !== "Enter") {
+    if (event.key !== "Enter" || event.nativeEvent?.isComposing) {
       return;
     }
 
     event.preventDefault();
     addDictionaryEditorTerms();
   }, [addDictionaryEditorTerms]);
+
+  useEffect(() => {
+    if (activeAudioTab !== "dictionary" || voiceRuleEditor?.kind !== "dictionary") {
+      setDictionaryWordListNeedsBottomJump(false);
+      return undefined;
+    }
+
+    const frame = window.requestAnimationFrame(updateDictionaryWordListBottomState);
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [
+    activeAudioTab,
+    updateDictionaryWordListBottomState,
+    visibleVoiceRuleEditorTerms.length,
+    voiceRuleEditor?.kind,
+    voiceRuleEditorTermSearch,
+    voiceRuleEditorTerms.length,
+  ]);
 
   const saveVoiceRuleEditor = useCallback(async (event) => {
     event?.preventDefault?.();
@@ -3980,6 +4329,43 @@ export default function AudioWorkspaceView({
   }, [loadAudioShortcutStatus]);
 
   useEffect(() => {
+    const attentionId = Number(audioHotkeyAttention?.id || 0);
+    if (!attentionId) {
+      return undefined;
+    }
+
+    const targets = normalizeAudioHotkeyAttentionTargets(audioHotkeyAttention);
+    setActiveAudioTab("general");
+    setAudioHotkeyHighlight({ id: attentionId, targets });
+    loadAudioInputDevices();
+    loadAudioShortcutStatus();
+
+    const primaryRef = targets.includes("input") || targets.includes("microphone")
+      ? audioInputSourcePanelRef
+      : targets.includes("recorder")
+        ? audioRecorderPanelRef
+        : targets.includes("permissions")
+          ? audioShortcutSettingsPanelRef
+          : audioInputSourcePanelRef;
+    const scrollFrame = window.requestAnimationFrame(() => {
+      primaryRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    });
+    const clearTimer = window.setTimeout(() => {
+      setAudioHotkeyHighlight((current) => (
+        current.id === attentionId ? { id: 0, targets: [] } : current
+      ));
+    }, AUDIO_HOTKEY_ATTENTION_HIGHLIGHT_MS);
+
+    return () => {
+      window.cancelAnimationFrame(scrollFrame);
+      window.clearTimeout(clearTimer);
+    };
+  }, [audioHotkeyAttention, loadAudioInputDevices, loadAudioShortcutStatus]);
+
+  useEffect(() => {
     loadVoiceTextRules().then(setVoiceRules).catch(() => {});
 
     return () => {
@@ -4251,6 +4637,120 @@ export default function AudioWorkspaceView({
             id="audio-tabpanel-general"
             role="tabpanel"
           >
+        <AudioInputSourcePanel aria-label="Audio input settings" ref={audioInputSourcePanelRef}>
+          {shouldHighlightAudioInput && (
+            <AudioAttentionFlash
+              aria-hidden="true"
+              key={`audio-input-highlight-${audioHotkeyHighlight.id}`}
+            />
+          )}
+          <AudioDeviceHeader>
+            <div>
+              <SettingsLabel>Input source</SettingsLabel>
+              <SettingsHint>{audioInputMessage}</SettingsHint>
+            </div>
+            <AudioInputHeaderControls>
+              <AudioInputInitializeButton
+                aria-label={audioInputPermissionMissing
+                  ? audioInputPrimaryActionLabel
+                  : audioInputState === "previewing"
+                    ? "Mute input monitor"
+                    : "Initialize input source"}
+                aria-pressed={audioInputState === "previewing"}
+                data-active={audioInputState === "previewing" ? "true" : "false"}
+                disabled={audioInputState === "checking" || audioInputState === "starting" || isOpeningAudioInputPermissions}
+                onClick={toggleAudioInputPreview}
+                title={audioInputPrimaryActionTitle}
+                type="button"
+              >
+                {audioInputState === "previewing" ? (
+                  <ButtonMicOffIcon aria-hidden="true" />
+                ) : (
+                  <ButtonMicIcon aria-hidden="true" />
+                )}
+                <span>{audioInputPrimaryActionLabel}</span>
+                {shouldHighlightAudioInput && (
+                  <AudioButtonAttentionFlash
+                    aria-hidden="true"
+                    key={`audio-input-button-highlight-${audioHotkeyHighlight.id}`}
+                  />
+                )}
+              </AudioInputInitializeButton>
+              <AudioStatePill data-installed={audioInputState === "previewing"}>
+                {audioInputDisplayStatusLabel}
+              </AudioStatePill>
+            </AudioInputHeaderControls>
+          </AudioDeviceHeader>
+
+          <AudioInputPill data-live={audioInputState === "previewing" ? "true" : "false"}>
+            <AudioInputMicButton
+              aria-label={audioInputPermissionMissing
+                ? audioInputPrimaryActionLabel
+                : audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
+              data-live={audioInputState === "previewing" ? "true" : "false"}
+              disabled={audioInputState === "checking" || audioInputState === "starting" || isOpeningAudioInputPermissions}
+              onClick={toggleAudioInputPreview}
+              title={audioInputPrimaryActionTitle}
+              type="button"
+            >
+              <ButtonMicIcon aria-hidden="true" />
+            </AudioInputMicButton>
+            <AudioInputPillSelect
+              aria-label="Microphone input source"
+              disabled={audioInputState === "checking" || audioInputState === "starting"}
+              onChange={selectAudioInputDevice}
+              value={audioInputDeviceId}
+            >
+              {audioInputDevices.length ? (
+                audioInputDevices.map((device, index) => (
+                  <option key={`${device.deviceId || "default"}-${index}`} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))
+              ) : (
+                <option value="default">Default microphone</option>
+              )}
+            </AudioInputPillSelect>
+            <AudioInputMeter
+              aria-hidden="true"
+              data-active={audioInputState === "previewing"}
+              data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
+            >
+              {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
+                <span
+                  key={index}
+                  style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
+                />
+              ))}
+            </AudioInputMeter>
+            <AudioInputPillIconButton
+              aria-label="Refresh input sources"
+              disabled={audioInputState === "checking" || audioInputState === "starting"}
+              onClick={loadAudioInputDevices}
+              title="Refresh input sources"
+              type="button"
+            >
+              <ButtonRefreshIcon aria-hidden="true" />
+            </AudioInputPillIconButton>
+          </AudioInputPill>
+          <AudioInputMeta>
+            {selectedAudioInputLabel} / level {formatAudioLevel(audioInputLevel)} / buffer {Math.round((audioInputStats.bufferMs || 0) / 1000)}s
+          </AudioInputMeta>
+          {audioInputPermissionMissing && (
+            <AudioRecorderOptionRow>
+              <SettingsHint>System Settings / Privacy & Security / Microphone</SettingsHint>
+              <SecondaryButton
+                disabled={isOpeningAudioInputPermissions}
+                onClick={openAudioInputPermissionSettings}
+                type="button"
+              >
+                <ButtonMicIcon aria-hidden="true" />
+                <span>{audioInputPrimaryActionLabel}</span>
+              </SecondaryButton>
+            </AudioRecorderOptionRow>
+          )}
+        </AudioInputSourcePanel>
+
         <AudioGeneralToolbar>
           <AudioGeneralColumn>
           <AudioProviderPanel aria-label="Transcription provider">
@@ -4526,7 +5026,13 @@ export default function AudioWorkspaceView({
           </AudioRecorderPanel>
           </AudioGeneralColumn>
 
-          <AudioRecorderPanel aria-label="Recorder controls">
+          <AudioRecorderAttentionPanel aria-label="Recorder controls" ref={audioRecorderPanelRef}>
+            {shouldHighlightAudioRecorder && (
+              <AudioAttentionFlash
+                aria-hidden="true"
+                key={`audio-recorder-highlight-${audioHotkeyHighlight.id}`}
+              />
+            )}
             <AudioDeviceHeader>
               <div>
                 <SettingsLabel>Recorder</SettingsLabel>
@@ -4605,93 +5111,17 @@ export default function AudioWorkspaceView({
                   ? "The bubble stays invisible until you start speaking."
                   : "The bubble stays visible and draggable at all times."}
             </SettingsHint>
-          </AudioRecorderPanel>
+          </AudioRecorderAttentionPanel>
 
         </AudioGeneralToolbar>
 
-        <AudioDevicePanel aria-label="Audio input settings">
-          <AudioDeviceHeader>
-            <div>
-              <SettingsLabel>Input source</SettingsLabel>
-              <SettingsHint>{audioInputMessage}</SettingsHint>
-            </div>
-            <AudioInputHeaderControls>
-              <AudioInputMuteButton
-                aria-label={audioInputState === "previewing" ? "Mute input monitor" : "Enable input monitor"}
-                aria-pressed={audioInputState === "previewing"}
-                data-active={audioInputState === "previewing" ? "true" : "false"}
-                disabled={audioInputState === "checking" || audioInputState === "starting"}
-                onClick={toggleAudioInputPreview}
-                title={audioInputState === "previewing" ? "Mute (stop monitoring)" : "Enable input"}
-                type="button"
-              >
-                {audioInputState === "previewing" ? (
-                  <ButtonMicOffIcon aria-hidden="true" />
-                ) : (
-                  <ButtonMicIcon aria-hidden="true" />
-                )}
-              </AudioInputMuteButton>
-              <AudioStatePill data-installed={audioInputState === "previewing"}>
-                {audioInputStatusLabel}
-              </AudioStatePill>
-            </AudioInputHeaderControls>
-          </AudioDeviceHeader>
-
-          <AudioInputPill data-live={audioInputState === "previewing" ? "true" : "false"}>
-            <AudioInputMicButton
-              aria-label={audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
-              data-live={audioInputState === "previewing" ? "true" : "false"}
-              disabled={audioInputState === "checking" || audioInputState === "starting"}
-              onClick={toggleAudioInputPreview}
-              title={audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
-              type="button"
-            >
-              <ButtonMicIcon aria-hidden="true" />
-            </AudioInputMicButton>
-            <AudioInputPillSelect
-              aria-label="Microphone input source"
-              disabled={audioInputState === "checking" || audioInputState === "starting"}
-              onChange={selectAudioInputDevice}
-              value={audioInputDeviceId}
-            >
-              {audioInputDevices.length ? (
-                audioInputDevices.map((device, index) => (
-                  <option key={`${device.deviceId || "default"}-${index}`} value={device.deviceId}>
-                    {device.label}
-                  </option>
-                ))
-              ) : (
-                <option value="default">Default microphone</option>
-              )}
-            </AudioInputPillSelect>
-            <AudioInputMeter
+        <AudioShortcutSettingsPanel aria-label="Audio shortcut settings" ref={audioShortcutSettingsPanelRef}>
+          {shouldHighlightAudioPermissions && (
+            <AudioAttentionFlash
               aria-hidden="true"
-              data-active={audioInputState === "previewing"}
-              data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
-            >
-              {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
-                <span
-                  key={index}
-                  style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
-                />
-              ))}
-            </AudioInputMeter>
-            <AudioInputPillIconButton
-              aria-label="Refresh input sources"
-              disabled={audioInputState === "checking" || audioInputState === "starting"}
-              onClick={loadAudioInputDevices}
-              title="Refresh input sources"
-              type="button"
-            >
-              <ButtonRefreshIcon aria-hidden="true" />
-            </AudioInputPillIconButton>
-          </AudioInputPill>
-          <AudioInputMeta>
-            {selectedAudioInputLabel} / level {formatAudioLevel(audioInputLevel)} / buffer {Math.round((audioInputStats.bufferMs || 0) / 1000)}s
-          </AudioInputMeta>
-        </AudioDevicePanel>
-
-        <AudioDevicePanel aria-label="Audio shortcut settings">
+              key={`audio-permissions-highlight-${audioHotkeyHighlight.id}`}
+            />
+          )}
           <AudioDeviceHeader>
             <div>
               <SettingsLabel>Bindings</SettingsLabel>
@@ -4716,6 +5146,17 @@ export default function AudioWorkspaceView({
             Mode
             <AudioModeGrid role="group" aria-label="Recorder mode">
               <AudioModeButton
+                aria-pressed={recorderMode === AUDIO_RECORDER_MODE_HYBRID}
+                onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_HYBRID)}
+                type="button"
+              >
+                <ButtonKeyIcon aria-hidden="true" />
+                <span>
+                  <strong>Hybrid</strong>
+                  <span>Hold / 2x tap locks</span>
+                </span>
+              </AudioModeButton>
+              <AudioModeButton
                 aria-pressed={recorderMode === AUDIO_RECORDER_MODE_PUSH_TO_TALK}
                 onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_PUSH_TO_TALK)}
                 type="button"
@@ -4735,17 +5176,6 @@ export default function AudioWorkspaceView({
                 <span>
                   <strong>Toggle to Talk</strong>
                   <span>Press start / stop</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={recorderMode === AUDIO_RECORDER_MODE_HYBRID}
-                onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_HYBRID)}
-                type="button"
-              >
-                <ButtonKeyIcon aria-hidden="true" />
-                <span>
-                  <strong>Hybrid</strong>
-                  <span>Hold / 2x tap locks</span>
                 </span>
               </AudioModeButton>
             </AudioModeGrid>
@@ -4850,7 +5280,7 @@ export default function AudioWorkspaceView({
           )}
 
           {audioShortcutError && <FormMessage $state="error">{audioShortcutError}</FormMessage>}
-        </AudioDevicePanel>
+        </AudioShortcutSettingsPanel>
 
         {!isCloudMode && audioModelStatus && !audioModelStatus.runtimeInstalled && (
           <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
@@ -5008,34 +5438,18 @@ export default function AudioWorkspaceView({
                 <AudioRuleEditorBody>
                   {voiceRuleEditor.kind === "dictionary" && (
                     <>
-                      <AudioRuleFieldLabel>
-                        <span>List name</span>
-                        <AudioCloudInput
-                          aria-label="Word list name"
-                          onChange={(event) => updateVoiceRuleEditorDraft({ name: event.target.value })}
-                          placeholder="List name"
-                          value={editorDraft.name || ""}
-                        />
-                      </AudioRuleFieldLabel>
-                      <AudioRuleFieldLabel as="div">
-                        <span>Words</span>
-                        <AudioDictionaryTermTools>
+                      <AudioDictionaryNameSearchRow>
+                        <AudioRuleFieldLabel>
+                          <span>List name</span>
                           <AudioCloudInput
-                            aria-label="Add word"
-                            onChange={(event) => updateVoiceRuleEditorDraft({ termInput: event.target.value })}
-                            onKeyDown={handleDictionaryTermInputKeyDown}
-                            placeholder="Add word"
-                            value={editorDraft.termInput || ""}
+                            aria-label="Word list name"
+                            onChange={(event) => updateVoiceRuleEditorDraft({ name: event.target.value })}
+                            placeholder="List name"
+                            value={editorDraft.name || ""}
                           />
-                          <SecondaryButton
-                            aria-label="Add word to list"
-                            disabled={!parseDictionaryTerms(editorDraft.termInput || "").length}
-                            onClick={addDictionaryEditorTerms}
-                            type="button"
-                          >
-                            <ButtonAddIcon aria-hidden="true" />
-                            <span>Add</span>
-                          </SecondaryButton>
+                        </AudioRuleFieldLabel>
+                        <AudioRuleFieldLabel>
+                          <span>Search words</span>
                           <AudioCloudInput
                             aria-label="Search words"
                             onChange={(event) => updateVoiceRuleEditorDraft({ termSearch: event.target.value })}
@@ -5047,29 +5461,60 @@ export default function AudioWorkspaceView({
                             placeholder="Search words"
                             value={editorDraft.termSearch || ""}
                           />
-                        </AudioDictionaryTermTools>
-                        <AudioDictionaryWordList aria-label="Word list terms" role="list">
-                          {visibleVoiceRuleEditorTerms.length ? (
-                            visibleVoiceRuleEditorTerms.map((term) => (
-                              <AudioDictionaryWordRow key={term} role="listitem">
-                                <AudioDictionaryWordText title={term}>{term}</AudioDictionaryWordText>
-                                <AudioDictionaryWordDeleteButton
-                                  aria-label={`Delete word ${term}`}
-                                  onClick={() => removeDictionaryEditorTerm(term)}
-                                  type="button"
-                                >
-                                  <ButtonDeleteIcon aria-hidden="true" />
-                                </AudioDictionaryWordDeleteButton>
-                              </AudioDictionaryWordRow>
-                            ))
-                          ) : (
-                            <AudioDictionaryWordEmpty>
-                              {voiceRuleEditorTerms.length
-                                ? "No words match your search."
-                                : "Add words to this list."}
-                            </AudioDictionaryWordEmpty>
+                        </AudioRuleFieldLabel>
+                      </AudioDictionaryNameSearchRow>
+                      <AudioRuleFieldLabel as="div">
+                        <span>Words</span>
+                        <AudioDictionaryWordListFrame>
+                          <AudioDictionaryWordList
+                            aria-label="Word list terms"
+                            onScroll={updateDictionaryWordListBottomState}
+                            ref={dictionaryWordListRef}
+                            role="list"
+                          >
+                            {visibleVoiceRuleEditorTerms.length ? (
+                              visibleVoiceRuleEditorTerms.map((term) => (
+                                <AudioDictionaryWordRow key={term} role="listitem">
+                                  <AudioDictionaryWordText title={term}>{term}</AudioDictionaryWordText>
+                                  <AudioDictionaryWordDeleteButton
+                                    aria-label={`Delete word ${term}`}
+                                    onClick={() => removeDictionaryEditorTerm(term)}
+                                    type="button"
+                                  >
+                                    <ButtonDeleteIcon aria-hidden="true" />
+                                  </AudioDictionaryWordDeleteButton>
+                                </AudioDictionaryWordRow>
+                              ))
+                            ) : (
+                              <AudioDictionaryWordEmpty>
+                                {voiceRuleEditorTerms.length
+                                  ? "No words match your search."
+                                  : "Type below, then press Enter."}
+                              </AudioDictionaryWordEmpty>
+                            )}
+                            <AudioDictionaryWordComposerRow role="listitem">
+                              <AudioDictionaryWordInput
+                                aria-label="Type a word and press Enter"
+                                onChange={(event) => updateVoiceRuleEditorDraft({ termInput: event.target.value })}
+                                onKeyDown={handleDictionaryTermInputKeyDown}
+                                placeholder="Type word and press Enter"
+                                spellCheck="true"
+                                type="text"
+                                value={editorDraft.termInput || ""}
+                              />
+                            </AudioDictionaryWordComposerRow>
+                          </AudioDictionaryWordList>
+                          {dictionaryWordListNeedsBottomJump && (
+                            <AudioDictionaryBottomJumpButton
+                              aria-label="Jump to bottom of word list"
+                              onClick={() => scrollDictionaryWordListToBottom("smooth")}
+                              title="Jump to bottom"
+                              type="button"
+                            >
+                              <FileExpandIcon aria-hidden="true" />
+                            </AudioDictionaryBottomJumpButton>
                           )}
-                        </AudioDictionaryWordList>
+                        </AudioDictionaryWordListFrame>
                         <AudioRuleFieldCaption>
                           {voiceRuleEditorTermSearch
                             ? `${visibleVoiceRuleEditorTerms.length} of ${voiceRuleEditorTerms.length}`
@@ -5744,7 +6189,7 @@ export function AudioWidgetWindow() {
     setMessage(hasSetup ? "Model ready" : "Audio setup needed");
   }, [modelStatus?.installed]);
 
-  const startWarmBuffer = useCallback(async () => {
+  const startWarmBuffer = useCallback(async ({ notifyOnPermissionError = true } = {}) => {
     if (audioBufferRef.current) {
       return audioBufferRef.current;
     }
@@ -5753,7 +6198,26 @@ export function AudioWidgetWindow() {
       return audioBufferStartRef.current;
     }
 
+    const permissionStatus = await getAudioInputPermissionStatus().catch(() => null);
+    if (audioInputPermissionNeedsAttention(permissionStatus)) {
+      clearAudioInputSetupReady();
+      const message = permissionStatus?.message || "Enable Microphone access for Diff Forge AI in System Settings.";
+      if (notifyOnPermissionError) {
+        emitAudioHotkeyAttention(
+          "microphone-permission",
+          ["input", "microphone"],
+          message,
+        );
+      }
+      throw new Error(message);
+    }
+
     if (!hasAudioInputSetup()) {
+      emitAudioHotkeyAttention(
+        "input",
+        ["input"],
+        "Initialize a microphone in the Audio tab before recording.",
+      );
       throw new Error("Choose and enable a microphone in the Audio tab before recording.");
     }
 
@@ -5861,6 +6325,11 @@ export function AudioWidgetWindow() {
     }
 
     if (currentState === "setup") {
+      emitAudioHotkeyAttention(
+        "input",
+        ["input"],
+        "Initialize a microphone in the Audio tab before recording.",
+      );
       setError("Choose and enable a microphone in the Audio tab before recording.");
       return;
     }
@@ -6031,6 +6500,15 @@ export function AudioWidgetWindow() {
       }
       pushToTalkDownRef.current = false;
       stopAfterStartRef.current = false;
+      const recordingErrorText = String(recordingError?.message || recordingError || "").toLowerCase();
+      if (recordingErrorText.includes("permission") || recordingErrorText.includes("denied")) {
+        clearAudioInputSetupReady();
+        emitAudioHotkeyAttention(
+          "microphone-permission",
+          ["input", "microphone"],
+          getAudioInputErrorMessage(recordingError, "Enable Microphone access for Diff Forge AI in System Settings."),
+        );
+      }
       widgetStateRef.current = "error";
       setWidgetState("error");
       setError(getAudioInputErrorMessage(recordingError, "Choose and enable a microphone in the Audio tab before recording."));
@@ -6881,9 +7359,15 @@ export function AudioWidgetWindow() {
       }
       const previousReadyKey = barPlacementReadyKeyRef.current;
       const modeGeometryChanged = previousReadyKey !== targetKey;
+      const noticeGeometryChanged = modeGeometryChanged
+        && (previousReadyKey === "notice" || targetKey === "notice");
+      // The bottom-bar cancel notice can be shown while the click that cancels
+      // recording is still unwinding. Avoid AppKit's animated setFrame path for
+      // that notice resize; the non-animated placement keeps the notice behavior
+      // without freezing the host event loop.
       const shouldAnimatePlacement = options.animate !== false
-        && (!modeGeometryChanged
-          || (Boolean(previousReadyKey) && (previousReadyKey === "notice" || targetKey === "notice")));
+        && !modeGeometryChanged
+        && !noticeGeometryChanged;
       const nativeOwnsBarPlacement = isMacPlatform();
       const nativePlacement = await positionAudioBarWindowNatively({
         width: target.width,
@@ -8417,7 +8901,7 @@ export function AudioWidgetWindow() {
     }
 
     let disposed = false;
-    startWarmBuffer().catch(() => {
+    startWarmBuffer({ notifyOnPermissionError: false }).catch(() => {
       if (!disposed && (widgetStateRef.current === "ready" || widgetStateRef.current === "error")) {
         setMessage("Audio input standby");
       }
@@ -9119,7 +9603,16 @@ export function AudioWidgetWindow() {
     >
       <AudioBarCancelButton
         aria-label="Dismiss"
-        onClick={dismissCancelNotice}
+        onClick={(event) => {
+          event.stopPropagation();
+          dismissCancelNotice();
+        }}
+        onMouseDown={(event) => {
+          event.stopPropagation();
+        }}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+        }}
         title="Dismiss now"
         type="button"
       >
@@ -9234,6 +9727,12 @@ export function AudioWidgetWindow() {
                 onClick={(event) => {
                   event.stopPropagation();
                   cancelRecording();
+                }}
+                onMouseDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onPointerDown={(event) => {
+                  event.stopPropagation();
                 }}
                 title="Cancel: stop without pasting. The transcript is still saved to History."
                 type="button"

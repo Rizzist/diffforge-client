@@ -514,6 +514,7 @@ import {
   normalizeCodexResizeGateSize,
   sanitizeTerminalDiagnosticText,
   setActiveTerminalKeyboardTarget,
+  TERMINAL_ACTIVITY_HOOK_EVENT,
   TERMINAL_PROMPT_SUBMITTED_EVENT,
   terminalGlobalRenderScheduler,
   terminalKeyboardTargetMatches,
@@ -1128,6 +1129,66 @@ function normalizeTerminalPromptEpoch(value) {
 function normalizeTerminalNativeRailState(value, fallback = "unknown") {
   const text = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
   return text || fallback;
+}
+
+function normalizeTerminalActivityHookEventType(value, fallback = "") {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, "-")
+    || fallback;
+}
+
+function terminalActivityHookEventTypeFromPayload(payload = {}) {
+  const directType = normalizeTerminalActivityHookEventType(
+    payload.eventType || payload.event_type || payload.type,
+  );
+  if (directType) {
+    return directType;
+  }
+
+  const hookName = String(payload.hookEventName || payload.hook_event_name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+  if (hookName === "userpromptsubmit") return "provider-turn-started";
+  if (hookName === "stop") return "provider-turn-completed";
+  if (hookName === "stopfailure" || hookName === "error") return "provider-turn-error";
+  if (hookName === "interrupt") return "provider-turn-interrupted";
+  return "";
+}
+
+function terminalActivityStatusFromHookPayload(payload = {}, eventType = "") {
+  const explicitActivity = normalizeTerminalNativeRailState(
+    payload.activityStatus || payload.activity_status,
+    "",
+  );
+  if (explicitActivity) {
+    return explicitActivity;
+  }
+
+  const type = normalizeTerminalActivityHookEventType(eventType);
+  if (
+    type === "provider-turn-started"
+    || type === "message-submitted"
+    || type === "pending-prompt-sent"
+    || type === "agent-output"
+    || type.endsWith("-started")
+  ) {
+    return "thinking";
+  }
+  if (type === "provider-turn-error" || type === "pending-prompt-error" || type.endsWith("-error")) {
+    return "error";
+  }
+  if (
+    type === "provider-turn-completed"
+    || type === "provider-turn-interrupted"
+    || type.endsWith("-completed")
+    || type.endsWith("-interrupted")
+  ) {
+    return "idle";
+  }
+  return "";
 }
 
 function formatTerminalNativeRailLabel(value) {
@@ -2047,6 +2108,8 @@ function WorkspaceTerminal({
   const terminalThreadIdRef = useRef(terminalThreadId);
   const terminalThreadSlotKeyRef = useRef(terminalThreadSlotKey);
   const terminalThreadActivityStatusRef = useRef(terminalThreadActivityStatus);
+  const [terminalRuntimeActivityStatus, setTerminalRuntimeActivityStatus] = useState(terminalThreadActivityStatus);
+  const terminalRuntimeActivityStatusRef = useRef(terminalThreadActivityStatus);
   const terminalThreadThinkingTraceSignatureRef = useRef("");
   const terminalThreadThinkingSinceRef = useRef(terminalThreadActivityStatus === "thinking" ? performance.now() : 0);
   const terminalThreadPromptEpochRef = useRef(0);
@@ -2062,15 +2125,24 @@ function WorkspaceTerminal({
   const [terminalPtyRevealReady, setTerminalPtyRevealReady] = useState(!shouldDelayInitialPtyReveal);
   const terminalPtyRevealReadyRef = useRef(!shouldDelayInitialPtyReveal);
   const setTerminalPtyRevealReadyState = useCallback((ready) => {
-    const nextReady = Boolean(ready);
+    const nextReady = typeof ready === "function"
+      ? Boolean(ready(terminalPtyRevealReadyRef.current))
+      : Boolean(ready);
     terminalPtyRevealReadyRef.current = nextReady;
     setTerminalPtyRevealReady(nextReady);
   }, []);
   useEffect(() => {
     if (shouldDelayInitialPtyReveal) {
-      setTerminalPtyRevealReadyState(false);
+      setTerminalPtyRevealReadyState((currentReady) => (
+        currentReady && terminalState === "running"
+          ? true
+          : false
+      ));
+      return;
     }
-  }, [setTerminalPtyRevealReadyState, shouldDelayInitialPtyReveal]);
+
+    setTerminalPtyRevealReadyState(true);
+  }, [setTerminalPtyRevealReadyState, shouldDelayInitialPtyReveal, terminalState]);
   const terminalDefaultSessionMode = defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady);
   const [, setTerminalSessionMode] = useState(terminalDefaultSessionMode);
   const terminalSessionModeRef = useRef(terminalDefaultSessionMode);
@@ -2144,6 +2216,12 @@ function WorkspaceTerminal({
     terminalThreadLastReadyAtMsRef.current = 0;
     terminalThreadLastWorkStartedAtRef.current = 0;
     terminalThreadActivityStatusRef.current = String(activityStatus || "idle").trim().toLowerCase() || "idle";
+    terminalRuntimeActivityStatusRef.current = terminalThreadActivityStatusRef.current;
+    setTerminalRuntimeActivityStatus((current) => (
+      current === terminalRuntimeActivityStatusRef.current
+        ? current
+        : terminalRuntimeActivityStatusRef.current
+    ));
     if (!isGenericTerminal) {
       logTerminalStatus("frontend.terminal_cli.instance_epoch_reset", getTerminalCliStatusLogBase({
         activityStatus: terminalThreadActivityStatusRef.current,
@@ -2190,6 +2268,8 @@ function WorkspaceTerminal({
       terminalThreadThinkingSinceRef.current = 0;
     }
     terminalThreadActivityStatusRef.current = nextStatus;
+    terminalRuntimeActivityStatusRef.current = nextStatus;
+    setTerminalRuntimeActivityStatus((current) => (current === nextStatus ? current : nextStatus));
     if (!isGenericTerminal && (previousStatus !== nextStatus || options.forceNewTurn === true)) {
       const finishCandidate = previousStatus === "thinking" && nextStatus !== "thinking";
       logTerminalStatus("frontend.terminal_cli.status_transition", getTerminalCliStatusLogBase({
@@ -2416,6 +2496,133 @@ function WorkspaceTerminal({
     };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+
+    listen(TERMINAL_ACTIVITY_HOOK_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const listenerState = terminalEventListenerStateRef.current || {};
+      const payload = event?.payload || {};
+      const eventType = terminalActivityHookEventTypeFromPayload(payload);
+      const nextActivityStatus = terminalActivityStatusFromHookPayload(payload, eventType);
+      if (!eventType || !nextActivityStatus) {
+        return;
+      }
+
+      const payloadPaneId = String(payload.paneId || payload.pane_id || "").trim();
+      const currentPaneId = String(listenerState.paneId || "").trim();
+      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const currentWorkspaceId = String(listenerState.workspaceId || listenerState.threadWorkspaceId || "").trim();
+      const payloadThreadId = String(payload.threadId || payload.thread_id || "").trim();
+      const currentThreadId = String(listenerState.threadId || terminalThreadIdRef.current || "").trim();
+      const payloadInstanceId = Number(payload.instanceId ?? payload.instance_id ?? 0);
+      const currentInstanceId = Number(terminalInstanceIdRef.current || 0);
+      const payloadTerminalIndex = Number(payload.terminalIndex ?? payload.terminal_index);
+      const currentTerminalIndex = Number(listenerState.terminalIndex);
+      const paneMatches = !payloadPaneId || !currentPaneId || payloadPaneId === currentPaneId;
+      const workspaceMatches = !payloadWorkspaceId || !currentWorkspaceId || payloadWorkspaceId === currentWorkspaceId;
+      const threadMatches = !payloadThreadId || !currentThreadId || payloadThreadId === currentThreadId;
+      const instanceMatches = !Number.isFinite(payloadInstanceId)
+        || payloadInstanceId <= 0
+        || !Number.isFinite(currentInstanceId)
+        || currentInstanceId <= 0
+        || payloadInstanceId === currentInstanceId;
+      const terminalIndexMatches = !Number.isFinite(payloadTerminalIndex)
+        || !Number.isFinite(currentTerminalIndex)
+        || payloadTerminalIndex === currentTerminalIndex;
+
+      if (!paneMatches || !workspaceMatches || !threadMatches || !instanceMatches || !terminalIndexMatches) {
+        return;
+      }
+
+      const started = eventType === "provider-turn-started"
+        || eventType === "message-submitted"
+        || eventType === "pending-prompt-sent";
+      const completed = eventType === "provider-turn-completed"
+        || eventType === "provider-turn-error"
+        || eventType === "provider-turn-interrupted";
+      const promptEventId = String(
+        payload.promptEventId
+          || payload.prompt_event_id
+          || payload.providerTurnId
+          || payload.provider_turn_id
+          || payload.turnId
+          || payload.turn_id
+          || "",
+      ).trim();
+      const promptText = String(
+        payload.userMessage
+          || payload.user_message
+          || payload.message
+          || "",
+      ).trim();
+      const submittedAt = String(
+        payload.promptReadyAt
+          || payload.prompt_ready_at
+          || payload.inputReadyAt
+          || payload.input_ready_at
+          || new Date().toISOString(),
+      ).trim();
+      const threadIdForPrompt = payloadThreadId || currentThreadId;
+      if (started && promptText && threadIdForPrompt) {
+        listenerState.rememberTerminalThreadSubmittedPrompt?.({
+          promptEventId,
+          promptText,
+          source: payload.source || `terminal_activity_hook:${eventType}`,
+          submittedAt,
+          threadId: threadIdForPrompt,
+        });
+      }
+
+      listenerState.markTerminalThreadActivityStatus?.(nextActivityStatus, {
+        forceNewTurn: Boolean(started),
+        reason: `terminal_activity_hook:${eventType}`,
+      });
+
+      if (completed || payload.inputReady === true || payload.input_ready === true) {
+        const inputReadyAt = String(
+          payload.inputReadyAt
+            || payload.input_ready_at
+            || payload.completedAt
+            || payload.completed_at
+            || new Date().toISOString(),
+        ).trim();
+        terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
+        if (completed) {
+          terminalThreadSubmittedPromptRef.current = null;
+        }
+      }
+
+      logTerminalStatus("frontend.terminal_cli.activity_hook_badge_state", listenerState.getTerminalCliStatusLogBase?.({
+        activityStatus: nextActivityStatus,
+        eventType,
+        hookEventName: payload.hookEventName || payload.hook_event_name || "",
+        hookHealthStatus: payload.hookHealthStatus || payload.hook_health_status || "",
+        instanceId: payload.instanceId || payload.instance_id || "",
+        paneId: payloadPaneId || currentPaneId,
+        providerSessionPresent: Boolean(payload.providerSessionId || payload.provider_session_id),
+        source: payload.source || "terminal_activity_hook",
+        threadId: payloadThreadId || currentThreadId,
+      }) || {});
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+        return;
+      }
+      unlisten = nextUnlisten;
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
   const terminalStartupSnapshotRef = useRef(null);
   const terminalStabilityFeatures = useMemo(() => getTerminalStabilityFeatureFlags({
     agentKind: terminalAgentKind,
@@ -2511,7 +2718,9 @@ function WorkspaceTerminal({
     if (isGenericTerminal) {
       return;
     }
-    const localActivityStatus = String(terminalThreadActivityStatusRef.current || "").trim().toLowerCase();
+    const localActivityStatus = String(
+      terminalRuntimeActivityStatus || terminalThreadActivityStatusRef.current || "",
+    ).trim().toLowerCase();
     const propActivityStatus = String(terminalThreadActivityStatus || "").trim().toLowerCase();
     const latestTurnState = String(
       thread?.latestTurn?.state || thread?.latestTurn?.status || "",
@@ -2553,6 +2762,7 @@ function WorkspaceTerminal({
     }));
   }, [
     isGenericTerminal,
+    terminalRuntimeActivityStatus,
     terminalThreadActivityStatus,
     terminalThreadId,
     thread?.latestTurn?.id,
@@ -3952,7 +4162,7 @@ function WorkspaceTerminal({
 
     const acceptedProviderSessionId = String(acceptedDetail?.sessionId || providerSessionId || "").trim();
     setThreadComposerDraftValue(syncKey, "", "bigview_submit_confirmed_clear");
-    if (terminalAgentUsesActivityHooks(agentId)) {
+    if (terminalAgentUsesActivityHooks(agentId) && getTerminalAgentKind(agentId) !== "codex") {
       logThreadBridgeDiagnostic("frontend.thread_submit.hook_managed_start_deferred", {
         agentId,
         bindingInstanceId: binding.instanceId,
@@ -6255,6 +6465,42 @@ function WorkspaceTerminal({
     });
 
     scheduleWebglAttach("xterm_open", TERMINAL_WEBGL_IDLE_DELAY_MS);
+
+    const resetTerminalWebglRenderer = (reason) => {
+      if (!useWebglRenderer) {
+        return false;
+      }
+
+      if (webglAttachTimer) {
+        window.clearTimeout(webglAttachTimer);
+        webglAttachTimer = 0;
+        webglAttachAt = 0;
+      }
+
+      const hadAttempt = webglAttachAttempted;
+      const hadAddon = Boolean(activeWebglAddon);
+      if (activeWebglAddon) {
+        try {
+          activeWebglAddon.dispose();
+        } catch (_error) {
+          // xterm renderer reset is best effort; the forced refresh below
+          // still leaves the DOM/canvas renderer available.
+        }
+      }
+
+      activeWebglAddon = null;
+      webglAttachAttempted = false;
+      webglBackgroundDeferred = false;
+      rendererMode = "webgl_pending";
+      logTerminalDiagnosticEvent("frontend.webgl.reset_for_reveal", {
+        hadAddon,
+        hadAttempt,
+        paneId,
+        reason,
+        terminalIndex,
+      });
+      return hadAddon || hadAttempt;
+    };
 
     const clearTerminalRendererRows = (reason, extraFields = {}) => {
       if (isDisposed || !container?.isConnected) {
@@ -9390,6 +9636,50 @@ function WorkspaceTerminal({
       claudeResizeBlankFrameGuard.until = 0;
     });
 
+    const terminalSurfaceSlot = container.closest?.('[data-terminal-surface-slot="true"]') || null;
+    const elementNodeType = typeof Node !== "undefined" ? Node.ELEMENT_NODE : 1;
+    const terminalVisibleForPaint = () => {
+      if (isDisposed || !container?.isConnected) {
+        return false;
+      }
+
+      if (
+        terminalSurfaceSlot
+        && (
+          terminalSurfaceSlot.getAttribute("data-terminal-tab-hidden") === "true"
+          || terminalSurfaceSlot.getAttribute("data-terminal-hidden") === "true"
+        )
+      ) {
+        return false;
+      }
+
+      const rect = container.getBoundingClientRect?.();
+      if (!rect || rect.width < 2 || rect.height < 2) {
+        return false;
+      }
+
+      let node = container;
+      while (node && node.nodeType === elementNodeType) {
+        if (node.hidden) {
+          return false;
+        }
+        const style = window.getComputedStyle?.(node);
+        if (
+          style
+          && (
+            style.display === "none"
+            || style.visibility === "hidden"
+            || style.visibility === "collapse"
+          )
+        ) {
+          return false;
+        }
+        node = node.parentElement;
+      }
+
+      return true;
+    };
+
     resizeController = createTerminalResizeController({
       canResize: () => hasOpenPty && !isDisposed && !windowBreakoutHostedRef.current,
       container,
@@ -9402,14 +9692,7 @@ function WorkspaceTerminal({
       isPriority: () => terminalActiveRef.current === true,
       // Hidden slots (inactive tab, unmeasured rect) keep layout, so their
       // ResizeObservers still fire; skip the reflow until the slot is shown.
-      isVisible: () => {
-        const slot = container.closest?.('[data-terminal-surface-slot="true"]');
-        return !slot
-          || (
-            slot.getAttribute("data-terminal-tab-hidden") !== "true"
-            && slot.getAttribute("data-terminal-hidden") !== "true"
-          );
-      },
+      isVisible: terminalVisibleForPaint,
       maxCols: TERMINAL_MAX_COLS,
       maxRows: TERMINAL_MAX_ROWS,
       minCols: TERMINAL_MIN_COLS,
@@ -9468,12 +9751,12 @@ function WorkspaceTerminal({
     resizeControllerRef.current = resizeController;
     resizeController?.schedule("mount");
 
-    // Reveal path: terminal slots hide with `visibility: hidden`, which keeps
-    // their layout box, so the ResizeObserver does NOT fire when a slot goes
-    // from hidden -> visible (e.g. when the workspace opens and the layout rect
-    // finally arrives). Without an explicit recovery the mount/activation
-    // resizes that ran while the slot was hidden were skipped as
-    // "surface_hidden" and the terminal never painted until a full reload.
+    // Reveal path: terminal slots and workspace runtime layers hide with
+    // `visibility: hidden`, which keeps layout boxes alive, so ResizeObserver
+    // does NOT fire when a workspace or tab goes hidden -> visible. Without an
+    // explicit recovery the mount/activation resizes that ran while the surface
+    // was hidden were skipped as "surface_hidden" and the terminal never
+    // painted until a full reload.
     //
     // A plain refresh + non-forced resize is not enough on its own: when the
     // grid size was already applied during launch, the reveal resize is dropped
@@ -9488,15 +9771,17 @@ function WorkspaceTerminal({
     // renderer, does a full refresh, and re-paints once more shortly after in
     // case the render service was still settling visibility at the exact reveal
     // instant. This mirrors the manual "restart pane" cure without remounting.
-    const revealSlot = container.closest?.('[data-terminal-surface-slot="true"]');
-    if (revealSlot && typeof MutationObserver === "function") {
-      const isSlotVisible = () => (
-        revealSlot.getAttribute("data-terminal-tab-hidden") !== "true"
-        && revealSlot.getAttribute("data-terminal-hidden") !== "true"
-      );
-      const recoverRevealedTerminalPaint = (reason) => {
-        if (isDisposed) {
+    if (typeof MutationObserver === "function") {
+      const recoverRevealedTerminalPaint = (reason, options = {}) => {
+        if (isDisposed || !terminalVisibleForPaint()) {
           return;
+        }
+        if (!terminalPtyRevealReadyRef.current && runtimeTerminalState === "running") {
+          setTerminalPtyRevealReadyState(true);
+        }
+        const resetWebgl = options.resetWebgl !== false;
+        if (resetWebgl) {
+          resetTerminalWebglRenderer(reason);
         }
         try {
           terminal.clearTextureAtlas?.();
@@ -9511,19 +9796,77 @@ function WorkspaceTerminal({
         }
         scheduleVisibleOutputRefresh(`${reason}_retry`, {}, 48);
       };
-      let slotWasVisible = isSlotVisible();
-      const slotRevealObserver = new MutationObserver(() => {
-        const slotVisibleNow = isSlotVisible();
-        if (slotVisibleNow && !slotWasVisible) {
-          recoverRevealedTerminalPaint("slot_revealed");
+
+      const revealTimers = new Set();
+      const scheduleRevealRecovery = (reason, options = {}) => {
+        const delays = Array.isArray(options.delays) && options.delays.length
+          ? options.delays
+          : [0, 80, 220];
+        delays.forEach((delayMs) => {
+          const timer = window.setTimeout(() => {
+            revealTimers.delete(timer);
+            recoverRevealedTerminalPaint(delayMs ? `${reason}_settled` : reason, {
+              resetWebgl: delayMs === 0,
+            });
+          }, Math.max(0, Number(delayMs) || 0));
+          revealTimers.add(timer);
+        });
+      };
+
+      const observeTargets = [];
+      let ancestor = terminalSurfaceSlot || container;
+      while (ancestor && ancestor.nodeType === elementNodeType) {
+        observeTargets.push(ancestor);
+        if (ancestor === document.body || ancestor === document.documentElement) {
+          break;
         }
-        slotWasVisible = slotVisibleNow;
+        ancestor = ancestor.parentElement;
+      }
+
+      let surfaceWasVisible = terminalVisibleForPaint();
+      const handleRevealCandidate = (reason, options = {}) => {
+        const surfaceVisibleNow = terminalVisibleForPaint();
+        if (surfaceVisibleNow && (!surfaceWasVisible || options.force === true)) {
+          scheduleRevealRecovery(reason, options);
+        }
+        surfaceWasVisible = surfaceVisibleNow;
+      };
+
+      const revealObserver = new MutationObserver(() => {
+        handleRevealCandidate("surface_revealed");
       });
-      slotRevealObserver.observe(revealSlot, {
-        attributes: true,
-        attributeFilter: ["data-terminal-hidden", "data-terminal-tab-hidden"],
+      observeTargets.forEach((target) => {
+        revealObserver.observe(target, {
+          attributes: true,
+          attributeFilter: [
+            "class",
+            "data-active",
+            "data-terminal-hidden",
+            "data-terminal-tab-hidden",
+            "data-visible",
+            "hidden",
+            "style",
+          ],
+        });
       });
-      disposables.push(() => slotRevealObserver.disconnect());
+      disposables.push(() => revealObserver.disconnect());
+
+      const handleWindowReveal = () => {
+        handleRevealCandidate("window_revealed", {
+          delays: [0, 120, 320],
+          force: true,
+        });
+      };
+      window.addEventListener("focus", handleWindowReveal);
+      window.addEventListener("pageshow", handleWindowReveal);
+      document.addEventListener("visibilitychange", handleWindowReveal);
+      disposables.push(() => {
+        window.removeEventListener("focus", handleWindowReveal);
+        window.removeEventListener("pageshow", handleWindowReveal);
+        document.removeEventListener("visibilitychange", handleWindowReveal);
+        revealTimers.forEach((timer) => window.clearTimeout(timer));
+        revealTimers.clear();
+      });
     }
 
     async function startTerminal() {
@@ -9532,7 +9875,7 @@ function WorkspaceTerminal({
         const outputDisplayMasker = createCoreRepoNameDisplayMasker({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
-        const outputSessionInspectionEnabled = !terminalUsesActivityHooks && !isGenericTerminal;
+        const outputSessionInspectionEnabled = !isGenericTerminal;
         const outputTextDecoder = outputSessionInspectionEnabled
           ? new TextDecoder("utf-8", { fatal: false })
           : null;
@@ -9776,10 +10119,29 @@ function WorkspaceTerminal({
                   nativeSessionKind: "session",
                   nativeSessionSource: "terminal-output",
                   paneId,
+                  providerSessionId: nativeSessionId,
                   terminalIndex,
                   threadId: terminalThreadIdRef.current,
                   type: "provider-session",
                   workspaceId: workspace?.id || "",
+                });
+                invoke("terminal_record_provider_session", {
+                  request: {
+                    paneId,
+                    instanceId: terminalInstanceId,
+                    providerSessionId: nativeSessionId,
+                    source: "terminal-output",
+                  },
+                }).catch((error) => {
+                  logThreadBridgeDiagnostic("frontend.thread_provider_session.record_error", {
+                    agentId: terminalAgentKind,
+                    instanceId: terminalInstanceId,
+                    message: error?.message || String(error || ""),
+                    paneId,
+                    terminalIndex,
+                    threadId: terminalThreadIdRef.current || "",
+                    workspaceId: workspace?.id || "",
+                  });
                 });
               } else if (providerSessionCaptureMissesLogged < 8 && providerSessionCaptureBuffer.trim()) {
                 providerSessionCaptureMissesLogged += 1;
@@ -11775,6 +12137,7 @@ function WorkspaceTerminal({
               });
               const writePromise = writeBufferedTerminalInput(submitData, "submit", promptMetadata);
               let submittedWaiter = null;
+              let codexConfirmedStartDispatched = false;
               Promise.resolve(bridge.submittedWaiterReady)
                 .then((resolvedSubmittedWaiter) => {
                   submittedWaiter = resolvedSubmittedWaiter;
@@ -11828,7 +12191,72 @@ function WorkspaceTerminal({
                         threadId: bridge.threadId,
                         workspaceId: bridge.workspaceId,
                       });
-                      return bridge.acceptedWaiter.promise;
+                      if (terminalUsesActivityHooks && terminalAgentKind === "codex") {
+                        const providerTurnStartProjectionEvents = buildProviderTurnStartProjectionEvents({
+                          agentId: terminalAgentKind,
+                          includeUserMessage: false,
+                          source: "terminal-confirmed",
+                          startedAt: bridge.startedAt,
+                          text: bridge.promptEventText,
+                          turnId: bridge.turnId,
+                          userMessageId: bridge.promptEventId,
+                        });
+                        codexConfirmedStartDispatched = true;
+                        onThreadTerminalLifecycle?.({
+                          activityStatus: "thinking",
+                          agentId: terminalAgentKind,
+                          instanceId: terminalInstanceId,
+                          paneId,
+                          status: "active",
+                          terminalIndex,
+                          threadId: bridge.threadId,
+                          type: "agent-output",
+                          workspaceId: bridge.workspaceId,
+                        });
+                        onThreadTerminalLifecycle?.({
+                          agentId: terminalAgentKind,
+                          clearPendingPrompt: false,
+                          instanceId: terminalInstanceId,
+                          nativeSessionId: "",
+                          nativeSessionKind: "",
+                          nativeSessionSource: "",
+                          paneId,
+                          pendingPromptId: bridge.promptEventId,
+                          projectionEvents: providerTurnStartProjectionEvents,
+                          providerSessionId: "",
+                          repoPath: workingDirectory || "",
+                          status: "active",
+                          terminalIndex,
+                          threadId: bridge.threadId,
+                          type: "provider-turn-started",
+                          workspaceId: bridge.workspaceId,
+                          workspaceName: workspace?.name || "",
+                        });
+                        logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_codex_start", {
+                          agentId: terminalAgentKind,
+                          instanceId: terminalInstanceId,
+                          paneId,
+                          promptEventId: bridge.promptEventId,
+                          promptSource: submittedPayload?.promptSource || "",
+                          reason: "terminal_submit_observed",
+                          terminalIndex,
+                          threadId: bridge.threadId,
+                          workspaceId: bridge.workspaceId,
+                        });
+                      }
+                      return bridge.acceptedWaiter.promise.catch((acceptanceError) => {
+                        logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_acceptance_missed", {
+                          agentId: terminalAgentKind,
+                          instanceId: terminalInstanceId,
+                          message: getErrorMessage(acceptanceError, "Prompt was submitted but session acceptance was not observed."),
+                          paneId,
+                          promptEventId: bridge.promptEventId,
+                          terminalIndex,
+                          threadId: bridge.threadId,
+                          workspaceId: bridge.workspaceId,
+                        });
+                        return null;
+                      });
                     })
                     .then((acceptedDetail) => {
                       const acceptedProviderSessionId = String(acceptedDetail?.sessionId || "").trim();
@@ -11843,7 +12271,27 @@ function WorkspaceTerminal({
                         threadId: bridge.threadId,
                         workspaceId: bridge.workspaceId,
                       });
-                      if (terminalUsesActivityHooks) {
+                      if (codexConfirmedStartDispatched) {
+                        if (acceptedProviderSessionId) {
+                          onThreadTerminalLifecycle?.({
+                            agentId: terminalAgentKind,
+                            instanceId: terminalInstanceId,
+                            nativeSessionId: acceptedProviderSessionId,
+                            nativeSessionKind: "session",
+                            nativeSessionSource: "terminal-confirmed:session-accepted",
+                            paneId,
+                            pendingPromptId: bridge.promptEventId,
+                            providerSessionId: acceptedProviderSessionId,
+                            repoPath: workingDirectory || "",
+                            status: "active",
+                            terminalIndex,
+                            threadId: bridge.threadId,
+                            type: "provider-session",
+                            workspaceId: bridge.workspaceId,
+                            workspaceName: workspace?.name || "",
+                          });
+                        }
+                      } else if (terminalUsesActivityHooks) {
                         logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_hook_managed_start_deferred", {
                           acceptedMatchedBy: acceptedDetail?.matchedBy || "",
                           agentId: terminalAgentKind,
@@ -12365,6 +12813,20 @@ function WorkspaceTerminal({
         terminalSessionModeRef.current = openedSessionMode;
         setTerminalSessionMode(openedSessionMode);
         terminalThreadSlotKeyRef.current = openResult?.slotKey || terminalThreadSlotKeyRef.current;
+        const backendReturnedProviderSession = Object.prototype.hasOwnProperty.call(openResult || {}, "providerSessionId");
+        const openedProviderSessionId = String(
+          backendReturnedProviderSession
+            ? openResult?.providerSessionId || ""
+            : startupThreadProviderSessionId || "",
+        ).trim();
+        const openedNativeSessionId = String(openResult?.nativeSessionId || openedProviderSessionId).trim();
+        const openedActivityStatus = String(openResult?.activityStatus || "idle").trim() || "idle";
+        const openedCommandPhase = String(openResult?.commandPhase || "ready").trim() || "ready";
+        const openedInputReady = typeof openResult?.inputReady === "boolean"
+          ? openResult.inputReady
+          : !shouldPrewarmShell;
+        const openedInputReadyAt = String(openResult?.inputReadyAt || "").trim()
+          || (openedInputReady ? new Date().toISOString() : "");
         logThreadBridgeDiagnostic("frontend.terminal_open.emit_opened_lifecycle", {
           agentId: agent?.id || terminalAgentKind,
           coordinationSessionPresent: Boolean(openResult?.sessionId),
@@ -12377,27 +12839,37 @@ function WorkspaceTerminal({
           startupThreadProviderModelSource,
           startupThreadId: startupThreadId || "",
           startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
+          backendProviderSessionPresent: Boolean(openedProviderSessionId),
+          backendNativeSessionPresent: Boolean(openedNativeSessionId),
+          backendProviderSessionReturned: backendReturnedProviderSession,
           terminalIndex,
           workspaceId: workspace?.id || "",
         });
         onThreadTerminalLifecycle?.({
+          activityStatus: openedActivityStatus,
           agentBranch: openResult?.agentBranch || "",
           agentId: agent?.id || terminalAgentKind,
+          commandPhase: openedCommandPhase,
           coordinationAgentId: openResult?.agentId || "",
           coordinationMode: openResult?.coordinationMode || "",
+          inputReady: openedInputReady,
+          inputReadyAt: openedInputReadyAt,
+          inputReadyConfidence: openedInputReady ? "terminal-open" : "",
           instanceId: terminalInstanceId,
           model: startupThreadProviderModel,
           modelSource: startupThreadProviderModelSource,
-          nativeSessionId: startupThreadProviderSessionId,
-          nativeSessionKind: startupThreadProviderSessionId ? "session" : "",
-          nativeSessionSource: startupThreadProviderSessionId ? "session-restore" : "",
+          nativeSessionId: openedNativeSessionId,
+          nativeSessionKind: openedNativeSessionId ? "session" : "",
+          nativeSessionSource: openedNativeSessionId ? "session-restore" : "",
           paneId,
-          providerSessionId: startupThreadProviderSessionId,
+          providerSessionId: openedProviderSessionId || openedNativeSessionId,
           sessionId: openResult?.sessionId || "",
           sessionMode: openResult?.sessionMode || sessionModeForThisStart,
           fileAuthority: openResult?.fileAuthority || "",
           slotKey: openResult?.slotKey || terminalThreadSlotKeyRef.current,
           status: shouldPrewarmShell ? "starting" : "active",
+          statusTruth: openResult?.terminalWorkState || "complete",
+          terminalWorkState: openResult?.terminalWorkState || "complete",
           terminalIndex,
           threadId: startupThreadId,
           type: "opened",
@@ -13110,7 +13582,7 @@ function WorkspaceTerminal({
             },
           );
           setThreadComposerDraftValue(pendingSyncKey, "", "pending_prompt_confirmed_clear");
-          if (useTerminalConfirmedDelivery && terminalUsesActivityHooks) {
+          if (useTerminalConfirmedDelivery && terminalUsesActivityHooks && terminalAgentKind !== "codex") {
             logThreadBridgeDiagnostic("frontend.pending_prompt.hook_managed_start_deferred", {
               agentId: terminalAgentKind,
               deliveryMode: effectiveDeliveryMode,
@@ -14094,7 +14566,7 @@ function WorkspaceTerminal({
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
   const terminalStateDebugLabel = formatTerminalNativeRailLabel(resolveTerminalNativeRailState({
-    activityStatus: terminalThreadActivityStatus,
+    activityStatus: terminalRuntimeActivityStatus || terminalThreadActivityStatus,
     parked: Boolean(parkedPrompt),
     terminalState,
   }));

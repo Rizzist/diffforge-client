@@ -2762,14 +2762,17 @@ const ActivitySyncDirectionCount = styled.span`
 `;
 
 const OverlayBody = styled.div`
+  --activity-scrollbar-lane: 12px;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  padding-right: var(--activity-scrollbar-lane);
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   scrollbar-width: thin;
   scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
   cursor: grab;
@@ -2786,6 +2789,10 @@ const OverlayBody = styled.div`
 
   &::-webkit-scrollbar-track {
     background: transparent;
+  }
+
+  @container (max-width: 280px) {
+    --activity-scrollbar-lane: 10px;
   }
 
   &:active {
@@ -2995,6 +3002,9 @@ const SectionLabel = styled.span`
    words stay visible as the stream grows. */
 const LiveStreamRow = styled.div`
   flex: 0 0 auto;
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
@@ -3006,7 +3016,12 @@ const LiveStreamRow = styled.div`
   overflow: hidden;
   border: 1px solid rgba(242, 85, 85, 0.28);
   border-radius: 9px;
-  background: linear-gradient(180deg, rgba(242, 85, 85, 0.1), rgba(242, 85, 85, 0.04));
+  background:
+    linear-gradient(180deg, rgba(242, 85, 85, 0.12), rgba(242, 85, 85, 0.05)),
+    rgba(10, 12, 17, 0.96);
+  box-shadow: 0 5px 14px rgba(2, 4, 8, 0.32);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
 `;
 
 const liveStreamPulse = keyframes`

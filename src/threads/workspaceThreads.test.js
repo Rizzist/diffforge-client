@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   appendWorkspaceThreadProjectionEvents,
+  applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
   getWorkspaceThreadTerminalNickname,
@@ -13,7 +14,108 @@ import {
   normalizeWorkspaceThreads,
   persistWorkspaceThreads,
   updateWorkspaceActiveTerminal,
+  updateWorkspaceThreadProviderSession,
 } from "./workspaceThreads.js";
+
+test("provider session binding attaches to the live terminal thread without a thread id", () => {
+  const workspaceId = "workspace-session-binding";
+  const threadId = "thread-session-binding";
+  const sessionId = "codex-session-12345678";
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      terminalThreadIds: {
+        1: threadId,
+      },
+      terminals: {
+        1: {
+          activityStatus: "thinking",
+          agentId: "codex",
+          inputReady: false,
+          instanceId: 42,
+          paneId: "pane-session-binding",
+          status: "active",
+          terminalIndex: 1,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          id: threadId,
+          latestTurn: {
+            messageId: "prompt-session-binding",
+            promptEpoch: 3,
+            startedAt: "2026-06-18T12:00:00.000Z",
+            state: "running",
+            turnId: "turn-session-binding",
+          },
+          messageCount: 1,
+          messages: [{
+            createdAt: "2026-06-18T12:00:00.000Z",
+            id: "prompt-session-binding",
+            role: "user",
+            text: "bind this session",
+            turnId: "turn-session-binding",
+          }],
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: "2026-06-18T12:00:00.000Z",
+            id: "turn-session-binding-started",
+            messageId: "prompt-session-binding",
+            promptEpoch: 3,
+            status: "running",
+            turnId: "turn-session-binding",
+            type: "thread.turn.started",
+          }, {
+            agentId: "codex",
+            createdAt: "2026-06-18T12:00:00.000Z",
+            id: "prompt-session-binding",
+            messageId: "prompt-session-binding",
+            role: "user",
+            status: "submitted",
+            text: "bind this session",
+            turnId: "turn-session-binding",
+            type: "thread.message.user",
+          }],
+          providerBindings: {},
+          status: "active",
+          terminalBinding: {
+            instanceId: 42,
+            paneId: "pane-session-binding",
+            terminalIndex: 1,
+          },
+          terminalIndex: 1,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const nextState = applyWorkspaceThreadProviderSessionBinding(state, {
+    agentId: "codex",
+    instanceId: 42,
+    nativeSessionId: sessionId,
+    paneId: "pane-session-binding",
+    providerSessionId: sessionId,
+    source: "rust-session-binding",
+    terminalIndex: 1,
+    type: "provider-session",
+    workspaceId,
+  });
+
+  const nextEntry = nextState[workspaceId];
+  const nextThread = nextEntry.threads[threadId];
+  assert.equal(nextThread.transcriptSessionId, sessionId);
+  assert.equal(nextThread.activityStatus, "thinking");
+  assert.equal(nextThread.providerBindings.codex.nativeSessionId, sessionId);
+  assert.equal(nextThread.providerBindings.codex.nativeSessionSource, "rust-session-binding");
+  assert.equal(nextThread.providerBindings.codex.terminalBinding.paneId, "pane-session-binding");
+  assert.equal(nextEntry.terminals[1].nativeSessionId, sessionId);
+  assert.equal(nextEntry.terminals[1].activityStatus, "thinking");
+});
 
 test("session transcript completion settles the exact active running turn", () => {
   const workspaceId = "workspace-test";
@@ -573,6 +675,119 @@ test("session transcript acceptance preserves a locally pending submitted prompt
   assert.equal(acceptedThread.pendingPrompt.id, promptId);
   assert.equal(acceptedThread.latestTurn.state, "running");
   assert.equal(acceptedThread.activityStatus, "thinking");
+});
+
+test("accepted provider session attaches to a previously submitted prompt for resume", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-session-accepted";
+  const promptId = "prompt-session-accepted";
+  const submittedAt = "2026-05-31T04:15:07.094Z";
+  const sessionId = "session-accepted";
+
+  const submitted = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "claude",
+    instanceId: 1,
+    messageCreatedAt: submittedAt,
+    messageId: promptId,
+    paneId: "pane-test",
+    pendingPromptDeliveryMode: "session-acceptance",
+    pendingPromptId: promptId,
+    pendingPromptText: "Fix the bug",
+    promptEventId: promptId,
+    promptEventSubmittedAt: submittedAt,
+    sessionAcceptancePending: true,
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "Fix the bug",
+    workspaceId,
+  });
+
+  const submittedThread = submitted[workspaceId].threads[threadId];
+  assert.equal(submittedThread.providerBindings.claude.nativeSessionId, "");
+  assert.equal(submittedThread.latestTurn.state, "running");
+  assert.equal(submittedThread.pendingPrompt.id, promptId);
+
+  const accepted = updateWorkspaceThreadProviderSession(submitted, {
+    agentId: "claude",
+    instanceId: 1,
+    nativeSessionId: sessionId,
+    nativeSessionKind: "session",
+    nativeSessionSource: "todo-drop:session-accepted",
+    paneId: "pane-test",
+    promptEventId: promptId,
+    providerSessionId: sessionId,
+    terminalIndex: 0,
+    threadId,
+    type: "provider-session",
+    workspaceId,
+  });
+
+  const acceptedThread = accepted[workspaceId].threads[threadId];
+  assert.equal(acceptedThread.providerBindings.claude.nativeSessionId, sessionId);
+  assert.equal(acceptedThread.transcriptSessionId, sessionId);
+  assert.equal(acceptedThread.latestTurn.state, "running");
+  assert.equal(acceptedThread.pendingPrompt.id, promptId);
+  assert.equal(acceptedThread.activityStatus, "thinking");
+  assert.equal(accepted[workspaceId].terminals["0"].providerSessionId, sessionId);
+  assert.equal(accepted[workspaceId].terminals["0"].nativeSessionId, sessionId);
+  assert.equal(accepted[workspaceId].terminals["0"].sessionId, sessionId);
+  assert.equal(accepted[workspaceId].terminals["0"].threadId, threadId);
+
+  const persisted = persistWorkspaceThreads(accepted);
+  assert.equal(
+    persisted[workspaceId].threads[threadId].providerBindings.claude.nativeSessionId,
+    sessionId,
+  );
+  assert.equal(persisted[workspaceId].threads[threadId].transcriptSessionId, sessionId);
+});
+
+test("provider session change updates the active terminal ground truth", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-session-switch";
+  const oldSessionId = "session-old";
+  const newSessionId = "session-new";
+
+  const opened = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    instanceId: 4,
+    nativeSessionId: oldSessionId,
+    nativeSessionKind: "session",
+    nativeSessionSource: "terminal-open",
+    paneId: "pane-switch",
+    providerSessionId: oldSessionId,
+    terminalIndex: 1,
+    threadId,
+    type: "opened",
+    workspaceId,
+  });
+
+  const switched = updateWorkspaceThreadProviderSession(opened, {
+    agentId: "codex",
+    instanceId: 4,
+    nativeSessionId: newSessionId,
+    nativeSessionKind: "session",
+    nativeSessionSource: "terminal-output",
+    paneId: "pane-switch",
+    providerSessionId: newSessionId,
+    terminalIndex: 1,
+    threadId,
+    type: "provider-session",
+    workspaceId,
+  });
+
+  const entry = switched[workspaceId];
+  const thread = entry.threads[threadId];
+  const terminal = entry.terminals["1"];
+
+  assert.equal(thread.providerBindings.codex.nativeSessionId, newSessionId);
+  assert.equal(thread.transcriptSessionId, newSessionId);
+  assert.equal(thread.providerBindings.codex.terminalBinding.terminalIndex, 1);
+  assert.equal(thread.terminalBinding.terminalIndex, 1);
+  assert.equal(terminal.providerSessionId, newSessionId);
+  assert.equal(terminal.nativeSessionId, newSessionId);
+  assert.equal(terminal.sessionId, newSessionId);
+  assert.equal(terminal.threadId, threadId);
 });
 
 test("session transcript acceptance preserves pending prompts when transcript ids include the thread prefix", () => {

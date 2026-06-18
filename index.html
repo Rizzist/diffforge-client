@@ -24,6 +24,7 @@
           const isAudioWidget = window.location.hash === "#/audio-widget";
           const isAudioWidgetError = window.location.hash === "#/audio-widget-error";
           const isActivityOverlay = window.location.hash === "#/activity-overlay";
+          const isSnippingOverlay = window.location.hash === "#/snipping-overlay";
           const isSnippingEditor = window.location.hash.startsWith("#/snipping-editor");
           const rawSettings = isAudioWidget || isAudioWidgetError
             ? window.localStorage.getItem(AUDIO_WIDGET_THEME_STORAGE_KEY)
@@ -49,6 +50,9 @@
           if (isActivityOverlay) {
             document.documentElement.dataset.activityOverlay = "true";
           }
+          if (isSnippingOverlay) {
+            document.documentElement.dataset.snippingOverlay = "true";
+          }
           if (isSnippingEditor) {
             document.documentElement.dataset.snippingEditor = "true";
           }
@@ -67,6 +71,9 @@
           }
           if (window.location.hash === "#/activity-overlay") {
             document.documentElement.dataset.activityOverlay = "true";
+          }
+          if (window.location.hash === "#/snipping-overlay") {
+            document.documentElement.dataset.snippingOverlay = "true";
           }
           if (window.location.hash.startsWith("#/snipping-editor")) {
             document.documentElement.dataset.snippingEditor = "true";
@@ -123,6 +130,15 @@
       html[data-background-monitor="true"],
       html[data-background-monitor="true"] body,
       html[data-background-monitor="true"] #app {
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+        background: transparent !important;
+      }
+
+      html[data-snipping-overlay="true"],
+      html[data-snipping-overlay="true"] body,
+      html[data-snipping-overlay="true"] #app {
         min-width: 0;
         min-height: 0;
         overflow: hidden;

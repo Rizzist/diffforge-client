@@ -97,6 +97,16 @@ struct CodexRolloutMeta {
     title: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CodexObservedSession {
+    pub(crate) session_id: String,
+    pub(crate) session_title: String,
+    pub(crate) rollout_path: String,
+    pub(crate) cwd: String,
+    pub(crate) latest_timestamp: String,
+    pub(crate) modified_at_ms: u64,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptResult {
@@ -267,7 +277,9 @@ fn collect_codex_rollout_candidates(cwd: &str) -> Result<Vec<PathBuf>, String> {
             .map(|home| home.join("sessions").to_string_lossy().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(format!("No Codex rollout transcripts were found in: {searched}"));
+        return Err(format!(
+            "No Codex rollout transcripts were found in: {searched}"
+        ));
     }
 
     Ok(files)
@@ -279,8 +291,7 @@ fn clean_codex_id(value: impl AsRef<str>) -> String {
         .trim()
         .chars()
         .filter(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '-' | '_' | '.' | ':' | '/')
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
         })
         .take(180)
         .collect()
@@ -439,9 +450,9 @@ fn jsonl_tail_last_model(path: &Path) -> Option<String> {
         if !value.is_empty()
             && value.len() <= 120
             && value != "<synthetic>"
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/'))
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+            })
         {
             last = Some(value.to_string());
         }
@@ -502,14 +513,22 @@ pub(crate) fn agent_session_last_model(
 
 fn sort_rollouts_newest_first(files: &mut [PathBuf]) {
     files.sort_by(|left, right| {
-        let left_modified = fs::metadata(left).and_then(|metadata| metadata.modified()).ok();
-        let right_modified = fs::metadata(right).and_then(|metadata| metadata.modified()).ok();
+        let left_modified = fs::metadata(left)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_modified = fs::metadata(right)
+            .and_then(|metadata| metadata.modified())
+            .ok();
         right_modified.cmp(&left_modified)
     });
 }
 
 fn value_string(value: Option<&Value>) -> String {
-    value.and_then(Value::as_str).unwrap_or_default().trim().to_string()
+    value
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn first_value_string(values: &[Option<&Value>]) -> String {
@@ -555,18 +574,11 @@ fn redact_prefixed_secret(text: &str, prefix: &str) -> String {
 }
 
 fn redact_codex_transcript_secrets(text: &str) -> String {
-    [
-        "sk-proj-",
-        "sk-",
-        "github_pat_",
-        "ghp_",
-        "gho_",
-        "glpat-",
-    ]
-    .iter()
-    .fold(text.to_string(), |current, prefix| {
-        redact_prefixed_secret(&current, prefix)
-    })
+    ["sk-proj-", "sk-", "github_pat_", "ghp_", "gho_", "glpat-"]
+        .iter()
+        .fold(text.to_string(), |current, prefix| {
+            redact_prefixed_secret(&current, prefix)
+        })
 }
 
 fn clean_codex_transcript_text(value: impl AsRef<str>, max_chars: usize) -> String {
@@ -738,10 +750,7 @@ fn codex_artifact_path_url(reference: &str) -> (String, String) {
         if let Some(stripped) = path.strip_prefix("localhost/") {
             path = format!("/{stripped}");
         }
-        return (
-            codex_percent_decode_path(&path),
-            reference,
-        );
+        return (codex_percent_decode_path(&path), reference);
     }
     if reference.starts_with("http://")
         || reference.starts_with("https://")
@@ -808,7 +817,11 @@ fn codex_artifact_path_from_reference(reference: &str) -> Option<PathBuf> {
 }
 
 fn codex_generated_image_source_path(artifact: &CodexThreadTranscriptArtifact) -> Option<PathBuf> {
-    if !artifact.mime_type.to_ascii_lowercase().starts_with("image/") {
+    if !artifact
+        .mime_type
+        .to_ascii_lowercase()
+        .starts_with("image/")
+    {
         return None;
     }
     let path = codex_artifact_path_from_reference(&artifact.path)?;
@@ -846,8 +859,9 @@ fn promote_generated_image_artifacts(
             let Ok(promoted) = promoted else {
                 continue;
             };
-            let asset_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
-                .unwrap_or_default();
+            let asset_path =
+                cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+                    .unwrap_or_default();
             if asset_path.is_empty() {
                 continue;
             }
@@ -880,7 +894,11 @@ fn promoted_generated_asset_event(
 ) -> Option<Value> {
     let mut seen = HashSet::new();
     let mut assets = Vec::new();
-    for artifact in result.messages.iter().flat_map(|message| &message.artifacts) {
+    for artifact in result
+        .messages
+        .iter()
+        .flat_map(|message| &message.artifacts)
+    {
         if artifact.asset_path.trim().is_empty() {
             continue;
         }
@@ -979,7 +997,10 @@ fn collect_codex_generated_image_dir_artifacts(
         .collect::<Vec<_>>();
     image_paths.sort();
 
-    for path in image_paths.into_iter().take(CODEX_GENERATED_IMAGE_DIR_SCAN_LIMIT) {
+    for path in image_paths
+        .into_iter()
+        .take(CODEX_GENERATED_IMAGE_DIR_SCAN_LIMIT)
+    {
         let path = path.to_string_lossy().to_string();
         push_codex_image_artifact(artifacts, seen, &path, title, prompt, "");
     }
@@ -1034,8 +1055,8 @@ fn collect_codex_generated_image_notice_artifacts(
             continue;
         };
         let after_marker = &line[index + marker.len()..];
-        let directory = text_before_any_marker(after_marker, &[" as ", " by default", " unless "])
-            .trim();
+        let directory =
+            text_before_any_marker(after_marker, &[" as ", " by default", " unless "]).trim();
         collect_codex_generated_image_dir_artifacts(directory, title, prompt, artifacts, seen);
 
         let after_marker_lower = after_marker.to_ascii_lowercase();
@@ -1071,13 +1092,7 @@ fn collect_codex_image_artifacts_from_text(
     for line in text.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
-        collect_codex_generated_image_notice_artifacts(
-            trimmed,
-            title,
-            prompt,
-            artifacts,
-            seen,
-        );
+        collect_codex_generated_image_notice_artifacts(trimmed, title, prompt, artifacts, seen);
 
         for marker in ["saved to:", "generated image:", "image:", "path:"] {
             if lower.starts_with(marker) {
@@ -1221,8 +1236,13 @@ fn codex_artifact_activity_kind(text: &str, artifacts: &[CodexThreadTranscriptAr
     "tool_output".to_string()
 }
 
-fn codex_artifact_activity_title(text: &str, fallback: &str, artifacts: &[CodexThreadTranscriptArtifact]) -> String {
-    if !artifacts.is_empty() && codex_artifact_activity_kind(text, artifacts) == "image_generation" {
+fn codex_artifact_activity_title(
+    text: &str,
+    fallback: &str,
+    artifacts: &[CodexThreadTranscriptArtifact],
+) -> String {
+    if !artifacts.is_empty() && codex_artifact_activity_kind(text, artifacts) == "image_generation"
+    {
         return "Generated image".to_string();
     }
 
@@ -1278,7 +1298,7 @@ fn transcript_task_complete_message(
         call_id: String::new(),
         created_at: timestamp.to_string(),
         source: source.to_string(),
-    artifacts: Vec::new(),
+        artifacts: Vec::new(),
     }
 }
 
@@ -1297,7 +1317,7 @@ fn transcript_error_message(
         call_id: String::new(),
         created_at: timestamp.to_string(),
         source: source.to_string(),
-    artifacts: Vec::new(),
+        artifacts: Vec::new(),
     }
 }
 
@@ -1342,10 +1362,7 @@ fn codex_function_call_message(
         if !timeout.trim().is_empty() {
             lines.push(format!("timeout: {timeout} ms"));
         }
-        (
-            command_title(command, "Ran command"),
-            lines.join("\n"),
-        )
+        (command_title(command, "Ran command"), lines.join("\n"))
     } else {
         let text = parsed_arguments
             .as_ref()
@@ -1368,7 +1385,7 @@ fn codex_function_call_message(
         call_id,
         created_at: timestamp.to_string(),
         source: "codex".to_string(),
-    artifacts: Vec::new(),
+        artifacts: Vec::new(),
     })
 }
 
@@ -1421,7 +1438,10 @@ fn codex_rollout_meta(path: &Path) -> Option<CodexRolloutMeta> {
             meta.latest_timestamp = latest_timestamp;
         }
 
-        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let record_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let payload = value.get("payload").unwrap_or(&Value::Null);
         match record_type {
             "session_meta" => {
@@ -1488,6 +1508,57 @@ fn first_non_empty_title(values: &[String]) -> String {
         .unwrap_or_default()
 }
 
+fn system_time_to_unix_ms(value: SystemTime) -> u64 {
+    value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+pub(crate) fn discover_latest_codex_session_for_cwd(
+    cwd: &str,
+    not_before_ms: u64,
+) -> Result<Option<CodexObservedSession>, String> {
+    let files = collect_codex_rollout_candidates(cwd)?;
+    let threshold_ms = not_before_ms.saturating_sub(30_000);
+
+    for path in files {
+        let modified_at_ms = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .map(system_time_to_unix_ms)
+            .unwrap_or(0);
+        if modified_at_ms > 0 && modified_at_ms < threshold_ms {
+            continue;
+        }
+
+        let Some(meta) = codex_rollout_meta(&path) else {
+            continue;
+        };
+        if meta.session_id.is_empty() {
+            continue;
+        }
+        if !cwd.trim().is_empty() && !agent_paths_match(&meta.cwd, cwd) {
+            continue;
+        }
+
+        let session_title = first_non_empty_title(&[
+            meta.title.clone(),
+            codex_session_index_title(&meta.session_id),
+        ]);
+
+        return Ok(Some(CodexObservedSession {
+            session_id: meta.session_id,
+            session_title,
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd: meta.cwd,
+            latest_timestamp: meta.latest_timestamp,
+            modified_at_ms,
+        }));
+    }
+
+    Ok(None)
+}
+
 fn push_codex_message(
     messages: &mut Vec<CodexThreadTranscriptMessage>,
     seen: &mut HashSet<String>,
@@ -1508,10 +1579,7 @@ fn push_codex_message(
     } else if !message.call_id.is_empty() {
         format!(
             "{}:{}:{}:{}",
-            message.role,
-            message.kind,
-            message.call_id,
-            message.text
+            message.role, message.kind, message.call_id, message.text
         )
     } else {
         format!("{}:{}:{}", message.role, message.kind, message.text)
@@ -1528,7 +1596,10 @@ fn codex_messages_from_event(
     timestamp: &str,
     payload: &Value,
 ) -> Vec<CodexThreadTranscriptMessage> {
-    let event_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match event_type {
         "user_message" => {
             let mut text = value_string(payload.get("message"));
@@ -1564,7 +1635,8 @@ fn codex_messages_from_event(
         "agent_message" => {
             let raw_message = value_string(payload.get("message"));
             let text = clean_codex_transcript_text(&raw_message, CODEX_TRANSCRIPT_MAX_TEXT);
-            let artifacts = codex_image_artifacts_from_content(payload, &raw_message, "Generated image");
+            let artifacts =
+                codex_image_artifacts_from_content(payload, &raw_message, "Generated image");
             if text.is_empty() && artifacts.is_empty() {
                 Vec::new()
             } else {
@@ -1600,10 +1672,13 @@ fn codex_messages_from_event(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
-        artifacts: Vec::new(),
+            artifacts: Vec::new(),
         }],
         "patch_apply_end" => {
-            let success = payload.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let success = payload
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let stdout = value_string(payload.get("stdout"));
             let stderr = value_string(payload.get("stderr"));
             let text = [stdout, stderr]
@@ -1616,11 +1691,16 @@ fn codex_messages_from_event(
                 role: "activity".to_string(),
                 kind: "patch".to_string(),
                 text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: if success { "Patch applied" } else { "Patch failed" }.to_string(),
+                title: if success {
+                    "Patch applied"
+                } else {
+                    "Patch failed"
+                }
+                .to_string(),
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
-            artifacts: Vec::new(),
+                artifacts: Vec::new(),
             }]
         }
         "context_compacted" => vec![CodexThreadTranscriptMessage {
@@ -1632,7 +1712,7 @@ fn codex_messages_from_event(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
-        artifacts: Vec::new(),
+            artifacts: Vec::new(),
         }],
         "mcp_tool_call_end" => {
             let invocation = payload.get("invocation").unwrap_or(&Value::Null);
@@ -1661,7 +1741,11 @@ fn codex_messages_from_event(
                 .unwrap_or(&Value::Null);
             let artifacts = codex_image_artifacts_from_content(artifact_value, &text, &title);
             let kind = codex_artifact_activity_kind(&text, &artifacts);
-            let title = codex_artifact_activity_title(&text, &clean_codex_title(title, "MCP tool"), &artifacts);
+            let title = codex_artifact_activity_title(
+                &text,
+                &clean_codex_title(title, "MCP tool"),
+                &artifacts,
+            );
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-mcp"),
                 role: "activity".to_string(),
@@ -1683,14 +1767,21 @@ fn codex_messages_from_response_item(
     timestamp: &str,
     payload: &Value,
 ) -> Vec<CodexThreadTranscriptMessage> {
-    let item_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+    let item_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match item_type {
         "message" => {
-            let role = payload.get("role").and_then(Value::as_str).unwrap_or_default();
+            let role = payload
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let content = payload.get("content").unwrap_or(&Value::Null);
             let raw_text = codex_content_text(content);
             let text = clean_codex_transcript_text(&raw_text, CODEX_TRANSCRIPT_MAX_TEXT);
-            let artifacts = codex_image_artifacts_from_content(content, &raw_text, "Generated image");
+            let artifacts =
+                codex_image_artifacts_from_content(content, &raw_text, "Generated image");
             if role == "developer" {
                 if artifacts.is_empty() {
                     return Vec::new();
@@ -1746,7 +1837,7 @@ fn codex_messages_from_response_item(
             call_id: value_string(payload.get("id")),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
-        artifacts: Vec::new(),
+            artifacts: Vec::new(),
         }],
         "reasoning" => {
             let summary = clean_codex_transcript_text(
@@ -1765,7 +1856,7 @@ fn codex_messages_from_response_item(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "codex".to_string(),
-                artifacts: Vec::new(),
+                    artifacts: Vec::new(),
                 }]
             }
         }
@@ -1833,7 +1924,8 @@ mod agent_sessions_tests {
             .join("codex-home")
             .join("generated_images")
             .join("019ea89a-b677-7fd3-a293-cdc2d10c0351");
-        let image_path = image_dir.join("ig_0baf5da02d75dc2f016a2711455b2c81908b3860dc4fbe6d20.png");
+        let image_path =
+            image_dir.join("ig_0baf5da02d75dc2f016a2711455b2c81908b3860dc4fbe6d20.png");
         fs::create_dir_all(&image_dir).unwrap();
         fs::write(&image_path, b"fake png").unwrap();
 
@@ -1898,7 +1990,10 @@ fn parse_codex_rollout(
             meta.latest_timestamp = timestamp.clone();
         }
 
-        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let record_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let payload = value.get("payload").unwrap_or(&Value::Null);
         match record_type {
             "session_meta" => {
@@ -2079,7 +2174,10 @@ fn claude_file_meta(path: &Path) -> Option<CodexRolloutMeta> {
         if !next_cwd.is_empty() {
             cwd = next_cwd;
         }
-        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let entry_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if entry_type == "ai-title" {
             title = clean_codex_title(value_string(value.get("aiTitle")), "");
         } else if entry_type == "summary" {
@@ -2223,7 +2321,10 @@ fn claude_activity_from_block(
     timestamp: &str,
     block: &Value,
 ) -> Option<CodexThreadTranscriptMessage> {
-    let block_type = block.get("type").and_then(Value::as_str).unwrap_or_default();
+    let block_type = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match block_type {
         "tool_use" => {
             let name = value_string(block.get("name"));
@@ -2242,7 +2343,7 @@ fn claude_activity_from_block(
                 call_id,
                 created_at: timestamp.to_string(),
                 source: "claude".to_string(),
-            artifacts: Vec::new(),
+                artifacts: Vec::new(),
             })
         }
         "tool_result" => {
@@ -2281,7 +2382,7 @@ fn claude_activity_from_block(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "claude".to_string(),
-                artifacts: Vec::new(),
+                    artifacts: Vec::new(),
                 })
             }
         }
@@ -2293,8 +2394,12 @@ fn parse_claude_session(
     path: &Path,
     max_messages: usize,
 ) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Unable to open Claude Code transcript {}: {error}", path.display()))?;
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "Unable to open Claude Code transcript {}: {error}",
+            path.display()
+        )
+    })?;
     let reader = std::io::BufReader::new(file);
     let mut meta = CodexRolloutMeta {
         session_id: path
@@ -2329,7 +2434,10 @@ fn parse_claude_session(
             meta.cwd = cwd;
         }
 
-        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let entry_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if entry_type == "ai-title" {
             meta.title = clean_codex_title(value_string(value.get("aiTitle")), "");
             continue;
@@ -2339,8 +2447,13 @@ fn parse_claude_session(
             continue;
         }
         if entry_type == "result" {
-            let is_error = value.get("is_error").and_then(Value::as_bool).unwrap_or(false)
-                || value_string(value.get("subtype")).to_lowercase().contains("error");
+            let is_error = value
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || value_string(value.get("subtype"))
+                    .to_lowercase()
+                    .contains("error");
             let result_text = first_value_string(&[
                 value.get("result"),
                 value.get("message"),
@@ -2403,7 +2516,7 @@ fn parse_claude_session(
                         call_id: String::new(),
                         created_at: timestamp.clone(),
                         source: "claude".to_string(),
-                    artifacts: Vec::new(),
+                        artifacts: Vec::new(),
                     }),
                 );
             }
@@ -2419,9 +2532,11 @@ fn parse_claude_session(
             }
 
             if role == "assistant"
-                && claude_stop_reason_completes_turn(
-                    &value_string(message.get("stop_reason").or_else(|| value.get("stop_reason"))),
-                )
+                && claude_stop_reason_completes_turn(&value_string(
+                    message
+                        .get("stop_reason")
+                        .or_else(|| value.get("stop_reason")),
+                ))
             {
                 push_codex_message(
                     &mut messages,
@@ -2459,7 +2574,12 @@ fn opencode_data_home() -> Vec<PathBuf> {
         candidates.push(home.join("AppData").join("Local").join("opencode"));
     }
     if let Some(value) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(value).join(".local").join("share").join("opencode"));
+        candidates.push(
+            PathBuf::from(value)
+                .join(".local")
+                .join("share")
+                .join("opencode"),
+        );
     }
 
     candidates
@@ -2498,9 +2618,7 @@ fn opencode_tool_title(tool: &str, input_value: &Value) -> String {
     };
     let normalized_tool = tool.trim().to_lowercase();
     if normalized_tool == "bash" || normalized_tool == "shell" {
-        let command = value_string(input_value.get("command"))
-            .trim()
-            .to_string();
+        let command = value_string(input_value.get("command")).trim().to_string();
         if !command.is_empty() {
             return command_title(&command, &fallback);
         }
@@ -2537,7 +2655,11 @@ fn opencode_part_message(
     data: &Value,
 ) -> Vec<CodexThreadTranscriptMessage> {
     let part_type = data.get("type").and_then(Value::as_str).unwrap_or_default();
-    let message_role = if role == "assistant" { "assistant" } else { "user" };
+    let message_role = if role == "assistant" {
+        "assistant"
+    } else {
+        "user"
+    };
     match part_type {
         "text" => {
             let text = first_value_string(&[data.get("text"), data.get("content")]);
@@ -2553,7 +2675,7 @@ fn opencode_part_message(
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
-            artifacts: Vec::new(),
+                artifacts: Vec::new(),
             }]
         }
         "reasoning" => {
@@ -2570,14 +2692,18 @@ fn opencode_part_message(
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
-            artifacts: Vec::new(),
+                artifacts: Vec::new(),
             }]
         }
         "tool" => {
             let tool = first_value_string(&[data.get("tool"), data.get("name"), data.get("title")]);
-            let call_id = first_value_string(&[data.get("callID"), data.get("callId"), data.get("id")]);
+            let call_id =
+                first_value_string(&[data.get("callID"), data.get("callId"), data.get("id")]);
             let state = data.get("state").unwrap_or(&Value::Null);
-            let input_value = data.get("input").or_else(|| state.get("input")).unwrap_or(&Value::Null);
+            let input_value = data
+                .get("input")
+                .or_else(|| state.get("input"))
+                .unwrap_or(&Value::Null);
             let input = opencode_json_text(data.get("input").or_else(|| state.get("input")));
             let output = opencode_json_text(
                 data.get("output")
@@ -2601,16 +2727,13 @@ fn opencode_part_message(
                 call_id: call_id.clone(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
-            artifacts: Vec::new(),
+                artifacts: Vec::new(),
             });
             let has_error = !error.trim().is_empty();
-            let output_text = if has_error {
-                error
-            } else {
-                output
-            };
+            let output_text = if has_error { error } else { output };
             if !output_text.trim().is_empty() {
-                let artifacts = codex_image_artifacts_from_content(data, &output_text, "Tool output");
+                let artifacts =
+                    codex_image_artifacts_from_content(data, &output_text, "Tool output");
                 let kind = if has_error {
                     "tool_output".to_string()
                 } else {
@@ -2644,7 +2767,7 @@ fn opencode_part_message(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
-        artifacts: Vec::new(),
+            artifacts: Vec::new(),
         }],
         "file" => {
             let text = pretty_json(data);
@@ -2677,13 +2800,13 @@ fn opencode_part_message(
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "opencode".to_string(),
-            artifacts: Vec::new(),
+                artifacts: Vec::new(),
             }]
         }
         "step-finish" => {
             let reason = first_value_string(&[data.get("reason"), data.get("summary")]);
-            let reason_is_error = reason.to_lowercase().contains("error")
-                || reason.to_lowercase().contains("fail");
+            let reason_is_error =
+                reason.to_lowercase().contains("error") || reason.to_lowercase().contains("fail");
             if reason_is_error {
                 vec![transcript_error_message(
                     format!("opencode-{message_id}-{part_id}-step-error"),
@@ -2713,7 +2836,7 @@ fn opencode_part_message(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
-        artifacts: Vec::new(),
+            artifacts: Vec::new(),
         }],
         _ => Vec::new(),
     }
@@ -2736,12 +2859,16 @@ fn find_opencode_session(
     provider_session_id: &str,
     _cwd: &str,
 ) -> Result<(String, String, String, String), String> {
-    let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
-    let connection = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| format!("Unable to open OpenCode database {}: {error}", db_path.display()))?;
+    let db_path =
+        opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    let connection =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                format!(
+                    "Unable to open OpenCode database {}: {error}",
+                    db_path.display()
+                )
+            })?;
     let requested_session_id = clean_codex_id(provider_session_id);
 
     if !requested_session_id.is_empty() {
@@ -2940,14 +3067,20 @@ fn discover_opencode_session_by_prompt(
     cwd: &str,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
-    let connection = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| format!("Unable to open OpenCode database {}: {error}", db_path.display()))?;
+    let db_path =
+        opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    let connection =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                format!(
+                    "Unable to open OpenCode database {}: {error}",
+                    db_path.display()
+                )
+            })?;
     let mut statement = connection
-        .prepare("select id, title, directory, time_updated from session order by time_updated desc")
+        .prepare(
+            "select id, title, directory, time_updated from session order by time_updated desc",
+        )
         .map_err(|error| format!("Unable to query OpenCode sessions: {error}"))?;
     let rows = statement
         .query_map([], |row| {
@@ -3002,12 +3135,16 @@ fn parse_opencode_session(
     cwd: &str,
     max_messages: usize,
 ) -> Result<(CodexRolloutMeta, Vec<CodexThreadTranscriptMessage>), String> {
-    let db_path = opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
-    let connection = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| format!("Unable to open OpenCode database {}: {error}", db_path.display()))?;
+    let db_path =
+        opencode_db_path().ok_or_else(|| "Unable to locate OpenCode database.".to_string())?;
+    let connection =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                format!(
+                    "Unable to open OpenCode database {}: {error}",
+                    db_path.display()
+                )
+            })?;
 
     let mut part_statement = connection
         .prepare(
@@ -3027,7 +3164,10 @@ fn parse_opencode_session(
     let mut parts_by_message: HashMap<String, Vec<(String, i64, Value)>> = HashMap::new();
     for row in part_rows.flatten() {
         let data = serde_json::from_str::<Value>(&row.3).unwrap_or(Value::Null);
-        parts_by_message.entry(row.1).or_default().push((row.0, row.2, data));
+        parts_by_message
+            .entry(row.1)
+            .or_default()
+            .push((row.0, row.2, data));
     }
 
     let mut message_statement = connection
@@ -3074,14 +3214,16 @@ fn parse_opencode_session(
                     call_id: String::new(),
                     created_at: timestamp.clone(),
                     source: "opencode".to_string(),
-                artifacts: Vec::new(),
+                    artifacts: Vec::new(),
                 }),
             );
         }
 
         for (part_id, part_time, part_data) in parts_by_message.remove(&row.0).unwrap_or_default() {
             let part_timestamp = opencode_timestamp(part_time);
-            for message in opencode_part_message(&row.0, &role, &part_id, &part_timestamp, &part_data) {
+            for message in
+                opencode_part_message(&row.0, &role, &part_id, &part_timestamp, &part_data)
+            {
                 push_codex_message(&mut messages, &mut seen, Some(message));
             }
         }
@@ -3210,7 +3352,8 @@ fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> St
         result.latest_timestamp,
         result.messages.len(),
         tail.map(|message| message.id.as_str()).unwrap_or_default(),
-        tail.map(|message| message.kind.as_str()).unwrap_or_default(),
+        tail.map(|message| message.kind.as_str())
+            .unwrap_or_default(),
         tail.map(|message| message.text.len()).unwrap_or_default(),
     )
 }
@@ -3219,8 +3362,13 @@ fn agent_thread_transcript_watch_context(
     request: &AgentThreadTranscriptWatchRequest,
 ) -> AgentThreadTranscriptWatchContext {
     AgentThreadTranscriptWatchContext {
-        agent_id: clean_codex_id(request.agent_id.clone().unwrap_or_else(|| "codex".to_string()))
-            .to_lowercase(),
+        agent_id: clean_codex_id(
+            request
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "codex".to_string()),
+        )
+        .to_lowercase(),
         allow_timestamp_fallback: request.allow_timestamp_fallback.unwrap_or(false),
         cwd: request.cwd.clone().unwrap_or_default(),
         expected_message_created_at: request
@@ -3236,8 +3384,13 @@ fn agent_thread_transcript_watch_context(
         pane_id: request.pane_id.clone().unwrap_or_default(),
         poll_until_turn_complete: request.poll_until_turn_complete.unwrap_or(false),
         prompt_event_id: request.prompt_event_id.clone().unwrap_or_default(),
-        prompt_event_submitted_at: request.prompt_event_submitted_at.clone().unwrap_or_default(),
-        provider_session_id: clean_codex_id(request.provider_session_id.clone().unwrap_or_default()),
+        prompt_event_submitted_at: request
+            .prompt_event_submitted_at
+            .clone()
+            .unwrap_or_default(),
+        provider_session_id: clean_codex_id(
+            request.provider_session_id.clone().unwrap_or_default(),
+        ),
         source: request.source.clone().unwrap_or_default(),
         submitted_at: request.submitted_at.clone().unwrap_or_default(),
         terminal_index: request.terminal_index,
@@ -3287,13 +3440,11 @@ fn agent_thread_transcript_watch_event_matches(watch_path: &Path, paths: &[PathB
     paths.iter().any(|path| {
         path == watch_path
             || path.starts_with(watch_path)
-            || (
-                !watch_name.is_empty()
-                    && path
-                        .file_name()
-                        .map(|value| value.to_string_lossy().starts_with(&watch_name))
-                        .unwrap_or(false)
-            )
+            || (!watch_name.is_empty()
+                && path
+                    .file_name()
+                    .map(|value| value.to_string_lossy().starts_with(&watch_name))
+                    .unwrap_or(false))
     })
 }
 
@@ -3318,8 +3469,7 @@ async fn emit_agent_thread_transcript_watch_update(
     reason: &'static str,
 ) {
     let context = {
-        let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
-            .get_or_init(|| StdMutex::new(HashMap::new()));
+        let watches = AGENT_THREAD_TRANSCRIPT_WATCHES.get_or_init(|| StdMutex::new(HashMap::new()));
         watches
             .lock()
             .ok()
@@ -3363,8 +3513,7 @@ async fn emit_agent_thread_transcript_watch_update(
 
     let signature = agent_thread_transcript_signature(&result);
     let should_emit = {
-        let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
-            .get_or_init(|| StdMutex::new(HashMap::new()));
+        let watches = AGENT_THREAD_TRANSCRIPT_WATCHES.get_or_init(|| StdMutex::new(HashMap::new()));
         let Ok(mut entries) = watches.lock() else {
             return;
         };
@@ -3433,8 +3582,7 @@ fn register_agent_thread_transcript_watch(
     }
     let key = agent_thread_transcript_watch_key(&context, &watch_path);
     let initial_signature = agent_thread_transcript_signature(result);
-    let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
-        .get_or_init(|| StdMutex::new(HashMap::new()));
+    let watches = AGENT_THREAD_TRANSCRIPT_WATCHES.get_or_init(|| StdMutex::new(HashMap::new()));
     if let Ok(mut entries) = watches.lock() {
         if let Some(entry) = entries.get_mut(&key) {
             if let Ok(mut existing_context) = entry.context.lock() {
@@ -3473,7 +3621,10 @@ fn register_agent_thread_transcript_watch(
         let app_for_emit = app_for_watch.clone();
         let key_for_emit = key_for_watch.clone();
         tauri::async_runtime::spawn(async move {
-            sleep(Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)).await;
+            sleep(Duration::from_millis(
+                AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS,
+            ))
+            .await;
             emit_agent_thread_transcript_watch_update(app_for_emit, key_for_emit, "file-change")
                 .await;
         });
@@ -3508,8 +3659,8 @@ async fn agent_thread_session_discover(
     app: AppHandle,
     request: CodexThreadSessionDiscoverRequest,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
-        .to_lowercase();
+    let agent_id =
+        clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string())).to_lowercase();
     let expected_user_message = request.expected_user_message.unwrap_or_default();
     let allow_timestamp_fallback = request.allow_timestamp_fallback.unwrap_or(false);
     let submitted_at = request.submitted_at.unwrap_or_default();
@@ -3554,8 +3705,8 @@ async fn agent_thread_transcript(
     app: AppHandle,
     request: CodexThreadTranscriptRequest,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
-        .to_lowercase();
+    let agent_id =
+        clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string())).to_lowercase();
     let provider_session_id = clean_codex_id(request.provider_session_id.unwrap_or_default());
     let cwd = request.cwd.unwrap_or_default();
     let max_messages = request

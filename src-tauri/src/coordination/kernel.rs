@@ -25858,16 +25858,18 @@ struct CodexManagedGitRoute {
 }
 
 fn codex_architecture_graphs_root(repo_path: &Path) -> PathBuf {
-    repo_path
-        .join(".agents")
-        .join("architectures")
-        .join("graphs")
+    crate::architecture_global_graphs_root_dir().unwrap_or_else(|_| {
+        repo_path
+            .join(".agents")
+            .join("architectures")
+            .join("graphs")
+    })
 }
 
 fn codex_architecture_graphs_write_enabled(enforcement_mode: &str) -> bool {
     matches!(
         enforcement_mode,
-        "worktree_required" | "bounded_direct_edit" | "general_worker"
+        "worktree_required" | "bounded_direct_edit" | "general_worker" | "direct_unmanaged"
     )
 }
 
@@ -25875,7 +25877,7 @@ fn append_codex_managed_permission_profile(
     config: String,
     repo_path: &Path,
     write_root: &Path,
-    enforcement_mode: &str,
+    _enforcement_mode: &str,
     slot_key: Option<&str>,
     agent_kind: &str,
     _hooks_config: Option<&str>,
@@ -25887,44 +25889,11 @@ fn append_codex_managed_permission_profile(
     let write_root = write_root
         .canonicalize()
         .unwrap_or_else(|_| write_root.to_path_buf());
-    let repo_path = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
-    let architecture_graphs_root = codex_architecture_graphs_root(&repo_path)
-        .canonicalize()
-        .unwrap_or_else(|_| codex_architecture_graphs_root(&repo_path));
-    let routes = match enforcement_mode {
-        "bounded_direct_edit" => {
-            codex_managed_git_routes_for_direct_root(&write_root, slot_key, agent_kind)?
-        }
-        "general_worker" => {
-            codex_managed_git_routes_for_general_worker_root(&write_root, slot_key, agent_kind)?
-        }
-        _ => Vec::new(),
-    };
-    let write_enabled = matches!(
-        enforcement_mode,
-        "worktree_required" | "bounded_direct_edit" | "general_worker" | "direct_unmanaged"
-    );
-    let parent_profile = if enforcement_mode == "general_worker" {
-        ":read-only"
-    } else if write_enabled {
-        ":workspace"
-    } else {
-        ":read-only"
-    };
+    let _ = (repo_path, slot_key, agent_kind);
+    let parent_profile = ":workspace";
     let profile = "diffforge-coordinated";
     let mut config = prepend_codex_managed_root_permission_profile(config, profile);
     let mut workspace_roots = vec![write_root.clone()];
-    if enforcement_mode == "worktree_required"
-        && codex_architecture_graphs_write_enabled(enforcement_mode)
-        && !same_path_text(
-            &process_path_text(&write_root),
-            &process_path_text(&architecture_graphs_root),
-        )
-    {
-        workspace_roots.push(architecture_graphs_root.clone());
-    }
     workspace_roots.sort_by_key(|root| process_path_text(root));
     workspace_roots.dedup_by(|left, right| {
         same_path_text(&process_path_text(left), &process_path_text(right))
@@ -25944,34 +25913,9 @@ extends = \"{parent_profile}\"\n\n\
     }
     config.push_str(&format!(
         "\n[permissions.{profile}.filesystem]\n\
-\":root\" = \"read\"\n"
+\":root\" = \"{}\"\n",
+        "write"
     ));
-
-    if write_enabled && (enforcement_mode != "general_worker" || !routes.is_empty()) {
-        config.push_str(&format!(
-            "\n[permissions.{profile}.filesystem.\":workspace_roots\"]\n"
-        ));
-
-        if enforcement_mode != "general_worker" {
-            config.push_str("\".\" = \"write\"\n");
-        }
-
-        for route in &routes {
-            let repo_relative = codex_permission_relative_path(&write_root, &route.repo_root)?;
-            config.push_str(&format!("\"{}\" = \"read\"\n", toml_escape(&repo_relative)));
-        }
-
-        if enforcement_mode == "general_worker"
-            && codex_architecture_graphs_write_enabled(enforcement_mode)
-        {
-            let architecture_relative =
-                codex_permission_relative_path(&write_root, &architecture_graphs_root)?;
-            config.push_str(&format!(
-                "\"{}\" = \"write\"\n",
-                toml_escape(&architecture_relative)
-            ));
-        }
-    }
 
     Ok(config)
 }
@@ -25984,10 +25928,9 @@ pub(crate) fn codex_managed_hooks_config_toml(hooks_json: &Value) -> String {
     for event_name in [
         "UserPromptSubmit",
         "Stop",
-        "Error",
-        "Interrupt",
         "PreToolUse",
         "PostToolUse",
+        "PermissionRequest",
         "SubagentStart",
         "SubagentStop",
     ] {
@@ -26050,14 +25993,8 @@ fn codex_managed_hooks_config_json(
     agent_kind: &str,
 ) -> Value {
     let activity_hook_command = codex_activity_hook_command(mcp_command);
-    let write_guard_hook_command = codex_write_guard_hook_command(
-        mcp_command,
-        repo_path,
-        db_path,
-        agent_id,
-        session_id,
-        slot_key,
-        agent_kind,
+    let _ = (
+        repo_path, db_path, agent_id, session_id, slot_key, agent_kind,
     );
     let mut hooks = Map::new();
     hooks.insert(
@@ -26079,34 +26016,22 @@ fn codex_managed_hooks_config_json(
         )]),
     );
     hooks.insert(
-        "Error".to_string(),
-        Value::Array(vec![codex_managed_command_hook_json(
-            None,
-            &activity_hook_command,
-            5,
-            None,
-        )]),
-    );
-    hooks.insert(
-        "Interrupt".to_string(),
-        Value::Array(vec![codex_managed_command_hook_json(
-            None,
-            &activity_hook_command,
-            5,
-            None,
-        )]),
-    );
-    hooks.insert(
         "PreToolUse".to_string(),
-        Value::Array(vec![
-            codex_managed_command_hook_json(None, &activity_hook_command, 5, None),
-            codex_managed_command_hook_json(
-                Some("apply_patch|functions.apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command"),
-                &write_guard_hook_command,
-                30,
-                Some("Validating Diff Forge writes"),
-            ),
-        ]),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "PermissionRequest".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
     );
     hooks.insert(
         "PostToolUse".to_string(),
@@ -26186,19 +26111,15 @@ fn codex_managed_git_launch_self_test(
         "extends = \":workspace\"",
         "[permissions.diffforge-coordinated.workspace_roots]",
         "[permissions.diffforge-coordinated.filesystem]",
-        "\":root\" = \"read\"",
-        "[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]",
-        "\".\" = \"write\"",
+        "\":root\" = \"write\"",
         "[[hooks.UserPromptSubmit]]",
         "[[hooks.Stop]]",
-        "[[hooks.Error]]",
-        "[[hooks.Interrupt]]",
         "[[hooks.PreToolUse]]",
         "[[hooks.PostToolUse]]",
+        "[[hooks.PermissionRequest]]",
         "[[hooks.SubagentStart]]",
         "[[hooks.SubagentStop]]",
         "--diff-forge-activity-hook",
-        "--diff-forge-write-guard",
         &format!(
             "[projects.\"{}\"]",
             toml_escape(&process_path_text(repo_path))
@@ -26216,61 +26137,18 @@ fn codex_managed_git_launch_self_test(
     for expected in [
         "\"UserPromptSubmit\"",
         "\"Stop\"",
-        "\"Error\"",
-        "\"Interrupt\"",
         "\"PreToolUse\"",
         "\"PostToolUse\"",
+        "\"PermissionRequest\"",
         "\"SubagentStart\"",
         "\"SubagentStop\"",
         "--diff-forge-activity-hook",
-        "--diff-forge-write-guard",
-        "functions.apply_patch",
     ] {
         if !hooks_config.contains(expected) {
             missing.push(format!("hooks config missing {expected}"));
         }
     }
-
-    for expected in [
-        "apply_patch",
-        "functions.apply_patch",
-        "Edit",
-        "Write",
-        "Bash",
-        "Shell",
-        "functions.exec_command",
-    ] {
-        if !hooks_config.contains(expected) {
-            missing.push(format!("hook matcher missing {expected}"));
-        }
-    }
-
-    for expected in [
-        "--diff-forge-write-guard".to_string(),
-        format!("--provider {}", quote_shell_literal_for_config("codex")),
-        format!(
-            "--repo-path {}",
-            quote_shell_literal_for_config(&process_path_text(repo_path))
-        ),
-        format!(
-            "--db-path {}",
-            quote_shell_literal_for_config(&process_path_text(db_path))
-        ),
-        format!("--agent-id {}", quote_shell_literal_for_config(agent_id)),
-        format!(
-            "--session-id {}",
-            quote_shell_literal_for_config(session_id)
-        ),
-        format!("--slot-key {}", quote_shell_literal_for_config(slot_key)),
-        format!(
-            "--agent-kind {}",
-            quote_shell_literal_for_config(agent_kind)
-        ),
-    ] {
-        if !hooks_config.contains(&expected) {
-            missing.push(format!("hook command missing {expected}"));
-        }
-    }
+    let _ = (db_path, agent_id, session_id, slot_key, agent_kind);
 
     if missing.is_empty() {
         Ok(())
@@ -26452,28 +26330,6 @@ fn codex_permission_relative_path(root: &Path, child: &Path) -> Result<String, S
     } else {
         Ok(text)
     }
-}
-
-fn codex_write_guard_hook_command(
-    command: &str,
-    repo_path: &Path,
-    db_path: &Path,
-    agent_id: &str,
-    session_id: &str,
-    slot_key: &str,
-    agent_kind: &str,
-) -> String {
-    format!(
-        "{} --diff-forge-write-guard --provider {} --repo-path {} --db-path {} --agent-id {} --session-id {} --slot-key {} --agent-kind {}",
-        quote_shell_literal_for_config(command),
-        quote_shell_literal_for_config("codex"),
-        quote_shell_literal_for_config(&process_path_text(repo_path)),
-        quote_shell_literal_for_config(&process_path_text(db_path)),
-        quote_shell_literal_for_config(agent_id),
-        quote_shell_literal_for_config(session_id),
-        quote_shell_literal_for_config(slot_key),
-        quote_shell_literal_for_config(agent_kind),
-    )
 }
 
 fn codex_activity_hook_command(command: &str) -> String {
@@ -27099,8 +26955,8 @@ fn diffforge_agent_contract_markdown(variant: AgentContractVariant) -> String {
 Work normally from the visible project root. This file only documents account-global Diff Forge architecture graph artifacts.\n\n\
 ## Architecture Graphs\n\n\
 - Diff Forge architecture graphs are account-global artifacts under the Diff Forge global architectures root. Use the absolute `globalGraphsRoot` from architecture_context when available.\n\
-- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `.agents/architectures/graphs/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
-- Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
+- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `globalGraphsRoot/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
+- Direct file edits to `globalGraphsRoot/*.arch` are allowed for live architecture previews. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
 - Preserve group `intent`, node `role`/`lifecycle`/`source`/`status`, edge `role`/`condition`/`event`/`criticality`, and api-corridor route/step props when updating existing graphs.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
         );
@@ -27118,10 +26974,10 @@ This contract applies only to coding agents launched by the Diff Forge AI deskto
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, direct completion, and optional patch submission.\n\n\
 ## Required flow for every user task\n\n\
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
-2. Architecture graph-only work is the direct-live exception: if the only edits are `.agents/architectures/graphs/*.arch`, do not call `start_task`, do not acquire a normal file lease, and do not call `submit_patch`. Use the architecture MCP context/list/reference tools, edit the graph file directly in the visible repo root, then report the graph path in the final summary.\n\
+2. Architecture graph-only work is the direct-live exception: if the only edits are files under `DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT` / `architecture_context.globalGraphsRoot`, do not call `start_task`, do not acquire a normal file lease, and do not call `submit_patch`. Use the architecture MCP context/list/reference tools, edit the global graph file directly, then report the graph path in the final summary.\n\
 3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission. Task/context/history Cloud sync is disabled; todos are the shared cloud work state.\n\
-4. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-5. Use normal shell and edit tools after the lease. Follow the active session file authority: `bounded_direct_edit` edits leased files directly in the visible repo root, while `worktree_required` edits leased files only inside the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT`. Do not sidestep into `.agents/worktrees` when the session is direct, and never edit another agent slot's worktree.\n\
+4. Filesystem edits are not lease-gated. Use normal shell and edit tools against any path the user asks you to change; `coordination-kernel.acquire_lease` is not required for file access.\n\
+5. Coordinated task calls are for shared activity state, not local filesystem permission. Keep summaries/checkpoints useful, but do not treat worktree roots or leases as write barriers.\n\
 6. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
 7. When finished with non-architecture graph edits, follow the active session `completion_mode`: call `coordination-kernel.complete_task` for direct/activity work, or `coordination-kernel.submit_patch` only when the session reports `worktree_required`/`submit_patch`. If `submit_patch` returns a `submit_job_id`, use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 8. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
@@ -27129,7 +26985,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
 - Task/context/history Cloud sync is disabled. Diff Forge's Rust app/kernel keeps task lifecycle, checkpoint summaries, and merge context local while todos remain the shared cloud work state.\n\
 - Use the local coordination kernel for leases, completion, patch submission when enabled, and merge safety.\n\
-- For Git-managed files, obey the active file authority: direct sessions edit the visible repo root after leases; isolated sessions edit only through the assigned agent worktree/branch root.\n\
+- For Git-managed files, Diff Forge no longer gates local filesystem writes by worktree or lease. Use the path that matches the user's request and the current repo state.\n\
 - Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and finish through the reported completion mode.\n\
 - Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path when isolated worktree submission is enabled.\n\
 \n\
@@ -27138,12 +26994,12 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 - Workspace MCP tools are namespaced as `<server_key>__<tool_name>` and can change when the user enables, disables, or configures MCPs in Diff Forge.\n\
 \n\
 ## Architecture graphs\n\n\
-- Diff Forge architecture graphs are account-global agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`; use that absolute root (or `architecture_context.globalGraphsRoot`) instead of assuming `.agents/architectures` inside the repo.\n\
-- Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews, including when isolated worktrees are enabled. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
-- Architecture graph-only work is live artifact work, not a managed patch task: do not call `start_task`, `acquire_lease`, `checkpoint`, or `submit_patch` when the only files you create or edit are `.agents/architectures/graphs/*.arch`.\n\
-- For architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
-- Before creating a generic architecture doc, inspect the architecture MCP context and existing `.agents/architectures/graphs/*.arch` files.\n\
-- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, create or update `.agents/architectures/graphs/*.arch` using normal file edits and the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
+- Diff Forge architecture graphs are account-global agent artifacts under `DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT` / `architecture_context.globalGraphsRoot`; use that absolute root instead of assuming `.agents/architectures` inside the repo.\n\
+- Direct file edits to `globalGraphsRoot/*.arch` are allowed for live architecture previews, including when isolated worktrees are enabled. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
+- Architecture graph-only work is live artifact work, not a managed patch task: do not call `start_task`, `acquire_lease`, `checkpoint`, or `submit_patch` when the only files you create or edit are under `globalGraphsRoot`.\n\
+- For architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `globalGraphsRoot/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
+- Before creating a generic architecture doc, inspect the architecture MCP context and existing `globalGraphsRoot/*.arch` files.\n\
+- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, create or update `globalGraphsRoot/*.arch` using normal file edits and the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
 - The DSL supports `title`, `folder`, `direction`, one-line run targets such as `run \"Deploy\" [action: deploy, envs: \"local,staging,production\", modes: \"plan,apply,verify,rollback\", defaultEnv: staging, scope: \"Deployment\"]`, containers with `{{ ... }}` and semantic props like `[icon: api, intent: api-pathway]`, node props such as `[icon: api, role: endpoint, desc: Request handling]`, compact actor props such as `[icon: users, role: actor, display: compact]`, api-corridor overlays such as `[intent: api-corridor, display: overlay, from: Client, to: API, anchor: Auth API, orient: shortest-path]`, and edges such as `A > B: label [role: calls]`, `A -- B: dependency [role: depends-on]`, and `Decision > Retry: retry [role: guards, condition: recoverable]`.\n\
 - Preserve group `intent`, node `role`/`lifecycle`/`source`/`status`, edge `role`/`condition`/`event`/`criticality` props, and api-corridor `from`/`to`/`anchor`/`route` plus ordered step `method`/`path`/`status`/`condition` props. One graph may contain connected or disconnected semantic groups.\n\
 - Use api-corridor overlays only for important ordered API procedures, not line-by-line implementation narration. Corridor endpoints should reference existing nodes or groups, and each message should use ordered `step` props with roles such as `request`, `response`, `redirect`, or `callback`.\n\
@@ -29769,24 +29625,22 @@ APPWRITE_PROJECT_ID = "project"
         )));
         assert!(hooks_json.contains("\"UserPromptSubmit\""));
         assert!(hooks_json.contains("\"Stop\""));
-        assert!(hooks_json.contains("\"Error\""));
-        assert!(hooks_json.contains("\"Interrupt\""));
         assert!(hooks_json.contains("\"PreToolUse\""));
         assert!(hooks_json.contains("\"PostToolUse\""));
+        assert!(hooks_json.contains("\"PermissionRequest\""));
         assert!(hooks_json.contains("\"SubagentStart\""));
         assert!(hooks_json.contains("\"SubagentStop\""));
         assert!(hooks_json.contains("--diff-forge-activity-hook"));
-        assert!(hooks_json.contains("--diff-forge-write-guard"));
+        assert!(!hooks_json.contains("--diff-forge-write-guard"));
         assert!(config.contains("[[hooks.UserPromptSubmit]]"));
         assert!(config.contains("[[hooks.Stop]]"));
-        assert!(config.contains("[[hooks.Error]]"));
-        assert!(config.contains("[[hooks.Interrupt]]"));
         assert!(config.contains("[[hooks.PreToolUse]]"));
         assert!(config.contains("[[hooks.PostToolUse]]"));
+        assert!(config.contains("[[hooks.PermissionRequest]]"));
         assert!(config.contains("[[hooks.SubagentStart]]"));
         assert!(config.contains("[[hooks.SubagentStop]]"));
         assert!(config.contains("--diff-forge-activity-hook"));
-        assert!(config.contains("--diff-forge-write-guard"));
+        assert!(!config.contains("--diff-forge-write-guard"));
         assert!(!config.contains("[[hooks.user_prompt_submit]]"));
         assert!(!config.contains("hooksPath ="));
     }
@@ -29876,11 +29730,10 @@ enabled = true
             .unwrap();
         assert!(pre_tool_hook_index > 0);
         assert!(hooks[pre_tool_index..].contains("--diff-forge-activity-hook"));
-        assert!(hooks[pre_tool_index..].contains("--diff-forge-write-guard"));
+        assert!(!hooks[pre_tool_index..].contains("--diff-forge-write-guard"));
         for event_name in [
-            "Error",
-            "Interrupt",
             "PostToolUse",
+            "PermissionRequest",
             "SubagentStart",
             "SubagentStop",
         ] {
@@ -29911,7 +29764,7 @@ trusted_hash = "sha256:abc"
         let generated = r#"default_permissions = "diffforge-coordinated"
 
 [[hooks.pre_tool_use]]
-command = "diffforge --diff-forge-write-guard"
+command = "diffforge --diff-forge-activity-hook"
 "#;
 
         let config = codex_managed_profile_config_with_preserved_hook_state(
@@ -29925,7 +29778,7 @@ command = "diffforge --diff-forge-write-guard"
     }
 
     #[test]
-    fn managed_codex_home_config_sets_permission_profile_at_document_root() {
+    fn managed_codex_home_config_sets_full_filesystem_permission_profile() {
         let repo = init_git_repo("managed_codex_home_root_permission_profile");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
@@ -29943,28 +29796,15 @@ command = "diffforge --diff-forge-write-guard"
         assert!(config.starts_with("default_permissions = \"diffforge-coordinated\"\n"));
         assert_eq!(config.matches("default_permissions =").count(), 1);
         assert!(!config.contains("permission_profile ="));
-        let architecture_graphs_project_root =
-            repo.join(".agents").join("architectures").join("graphs");
-        let architecture_graphs_workspace_root = repo
-            .canonicalize()
-            .unwrap()
-            .join(".agents")
-            .join("architectures")
-            .join("graphs");
-        assert!(config.contains(&format!(
-            "[projects.\"{}\"]",
-            toml_escape(&process_path_text(&architecture_graphs_project_root))
-        )));
-        assert!(config.contains(&format!(
-            "\"{}\" = true",
-            toml_escape(&process_path_text(&architecture_graphs_workspace_root))
-        )));
+        assert!(config.contains("extends = \":workspace\""));
+        assert!(config.contains("\":root\" = \"write\""));
+        assert!(!config.contains(".agents/architectures/graphs\" = \"write\""));
         let permissions_index = config.find("[permissions.diffforge-coordinated]").unwrap();
         assert!(permissions_index > 0);
     }
 
     #[test]
-    fn managed_codex_git_launch_self_test_requires_apply_patch_hook() {
+    fn managed_codex_git_launch_self_test_requires_activity_hook() {
         let repo = init_git_repo("managed_codex_launch_self_test");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         let db_path = repo.join(".agents").join("coordination.db");
@@ -30003,7 +29843,8 @@ command = "diffforge --diff-forge-write-guard"
         )
         .unwrap();
 
-        let broken_hooks = hooks_json.replace("functions.apply_patch", "functions.not_apply_patch");
+        let broken_hooks =
+            hooks_json.replace("--diff-forge-activity-hook", "--missing-activity-hook");
 
         let error = codex_managed_git_launch_self_test(
             &config,
@@ -30017,11 +29858,11 @@ command = "diffforge --diff-forge-write-guard"
             "codex",
         )
         .unwrap_err();
-        assert!(error.contains("functions.apply_patch"));
+        assert!(error.contains("--diff-forge-activity-hook"));
     }
 
     #[test]
-    fn managed_codex_home_config_protects_nested_git_roots_in_direct_container() {
+    fn managed_codex_home_config_allows_nested_git_roots_in_direct_container() {
         let container = temp_repo("managed_codex_container");
         let child = container.join("nested").join("repo");
         fs::create_dir_all(&child).unwrap();
@@ -30064,17 +29905,17 @@ command = "diffforge --diff-forge-write-guard"
 
         assert!(config.contains("default_permissions = \"diffforge-coordinated\""));
         assert!(!config.contains("sandbox_mode ="));
-        assert!(config.contains("\"nested/repo\" = \"read\""));
+        assert!(config.contains("extends = \":workspace\""));
+        assert!(config.contains("\":root\" = \"write\""));
+        assert!(!config.contains("\"nested/repo\" = \"read\""));
         assert!(!config.contains("nested/repo/.agents/worktrees/slot1"));
         assert!(!config.contains("--diff-forge-write-guard"));
-        assert!(hooks_json.contains("--diff-forge-write-guard"));
-        assert!(hooks_json.contains(process_path_text(&container).as_str()));
-        assert!(hooks_json.contains("slot1"));
-        assert!(hooks_json.contains("--agent-kind"));
+        assert!(!hooks_json.contains("--diff-forge-write-guard"));
+        assert!(hooks_json.contains("--diff-forge-activity-hook"));
     }
 
     #[test]
-    fn managed_codex_home_config_general_worker_reads_root_without_raw_worktree_write() {
+    fn managed_codex_home_config_general_worker_writes_full_filesystem() {
         let repo = init_git_repo("managed_codex_general_worker");
 
         let config = codex_managed_profile_config(
@@ -30087,10 +29928,10 @@ command = "diffforge --diff-forge-write-guard"
         )
         .unwrap();
 
-        assert!(config.contains("extends = \":read-only\""));
-        assert!(config.contains("\".\" = \"read\""));
-        assert!(!config.contains("\".\" = \"write\""));
-        assert!(config.contains("\".agents/architectures/graphs\" = \"write\""));
+        assert!(config.contains("extends = \":workspace\""));
+        assert!(config.contains("\":root\" = \"write\""));
+        assert!(!config.contains("\".\" = \"read\""));
+        assert!(!config.contains("\".agents/architectures/graphs\" = \"write\""));
         assert!(!config.contains(".agents/worktrees/slot1"));
     }
 
@@ -30109,12 +29950,12 @@ command = "diffforge --diff-forge-write-guard"
         .unwrap();
 
         assert!(config.contains("extends = \":workspace\""));
-        assert!(config.contains("\".\" = \"write\""));
+        assert!(config.contains("\":root\" = \"write\""));
         assert!(!config.contains(".agents/worktrees/slot1"));
     }
 
     #[test]
-    fn managed_codex_home_config_general_worker_protects_nested_git_roots() {
+    fn managed_codex_home_config_general_worker_allows_nested_git_roots() {
         let repo = init_git_repo("managed_codex_general_worker_nested");
         let child = repo.join("packages").join("nested-app");
         fs::create_dir_all(&child).unwrap();
@@ -30145,16 +29986,16 @@ command = "diffforge --diff-forge-write-guard"
         )
         .unwrap();
 
-        assert!(config.contains("extends = \":read-only\""));
-        assert!(config.contains("\".\" = \"read\""));
-        assert!(!config.contains("\".\" = \"write\""));
-        assert!(config.contains("\".agents/architectures/graphs\" = \"write\""));
-        assert!(config.contains("\"packages/nested-app\" = \"read\""));
+        assert!(config.contains("extends = \":workspace\""));
+        assert!(config.contains("\":root\" = \"write\""));
+        assert!(!config.contains("\".\" = \"read\""));
+        assert!(!config.contains("\".agents/architectures/graphs\" = \"write\""));
+        assert!(!config.contains("\"packages/nested-app\" = \"read\""));
         assert!(!config.contains("packages/nested-app/.agents/worktrees/slot1"));
     }
 
     #[test]
-    fn managed_codex_home_config_keeps_activity_sessions_read_only() {
+    fn managed_codex_home_config_activity_sessions_write_full_filesystem() {
         let root = temp_repo("managed_codex_activity");
         let config = codex_managed_profile_config(
             &root,
@@ -30166,11 +30007,11 @@ command = "diffforge --diff-forge-write-guard"
         )
         .unwrap();
 
-        assert!(config.contains("extends = \":read-only\""));
+        assert!(config.contains("extends = \":workspace\""));
+        assert!(config.contains("\":root\" = \"write\""));
         assert!(
             !config.contains("[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]")
         );
-        assert!(!config.contains("\".\" = \"write\""));
         assert!(!config.contains(".agents/architectures/graphs\" = \"write\""));
     }
 

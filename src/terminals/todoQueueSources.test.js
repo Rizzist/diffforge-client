@@ -55,6 +55,14 @@ test("known todo queue sources keep their existing mappings", () => {
     TODO_QUEUE_SOURCE_VOICE_PLAN,
   );
   assert.equal(
+    getTodoQueuePromptEventSourceForSource({ source: TODO_QUEUE_SOURCE_TODO_AUTO }),
+    "todo-auto-queue",
+  );
+  assert.equal(
+    getTodoQueuePromptEventSourceForSource({ source: "tui-todo-drop" }),
+    "terminal-view-drop",
+  );
+  assert.equal(
     getTodoQueueAutoQueueSourceForSource({ source: "manual-drop" }),
     TODO_QUEUE_SOURCE_TODO_AUTO,
   );

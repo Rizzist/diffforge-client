@@ -2761,9 +2761,12 @@ function normalizeActiveTerminal(value) {
   }
 
   return {
+    activityStatus: normalizeThreadActivityStatus(value.activityStatus || value.activity_status),
     agentId: cleanAgentId(value.agentId || value.currentAgent),
     agentDisplayName: cleanAgentDisplayName(value.agentDisplayName || value.agent_display_name),
     agentType: cleanAgentDisplayName(value.agentType || value.agent_type),
+    commandPhase: cleanText(value.commandPhase || value.command_phase),
+    executionPhase: cleanText(value.executionPhase || value.execution_phase),
     instanceId: Number.isInteger(instanceId) && instanceId > 0 ? instanceId : 0,
     inputReady: value.inputReady === true,
     inputReadyAt: cleanText(value.inputReadyAt),
@@ -2774,10 +2777,15 @@ function normalizeActiveTerminal(value) {
     ...promptingUserFields(value),
     displayName: workspaceTerminalNicknameFromRecord(value),
     fileAuthority: cleanText(value.fileAuthority || value.coordination?.fileAuthority),
+    nativeRailState: cleanText(value.nativeRailState || value.native_rail_state),
     provider: cleanAgentDisplayName(value.provider),
+    providerSessionId: cleanText(value.providerSessionId || value.provider_session_id || value.nativeSessionId || value.native_session_id || value.sessionId),
+    nativeSessionId: cleanText(value.nativeSessionId || value.native_session_id || value.providerSessionId || value.provider_session_id || value.sessionId),
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
     status: safeStatus,
+    turnStatus: cleanText(value.turnStatus || value.turn_status),
     sessionMode: cleanText(value.sessionMode || value.coordination?.sessionMode),
+    sessionId: cleanText(value.sessionId || value.session_id || value.providerSessionId || value.provider_session_id || value.nativeSessionId || value.native_session_id),
     terminalName: workspaceTerminalNicknameFromRecord(value),
     terminalNickname: workspaceTerminalNicknameFromRecord(value),
     terminalIndex,
@@ -3950,10 +3958,13 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     },
   );
   const terminal = normalizeActiveTerminal({
+    activityStatus: eventActivityStatus || existing.activityStatus || "",
     agentId: event.agentId || event.currentAgent || existing.agentId,
     agentDisplayName,
     agentType,
+    commandPhase: event.commandPhase || event.command_phase || existing.commandPhase || existing.command_phase,
     displayName: terminalNickname,
+    executionPhase: event.executionPhase || event.execution_phase || existing.executionPhase || existing.execution_phase,
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
@@ -3962,9 +3973,31 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     lastActiveAt: now,
     paneId: event.paneId || existing.paneId,
     ...terminalPromptingFields,
+    nativeRailState: event.nativeRailState || event.native_rail_state || existing.nativeRailState || existing.native_rail_state,
     provider: event.provider || existing.provider,
+    providerSessionId: event.providerSessionId
+      || event.provider_session_id
+      || event.nativeSessionId
+      || event.native_session_id
+      || existing.providerSessionId
+      || existing.provider_session_id,
+    nativeSessionId: event.nativeSessionId
+      || event.native_session_id
+      || event.providerSessionId
+      || event.provider_session_id
+      || existing.nativeSessionId
+      || existing.native_session_id,
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
+    turnStatus: event.turnStatus || event.turn_status || existing.turnStatus || existing.turn_status,
+    sessionId: event.sessionId
+      || event.session_id
+      || event.providerSessionId
+      || event.provider_session_id
+      || event.nativeSessionId
+      || event.native_session_id
+      || existing.sessionId
+      || existing.session_id,
     terminalName: terminalNickname,
     terminalNickname,
     terminalIndex,
@@ -5351,11 +5384,192 @@ function findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId, igno
   ))?.id || "";
 }
 
+function findWorkspaceThreadIdForTerminalSessionBinding(entry, event = {}, agentId = "", sessionId = "") {
+  const directThreadId = cleanText(event.threadId);
+  if (directThreadId && entry?.threads?.[directThreadId]) {
+    return directThreadId;
+  }
+
+  const sessionThreadId = findWorkspaceThreadIdForProviderSession(entry, agentId, sessionId);
+  if (sessionThreadId) {
+    return sessionThreadId;
+  }
+
+  const paneId = cleanText(event.paneId);
+  const instanceId = Number.parseInt(event.instanceId, 10);
+  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  const terminalKey = terminalSessionKey(terminalIndex);
+  const terminalThreadId = terminalKey ? cleanText(entry?.terminals?.[terminalKey]?.threadId) : "";
+  if (terminalThreadId && entry?.threads?.[terminalThreadId]) {
+    return terminalThreadId;
+  }
+
+  const exactTerminalThread = Object.values(entry?.threads || {}).find((thread) => {
+    const binding = normalizeTerminalBinding(thread?.terminalBinding);
+    const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+    const providerTerminalBinding = normalizeTerminalBinding(providerBinding?.terminalBinding);
+    return [binding, providerTerminalBinding].some((candidate) => (
+      candidate
+        && (!paneId || candidate.paneId === paneId)
+        && (!Number.isInteger(instanceId) || Number(candidate.instanceId) === instanceId)
+    ));
+  });
+  if (exactTerminalThread?.id) {
+    return exactTerminalThread.id;
+  }
+
+  const terminalByPane = Object.values(entry?.terminals || {}).find((terminal) => (
+    (paneId && terminal?.paneId === paneId)
+      || (Number.isInteger(instanceId) && Number(terminal?.instanceId) === instanceId)
+  ));
+  if (terminalByPane?.threadId && entry?.threads?.[terminalByPane.threadId]) {
+    return terminalByPane.threadId;
+  }
+
+  const restoredThreadId = terminalKey ? cleanText(entry?.terminalThreadIds?.[terminalKey]) : "";
+  if (restoredThreadId && entry?.threads?.[restoredThreadId]) {
+    return restoredThreadId;
+  }
+
+  const indexedThread = getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex);
+  return cleanText(indexedThread?.id);
+}
+
+export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
+  const workspaceId = cleanText(event.workspaceId);
+  const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
+  const nativeSessionId = cleanText(
+    event.nativeSessionId
+      || event.native_session_id
+      || event.providerSessionId
+      || event.provider_session_id
+      || event.sessionId
+      || event.session_id,
+  );
+  if (!workspaceId || !isThreadAgentId(agentId) || !nativeSessionId) {
+    return state || {};
+  }
+
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
+  if (workspaceEntryHasArchivedSession(entry, agentId, nativeSessionId)) {
+    return state || {};
+  }
+
+  const terminalIndex = normalizeTerminalIndex(event.terminalIndex);
+  let threadId = findWorkspaceThreadIdForTerminalSessionBinding(entry, event, agentId, nativeSessionId);
+  if (!threadId && terminalIndex != null) {
+    threadId = createThreadIdForTerminal(workspaceId, terminalIndex);
+  }
+  if (!threadId) {
+    return state || {};
+  }
+
+  const now = nowIso();
+  const terminalNickname = resolveWorkspaceTerminalNickname(
+    entry,
+    [
+      event.terminalNickname,
+      event.terminal_nickname,
+      event.terminalName,
+      event.terminal_name,
+      event.displayName,
+      event.display_name,
+      workspaceTerminalNicknameFromRecord(entry.threads?.[threadId]),
+      workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(entry.threads?.[threadId], agentId)),
+    ],
+    {
+      excludeTerminalIndex: terminalIndex,
+      excludeThreadId: threadId,
+    },
+  );
+  if (!entry.threads[threadId]) {
+    const title = cleanRealThreadTitleCandidate(event.nativeSessionTitle || event.sessionTitle)
+      || defaultThreadTitle(terminalIndex ?? 0, agentId);
+    entry.threads[threadId] = {
+      coordination: normalizeCoordination({
+        worktreePath: event.worktreePath || event.cwd,
+      }),
+      createdAt: now,
+      currentAgent: agentId,
+      displayName: terminalNickname,
+      id: threadId,
+      lastActiveAt: now,
+      lastMessageAt: "",
+      latestTurn: null,
+      materialized: true,
+      messageCount: 0,
+      messages: [],
+      pendingPrompt: null,
+      preferredAgent: agentId,
+      projectionEvents: [],
+      providerBindings: {},
+      sessionName: title,
+      slotKey: cleanText(event.slotKey, defaultSlotKey(terminalIndex)),
+      status: cleanText(event.status, "active"),
+      terminalBinding: null,
+      terminalIndex,
+      terminalName: terminalNickname,
+      terminalNickname,
+      title,
+      transcriptSessionId: nativeSessionId,
+      updatedAt: now,
+      workspaceId,
+    };
+    entry.threadOrder.push(threadId);
+  }
+
+  const existingThread = entry.threads[threadId] || null;
+  const terminalKey = terminalSessionKey(terminalIndex);
+  const existingTerminal = terminalKey ? entry.terminals?.[terminalKey] || null : null;
+  const inheritedActivityStatus = normalizeThreadActivityStatus(
+    event.activityStatus
+      || event.activity_status
+      || existingTerminal?.activityStatus
+      || existingTerminal?.activity_status
+      || existingThread?.activityStatus
+      || existingThread?.activity_status,
+    "",
+  );
+  const bindingEvent = {
+    ...event,
+    activityStatus: inheritedActivityStatus || event.activityStatus,
+    activity_status: inheritedActivityStatus || event.activity_status,
+    agentId,
+    nativeSessionId,
+    nativeSessionKind: cleanText(event.nativeSessionKind || event.native_session_kind, "session"),
+    nativeSessionSource: cleanText(event.nativeSessionSource || event.native_session_source || event.source, "rust-session-binding"),
+    providerSessionId: nativeSessionId,
+    sessionId: event.sessionId || event.session_id || nativeSessionId,
+    status: event.status || "active",
+    terminalIndex,
+    threadId,
+    workspaceId,
+  };
+  upsertActiveTerminal(entry, bindingEvent, {
+    status: bindingEvent.status,
+    threadId,
+  });
+  bindExistingThreadToTerminal(entry, threadId, bindingEvent, {
+    status: bindingEvent.status,
+  });
+
+  return updateWorkspaceThreadProviderSession({
+    ...currentState,
+    [workspaceId]: entry,
+  }, bindingEvent);
+}
+
 export function updateWorkspaceThreadProviderSession(state, event = {}) {
   const workspaceId = cleanText(event.workspaceId);
   const threadId = cleanText(event.threadId);
   const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
-  const nativeSessionId = cleanText(event.nativeSessionId || event.providerSessionId);
+  const nativeSessionId = cleanText(
+    event.nativeSessionId
+      || event.native_session_id
+      || event.providerSessionId
+      || event.provider_session_id,
+  );
   if (!workspaceId || !threadId || !isThreadAgentId(agentId) || !nativeSessionId) {
     return state || {};
   }
@@ -5398,6 +5612,11 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
 
   const now = nowIso();
   const nativeSessionTitle = cleanRealThreadTitleCandidate(event.nativeSessionTitle || event.sessionTitle, existing);
+  const sessionTerminalBinding = normalizeTerminalBinding({
+    instanceId: event.instanceId ?? existing.terminalBinding?.instanceId,
+    paneId: event.paneId || existing.terminalBinding?.paneId,
+    terminalIndex: event.terminalIndex ?? existing.terminalIndex,
+  });
   const providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
@@ -5436,19 +5655,70 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
       ? now
       : providerBindings[agentId]?.nativeSessionTitleUpdatedAt || "",
     nativeSessionUpdatedAt: now,
+    terminalBinding: sessionTerminalBinding || providerBindings[agentId]?.terminalBinding || existing.terminalBinding || null,
     updatedAt: now,
   };
+  const effectiveTerminalBinding = providerBindings[agentId]?.terminalBinding
+    || sessionTerminalBinding
+    || existing.terminalBinding
+    || null;
+  const terminalKey = getTerminalKeyForEvent(entry, {
+    ...event,
+    terminalIndex: event.terminalIndex
+      ?? sessionTerminalBinding?.terminalIndex
+      ?? effectiveTerminalBinding?.terminalIndex
+      ?? existing.terminalIndex,
+    threadId,
+  });
+  const terminals = { ...entry.terminals };
+  if (terminalKey && terminals[terminalKey]) {
+    const terminal = terminals[terminalKey];
+    terminals[terminalKey] = normalizeActiveTerminal({
+      ...terminal,
+      activityStatus: normalizeThreadActivityStatus(
+        event.activityStatus || event.activity_status,
+        terminal.activityStatus || providerBindings[agentId]?.activityStatus || existing.activityStatus,
+      ),
+      agentId,
+      agentDisplayName: event.agentDisplayName || event.agent_display_name || terminal.agentDisplayName,
+      agentType: event.agentType || event.agent_type || terminal.agentType,
+      instanceId: event.instanceId ?? terminal.instanceId,
+      nativeSessionId,
+      paneId: event.paneId || terminal.paneId,
+      provider: event.provider || terminal.provider,
+      providerSessionId: nativeSessionId,
+      sessionId: event.sessionId || event.session_id || nativeSessionId,
+      terminalIndex: normalizeTerminalIndex(
+        event.terminalIndex
+          ?? terminal.terminalIndex
+          ?? sessionTerminalBinding?.terminalIndex
+          ?? existing.terminalIndex,
+      ),
+      threadId,
+      updatedAt: now,
+    }) || {
+      ...terminal,
+      nativeSessionId,
+      providerSessionId: nativeSessionId,
+      sessionId: event.sessionId || event.session_id || nativeSessionId,
+      threadId,
+      updatedAt: now,
+    };
+  }
 
   return {
     ...currentState,
     [workspaceId]: {
       ...entry,
+      terminals,
       threads: {
         ...entry.threads,
         [threadId]: {
           ...existing,
           providerBindings,
           sessionName: nativeSessionTitle || existing.sessionName,
+          terminalBinding: effectiveTerminalBinding,
+          terminalIndex: effectiveTerminalBinding?.terminalIndex ?? existing.terminalIndex,
           title: nativeSessionTitle || existing.title,
           transcriptSessionId: nativeSessionId || existing.transcriptSessionId,
           updatedAt: now,
@@ -6000,6 +6270,9 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     });
     terminals[terminalKey] = {
       ...terminals[terminalKey],
+      activityStatus,
+      commandPhase: cleanText(event.commandPhase || event.command_phase, terminals[terminalKey].commandPhase),
+      executionPhase: cleanText(event.executionPhase || event.execution_phase, terminals[terminalKey].executionPhase),
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
@@ -6010,7 +6283,21 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       ),
       agentType: cleanAgentDisplayName(event.agentType || event.agent_type, terminals[terminalKey].agentType),
       ...terminalPromptingFields,
+      nativeRailState: cleanText(event.nativeRailState || event.native_rail_state, terminals[terminalKey].nativeRailState),
       provider: cleanAgentDisplayName(event.provider, terminals[terminalKey].provider),
+      providerSessionId: cleanText(
+        event.providerSessionId || event.provider_session_id || event.nativeSessionId,
+        terminals[terminalKey].providerSessionId,
+      ),
+      nativeSessionId: cleanText(
+        event.nativeSessionId || event.native_session_id || event.providerSessionId || event.provider_session_id,
+        terminals[terminalKey].nativeSessionId,
+      ),
+      sessionId: cleanText(
+        event.sessionId || event.session_id || event.providerSessionId || event.provider_session_id || event.nativeSessionId || event.native_session_id,
+        terminals[terminalKey].sessionId,
+      ),
+      turnStatus: cleanText(event.turnStatus || event.turn_status, terminals[terminalKey].turnStatus),
       updatedAt: now,
     };
   }

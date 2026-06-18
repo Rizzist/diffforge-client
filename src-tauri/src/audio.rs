@@ -39,6 +39,11 @@ const AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS: u64 = 8;
 const AUDIO_WIDGET_MAIN_THREAD_ACTION_TIMEOUT_SECS: u64 = 5;
 const NATIVE_AUDIO_COMMAND_TIMEOUT_SECS: u64 = 12;
 const NATIVE_AUDIO_FINISH_TIMEOUT_SECS: u64 = 30;
+#[cfg(target_os = "macos")]
+const MACOS_MICROPHONE_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+#[cfg(not(target_os = "macos"))]
+const NON_MAC_MICROPHONE_SETTINGS_URL: &str = "";
 // Cold-connect route cache, keyed by websocket path: every successful voice
 // route resolve (mostly the dictation warm keeper's) is remembered briefly so
 // a cold press-to-talk skips the serial auth + heartbeat + balancer round
@@ -53,6 +58,12 @@ struct ForgeVoiceCachedRoute {
 
 static FORGE_VOICE_ROUTE_CACHE: OnceLock<StdMutex<HashMap<String, ForgeVoiceCachedRoute>>> =
     OnceLock::new();
+
+#[cfg(target_os = "macos")]
+#[link(name = "AVFoundation", kind = "framework")]
+extern "C" {
+    static AVMediaTypeAudio: *const objc2_foundation::NSString;
+}
 
 fn forge_voice_route_cache() -> &'static StdMutex<HashMap<String, ForgeVoiceCachedRoute>> {
     FORGE_VOICE_ROUTE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -891,6 +902,153 @@ fn native_audio_error_message(error: impl std::fmt::Display) -> String {
         "That input source could not be opened. Check the OS input settings or choose another source, then try again.".to_string()
     } else {
         message
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_audio_input_authorization_status_raw() -> Option<isize> {
+    let media_type = unsafe { AVMediaTypeAudio.as_ref()? };
+    Some(unsafe {
+        objc2::msg_send![
+            objc2::class!(AVCaptureDevice),
+            authorizationStatusForMediaType: media_type
+        ]
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_input_permission_status_for_macos_status(status: Option<isize>) -> AudioInputPermissionStatus {
+    match status {
+        Some(3) => AudioInputPermissionStatus {
+            platform: "macos",
+            microphone_required: true,
+            microphone_granted: true,
+            microphone_promptable: false,
+            microphone_denied: false,
+            microphone_restricted: false,
+            microphone_settings_url: MACOS_MICROPHONE_SETTINGS_URL,
+            status: "authorized".to_string(),
+            message: "Microphone access is enabled.".to_string(),
+        },
+        Some(0) => AudioInputPermissionStatus {
+            platform: "macos",
+            microphone_required: true,
+            microphone_granted: false,
+            microphone_promptable: true,
+            microphone_denied: false,
+            microphone_restricted: false,
+            microphone_settings_url: MACOS_MICROPHONE_SETTINGS_URL,
+            status: "not-determined".to_string(),
+            message: "Allow microphone access for Diff Forge AI before recording.".to_string(),
+        },
+        Some(1) => AudioInputPermissionStatus {
+            platform: "macos",
+            microphone_required: true,
+            microphone_granted: false,
+            microphone_promptable: false,
+            microphone_denied: false,
+            microphone_restricted: true,
+            microphone_settings_url: MACOS_MICROPHONE_SETTINGS_URL,
+            status: "restricted".to_string(),
+            message: "macOS is restricting microphone access for Diff Forge AI.".to_string(),
+        },
+        Some(2) => AudioInputPermissionStatus {
+            platform: "macos",
+            microphone_required: true,
+            microphone_granted: false,
+            microphone_promptable: false,
+            microphone_denied: true,
+            microphone_restricted: false,
+            microphone_settings_url: MACOS_MICROPHONE_SETTINGS_URL,
+            status: "denied".to_string(),
+            message: "Enable Microphone access for Diff Forge AI in System Settings.".to_string(),
+        },
+        _ => AudioInputPermissionStatus {
+            platform: "macos",
+            microphone_required: true,
+            microphone_granted: false,
+            microphone_promptable: false,
+            microphone_denied: false,
+            microphone_restricted: false,
+            microphone_settings_url: MACOS_MICROPHONE_SETTINGS_URL,
+            status: "unknown".to_string(),
+            message: "Unable to read macOS microphone permission for Diff Forge AI.".to_string(),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_input_permission_status_for_platform() -> AudioInputPermissionStatus {
+    audio_input_permission_status_for_macos_status(macos_audio_input_authorization_status_raw())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_input_permission_status_for_platform() -> AudioInputPermissionStatus {
+    AudioInputPermissionStatus {
+        platform: "other",
+        microphone_required: false,
+        microphone_granted: true,
+        microphone_promptable: false,
+        microphone_denied: false,
+        microphone_restricted: false,
+        microphone_settings_url: NON_MAC_MICROPHONE_SETTINGS_URL,
+        status: "authorized".to_string(),
+        message: "Microphone permission is managed by the operating system.".to_string(),
+    }
+}
+
+fn audio_input_permissions_need_attention(status: &AudioInputPermissionStatus) -> bool {
+    status.microphone_required && !status.microphone_granted
+}
+
+#[cfg(target_os = "macos")]
+fn macos_request_audio_input_permission() -> bool {
+    let Some(media_type) = (unsafe { AVMediaTypeAudio.as_ref() }) else {
+        return false;
+    };
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let completion = block2::RcBlock::new(move |granted: objc2::runtime::Bool| {
+        let _ = sender.send(granted.as_bool());
+    });
+    unsafe {
+        let _: () = objc2::msg_send![
+            objc2::class!(AVCaptureDevice),
+            requestAccessForMediaType: media_type,
+            completionHandler: &*completion
+        ];
+    }
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_open_microphone_settings() -> Result<(), String> {
+    Command::new("open")
+        .arg(MACOS_MICROPHONE_SETTINGS_URL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open macOS Microphone settings: {error}"))
+}
+
+fn open_audio_input_permissions_for_platform() -> Result<AudioInputPermissionStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = audio_input_permission_status_for_platform();
+        if status.microphone_promptable {
+            let _ = macos_request_audio_input_permission();
+        } else if audio_input_permissions_need_attention(&status) {
+            macos_open_microphone_settings()?;
+        }
+        return Ok(audio_input_permission_status_for_platform());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(audio_input_permission_status_for_platform())
     }
 }
 
@@ -6601,6 +6759,16 @@ async fn audio_input_devices() -> Result<Vec<AudioInputDeviceSummary>, String> {
                 .to_string(),
         ),
     }
+}
+
+#[tauri::command]
+async fn audio_input_permission_status() -> Result<AudioInputPermissionStatus, String> {
+    Ok(audio_input_permission_status_for_platform())
+}
+
+#[tauri::command]
+async fn open_audio_input_permissions() -> Result<AudioInputPermissionStatus, String> {
+    open_audio_input_permissions_for_platform()
 }
 
 #[tauri::command]

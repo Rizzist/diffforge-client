@@ -5793,8 +5793,16 @@ function WorkspaceThreadDetail({
   const todoDropOverlayUnsupported = Boolean(todoDropOverlayMessage);
   const detailDensity = density === "compact" ? "compact" : undefined;
   const headerAgentLabel = getWorkspaceThreadAgentLabel(activeAgentId);
-  const headerTurnState = String(thread?.latestTurn?.state || "").toLowerCase();
-  const headerWorking = Boolean(latestActivity?.live) || headerTurnState === "running";
+  const headerTurnState = String(
+    threadGroundTruth?.effectiveLatestTurnState
+      || thread?.latestTurn?.state
+      || "",
+  ).toLowerCase();
+  const headerTerminalWorkState = String(threadGroundTruth?.terminalWorkState || "").toLowerCase();
+  const headerWorking = Boolean(latestActivity?.live)
+    || headerTerminalWorkState === "running"
+    || headerTerminalWorkState === "prompting_user"
+    || headerTurnState === "running";
   const headerState = headerWorking
     ? "working"
     : headerTurnState === "error"

@@ -166,8 +166,8 @@ async fn tokenomics_get_sync_payload(app: AppHandle) -> Result<Value, String> {
         let _span = BackendCpuSpan::new("tokenomics.command.get_sync_payload");
         tokenomics_summary_for(&app, true, false)
     })
-        .await
-        .map_err(|error| format!("Unable to join Tokenomics sync payload: {error}"))?
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics sync payload: {error}"))?
 }
 
 #[tauri::command]
@@ -545,6 +545,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Unable to backfill Tokenomics billing scope source: {error}"))?;
     }
+    tokenomics_prune_unknown_provider_account_rows(conn)?;
     // The display views are rebuilt ONLY when their stored schema version is
     // stale, and the whole DDL batch runs inside one IMMEDIATE transaction.
     // Rebuilding them unconditionally on every open (the old behavior) raced:
@@ -1329,8 +1330,7 @@ fn tokenomics_cached_read_only_summary_for(
     }
 
     let conn = tokenomics_open_db(app)?;
-    if let Some(summary) = tokenomics_read_summary_snapshot(&conn, include_rollups, include_cloud)
-    {
+    if let Some(summary) = tokenomics_read_summary_snapshot(&conn, include_rollups, include_cloud) {
         if let Ok(mut cache) = tokenomics_summary_cache().lock() {
             *cache = Some(TokenomicsSummaryCacheEntry {
                 include_rollups,
@@ -1530,20 +1530,48 @@ fn tokenomics_value_account_key(value: &Value) -> String {
     value
         .get("provider_account_key")
         .or_else(|| value.get("providerAccountKey"))
+        .or_else(|| value.get("subscription_key"))
+        .or_else(|| value.get("subscriptionKey"))
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default()
         .to_string()
 }
 
+fn tokenomics_provider_account_key_is_unknown(key: &str) -> bool {
+    let clean = key.trim().to_ascii_lowercase();
+    clean.is_empty() || clean.ends_with(":unknown")
+}
+
 fn tokenomics_retain_active_account_rows(rows: &mut Vec<Value>, retired_keys: &[String]) {
-    if retired_keys.is_empty() {
-        return;
-    }
     rows.retain(|row| {
         let key = tokenomics_value_account_key(row);
-        key.is_empty() || !retired_keys.iter().any(|retired| retired == &key)
+        !tokenomics_provider_account_key_is_unknown(&key)
+            && !retired_keys.iter().any(|retired| retired == &key)
     });
+}
+
+fn tokenomics_prune_unknown_provider_account_rows(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    for table in [
+        "tokenomics_provider_accounts",
+        "tokenomics_latest_windows",
+        "tokenomics_provider_limit_samples",
+    ] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE TRIM(COALESCE(provider_account_key, ''))=''
+                    OR LOWER(TRIM(provider_account_key)) LIKE '%:unknown'"
+            ),
+            [],
+        )
+        .map_err(|error| {
+            format!("Unable to prune unknown Tokenomics provider accounts: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 fn tokenomics_purge_retired_limit_samples(
@@ -3769,6 +3797,11 @@ fn tokenomics_reconcile_codex_provider_account_from_usage(
 ) -> Result<TokenomicsProviderAccount, String> {
     let canonical_account =
         tokenomics_codex_canonical_provider_account_from_usage(conn, usage, provider_account);
+    let alias_cache_key = if canonical_account.key != provider_account.key {
+        Some(tokenomics_codex_usage_cache_key(provider_account))
+    } else {
+        None
+    };
     if canonical_account.key != provider_account.key {
         tokenomics_migrate_provider_account_key(
             conn,
@@ -3780,7 +3813,10 @@ fn tokenomics_reconcile_codex_provider_account_from_usage(
     }
     tokenomics_reconcile_provider_account_label(conn, "openai", "codex", &canonical_account)?;
     let canonical_cache_key = tokenomics_codex_usage_cache_key(&canonical_account);
-    let _ = tokenomics_store_codex_usage_cache(conn, &canonical_cache_key, usage);
+    tokenomics_store_codex_usage_cache(conn, &canonical_cache_key, usage)?;
+    if let Some(alias_cache_key) = alias_cache_key {
+        tokenomics_delete_codex_usage_cache(conn, &alias_cache_key)?;
+    }
     Ok(canonical_account)
 }
 
@@ -3834,6 +3870,7 @@ fn tokenomics_reconcile_codex_cached_usage_aliases(
         if canonical_account.key != old_key {
             let canonical_cache_key = tokenomics_codex_usage_cache_key(&canonical_account);
             tokenomics_store_codex_usage_cache(conn, &canonical_cache_key, usage)?;
+            tokenomics_delete_codex_usage_cache(conn, &cache_key)?;
         }
     }
     Ok(())
@@ -4948,7 +4985,7 @@ fn tokenomics_scan_codex_state_db(
     });
     if emit_progress && !scan_mode.is_realtime() {
         if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
-        complete_progress["summary"] = summary;
+            complete_progress["summary"] = summary;
         }
     }
     tokenomics_emit_scan_progress(app, emit_progress, complete_progress);
@@ -6539,7 +6576,10 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     let mut latest_windows = tokenomics_latest_window_rows(conn, None, scope_filter)?;
     tokenomics_retain_active_account_rows(&mut latest_windows, &retired_account_keys);
     let mut limits = if include_cloud {
-        tokenomics_merge_provider_limits(tokenomics_cloud_provider_limits(conn)?, latest_windows.clone())
+        tokenomics_merge_provider_limits(
+            tokenomics_cloud_provider_limits(conn)?,
+            latest_windows.clone(),
+        )
     } else {
         latest_windows.clone()
     };
@@ -6653,14 +6693,14 @@ fn tokenomics_scan_index_status(conn: &rusqlite::Connection) -> Result<Value, St
            SELECT updated_at FROM tokenomics_scan_days WHERE scanner_version IN ({scanner_versions})
          )"
     ))?;
-    let status = if scan_state_count == 0 && source_offset_count == 0 && complete_scan_day_count == 0
-    {
-        "not_started"
-    } else if scan_state_count > 0 && complete_scan_state_count >= scan_state_count {
-        "indexed"
-    } else {
-        "partial"
-    };
+    let status =
+        if scan_state_count == 0 && source_offset_count == 0 && complete_scan_day_count == 0 {
+            "not_started"
+        } else if scan_state_count > 0 && complete_scan_state_count >= scan_state_count {
+            "indexed"
+        } else {
+            "partial"
+        };
     let covered_since_value = if covered_since_unix > 0 {
         json!(covered_since_unix)
     } else {
@@ -6814,6 +6854,9 @@ fn tokenomics_upsert_provider_account(
     } else {
         provider_account_key.to_string()
     };
+    if tokenomics_provider_account_key_is_unknown(&provider_account_key) {
+        return Ok(());
+    }
     let provider_account_label = provider_account_label
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -6891,6 +6934,8 @@ fn tokenomics_refresh_provider_accounts_from_usage(
                MAX(COALESCE(NULLIF(billing_scope_source, ''), 'unknown')) AS billing_scope_source
              FROM tokenomics_rollups
              WHERE bucket_width='hour'
+               AND TRIM(COALESCE(provider_account_key, subscription_key, ''))!=''
+               AND LOWER(TRIM(COALESCE(provider_account_key, subscription_key, ''))) NOT LIKE '%:unknown'
              GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_type, billing_team_id",
         )
         .map_err(|error| format!("Unable to prepare Tokenomics provider account refresh: {error}"))?;
@@ -6970,6 +7015,8 @@ fn tokenomics_provider_account_rows(
                updated_at
              FROM tokenomics_provider_accounts
              WHERE (?1 IS NULL OR updated_at >= ?1)
+               AND TRIM(COALESCE(provider_account_key, ''))!=''
+               AND LOWER(TRIM(provider_account_key)) NOT LIKE '%:unknown'
                {scope_filter_sql}
              ORDER BY updated_at DESC, provider, agent_kind, provider_account_label
              LIMIT ?2"
@@ -7068,6 +7115,9 @@ fn tokenomics_upsert_latest_window(
         ],
     )
     .unwrap_or_else(|| fallback_account.key.clone());
+    if tokenomics_provider_account_key_is_unknown(&provider_account_key) {
+        return Ok(false);
+    }
     let provider_account_label =
         tokenomics_value_string(value, &["provider_account_label", "providerAccountLabel"])
             .unwrap_or_else(|| fallback_account.label.clone());
@@ -7234,6 +7284,9 @@ fn tokenomics_record_latest_windows(
     let device_id = tokenomics_local_device_id();
     let mut count = 0usize;
     for limit in limits.iter().take(128) {
+        if tokenomics_provider_limit_is_unknown(limit) {
+            continue;
+        }
         if tokenomics_upsert_latest_window(conn, limit, &fallback_scope, &device_id, Some("local"))?
         {
             count += 1;
@@ -7289,6 +7342,8 @@ fn tokenomics_latest_window_rows(
                updated_at
              FROM tokenomics_latest_windows
              WHERE (?1 IS NULL OR updated_at >= ?1)
+               AND TRIM(COALESCE(provider_account_key, ''))!=''
+               AND LOWER(TRIM(provider_account_key)) NOT LIKE '%:unknown'
                {scope_filter_sql}
              ORDER BY updated_at DESC, provider, agent_kind, provider_account_label, window_kind
              LIMIT ?2"
@@ -7397,6 +7452,8 @@ fn tokenomics_account_daily_display_rollups(
                    MAX(updated_at) AS updated_at
                  FROM {table}
                  WHERE bucket_width='day'
+                   AND TRIM({account_key_sql})!=''
+                   AND LOWER(TRIM({account_key_sql})) NOT LIKE '%:unknown'
                    AND bucket_start GLOB '????-??-??'
                    AND bucket_start >= date('now', '-29 days')
                    {scope_filter_sql}
@@ -7515,6 +7572,8 @@ fn tokenomics_account_hourly_display_rollups(
                MAX(updated_at) AS updated_at
 		             FROM {table}
 		             WHERE bucket_width='hour'
+                   AND TRIM({account_key_sql})!=''
+                   AND LOWER(TRIM({account_key_sql})) NOT LIKE '%:unknown'
 		               AND bucket_start GLOB '????-??-??T??:00:00Z'
 		               AND bucket_start >= strftime('%Y-%m-%dT00:00:00Z', 'now', '-29 days')
 		               {scope_filter_sql}
@@ -7690,6 +7749,9 @@ fn tokenomics_upsert_provider_limit_sample(
         ],
     )
     .unwrap_or_else(|| fallback_account.key.clone());
+    if tokenomics_provider_account_key_is_unknown(&provider_account_key) {
+        return Ok(false);
+    }
     let provider_account_label =
         tokenomics_value_string(value, &["provider_account_label", "providerAccountLabel"])
             .unwrap_or_else(|| fallback_account.label.clone());
@@ -7937,6 +7999,8 @@ fn tokenomics_provider_limit_sample_rows(
                updated_at
              FROM tokenomics_provider_limit_samples
              WHERE (?1 IS NULL OR updated_at >= ?1)
+               AND TRIM(COALESCE(provider_account_key, ''))!=''
+               AND LOWER(TRIM(provider_account_key)) NOT LIKE '%:unknown'
                {scope_filter_sql}
                {cloud_filter_sql}
              ORDER BY updated_at DESC, sample_bucket_unix DESC
@@ -8004,6 +8068,9 @@ fn tokenomics_recent_provider_limit_samples_for_limit(
         ],
     )
     .unwrap_or_else(|| fallback_account.key);
+    if tokenomics_provider_account_key_is_unknown(&provider_account_key) {
+        return Ok(Vec::new());
+    }
     let window_kind = tokenomics_value_string(
         limit,
         &["window_kind", "windowKind", "limit_kind", "limitKind"],
@@ -10669,6 +10736,16 @@ fn tokenomics_codex_usage_cache_key(provider_account: &TokenomicsProviderAccount
     )
 }
 
+fn tokenomics_codex_usage_cache_key_from_account_key(provider_account_key: &str) -> String {
+    format!("{TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX}{provider_account_key}")
+}
+
+fn tokenomics_codex_canonical_usage_cache_key(usage: &Value) -> Option<String> {
+    tokenomics_codex_usage_account_id(usage)
+        .map(|account_id| tokenomics_codex_provider_account_key_from_usage_account_id(&account_id))
+        .map(|account_key| tokenomics_codex_usage_cache_key_from_account_key(&account_key))
+}
+
 fn tokenomics_strip_account_usage_fields(value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -10725,6 +10802,7 @@ fn tokenomics_cached_codex_usage(
     let Some(usage) = cached.get("usage").filter(|value| value.is_object()) else {
         return Ok(None);
     };
+    tokenomics_rewrite_codex_usage_cache_alias(conn, cache_key, usage, fetched_at)?;
     let mut usage =
         tokenomics_adjust_cached_codex_usage(usage, now_unix.saturating_sub(fetched_at));
     tokenomics_mark_usage_updated_at(&mut usage, tokenomics_unix_iso_like(fetched_at));
@@ -10757,6 +10835,34 @@ fn tokenomics_store_codex_usage_cache_at(
     )
     .map_err(|error| format!("Unable to write Codex usage cache: {error}"))?;
     Ok(())
+}
+
+fn tokenomics_delete_codex_usage_cache(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM tokenomics_meta WHERE key=?1",
+        rusqlite::params![cache_key],
+    )
+    .map_err(|error| format!("Unable to remove stale Codex usage cache: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_rewrite_codex_usage_cache_alias(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    usage: &Value,
+    fetched_at_unix: u64,
+) -> Result<(), String> {
+    let Some(canonical_cache_key) = tokenomics_codex_canonical_usage_cache_key(usage) else {
+        return Ok(());
+    };
+    if canonical_cache_key == cache_key {
+        return Ok(());
+    }
+    tokenomics_store_codex_usage_cache_at(conn, &canonical_cache_key, usage, fetched_at_unix)?;
+    tokenomics_delete_codex_usage_cache(conn, cache_key)
 }
 
 fn tokenomics_adjust_cached_codex_usage(usage: &Value, elapsed_seconds: u64) -> Value {
@@ -13988,6 +14094,9 @@ mod tokenomics_tests {
             key: old_key.to_string(),
             label: "Codex · support".to_string(),
         };
+        let old_cache_key = tokenomics_codex_usage_cache_key(&old_account);
+        tokenomics_store_codex_usage_cache_at(&conn, &old_cache_key, &usage, 1_780_000_000)
+            .unwrap();
         let account =
             tokenomics_reconcile_codex_provider_account_from_usage(&conn, &old_account, &usage)
                 .unwrap();
@@ -14056,6 +14165,66 @@ mod tokenomics_tests {
             )
             .unwrap();
         assert_eq!(cached_count, 1);
+        let old_cached_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_meta WHERE key=?1",
+                rusqlite::params![old_cache_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_cached_count, 0);
+    }
+
+    #[test]
+    fn tokenomics_cached_codex_usage_rewrites_alias_cache_key() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        let old_account = TokenomicsProviderAccount {
+            key: "openai:codex:legacy-auth-hash".to_string(),
+            label: "Rizzist".to_string(),
+        };
+        let usage = json!({
+            "account_id": "user-stable-cache-account",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "reset_after_seconds": 600
+                }
+            }
+        });
+        let old_cache_key = tokenomics_codex_usage_cache_key(&old_account);
+        tokenomics_store_codex_usage_cache_at(&conn, &old_cache_key, &usage, 1_780_000_000)
+            .unwrap();
+
+        let loaded = tokenomics_cached_codex_usage(&conn, &old_cache_key, 1_780_000_100, 3_600)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tokenomics_value_string(&loaded, &["account_id"]),
+            Some("user-stable-cache-account".to_string())
+        );
+
+        let canonical_key = tokenomics_codex_provider_account_key_from_usage_account_id(
+            "user-stable-cache-account",
+        );
+        let canonical_cache_key = tokenomics_codex_usage_cache_key_from_account_key(&canonical_key);
+        let canonical_cached_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_meta WHERE key=?1",
+                rusqlite::params![canonical_cache_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_cached_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokenomics_meta WHERE key=?1",
+                rusqlite::params![old_cache_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical_cached_count, 1);
+        assert_eq!(old_cached_count, 0);
     }
 
     #[test]
@@ -14384,7 +14553,8 @@ mod tokenomics_tests {
             "updated_at": "unix:1010"
         });
 
-        let merged = tokenomics_merge_provider_limits(vec![cloud_known.clone()], vec![live_no_data.clone()]);
+        let merged =
+            tokenomics_merge_provider_limits(vec![cloud_known.clone()], vec![live_no_data.clone()]);
 
         assert_eq!(merged.len(), 1);
         assert!(merged[0]["used_percent"].is_null());

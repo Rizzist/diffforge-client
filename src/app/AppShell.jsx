@@ -40,6 +40,7 @@ import {
 import {
   TERMINAL_ACTIVITY_HOOK_EVENT,
   TERMINAL_ARCHITECTURE_ACTIVITY_EVENT,
+  TERMINAL_PROVIDER_SESSION_BOUND_EVENT,
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
 import {
   getProviderTurnCompletionIntent,
@@ -94,7 +95,11 @@ import {
   getSharedNotificationSfx,
   playNotificationSfx,
 } from "../notifications/notificationSfx";
-import { sendNativeNotification } from "../notifications/nativeNotifications";
+import {
+  getNativeNotificationPermissionStatus,
+  requestNativeNotificationPermission,
+  sendNativeNotification,
+} from "../notifications/nativeNotifications";
 import {
   collectWorkspaceNotificationAttentionPanes,
   formatWorkspaceNotificationBadgeCount,
@@ -116,6 +121,7 @@ import {
 import {
   archiveWorkspaceThread,
   appendWorkspaceThreadProjectionEvents,
+  applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
   buildWorkspaceThreadsPersistDelta,
   clearWorkspaceThreadsBrowserPersistence,
@@ -142,7 +148,6 @@ import {
   updateWorkspaceActiveTerminal,
   updateWorkspaceThreadAgent,
   updateWorkspaceThreadProviderModel,
-  updateWorkspaceThreadProviderSession,
   updateWorkspaceThreadsViewState,
   WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT,
   workspaceThreadIdIsArchived,
@@ -466,13 +471,21 @@ import {
   AgentInstallMessage,
   AgentActions,
   AgentActionTooltip,
-  PageHeader,
-  PageSubline,
-  DashboardTitle,
   PanelHeaderRow,
   PanelKicker,
   PanelHeading,
   SettingsPage,
+  SettingsTabNav,
+  SettingsTabButton,
+  SettingsPermissionGrid,
+  SettingsPermissionRow,
+  SettingsPermissionIcon,
+  SettingsPermissionMain,
+  SettingsPermissionTopline,
+  SettingsPermissionCopy,
+  SettingsPermissionStatus,
+  SettingsPermissionActions,
+  SettingsPermissionHighlight,
   AccountSettingsPanel,
   AccountCard,
   AccountCardHeader,
@@ -537,6 +550,9 @@ import {
   ButtonTerminalIcon,
   ButtonKeyIcon,
   ButtonMicIcon,
+  ButtonNotificationIcon,
+  ButtonPrivacyIcon,
+  ButtonSecurityIcon,
   ButtonSnippingIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
@@ -589,6 +605,7 @@ import AudioWorkspaceView, {
   AudioWidgetErrorOverlayWindow,
   AudioWidgetWindow,
   AUDIO_WIDGET_ERROR_HASH,
+  AUDIO_HOTKEY_ATTENTION_EVENT,
   AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT,
   AUDIO_WIDGET_HASH,
   AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT,
@@ -598,6 +615,7 @@ import SnippingWorkspaceView, {
   SnippingOverlayWindow,
   SnippingRecordingControlsWindow,
   SNIPPING_OVERLAY_HASH,
+  SNIPPING_PERMISSION_ATTENTION_EVENT,
   SNIPPING_RECORDING_CONTROLS_HASH,
 } from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
@@ -641,6 +659,12 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
+const SETTINGS_TAB_GENERAL = "general";
+const SETTINGS_TAB_PERMISSIONS = "permissions";
+const SETTINGS_PERMISSION_HIGHLIGHT_MS = 4200;
+const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
+const MACOS_AUTOMATION_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
+const MACOS_FULL_DISK_ACCESS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture"]);
 const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps"]);
 const WORKSPACE_TAB_VIEW_BY_ID = {
@@ -682,6 +706,30 @@ const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
 
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function appShellIsMacPlatform() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  return /mac|iphone|ipad|ipod/iu.test(navigator.platform || "");
+}
+
+function permissionRowTone(known, ready) {
+  if (!known) {
+    return "neutral";
+  }
+
+  return ready ? "ready" : "attention";
+}
+
+function permissionStatusLabel(known, ready, readyLabel = "Ready", attentionLabel = "Needs access") {
+  if (!known) {
+    return "Check";
+  }
+
+  return ready ? readyLabel : attentionLabel;
 }
 
 function normalizeRemoteCommandName(value) {
@@ -8432,6 +8480,20 @@ export default function App() {
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
+  const [snippingPermissionAttentionId, setSnippingPermissionAttentionId] = useState(0);
+  const [audioHotkeyAttention, setAudioHotkeyAttention] = useState(null);
+  const [settingsTab, setSettingsTab] = useState(SETTINGS_TAB_GENERAL);
+  const [settingsPermissionState, setSettingsPermissionState] = useState({
+    status: "idle",
+    audioInput: null,
+    audioShortcuts: null,
+    snipping: null,
+    activity: null,
+    notifications: null,
+    error: "",
+  });
+  const [settingsPermissionHighlight, setSettingsPermissionHighlight] = useState({ id: 0, target: "" });
+  const settingsPermissionRowRefs = useRef({});
   // workspaceId -> { id, panes: [{ paneId, terminalIndex, count, title, kind }] }
   // captured at the switch-back moment so the terminal grid can show WHICH
   // terminals produced the badge/SFX that pulled the user back.
@@ -8575,6 +8637,7 @@ export default function App() {
   const workspaceThreadTranscriptEventHandlerRef = useRef(null);
   const terminalPromptSubmittedHandlerRef = useRef(null);
   const terminalActivityHookHandlerRef = useRef(null);
+  const terminalProviderSessionBindingHandlerRef = useRef(null);
   const workspacePendingPromptDeliveriesRef = useRef(new Map());
   const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
@@ -11102,9 +11165,205 @@ export default function App() {
     }, VIEW_TRANSITION_MS);
   }, [activeView, visibleView]);
 
-  const showSettingsView = useCallback(() => {
+  const loadSettingsPermissionState = useCallback(async () => {
+    setSettingsPermissionState((current) => ({
+      ...current,
+      status: "loading",
+      error: "",
+    }));
+
+    const [
+      audioInputResult,
+      audioShortcutsResult,
+      snippingResult,
+      activityResult,
+      notificationsResult,
+    ] = await Promise.allSettled([
+      invoke("audio_input_permission_status"),
+      invoke("audio_shortcuts_status"),
+      invoke("snipping_shortcuts_status"),
+      invoke("activity_overlay_status"),
+      getNativeNotificationPermissionStatus(),
+    ]);
+
+    const readSettledValue = (result) => (result.status === "fulfilled" ? result.value : null);
+    const failures = [
+      audioInputResult,
+      audioShortcutsResult,
+      snippingResult,
+      activityResult,
+      notificationsResult,
+    ].filter((result) => result.status === "rejected");
+
+    setSettingsPermissionState((current) => ({
+      status: "ready",
+      audioInput: readSettledValue(audioInputResult) || current.audioInput,
+      audioShortcuts: readSettledValue(audioShortcutsResult) || current.audioShortcuts,
+      snipping: readSettledValue(snippingResult) || current.snipping,
+      activity: readSettledValue(activityResult) || current.activity,
+      notifications: readSettledValue(notificationsResult) || current.notifications,
+      error: failures.length > 0 ? "Some permission checks could not be refreshed." : "",
+    }));
+  }, []);
+
+  const setSettingsPermissionError = useCallback((message) => {
+    setSettingsPermissionState((current) => ({
+      ...current,
+      status: current.status === "idle" ? "ready" : current.status,
+      error: message,
+    }));
+  }, []);
+
+  const highlightSettingsPermission = useCallback((target) => {
+    const safeTarget = String(target || "").trim();
+    if (!safeTarget) {
+      return;
+    }
+
+    setSettingsTab(SETTINGS_TAB_PERMISSIONS);
+    setSettingsPermissionHighlight({
+      id: Date.now(),
+      target: safeTarget,
+    });
+  }, []);
+
+  const setSettingsPermissionRowRef = useCallback((target) => (node) => {
+    if (node) {
+      settingsPermissionRowRefs.current[target] = node;
+      return;
+    }
+
+    delete settingsPermissionRowRefs.current[target];
+  }, []);
+
+  const openSettingsMicrophonePermission = useCallback(async () => {
+    highlightSettingsPermission("microphone");
+    setSettingsPermissionError("");
+
+    try {
+      const status = await invoke("open_audio_input_permissions");
+      setSettingsPermissionState((current) => ({
+        ...current,
+        status: "ready",
+        audioInput: status || current.audioInput,
+        error: "",
+      }));
+      await loadSettingsPermissionState();
+    } catch (error) {
+      setSettingsPermissionError(getErrorMessage(error, "Unable to open microphone permissions."));
+    }
+  }, [highlightSettingsPermission, loadSettingsPermissionState, setSettingsPermissionError]);
+
+  const openSettingsShortcutPermission = useCallback(async () => {
+    highlightSettingsPermission("shortcuts");
+    setSettingsPermissionError("");
+
+    try {
+      const status = await invoke("open_audio_shortcut_permissions");
+      setSettingsPermissionState((current) => ({
+        ...current,
+        status: "ready",
+        audioShortcuts: status || current.audioShortcuts,
+        error: "",
+      }));
+      await loadSettingsPermissionState();
+    } catch (error) {
+      setSettingsPermissionError(getErrorMessage(error, "Unable to open accessibility permissions."));
+    }
+  }, [highlightSettingsPermission, loadSettingsPermissionState, setSettingsPermissionError]);
+
+  const openSettingsScreenPermission = useCallback(async () => {
+    highlightSettingsPermission("screen");
+    setSettingsPermissionError("");
+
+    try {
+      const status = await invoke("open_snipping_permissions");
+      setSettingsPermissionState((current) => ({
+        ...current,
+        status: "ready",
+        snipping: status || current.snipping,
+        error: "",
+      }));
+      await loadSettingsPermissionState();
+    } catch (error) {
+      setSettingsPermissionError(getErrorMessage(error, "Unable to open screen recording permissions."));
+    }
+  }, [highlightSettingsPermission, loadSettingsPermissionState, setSettingsPermissionError]);
+
+  const requestSettingsNotificationPermission = useCallback(async () => {
+    highlightSettingsPermission("notifications");
+    setSettingsPermissionError("");
+
+    try {
+      const status = await requestNativeNotificationPermission();
+      setSettingsPermissionState((current) => ({
+        ...current,
+        status: "ready",
+        notifications: status || current.notifications,
+        error: "",
+      }));
+      await loadSettingsPermissionState();
+    } catch (error) {
+      setSettingsPermissionError(getErrorMessage(error, "Unable to request notification permissions."));
+    }
+  }, [highlightSettingsPermission, loadSettingsPermissionState, setSettingsPermissionError]);
+
+  const openSettingsPermissionUrl = useCallback(async (target, url, fallbackMessage) => {
+    highlightSettingsPermission(target);
+    if (!url) {
+      return;
+    }
+
+    try {
+      await openUrl(url);
+    } catch (error) {
+      setSettingsPermissionError(getErrorMessage(error, fallbackMessage));
+    }
+  }, [highlightSettingsPermission, setSettingsPermissionError]);
+
+  const showSettingsView = useCallback((tab = SETTINGS_TAB_GENERAL) => {
+    setSettingsTab(tab === SETTINGS_TAB_PERMISSIONS ? SETTINGS_TAB_PERMISSIONS : SETTINGS_TAB_GENERAL);
     showView("settings");
   }, [showView]);
+
+  useEffect(() => {
+    if (visibleView !== "settings" || settingsTab !== SETTINGS_TAB_PERMISSIONS) {
+      return;
+    }
+
+    loadSettingsPermissionState();
+  }, [loadSettingsPermissionState, settingsTab, visibleView]);
+
+  useEffect(() => {
+    const highlightId = Number(settingsPermissionHighlight?.id || 0);
+    const highlightTarget = String(settingsPermissionHighlight?.target || "").trim();
+    if (!highlightId || !highlightTarget) {
+      return undefined;
+    }
+
+    let animationFrame = 0;
+    if (visibleView === "settings" && settingsTab === SETTINGS_TAB_PERMISSIONS) {
+      animationFrame = window.requestAnimationFrame(() => {
+        settingsPermissionRowRefs.current[highlightTarget]?.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+        });
+      });
+    }
+
+    const clearTimer = window.setTimeout(() => {
+      setSettingsPermissionHighlight((current) => (
+        current.id === highlightId ? { id: 0, target: "" } : current
+      ));
+    }, SETTINGS_PERMISSION_HIGHLIGHT_MS);
+
+    return () => {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      window.clearTimeout(clearTimer);
+    };
+  }, [settingsPermissionHighlight, settingsTab, visibleView]);
 
   // The dictation bar's History button (foreground path): Rust focuses the
   // main window and asks for the Audio view, where dictation history lives.
@@ -11129,6 +11388,82 @@ export default function App() {
       }
     };
   }, [showView]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenSnippingPermissionAttention = null;
+    listen(SNIPPING_PERMISSION_ATTENTION_EVENT, (attentionEvent) => {
+      if (cancelled) {
+        return;
+      }
+      const eventId = Number(attentionEvent?.payload?.id || 0);
+      setSnippingPermissionAttentionId(eventId || Date.now());
+      highlightSettingsPermission("screen");
+      showView("snipping", {
+        immediate: true,
+        telemetrySource: "snipping_permission_attention",
+      });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSnippingPermissionAttention = unlisten;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenSnippingPermissionAttention) {
+        unlistenSnippingPermissionAttention();
+      }
+    };
+  }, [highlightSettingsPermission, showView]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenAudioHotkeyAttention = null;
+    listen(AUDIO_HOTKEY_ATTENTION_EVENT, (attentionEvent) => {
+      if (cancelled) {
+        return;
+      }
+      const payload = attentionEvent?.payload && typeof attentionEvent.payload === "object"
+        ? attentionEvent.payload
+        : {};
+      const eventId = Number(payload.id || 0) || Date.now();
+      setAudioHotkeyAttention({
+        ...payload,
+        id: eventId,
+      });
+      const audioAttentionTargets = Array.isArray(payload.targets)
+        ? payload.targets
+        : [payload.target || payload.reason || "input"];
+      const audioSettingsTarget = audioAttentionTargets
+        .map((target) => String(target || "").trim().toLowerCase())
+        .some((target) => target === "input" || target === "microphone")
+        ? "microphone"
+        : "shortcuts";
+      highlightSettingsPermission(audioSettingsTarget);
+      const currentWindow = getCurrentWindow();
+      currentWindow.unminimize?.().catch(() => {});
+      currentWindow.show?.().catch(() => {});
+      currentWindow.setFocus?.().catch(() => {});
+      showView("audio", {
+        immediate: true,
+        telemetrySource: "audio_hotkey_attention",
+      });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenAudioHotkeyAttention = unlisten;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenAudioHotkeyAttention) {
+        unlistenAudioHotkeyAttention();
+      }
+    };
+  }, [highlightSettingsPermission, showView]);
 
   const animateWorkspaceRailWidth = useCallback((nextCollapsed) => {
     const shell = dashboardShellRef.current;
@@ -14942,6 +15277,11 @@ export default function App() {
         presenceTurnStatus,
         presenceReadiness,
       ].filter(Boolean);
+      const presenceBusyStatus = presenceStatuses.find((status) => (
+        terminalActivityStatusIsBusy(status)
+          || terminalActivityStatusIsPaused(status)
+          || ["awaiting_input", "busy", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
+      ));
       const presenceIdleStatus = presenceStatuses.find((status) => (
         terminalActivityStatusIsSendable(status)
           || ["cancelled", "canceled", "complete", "completed", "done", "idle", "input_ready", "interrupted", "ready"].includes(status)
@@ -14949,6 +15289,7 @@ export default function App() {
       const presenceSaysIdle = Boolean(
         presenceTerminal
           && presenceIdleStatus
+          && !presenceBusyStatus
       );
       const activityStatus = String(
         presenceSaysIdle
@@ -17681,10 +18022,28 @@ export default function App() {
     [workspaceCatalogSyncTargets],
   );
   const workspaceMcpSyncTargets = useMemo(
-    () => workspaceCatalogSyncTargets.filter((target) => (
-      Boolean(target?.workspaceActive)
-        && String(target?.repoPath || "").trim()
-    )),
+    () => workspaceCatalogSyncTargets
+      .filter((target) => (
+        Boolean(target?.workspaceActive)
+          && String(target?.repoPath || "").trim()
+          && String(target?.workspaceId || "").trim()
+      ))
+      .map((target) => {
+        const workspaceId = String(target?.workspaceId || "").trim();
+        const workspaceIndex = Number(target?.workspaceIndex ?? 0);
+        const workspaceActive = Boolean(target?.workspaceActive);
+        return {
+          repoPath: String(target?.repoPath || "").trim(),
+          workspaceActive,
+          workspaceId,
+          workspaceIndex,
+          workspaceName: String(target?.workspaceName || workspaceId).trim() || workspaceId,
+          workspaceOrder: Number(target?.workspaceOrder ?? workspaceIndex),
+          workspaceStatus: String(
+            target?.workspaceStatus || (workspaceActive ? "active" : "deactivated"),
+          ).trim(),
+        };
+      }),
     [workspaceCatalogSyncTargets],
   );
   const workspaceMcpSyncTargetKey = useMemo(
@@ -20703,12 +21062,9 @@ export default function App() {
         return { idle: false, reason: "already_closed" };
       }
       const statuses = remoteControlTerminalStatusValues(terminal);
-      const idleStatus = statuses.find((status) => (
-        terminalActivityStatusIsSendable(status)
-          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "ready"].includes(status)
-      ));
-      if (idleStatus) {
-        return { idle: true, reason: idleStatus };
+      const errorStatus = statuses.find((status) => ["error", "failed", "timeout"].includes(status));
+      if (errorStatus) {
+        return { idle: false, reason: errorStatus };
       }
       const busyStatus = statuses.find((status) => (
         terminalActivityStatusIsBusy(status)
@@ -20718,9 +21074,12 @@ export default function App() {
       if (busyStatus) {
         return { idle: false, reason: busyStatus };
       }
-      const errorStatus = statuses.find((status) => ["error", "failed", "timeout"].includes(status));
-      if (errorStatus) {
-        return { idle: false, reason: errorStatus };
+      const idleStatus = statuses.find((status) => (
+        terminalActivityStatusIsSendable(status)
+          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "ready"].includes(status)
+      ));
+      if (idleStatus) {
+        return { idle: true, reason: idleStatus };
       }
       return { idle: false, reason: "unknown" };
     };
@@ -24466,7 +24825,7 @@ export default function App() {
         nextThreads = invalidateWorkspaceThreadProviderSession(threads, lifecycleEvent);
       } else if (lifecycleEvent.type === "provider-session") {
         operation = "provider_session";
-        nextThreads = updateWorkspaceThreadProviderSession(threads, lifecycleEvent);
+        nextThreads = applyWorkspaceThreadProviderSessionBinding(threads, lifecycleEvent);
       } else if (lifecycleEvent.type === "model-selected") {
         operation = "model_selected";
         nextThreads = updateWorkspaceThreadProviderModel(threads, lifecycleEvent);
@@ -24604,7 +24963,7 @@ export default function App() {
 
       if (shouldApplyProviderSessionFromOpen) {
         operation = operation === "update_active_terminal" ? "opened_provider_session" : `${operation}_with_open_provider_session`;
-        nextThreads = updateWorkspaceThreadProviderSession(nextThreads, {
+        nextThreads = applyWorkspaceThreadProviderSessionBinding(nextThreads, {
           ...lifecycleEvent,
           source: lifecycleEvent.source || "terminal-open",
         });
@@ -25090,6 +25449,75 @@ export default function App() {
   }, [acceptWorkspaceThreadPromptFromActivityHook, handleThreadTerminalLifecycle]);
 
   useEffect(() => {
+    terminalProviderSessionBindingHandlerRef.current = (sessionEvent) => {
+      const payload = sessionEvent?.payload || {};
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const sessionId = String(
+        payload.nativeSessionId
+          || payload.native_session_id
+          || payload.providerSessionId
+          || payload.provider_session_id
+          || payload.sessionId
+          || payload.session_id
+          || "",
+      ).trim();
+      const agentId = String(
+        payload.agentId
+          || payload.agent_id
+          || payload.agentKind
+          || payload.agent_kind
+          || payload.provider
+          || "",
+      ).trim().toLowerCase();
+      if (!workspaceId || !sessionId || !agentId) {
+        logTerminalStatus("frontend.terminal_provider_session_bound.skip", {
+          agentId,
+          hasSessionId: Boolean(sessionId),
+          hasWorkspaceId: Boolean(workspaceId),
+          instanceId: payload.instanceId ?? payload.instance_id ?? "",
+          paneId: payload.paneId || payload.pane_id || "",
+          reason: "missing_identity",
+          threadId: payload.threadId || payload.thread_id || "",
+        });
+        return;
+      }
+      const source = String(payload.source || "rust-session-binding").trim();
+      const lifecycleEvent = {
+        ...payload,
+        agentId,
+        instanceId: payload.instanceId ?? payload.instance_id,
+        nativeSessionId: sessionId,
+        nativeSessionKind: payload.nativeSessionKind
+          || payload.native_session_kind
+          || "session",
+        nativeSessionSource: payload.nativeSessionSource
+          || payload.native_session_source
+          || source,
+        paneId: payload.paneId || payload.pane_id || "",
+        providerSessionId: sessionId,
+        sessionId,
+        source,
+        status: payload.status || "active",
+        terminalIndex: payload.terminalIndex ?? payload.terminal_index,
+        threadId: payload.threadId || payload.thread_id || "",
+        type: "provider-session",
+        workspaceId,
+      };
+      logTerminalStatus("frontend.terminal_provider_session_bound.lifecycle", {
+        agentId,
+        hasThreadId: Boolean(lifecycleEvent.threadId),
+        instanceId: lifecycleEvent.instanceId ?? "",
+        paneId: lifecycleEvent.paneId || "",
+        recorded: payload.recorded,
+        source,
+        terminalIndex: lifecycleEvent.terminalIndex ?? "",
+        workspaceId,
+      });
+      handleThreadTerminalLifecycle(lifecycleEvent);
+    };
+  }, [handleThreadTerminalLifecycle]);
+
+  useEffect(() => {
     let unlistenActivityHook = null;
     let cancelled = false;
 
@@ -25110,6 +25538,31 @@ export default function App() {
       cancelled = true;
       if (unlistenActivityHook) {
         unlistenActivityHook();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlistenProviderSessionBound = null;
+    let cancelled = false;
+
+    listen(TERMINAL_PROVIDER_SESSION_BOUND_EVENT, (sessionEvent) => {
+      if (cancelled) {
+        return;
+      }
+      terminalProviderSessionBindingHandlerRef.current?.(sessionEvent);
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenProviderSessionBound = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenProviderSessionBound) {
+        unlistenProviderSessionBound();
       }
     };
   }, []);
@@ -25531,7 +25984,12 @@ export default function App() {
           workspaceThreadsRef.current?.[activatedWorkspace.id]?.threads?.[session.threadId],
           session.agentId,
         );
-        const providerSessionId = String(providerBinding?.nativeSessionId || "").trim();
+        const thread = workspaceThreadsRef.current?.[activatedWorkspace.id]?.threads?.[session.threadId];
+        const providerSessionId = String(
+          providerBinding?.nativeSessionId
+            || thread?.transcriptSessionId
+            || "",
+        ).trim();
         const storedModel = String(providerBinding?.modelId || "").trim();
         const model = storedModel || getWorkspaceAgentStartupModel(session.agentId, agentStatuses);
 
@@ -25596,6 +26054,17 @@ export default function App() {
       workspaceAgentBatchStartedSessionKeysRef.current.clear();
       workspaceAgentBatchInFlightSessionKeysRef.current.clear();
       setWorkspaceAgentBatchSentLaunchKey("");
+    }
+
+    if (!workspaceThreadsHydrated) {
+      logWorkspaceActivationTrace("workspace.open.agent_batch.wait", activatedWorkspace?.id || "", {
+        agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
+        launchKey: workspaceAgentLaunchKey,
+        preparedWorkspaceTerminalAgentStartCount,
+        preparedWorkspaceTerminalCount,
+        reason: "workspace_threads_hydrating",
+      });
+      return;
     }
 
     const pendingPreparedWorkspaceTerminalRequests = preparedWorkspaceTerminalRequests.filter((request) => {
@@ -25775,13 +26244,24 @@ export default function App() {
           });
 
           const terminalLifecycleEvent = {
+            activityStatus: "idle",
             agentId: request.provider,
+            commandPhase: "ready",
+            inputReady: true,
+            inputReadyAt: new Date().toISOString(),
+            inputReadyConfidence: "terminal-start-agent",
             instanceId: paneResult.instanceId,
             model: request.model || "",
             modelSource: request.model ? "session-restore" : "",
+            nativeSessionId: request.providerSessionId || "",
+            nativeSessionKind: request.providerSessionId ? "session" : "",
+            nativeSessionSource: request.providerSessionId ? "session-restore" : "",
             paneId: paneResult.paneId,
+            providerSessionId: request.providerSessionId || "",
             status: "active",
+            statusTruth: "complete",
             terminalIndex: request.terminalIndex,
+            terminalWorkState: "complete",
             threadId: request.threadId,
             workspaceId: request.workspaceId,
           };
@@ -25924,6 +26404,7 @@ export default function App() {
     setWorkspaceAgentBatchSentLaunchKey,
     workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
+    workspaceThreadsHydrated,
     workspaceTerminalAgentLaunchReady,
     logWorkspaceActivationTrace,
   ]);
@@ -26136,6 +26617,57 @@ export default function App() {
     : 0;
   const workspaceDeactivateTerminalLabel = workspaceDeactivateTotal === 1 ? "terminal" : "terminals";
   const isWorkspaceStartupOverlayVisible = shouldShowStartupPhases && workspaceState !== "ready";
+  const settingsPermissionsAreLoading = settingsPermissionState.status === "loading";
+  const settingsAudioInputPermission = settingsPermissionState.audioInput;
+  const settingsAudioShortcutPermissions = settingsPermissionState.audioShortcuts?.permissions || null;
+  const settingsSnippingPermissions = settingsPermissionState.snipping?.permissions || null;
+  const settingsNotificationPermissions = settingsPermissionState.notifications;
+  const microphonePermissionKnown = Boolean(settingsAudioInputPermission);
+  const microphonePermissionReady = microphonePermissionKnown
+    && (!settingsAudioInputPermission.microphoneRequired || settingsAudioInputPermission.microphoneGranted);
+  const microphonePermissionTone = permissionRowTone(microphonePermissionKnown, microphonePermissionReady);
+  const microphonePermissionLabel = permissionStatusLabel(
+    microphonePermissionKnown,
+    microphonePermissionReady,
+    "Ready",
+    settingsAudioInputPermission?.microphonePromptable ? "Needs prompt" : "Needs access",
+  );
+  const screenPermissionKnown = Boolean(settingsSnippingPermissions);
+  const screenPermissionReady = screenPermissionKnown
+    && (!settingsSnippingPermissions.screenCaptureRequired || settingsSnippingPermissions.screenCaptureGranted);
+  const screenPermissionTone = permissionRowTone(screenPermissionKnown, screenPermissionReady);
+  const screenPermissionLabel = permissionStatusLabel(screenPermissionKnown, screenPermissionReady);
+  const shortcutPermissionKnown = Boolean(settingsAudioShortcutPermissions);
+  const shortcutPermissionReady = shortcutPermissionKnown
+    && (!settingsAudioShortcutPermissions.accessibilityRequired || settingsAudioShortcutPermissions.accessibilityGranted)
+    && !settingsAudioShortcutPermissions.quarantineDetected;
+  const shortcutPermissionTone = permissionRowTone(shortcutPermissionKnown, shortcutPermissionReady);
+  const shortcutPermissionLabel = permissionStatusLabel(
+    shortcutPermissionKnown,
+    shortcutPermissionReady,
+    "Ready",
+    settingsAudioShortcutPermissions?.quarantineDetected ? "Quarantined" : "Needs access",
+  );
+  const notificationPermissionKnown = Boolean(settingsNotificationPermissions);
+  const notificationPermissionReady = notificationPermissionKnown
+    && settingsNotificationPermissions.appEnabled !== false
+    && Boolean(settingsNotificationPermissions.granted);
+  const notificationPermissionTone = permissionRowTone(notificationPermissionKnown, notificationPermissionReady);
+  const notificationPermissionLabel = permissionStatusLabel(
+    notificationPermissionKnown,
+    notificationPermissionReady,
+    "Ready",
+    settingsNotificationPermissions?.permission === "disabled" ? "Disabled" : "Needs access",
+  );
+  const settingsPlatformIsMac = appShellIsMacPlatform();
+  const renderSettingsPermissionHighlight = (target) => (
+    settingsPermissionHighlight.target === target ? (
+      <SettingsPermissionHighlight
+        aria-hidden="true"
+        key={`settings-permission-${target}-${settingsPermissionHighlight.id}`}
+      />
+    ) : null
+  );
 
   return (
     <>
@@ -27036,18 +27568,27 @@ export default function App() {
                 >
               {visibleView === "settings" ? (
                 <SettingsPage data-motion={viewMotion}>
-                  <PageHeader>
-                    <div>
-                      <Kicker>Settings</Kicker>
-                      <DashboardTitle>Desktop settings</DashboardTitle>
-                      <PageSubline>Terminal providers and verified account state for this device.</PageSubline>
-                    </div>
-                    <SecondaryButton data-padding="wide" onClick={() => showView(DEFAULT_WORKSPACE_VIEW)} type="button">
-                      <ConnectedIcon aria-hidden="true" />
-                      <span>Back</span>
-                    </SecondaryButton>
-                  </PageHeader>
+                  <SettingsTabNav aria-label="Settings sections">
+                    <SettingsTabButton
+                      data-active={settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
+                      onClick={() => setSettingsTab(SETTINGS_TAB_GENERAL)}
+                      type="button"
+                    >
+                      <ButtonSettingsIcon aria-hidden="true" />
+                      <span>General</span>
+                    </SettingsTabButton>
+                    <SettingsTabButton
+                      data-active={settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
+                      onClick={() => setSettingsTab(SETTINGS_TAB_PERMISSIONS)}
+                      type="button"
+                    >
+                      <ButtonSecurityIcon aria-hidden="true" />
+                      <span>Permissions</span>
+                    </SettingsTabButton>
+                  </SettingsTabNav>
 
+                  {settingsTab === SETTINGS_TAB_GENERAL ? (
+                    <>
                   <AccountSettingsPanel>
                     <PanelHeaderRow>
                       <div>
@@ -27681,6 +28222,246 @@ export default function App() {
                       </AccountCardFooter>
                     </AccountCard>
                   </AccountSettingsPanel>
+                    </>
+                  ) : (
+                    <AccountSettingsPanel>
+                      <PanelHeaderRow>
+                        <div>
+                          <PanelKicker>Permissions</PanelKicker>
+                          <PanelHeading>Device access</PanelHeading>
+                        </div>
+                        <AgentPanelActions>
+                          <AgentReadyPill data-tone={settingsPermissionsAreLoading ? "orange" : "blue"}>
+                            {settingsPermissionsAreLoading ? (
+                              <PendingIcon aria-hidden="true" />
+                            ) : (
+                              <ButtonSecurityIcon aria-hidden="true" />
+                            )}
+                            <span>{settingsPermissionsAreLoading ? "Checking" : "Ready to check"}</span>
+                          </AgentReadyPill>
+                          <SecondaryButton
+                            disabled={settingsPermissionsAreLoading}
+                            onClick={loadSettingsPermissionState}
+                            type="button"
+                          >
+                            {settingsPermissionsAreLoading ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                            <span>{settingsPermissionsAreLoading ? "Checking..." : "Recheck"}</span>
+                          </SecondaryButton>
+                        </AgentPanelActions>
+                      </PanelHeaderRow>
+
+                      {settingsPermissionState.error && (
+                        <FormMessage $state="error">{settingsPermissionState.error}</FormMessage>
+                      )}
+
+                      <SettingsPermissionGrid>
+                        <SettingsPermissionRow
+                          aria-label="Microphone permission"
+                          data-tone={microphonePermissionTone}
+                          ref={setSettingsPermissionRowRef("microphone")}
+                        >
+                          {renderSettingsPermissionHighlight("microphone")}
+                          <SettingsPermissionIcon aria-hidden="true">
+                            <ButtonMicIcon />
+                          </SettingsPermissionIcon>
+                          <SettingsPermissionMain>
+                            <SettingsPermissionTopline>
+                              <SettingsPermissionCopy>
+                                <SettingsLabel>Microphone</SettingsLabel>
+                                <SettingsHint>
+                                  {settingsAudioInputPermission?.message || "Required for dictation, input monitoring, and the recorder widget."}
+                                </SettingsHint>
+                              </SettingsPermissionCopy>
+                              <SettingsPermissionStatus data-tone={microphonePermissionTone}>
+                                {microphonePermissionLabel}
+                              </SettingsPermissionStatus>
+                            </SettingsPermissionTopline>
+                            <SettingsPermissionActions>
+                              <SecondaryButton onClick={openSettingsMicrophonePermission} type="button">
+                                <ButtonMicIcon aria-hidden="true" />
+                                <span>Open Settings</span>
+                              </SecondaryButton>
+                            </SettingsPermissionActions>
+                          </SettingsPermissionMain>
+                        </SettingsPermissionRow>
+
+                        <SettingsPermissionRow
+                          aria-label="Screen recording permission"
+                          data-tone={screenPermissionTone}
+                          ref={setSettingsPermissionRowRef("screen")}
+                        >
+                          {renderSettingsPermissionHighlight("screen")}
+                          <SettingsPermissionIcon aria-hidden="true">
+                            <ButtonSnippingIcon />
+                          </SettingsPermissionIcon>
+                          <SettingsPermissionMain>
+                            <SettingsPermissionTopline>
+                              <SettingsPermissionCopy>
+                                <SettingsLabel>Screen Recording</SettingsLabel>
+                                <SettingsHint>
+                                  {settingsSnippingPermissions?.message || "Required for screenshots, area snips, and snipping recordings."}
+                                </SettingsHint>
+                              </SettingsPermissionCopy>
+                              <SettingsPermissionStatus data-tone={screenPermissionTone}>
+                                {screenPermissionLabel}
+                              </SettingsPermissionStatus>
+                            </SettingsPermissionTopline>
+                            <SettingsPermissionActions>
+                              <SecondaryButton onClick={openSettingsScreenPermission} type="button">
+                                <ButtonSnippingIcon aria-hidden="true" />
+                                <span>Open Settings</span>
+                              </SecondaryButton>
+                            </SettingsPermissionActions>
+                          </SettingsPermissionMain>
+                        </SettingsPermissionRow>
+
+                        <SettingsPermissionRow
+                          aria-label="Shortcut accessibility permission"
+                          data-tone={shortcutPermissionTone}
+                          ref={setSettingsPermissionRowRef("shortcuts")}
+                        >
+                          {renderSettingsPermissionHighlight("shortcuts")}
+                          <SettingsPermissionIcon aria-hidden="true">
+                            <ButtonKeyIcon />
+                          </SettingsPermissionIcon>
+                          <SettingsPermissionMain>
+                            <SettingsPermissionTopline>
+                              <SettingsPermissionCopy>
+                                <SettingsLabel>Shortcuts & Accessibility</SettingsLabel>
+                                <SettingsHint>
+                                  {settingsAudioShortcutPermissions?.message || "Required for global audio, snipping, and activity overlay hotkeys."}
+                                </SettingsHint>
+                              </SettingsPermissionCopy>
+                              <SettingsPermissionStatus data-tone={shortcutPermissionTone}>
+                                {shortcutPermissionLabel}
+                              </SettingsPermissionStatus>
+                            </SettingsPermissionTopline>
+                            <SettingsPermissionActions>
+                              <SecondaryButton onClick={openSettingsShortcutPermission} type="button">
+                                <ButtonKeyIcon aria-hidden="true" />
+                                <span>Open Settings</span>
+                              </SecondaryButton>
+                            </SettingsPermissionActions>
+                          </SettingsPermissionMain>
+                        </SettingsPermissionRow>
+
+                        <SettingsPermissionRow
+                          aria-label="Notification permission"
+                          data-tone={notificationPermissionTone}
+                          ref={setSettingsPermissionRowRef("notifications")}
+                        >
+                          {renderSettingsPermissionHighlight("notifications")}
+                          <SettingsPermissionIcon aria-hidden="true">
+                            <ButtonNotificationIcon />
+                          </SettingsPermissionIcon>
+                          <SettingsPermissionMain>
+                            <SettingsPermissionTopline>
+                              <SettingsPermissionCopy>
+                                <SettingsLabel>Notifications</SettingsLabel>
+                                <SettingsHint>
+                                  {settingsNotificationPermissions?.message || "Used for parked agent work, finished tasks, and attention prompts."}
+                                </SettingsHint>
+                              </SettingsPermissionCopy>
+                              <SettingsPermissionStatus data-tone={notificationPermissionTone}>
+                                {notificationPermissionLabel}
+                              </SettingsPermissionStatus>
+                            </SettingsPermissionTopline>
+                            <SettingsPermissionActions>
+                              <SecondaryButton onClick={requestSettingsNotificationPermission} type="button">
+                                <ButtonNotificationIcon aria-hidden="true" />
+                                <span>Request</span>
+                              </SecondaryButton>
+                              {settingsPlatformIsMac && (
+                                <SecondaryButton
+                                  onClick={() => openSettingsPermissionUrl(
+                                    "notifications",
+                                    MACOS_NOTIFICATIONS_SETTINGS_URL,
+                                    "Unable to open notification settings.",
+                                  )}
+                                  type="button"
+                                >
+                                  <ButtonSettingsIcon aria-hidden="true" />
+                                  <span>Open Settings</span>
+                                </SecondaryButton>
+                              )}
+                            </SettingsPermissionActions>
+                          </SettingsPermissionMain>
+                        </SettingsPermissionRow>
+
+                        <SettingsPermissionRow
+                          aria-label="Automation permission"
+                          data-tone="neutral"
+                          ref={setSettingsPermissionRowRef("automation")}
+                        >
+                          {renderSettingsPermissionHighlight("automation")}
+                          <SettingsPermissionIcon aria-hidden="true">
+                            <ButtonPrivacyIcon />
+                          </SettingsPermissionIcon>
+                          <SettingsPermissionMain>
+                            <SettingsPermissionTopline>
+                              <SettingsPermissionCopy>
+                                <SettingsLabel>Automation</SettingsLabel>
+                                <SettingsHint>
+                                  macOS may ask when Diff Forge sends text or control events to another application.
+                                </SettingsHint>
+                              </SettingsPermissionCopy>
+                              <SettingsPermissionStatus data-tone="neutral">Review</SettingsPermissionStatus>
+                            </SettingsPermissionTopline>
+                            <SettingsPermissionActions>
+                              <SecondaryButton
+                                disabled={!settingsPlatformIsMac}
+                                onClick={() => openSettingsPermissionUrl(
+                                  "automation",
+                                  MACOS_AUTOMATION_SETTINGS_URL,
+                                  "Unable to open automation settings.",
+                                )}
+                                type="button"
+                              >
+                                <ButtonPrivacyIcon aria-hidden="true" />
+                                <span>Open Settings</span>
+                              </SecondaryButton>
+                            </SettingsPermissionActions>
+                          </SettingsPermissionMain>
+                        </SettingsPermissionRow>
+
+                        <SettingsPermissionRow
+                          aria-label="Full Disk Access permission"
+                          data-tone="neutral"
+                          ref={setSettingsPermissionRowRef("files")}
+                        >
+                          {renderSettingsPermissionHighlight("files")}
+                          <SettingsPermissionIcon aria-hidden="true">
+                            <ButtonFolderIcon />
+                          </SettingsPermissionIcon>
+                          <SettingsPermissionMain>
+                            <SettingsPermissionTopline>
+                              <SettingsPermissionCopy>
+                                <SettingsLabel>Full Disk Access</SettingsLabel>
+                                <SettingsHint>
+                                  Optional for protected folders, external project roots, and repositories outside the normal file picker scope.
+                                </SettingsHint>
+                              </SettingsPermissionCopy>
+                              <SettingsPermissionStatus data-tone="neutral">Optional</SettingsPermissionStatus>
+                            </SettingsPermissionTopline>
+                            <SettingsPermissionActions>
+                              <SecondaryButton
+                                disabled={!settingsPlatformIsMac}
+                                onClick={() => openSettingsPermissionUrl(
+                                  "files",
+                                  MACOS_FULL_DISK_ACCESS_SETTINGS_URL,
+                                  "Unable to open Full Disk Access settings.",
+                                )}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Open Settings</span>
+                              </SecondaryButton>
+                            </SettingsPermissionActions>
+                          </SettingsPermissionMain>
+                        </SettingsPermissionRow>
+                      </SettingsPermissionGrid>
+                    </AccountSettingsPanel>
+                  )}
                 </SettingsPage>
               ) : visibleView === "files" ? (
                 <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
@@ -27789,6 +28570,7 @@ export default function App() {
                     untrackedLibrary={untrackedAssetsLibrary.library}
                     untrackedLoading={untrackedAssetsLibrary.loading || untrackedAssetsLibrary.syncing}
                     onUntrackedRefresh={untrackedAssetsLibrary.refresh}
+                    permissionAttentionId={snippingPermissionAttentionId}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (
@@ -27797,6 +28579,7 @@ export default function App() {
                     audioActionState={audioActionState}
                     audioDownloadProgress={audioDownloadProgress}
                     audioError={audioError}
+                    audioHotkeyAttention={audioHotkeyAttention}
                     audioModelStatus={audioModelStatus}
                     audioStatusState={audioStatusState}
                     audioWidgetVisible={audioWidgetVisible}

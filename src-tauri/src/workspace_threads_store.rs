@@ -72,6 +72,27 @@ struct WorkspaceThreadsPersistResult {
     saved: usize,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceThreadProviderSessionBinding {
+    workspace_id: String,
+    thread_id: String,
+    agent_id: String,
+    provider_session_id: String,
+    native_session_id: String,
+    native_session_kind: String,
+    native_session_source: String,
+    pane_id: String,
+    instance_id: Option<u64>,
+    terminal_index: Option<i64>,
+    provider: String,
+    session_title: String,
+    model_id: String,
+    source: String,
+    cwd: String,
+    observed_at_ms: u64,
+}
+
 fn workspace_threads_clean_workspace_id(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -91,6 +112,37 @@ fn workspace_threads_clean_thread_id(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty()
         || trimmed.len() > 512
+        || trimmed
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'\x7f')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn workspace_threads_clean_agent_id(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    let agent_id = if normalized.contains("claude") {
+        "claude"
+    } else if normalized.contains("opencode") || normalized.contains("open-code") {
+        "opencode"
+    } else if normalized.contains("codex") {
+        "codex"
+    } else {
+        normalized.as_str()
+    };
+    if matches!(agent_id, "codex" | "claude" | "opencode") {
+        Some(agent_id.to_string())
+    } else {
+        None
+    }
+}
+
+fn workspace_threads_clean_provider_session_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
         || trimmed
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b'\x7f')
@@ -162,9 +214,26 @@ fn workspace_threads_open_store(
             CREATE INDEX IF NOT EXISTS idx_workspace_thread_thread_state_root
                 ON workspace_thread_thread_state(workspace_root);
             CREATE INDEX IF NOT EXISTS idx_workspace_thread_thread_state_workspace
-                ON workspace_thread_thread_state(workspace_id, bucket);",
+                ON workspace_thread_thread_state(workspace_id, bucket);
+            CREATE TABLE IF NOT EXISTS workspace_thread_provider_session_binding (
+                workspace_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                workspace_root TEXT NOT NULL,
+                binding_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, thread_id, agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_thread_provider_session_binding_session
+                ON workspace_thread_provider_session_binding(provider_session_id);
+            CREATE INDEX IF NOT EXISTS idx_workspace_thread_provider_session_binding_workspace
+                ON workspace_thread_provider_session_binding(workspace_id);",
         )
-        .map_err(|error| format!("Unable to initialize workspace threads SQLite schema: {error}"))?;
+        .map_err(|error| {
+            format!("Unable to initialize workspace threads SQLite schema: {error}")
+        })?;
     Ok((connection, root, db_path))
 }
 
@@ -176,18 +245,22 @@ fn workspace_threads_collect_thread_entries(value: Option<Value>) -> Vec<(String
     entries
         .into_iter()
         .filter_map(|(thread_id, thread)| {
-            workspace_threads_clean_thread_id(&thread_id).map(|safe_thread_id| (safe_thread_id, thread))
+            workspace_threads_clean_thread_id(&thread_id)
+                .map(|safe_thread_id| (safe_thread_id, thread))
         })
         .collect()
 }
 
-fn workspace_threads_split_state(state: &Value) -> (Value, Vec<(String, Value)>, Vec<(String, Value)>) {
+fn workspace_threads_split_state(
+    state: &Value,
+) -> (Value, Vec<(String, Value)>, Vec<(String, Value)>) {
     let mut shell = match state {
         Value::Object(map) => map.clone(),
         _ => serde_json::Map::new(),
     };
     let threads = workspace_threads_collect_thread_entries(shell.remove("threads"));
-    let archived_threads = workspace_threads_collect_thread_entries(shell.remove("archivedThreads"));
+    let archived_threads =
+        workspace_threads_collect_thread_entries(shell.remove("archivedThreads"));
     (Value::Object(shell), threads, archived_threads)
 }
 
@@ -289,6 +362,382 @@ fn workspace_threads_write_split_state(
     Ok(())
 }
 
+fn workspace_threads_thread_status_is_closed(thread: &Value) -> bool {
+    let status = thread
+        .get("status")
+        .or_else(|| thread.get("activityStatus"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "closed" | "closing" | "exited" | "offline" | "terminated"
+    )
+}
+
+fn workspace_threads_terminal_binding_matches(
+    binding_value: Option<&Value>,
+    binding: &WorkspaceThreadProviderSessionBinding,
+) -> bool {
+    let Some(binding_value) = binding_value else {
+        return false;
+    };
+    let pane_matches = !binding.pane_id.trim().is_empty()
+        && binding_value
+            .get("paneId")
+            .or_else(|| binding_value.get("pane_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|pane_id| pane_id == binding.pane_id);
+    let instance_matches = binding.instance_id.is_some_and(|instance_id| {
+        binding_value
+            .get("instanceId")
+            .or_else(|| binding_value.get("instance_id"))
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value == instance_id)
+    });
+    pane_matches || instance_matches
+}
+
+fn workspace_threads_thread_matches_provider_binding(
+    thread: &Value,
+    binding: &WorkspaceThreadProviderSessionBinding,
+) -> bool {
+    if workspace_threads_thread_status_is_closed(thread) {
+        return false;
+    }
+    if workspace_threads_terminal_binding_matches(thread.get("terminalBinding"), binding) {
+        return true;
+    }
+    if let Some(provider_binding) = thread
+        .get("providerBindings")
+        .and_then(|bindings| bindings.get(binding.agent_id.as_str()))
+    {
+        if workspace_threads_terminal_binding_matches(
+            provider_binding.get("terminalBinding"),
+            binding,
+        ) {
+            return true;
+        }
+    }
+    if let Some(index) = binding.terminal_index {
+        return thread
+            .get("terminalIndex")
+            .or_else(|| thread.get("terminal_index"))
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value == index);
+    }
+    false
+}
+
+fn workspace_threads_resolve_thread_id_for_provider_binding(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    binding: &WorkspaceThreadProviderSessionBinding,
+) -> Result<Option<String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT thread_id, thread_json
+            FROM workspace_thread_thread_state
+            WHERE workspace_id = ?1 AND bucket = 'active'
+            ORDER BY updated_at DESC, thread_id DESC",
+        )
+        .map_err(|error| format!("Unable to prepare provider session thread lookup: {error}"))?;
+    let mut rows = statement
+        .query(rusqlite::params![workspace_id])
+        .map_err(|error| format!("Unable to query provider session thread lookup: {error}"))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Unable to read provider session thread lookup: {error}"))?
+    {
+        let thread_id = row
+            .get::<_, String>(0)
+            .map_err(|error| format!("Unable to read provider session thread id: {error}"))?;
+        let thread_json = row
+            .get::<_, String>(1)
+            .map_err(|error| format!("Unable to read provider session thread JSON: {error}"))?;
+        let Ok(thread) = serde_json::from_str::<Value>(&thread_json) else {
+            continue;
+        };
+        if workspace_threads_thread_matches_provider_binding(&thread, binding) {
+            if let Some(thread_id) = workspace_threads_clean_thread_id(&thread_id) {
+                return Ok(Some(thread_id));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn workspace_threads_record_provider_session_binding(
+    root_directory: Option<&str>,
+    binding: WorkspaceThreadProviderSessionBinding,
+) -> Result<bool, String> {
+    let workspace_id = workspace_threads_clean_workspace_id(&binding.workspace_id)?;
+    let Some(agent_id) = workspace_threads_clean_agent_id(&binding.agent_id) else {
+        return Ok(false);
+    };
+    let Some(provider_session_id) =
+        workspace_threads_clean_provider_session_id(&binding.provider_session_id)
+    else {
+        return Ok(false);
+    };
+    let (connection, root, _) = workspace_threads_open_store(root_directory, true)?;
+    let Some(thread_id) = workspace_threads_clean_thread_id(&binding.thread_id).or_else(|| {
+        workspace_threads_resolve_thread_id_for_provider_binding(
+            &connection,
+            &workspace_id,
+            &binding,
+        )
+        .ok()
+        .flatten()
+    }) else {
+        return Ok(false);
+    };
+    let native_session_id = workspace_threads_clean_provider_session_id(&binding.native_session_id)
+        .unwrap_or_else(|| provider_session_id.clone());
+    let mut normalized = binding.clone();
+    normalized.workspace_id = workspace_id.clone();
+    normalized.thread_id = thread_id.clone();
+    normalized.agent_id = agent_id.clone();
+    normalized.provider_session_id = provider_session_id.clone();
+    normalized.native_session_id = native_session_id;
+    normalized.native_session_kind = if normalized.native_session_kind.trim().is_empty() {
+        "session".to_string()
+    } else {
+        normalized.native_session_kind.trim().to_string()
+    };
+    normalized.native_session_source = if normalized.native_session_source.trim().is_empty() {
+        normalized.source.trim().to_string()
+    } else {
+        normalized.native_session_source.trim().to_string()
+    };
+
+    let binding_text = serde_json::to_string(&normalized)
+        .map_err(|error| format!("Unable to serialize provider session binding: {error}"))?;
+    let now = workspace_threads_now_millis();
+    let root_display = workspace_path_display(&root);
+    connection
+        .execute(
+            "INSERT INTO workspace_thread_provider_session_binding (
+                workspace_id,
+                thread_id,
+                agent_id,
+                provider_session_id,
+                workspace_root,
+                binding_json,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            ON CONFLICT(workspace_id, thread_id, agent_id) DO UPDATE SET
+                provider_session_id = excluded.provider_session_id,
+                workspace_root = excluded.workspace_root,
+                binding_json = excluded.binding_json,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                workspace_id,
+                thread_id,
+                agent_id,
+                provider_session_id,
+                root_display,
+                binding_text,
+                now,
+            ],
+        )
+        .map_err(|error| format!("Unable to persist provider session binding: {error}"))?;
+    Ok(true)
+}
+
+fn workspace_threads_binding_text(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn workspace_threads_apply_provider_session_binding(state: &mut Value, binding: &Value) {
+    let workspace_id = workspace_threads_binding_text(binding, &["workspaceId", "workspace_id"]);
+    let thread_id = workspace_threads_binding_text(binding, &["threadId", "thread_id"]);
+    let agent_id = workspace_threads_binding_text(binding, &["agentId", "agent_id"]);
+    let provider_session_id = workspace_threads_binding_text(
+        binding,
+        &[
+            "providerSessionId",
+            "provider_session_id",
+            "nativeSessionId",
+            "native_session_id",
+        ],
+    );
+    if workspace_id.is_empty()
+        || thread_id.is_empty()
+        || agent_id.is_empty()
+        || provider_session_id.is_empty()
+    {
+        return;
+    }
+    let Some(state_object) = state.as_object_mut() else {
+        return;
+    };
+    let now = workspace_threads_now_millis();
+    let session_title = workspace_threads_binding_text(binding, &["sessionTitle", "session_title"]);
+    let source = workspace_threads_binding_text(binding, &["source"]);
+    let provider = workspace_threads_binding_text(binding, &["provider"]);
+    let model_id = workspace_threads_binding_text(binding, &["modelId", "model_id"]);
+    let terminal_index = binding
+        .get("terminalIndex")
+        .or_else(|| binding.get("terminal_index"))
+        .and_then(Value::as_i64);
+
+    if !state_object
+        .get("threadOrder")
+        .and_then(Value::as_array)
+        .is_some_and(|order| {
+            order
+                .iter()
+                .any(|value| value.as_str() == Some(thread_id.as_str()))
+        })
+    {
+        let order_value = state_object
+            .entry("threadOrder".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(order) = order_value.as_array_mut() {
+            order.push(json!(thread_id.clone()));
+        }
+    }
+
+    if let Some(index) = terminal_index {
+        let ids_value = state_object
+            .entry("terminalThreadIds".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(ids) = ids_value.as_object_mut() {
+            ids.insert(index.to_string(), json!(thread_id.clone()));
+        }
+    }
+
+    let threads_value = state_object
+        .entry("threads".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(threads) = threads_value.as_object_mut() else {
+        return;
+    };
+    let thread_value = threads.entry(thread_id.clone()).or_insert_with(|| {
+        json!({
+            "activityStatus": "idle",
+            "createdAt": now,
+            "currentAgent": agent_id,
+            "id": thread_id,
+            "lastActiveAt": now,
+            "lastMessageAt": "",
+            "latestTurn": null,
+            "materialized": true,
+            "messageCount": 0,
+            "messages": [],
+            "pendingPrompt": null,
+            "preferredAgent": agent_id,
+            "projectionEvents": [],
+            "providerBindings": {},
+            "sessionName": if session_title.is_empty() { "Coding agent session" } else { session_title.as_str() },
+            "status": "idle",
+            "threadId": thread_id,
+            "title": if session_title.is_empty() { "Coding agent session" } else { session_title.as_str() },
+            "updatedAt": now,
+            "workspaceId": workspace_id,
+        })
+    });
+    let Some(thread) = thread_value.as_object_mut() else {
+        return;
+    };
+    thread.insert("id".to_string(), json!(thread_id.clone()));
+    thread.insert("workspaceId".to_string(), json!(workspace_id));
+    thread.insert("currentAgent".to_string(), json!(agent_id.clone()));
+    thread.insert("preferredAgent".to_string(), json!(agent_id.clone()));
+    thread.insert("materialized".to_string(), json!(true));
+    thread.insert(
+        "transcriptSessionId".to_string(),
+        json!(provider_session_id.clone()),
+    );
+    thread.insert("transcriptStatus".to_string(), json!("ready"));
+    thread.insert("updatedAt".to_string(), json!(now.clone()));
+    if let Some(index) = terminal_index {
+        thread.insert("terminalIndex".to_string(), json!(index));
+    }
+    if !session_title.is_empty() {
+        thread.insert("sessionName".to_string(), json!(session_title.clone()));
+        thread.insert("title".to_string(), json!(session_title));
+    }
+
+    let provider_bindings_value = thread
+        .entry("providerBindings".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(provider_bindings) = provider_bindings_value.as_object_mut() else {
+        return;
+    };
+    let binding_value = provider_bindings
+        .entry(agent_id.clone())
+        .or_insert_with(|| json!({ "agentId": agent_id.clone() }));
+    let Some(binding_object) = binding_value.as_object_mut() else {
+        return;
+    };
+    binding_object.insert("agentId".to_string(), json!(agent_id));
+    binding_object.insert(
+        "nativeSessionId".to_string(),
+        json!(provider_session_id.clone()),
+    );
+    binding_object.insert("nativeSessionKind".to_string(), json!("session"));
+    binding_object.insert(
+        "nativeSessionSource".to_string(),
+        json!(if source.is_empty() {
+            "rust-session-binding"
+        } else {
+            source.as_str()
+        }),
+    );
+    binding_object.insert("nativeSessionUpdatedAt".to_string(), json!(now));
+    binding_object.insert("providerSessionId".to_string(), json!(provider_session_id));
+    if !provider.is_empty() {
+        binding_object.insert("provider".to_string(), json!(provider));
+    }
+    if !model_id.is_empty() {
+        binding_object.insert("modelId".to_string(), json!(model_id));
+        binding_object.insert("modelSource".to_string(), json!("session-binding"));
+    }
+}
+
+fn workspace_threads_merge_provider_session_bindings(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    state: &mut Value,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT binding_json
+            FROM workspace_thread_provider_session_binding
+            WHERE workspace_id = ?1
+            ORDER BY updated_at ASC",
+        )
+        .map_err(|error| format!("Unable to prepare provider session binding read: {error}"))?;
+    let mut rows = statement
+        .query(rusqlite::params![workspace_id])
+        .map_err(|error| format!("Unable to read provider session binding rows: {error}"))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Unable to read provider session binding row: {error}"))?
+    {
+        let binding_text = row
+            .get::<_, String>(0)
+            .map_err(|error| format!("Unable to read provider session binding JSON: {error}"))?;
+        let Ok(binding) = serde_json::from_str::<Value>(&binding_text) else {
+            continue;
+        };
+        workspace_threads_apply_provider_session_binding(state, &binding);
+    }
+
+    Ok(())
+}
+
 fn workspace_threads_read_split_state(
     connection: &rusqlite::Connection,
     workspace_id: &str,
@@ -354,8 +803,13 @@ fn workspace_threads_read_split_state(
     }
 
     state.insert("threads".to_string(), Value::Object(threads));
-    state.insert("archivedThreads".to_string(), Value::Object(archived_threads));
-    Ok(Some(Value::Object(state)))
+    state.insert(
+        "archivedThreads".to_string(),
+        Value::Object(archived_threads),
+    );
+    let mut state = Value::Object(state);
+    workspace_threads_merge_provider_session_bindings(connection, workspace_id, &mut state)?;
+    Ok(Some(state))
 }
 
 fn workspace_threads_read_blocking(
@@ -382,20 +836,18 @@ fn workspace_threads_read_blocking(
                 ));
             }
         };
-        let found = split_state.is_some() || state_text.is_some();
+        let mut found = split_state.is_some() || state_text.is_some();
         if let Some(state) = split_state {
             threads.insert(workspace_id.clone(), state);
         } else if let Some(state_text) = state_text {
             if let Ok(Value::Object(_)) = serde_json::from_str::<Value>(&state_text) {
-                let state = serde_json::from_str::<Value>(&state_text)
+                let mut state = serde_json::from_str::<Value>(&state_text)
                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
                 let now = workspace_threads_now_millis();
                 let root_display = workspace_path_display(&root);
-                let transaction = connection
-                    .transaction()
-                    .map_err(|error| {
-                        format!("Unable to start workspace thread migration transaction: {error}")
-                    })?;
+                let transaction = connection.transaction().map_err(|error| {
+                    format!("Unable to start workspace thread migration transaction: {error}")
+                })?;
                 workspace_threads_write_split_state(
                     &transaction,
                     &workspace_id,
@@ -403,9 +855,49 @@ fn workspace_threads_read_blocking(
                     &state,
                     &now,
                 )?;
-                transaction
-                    .commit()
-                    .map_err(|error| format!("Unable to commit workspace thread migration: {error}"))?;
+                transaction.commit().map_err(|error| {
+                    format!("Unable to commit workspace thread migration: {error}")
+                })?;
+                workspace_threads_merge_provider_session_bindings(
+                    &connection,
+                    &workspace_id,
+                    &mut state,
+                )?;
+                threads.insert(workspace_id.clone(), state);
+            }
+        } else {
+            let mut state = json!({
+                "activeThreadId": "",
+                "archivedThreadOrder": [],
+                "archivedThreads": {},
+                "terminalOrder": [],
+                "terminalThreadIds": {},
+                "terminals": {},
+                "threadOrder": [],
+                "threads": {},
+                "threadsView": {},
+            });
+            workspace_threads_merge_provider_session_bindings(
+                &connection,
+                &workspace_id,
+                &mut state,
+            )?;
+            let has_threads = state
+                .get("threads")
+                .and_then(Value::as_object)
+                .is_some_and(|threads| !threads.is_empty());
+            if has_threads {
+                if let Some(first_thread_id) = state
+                    .get("threadOrder")
+                    .and_then(Value::as_array)
+                    .and_then(|order| order.iter().find_map(Value::as_str))
+                    .map(str::to_string)
+                {
+                    if let Some(object) = state.as_object_mut() {
+                        object.insert("activeThreadId".to_string(), json!(first_thread_id));
+                    }
+                }
+                found = true;
                 threads.insert(workspace_id.clone(), state);
             }
         }
@@ -436,9 +928,9 @@ fn workspace_threads_persist_blocking(
         let (mut connection, root, _) =
             workspace_threads_open_store(workspace.root_directory.as_deref(), true)?;
         let root_display = workspace_path_display(&root);
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("Unable to start workspace thread persist transaction: {error}"))?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("Unable to start workspace thread persist transaction: {error}")
+        })?;
         transaction
             .execute(
                 "INSERT INTO workspace_thread_state (
@@ -521,9 +1013,9 @@ fn workspace_threads_persist_delta_blocking(
         let (mut connection, root, _) =
             workspace_threads_open_store(workspace.root_directory.as_deref(), true)?;
         let root_display = workspace_path_display(&root);
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("Unable to start workspace thread delta transaction: {error}"))?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("Unable to start workspace thread delta transaction: {error}")
+        })?;
 
         let mut changed = false;
         if let Some(shell) = workspace.shell {
@@ -542,7 +1034,12 @@ fn workspace_threads_persist_delta_blocking(
                         workspace_root = excluded.workspace_root,
                         shell_json = excluded.shell_json,
                         updated_at = excluded.updated_at",
-                    rusqlite::params![workspace_id.as_str(), root_display.as_str(), shell_text, now],
+                    rusqlite::params![
+                        workspace_id.as_str(),
+                        root_display.as_str(),
+                        shell_text,
+                        now
+                    ],
                 )
                 .map_err(|error| format!("Unable to persist workspace thread shell: {error}"))?;
             changed = true;
@@ -629,4 +1126,89 @@ async fn workspace_threads_persist_delta(
     tauri::async_runtime::spawn_blocking(move || workspace_threads_persist_delta_blocking(request))
         .await
         .map_err(|error| format!("Workspace threads delta persist worker failed: {error}"))?
+}
+
+#[cfg(test)]
+mod workspace_threads_store_tests {
+    use super::*;
+
+    fn unique_workspace_threads_test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!("diffforge-workspace-threads-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn provider_session_binding_round_trips_without_prior_thread_state() {
+        let root = unique_workspace_threads_test_root("provider-binding");
+        fs::create_dir_all(&root).expect("create workspace root");
+        let root_text = root.to_string_lossy().to_string();
+
+        let recorded = workspace_threads_record_provider_session_binding(
+            Some(root_text.as_str()),
+            WorkspaceThreadProviderSessionBinding {
+                agent_id: "codex".to_string(),
+                cwd: root_text.clone(),
+                instance_id: Some(42),
+                model_id: "gpt-5.5".to_string(),
+                native_session_id: "codex-session-12345678".to_string(),
+                native_session_kind: "session".to_string(),
+                native_session_source: "terminal-output".to_string(),
+                observed_at_ms: 1234,
+                pane_id: "pane-session-binding".to_string(),
+                provider: "codex".to_string(),
+                provider_session_id: "codex-session-12345678".to_string(),
+                session_title: "Codex".to_string(),
+                source: "terminal-output".to_string(),
+                terminal_index: Some(1),
+                thread_id: "thread-session-binding".to_string(),
+                workspace_id: "workspace-session-binding".to_string(),
+            },
+        )
+        .expect("record provider binding");
+        assert!(recorded);
+
+        let result = workspace_threads_read_blocking(WorkspaceThreadsReadRequest {
+            workspaces: vec![WorkspaceThreadsReadWorkspace {
+                root_directory: Some(root_text.clone()),
+                workspace_id: "workspace-session-binding".to_string(),
+            }],
+        })
+        .expect("read workspace threads");
+        assert_eq!(result.workspaces.len(), 1);
+        assert!(result.workspaces[0].found);
+
+        let state = result
+            .threads
+            .get("workspace-session-binding")
+            .expect("workspace state");
+        assert_eq!(
+            state
+                .pointer("/terminalThreadIds/1")
+                .and_then(Value::as_str),
+            Some("thread-session-binding")
+        );
+        assert_eq!(
+            state
+                .pointer("/threads/thread-session-binding/transcriptSessionId")
+                .and_then(Value::as_str),
+            Some("codex-session-12345678")
+        );
+        assert_eq!(
+            state
+                .pointer("/threads/thread-session-binding/providerBindings/codex/nativeSessionId")
+                .and_then(Value::as_str),
+            Some("codex-session-12345678")
+        );
+        assert_eq!(
+            state
+                .pointer("/threads/thread-session-binding/providerBindings/codex/modelId")
+                .and_then(Value::as_str),
+            Some("gpt-5.5")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

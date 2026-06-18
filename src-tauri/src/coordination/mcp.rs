@@ -3711,9 +3711,9 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     if start_task_plan_is_direct_architecture_graph_work(&start_plan) {
         return Ok(api_error(
             "architecture_graph_direct_edit",
-            "Do not create a normal task for architecture graph-only work. Call architecture_context/list/reference as needed, edit .agents/architectures/graphs/*.arch directly in the visible repo root, and report the graph path when done. If this work also edits code or docs, call start_task again with a plan naming the non-architecture files.",
+            "Do not create a normal task for architecture graph-only work. Call architecture_context/list/reference as needed, edit globalGraphsRoot/*.arch directly, and report the graph path when done. If this work also edits code or docs, call start_task again with a plan naming the non-architecture files.",
             json!({
-                "direct_artifact_root": ".agents/architectures/graphs",
+                "direct_artifact_root": "globalGraphsRoot",
                 "plan": start_plan,
             }),
         ));
@@ -4136,7 +4136,7 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
     if input["__explicit_task_id_missing"].as_bool() == Some(true) {
         return Ok(api_error(
             "task_id_required_after_start_task",
-            "acquire_lease requires the task_id returned by start_task; implicit session task defaults are not allowed for write leases.",
+            "acquire_lease records optional coordination bookkeeping and requires the task_id returned by start_task.",
             json!({}),
         ));
     }
@@ -4146,7 +4146,7 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
     if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
         return Ok(api_error(
             "start_task_required_before_lease",
-            "Call start_task for this session and pass its returned task_id before acquiring a write lease.",
+            "Call start_task for this session and pass its returned task_id before recording lease bookkeeping.",
             json!({"task_id": task_id, "session_id": session_id}),
         ));
     }
@@ -4393,6 +4393,8 @@ fn optional_start_task_text(input: &Value) -> Option<String> {
 fn start_task_plan_is_direct_architecture_graph_work(plan: &str) -> bool {
     let normalized = plan.to_ascii_lowercase();
     let graph_intent = [
+        "globalgraphsroot",
+        "diffforge_architecture_graphs_root",
         ".agents/architectures/graphs",
         ".arch",
         "architecture graph",
@@ -5149,7 +5151,7 @@ fn tool_description(name: &str) -> String {
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
         "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
         "architecture_revision_read" => "Read one local-only architecture revision snapshot by graph_id and revision_id. Use explicit revision reads only when the user asks to compare, recover, or reuse old architecture content.".to_string(),
-        "architecture_revision_restore" => "Restore one local-only architecture revision into .agents/architectures/graphs/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
+        "architecture_revision_restore" => "Restore one local-only architecture revision into globalGraphsRoot/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
         "list_todo_targets" => "List same-account device/workspace targets from the local Rust SQLite todo mirror. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call. Use this before send_todos instead of guessing device ids.".to_string(),
         "send_todos" => "Send one or more cloud todos to one or more same-account device/workspace targets and return a batch id plus child dispatch ids. Supports single text/target shortcuts and multi-item/multi-target fanout. mode=listed leaves normal listed todos; mode=queued actively queues online targets and lets Cloud fall back for offline targets.".to_string(),
         "get_todo_status" => "Return compact current status rows for todo batches, dispatch ids, todo ids, or target filters from the local Rust SQLite todo mirror only. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
@@ -5513,7 +5515,10 @@ mod tests {
             "Create a new architecture graph for the React context auth flow."
         ));
         assert!(start_task_plan_is_direct_architecture_graph_work(
-            "Update .agents/architectures/graphs/auth-flow.arch with the new API corridor."
+            "Update globalGraphsRoot/auth-flow.arch with the new API corridor."
+        ));
+        assert!(start_task_plan_is_direct_architecture_graph_work(
+            "Update $DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT/auth-flow.arch with the new API corridor."
         ));
         assert!(!start_task_plan_is_direct_architecture_graph_work(
             "Implement code for the auth flow based on the architecture graph."

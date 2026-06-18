@@ -12,7 +12,6 @@ export function terminalPromptSubmittedPayloadIsAuthoritative(payload = {}) {
   if (
     promptSource === "activity_hook_user_prompt_submit"
     || promptSource === "cli_hook_user_prompt_submit"
-    || promptSource === "prompt_event_submit_metadata"
   ) {
     return String(
       payload?.prompt || payload?.observedPrompt || payload?.expectedPrompt || "",

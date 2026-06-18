@@ -196,6 +196,7 @@ const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
+const TERMINAL_PROVIDER_SESSION_BOUND_EVENT: &str = "forge-terminal-provider-session-bound";
 const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT: &str = "diffforge:terminal-architecture-activity";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
@@ -967,6 +968,53 @@ struct ForgeDictationWarmSlot {
 }
 
 #[derive(Clone)]
+struct TerminalRuntimeSnapshot {
+    status: String,
+    activity_status: String,
+    command_phase: String,
+    input_ready: bool,
+    input_ready_at: Option<String>,
+    prompt_ready_at: Option<String>,
+    completed_at: Option<String>,
+    provider_session_id: Option<String>,
+    native_session_id: Option<String>,
+    provider_turn_id: Option<String>,
+    turn_id: Option<String>,
+    source: String,
+    event_type: String,
+    hook_event_name: String,
+    updated_at_ms: u64,
+}
+
+impl TerminalRuntimeSnapshot {
+    fn opened_idle(provider_session_id: Option<String>) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let now = crate::coordination::kernel::now_rfc3339();
+        let native_session_id = provider_session_id.clone();
+        Self {
+            status: "active".to_string(),
+            activity_status: "idle".to_string(),
+            command_phase: "ready".to_string(),
+            input_ready: true,
+            input_ready_at: Some(now.clone()),
+            prompt_ready_at: Some(now),
+            completed_at: None,
+            provider_session_id,
+            native_session_id,
+            provider_turn_id: None,
+            turn_id: None,
+            source: "terminal-open".to_string(),
+            event_type: "opened".to_string(),
+            hook_event_name: "TerminalOpen".to_string(),
+            updated_at_ms: now_ms,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct TerminalInstance {
     id: u64,
     child: Arc<Mutex<Option<Box<dyn Child + Send>>>>,
@@ -982,6 +1030,7 @@ struct TerminalInstance {
     coordination: Option<TerminalCoordinationSession>,
     session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
+    runtime: Arc<StdMutex<TerminalRuntimeSnapshot>>,
 }
 
 #[derive(Default)]
@@ -1324,6 +1373,7 @@ impl TerminalInstance {
                 coordination,
                 session_mode,
                 metadata,
+                runtime: Arc::new(StdMutex::new(TerminalRuntimeSnapshot::opened_idle(None))),
             },
             reader,
         )
@@ -1834,6 +1884,33 @@ struct TerminalOpenResult {
     coordination_mode: Option<String>,
     session_mode: String,
     file_authority: String,
+    provider_session_id: Option<String>,
+    native_session_id: Option<String>,
+    requested_provider_session_id: Option<String>,
+    activity_status: String,
+    command_phase: String,
+    input_ready: bool,
+    input_ready_at: Option<String>,
+    terminal_work_state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalProviderSessionRecordRequest {
+    pane_id: String,
+    instance_id: Option<u64>,
+    provider_session_id: String,
+    source: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalProviderSessionRecordResult {
+    pane_id: String,
+    instance_id: u64,
+    provider_session_id: String,
+    recorded: bool,
+    source: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -2025,6 +2102,20 @@ struct AudioInputDeviceSummary {
     device_id: String,
     label: String,
     is_default: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioInputPermissionStatus {
+    platform: &'static str,
+    microphone_required: bool,
+    microphone_granted: bool,
+    microphone_promptable: bool,
+    microphone_denied: bool,
+    microphone_restricted: bool,
+    microphone_settings_url: &'static str,
+    status: String,
+    message: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -4692,6 +4783,8 @@ pub fn run() {
             select_whisper_model,
             uninstall_whisper_model,
             audio_input_devices,
+            audio_input_permission_status,
+            open_audio_input_permissions,
             start_audio_input_monitor,
             stop_audio_input_monitor,
             begin_audio_input_capture,
@@ -4734,6 +4827,7 @@ pub fn run() {
             snipping_begin_area_snip,
             snipping_begin_area_recording,
             snipping_area_overlay_status,
+            snipping_area_overlay_ready,
             snipping_log_area_cursor_event,
             snipping_finish_area_snip,
             snipping_start_area_recording,
@@ -4861,6 +4955,7 @@ pub fn run() {
             todo_dispatch_notify_queue_drained,
             todo_dispatch_queue_sync,
             todo_dispatch_dispatcher_heartbeat,
+            todo_dispatch_backend_submit_now,
             todo_dispatch_backend_submissions_drain,
             todo_dispatch_overview,
             todo_dispatch_queue_get,
@@ -4909,6 +5004,7 @@ pub fn run() {
             workspace_git_generate_commit_message,
             workspace_git_commit_and_push,
             terminal_open,
+            terminal_record_provider_session,
             terminal_start_agent,
             terminal_start_agent_many,
             set_terminal_audio_input_target,

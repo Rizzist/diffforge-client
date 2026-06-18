@@ -32,10 +32,13 @@ import { Logout } from "@styled-icons/material-rounded/Logout";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { Mic } from "@styled-icons/material-rounded/Mic";
 import { MicOff } from "@styled-icons/material-rounded/MicOff";
+import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
 import { Remove } from "@styled-icons/material-rounded/Remove";
 import { OpenInBrowser } from "@styled-icons/material-rounded/OpenInBrowser";
 import { Pending } from "@styled-icons/material-rounded/Pending";
+import { PrivacyTip } from "@styled-icons/material-rounded/PrivacyTip";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
+import { Security } from "@styled-icons/material-rounded/Security";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { ContentCut } from "@styled-icons/material-rounded/ContentCut";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
@@ -8052,10 +8055,11 @@ export const AudioDictionaryWordList = styled.div`
   gap: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 4px 0;
+  padding: 4px 0 52px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   background: rgba(2, 4, 8, 0.48);
+  scroll-padding-bottom: 52px;
 
   html[data-forge-theme="light"] & {
     background: #ffffff;
@@ -8063,16 +8067,22 @@ export const AudioDictionaryWordList = styled.div`
 `;
 
 export const AudioDictionaryWordRow = styled.div`
+  --audio-word-dot-center-x: 19px;
+  --audio-word-row-padding-top: 6px;
+  --audio-word-text-line-height: 17.4px;
+  --audio-word-dot-center-y: calc(var(--audio-word-row-padding-top) + (var(--audio-word-text-line-height) / 2));
+  --audio-word-dot-radius: 3px;
+  --audio-word-dot-size: 6px;
   --audio-word-dot-color: #7db0ff;
 
   position: relative;
   display: grid;
   min-width: 0;
   min-height: 35px;
-  grid-template-columns: 22px minmax(0, 1fr) 28px;
-  align-items: center;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
   gap: 0;
-  padding: 6px 7px 6px 10px;
+  padding: var(--audio-word-row-padding-top) 10px 6px 10px;
   color: #edf5ff;
   background: transparent;
   transition:
@@ -8081,8 +8091,10 @@ export const AudioDictionaryWordRow = styled.div`
 
   &::before {
     content: "";
-    width: 6px;
-    height: 6px;
+    width: var(--audio-word-dot-size);
+    height: var(--audio-word-dot-size);
+    margin-top: calc(var(--audio-word-dot-center-y) - var(--audio-word-row-padding-top) - var(--audio-word-dot-radius));
+    margin-left: calc(var(--audio-word-dot-center-x) - 10px - var(--audio-word-dot-radius));
     justify-self: center;
     border-radius: 999px;
     background: var(--audio-word-dot-color);
@@ -8096,7 +8108,7 @@ export const AudioDictionaryWordRow = styled.div`
 
   &:hover::before,
   &:focus-within::before {
-    opacity: 0.44;
+    opacity: 0;
   }
 
   > button {
@@ -8128,7 +8140,7 @@ export const AudioDictionaryWordText = styled.span`
   min-width: 0;
   overflow: hidden;
   color: inherit;
-  font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font: 12px/var(--audio-word-text-line-height) "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   letter-spacing: 0;
   overflow-wrap: anywhere;
   text-overflow: ellipsis;
@@ -8136,12 +8148,16 @@ export const AudioDictionaryWordText = styled.span`
 `;
 
 export const AudioDictionaryWordDeleteButton = styled.button`
+  position: absolute;
+  top: calc(var(--audio-word-dot-center-y) - 11px);
+  left: calc(var(--audio-word-dot-center-x) - 11px);
+  z-index: 3;
   display: grid;
   width: 22px;
   height: 22px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(239, 107, 107, 0.14);
+  border: 0;
   border-radius: 6px;
   color: #ffd0d0;
   background: rgba(127, 29, 29, 0.18);
@@ -14754,6 +14770,212 @@ export const SettingsPage = styled.section`
   }
 `;
 
+export const SettingsTabNav = styled.nav`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  width: min(100%, 620px);
+  padding: 4px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 10, 16, 0.64);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
+`;
+
+export const SettingsTabButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 780;
+  letter-spacing: 0;
+  cursor: pointer;
+
+  svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: rgba(125, 160, 205, 0.1);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(100, 143, 226, 0.52);
+    color: var(--forge-text);
+    background:
+      linear-gradient(180deg, rgba(83, 130, 215, 0.28), rgba(83, 130, 215, 0.12)),
+      rgba(42, 70, 118, 0.34);
+    box-shadow: inset 0 0 0 1px rgba(160, 190, 255, 0.12);
+  }
+`;
+
+const settingsPermissionPulse = keyframes`
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  42% { opacity: 0.66; }
+  62% { opacity: 1; }
+  100% { opacity: 0; }
+`;
+
+export const SettingsPermissionGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+export const SettingsPermissionRow = styled.section`
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 250, 0.03), rgba(244, 247, 250, 0.01)),
+    rgba(17, 22, 29, 0.72);
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  &[data-tone="ready"] {
+    border-color: rgba(91, 196, 125, 0.28);
+  }
+
+  &[data-tone="attention"] {
+    border-color: rgba(223, 165, 90, 0.38);
+  }
+
+  &[data-tone="neutral"] {
+    border-color: rgba(125, 160, 205, 0.18);
+  }
+`;
+
+export const SettingsPermissionIcon = styled.span`
+  display: inline-flex;
+  width: 38px;
+  height: 38px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(125, 160, 205, 0.22);
+  border-radius: 8px;
+  color: rgba(153, 190, 255, 0.96);
+  background: rgba(44, 72, 121, 0.22);
+
+  svg {
+    width: 19px;
+    height: 19px;
+  }
+
+  ${SettingsPermissionRow}[data-tone="attention"] & {
+    border-color: rgba(223, 165, 90, 0.32);
+    color: rgba(252, 201, 126, 0.96);
+    background: rgba(121, 80, 28, 0.22);
+  }
+
+  ${SettingsPermissionRow}[data-tone="ready"] & {
+    border-color: rgba(91, 196, 125, 0.28);
+    color: rgba(124, 220, 154, 0.96);
+    background: rgba(34, 92, 57, 0.2);
+  }
+`;
+
+export const SettingsPermissionMain = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+`;
+
+export const SettingsPermissionTopline = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+`;
+
+export const SettingsPermissionCopy = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+`;
+
+export const SettingsPermissionStatus = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 1px solid rgba(125, 160, 205, 0.2);
+  border-radius: 999px;
+  color: var(--forge-text-soft);
+  background: rgba(12, 17, 25, 0.56);
+  font-size: 11px;
+  font-weight: 820;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+
+  &[data-tone="ready"] {
+    border-color: rgba(91, 196, 125, 0.34);
+    color: rgba(124, 220, 154, 0.95);
+    background: rgba(38, 118, 71, 0.14);
+  }
+
+  &[data-tone="attention"] {
+    border-color: rgba(223, 165, 90, 0.36);
+    color: rgba(252, 201, 126, 0.96);
+    background: rgba(121, 80, 28, 0.16);
+  }
+`;
+
+export const SettingsPermissionActions = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+
+  button {
+    min-height: 34px;
+  }
+`;
+
+export const SettingsPermissionHighlight = styled.span`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  border: 2px solid rgba(250, 204, 21, 0.98);
+  border-radius: inherit;
+  box-shadow:
+    0 0 15px 4px rgba(250, 204, 21, 0.58),
+    0 0 38px 10px rgba(250, 204, 21, 0.3),
+    inset 0 0 20px rgba(250, 204, 21, 0.22);
+  opacity: 0;
+  animation: ${settingsPermissionPulse} 2s ease-in-out infinite;
+`;
+
 export const AccountSettingsPanel = styled.section`
   display: grid;
   gap: 10px;
@@ -16064,6 +16286,18 @@ export const ButtonMicIcon = styled(Mic)`
 `;
 
 export const ButtonMicOffIcon = styled(MicOff)`
+  ${buttonIconSize}
+`;
+
+export const ButtonNotificationIcon = styled(NotificationsActive)`
+  ${buttonIconSize}
+`;
+
+export const ButtonPrivacyIcon = styled(PrivacyTip)`
+  ${buttonIconSize}
+`;
+
+export const ButtonSecurityIcon = styled(Security)`
   ${buttonIconSize}
 `;
 

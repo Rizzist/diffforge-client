@@ -44,6 +44,68 @@ async function ensurePluginPermission(plugin) {
   return permissionGranted;
 }
 
+export async function getNativeNotificationPermissionStatus() {
+  if (!readSettings().enabled) {
+    return {
+      appEnabled: false,
+      granted: false,
+      permission: "disabled",
+      message: "Native notifications are disabled in Diff Forge settings.",
+    };
+  }
+
+  try {
+    const plugin = await loadNotificationPlugin();
+    if (plugin && typeof plugin.isPermissionGranted === "function") {
+      const granted = await plugin.isPermissionGranted();
+      const browserPermission = typeof window !== "undefined" && window.Notification
+        ? window.Notification.permission
+        : "";
+      return {
+        appEnabled: true,
+        granted,
+        permission: granted ? "granted" : browserPermission || "default",
+        message: granted
+          ? "Native notifications are enabled."
+          : "Allow notifications to receive background todo and agent alerts.",
+      };
+    }
+  } catch {
+    // Fall through to the web Notification API status.
+  }
+
+  const permission = typeof window !== "undefined" && window.Notification
+    ? window.Notification.permission
+    : "unavailable";
+  return {
+    appEnabled: true,
+    granted: permission === "granted",
+    permission,
+    message: permission === "granted"
+      ? "Native notifications are enabled."
+      : permission === "denied"
+        ? "Enable notifications for Diff Forge AI in System Settings."
+        : "Allow notifications to receive background todo and agent alerts.",
+  };
+}
+
+export async function requestNativeNotificationPermission() {
+  const plugin = await loadNotificationPlugin();
+  if (plugin && typeof plugin.requestPermission === "function") {
+    const permission = await plugin.requestPermission();
+    permissionGranted = permission === "granted";
+    return getNativeNotificationPermissionStatus();
+  }
+
+  if (typeof window !== "undefined" && typeof window.Notification === "function") {
+    const permission = await window.Notification.requestPermission();
+    permissionGranted = permission === "granted";
+    return getNativeNotificationPermissionStatus();
+  }
+
+  return getNativeNotificationPermissionStatus();
+}
+
 /**
  * Send a native OS notification. By default it is suppressed while the app
  * window is focused and visible, because in-app SFX and badges already cover

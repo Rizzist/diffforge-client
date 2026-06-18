@@ -115,11 +115,15 @@ function normalizeAudioTranscriptionProvider(value) {
 }
 
 function normalizeAudioRecorderMode(value) {
-  if (value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK || value === AUDIO_RECORDER_MODE_HYBRID) {
+  if (
+    value === AUDIO_RECORDER_MODE_PUSH_TO_TALK
+    || value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
+    || value === AUDIO_RECORDER_MODE_HYBRID
+  ) {
     return value;
   }
 
-  return AUDIO_RECORDER_MODE_PUSH_TO_TALK;
+  return AUDIO_RECORDER_MODE_HYBRID;
 }
 
 export function normalizeOrchestratorVoiceSubmissionMode(value) {
@@ -469,6 +473,16 @@ export function markAudioInputSetupReady() {
   }
 }
 
+export function clearAudioInputSetupReady() {
+  if (canUseStorage()) {
+    window.localStorage.removeItem(AUDIO_INPUT_SETUP_STORAGE_KEY);
+  }
+}
+
+export function audioInputPermissionNeedsAttention(status) {
+  return Boolean(status?.microphoneRequired && !status?.microphoneGranted);
+}
+
 export function readAutoOpenAudioRecorder() {
   return canUseStorage() && window.localStorage.getItem(AUDIO_RECORDER_AUTO_OPEN_STORAGE_KEY) === "true";
 }
@@ -481,7 +495,7 @@ export function writeAutoOpenAudioRecorder(enabled) {
 
 export function readAudioRecorderMode() {
   if (!canUseStorage()) {
-    return AUDIO_RECORDER_MODE_PUSH_TO_TALK;
+    return AUDIO_RECORDER_MODE_HYBRID;
   }
 
   return normalizeAudioRecorderMode(window.localStorage.getItem(AUDIO_RECORDER_MODE_STORAGE_KEY));
@@ -1087,6 +1101,14 @@ export function getAudioInputErrorMessage(error, fallback = "Unable to open the 
 
 export async function listAudioInputDevices() {
   return invoke("audio_input_devices");
+}
+
+export async function getAudioInputPermissionStatus() {
+  return invoke("audio_input_permission_status");
+}
+
+export async function openAudioInputPermissions() {
+  return invoke("open_audio_input_permissions");
 }
 
 export async function prepareWhisperModel() {

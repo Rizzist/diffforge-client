@@ -1,6 +1,7 @@
 const AUDIO_PUSH_TO_TALK_EVENT: &str = "forge-audio-push-to-talk";
 const AUDIO_CANCEL_EVENT: &str = "forge-audio-cancel";
 const AUDIO_SHORTCUTS_CHANGED_EVENT: &str = "forge-audio-shortcuts-changed";
+const AUDIO_HOTKEY_ATTENTION_EVENT: &str = "forge-audio-hotkey-attention";
 const AUDIO_SHORTCUT_SETTINGS_FILE: &str = "audio-shortcuts.json";
 const AUDIO_HANDSFREE_INSERT_DELAY_MS: u64 = 160;
 const AUDIO_FN_KEY_SHORTCUT: &str = "Fn";
@@ -1964,6 +1965,45 @@ fn emit_audio_push_to_talk_event(
     }
 }
 
+fn audio_shortcut_permissions_need_attention(status: &AudioShortcutPermissionStatus) -> bool {
+    (status.accessibility_required && !status.accessibility_granted) || status.quarantine_detected
+}
+
+fn focus_main_window_for_audio_attention(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn emit_audio_hotkey_attention(
+    app: &AppHandle,
+    reason: &str,
+    shortcut: &str,
+    targets: &[&str],
+    message: &str,
+) {
+    focus_main_window_for_audio_attention(app);
+    emit_audio_shortcuts_changed(app);
+    let _ = app.emit_to(
+        "main",
+        AUDIO_HOTKEY_ATTENTION_EVENT,
+        json!({
+            "id": current_time_ms(),
+            "reason": reason,
+            "shortcut": shortcut,
+            "targets": targets,
+            "message": message,
+        }),
+    );
+}
+
 fn audio_push_to_talk_status_for(app: &AppHandle) -> AudioPushToTalkEvent {
     let pressed = AUDIO_PUSH_TO_TALK_IS_DOWN.load(Ordering::Acquire);
 
@@ -2064,6 +2104,45 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
 
     match state {
         ShortcutState::Pressed => {
+            let permission_status = audio_shortcut_permission_status();
+            if audio_shortcut_permissions_need_attention(&permission_status) {
+                AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
+                log_audio_diagnostic_event(
+                    "audio.ptt.handle.ignored_permissions",
+                    json!({
+                        "message": clean_whisper_local_audio_log_text(&permission_status.message),
+                    }),
+                );
+                emit_audio_hotkey_attention(
+                    &app,
+                    "permissions",
+                    &shortcut,
+                    &["permissions"],
+                    &permission_status.message,
+                );
+                return false;
+            }
+
+            let input_permission_status = audio_input_permission_status_for_platform();
+            if audio_input_permissions_need_attention(&input_permission_status) {
+                AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
+                log_audio_diagnostic_event(
+                    "audio.ptt.handle.ignored_microphone_permissions",
+                    json!({
+                        "message": clean_whisper_local_audio_log_text(&input_permission_status.message),
+                        "status": input_permission_status.status,
+                    }),
+                );
+                emit_audio_hotkey_attention(
+                    &app,
+                    "microphone-permission",
+                    &shortcut,
+                    &["input", "microphone"],
+                    &input_permission_status.message,
+                );
+                return false;
+            }
+
             let widget_visible = match audio_widget_visible_on_main_thread(&app) {
                 Ok(visible) => {
                     log_audio_diagnostic_event(
@@ -2088,6 +2167,13 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
             if !widget_visible {
                 AUDIO_PUSH_TO_TALK_IS_DOWN.store(false, Ordering::Release);
                 log_audio_diagnostic_event("audio.ptt.handle.ignored_not_visible", json!({}));
+                emit_audio_hotkey_attention(
+                    &app,
+                    "recorder",
+                    &shortcut,
+                    &["recorder"],
+                    "Open the floating recorder before using the audio hotkey.",
+                );
                 return false;
             }
 
@@ -2133,6 +2219,13 @@ fn handle_audio_push_to_talk_state(app: AppHandle, state: ShortcutState, shortcu
                     log_audio_diagnostic_event(
                         "audio.ptt.press_task.ignored_not_visible",
                         json!({}),
+                    );
+                    emit_audio_hotkey_attention(
+                        &app,
+                        "recorder",
+                        &shortcut,
+                        &["recorder"],
+                        "Open the floating recorder before using the audio hotkey.",
                     );
                     return;
                 }

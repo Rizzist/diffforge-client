@@ -290,6 +290,7 @@ pub(crate) fn app_enter_background_internal(app: &AppHandle) {
         // Pre-create the hidden popover so the first tray click is instant.
         let _ = background_monitor_window(&main_app);
         background_mode_emit_changed(&main_app, true);
+        todo_dispatch_wake_background_dispatcher(main_app.clone());
         log_terminal_status_event(
             "backend.background_mode.entered",
             json!({ "monitor_window": BACKGROUND_MONITOR_WINDOW_LABEL }),
