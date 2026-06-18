@@ -4657,16 +4657,25 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     };
   }
 
-  if (["route_provisioning", "assignment_booting", "dns_propagating"].includes(statusKey)) {
+  if (
+    [
+      "route_initializing",
+      "route_provisioning",
+      "assignment_booting",
+      "dns_propagating",
+      "route_not_configured",
+      "route_not_browser_ready",
+    ].includes(statusKey)
+  ) {
     return {
       connectedDevices,
-      detail: "Your cloud workspace is being prepared. Local work is available while it starts.",
+      detail: "Your cloud workspace is initializing. Local work is available while it starts.",
       deviceLiveState,
       knownDevices,
       stage: "cloud_instance",
       status: "active",
       storageUsage,
-      title: "Provisioning",
+      title: "Initializing",
       workspaceTodos,
     };
   }
@@ -4953,9 +4962,12 @@ const CLOUD_SYNC_LOCAL_STATUSES = [
   "auth_missing",
 ];
 const CLOUD_SYNC_PROVISIONING_STATUSES = [
+  "route_initializing",
   "route_provisioning",
   "assignment_booting",
   "dns_propagating",
+  "route_not_configured",
+  "route_not_browser_ready",
 ];
 const CLOUD_SYNC_SYNCING_STATUSES = [
   "desktop_registering",
@@ -26018,7 +26030,7 @@ export default function App() {
     live: "Live Sync",
     offline: "Offline",
     offline_permanent: "Offline",
-    provisioning: "Provisioning",
+    provisioning: "Initializing",
     syncing: "Syncing",
     upgrade: "Upgrade",
   }[cloudSyncPillState] || "";
@@ -26034,7 +26046,7 @@ export default function App() {
     offline: "Cloud sync is unavailable right now. Local workspace features remain available.",
     offline_permanent:
       "Offline mode. Auto-reconnect has stopped — click to retry connecting.",
-    provisioning: "Your cloud workspace is starting. Local workspace features remain available.",
+    provisioning: "Your cloud workspace is initializing. Local workspace features remain available.",
     syncing: cloudSyncDirectionSummary
       ? `Syncing ${cloudSyncDirectionSummary}.`
       : cloudSyncControlCount > 0

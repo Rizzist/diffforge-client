@@ -10,6 +10,10 @@ const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
 const CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 15;
+const CLOUD_MCP_ROUTE_INITIALIZING_TIMEOUT_SECS: u64 = 150;
+const CLOUD_MCP_ROUTE_INITIALIZING_MIN_POLL_MS: u64 = 1_500;
+const CLOUD_MCP_ROUTE_INITIALIZING_MAX_POLL_MS: u64 = 8_000;
+const CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS: u64 = 2_500;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
 const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS: u64 = 45;
@@ -3726,7 +3730,12 @@ fn cloud_mcp_sync_connection_for_runtime(connected: bool, status: &str) -> &'sta
             "blocked"
         }
         "starting" | "idle" | "signed_out" | "auth_missing" => "local",
-        "route_provisioning" | "assignment_booting" | "dns_propagating" => "provisioning",
+        "route_initializing"
+        | "route_provisioning"
+        | "assignment_booting"
+        | "dns_propagating"
+        | "route_not_configured"
+        | "route_not_browser_ready" => "provisioning",
         "desktop_registering" | "websocket_handshaking" | "handshaking" => "syncing",
         "websocket_retrying" | "retrying" => "offline",
         _ => "connecting",
@@ -15991,75 +16000,136 @@ async fn cloud_mcp_resolve_ws_target(
     )
     .await;
     cloud_mcp_set_global_ws_phase(state, "resolving_route", "resolving_route").await;
-    match cloud_mcp_fetch_direct_route_async(
-        base_url,
-        endpoint_path,
-        &bearer,
-        &billing_scope_type,
-        team_id.as_deref(),
-        &plan_name,
-        device_limit,
-        device_id.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(target)) => {
-            cloud_mcp_note_direct_route(&target);
-            cloud_mcp_record_signin_diagnostic(
-                state,
-                "route.resolve",
-                "ok",
-                "Cloud MCP direct route resolved",
-                json!({"transport": target.transport, "ws_url": target.ws_url}),
-            )
-            .await;
-            Ok(target)
-        }
-        Ok(None) => {
-            let message = "Balancer did not offer a direct route (direct routing disabled or backend unsupported).".to_string();
-            if let Some(target) = cloud_mcp_last_direct_route_fresh(endpoint_path) {
+    let route_started = Instant::now();
+    let mut route_attempt: u64 = 0;
+    loop {
+        route_attempt = route_attempt.saturating_add(1);
+        match cloud_mcp_fetch_direct_route_async(
+            base_url,
+            endpoint_path,
+            &bearer,
+            &billing_scope_type,
+            team_id.as_deref(),
+            &plan_name,
+            device_limit,
+            device_id.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(target)) => {
+                cloud_mcp_note_direct_route(&target);
                 cloud_mcp_record_signin_diagnostic(
                     state,
                     "route.resolve",
-                    "warn",
-                    "Balancer offered no direct route; reusing the last known direct route",
-                    json!({"transport": target.transport, "ws_url": target.ws_url}),
+                    "ok",
+                    "Cloud MCP direct route resolved",
+                    json!({
+                        "attempt": route_attempt,
+                        "elapsed_ms": route_started.elapsed().as_millis() as u64,
+                        "transport": target.transport,
+                        "ws_url": target.ws_url
+                    }),
                 )
                 .await;
                 return Ok(target);
             }
-            cloud_mcp_record_signin_diagnostic(
-                state,
-                "route.resolve",
-                "error",
-                &message,
-                json!({"transport": "direct_route_unavailable"}),
-            )
-            .await;
-            Err(message)
-        }
-        Err(error) => {
-            let message = format!("Cloud MCP direct route unavailable: {error}");
-            if let Some(target) = cloud_mcp_last_direct_route_fresh(endpoint_path) {
+            Ok(None) => {
+                let message = "Balancer did not offer a direct route (direct routing disabled or backend unsupported).".to_string();
+                if let Some(target) = cloud_mcp_last_direct_route_fresh(endpoint_path) {
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "route.resolve",
+                        "warn",
+                        "Balancer offered no direct route; reusing the last known direct route",
+                        json!({"transport": target.transport, "ws_url": target.ws_url}),
+                    )
+                    .await;
+                    return Ok(target);
+                }
                 cloud_mcp_record_signin_diagnostic(
                     state,
                     "route.resolve",
-                    "warn",
-                    &format!("Balancer route request failed; reusing the last known direct route: {error}"),
-                    json!({"transport": target.transport, "ws_url": target.ws_url}),
+                    "error",
+                    &message,
+                    json!({"transport": "direct_route_unavailable"}),
                 )
                 .await;
-                return Ok(target);
+                return Err(message);
             }
-            cloud_mcp_record_signin_diagnostic(
-                state,
-                "route.resolve",
-                "error",
-                &message,
-                json!({"transport": "direct_route_unavailable"}),
-            )
-            .await;
-            Err(message)
+            Err(error) => {
+                if cloud_mcp_route_error_runtime_status(&error) == Some("route_initializing") {
+                    cloud_mcp_set_global_ws_phase(state, "route_initializing", "route_initializing")
+                        .await;
+                    let elapsed = route_started.elapsed();
+                    if elapsed >= Duration::from_secs(CLOUD_MCP_ROUTE_INITIALIZING_TIMEOUT_SECS) {
+                        let message = format!(
+                            "Cloud MCP route initialization timed out after {CLOUD_MCP_ROUTE_INITIALIZING_TIMEOUT_SECS}s."
+                        );
+                        cloud_mcp_record_signin_diagnostic(
+                            state,
+                            "route.resolve",
+                            "error",
+                            &message,
+                            json!({
+                                "attempt": route_attempt,
+                                "elapsed_ms": elapsed.as_millis() as u64,
+                                "last_error": clean_terminal_telemetry_text(&error),
+                                "transport": "direct_route_unavailable"
+                            }),
+                        )
+                        .await;
+                        return Err(message);
+                    }
+
+                    let poll_delay = cloud_mcp_route_initializing_poll_delay(&error);
+                    let remaining =
+                        Duration::from_secs(CLOUD_MCP_ROUTE_INITIALIZING_TIMEOUT_SECS)
+                            .saturating_sub(elapsed);
+                    let sleep_for = poll_delay.min(remaining);
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "route.resolve",
+                        "info",
+                        "Cloud MCP route is initializing; polling for readiness",
+                        json!({
+                            "attempt": route_attempt,
+                            "elapsed_ms": elapsed.as_millis() as u64,
+                            "poll_ms": sleep_for.as_millis() as u64,
+                            "retry_after_ms": cloud_mcp_route_error_retry_after_ms(&error),
+                        }),
+                    )
+                    .await;
+                    tokio::select! {
+                        _ = sleep(sleep_for) => {}
+                        _ = state.global_ws_reconnect.notified() => {
+                            return Err("Cloud MCP route initialization was interrupted by a reconnect request.".to_string());
+                        }
+                    }
+                    continue;
+                }
+
+                let message = format!("Cloud MCP direct route unavailable: {error}");
+                if let Some(target) = cloud_mcp_last_direct_route_fresh(endpoint_path) {
+                    cloud_mcp_record_signin_diagnostic(
+                        state,
+                        "route.resolve",
+                        "warn",
+                        &format!("Balancer route request failed; reusing the last known direct route: {error}"),
+                        json!({"transport": target.transport, "ws_url": target.ws_url}),
+                    )
+                    .await;
+                    return Ok(target);
+                }
+                cloud_mcp_record_signin_diagnostic(
+                    state,
+                    "route.resolve",
+                    "error",
+                    &message,
+                    json!({"transport": "direct_route_unavailable"}),
+                )
+                .await;
+                return Err(message);
+            }
         }
     }
 }
@@ -16644,7 +16714,15 @@ async fn cloud_mcp_fetch_direct_route_async(
             .get("waiting")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if waiting || cloud_mcp_route_state_is_provisioning(route_state, backend_status) {
+        let initializing = parsed
+            .get("initializing")
+            .or_else(|| parsed.get("initializingWorkspace"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if initializing
+            || waiting
+            || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
+        {
             return Err(format!(
                 "Cloud MCP route pending: route_state={route_state}; backend_status={backend_status}; retry_after_ms={retry_after_ms}"
             ));
@@ -16671,16 +16749,40 @@ fn cloud_mcp_route_state_is_provisioning(route_state: &str, backend_status: &str
 fn cloud_mcp_route_error_runtime_status(error: &str) -> Option<&'static str> {
     let error = error.to_ascii_lowercase();
     if error.contains("route pending")
+        || error.contains("route_initializing")
         || error.contains("assignment_booting")
         || error.contains("dns_propagating")
+        || error.contains("route_not_configured")
+        || error.contains("route_not_browser_ready")
         || error.contains("backend_status=booting")
         || error.contains("backend_status=pending")
         || error.contains("backend_status=starting")
         || error.contains("backend_status=provisioning")
     {
-        return Some("route_provisioning");
+        return Some("route_initializing");
     }
     None
+}
+
+fn cloud_mcp_route_error_retry_after_ms(error: &str) -> Option<u64> {
+    let marker = "retry_after_ms=";
+    let start = error.find(marker)? + marker.len();
+    let digits = error[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<u64>().ok()
+}
+
+fn cloud_mcp_route_initializing_poll_delay(error: &str) -> Duration {
+    let delay_ms = cloud_mcp_route_error_retry_after_ms(error)
+        .filter(|value| *value > 0)
+        .unwrap_or(CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS)
+        .clamp(
+            CLOUD_MCP_ROUTE_INITIALIZING_MIN_POLL_MS,
+            CLOUD_MCP_ROUTE_INITIALIZING_MAX_POLL_MS,
+        );
+    Duration::from_millis(delay_ms)
 }
 
 fn cloud_mcp_direct_target_from_route(
@@ -36026,6 +36128,28 @@ mod cloud_mcp_tests {
         );
         assert_eq!(cloud_mcp_device_limit_from_value(Some(0), "ultra"), Some(0));
         assert_eq!(cloud_mcp_device_limit_from_value(None, "pro"), Some(15));
+    }
+
+    #[test]
+    fn route_pending_errors_map_to_initializing_with_bounded_retry() {
+        let error =
+            "Cloud MCP route pending: route_state=assignment_booting; backend_status=booting; retry_after_ms=12000";
+        assert_eq!(
+            cloud_mcp_route_error_runtime_status(error),
+            Some("route_initializing")
+        );
+        assert_eq!(cloud_mcp_route_error_retry_after_ms(error), Some(12000));
+        assert_eq!(
+            cloud_mcp_route_initializing_poll_delay(error),
+            Duration::from_millis(CLOUD_MCP_ROUTE_INITIALIZING_MAX_POLL_MS)
+        );
+
+        let no_hint =
+            "Cloud MCP route pending: route_state=route_not_configured; backend_status=active";
+        assert_eq!(
+            cloud_mcp_route_initializing_poll_delay(no_hint),
+            Duration::from_millis(CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS)
+        );
     }
 
     #[test]
