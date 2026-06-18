@@ -82,6 +82,7 @@ test("visible terminal rail preserves exact activity status", () => {
 test("queue sendability is driven by idle activity status only", () => {
   assert.equal(terminalActivityStatusIsSendable("idle"), true);
   assert.equal(terminalActivityStatusIsSendable("input_ready"), true);
+  assert.equal(terminalActivityStatusIsSendable("interrupted"), true);
   assert.equal(terminalActivityStatusIsSendable("prompt_ready"), false);
   assert.equal(terminalActivityStatusIsSendable("active"), false);
   assert.equal(terminalActivityStatusIsSendable("thinking"), false);
@@ -119,7 +120,8 @@ test("canonical execution phase clears stale thinking after interruption", () =>
     turnStatus: "interrupted",
   });
 
-  assert.equal(commandPhase, "cancelled");
+  assert.equal(commandPhase, "interrupted");
   assert.equal(executionPhase, "interrupted");
-  assert.equal(terminalRailStateFromExecutionPhase(executionPhase), "idle");
+  assert.equal(terminalRailStateFromExecutionPhase(executionPhase), "interrupted");
+  assert.equal(terminalTurnStatusFromActivityStatus("interrupted"), "interrupted");
 });

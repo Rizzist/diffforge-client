@@ -141,6 +141,7 @@ export function terminalReadinessFromPresenceStatus(status) {
 
 export function terminalTurnStatusFromActivityStatus(activityStatus, status = "") {
   const activity = normalizeActivityText(activityStatus, normalizeActivityText(status, "idle"));
+  if (["cancelled", "canceled", "interrupted"].includes(activity)) return "interrupted";
   if (TERMINAL_ACTIVITY_THINKING_STATES.has(activity)) return "running";
   if (TERMINAL_ACTIVITY_ERROR_STATES.has(activity)) return "failed";
   if (TERMINAL_ACTIVITY_PAUSED_STATES.has(activity)) return "pending";
@@ -159,7 +160,7 @@ export function terminalCommandPhaseFromLifecycleEvent(eventType, fields = {}) {
   if (type === "provider_turn_started" || type === "provider-turn-started") return "running";
   if (type === "agent_output" || type === "agent-output") return "running";
   if (type === "provider_turn_completed" || type === "provider-turn-completed") return "completed";
-  if (type === "provider_turn_interrupted" || type === "provider-turn-interrupted") return "cancelled";
+  if (type === "provider_turn_interrupted" || type === "provider-turn-interrupted") return "interrupted";
   if (type === "pending_prompt_error" || type === "pending-prompt-error") return "failed";
   if (type === "provider_turn_error" || type === "provider-turn-error") return "failed";
   if (type === "closed" || type === "closing" || type === "exited") return type;
@@ -223,7 +224,8 @@ export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "
   if (phase === "failed") return "error";
   if (phase === "needs_input" || phase === "paused" || phase === "parked" || phase === "resume_ready") return "paused";
   if (["queued", "submitted", "input_written", "accepted", "running", "cancelling"].includes(phase)) return "thinking";
-  if (["cancelled", "canceled", "interrupted", "completed", "complete", "done", "idle"].includes(phase)) return "idle";
+  if (["cancelled", "canceled", "interrupted"].includes(phase)) return "interrupted";
+  if (["completed", "complete", "done", "idle"].includes(phase)) return "idle";
   return terminalRailStateFromActivityStatus("", fallback);
 }
 

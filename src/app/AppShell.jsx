@@ -1207,6 +1207,7 @@ const WORKSPACE_THREAD_TRANSCRIPT_WATCH_FALLBACK_INTERVAL_MS = 12_000;
 const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 30 * 60 * 1000;
 const WORKSPACE_THREAD_TERMINAL_SUBMIT_TRANSCRIPT_POLL_TIMEOUT_MS = 4_000;
 const WORKSPACE_THREAD_UNACCEPTED_PROMPT_TRANSCRIPT_POLL_TIMEOUT_MS = 6_000;
+const WORKSPACE_THREAD_HOOK_TRANSCRIPT_REFRESH_TIMEOUT_MS = 12_000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_TTL_MS = 2 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_MAX = 512;
 const WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS = 120;
@@ -1377,10 +1378,24 @@ function getWorkspaceThreadPromptAcceptance(cache, detail = {}) {
   return null;
 }
 
+function workspaceThreadRequestAllowsHookTranscriptPolling(event = {}) {
+  const source = String(event.source || "").trim();
+  const type = String(event.type || "").trim();
+  return Boolean(
+    event.allowHookTranscriptPolling === true
+      || event.forceTranscriptPolling === true
+      || source === "bigview-submit"
+      || source === "terminal-confirmed"
+      || source.startsWith("cli-hook:")
+      || type === "provider-turn-completed"
+      || type === "provider-turn-error"
+      || type === "provider-turn-interrupted",
+  );
+}
+
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
   "provider-turn-completed",
-  "provider-turn-interrupted",
 ]);
 
 function terminalStatusEventForcesIdle(eventType) {
@@ -1921,13 +1936,33 @@ function threadLatestTurnMatchesPrompt(thread, event = {}) {
       || latestMessageId === promptEventId
       || latestUserMessageId === promptEventId
   );
+  const promptEpochCompatible = Boolean(
+    promptEpoch <= 0
+      || latestPromptEpoch <= 0
+      || promptEpochMatches
+  );
+  if (!promptIdMatches && promptEpochCompatible) {
+    const expectedUserMessage = normalizeWorkspaceThreadProjectionText(
+      event.expectedUserMessage || event.userMessage || event.message,
+    );
+    const latestUserMessage = getLatestWorkspaceThreadUserMessage(thread);
+    const latestUserText = normalizeWorkspaceThreadProjectionText(
+      latestUserMessage?.text || latestUserMessage?.message,
+    );
+    const matchedBySessionId = String(event.matchedBy || "").trim().toLowerCase() === "sessionid";
+    if (expectedUserMessage && latestUserText === expectedUserMessage && matchedBySessionId) {
+      const expectedAtMs = workspaceThreadMessageTimestampMs({
+        createdAt: event.expectedMessageCreatedAt || event.messageCreatedAt || event.submittedAt || event.createdAt,
+      });
+      const latestUserAtMs = workspaceThreadMessageTimestampMs(latestUserMessage);
+      if (!expectedAtMs || !latestUserAtMs || Math.abs(latestUserAtMs - expectedAtMs) <= 5000) {
+        return true;
+      }
+    }
+  }
   return Boolean(
     promptIdMatches
-      && (
-        promptEpoch <= 0
-          || latestPromptEpoch <= 0
-          || promptEpochMatches
-      )
+      && promptEpochCompatible
   );
 }
 
@@ -6219,20 +6254,77 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           : null;
         const activeTask = normalizeAppCloseLiveTask(session.activeTask || session.active_task);
         const parkedPrompt = normalizeAppCloseParkedPrompt(session.parkedPrompt || session.parked_prompt);
+        const nativeRailState = normalizeTerminalNativeRailState(
+          session.nativeRailState || session.native_rail_state || session.activityStatus || session.activity_status,
+          "",
+        );
+        const terminalStatus = normalizeTerminalNativeRailState(
+          session.terminalStatus || session.terminal_status || session.status,
+          nativeRailState || "idle",
+        );
+        const readiness = normalizeTerminalNativeRailState(
+          session.readiness || session.readinessAfter || session.readiness_after,
+          terminalReadinessFromPresenceStatus(terminalStatus || nativeRailState || "idle"),
+        );
+        const turnStatus = normalizeTerminalNativeRailState(
+          session.turnStatus || session.turn_status,
+          terminalTurnStatusFromActivityStatus(nativeRailState || terminalStatus, terminalStatus),
+        );
+        const executionPhase = normalizeTerminalNativeRailState(
+          session.executionPhase || session.execution_phase,
+          terminalExecutionPhaseFromState({
+            activityStatus: nativeRailState || terminalStatus,
+            commandPhase: session.commandPhase || session.command_phase,
+            readiness,
+            status: terminalStatus,
+            terminalLifecycle: session.terminalLifecycle || session.terminal_lifecycle || "open",
+            turnStatus,
+          }),
+        );
+        const terminalLifecycle = normalizeTerminalNativeRailState(
+          session.terminalLifecycle || session.terminal_lifecycle,
+          terminalStatus === "closed" ? "closed" : "open",
+        );
+        const terminalNickname = cleanAppCloseText(session.terminalNickname || session.terminal_nickname);
+        const terminalName = cleanAppCloseText(
+          session.terminalName || session.terminal_name || session.displayName || session.display_name,
+          terminalNickname || cleanAppCloseText(session.agentKind || session.agent_kind, "Terminal"),
+        );
         return {
           activeTask,
           agentId: cleanAppCloseText(session.agentId || session.agent_id),
           agentKind: cleanAppCloseText(session.agentKind || session.agent_kind),
+          activityStatus: cleanAppCloseText(session.activityStatus || session.activity_status),
+          commandPhase: cleanAppCloseText(session.commandPhase || session.command_phase),
           coordination,
+          displayName: cleanAppCloseText(session.displayName || session.display_name, terminalName),
+          executionPhase,
           fileAuthority: cleanAppCloseText(session.fileAuthority || session.file_authority),
           hasActiveTask: session.hasActiveTask === true || session.has_active_task === true || Boolean(activeTask),
           instanceId,
+          inputReady: session.inputReady === true || session.input_ready === true,
+          nativeRailLabel: cleanAppCloseText(
+            session.nativeRailLabel || session.native_rail_label,
+            formatTerminalNativeRailLabel(nativeRailState || terminalStatus),
+          ),
+          nativeRailState: nativeRailState || terminalStatus,
           paneId,
           parked: session.parked === true || Boolean(parkedPrompt),
           parkedPrompt,
+          readiness,
+          runtimeUpdatedAtMs: normalizeCloseCount(session.runtimeUpdatedAtMs || session.runtime_updated_at_ms),
           sessionMode: cleanAppCloseText(session.sessionMode || session.session_mode),
+          sessionState: cleanAppCloseText(session.sessionState || session.session_state),
+          status: terminalStatus,
           terminalIndex: normalizeAppCloseTerminalIndex(session.terminalIndex ?? session.terminal_index),
+          terminalLifecycle,
+          terminalName,
+          terminalNickname,
+          terminalStatus,
+          terminalWorkState: cleanAppCloseText(session.terminalWorkState || session.terminal_work_state),
           threadId: cleanAppCloseText(session.threadId || session.thread_id),
+          turnId: cleanAppCloseText(session.turnId || session.turn_id || session.providerTurnId || session.provider_turn_id),
+          turnStatus,
           workingDirectory: cleanAppCloseText(session.workingDirectory || session.working_directory),
           workspaceId: cleanAppCloseText(session.workspaceId || session.workspace_id),
           workspaceName: cleanAppCloseText(session.workspaceName || session.workspace_name),
@@ -6240,6 +6332,169 @@ function normalizeTerminalLiveSessionsPayload(payload) {
       })
       .filter(Boolean),
   };
+}
+
+function buildRustTerminalAuthorityWorkspaces({
+  payload,
+  workspaceSettings,
+  workspaces,
+  defaultWorkingDirectory,
+  workspaceSidebarOrderById,
+} = {}) {
+  const liveSnapshot = normalizeTerminalLiveSessionsPayload(payload);
+  const workspaceById = new Map((workspaces || []).map((workspace) => [
+    String(workspace?.id || "").trim(),
+    workspace,
+  ]));
+  const grouped = new Map();
+
+  liveSnapshot.sessions.forEach((session) => {
+    const workspaceId = session.workspaceId;
+    if (!workspaceId) {
+      return;
+    }
+    const workspaceRecord = workspaceById.get(workspaceId) || null;
+    const repoPath = cleanWorkspaceRootDirectory(
+      session.workingDirectory
+        || getWorkspaceRootDirectory(workspaceSettings || {}, workspaceId)
+        || defaultWorkingDirectory
+        || "",
+    );
+    if (!repoPath) {
+      return;
+    }
+
+    if (!grouped.has(workspaceId)) {
+      grouped.set(workspaceId, {
+        commandable: true,
+        lastKnownRuntime: false,
+        last_known_runtime: false,
+        repoPath,
+        runtimeReadOnly: false,
+        runtime_read_only: false,
+        terminalClearReason: "",
+        terminal_clear_reason: "",
+        terminalListAuthoritative: true,
+        terminal_list_authoritative: true,
+        terminalListEmptyAuthoritative: false,
+        terminal_list_empty_authoritative: false,
+        workspaceActive: true,
+        workspace_active: true,
+        workspaceId,
+        workspace_id: workspaceId,
+        workspaceIndex: workspaceSidebarOrderById?.get?.(workspaceId) ?? 0,
+        workspaceName: session.workspaceName || workspaceRecord?.name || workspaceId,
+        workspace_name: session.workspaceName || workspaceRecord?.name || workspaceId,
+        workspaceOrder: workspaceSidebarOrderById?.get?.(workspaceId) ?? 0,
+        workspaceStatus: "active",
+        workspace_status: "active",
+        terminals: [],
+      });
+    }
+
+    const terminalIndex = session.terminalIndex ?? 0;
+    const agentId = normalizeManagedAgentProviderId(session.agentId || session.agentKind)
+      || session.agentId
+      || session.agentKind
+      || WORKSPACE_TERMINAL_ROLE_GENERIC;
+    const colorSlot = getTerminalAgentColorSlot(terminalIndex);
+    const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
+    const terminalStatus = normalizeTerminalNativeRailState(session.terminalStatus || session.status, "idle");
+    const nativeRailState = normalizeTerminalNativeRailState(
+      session.nativeRailState,
+      terminalRailStateFromActivityStatus(session.activityStatus || terminalStatus, terminalStatus),
+    );
+    const nativeRailFields = getTerminalNativeRailStateFields(
+      nativeRailState,
+      session.nativeRailLabel || "",
+    );
+    const readiness = normalizeTerminalNativeRailState(
+      session.readiness,
+      terminalReadinessFromPresenceStatus(terminalStatus || nativeRailState),
+    );
+    const turnStatus = normalizeTerminalNativeRailState(
+      session.turnStatus,
+      terminalTurnStatusFromActivityStatus(nativeRailState || terminalStatus, terminalStatus),
+    );
+    const executionPhase = normalizeTerminalNativeRailState(
+      session.executionPhase,
+      terminalExecutionPhaseFromState({
+        activityStatus: nativeRailState,
+        commandPhase: session.commandPhase,
+        readiness,
+        status: terminalStatus,
+        terminalLifecycle: session.terminalLifecycle,
+        turnStatus,
+      }),
+    );
+    const terminalName = session.terminalName || session.displayName || getManagedAgentLabel(agentId);
+    grouped.get(workspaceId).terminals.push({
+      agentId,
+      agentKind: agentId,
+      agentLabel: agentId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(agentId),
+      agentDisplayName: "",
+      agent_display_name: "",
+      agentType: "",
+      agent_type: "",
+      activityStatus: nativeRailState,
+      activity_status: nativeRailState,
+      color,
+      colorSlot,
+      commandPhase: session.commandPhase || "",
+      command_phase: session.commandPhase || "",
+      commandable: true,
+      connected: true,
+      displayStatus: nativeRailFields.nativeRailLabel,
+      display_status: nativeRailFields.nativeRailLabel,
+      executionPhase,
+      execution_phase: executionPhase,
+      inputReady: session.inputReady === true || readiness === "ready",
+      lastKnownRuntime: false,
+      last_known_runtime: false,
+      ...nativeRailFields,
+      nativeConnected: true,
+      native_connected: true,
+      pane_id: session.paneId,
+      paneId: session.paneId,
+      readiness,
+      runtimeReadOnly: false,
+      runtime_read_only: false,
+      sessionState: session.sessionState || "session_attached",
+      session_state: session.sessionState || "session_attached",
+      status: terminalStatus,
+      statusSeq: session.runtimeUpdatedAtMs || liveSnapshot.generatedAtMs || Date.now(),
+      targetTerminalId: session.paneId,
+      target_terminal_id: session.paneId,
+      terminalEpoch: `${session.paneId}:${session.instanceId || "0"}`,
+      terminalId: session.paneId,
+      terminal_id: session.paneId,
+      terminalIndex,
+      terminalInstanceId: session.instanceId,
+      terminalLifecycle: session.terminalLifecycle || "open",
+      terminalStatus,
+      terminal_status: terminalStatus,
+      terminalWorkState: session.terminalWorkState || "",
+      terminal_work_state: session.terminalWorkState || "",
+      displayName: terminalName,
+      terminalName,
+      terminal_name: terminalName,
+      terminalNickname: session.terminalNickname || "",
+      terminal_nickname: session.terminalNickname || "",
+      threadId: session.threadId || createWorkspaceThreadId(workspaceId, terminalIndex),
+      turnId: session.turnId || "",
+      turnStatus,
+      turn_status: turnStatus,
+    });
+  });
+
+  return [...grouped.values()].map((workspace) => ({
+    ...workspace,
+    terminalCount: workspace.terminals.length,
+    terminal_count: workspace.terminals.length,
+    terminals: workspace.terminals.sort((left, right) => (
+      Number(left.terminalIndex ?? 9999) - Number(right.terminalIndex ?? 9999)
+    )),
+  }));
 }
 
 function appCloseTerminalRiskLabel(risk) {
@@ -7891,6 +8146,107 @@ function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
   ].join(":");
 }
 
+function getPreparedWorkspaceThreadRestoreTimestamp(thread) {
+  return [
+    thread?.lastActiveAt,
+    thread?.lastMessageAt,
+    thread?.updatedAt,
+    thread?.createdAt,
+  ].reduce((latest, value) => {
+    const timestamp = Date.parse(value || "");
+    return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
+  }, 0);
+}
+
+function getPreparedWorkspaceThreadProviderSessionId(thread, agentId) {
+  const safeAgentId = String(agentId || "").trim().toLowerCase();
+  if (!thread || !safeAgentId) {
+    return "";
+  }
+
+  const providerBinding = getWorkspaceThreadProviderBinding(thread, safeAgentId);
+  const threadSessionId = String(thread.currentAgent || "").trim().toLowerCase() === safeAgentId
+    ? thread.transcriptSessionId
+    : "";
+  return String(
+    providerBinding?.nativeSessionId
+      || providerBinding?.providerSessionId
+      || threadSessionId
+      || "",
+  ).trim();
+}
+
+function resolvePreparedWorkspaceTerminalThread(workspaceThreads, {
+  agentId = "",
+  terminalIndex = null,
+  threadId = "",
+  workspaceId = "",
+} = {}) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeAgentId = String(agentId || "").trim().toLowerCase();
+  const safeTerminalIndex = Number.parseInt(terminalIndex, 10);
+  const entry = workspaceThreads?.[safeWorkspaceId] || null;
+  if (!entry) {
+    return null;
+  }
+
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (thread) => {
+    const id = String(thread?.id || "").trim();
+    if (!id || seen.has(id)) {
+      return;
+    }
+    seen.add(id);
+    candidates.push(thread);
+  };
+
+  const safeThreadId = String(threadId || "").trim();
+  pushCandidate(safeThreadId ? entry.threads?.[safeThreadId] : null);
+  if (Number.isInteger(safeTerminalIndex) && safeTerminalIndex >= 0) {
+    pushCandidate(getWorkspaceThreadForTerminalIndex(workspaceThreads, safeWorkspaceId, safeTerminalIndex));
+    Object.values(entry.threads || {})
+      .filter((thread) => Number(thread?.terminalIndex) === safeTerminalIndex)
+      .sort((left, right) => (
+        getPreparedWorkspaceThreadRestoreTimestamp(right)
+        - getPreparedWorkspaceThreadRestoreTimestamp(left)
+      ))
+      .forEach(pushCandidate);
+  }
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  return candidates
+    .map((thread, index) => {
+      const sessionId = getPreparedWorkspaceThreadProviderSessionId(thread, safeAgentId);
+      const currentAgent = String(thread?.currentAgent || "").trim().toLowerCase();
+      const providerBinding = getWorkspaceThreadProviderBinding(thread, safeAgentId);
+      const agentMatches = !safeAgentId
+        || currentAgent === safeAgentId
+        || Boolean(
+          sessionId
+            || providerBinding?.modelId
+            || providerBinding?.nativeSessionTitle
+            || providerBinding?.terminalBinding,
+        );
+      return {
+        agentMatches,
+        index,
+        sessionId,
+        thread,
+        timestamp: getPreparedWorkspaceThreadRestoreTimestamp(thread),
+      };
+    })
+    .filter((candidate) => candidate.agentMatches || candidate.sessionId)
+    .sort((left, right) => (
+      Number(Boolean(right.sessionId)) - Number(Boolean(left.sessionId))
+      || right.timestamp - left.timestamp
+      || left.index - right.index
+    ))[0]?.thread || candidates[0] || null;
+}
+
 function scheduleWorkspaceStartupIdleTask(callback, options = {}) {
   if (typeof callback !== "function") {
     return () => {};
@@ -8477,6 +8833,7 @@ export default function App() {
   const [workspaceUnsafeModeArmed, setWorkspaceUnsafeModeArmed] = useState(false);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
+  const [rustTerminalAuthoritySnapshot, setRustTerminalAuthoritySnapshot] = useState(null);
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
@@ -8678,6 +9035,9 @@ export default function App() {
   const workspaceTerminalsSyncInFlightRef = useRef(false);
   const workspaceTerminalsSyncPendingRef = useRef(null);
   const workspaceTerminalsWorkspacesRef = useRef([]);
+  const rustTerminalAuthoritySnapshotRef = useRef(null);
+  const rustTerminalAuthorityRefreshInFlightRef = useRef(false);
+  const rustTerminalAuthorityRefreshPendingRef = useRef("");
   const workspaceTerminalIdentityCacheRef = useRef(new Map());
   const workspaceTerminalExplicitEmptyRef = useRef(new Set());
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
@@ -10472,6 +10832,49 @@ export default function App() {
   useEffect(() => {
     defaultWorkingDirectoryRef.current = defaultWorkingDirectory;
   }, [defaultWorkingDirectory]);
+
+  useEffect(() => {
+    rustTerminalAuthoritySnapshotRef.current = rustTerminalAuthoritySnapshot;
+  }, [rustTerminalAuthoritySnapshot]);
+
+  const refreshRustTerminalAuthoritySnapshot = useCallback((reason = "terminal_authority_refresh") => {
+    const safeReason = String(reason || "terminal_authority_refresh").trim();
+    if (rustTerminalAuthorityRefreshInFlightRef.current) {
+      rustTerminalAuthorityRefreshPendingRef.current = safeReason;
+      return;
+    }
+    rustTerminalAuthorityRefreshInFlightRef.current = true;
+    invoke("terminal_live_sessions")
+      .then((payload) => {
+        setRustTerminalAuthoritySnapshot(payload || null);
+        logTerminalStatus("frontend.terminal_authority.refresh_done", {
+          reason: safeReason,
+          sessionCount: Array.isArray(payload?.sessions)
+            ? payload.sessions.length
+            : Array.isArray(payload?.data?.sessions)
+              ? payload.data.sessions.length
+              : 0,
+        });
+      })
+      .catch((error) => {
+        logTerminalStatus("frontend.terminal_authority.refresh_error", {
+          message: getErrorMessage(error, "Unable to read Rust terminal state."),
+          reason: safeReason,
+        });
+      })
+      .finally(() => {
+        rustTerminalAuthorityRefreshInFlightRef.current = false;
+        const pendingReason = rustTerminalAuthorityRefreshPendingRef.current;
+        rustTerminalAuthorityRefreshPendingRef.current = "";
+        if (pendingReason) {
+          refreshRustTerminalAuthoritySnapshot(pendingReason);
+        }
+      });
+  }, []);
+
+  useEffect(() => {
+    refreshRustTerminalAuthoritySnapshot("app_ready");
+  }, [refreshRustTerminalAuthoritySnapshot]);
 
   useEffect(() => {
     workspaceThreadsRef.current = workspaceThreads;
@@ -15277,6 +15680,9 @@ export default function App() {
         presenceTurnStatus,
         presenceReadiness,
       ].filter(Boolean);
+      const presenceInterruptedStatus = presenceStatuses.find((status) => (
+        ["cancelled", "canceled", "interrupted"].includes(status)
+      ));
       const presenceBusyStatus = presenceStatuses.find((status) => (
         terminalActivityStatusIsBusy(status)
           || terminalActivityStatusIsPaused(status)
@@ -15292,7 +15698,9 @@ export default function App() {
           && !presenceBusyStatus
       );
       const activityStatus = String(
-        presenceSaysIdle
+        presenceInterruptedStatus
+          ? "interrupted"
+          : presenceSaysIdle
           ? "idle"
           : groundTruth.effectiveActivityStatus
             || thread?.activityStatus
@@ -17032,7 +17440,28 @@ export default function App() {
     });
     return order;
   }, [workspaces]);
+  const rustTerminalAuthorityWorkspaces = useMemo(() => (
+    buildRustTerminalAuthorityWorkspaces({
+      defaultWorkingDirectory,
+      payload: rustTerminalAuthoritySnapshot,
+      workspaceSettings,
+      workspaceSidebarOrderById,
+      workspaces,
+    })
+  ), [
+    defaultWorkingDirectory,
+    rustTerminalAuthoritySnapshot,
+    workspaceSettings,
+    workspaceSidebarOrderById,
+    workspaces,
+  ]);
   const workspaceTerminalsWorkspaces = useMemo(() => {
+    const rustAuthorityByWorkspaceId = new Map(
+      rustTerminalAuthorityWorkspaces.map((workspace) => [
+        String(workspace?.workspaceId || workspace?.workspace_id || "").trim(),
+        workspace,
+      ]).filter(([workspaceId]) => workspaceId),
+    );
     const activeWorkspaceRows = enabledWorkspaceRuntimeDescriptors
       .map((descriptor) => {
         const repoPath = String(descriptor.workingDirectory || "").trim();
@@ -17259,13 +17688,43 @@ export default function App() {
           workspaceName: descriptor.workspace?.name || workspaceId,
           workspace_name: descriptor.workspace?.name || workspaceId,
           workspaceOrder: workspaceSidebarOrderById.get(workspaceId) ?? 0,
-          workspaceStatus: "active",
-          workspace_status: "active",
-          terminals,
-        };
+            workspaceStatus: "active",
+            workspace_status: "active",
+            terminals,
+          };
       })
       .filter(Boolean);
-    const activeWorkspaceIds = new Set(activeWorkspaceRows.map((workspace) => (
+    const activeWorkspaceRowsWithRustAuthority = activeWorkspaceRows.map((workspace) => {
+      const workspaceId = String(workspace?.workspaceId || workspace?.workspace_id || "").trim();
+      const rustWorkspace = rustAuthorityByWorkspaceId.get(workspaceId);
+      if (!rustWorkspace) {
+        return workspace;
+      }
+      return {
+        ...workspace,
+        ...rustWorkspace,
+        repoPath: rustWorkspace.repoPath || workspace.repoPath,
+        workspaceActive: true,
+        workspace_active: true,
+        workspaceName: rustWorkspace.workspaceName || workspace.workspaceName,
+        workspace_name: rustWorkspace.workspace_name || workspace.workspace_name,
+        workspaceStatus: "active",
+        workspace_status: "active",
+      };
+    });
+    const activeWorkspaceIdsFromRows = new Set(
+      activeWorkspaceRowsWithRustAuthority
+        .map((workspace) => String(workspace?.workspaceId || workspace?.workspace_id || "").trim())
+        .filter(Boolean),
+    );
+    const rustOnlyRows = rustTerminalAuthorityWorkspaces.filter((workspace) => {
+      const workspaceId = String(workspace?.workspaceId || workspace?.workspace_id || "").trim();
+      return workspaceId && !activeWorkspaceIdsFromRows.has(workspaceId);
+    });
+    const activeWorkspaceIds = new Set([
+      ...activeWorkspaceRowsWithRustAuthority,
+      ...rustOnlyRows,
+    ].map((workspace) => (
       String(workspace?.workspaceId || workspace?.workspace_id || "").trim()
     )).filter(Boolean));
     const knownWorkspaceIds = new Set((workspaces || []).map((workspace) => (
@@ -17280,11 +17739,13 @@ export default function App() {
       })
       .map((workspace) => markWorkspaceLastKnownRuntimeReadOnly(workspace));
     return [
-      ...activeWorkspaceRows,
+      ...activeWorkspaceRowsWithRustAuthority,
+      ...rustOnlyRows,
       ...lastKnownRows,
     ];
   }, [
     enabledWorkspaceRuntimeDescriptors,
+    rustTerminalAuthorityWorkspaces,
     workspaces,
     workspaceSidebarOrderById,
     workspaceTerminalFallbackRole,
@@ -17477,7 +17938,6 @@ export default function App() {
     const hookStatusSyncedByRust = Boolean(
       options.cloudStatusSyncedByRust === true
         || event.cloudStatusSyncedByRust === true
-        || String(statusSyncReason || "").trim().startsWith("cli-hook:")
     );
     if (hookStatusSyncedByRust) {
       logTerminalStatus("frontend.terminal_status.event_sync.skip", {
@@ -17550,10 +18010,15 @@ export default function App() {
           ? "closing"
           : "open"
     );
-    const statusActivity = (idleStatusEvent ? "idle" : eventActivityStatus)
+    const statusActivity = (
+      eventType === "provider-turn-interrupted"
+        ? "interrupted"
+        : idleStatusEvent
+          ? "idle"
+          : eventActivityStatus
+    )
       || (
         eventType === "provider-turn-completed"
-        || eventType === "provider-turn-interrupted"
           ? "idle"
           : ""
       )
@@ -22762,7 +23227,11 @@ export default function App() {
     ).trim();
     const requestedRepoPath = String(event.repoPath || "").trim();
     const requestedPollUntilTurnComplete = event.pollUntilTurnComplete === true || event.pollUntilAssistant === true;
-    const pollUntilTurnComplete = requestedPollUntilTurnComplete && !requestUsesActivityHooks;
+    const hookTranscriptPollingAllowed = Boolean(
+      requestUsesActivityHooks && workspaceThreadRequestAllowsHookTranscriptPolling(event),
+    );
+    const pollUntilTurnComplete = requestedPollUntilTurnComplete
+      && (!requestUsesActivityHooks || hookTranscriptPollingAllowed);
     const pollStartedAt = Number.parseFloat(event.pollStartedAt) || Date.now();
     const expectedUserMessage = String(
       event.expectedUserMessage
@@ -22817,7 +23286,9 @@ export default function App() {
           || event.source === "terminal-prompt-submitted"
         )
     );
-    const transcriptPollTimeoutMs = terminalSubmitPromptAccepted
+    const transcriptPollTimeoutMs = hookTranscriptPollingAllowed
+      ? WORKSPACE_THREAD_HOOK_TRANSCRIPT_REFRESH_TIMEOUT_MS
+      : terminalSubmitPromptAccepted
       ? WORKSPACE_THREAD_TERMINAL_SUBMIT_TRANSCRIPT_POLL_TIMEOUT_MS
       : promptAcceptanceTimeoutApplies
         ? WORKSPACE_THREAD_UNACCEPTED_PROMPT_TRANSCRIPT_POLL_TIMEOUT_MS
@@ -23934,8 +24405,15 @@ export default function App() {
                 && !expectedUserMessageIsControlPrompt
                 && !promptAccepted
             );
+            const waitingForHookTranscriptResponse = Boolean(
+              hookTranscriptPollingAllowed
+                && expectedUserMessage
+                && !expectedUserMessageIsControlPrompt
+                && !settledAssistantResponseSeen
+            );
             const shouldContinuePolling = (
               waitingForPromptAcceptance
+              || waitingForHookTranscriptResponse
               || (
 	                activeRunningTurnAtTranscriptResult
 	                && (
@@ -23959,6 +24437,7 @@ export default function App() {
 	              transcriptCompletionCanSettleTurn,
 	              turnCompleteSeen,
 	              waitingForPromptAcceptance,
+              waitingForHookTranscriptResponse,
               workspaceId,
             });
             logTerminalStatus("frontend.terminal_status.transcript_poll_decision", {
@@ -23979,6 +24458,7 @@ export default function App() {
 	              transcriptCompletionCanSettleTurn,
 	              turnCompleteSeen,
               waitingForPromptAcceptance,
+              waitingForHookTranscriptResponse,
               workspaceId,
             });
             if (shouldContinuePolling) {
@@ -24201,6 +24681,9 @@ export default function App() {
       });
       return;
     }
+    refreshRustTerminalAuthoritySnapshot(
+      `thread_lifecycle:${String(event.source || event.type || "terminal").trim() || "terminal"}`,
+    );
 
     let lifecycleEvent = event;
     if (event.type === "message-submitted") {
@@ -24845,14 +25328,14 @@ export default function App() {
         nextThreads = projectionEvents.length
           ? appendWorkspaceThreadProjectionEvents(threads, {
             ...lifecycleEvent,
-            activityStatus: "idle",
+            activityStatus: "interrupted",
             clearPendingPrompt: true,
             inputReady: true,
             projectionEvents,
           })
           : markWorkspaceThreadAgentActivity(threads, {
             ...lifecycleEvent,
-            activityStatus: "idle",
+            activityStatus: "interrupted",
             inputReady: true,
             status: lifecycleEvent.status || "active",
           });
@@ -25165,12 +25648,24 @@ export default function App() {
         && lifecycleTranscriptProviderSessionId
         && String(lifecycleThreadForTranscript?.latestTurn?.state || "").trim().toLowerCase() === "running",
     );
+    const lifecycleHookTranscriptRefresh = Boolean(
+      lifecycleUsesActivityHooks
+        && (
+          (
+            lifecycleEvent.type === "message-submitted"
+            && lifecycleEvent.source === "bigview-submit"
+          )
+          || lifecycleEvent.type === "provider-turn-completed"
+          || lifecycleEvent.type === "provider-turn-error"
+          || lifecycleEvent.type === "provider-turn-interrupted"
+        ),
+    );
     const shouldRequestTranscript = (
       ["claude", "codex", "opencode"].includes(
         lifecycleAgentId,
       )
       && (
-        (!lifecycleUsesActivityHooks && lifecycleEvent.type === "message-submitted")
+        ((!lifecycleUsesActivityHooks || lifecycleHookTranscriptRefresh) && lifecycleEvent.type === "message-submitted")
         || lifecycleEvent.type === "provider-turn-completed"
         || lifecycleEvent.type === "provider-session"
         || (lifecycleEvent.type === "opened" && Boolean(lifecycleNativeSessionId))
@@ -25181,6 +25676,7 @@ export default function App() {
       agentId: lifecycleAgentId,
       hasOutputText: lifecycleHasOutputText,
       lifecycleUsesActivityHooks,
+      lifecycleHookTranscriptRefresh,
       shouldRequestTranscript,
       threadId: lifecycleThreadId,
       type: lifecycleEvent.type || "",
@@ -25202,15 +25698,19 @@ export default function App() {
         expectedMessageCreatedAt: lifecycleTranscriptSubmittedAt,
         expectedUserMessage: lifecycleTranscriptExpectedUserMessage,
         pollStartedAt: Date.now(),
+        allowHookTranscriptPolling: lifecycleHookTranscriptRefresh,
         pollUntilTurnComplete: lifecycleEvent.type === "message-submitted"
-          || lifecycleDetachedNeedsTranscriptReconcile,
+          || lifecycleDetachedNeedsTranscriptReconcile
+          || lifecycleHookTranscriptRefresh,
         providerSessionId: lifecycleTranscriptProviderSessionId,
         submittedAt: lifecycleTranscriptSubmittedAt,
+        terminalPromptAccepted: lifecycleHookTranscriptRefresh || lifecycleEvent.terminalPromptAccepted === true,
       });
     }
   }, [
     rejectWorkspacePromptDeliveriesForThread,
     requestWorkspaceThreadTranscript,
+    refreshRustTerminalAuthoritySnapshot,
     settleWorkspacePromptDelivery,
     workspaceNotificationReducerOptions,
   ]);
@@ -25372,10 +25872,16 @@ export default function App() {
         || type === "provider-turn-completed"
         || type === "provider-turn-error"
         || type === "provider-turn-interrupted";
-      const activityStatus = payload.activityStatus
-        || (inputReady ? "idle" : "thinking");
+      const payloadNativeRailState = payload.nativeRailState || payload.native_rail_state || "";
+      const payloadActivityStatus = payload.activityStatus || payload.activity_status || "";
+      const activityStatus = payloadNativeRailState
+        || (type === "provider-turn-interrupted"
+          ? "interrupted"
+          : payloadActivityStatus || (inputReady ? "idle" : "thinking"));
       const hookAgentId = payload.agentId || payload.agentKind || "";
       const hookAgentType = payload.agentType || payload.agent_type || "";
+      const hookSource = String(payload.source || `cli-hook:${type}`).trim();
+      const hookCloudSyncedByRust = hookSource.startsWith("cli-hook:");
       const hookAgentDisplayName = payload.agentDisplayName
         || payload.agent_display_name
         || hookAgentType
@@ -25388,7 +25894,8 @@ export default function App() {
         agentId: hookAgentId,
         agentDisplayName: hookAgentDisplayName,
         agentType: hookAgentType,
-        commandPhase: payload.commandPhase || (inputReady ? "completed" : "running"),
+        cloudStatusSyncedByRust: hookCloudSyncedByRust,
+        commandPhase: payload.commandPhase || (type === "provider-turn-interrupted" ? "interrupted" : inputReady ? "completed" : "running"),
         completionEvidence: payload.completionEvidence || "cli-hook",
         completedAt: payload.completedAt || (inputReady ? new Date().toISOString() : ""),
         inputReady,
@@ -25397,8 +25904,10 @@ export default function App() {
         nativeSessionId: payload.nativeSessionId || payload.providerSessionId || "",
         nativeSessionKind: payload.nativeSessionId || payload.providerSessionId ? "session" : "",
         nativeSessionSource: payload.nativeSessionId || payload.providerSessionId ? "cli-hook" : "",
+        nativeRailLabel: payload.nativeRailLabel || payload.native_rail_label || "",
+        nativeRailState: activityStatus,
         providerSessionId: payload.providerSessionId || payload.nativeSessionId || "",
-        source: payload.source || `cli-hook:${type}`,
+        source: hookSource,
         status: payload.status || "active",
         terminalIndex: payload.terminalIndex,
         threadId: payload.threadId || "",
@@ -25418,7 +25927,7 @@ export default function App() {
         ? buildTerminalStartedProjectionEvents({
           ...lifecycleEvent,
           agentId: hookAgentId,
-          source: payload.source || `cli-hook:${type}`,
+          source: hookSource,
           type,
         })
         : [];
@@ -25433,6 +25942,7 @@ export default function App() {
         acceptedPromptMatched: Boolean(acceptedPromptDetail),
         hookEventName: payload.hookEventName || "",
         hookHealthStatus: payload.hookHealthStatus || "",
+        cloudStatusSyncedByRust: hookCloudSyncedByRust,
         agentDisplayNamePresent: Boolean(hookAgentDisplayName),
         agentTypePresent: Boolean(hookAgentType),
         instanceId: payload.instanceId || "",
@@ -25649,7 +26159,9 @@ export default function App() {
       const submittedPromptSource = String(payload.promptSource || payload.prompt_source || "").trim();
       const submittedByActivityHook = submittedPromptSource === "activity_hook_user_prompt_submit"
         || submittedPromptSource === "cli_hook_user_prompt_submit";
-      if (terminalAgentUsesActivityHooks(submittedAgentId) && !submittedByActivityHook) {
+      const submittedByCodexInputGate = submittedAgentId === "codex"
+        && submittedPromptSource === "observed_input_gate";
+      if (terminalAgentUsesActivityHooks(submittedAgentId) && !submittedByActivityHook && !submittedByCodexInputGate) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
           agentId: submittedAgentId,
           instanceId: payload.instanceId || "",
@@ -25933,8 +26445,10 @@ export default function App() {
         agentId: session.agentId || "",
         agentStarted: session.agentStarted === true,
         instanceId: session.instanceId,
+        model: session.model || "",
         needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId,
+        providerSessionId: session.providerSessionId || "",
         threadId: session.threadId || "",
         terminalIndex: session.terminalIndex,
         workspaceId: session.workspaceId || "",
@@ -25942,6 +26456,7 @@ export default function App() {
       logWorkspaceActivationTrace("workspace.open.prepared_terminal.ready", session.workspaceId || "", {
         agentId: session.agentId || "",
         agentStarted: session.agentStarted === true,
+        hasProviderSessionId: Boolean(session.providerSessionId),
         instanceId: session.instanceId || "",
         needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId || "",
@@ -25953,6 +26468,7 @@ export default function App() {
       preparedTerminalsRef.current.delete(key);
       logWorkspaceActivationTrace("workspace.open.prepared_terminal.removed", session.workspaceId || "", {
         agentId: session.agentId || "",
+        hasProviderSessionId: Boolean(session.providerSessionId),
         instanceId: session.instanceId || "",
         paneId: session.paneId || "",
         preparedCount: preparedTerminalsRef.current.size,
@@ -25980,17 +26496,23 @@ export default function App() {
       ))
       .sort((left, right) => left.terminalIndex - right.terminalIndex)
       .map((session) => {
+        const thread = resolvePreparedWorkspaceTerminalThread(workspaceThreadsRef.current, {
+          agentId: session.agentId,
+          terminalIndex: session.terminalIndex,
+          threadId: session.threadId,
+          workspaceId: activatedWorkspace.id,
+        });
         const providerBinding = getWorkspaceThreadProviderBinding(
-          workspaceThreadsRef.current?.[activatedWorkspace.id]?.threads?.[session.threadId],
+          thread,
           session.agentId,
         );
-        const thread = workspaceThreadsRef.current?.[activatedWorkspace.id]?.threads?.[session.threadId];
         const providerSessionId = String(
-          providerBinding?.nativeSessionId
+          session.providerSessionId
+            || providerBinding?.nativeSessionId
             || thread?.transcriptSessionId
             || "",
         ).trim();
-        const storedModel = String(providerBinding?.modelId || "").trim();
+        const storedModel = String(session.model || providerBinding?.modelId || "").trim();
         const model = storedModel || getWorkspaceAgentStartupModel(session.agentId, agentStatuses);
 
         return {
@@ -26001,7 +26523,7 @@ export default function App() {
           paneId: session.paneId,
           provider: session.agentId,
           providerSessionId,
-          threadId: session.threadId || "",
+          threadId: thread?.id || session.threadId || "",
           terminalIndex: session.terminalIndex,
           workspaceId: activatedWorkspace.id,
         };

@@ -6479,7 +6479,12 @@ function getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex) {
     return null;
   }
 
-  const terminalKey = terminalSessionKey(terminalIndex);
+  const safeTerminalIndex = normalizeTerminalIndex(terminalIndex);
+  if (safeTerminalIndex == null) {
+    return null;
+  }
+
+  const terminalKey = terminalSessionKey(safeTerminalIndex);
   const terminal = terminalKey ? entry.terminals[terminalKey] : null;
   if (terminal?.threadId && entry.threads[terminal.threadId]) {
     return entry.threads[terminal.threadId];
@@ -6492,16 +6497,26 @@ function getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex) {
 
   const activeThread = entry.threads[entry.activeThreadId];
   if (
-    activeThread?.terminalBinding?.terminalIndex === terminalIndex
-    || (activeThread?.terminalIndex === terminalIndex && activeThread.status === "starting")
+    activeThread?.terminalBinding?.terminalIndex === safeTerminalIndex
+    || (activeThread?.terminalIndex === safeTerminalIndex && activeThread.status === "starting")
   ) {
     return activeThread;
   }
 
+  const liveThread = Object.values(entry.threads)
+    .filter((thread) => (
+      thread.terminalBinding?.terminalIndex === safeTerminalIndex
+      || (thread.terminalIndex === safeTerminalIndex && thread.status === "starting")
+    ))
+    .sort((left, right) => getThreadRestoreTimestamp(right) - getThreadRestoreTimestamp(left))[0] || null;
+  if (liveThread) {
+    return liveThread;
+  }
+
   return Object.values(entry.threads)
     .filter((thread) => (
-      thread.terminalBinding?.terminalIndex === terminalIndex
-      || (thread.terminalIndex === terminalIndex && thread.status === "starting")
+      getThreadTerminalIndex(thread) === safeTerminalIndex
+      && getWorkspaceThreadHasSession(thread)
     ))
     .sort((left, right) => getThreadRestoreTimestamp(right) - getThreadRestoreTimestamp(left))[0] || null;
 }
@@ -6509,6 +6524,119 @@ function getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex) {
 export function getWorkspaceThreadForTerminalIndex(state, workspaceId, terminalIndex) {
   const entry = getWorkspaceThreadsStateObject(state)[workspaceId];
   return getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex);
+}
+
+function workspaceThreadMatchesLiveTerminalIdentity(thread, providerBinding, target = {}) {
+  const terminalIndex = normalizeTerminalIndex(target.terminalIndex);
+  const paneId = cleanText(target.paneId);
+  const instanceId = Number.parseInt(target.instanceId, 10);
+  const bindings = [
+    providerBinding?.terminalBinding,
+    thread?.terminalBinding,
+  ]
+    .map((binding) => normalizeTerminalBinding(binding))
+    .filter(Boolean);
+
+  return bindings.some((binding) => {
+    const indexMatches = terminalIndex == null
+      || normalizeTerminalIndex(binding.terminalIndex) === terminalIndex;
+    const paneMatches = !paneId || binding.paneId === paneId;
+    const instanceMatches = !Number.isInteger(instanceId)
+      || Number(binding.instanceId) === instanceId;
+    return indexMatches && paneMatches && instanceMatches;
+  });
+}
+
+function workspaceThreadLiveSelectionScore(thread, providerBinding, target = {}) {
+  const liveThreadId = cleanText(target.threadId);
+  const terminalIndex = normalizeTerminalIndex(target.terminalIndex);
+  let score = 0;
+  if (liveThreadId && thread?.id === liveThreadId) {
+    score += 1000;
+  }
+  if (workspaceThreadMatchesLiveTerminalIdentity(thread, providerBinding, target)) {
+    score += 500;
+  }
+  if (terminalIndex != null && getThreadTerminalIndex(thread) === terminalIndex) {
+    score += 100;
+  }
+  if (["active", "starting"].includes(cleanText(thread?.status).toLowerCase())) {
+    score += 50;
+  }
+  score += Math.min(49, Math.floor(getThreadRestoreTimestamp(thread) / 1000) % 50);
+  return score;
+}
+
+export function getWorkspaceThreadSelectionForLiveTerminal(entry, target = {}) {
+  if (!entry?.threads || typeof entry.threads !== "object") {
+    return "";
+  }
+
+  const terminalIndex = normalizeTerminalIndex(target.terminalIndex);
+  const terminalKey = terminalSessionKey(terminalIndex);
+  const terminal = terminalKey ? entry.terminals?.[terminalKey] || null : null;
+  const agentId = cleanAgentId(target.agentId || target.currentAgent || terminal?.agentId, "");
+  const providerSessionId = cleanText(
+    target.providerSessionId
+      || target.provider_session_id
+      || target.nativeSessionId
+      || target.native_session_id
+      || target.sessionId
+      || target.session_id,
+  );
+  const liveThreadId = cleanText(target.threadId || terminal?.threadId);
+  const threads = Object.values(entry.threads).filter((thread) => {
+    if (!thread?.id || workspaceEntryHasArchivedThreadId(entry, thread.id)) {
+      return false;
+    }
+    if (!agentId) {
+      return true;
+    }
+    return cleanAgentId(thread.currentAgent) === agentId
+      || Boolean(thread.providerBindings?.[agentId]);
+  });
+
+  if (providerSessionId) {
+    const sessionThread = threads
+      .filter((thread) => workspaceThreadHasProviderSession(thread, agentId, providerSessionId))
+      .sort((left, right) => {
+        const leftBinding = getWorkspaceThreadProviderBinding(left, agentId);
+        const rightBinding = getWorkspaceThreadProviderBinding(right, agentId);
+        return workspaceThreadLiveSelectionScore(right, rightBinding, {
+          ...target,
+          threadId: liveThreadId,
+        }) - workspaceThreadLiveSelectionScore(left, leftBinding, {
+          ...target,
+          threadId: liveThreadId,
+        });
+      })[0] || null;
+    return cleanText(sessionThread?.id);
+  }
+
+  const directThread = liveThreadId ? entry.threads[liveThreadId] : null;
+  if (
+    directThread
+    && !getWorkspaceThreadHasSession(directThread)
+    && (!agentId || cleanAgentId(directThread.currentAgent) === agentId || directThread.providerBindings?.[agentId])
+  ) {
+    return directThread.id;
+  }
+
+  const sessionlessThread = threads
+    .filter((thread) => !getWorkspaceThreadHasSession(thread))
+    .sort((left, right) => {
+      const leftBinding = getWorkspaceThreadProviderBinding(left, agentId);
+      const rightBinding = getWorkspaceThreadProviderBinding(right, agentId);
+      return workspaceThreadLiveSelectionScore(right, rightBinding, {
+        ...target,
+        threadId: liveThreadId,
+      }) - workspaceThreadLiveSelectionScore(left, leftBinding, {
+        ...target,
+        threadId: liveThreadId,
+      });
+    })[0] || null;
+
+  return cleanText(sessionlessThread?.id);
 }
 
 export function getWorkspaceThreadsByTerminalIndex(state, workspaceId, terminalIndexes = []) {

@@ -1975,18 +1975,8 @@ fn architecture_graph_delete_blocking(
 }
 
 pub(crate) fn architecture_icon_reference_value(repo_path: String) -> Result<Value, String> {
-    let (display_repo, repo) = architecture_resolved_and_storage(repo_path.as_str())?;
-    let (_, _, _, _, icon_reference_path) =
-        architecture_global_agent_paths().unwrap_or_else(|_| {
-            let _ = ensure_architecture_agent_guide(&repo);
-            (
-                repo.clone(),
-                architecture_agents_root(&repo),
-                architecture_agents_root(&repo).join("graphs"),
-                architecture_agent_guide_path(&repo),
-                architecture_icon_reference_path(&repo),
-            )
-        });
+    let display_repo = architecture_display_repo_path(repo_path.as_str());
+    let (_, _, _, _, icon_reference_path) = architecture_global_agent_paths_or_fallback();
     let mut reference = serde_json::from_str::<Value>(ARCHITECTURE_ICON_REFERENCE)
         .map_err(|error| format!("Unable to parse architecture icon reference: {error}"))?;
     if let Some(object) = reference.as_object_mut() {
@@ -2003,18 +1993,9 @@ pub(crate) fn architecture_icon_reference_value(repo_path: String) -> Result<Val
 }
 
 pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, String> {
-    let (display_repo, fallback_repo) = architecture_resolved_and_storage(repo_path.as_str())?;
+    let display_repo = architecture_display_repo_path(repo_path.as_str());
     let (storage_root, architecture_root, graphs_root, guide_path, icon_reference_path) =
-        architecture_global_agent_paths().unwrap_or_else(|_| {
-            let _ = ensure_architecture_agent_guide(&fallback_repo);
-            (
-                fallback_repo.clone(),
-                architecture_agents_root(&fallback_repo),
-                architecture_agents_root(&fallback_repo).join("graphs"),
-                architecture_agent_guide_path(&fallback_repo),
-                architecture_icon_reference_path(&fallback_repo),
-            )
-        });
+        architecture_global_agent_paths_or_fallback();
     let graphs = architecture_graph_summaries(&storage_root)?;
     let _ = architecture_write_index(&storage_root, &graphs);
     Ok(json!({
@@ -2171,9 +2152,8 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
 }
 
 pub(crate) fn architecture_graphs_list_value(repo_path: String) -> Result<Value, String> {
-    let list_path = architecture_global_agent_paths()
-        .map(|(root, _, _, _, _)| workspace_path_display(&root))
-        .unwrap_or(repo_path);
+    let _ = repo_path;
+    let list_path = workspace_path_display(&architecture_global_agent_paths_or_fallback().0);
     let list = architecture_graphs_list_blocking(list_path)?;
     serde_json::to_value(list)
         .map_err(|error| format!("Unable to serialize architecture graph list: {error}"))
@@ -2183,9 +2163,8 @@ pub(crate) fn architecture_graph_revisions_list_value(
     repo_path: String,
     graph_id: Option<String>,
 ) -> Result<Value, String> {
-    let list_path = architecture_global_agent_paths()
-        .map(|(root, _, _, _, _)| workspace_path_display(&root))
-        .unwrap_or(repo_path);
+    let _ = repo_path;
+    let list_path = workspace_path_display(&architecture_global_agent_paths_or_fallback().0);
     let list = architecture_graph_revisions_list_blocking(list_path, graph_id)?;
     serde_json::to_value(list)
         .map_err(|error| format!("Unable to serialize architecture revision list: {error}"))
@@ -2196,9 +2175,8 @@ pub(crate) fn architecture_graph_revision_read_value(
     graph_id: String,
     revision_id: String,
 ) -> Result<Value, String> {
-    let read_path = architecture_global_agent_paths()
-        .map(|(root, _, _, _, _)| workspace_path_display(&root))
-        .unwrap_or(repo_path);
+    let _ = repo_path;
+    let read_path = workspace_path_display(&architecture_global_agent_paths_or_fallback().0);
     let revision = architecture_graph_revision_read_blocking(read_path, graph_id, revision_id)?;
     serde_json::to_value(revision)
         .map_err(|error| format!("Unable to serialize architecture revision: {error}"))
@@ -2209,9 +2187,8 @@ pub(crate) fn architecture_graph_revision_restore_value(
     graph_id: String,
     revision_id: String,
 ) -> Result<Value, String> {
-    let restore_path = architecture_global_agent_paths()
-        .map(|(root, _, _, _, _)| workspace_path_display(&root))
-        .unwrap_or(repo_path);
+    let _ = repo_path;
+    let restore_path = workspace_path_display(&architecture_global_agent_paths_or_fallback().0);
     let result = architecture_graph_revision_restore_blocking(restore_path, graph_id, revision_id)?;
     serde_json::to_value(result)
         .map_err(|error| format!("Unable to serialize architecture revision restore: {error}"))
@@ -2427,8 +2404,27 @@ pub(crate) fn architecture_global_agent_paths()
     ))
 }
 
-pub(crate) fn architecture_global_graphs_root_dir() -> Result<PathBuf, String> {
-    architecture_global_agent_paths().map(|(_, _, graphs_root, _, _)| graphs_root)
+pub(crate) fn architecture_global_agent_paths_or_fallback()
+-> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    architecture_global_agent_paths().unwrap_or_else(|_| {
+        let root = std::env::temp_dir()
+            .join("diffforge")
+            .join("architectures")
+            .join("global");
+        let _ = ensure_architecture_agent_guide(&root);
+        let architecture_root = architecture_agents_root(&root);
+        let graphs_root = architecture_root.join("graphs");
+        let _ = fs::create_dir_all(&graphs_root);
+        let guide_path = architecture_agent_guide_path(&root);
+        let icon_reference_path = architecture_icon_reference_path(&root);
+        (
+            root,
+            architecture_root,
+            graphs_root,
+            guide_path,
+            icon_reference_path,
+        )
+    })
 }
 
 fn architecture_central_data_root() -> Option<PathBuf> {
@@ -2551,14 +2547,14 @@ static ARCHITECTURE_CENTRAL_REPO_ROOT_CACHE: OnceLock<StdMutex<HashMap<String, P
 /// Centralized per-repo architecture storage: every repo gets one folder under
 /// the device's global architectures data root, keyed by its stable identity
 /// (git remote identity when available, so the same repo maps to the same
-/// folder on every device). Existing repo-local `.agents/architectures`
-/// content and legacy `orphans/<identity>` folders are migrated in once.
+/// folder on every device). Old workspace-local architecture artifacts and
+/// legacy `orphans/<identity>` folders are migrated in once.
 pub(crate) fn architecture_central_repo_root_for(repo: &Path) -> Result<PathBuf, String> {
     // Ephemeral guard: repos living under the OS temp dir never register in
     // the central architecture store — test harnesses and scratch checkouts
-    // were polluting the Architecture hub with one entry per run. They get
-    // the legacy repo-local `.agents/architectures` layout instead, so every
-    // tool still works. An env-overridden data root (explicit test isolation)
+    // were polluting the Architecture hub with one entry per run. They stay
+    // isolated to the scratch checkout for legacy test commands only. An
+    // env-overridden data root (explicit test isolation)
     // is exempt and may exercise the central-store path.
     if cloud_mcp_env_path(CLOUD_MCP_LOCAL_DATA_DIR_ENV).is_none()
         && cloud_mcp_env_path(CLOUD_MCP_LOCAL_HOME_ENV).is_none()
@@ -2665,29 +2661,21 @@ fn architecture_storage_repo_base(repo_path: &str) -> Result<PathBuf, String> {
     architecture_resolved_and_storage(repo_path).map(|(_, storage)| storage)
 }
 
-/// Architecture env/context paths for coding agents launched against a repo.
-/// Falls back to the legacy repo-local layout only when the account-global
-/// architecture store cannot be resolved.
-pub(crate) fn architecture_env_paths_for_repo(repo_path: &str) -> (String, String, String, String) {
-    if let Ok((_, architecture_root, graphs_root, guide_path, icon_reference_path)) =
-        architecture_global_agent_paths()
-    {
-        return (
-            workspace_path_display(&architecture_root),
-            workspace_path_display(&graphs_root),
-            workspace_path_display(&guide_path),
-            workspace_path_display(&icon_reference_path),
-        );
-    }
+fn architecture_display_repo_path(repo_path: &str) -> PathBuf {
+    resolve_workspace_root_directory(Some(repo_path)).unwrap_or_else(|_| PathBuf::from(repo_path))
+}
 
-    let base = architecture_storage_repo_base(repo_path)
-        .unwrap_or_else(|_| PathBuf::from(repo_path));
-    let root = architecture_agents_root(&base);
+/// Architecture env/context paths for coding agents launched against a repo.
+/// Architecture graph storage is account-global; the repo path is intentionally
+/// ignored so agents do not recreate workspace-scoped architecture stores.
+pub(crate) fn architecture_env_paths_for_repo(_repo_path: &str) -> (String, String, String, String) {
+    let (_, root, graphs_root, guide_path, icon_reference_path) =
+        architecture_global_agent_paths_or_fallback();
     (
         workspace_path_display(&root),
-        workspace_path_display(&root.join("graphs")),
-        workspace_path_display(&root.join(ARCHITECTURE_AGENT_GUIDE_FILENAME)),
-        workspace_path_display(&root.join(ARCHITECTURE_ICON_REFERENCE_FILENAME)),
+        workspace_path_display(&graphs_root),
+        workspace_path_display(&guide_path),
+        workspace_path_display(&icon_reference_path),
     )
 }
 

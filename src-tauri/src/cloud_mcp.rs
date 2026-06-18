@@ -8522,7 +8522,7 @@ fn cloud_mcp_direct_prompt_dispatch_status_for_turn(turn_status: &str) -> Option
     match turn_status.trim().to_ascii_lowercase().as_str() {
         "completed" | "complete" | "done" => Some("completed"),
         "failed" | "error" => Some("failed"),
-        "interrupted" | "cancelled" | "canceled" => Some("cancelled"),
+        "interrupted" | "cancelled" | "canceled" => Some("interrupted"),
         "running" | "queued" => Some("running"),
         _ => None,
     }
@@ -22104,6 +22104,20 @@ fn cloud_mcp_terminal_lifecycle_state(
     }) {
         return "paused";
     }
+    if event_type == "provider_turn_interrupted"
+        || values
+            .iter()
+            .any(|value| matches!(*value, "interrupted" | "interrupt" | "cancelled" | "canceled"))
+    {
+        return "interrupted";
+    }
+    if event_type == "provider_turn_completed"
+        || matches!(
+        turn_status.as_str(),
+        "complete" | "completed" | "done"
+    ) {
+        return "idle";
+    }
     if values.iter().any(|value| {
         matches!(
             *value,
@@ -22185,6 +22199,7 @@ fn cloud_mcp_terminal_lifecycle_readiness(state: &str, input_ready: Option<bool>
     }
     match state {
         "idle" => "ready",
+        "interrupted" => "ready",
         "closed" => "closed",
         "error" => "error",
         "paused" => "needs_input",
@@ -22548,15 +22563,17 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         .and_then(|entry| entry.prompt_event_id.as_deref());
     let state_value = cloud_mcp_terminal_lifecycle_state(
         &payload.event_type,
-        &payload.status,
-        &payload.activity_status,
-        "",
-        &payload.command_phase,
-        "",
+        &payload.terminal_status,
+        &payload.native_rail_state,
+        &payload.readiness,
+        &payload.execution_phase,
+        &payload.turn_status,
     );
-    let turn_status =
-        cloud_mcp_terminal_lifecycle_turn_status(&payload.event_type, "", state_value);
-    let readiness = cloud_mcp_terminal_lifecycle_readiness(state_value, Some(payload.input_ready));
+    let turn_status = cloud_mcp_terminal_lifecycle_turn_status(
+        &payload.event_type,
+        &payload.turn_status,
+        state_value,
+    );
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(payload.observed_at_ms));
     let workspace_runtime_seq =
         cloud_mcp_next_workspace_runtime_seq(state, Some(payload.observed_at_ms));
@@ -22574,11 +22591,20 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "workspaceRuntimeSeq": workspace_runtime_seq,
         "workspace_runtime_epoch": workspace_runtime_epoch,
         "workspaceRuntimeEpoch": workspace_runtime_epoch,
+        "display_name": payload.display_name.as_str(),
+        "displayName": payload.display_name.as_str(),
         "terminal_id": terminal_id,
+        "target_terminal_id": terminal_id,
         "pane_id": terminal_id,
         "terminal_instance_id": payload.instance_id,
         "terminal_index": payload.terminal_index,
         "terminal_epoch": format!("{}:{}", terminal_id, payload.instance_id),
+        "terminal_name": payload.terminal_name.as_str(),
+        "terminalName": payload.terminal_name.as_str(),
+        "terminal_nickname": payload.terminal_nickname.as_str(),
+        "terminalNickname": payload.terminal_nickname.as_str(),
+        "terminal_lifecycle": payload.terminal_lifecycle.as_str(),
+        "terminalLifecycle": payload.terminal_lifecycle.as_str(),
         "agent_kind": payload.agent_kind,
         "agent_type": payload.agent_type.as_str(),
         "agentType": payload.agent_type.as_str(),
@@ -22589,10 +22615,27 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "hook_event_name": payload.hook_event_name,
         "state": state_value,
         "status": state_value,
-        "activity_status": state_value,
-        "readiness": readiness,
-        "turn_status": turn_status,
+        "activity_status": payload.native_rail_state.as_str(),
+        "activityStatus": payload.native_rail_state.as_str(),
+        "display_status": payload.native_rail_label.as_str(),
+        "displayStatus": payload.native_rail_label.as_str(),
+        "native_rail_state": payload.native_rail_state.as_str(),
+        "nativeRailState": payload.native_rail_state.as_str(),
+        "native_rail_label": payload.native_rail_label.as_str(),
+        "nativeRailLabel": payload.native_rail_label.as_str(),
+        "readiness": payload.readiness.as_str(),
+        "turn_status": payload.turn_status.as_str(),
+        "turnStatus": payload.turn_status.as_str(),
         "command_phase": payload.command_phase,
+        "commandPhase": payload.command_phase,
+        "execution_phase": payload.execution_phase.as_str(),
+        "executionPhase": payload.execution_phase.as_str(),
+        "terminal_status": payload.terminal_status.as_str(),
+        "terminalStatus": payload.terminal_status.as_str(),
+        "terminal_work_state": payload.terminal_work_state.as_str(),
+        "terminalWorkState": payload.terminal_work_state.as_str(),
+        "session_state": payload.session_state.as_str(),
+        "sessionState": payload.session_state.as_str(),
         "input_ready": payload.input_ready,
         "status_seq": status_seq,
         "observed_at_ms": payload.observed_at_ms,
@@ -22622,7 +22665,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     };
     cloud_mcp_publish_terminal_state_live_update(state, &delta, reason).await;
     if let Some(agent_session_payload) = agent_session_observed {
-        let priority = if matches!(state_value, "idle" | "paused" | "error" | "closed") {
+        let priority = if matches!(state_value, "idle" | "interrupted" | "paused" | "error" | "closed") {
             CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
         } else {
             CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
@@ -36348,6 +36391,32 @@ mod cloud_mcp_tests {
         );
         assert_eq!(cloud_mcp_device_limit_from_value(Some(0), "ultra"), Some(0));
         assert_eq!(cloud_mcp_device_limit_from_value(None, "pro"), Some(15));
+    }
+
+    #[test]
+    fn terminal_lifecycle_completion_beats_raw_active_status() {
+        assert_eq!(
+            cloud_mcp_terminal_lifecycle_state(
+                "provider-turn-completed",
+                "active",
+                "idle",
+                "ready",
+                "idle",
+                "completed",
+            ),
+            "idle"
+        );
+        assert_eq!(
+            cloud_mcp_terminal_lifecycle_state(
+                "provider-turn-started",
+                "active",
+                "thinking",
+                "busy",
+                "running",
+                "running",
+            ),
+            "thinking"
+        );
     }
 
     #[test]

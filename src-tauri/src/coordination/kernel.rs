@@ -25852,25 +25852,12 @@ fn codex_managed_profile_config(
     Ok(config)
 }
 
-#[derive(Debug, Clone)]
-struct CodexManagedGitRoute {
-    repo_root: PathBuf,
+fn codex_architecture_graphs_root(_repo_path: &Path) -> PathBuf {
+    crate::architecture_global_agent_paths_or_fallback().2
 }
 
-fn codex_architecture_graphs_root(repo_path: &Path) -> PathBuf {
-    crate::architecture_global_graphs_root_dir().unwrap_or_else(|_| {
-        repo_path
-            .join(".agents")
-            .join("architectures")
-            .join("graphs")
-    })
-}
-
-fn codex_architecture_graphs_write_enabled(enforcement_mode: &str) -> bool {
-    matches!(
-        enforcement_mode,
-        "worktree_required" | "bounded_direct_edit" | "general_worker" | "direct_unmanaged"
-    )
+fn codex_architecture_graphs_write_enabled(_enforcement_mode: &str) -> bool {
+    true
 }
 
 fn append_codex_managed_permission_profile(
@@ -26288,48 +26275,6 @@ fn prepend_codex_managed_root_permission_profile(config: String, profile: &str) 
         }
     }
     next
-}
-
-fn codex_managed_git_routes_for_general_worker_root(
-    write_root: &Path,
-    _slot_key: &str,
-    _agent_kind: &str,
-) -> Result<Vec<CodexManagedGitRoute>, String> {
-    let mut routes = Vec::new();
-    if write_root.join(".git").is_dir() || write_root.join(".git").is_file() {
-        routes.push(CodexManagedGitRoute {
-            repo_root: write_root.to_path_buf(),
-        });
-    }
-    Ok(routes)
-}
-
-fn codex_managed_git_routes_for_direct_root(
-    _write_root: &Path,
-    _slot_key: &str,
-    _agent_kind: &str,
-) -> Result<Vec<CodexManagedGitRoute>, String> {
-    Ok(Vec::new())
-}
-
-fn codex_permission_relative_path(root: &Path, child: &Path) -> Result<String, String> {
-    let relative = child.strip_prefix(root).map_err(|_| {
-        format!(
-            "Unable to express {} relative to {} for Codex permissions.",
-            child.display(),
-            root.display()
-        )
-    })?;
-    let text = relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join("/");
-    if text.is_empty() {
-        Ok(".".to_string())
-    } else {
-        Ok(text)
-    }
 }
 
 fn codex_activity_hook_command(command: &str) -> String {

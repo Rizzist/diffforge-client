@@ -1901,6 +1901,11 @@ const SnippingOverlayGlobalStyle = createGlobalStyle`
     cursor: crosshair !important;
   }
 
+  #app [data-snipping-mode="recording"],
+  #app [data-snipping-mode="recording"] * {
+    cursor: pointer;
+  }
+
   @keyframes recordingSelectionMarch {
     to {
       background-position:
@@ -1931,6 +1936,10 @@ const SnippingOverlayRoot = styled.main`
     sans-serif;
   cursor: crosshair;
   touch-action: none;
+
+  &[data-snipping-mode="recording"] {
+    cursor: pointer;
+  }
 `;
 
 const SnippingOverlayHint = styled.div`
@@ -1973,14 +1982,14 @@ const SnippingSelectionBox = styled.div`
   &[data-mode="recording"]::before {
     content: "";
     position: absolute;
-    inset: -2px;
-    border: 2px dashed rgba(248, 250, 252, 0.92);
+    inset: -1px;
+    border: 1px dashed rgba(248, 250, 252, 0.92);
     border-radius: 4px;
     background:
-      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 0 / 12px 2px repeat-x,
-      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 100% / 12px 2px repeat-x,
-      linear-gradient(0deg, #0f172a 50%, transparent 0) 0 0 / 2px 12px repeat-y,
-      linear-gradient(0deg, #0f172a 50%, transparent 0) 100% 0 / 2px 12px repeat-y;
+      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 0 / 12px 1px repeat-x,
+      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 100% / 12px 1px repeat-x,
+      linear-gradient(0deg, #0f172a 50%, transparent 0) 0 0 / 1px 12px repeat-y,
+      linear-gradient(0deg, #0f172a 50%, transparent 0) 100% 0 / 1px 12px repeat-y;
     animation: recordingSelectionMarch 720ms linear infinite;
     pointer-events: none;
   }
@@ -2010,60 +2019,72 @@ const SnippingRecordingResizeHandle = styled.i`
   position: absolute;
   z-index: 3;
   display: block;
-  width: 16px;
-  height: 16px;
-  border: 2px solid rgba(248, 250, 252, 0.96);
-  border-radius: 999px;
-  background: rgba(13, 17, 23, 0.88);
-  box-shadow:
-    0 0 0 1px rgba(15, 23, 42, 0.72),
-    0 6px 18px rgba(0, 0, 0, 0.28);
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  touch-action: none;
 
   &[data-side="nw"] {
-    left: -8px;
-    top: -8px;
+    left: -14px;
+    top: -14px;
+    width: 28px;
+    height: 28px;
     cursor: nwse-resize !important;
   }
 
   &[data-side="n"] {
-    left: calc(50% - 8px);
-    top: -8px;
+    left: 14px;
+    right: 14px;
+    top: -12px;
+    height: 24px;
     cursor: ns-resize !important;
   }
 
   &[data-side="ne"] {
-    right: -8px;
-    top: -8px;
+    right: -14px;
+    top: -14px;
+    width: 28px;
+    height: 28px;
     cursor: nesw-resize !important;
   }
 
   &[data-side="e"] {
-    right: -8px;
-    top: calc(50% - 8px);
+    right: -12px;
+    top: 14px;
+    bottom: 14px;
+    width: 24px;
     cursor: ew-resize !important;
   }
 
   &[data-side="se"] {
-    right: -8px;
-    bottom: -8px;
+    right: -14px;
+    bottom: -14px;
+    width: 28px;
+    height: 28px;
     cursor: nwse-resize !important;
   }
 
   &[data-side="s"] {
-    left: calc(50% - 8px);
-    bottom: -8px;
+    left: 14px;
+    right: 14px;
+    bottom: -12px;
+    height: 24px;
     cursor: ns-resize !important;
   }
 
   &[data-side="sw"] {
-    left: -8px;
-    bottom: -8px;
+    left: -14px;
+    bottom: -14px;
+    width: 28px;
+    height: 28px;
     cursor: nesw-resize !important;
   }
 
   &[data-side="w"] {
-    left: -8px;
-    top: calc(50% - 8px);
+    left: -12px;
+    top: 14px;
+    bottom: 14px;
+    width: 24px;
     cursor: ew-resize !important;
   }
 `;

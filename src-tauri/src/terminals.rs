@@ -161,6 +161,23 @@ fn terminal_provider_session_id_from_transcript_path(event: &Value) -> Option<St
     .and_then(|path| terminal_uuid_session_id_from_text(&path))
 }
 
+fn terminal_activity_hook_provider_session_id(event: &Value) -> Option<String> {
+    terminal_activity_hook_string(
+        event,
+        &[
+            "sessionId",
+            "session_id",
+            "providerSessionId",
+            "provider_session_id",
+            "nativeSessionId",
+            "native_session_id",
+            "conversationId",
+            "conversation_id",
+        ],
+    )
+    .or_else(|| terminal_provider_session_id_from_transcript_path(event))
+}
+
 fn terminal_runtime_snapshot(instance: &TerminalInstance) -> TerminalRuntimeSnapshot {
     instance
         .runtime
@@ -236,6 +253,358 @@ fn terminal_runtime_apply_activity_payload(
         *runtime = snapshot.clone();
     }
     snapshot
+}
+
+fn terminal_projection_text(value: &str, fallback: &str) -> String {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    if normalized.is_empty() {
+        fallback.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn terminal_projection_state_is_busy(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "busy"
+            | "delegating"
+            | "dispatched"
+            | "editing"
+            | "implementing"
+            | "mcp"
+            | "pending"
+            | "queued"
+            | "reasoning"
+            | "resume_requested"
+            | "resumed"
+            | "running"
+            | "shell"
+            | "starting"
+            | "subagent"
+            | "subagent_completed"
+            | "subagent_running"
+            | "submitted"
+            | "thinking"
+            | "tool"
+            | "tool_completed"
+            | "tool_running"
+            | "working"
+    )
+}
+
+fn terminal_projection_state_is_idle(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "complete" | "completed" | "done" | "idle" | "input_ready" | "interrupted" | "ready"
+    )
+}
+
+fn terminal_projection_state_is_paused(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "needs_input" | "parked" | "paused" | "prompting_user" | "resume_ready" | "waiting"
+    )
+}
+
+fn terminal_projection_state_is_error(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "error" | "failed" | "failure"
+    )
+}
+
+fn terminal_projection_state_is_closed(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "closed" | "closing" | "exited" | "no_session" | "offline" | "stopped" | "terminated"
+    )
+}
+
+fn terminal_projection_state_is_finished(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "cancelled" | "canceled" | "complete" | "completed" | "done" | "interrupted"
+    )
+}
+
+fn terminal_projection_readiness(status: &str) -> &'static str {
+    let status = terminal_projection_text(status, "idle");
+    if terminal_projection_state_is_busy(&status) {
+        "busy"
+    } else if terminal_projection_state_is_paused(&status) {
+        "needs_input"
+    } else if terminal_projection_state_is_error(&status) {
+        "error"
+    } else if status == "closing" {
+        "closing"
+    } else if terminal_projection_state_is_closed(&status) {
+        "closed"
+    } else {
+        "ready"
+    }
+}
+
+fn terminal_projection_turn_status(activity_status: &str, status: &str) -> &'static str {
+    let activity = terminal_projection_text(
+        activity_status,
+        &terminal_projection_text(status, "idle"),
+    );
+    if matches!(activity.as_str(), "cancelled" | "canceled" | "interrupted") {
+        "interrupted"
+    } else if terminal_projection_state_is_busy(&activity) {
+        "running"
+    } else if terminal_projection_state_is_error(&activity) {
+        "failed"
+    } else if terminal_projection_state_is_paused(&activity) {
+        "pending"
+    } else if terminal_projection_state_is_closed(&activity) {
+        "interrupted"
+    } else {
+        "completed"
+    }
+}
+
+fn terminal_projection_execution_phase(
+    event_type: &str,
+    command_phase: &str,
+    activity_status: &str,
+    status: &str,
+    readiness: &str,
+    turn_status: &str,
+    terminal_lifecycle: &str,
+) -> &'static str {
+    let event_type = terminal_projection_text(event_type, "");
+    let command_phase = terminal_projection_text(command_phase, "");
+    let activity = terminal_projection_text(activity_status, "");
+    let status = terminal_projection_text(status, "");
+    let readiness = terminal_projection_text(readiness, "");
+    let turn = terminal_projection_text(turn_status, "");
+    let lifecycle = terminal_projection_text(terminal_lifecycle, "");
+
+    if lifecycle == "offline" || activity == "offline" || status == "offline" {
+        return "offline";
+    }
+    if lifecycle == "exited" || activity == "exited" || status == "exited" {
+        return "exited";
+    }
+    if ["closed", "closing", "terminated"].contains(&lifecycle.as_str())
+        || ["closed", "closing", "terminated"].contains(&status.as_str())
+    {
+        return if lifecycle == "closing" || status == "closing" {
+            "closing"
+        } else {
+            "closed"
+        };
+    }
+    if event_type == "provider_turn_interrupted" || turn == "interrupted" {
+        return "interrupted";
+    }
+    if matches!(turn.as_str(), "cancelled" | "canceled")
+        || matches!(command_phase.as_str(), "cancelled" | "canceled")
+    {
+        return "cancelled";
+    }
+    if matches!(event_type.as_str(), "provider_turn_error" | "pending_prompt_error")
+        || matches!(turn.as_str(), "failed" | "error")
+        || terminal_projection_state_is_error(&activity)
+        || readiness == "error"
+        || status == "error"
+    {
+        return "failed";
+    }
+    if terminal_projection_state_is_paused(&activity)
+        || matches!(readiness.as_str(), "needs_input" | "paused")
+    {
+        return "needs_input";
+    }
+    if command_phase == "queued" {
+        return "queued";
+    }
+    if matches!(
+        command_phase.as_str(),
+        "submitted" | "input_written" | "accepted" | "running"
+    ) || matches!(
+        event_type.as_str(),
+        "message_submitted" | "provider_turn_started" | "agent_output" | "pending_prompt_sent"
+    ) || terminal_projection_state_is_busy(&activity)
+        || matches!(
+            turn.as_str(),
+            "queued" | "submitted" | "pending" | "running" | "thinking" | "reasoning" | "working"
+        )
+        || (readiness == "busy" && !terminal_projection_state_is_finished(&turn))
+    {
+        return "running";
+    }
+    if event_type == "provider_turn_completed"
+        || matches!(
+            command_phase.as_str(),
+            "completed" | "complete" | "done"
+        )
+        || terminal_projection_state_is_finished(&turn)
+        || terminal_projection_state_is_idle(&activity)
+        || matches!(readiness.as_str(), "ready" | "input_ready")
+    {
+        return "idle";
+    }
+
+    "idle"
+}
+
+fn terminal_projection_rail_state(execution_phase: &str, fallback: &str) -> String {
+    match terminal_projection_text(execution_phase, "").as_str() {
+        "offline" | "closed" | "closing" | "exited" => {
+            terminal_projection_text(execution_phase, "closed")
+        }
+        "failed" => "error".to_string(),
+        "needs_input" | "paused" | "parked" | "resume_ready" => "paused".to_string(),
+        "queued" | "submitted" | "input_written" | "accepted" | "running" | "cancelling" => {
+            "thinking".to_string()
+        }
+        "cancelled" | "canceled" | "interrupted" => "interrupted".to_string(),
+        "completed" | "complete" | "done" | "idle" => {
+            "idle".to_string()
+        }
+        _ => terminal_projection_text(fallback, "idle"),
+    }
+}
+
+fn terminal_projection_label(value: &str) -> String {
+    terminal_projection_text(value, "unknown").replace(['_', '-'], " ")
+}
+
+fn terminal_projection_display_name(metadata: &TerminalInstanceMetadata) -> String {
+    [
+        metadata.terminal_nickname.as_str(),
+        metadata.terminal_name.as_str(),
+        metadata.agent_kind.as_str(),
+        metadata.agent_id.as_str(),
+        "Terminal",
+    ]
+    .iter()
+    .map(|value| value.trim())
+    .find(|value| !value.is_empty())
+    .unwrap_or("Terminal")
+    .to_string()
+}
+
+#[derive(Clone)]
+struct TerminalProjectedRuntime {
+    display_name: String,
+    terminal_name: String,
+    terminal_nickname: String,
+    execution_phase: String,
+    native_rail_state: String,
+    native_rail_label: String,
+    readiness: String,
+    terminal_lifecycle: String,
+    terminal_status: String,
+    terminal_work_state: String,
+    turn_status: String,
+    session_state: String,
+}
+
+fn terminal_project_runtime(
+    metadata: &TerminalInstanceMetadata,
+    runtime: &TerminalRuntimeSnapshot,
+    parked: bool,
+) -> TerminalProjectedRuntime {
+    let terminal_lifecycle = if terminal_projection_state_is_closed(&runtime.status) {
+        "closed"
+    } else {
+        "open"
+    };
+    let raw_activity = terminal_projection_text(&runtime.activity_status, "");
+    let raw_event_type = terminal_projection_text(&runtime.event_type, "");
+    let raw_command_phase = terminal_projection_text(&runtime.command_phase, "");
+    let status = if terminal_lifecycle == "closed" {
+        "closed".to_string()
+    } else if raw_event_type == "provider_turn_interrupted"
+        || matches!(raw_command_phase.as_str(), "cancelled" | "canceled" | "interrupted")
+        || matches!(raw_activity.as_str(), "cancelled" | "canceled" | "interrupted")
+    {
+        "interrupted".to_string()
+    } else if parked || terminal_projection_state_is_paused(&raw_activity) {
+        "paused".to_string()
+    } else if terminal_projection_state_is_error(&raw_activity)
+        || terminal_projection_state_is_error(&runtime.status)
+    {
+        "error".to_string()
+    } else if terminal_projection_state_is_busy(&raw_activity) {
+        "thinking".to_string()
+    } else if terminal_projection_state_is_idle(&raw_activity) || runtime.input_ready {
+        "idle".to_string()
+    } else {
+        terminal_projection_text(&runtime.status, "idle")
+    };
+    let readiness = terminal_projection_readiness(&status).to_string();
+    let turn_status = terminal_projection_turn_status(&raw_activity, &status).to_string();
+    let execution_phase = terminal_projection_execution_phase(
+        &runtime.event_type,
+        &runtime.command_phase,
+        &raw_activity,
+        &status,
+        &readiness,
+        &turn_status,
+        terminal_lifecycle,
+    )
+    .to_string();
+    let native_rail_state = terminal_projection_rail_state(&execution_phase, &status);
+    let native_rail_label = terminal_projection_label(&native_rail_state);
+    let terminal_work_state = if terminal_lifecycle == "closed" {
+        "closed"
+    } else if parked || terminal_projection_state_is_paused(&native_rail_state) {
+        "prompting_user"
+    } else if terminal_projection_state_is_error(&native_rail_state) {
+        "error"
+    } else if terminal_projection_state_is_busy(&native_rail_state) {
+        "running"
+    } else {
+        "complete"
+    }
+    .to_string();
+    let display_name = terminal_projection_display_name(metadata);
+    let terminal_name = metadata
+        .terminal_name
+        .trim()
+        .to_string()
+        .if_empty_then(|| display_name.clone());
+
+    TerminalProjectedRuntime {
+        display_name,
+        terminal_name,
+        terminal_nickname: metadata.terminal_nickname.trim().to_string(),
+        execution_phase,
+        native_rail_state,
+        native_rail_label,
+        readiness,
+        terminal_lifecycle: terminal_lifecycle.to_string(),
+        terminal_status: status,
+        terminal_work_state,
+        turn_status,
+        session_state: if terminal_lifecycle == "closed" {
+            "no_session".to_string()
+        } else {
+            "session_attached".to_string()
+        },
+    }
+}
+
+trait TerminalIfEmptyThen {
+    fn if_empty_then<F: FnOnce() -> String>(self, fallback: F) -> String;
+}
+
+impl TerminalIfEmptyThen for String {
+    fn if_empty_then<F: FnOnce() -> String>(self, fallback: F) -> String {
+        if self.trim().is_empty() {
+            fallback()
+        } else {
+            self
+        }
+    }
 }
 
 fn terminal_record_coordination_provider_session_id(
@@ -510,13 +879,32 @@ fn terminal_launch(
     provider: Option<String>,
     model: Option<String>,
     provider_session_id: Option<String>,
-) -> Result<(Vec<String>, Vec<String>, String), String> {
+    working_directory: &str,
+) -> Result<(Vec<String>, Vec<String>, String, Option<String>), String> {
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
-    let mut args = terminal_provider_resume_args(provider, provider_session_id.as_deref());
-    let resume_session_id = provider_session_id
+    let requested_resume_session_id = provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let mut codex_resume_home = None;
+    let resume_session_id =
+        if matches!(provider, AgentProvider::Codex) && requested_resume_session_id.is_some() {
+            requested_resume_session_id
+                .as_deref()
+                .and_then(|session_id| {
+                    match resolve_codex_resume_session(session_id, working_directory) {
+                        Ok((session_id, home)) => {
+                            let _ = prepare_codex_rollout_for_resume(&session_id, working_directory);
+                            codex_resume_home = Some(home.to_string_lossy().to_string());
+                            Some(session_id)
+                        }
+                        Err(_) => None,
+                    }
+                })
+        } else {
+            requested_resume_session_id
+        };
+    let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
 
     // When resuming, the session transcript knows the exact model that was
     // active when the session closed — including in-session `/model`
@@ -539,6 +927,7 @@ fn terminal_launch(
         agent_command_candidates(definition),
         args,
         definition.label.to_string(),
+        codex_resume_home,
     ))
 }
 
@@ -1632,9 +2021,21 @@ struct TerminalLiveSessionSummary {
     thread_id: String,
     agent_id: String,
     agent_kind: String,
+    display_name: String,
+    terminal_name: String,
+    terminal_nickname: String,
     status: String,
     activity_status: String,
     command_phase: String,
+    execution_phase: String,
+    native_rail_state: String,
+    native_rail_label: String,
+    readiness: String,
+    terminal_lifecycle: String,
+    terminal_status: String,
+    terminal_work_state: String,
+    turn_status: String,
+    session_state: String,
     input_ready: bool,
     input_ready_at: Option<String>,
     prompt_ready_at: Option<String>,
@@ -4547,31 +4948,22 @@ async fn terminal_open(
                 return Err(error);
             }
         };
-    if !is_prewarm_pty && !plain_shell {
-        let launch_provider = terminal_launch_provider(&kind, provider.as_deref())?;
-        if matches!(launch_provider, AgentProvider::Codex) {
-            if let Some(provider_session_id) = requested_provider_session_id.as_deref() {
-                let _ = prepare_codex_rollout_for_resume(
-                    provider_session_id,
-                    &working_directory.to_string_lossy(),
-                );
-            }
-        }
-    }
+    let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut terminal_project_root = working_directory.clone();
     let mut process_working_directory = workspace_path_for_process(&working_directory);
     let mut launch_worktree: Option<Value> = None;
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
         None;
 
-    let (command_candidates, args, label) = if is_prewarm_pty || plain_shell {
-        (Vec::new(), Vec::new(), "Prepared PTY".to_string())
+    let (command_candidates, args, label, codex_resume_home) = if is_prewarm_pty || plain_shell {
+        (Vec::new(), Vec::new(), "Prepared PTY".to_string(), None)
     } else {
         terminal_launch(
             &kind,
             provider,
             model,
             requested_provider_session_id.clone(),
+            &working_directory_text,
         )?
     };
     let instance_id = request.instance_id.filter(|id| *id > 0).unwrap_or_else(|| {
@@ -4666,6 +5058,9 @@ async fn terminal_open(
             .as_ref()
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
+        if let Some(home) = codex_resume_home.as_deref() {
+            apply_codex_resume_home_env(&mut coordination_env_vars, home);
+        }
         let activity_provider_id = provider_for_coordination
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -4736,6 +5131,9 @@ async fn terminal_open(
             .as_ref()
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
+        if let Some(home) = codex_resume_home.as_deref() {
+            apply_codex_resume_home_env(&mut coordination_env_vars, home);
+        }
         extend_terminal_activity_env_vars(
             &mut coordination_env_vars,
             &pane_id,
@@ -5483,10 +5881,45 @@ async fn start_terminal_agent_in_prepared_pty(
         }
     };
     let definition = agent_definition(provider);
-    let resume_session_id = request
+    let requested_resume_session_id = request
         .provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+
+    let Some(instance) = ({
+        let terminals = terminals.read().await;
+        terminals.get(&pane_id).cloned()
+    }) else {
+        return TerminalStartAgentPaneResult {
+            pane_id,
+            instance_id,
+            started: false,
+            skipped: true,
+            message: "Terminal session is not running.".to_string(),
+        };
+    };
+    let working_directory_text = instance.working_directory.to_string_lossy().to_string();
+    let mut codex_resume_home = None;
+    let resume_session_id =
+        if matches!(provider, AgentProvider::Codex) && requested_resume_session_id.is_some() {
+            requested_resume_session_id
+                .as_deref()
+                .and_then(|session_id| {
+                    match resolve_codex_resume_session(session_id, &working_directory_text) {
+                        Ok((session_id, home)) => {
+                            let _ = prepare_codex_rollout_for_resume(
+                                &session_id,
+                                &working_directory_text,
+                            );
+                            codex_resume_home = Some(home.to_string_lossy().to_string());
+                            Some(session_id)
+                        }
+                        Err(_) => None,
+                    }
+                })
+        } else {
+            requested_resume_session_id
+        };
     let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
 
     // Resumed sessions continue on the exact model they last used; the
@@ -5514,27 +5947,6 @@ async fn start_terminal_agent_in_prepared_pty(
                 skipped: true,
                 message: error,
             };
-        }
-    }
-
-    let Some(instance) = ({
-        let terminals = terminals.read().await;
-        terminals.get(&pane_id).cloned()
-    }) else {
-        return TerminalStartAgentPaneResult {
-            pane_id,
-            instance_id,
-            started: false,
-            skipped: true,
-            message: "Terminal session is not running.".to_string(),
-        };
-    };
-    if matches!(provider, AgentProvider::Codex) {
-        if let Some(provider_session_id) = resume_session_id.as_deref() {
-            let _ = prepare_codex_rollout_for_resume(
-                provider_session_id,
-                &instance.working_directory.to_string_lossy(),
-            );
         }
     }
 
@@ -5641,6 +6053,9 @@ async fn start_terminal_agent_in_prepared_pty(
             .as_ref()
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
+        if let Some(home) = codex_resume_home.as_deref() {
+            apply_codex_resume_home_env(&mut coordination_env_vars, home);
+        }
         extend_terminal_activity_env_vars(
             &mut coordination_env_vars,
             &pane_id,
@@ -8661,6 +9076,24 @@ fn emit_terminal_prompt_submitted_activity_started(
         .filter(|value| !value.is_empty())
         .unwrap_or(metadata.thread_id.as_str())
         .to_string();
+    let synthetic_runtime = TerminalRuntimeSnapshot {
+        status: "active".to_string(),
+        activity_status: "thinking".to_string(),
+        command_phase: "running".to_string(),
+        input_ready: false,
+        input_ready_at: None,
+        prompt_ready_at: Some(event_time.clone()),
+        completed_at: None,
+        provider_session_id: None,
+        native_session_id: None,
+        provider_turn_id: prompt_event_id.clone(),
+        turn_id: prompt_event_id.clone(),
+        source: "backend:prompt-submitted".to_string(),
+        event_type: "provider-turn-started".to_string(),
+        hook_event_name: "BackendPromptSubmit".to_string(),
+        updated_at_ms: now_ms,
+    };
+    let projected_runtime = terminal_project_runtime(&metadata, &synthetic_runtime, false);
     let payload = TerminalActivityHookPayload {
         pane_id: metadata.pane_id.clone(),
         instance_id: instance.id,
@@ -8672,6 +9105,9 @@ fn emit_terminal_prompt_submitted_activity_started(
         agent_kind: metadata.agent_kind.clone(),
         agent_type: String::new(),
         agent_display_name: String::new(),
+        display_name: projected_runtime.display_name,
+        terminal_name: projected_runtime.terminal_name,
+        terminal_nickname: projected_runtime.terminal_nickname,
         provider: metadata.agent_kind.clone(),
         event_type: "provider-turn-started".to_string(),
         hook_event_name: "BackendPromptSubmit".to_string(),
@@ -8679,6 +9115,15 @@ fn emit_terminal_prompt_submitted_activity_started(
         status: "active".to_string(),
         activity_status: "thinking".to_string(),
         command_phase: "running".to_string(),
+        execution_phase: projected_runtime.execution_phase,
+        native_rail_state: projected_runtime.native_rail_state,
+        native_rail_label: projected_runtime.native_rail_label,
+        readiness: projected_runtime.readiness,
+        terminal_lifecycle: projected_runtime.terminal_lifecycle,
+        terminal_status: projected_runtime.terminal_status,
+        terminal_work_state: projected_runtime.terminal_work_state,
+        turn_status: projected_runtime.turn_status,
+        session_state: projected_runtime.session_state,
         input_ready: false,
         input_ready_at: None,
         prompt_ready_at: Some(event_time),
@@ -9204,8 +9649,9 @@ fn terminal_activity_hook_manual_prompt(
 fn terminal_activity_hook_lifecycle_kind(
     hook_event_name: &str,
 ) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
-    match terminal_activity_hook_name_key(hook_event_name).as_str() {
-        "userpromptsubmit" | "userpromptsubmitted" | "promptsubmit" | "promptsubmitted" => Some((
+    let hook_key = terminal_activity_hook_name_key(hook_event_name);
+    match hook_key.as_str() {
+        key if terminal_activity_hook_is_prompt_submit_key(key) => Some((
             "provider-turn-started",
             "thinking",
             "active",
@@ -9231,13 +9677,24 @@ fn terminal_activity_hook_lifecycle_kind(
         | "userinterrupt"
         | "userinterrupted" => Some((
             "provider-turn-interrupted",
-            "idle",
+            "interrupted",
             "active",
             "interrupted",
             true,
         )),
         _ => None,
     }
+}
+
+fn terminal_activity_hook_is_prompt_submit_key(hook_key: &str) -> bool {
+    matches!(
+        hook_key,
+        "userpromptsubmit" | "userpromptsubmitted" | "promptsubmit" | "promptsubmitted"
+    )
+}
+
+fn terminal_activity_hook_is_prompt_submit(hook_event_name: &str) -> bool {
+    terminal_activity_hook_is_prompt_submit_key(&terminal_activity_hook_name_key(hook_event_name))
 }
 
 fn terminal_activity_hook_tool_activity_status(event: &Value) -> &'static str {
@@ -9585,8 +10042,7 @@ fn terminal_activity_hook_payload(
         &provider,
         &metadata.agent_kind,
     );
-    let provider_session_id = terminal_activity_hook_string(event, &["sessionId", "session_id"])
-        .or_else(|| terminal_provider_session_id_from_transcript_path(event));
+    let provider_session_id = terminal_activity_hook_provider_session_id(event);
     let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
     let user_message = terminal_activity_hook_string(
         event,
@@ -9632,6 +10088,31 @@ fn terminal_activity_hook_payload(
     let permission_request_id = manual_prompt
         .as_ref()
         .and_then(|prompt| prompt.permission_request_id.clone());
+    let projected_runtime = terminal_project_runtime(
+        &metadata,
+        &TerminalRuntimeSnapshot {
+            status: status.to_string(),
+            activity_status: activity_status.to_string(),
+            command_phase: command_phase.to_string(),
+            input_ready,
+            input_ready_at: input_ready_at.clone(),
+            prompt_ready_at: prompt_ready_at.clone(),
+            completed_at: completed_at.clone(),
+            provider_session_id: provider_session_id.clone(),
+            native_session_id: provider_session_id.clone(),
+            provider_turn_id: provider_turn_id.clone(),
+            turn_id: provider_turn_id.clone(),
+            source: if manual_prompt.is_some() {
+                "cli-hook:manual-prompt".to_string()
+            } else {
+                format!("cli-hook:{event_type}")
+            },
+            event_type: event_type.to_string(),
+            hook_event_name: hook_event_name.clone(),
+            updated_at_ms: now_ms,
+        },
+        terminal_is_prompting_user,
+    );
 
     Some(TerminalActivityHookPayload {
         pane_id: metadata.pane_id,
@@ -9644,6 +10125,9 @@ fn terminal_activity_hook_payload(
         agent_kind: metadata.agent_kind,
         agent_type: agent_type.unwrap_or_default(),
         agent_display_name,
+        display_name: projected_runtime.display_name,
+        terminal_name: projected_runtime.terminal_name,
+        terminal_nickname: projected_runtime.terminal_nickname,
         provider,
         event_type: event_type.to_string(),
         hook_event_name,
@@ -9655,6 +10139,15 @@ fn terminal_activity_hook_payload(
         status: status.to_string(),
         activity_status: activity_status.to_string(),
         command_phase: command_phase.to_string(),
+        execution_phase: projected_runtime.execution_phase,
+        native_rail_state: projected_runtime.native_rail_state,
+        native_rail_label: projected_runtime.native_rail_label,
+        readiness: projected_runtime.readiness,
+        terminal_lifecycle: projected_runtime.terminal_lifecycle,
+        terminal_status: projected_runtime.terminal_status,
+        terminal_work_state: projected_runtime.terminal_work_state,
+        turn_status: projected_runtime.turn_status,
+        session_state: projected_runtime.session_state,
         input_ready,
         input_ready_at,
         prompt_ready_at,
@@ -9862,7 +10355,7 @@ fn terminal_hook_prompt_submitted_observe(
     instance: &TerminalInstance,
     payload: &TerminalActivityHookPayload,
 ) {
-    if terminal_activity_hook_name_key(&payload.hook_event_name) != "userpromptsubmit" {
+    if !terminal_activity_hook_is_prompt_submit(&payload.hook_event_name) {
         return;
     }
     let Some(prompt) = payload
@@ -11351,6 +11844,12 @@ async fn terminal_write_inner(
             Some(active_task_id),
         )
         .await?;
+        todo_dispatch_mark_active_for_pane_interrupted(
+            &app,
+            &instance.metadata.workspace_id,
+            &pane_id,
+            "escape_key",
+        );
         return Ok(());
     }
 
@@ -11915,6 +12414,45 @@ async fn terminal_write(
     .await
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalCaptureDirectPromptTodoRequest {
+    workspace_id: String,
+    workspace_name: Option<String>,
+    pane_id: String,
+    terminal_index: Option<u64>,
+    thread_id: String,
+    agent_kind: String,
+    prompt: String,
+    prompt_event_id: Option<String>,
+    item_id: Option<String>,
+}
+
+#[tauri::command]
+async fn terminal_capture_direct_prompt_todo(
+    app: AppHandle,
+    request: TerminalCaptureDirectPromptTodoRequest,
+) -> Result<Option<String>, String> {
+    validate_terminal_pane_id(&request.pane_id)?;
+    let workspace_id = request.workspace_id.trim();
+    let prompt = request.prompt.trim();
+    if workspace_id.is_empty() || prompt.is_empty() {
+        return Ok(None);
+    }
+    Ok(todo_dispatch_capture_direct_prompt_todo(
+        &app,
+        workspace_id,
+        request.workspace_name.as_deref().unwrap_or_default(),
+        request.pane_id.trim(),
+        request.terminal_index.unwrap_or(0),
+        request.thread_id.trim(),
+        request.agent_kind.trim(),
+        prompt,
+        request.prompt_event_id.as_deref(),
+        request.item_id.as_deref(),
+    ))
+}
+
 #[tauri::command]
 async fn terminal_write_realtime(
     app: AppHandle,
@@ -12452,6 +12990,7 @@ async fn interrupt_terminal_parked_prompts(
 struct TerminalInterruptAgentResult {
     interrupted_active_task: bool,
     interrupted_parked_prompt_count: usize,
+    interrupted_todo_count: usize,
     wrote_escape: bool,
 }
 
@@ -12470,6 +13009,7 @@ async fn terminal_interrupt_agent(
         return Ok(TerminalInterruptAgentResult {
             interrupted_active_task: false,
             interrupted_parked_prompt_count: 0,
+            interrupted_todo_count: 0,
             wrote_escape: false,
         });
     };
@@ -12510,10 +13050,17 @@ async fn terminal_interrupt_agent(
         active_task_id.as_deref(),
     )
     .await?;
+    let interrupted_todo_count = todo_dispatch_mark_active_for_pane_interrupted(
+        &app,
+        &instance.metadata.workspace_id,
+        &pane_id,
+        &reason,
+    );
 
     Ok(TerminalInterruptAgentResult {
         interrupted_active_task,
         interrupted_parked_prompt_count,
+        interrupted_todo_count,
         wrote_escape: true,
     })
 }
@@ -13003,6 +13550,7 @@ async fn terminal_live_sessions(
         let runtime = terminal_runtime_snapshot(&instance);
         let has_active_task = active_task.is_some();
         let parked = parked_prompt.is_some();
+        let projected_runtime = terminal_project_runtime(&metadata, &runtime, parked);
 
         summaries.push(TerminalLiveSessionSummary {
             pane_id,
@@ -13013,9 +13561,21 @@ async fn terminal_live_sessions(
             thread_id: metadata.thread_id,
             agent_id: metadata.agent_id,
             agent_kind: metadata.agent_kind,
+            display_name: projected_runtime.display_name,
+            terminal_name: projected_runtime.terminal_name,
+            terminal_nickname: projected_runtime.terminal_nickname,
             status: runtime.status,
             activity_status: runtime.activity_status,
             command_phase: runtime.command_phase,
+            execution_phase: projected_runtime.execution_phase,
+            native_rail_state: projected_runtime.native_rail_state,
+            native_rail_label: projected_runtime.native_rail_label,
+            readiness: projected_runtime.readiness,
+            terminal_lifecycle: projected_runtime.terminal_lifecycle,
+            terminal_status: projected_runtime.terminal_status,
+            terminal_work_state: projected_runtime.terminal_work_state,
+            turn_status: projected_runtime.turn_status,
+            session_state: projected_runtime.session_state,
             input_ready: runtime.input_ready,
             input_ready_at: runtime.input_ready_at,
             prompt_ready_at: runtime.prompt_ready_at,
@@ -14085,6 +14645,45 @@ mod terminal_tests {
     }
 
     #[test]
+    fn activity_hook_provider_session_id_accepts_provider_aliases() {
+        assert_eq!(
+            terminal_activity_hook_provider_session_id(&json!({
+                "providerSessionId": "codex-session-123",
+            }))
+            .as_deref(),
+            Some("codex-session-123")
+        );
+        assert_eq!(
+            terminal_activity_hook_provider_session_id(&json!({
+                "native_session_id": "claude-session-456",
+            }))
+            .as_deref(),
+            Some("claude-session-456")
+        );
+        assert_eq!(
+            terminal_activity_hook_provider_session_id(&json!({
+                "threadId": "workspace-thread-not-provider-session",
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_submit_hook_aliases_are_shared_by_lifecycle_and_direct_capture() {
+        for hook_name in [
+            "UserPromptSubmit",
+            "UserPromptSubmitted",
+            "PromptSubmit",
+            "PromptSubmitted",
+        ] {
+            assert!(terminal_activity_hook_is_prompt_submit(hook_name));
+            assert!(terminal_activity_hook_lifecycle_kind(hook_name).is_some());
+        }
+
+        assert!(!terminal_activity_hook_is_prompt_submit("Stop"));
+    }
+
+    #[test]
     fn empty_gate_prompt_metadata_diagnostic_allows_known_local_submit_sources() {
         assert!(
             terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
@@ -14237,7 +14836,7 @@ mod terminal_tests {
             terminal_activity_hook_lifecycle_kind("Interrupt"),
             Some((
                 "provider-turn-interrupted",
-                "idle",
+                "interrupted",
                 "active",
                 "interrupted",
                 true
@@ -15708,7 +16307,7 @@ mod terminal_tests {
             "tool_name": "Bash",
             "cwd": repo.display().to_string(),
             "tool_input": {
-                "command": "mkdir -p .agents/architectures/graphs && printf 'title \"Auth\"\\n' > .agents/architectures/graphs/auth.arch"
+                "command": "mkdir -p \"$DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT\" && printf 'title \"Auth\"\\n' > \"$DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT/auth.arch\""
             }
         });
 

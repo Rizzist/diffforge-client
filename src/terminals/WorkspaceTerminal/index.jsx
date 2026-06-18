@@ -1160,7 +1160,10 @@ function terminalActivityHookEventTypeFromPayload(payload = {}) {
 
 function terminalActivityStatusFromHookPayload(payload = {}, eventType = "") {
   const explicitActivity = normalizeTerminalNativeRailState(
-    payload.activityStatus || payload.activity_status,
+    payload.nativeRailState
+      || payload.native_rail_state
+      || payload.activityStatus
+      || payload.activity_status,
     "",
   );
   if (explicitActivity) {
@@ -1180,11 +1183,12 @@ function terminalActivityStatusFromHookPayload(payload = {}, eventType = "") {
   if (type === "provider-turn-error" || type === "pending-prompt-error" || type.endsWith("-error")) {
     return "error";
   }
+  if (type === "provider-turn-interrupted" || type.endsWith("-interrupted")) {
+    return "interrupted";
+  }
   if (
     type === "provider-turn-completed"
-    || type === "provider-turn-interrupted"
     || type.endsWith("-completed")
-    || type.endsWith("-interrupted")
   ) {
     return "idle";
   }
@@ -1941,6 +1945,7 @@ function WorkspaceTerminal({
   workspaceThreads = {},
   workspaces = [],
   selectedWorkspaceThreadId = "",
+  selectedWorkspaceThreadIdOverride = false,
 }) {
   const containerRef = useRef(null);
   const restartMenuRef = useRef(null);
@@ -2394,7 +2399,9 @@ function WorkspaceTerminal({
       ).trim();
       const submittedByActivityHook = promptSource === "activity_hook_user_prompt_submit"
         || promptSource === "cli_hook_user_prompt_submit";
-      if (listenerState.terminalUsesActivityHooks && !submittedByActivityHook) {
+      const submittedByCodexInputGate = listenerState.terminalAgentKind === "codex"
+        && promptSource === "observed_input_gate";
+      if (listenerState.terminalUsesActivityHooks && !submittedByActivityHook && !submittedByCodexInputGate) {
         logTerminalStatus("frontend.terminal_cli.prompt_submitted_event_ignored", listenerState.getTerminalCliStatusLogBase?.({
           instanceId: payload.instanceId || payload.instance_id || "",
           paneId: payloadPaneId,
@@ -3846,6 +3853,39 @@ function WorkspaceTerminal({
       throw new Error("This thread cannot send without a live coding-agent TUI.");
     }
 
+    onThreadTerminalLifecycle?.({
+      agentId,
+      instanceId: binding.instanceId,
+      messageCreatedAt: startedAt,
+      messageId: promptId,
+      messageSource: "bigview-submit",
+      paneId: binding.paneId,
+      promptEpoch: submittedPromptRecord?.promptEpoch || 0,
+      prompt_epoch: submittedPromptRecord?.promptEpoch || 0,
+      promptEventId: promptId,
+      promptEventSubmittedAt: startedAt,
+      repoPath: latestThread.coordination?.worktreePath || workingDirectory || "",
+      source: "bigview-submit",
+      status: "active",
+      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
+      threadId: latestThread.id,
+      turnId,
+      type: "message-submitted",
+      userMessage: text,
+      workspaceId,
+      workspaceName: targetWorkspace?.name || workspace?.name || "",
+    });
+    logBigViewSyncDiagnosticEvent("bigview.submit.materialized_local_turn", {
+      agentId,
+      bindingInstanceId: binding.instanceId,
+      bindingPaneId: binding.paneId,
+      latestThreadId: latestThread.id,
+      messageLength: text.length,
+      promptId,
+      turnId,
+      workspaceId,
+    });
+
     logBigViewSyncDiagnosticEvent("bigview.submit.terminal_sync_start", {
       agentId,
       bindingInstanceId: binding.instanceId,
@@ -3870,7 +3910,7 @@ function WorkspaceTerminal({
       textLength: text.length,
       workspaceId,
     });
-    setThreadComposerDraftValue(syncKey, text, "bigview_submit_sync_prompt");
+    const draftTransaction = setThreadComposerDraftValue(syncKey, text, "bigview_submit_sync_prompt");
     try {
       if (syncData) {
         await queueWorkspaceThreadComposerWrite({
@@ -3913,39 +3953,6 @@ function WorkspaceTerminal({
       latestThreadId: latestThread.id,
       promptId,
       textLength: text.length,
-      workspaceId,
-    });
-
-    onThreadTerminalLifecycle?.({
-      agentId,
-      instanceId: binding.instanceId,
-      messageCreatedAt: startedAt,
-      messageId: promptId,
-      messageSource: "bigview-submit",
-      paneId: binding.paneId,
-      promptEpoch: submittedPromptRecord?.promptEpoch || 0,
-      prompt_epoch: submittedPromptRecord?.promptEpoch || 0,
-      promptEventId: promptId,
-      promptEventSubmittedAt: startedAt,
-      repoPath: latestThread.coordination?.worktreePath || workingDirectory || "",
-      source: "bigview-submit",
-      status: "active",
-      terminalIndex: latestThread.terminalIndex ?? binding.terminalIndex,
-      threadId: latestThread.id,
-      turnId,
-      type: "message-submitted",
-      userMessage: text,
-      workspaceId,
-      workspaceName: targetWorkspace?.name || workspace?.name || "",
-    });
-    logBigViewSyncDiagnosticEvent("bigview.submit.materialized_local_turn", {
-      agentId,
-      bindingInstanceId: binding.instanceId,
-      bindingPaneId: binding.paneId,
-      latestThreadId: latestThread.id,
-      messageLength: text.length,
-      promptId,
-      turnId,
       workspaceId,
     });
 
@@ -4161,7 +4168,60 @@ function WorkspaceTerminal({
     }
 
     const acceptedProviderSessionId = String(acceptedDetail?.sessionId || providerSessionId || "").trim();
-    setThreadComposerDraftValue(syncKey, "", "bigview_submit_confirmed_clear");
+    const clearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
+      expectedValue: text,
+      source: "bigview_submit_confirmed_clear",
+      transactionId: promptId,
+    });
+    if (clearResult.cleared) {
+      const clearInputData = buildTerminalComposerDraftInput(text, "", true);
+      if (clearInputData) {
+        try {
+          await invoke("terminal_write", {
+            data: clearInputData,
+            instanceId: binding.instanceId,
+            paneId: binding.paneId,
+            threadId: latestThread.id,
+          });
+          logThreadBridgeDiagnostic("frontend.thread_submit.confirmed_terminal_draft_clear_done", {
+            agentId,
+            bindingInstanceId: binding.instanceId,
+            bindingPaneId: binding.paneId,
+            draftRevision: draftTransaction?.revision || 0,
+            latestThreadId: latestThread.id,
+            promptId,
+            textLength: text.length,
+            workspaceId,
+          });
+        } catch (clearError) {
+          logThreadBridgeDiagnostic("frontend.thread_submit.confirmed_terminal_draft_clear_error", {
+            agentId,
+            bindingInstanceId: binding.instanceId,
+            bindingPaneId: binding.paneId,
+            draftRevision: draftTransaction?.revision || 0,
+            latestThreadId: latestThread.id,
+            message: getErrorMessage(clearError, "Unable to clear submitted terminal draft."),
+            promptId,
+            textLength: text.length,
+            workspaceId,
+          });
+        }
+      }
+    } else {
+      logThreadBridgeDiagnostic("frontend.thread_submit.confirmed_draft_clear_skip", {
+        agentId,
+        bindingInstanceId: binding.instanceId,
+        bindingPaneId: binding.paneId,
+        currentDraftLength: String(clearResult.value || "").length,
+        currentDraftRevision: clearResult.revision || 0,
+        expectedDraftRevision: draftTransaction?.revision || 0,
+        latestThreadId: latestThread.id,
+        promptId,
+        reason: clearResult.reason || "draft_changed",
+        textLength: text.length,
+        workspaceId,
+      });
+    }
     if (terminalAgentUsesActivityHooks(agentId) && getTerminalAgentKind(agentId) !== "codex") {
       logThreadBridgeDiagnostic("frontend.thread_submit.hook_managed_start_deferred", {
         agentId,
@@ -12507,26 +12567,31 @@ function WorkspaceTerminal({
                   ?? result?.interrupted_parked_prompt_count
                   ?? 0,
               ) || 0;
+              const interruptedTodoCount = Number(
+                result?.interruptedTodoCount
+                  ?? result?.interrupted_todo_count
+                  ?? 0,
+              ) || 0;
               const inputReadyAt = new Date().toISOString();
-              const interruptSource = interruptedActiveTask || interruptedParkedPromptCount > 0
+              const interruptSource = interruptedActiveTask || interruptedParkedPromptCount > 0 || interruptedTodoCount > 0
                 ? "escape_key_task_interrupted"
                 : "escape_key_manual_cancel";
               const submittedPromptForReady = terminalThreadSubmittedPromptRef.current;
-              markTerminalThreadActivityStatus("idle", {
+              markTerminalThreadActivityStatus("interrupted", {
                 reason: interruptSource,
               });
               terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
               terminalThreadSubmittedPromptRef.current = null;
               onThreadTerminalLifecycle?.({
-                activityStatus: "idle",
+                activityStatus: "interrupted",
                 agentId: terminalAgentKind,
-                commandPhase: "cancelled",
+                commandPhase: "interrupted",
                 executionPhase: "interrupted",
                 inputReady: true,
                 inputReadyAt,
                 inputReadyConfidence: interruptSource,
                 instanceId: terminalInstanceId,
-                ...getTerminalNativeRailStateFields("idle"),
+                ...getTerminalNativeRailStateFields("interrupted"),
                 paneId,
                 pendingPromptId: submittedPromptForReady?.promptEventId || "",
                 promptEpoch: submittedPromptForReady?.promptEpoch || 0,
@@ -12915,8 +12980,10 @@ function WorkspaceTerminal({
           agentId: agent?.id || terminalAgentKind,
           agentStarted: !shouldPrewarmShell,
           instanceId: terminalInstanceId,
+          model: startupThreadProviderModel,
           needsAgentStart: shouldPrewarmShell,
           paneId,
+          providerSessionId: openedProviderSessionId || openedNativeSessionId || startupThreadProviderSessionId,
           ready: true,
           terminalIndex,
           threadId: startupThreadId,
@@ -13127,6 +13194,7 @@ function WorkspaceTerminal({
         agentId: agent?.id || "",
         instanceId: terminalInstanceId,
         paneId,
+        providerSessionId: startupThreadProviderSessionId,
         ready: false,
         terminalIndex,
         threadId: startupThreadId,
@@ -13392,6 +13460,9 @@ function WorkspaceTerminal({
         threadId: currentThreadId,
       });
 
+      let pendingPromptDraftTransaction = null;
+      let pendingPromptSyncKey = "";
+
       Promise.resolve()
         .then(async () => {
           const pendingWorkspaceId = workspace?.id || thread?.workspaceId || "";
@@ -13405,9 +13476,14 @@ function WorkspaceTerminal({
               paneId,
             },
           );
+          pendingPromptSyncKey = pendingSyncKey;
           const syncData = buildTerminalComposerDraftInput("", promptText, true);
           const syncSequenceTrace = getTerminalInputSequenceDiagnosticFields(syncData);
-          setThreadComposerDraftValue(pendingSyncKey, promptText, "pending_prompt_sync_prompt");
+          pendingPromptDraftTransaction = setThreadComposerDraftValue(
+            pendingSyncKey,
+            promptText,
+            "pending_prompt_sync_prompt",
+          );
           logTerminalStatus("frontend.pending_prompt.sync_write_start", {
             ...pendingPromptLogFields,
             instanceId: currentInstanceId,
@@ -13529,6 +13605,61 @@ function WorkspaceTerminal({
               threadId: currentThreadId,
               workspaceId: workspace?.id || thread?.workspaceId || "",
             });
+            try {
+              const capturedTodoItemId = await invoke("terminal_capture_direct_prompt_todo", {
+                request: {
+                  agentKind: terminalAgentKind,
+                  itemId: "",
+                  paneId,
+                  prompt: promptText,
+                  promptEventId: promptId,
+                  terminalIndex,
+                  threadId: currentThreadId,
+                  workspaceId: workspace?.id || thread?.workspaceId || "",
+                  workspaceName: workspace?.name || "",
+                },
+              });
+              logTerminalStatus("frontend.pending_prompt.direct_todo_captured", {
+                ...pendingPromptLogFields,
+                capturedTodoItemId: capturedTodoItemId || "",
+                instanceId: currentInstanceId,
+                promptEventSubmittedAt: pendingPromptSubmittedAt,
+                threadId: currentThreadId,
+              });
+              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_captured", {
+                agentId: terminalAgentKind,
+                capturedTodoItemId: capturedTodoItemId || "",
+                deliveryMode: effectiveDeliveryMode,
+                instanceId: currentInstanceId,
+                paneId,
+                promptId,
+                promptText: pendingPromptTextDiagnostic,
+                sendPolicy: "pending-prompt-terminal-direct-todo",
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+            } catch (captureError) {
+              const captureMessage = getErrorMessage(captureError, "Unable to capture pending prompt todo.");
+              logTerminalStatus("frontend.pending_prompt.direct_todo_capture_error", {
+                ...pendingPromptLogFields,
+                error: captureMessage,
+                instanceId: currentInstanceId,
+                promptEventSubmittedAt: pendingPromptSubmittedAt,
+                threadId: currentThreadId,
+              });
+              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_capture_error", {
+                agentId: terminalAgentKind,
+                deliveryMode: effectiveDeliveryMode,
+                error: captureMessage,
+                instanceId: currentInstanceId,
+                paneId,
+                promptId,
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+            }
             await waiter.promise;
             logTerminalStatus("frontend.pending_prompt.submit_observed", {
               ...pendingPromptLogFields,
@@ -13569,9 +13700,9 @@ function WorkspaceTerminal({
             throw error;
           }
         })
-        .then((acceptedDetail) => {
+        .then(async (acceptedDetail) => {
           const pendingWorkspaceId = workspace?.id || thread?.workspaceId || "";
-          const pendingSyncKey = getThreadComposerSyncKey(
+          const pendingSyncKey = pendingPromptSyncKey || getThreadComposerSyncKey(
             {
               id: currentThreadId,
               workspaceId: pendingWorkspaceId,
@@ -13581,7 +13712,92 @@ function WorkspaceTerminal({
               paneId,
             },
           );
-          setThreadComposerDraftValue(pendingSyncKey, "", "pending_prompt_confirmed_clear");
+          const pendingPromptClearResult = clearWorkspaceThreadComposerDraftIfRevision(
+            pendingSyncKey,
+            pendingPromptDraftTransaction?.revision || 0,
+            {
+              expectedValue: promptText,
+              source: "pending_prompt_confirmed_clear",
+              transactionId: promptId,
+            },
+          );
+          if (pendingPromptClearResult.cleared) {
+            const clearInputData = buildTerminalComposerDraftInput(promptText, "", true);
+            if (clearInputData) {
+              try {
+                await invoke("terminal_write", {
+                  data: clearInputData,
+                  instanceId: currentInstanceId,
+                  paneId,
+                  threadId: currentThreadId,
+                });
+                logThreadBridgeDiagnostic("frontend.pending_prompt.confirmed_terminal_draft_clear_done", {
+                  agentId: terminalAgentKind,
+                  deliveryMode: effectiveDeliveryMode,
+                  draftRevision: pendingPromptDraftTransaction?.revision || 0,
+                  instanceId: currentInstanceId,
+                  paneId,
+                  promptId,
+                  terminalIndex,
+                  textLength: promptText.length,
+                  threadId: currentThreadId,
+                  workspaceId: pendingWorkspaceId,
+                });
+                logTerminalStatus("frontend.pending_prompt.confirmed_terminal_draft_clear_done", {
+                  ...pendingPromptLogFields,
+                  draftRevision: pendingPromptDraftTransaction?.revision || 0,
+                  instanceId: currentInstanceId,
+                  threadId: currentThreadId,
+                });
+              } catch (clearError) {
+                logThreadBridgeDiagnostic("frontend.pending_prompt.confirmed_terminal_draft_clear_error", {
+                  agentId: terminalAgentKind,
+                  deliveryMode: effectiveDeliveryMode,
+                  draftRevision: pendingPromptDraftTransaction?.revision || 0,
+                  error: getErrorMessage(clearError, "Unable to clear submitted terminal draft."),
+                  instanceId: currentInstanceId,
+                  paneId,
+                  promptId,
+                  terminalIndex,
+                  textLength: promptText.length,
+                  threadId: currentThreadId,
+                  workspaceId: pendingWorkspaceId,
+                });
+                logTerminalStatus("frontend.pending_prompt.confirmed_terminal_draft_clear_error", {
+                  ...pendingPromptLogFields,
+                  draftRevision: pendingPromptDraftTransaction?.revision || 0,
+                  error: getErrorMessage(clearError, "Unable to clear submitted terminal draft."),
+                  instanceId: currentInstanceId,
+                  threadId: currentThreadId,
+                });
+              }
+            }
+          } else {
+            logThreadBridgeDiagnostic("frontend.pending_prompt.confirmed_draft_clear_skip", {
+              agentId: terminalAgentKind,
+              currentDraftLength: String(pendingPromptClearResult.value || "").length,
+              currentDraftRevision: pendingPromptClearResult.revision || 0,
+              deliveryMode: effectiveDeliveryMode,
+              expectedDraftRevision: pendingPromptDraftTransaction?.revision || 0,
+              instanceId: currentInstanceId,
+              paneId,
+              promptId,
+              reason: pendingPromptClearResult.reason || "draft_changed",
+              terminalIndex,
+              textLength: promptText.length,
+              threadId: currentThreadId,
+              workspaceId: pendingWorkspaceId,
+            });
+            logTerminalStatus("frontend.pending_prompt.confirmed_draft_clear_skip", {
+              ...pendingPromptLogFields,
+              currentDraftLength: String(pendingPromptClearResult.value || "").length,
+              currentDraftRevision: pendingPromptClearResult.revision || 0,
+              expectedDraftRevision: pendingPromptDraftTransaction?.revision || 0,
+              instanceId: currentInstanceId,
+              reason: pendingPromptClearResult.reason || "draft_changed",
+              threadId: currentThreadId,
+            });
+          }
           if (useTerminalConfirmedDelivery && terminalUsesActivityHooks && terminalAgentKind !== "codex") {
             logThreadBridgeDiagnostic("frontend.pending_prompt.hook_managed_start_deferred", {
               agentId: terminalAgentKind,
@@ -15166,7 +15382,8 @@ function WorkspaceTerminal({
               onTogglePinnedThread={onToggleWorkspaceThreadPinned}
               onViewStateChange={onWorkspaceThreadsViewStateChange}
               open={threadsViewActive}
-              selectedThreadId={selectedWorkspaceThreadId || terminalThreadId}
+              preferSelectedThreadId={selectedWorkspaceThreadIdOverride}
+              selectedThreadId={selectedWorkspaceThreadIdOverride ? selectedWorkspaceThreadId : selectedWorkspaceThreadId || terminalThreadId}
               selectedWorkspaceId={workspace?.id || ""}
               todoDropActive={todoDropActive}
               todoDropTarget={todoDropTarget}

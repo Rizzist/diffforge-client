@@ -228,6 +228,148 @@ test("hook-managed queued prompt releases from provider turn closure", () => {
   assert.equal(evaluation.releaseReason, "provider_turn_closed");
 });
 
+test("claude queued prompt interruption releases as interrupted", () => {
+  const evaluation = baseEvaluation({
+    hookManaged: true,
+    effectiveLatestTurnState: "interrupted",
+    terminalGroundTruth: {
+      agentInputReady: true,
+      completedTurnLooksSendable: true,
+      effectiveActivityStatus: "interrupted",
+      effectiveLatestTurnState: "interrupted",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "interrupted",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.latestTurnClosed, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_interrupted");
+});
+
+test("codex queued prompt cancellation releases as interrupted", () => {
+  const evaluation = baseEvaluation({
+    effectiveLatestTurnState: "canceled",
+    terminalGroundTruth: {
+      agentInputReady: true,
+      completedTurnLooksSendable: true,
+      effectiveActivityStatus: "interrupted",
+      effectiveLatestTurnState: "canceled",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "canceled",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.latestTurnClosed, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_interrupted");
+});
+
+test("effective interruption beats a stale running transcript turn", () => {
+  const evaluation = baseEvaluation({
+    effectiveLatestTurnState: "interrupted",
+    terminalGroundTruth: {
+      agentInputReady: true,
+      completedTurnLooksSendable: true,
+      effectiveActivityStatus: "interrupted",
+      effectiveLatestTurnState: "interrupted",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.latestTurnState, "interrupted");
+  assert.equal(evaluation.latestTurnClosed, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_interrupted");
+});
+
+test("queued prompt error releases as failed provider turn", () => {
+  const evaluation = baseEvaluation({
+    effectiveLatestTurnState: "error",
+    terminalGroundTruth: {
+      agentInputReady: true,
+      completedTurnLooksSendable: true,
+      effectiveActivityStatus: "idle",
+      effectiveLatestTurnState: "error",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "error",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.latestTurnClosed, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_error");
+});
+
 test("hook-managed queued prompt does not accept from matching transcript state", () => {
   const evaluation = baseEvaluation({
     hookManaged: true,

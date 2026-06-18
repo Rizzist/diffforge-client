@@ -4,7 +4,14 @@ import {
   terminalActivityStatusIsSendable,
 } from "./terminalActivityState.js";
 
-const DEFAULT_CLOSED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
+const DEFAULT_CLOSED_TURN_STATES = new Set([
+  "cancelled",
+  "canceled",
+  "completed",
+  "error",
+  "failed",
+  "interrupted",
+]);
 
 function cleanText(value) {
   return String(value || "").trim();
@@ -17,6 +24,17 @@ function parseTimestampMs(value) {
 
 function normalizeTurnState(value) {
   return cleanText(value).toLowerCase();
+}
+
+function getProviderTurnReleaseReason(turnState) {
+  const state = normalizeTurnState(turnState);
+  if (["cancelled", "canceled", "interrupted"].includes(state)) {
+    return "provider_turn_interrupted";
+  }
+  if (["error", "failed", "failure"].includes(state)) {
+    return "provider_turn_error";
+  }
+  return "provider_turn_closed";
 }
 
 function messageText(message) {
@@ -180,7 +198,11 @@ export function evaluateTodoQueueInFlightPrompt({
       || 0,
   );
   const latestTurn = targetThread?.latestTurn || null;
-  const latestTurnState = normalizeTurnState(latestTurn?.state || effectiveLatestTurnState);
+  const rawLatestTurnState = normalizeTurnState(latestTurn?.state);
+  const effectiveTurnState = normalizeTurnState(effectiveLatestTurnState);
+  const latestTurnState = closedTurnStates.has(effectiveTurnState)
+    ? effectiveTurnState
+    : rawLatestTurnState || effectiveTurnState;
   const latestTurnId = cleanText(latestTurn?.turnId || latestTurn?.id);
   const latestMessageId = cleanText(latestTurn?.messageId);
   const latestTurnClosed = closedTurnStates.has(latestTurnState);
@@ -357,7 +379,7 @@ export function evaluateTodoQueueInFlightPrompt({
       && nowMs - Number(inFlightPrompt.startedAtMs || 0) > timeoutMs
   );
   const releaseReason = terminalConfirmedFinished
-    ? "provider_turn_closed"
+    ? getProviderTurnReleaseReason(latestTurnState)
     : terminalPaused
       ? (
         normalizedActivityStatus === "resume_ready"

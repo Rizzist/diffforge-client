@@ -6,6 +6,8 @@ import {
   applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
+  getWorkspaceThreadForTerminalIndex,
+  getWorkspaceThreadSelectionForLiveTerminal,
   getWorkspaceThreadTerminalNickname,
   hydrateWorkspaceThreadSessionTranscript,
   markWorkspaceThreadAgentActivity,
@@ -1755,6 +1757,200 @@ test("workspace terminal nickname survives close and reopen", () => {
     ),
     firstNickname,
   );
+});
+
+test("closed session-backed thread restores by terminal index after persistence", () => {
+  const workspaceId = "workspace-session-reopen";
+  const threadId = "thread-session-reopen";
+  const sessionId = "codex-session-reopen";
+  const active = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    instanceId: 1,
+    nativeSessionId: sessionId,
+    paneId: "pane-session-reopen-1",
+    providerSessionId: sessionId,
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "resume me later",
+    workspaceId,
+  });
+  const bound = updateWorkspaceThreadProviderSession(active, {
+    agentId: "codex",
+    instanceId: 1,
+    nativeSessionId: sessionId,
+    paneId: "pane-session-reopen-1",
+    providerSessionId: sessionId,
+    terminalIndex: 0,
+    threadId,
+    workspaceId,
+  });
+  const closed = markWorkspaceThreadTerminalDetached(bound, {
+    agentId: "codex",
+    instanceId: 1,
+    paneId: "pane-session-reopen-1",
+    status: "closed",
+    terminalIndex: 0,
+    threadId,
+    workspaceId,
+  });
+
+  const restored = normalizeWorkspaceThreads(persistWorkspaceThreads(closed));
+  const restoredThread = getWorkspaceThreadForTerminalIndex(restored, workspaceId, "0");
+
+  assert.equal(restored[workspaceId].terminals[0], undefined);
+  assert.equal(restored[workspaceId].terminalThreadIds[0], threadId);
+  assert.equal(restoredThread?.id, threadId);
+  assert.equal(restoredThread?.terminalBinding, null);
+  assert.equal(restoredThread?.transcriptSessionId, sessionId);
+  assert.equal(restoredThread?.providerBindings.codex.nativeSessionId, sessionId);
+});
+
+test("live terminal thread selection prefers the current provider session over a cached terminal thread", () => {
+  const workspaceId = "workspace-live-selection-session";
+  const staleThreadId = "thread-stale-terminal-session";
+  const currentThreadId = "thread-current-terminal-session";
+  const state = normalizeWorkspaceThreads({
+    [workspaceId]: {
+      activeThreadId: staleThreadId,
+      terminalThreadIds: {
+        0: staleThreadId,
+      },
+      terminals: {
+        0: {
+          agentId: "codex",
+          instanceId: 11,
+          paneId: "pane-live-selection",
+          providerSessionId: "old-session",
+          status: "active",
+          terminalIndex: 0,
+          threadId: staleThreadId,
+        },
+      },
+      threadOrder: [staleThreadId, currentThreadId],
+      threads: {
+        [staleThreadId]: {
+          currentAgent: "codex",
+          id: staleThreadId,
+          materialized: true,
+          providerBindings: {
+            codex: {
+              nativeSessionId: "old-session",
+            },
+          },
+          status: "active",
+          terminalIndex: 0,
+          transcriptSessionId: "old-session",
+          workspaceId,
+        },
+        [currentThreadId]: {
+          currentAgent: "codex",
+          id: currentThreadId,
+          materialized: true,
+          providerBindings: {
+            codex: {
+              nativeSessionId: "current-session",
+              terminalBinding: {
+                instanceId: 12,
+                paneId: "pane-live-selection",
+                terminalIndex: 0,
+              },
+            },
+          },
+          status: "active",
+          terminalIndex: 0,
+          transcriptSessionId: "current-session",
+          workspaceId,
+        },
+      },
+    },
+  });
+
+  const selectedThreadId = getWorkspaceThreadSelectionForLiveTerminal(state[workspaceId], {
+    agentId: "codex",
+    instanceId: 12,
+    paneId: "pane-live-selection",
+    providerSessionId: "current-session",
+    terminalIndex: 0,
+    threadId: staleThreadId,
+  });
+
+  assert.equal(selectedThreadId, currentThreadId);
+});
+
+test("live terminal thread selection uses a sessionless thread for no-session coding terminals", () => {
+  const workspaceId = "workspace-live-selection-yellow";
+  const staleThreadId = "thread-stale-session";
+  const sessionlessThreadId = "thread-yellow-sessionless";
+  const state = normalizeWorkspaceThreads({
+    [workspaceId]: {
+      activeThreadId: staleThreadId,
+      terminalThreadIds: {
+        0: staleThreadId,
+      },
+      terminals: {
+        0: {
+          agentId: "codex",
+          instanceId: 21,
+          paneId: "pane-yellow-selection",
+          providerSessionId: "old-session",
+          status: "active",
+          terminalIndex: 0,
+          threadId: staleThreadId,
+        },
+      },
+      threadOrder: [staleThreadId, sessionlessThreadId],
+      threads: {
+        [staleThreadId]: {
+          currentAgent: "codex",
+          id: staleThreadId,
+          materialized: true,
+          providerBindings: {
+            codex: {
+              nativeSessionId: "old-session",
+            },
+          },
+          status: "active",
+          terminalIndex: 0,
+          transcriptSessionId: "old-session",
+          workspaceId,
+        },
+        [sessionlessThreadId]: {
+          currentAgent: "codex",
+          id: sessionlessThreadId,
+          materialized: true,
+          providerBindings: {
+            codex: {
+              terminalBinding: {
+                instanceId: 22,
+                paneId: "pane-yellow-selection",
+                terminalIndex: 0,
+              },
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 22,
+            paneId: "pane-yellow-selection",
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  });
+
+  const selectedThreadId = getWorkspaceThreadSelectionForLiveTerminal(state[workspaceId], {
+    agentId: "codex",
+    instanceId: 22,
+    paneId: "pane-yellow-selection",
+    terminalIndex: 0,
+    threadId: staleThreadId,
+  });
+
+  assert.equal(selectedThreadId, sessionlessThreadId);
 });
 
 test("provider turn interruption settles running thread and keeps terminal input ready", () => {

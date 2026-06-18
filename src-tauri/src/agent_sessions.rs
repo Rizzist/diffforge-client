@@ -160,6 +160,25 @@ fn codex_home_dir() -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
 }
 
+fn diffforge_app_support_dir() -> Option<PathBuf> {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("DiffForge"))
+        .or_else(|| {
+            env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("DiffForge"))
+        })
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("DiffForge")
+            })
+        })
+}
+
 fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
     let key_path = path.canonicalize().unwrap_or_else(|_| path.clone());
     let key = key_path.to_string_lossy().replace('\\', "/");
@@ -247,6 +266,9 @@ fn codex_home_candidates(cwd: &str) -> Vec<PathBuf> {
     }
 
     if let Some(home) = codex_home_dir() {
+        push_unique_path(&mut paths, &mut seen, home);
+    }
+    if let Some(home) = agent_accounts_codex_home_for_launch() {
         push_unique_path(&mut paths, &mut seen, home);
     }
 
@@ -1918,6 +1940,76 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn claude_session_parser_keeps_assistant_output_visible() {
+        let root = unique_test_dir("claude-transcript-output");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let user = json!({
+            "type": "user",
+            "sessionId": "claude-session",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-06-18T20:50:15Z",
+            "message": {
+                "role": "user",
+                "content": "hey there"
+            }
+        })
+        .to_string();
+        let assistant = json!({
+            "type": "assistant",
+            "sessionId": "claude-session",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-06-18T20:50:17Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hey! How can I help you today?"}],
+                "stop_reason": "end_turn"
+            }
+        })
+        .to_string();
+        fs::write(&path, format!("{user}\n{assistant}\n")).unwrap();
+
+        let (_, messages) = parse_claude_session(&path, 20).unwrap();
+
+        assert!(messages
+            .iter()
+            .any(|message| message.role == "user" && message.text == "hey there"));
+        assert!(messages.iter().any(|message| {
+            message.role == "assistant"
+                && message.kind == "message"
+                && message.text == "Hey! How can I help you today?"
+        }));
+        assert!(messages
+            .iter()
+            .any(|message| message.kind == "task_complete"));
+    }
+
+    #[test]
+    fn claude_session_parser_promotes_result_text_to_assistant_message() {
+        let root = unique_test_dir("claude-result-output");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let result = json!({
+            "type": "result",
+            "sessionId": "claude-session",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-06-18T20:50:17Z",
+            "result": "Done."
+        })
+        .to_string();
+        fs::write(&path, format!("{result}\n")).unwrap();
+
+        let (_, messages) = parse_claude_session(&path, 20).unwrap();
+
+        assert!(messages.iter().any(|message| {
+            message.role == "assistant" && message.kind == "message" && message.text == "Done."
+        }));
+        assert!(messages
+            .iter()
+            .any(|message| message.kind == "task_complete" && message.text == "Done."));
+    }
+
+    #[test]
     fn developer_imagegen_response_item_yields_generated_dir_artifact() {
         let root = unique_test_dir("codex-developer-imagegen-artifact");
         let image_dir = root
@@ -2101,11 +2193,61 @@ fn prepare_codex_rollout_for_resume(provider_session_id: &str, cwd: &str) -> Res
     Ok(removed)
 }
 
+fn codex_home_from_rollout_path(path: &Path) -> Option<PathBuf> {
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if parent.file_name().and_then(|name| name.to_str()) == Some("sessions") {
+            return parent.parent().map(Path::to_path_buf);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn resolve_codex_resume_session(
+    provider_session_id: &str,
+    cwd: &str,
+) -> Result<(String, PathBuf), String> {
+    let (path, meta, _) = find_codex_rollout(provider_session_id, cwd)?;
+    if meta.session_id.trim().is_empty() {
+        return Err("Codex rollout transcript has no resumable session id.".to_string());
+    }
+    let home = codex_home_from_rollout_path(&path)
+        .ok_or_else(|| "Codex rollout transcript is not inside a sessions directory.".to_string())?;
+    Ok((meta.session_id, home))
+}
+
 fn claude_home_dir() -> Option<PathBuf> {
     env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claude")))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+}
+
+fn claude_home_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(home) = claude_home_dir() {
+        push_unique_path(&mut paths, &mut seen, home);
+    }
+    if let Some(home) = agent_accounts_profile_home_for_launch("claude") {
+        push_unique_path(&mut paths, &mut seen, home);
+    }
+    if let Some(profile_root) = diffforge_app_support_dir()
+        .map(|root| root.join("agent-profiles").join("claude"))
+        .filter(|root| root.is_dir())
+    {
+        let Ok(entries) = fs::read_dir(profile_root) else {
+            return paths;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                push_unique_path(&mut paths, &mut seen, path);
+            }
+        }
+    }
+    paths
 }
 
 fn claude_project_dir_name(cwd: &str) -> String {
@@ -2144,6 +2286,42 @@ fn collect_claude_session_files(root: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn collect_claude_candidate_files(cwd: &str) -> Result<Vec<PathBuf>, String> {
+    let homes = claude_home_candidates();
+    if homes.is_empty() {
+        return Err("Unable to locate Claude Code home.".to_string());
+    }
+
+    let mut files = Vec::new();
+    for home in homes {
+        if files.len() >= CODEX_ROLLOUT_SCAN_LIMIT {
+            break;
+        }
+        let projects_dir = home.join("projects");
+        if !projects_dir.exists() {
+            continue;
+        }
+        if !cwd.trim().is_empty() {
+            let encoded = claude_project_dir_name(cwd);
+            for candidate in [
+                projects_dir.join(&encoded),
+                projects_dir.join(encoded.to_lowercase()),
+            ] {
+                if candidate.exists() {
+                    collect_claude_session_files(&candidate, &mut files);
+                }
+            }
+        }
+        collect_claude_session_files(&projects_dir, &mut files);
+    }
+    sort_rollouts_newest_first(&mut files);
+
+    if files.is_empty() {
+        return Err("No Claude Code transcripts were found.".to_string());
+    }
+    Ok(files)
 }
 
 fn claude_file_meta(path: &Path) -> Option<CodexRolloutMeta> {
@@ -2204,31 +2382,19 @@ fn find_claude_session(
     provider_session_id: &str,
     cwd: &str,
 ) -> Result<(PathBuf, CodexRolloutMeta, String), String> {
-    let claude_home =
-        claude_home_dir().ok_or_else(|| "Unable to locate Claude Code home.".to_string())?;
-    let projects_dir = claude_home.join("projects");
-    if !projects_dir.exists() {
-        return Err(format!(
-            "Claude Code projects directory does not exist: {}",
-            projects_dir.display()
-        ));
-    }
-
     let requested_session_id = clean_codex_id(provider_session_id);
     if !requested_session_id.is_empty() {
-        let direct_matches = fs::read_dir(&projects_dir)
-            .ok()
-            .into_iter()
-            .flat_map(|entries| entries.flatten())
-            .filter_map(|entry| {
+        let mut direct_matches = Vec::new();
+        for home in claude_home_candidates() {
+            let projects_dir = home.join("projects");
+            let Ok(entries) = fs::read_dir(projects_dir) else {
+                continue;
+            };
+            direct_matches.extend(entries.flatten().filter_map(|entry| {
                 let path = entry.path().join(format!("{requested_session_id}.jsonl"));
-                if path.exists() {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+                path.exists().then_some(path)
+            }));
+        }
 
         for path in direct_matches {
             if let Some(meta) = claude_file_meta(&path) {
@@ -2237,20 +2403,7 @@ fn find_claude_session(
         }
     }
 
-    let mut files = Vec::new();
-    if !cwd.trim().is_empty() {
-        let encoded = claude_project_dir_name(cwd);
-        for candidate in [
-            projects_dir.join(&encoded),
-            projects_dir.join(encoded.to_lowercase()),
-        ] {
-            if candidate.exists() {
-                collect_claude_session_files(&candidate, &mut files);
-            }
-        }
-    }
-    collect_claude_session_files(&projects_dir, &mut files);
-    sort_rollouts_newest_first(&mut files);
+    let files = collect_claude_candidate_files(cwd)?;
 
     if !requested_session_id.is_empty() {
         for path in &files {
@@ -2475,6 +2628,30 @@ fn parse_claude_session(
                     )),
                 );
             } else {
+                let assistant_text =
+                    clean_codex_transcript_text(&result_text, CODEX_TRANSCRIPT_MAX_TEXT);
+                let already_has_assistant_text = !assistant_text.is_empty()
+                    && messages
+                        .iter()
+                        .rev()
+                        .any(|message| message.role == "assistant" && message.text == assistant_text);
+                if !assistant_text.is_empty() && !already_has_assistant_text {
+                    push_codex_message(
+                        &mut messages,
+                        &mut seen,
+                        Some(CodexThreadTranscriptMessage {
+                            id: format!("claude-{line_index}-result-assistant"),
+                            role: "assistant".to_string(),
+                            kind: "message".to_string(),
+                            text: assistant_text,
+                            title: String::new(),
+                            call_id: String::new(),
+                            created_at: timestamp.clone(),
+                            source: "claude".to_string(),
+                            artifacts: Vec::new(),
+                        }),
+                    );
+                }
                 push_codex_message(
                     &mut messages,
                     &mut seen,
@@ -2493,8 +2670,13 @@ fn parse_claude_session(
         };
         let content = message.get("content").unwrap_or(&Value::Null);
 
-        if entry_type == "user" || entry_type == "assistant" {
-            let role = if entry_type == "assistant" {
+        let message_role = value_string(message.get("role"));
+        if entry_type == "user"
+            || entry_type == "assistant"
+            || message_role == "user"
+            || message_role == "assistant"
+        {
+            let role = if entry_type == "assistant" || message_role == "assistant" {
                 "assistant"
             } else {
                 "user"
@@ -2983,30 +3165,7 @@ fn discover_claude_session_by_prompt(
     cwd: &str,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let claude_home =
-        claude_home_dir().ok_or_else(|| "Unable to locate Claude Code home.".to_string())?;
-    let projects_dir = claude_home.join("projects");
-    if !projects_dir.exists() {
-        return Err(format!(
-            "Claude Code projects directory does not exist: {}",
-            projects_dir.display()
-        ));
-    }
-
-    let mut files = Vec::new();
-    if !cwd.trim().is_empty() {
-        let encoded = claude_project_dir_name(cwd);
-        for candidate in [
-            projects_dir.join(&encoded),
-            projects_dir.join(encoded.to_lowercase()),
-        ] {
-            if candidate.exists() {
-                collect_claude_session_files(&candidate, &mut files);
-            }
-        }
-    }
-    collect_claude_session_files(&projects_dir, &mut files);
-    sort_rollouts_newest_first(&mut files);
+    let files = collect_claude_candidate_files(cwd)?;
 
     for path in files {
         let Some(initial_meta) = claude_file_meta(&path) else {

@@ -411,22 +411,6 @@ impl TerminalCoordinationContext {
                 "File authority: full_filesystem",
             )
             .replace(
-                "then edit .agents/architectures/graphs/*.arch directly with the eraser-like DSL",
-                "then edit files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT (architecture_context.globalGraphsRoot) directly with the eraser-like DSL",
-            )
-            .replace(
-                "Architecture graph files under .agents/architectures are the exception: edit them directly in the visible repo root so live preview works.",
-                "Architecture graph files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT are the exception: edit them directly so live preview works.",
-            )
-            .replace(
-                "Architecture graph files under .agents/architectures can be edited directly in the visible repo root so live preview works.",
-                "Architecture graph files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT can be edited directly so live preview works.",
-            )
-            .replace(
-                "edit only .agents/architectures/graphs/*.arch directly and report the graph path when done.",
-                "edit only files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT directly and report the graph path when done.",
-            )
-            .replace(
                 "Cloud MCP lifecycle: automatic through Diff Forge Rust, not agent-called",
                 "Cloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state",
             )

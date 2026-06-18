@@ -1238,12 +1238,12 @@ function getThreadIsWorking({
     valueLooksLikeWorkingThreadState(thread?.activityStatus)
       || valueLooksLikeWorkingThreadState(thread?.status)
   );
-  const hasLiveWorkAuthority = Boolean(isActiveTerminal || providerLooksBusy || terminalLooksBusy);
-
   return Boolean(
-    providerLooksBusy
+    isActiveTerminal
+      && (providerLooksBusy
       || terminalLooksBusy
-      || (hasLiveWorkAuthority && (lifecycleLooksBusy || threadLooksBusy))
+      || lifecycleLooksBusy
+      || threadLooksBusy)
   );
 }
 
@@ -1281,11 +1281,12 @@ function getThreadState(thread, entry) {
 
   const inactiveNoSession = threadViewState === THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
   const groundTruthWorkState = String(terminalGroundTruth?.terminalWorkState || "").toLowerCase();
-  const isWorking = inactiveNoSession
+  const liveGroundTruthWorkState = isActiveTerminal ? groundTruthWorkState : "";
+  const isWorking = inactiveNoSession || !isActiveTerminal
     ? false
-    : groundTruthWorkState === "complete"
+    : liveGroundTruthWorkState === "complete"
       ? false
-      : groundTruthWorkState === "running" || groundTruthWorkState === "prompting_user"
+      : liveGroundTruthWorkState === "running" || liveGroundTruthWorkState === "prompting_user"
         ? true
         : getThreadIsWorking({
           isActiveTerminal,
@@ -1444,6 +1445,7 @@ function WorkspaceThreadsOverlay({
   onTogglePinnedThread,
   onViewStateChange,
   open,
+  preferSelectedThreadId = false,
   selectedThreadId,
   selectedWorkspaceId,
   todoDropActive = false,
@@ -1458,7 +1460,7 @@ function WorkspaceThreadsOverlay({
     ? viewState
     : {};
   const railCollapsed = safeViewState.railCollapsed === true;
-  const newChatActive = safeViewState.newChatActive === true;
+  const newChatActive = preferSelectedThreadId ? false : safeViewState.newChatActive === true;
   const searchInputRef = useRef(null);
   const selectionDiagnosticRef = useRef("");
   const [searchActive, setSearchActive] = useState(false);
@@ -1467,8 +1469,12 @@ function WorkspaceThreadsOverlay({
   const normalizedSearchQuery = normalizeThreadSearchText(deferredSearchQuery);
   const searchVisible = searchActive || normalizeThreadSearchText(searchQuery).length > 0;
   const localSelection = {
-    threadId: safeViewState.selectedThreadId || selectedThreadId || "",
-    workspaceId: safeViewState.selectedWorkspaceId || selectedWorkspaceId || "",
+    threadId: preferSelectedThreadId
+      ? selectedThreadId || ""
+      : safeViewState.selectedThreadId || selectedThreadId || "",
+    workspaceId: preferSelectedThreadId
+      ? selectedWorkspaceId || safeViewState.selectedWorkspaceId || ""
+      : safeViewState.selectedWorkspaceId || selectedWorkspaceId || "",
   };
   const commitViewState = (workspaceId, patch = {}) => {
     const safeWorkspaceId = workspaceId

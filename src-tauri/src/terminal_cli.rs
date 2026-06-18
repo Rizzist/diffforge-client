@@ -1386,6 +1386,20 @@ fn extend_terminal_activity_env_vars(
     agent_accounts_apply_spawn_env(env_vars, pane_id, provider_id);
 }
 
+fn set_terminal_env_var(env_vars: &mut Vec<(String, String)>, key: &str, value: &str) {
+    env_vars.retain(|(existing_key, _)| existing_key != key);
+    env_vars.push((key.to_string(), value.to_string()));
+}
+
+fn apply_codex_resume_home_env(env_vars: &mut Vec<(String, String)>, home: &str) {
+    let home = home.trim();
+    if home.is_empty() {
+        return;
+    }
+    set_terminal_env_var(env_vars, "CODEX_HOME", home);
+    set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", home);
+}
+
 fn refresh_codex_activity_hook_profile_for_terminal(
     coordination: Option<&TerminalCoordinationSession>,
     provider_id: &str,
@@ -2676,6 +2690,59 @@ pub fn run_claude_worktree_guard(_args: &[String]) -> i32 {
 
 pub fn run_diff_forge_write_guard(_args: &[String]) -> i32 {
     0
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct DiffForgeWriteGuardIdentity;
+
+#[cfg(test)]
+impl DiffForgeWriteGuardIdentity {
+    fn new(
+        _agent_id: Option<String>,
+        _session_id: Option<String>,
+        _db_path: Option<PathBuf>,
+    ) -> Self {
+        Self
+    }
+}
+
+#[cfg(test)]
+fn diff_forge_write_guard_decision(
+    _provider: &str,
+    _hook_input: &Value,
+    _coordination_root: &Path,
+    _slot_key: &str,
+    _agent_kind: &str,
+    _identity: &DiffForgeWriteGuardIdentity,
+) -> Result<Option<Value>, String> {
+    Ok(None)
+}
+
+#[cfg(test)]
+fn claude_worktree_guard_denial_reason(
+    _hook_input: &Value,
+    _repo_path: &Path,
+    _worktree_path: &Path,
+    _slot_key: &str,
+    _identity: &DiffForgeWriteGuardIdentity,
+) -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct DiffForgeGitWriteRoute;
+
+#[cfg(test)]
+fn diff_forge_git_write_route(
+    _candidate_path: &Path,
+    _slot_key: &str,
+    _agent_kind: &str,
+    _identity: &DiffForgeWriteGuardIdentity,
+    _require_lease: bool,
+) -> Result<Option<DiffForgeGitWriteRoute>, String> {
+    Ok(None)
 }
 
 fn terminal_cli_arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
@@ -4970,18 +5037,27 @@ fn run_agent_thread_turn_for_context(
     }
 
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
-    if matches!(provider, AgentProvider::Codex) && !requested_provider_session_id.is_empty() {
-        let _ = prepare_codex_rollout_for_resume(
-            &requested_provider_session_id,
-            &working_directory.to_string_lossy(),
-        );
-    }
+    let working_directory_text = working_directory.to_string_lossy().to_string();
+    let mut launch_env_vars = env_vars.to_vec();
+    let launch_provider_session_id =
+        if matches!(provider, AgentProvider::Codex) && !requested_provider_session_id.is_empty() {
+            match resolve_codex_resume_session(&requested_provider_session_id, &working_directory_text) {
+                Ok((session_id, home)) => {
+                    let _ = prepare_codex_rollout_for_resume(&session_id, &working_directory_text);
+                    apply_codex_resume_home_env(&mut launch_env_vars, &home.to_string_lossy());
+                    session_id
+                }
+                Err(_) => String::new(),
+            }
+        } else {
+            requested_provider_session_id.clone()
+        };
     let mut output_path = None;
     let (args, stdin_text) = match provider {
         AgentProvider::Codex => {
             let path = temporary_agent_output_path("codex")?;
             let mut args =
-                build_codex_turn_args(model.as_deref(), &requested_provider_session_id, &path);
+                build_codex_turn_args(model.as_deref(), &launch_provider_session_id, &path);
             if let Some(coordination) = coordination {
                 apply_codex_coordinated_exec_args(&mut args, coordination);
             }
@@ -5019,7 +5095,7 @@ fn run_agent_thread_turn_for_context(
         stdin_text,
         Duration::from_secs(AGENT_THREAD_TURN_TIMEOUT_SECS),
         Some(&working_directory),
-        env_vars,
+        &launch_env_vars,
     );
     let output_from_file = output_path
         .as_ref()
