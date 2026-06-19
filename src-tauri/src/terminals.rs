@@ -94,6 +94,29 @@ fn terminal_launch_provider(kind: &str, provider: Option<&str>) -> Result<AgentP
     })
 }
 
+fn terminal_normalize_agent_kind(value: Option<&str>) -> Option<String> {
+    let normalized = value?.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("claude") {
+        return Some("claude".to_string());
+    }
+    if normalized.contains("opencode") || normalized.contains("open-code") {
+        return Some("opencode".to_string());
+    }
+    if normalized.contains("codex") || normalized == "console" {
+        return Some("codex".to_string());
+    }
+    if matches!(
+        normalized.as_str(),
+        "generic" | "shell" | "terminal" | "plain-shell" | "plain_shell" | "generic-shell" | "generic_shell"
+    ) {
+        return Some("generic".to_string());
+    }
+    None
+}
+
 fn terminal_clean_provider_session_id(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -4836,6 +4859,8 @@ async fn terminal_open(
     let requested_cols = request.cols;
     let requested_rows = request.rows;
     let kind = request.kind;
+    let requested_agent_id = terminal_normalize_agent_kind(request.agent_id.as_deref())
+        .or_else(|| terminal_normalize_agent_kind(request.agent_kind.as_deref()));
     let provider = request.provider;
     let provider_for_coordination = provider.clone();
     let provider_session_id = request.provider_session_id;
@@ -5173,13 +5198,10 @@ async fn terminal_open(
         return Err(error);
     }
 
-    let terminal_metadata = TerminalInstanceMetadata {
-        pane_id: pane_id.clone(),
-        workspace_id: workspace_id.clone().unwrap_or_default(),
-        workspace_name: workspace_name.clone().unwrap_or_default(),
-        terminal_index,
-        thread_id: thread_id.clone().unwrap_or_default(),
-        agent_id: provider_for_coordination.clone().unwrap_or_else(|| {
+    let semantic_agent_kind = requested_agent_id
+        .clone()
+        .or_else(|| terminal_normalize_agent_kind(provider_for_coordination.as_deref()))
+        .unwrap_or_else(|| {
             if plain_shell {
                 "generic".to_string()
             } else if kind == "console" {
@@ -5187,16 +5209,15 @@ async fn terminal_open(
             } else {
                 kind.clone()
             }
-        }),
-        agent_kind: if plain_shell {
-            "generic".to_string()
-        } else if kind == "console" {
-            provider_for_coordination
-                .clone()
-                .unwrap_or_else(|| "codex".to_string())
-        } else {
-            kind.clone()
-        },
+        });
+    let terminal_metadata = TerminalInstanceMetadata {
+        pane_id: pane_id.clone(),
+        workspace_id: workspace_id.clone().unwrap_or_default(),
+        workspace_name: workspace_name.clone().unwrap_or_default(),
+        terminal_index,
+        thread_id: thread_id.clone().unwrap_or_default(),
+        agent_id: semantic_agent_kind.clone(),
+        agent_kind: semantic_agent_kind,
         terminal_name,
         terminal_nickname,
     };
@@ -13632,6 +13653,27 @@ async fn terminal_live_sessions(
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
+
+    #[test]
+    fn terminal_agent_kind_normalization_keeps_prewarm_from_becoming_identity() {
+        assert_eq!(
+            terminal_normalize_agent_kind(Some("claude-code")).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            terminal_normalize_agent_kind(Some("OpenCode")).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(
+            terminal_normalize_agent_kind(Some("console")).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            terminal_normalize_agent_kind(Some("shell")).as_deref(),
+            Some("generic")
+        );
+        assert_eq!(terminal_normalize_agent_kind(Some("prewarm-pty")), None);
+    }
 
     #[test]
     fn provider_resume_args_are_provider_specific() {

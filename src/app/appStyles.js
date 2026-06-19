@@ -115,9 +115,17 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-blue: var(--forge-accent);
     --forge-accent-rgb: 59, 130, 246;
     --forge-accent-soft-rgb: 125, 176, 255;
+    --forge-tint: var(--forge-accent);
+    --forge-tint-soft: var(--forge-accent-soft);
+    --forge-tint-rgb: var(--forge-accent-rgb);
+    --forge-tint-soft-rgb: var(--forge-accent-soft-rgb);
     --forge-accent-selected-bg: rgba(59, 130, 246, 0.08);
     --forge-accent-selected-border: rgba(125, 176, 255, 0.5);
     --forge-accent-selected-ring: rgba(79, 163, 255, 0.24);
+    --forge-titlebar-bg: #000000;
+    --forge-shell-rail-bg: rgba(6, 9, 16, 0.94);
+    --forge-shell-right-bg: rgba(5, 8, 13, 0.96);
+    --forge-shell-right-muted-bg: rgba(2, 4, 8, 0.44);
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
@@ -160,9 +168,17 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-blue: var(--forge-accent);
     --forge-accent-rgb: 59, 130, 246;
     --forge-accent-soft-rgb: 125, 176, 255;
+    --forge-tint: var(--forge-accent);
+    --forge-tint-soft: var(--forge-accent-soft);
+    --forge-tint-rgb: var(--forge-accent-rgb);
+    --forge-tint-soft-rgb: var(--forge-accent-soft-rgb);
     --forge-accent-selected-bg: rgba(59, 130, 246, 0.08);
     --forge-accent-selected-border: rgba(125, 176, 255, 0.5);
     --forge-accent-selected-ring: rgba(79, 163, 255, 0.24);
+    --forge-titlebar-bg: #000000;
+    --forge-shell-rail-bg: rgba(6, 9, 16, 0.94);
+    --forge-shell-right-bg: rgba(5, 8, 13, 0.96);
+    --forge-shell-right-muted-bg: rgba(2, 4, 8, 0.44);
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
@@ -191,9 +207,17 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-blue: var(--forge-accent);
     --forge-accent-rgb: 0, 102, 204;
     --forge-accent-soft-rgb: 0, 113, 227;
+    --forge-tint: var(--forge-accent);
+    --forge-tint-soft: var(--forge-accent-soft);
+    --forge-tint-rgb: var(--forge-accent-rgb);
+    --forge-tint-soft-rgb: var(--forge-accent-soft-rgb);
     --forge-accent-selected-bg: rgba(0, 102, 204, 0.1);
     --forge-accent-selected-border: rgba(0, 102, 204, 0.46);
     --forge-accent-selected-ring: rgba(0, 102, 204, 0.18);
+    --forge-titlebar-bg: #f5f5f7;
+    --forge-shell-rail-bg: rgba(245, 245, 247, 0.88);
+    --forge-shell-right-bg: #ffffff;
+    --forge-shell-right-muted-bg: rgba(245, 245, 247, 0.86);
     --forge-amber: #8b5a00;
     --forge-ember: #0066cc;
     --forge-green: #0a7f45;
@@ -242,6 +266,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-selected-bg: rgba(245, 158, 11, 0.105);
     --forge-accent-selected-border: rgba(255, 209, 102, 0.5);
     --forge-accent-selected-ring: rgba(245, 158, 11, 0.22);
+    --forge-titlebar-bg: #050300;
+    --forge-shell-rail-bg: rgba(16, 10, 3, 0.94);
+    --forge-shell-right-bg: rgba(14, 9, 3, 0.96);
+    --forge-shell-right-muted-bg: rgba(14, 9, 3, 0.5);
     --forge-amber: #ffd166;
     --forge-ember: #f59e0b;
   }
@@ -257,6 +285,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-selected-bg: rgba(181, 106, 0, 0.1);
     --forge-accent-selected-border: rgba(181, 106, 0, 0.42);
     --forge-accent-selected-ring: rgba(181, 106, 0, 0.16);
+    --forge-titlebar-bg: #fff8ea;
+    --forge-shell-rail-bg: rgba(255, 248, 234, 0.9);
+    --forge-shell-right-bg: #fffaf0;
+    --forge-shell-right-muted-bg: rgba(255, 248, 234, 0.88);
     --forge-amber: #8b5a00;
     --forge-ember: #b56a00;
   }
@@ -310,17 +342,22 @@ export const GlobalStyle = createGlobalStyle`
     min-height: 100vh;
     margin: 0;
     background: var(--forge-bg);
+    transition:
+      background 260ms ease,
+      color 260ms ease;
   }
 
   body {
     overflow: hidden;
     background:
-      linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(7, 9, 13, 0) 36rem),
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), rgba(7, 9, 13, 0) 36rem),
       var(--forge-bg);
   }
 
   html[data-forge-theme="light"] body {
-    background: var(--forge-bg);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent 30rem),
+      var(--forge-bg);
   }
 
   html[data-window-platform="macos"],
@@ -518,7 +555,15 @@ export const WindowTitleBar = styled.header`
   align-items: center;
   border-bottom: 1px solid rgba(185, 191, 203, 0.16);
   color: #e8eef8;
-  background: #000000;
+  background:
+    linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.1), transparent 46%, rgba(var(--forge-tint-soft-rgb), 0.055)),
+    var(--forge-titlebar-bg);
+  box-shadow: inset 0 -1px 0 rgba(var(--forge-tint-rgb), 0.13);
+  transition:
+    background 260ms ease,
+    border-color 260ms ease,
+    box-shadow 260ms ease,
+    color 260ms ease;
   user-select: none;
 
   &[data-platform="macos"] {
@@ -528,7 +573,9 @@ export const WindowTitleBar = styled.header`
   html[data-forge-theme="light"] & {
     border-bottom-color: var(--forge-border);
     color: var(--forge-text);
-    background: var(--forge-bg);
+    background:
+      linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.085), transparent 48%, rgba(var(--forge-tint-soft-rgb), 0.04)),
+      var(--forge-titlebar-bg);
   }
 `;
 
@@ -2327,14 +2374,21 @@ export const DashboardShell = styled.main`
   color: var(--forge-text);
   overflow: hidden;
   background:
-    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(var(--forge-tint-soft-rgb), 0.022) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(var(--forge-tint-soft-rgb), 0.016) 1px, transparent 1px),
     var(--forge-bg);
   background-size: 76px 76px, 76px 76px, auto;
   animation: ${shellReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  transition:
+    background 260ms ease,
+    color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    background: var(--forge-bg);
+    background:
+      linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.018) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.014) 1px, transparent 1px),
+      var(--forge-bg);
+    background-size: 76px 76px, 76px 76px, auto;
   }
 
   &[data-startup="true"] {
@@ -2369,19 +2423,25 @@ export const WorkspaceRail = styled.aside`
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 10px;
   padding: 10px;
-  border-right: 1px solid rgba(230, 236, 245, 0.09);
+  border-right: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);
   background:
-    linear-gradient(180deg, rgba(47, 128, 255, 0.035), rgba(255, 122, 24, 0.018)),
-    rgba(6, 9, 16, 0.94);
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.09), rgba(var(--forge-tint-soft-rgb), 0.025)),
+    var(--forge-shell-rail-bg);
+  box-shadow: inset -1px 0 0 rgba(var(--forge-tint-rgb), 0.065);
   animation: ${railReveal} 300ms cubic-bezier(0.2, 0.8, 0.2, 1) 40ms both;
   overflow: hidden;
   transition:
+    background 260ms ease,
+    border-color 260ms ease,
+    box-shadow 260ms ease,
     padding 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
     gap 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   html[data-forge-theme="light"] & {
-    border-right-color: var(--forge-border);
-    background: rgba(245, 245, 247, 0.88);
+    border-right-color: rgba(var(--forge-tint-rgb), 0.12);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.07), rgba(var(--forge-tint-soft-rgb), 0.02)),
+      var(--forge-shell-rail-bg);
     backdrop-filter: saturate(180%) blur(20px);
   }
 
@@ -2559,10 +2619,10 @@ export const RailCreateWorkspaceButton = styled(RailCollapseButton)`
   color: var(--forge-text-soft);
 
   &:hover {
-    border-color: rgba(255, 122, 24, 0.24);
-    color: #ffd0a5;
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.28);
+    color: var(--forge-tint-soft);
     background:
-      linear-gradient(90deg, rgba(255, 122, 24, 0.09), rgba(47, 128, 255, 0.035)),
+      linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.14), rgba(var(--forge-tint-soft-rgb), 0.045)),
       rgba(13, 17, 23, 0.58);
   }
 
@@ -3227,14 +3287,20 @@ export const RailFooter = styled.div`
   min-height: 0;
   padding-top: 8px;
   border-top: 1px solid var(--forge-border);
-  background: rgba(7, 9, 13, 0.7);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
+    rgba(7, 9, 13, 0.7);
   animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
   transition:
+    background 260ms ease,
+    border-color 260ms ease,
     gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   html[data-forge-theme="light"] & {
-    background: rgba(245, 245, 247, 0.68);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent),
+      rgba(245, 245, 247, 0.68);
   }
 `;
 
@@ -3245,7 +3311,9 @@ export const RailGlobalActions = styled.div`
   padding: 4px;
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 8px;
-  background: rgba(230, 236, 245, 0.018);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
+    rgba(230, 236, 245, 0.018);
   transition:
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     border-color 160ms ease,
@@ -3258,8 +3326,10 @@ export const RailGlobalActions = styled.div`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: var(--forge-border);
-    background: var(--forge-surface);
+    border-color: rgba(var(--forge-tint-rgb), 0.12);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent),
+      var(--forge-surface);
   }
 `;
 
@@ -3398,14 +3468,14 @@ export const RailActionButton = styled.button`
 
   &[data-scope="global"]:hover,
   &[data-scope="global"][data-active="true"] {
-    border-color: rgba(185, 191, 203, 0.1);
-    color: #d8dee7;
-    background: #070809;
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.22);
+    color: var(--forge-text);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   &[data-scope="global"]:hover svg,
   &[data-scope="global"][data-active="true"] svg {
-    color: #c7d0dc;
+    color: var(--forge-tint-soft);
   }
 
   html[data-forge-theme="light"] &[data-scope="global"] {
@@ -3567,7 +3637,10 @@ export const WorkspaceViewStack = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: var(--forge-bg);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent 18rem),
+    var(--forge-bg);
+  transition: background 260ms ease;
 `;
 
 export const WorkspaceAppToolLayout = styled.div`
@@ -3578,7 +3651,10 @@ export const WorkspaceAppToolLayout = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: var(--forge-bg);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent 22rem),
+    var(--forge-bg);
+  transition: background 260ms ease;
 
   &[data-workspace-tool-fullscreen="true"] [data-workspace-main-panel="true"] {
     opacity: 0.36;
@@ -3631,24 +3707,29 @@ export const WorkspaceAppToolMinimizedRail = styled.aside`
   grid-template-rows: 1fr;
   place-items: center;
   padding: 7px 2px;
-  border-left: 1px solid rgba(230, 236, 245, 0.08);
+  border-left: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   color: rgba(232, 238, 248, 0.86);
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
-    rgba(0, 0, 0, 0.72);
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.14), rgba(255, 255, 255, 0.02)),
+    var(--forge-shell-right-bg);
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045),
+    inset 1px 0 0 rgba(var(--forge-tint-soft-rgb), 0.08),
     0 8px 22px rgba(0, 0, 0, 0.2);
   overflow: hidden;
   backdrop-filter: blur(18px) saturate(135%);
+  transition:
+    background 260ms ease,
+    border-color 260ms ease,
+    box-shadow 260ms ease,
+    color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    border-left-color: rgba(0, 0, 0, 0.08);
+    border-left-color: rgba(var(--forge-tint-rgb), 0.12);
     color: #2a2c31;
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.5)),
-      rgba(18, 20, 24, 0.2);
-    box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.8);
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.08), rgba(255, 255, 255, 0.5)),
+      var(--forge-shell-right-bg);
+    box-shadow: inset 1px 0 0 rgba(var(--forge-tint-rgb), 0.08);
   }
 `;
 
@@ -3776,14 +3857,18 @@ export const WorkspaceIdleSurface = styled(BlankWorkspace)`
   isolation: isolate;
   place-items: center;
   padding: 24px;
-  background: #000000;
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent 22rem),
+    var(--forge-shell-right-bg);
 
   &::after {
     display: none;
   }
 
   html[data-forge-theme="light"] & {
-    background: var(--forge-bg);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent 22rem),
+      var(--forge-shell-right-bg);
   }
 `;
 
@@ -4123,8 +4208,8 @@ export const ResizeHandle = styled(Separator)`
 
   &:hover,
   &[data-resize-handle-state="drag"] {
-    background: rgba(47, 128, 255, 0.28);
-    box-shadow: 0 0 16px rgba(47, 128, 255, 0.18);
+    background: rgba(var(--forge-tint-rgb), 0.28);
+    box-shadow: 0 0 16px rgba(var(--forge-tint-rgb), 0.18);
   }
 
   &[data-surface="files"] {
@@ -7123,9 +7208,9 @@ export const AudioCloudInput = styled.input`
   text-transform: none;
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.44);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.44);
     outline: none;
-    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+    box-shadow: 0 0 0 3px rgba(var(--forge-tint-rgb), 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -12533,14 +12618,14 @@ export const SetupInput = styled.input`
   }
 
   html[data-forge-theme="light"] &:hover:not(:disabled) {
-    border-color: rgba(0, 102, 204, 0.22);
+    border-color: rgba(var(--forge-tint-rgb), 0.22);
     background: #ffffff;
   }
 
   html[data-forge-theme="light"] &:focus {
-    border-color: var(--forge-blue-soft);
+    border-color: var(--forge-tint-soft);
     box-shadow:
-      0 0 0 3px rgba(0, 113, 227, 0.16),
+      0 0 0 3px rgba(var(--forge-tint-rgb), 0.16),
       0 1px 2px rgba(0, 0, 0, 0.045),
       inset 0 1px 0 rgba(255, 255, 255, 1);
   }
@@ -12596,7 +12681,7 @@ export const WorkspaceSettingsDialog = styled.aside`
   border: 1px solid var(--forge-border-strong);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(98, 160, 255, 0.045), rgba(255, 122, 24, 0.018)),
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), rgba(var(--forge-tint-soft-rgb), 0.018)),
     rgba(8, 13, 20, 0.98);
   box-shadow:
     0 24px 80px rgba(0, 0, 0, 0.5),
@@ -13339,7 +13424,7 @@ export const AppCloseDialog = styled(CrashRecoveryDialog)`
   padding: 0;
   border-color: rgba(125, 160, 205, 0.24);
   background:
-    linear-gradient(145deg, rgba(98, 160, 255, 0.07), transparent 42%),
+    linear-gradient(145deg, rgba(var(--forge-tint-rgb), 0.07), transparent 42%),
     linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.018)),
     rgba(9, 14, 21, 0.985);
   box-shadow:
@@ -13349,7 +13434,7 @@ export const AppCloseDialog = styled(CrashRecoveryDialog)`
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.1);
     background:
-      linear-gradient(145deg, rgba(0, 102, 204, 0.06), transparent 42%),
+      linear-gradient(145deg, rgba(var(--forge-tint-rgb), 0.06), transparent 42%),
       rgba(255, 255, 255, 0.96);
     box-shadow: 0 22px 60px rgba(15, 23, 42, 0.14);
   }
@@ -13408,10 +13493,10 @@ export const AppCloseHint = styled.p`
   align-items: center;
   gap: 8px;
   padding: 7px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.2);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.2);
   border-radius: 8px;
-  color: rgba(210, 226, 255, 0.9);
-  background: rgba(59, 130, 246, 0.09);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.09);
   font-size: 12px;
   font-weight: 720;
 
@@ -13426,9 +13511,9 @@ export const AppCloseHint = styled.p`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.16);
-    color: var(--forge-blue);
-    background: rgba(0, 102, 204, 0.06);
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.06);
   }
 `;
 
@@ -13441,7 +13526,7 @@ export const AppCloseMark = styled.div`
   border: 1px solid rgba(125, 160, 205, 0.24);
   border-radius: 8px;
   background:
-    linear-gradient(135deg, rgba(255, 189, 110, 0.12), rgba(98, 160, 255, 0.09)),
+    linear-gradient(135deg, rgba(255, 189, 110, 0.12), rgba(var(--forge-tint-rgb), 0.09)),
     rgba(14, 21, 31, 0.8);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
@@ -13456,7 +13541,7 @@ export const AppCloseMark = styled.div`
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.08);
     background:
-      linear-gradient(135deg, rgba(255, 189, 110, 0.16), rgba(0, 102, 204, 0.08)),
+      linear-gradient(135deg, rgba(255, 189, 110, 0.16), rgba(var(--forge-tint-rgb), 0.08)),
       rgba(255, 255, 255, 0.82);
     box-shadow: none;
   }
@@ -13539,16 +13624,16 @@ export const AppCloseActionButton = styled.button`
   }
 
   &[data-tone="background"] {
-    border-color: rgba(125, 176, 255, 0.36);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.36);
     background:
-      linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(255, 189, 110, 0.06)),
+      linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.18), rgba(255, 189, 110, 0.06)),
       rgba(20, 28, 39, 0.8);
   }
 
   &[data-tone="background"]:hover:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.54);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.54);
     background:
-      linear-gradient(135deg, rgba(59, 130, 246, 0.24), rgba(255, 189, 110, 0.08)),
+      linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.24), rgba(255, 189, 110, 0.08)),
       rgba(23, 33, 47, 0.9);
   }
 
@@ -14514,9 +14599,9 @@ export const AgentReadyPill = styled.div`
   }
 
   &[data-tone="blue"] {
-    border-color: rgba(59, 130, 246, 0.3);
-    color: var(--forge-blue-soft);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-tint-rgb), 0.3);
+    color: var(--forge-tint-soft);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   &[data-tone="orange"] {
@@ -14952,12 +15037,12 @@ export const SettingsTabButton = styled.button`
   }
 
   &[data-active="true"] {
-    border-color: rgba(100, 143, 226, 0.52);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.52);
     color: var(--forge-text);
     background:
-      linear-gradient(180deg, rgba(83, 130, 215, 0.28), rgba(83, 130, 215, 0.12)),
-      rgba(42, 70, 118, 0.34);
-    box-shadow: inset 0 0 0 1px rgba(160, 190, 255, 0.12);
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.28), rgba(var(--forge-tint-rgb), 0.12)),
+      rgba(var(--forge-tint-rgb), 0.18);
+    box-shadow: inset 0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.12);
   }
 `;
 
@@ -15277,13 +15362,13 @@ export const SettingsRepoCard = styled.button`
 
   &:hover:not(:disabled),
   &[data-selected="true"] {
-    border-color: rgba(124, 164, 255, 0.62);
-    background: rgba(43, 78, 128, 0.24);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.62);
+    background: rgba(var(--forge-tint-rgb), 0.18);
   }
 
   html[data-forge-theme="light"] &:hover:not(:disabled),
   html[data-forge-theme="light"] &[data-selected="true"] {
-    background: rgba(59, 130, 246, 0.1);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   &:disabled {
@@ -15295,7 +15380,7 @@ export const SettingsRepoCard = styled.button`
     grid-row: 1 / span 2;
     width: 17px;
     height: 17px;
-    color: var(--forge-accent-blue);
+    color: var(--forge-tint);
   }
 
   strong {
@@ -15445,14 +15530,14 @@ export const AppearanceThemeButton = styled.button`
   }
 
   &[data-selected="true"] {
-    border-color: rgba(59, 130, 246, 0.38);
+    border-color: rgba(var(--forge-tint-rgb), 0.38);
     color: var(--forge-text);
     background:
-      linear-gradient(180deg, rgba(59, 130, 246, 0.12), rgba(59, 130, 246, 0.045)),
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.12), rgba(var(--forge-tint-rgb), 0.045)),
       rgba(21, 27, 35, 0.82);
     box-shadow:
-      inset 0 0 0 1px rgba(125, 160, 205, 0.12),
-      0 0 18px rgba(59, 130, 246, 0.08);
+      inset 0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.12),
+      0 0 18px rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] & {
@@ -15464,8 +15549,8 @@ export const AppearanceThemeButton = styled.button`
   }
 
   html[data-forge-theme="light"] &[data-selected="true"] {
-    border-color: rgba(0, 102, 204, 0.34);
-    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.34);
+    background: rgba(var(--forge-tint-rgb), 0.08);
     box-shadow: none;
   }
 
@@ -15481,9 +15566,9 @@ export const AppearanceThemeButton = styled.button`
   }
 
   &[data-selected="true"] > span {
-    border-color: rgba(59, 130, 246, 0.34);
-    color: var(--forge-blue-soft);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-tint-rgb), 0.34);
+    color: var(--forge-tint-soft);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   svg {
@@ -15855,7 +15940,7 @@ export const PrimaryButton = styled.button`
 
   &:hover:not(:disabled) {
     background: var(--forge-blue-soft);
-    box-shadow: 0 0 18px rgba(59, 130, 246, 0.2);
+    box-shadow: 0 0 18px rgba(var(--forge-tint-rgb), 0.2);
     transform: translateY(-1px);
   }
 
@@ -16015,19 +16100,23 @@ export const WindowBackgroundPill = styled.button`
   gap: 5px;
   align-self: center;
   padding: 3px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.32);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.32);
   border-radius: 999px;
-  color: rgba(200, 222, 255, 0.92);
-  background: rgba(59, 130, 246, 0.12);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.12);
   font-size: 10.5px;
   font-weight: 750;
   letter-spacing: 0.02em;
   white-space: nowrap;
   cursor: pointer;
+  transition:
+    background 220ms ease,
+    border-color 220ms ease,
+    color 220ms ease;
 
   &:hover {
     color: #ffffff;
-    background: rgba(59, 130, 246, 0.28);
+    background: rgba(var(--forge-tint-rgb), 0.28);
   }
 
   &[data-platform="macos"] {
@@ -16041,14 +16130,14 @@ export const WindowBackgroundPill = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.35);
-    color: rgba(29, 78, 216, 0.9);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-tint-rgb), 0.35);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   html[data-forge-theme="light"] &:hover {
-    color: rgba(29, 78, 216, 1);
-    background: rgba(59, 130, 246, 0.2);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.2);
   }
 `;
 
@@ -16080,13 +16169,13 @@ export const WindowSyncPill = styled.button`
     transform 150ms ease;
 
   &:hover {
-    border-color: rgba(125, 176, 255, 0.42);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.42);
     color: #ffffff;
-    background: rgba(59, 130, 246, 0.18);
+    background: rgba(var(--forge-tint-rgb), 0.18);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(96, 165, 250, 0.72);
+    outline: 2px solid rgba(var(--forge-tint-soft-rgb), 0.72);
     outline-offset: 2px;
   }
 
@@ -16151,9 +16240,9 @@ export const WindowSyncPill = styled.button`
   }
 
   &[data-state="syncing"] {
-    border-color: rgba(125, 176, 255, 0.34);
-    color: rgba(200, 222, 255, 0.92);
-    background: rgba(59, 130, 246, 0.12);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.34);
+    color: var(--forge-tint-soft);
+    background: rgba(var(--forge-tint-rgb), 0.12);
   }
 
   &[data-state="provisioning"] {
@@ -16204,9 +16293,9 @@ export const WindowSyncPill = styled.button`
   }
 
   html[data-forge-theme="light"] &[data-state="syncing"] {
-    border-color: rgba(37, 99, 235, 0.35);
-    color: rgba(29, 78, 216, 0.9);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-tint-rgb), 0.35);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   html[data-forge-theme="light"] &[data-state="provisioning"] {
@@ -16501,7 +16590,9 @@ export const WorkspaceCreateSurface = styled.div`
   place-items: start center;
   padding: 28px 24px;
   overflow: auto;
-  background: var(--forge-bg);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent 22rem),
+    var(--forge-shell-right-bg);
 `;
 
 export const WorkspaceCreateCard = styled.form`

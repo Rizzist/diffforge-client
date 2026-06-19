@@ -1816,6 +1816,8 @@ struct TerminalOpenRequest {
     pane_id: String,
     instance_id: Option<u64>,
     kind: String,
+    agent_id: Option<String>,
+    agent_kind: Option<String>,
     provider: Option<String>,
     provider_session_id: Option<String>,
     model: Option<String>,

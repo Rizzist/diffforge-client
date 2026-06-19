@@ -12713,7 +12713,7 @@ function WorkspaceTerminal({
 
         const shouldPrewarmShell = !isGenericTerminal && prewarmShell && !agentLaunchReadyRef.current;
         const openKind = isGenericTerminal || shouldPrewarmShell ? "prewarm-pty" : agent.id;
-        const openProvider = isGenericTerminal || shouldPrewarmShell ? null : agent.id;
+        const openProvider = isGenericTerminal ? null : agent.id;
         let agentStartedInCurrentPty = isGenericTerminal || !shouldPrewarmShell;
         if (shouldPrewarmShell) {
           hidePrewarmPtyOutput("terminal_open_prewarm");
@@ -12808,6 +12808,8 @@ function WorkspaceTerminal({
               paneId,
               instanceId: terminalInstanceId,
               kind: openKind,
+              agentId: terminalAgentKind,
+              agentKind: terminalAgentKind,
               provider: openProvider,
               freshSession: forceFreshSessionForThisStart,
               providerSessionId: startupThreadProviderSessionId,

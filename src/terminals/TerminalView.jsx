@@ -582,13 +582,75 @@ function getForgeThemeMode() {
   return document.documentElement?.dataset?.forgeTheme === "light" ? "light" : "dark";
 }
 
-function drawOrchestratorVoiceDotField(context, themeMode, alpha, phase) {
-  const dotColor = themeMode === "light"
-    ? "rgba(0, 102, 204, 0.24)"
-    : "rgba(155, 213, 255, 0.26)";
-  const warmDotColor = themeMode === "light"
-    ? "rgba(221, 112, 31, 0.2)"
-    : "rgba(240, 140, 69, 0.22)";
+function getForgeSpaceMode() {
+  if (typeof document === "undefined") {
+    return "workspaces";
+  }
+
+  return document.documentElement?.dataset?.forgeSpace === "loopspaces" ? "loopspaces" : "workspaces";
+}
+
+function getForgeCanvasTintPalette(themeMode, spaceMode = getForgeSpaceMode()) {
+  if (spaceMode === "loopspaces") {
+    return themeMode === "light"
+      ? {
+        baseStroke: "rgba(181, 106, 0, 0.22)",
+        centerStroke: "rgba(75, 46, 0, 0.08)",
+        dot: "rgba(181, 106, 0, 0.22)",
+        glow: "rgba(181, 106, 0, 0.28)",
+        glowStart: "rgba(181, 106, 0, 0.14)",
+        glowMid: "rgba(200, 128, 0, 0.2)",
+        glowEnd: "rgba(221, 112, 31, 0.22)",
+        strokeStart: "#8b5a00",
+        strokeMid: "#c88000",
+        strokeEnd: "#d8681b",
+        warmDot: "rgba(221, 112, 31, 0.2)",
+      }
+      : {
+        baseStroke: "rgba(255, 209, 102, 0.22)",
+        centerStroke: "rgba(255, 244, 214, 0.08)",
+        dot: "rgba(255, 209, 102, 0.26)",
+        glow: "rgba(245, 158, 11, 0.34)",
+        glowStart: "rgba(255, 209, 102, 0.18)",
+        glowMid: "rgba(245, 158, 11, 0.28)",
+        glowEnd: "rgba(240, 140, 69, 0.26)",
+        strokeStart: "#fff0a5",
+        strokeMid: "#ffd166",
+        strokeEnd: "#f08c45",
+        warmDot: "rgba(240, 140, 69, 0.24)",
+      };
+  }
+
+  return themeMode === "light"
+    ? {
+      baseStroke: "rgba(0, 102, 204, 0.22)",
+      centerStroke: "rgba(24, 34, 48, 0.08)",
+      dot: "rgba(0, 102, 204, 0.24)",
+      glow: "rgba(0, 102, 204, 0.3)",
+      glowStart: "rgba(0, 102, 204, 0.14)",
+      glowMid: "rgba(26, 140, 255, 0.22)",
+      glowEnd: "rgba(221, 112, 31, 0.22)",
+      strokeStart: "#005fb8",
+      strokeMid: "#1a8cff",
+      strokeEnd: "#d8681b",
+      warmDot: "rgba(221, 112, 31, 0.2)",
+    }
+    : {
+      baseStroke: "rgba(125, 176, 255, 0.2)",
+      centerStroke: "rgba(230, 236, 245, 0.08)",
+      dot: "rgba(155, 213, 255, 0.26)",
+      glow: "rgba(125, 176, 255, 0.34)",
+      glowStart: "rgba(158, 219, 255, 0.18)",
+      glowMid: "rgba(74, 163, 255, 0.28)",
+      glowEnd: "rgba(240, 140, 69, 0.26)",
+      strokeStart: "#9edbff",
+      strokeMid: "#4aa3ff",
+      strokeEnd: "#f08c45",
+      warmDot: "rgba(240, 140, 69, 0.22)",
+    };
+}
+
+function drawOrchestratorVoiceDotField(context, tintPalette, alpha, phase) {
   const rings = [
     { count: 22, radius: 35.4, size: 0.42, speed: -0.09 },
     { count: 30, radius: 42.4, size: 0.5, speed: 0.07 },
@@ -606,7 +668,7 @@ function drawOrchestratorVoiceDotField(context, themeMode, alpha, phase) {
 
       context.beginPath();
       context.arc(point.x, point.y, ring.size * (0.75 + (pulse * 0.38)), 0, Math.PI * 2);
-      context.fillStyle = index % 5 === 0 ? warmDotColor : dotColor;
+      context.fillStyle = index % 5 === 0 ? tintPalette.warmDot : tintPalette.dot;
       context.fill();
     }
   });
@@ -617,6 +679,7 @@ function drawOrchestratorVoiceDotField(context, themeMode, alpha, phase) {
 function drawOrchestratorVoiceCanvasRing(context, waveform, options = {}) {
   const active = Boolean(options.active);
   const themeMode = options.themeMode === "light" ? "light" : "dark";
+  const tintPalette = getForgeCanvasTintPalette(themeMode, options.spaceMode);
   const breath = active ? Math.min(1, Math.max(0, Number(options.breath || 0))) : 0;
   const phase = Number(options.phase || 0);
   const maxAmplitude = waveform.reduce(
@@ -642,33 +705,18 @@ function drawOrchestratorVoiceCanvasRing(context, waveform, options = {}) {
   const visibleAlpha = active || maxAmplitude > 0.01
     ? Math.min(1, 0.32 + (breath * 0.16) + (maxAmplitude * 0.48))
     : 0;
-  const baseStroke = themeMode === "light"
-    ? "rgba(0, 102, 204, 0.22)"
-    : "rgba(125, 176, 255, 0.2)";
-  const centerStroke = themeMode === "light"
-    ? "rgba(24, 34, 48, 0.08)"
-    : "rgba(230, 236, 245, 0.08)";
-  const glow = themeMode === "light"
-    ? "rgba(0, 102, 204, 0.3)"
-    : "rgba(125, 176, 255, 0.34)";
+  const baseStroke = tintPalette.baseStroke;
+  const centerStroke = tintPalette.centerStroke;
+  const glow = tintPalette.glow;
   const strokeGradient = context.createLinearGradient(18, 10, 82, 90);
   const glowGradient = context.createLinearGradient(14, 16, 88, 84);
 
-  if (themeMode === "light") {
-    strokeGradient.addColorStop(0, "#005fb8");
-    strokeGradient.addColorStop(0.54, "#1a8cff");
-    strokeGradient.addColorStop(1, "#d8681b");
-    glowGradient.addColorStop(0, "rgba(0, 102, 204, 0.14)");
-    glowGradient.addColorStop(0.56, "rgba(26, 140, 255, 0.22)");
-    glowGradient.addColorStop(1, "rgba(221, 112, 31, 0.22)");
-  } else {
-    strokeGradient.addColorStop(0, "#9edbff");
-    strokeGradient.addColorStop(0.46, "#4aa3ff");
-    strokeGradient.addColorStop(1, "#f08c45");
-    glowGradient.addColorStop(0, "rgba(158, 219, 255, 0.18)");
-    glowGradient.addColorStop(0.48, "rgba(74, 163, 255, 0.28)");
-    glowGradient.addColorStop(1, "rgba(240, 140, 69, 0.26)");
-  }
+  strokeGradient.addColorStop(0, tintPalette.strokeStart);
+  strokeGradient.addColorStop(0.5, tintPalette.strokeMid);
+  strokeGradient.addColorStop(1, tintPalette.strokeEnd);
+  glowGradient.addColorStop(0, tintPalette.glowStart);
+  glowGradient.addColorStop(0.5, tintPalette.glowMid);
+  glowGradient.addColorStop(1, tintPalette.glowEnd);
 
   context.clearRect(0, 0, 100, 100);
 
@@ -679,7 +727,7 @@ function drawOrchestratorVoiceCanvasRing(context, waveform, options = {}) {
   context.save();
   context.globalAlpha = visibleAlpha;
 
-  drawOrchestratorVoiceDotField(context, themeMode, Math.min(0.42, 0.16 + (breath * 0.16)), phase);
+  drawOrchestratorVoiceDotField(context, tintPalette, Math.min(0.42, 0.16 + (breath * 0.16)), phase);
 
   context.beginPath();
   context.arc(
@@ -1083,9 +1131,9 @@ const TerminalSurfaceSlot = styled.div`
 
   &[data-terminal-breakout="true"][data-terminal-active="true"] {
     box-shadow:
-      0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(96, 165, 250, 0.72),
+      0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(var(--forge-tint-soft-rgb), 0.72),
       0 calc(20px * var(--terminal-slot-inverse-scale, 1)) calc(54px * var(--terminal-slot-inverse-scale, 1)) rgba(0, 0, 0, 0.62),
-      0 0 calc(28px * var(--terminal-slot-inverse-scale, 1)) rgba(59, 130, 246, 0.2);
+      0 0 calc(28px * var(--terminal-slot-inverse-scale, 1)) rgba(var(--forge-tint-rgb), 0.2);
   }
 
   html[data-forge-theme="light"] &[data-terminal-breakout="true"] {
@@ -1097,9 +1145,9 @@ const TerminalSurfaceSlot = styled.div`
 
   html[data-forge-theme="light"] &[data-terminal-breakout="true"][data-terminal-active="true"] {
     box-shadow:
-      0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(37, 99, 235, 0.64),
+      0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(var(--forge-tint-rgb), 0.64),
       0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(44px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.22),
-      0 0 calc(26px * var(--terminal-slot-inverse-scale, 1)) rgba(37, 99, 235, 0.18);
+      0 0 calc(26px * var(--terminal-slot-inverse-scale, 1)) rgba(var(--forge-tint-rgb), 0.18);
   }
 
   &[data-terminal-hidden="true"] {
@@ -1282,7 +1330,7 @@ const TerminalWindowBreakoutOverlay = styled.div`
   border-radius: inherit;
   border: 1px dashed rgba(125, 160, 205, 0.32);
   background:
-    radial-gradient(circle at 50% 0%, rgba(125, 176, 255, 0.07), transparent 52%),
+    radial-gradient(circle at 50% 0%, rgba(var(--forge-tint-rgb), 0.07), transparent 52%),
     rgba(4, 6, 9, 0.94);
 
   > strong {
@@ -1305,9 +1353,9 @@ const TerminalWindowBreakoutOverlay = styled.div`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.24);
+    border-color: rgba(var(--forge-tint-rgb), 0.24);
     background:
-      radial-gradient(circle at 50% 0%, rgba(0, 102, 204, 0.05), transparent 52%),
+      radial-gradient(circle at 50% 0%, rgba(var(--forge-tint-rgb), 0.05), transparent 52%),
       rgba(245, 245, 247, 0.96);
   }
 `;
@@ -1328,7 +1376,7 @@ const TerminalWindowBreakoutOverlayButton = styled.button`
   border: 1px solid rgba(125, 160, 205, 0.3);
   border-radius: 999px;
   color: var(--forge-text-soft, rgba(230, 236, 245, 0.88));
-  background: rgba(125, 160, 205, 0.1);
+  background: rgba(var(--forge-tint-rgb), 0.1);
   font-size: 11.5px;
   font-weight: 760;
   cursor: pointer;
@@ -1341,7 +1389,7 @@ const TerminalWindowBreakoutOverlayButton = styled.button`
 
   &:hover {
     color: #fff;
-    background: rgba(125, 160, 205, 0.26);
+    background: rgba(var(--forge-tint-rgb), 0.26);
   }
 
   &[data-variant="return"]:hover {
@@ -1352,8 +1400,8 @@ const TerminalWindowBreakoutOverlayButton = styled.button`
 
   html[data-forge-theme="light"] & {
     color: var(--forge-text, #1d1d1f);
-    background: rgba(0, 102, 204, 0.08);
-    border-color: rgba(0, 102, 204, 0.22);
+    background: rgba(var(--forge-tint-rgb), 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.22);
   }
 `;
 
@@ -1370,13 +1418,13 @@ const TerminalBreakoutResizeHandle = styled.button`
   width: calc(10px * var(--terminal-slot-inverse-scale, 1));
   height: calc(10px * var(--terminal-slot-inverse-scale, 1));
   padding: 0;
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(191, 219, 254, 0.8);
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(var(--forge-tint-soft-rgb), 0.8);
   border-radius: calc(1px * var(--terminal-slot-inverse-scale, 1));
   color: transparent;
   background: rgba(15, 23, 42, 0.92);
   box-shadow:
     0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.9),
-    0 0 calc(12px * var(--terminal-slot-inverse-scale, 1)) rgba(96, 165, 250, 0.18);
+    0 0 calc(12px * var(--terminal-slot-inverse-scale, 1)) rgba(var(--forge-tint-rgb), 0.18);
   opacity: 0.76;
   pointer-events: auto;
   touch-action: none;
@@ -1385,8 +1433,8 @@ const TerminalBreakoutResizeHandle = styled.button`
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(219, 234, 254, 0.98);
-    background: rgba(30, 64, 175, 0.96);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.98);
+    background: rgba(var(--forge-tint-rgb), 0.34);
     opacity: 1;
     outline: none;
   }
@@ -1440,11 +1488,11 @@ const TerminalBreakoutResizeHandle = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.7);
+    border-color: rgba(var(--forge-tint-rgb), 0.7);
     background: rgba(255, 255, 255, 0.94);
     box-shadow:
       0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.95),
-      0 0 calc(10px * var(--terminal-slot-inverse-scale, 1)) rgba(37, 99, 235, 0.16);
+      0 0 calc(10px * var(--terminal-slot-inverse-scale, 1)) rgba(var(--forge-tint-rgb), 0.16);
   }
 `;
 
@@ -1462,7 +1510,7 @@ const TerminalBreakoutPlanPanel = styled.aside`
   flex-direction: column;
   gap: calc(10px * var(--terminal-slot-inverse-scale, 1));
   padding: calc(14px * var(--terminal-slot-inverse-scale, 1));
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(96, 165, 250, 0.28);
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(var(--forge-tint-soft-rgb), 0.28);
   border-radius: calc(10px * var(--terminal-slot-inverse-scale, 1));
   color: rgba(241, 245, 249, 0.94);
   background:
@@ -1478,7 +1526,7 @@ const TerminalBreakoutPlanPanel = styled.aside`
   backdrop-filter: blur(14px) saturate(135%);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.24);
+    border-color: rgba(var(--forge-tint-rgb), 0.24);
     color: #111827;
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 245, 249, 0.96)),
@@ -1530,10 +1578,10 @@ const TerminalBreakoutPlanStatusPill = styled.span`
   justify-content: center;
   min-height: calc(22px * var(--terminal-slot-inverse-scale, 1));
   padding: 0 calc(9px * var(--terminal-slot-inverse-scale, 1));
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(96, 165, 250, 0.45);
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(var(--forge-tint-soft-rgb), 0.45);
   border-radius: 999px;
-  color: rgba(191, 219, 254, 0.96);
-  background: rgba(37, 99, 235, 0.14);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.14);
   font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
   font-weight: 900;
   letter-spacing: 0.08em;
@@ -1547,9 +1595,9 @@ const TerminalBreakoutPlanStatusPill = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.36);
-    color: #1d4ed8;
-    background: rgba(37, 99, 235, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.36);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-status="blocked"] {
@@ -1600,8 +1648,8 @@ const TerminalBreakoutPlanStepDot = styled.span`
   box-shadow: 0 0 0 calc(2px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.9);
 
   &[data-status="active"] {
-    border-color: rgba(96, 165, 250, 0.96);
-    background: rgba(96, 165, 250, 0.28);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.96);
+    background: rgba(var(--forge-tint-rgb), 0.28);
   }
 
   &[data-status="completed"] {
@@ -2093,10 +2141,10 @@ const TerminalBreakoutArchitectureStatus = styled.span`
   min-height: 20px;
   align-items: center;
   padding: 0 8px;
-  border: 1px solid rgba(96, 165, 250, 0.24);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.24);
   border-radius: 999px;
-  color: rgba(191, 219, 254, 0.94);
-  background: rgba(37, 99, 235, 0.12);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.12);
   font-size: 9px;
   font-weight: 860;
   letter-spacing: 0.04em;
@@ -2105,9 +2153,9 @@ const TerminalBreakoutArchitectureStatus = styled.span`
 
   &[data-status="queued"],
   &[data-status="running"] {
-    border-color: rgba(96, 165, 250, 0.34);
-    color: rgba(219, 234, 254, 0.96);
-    background: rgba(37, 99, 235, 0.18);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.34);
+    color: var(--forge-tint-soft);
+    background: rgba(var(--forge-tint-rgb), 0.18);
   }
 
   &[data-status="done"] {
@@ -2124,8 +2172,8 @@ const TerminalBreakoutArchitectureStatus = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    color: #1d4ed8;
-    background: rgba(37, 99, 235, 0.08);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-status="done"] {
@@ -2473,17 +2521,23 @@ const TodoQueueSurface = styled.aside`
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
   padding: 0;
-  border-left: 1px solid rgba(230, 236, 245, 0.08);
+  border-left: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   color: #e8eef8;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
-    rgba(5, 8, 13, 0.96);
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.07), rgba(255, 255, 255, 0.012)),
+    var(--forge-shell-right-bg);
   overflow: hidden;
+  transition:
+    background 260ms ease,
+    border-color 260ms ease,
+    color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    border-left-color: rgba(0, 0, 0, 0.08);
+    border-left-color: rgba(var(--forge-tint-rgb), 0.12);
     color: #1d1d1f;
-    background: #f5f5f7;
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), transparent),
+      var(--forge-shell-right-bg);
   }
 
   &[data-pane-mode="fullscreen"] {
@@ -2553,24 +2607,29 @@ const WorkspaceToolMinimizedRail = styled.aside`
   grid-template-rows: 1fr;
   place-items: center;
   padding: 7px 2px;
-  border-left: 1px solid rgba(230, 236, 245, 0.08);
+  border-left: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   color: rgba(232, 238, 248, 0.86);
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
-    rgba(0, 0, 0, 0.72);
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.14), rgba(255, 255, 255, 0.02)),
+    var(--forge-shell-right-bg);
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045),
+    inset 1px 0 0 rgba(var(--forge-tint-soft-rgb), 0.08),
     0 8px 22px rgba(0, 0, 0, 0.2);
   overflow: hidden;
   backdrop-filter: blur(18px) saturate(135%);
+  transition:
+    background 260ms ease,
+    border-color 260ms ease,
+    box-shadow 260ms ease,
+    color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    border-left-color: rgba(0, 0, 0, 0.08);
+    border-left-color: rgba(var(--forge-tint-rgb), 0.12);
     color: #2a2c31;
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.5)),
-      rgba(18, 20, 24, 0.2);
-    box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.8);
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.08), rgba(255, 255, 255, 0.5)),
+      var(--forge-shell-right-bg);
+    box-shadow: inset 1px 0 0 rgba(var(--forge-tint-rgb), 0.08);
   }
 `;
 
@@ -2624,13 +2683,20 @@ const OrchestratorTopNav = styled.div`
   flex-wrap: nowrap;
   align-items: stretch;
   min-height: 40px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
-  background: rgba(2, 4, 8, 0.44);
+  border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), transparent),
+    var(--forge-shell-right-muted-bg);
   overflow: hidden;
+  transition:
+    background 260ms ease,
+    border-color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
-    background: rgba(245, 245, 247, 0.86);
+    border-bottom-color: rgba(var(--forge-tint-rgb), 0.12);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), transparent),
+      var(--forge-shell-right-muted-bg);
     backdrop-filter: saturate(180%) blur(20px);
   }
 `;
@@ -2659,8 +2725,9 @@ const OrchestratorTopButton = styled.button`
   line-height: 1;
   outline: none;
   transition:
-    background 140ms ease,
-    color 140ms ease,
+    background 220ms ease,
+    border-color 220ms ease,
+    color 220ms ease,
     opacity 140ms ease;
   white-space: nowrap;
 
@@ -2681,7 +2748,7 @@ const OrchestratorTopButton = styled.button`
 
   &[data-active="true"] {
     color: #f7fafc;
-    background: rgba(47, 128, 255, 0.13);
+    background: rgba(var(--forge-tint-rgb), 0.16);
   }
 
   &:disabled {
@@ -2691,7 +2758,7 @@ const OrchestratorTopButton = styled.button`
 
   &:not(:disabled):hover {
     color: #f7fafc;
-    background: rgba(47, 128, 255, 0.16);
+    background: rgba(var(--forge-tint-rgb), 0.2);
   }
 
   html[data-forge-theme="light"] & {
@@ -2701,8 +2768,8 @@ const OrchestratorTopButton = styled.button`
 
   html[data-forge-theme="light"] &[data-active="true"],
   html[data-forge-theme="light"] &:not(:disabled):hover {
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   /* Compact labels engage before full labels would start truncating with
@@ -2732,14 +2799,19 @@ const OrchestratorVoiceArea = styled.div`
   place-items: center;
   gap: 10px;
   padding: 18px 12px 16px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   background:
-    radial-gradient(circle at center, rgba(98, 160, 255, 0.14), transparent 62%),
-    rgba(2, 4, 8, 0.26);
+    radial-gradient(circle at center, rgba(var(--forge-tint-rgb), 0.16), transparent 62%),
+    rgba(var(--forge-tint-rgb), 0.035);
+  transition:
+    background 260ms ease,
+    border-color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
-    background: #ffffff;
+    border-bottom-color: rgba(var(--forge-tint-rgb), 0.1);
+    background:
+      radial-gradient(circle at center, rgba(var(--forge-tint-rgb), 0.105), transparent 62%),
+      var(--forge-shell-right-bg);
   }
 `;
 
@@ -2868,7 +2940,7 @@ const OrchestratorVoiceButton = styled.button`
     z-index: 0;
     border-radius: inherit;
     background:
-      radial-gradient(circle, rgba(125, 176, 255, 0.2), transparent 62%),
+      radial-gradient(circle, rgba(var(--forge-tint-soft-rgb), 0.2), transparent 62%),
       radial-gradient(circle, rgba(217, 121, 53, 0.1), transparent 76%);
     content: "";
     opacity: 0;
@@ -2881,13 +2953,13 @@ const OrchestratorVoiceButton = styled.button`
 
   html[data-forge-theme="light"] &::before {
     background:
-      radial-gradient(circle, rgba(0, 102, 204, 0.15), transparent 62%),
+      radial-gradient(circle, rgba(var(--forge-tint-rgb), 0.15), transparent 62%),
       radial-gradient(circle, rgba(221, 112, 31, 0.09), transparent 76%);
   }
 
   &:hover {
-    border-color: rgba(138, 216, 255, 0.26);
-    box-shadow: 0 0 0 4px rgba(125, 176, 255, 0.16);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.32);
+    box-shadow: 0 0 0 4px rgba(var(--forge-tint-soft-rgb), 0.16);
   }
 
   &:active {
@@ -2895,10 +2967,10 @@ const OrchestratorVoiceButton = styled.button`
   }
 
   &[data-monitoring="true"] {
-    border-color: rgba(138, 216, 255, 0.34);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.38);
     box-shadow:
-      0 0 0 4px rgba(125, 176, 255, 0.13),
-      0 0 0 1px rgba(138, 216, 255, 0.14) inset;
+      0 0 0 4px rgba(var(--forge-tint-soft-rgb), 0.13),
+      0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.14) inset;
   }
 
   &[data-monitoring="true"]::before {
@@ -2946,14 +3018,14 @@ const OrchestratorVoiceButton = styled.button`
 
   html[data-forge-theme="light"] &:hover {
     border-color: rgba(255, 255, 255, 0.22);
-    box-shadow: 0 0 0 4px rgba(0, 102, 204, 0.12);
+    box-shadow: 0 0 0 4px rgba(var(--forge-tint-rgb), 0.12);
   }
 
   html[data-forge-theme="light"] &[data-monitoring="true"] {
     border-color: rgba(255, 255, 255, 0.36);
     box-shadow:
-      0 0 0 4px rgba(0, 102, 204, 0.11),
-      0 0 0 1px rgba(0, 102, 204, 0.12) inset;
+      0 0 0 4px rgba(var(--forge-tint-rgb), 0.11),
+      0 0 0 1px rgba(var(--forge-tint-rgb), 0.12) inset;
   }
 `;
 
@@ -3044,10 +3116,11 @@ const OrchestratorSectionTabs = styled.div`
   display: grid;
   grid-template-columns: 1fr 1fr;
   min-height: 38px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
+  transition: border-color 260ms ease;
 
   html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
+    border-bottom-color: rgba(var(--forge-tint-rgb), 0.1);
   }
 `;
 
@@ -3064,8 +3137,9 @@ const OrchestratorSectionButton = styled.button`
   font-weight: 780;
   outline: none;
   transition:
-    background 140ms ease,
-    color 140ms ease;
+    background 220ms ease,
+    border-color 220ms ease,
+    color 220ms ease;
 
   &:last-child {
     border-right: 0;
@@ -3073,12 +3147,12 @@ const OrchestratorSectionButton = styled.button`
 
   &[data-active="true"] {
     color: #f7fafc;
-    background: rgba(47, 128, 255, 0.12);
+    background: rgba(var(--forge-tint-rgb), 0.16);
   }
 
   &:hover {
     color: #f7fafc;
-    background: rgba(47, 128, 255, 0.16);
+    background: rgba(var(--forge-tint-rgb), 0.2);
   }
 
   html[data-forge-theme="light"] & {
@@ -3089,8 +3163,8 @@ const OrchestratorSectionButton = styled.button`
 
   html[data-forge-theme="light"] &[data-active="true"],
   html[data-forge-theme="light"] &:hover {
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 `;
 
@@ -3098,10 +3172,15 @@ const OrchestratorConnectedDevices = styled.div`
   display: grid;
   min-width: 0;
   max-height: min(180px, 32vh);
-  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
-  background: rgba(2, 4, 8, 0.48);
+  border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.05), transparent),
+    var(--forge-shell-right-muted-bg);
   overflow: auto;
   overscroll-behavior: contain;
+  transition:
+    background 260ms ease,
+    border-color 260ms ease;
 
   &[data-empty="true"] {
     max-height: 0;
@@ -3110,8 +3189,10 @@ const OrchestratorConnectedDevices = styled.div`
   }
 
   html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
-    background: #ffffff;
+    border-bottom-color: rgba(var(--forge-tint-rgb), 0.1);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
+      var(--forge-shell-right-bg);
   }
 `;
 
@@ -3139,11 +3220,15 @@ const OrchestratorConnectedDeviceIcon = styled.span`
   width: 24px;
   height: 24px;
   place-items: center;
-  border: 1px solid rgba(100, 160, 255, 0.2);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.22);
   border-radius: 7px;
   color: #dce9ff;
-  background: rgba(47, 128, 255, 0.1);
+  background: rgba(var(--forge-tint-rgb), 0.12);
   line-height: 0;
+  transition:
+    background 220ms ease,
+    border-color 220ms ease,
+    color 220ms ease;
 
   svg {
     width: 14px;
@@ -3176,9 +3261,9 @@ const OrchestratorConnectedDeviceIcon = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.16);
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-platform="android"] {
@@ -3255,9 +3340,9 @@ const OrchestratorConnectedDeviceBadge = styled.span`
   white-space: nowrap;
 
   &[data-active="true"] {
-    border-color: rgba(105, 158, 255, 0.52);
-    color: #7fa9ff;
-    background: rgba(47, 128, 255, 0.16);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.52);
+    color: var(--forge-tint-soft);
+    background: rgba(var(--forge-tint-rgb), 0.16);
   }
 
   html[data-forge-theme="light"] & {
@@ -3267,9 +3352,9 @@ const OrchestratorConnectedDeviceBadge = styled.span`
   }
 
   html[data-forge-theme="light"] &[data-active="true"] {
-    border-color: rgba(0, 102, 204, 0.28);
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.28);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
 `;
@@ -3298,23 +3383,32 @@ const TodoDeviceSwitcher = styled.div`
   min-width: 0;
   gap: 8px;
   padding: 9px 10px 8px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.075);
-  background: rgba(2, 4, 8, 0.38);
+  border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.11);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent),
+    rgba(2, 4, 8, 0.38);
   overflow-x: auto;
   overscroll-behavior-x: contain;
+  transition:
+    background 260ms ease,
+    border-color 260ms ease;
 
   &[data-layout="strip"] {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     gap: 0;
     padding: 0;
-    background: rgba(2, 4, 8, 0.48);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.05), transparent),
+      var(--forge-shell-right-muted-bg);
     overflow: visible;
   }
 
   html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
-    background: #ffffff;
+    border-bottom-color: rgba(var(--forge-tint-rgb), 0.1);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
+      var(--forge-shell-right-bg);
   }
 `;
 
@@ -3342,16 +3436,16 @@ const TodoDeviceButton = styled.button`
     transform 140ms ease;
 
   &:hover {
-    border-color: rgba(125, 176, 255, 0.28);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.28);
     color: #eef5ff;
     background: rgba(18, 27, 41, 0.88);
     transform: translateY(-1px);
   }
 
   &[data-active="true"] {
-    border-color: rgba(125, 176, 255, 0.42);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.42);
     color: #f6fbff;
-    background: rgba(47, 128, 255, 0.16);
+    background: rgba(var(--forge-tint-rgb), 0.16);
   }
 
   html[data-forge-theme="light"] & {
@@ -3362,9 +3456,9 @@ const TodoDeviceButton = styled.button`
 
   html[data-forge-theme="light"] &:hover,
   html[data-forge-theme="light"] &[data-active="true"] {
-    border-color: rgba(0, 102, 204, 0.22);
-    color: #164377;
-    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.22);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   &[data-strip="true"] {
@@ -3388,17 +3482,17 @@ const TodoDeviceButton = styled.button`
 
   &[data-strip="true"]:hover {
     border-bottom-color: rgba(230, 236, 245, 0.075);
-    background: rgba(47, 128, 255, 0.08);
+    background: rgba(var(--forge-tint-rgb), 0.08);
     transform: none;
   }
 
   &[data-strip="true"][data-active="true"] {
-    border-bottom-color: rgba(125, 176, 255, 0.14);
-    background: rgba(47, 128, 255, 0.1);
+    border-bottom-color: rgba(var(--forge-tint-soft-rgb), 0.14);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   &[data-cluster="true"] {
-    border-color: rgba(125, 176, 255, 0.24);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.24);
     background: rgba(18, 27, 41, 0.74);
   }
 
@@ -3407,7 +3501,7 @@ const TodoDeviceButton = styled.button`
   }
 
   &[data-strip="true"][data-cluster="true"]:hover {
-    background: rgba(47, 128, 255, 0.08);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-strip="true"] {
@@ -3417,8 +3511,8 @@ const TodoDeviceButton = styled.button`
 
   html[data-forge-theme="light"] &[data-strip="true"]:hover,
   html[data-forge-theme="light"] &[data-strip="true"][data-active="true"] {
-    border-bottom-color: rgba(0, 102, 204, 0.12);
-    background: rgba(0, 102, 204, 0.06);
+    border-bottom-color: rgba(var(--forge-tint-rgb), 0.12);
+    background: rgba(var(--forge-tint-rgb), 0.06);
   }
 `;
 
@@ -3427,10 +3521,10 @@ const TodoDeviceButtonIcon = styled.span`
   width: 24px;
   height: 24px;
   place-items: center;
-  border: 1px solid rgba(125, 176, 255, 0.18);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.18);
   border-radius: 7px;
   color: #d7e6ff;
-  background: rgba(47, 128, 255, 0.1);
+  background: rgba(var(--forge-tint-rgb), 0.1);
   line-height: 0;
 
   svg {
@@ -3464,9 +3558,9 @@ const TodoDeviceButtonIcon = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.16);
-    color: #0066cc;
-    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-platform="android"] {
@@ -3495,9 +3589,9 @@ const TodoDeviceButtonIcon = styled.span`
   }
 
   &[data-platform="cluster"] {
-    border-color: rgba(125, 176, 255, 0.24);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.24);
     color: #d7e6ff;
-    background: rgba(47, 128, 255, 0.12);
+    background: rgba(var(--forge-tint-rgb), 0.12);
   }
 `;
 
@@ -3542,7 +3636,7 @@ const TodoDeviceClusterIconSlot = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    color: #0066cc;
+    color: var(--forge-tint);
   }
 
   html[data-forge-theme="light"] &[data-platform="android"] {
@@ -3646,14 +3740,21 @@ const OrchestratorHistoryView = styled.div`
   box-sizing: border-box;
   grid-template-rows: auto minmax(0, 1fr) auto;
   color: #7f8da1;
-  background: rgba(2, 4, 8, 0.76);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), transparent),
+    rgba(2, 4, 8, 0.76);
   font-size: 12px;
   font-weight: 720;
   overflow: hidden;
+  transition:
+    background 260ms ease,
+    color 260ms ease;
 
   html[data-forge-theme="light"] & {
     color: #7a7a7a;
-    background: #ffffff;
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), transparent),
+      var(--forge-shell-right-bg);
   }
 `;
 
@@ -3819,8 +3920,8 @@ const OrchestratorHistoryToolChip = styled.button`
 
   &:hover,
   &[data-expanded="true"] {
-    border-color: rgba(96, 165, 250, 0.45);
-    color: rgba(219, 234, 254, 0.96);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.45);
+    color: var(--forge-tint-soft);
   }
 `;
 
@@ -3961,7 +4062,7 @@ const OrchestratorHistoryTurn = styled.article`
   overflow: hidden;
 
   &[data-pending="true"] {
-    border-color: rgba(96, 165, 250, 0.2);
+    border-color: rgba(var(--forge-tint-rgb), 0.2);
   }
 
   &[data-cancelled="true"] {
@@ -3974,7 +4075,7 @@ const OrchestratorHistoryTurn = styled.article`
   }
 
   html[data-forge-theme="light"] &[data-pending="true"] {
-    border-color: rgba(37, 99, 235, 0.18);
+    border-color: rgba(var(--forge-tint-rgb), 0.18);
   }
 `;
 
@@ -4255,14 +4356,14 @@ const OrchestratorHistoryInlineSpinner = styled.span`
   flex: 0 0 auto;
   width: 11px;
   height: 11px;
-  border: 2px solid rgba(125, 176, 255, 0.2);
-  border-top-color: rgba(125, 176, 255, 0.88);
+  border: 2px solid rgba(var(--forge-tint-soft-rgb), 0.2);
+  border-top-color: rgba(var(--forge-tint-soft-rgb), 0.88);
   border-radius: 999px;
   animation: ${orchestratorHistorySpinner} 760ms linear infinite;
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.16);
-    border-top-color: rgba(0, 102, 204, 0.82);
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    border-top-color: rgba(var(--forge-tint-rgb), 0.82);
   }
 `;
 
@@ -4359,7 +4460,7 @@ const OrchestratorHistoryPlanProgressBar = styled.span`
   width: var(--voice-plan-progress, 0%);
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #2dd4bf, #60a5fa);
+  background: linear-gradient(90deg, #2dd4bf, var(--forge-tint-soft));
 `;
 
 const OrchestratorHistoryPlanSteps = styled.div`
@@ -4488,9 +4589,9 @@ const OrchestratorHistoryPlanTaskIcon = styled.span`
 
   &[data-status-tone="queued"],
   &[data-status-tone="running"] {
-    border-color: rgba(96, 165, 250, 0.34);
-    background: rgba(96, 165, 250, 0.1);
-    color: #93c5fd;
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.34);
+    background: rgba(var(--forge-tint-rgb), 0.1);
+    color: var(--forge-tint-soft);
   }
 
   &[data-status-tone="failed"],
@@ -4533,7 +4634,7 @@ const OrchestratorHistoryPlanTaskStatus = styled.span`
 
   &[data-status-tone="queued"],
   &[data-status-tone="running"] {
-    color: #93c5fd;
+    color: var(--forge-tint-soft);
   }
 
   &[data-status-tone="failed"],
@@ -4599,7 +4700,7 @@ const OrchestratorHistoryPlanActionButton = styled.button`
   }
 
   &:hover {
-    border-color: rgba(96, 165, 250, 0.32);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.32);
     background: rgba(30, 41, 59, 0.72);
     color: #eff6ff;
     transform: translateY(-1px);
@@ -4662,7 +4763,7 @@ const OrchestratorHistoryPlanTaskPulse = styled.span`
   height: 5px;
   border-radius: 999px;
   background: currentColor;
-  box-shadow: 0 0 0 0 rgba(147, 197, 253, 0.4);
+  box-shadow: 0 0 0 0 rgba(var(--forge-tint-soft-rgb), 0.4);
   animation: ${orchestratorHistoryTaskPulse} 1.2s ease-in-out infinite;
 `;
 
@@ -4743,7 +4844,7 @@ const OrchestratorHistoryInput = styled.textarea`
   }
 
   &:focus {
-    border-color: rgba(125, 176, 255, 0.45);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.45);
   }
 
   &:disabled {
@@ -4762,7 +4863,7 @@ const OrchestratorHistoryInput = styled.textarea`
   }
 
   html[data-forge-theme="light"] &:focus {
-    border-color: rgba(0, 102, 204, 0.38);
+    border-color: rgba(var(--forge-tint-rgb), 0.38);
   }
 `;
 
@@ -4850,7 +4951,10 @@ const WorkspaceToolSurface = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #05070a;
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
+    var(--forge-shell-right-bg);
+  transition: background 260ms ease;
 
   > * {
     width: 100%;
@@ -4864,7 +4968,9 @@ const WorkspaceToolSurface = styled.div`
   }
 
   html[data-forge-theme="light"] & {
-    background: #ffffff;
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), transparent),
+      var(--forge-shell-right-bg);
   }
 
   &[hidden] {
@@ -4947,7 +5053,7 @@ const TodoQueueTextArea = styled.textarea`
   }
 
   &:focus {
-    border-color: rgba(98, 160, 255, 0.46);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.46);
     background: transparent;
     box-shadow: none;
   }
@@ -5021,7 +5127,7 @@ const TodoQueueItemCard = styled.article`
     margin-top: calc(var(--todo-dot-center-y) - var(--todo-row-padding-top) - var(--todo-dot-radius));
     margin-left: calc(var(--todo-dot-center-x) - 12px - var(--todo-dot-radius));
     border-radius: 999px;
-    background: var(--todo-agent-color, ${TODO_QUEUE_DEFAULT_DOT_COLOR});
+    background: var(--todo-agent-color, var(--forge-tint-soft));
     box-shadow: none;
     transition: opacity 130ms ease;
   }
@@ -5060,7 +5166,7 @@ const TodoQueueItemCard = styled.article`
   }
 
   html[data-forge-theme="light"] &::before {
-    background: var(--todo-agent-color, #0066cc);
+    background: var(--todo-agent-color, var(--forge-tint));
   }
 
   html[data-forge-theme="light"] &:hover {
@@ -5158,7 +5264,7 @@ const TodoQueueItemCard = styled.article`
   }
 
   &[data-todo-reordering="true"] {
-    background: rgba(47, 128, 255, 0.14);
+    background: rgba(var(--forge-tint-rgb), 0.14);
   }
 
   &:hover [data-todo-delete="true"],
@@ -5181,8 +5287,8 @@ const TodoQueueItemActionButton = styled.button`
   padding: 0;
   border: 0;
   border-radius: 6px;
-  color: #cfe2ff;
-  background: rgba(47, 128, 255, 0.16);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.16);
   opacity: 0;
   pointer-events: none;
   transition:
@@ -5193,12 +5299,12 @@ const TodoQueueItemActionButton = styled.button`
 
   &:hover {
     color: #ffffff;
-    background: rgba(47, 128, 255, 0.26);
+    background: rgba(var(--forge-tint-rgb), 0.26);
     transform: translateY(-1px);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(139, 184, 255, 0.52);
+    outline: 2px solid rgba(var(--forge-tint-soft-rgb), 0.52);
     outline-offset: 1px;
     opacity: 1;
     pointer-events: auto;
@@ -5221,13 +5327,13 @@ const TodoQueueItemActionButton = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    color: #0056b3;
-    background: rgba(0, 102, 204, 0.1);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.1);
   }
 
   html[data-forge-theme="light"] &:hover {
-    color: #003f82;
-    background: rgba(0, 102, 204, 0.18);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.18);
   }
 
   html[data-forge-theme="light"] &[data-action="cancel"] {
@@ -5276,14 +5382,14 @@ const TodoQueueItemPendingSpinner = styled.div`
     width: 2px;
     height: 5px;
     border-radius: 999px;
-    background: #8bb8ff;
+    background: var(--forge-tint-soft);
     opacity: calc(0.26 + (var(--todo-spinner-index, 0) * 0.085));
     transform: rotate(calc(var(--todo-spinner-index, 0) * 45deg)) translateY(-1px);
     transform-origin: 1px 7px;
   }
 
   html[data-forge-theme="light"] & span {
-    background: #0066cc;
+    background: var(--forge-tint);
   }
 `;
 
@@ -5397,7 +5503,7 @@ const TodoQueueItemNoteFrame = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(98, 160, 255, 0.12), rgba(255, 255, 255, 0.025)),
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.12), rgba(255, 255, 255, 0.025)),
     rgba(2, 4, 8, 0.34);
 
   html[data-forge-theme="light"] & {
@@ -5491,13 +5597,13 @@ const TodoQueueItemNoteIcon = styled.div`
   height: 52px;
   align-self: center;
   justify-self: center;
-  border: 1px solid rgba(138, 216, 255, 0.42);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.42);
   border-radius: 5px;
   background: rgba(13, 17, 23, 0.7);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.22);
+    border-color: rgba(var(--forge-tint-rgb), 0.22);
     background: #ffffff;
     box-shadow: none;
   }
@@ -5508,10 +5614,10 @@ const TodoQueueItemNoteIcon = styled.div`
     right: -1px;
     width: 14px;
     height: 14px;
-    border-bottom: 1px solid rgba(138, 216, 255, 0.32);
-    border-left: 1px solid rgba(138, 216, 255, 0.32);
+    border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.32);
+    border-left: 1px solid rgba(var(--forge-tint-soft-rgb), 0.32);
     border-bottom-left-radius: 4px;
-    background: rgba(98, 160, 255, 0.18);
+    background: rgba(var(--forge-tint-rgb), 0.18);
     content: "";
   }
 
@@ -5595,9 +5701,9 @@ const TodoQueueDispatchSelect = styled.select`
   width: 26px;
   height: 22px;
   padding: 0;
-  border: 1px solid rgba(95, 179, 255, 0.24);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.24);
   border-radius: 6px;
-  color: #cfe2ff;
+  color: var(--forge-tint-soft);
   background: rgba(24, 34, 54, 0.92);
   font-size: 11px;
   font-weight: 800;
@@ -5611,7 +5717,7 @@ const TodoQueueDispatchSelect = styled.select`
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(95, 179, 255, 0.42);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.42);
     background: rgba(32, 48, 78, 0.96);
     outline: none;
     transform: translateY(-1px);
@@ -5624,7 +5730,7 @@ const TodoQueueDispatchSelect = styled.select`
   }
 
   html[data-forge-theme="light"] & {
-    color: #164377;
+    color: var(--forge-tint);
     background: rgba(255, 255, 255, 0.94);
   }
 `;
@@ -5679,9 +5785,9 @@ const TodoQueuePeerDeviceTag = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.22);
-    color: #164377;
-    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.22);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 `;
 
@@ -5747,7 +5853,7 @@ const TodoQueueDraftBullet = styled.span`
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: ${TODO_QUEUE_DEFAULT_DOT_COLOR};
+  background: var(--forge-tint-soft);
   pointer-events: none;
 
   &::before {
@@ -5755,7 +5861,7 @@ const TodoQueueDraftBullet = styled.span`
   }
 
   html[data-forge-theme="light"] & {
-    background: #0066cc;
+    background: var(--forge-tint);
   }
 `;
 
@@ -5829,14 +5935,14 @@ const TodoQueueAutoQueueAllButton = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    color: #0056b3;
+    color: var(--forge-tint);
     background: transparent;
   }
 
   html[data-forge-theme="light"] &:not(:disabled):hover,
   html[data-forge-theme="light"] &:not(:disabled):focus-visible {
-    color: #003f82;
-    background: rgba(0, 102, 204, 0.07);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.07);
   }
 `;
 
@@ -5893,7 +5999,7 @@ const TodoResumeDialog = styled.section`
   max-height: min(70vh, 560px);
   overflow-y: auto;
   padding: 16px;
-  border: 1px solid rgba(125, 176, 255, 0.28);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
   border-radius: 12px;
   color: var(--forge-text, #f4f7fa);
   background: rgba(8, 12, 20, 0.97);
@@ -6001,11 +6107,11 @@ const TodoDragPreview = styled.div`
   gap: 7px;
   overflow: hidden;
   padding: 10px;
-  border: 1px solid rgba(138, 216, 255, 0.52);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.52);
   border-radius: 8px;
   color: #f5fbff;
   background:
-    linear-gradient(90deg, rgba(47, 128, 255, 0.18), rgba(255, 122, 24, 0.08)),
+    linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.18), rgba(255, 122, 24, 0.08)),
     rgba(5, 10, 18, 0.96);
   box-shadow:
     0 22px 54px rgba(0, 0, 0, 0.46),
@@ -6016,7 +6122,7 @@ const TodoDragPreview = styled.div`
   will-change: transform;
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.28);
+    border-color: rgba(var(--forge-tint-rgb), 0.28);
     color: #1d1d1f;
     background: #ffffff;
     box-shadow: none;
@@ -13805,6 +13911,7 @@ function OrchestratorVoiceCanvasRing({
           active: frameState.active,
           breath: breathRef.current,
           phase: timestamp / 1000,
+          spaceMode: getForgeSpaceMode(),
           themeMode: getForgeThemeMode(),
         });
       }
@@ -22602,15 +22709,26 @@ function TerminalView({
         }
 
         context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-        const isLightTheme = document.documentElement.getAttribute("data-forge-theme") === "light";
-        context.fillStyle = isLightTheme ? "#ffffff" : "#010204";
+        const themeMode = getForgeThemeMode();
+        const spaceMode = getForgeSpaceMode();
+        const isLightTheme = themeMode === "light";
+        const isLoopspaces = spaceMode === "loopspaces";
+        context.fillStyle = isLightTheme ? (isLoopspaces ? "#fffaf0" : "#ffffff") : (isLoopspaces ? "#050300" : "#010204");
         context.fillRect(0, 0, width, height);
 
         const shade = context.createLinearGradient(0, 0, 0, height);
-        if (isLightTheme) {
+        if (isLightTheme && isLoopspaces) {
+          shade.addColorStop(0, "rgba(255, 209, 102, 0.18)");
+          shade.addColorStop(0.5, "rgba(255, 248, 234, 0.1)");
+          shade.addColorStop(1, "rgba(245, 158, 11, 0.13)");
+        } else if (isLightTheme) {
           shade.addColorStop(0, "rgba(239, 243, 250, 0.32)");
           shade.addColorStop(0.5, "rgba(255, 255, 255, 0.1)");
           shade.addColorStop(1, "rgba(226, 232, 240, 0.24)");
+        } else if (isLoopspaces) {
+          shade.addColorStop(0, "rgba(255, 209, 102, 0.11)");
+          shade.addColorStop(0.5, "rgba(5, 3, 0, 0.04)");
+          shade.addColorStop(1, "rgba(245, 158, 11, 0.12)");
         } else {
           shade.addColorStop(0, "rgba(6, 11, 19, 0.38)");
           shade.addColorStop(0.5, "rgba(1, 2, 4, 0.04)");
@@ -22624,8 +22742,12 @@ function TerminalView({
         const spacing = Math.max(14, Math.min(86, worldStep * viewport.zoom));
         const offsetX = ((viewport.x % spacing) + spacing) % spacing;
         const offsetY = ((viewport.y % spacing) + spacing) % spacing;
-        const minorColor = isLightTheme ? "rgba(50, 58, 74, 0.11)" : "rgba(148, 163, 184, 0.105)";
-        const majorColor = isLightTheme ? "rgba(28, 38, 55, 0.19)" : "rgba(178, 197, 226, 0.17)";
+        const minorColor = isLightTheme
+          ? (isLoopspaces ? "rgba(181, 106, 0, 0.11)" : "rgba(50, 58, 74, 0.11)")
+          : (isLoopspaces ? "rgba(255, 209, 102, 0.105)" : "rgba(148, 163, 184, 0.105)");
+        const majorColor = isLightTheme
+          ? (isLoopspaces ? "rgba(181, 106, 0, 0.19)" : "rgba(28, 38, 55, 0.19)")
+          : (isLoopspaces ? "rgba(255, 224, 138, 0.17)" : "rgba(178, 197, 226, 0.17)");
 
         for (let x = offsetX - spacing; x <= width + spacing; x += spacing) {
           const worldColumn = Math.round((x - viewport.x) / Math.max(1, worldStep * viewport.zoom));
@@ -22648,7 +22770,7 @@ function TerminalView({
     observer?.observe(canvas);
     const themeObserver = typeof MutationObserver === "undefined" ? null : new MutationObserver(scheduleDraw);
     themeObserver?.observe(document.documentElement, {
-      attributeFilter: ["data-forge-theme"],
+      attributeFilter: ["data-forge-theme", "data-forge-space"],
       attributes: true,
     });
     window.addEventListener("resize", scheduleDraw);

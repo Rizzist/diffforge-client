@@ -5401,12 +5401,11 @@ function cloudSyncStatusFromRuntimeStatus(status) {
   if (!status || typeof status !== "object") {
     return null;
   }
-  const connected = Boolean(
-    status.connected && (status.globalWsConnected ?? status.global_ws_connected),
-  );
+  const globalConnected = Boolean(status.globalWsConnected ?? status.global_ws_connected);
+  const connected = globalConnected || Boolean(status.connected);
   const rawStatus = String(status.status || "").toLowerCase();
   const globalStatus = String(status.globalWsStatus || status.global_ws_status || "").toLowerCase();
-  const statusKey = globalStatus || rawStatus;
+  const statusKey = connected ? "connected" : globalStatus || rawStatus;
   const activity = normalizeCloudSyncActivity(status);
   return {
     connection: connected
@@ -5646,7 +5645,7 @@ function networkItemLabel(item, fallback = "network event") {
 }
 
 function networkItemErrorText(item) {
-  return networkString(
+  const error = networkString(
     item?.lastError
       || item?.last_error
       || item?.error
@@ -5654,6 +5653,7 @@ function networkItemErrorText(item) {
       || item?.metadata?.error
       || item?.metadata?.message,
   );
+  return error === "recovered stale in-flight outbox row" ? "" : error;
 }
 
 function networkSyncLogStage(entry) {
@@ -6130,12 +6130,16 @@ function normalizeNetworkingDiagnostics(payload, syncStatus = null) {
   const outbound = payload?.outbound && typeof payload.outbound === "object" ? payload.outbound : {};
   const tokenomics = payload?.tokenomics && typeof payload.tokenomics === "object" ? payload.tokenomics : {};
   const nowMs = networkNumber(payload?.nowMs ?? payload?.now_ms, Date.now());
+  const connectionConnected = Boolean(connection.globalWsConnected ?? connection.global_ws_connected ?? status.globalWsConnected ?? status.global_ws_connected);
+  const connectionState = connectionConnected
+    ? "connected"
+    : networkString(connection.globalWsStatus || connection.global_ws_status || connection.status || status.globalWsStatus || status.global_ws_status || status.status || syncStatus?.connection, syncStatus?.connection || "local");
   return {
     activities: networkList(syncActivity.activities),
     connection: {
-      connected: Boolean(connection.globalWsConnected ?? connection.global_ws_connected ?? status.globalWsConnected ?? status.global_ws_connected),
-      error: networkString(connection.globalWsLastError || connection.global_ws_last_error || connection.lastError || connection.last_error || status.globalWsLastError || status.global_ws_last_error || status.lastError || status.last_error),
-      state: networkString(connection.globalWsStatus || connection.global_ws_status || connection.status || status.globalWsStatus || status.global_ws_status || status.status || syncStatus?.connection, syncStatus?.connection || "local"),
+      connected: connectionConnected,
+      error: connectionConnected ? "" : networkString(connection.globalWsLastError || connection.global_ws_last_error || connection.lastError || connection.last_error || status.globalWsLastError || status.global_ws_last_error || status.lastError || status.last_error),
+      state: connectionState,
       contract: networkString(connection.contract || status.connectionContract || status.connection_contract),
     },
     health,
@@ -6558,10 +6562,19 @@ function buildRustTerminalAuthorityWorkspaces({
     }
 
     const terminalIndex = session.terminalIndex ?? 0;
-    const agentId = normalizeManagedAgentProviderId(session.agentId || session.agentKind)
-      || session.agentId
-      || session.agentKind
-      || WORKSPACE_TERMINAL_ROLE_GENERIC;
+    const configuredTerminalCount = getWorkspaceTerminalCount(workspaceSettings || {}, workspaceId);
+    const configuredTerminalRoles = getWorkspaceTerminalRoles(
+      workspaceSettings || {},
+      workspaceId,
+      configuredTerminalCount,
+      WORKSPACE_TERMINAL_ROLE_GENERIC,
+      WORKSPACE_TERMINAL_ROLE_OPTIONS,
+    );
+    const configuredAgentId = normalizeWorkspaceLiveTerminalAgentId(
+      configuredTerminalRoles[terminalIndex],
+    );
+    const sessionAgentId = normalizeWorkspaceLiveTerminalAgentId(session.agentId || session.agentKind);
+    const agentId = sessionAgentId || configuredAgentId || WORKSPACE_TERMINAL_ROLE_GENERIC;
     const workspaceThread = getWorkspaceThreadForTerminalIndex(workspaceThreads, workspaceId, terminalIndex);
     const providerBinding = getWorkspaceThreadProviderBinding(
       workspaceThread,
@@ -6872,6 +6885,18 @@ function normalizeManagedAgentProviderId(value) {
     return "claude";
   }
   return ["codex", "claude", "opencode"].includes(providerId) ? providerId : "";
+}
+
+function normalizeWorkspaceLiveTerminalAgentId(value) {
+  const managedAgentId = normalizeManagedAgentProviderId(value);
+  if (managedAgentId) {
+    return managedAgentId;
+  }
+  const terminalRole = String(value || "").trim().toLowerCase();
+  if (["generic", "shell", "terminal", "plain-shell", "plain_shell"].includes(terminalRole)) {
+    return WORKSPACE_TERMINAL_ROLE_GENERIC;
+  }
+  return "";
 }
 
 function getManagedAgentLabel(agentId) {

@@ -296,7 +296,7 @@ const FilterButton = styled.button`
 
   &[data-active="true"] {
     color: var(--forge-text, #f4f7fa);
-    background: rgba(125, 176, 255, 0.14);
+    background: rgba(var(--forge-tint-rgb), 0.14);
   }
 `;
 
@@ -393,7 +393,7 @@ const ToolRow = styled.div`
   cursor: grab;
 
   &:hover {
-    border-color: rgba(125, 176, 255, 0.25);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.25);
   }
 
   &:active {
@@ -410,8 +410,8 @@ const ToolGlyph = styled.span`
   font-size: 13px;
 
   &[data-kind="architecture"] {
-    color: rgba(125, 176, 255, 0.9);
-    background: rgba(59, 130, 246, 0.12);
+    color: var(--forge-tint-soft);
+    background: rgba(var(--forge-tint-rgb), 0.12);
   }
 
   &[data-kind="skill"] {
@@ -444,16 +444,16 @@ const ToolCopy = styled.div`
 
 const AddButton = styled.button`
   padding: 5px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.3);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.3);
   border-radius: 7px;
-  color: rgba(200, 222, 255, 0.95);
-  background: rgba(59, 130, 246, 0.14);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.14);
   font-size: 11px;
   font-weight: 750;
   cursor: pointer;
 
   &:hover {
-    background: rgba(59, 130, 246, 0.26);
+    background: rgba(var(--forge-tint-rgb), 0.26);
   }
 `;
 

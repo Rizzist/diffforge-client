@@ -214,9 +214,9 @@ const AgentAccountAddButton = styled.button`
   transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
 
   &:hover {
-    border-color: rgba(125, 176, 255, 0.6);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.6);
     color: rgba(226, 232, 240, 0.95);
-    background: rgba(125, 176, 255, 0.18);
+    background: rgba(var(--forge-tint-rgb), 0.18);
   }
 
   html[data-forge-theme="light"] & {
@@ -258,7 +258,7 @@ const AgentAccountPill = styled.button`
   }
 
   &:hover:not([data-active="true"]) {
-    border-color: rgba(125, 176, 255, 0.5);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.5);
   }
 
   /* The account name; ellipsizes so one pill can never force the panel
@@ -326,7 +326,7 @@ const AgentAccountIconButton = styled.button`
 
   &:hover {
     color: rgba(226, 232, 240, 0.95);
-    background: rgba(125, 176, 255, 0.25);
+    background: rgba(var(--forge-tint-rgb), 0.25);
   }
 
   &[data-danger="true"]:hover {
@@ -350,7 +350,7 @@ const AgentAccountEditorForm = styled.form`
   min-width: 0;
   max-width: 100%;
   padding: 7px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.3);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.3);
   border-radius: 10px;
   color: rgba(203, 213, 225, 0.9);
   background: rgba(30, 41, 59, 0.45);
@@ -2334,7 +2334,7 @@ function toneColor(tone) {
   if (tone === "danger") return "#ff5a5f";
   if (tone === "warn") return "#fb923c";
   if (tone === "unknown") return "#94a3b8";
-  return "#60a5fa";
+  return "var(--forge-tint-soft)";
 }
 
 function dailyPercentTone(value, weeklyLimitPercent) {
@@ -3559,7 +3559,7 @@ const TokenomicsShell = styled.section`
   padding: clamp(6px, 1.8vw, 12px);
   color: #e5eefb;
   background:
-    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.13), transparent 34%),
+    radial-gradient(circle at 50% 0%, rgba(var(--forge-tint-rgb), 0.13), transparent 34%),
     radial-gradient(circle at 100% 12%, rgba(251, 146, 60, 0.08), transparent 28%),
     linear-gradient(180deg, #05070a, #020304 68%, #05070a);
 
@@ -3571,7 +3571,7 @@ const TokenomicsShell = styled.section`
   html[data-forge-theme="light"] & {
     color: #0f172a;
     background:
-      radial-gradient(circle at 50% 0%, rgba(37, 99, 235, 0.1), transparent 34%),
+      radial-gradient(circle at 50% 0%, rgba(var(--forge-tint-rgb), 0.1), transparent 34%),
       radial-gradient(circle at 100% 12%, rgba(249, 115, 22, 0.08), transparent 28%),
       linear-gradient(180deg, #f8fafc, #eef4ff);
   }
@@ -3708,10 +3708,10 @@ const TokenomicsLoading = styled.div`
   gap: 9px;
   min-width: 0;
   padding: 9px 10px;
-  border: 1px solid rgba(96, 165, 250, 0.2);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.2);
   border-radius: 8px;
   color: #9fb2cc;
-  background: rgba(96, 165, 250, 0.08);
+  background: rgba(var(--forge-tint-rgb), 0.08);
   font-size: 11px;
   font-weight: 900;
 
@@ -3719,8 +3719,8 @@ const TokenomicsLoading = styled.div`
     width: 12px;
     height: 12px;
     flex: 0 0 auto;
-    border: 2px solid rgba(96, 165, 250, 0.18);
-    border-top-color: #60a5fa;
+    border: 2px solid rgba(var(--forge-tint-soft-rgb), 0.18);
+    border-top-color: var(--forge-tint-soft);
     border-radius: 999px;
     animation: tokenomics-spin 0.8s linear infinite;
   }
@@ -3750,8 +3750,8 @@ const TokenomicsLoading = styled.div`
 
   html[data-forge-theme="light"] & {
     color: #475569;
-    border-color: rgba(37, 99, 235, 0.16);
-    background: rgba(37, 99, 235, 0.07);
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    background: rgba(var(--forge-tint-rgb), 0.07);
   }
 `;
 
@@ -4042,7 +4042,7 @@ const PanelTitle = styled.div`
     height: 15px;
     flex: 0 0 auto;
     fill: none;
-    stroke: #60a5fa;
+    stroke: var(--forge-tint-soft);
     stroke-width: 2;
   }
 
@@ -4071,7 +4071,7 @@ const RateGraph = styled.svg`
   }
 
   rect.cool {
-    fill: rgba(96, 165, 250, 0.36);
+    fill: rgba(var(--forge-tint-rgb), 0.36);
   }
 
   rect.hot {
@@ -4110,12 +4110,12 @@ const RangeToggle = styled.div`
   align-items: center;
   gap: 2px;
   padding: 2px;
-  border: 1px solid rgba(96, 165, 250, 0.18);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.18);
   border-radius: 999px;
   background: rgba(15, 23, 42, 0.72);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.16);
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
     background: rgba(241, 245, 249, 0.82);
   }
 `;
@@ -4129,8 +4129,8 @@ const RangeToggleButton = styled.button`
   padding: 0 7px;
   border: 0;
   border-radius: 999px;
-  color: ${({ $active }) => ($active ? "#bfdbfe" : "#738196")};
-  background: ${({ $active }) => ($active ? "rgba(96, 165, 250, 0.20)" : "transparent")};
+  color: ${({ $active }) => ($active ? "var(--forge-tint-soft)" : "#738196")};
+  background: ${({ $active }) => ($active ? "rgba(var(--forge-tint-rgb), 0.20)" : "transparent")};
   font: inherit;
   font-size: 10px;
   font-weight: 900;
@@ -4142,8 +4142,8 @@ const RangeToggleButton = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    color: ${({ $active }) => ($active ? "#1d4ed8" : "#64748b")};
-    background: ${({ $active }) => ($active ? "rgba(37, 99, 235, 0.12)" : "transparent")};
+    color: ${({ $active }) => ($active ? "var(--forge-tint)" : "#64748b")};
+    background: ${({ $active }) => ($active ? "rgba(var(--forge-tint-rgb), 0.12)" : "transparent")};
 
     &:hover {
       color: #0f172a;
@@ -4185,9 +4185,14 @@ const DailyBar = styled.div`
     if ($tone === "danger") return "#ff5a5f";
     if ($tone === "warn") return "#facc15";
     if ($tone === "quiet") return "rgba(114, 130, 150, 0.25)";
-    return "#60a5fa";
+    return "var(--forge-tint-soft)";
   }};
-  box-shadow: ${({ $tone }) => ($tone && $tone !== "quiet" ? "0 0 18px rgba(96, 165, 250, 0.16)" : "none")};
+  box-shadow: ${({ $tone }) => {
+    if (!$tone || $tone === "quiet") return "none";
+    if ($tone === "danger") return "0 0 18px rgba(255, 90, 95, 0.16)";
+    if ($tone === "warn") return "0 0 18px rgba(250, 204, 21, 0.16)";
+    return "0 0 18px rgba(var(--forge-tint-rgb), 0.16)";
+  }};
 `;
 
 const UsageCard = styled.div`
@@ -4195,16 +4200,16 @@ const UsageCard = styled.div`
   gap: 9px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(96, 165, 250, 0.17);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.17);
   border-radius: 8px;
   background:
-    radial-gradient(circle at 0% 0%, rgba(96, 165, 250, 0.12), transparent 36%),
+    radial-gradient(circle at 0% 0%, rgba(var(--forge-tint-rgb), 0.12), transparent 36%),
     rgba(15, 23, 42, 0.76);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.15);
+    border-color: rgba(var(--forge-tint-rgb), 0.15);
     background:
-      radial-gradient(circle at 0% 0%, rgba(37, 99, 235, 0.08), transparent 36%),
+      radial-gradient(circle at 0% 0%, rgba(var(--forge-tint-rgb), 0.08), transparent 36%),
       #f8fafc;
   }
 `;
@@ -4393,14 +4398,14 @@ const StorageCard = styled.div`
   gap: 9px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(96, 165, 250, 0.17);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.17);
   border-radius: 8px;
   background:
     radial-gradient(circle at 100% 0%, rgba(52, 211, 153, 0.08), transparent 34%),
     rgba(15, 23, 42, 0.72);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.14);
+    border-color: rgba(var(--forge-tint-rgb), 0.14);
     background:
       radial-gradient(circle at 100% 0%, rgba(52, 211, 153, 0.08), transparent 34%),
       #f8fafc;
@@ -4416,7 +4421,7 @@ const StorageTitle = styled.div`
   font-weight: 900;
 
   strong {
-    color: #60a5fa;
+    color: var(--forge-tint-soft);
     letter-spacing: 0.12em;
     text-transform: uppercase;
   }
@@ -4474,8 +4479,8 @@ const StorageFill = styled.div`
   height: 100%;
   min-width: 0;
   border-radius: inherit;
-  background: linear-gradient(90deg, #60a5fa, #34d399);
-  box-shadow: 0 0 16px rgba(96, 165, 250, 0.28);
+  background: linear-gradient(90deg, var(--forge-tint-soft), #34d399);
+  box-shadow: 0 0 16px rgba(var(--forge-tint-rgb), 0.28);
 `;
 
 const tokenomicsRescanSpin = keyframes`
@@ -4507,10 +4512,10 @@ const TokenomicsRescanButton = styled.button`
   gap: 5px;
   min-height: 24px;
   padding: 4px 9px;
-  border: 1px solid rgba(96, 165, 250, 0.28);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
   border-radius: 999px;
-  color: rgba(191, 219, 254, 0.9);
-  background: rgba(59, 130, 246, 0.1);
+  color: var(--forge-tint-soft);
+  background: rgba(var(--forge-tint-rgb), 0.1);
   font: inherit;
   font-size: 10px;
   font-weight: 900;
@@ -4524,13 +4529,13 @@ const TokenomicsRescanButton = styled.button`
     opacity 120ms ease;
 
   &:hover:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.52);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.52);
     color: #e5eefb;
-    background: rgba(59, 130, 246, 0.18);
+    background: rgba(var(--forge-tint-rgb), 0.18);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(96, 165, 250, 0.72);
+    outline: 2px solid rgba(var(--forge-tint-soft-rgb), 0.72);
     outline-offset: 2px;
   }
 
@@ -4540,14 +4545,14 @@ const TokenomicsRescanButton = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(37, 99, 235, 0.25);
-    color: rgba(29, 78, 216, 0.88);
-    background: rgba(59, 130, 246, 0.08);
+    border-color: rgba(var(--forge-tint-rgb), 0.25);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &:hover:not(:disabled) {
-    color: rgba(30, 64, 175, 0.95);
-    background: rgba(59, 130, 246, 0.15);
+    color: var(--forge-tint);
+    background: rgba(var(--forge-tint-rgb), 0.15);
   }
 `;
 

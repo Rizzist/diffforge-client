@@ -2195,7 +2195,7 @@ fn cloud_mcp_outbox_recover_stale_in_flight_once() {
                  SET status='retrying',
                      next_attempt_at_ms=0,
                      updated_at_ms=?1,
-                     last_error='recovered stale in-flight outbox row'
+                     last_error=''
                  WHERE status='in_flight'
                    AND updated_at_ms<?2"
             ),
@@ -2203,6 +2203,10 @@ fn cloud_mcp_outbox_recover_stale_in_flight_once() {
         )
         .unwrap_or_default();
     if recovered > 0 {
+        log_cloud_sync_event(
+            "outbox.recovered_stale_in_flight",
+            json!({ "count": recovered }),
+        );
         cloud_mcp_emit_sync_status(None);
     }
 }
@@ -8829,15 +8833,37 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
     registered_workspaces.sort_by(|left, right| left.root.cmp(&right.root));
     let sync_activity = cloud_mcp_sync_activity_aggregate_cached();
     let sync_activity_payload = cloud_mcp_sync_activity_payload(&sync_activity);
+    let websocket_connected = runtime.global_ws_connected;
+    let connected = runtime.connected || websocket_connected;
+    let status = if websocket_connected {
+        let global_status = runtime.global_ws_status.trim();
+        if global_status.is_empty() {
+            "connected".to_string()
+        } else {
+            global_status.to_string()
+        }
+    } else {
+        runtime.status.clone()
+    };
+    let last_error = if websocket_connected {
+        String::new()
+    } else {
+        runtime.last_error.clone()
+    };
+    let global_ws_last_error = if websocket_connected {
+        String::new()
+    } else {
+        runtime.global_ws_last_error.clone()
+    };
     CloudMcpStatus {
         base_url: runtime.base_url.clone(),
-        connected: runtime.connected,
-        status: runtime.status.clone(),
-        last_error: runtime.last_error.clone(),
+        connected,
+        status,
+        last_error,
         last_connected_ms: runtime.last_connected_ms,
         global_ws_connected: runtime.global_ws_connected,
         global_ws_status: runtime.global_ws_status.clone(),
-        global_ws_last_error: runtime.global_ws_last_error.clone(),
+        global_ws_last_error,
         global_ws_last_connected_ms: runtime.global_ws_last_connected_ms,
         connection_contract: "diffforge.app_ws.v1".to_string(),
         account_device_live_state_snapshot: runtime.account_device_live_state_snapshot.clone(),
@@ -9021,7 +9047,7 @@ async fn cloud_mcp_set_global_ws_phase(
 ) {
     let mut runtime = state.inner.lock().await;
     let previous_status = runtime.status.clone();
-    let preserve_connected = runtime.connected && runtime.global_ws_connected;
+    let preserve_connected = runtime.global_ws_connected;
     if !preserve_connected {
         runtime.status = status.to_string();
         runtime.connected = false;
@@ -9780,6 +9806,9 @@ async fn cloud_mcp_open_global_ws(
             }
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else {
+                    if state.global_ws_epoch.load(Ordering::SeqCst) != ws_epoch {
+                        break Ok(());
+                    }
                     break Err("Cloud MCP app websocket outgoing sender closed.".to_string());
                 };
                 let outgoing_kind = outgoing
@@ -16214,7 +16243,7 @@ async fn cloud_mcp_asset_resolve_direct_target_async(
     let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
-    cloud_mcp_fetch_direct_route_async(
+    match cloud_mcp_fetch_direct_route_async(
         base_url,
         endpoint_path,
         &bearer,
@@ -16224,11 +16253,19 @@ async fn cloud_mcp_asset_resolve_direct_target_async(
         device_limit,
         device_id.as_deref(),
     )
-    .await?
-    .ok_or_else(|| {
-        "Balancer did not offer a direct asset route (direct routing disabled or backend unsupported)."
-            .to_string()
-    })
+    .await
+    {
+        Ok(Some(target)) => {
+            cloud_mcp_note_direct_route(&target);
+            Ok(target)
+        }
+        Ok(None) => cloud_mcp_last_direct_route_fresh(endpoint_path).ok_or_else(|| {
+            "Balancer did not offer a direct asset route (direct routing disabled or backend unsupported)."
+                .to_string()
+        }),
+        Err(error) => cloud_mcp_last_direct_route_fresh(endpoint_path)
+            .ok_or_else(|| format!("Cloud MCP direct route unavailable: {error}")),
+    }
 }
 
 fn cloud_mcp_asset_resolve_direct_target_blocking(
@@ -16249,7 +16286,7 @@ fn cloud_mcp_asset_resolve_direct_target_blocking(
     let (plan_name, device_limit) = cloud_mcp_process_account_plan();
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
-    cloud_mcp_fetch_direct_route_blocking(
+    match cloud_mcp_fetch_direct_route_blocking(
         base_url,
         endpoint_path,
         &bearer,
@@ -16258,11 +16295,19 @@ fn cloud_mcp_asset_resolve_direct_target_blocking(
         &plan_name,
         device_limit,
         device_id.as_deref(),
-    )?
-    .ok_or_else(|| {
-        "Balancer did not offer a direct asset route (direct routing disabled or backend unsupported)."
-            .to_string()
-    })
+    )
+    {
+        Ok(Some(target)) => {
+            cloud_mcp_note_direct_route(&target);
+            Ok(target)
+        }
+        Ok(None) => cloud_mcp_last_direct_route_fresh(endpoint_path).ok_or_else(|| {
+            "Balancer did not offer a direct asset route (direct routing disabled or backend unsupported)."
+                .to_string()
+        }),
+        Err(error) => cloud_mcp_last_direct_route_fresh(endpoint_path)
+            .ok_or_else(|| format!("Cloud MCP direct route unavailable: {error}")),
+    }
 }
 
 async fn cloud_mcp_asset_http_target_async(
@@ -26443,26 +26488,44 @@ fn cloud_mcp_asset_overlay_local_columns(row: &mut Value, local_path: &str, loca
     let Some(object) = row.as_object_mut() else {
         return;
     };
+    let local_path = local_path.trim();
     let json_path = object
         .get("local_path")
         .or_else(|| object.get("localPath"))
+        .or_else(|| object.get("path"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if json_path.trim().is_empty() && !local_path.trim().is_empty() {
+    let json_path_is_file = !json_path.trim().is_empty() && Path::new(json_path.trim()).is_file();
+    let local_path_is_file = !local_path.is_empty() && Path::new(local_path).is_file();
+    if !local_path.is_empty()
+        && (json_path.trim().is_empty() || (local_path_is_file && !json_path_is_file))
+    {
         object.insert("local_path".to_string(), json!(local_path));
         object.insert("localPath".to_string(), json!(local_path));
+        object.insert("path".to_string(), json!(local_path));
     }
     let json_status = object
         .get("local_status")
         .or_else(|| object.get("localStatus"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if (json_status.trim().is_empty() || json_status == "unknown")
-        && !local_status.trim().is_empty()
-        && local_status != "unknown"
+    let local_status = local_status.trim();
+    let normalized_local_status = cloud_mcp_asset_normalized_status(local_status);
+    let normalized_json_status = cloud_mcp_asset_normalized_status(json_status);
+    let local_status_is_available =
+        matches!(normalized_local_status.as_str(), "local-available" | "available");
+    if !local_status.is_empty()
+        && normalized_local_status != "unknown"
+        && (normalized_json_status.is_empty()
+            || normalized_json_status == "unknown"
+            || (local_status_is_available && local_path_is_file))
     {
         object.insert("local_status".to_string(), json!(local_status));
         object.insert("localStatus".to_string(), json!(local_status));
+    }
+    if local_status_is_available && local_path_is_file {
+        object.insert("local_available".to_string(), json!(true));
+        object.insert("localAvailable".to_string(), json!(true));
     }
 }
 
@@ -26513,6 +26576,53 @@ fn cloud_mcp_asset_recover_managed_path(row: &Value, asset_id: &str) -> Option<P
     fallback
 }
 
+fn cloud_mcp_asset_apply_recovered_managed_path(
+    row: &mut Value,
+    asset_id: &str,
+    verify_sha: bool,
+) -> bool {
+    let Some(recovered) = cloud_mcp_asset_recover_managed_path(row, asset_id) else {
+        return false;
+    };
+    let metadata = match fs::metadata(&recovered) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return false,
+    };
+    let expected_size = cloud_mcp_asset_row_i64(row, &["size_bytes", "sizeBytes"]);
+    if expected_size > 0 && metadata.len() != expected_size as u64 {
+        return false;
+    }
+    if verify_sha {
+        let Some(expected_sha) =
+            cloud_mcp_payload_text(row, &["sha256"]).filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let Ok((actual_sha, actual_size)) = cloud_mcp_file_sha256_and_size(&recovered) else {
+            return false;
+        };
+        if actual_sha != expected_sha {
+            return false;
+        }
+        if expected_size > 0 && actual_size != expected_size as u64 {
+            return false;
+        }
+    }
+    let display = recovered.display().to_string();
+    if let Some(object) = row.as_object_mut() {
+        object.insert("local_path".to_string(), json!(display.clone()));
+        object.insert("localPath".to_string(), json!(display.clone()));
+        object.insert("path".to_string(), json!(display));
+        object.insert("local_status".to_string(), json!("local_available"));
+        object.insert("localStatus".to_string(), json!("local_available"));
+        object.insert("local_available".to_string(), json!(true));
+        object.insert("localAvailable".to_string(), json!(true));
+        object.insert("can_upload".to_string(), json!(true));
+        object.insert("canUpload".to_string(), json!(true));
+    }
+    true
+}
+
 /// Loads the asset row and guarantees its local copy is the asset the row
 /// describes: a row whose path went missing (cache rebuilds, server-row
 /// merges) is re-attached to the tracked file at its managed location with a
@@ -26551,10 +26661,15 @@ fn cloud_mcp_asset_row_with_local_copy(asset_id: &str) -> Result<Value, String> 
     }
     let display = recovered.display().to_string();
     if let Some(object) = row.as_object_mut() {
-        object.insert("local_path".to_string(), json!(display));
-        object.insert("localPath".to_string(), json!(display));
+        object.insert("local_path".to_string(), json!(display.clone()));
+        object.insert("localPath".to_string(), json!(display.clone()));
+        object.insert("path".to_string(), json!(display));
         object.insert("local_status".to_string(), json!("local_available"));
         object.insert("localStatus".to_string(), json!("local_available"));
+        object.insert("local_available".to_string(), json!(true));
+        object.insert("localAvailable".to_string(), json!(true));
+        object.insert("can_upload".to_string(), json!(true));
+        object.insert("canUpload".to_string(), json!(true));
         object.insert("sha256".to_string(), json!(sha256));
         object.insert("size_bytes".to_string(), json!(size_bytes));
         object.insert("sizeBytes".to_string(), json!(size_bytes));
@@ -26625,9 +26740,16 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
 }
 
 fn cloud_mcp_delete_local_asset_copy(asset_id: &str, delete_file: bool) -> Result<Value, String> {
-    let mut row = cloud_mcp_asset_row_from_file(asset_id)?;
-    let local_path =
+    let mut row = cloud_mcp_asset_row_with_local_copy(asset_id)
+        .or_else(|_| cloud_mcp_asset_row_from_file(asset_id))?;
+    let mut local_path =
         cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"]).unwrap_or_default();
+    if local_path.trim().is_empty()
+        && cloud_mcp_asset_apply_recovered_managed_path(&mut row, asset_id, false)
+    {
+        local_path =
+            cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"]).unwrap_or_default();
+    }
     let mut removed_file = false;
     if delete_file && !local_path.is_empty() {
         let path = PathBuf::from(&local_path);
@@ -29569,15 +29691,38 @@ fn cloud_mcp_filter_unavailable_asset_rows(items: &mut Vec<Value>, transfers: &m
 }
 
 fn cloud_mcp_asset_merge_local_overlay_row(remote: &mut Value, local: &Value) {
-    let local_path = cloud_mcp_asset_local_path_text(local);
+    let mut local = local.clone();
+    let asset_id = cloud_mcp_asset_row_text(&local, &["asset_id", "assetId", "id"]);
+    let mut local_path = cloud_mcp_asset_local_path_text(&local);
+    let mut local_status = cloud_mcp_asset_row_text(&local, &["local_status", "localStatus"]);
+    if !asset_id.is_empty()
+        && ((local_path.is_empty()
+            && cloud_mcp_asset_local_unavailable_status(&local_status))
+            || (!local_path.is_empty() && !Path::new(&local_path).is_file()))
+        && cloud_mcp_asset_apply_recovered_managed_path(&mut local, &asset_id, false)
+    {
+        local_path = cloud_mcp_asset_local_path_text(&local);
+        local_status = cloud_mcp_asset_row_text(&local, &["local_status", "localStatus"]);
+    }
+    if !local_path.is_empty()
+        && Path::new(&local_path).is_file()
+        && cloud_mcp_asset_local_unavailable_status(&local_status)
+    {
+        if let Some(object) = local.as_object_mut() {
+            object.insert("local_status".to_string(), json!("local_available"));
+            object.insert("localStatus".to_string(), json!("local_available"));
+            object.insert("local_available".to_string(), json!(true));
+            object.insert("localAvailable".to_string(), json!(true));
+        }
+        local_status = "local_available".to_string();
+    }
     if !local_path.is_empty() && !Path::new(&local_path).is_file() {
         cloud_mcp_asset_mark_local_unavailable(remote, &local_path, "local_missing");
         return;
     }
-    let local_status = cloud_mcp_asset_row_text(local, &["local_status", "localStatus"]);
     if local_path.is_empty() && cloud_mcp_asset_local_unavailable_status(&local_status) {
         let previous_path = cloud_mcp_asset_row_text(
-            local,
+            &local,
             &[
                 "local_path_hint",
                 "localPathHint",
@@ -29597,10 +29742,12 @@ fn cloud_mcp_asset_merge_local_overlay_row(remote: &mut Value, local: &Value) {
         "path",
         "local_status",
         "localStatus",
+        "local_available",
+        "localAvailable",
     ] {
         if let Some(value) = local
             .get(key)
-            .filter(|value| !value.as_str().unwrap_or_default().trim().is_empty())
+            .filter(|value| !value.as_str().is_some_and(|text| text.trim().is_empty()))
         {
             remote.insert(key.to_string(), value.clone());
         }
@@ -29798,12 +29945,23 @@ fn cloud_mcp_update_asset_library_conn_inner(
         if asset_id.is_empty() {
             continue;
         }
-        if let Ok(existing_json) = conn.query_row(
-            "SELECT row_json FROM account_asset_items WHERE asset_id=?1 LIMIT 1",
+        if let Ok((existing_json, existing_local_path, existing_local_status)) = conn.query_row(
+            "SELECT row_json, local_path, local_status FROM account_asset_items WHERE asset_id=?1 LIMIT 1",
             [&asset_id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         ) {
-            if let Ok(existing) = serde_json::from_str::<Value>(&existing_json) {
+            if let Ok(mut existing) = serde_json::from_str::<Value>(&existing_json) {
+                cloud_mcp_asset_overlay_local_columns(
+                    &mut existing,
+                    &existing_local_path,
+                    &existing_local_status,
+                );
                 cloud_mcp_asset_merge_local_overlay_row(&mut item, &existing);
             }
         }
@@ -30088,7 +30246,31 @@ fn cloud_mcp_asset_library_rows_from_conn(
     for (asset_id, text, local_path, local_status) in raw_rows {
         if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
             cloud_mcp_asset_overlay_local_columns(&mut value, &local_path, &local_status);
-            let local_path = cloud_mcp_asset_local_path_text(&value);
+            let mut local_path = cloud_mcp_asset_local_path_text(&value);
+            let mut local_status = cloud_mcp_asset_row_text(&value, &["local_status", "localStatus"]);
+            if !local_path.is_empty()
+                && Path::new(&local_path).is_file()
+                && cloud_mcp_asset_local_unavailable_status(&local_status)
+            {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("local_status".to_string(), json!("local_available"));
+                    object.insert("localStatus".to_string(), json!("local_available"));
+                    object.insert("local_available".to_string(), json!(true));
+                    object.insert("localAvailable".to_string(), json!(true));
+                    object.insert("can_upload".to_string(), json!(true));
+                    object.insert("canUpload".to_string(), json!(true));
+                }
+                local_status = "local_available".to_string();
+                let _ = cloud_mcp_asset_replace_local_row(&asset_id, &value);
+            }
+            if ((local_path.is_empty()
+                && cloud_mcp_asset_local_unavailable_status(&local_status))
+                || (!local_path.is_empty() && !Path::new(&local_path).is_file()))
+                && cloud_mcp_asset_apply_recovered_managed_path(&mut value, &asset_id, false)
+            {
+                local_path = cloud_mcp_asset_local_path_text(&value);
+                let _ = cloud_mcp_asset_replace_local_row(&asset_id, &value);
+            }
             if !local_path.is_empty() && !Path::new(&local_path).is_file() {
                 cloud_mcp_asset_mark_local_unavailable(&mut value, &local_path, "local_missing");
                 cloud_mcp_strip_asset_workspace_identity(&mut value);
