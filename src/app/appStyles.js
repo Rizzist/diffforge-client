@@ -266,10 +266,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-selected-bg: rgba(245, 158, 11, 0.105);
     --forge-accent-selected-border: rgba(255, 209, 102, 0.5);
     --forge-accent-selected-ring: rgba(245, 158, 11, 0.22);
-    --forge-titlebar-bg: #050300;
-    --forge-shell-rail-bg: rgba(16, 10, 3, 0.94);
-    --forge-shell-right-bg: rgba(14, 9, 3, 0.96);
-    --forge-shell-right-muted-bg: rgba(14, 9, 3, 0.5);
+    --forge-titlebar-bg: #000000;
+    --forge-shell-rail-bg: rgba(7, 7, 8, 0.96);
+    --forge-shell-right-bg: rgba(6, 6, 7, 0.96);
+    --forge-shell-right-muted-bg: rgba(3, 4, 6, 0.6);
     --forge-amber: #ffd166;
     --forge-ember: #f59e0b;
   }
@@ -285,10 +285,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-accent-selected-bg: rgba(181, 106, 0, 0.1);
     --forge-accent-selected-border: rgba(181, 106, 0, 0.42);
     --forge-accent-selected-ring: rgba(181, 106, 0, 0.16);
-    --forge-titlebar-bg: #fff8ea;
-    --forge-shell-rail-bg: rgba(255, 248, 234, 0.9);
-    --forge-shell-right-bg: #fffaf0;
-    --forge-shell-right-muted-bg: rgba(255, 248, 234, 0.88);
+    --forge-titlebar-bg: #f5f5f7;
+    --forge-shell-rail-bg: rgba(245, 245, 247, 0.9);
+    --forge-shell-right-bg: #ffffff;
+    --forge-shell-right-muted-bg: rgba(245, 245, 247, 0.88);
     --forge-amber: #8b5a00;
     --forge-ember: #b56a00;
   }
@@ -2425,9 +2425,9 @@ export const WorkspaceRail = styled.aside`
   padding: 10px;
   border-right: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);
   background:
-    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.09), rgba(var(--forge-tint-soft-rgb), 0.025)),
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), rgba(var(--forge-tint-soft-rgb), 0.01)),
     var(--forge-shell-rail-bg);
-  box-shadow: inset -1px 0 0 rgba(var(--forge-tint-rgb), 0.065);
+  box-shadow: inset -1px 0 0 rgba(var(--forge-tint-rgb), 0.04);
   animation: ${railReveal} 300ms cubic-bezier(0.2, 0.8, 0.2, 1) 40ms both;
   overflow: hidden;
   transition:
@@ -2440,7 +2440,7 @@ export const WorkspaceRail = styled.aside`
   html[data-forge-theme="light"] & {
     border-right-color: rgba(var(--forge-tint-rgb), 0.12);
     background:
-      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.07), rgba(var(--forge-tint-soft-rgb), 0.02)),
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.035), rgba(var(--forge-tint-soft-rgb), 0.01)),
       var(--forge-shell-rail-bg);
     backdrop-filter: saturate(180%) blur(20px);
   }
@@ -3312,7 +3312,7 @@ export const RailGlobalActions = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.018), transparent),
     rgba(230, 236, 245, 0.018);
   transition:
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
@@ -3328,7 +3328,7 @@ export const RailGlobalActions = styled.div`
   html[data-forge-theme="light"] & {
     border-color: rgba(var(--forge-tint-rgb), 0.12);
     background:
-      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent),
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.02), transparent),
       var(--forge-surface);
   }
 `;
@@ -3468,9 +3468,9 @@ export const RailActionButton = styled.button`
 
   &[data-scope="global"]:hover,
   &[data-scope="global"][data-active="true"] {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.22);
-    color: var(--forge-text);
-    background: rgba(var(--forge-tint-rgb), 0.1);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.14);
+    color: #d8dee7;
+    background: rgba(7, 8, 9, 0.9);
   }
 
   &[data-scope="global"]:hover svg,
@@ -3489,14 +3489,14 @@ export const RailActionButton = styled.button`
 
   html[data-forge-theme="light"] &[data-scope="global"]:hover,
   html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] {
-    border-color: rgba(var(--forge-accent-rgb), 0.22);
+    border-color: rgba(var(--forge-accent-rgb), 0.18);
     color: var(--forge-text);
-    background: rgba(var(--forge-accent-rgb), 0.08);
+    background: rgba(var(--forge-accent-rgb), 0.045);
   }
 
   html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] {
-    border-color: rgba(var(--forge-accent-rgb), 0.3);
-    background: rgba(var(--forge-accent-rgb), 0.11);
+    border-color: rgba(var(--forge-accent-rgb), 0.24);
+    background: rgba(var(--forge-accent-rgb), 0.065);
   }
 
   html[data-forge-theme="light"] &[data-scope="global"]:hover svg,
@@ -16100,10 +16100,12 @@ export const WindowBackgroundPill = styled.button`
   gap: 5px;
   align-self: center;
   padding: 3px 10px;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.32);
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.24);
   border-radius: 999px;
   color: var(--forge-tint-soft);
-  background: rgba(var(--forge-tint-rgb), 0.12);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), rgba(var(--forge-tint-rgb), 0.018)),
+    rgba(7, 10, 16, 0.72);
   font-size: 10.5px;
   font-weight: 750;
   letter-spacing: 0.02em;
@@ -16116,7 +16118,9 @@ export const WindowBackgroundPill = styled.button`
 
   &:hover {
     color: #ffffff;
-    background: rgba(var(--forge-tint-rgb), 0.28);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.09), rgba(var(--forge-tint-rgb), 0.03)),
+      rgba(10, 14, 22, 0.82);
   }
 
   &[data-platform="macos"] {
@@ -16130,14 +16134,18 @@ export const WindowBackgroundPill = styled.button`
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(var(--forge-tint-rgb), 0.35);
+    border-color: rgba(var(--forge-tint-rgb), 0.24);
     color: var(--forge-tint);
-    background: rgba(var(--forge-tint-rgb), 0.1);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), rgba(var(--forge-tint-rgb), 0.015)),
+      rgba(255, 255, 255, 0.78);
   }
 
   html[data-forge-theme="light"] &:hover {
     color: var(--forge-tint);
-    background: rgba(var(--forge-tint-rgb), 0.2);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.065), rgba(var(--forge-tint-rgb), 0.025)),
+      rgba(255, 255, 255, 0.9);
   }
 `;
 
@@ -16169,9 +16177,11 @@ export const WindowSyncPill = styled.button`
     transform 150ms ease;
 
   &:hover {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.42);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.3);
     color: #ffffff;
-    background: rgba(var(--forge-tint-rgb), 0.18);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.065), rgba(var(--forge-tint-rgb), 0.02)),
+      rgba(10, 14, 22, 0.78);
   }
 
   &:focus-visible {
@@ -16240,9 +16250,11 @@ export const WindowSyncPill = styled.button`
   }
 
   &[data-state="syncing"] {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.34);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.26);
     color: var(--forge-tint-soft);
-    background: rgba(var(--forge-tint-rgb), 0.12);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.06), rgba(var(--forge-tint-rgb), 0.02)),
+      rgba(7, 10, 16, 0.72);
   }
 
   &[data-state="provisioning"] {
@@ -16293,9 +16305,11 @@ export const WindowSyncPill = styled.button`
   }
 
   html[data-forge-theme="light"] &[data-state="syncing"] {
-    border-color: rgba(var(--forge-tint-rgb), 0.35);
+    border-color: rgba(var(--forge-tint-rgb), 0.26);
     color: var(--forge-tint);
-    background: rgba(var(--forge-tint-rgb), 0.1);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), rgba(var(--forge-tint-rgb), 0.018)),
+      rgba(255, 255, 255, 0.86);
   }
 
   html[data-forge-theme="light"] &[data-state="provisioning"] {

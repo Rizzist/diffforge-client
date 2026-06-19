@@ -557,6 +557,31 @@ export default function GitWorkspaceView({
   }, [onRefreshRepositories, rootDirectory, workspace?.name, workspaceId]);
 
   useEffect(() => {
+    if (preloadMatches || typeof onRefreshRepositories !== "function" || !rootDirectory || !workspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    setRepositoriesState("loading");
+    setRepositoriesError("");
+    refreshRepositories().catch((error) => {
+      if (cancelled) {
+        return;
+      }
+      setRepositoriesError(error?.message || String(error || "Unable to load Git repositories."));
+      setRepositoriesState("error");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    onRefreshRepositories,
+    preloadMatches,
+    refreshRepositories,
+    rootDirectory,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
     if (!preloadMatches) {
       return;
     }

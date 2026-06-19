@@ -8166,6 +8166,37 @@ function workspaceArchitectureGraphContentHash(graph) {
   return graphText(graph?.contentHash || graph?.content_hash || graph?.hash);
 }
 
+function workspaceArchitectureGraphCloudRef(graph) {
+  const cloudGraph = graph?.cloudGraph || graph?.cloud_graph || graph;
+  const graphId = workspaceArchitectureGraphId(cloudGraph) || workspaceArchitectureGraphId(graph);
+  if (!graphId) return null;
+  return {
+    id: graphId,
+    architectureId: graphId,
+    architecture_id: graphId,
+    contentHash: workspaceArchitectureGraphContentHash(cloudGraph) || workspaceArchitectureGraphContentHash(graph),
+    content_hash: workspaceArchitectureGraphContentHash(cloudGraph) || workspaceArchitectureGraphContentHash(graph),
+    contentRevision: graphText(
+      cloudGraph?.contentRevision
+        || cloudGraph?.content_revision
+        || graph?.contentRevision
+        || graph?.content_revision,
+    ),
+  };
+}
+
+function workspaceArchitectureGraphNeedsCloudHydration(graph) {
+  return Boolean(graph?.cloudOnly || graph?.cloudNeedsHydration || graph?.cloud_needs_hydration);
+}
+
+function workspaceArchitectureHydrationKey(repoPath, ref) {
+  return [
+    workspaceArchitectureRepoKey(repoPath),
+    graphText(ref?.id || ref?.architectureId || ref?.architecture_id),
+    graphText(ref?.contentHash || ref?.content_hash || ref?.contentRevision || ref?.content_revision),
+  ].join("::");
+}
+
 function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs) {
   const merged = new Map();
   jsonArray(localGraphs).forEach((graph) => {
@@ -10155,6 +10186,18 @@ export default function App() {
   const architectureHubGraphListInFlightRef = useRef(new Set());
   const architectureHubGraphStateRef = useRef(architectureHubGraphState);
   architectureHubGraphStateRef.current = architectureHubGraphState;
+  const [architectureHubHydration, setArchitectureHubHydration] = useState({
+    error: "",
+    meta: "",
+    percent: 0,
+    state: "idle",
+    title: "",
+    visible: false,
+  });
+  const architectureHubHydratedRefsRef = useRef(new Set());
+  const architectureHubHydratingRefsRef = useRef(new Set());
+  const architectureHubHydrationRunRef = useRef(0);
+  const architectureHubStartupSyncKeyRef = useRef("");
 
   const architectureHubEntries = useMemo(() => {
     const catalog = architectureHub.catalog;
@@ -10242,6 +10285,127 @@ export default function App() {
     };
   }, [findArchitectureHubEntry]);
 
+  const hydrateArchitectureHubGraphRefs = useCallback(async (repoPath, refs, context = {}) => {
+    const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
+    if (!safeRepoPath) return [];
+    const uniqueRefs = [];
+    const seenKeys = new Set();
+    jsonArray(refs).forEach((ref) => {
+      const graphId = graphText(ref?.id || ref?.architectureId || ref?.architecture_id);
+      if (!graphId) return;
+      const key = workspaceArchitectureHydrationKey(safeRepoPath, ref);
+      if (!key || seenKeys.has(key) || architectureHubHydratedRefsRef.current.has(key) || architectureHubHydratingRefsRef.current.has(key)) {
+        return;
+      }
+      seenKeys.add(key);
+      uniqueRefs.push({ key, ref });
+    });
+    if (!uniqueRefs.length) return [];
+
+    uniqueRefs.forEach(({ key }) => architectureHubHydratingRefsRef.current.add(key));
+    const runId = architectureHubHydrationRunRef.current + 1;
+    architectureHubHydrationRunRef.current = runId;
+    const total = uniqueRefs.length;
+    const hydrated = [];
+    const failed = [];
+
+    setArchitectureHubHydration({
+      error: "",
+      meta: `0 of ${total} graphs`,
+      percent: 0,
+      state: "hydrating",
+      title: "Hydrating architectures",
+      visible: true,
+    });
+
+    for (let index = 0; index < uniqueRefs.length; index += 1) {
+      const { key, ref } = uniqueRefs[index];
+      const graphId = graphText(ref?.id || ref?.architectureId || ref?.architecture_id, `graph ${index + 1}`);
+      if (architectureHubHydrationRunRef.current === runId) {
+        setArchitectureHubHydration({
+          error: "",
+          meta: `${index} of ${total} graphs · ${graphId}`,
+          percent: Math.round((index / total) * 100),
+          state: "hydrating",
+          title: "Hydrating architectures",
+          visible: true,
+        });
+      }
+      try {
+        const result = await invoke("cloud_mcp_hydrate_architecture", {
+          refs: [ref],
+          repoPath: safeRepoPath,
+          workspaceId: context.workspaceId || "account-global",
+          workspaceName: context.workspaceName || "Global",
+          ...(context.scopeRepoId ? {
+            scopeRepoId: context.scopeRepoId,
+            scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
+          } : {}),
+        });
+        hydrated.push(...jsonArray(result?.items));
+        architectureHubHydratedRefsRef.current.add(key);
+      } catch (error) {
+        failed.push(getErrorMessage(error, `Unable to hydrate ${graphId}.`));
+      } finally {
+        architectureHubHydratingRefsRef.current.delete(key);
+      }
+      if (architectureHubHydrationRunRef.current === runId) {
+        setArchitectureHubHydration({
+          error: failed[0] || "",
+          meta: `${Math.min(index + 1, total)} of ${total} graphs`,
+          percent: Math.round(((index + 1) / total) * 100),
+          state: failed.length ? "error" : "hydrating",
+          title: failed.length ? "Architecture hydration needs attention" : "Hydrating architectures",
+          visible: true,
+        });
+      }
+    }
+
+    try {
+      const result = await invoke("architecture_graphs_list", { repoPath: safeRepoPath });
+      const localGraphs = jsonArray(result?.graphs);
+      const repoKey = workspaceArchitectureRepoKey(safeRepoPath);
+      setArchitectureHubGraphState((current) => ({
+        ...current,
+        architectureGraphLists: {
+          ...(current.architectureGraphLists || {}),
+          [repoKey]: workspaceArchitectureGraphListEntry(safeRepoPath, {
+            architectureRoot: result?.architectureRoot || result?.architecture_root,
+            graphs: localGraphs,
+            navTree: localGraphs,
+            repoPath: safeRepoPath,
+            requestedAt: Date.now(),
+            state: "ready",
+            updatedAt: Date.now(),
+          }),
+        },
+      }));
+    } catch {
+      // The cloud hydrate command already writes graph files; local refresh is best-effort.
+    }
+
+    if (architectureHubHydrationRunRef.current === runId) {
+      setArchitectureHubHydration({
+        error: failed[0] || "",
+        meta: failed.length
+          ? `${hydrated.length} hydrated · ${failed.length} failed`
+          : `${hydrated.length || total} graphs ready`,
+        percent: 100,
+        state: failed.length ? "error" : "ready",
+        title: failed.length ? "Architecture hydration needs attention" : "Architectures hydrated",
+        visible: true,
+      });
+      window.setTimeout(() => {
+        if (architectureHubHydrationRunRef.current === runId) {
+          setArchitectureHubHydration((current) => (
+            current.state === "ready" ? { ...current, visible: false } : current
+          ));
+        }
+      }, 1800);
+    }
+    return hydrated;
+  }, []);
+
   const refreshArchitectureHubGraphList = useCallback((repoPath, options = {}) => {
     const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
     if (!safeRepoPath) return Promise.resolve([]);
@@ -10302,6 +10466,15 @@ export default function App() {
         const localGraphs = jsonArray(result?.graphs);
         const cloudGraphs = jsonArray(cloudResult?.graphs);
         const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
+        if (!options.localOnly) {
+          const hydrateRefs = graphs
+            .filter(workspaceArchitectureGraphNeedsCloudHydration)
+            .map(workspaceArchitectureGraphCloudRef)
+            .filter(Boolean);
+          if (hydrateRefs.length) {
+            void hydrateArchitectureHubGraphRefs(safeRepoPath, hydrateRefs, context);
+          }
+        }
         if (!options.localOnly && localGraphs.length && context.workspaceId) {
           const syncSignature = workspaceArchitectureCloudSyncSignature(localGraphs);
           if (architectureCloudSyncSignatureRef.current[repoKey] !== syncSignature) {
@@ -10359,6 +10532,7 @@ export default function App() {
       });
   }, [
     findArchitectureHubEntry,
+    hydrateArchitectureHubGraphRefs,
     refreshWorkspaceArchitectureGraphList,
     resolveArchitectureHubSyncContext,
   ]);
@@ -10496,12 +10670,24 @@ export default function App() {
   // architecture hub catalog plus a background prefetch of the global graph
   // list, so opening the Architectures tab never shows a loading flash.
   useEffect(() => {
-    if (authState !== "authenticated") return undefined;
+    if (authState !== "authenticated") {
+      architectureHubStartupSyncKeyRef.current = "";
+      return undefined;
+    }
+
+    const syncKey = graphText(authAccountKey || user?.id || user?.email);
+    if (!syncKey) {
+      return undefined;
+    }
+    if (architectureHubStartupSyncKeyRef.current === syncKey) {
+      return undefined;
+    }
+    architectureHubStartupSyncKeyRef.current = syncKey;
 
     let cancelled = false;
     const prefetchTimers = new Set();
 
-    void refreshArchitectureHubCatalog({ localOnly: true }).then((catalog) => {
+    void refreshArchitectureHubCatalog({ localOnly: false, refresh: true }).then((catalog) => {
       if (cancelled || !catalog || typeof catalog !== "object") return;
       const entries = [];
       if (catalog.global && typeof catalog.global === "object") entries.push(catalog.global);
@@ -10512,7 +10698,7 @@ export default function App() {
         const timer = window.setTimeout(() => {
           prefetchTimers.delete(timer);
           if (!cancelled) {
-            void refreshArchitectureHubGraphList(repoPath, { localOnly: true, silent: true });
+            void refreshArchitectureHubGraphList(repoPath, { localOnly: true, refresh: true, silent: true });
           }
         }, 150 * index);
         prefetchTimers.add(timer);
@@ -10524,7 +10710,7 @@ export default function App() {
       prefetchTimers.forEach((timer) => window.clearTimeout(timer));
       prefetchTimers.clear();
     };
-  }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
+  }, [authAccountKey, authState, user?.email, user?.id]);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -19812,7 +19998,7 @@ export default function App() {
         refresh: true,
         rootDirectory: workspaceGitPullPrompt.rootDirectory,
         workspaceId: workspaceGitPullPrompt.workspaceId,
-        workspaceName: selectedWorkspace?.name || "",
+        workspaceName: findWorkspaceById(workspaces, workspaceGitPullPrompt.workspaceId)?.name || "",
       });
     } catch (error) {
       if (workspaceGitPullPromptCheckRef.current !== checkKey) {
@@ -19827,24 +20013,23 @@ export default function App() {
     }
   }, [
     refreshWorkspaceGitRepositoryPreload,
-    selectedWorkspace?.name,
     workspaceGitPullPrompt.checkKey,
     workspaceGitPullPrompt.rootDirectory,
     workspaceGitPullPrompt.workspaceId,
     workspaceGitPullSelectedPaths,
+    workspaces,
   ]);
 
   useEffect(() => {
-    const workspaceId = selectedWorkspace?.id || "";
-    const workspaceNameForCheck = selectedWorkspace?.name || "";
-    const rootDirectory = selectedWorkspaceFileRoot || "";
+    const workspaceId = activatedWorkspace?.id || "";
+    const workspaceNameForCheck = activatedWorkspace?.name || "";
+    const rootDirectory = activatedWorkspaceTerminalWorkingDirectory || "";
     const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
     const existingPreload = checkKey ? workspaceGitRepositoryPreloads[checkKey] : null;
 
     if (
       authState !== "authenticated"
       || shouldShowWorkspaceSetup
-      || workspaceActivationDeferred
       || !workspaceId
       || !rootDirectory
     ) {
@@ -19919,12 +20104,11 @@ export default function App() {
       cancelled = true;
     };
   }, [
+    activatedWorkspace?.id,
+    activatedWorkspace?.name,
+    activatedWorkspaceTerminalWorkingDirectory,
     authState,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspaceFileRoot,
     shouldShowWorkspaceSetup,
-    workspaceActivationDeferred,
     refreshWorkspaceGitRepositoryPreload,
     workspaceGitRepositoryPreloads,
   ]);
@@ -20552,15 +20736,21 @@ export default function App() {
       }
       const normalizedCredits = normalizeLiveCreditWallet(credits || snapshot?.credits, billingStatusRef.current?.credits);
       if (normalizedCredits) {
-        setBillingStatus((current) => mergeBillingStatusSnapshot(current, {
+        const currentBillingStatus = billingStatusRef.current;
+        const mergedBillingStatus = mergeBillingStatusSnapshot(currentBillingStatus, {
           credits: normalizedCredits,
-          planName: normalizedCredits.planName || snapshot?.planName || snapshot?.plan_name || current?.planName || current?.plan_name,
-          plan_name: normalizedCredits.planName || snapshot?.plan_name || snapshot?.planName || current?.plan_name || current?.planName,
-          planStatus: current?.planStatus || current?.plan_status || "paid",
-          plan_status: current?.plan_status || current?.planStatus || "paid",
-        }));
-        setBillingStatusState("ready");
-        setBillingStatusError("");
+          planName: normalizedCredits.planName || snapshot?.planName || snapshot?.plan_name || currentBillingStatus?.planName || currentBillingStatus?.plan_name,
+          plan_name: normalizedCredits.planName || snapshot?.plan_name || snapshot?.planName || currentBillingStatus?.plan_name || currentBillingStatus?.planName,
+          planStatus: currentBillingStatus?.planStatus || currentBillingStatus?.plan_status || "paid",
+          plan_status: currentBillingStatus?.plan_status || currentBillingStatus?.planStatus || "paid",
+        });
+        if (mergedBillingStatus) {
+          billingStatusRef.current = mergedBillingStatus;
+          void authStore.applyBillingStatus(mergedBillingStatus).catch(() => {});
+          setBillingStatus(mergedBillingStatus);
+          setBillingStatusState("ready");
+          setBillingStatusError("");
+        }
       }
     }).then((unlisten) => {
       if (cancelled) {
@@ -20991,6 +21181,55 @@ export default function App() {
       }
       return null;
     };
+    const remoteControlTerminalIdentityValues = (workspaceId, terminal) => {
+      const values = new Set();
+      const append = (value) => {
+        const text = String(value || "").trim();
+        if (text) {
+          values.add(text);
+        }
+      };
+      [
+        "id",
+        "paneId",
+        "pane_id",
+        "terminalId",
+        "terminal_id",
+        "targetTerminalId",
+        "target_terminal_id",
+      ].forEach((key) => append(terminal?.[key]));
+      const terminalIndex = remoteControlTerminalNumber(terminal, [
+        "terminalIndex",
+        "terminal_index",
+        "index",
+      ]);
+      const agentId = normalizeWorkspaceLiveTerminalAgentId(
+        remoteControlTerminalText(terminal, [
+          "agentId",
+          "agent_id",
+          "agentKind",
+          "agent_kind",
+          "agentType",
+          "agent_type",
+          "agent",
+          "provider",
+          "role",
+        ]),
+      );
+      const safeWorkspaceId = String(workspaceId || "").trim();
+      if (safeWorkspaceId && Number.isInteger(terminalIndex)) {
+        const baseId = `workspace-terminal-${safeWorkspaceId}-${terminalIndex}`;
+        append(baseId);
+        if (agentId) {
+          append(`${baseId}-${agentId}`);
+        }
+      }
+      return values;
+    };
+    const remoteControlTerminalMatchesTargetId = (workspaceId, terminal, targetTerminalId) => {
+      const targetId = String(targetTerminalId || "").trim();
+      return Boolean(targetId && remoteControlTerminalIdentityValues(workspaceId, terminal).has(targetId));
+    };
     const remoteControlTerminalStatusValues = (terminal) => [
       terminal?.nativeRailState,
       terminal?.native_rail_state,
@@ -21055,12 +21294,7 @@ export default function App() {
       const targetTerminalId = String(target.targetTerminalId || "").trim();
       const terminal = targetTerminalId
         ? terminals.find((candidate) => (
-          [
-            candidate?.paneId,
-            candidate?.pane_id,
-            candidate?.terminalId,
-            candidate?.terminal_id,
-          ].map((value) => String(value || "").trim()).includes(targetTerminalId)
+          remoteControlTerminalMatchesTargetId(workspaceId, candidate, targetTerminalId)
         )) || null
         : null;
       return {
@@ -28634,6 +28868,7 @@ export default function App() {
                       catalogError: architectureHub.error,
                       catalogState: architectureHub.state,
                       graphLists: architectureHubGraphLists,
+                      hydration: architectureHubHydration,
                       onCopyGraph: copyArchitectureHubGraph,
                       onGraphListRefresh: refreshArchitectureHubGraphList,
                       onRefreshCatalog: refreshArchitectureHubCatalog,

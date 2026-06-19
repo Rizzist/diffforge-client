@@ -2685,7 +2685,7 @@ const OrchestratorTopNav = styled.div`
   min-height: 40px;
   border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   background:
-    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), transparent),
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.022), transparent),
     var(--forge-shell-right-muted-bg);
   overflow: hidden;
   transition:
@@ -2695,7 +2695,7 @@ const OrchestratorTopNav = styled.div`
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(var(--forge-tint-rgb), 0.12);
     background:
-      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), transparent),
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.026), transparent),
       var(--forge-shell-right-muted-bg);
     backdrop-filter: saturate(180%) blur(20px);
   }
@@ -2748,7 +2748,9 @@ const OrchestratorTopButton = styled.button`
 
   &[data-active="true"] {
     color: #f7fafc;
-    background: rgba(var(--forge-tint-rgb), 0.16);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.08), rgba(var(--forge-tint-rgb), 0.035)),
+      rgba(8, 12, 18, 0.48);
   }
 
   &:disabled {
@@ -2758,7 +2760,9 @@ const OrchestratorTopButton = styled.button`
 
   &:not(:disabled):hover {
     color: #f7fafc;
-    background: rgba(var(--forge-tint-rgb), 0.2);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.09), rgba(var(--forge-tint-rgb), 0.04)),
+      rgba(8, 12, 18, 0.5);
   }
 
   html[data-forge-theme="light"] & {
@@ -2769,7 +2773,7 @@ const OrchestratorTopButton = styled.button`
   html[data-forge-theme="light"] &[data-active="true"],
   html[data-forge-theme="light"] &:not(:disabled):hover {
     color: var(--forge-tint);
-    background: rgba(var(--forge-tint-rgb), 0.08);
+    background: rgba(var(--forge-tint-rgb), 0.045);
   }
 
   /* Compact labels engage before full labels would start truncating with
@@ -2801,8 +2805,8 @@ const OrchestratorVoiceArea = styled.div`
   padding: 18px 12px 16px;
   border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   background:
-    radial-gradient(circle at center, rgba(var(--forge-tint-rgb), 0.16), transparent 62%),
-    rgba(var(--forge-tint-rgb), 0.035);
+    radial-gradient(circle at center, rgba(var(--forge-tint-rgb), 0.07), transparent 62%),
+    rgba(var(--forge-tint-rgb), 0.012);
   transition:
     background 260ms ease,
     border-color 260ms ease;
@@ -2810,7 +2814,7 @@ const OrchestratorVoiceArea = styled.div`
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(var(--forge-tint-rgb), 0.1);
     background:
-      radial-gradient(circle at center, rgba(var(--forge-tint-rgb), 0.105), transparent 62%),
+      radial-gradient(circle at center, rgba(var(--forge-tint-rgb), 0.052), transparent 62%),
       var(--forge-shell-right-bg);
   }
 `;
@@ -2940,8 +2944,8 @@ const OrchestratorVoiceButton = styled.button`
     z-index: 0;
     border-radius: inherit;
     background:
-      radial-gradient(circle, rgba(var(--forge-tint-soft-rgb), 0.2), transparent 62%),
-      radial-gradient(circle, rgba(217, 121, 53, 0.1), transparent 76%);
+      radial-gradient(circle, rgba(var(--forge-tint-soft-rgb), 0.11), transparent 62%),
+      radial-gradient(circle, rgba(217, 121, 53, 0.05), transparent 76%);
     content: "";
     opacity: 0;
     transform: scale(0.92);
@@ -2953,13 +2957,13 @@ const OrchestratorVoiceButton = styled.button`
 
   html[data-forge-theme="light"] &::before {
     background:
-      radial-gradient(circle, rgba(var(--forge-tint-rgb), 0.15), transparent 62%),
-      radial-gradient(circle, rgba(221, 112, 31, 0.09), transparent 76%);
+      radial-gradient(circle, rgba(var(--forge-tint-rgb), 0.075), transparent 62%),
+      radial-gradient(circle, rgba(221, 112, 31, 0.045), transparent 76%);
   }
 
   &:hover {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.32);
-    box-shadow: 0 0 0 4px rgba(var(--forge-tint-soft-rgb), 0.16);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.26);
+    box-shadow: 0 0 0 4px rgba(var(--forge-tint-soft-rgb), 0.09);
   }
 
   &:active {
@@ -2967,10 +2971,10 @@ const OrchestratorVoiceButton = styled.button`
   }
 
   &[data-monitoring="true"] {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.38);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.3);
     box-shadow:
-      0 0 0 4px rgba(var(--forge-tint-soft-rgb), 0.13),
-      0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.14) inset;
+      0 0 0 4px rgba(var(--forge-tint-soft-rgb), 0.08),
+      0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.1) inset;
   }
 
   &[data-monitoring="true"]::before {
@@ -3018,14 +3022,14 @@ const OrchestratorVoiceButton = styled.button`
 
   html[data-forge-theme="light"] &:hover {
     border-color: rgba(255, 255, 255, 0.22);
-    box-shadow: 0 0 0 4px rgba(var(--forge-tint-rgb), 0.12);
+    box-shadow: 0 0 0 4px rgba(var(--forge-tint-rgb), 0.065);
   }
 
   html[data-forge-theme="light"] &[data-monitoring="true"] {
     border-color: rgba(255, 255, 255, 0.36);
     box-shadow:
-      0 0 0 4px rgba(var(--forge-tint-rgb), 0.11),
-      0 0 0 1px rgba(var(--forge-tint-rgb), 0.12) inset;
+      0 0 0 4px rgba(var(--forge-tint-rgb), 0.06),
+      0 0 0 1px rgba(var(--forge-tint-rgb), 0.08) inset;
   }
 `;
 
@@ -8417,6 +8421,8 @@ function getVoiceAgentHighlightStringValues(...values) {
         value.id
           || value.terminal_id
           || value.terminalId
+          || value.target_terminal_id
+          || value.targetTerminalId
           || value.pane_id
           || value.paneId
           || value.name
@@ -8438,6 +8444,17 @@ function getVoiceAgentHighlightIntegerValues(...values) {
   return getVoiceAgentHighlightStringValues(...values)
     .map((value) => Number.parseInt(value, 10))
     .filter((value) => Number.isInteger(value) && value >= 0);
+}
+
+function getVoiceAgentWorkspaceTerminalCanonicalIds(workspaceId, terminalIndex, agentType) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const normalizedIndex = Number.parseInt(terminalIndex, 10);
+  if (!safeWorkspaceId || !Number.isInteger(normalizedIndex) || normalizedIndex < 0) {
+    return [];
+  }
+  const baseId = `workspace-terminal-${safeWorkspaceId}-${normalizedIndex}`;
+  const normalizedAgentType = normalizeTodoTerminalAgentId(agentType || "");
+  return normalizedAgentType ? [baseId, `${baseId}-${normalizedAgentType}`] : [baseId];
 }
 
 function getVoiceAgentHighlightQuery(args = {}) {
@@ -12419,6 +12436,31 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
       ...(item.agentKind ? { agent_kind: item.agentKind, agentKind: item.agentKind } : {}),
       ...(item.provider ? { provider: item.provider } : {}),
     };
+    const inputs = Array.isArray(item.inputs)
+      ? item.inputs
+      : Array.isArray(item.todoInputs)
+        ? item.todoInputs
+        : Array.isArray(item.todo_inputs)
+          ? item.todo_inputs
+          : [];
+    const inputCount = Math.max(
+      Number.isFinite(Number(item.inputCount)) ? Number(item.inputCount) : 0,
+      Number.isFinite(Number(item.input_count)) ? Number(item.input_count) : 0,
+      Number.isFinite(Number(item.todoInputCount)) ? Number(item.todoInputCount) : 0,
+      Number.isFinite(Number(item.todo_input_count)) ? Number(item.todo_input_count) : 0,
+      inputs.length,
+    );
+    if (inputs.length) {
+      meta.inputs = inputs;
+      meta.todoInputs = inputs;
+      meta.todo_inputs = inputs;
+    }
+    if (inputCount > 0) {
+      meta.inputCount = inputCount;
+      meta.input_count = inputCount;
+      meta.todoInputCount = inputCount;
+      meta.todo_input_count = inputCount;
+    }
     if (["deleted", "removed", "archived"].includes(status)) {
       ops.push(["d", todoId, meta]);
       return;
@@ -28492,20 +28534,33 @@ function TerminalView({
           || liveTerminal?.agent_type
           || liveTerminal?.agentKind
           || liveTerminal?.agent_kind
+          || liveTerminal?.agent
+          || workspaceLiveTerminal?.agentId
+          || workspaceLiveTerminal?.agent_id
+          || workspaceLiveTerminal?.agentType
+          || workspaceLiveTerminal?.agent_type
+          || workspaceLiveTerminal?.agentKind
+          || workspaceLiveTerminal?.agent_kind
+          || workspaceLiveTerminal?.agent
           || getTerminalRole(terminalIndex),
       );
       const terminalIds = new Set(getVoiceAgentHighlightStringValues(
         paneId,
+        getVoiceAgentWorkspaceTerminalCanonicalIds(terminalWorkspace?.id, terminalIndex, agentType),
+        liveTerminal?.id,
         liveTerminal?.paneId,
         liveTerminal?.pane_id,
         liveTerminal?.terminalId,
         liveTerminal?.terminal_id,
         liveTerminal?.targetTerminalId,
         liveTerminal?.target_terminal_id,
+        workspaceLiveTerminal?.id,
         workspaceLiveTerminal?.paneId,
         workspaceLiveTerminal?.pane_id,
         workspaceLiveTerminal?.terminalId,
         workspaceLiveTerminal?.terminal_id,
+        workspaceLiveTerminal?.targetTerminalId,
+        workspaceLiveTerminal?.target_terminal_id,
       ));
       const threadIds = new Set(getVoiceAgentHighlightStringValues(
         thread?.id,
@@ -28552,6 +28607,7 @@ function TerminalView({
     getTerminalRole,
     getTerminalThread,
     logicalTerminalIndexes,
+    terminalWorkspace?.id,
     workspaceThreadEntry,
   ]);
 

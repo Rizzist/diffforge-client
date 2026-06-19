@@ -1847,6 +1847,25 @@ fn todo_dispatch_backend_item_text_for_sync(item: &Value) -> String {
     }
 }
 
+fn todo_dispatch_copy_todo_input_aliases(item: &Value, target: &mut Value) {
+    let Some(target_object) = target.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "inputs",
+        "todoInputs",
+        "todo_inputs",
+        "inputCount",
+        "input_count",
+        "todoInputCount",
+        "todo_input_count",
+    ] {
+        if let Some(value) = item.get(key).filter(|value| !value.is_null()).cloned() {
+            target_object.insert(key.to_string(), value);
+        }
+    }
+}
+
 fn todo_dispatch_todo_sync_commit_payload(
     workspace_id: &str,
     workspace_name: &str,
@@ -1884,7 +1903,7 @@ fn todo_dispatch_todo_sync_commit_payload(
     } else {
         item_source
     };
-    let meta = json!({
+    let mut meta = json!({
         "source": source_kind,
         "source_kind": source_kind,
         "sourceKind": source_kind,
@@ -1938,6 +1957,7 @@ fn todo_dispatch_todo_sync_commit_payload(
         "provider_session_id": todo_dispatch_text(item, &["providerSessionId", "provider_session_id", "sessionId", "session_id"]),
         "providerSessionId": todo_dispatch_text(item, &["providerSessionId", "provider_session_id", "sessionId", "session_id"]),
     });
+    todo_dispatch_copy_todo_input_aliases(item, &mut meta);
     Some(json!({
         "c": "todo.sync",
         "cid": format!("rust-todo-dispatch-{todo_id}-{status}-{}", todo_dispatch_now_ms()),
@@ -1956,6 +1976,169 @@ fn todo_dispatch_todo_sync_commit_payload(
         "workspace_name": workspace_name,
         "workspaceName": workspace_name,
     }))
+}
+
+fn todo_dispatch_delete_todo_sync_commit_payload(
+    workspace_id: &str,
+    todo_ids: &[String],
+    reason: &str,
+    origin: &str,
+) -> Option<Value> {
+    let safe_todo_ids = todo_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if safe_todo_ids.is_empty() {
+        return None;
+    }
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return None;
+    }
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = device_profile
+        .get("device_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if device_id.is_empty() {
+        return None;
+    }
+    let deleted_at = chrono_like_now_iso();
+    let ops = safe_todo_ids
+        .iter()
+        .map(|todo_id| {
+            json!([
+                "d",
+                todo_id,
+                {
+                    "source": "rust-diffforge-todo-store",
+                    "source_kind": "rust-diffforge-todo-store",
+                    "sourceKind": "rust-diffforge-todo-store",
+                    "source_device_id": device_id,
+                    "sourceDeviceId": device_id,
+                    "source_workspace_id": workspace_id,
+                    "sourceWorkspaceId": workspace_id,
+                    "target_device_id": device_id,
+                    "targetDeviceId": device_id,
+                    "target_workspace_id": workspace_id,
+                    "targetWorkspaceId": workspace_id,
+                    "deleted_at": deleted_at,
+                    "deletedAt": deleted_at,
+                    "delete_reason": reason,
+                    "deleteReason": reason,
+                    "origin": origin,
+                    "reason": reason,
+                }
+            ])
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "c": "todo.sync",
+        "cid": format!("rust-todo-delete-{workspace_id}-{}", todo_dispatch_now_ms()),
+        "device_id": device_id,
+        "deviceId": device_id,
+        "did": device_id,
+        "m": "commit",
+        "ops": ops,
+        "source": "rust-diffforge-todo-store",
+        "v": 2,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+    }))
+}
+
+fn todo_store_enqueue_delete_todo_sync_commit(
+    app: &AppHandle,
+    workspace_id: &str,
+    todo_ids: &[String],
+    reason: &str,
+    origin: &str,
+) {
+    let Some(payload) =
+        todo_dispatch_delete_todo_sync_commit_payload(workspace_id, todo_ids, reason, origin)
+    else {
+        return;
+    };
+    let app = app.clone();
+    let workspace_id = workspace_id.to_string();
+    let reason = reason.to_string();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let response = cloud_mcp_enqueue_workspace_todo_sync_commit(&state, payload, &reason).await;
+        let _ = app.emit(
+            CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT,
+            json!({
+                "reason": reason,
+                "source": "todo_store_delete_todo_sync_commit",
+                "workspaceId": workspace_id,
+            }),
+        );
+        log_terminal_status_event(
+            "backend.todo_store.delete_todo_sync_commit_queued",
+            json!({
+                "reason": reason,
+                "response": response,
+                "workspace_id": workspace_id,
+            }),
+        );
+    });
+}
+
+fn todo_store_enqueue_item_todo_sync_commit(
+    app: &AppHandle,
+    workspace_id: &str,
+    item: Value,
+    reason: &str,
+    source: &str,
+) {
+    let workspace_name = todo_dispatch_text(&item, &["workspaceName", "workspace_name"]);
+    let repo_path = todo_dispatch_text(
+        &item,
+        &[
+            "repoPath",
+            "repo_path",
+            "workspaceRoot",
+            "workspace_root",
+            "projectRoot",
+            "project_root",
+        ],
+    );
+    let Some(payload) = todo_dispatch_todo_sync_commit_payload(
+        workspace_id,
+        &workspace_name,
+        &repo_path,
+        &item,
+        reason,
+        source,
+    ) else {
+        return;
+    };
+    let app = app.clone();
+    let workspace_id = workspace_id.to_string();
+    let reason = reason.to_string();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let response = cloud_mcp_enqueue_workspace_todo_sync_commit(&state, payload, &reason).await;
+        let _ = app.emit(
+            CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT,
+            json!({
+                "reason": reason,
+                "source": "todo_store_status_todo_sync_commit",
+                "workspaceId": workspace_id,
+            }),
+        );
+        log_terminal_status_event(
+            "backend.todo_store.status_todo_sync_commit_queued",
+            json!({
+                "reason": reason,
+                "response": response,
+                "workspace_id": workspace_id,
+            }),
+        );
+    });
 }
 
 async fn todo_dispatch_enqueue_todo_sync_commit(
@@ -2143,6 +2326,7 @@ pub(crate) fn todo_store_delete_internal(
     // Client-authoritative: purge the local mirror right away so every view
     // converges instantly; the cloud removal below syncs in the background.
     let purged = cloud_mcp_todo_mirror_purge_todo_ids(&all_ids);
+    todo_store_enqueue_delete_todo_sync_commit(app, workspace_id, &all_ids, reason, origin);
     todo_store_push_removals(app, workspace_id, all_ids, reason);
     todo_store_emit_changed(app, workspace_id, reason, "store");
     if purged > 0 {
@@ -2532,7 +2716,14 @@ async fn todo_store_set_status(
                 item
             }
         };
-        todo_store_push_corrections(&app, &workspace_id, vec![correction], &reason);
+        todo_store_push_corrections(&app, &workspace_id, vec![correction.clone()], &reason);
+        todo_store_enqueue_item_todo_sync_commit(
+            &app,
+            &workspace_id,
+            correction,
+            &reason,
+            "rust-diffforge-todo-store",
+        );
         todo_store_emit_changed(&app, &workspace_id, &reason, "store");
         Ok(json!({
             "ok": true,

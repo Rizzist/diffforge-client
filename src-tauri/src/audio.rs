@@ -8810,6 +8810,7 @@ async fn start_cloud_voice_agent_stream(
             audio_tx: session_audio_tx,
             control_tx,
             finished_rx,
+            voice_session_id: voice_session_id.clone(),
         });
         status
     };
@@ -8838,14 +8839,46 @@ async fn start_cloud_voice_agent_stream(
     };
 
     if let Some((action, error, details)) = ready_failure {
-        {
+        let failed_session = {
             let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
             let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
-            *session_guard = None;
-            audio_state
-                .cloud_voice_agent_input_enabled
-                .store(false, Ordering::SeqCst);
-            let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
+            let owns_failed_session = session_guard
+                .as_ref()
+                .map(|session| session.voice_session_id == voice_session_id)
+                .unwrap_or(false);
+            if owns_failed_session {
+                let session = session_guard.take();
+                audio_state
+                    .cloud_voice_agent_input_enabled
+                    .store(false, Ordering::SeqCst);
+                let _ = realtime_mic_detach_for(&audio_state, RealtimeMicHolder::VoiceAgent);
+                session
+            } else {
+                None
+            }
+        };
+        if let Some(session) = failed_session {
+            let _ = session.control_tx.send(CloudVoiceAgentControl::Stop);
+            let cleanup_result = timeout(
+                Duration::from_secs(DEEPGRAM_CLOSE_TIMEOUT_SECS),
+                session.finished_rx,
+            )
+            .await;
+            log_audio_diagnostic_event(
+                "audio.cloud_voice.start_failed_cleanup",
+                json!({
+                    "action": action,
+                    "cleanup": match cleanup_result {
+                        Ok(Ok(Ok(()))) => "stopped",
+                        Ok(Ok(Err(_))) => "stopped_with_error",
+                        Ok(Err(_)) => "closed",
+                        Err(_) => "timeout",
+                    },
+                    "repo_id": repo_id.clone(),
+                    "voice_session_id": voice_session_id.clone(),
+                    "workspace_id": workspace_id.clone(),
+                }),
+            );
         }
         spawn_cloud_voice_agent_desktop_log(
             cloud_mcp_state.inner(),

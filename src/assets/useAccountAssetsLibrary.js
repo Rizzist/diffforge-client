@@ -62,6 +62,20 @@ function text(value) {
   return String(value ?? "").trim();
 }
 
+function assetLibraryPayload(value, depth = 0) {
+  const object = jsonObject(value);
+  if (!object || depth > 4) return object || {};
+  const data = jsonObject(object.data);
+  if (data) return assetLibraryPayload(data, depth + 1);
+  const payload = jsonObject(object.payload);
+  if (payload) return assetLibraryPayload(payload, depth + 1);
+  return object;
+}
+
+function assetLocalPath(asset) {
+  return text(asset?.localPath || asset?.local_path || asset?.path);
+}
+
 export function assetIdentityKeys(asset) {
   const keys = [];
   const add = (prefix, value) => {
@@ -85,13 +99,34 @@ function mergeAssetRows(existing, incoming) {
     const current = merged[key];
     const incomingText = typeof value === "string" ? value.trim() : "";
     const currentText = typeof current === "string" ? current.trim() : "";
+    const existingPath = assetLocalPath(merged);
+    const incomingPath = assetLocalPath(incoming);
     if ((value === null || value === undefined || incomingText === "") && currentText) {
+      return;
+    }
+    if (["local_path", "localPath", "path"].includes(key) && !incomingText && existingPath) {
       return;
     }
     if (
       ["local_status", "localStatus", "cloud_status", "cloudStatus"].includes(key)
       && ["", "unknown"].includes(incomingText.toLowerCase())
       && currentText
+    ) {
+      return;
+    }
+    if (
+      ["local_status", "localStatus"].includes(key)
+      && existingPath
+      && !incomingPath
+      && ["deleted", "local-deleted", "local-missing", "missing", "not-found", "unavailable"].includes(incomingText.toLowerCase().replace(/[_\s]+/gu, "-"))
+    ) {
+      return;
+    }
+    if (
+      ["local_available", "localAvailable"].includes(key)
+      && value === false
+      && existingPath
+      && !incomingPath
     ) {
       return;
     }
@@ -117,6 +152,28 @@ function dedupeAssetRows(items) {
     assetIdentityKeys(rows[existingIndex]).forEach((key) => byKey.set(key, existingIndex));
   });
   return rows;
+}
+
+function assetHiddenFromGenericLibrary(asset) {
+  const metadata = jsonObject(asset?.metadata) || {};
+  const sourceKind = text(
+    asset?.sourceKind,
+    asset?.source_kind,
+    asset?.source,
+    metadata.sourceKind,
+    metadata.source_kind,
+    metadata.source,
+  ).toLowerCase();
+  if (sourceKind === "account_skill" || sourceKind === "account-architecture" || sourceKind === "account_architecture") {
+    return true;
+  }
+  const docDomain = text(
+    asset?.docDomain,
+    asset?.doc_domain,
+    metadata.docDomain,
+    metadata.doc_domain,
+  ).toLowerCase();
+  return docDomain === "skills" || docDomain === "architectures";
 }
 
 function dedupeTransferRows(transfers) {
@@ -149,18 +206,29 @@ function dedupeTransferRows(transfers) {
 
 function normalizeAssetsLibrary(library) {
   if (!library || typeof library !== "object") return library;
+  const payload = assetLibraryPayload(library);
   const fanout = accountAssetFanoutFromValue(library);
-  const items = dedupeAssetRows(fanout ? fanout.items : jsonArray(library.items));
-  const transfers = dedupeTransferRows(fanout ? fanout.transfers : jsonArray(library.transfers));
+  const directItems = jsonArray(payload.items).length
+    ? jsonArray(payload.items)
+    : jsonArray(payload.assets);
+  const items = dedupeAssetRows([
+    ...(fanout?.items || []),
+    ...directItems,
+  ]).filter((item) => !assetHiddenFromGenericLibrary(item));
+  const visibleIds = new Set(items.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
+  const transfers = dedupeTransferRows([
+    ...(fanout?.transfers || []),
+    ...jsonArray(payload.transfers),
+  ]).filter((transfer) => visibleIds.has(text(transfer.assetId || transfer.asset_id)));
   const clouds = jsonArray(fanout?.clouds).length
     ? jsonArray(fanout.clouds)
-    : jsonArray(library.clouds).length
-      ? jsonArray(library.clouds)
-      : jsonArray(library.assetClouds).length
-        ? jsonArray(library.assetClouds)
-        : jsonArray(library.asset_clouds);
+    : jsonArray(payload.clouds).length
+      ? jsonArray(payload.clouds)
+      : jsonArray(payload.assetClouds).length
+        ? jsonArray(payload.assetClouds)
+        : jsonArray(payload.asset_clouds);
   return {
-    ...library,
+    ...payload,
     ...(fanout || {}),
     items,
     assets: items,
@@ -174,8 +242,9 @@ function normalizeAssetsLibrary(library) {
 
 function mergeAssetsLibraryEvent(library, eventPayload) {
   const fanout = accountAssetFanoutFromValue(eventPayload);
-  const items = fanout?.items || [];
-  const transfers = fanout?.transfers || [];
+  const normalizedEvent = normalizeAssetsLibrary(assetLibraryPayload(eventPayload));
+  const items = normalizedEvent?.items || fanout?.items || [];
+  const transfers = normalizedEvent?.transfers || fanout?.transfers || [];
   const removedAssets = fanout?.removedAssets || fanout?.removed_assets || [];
   if (!items.length && !transfers.length && !removedAssets.length) return library;
   const current = normalizeAssetsLibrary(library || {});
@@ -183,11 +252,16 @@ function mergeAssetsLibraryEvent(library, eventPayload) {
   const nextItems = dedupeAssetRows([
     ...jsonArray(current?.items),
     ...items,
-  ]).filter((item) => !removedIds.has(text(item.assetId || item.asset_id || item.id)));
+  ])
+    .filter((item) => !assetHiddenFromGenericLibrary(item))
+    .filter((item) => !removedIds.has(text(item.assetId || item.asset_id || item.id)));
+  const visibleIds = new Set(nextItems.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
   const nextTransfers = dedupeTransferRows([
     ...jsonArray(current?.transfers),
     ...transfers,
-  ]).filter((transfer) => !removedIds.has(text(transfer.assetId || transfer.asset_id)));
+  ])
+    .filter((transfer) => visibleIds.has(text(transfer.assetId || transfer.asset_id)))
+    .filter((transfer) => !removedIds.has(text(transfer.assetId || transfer.asset_id)));
   return normalizeAssetsLibrary({
     ...(current || {}),
     ...(fanout || {}),

@@ -14630,6 +14630,23 @@ function WorkspaceTerminal({
 
   const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
   const canOpenTerminalUiView = !threadsViewActive && !terminalClosed && !terminalClosing && Boolean(thread);
+  const fullscreenThreadUiViewActive = Boolean(isFullscreen && terminalUiViewActive && !threadsViewActive);
+  const selectCurrentTerminalThreadForFullscreenView = useCallback(() => {
+    if (!isFullscreen || !workspace?.id || !terminalThreadId) {
+      return;
+    }
+
+    onWorkspaceThreadsViewStateChange?.(workspace.id, {
+      newChatActive: false,
+      selectedThreadId: terminalThreadId,
+      selectedWorkspaceId: workspace.id,
+    });
+  }, [
+    isFullscreen,
+    onWorkspaceThreadsViewStateChange,
+    terminalThreadId,
+    workspace?.id,
+  ]);
   const focusTerminalKeyboardInputAfterUiHide = useCallback(() => {
     const focusAfterHide = () => {
       if (terminalUiViewActiveRef.current) {
@@ -14653,6 +14670,9 @@ function WorkspaceTerminal({
 
     const nextUiViewActive = !terminalUiViewActive;
     activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
+    if (nextUiViewActive) {
+      selectCurrentTerminalThreadForFullscreenView();
+    }
     terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
     if (!nextUiViewActive) {
@@ -14662,6 +14682,7 @@ function WorkspaceTerminal({
     activateTerminalPane,
     canOpenTerminalUiView,
     focusTerminalKeyboardInputAfterUiHide,
+    selectCurrentTerminalThreadForFullscreenView,
     terminalUiViewActive,
   ]);
   const setTerminalUiViewFromArrowShortcut = useCallback((nextUiViewActive) => {
@@ -14680,6 +14701,9 @@ function WorkspaceTerminal({
     }
 
     terminalUiViewActiveRef.current = nextUiViewActive;
+    if (nextUiViewActive) {
+      selectCurrentTerminalThreadForFullscreenView();
+    }
     setTerminalUiViewActive(nextUiViewActive);
     if (!nextUiViewActive) {
       focusTerminalKeyboardInputAfterUiHide();
@@ -14689,7 +14713,11 @@ function WorkspaceTerminal({
     activateTerminalPane,
     canOpenTerminalUiView,
     focusTerminalKeyboardInputAfterUiHide,
+    selectCurrentTerminalThreadForFullscreenView,
   ]);
+  const closeFullscreenThreadUiView = useCallback(() => {
+    setTerminalUiViewFromArrowShortcut(false);
+  }, [setTerminalUiViewFromArrowShortcut]);
   useEffect(() => {
     if (terminalClosed || terminalClosing) {
       return undefined;
@@ -14742,6 +14770,22 @@ function WorkspaceTerminal({
       setTerminalUiViewActive(false);
     }
   }, [terminalClosed, terminalClosing, thread]);
+  useEffect(() => {
+    if (!fullscreenThreadUiViewActive || !workspace?.id || !terminalThreadId) {
+      return;
+    }
+
+    onWorkspaceThreadsViewStateChange?.(workspace.id, {
+      newChatActive: false,
+      selectedThreadId: terminalThreadId,
+      selectedWorkspaceId: workspace.id,
+    });
+  }, [
+    fullscreenThreadUiViewActive,
+    onWorkspaceThreadsViewStateChange,
+    terminalThreadId,
+    workspace?.id,
+  ]);
   const splitTerminal = useCallback((direction) => {
     if (threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal) {
       return;
@@ -15012,10 +15056,16 @@ function WorkspaceTerminal({
       ref={containerRef}
     />
   );
+  const threadOverlayOpen = Boolean(
+    (threadsViewActive || fullscreenThreadUiViewActive)
+      && !terminalClosed
+      && !terminalClosing,
+  );
   const terminalUiViewShouldRender = Boolean(thread)
     && !terminalClosed
     && !terminalClosing
-    && terminalUiViewActive;
+    && terminalUiViewActive
+    && !fullscreenThreadUiViewActive;
   const restartMenuAgentKind = terminalAgentKind;
   const restartRoleOptions = getTerminalRoleSwitchOptions(agentStatuses);
 
@@ -15027,7 +15077,7 @@ function WorkspaceTerminal({
       data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}
       data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-terminal-index={terminalIndex}
-      data-threads-view={threadsViewActive ? "true" : undefined}
+      data-threads-view={threadOverlayOpen ? "true" : undefined}
       data-ui-view={terminalUiViewActive ? "true" : undefined}
       onFocusCapture={handleTerminalSurfaceFocusCapture}
       onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
@@ -15416,7 +15466,7 @@ function WorkspaceTerminal({
               composerAttachments={threadComposerAttachments}
               composerDrafts={threadComposerDrafts}
               onActiveThreadChange={handleThreadsViewActiveThreadChange}
-              onClose={toggleTerminalFullscreen}
+              onClose={fullscreenThreadUiViewActive ? closeFullscreenThreadUiView : toggleTerminalFullscreen}
               onCreateChat={createWorkspaceThreadChat}
               onArchiveThread={onArchiveWorkspaceThread}
               onDraftInput={syncWorkspaceThreadComposerInput}
@@ -15425,7 +15475,7 @@ function WorkspaceTerminal({
               onSubmitMessage={submitWorkspaceThreadMessage}
               onTogglePinnedThread={onToggleWorkspaceThreadPinned}
               onViewStateChange={onWorkspaceThreadsViewStateChange}
-              open={threadsViewActive}
+              open={threadOverlayOpen}
               preferSelectedThreadId={selectedWorkspaceThreadIdOverride}
               selectedThreadId={selectedWorkspaceThreadIdOverride ? selectedWorkspaceThreadId : selectedWorkspaceThreadId || terminalThreadId}
               selectedWorkspaceId={workspace?.id || ""}

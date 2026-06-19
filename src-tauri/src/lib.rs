@@ -933,6 +933,7 @@ struct CloudVoiceAgentSession {
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     control_tx: mpsc::UnboundedSender<CloudVoiceAgentControl>,
     finished_rx: oneshot::Receiver<Result<(), String>>,
+    voice_session_id: String,
 }
 
 enum CloudVoiceAgentControl {

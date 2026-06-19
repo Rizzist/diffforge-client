@@ -2334,7 +2334,7 @@ function toneColor(tone) {
   if (tone === "danger") return "#ff5a5f";
   if (tone === "warn") return "#fb923c";
   if (tone === "unknown") return "#94a3b8";
-  return "var(--forge-tint-soft)";
+  return "#60a5fa";
 }
 
 function dailyPercentTone(value, weeklyLimitPercent) {
@@ -4185,13 +4185,13 @@ const DailyBar = styled.div`
     if ($tone === "danger") return "#ff5a5f";
     if ($tone === "warn") return "#facc15";
     if ($tone === "quiet") return "rgba(114, 130, 150, 0.25)";
-    return "var(--forge-tint-soft)";
+    return "#60a5fa";
   }};
   box-shadow: ${({ $tone }) => {
     if (!$tone || $tone === "quiet") return "none";
     if ($tone === "danger") return "0 0 18px rgba(255, 90, 95, 0.16)";
     if ($tone === "warn") return "0 0 18px rgba(250, 204, 21, 0.16)";
-    return "0 0 18px rgba(var(--forge-tint-rgb), 0.16)";
+    return "0 0 18px rgba(96, 165, 250, 0.16)";
   }};
 `;
 
@@ -4479,8 +4479,8 @@ const StorageFill = styled.div`
   height: 100%;
   min-width: 0;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--forge-tint-soft), #34d399);
-  box-shadow: 0 0 16px rgba(var(--forge-tint-rgb), 0.28);
+  background: linear-gradient(90deg, #60a5fa, #34d399);
+  box-shadow: 0 0 16px rgba(96, 165, 250, 0.28);
 `;
 
 const tokenomicsRescanSpin = keyframes`

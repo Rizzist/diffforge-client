@@ -24,10 +24,15 @@ const SECTIONS = [
 
 export const GLOBAL_MCP_DEFAULTS_SCOPE = "global-defaults";
 const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID = "account-global-mcp-defaults";
+const SKILL_EDITOR_THEME_STORAGE_KEY = "diffforge.tools.skillEditorTheme";
 
 function normalizedSectionId(value, fallback = "architectures") {
   const normalized = text(value);
   return SECTIONS.some((entry) => entry.id === normalized) ? normalized : fallback;
+}
+
+function normalizedSkillEditorTheme(value, fallback = "dark") {
+  return value === "light" || value === "dark" ? value : fallback;
 }
 
 function text(value, fallback = "") {
@@ -37,6 +42,12 @@ function text(value, fallback = "") {
 
 function getErrorMessage(error, fallback) {
   return error?.message || String(error || fallback || "Something went wrong.");
+}
+
+function clampProgressPercent(value, fallback = 0) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, Math.min(100, number));
 }
 
 function accountToolsEventCandidates(payload) {
@@ -175,6 +186,31 @@ function SkillIconGlyph({ icon, title }) {
   return <span>{text(title, "S").slice(0, 1).toUpperCase()}</span>;
 }
 
+function ToolsHydrationProgress({ placement = "panel", progress }) {
+  if (!progress?.visible) return null;
+  const percent = clampProgressPercent(progress.percent);
+  const title = text(progress.title, "Hydrating account tools");
+  const meta = text(progress.error || progress.meta, `${Math.round(percent)}%`);
+  return (
+    <ToolsHydrationPanel data-placement={placement} data-state={text(progress.state, "hydrating")}>
+      <ToolsHydrationCopy>
+        <strong>{title}</strong>
+        <span>{meta}</span>
+      </ToolsHydrationCopy>
+      <ToolsHydrationTrack
+        aria-label={title}
+        aria-valuemax={100}
+        aria-valuemin={0}
+        aria-valuenow={Math.round(percent)}
+        aria-valuetext={meta}
+        role="progressbar"
+      >
+        <ToolsHydrationFill style={{ width: `${percent}%` }} />
+      </ToolsHydrationTrack>
+    </ToolsHydrationPanel>
+  );
+}
+
 export default function ToolsWorkspaceView({
   architectures = null,
   defaultWorkingDirectory = "",
@@ -256,11 +292,37 @@ export default function ToolsWorkspaceView({
   const [skillsMeta, setSkillsMeta] = useState({ updatedAt: "", updatedBy: "", offline: false });
   const [skillsState, setSkillsState] = useState("loading");
   const [skillsError, setSkillsError] = useState("");
+  const [skillsHydration, setSkillsHydration] = useState({
+    error: "",
+    meta: "",
+    percent: 0,
+    state: "idle",
+    title: "",
+    visible: false,
+  });
+  const skillsHydrationRunRef = useRef(0);
   const [skillsQuery, setSkillsQuery] = useState("");
   // "library:<id>" or "catalog:<id>" — selecting a skill shows its contents.
   const [selectedSkillKey, setSelectedSkillKey] = useState("");
   // { id: ""|skillId, title, description, content } while creating/editing.
   const [skillEditor, setSkillEditor] = useState(null);
+  const [skillEditorTheme, setSkillEditorTheme] = useState(() => {
+    if (typeof window === "undefined") return "dark";
+    try {
+      return normalizedSkillEditorTheme(window.localStorage?.getItem(SKILL_EDITOR_THEME_STORAGE_KEY));
+    } catch {
+      return "dark";
+    }
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage?.setItem(SKILL_EDITOR_THEME_STORAGE_KEY, skillEditorTheme);
+    } catch {
+      // The editor theme is cosmetic; storage failures should not block editing.
+    }
+  }, [skillEditorTheme]);
 
   // ---- CLIs ----
   const [cliStatuses, setCliStatuses] = useState([]);
@@ -274,13 +336,39 @@ export default function ToolsWorkspaceView({
   const [catalogQuery, setCatalogQuery] = useState("");
 
   const loadAccountTools = useCallback(async () => {
+    const hydrationRunId = skillsHydrationRunRef.current + 1;
+    skillsHydrationRunRef.current = hydrationRunId;
+    let progressTimer = null;
+    setSkillsHydration({
+      error: "",
+      meta: "Checking account skill assets",
+      percent: 6,
+      runId: hydrationRunId,
+      state: "hydrating",
+      title: "Hydrating skills",
+      visible: true,
+    });
+    if (typeof window !== "undefined") {
+      progressTimer = window.setInterval(() => {
+        setSkillsHydration((current) => {
+          if (current.runId !== hydrationRunId || current.state !== "hydrating") return current;
+          const nextPercent = Math.min(92, Math.max(8, Number(current.percent || 0) + 7));
+          return {
+            ...current,
+            meta: nextPercent < 62 ? "Downloading missing skill assets" : "Finalizing skill library",
+            percent: nextPercent,
+          };
+        });
+      }, 360);
+    }
     setSkillsState((current) => (current === "ready" ? "refreshing" : "loading"));
     setSkillsError("");
     try {
       const data = await invoke("cloud_mcp_get_account_tools");
       const skills = data?.skills || {};
       const skillsMd = text(skills.skills_md ?? skills.skillsMd, "");
-      setSkillsLibrary(parseSkillsLibrary(skillsMd));
+      const parsedSkillsLibrary = parseSkillsLibrary(skillsMd);
+      setSkillsLibrary(parsedSkillsLibrary);
       noteAccountSkillsMarkdown(skillsMd);
       setSkillsRevision(
         Number.isFinite(Number(skills.revision)) && skills.revision !== null
@@ -293,9 +381,61 @@ export default function ToolsWorkspaceView({
         offline: Boolean(data?.offline),
       });
       setSkillsState("ready");
+      if (skillsHydrationRunRef.current === hydrationRunId) {
+        const units = Array.isArray(data?.skill_units)
+          ? data.skill_units
+          : Array.isArray(data?.skillUnits)
+            ? data.skillUnits
+            : [];
+        const hydratedUnits = units.filter((unit) => (
+          text(unit?.content_md ?? unit?.contentMd ?? unit?.content).length
+        ));
+        const readyCount = parsedSkillsLibrary.skills.length || units.length;
+        const readyLabel = readyCount
+          ? `${readyCount} skill${readyCount === 1 ? "" : "s"} ready`
+          : "Skill library ready";
+        const hydratedLabel = units.length
+          ? ` · ${hydratedUnits.length || units.length}/${units.length} downloaded`
+          : "";
+        const offline = Boolean(data?.offline);
+        setSkillsHydration({
+          error: "",
+          meta: offline ? "Showing cached skills" : `${readyLabel}${hydratedLabel}`,
+          percent: 100,
+          runId: hydrationRunId,
+          state: "ready",
+          title: offline ? "Skills loaded from cache" : "Skills hydrated",
+          visible: true,
+        });
+        if (typeof window !== "undefined") {
+          window.setTimeout(() => {
+            if (skillsHydrationRunRef.current === hydrationRunId) {
+              setSkillsHydration((current) => (
+                current.state === "ready" ? { ...current, visible: false } : current
+              ));
+            }
+          }, 1600);
+        }
+      }
     } catch (error) {
-      setSkillsError(getErrorMessage(error, "Unable to load account tools."));
+      const message = getErrorMessage(error, "Unable to load account tools.");
+      setSkillsError(message);
       setSkillsState("error");
+      if (skillsHydrationRunRef.current === hydrationRunId) {
+        setSkillsHydration({
+          error: message,
+          meta: "Skill hydration failed",
+          percent: 100,
+          runId: hydrationRunId,
+          state: "error",
+          title: "Skill hydration needs attention",
+          visible: true,
+        });
+      }
+    } finally {
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+      }
     }
   }, []);
 
@@ -748,19 +888,22 @@ export default function ToolsWorkspaceView({
       {section === "architectures" && (
         <ToolsHubFill aria-label="Account architectures">
           {architectures ? (
-            <ArchitectureHubView
-              catalog={architectures.catalog}
-              catalogError={architectures.catalogError}
-              catalogState={architectures.catalogState}
-              graphLists={architectures.graphLists}
-              onCopyGraph={architectures.onCopyGraph}
-              onGraphListRefresh={architectures.onGraphListRefresh}
-              onRefreshCatalog={architectures.onRefreshCatalog}
-              onSelectionChange={architectures.onSelectionChange}
-              resolveRepoSyncContext={architectures.resolveRepoSyncContext}
-              selectedGraphId={architectures.selectedGraphId}
-              selectedRepoPath={architectures.selectedRepoPath}
-            />
+            <ToolsHubStack data-has-progress={architectures.hydration?.visible ? "true" : undefined}>
+              <ToolsHydrationProgress placement="hub" progress={architectures.hydration} />
+              <ArchitectureHubView
+                catalog={architectures.catalog}
+                catalogError={architectures.catalogError}
+                catalogState={architectures.catalogState}
+                graphLists={architectures.graphLists}
+                onCopyGraph={architectures.onCopyGraph}
+                onGraphListRefresh={architectures.onGraphListRefresh}
+                onRefreshCatalog={architectures.onRefreshCatalog}
+                onSelectionChange={architectures.onSelectionChange}
+                resolveRepoSyncContext={architectures.resolveRepoSyncContext}
+                selectedGraphId={architectures.selectedGraphId}
+                selectedRepoPath={architectures.selectedRepoPath}
+              />
+            </ToolsHubStack>
           ) : (
             <ToolsEmpty>Architectures are unavailable right now.</ToolsEmpty>
           )}
@@ -804,41 +947,66 @@ export default function ToolsWorkspaceView({
         <ToolsScroll>
           <ToolsLayout>
             {section === "skills" && (
-              <ToolsPanel aria-label="Skills">
+              <ToolsPanel aria-label="Skills" data-mode={skillEditor ? "editor" : undefined}>
+                <ToolsHydrationProgress
+                  placement={skillEditor ? "editor" : "panel"}
+                  progress={skillsHydration}
+                />
                 {skillEditor ? (
                   <>
-                    <ToolsPanelTopline>
-                      <div>
-                        <ToolsPanelTitle>{skillEditor.id ? "Edit skill" : "New skill"}</ToolsPanelTitle>
-                        <ToolsPanelHint>
-                          Skills sync to your account and feed every coding agent.
-                        </ToolsPanelHint>
-                      </div>
-                      <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : "good"}>
-                        {skillsStatusLabel}
-                      </ToolsStatusPill>
-                    </ToolsPanelTopline>
-                    <SkillEditorField
-                      aria-label="Skill title"
-                      onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
-                      placeholder="Skill title"
-                      value={skillEditor.title}
-                    />
-                    <SkillEditorField
-                      aria-label="Skill description"
-                      onChange={(event) => setSkillEditor((current) => ({ ...current, description: event.target.value }))}
-                      placeholder="One-line description"
-                      value={skillEditor.description}
-                    />
-                    <ToolsSkillsEditor
-                      aria-label="Skill content"
-                      onChange={(event) => setSkillEditor((current) => ({ ...current, content: event.target.value }))}
-                      placeholder={"Document the workflow, commands, and conventions this skill covers…"}
-                      spellCheck={false}
-                      value={skillEditor.content}
-                    />
+                    <SkillDocumentEditor data-page-theme={skillEditorTheme}>
+                      <SkillDocumentToolbar>
+                        <SkillDocumentToolbarCopy>
+                          <ToolsPanelTitle>{skillEditor.id ? "Edit skill" : "New skill"}</ToolsPanelTitle>
+                          <ToolsPanelHint>
+                            Skills sync to your account and feed every coding agent.
+                          </ToolsPanelHint>
+                        </SkillDocumentToolbarCopy>
+                        <SkillDocumentToolbarControls>
+                          <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : "good"}>
+                            {skillsStatusLabel}
+                          </ToolsStatusPill>
+                          <SkillDocumentThemeSwitch aria-label="Skill editor page theme">
+                            {["dark", "light"].map((theme) => (
+                              <SkillDocumentThemeButton
+                                aria-pressed={skillEditorTheme === theme}
+                                data-active={skillEditorTheme === theme ? "true" : "false"}
+                                key={theme}
+                                onClick={() => setSkillEditorTheme(theme)}
+                                type="button"
+                              >
+                                {theme === "dark" ? "Dark" : "Light"}
+                              </SkillDocumentThemeButton>
+                            ))}
+                          </SkillDocumentThemeSwitch>
+                        </SkillDocumentToolbarControls>
+                      </SkillDocumentToolbar>
+                      <SkillDocumentCanvas>
+                        <SkillDocumentPage>
+                          <SkillDocumentTitleInput
+                            aria-label="Skill title"
+                            onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
+                            placeholder="Untitled skill"
+                            value={skillEditor.title}
+                          />
+                          <SkillDocumentDescriptionInput
+                            aria-label="Skill description"
+                            onChange={(event) => setSkillEditor((current) => ({ ...current, description: event.target.value }))}
+                            placeholder="One-line description"
+                            value={skillEditor.description}
+                          />
+                          <ToolsSkillsEditor
+                            aria-label="Skill content"
+                            onChange={(event) => setSkillEditor((current) => ({ ...current, content: event.target.value }))}
+                            placeholder={"Document the workflow, commands, and conventions this skill covers..."}
+                            spellCheck={false}
+                            value={skillEditor.content}
+                          />
+                        </SkillDocumentPage>
+                      </SkillDocumentCanvas>
+                    </SkillDocumentEditor>
                     {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
-                    <ToolsPanelActions>
+                    <SkillDocumentActions>
                       <ToolsGhostButton onClick={() => setSkillEditor(null)} type="button">
                         Cancel
                       </ToolsGhostButton>
@@ -849,7 +1017,7 @@ export default function ToolsWorkspaceView({
                       >
                         {skillsState === "saving" ? "Syncing…" : "Save skill"}
                       </ToolsPrimaryButton>
-                    </ToolsPanelActions>
+                    </SkillDocumentActions>
                   </>
                 ) : selectedSkill ? (
                   <>
@@ -1116,7 +1284,7 @@ const ToolsHubShell = styled.section`
   position: relative;
   isolation: isolate;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: 48px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -1125,13 +1293,12 @@ const ToolsHubShell = styled.section`
 `;
 
 const ToolsHubHeader = styled.header`
-  position: sticky;
-  top: 0;
   z-index: 30;
   display: flex;
   align-items: center;
   min-width: 0;
-  min-height: 40px;
+  height: 48px;
+  overflow: hidden;
   padding: 6px 10px;
   border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
   background: rgba(5, 8, 13, 0.96);
@@ -1153,11 +1320,104 @@ const ToolsHubFill = styled.div`
   overflow: hidden;
 `;
 
+const ToolsHubStack = styled.div`
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+
+  &[data-has-progress="true"] {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  > * {
+    min-width: 0;
+    min-height: 0;
+  }
+`;
+
 const ToolsScroll = styled.div`
   min-width: 0;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
   padding: 14px 16px 24px;
+`;
+
+const ToolsHydrationPanel = styled.div`
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(125, 176, 255, 0.22);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(20, 29, 44, 0.92), rgba(10, 15, 24, 0.92));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+  &[data-placement="hub"],
+  &[data-placement="editor"] {
+    margin: 10px 10px 0;
+  }
+
+  &[data-state="error"] {
+    border-color: rgba(255, 132, 119, 0.34);
+    background: linear-gradient(180deg, rgba(49, 24, 24, 0.94), rgba(20, 12, 14, 0.94));
+  }
+
+  &[data-state="ready"] {
+    border-color: rgba(113, 214, 151, 0.28);
+  }
+`;
+
+const ToolsHydrationCopy = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 12px;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text, #f4f7fa);
+    font-size: 11px;
+    font-weight: 780;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 10px;
+    font-weight: 720;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const ToolsHydrationTrack = styled.div`
+  position: relative;
+  height: 5px;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+`;
+
+const ToolsHydrationFill = styled.div`
+  height: 100%;
+  min-width: 4px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7db0ff, #8fe0aa);
+  transition: width 180ms ease;
 `;
 
 const ToolsMcpPane = styled.div`
@@ -1191,15 +1451,22 @@ const ToolsSectionNav = styled.nav`
   min-width: 0;
   max-width: 100%;
   overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
   padding: 3px;
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
   border-radius: 9px;
   background: rgba(7, 9, 13, 0.56);
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 `;
 
 const ToolsSectionButton = styled.button`
   position: relative;
-  min-height: 26px;
+  flex: 0 0 auto;
+  height: 26px;
   padding: 0 12px;
   border: 0;
   border-radius: 6px;
@@ -1228,14 +1495,13 @@ const ToolsPanel = styled.section`
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
   border-radius: 10px;
   background: rgba(13, 17, 23, 0.6);
-`;
 
-const ToolsPanelTopline = styled.div`
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  &[data-mode="editor"] {
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+    background: rgba(8, 11, 16, 0.72);
+  }
 `;
 
 const ToolsPanelTitle = styled.h3`
@@ -1254,12 +1520,15 @@ const ToolsPanelHint = styled.p`
 const ToolsStatusPill = styled.span`
   display: inline-flex;
   align-items: center;
+  max-width: 100%;
+  overflow: hidden;
   padding: 4px 10px;
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
   border-radius: 999px;
   color: var(--forge-text-soft, #b6c0cc);
   font-size: 10px;
   font-weight: 750;
+  text-overflow: ellipsis;
   white-space: nowrap;
 
   &[data-tone="good"] {
@@ -1277,29 +1546,189 @@ const ToolsStatusPill = styled.span`
   }
 `;
 
-const ToolsSkillsEditor = styled.textarea`
-  width: 100%;
-  min-height: 320px;
-  padding: 12px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
-  border-radius: 8px;
-  color: var(--forge-text, #f4f7fa);
-  background: rgba(7, 9, 13, 0.55);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
-  font-size: 12.5px;
-  line-height: 1.55;
-  resize: vertical;
+const SkillDocumentEditor = styled.div`
+  --skill-editor-desk: linear-gradient(180deg, rgba(12, 16, 24, 0.96), rgba(5, 8, 13, 0.98));
+  --skill-editor-page: #0d1118;
+  --skill-editor-page-border: rgba(230, 236, 245, 0.1);
+  --skill-editor-page-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+  --skill-editor-page-text: #e8edf5;
+  --skill-editor-page-muted: #778396;
+  --skill-editor-page-placeholder: rgba(119, 131, 150, 0.72);
+  --skill-editor-page-rule: rgba(230, 236, 245, 0.08);
 
-  &:focus-visible {
-    outline: 2px solid rgba(125, 176, 255, 0.35);
-    outline-offset: -1px;
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  background: rgba(5, 8, 13, 0.8);
+
+  &[data-page-theme="light"] {
+    --skill-editor-desk: linear-gradient(180deg, #dfe6ef, #cbd5e1);
+    --skill-editor-page: #fffdf8;
+    --skill-editor-page-border: rgba(40, 50, 65, 0.16);
+    --skill-editor-page-shadow: 0 24px 70px rgba(15, 23, 42, 0.22);
+    --skill-editor-page-text: #1c2430;
+    --skill-editor-page-muted: #647084;
+    --skill-editor-page-placeholder: rgba(100, 112, 132, 0.68);
+    --skill-editor-page-rule: rgba(30, 41, 59, 0.14);
   }
 `;
 
-const ToolsPanelActions = styled.div`
+const SkillDocumentToolbar = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  background: rgba(7, 10, 16, 0.76);
+`;
+
+const SkillDocumentToolbarCopy = styled.div`
+  display: grid;
+  flex: 1 1 320px;
+  min-width: 0;
+  gap: 2px;
+`;
+
+const SkillDocumentToolbarControls = styled.div`
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const SkillDocumentThemeSwitch = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  background: rgba(4, 7, 12, 0.78);
+`;
+
+const SkillDocumentThemeButton = styled.button`
+  height: 24px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--forge-text-muted, #7a8493);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 780;
+  cursor: pointer;
+
+  &[data-active="true"] {
+    color: var(--forge-text, #f4f7fa);
+    background: rgba(125, 176, 255, 0.16);
+  }
+
+  &:hover:not([data-active="true"]) {
+    color: var(--forge-text-soft, #b6c0cc);
+  }
+`;
+
+const SkillDocumentCanvas = styled.div`
+  display: grid;
+  justify-items: center;
+  min-width: 0;
+  min-height: 540px;
+  max-height: min(72vh, 780px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: clamp(18px, 3.5vw, 34px);
+  background: var(--skill-editor-desk);
+`;
+
+const SkillDocumentPage = styled.div`
+  display: grid;
+  align-content: start;
+  width: min(780px, 100%);
+  min-height: 900px;
+  padding: clamp(34px, 5vw, 58px) clamp(28px, 6vw, 70px) 64px;
+  border: 1px solid var(--skill-editor-page-border);
+  border-radius: 4px;
+  color: var(--skill-editor-page-text);
+  background: var(--skill-editor-page);
+  box-shadow: var(--skill-editor-page-shadow);
+`;
+
+const SkillDocumentTitleInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  padding: 0 0 7px;
+  border: 0;
+  border-bottom: 1px solid var(--skill-editor-page-rule);
+  color: var(--skill-editor-page-text);
+  background: transparent;
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-size: clamp(24px, 3.2vw, 34px);
+  font-weight: 760;
+  line-height: 1.18;
+  outline: none;
+
+  &::placeholder {
+    color: var(--skill-editor-page-placeholder);
+  }
+`;
+
+const SkillDocumentDescriptionInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  margin-top: 12px;
+  padding: 0 0 18px;
+  border: 0;
+  border-bottom: 1px solid var(--skill-editor-page-rule);
+  color: var(--skill-editor-page-muted);
+  background: transparent;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-weight: 640;
+  line-height: 1.45;
+  outline: none;
+
+  &::placeholder {
+    color: var(--skill-editor-page-placeholder);
+  }
+`;
+
+const ToolsSkillsEditor = styled.textarea`
+  width: 100%;
+  min-width: 0;
+  min-height: 650px;
+  margin-top: 24px;
+  padding: 0;
+  border: 0;
+  color: var(--skill-editor-page-text);
+  background: transparent;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 15px;
+  font-weight: 520;
+  line-height: 1.72;
+  outline: none;
+  resize: none;
+
+  &:focus-visible {
+    box-shadow: inset 3px 0 0 rgba(125, 176, 255, 0.36);
+  }
+
+  &::placeholder {
+    color: var(--skill-editor-page-placeholder);
+  }
+`;
+
+const SkillDocumentActions = styled.div`
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  background: rgba(7, 10, 16, 0.72);
 `;
 
 const ToolsPrimaryButton = styled.button`
@@ -1732,20 +2161,4 @@ const SkillContent = styled.pre`
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-`;
-
-const SkillEditorField = styled.input`
-  width: 100%;
-  padding: 9px 11px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
-  border-radius: 8px;
-  color: var(--forge-text, #f4f7fa);
-  background: rgba(7, 9, 13, 0.55);
-  font-size: 12.5px;
-  font-weight: 650;
-
-  &:focus-visible {
-    outline: 2px solid rgba(125, 176, 255, 0.35);
-    outline-offset: -1px;
-  }
 `;

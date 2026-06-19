@@ -78,17 +78,23 @@ function shortLabel(value, maxLength = 30) {
 function assetLibraryItems(value) {
   const object = jsonObject(value) || {};
   const data = jsonObject(object.data) || object;
+  const direct = jsonArray(data.items).length
+    ? jsonArray(data.items)
+    : jsonArray(data.assets);
+  if (direct.length) return direct;
   const fanout = accountAssetFanoutFromValue(data);
   if (fanout) return jsonArray(fanout.items);
-  return jsonArray(data.items);
+  return direct;
 }
 
 function assetLibraryTransfers(value) {
   const object = jsonObject(value) || {};
   const data = jsonObject(object.data) || object;
+  const direct = jsonArray(data.transfers);
+  if (direct.length) return direct;
   const fanout = accountAssetFanoutFromValue(data);
   if (fanout) return jsonArray(fanout.transfers);
-  return jsonArray(data.transfers);
+  return direct;
 }
 
 function assetLibraryAggregate(value) {
@@ -158,7 +164,22 @@ function assetKind(asset) {
 function assetStatusKind(status) {
   const normalized = text(status).toLowerCase().replace(/[_\s]+/gu, "-");
   if (["cloud-available", "uploaded", "complete", "completed", "ready", "synced"].includes(normalized)) return "done";
-  if (["uploading", "downloading", "prepared", "preparing", "queued", "verifying", "committing", "transferring", "warming-cache", "cache-warming"].includes(normalized)) return "active";
+  if ([
+    "uploading",
+    "upload-queued",
+    "upload-prepared",
+    "download-queued",
+    "download-prepared",
+    "downloading",
+    "prepared",
+    "preparing",
+    "queued",
+    "verifying",
+    "committing",
+    "transferring",
+    "warming-cache",
+    "cache-warming",
+  ].includes(normalized)) return "active";
   if (["failed", "error", "hash-mismatch", "interrupted"].includes(normalized)) return "failed";
   if (["deleted", "cloud-deleted-local-kept"].includes(normalized)) return "cancelled";
   if (["local-only", "local-available", "registered"].includes(normalized)) return "parked";
@@ -364,6 +385,21 @@ function assetDeviceLocalAvailable(device) {
   return ["available", "local-available", "present", "ready", "synced"].includes(status);
 }
 
+function assetCurrentDeviceLocalAvailable(asset, currentDeviceId = "") {
+  const currentId = text(currentDeviceId).toLowerCase();
+  if (!currentId) return false;
+  return assetDeviceRows(asset).some((device) => {
+    if (!assetDeviceLocalAvailable(device)) return false;
+    const id = assetDeviceId(device).toLowerCase();
+    return id === currentId
+      || device?.current
+      || device?.isCurrent
+      || device?.is_current
+      || device?.currentDevice
+      || device?.current_device;
+  });
+}
+
 function assetDeviceUpdatedAt(device) {
   return text(
     device?.updatedAt
@@ -466,6 +502,7 @@ function assetCloudAvailable(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
 }
 
 function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel = "Cloud", currentDeviceId = "") {
+  const hasCurrentDevicePresence = assetCurrentDeviceLocalAvailable(asset, currentDeviceId);
   const hasLocal = assetLocalAvailable(asset);
   const hasCloud = assetCloudAvailable(asset, cloudId);
   const remoteDevices = assetRemoteDevices(asset, currentDeviceId);
@@ -478,6 +515,7 @@ function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel =
   if (!parts.length) {
     return {
       hasCloud,
+      hasCurrentDevicePresence,
       hasLocal,
       hasRemote,
       label: "Unavailable",
@@ -488,6 +526,7 @@ function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel =
   }
   return {
     hasCloud,
+    hasCurrentDevicePresence,
     hasLocal,
     hasRemote,
     label: parts.join(" + "),

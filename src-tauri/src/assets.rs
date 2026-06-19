@@ -892,7 +892,7 @@ fn diffforge_promote_untracked_asset(
         "snip",
     );
     let asset_root = cloud_mcp_managed_asset_root()?;
-    let target_dir = asset_root.join(group).join(&asset_id);
+    let target_dir = asset_root.join(&group).join(&asset_id);
     fs::create_dir_all(&target_dir).map_err(|error| {
         format!(
             "Unable to create tracked asset directory {}: {error}",
@@ -925,6 +925,12 @@ fn diffforge_promote_untracked_asset(
     let metadata = json!({
         "source": "asset_library",
         "sourceKind": "snip",
+        "folder": group,
+        "group": group,
+        "asset_folder": group,
+        "assetFolder": group,
+        "asset_group": group,
+        "assetGroup": group,
         "promoted_from": "untracked_scratch",
         "promotedFrom": "untracked_scratch",
         "promoted_at": now.clone(),
@@ -938,6 +944,10 @@ fn diffforge_promote_untracked_asset(
         "kind": cloud_mcp_asset_kind_for_mime(&mime_type),
         "mime_type": mime_type.clone(),
         "mimeType": mime_type,
+        "folder": group,
+        "group": group,
+        "asset_folder": group,
+        "assetFolder": group,
         "source_kind": "snip",
         "sourceKind": "snip",
         "metadata": metadata,

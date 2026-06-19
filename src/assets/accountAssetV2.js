@@ -186,10 +186,13 @@ export function accountAssetFanoutFromValue(value = {}) {
     });
 
     compactRows(payload, "a").forEach((row) => {
-      const object = compactRowObject(row, cols.a || ["aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut"]);
+      const object = compactRowObject(row, cols.a || ["aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom"]);
       const assetId = text(object?.aid, object?.asset_id, object?.assetId, object?.id);
       if (!assetId) return;
       const blobId = text(object.bid, object.blob_id, object.blobId);
+      const sourceKind = text(object.src, object.source_kind, object.sourceKind, object.source);
+      const folder = text(object.fold, object.asset_folder, object.assetFolder, object.folder, object.group, object.asset_group, object.assetGroup);
+      const docDomain = text(object.dom, object.doc_domain, object.docDomain);
       itemsById.set(assetId, {
         asset_id: assetId,
         assetId: assetId,
@@ -205,6 +208,26 @@ export function accountAssetFanoutFromValue(value = {}) {
         sha256: text(object.sha, object.sha256),
         cloud_status: text(object.st, object.status, object.cloud_status, object.cloudStatus),
         cloudStatus: text(object.st, object.status, object.cloud_status, object.cloudStatus),
+        source_kind: sourceKind,
+        sourceKind,
+        folder,
+        group: folder,
+        asset_folder: folder,
+        assetFolder: folder,
+        asset_group: folder,
+        assetGroup: folder,
+        doc_domain: docDomain,
+        docDomain,
+        metadata: {
+          source_kind: sourceKind,
+          sourceKind,
+          folder,
+          group: folder,
+          asset_folder: folder,
+          assetFolder: folder,
+          doc_domain: docDomain,
+          docDomain,
+        },
         updated_at: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
         updatedAt: compactUpdatedAt(object.ut ?? object.updated_at ?? object.updatedAt),
       });
