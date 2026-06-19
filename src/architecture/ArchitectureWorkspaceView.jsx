@@ -5654,7 +5654,7 @@ function ArchitecturesPanel({
       ? architectureGraphCloudRef(selectedSummary)
       : null;
     const readPromise = hydrateRef
-      ? invoke("cloud_mcp_hydrate_workspace_architecture", {
+      ? invoke("cloud_mcp_hydrate_architecture", {
         refs: [hydrateRef],
         repoPath: selectedRepoPath,
         workspaceId: syncWorkspaceId,
@@ -5664,7 +5664,7 @@ function ArchitecturesPanel({
           scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
         } : {}),
       }).then((result) => {
-        const hydratedGraph = jsonArray(result?.items || result?.graphs)[0];
+        const hydratedGraph = jsonArray(result?.items)[0];
         if (hydratedGraph) return hydratedGraph;
         return invoke("architecture_graph_read", {
           graphId: selectedGraphId,
@@ -5935,7 +5935,7 @@ function ArchitecturesPanel({
         setDraftFolderPath("");
         setSaveState("idle");
         if (syncWorkspaceId) {
-          void invoke("cloud_mcp_sync_workspace_architecture", {
+          void invoke("cloud_mcp_sync_architecture", {
             graph: nextGraph,
             reason: "architecture_graph_create",
             repoPath: selectedRepoPath,
@@ -5969,7 +5969,7 @@ function ArchitecturesPanel({
         setSelectedGraphId(result?.graphId || nextGraph.id);
         setSaveState("idle");
         if (syncWorkspaceId) {
-          void invoke("cloud_mcp_sync_workspace_architecture", {
+          void invoke("cloud_mcp_sync_architecture", {
             graph: nextGraph,
             reason: "architecture_graph_save",
             repoPath: selectedRepoPath,
@@ -5999,7 +5999,7 @@ function ArchitecturesPanel({
     setCreatingGraph(false);
     setSelectedGraphDirty(false);
     if (syncWorkspaceId && nextGraph) {
-      void invoke("cloud_mcp_sync_workspace_architecture", {
+      void invoke("cloud_mcp_sync_architecture", {
         graph: nextGraph,
         reason: "architecture_revision_restore",
         repoPath: selectedRepoPath,

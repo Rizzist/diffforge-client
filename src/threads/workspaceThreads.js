@@ -1358,6 +1358,21 @@ function activityStatusForLatestTurn(latestTurn, fallback = "idle") {
   return normalizeThreadActivityStatus(fallback);
 }
 
+function explicitRuntimeActivityStatus(event = {}, fallback = "") {
+  const rawStatus = cleanText(
+    event.activityStatus
+      || event.activity_status
+      || event.nativeRailState
+      || event.native_rail_state
+      || event.terminalWorkState
+      || event.terminal_work_state,
+  );
+  if (!rawStatus) {
+    return fallback;
+  }
+  return normalizeThreadActivityStatus(rawStatus, fallback);
+}
+
 function providerBindingsHaveNativeSession(providerBindings) {
   return Object.values(providerBindings || {}).some((binding) => (
     Boolean(cleanText(binding?.nativeSessionId))
@@ -3025,10 +3040,7 @@ function normalizeThread(thread, workspaceId, options = {}) {
       && !terminalBinding
       && ["closed", "exited", "idle"].includes(safeStatus)
   );
-  const storedActivityStatus = normalizeThreadActivityStatus(
-    thread.activityStatus,
-    providerBindings[currentAgent]?.activityStatus,
-  );
+  const storedActivityStatus = normalizeThreadActivityStatus("", "idle");
   const activityStatus = options.stripLiveBindings
     ? "idle"
     : orphanRunningThreadState
@@ -4225,13 +4237,14 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     terminalBinding,
     updatedAt: now,
   });
-  const activityStatus = options.incrementMessageCount
-    ? "thinking"
-    : eventType === "opened"
-      ? "idle"
-      : shouldClearOrphanRunning
-        ? "idle"
-        : normalizeThreadActivityStatus(existing.activityStatus, providerBinding?.activityStatus);
+  const runtimeActivityStatus = explicitRuntimeActivityStatus(event, "")
+    || normalizeThreadActivityStatus(
+      activeTerminal?.activityStatus || activeTerminal?.activity_status,
+      "",
+    );
+  const activityStatus = eventType === "opened" || shouldClearOrphanRunning
+    ? "idle"
+    : runtimeActivityStatus || "idle";
   const eventSessionName = cleanThreadLabelCandidate(event.sessionName);
   const eventTitle = eventSessionName
     || getWorkspaceThreadPromptLabel(event.title || event.userMessage, "");
@@ -4935,7 +4948,6 @@ function workspaceThreadHasLiveSessionClaim(thread) {
     normalizeTerminalBinding(thread?.terminalBinding)
       || status === "active"
       || status === "starting"
-      || cleanText(thread?.activityStatus).toLowerCase() === "thinking",
   );
 }
 
@@ -5522,15 +5534,12 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
   const existingThread = entry.threads[threadId] || null;
   const terminalKey = terminalSessionKey(terminalIndex);
   const existingTerminal = terminalKey ? entry.terminals?.[terminalKey] || null : null;
-  const inheritedActivityStatus = normalizeThreadActivityStatus(
-    event.activityStatus
-      || event.activity_status
-      || existingTerminal?.activityStatus
-      || existingTerminal?.activity_status
-      || existingThread?.activityStatus
-      || existingThread?.activity_status,
-    "",
-  );
+  const inheritedActivityStatus = explicitRuntimeActivityStatus(event, "")
+    || normalizeThreadActivityStatus(
+      existingTerminal?.activityStatus
+        || existingTerminal?.activity_status,
+      "",
+    );
   const bindingEvent = {
     ...event,
     activityStatus: inheritedActivityStatus || event.activityStatus,
@@ -5675,10 +5684,9 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
     const terminal = terminals[terminalKey];
     terminals[terminalKey] = normalizeActiveTerminal({
       ...terminal,
-      activityStatus: normalizeThreadActivityStatus(
-        event.activityStatus || event.activity_status,
-        terminal.activityStatus || providerBindings[agentId]?.activityStatus || existing.activityStatus,
-      ),
+      activityStatus: explicitRuntimeActivityStatus(event, "")
+        || normalizeThreadActivityStatus(terminal.activityStatus || terminal.activity_status, "")
+        || "idle",
       agentId,
       agentDisplayName: event.agentDisplayName || event.agent_display_name || terminal.agentDisplayName,
       agentType: event.agentType || event.agent_type || terminal.agentType,
@@ -6055,7 +6063,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const pendingPrompt = CLOSED_THREAD_TURN_STATES.has(latestTurn?.state)
     ? null
     : lifecycleExisting.pendingPrompt || existing.pendingPrompt;
-  const activityStatus = activityStatusForLatestTurn(latestTurn, lifecycleExisting.activityStatus);
+  const activityStatus = activityStatusForLatestTurn(latestTurn, "idle");
   const lastMessageAt = messages.length
     ? messages[messages.length - 1].createdAt
     : existing.lastMessageAt;
@@ -6169,7 +6177,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       ? "error"
       : eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted"
         ? "idle"
-        : activityStatusForLatestTurn(latestTurn, existing.activityStatus);
+        : activityStatusForLatestTurn(latestTurn, "idle");
   const existingProviderBindingForAgent = normalizeProviderBinding(existing.providerBindings?.[agentId], agentId, {
     activityStatus: existing.activityStatus,
     coordination: existing.coordination,
@@ -6346,11 +6354,20 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   const { currentState, entry, existing } = target;
 
   const now = nowIso();
-  const hasExplicitActivityStatus = cleanText(event.activityStatus) !== "";
-  const activityStatus = hasExplicitActivityStatus
-    ? normalizeThreadActivityStatus(event.activityStatus)
-    : activityStatusForLatestTurn(existing.latestTurn, existing.activityStatus);
   const eventType = cleanText(event.type).toLowerCase();
+  const explicitActivityStatus = explicitRuntimeActivityStatus(event, "");
+  const activityStatus = explicitActivityStatus || (
+    eventType === "agent-output"
+      || eventType === "provider-user-prompt-started"
+      || eventType === "provider-tool-started"
+      || eventType === "provider-subagent-started"
+      ? "thinking"
+      : eventType === "provider-turn-error"
+        ? "error"
+        : eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted"
+          ? "idle"
+          : "idle"
+  );
   const providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,

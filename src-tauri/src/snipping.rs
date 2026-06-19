@@ -79,6 +79,10 @@ const SNIPPING_MACOS_KEY_4: i64 = 21;
 const SNIPPING_MACOS_KEY_5: i64 = 23;
 #[cfg(target_os = "macos")]
 const SNIPPING_AREA_REASSERT_DELAYS_MS: [u64; 6] = [0, 120, 280, 700, 1_600, 3_000];
+#[cfg(target_os = "macos")]
+const SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS: u64 = 50;
+#[cfg(target_os = "macos")]
+const SNIPPING_AREA_CURSOR_GUARD_DURATION_MS: u64 = 5_000;
 
 // CGPreflightScreenCaptureAccess caches its result per process and is known to
 // keep reporting false after the user grants Screen Recording while the app is
@@ -5907,8 +5911,9 @@ static SNIPPING_AREA_REASSERT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// A Space swipe can finish before AppKit/WebKit are done restoring cursor
 /// ownership. Reassert from the event that changed the Space, then a few more
-/// one-shot ticks during the transition window. This is event-triggered, not a
-/// continuous cursor poll.
+/// one-shot ticks during the transition window. A short high-cadence guard runs
+/// for the same generation because fullscreen Space animations can steal cursor
+/// ownership without producing mouse-move/cursor-update events.
 #[cfg(target_os = "macos")]
 fn snipping_schedule_area_overlay_reassertions(app: &AppHandle, reason: &'static str) {
     if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
@@ -5928,6 +5933,29 @@ fn snipping_schedule_area_overlay_reassertions(app: &AppHandle, reason: &'static
             "context": snipping_macos_cursor_context_debug_value(),
         }),
     );
+
+    let app_for_guard = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut elapsed_ms = 0;
+        while elapsed_ms <= SNIPPING_AREA_CURSOR_GUARD_DURATION_MS {
+            if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                break;
+            }
+            if SNIPPING_AREA_REASSERT_GENERATION.load(Ordering::Acquire) != generation {
+                break;
+            }
+            let app_for_main = app_for_guard.clone();
+            let _ = app_for_guard.run_on_main_thread(move || {
+                snipping_force_area_crosshair_for_visible_overlays(
+                    &app_for_main,
+                    reason,
+                    false,
+                );
+            });
+            sleep(Duration::from_millis(SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS)).await;
+            elapsed_ms += SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS;
+        }
+    });
 
     for delay_ms in SNIPPING_AREA_REASSERT_DELAYS_MS {
         let app = app.clone();

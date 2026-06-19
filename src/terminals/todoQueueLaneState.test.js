@@ -589,6 +589,101 @@ test("exact transcript completion does not release while the terminal is not rea
   assert.equal(evaluation.releaseReason, "");
 });
 
+test("stale provider state cannot hide an unavailable Rust terminal", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "",
+    effectiveLatestTurnState: "running",
+    liveTerminal: null,
+    providerBinding: {
+      activityStatus: "thinking",
+      inputReady: false,
+      nativeSessionId: "session-1",
+      status: "active",
+    },
+    terminalGroundTruth: {
+      agentInputReady: false,
+      completedTurnLooksSendable: false,
+      effectiveActivityStatus: "",
+      effectiveLatestTurnState: "running",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    terminalStatus: "",
+    targetThread: {
+      activityStatus: "thinking",
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      status: "active",
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.terminalUnavailable, true);
+  assert.equal(evaluation.terminalPaused, false);
+  assert.equal(evaluation.releaseReason, "terminal_unavailable");
+});
+
+test("stale thread and provider activity cannot pause an idle Rust lane", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "idle",
+    effectiveLatestTurnState: "completed",
+    liveTerminal: {
+      activityStatus: "idle",
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:34:53.775Z",
+      instanceId: 4,
+      status: "active",
+      threadId: "thread-1",
+    },
+    providerBinding: {
+      activityStatus: "prompting_user",
+      inputReady: false,
+      nativeSessionId: "session-1",
+      status: "active",
+    },
+    terminalGroundTruth: {
+      agentInputReady: true,
+      completedTurnLooksSendable: true,
+      effectiveActivityStatus: "idle",
+      effectiveLatestTurnState: "completed",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: true,
+    },
+    targetThread: {
+      activityStatus: "prompting_user",
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.terminalPaused, false);
+  assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
 test("idle terminal status can release an accepted completed queued prompt", () => {
   const evaluation = baseEvaluation({
     liveTerminal: {

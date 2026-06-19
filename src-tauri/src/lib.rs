@@ -4077,6 +4077,23 @@ fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     {
         return true;
     }
+    if entry
+        .get("deleted")
+        .or_else(|| entry.get("removed"))
+        .or_else(|| entry.get("tombstoned"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if entry
+        .get("current")
+        .and_then(Value::as_bool)
+        .map(|current| !current)
+        .unwrap_or(false)
+    {
+        return true;
+    }
     if local_workspace_catalog_text(entry, &["deletedAt", "deleted_at"]).is_some() {
         return true;
     }
@@ -4125,6 +4142,55 @@ pub(crate) fn local_workspace_catalog_apply_cloud_merge(
     }
     next_items.extend(cloud_by_id.into_values());
     local_workspace_catalog_write_items(app, scope_key, &next_items)
+}
+
+/// Applies one server-authoritative catalog delta without requiring a full list
+/// refresh. Full-list merges remain available for bootstrap/reconnect.
+pub(crate) fn local_workspace_catalog_apply_cloud_delta(
+    app: &AppHandle,
+    scope_key: &str,
+    cloud_entry: &Value,
+) -> Result<(), String> {
+    let workspace_id =
+        local_workspace_catalog_text(cloud_entry, &["workspace_id", "workspaceId", "id"])
+            .ok_or_else(|| "Workspace catalog delta requires a workspace id.".to_string())?;
+    if local_workspace_catalog_entry_is_deleted(cloud_entry) {
+        let mut items = local_workspace_catalog_read_items(app, scope_key)?;
+        items.retain(|item| {
+            local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"])
+                .map(|id| id != workspace_id)
+                .unwrap_or(true)
+        });
+        return local_workspace_catalog_write_items(app, scope_key, &items);
+    }
+
+    let Some(cloud_row) = local_workspace_catalog_normalize_cloud_entry(cloud_entry) else {
+        return Ok(());
+    };
+    let cloud_updated = cloud_row["updatedAt"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mut items = local_workspace_catalog_read_items(app, scope_key)?;
+    let mut found = false;
+    for item in items.iter_mut() {
+        let item_id = local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]);
+        if item_id.as_deref() != Some(workspace_id.as_str()) {
+            continue;
+        }
+        found = true;
+        let sync_state = local_workspace_catalog_text(item, &["syncState"]).unwrap_or_default();
+        let local_pending = sync_state == "pending" || sync_state == "error";
+        let local_updated = local_workspace_catalog_text(item, &["updatedAt"]).unwrap_or_default();
+        if local_pending && local_updated.as_str() > cloud_updated.as_str() {
+            continue;
+        }
+        *item = cloud_row.clone();
+    }
+    if !found {
+        items.push(cloud_row);
+    }
+    local_workspace_catalog_write_items(app, scope_key, &items)
 }
 
 /// Rust-owned app-local state files (app-data/app-state/<key>.json). These
@@ -4660,7 +4726,7 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
-            cloud_mcp_start_architecture_headless_watcher(
+            cloud_mcp_start_architecture_event_sync(
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
@@ -4935,12 +5001,11 @@ pub fn run() {
             cloud_mcp_sync_device_live_app_context,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_update_voice_plan_steps,
-            cloud_mcp_get_workspace_architectures,
-            cloud_mcp_sync_workspace_architectures,
-            cloud_mcp_list_account_architectures,
+            cloud_mcp_get_architectures,
+            cloud_mcp_sync_architectures,
             cloud_mcp_architecture_hub_catalog,
-            cloud_mcp_sync_workspace_architecture,
-            cloud_mcp_hydrate_workspace_architecture,
+            cloud_mcp_sync_architecture,
+            cloud_mcp_hydrate_architecture,
             cloud_mcp_list_account_assets,
             cloud_mcp_list_asset_clouds,
             cloud_mcp_save_asset_cloud,
@@ -5000,10 +5065,10 @@ pub fn run() {
             diffforge_copy_image_data_url_to_clipboard,
             diffforge_untrack_account_asset,
             diffforge_promote_untracked_asset,
-            cloud_mcp_sync_workspace_todos,
             cloud_mcp_archive_workspace_todos,
             cloud_mcp_request_workspace_todo_dispatch,
             cloud_mcp_record_todo_dispatch_status,
+            cloud_mcp_commit_workspace_todo_sync,
             cloud_mcp_get_activity,
             cloud_mcp_hydrate_workspace_todos,
             agent_thread_session_discover,

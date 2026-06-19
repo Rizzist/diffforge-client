@@ -364,7 +364,7 @@ test("session transcript completion cannot settle a running turn without termina
   const nextThread = nextState[workspaceId].threads[threadId];
   assert.equal(nextThread.latestTurn.state, "running");
   assert.equal(nextThread.latestTurn.promptEpoch, 7);
-  assert.equal(nextThread.activityStatus, "thinking");
+  assert.equal(nextThread.activityStatus, "idle");
   assert.equal(nextThread.providerBindings.codex.inputReady, false);
   assert.equal(
     nextThread.projectionEvents.some((event) => (
@@ -496,8 +496,8 @@ test("transcript hydration preserves a live running turn over stale completed pr
   const nextThread = nextState[workspaceId].threads[threadId];
   assert.equal(nextThread.latestTurn.state, "running");
   assert.equal(nextThread.latestTurn.promptEpoch, 9);
-  assert.equal(nextThread.activityStatus, "thinking");
-  assert.equal(nextThread.providerBindings.codex.activityStatus, "thinking");
+  assert.equal(nextThread.activityStatus, "idle");
+  assert.equal(nextThread.providerBindings.codex.activityStatus, "idle");
 });
 
 test("normalization clears orphan running turn with stale message count only", () => {
@@ -676,7 +676,7 @@ test("session transcript acceptance preserves a locally pending submitted prompt
   const acceptedThread = accepted[workspaceId].threads[threadId];
   assert.equal(acceptedThread.pendingPrompt.id, promptId);
   assert.equal(acceptedThread.latestTurn.state, "running");
-  assert.equal(acceptedThread.activityStatus, "thinking");
+  assert.equal(acceptedThread.activityStatus, "idle");
 });
 
 test("accepted provider session attaches to a previously submitted prompt for resume", () => {
@@ -1498,7 +1498,7 @@ test("session transcript completion does not settle running turn for a later pro
 
   const hydratedThread = hydrated[workspaceId].threads[threadId];
   assert.equal(hydratedThread.latestTurn.state, "running");
-  assert.equal(hydratedThread.activityStatus, "thinking");
+  assert.equal(hydratedThread.activityStatus, "idle");
 });
 
 test("terminal hook activity preserves agent display identity", () => {

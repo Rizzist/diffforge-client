@@ -8,7 +8,6 @@ import { Search } from "@styled-icons/material-rounded/Search";
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
-import { terminalActivityStatusIsBusy } from "../terminals/terminalActivityState.js";
 import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import { getThreadTerminalGroundTruth } from "./threadTerminalGroundTruth.js";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
@@ -28,20 +27,6 @@ const THREAD_VIEW_STATE = {
   DETACHED_SESSION: "detached-session",
   INACTIVE_NO_SESSION: "inactive-no-session",
 };
-const THREAD_ACTIVITY_LINE_STATES = new Set([
-  "implementing",
-  "pending",
-  "queued",
-  "reasoning",
-  "resume_requested",
-  "resumed",
-  "running",
-  "starting",
-  "submitted",
-  "thinking",
-  "working",
-]);
-
 const overlayFadeIn = keyframes`
   from {
     opacity: 0;
@@ -1189,64 +1174,6 @@ function terminalMatchesThreadBinding(terminal, terminalBinding) {
   return terminalIndexMatches && instanceMatches && paneMatches;
 }
 
-function normalizeThreadActivityLineText(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s-]+/g, "_");
-}
-
-function valueLooksLikeWorkingThreadState(value) {
-  const normalized = normalizeThreadActivityLineText(value);
-  return Boolean(
-    normalized
-      && (
-        terminalActivityStatusIsBusy(normalized)
-        || THREAD_ACTIVITY_LINE_STATES.has(normalized)
-      )
-  );
-}
-
-function getThreadIsWorking({
-  isActiveTerminal = false,
-  mappedTerminal = null,
-  providerBinding = null,
-  thread = null,
-  turnState = "",
-} = {}) {
-  const providerLooksBusy = Boolean(
-    valueLooksLikeWorkingThreadState(providerBinding?.activityStatus)
-      || valueLooksLikeWorkingThreadState(providerBinding?.commandPhase || providerBinding?.command_phase)
-      || valueLooksLikeWorkingThreadState(providerBinding?.executionPhase || providerBinding?.execution_phase)
-      || valueLooksLikeWorkingThreadState(providerBinding?.status)
-      || valueLooksLikeWorkingThreadState(providerBinding?.turnStatus || providerBinding?.turn_status)
-  );
-  const terminalLooksBusy = Boolean(
-    valueLooksLikeWorkingThreadState(mappedTerminal?.activityStatus || mappedTerminal?.activity_status)
-      || valueLooksLikeWorkingThreadState(mappedTerminal?.commandPhase || mappedTerminal?.command_phase)
-      || valueLooksLikeWorkingThreadState(mappedTerminal?.executionPhase || mappedTerminal?.execution_phase)
-      || valueLooksLikeWorkingThreadState(mappedTerminal?.nativeRailState || mappedTerminal?.native_rail_state)
-      || valueLooksLikeWorkingThreadState(mappedTerminal?.turnStatus || mappedTerminal?.turn_status)
-      || valueLooksLikeWorkingThreadState(mappedTerminal?.status)
-  );
-  const lifecycleLooksBusy = Boolean(
-    turnState === "running"
-      || thread?.pendingPrompt
-      || valueLooksLikeWorkingThreadState(thread?.latestTurn?.state || thread?.latestTurn?.status)
-  );
-  const threadLooksBusy = Boolean(
-    valueLooksLikeWorkingThreadState(thread?.activityStatus)
-      || valueLooksLikeWorkingThreadState(thread?.status)
-  );
-  return Boolean(
-    isActiveTerminal
-      && (providerLooksBusy
-      || terminalLooksBusy
-      || lifecycleLooksBusy
-      || threadLooksBusy)
-  );
-}
-
 function getThreadState(thread, entry) {
   const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
   const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
@@ -1288,13 +1215,7 @@ function getThreadState(thread, entry) {
       ? false
       : liveGroundTruthWorkState === "running" || liveGroundTruthWorkState === "prompting_user"
         ? true
-        : getThreadIsWorking({
-          isActiveTerminal,
-          mappedTerminal,
-          providerBinding,
-          thread,
-          turnState: terminalGroundTruth?.effectiveLatestTurnState || turnState,
-        });
+        : false;
   const effectiveTurnState = terminalGroundTruth?.effectiveLatestTurnState || turnState;
   const dotState = isActiveTerminal
     ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()

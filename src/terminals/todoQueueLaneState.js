@@ -234,16 +234,12 @@ export function evaluateTodoQueueInFlightPrompt({
       ),
   );
   const terminalInputReadyAtMs = parseTimestampMs(
-    liveTerminal?.inputReadyAt
-      || providerBinding?.inputReadyAt
-      || "",
+    liveTerminal?.inputReadyAt || "",
   );
-  const terminalInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
+  const terminalInputReady = Boolean(liveTerminal?.inputReady);
   const normalizedTerminalStatus = normalizeTurnState(
     terminalStatus
       || liveTerminal?.status
-      || providerBinding?.status
-      || targetThread?.status
       || "",
   );
   const terminalClosed = Boolean(
@@ -253,7 +249,6 @@ export function evaluateTodoQueueInFlightPrompt({
   const terminalUnavailable = Boolean(
     submittedAtMs
       && !liveTerminal
-      && !providerBinding
   );
   const freshInputReady = Boolean(
     terminalInputReady
@@ -266,10 +261,6 @@ export function evaluateTodoQueueInFlightPrompt({
       || liveTerminal?.prompt_event_id
       || liveTerminal?.pendingPromptId
       || liveTerminal?.pending_prompt_id
-      || providerBinding?.promptEventId
-      || providerBinding?.prompt_event_id
-      || providerBinding?.pendingPromptId
-      || providerBinding?.pending_prompt_id
       || terminalGroundTruth?.promptEventId
       || terminalGroundTruth?.pendingPromptId
       || "",
@@ -290,8 +281,6 @@ export function evaluateTodoQueueInFlightPrompt({
   const normalizedActivityStatus = normalizeTurnState(
     effectiveActivityStatus
       || terminalGroundTruth?.effectiveActivityStatus
-      || targetThread?.activityStatus
-      || providerBinding?.activityStatus
       || liveTerminal?.activityStatus
       || liveTerminal?.activity_status
       || "",
@@ -431,6 +420,7 @@ export function evaluateTodoQueueInFlightPrompt({
     terminalInputReady,
     terminalInputReadyAtMs,
     terminalInstanceChanged,
+    terminalPaused,
     terminalReadinessMatchesPrompt,
     terminalReadinessPromptId,
     terminalReadinessPromptMatches,

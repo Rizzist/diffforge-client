@@ -39,6 +39,94 @@ function getErrorMessage(error, fallback) {
   return error?.message || String(error || fallback || "Something went wrong.");
 }
 
+function accountToolsEventCandidates(payload) {
+  return [
+    payload,
+    payload?.payload,
+    payload?.data,
+    payload?.event,
+    payload?.payload?.payload,
+    payload?.payload?.data,
+    payload?.data?.payload,
+  ];
+}
+
+function accountToolsEventHasKnownPayload(payload) {
+  return accountToolsEventCandidates(payload).some((candidate) => (
+    candidate
+      && typeof candidate === "object"
+      && !Array.isArray(candidate)
+      && (
+        candidate.contract === "diffforge.account_skills.v1"
+        || candidate.contract === "diffforge.account_clis.v1"
+        || candidate.contract === "diffforge.account_mcps.v1"
+        || candidate.kind === "account_skill_changed"
+        || candidate.kind === "account_cli_changed"
+        || candidate.kind === "account_mcp_changed"
+        || candidate.event_kind === "account_skill_changed"
+        || candidate.eventKind === "account_skill_changed"
+        || candidate.skill
+        || candidate.skill_units
+        || candidate.skillUnits
+        || candidate.delta === true
+        || candidate.skills
+        || candidate.clis
+        || candidate.mcps
+        || candidate.servers
+      )
+  ));
+}
+
+function accountToolsSkillsFromEventPayload(payload) {
+  const candidates = accountToolsEventCandidates(payload);
+  for (const candidate of candidates) {
+    const skills = candidate?.skills || candidate?.account_skills || candidate?.accountSkills;
+    if (skills?.skills_md != null || skills?.skillsMd != null) {
+      return skills;
+    }
+  }
+  return null;
+}
+
+function accountToolsSkillUnitFromEventPayload(payload) {
+  const candidates = accountToolsEventCandidates(payload);
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const contract = candidate.contract;
+    const kind = candidate.kind || candidate.event_kind || candidate.eventKind;
+    const skill = candidate.skill || candidate.account_skill || candidate.accountSkill;
+    if (skill && typeof skill === "object" && !Array.isArray(skill)) {
+      return skill;
+    }
+    const units = candidate.skill_units || candidate.skillUnits;
+    if (Array.isArray(units) && units.length) {
+      return units[0];
+    }
+    if (contract === "diffforge.account_skills.v1" || kind === "account_skill_changed") {
+      const nested = candidate.payload?.skill || candidate.data?.skill;
+      if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+        return nested;
+      }
+    }
+  }
+  return null;
+}
+
+function skillFromUnit(unit) {
+  const id = text(unit?.skill_id || unit?.skillId || unit?.id);
+  if (!id) return null;
+  return {
+    content: String(unit?.content_md ?? unit?.contentMd ?? unit?.content ?? ""),
+    description: text(unit?.description || unit?.summary),
+    icon: text(unit?.icon),
+    id,
+    source: text(unit?.source, "custom"),
+    title: text(unit?.title || unit?.name || unit?.label, id),
+    tone: text(unit?.tone),
+    updatedAt: text(unit?.updated_at || unit?.updatedAt),
+  };
+}
+
 function timeAgo(value) {
   const at = Date.parse(String(value || ""));
   const ms = Number.isFinite(at) ? at : Number(value) * 1000;
@@ -64,6 +152,21 @@ function cliSnapshotFromStatuses(statuses) {
     updateAvailable: Boolean(status?.npmUpdateAvailable || status?.npm_update_available),
     activeModel: text(status?.activeModel || status?.active_model),
   }));
+}
+
+function skillUnitsForSync(skills) {
+  return (Array.isArray(skills) ? skills : []).map((skill) => ({
+    skillId: text(skill?.id),
+    id: text(skill?.id),
+    title: text(skill?.title, "Untitled skill"),
+    description: text(skill?.description),
+    contentMd: String(skill?.content || "").trim(),
+    content: String(skill?.content || "").trim(),
+    icon: text(skill?.icon),
+    source: text(skill?.source, "custom"),
+    tone: text(skill?.tone),
+    updatedAt: text(skill?.updatedAt),
+  })).filter((skill) => skill.id && skill.title);
 }
 
 function SkillIconGlyph({ icon, title }) {
@@ -248,11 +351,63 @@ export default function ToolsWorkspaceView({
   useEffect(() => {
     let disposed = false;
     let unlisten = null;
-    void listen("cloud-mcp-account-tools-updated", () => {
+    void listen("cloud-mcp-account-tools-updated", (event) => {
       if (disposed) {
         return;
       }
-      void loadAccountTools();
+      const skills = accountToolsSkillsFromEventPayload(event?.payload);
+      if (skills) {
+        const skillsMd = text(skills.skills_md ?? skills.skillsMd, "");
+        setSkillsLibrary(parseSkillsLibrary(skillsMd));
+        noteAccountSkillsMarkdown(skillsMd);
+        setSkillsRevision(
+          Number.isFinite(Number(skills.revision)) && skills.revision !== null
+            ? Number(skills.revision)
+            : null,
+        );
+        setSkillsMeta({
+          updatedAt: text(skills.updated_at || skills.updatedAt),
+          updatedBy: text(skills.updated_by_device_name || skills.updatedByDeviceName),
+          offline: false,
+        });
+        setSkillsState("ready");
+        setSkillsError("");
+        return;
+      }
+      const skillUnit = accountToolsSkillUnitFromEventPayload(event?.payload);
+      const skill = skillFromUnit(skillUnit);
+      if (skill) {
+        const removed = skillUnit?.deleted === true
+          || skillUnit?.current === false
+          || skillUnit?.tombstoned === true;
+        setSkillsLibrary((current) => {
+          const nextSkills = removed
+            ? current.skills.filter((entry) => entry.id !== skill.id)
+            : [
+              ...current.skills.filter((entry) => entry.id !== skill.id),
+              skill,
+            ].sort((left, right) => left.title.localeCompare(right.title));
+          const nextLibrary = { preamble: current.preamble, skills: nextSkills };
+          noteAccountSkillsMarkdown(serializeSkillsLibrary(nextLibrary.skills, nextLibrary.preamble));
+          return nextLibrary;
+        });
+        setSkillsRevision(
+          Number.isFinite(Number(skillUnit?.revision)) && skillUnit?.revision !== null
+            ? Number(skillUnit.revision)
+            : skillsRevision,
+        );
+        setSkillsMeta((current) => ({
+          ...current,
+          updatedAt: text(skillUnit?.updated_at || skillUnit?.updatedAt, current.updatedAt),
+          offline: false,
+        }));
+        setSkillsState("ready");
+        setSkillsError("");
+        return;
+      }
+      if (!accountToolsEventHasKnownPayload(event?.payload)) {
+        void loadAccountTools();
+      }
     }).then((dispose) => {
       if (disposed) {
         dispose();
@@ -266,7 +421,7 @@ export default function ToolsWorkspaceView({
         unlisten();
       }
     };
-  }, [loadAccountTools]);
+  }, [loadAccountTools, skillsRevision]);
 
   // The Rust inventory watcher reports CLI installs/updates made outside the
   // app (terminals, remote levers, background mode); apply them live.
@@ -313,6 +468,7 @@ export default function ToolsWorkspaceView({
       const result = await invoke("cloud_mcp_save_account_skills", {
         skillsMd: serializedSkillsMd,
         baseRevision: skillsRevision,
+        skillUnits: skillUnitsForSync(nextLibrary.skills),
       });
       setSkillsRevision(
         Number.isFinite(Number(result?.revision)) ? Number(result.revision) : skillsRevision,

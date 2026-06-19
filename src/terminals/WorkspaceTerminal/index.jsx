@@ -2109,7 +2109,7 @@ function WorkspaceTerminal({
   const terminalThreadId = thread?.id || "";
   const terminalThreadSlotKey = thread?.slotKey
     || String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
-  const terminalThreadActivityStatus = thread?.activityStatus || "idle";
+  const terminalThreadActivityStatus = "idle";
   const terminalThreadIdRef = useRef(terminalThreadId);
   const terminalThreadSlotKeyRef = useRef(terminalThreadSlotKey);
   const terminalThreadActivityStatusRef = useRef(terminalThreadActivityStatus);
@@ -14210,14 +14210,23 @@ function WorkspaceTerminal({
       ? String(threadComposerDraftsRef.current.get(syncKey) || "")
       : "";
     const submitSequence = getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal);
-    const draftTransaction = syncKey
+    const shouldUseBackendHookSubmit = Boolean(
+      terminalUsesActivityHooks
+        && !isGenericTerminal
+        && submitSequence
+        && paneId
+        && terminalInstanceIdRef.current
+    );
+    const draftTransaction = syncKey && !shouldUseBackendHookSubmit
       ? setThreadComposerDraftValue(syncKey, prompt, "native_drop_submit_sync")
       : null;
-    const syncData = buildTerminalComposerDraftInput(previousDraft, prompt, true);
+    const syncData = shouldUseBackendHookSubmit
+      ? ""
+      : buildTerminalComposerDraftInput(previousDraft, prompt, true);
     let submittedWaiter = null;
 
     try {
-      submittedWaiter = submitSequence
+      submittedWaiter = submitSequence && !shouldUseBackendHookSubmit
         ? await createTerminalPromptSubmittedWaiter({
           allowObservedInputGateForHookManaged: true,
           agentId: terminalAgentKind,
@@ -14230,18 +14239,49 @@ function WorkspaceTerminal({
           workspaceId: workspace?.id || "",
         })
         : null;
-      await invoke("terminal_write", {
-        paneId,
-        instanceId: terminalInstanceIdRef.current || undefined,
-        data: `${syncData}${submitSequence}` || prompt,
-        promptEventId: submitSequence ? promptEventId : undefined,
-        promptEventSource: submitSequence ? "native-drop" : undefined,
-        promptEventSubmittedAt: submitSequence ? promptEventSubmittedAt : undefined,
-        promptEventText: submitSequence ? prompt : undefined,
-        threadId: terminalThreadIdRef.current,
-      });
+      if (shouldUseBackendHookSubmit) {
+        await invoke("todo_dispatch_backend_submit_now", {
+          item: {
+            id: promptEventId,
+            promptEventId,
+            status: "queued",
+            targetAgentId: terminalAgentKind,
+            targetTerminalId: paneId,
+            targetTerminalIndex: terminalIndex,
+            targetThreadId: terminalThreadIdRef.current || "",
+            text: prompt,
+            todoStatus: "queued",
+            workspaceId: workspace?.id || "",
+          },
+          promptEventId,
+          target: {
+            agentId: terminalAgentKind,
+            agentKind: terminalAgentKind,
+            instanceId: terminalInstanceIdRef.current || undefined,
+            paneId,
+            terminalIndex,
+            threadId: terminalThreadIdRef.current || "",
+            workspaceId: workspace?.id || "",
+            workspaceName: workspace?.name || "",
+          },
+          workspaceId: workspace?.id || "",
+        });
+      } else {
+        await invoke("terminal_write", {
+          paneId,
+          instanceId: terminalInstanceIdRef.current || undefined,
+          data: `${syncData}${submitSequence}` || prompt,
+          promptEventId: submitSequence ? promptEventId : undefined,
+          promptEventSource: submitSequence ? "native-drop" : undefined,
+          promptEventSubmittedAt: submitSequence ? promptEventSubmittedAt : undefined,
+          promptEventText: submitSequence ? prompt : undefined,
+          threadId: terminalThreadIdRef.current,
+        });
+      }
       if (submittedWaiter) {
         await submittedWaiter.promise;
+      }
+      if (submittedWaiter || shouldUseBackendHookSubmit) {
         recordSubmittedAgentMessage(terminalInstanceIdRef.current || 0, prompt, {
           messageCreatedAt: promptEventSubmittedAt,
           messageId: promptEventId,
@@ -14250,7 +14290,7 @@ function WorkspaceTerminal({
           source: "native-drop",
           turnId: `turn-${promptEventId}`,
         });
-        if (syncKey) {
+        if (syncKey && !shouldUseBackendHookSubmit) {
           clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
             expectedValue: prompt,
             source: "native_drop_submit_observed_clear",
@@ -14339,7 +14379,9 @@ function WorkspaceTerminal({
     terminalClosed,
     terminalClosing,
     terminalIndex,
+    terminalUsesActivityHooks,
     workspace?.id,
+    workspace?.name,
   ]);
 
   const terminalComposerSyncKey = getCurrentThreadComposerSyncKey();
@@ -14782,7 +14824,7 @@ function WorkspaceTerminal({
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
   const terminalStateDebugLabel = formatTerminalNativeRailLabel(resolveTerminalNativeRailState({
-    activityStatus: terminalRuntimeActivityStatus || terminalThreadActivityStatus,
+    activityStatus: terminalRuntimeActivityStatus || "idle",
     parked: Boolean(parkedPrompt),
     terminalState,
   }));
@@ -15117,10 +15159,10 @@ function WorkspaceTerminal({
             <ButtonSplitVerticalIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
-            aria-label={isFullscreen ? "Exit terminal fullscreen" : "Open terminal threads"}
+            aria-label={isFullscreen ? "Restore terminal" : "Maximize terminal"}
             disabled={terminalClosed || terminalClosing}
             onClick={toggleTerminalFullscreen}
-            title={isFullscreen ? "Exit fullscreen" : "Open terminal threads"}
+            title={isFullscreen ? "Restore terminal" : "Maximize terminal"}
             type="button"
           >
             {isFullscreen ? (

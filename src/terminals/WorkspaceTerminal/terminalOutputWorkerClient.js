@@ -17,6 +17,10 @@ function terminalOutputTransportEndpoint() {
   return outputTransportEndpointPromise;
 }
 
+function resetTerminalOutputTransportEndpoint() {
+  outputTransportEndpointPromise = null;
+}
+
 function settleTransportHandshake(id, ok, payload = {}) {
   const handshake = transportHandshakes.get(id);
   if (!handshake) {
@@ -57,11 +61,13 @@ function createWorker() {
       return;
     }
     if (message.type === "transport-error") {
+      resetTerminalOutputTransportEndpoint();
       transportStatusCallbacks.get(message.id)?.(message);
       settleTransportHandshake(message.id, false, message);
       return;
     }
     if (message.type === "transport-closed") {
+      resetTerminalOutputTransportEndpoint();
       transportStatusCallbacks.get(message.id)?.(message);
       settleTransportHandshake(message.id, false, {
         error: "Terminal output transport socket closed.",
@@ -220,6 +226,7 @@ export function createTerminalOutputWorkerSession(options = {}) {
         })
       )).catch((error) => {
         transportHandshakes.delete(id);
+        resetTerminalOutputTransportEndpoint();
         throw error;
       });
 

@@ -26,7 +26,7 @@ test("null terminal prompt sources are treated as idle", () => {
   assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), false);
 });
 
-test("active lifecycle status keeps a stale completed turn working", () => {
+test("stale thread thinking cannot make a Rust-idle completed turn working", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       inputReady: false,
@@ -39,6 +39,38 @@ test("active lifecycle status keeps a stale completed turn working", () => {
     targetRole: "codex",
     thread: {
       activityStatus: "thinking",
+      latestTurn: {
+        state: "completed",
+      },
+      messageCount: 1,
+      messages: [{ role: "user", text: "summarize the repo" }],
+      projectionEvents: [{ type: "thread.message.user" }],
+    },
+  });
+
+  assert.equal(groundTruth.completedTurnLooksStaleActive, false);
+  assert.equal(groundTruth.effectiveActivityStatus, "idle");
+  assert.equal(groundTruth.effectiveLatestTurnState, "completed");
+  assert.equal(groundTruth.terminalWorkState, "complete");
+  assert.equal(groundTruth.terminalIsComplete, true);
+  assert.equal(groundTruth.agentInputReady, true);
+});
+
+test("Rust thinking status keeps a stale completed turn working", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      activityStatus: "thinking",
+      inputReady: false,
+      status: "active",
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: false,
+      status: "active",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
       latestTurn: {
         state: "completed",
       },
@@ -408,6 +440,48 @@ test("idle hook-managed runtime settles a restored running turn without input-re
   assert.equal(groundTruth.terminalWorkState, "complete");
 });
 
+test("stale hook-managed running turn without Rust runtime is not working", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: null,
+    providerBinding: {
+      activityStatus: "thinking",
+      nativeSessionId: "claude-session-1",
+      status: "active",
+    },
+    targetRole: "claude",
+    thread: {
+      activityStatus: "thinking",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "running",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "tell me about claude" },
+        { role: "assistant", text: "Great! What do you want to build or fix?" },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+      providerBindings: {
+        claude: {
+          activityStatus: "thinking",
+          nativeSessionId: "claude-session-1",
+        },
+      },
+      transcriptSessionId: "claude-session-1",
+    },
+  });
+
+  assert.equal(groundTruth.staleRunningWithoutLiveRuntimeLooksIdle, true);
+  assert.equal(groundTruth.runningTurnLooksIdle, true);
+  assert.equal(groundTruth.effectiveLatestTurnState, "completed");
+  assert.equal(groundTruth.terminalGroundTruthStatus, "idle_or_input_ready");
+  assert.equal(groundTruth.terminalWorkState, "complete");
+  assert.equal(groundTruth.terminalIsComplete, true);
+});
+
 test("idle non-hook runtime does not settle a restored running turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
@@ -483,7 +557,7 @@ test("pending session acceptance keeps a running turn active despite lifecycle i
   assert.equal(groundTruth.terminalWorkState, "running");
 });
 
-test("completed transcript without fresh readiness is not sendable", () => {
+test("Rust live active terminal without a busy signal is sendable", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       inputReady: false,
@@ -514,6 +588,6 @@ test("completed transcript without fresh readiness is not sendable", () => {
 
   assert.equal(groundTruth.effectiveActivityStatus, "idle");
   assert.equal(groundTruth.effectiveLatestTurnState, "completed");
-  assert.equal(groundTruth.completedTurnLooksSendable, false);
-  assert.equal(groundTruth.agentInputReady, false);
+  assert.equal(groundTruth.completedTurnLooksSendable, true);
+  assert.equal(groundTruth.agentInputReady, true);
 });

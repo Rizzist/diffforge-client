@@ -3972,10 +3972,12 @@ function getThreadDiffTurnState(thread, groundTruth) {
 }
 
 function threadDiffTurnIsLive(thread, groundTruth) {
+  if (!groundTruth) {
+    return false;
+  }
   const state = getThreadDiffTurnState(thread, groundTruth);
   return THREAD_DIFF_LIVE_STATES.has(state)
-    || thread?.activityStatus === "thinking"
-    || thread?.activityStatus === "working";
+    && threadLooksEffectivelyThinking(groundTruth);
 }
 
 function threadDiffTurnIsTerminal(thread, groundTruth, hasAssistantBlock) {
@@ -4226,7 +4228,7 @@ function buildActivityItems(thread, messages = [], groundTruth = null) {
     || threadLatestTurnState(thread);
   const isThinking = groundTruth
     ? threadLooksEffectivelyThinking(groundTruth)
-    : rawTurnState === "running" || thread.activityStatus === "thinking";
+    : false;
   const latestTurnUserMessage = getLatestTurnUserMessage(messages, latestTurn?.turnId);
   const latestTurnIsSlashCommand = isSlashCommandPrompt(latestTurnUserMessage?.text);
 
@@ -5801,8 +5803,7 @@ function WorkspaceThreadDetail({
   const headerTerminalWorkState = String(threadGroundTruth?.terminalWorkState || "").toLowerCase();
   const headerWorking = Boolean(latestActivity?.live)
     || headerTerminalWorkState === "running"
-    || headerTerminalWorkState === "prompting_user"
-    || headerTurnState === "running";
+    || headerTerminalWorkState === "prompting_user";
   const headerState = headerWorking
     ? "working"
     : headerTurnState === "error"

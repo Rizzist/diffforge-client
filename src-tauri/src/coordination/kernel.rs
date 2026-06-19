@@ -30168,7 +30168,6 @@ command = "diffforge --diff-forge-activity-hook"
                 "architecture_revision_read",
                 "architecture_revision_restore",
                 "list_todo_targets",
-                "send_todos",
                 "get_todo_status",
                 "wait_for_todos",
                 "list_todo_history",

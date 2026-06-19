@@ -244,6 +244,37 @@ function providerBindingsHaveNativeSession(providerBindings) {
   ));
 }
 
+function normalizeLiveTerminalActivityStatus(liveTerminal) {
+  const explicit = cleanText(
+    liveTerminal?.activityStatus
+      || liveTerminal?.activity_status
+      || liveTerminal?.nativeRailState
+      || liveTerminal?.native_rail_state
+      || liveTerminal?.terminalWorkState
+      || liveTerminal?.terminal_work_state,
+  ).toLowerCase();
+  if (explicit) {
+    return explicit;
+  }
+
+  const status = cleanText(
+    liveTerminal?.terminalStatus
+      || liveTerminal?.terminal_status
+      || liveTerminal?.status,
+  ).toLowerCase();
+  if (
+    terminalActivityStatusIsBusy(status)
+    || terminalActivityStatusIsSendable(status)
+    || terminalActivityStatusIsClosed(status)
+    || terminalActivityStatusIsError(status)
+    || PARKED_TERMINAL_STATUSES.has(status)
+  ) {
+    return status;
+  }
+
+  return liveTerminal ? "idle" : "";
+}
+
 function normalizeMessageCount(value) {
   const count = Number.parseInt(value ?? 0, 10);
   return Number.isFinite(count) ? count : 0;
@@ -262,17 +293,9 @@ export function getLiveTerminalForThread(thread, providerBinding, workspaceThrea
     return null;
   }
 
-  const activityStatus = cleanText(
-    terminal.activityStatus
-      || terminal.activity_status
-      || providerBinding?.activityStatus
-      || providerBinding?.activity_status
-      || thread?.activityStatus
-      || "",
-  ).toLowerCase();
+  const activityStatus = normalizeLiveTerminalActivityStatus(terminal);
   if (
     terminal.threadId !== thread?.id
-    || !activityStatus
     || terminalActivityStatusIsClosed(activityStatus)
   ) {
     return null;
@@ -309,25 +332,10 @@ export function getThreadTerminalGroundTruth({
   const latestTurn = thread?.latestTurn || null;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const terminalStatus = cleanText(liveTerminal?.status).toLowerCase();
-  const providerActivityStatus = cleanText(
-    providerBinding?.activityStatus
-      || providerBinding?.activity_status
-      || "",
-  ).toLowerCase();
-  const liveActivityStatus = cleanText(
-    liveTerminal?.activityStatus
-      || liveTerminal?.activity_status
-      || providerActivityStatus
-      || "",
-  ).toLowerCase();
-  const activityStatus = cleanText(
-    liveTerminal?.activityStatus
-      || liveTerminal?.activity_status
-      || providerActivityStatus
-      || thread?.activityStatus
-      || "",
-  ).toLowerCase();
-  const parkedStatus = [providerActivityStatus, activityStatus].find((status) => (
+  const providerActivityStatus = "";
+  const liveActivityStatus = normalizeLiveTerminalActivityStatus(liveTerminal);
+  const activityStatus = liveActivityStatus;
+  const parkedStatus = [activityStatus].find((status) => (
     PARKED_TERMINAL_STATUSES.has(status)
   )) || "";
   const terminalIsParked = Boolean(parkedStatus);
@@ -394,11 +402,18 @@ export function getThreadTerminalGroundTruth({
       && !hasPendingPrompt
       && !terminalLooksActive
   );
+  const staleRunningWithoutLiveRuntimeLooksIdle = Boolean(
+    latestTurnState === "running"
+      && hookManagedAgent
+      && !liveTerminal
+      && !hasPendingPrompt
+  );
   const runningTurnLooksIdle = Boolean(
     latestTurnState === "running"
       && (
         orphanRunningLooksIdle
         || restoredRunningTurnLooksIdle
+        || staleRunningWithoutLiveRuntimeLooksIdle
         || (
           terminalLooksSendable
           && inputReadyIsFreshForTurn
@@ -522,6 +537,7 @@ export function getThreadTerminalGroundTruth({
     requiresAgentInputReady,
     restoredRunningTurnLooksIdle,
     runningTurnLooksIdle,
+    staleRunningWithoutLiveRuntimeLooksIdle,
     promptingUserConfidence: terminalIsPromptingUser ? promptingUser.confidence : "",
     promptingUserKind: terminalIsPromptingUser ? promptingUser.kind : "",
     promptingUserSource: terminalIsPromptingUser ? promptingUser.source : "",

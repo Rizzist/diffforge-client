@@ -867,7 +867,6 @@ fn diffforge_promote_untracked_asset(
     delete_source: Option<bool>,
 ) -> Result<Value, String> {
     let source = diffforge_untracked_asset_file(&path)?;
-    let untracked_root = diffforge_prepare_untracked_asset_root()?;
     let (sha256, size_bytes) = cloud_mcp_file_sha256_and_size(&source)?;
     let req = cloud_mcp_asset_scope_request();
     let asset_id = format!(
@@ -921,20 +920,13 @@ fn diffforge_promote_untracked_asset(
     let target_path = target_path
         .canonicalize()
         .unwrap_or_else(|_| target_path.to_path_buf());
-    let relative_path = source
-        .strip_prefix(&untracked_root)
-        .ok()
-        .map(|value| value.display().to_string())
-        .unwrap_or_else(|| diffforge_untracked_asset_name(&source));
     let mime_type = cloud_mcp_asset_mime_for_path(&target_path);
     let now = cloud_mcp_rfc3339_now();
     let metadata = json!({
-        "source": "untracked_assets",
+        "source": "asset_library",
         "sourceKind": "snip",
-        "original_path": source.display().to_string(),
-        "originalPath": source.display().to_string(),
-        "original_relative_path": relative_path.clone(),
-        "originalRelativePath": relative_path,
+        "promoted_from": "untracked_scratch",
+        "promotedFrom": "untracked_scratch",
         "promoted_at": now.clone(),
         "promotedAt": now,
     });

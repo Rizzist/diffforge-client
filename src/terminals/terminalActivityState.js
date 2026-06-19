@@ -33,6 +33,8 @@ const TERMINAL_ACTIVITY_THINKING_STATES = new Set([
 ]);
 
 const TERMINAL_ACTIVITY_IDLE_STATES = new Set([
+  "cancelled",
+  "canceled",
   "complete",
   "completed",
   "done",

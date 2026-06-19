@@ -82,6 +82,8 @@ test("visible terminal rail preserves exact activity status", () => {
 test("queue sendability is driven by idle activity status only", () => {
   assert.equal(terminalActivityStatusIsSendable("idle"), true);
   assert.equal(terminalActivityStatusIsSendable("input_ready"), true);
+  assert.equal(terminalActivityStatusIsSendable("cancelled"), true);
+  assert.equal(terminalActivityStatusIsSendable("canceled"), true);
   assert.equal(terminalActivityStatusIsSendable("interrupted"), true);
   assert.equal(terminalActivityStatusIsSendable("prompt_ready"), false);
   assert.equal(terminalActivityStatusIsSendable("active"), false);

@@ -1081,8 +1081,8 @@ fn todo_dispatch_journal_append(workspace_id: &str, entry: Value) {
 // terminal and live beside it: once a todo id is tombstoned nothing — journal
 // adoption, remote intake, webview snapshots, cloud echoes — may bring it
 // back. Every store mutation emits TODO_STORE_CHANGED_EVENT so the webview
-// (a renderer, not an owner) re-pulls the snapshot; mutations that must reach
-// the account ride the durable outbox via the cloud snapshot push.
+// (a renderer, not an owner) re-pulls the snapshot; account convergence rides
+// the supported todo sync/content contracts.
 // ---------------------------------------------------------------------------
 
 pub(crate) const TODO_STORE_CHANGED_EVENT: &str = "todo-store-changed";
@@ -1558,32 +1558,26 @@ fn todo_store_changed_items_for_sync(previous: &[Value], next: &[Value]) -> Vec<
 }
 
 fn todo_store_push_items(app: &AppHandle, workspace_id: &str, items: Vec<Value>, reason: &str) {
-    let items = items
+    let item_count = items
         .into_iter()
         .filter(|item| item.is_object() && !todo_store_item_sync_id(item).is_empty())
-        .collect::<Vec<_>>();
-    if items.is_empty() {
+        .count();
+    if item_count == 0 {
         return;
     }
-    let workspace_id = workspace_id.to_string();
-    let reason = reason.to_string();
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<CloudMcpState>().inner().clone();
-        for item in items {
-            let _ = cloud_mcp_sync_workspace_todo_item_internal(
-                &state,
-                workspace_id.clone(),
-                item,
-                Some(reason.clone()),
-            )
-            .await;
-        }
-    });
+    let _ = app;
+    log_terminal_status_event(
+        "backend.todo_store.cloud_push_retired",
+        json!({
+            "itemCount": item_count,
+            "reason": reason,
+            "workspaceId": workspace_id,
+        }),
+    );
 }
 
-/// Durable removal push: tombstoned ids reach the account through the outbox
-/// without re-sending the (possibly stale) full queue file.
+/// Local-only removal marker: `todo.sync`/`todo.content` own account sync now,
+/// so this no longer writes legacy workspace todo events.
 fn todo_store_push_removals(
     app: &AppHandle,
     workspace_id: &str,
@@ -1593,21 +1587,15 @@ fn todo_store_push_removals(
     if removed_todo_ids.is_empty() {
         return;
     }
-    let workspace_id = workspace_id.to_string();
-    let reason = reason.to_string();
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<CloudMcpState>().inner().clone();
-        for todo_id in removed_todo_ids {
-            let _ = cloud_mcp_sync_workspace_todo_delete_internal(
-                &state,
-                workspace_id.clone(),
-                todo_id,
-                Some(reason.clone()),
-            )
-            .await;
-        }
-    });
+    let _ = app;
+    log_terminal_status_event(
+        "backend.todo_store.cloud_delete_retired",
+        json!({
+            "removedCount": removed_todo_ids.len(),
+            "reason": reason,
+            "workspaceId": workspace_id,
+        }),
+    );
 }
 
 /// Status-correction push: upserts only the given rows (used to heal stale
@@ -1622,8 +1610,8 @@ fn todo_store_push_corrections(
         return;
     }
     // Client-authoritative: stamp the corrected statuses onto the local
-    // mirror first so every view settles instantly; the cloud push below is
-    // background convergence, not the source of UI truth.
+    // mirror so every view settles instantly. Account sync is handled by
+    // todo.sync/todo.content rather than the retired workspace todo events.
     if cloud_mcp_todo_mirror_apply_local_corrections(&items) > 0 {
         let _ = app.emit(
             CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT,
@@ -1638,7 +1626,7 @@ fn todo_store_push_corrections(
     todo_store_push_items(app, &workspace_id, items, reason);
 }
 
-/// Tombstone + queue-store removal + journal + durable cloud removal in one
+/// Tombstone + queue-store removal + journal update in one
 /// place. Every delete path (history view, webview list, remote lever) funnels
 /// here so a deleted todo can never come back from any replica.
 pub(crate) fn todo_store_delete_internal(
@@ -3914,9 +3902,8 @@ pub(crate) fn todo_dispatch_webview_dispatcher_active() -> bool {
         && todo_dispatch_now_ms().saturating_sub(heartbeat) < TODO_DISPATCH_DISPATCHER_LEASE_MS
 }
 
-/// Headless cloud convergence: push the Rust queue store as the authoritative
-/// todo snapshot (plus explicit removals) after a Rust-side queue mutation.
-/// Rides the durable outbox, so it also works offline.
+/// Headless local convergence marker after a Rust-side queue mutation.
+/// Account sync is handled by the supported todo sync contracts.
 fn todo_dispatch_push_queue_snapshot(
     app: &AppHandle,
     workspace_id: &str,
@@ -3935,30 +3922,16 @@ fn todo_dispatch_push_queue_snapshot(
     if items.is_empty() && removed_todo_ids.is_empty() {
         return;
     }
-    let workspace_id = workspace_id.to_string();
-    let reason = reason.to_string();
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<CloudMcpState>().inner().clone();
-        for item in items {
-            let _ = cloud_mcp_sync_workspace_todo_item_internal(
-                &state,
-                workspace_id.clone(),
-                item,
-                Some(reason.clone()),
-            )
-            .await;
-        }
-        for todo_id in removed_todo_ids {
-            let _ = cloud_mcp_sync_workspace_todo_delete_internal(
-                &state,
-                workspace_id.clone(),
-                todo_id,
-                Some(reason.clone()),
-            )
-            .await;
-        }
-    });
+    let _ = app;
+    log_terminal_status_event(
+        "backend.todo_dispatch.cloud_snapshot_retired",
+        json!({
+            "itemCount": items.len(),
+            "reason": reason,
+            "removedCount": removed_todo_ids.len(),
+            "workspaceId": workspace_id,
+        }),
+    );
 }
 
 /// Headless remote todo delete: applied directly to the Rust queue store so
@@ -3985,9 +3958,9 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
     if workspace_id.is_empty() || todo_id.is_empty() {
         return;
     }
-    // One funnel for every delete: tombstone, queue-store removal, journal,
-    // and a durable removal-only cloud push (safe next to a live webview —
-    // removals are idempotent and don't carry a possibly-stale item set).
+    // One funnel for every delete: tombstone, queue-store removal, and journal.
+    // The removed legacy Cloud push was idempotent, but todo.sync/todo.content
+    // now own account convergence.
     todo_store_delete_internal(
         app,
         &workspace_id,
@@ -4568,7 +4541,7 @@ async fn todo_dispatch_backend_submit(
         return false;
     }
     let submit_sequence = todo_dispatch_backend_submit_sequence(item, target);
-    if prompt.len() + submit_sequence.len() > MAX_TERMINAL_WRITE_BYTES {
+    if prompt.len() + submit_sequence.len() + 1 > MAX_TERMINAL_WRITE_BYTES {
         return false;
     }
     let terminal_state = app.state::<TerminalState>();
@@ -4581,6 +4554,9 @@ async fn todo_dispatch_backend_submit(
     }) else {
         return false;
     };
+    if todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
+        return false;
+    }
 
     let item_id = item
         .get("id")
@@ -4617,7 +4593,12 @@ async fn todo_dispatch_backend_submit(
     let _input_guard = instance.input_queue.lock().await;
     {
         let mut writer = instance.writer.lock().await;
-        if writer.write_all(prompt.as_bytes()).is_err() || writer.flush().is_err() {
+        // Ctrl-U clears any stale TUI input left by a previous interrupted or
+        // failed UI write before Rust submits the queued todo.
+        if writer.write_all(b"\x15").is_err()
+            || writer.write_all(prompt.as_bytes()).is_err()
+            || writer.flush().is_err()
+        {
             return false;
         }
     }
@@ -4771,6 +4752,10 @@ async fn todo_dispatch_backend_submit_now(
 
     let submitted = todo_dispatch_backend_submit(&app, &workspace_id, &item, &target).await;
     if !submitted {
+        let pane_id = todo_dispatch_text(&target, &["paneId", "pane_id", "targetTerminalId"]);
+        if !pane_id.is_empty() && todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
+            return Err("target_terminal_not_input_ready".to_string());
+        }
         return Err("Unable to submit todo to the target terminal.".to_string());
     }
 

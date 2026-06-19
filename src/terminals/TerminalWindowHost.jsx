@@ -562,9 +562,9 @@ export default function TerminalWindowHost() {
             <ButtonSplitVerticalIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
-            aria-label="Open terminal threads in the app"
+            aria-label="Maximize terminal in the app"
             onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_FULLSCREEN)}
-            title="Return to the app and open terminal threads"
+            title="Return to the app and maximize terminal"
             type="button"
           >
             <ButtonFullscreenIcon aria-hidden="true" />

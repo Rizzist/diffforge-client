@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import { parseSkillsLibrary, serializeSkillsLibrary } from "./skillsLibrary.js";
+
 // App-level cache for the orchestrator Tools tab. Architectures and account
 // skills are globally synced data, so they live at module scope and survive
 // the tab's mount/unmount cycle: the panel renders instantly from this cache
@@ -140,6 +142,112 @@ function applyAccountSkillsMarkdown(skillsMd) {
   if (changed) notifyWorkspaceToolsListeners();
 }
 
+function accountToolsEventCandidates(payload) {
+  return [
+    payload,
+    payload?.payload,
+    payload?.data,
+    payload?.event,
+    payload?.payload?.payload,
+    payload?.payload?.data,
+    payload?.data?.payload,
+  ];
+}
+
+function accountToolsEventHasKnownPayload(payload) {
+  return accountToolsEventCandidates(payload).some((candidate) => (
+    candidate
+      && typeof candidate === "object"
+      && !Array.isArray(candidate)
+      && (
+        candidate.contract === "diffforge.account_skills.v1"
+        || candidate.contract === "diffforge.account_clis.v1"
+        || candidate.contract === "diffforge.account_mcps.v1"
+        || candidate.kind === "account_skill_changed"
+        || candidate.kind === "account_cli_changed"
+        || candidate.kind === "account_mcp_changed"
+        || candidate.event_kind === "account_skill_changed"
+        || candidate.eventKind === "account_skill_changed"
+        || candidate.skill
+        || candidate.skill_units
+        || candidate.skillUnits
+        || candidate.delta === true
+        || candidate.skills
+        || candidate.clis
+        || candidate.mcps
+        || candidate.servers
+      )
+  ));
+}
+
+function accountToolsSkillsFromEventPayload(payload) {
+  const candidates = accountToolsEventCandidates(payload);
+  for (const candidate of candidates) {
+    const skills = candidate?.skills || candidate?.account_skills || candidate?.accountSkills;
+    const skillsMd = skills?.skills_md ?? skills?.skillsMd;
+    if (skillsMd != null) {
+      return String(skillsMd);
+    }
+  }
+  return null;
+}
+
+function accountToolsSkillUnitFromEventPayload(payload) {
+  const candidates = accountToolsEventCandidates(payload);
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const contract = candidate.contract;
+    const kind = candidate.kind || candidate.event_kind || candidate.eventKind;
+    const skill = candidate.skill || candidate.account_skill || candidate.accountSkill;
+    if (skill && typeof skill === "object" && !Array.isArray(skill)) {
+      return skill;
+    }
+    const units = candidate.skill_units || candidate.skillUnits;
+    if (Array.isArray(units) && units.length) {
+      return units[0];
+    }
+    if (contract === "diffforge.account_skills.v1" || kind === "account_skill_changed") {
+      const nested = candidate.payload?.skill || candidate.data?.skill;
+      if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+        return nested;
+      }
+    }
+  }
+  return null;
+}
+
+function skillFromUnit(unit) {
+  const id = text(unit?.skill_id || unit?.skillId || unit?.id);
+  if (!id) return null;
+  return {
+    content: String(unit?.content_md ?? unit?.contentMd ?? unit?.content ?? ""),
+    description: text(unit?.description || unit?.summary),
+    icon: text(unit?.icon),
+    id,
+    source: text(unit?.source, "custom"),
+    title: text(unit?.title || unit?.name || unit?.label, id),
+    tone: text(unit?.tone),
+    updatedAt: text(unit?.updated_at || unit?.updatedAt),
+  };
+}
+
+function applyAccountSkillUnit(unit) {
+  const skill = skillFromUnit(unit);
+  if (!skill) return false;
+  const library = parseSkillsLibrary(workspaceToolsStore.skillsMd);
+  const removed = unit?.deleted === true || unit?.current === false || unit?.tombstoned === true;
+  const nextSkills = removed
+    ? library.skills.filter((entry) => entry.id !== skill.id)
+    : [
+      ...library.skills.filter((entry) => entry.id !== skill.id),
+      skill,
+    ].sort((left, right) => left.title.localeCompare(right.title));
+  const nextMd = serializeSkillsLibrary(nextSkills, library.preamble);
+  workspaceToolsStore.skillsFetchedAtMs = Date.now();
+  applyAccountSkillsMarkdown(nextMd);
+  return true;
+}
+
 async function loadAccountSkills({ force = false } = {}) {
   if (inFlightSkillsLoad) return inFlightSkillsLoad;
   const now = Date.now();
@@ -192,7 +300,20 @@ function wireAccountToolsChangeEvents() {
   if (accountToolsEventsWired) return;
   accountToolsEventsWired = true;
   ACCOUNT_TOOLS_CHANGE_EVENTS.forEach((eventName) => {
-    void listen(eventName, () => {
+    void listen(eventName, (event) => {
+      const skillsMd = accountToolsSkillsFromEventPayload(event?.payload);
+      if (skillsMd != null) {
+        workspaceToolsStore.skillsFetchedAtMs = Date.now();
+        applyAccountSkillsMarkdown(skillsMd);
+        return;
+      }
+      const skillUnit = accountToolsSkillUnitFromEventPayload(event?.payload);
+      if (skillUnit && applyAccountSkillUnit(skillUnit)) {
+        return;
+      }
+      if (accountToolsEventHasKnownPayload(event?.payload)) {
+        return;
+      }
       if (accountToolsEventTimer) window.clearTimeout(accountToolsEventTimer);
       accountToolsEventTimer = window.setTimeout(() => {
         accountToolsEventTimer = 0;
