@@ -9,7 +9,6 @@ import {
   MarkerType,
   Position,
   ReactFlow,
-  addEdge as addReactFlowEdge,
   useEdgesState,
   useNodesState,
 } from "@xyflow/react";
@@ -217,14 +216,10 @@ const ARCHITECTURE_RUN_ACTION_LABELS = {
   "rotate-secret": "Rotate Secret",
   "smoke-test": "Smoke Test",
 };
-const ARCHITECTURE_ROUTE_GRID_CELL = 48;
-const ARCHITECTURE_ROUTE_GRID_MAX_POINTS = 1600;
 const ARCHITECTURE_ROUTE_CACHE_MAX = 700;
-const ARCHITECTURE_ROUTE_SETTLE_DELAY_MS = 120;
 const ARCHITECTURE_ROUTE_NODE_CLEARANCE = 44;
 const ARCHITECTURE_ROUTE_EDGE_CLEARANCE = 20;
 const ARCHITECTURE_ROUTE_ENDPOINT_STUB = ARCHITECTURE_ROUTE_NODE_CLEARANCE + 24;
-const ARCHITECTURE_ROUTE_INTERACTIVE_STUB = 28;
 const ARCHITECTURE_ROUTE_CROSSING_EPSILON = 2;
 const ARCHITECTURE_EDGE_LABEL_HEIGHT = 21;
 const ARCHITECTURE_EDGE_LABEL_MIN_WIDTH = 54;
@@ -2319,12 +2314,6 @@ function useArchitectureIcon(icon, kind = "service", labelHint = "") {
 
 function architectureEntityId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-}
-
-function architectureKindLabel(value) {
-  const raw = text(value, "architecture");
-  return ARCHITECTURE_KIND_OPTIONS.find((option) => option.value === raw)?.label
-    || raw.replace(/[-_]+/gu, " ");
 }
 
 function architectureFolderPathParts(value) {
@@ -6501,9 +6490,7 @@ function ArchitectureGraphEditor({
   const [localError, setLocalError] = useState("");
   const [expandedCorridorId, setExpandedCorridorId] = useState("");
   const [runSelections, setRunSelections] = useState({});
-  const [routingMode, setRoutingMode] = useState("settled");
   const routeCacheRef = useRef(new Map());
-  const routeSettleTimerRef = useRef(null);
   const runTargets = useMemo(() => architectureRunTargetsFromGraph(draftGraph), [draftGraph]);
   const renderNodes = useMemo(() => architectureOrderFlowNodes(nodes).map((node) => {
     if (node.type !== "architectureCorridor") return node;
@@ -6527,9 +6514,8 @@ function ArchitectureGraphEditor({
     };
   }), [expandedCorridorId, nodes]);
   const renderEdges = useMemo(() => architectureEdgesWithRoutingData(edges, renderNodes, {
-    interactive: routingMode === "interactive",
     routeCache: routeCacheRef.current,
-  }), [edges, renderNodes, routingMode]);
+  }), [edges, renderNodes]);
   const semanticWarnings = useMemo(
     () => architectureValidateSemanticGraph(draftGraph, nodes, edges),
     [draftGraph, edges, nodes],
@@ -6538,11 +6524,6 @@ function ArchitectureGraphEditor({
   useEffect(() => {
     const nextFlow = architectureGraphToFlow(graph);
     routeCacheRef.current.clear();
-    if (routeSettleTimerRef.current) {
-      clearTimeout(routeSettleTimerRef.current);
-      routeSettleTimerRef.current = null;
-    }
-    setRoutingMode("settled");
     setNodes(nextFlow.nodes);
     setEdges(nextFlow.edges);
     setDraftGraph(jsonObject(graph) || {});
@@ -6556,60 +6537,19 @@ function ArchitectureGraphEditor({
     setAgentCommandNotice("");
   }, [graph, setEdges, setNodes]);
 
-  useEffect(() => () => {
-    if (routeSettleTimerRef.current) clearTimeout(routeSettleTimerRef.current);
-  }, []);
-
   useEffect(() => {
     onDirtyChange(dirty);
   }, [dirty, onDirtyChange]);
 
+  // View-only canvas: let React Flow apply internal measurement/dimension
+  // changes, but never let viewing interactions mark the graph dirty.
   const onNodesChange = useCallback((changes) => {
-    if (changes.some((change) => change.type !== "select")) setDirty(true);
     handleNodesChange(changes);
   }, [handleNodesChange]);
 
   const onEdgesChange = useCallback((changes) => {
-    if (changes.some((change) => change.type !== "select")) setDirty(true);
     handleEdgesChange(changes);
   }, [handleEdgesChange]);
-
-  const beginInteractiveRouting = useCallback(() => {
-    if (routeSettleTimerRef.current) {
-      clearTimeout(routeSettleTimerRef.current);
-      routeSettleTimerRef.current = null;
-    }
-    setRoutingMode("interactive");
-  }, []);
-
-  const settleFullRouting = useCallback(() => {
-    if (routeSettleTimerRef.current) clearTimeout(routeSettleTimerRef.current);
-    routeSettleTimerRef.current = setTimeout(() => {
-      routeSettleTimerRef.current = null;
-      setRoutingMode("settled");
-    }, ARCHITECTURE_ROUTE_SETTLE_DELAY_MS);
-  }, []);
-
-  const onConnect = useCallback((connection) => {
-    const id = architectureEntityId("edge");
-    setDirty(true);
-    setEdges((currentEdges) => addReactFlowEdge({
-      ...connection,
-      id,
-      zIndex: 0,
-      markerEnd: {
-        color: "rgba(125, 211, 252, 0.88)",
-        height: 18,
-        type: MarkerType.ArrowClosed,
-        width: 18,
-      },
-      type: "architectureEdge",
-      data: {
-        kind: "calls",
-        label: "",
-      },
-    }, currentEdges));
-  }, [setEdges]);
 
   const deleteSelected = useCallback(() => {
     const nodeIds = new Set(selectedNodes.map((node) => node.id));
@@ -6737,23 +6677,26 @@ function ArchitectureGraphEditor({
             }}
             edgeTypes={architectureEdgeTypes}
             edges={renderEdges}
+            edgesFocusable={false}
+            elementsSelectable={false}
             fitView
+            fitViewOptions={{ maxZoom: 1.1, padding: 0.22 }}
             maxZoom={1.7}
             minZoom={0.18}
             nodeTypes={architectureNodeTypes}
             nodes={renderNodes}
-            onConnect={onConnect}
+            nodesConnectable={false}
+            nodesDraggable={false}
+            nodesFocusable={false}
             onEdgesChange={onEdgesChange}
-            onNodeDragStart={beginInteractiveRouting}
-            onNodeDragStop={settleFullRouting}
             onNodesChange={onNodesChange}
-            onSelectionChange={({ nodes: nextNodes, edges: nextEdges }) => {
-              setSelectedNodes(nextNodes);
-              setSelectedEdges(nextEdges);
-            }}
+            panOnDrag
+            panOnScroll
             proOptions={{ hideAttribution: true }}
+            selectionOnDrag={false}
+            zoomOnDoubleClick={false}
           >
-            <Background color="rgba(148, 163, 184, 0.22)" gap={22} size={1} />
+            <Background color="rgba(148, 163, 184, 0.16)" gap={26} size={1.4} />
           </ReactFlow>
           {agentEditMarker && (
             <ArchitectureAgentEditStatus
@@ -7385,17 +7328,6 @@ function architectureRectsRoutingHash(rects) {
   }, 2166136261);
 }
 
-function architectureRouteSegmentsRoutingHash(seed, segments) {
-  return jsonArray(segments).reduce((hash, segment) => {
-    let nextHash = architectureRouteHashString(hash, segment?.orientation || "");
-    nextHash = architectureRouteHashNumber(nextHash, segment?.x ?? segment?.x1);
-    nextHash = architectureRouteHashNumber(nextHash, segment?.y ?? segment?.y1);
-    nextHash = architectureRouteHashNumber(nextHash, segment?.x2);
-    nextHash = architectureRouteHashNumber(nextHash, segment?.y2);
-    return nextHash;
-  }, seed >>> 0);
-}
-
 function architectureRouteCacheGet(routeCache, key) {
   if (!routeCache?.has?.(key)) return null;
   const routePoints = routeCache.get(key);
@@ -7415,7 +7347,6 @@ function architectureRouteCacheSet(routeCache, key, routePoints) {
 }
 
 function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
-  const interactive = Boolean(options.interactive);
   const routeCache = options.routeCache || null;
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const positionCache = new Map();
@@ -7435,8 +7366,6 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
   const obstacleRects = [...nodeRects, ...groupHeaderRects];
   const obstacleHash = architectureRectsRoutingHash(obstacleRects);
   const endpointFanOffsets = architectureEndpointFanOffsets(edges);
-  const reservedSegments = [];
-  let reservedHash = 2166136261;
 
   const routedEdges = edges.map((edge, index) => {
     const sourceNode = nodeById.get(edge.source);
@@ -7459,7 +7388,6 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
     const targetPoint = architectureNodeHandlePoint(targetNode, targetSide, nodeById, positionCache);
     const edgeFan = endpointFanOffsets.get(edgeKey) || { source: 0, target: 0 };
     const routeKey = [
-      interactive ? "interactive" : "settled",
       edgeKey,
       edge.source,
       edge.target,
@@ -7472,42 +7400,24 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
       Math.round(edgeFan.source),
       Math.round(edgeFan.target),
       obstacleHash.toString(36),
-      reservedHash.toString(36),
     ].join("|");
     let routePoints = architectureRouteCacheGet(routeCache, routeKey);
     if (!routePoints) {
-      routePoints = interactive
-        ? architecturePreviewEdgePoints({
-          sourceFanOffset: edgeFan.source,
-          sourcePosition: sourceNode.sourcePosition,
-          sourceX: sourcePoint.x,
-          sourceY: sourcePoint.y,
-          targetFanOffset: edgeFan.target,
-          targetPosition: targetNode.targetPosition,
-          targetX: targetPoint.x,
-          targetY: targetPoint.y,
-        })
-        : architectureOrthogonalEdgePoints({
-          avoidanceRects: obstacleRects,
-          edgeIndex: index,
-          id: edge.id,
-          reservedSegments,
-          sourceFanOffset: edgeFan.source,
-          sourcePosition: sourceNode.sourcePosition,
-          sourceX: sourcePoint.x,
-          sourceY: sourcePoint.y,
-          targetFanOffset: edgeFan.target,
-          targetPosition: targetNode.targetPosition,
-          targetX: targetPoint.x,
-          targetY: targetPoint.y,
-        });
+      routePoints = architectureOrthogonalEdgePoints({
+        avoidanceRects: obstacleRects,
+        edgeIndex: index,
+        id: edge.id,
+        sourceFanOffset: edgeFan.source,
+        sourcePosition: sourceNode.sourcePosition,
+        sourceX: sourcePoint.x,
+        sourceY: sourcePoint.y,
+        targetFanOffset: edgeFan.target,
+        targetPosition: targetNode.targetPosition,
+        targetX: targetPoint.x,
+        targetY: targetPoint.y,
+      });
       architectureRouteCacheSet(routeCache, routeKey, routePoints);
     }
-    const routeSegments = architectureRouteSegments(routePoints);
-    routeSegments.forEach((segment) => {
-      reservedSegments.push({ ...segment, edgeId: edgeKey });
-    });
-    reservedHash = architectureRouteSegmentsRoutingHash(reservedHash, routeSegments);
 
     return {
       ...edge,
@@ -7651,23 +7561,6 @@ function architectureRouteSegments(points) {
     if (segment) segments.push(segment);
   }
   return segments;
-}
-
-function architecturePointInsideRect(point, rect, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
-  const x = Math.round(numberValue(point?.x, 0));
-  const y = Math.round(numberValue(point?.y, 0));
-  return x >= rect.x - padding
-    && x <= rect.x + rect.width + padding
-    && y >= rect.y - padding
-    && y <= rect.y + rect.height + padding;
-}
-
-function architecturePointClearOfRects(point, rects, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
-  return !jsonArray(rects).some((rect) => architecturePointInsideRect(point, rect, padding));
-}
-
-function architectureSegmentClearOfRects(start, end, rects, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
-  return !jsonArray(rects).some((rect) => architectureSegmentIntersectsRect(start, end, rect, padding));
 }
 
 function architecturePointOnRouteSegment(point, segment) {
@@ -7824,20 +7717,6 @@ function architectureSegmentCloseOverlap(left, right, spacing = ARCHITECTURE_ROU
   };
 }
 
-function architectureRouteSegmentTooCloseToReserved(segment, reservedSegment, spacing = ARCHITECTURE_ROUTE_EDGE_CLEARANCE) {
-  const closeOverlap = architectureSegmentCloseOverlap(segment, reservedSegment, spacing);
-  return closeOverlap.overlap > 0;
-}
-
-function architectureRouteSegmentClearOfReserved(start, end, reservedSegments, spacing = ARCHITECTURE_ROUTE_EDGE_CLEARANCE) {
-  const segment = architectureRouteSegment(start, end);
-  if (!segment) return true;
-  return !jsonArray(reservedSegments).some((reservedSegment) => (
-    architectureRouteSegmentTooCloseToReserved(segment, reservedSegment, spacing)
-    || architectureSegmentsCross(segment, reservedSegment)
-  ));
-}
-
 function architectureRouteConflictPenalty(points, reservedSegments) {
   const segments = architectureRouteSegments(points);
   let penalty = 0;
@@ -7958,329 +7837,8 @@ function architectureTargetRoutePoints(x, y, side, fanOffset, stubDistance) {
   };
 }
 
-function architecturePreviewEdgePoints({
-  sourceFanOffset = 0,
-  sourcePosition,
-  sourceX,
-  sourceY,
-  targetFanOffset = 0,
-  targetPosition,
-  targetX,
-  targetY,
-}) {
-  const sourceSide = architectureEdgeSide(sourcePosition);
-  const targetSide = architectureEdgeSide(targetPosition);
-  const sourceRoute = architectureSourceRoutePoints(
-    sourceX,
-    sourceY,
-    sourceSide,
-    sourceFanOffset,
-    ARCHITECTURE_ROUTE_INTERACTIVE_STUB,
-  );
-  const targetRoute = architectureTargetRoutePoints(
-    targetX,
-    targetY,
-    targetSide,
-    targetFanOffset,
-    ARCHITECTURE_ROUTE_INTERACTIVE_STUB,
-  );
-  const sourceStub = sourceRoute.stub;
-  const targetStub = targetRoute.stub;
-  const horizontal = sourceSide === "left"
-    || sourceSide === "right"
-    || targetSide === "left"
-    || targetSide === "right";
-  const middlePoints = horizontal
-    ? [
-      { x: Math.round((sourceStub.x + targetStub.x) / 2), y: sourceStub.y },
-      { x: Math.round((sourceStub.x + targetStub.x) / 2), y: targetStub.y },
-    ]
-    : [
-      { x: sourceStub.x, y: Math.round((sourceStub.y + targetStub.y) / 2) },
-      { x: targetStub.x, y: Math.round((sourceStub.y + targetStub.y) / 2) },
-    ];
-
-  return architectureSimplifyEdgePoints([
-    ...sourceRoute.points,
-    ...middlePoints,
-    ...targetRoute.points,
-  ]);
-}
-
-function architectureLaneValues(values) {
-  return [...new Set(values.map((value) => Math.round(numberValue(value, 0))))]
-    .filter((value) => Number.isFinite(value))
-    .sort((left, right) => left - right);
-}
-
 function architecturePointKey(point) {
   return `${Math.round(numberValue(point?.x, 0))},${Math.round(numberValue(point?.y, 0))}`;
-}
-
-function architectureGridRouteBounds(sourceStub, targetStub, rects, bendOffset = 0) {
-  const bounds = architectureEdgeBounds(sourceStub.x, sourceStub.y, targetStub.x, targetStub.y, rects);
-  const outside = 154 + Math.abs(bendOffset);
-  return {
-    bottom: bounds.bottom + outside,
-    left: bounds.left - outside,
-    right: bounds.right + outside,
-    top: bounds.top - outside,
-  };
-}
-
-function architectureGridSpacingForBounds(bounds) {
-  let spacing = ARCHITECTURE_ROUTE_GRID_CELL;
-  const width = Math.max(1, bounds.right - bounds.left);
-  const height = Math.max(1, bounds.bottom - bounds.top);
-  while (
-    Math.ceil(width / spacing) * Math.ceil(height / spacing) > ARCHITECTURE_ROUTE_GRID_MAX_POINTS
-    && spacing < 96
-  ) {
-    spacing += 8;
-  }
-  return spacing;
-}
-
-function architectureRegularAxisValues(min, max, spacing) {
-  const values = [];
-  const start = Math.floor(min / spacing) * spacing;
-  for (let value = start; value <= max + spacing; value += spacing) {
-    if (value >= min && value <= max) values.push(value);
-  }
-  return values;
-}
-
-function architectureGridRouteLanes(sourceStub, targetStub, rects, edgeIndex = 0, bendOffset = 0) {
-  const bounds = architectureGridRouteBounds(sourceStub, targetStub, rects, bendOffset);
-  const spacing = architectureGridSpacingForBounds(bounds);
-  const lanePads = [
-    ARCHITECTURE_ROUTE_NODE_CLEARANCE + 8,
-    ARCHITECTURE_ROUTE_NODE_CLEARANCE + spacing + 8,
-    ARCHITECTURE_ROUTE_NODE_CLEARANCE + spacing * 2 + 8,
-  ];
-  const xValues = [
-    sourceStub.x,
-    targetStub.x,
-    bounds.left,
-    bounds.right,
-    (sourceStub.x + targetStub.x) / 2,
-    ...architectureRegularAxisValues(bounds.left, bounds.right, spacing),
-  ];
-  const yValues = [
-    sourceStub.y,
-    targetStub.y,
-    bounds.top,
-    bounds.bottom,
-    (sourceStub.y + targetStub.y) / 2,
-    ...architectureRegularAxisValues(bounds.top, bounds.bottom, spacing),
-  ];
-  const nudges = architectureEdgeLaneOffsets(edgeIndex, bendOffset).slice(0, 5);
-  rects.forEach((rect) => {
-    lanePads.forEach((lanePad) => {
-      xValues.push(rect.x - lanePad, rect.x + rect.width + lanePad);
-      yValues.push(rect.y - lanePad, rect.y + rect.height + lanePad);
-    });
-  });
-  nudges.forEach((nudge) => {
-    xValues.push(sourceStub.x + nudge, targetStub.x + nudge);
-    yValues.push(sourceStub.y + nudge, targetStub.y + nudge);
-  });
-  return {
-    xValues: architectureLaneValues(xValues),
-    yValues: architectureLaneValues(yValues),
-  };
-}
-
-function architectureSegmentDirection(segment) {
-  if (!segment) return "";
-  return segment.orientation;
-}
-
-function architectureNeighborRouteCost(current, neighbor, currentDirection, reservedSegments) {
-  const segment = architectureRouteSegment(current, neighbor);
-  const length = Math.abs(neighbor.x - current.x) + Math.abs(neighbor.y - current.y);
-  const nextDirection = architectureSegmentDirection(segment);
-  let cost = length || 1;
-  if (currentDirection && nextDirection && currentDirection !== nextDirection) {
-    cost += 34;
-  }
-  cost += architectureRouteConflictPenalty([current, neighbor], reservedSegments);
-  return cost;
-}
-
-function architectureRouteHeuristic(point, target) {
-  return Math.abs(target.x - point.x) + Math.abs(target.y - point.y);
-}
-
-function architectureRouteStateKey(pointKey, direction = "") {
-  return `${pointKey}|${direction || "start"}`;
-}
-
-function architecturePointKeyFromRouteStateKey(stateKey) {
-  return String(stateKey || "").split("|")[0] || "";
-}
-
-function architectureDirectionFromRouteStateKey(stateKey) {
-  const direction = String(stateKey || "").split("|")[1] || "";
-  return direction === "start" ? "" : direction;
-}
-
-function architectureRouteHeapPush(heap, item) {
-  heap.push(item);
-  let index = heap.length - 1;
-  while (index > 0) {
-    const parentIndex = Math.floor((index - 1) / 2);
-    if (heap[parentIndex].priority <= item.priority) break;
-    heap[index] = heap[parentIndex];
-    index = parentIndex;
-  }
-  heap[index] = item;
-}
-
-function architectureRouteHeapPop(heap) {
-  if (!heap.length) return null;
-  const first = heap[0];
-  const last = heap.pop();
-  if (heap.length && last) {
-    let index = 0;
-    while (true) {
-      const leftIndex = index * 2 + 1;
-      const rightIndex = leftIndex + 1;
-      if (leftIndex >= heap.length) break;
-      const childIndex = rightIndex < heap.length && heap[rightIndex].priority < heap[leftIndex].priority
-        ? rightIndex
-        : leftIndex;
-      if (heap[childIndex].priority >= last.priority) break;
-      heap[index] = heap[childIndex];
-      index = childIndex;
-    }
-    heap[index] = last;
-  }
-  return first;
-}
-
-function architectureGridRoutePoints({
-  avoidReservedSegments = true,
-  bendOffset = 0,
-  edgeIndex = 0,
-  rects = [],
-  reservedSegments = [],
-  sourceStub,
-  targetStub,
-}) {
-  const cleanRects = jsonArray(rects);
-  const start = { x: Math.round(sourceStub.x), y: Math.round(sourceStub.y) };
-  const target = { x: Math.round(targetStub.x), y: Math.round(targetStub.y) };
-  const lanes = architectureGridRouteLanes(start, target, cleanRects, edgeIndex, bendOffset);
-  const points = [];
-  const pointByKey = new Map();
-  const addPoint = (point, force = false) => {
-    const candidate = { x: Math.round(point.x), y: Math.round(point.y) };
-    if (!force && !architecturePointClearOfRects(candidate, cleanRects)) return;
-    const key = architecturePointKey(candidate);
-    if (pointByKey.has(key)) return;
-    pointByKey.set(key, candidate);
-    points.push(candidate);
-  };
-
-  lanes.xValues.forEach((x) => {
-    lanes.yValues.forEach((y) => addPoint({ x, y }));
-  });
-  addPoint(start, true);
-  addPoint(target, true);
-
-  const startKey = architecturePointKey(start);
-  const targetKey = architecturePointKey(target);
-  const rowMap = new Map();
-  const columnMap = new Map();
-  points.forEach((point) => {
-    const rowKey = String(Math.round(point.y));
-    const columnKey = String(Math.round(point.x));
-    if (!rowMap.has(rowKey)) rowMap.set(rowKey, []);
-    if (!columnMap.has(columnKey)) columnMap.set(columnKey, []);
-    rowMap.get(rowKey).push(point);
-    columnMap.get(columnKey).push(point);
-  });
-  rowMap.forEach((rowPoints) => rowPoints.sort((left, right) => left.x - right.x));
-  columnMap.forEach((columnPoints) => columnPoints.sort((left, right) => left.y - right.y));
-
-  const neighborsByKey = new Map();
-  const connect = (left, right) => {
-    if (!architectureSegmentClearOfRects(left, right, cleanRects)) return;
-    if (
-      avoidReservedSegments
-      && !architectureRouteSegmentClearOfReserved(left, right, reservedSegments)
-    ) {
-      return;
-    }
-    const leftKey = architecturePointKey(left);
-    const rightKey = architecturePointKey(right);
-    if (!neighborsByKey.has(leftKey)) neighborsByKey.set(leftKey, []);
-    if (!neighborsByKey.has(rightKey)) neighborsByKey.set(rightKey, []);
-    neighborsByKey.get(leftKey).push(right);
-    neighborsByKey.get(rightKey).push(left);
-  };
-  const connectAdjacent = (linePoints) => {
-    for (let index = 1; index < linePoints.length; index += 1) {
-      connect(linePoints[index - 1], linePoints[index]);
-    }
-  };
-  rowMap.forEach(connectAdjacent);
-  columnMap.forEach(connectAdjacent);
-
-  const startStateKey = architectureRouteStateKey(startKey);
-  const distances = new Map([[startStateKey, 0]]);
-  const previousByStateKey = new Map();
-  const visited = new Set();
-  const heap = [];
-  architectureRouteHeapPush(heap, {
-    key: startStateKey,
-    priority: architectureRouteHeuristic(start, target),
-  });
-  let bestTargetStateKey = "";
-  while (heap.length) {
-    const item = architectureRouteHeapPop(heap);
-    if (!item || visited.has(item.key)) continue;
-    visited.add(item.key);
-    const currentPointKey = architecturePointKeyFromRouteStateKey(item.key);
-    if (currentPointKey === targetKey) {
-      bestTargetStateKey = item.key;
-      break;
-    }
-    const current = pointByKey.get(currentPointKey);
-    if (!current) continue;
-    const currentDirection = architectureDirectionFromRouteStateKey(item.key);
-    const currentDistance = distances.get(item.key) ?? Infinity;
-    (neighborsByKey.get(currentPointKey) || []).forEach((neighbor) => {
-      const neighborSegment = architectureRouteSegment(current, neighbor);
-      const neighborDirection = architectureSegmentDirection(neighborSegment);
-      const neighborPointKey = architecturePointKey(neighbor);
-      const neighborStateKey = architectureRouteStateKey(neighborPointKey, neighborDirection);
-      if (visited.has(neighborStateKey)) return;
-      const nextDistance = currentDistance
-        + architectureNeighborRouteCost(current, neighbor, currentDirection, reservedSegments);
-      if (nextDistance < (distances.get(neighborStateKey) ?? Infinity)) {
-        distances.set(neighborStateKey, nextDistance);
-        previousByStateKey.set(neighborStateKey, item.key);
-        architectureRouteHeapPush(heap, {
-          key: neighborStateKey,
-          priority: nextDistance + architectureRouteHeuristic(neighbor, target),
-        });
-      }
-    });
-  }
-
-  if (!bestTargetStateKey) return [];
-  const route = [];
-  let cursor = bestTargetStateKey;
-  while (cursor) {
-    const point = pointByKey.get(architecturePointKeyFromRouteStateKey(cursor));
-    if (point) route.push(point);
-    if (cursor === startStateKey) break;
-    cursor = previousByStateKey.get(cursor);
-  }
-  if (architecturePointKey(route.at(-1)) !== startKey) return [];
-  return architectureSimplifyEdgePoints(route.reverse());
 }
 
 function architectureOrthogonalEdgePoints({
@@ -8310,32 +7868,6 @@ function architectureOrthogonalEdgePoints({
   const sourceStub = sourceRoute.stub;
   const targetStub = targetRoute.stub;
   const rects = jsonArray(avoidanceRects).filter((rect) => text(rect?.id) !== text(id));
-  let gridRoute = architectureGridRoutePoints({
-    bendOffset,
-    edgeIndex,
-    rects,
-    reservedSegments,
-    sourceStub,
-    targetStub,
-  });
-  if (gridRoute.length < 2) {
-    gridRoute = architectureGridRoutePoints({
-      avoidReservedSegments: false,
-      bendOffset,
-      edgeIndex,
-      rects,
-      reservedSegments,
-      sourceStub,
-      targetStub,
-    });
-  }
-  if (gridRoute.length >= 2) {
-    return architectureSimplifyEdgePoints([
-      ...sourceRoute.points,
-      ...gridRoute,
-      ...targetRoute.points,
-    ]);
-  }
   const bounds = architectureEdgeBounds(sourceX, sourceY, targetX, targetY, rects);
   const outsideOffset = 76 + Math.abs(bendOffset);
   const leftLane = bounds.left - outsideOffset;
@@ -8796,7 +8328,7 @@ function ArchitectureCanvasEdge({
           strokeDasharray: architectureEdgeStrokeDash(role, kind),
           strokeLinecap: "round",
           strokeLinejoin: "round",
-          strokeWidth: selected ? 3 : 2.2,
+          strokeWidth: selected ? 2.6 : 1.7,
         }}
       />
       {label && !labelPlacement?.hidden && (
@@ -11142,8 +10674,9 @@ const ArchitectureCanvasViewport = styled.div`
   border: 0;
   border-radius: 0;
   background:
-    linear-gradient(180deg, rgba(15, 23, 42, 0.16), rgba(2, 6, 23, 0.18)),
-    rgba(2, 6, 23, 0.36);
+    radial-gradient(120% 80% at 50% -10%, rgba(30, 41, 59, 0.5), rgba(2, 6, 23, 0) 60%),
+    linear-gradient(180deg, rgba(9, 13, 24, 0.6), rgba(2, 6, 23, 0.6)),
+    rgba(4, 7, 16, 0.92);
 
   .react-flow {
     width: 100%;
@@ -11152,7 +10685,7 @@ const ArchitectureCanvasViewport = styled.div`
   }
 
   .react-flow__edge-path {
-    shape-rendering: crispEdges;
+    shape-rendering: geometricPrecision;
   }
 
 `;
@@ -11865,137 +11398,123 @@ const ArchitectureInspectorMeta = styled.div`
 `;
 
 const ArchitectureCanvasNodeShell = styled.div`
+  --node-accent: 125, 211, 252;
   box-sizing: border-box;
+  position: relative;
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr);
+  grid-template-columns: 30px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: 11px;
   width: ${ARCHITECTURE_NODE_CARD_WIDTH}px;
   min-height: ${ARCHITECTURE_NODE_CARD_HEIGHT}px;
-  padding: 10px;
-  border: 1px solid rgba(125, 211, 252, 0.28);
-  border-radius: 8px;
+  padding: 12px 15px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 14px;
   color: var(--forge-text);
   background:
-    linear-gradient(180deg, rgba(14, 165, 233, 0.18), rgba(15, 23, 42, 0.86)),
-    rgba(2, 6, 23, 0.9);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 42%),
+    rgba(15, 23, 42, 0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 8px 24px rgba(2, 6, 23, 0.42);
 
-  &[data-kind="client"] {
-    border-color: rgba(251, 191, 36, 0.36);
-    background: linear-gradient(180deg, rgba(217, 119, 6, 0.18), rgba(15, 23, 42, 0.86));
+  &::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 13px;
+    bottom: 13px;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: rgba(var(--node-accent), 0.92);
+    box-shadow: 0 0 14px rgba(var(--node-accent), 0.55);
   }
 
-  &[data-kind="database"] {
-    border-color: rgba(52, 211, 153, 0.34);
-    background: linear-gradient(180deg, rgba(5, 150, 105, 0.18), rgba(15, 23, 42, 0.86));
-  }
-
-  &[data-kind="external"] {
-    border-color: rgba(244, 114, 182, 0.36);
-    background: linear-gradient(180deg, rgba(190, 24, 93, 0.18), rgba(15, 23, 42, 0.86));
-  }
-
-  &[data-kind="queue"] {
-    border-color: rgba(167, 139, 250, 0.36);
-    background: linear-gradient(180deg, rgba(109, 40, 217, 0.18), rgba(15, 23, 42, 0.86));
-  }
-
-  &[data-role="state"] {
-    border-color: rgba(167, 139, 250, 0.38);
-    background: linear-gradient(180deg, rgba(124, 58, 237, 0.2), rgba(15, 23, 42, 0.86));
-  }
-
-  &[data-role="decision"] {
-    border-color: rgba(251, 191, 36, 0.42);
-    background: linear-gradient(180deg, rgba(217, 119, 6, 0.2), rgba(15, 23, 42, 0.86));
-  }
-
-  &[data-role="terminal"] {
-    border-color: rgba(251, 113, 133, 0.42);
-    background: linear-gradient(180deg, rgba(190, 18, 60, 0.18), rgba(15, 23, 42, 0.86));
-  }
-
+  &[data-kind="client"] { --node-accent: 251, 191, 36; }
+  &[data-kind="database"] { --node-accent: 52, 211, 153; }
+  &[data-kind="external"] { --node-accent: 244, 114, 182; }
+  &[data-kind="queue"] { --node-accent: 167, 139, 250; }
+  &[data-role="state"] { --node-accent: 167, 139, 250; }
+  &[data-role="decision"] { --node-accent: 251, 191, 36; }
+  &[data-role="terminal"] { --node-accent: 251, 113, 133; }
   &[data-role="dependency"],
-  &[data-role="package"] {
-    border-color: rgba(244, 114, 182, 0.34);
-    background: linear-gradient(180deg, rgba(190, 24, 93, 0.16), rgba(15, 23, 42, 0.86));
+  &[data-role="package"] { --node-accent: 244, 114, 182; }
+
+  &[data-lifecycle="start"]::before {
+    background: rgba(52, 211, 153, 0.95);
+    box-shadow: 0 0 16px rgba(52, 211, 153, 0.6);
   }
 
-  &[data-lifecycle="start"] {
-    box-shadow: inset 0 0 0 1px rgba(52, 211, 153, 0.24), 0 12px 30px rgba(0, 0, 0, 0.22);
-  }
-
-  &[data-display="compact"],
-  &[data-display="compact"][data-kind="client"],
-  &[data-display="compact"][data-kind="database"],
-  &[data-display="compact"][data-kind="external"],
-  &[data-display="compact"][data-kind="queue"] {
+  &[data-display="compact"] {
     grid-template-columns: 1fr;
     align-content: center;
     justify-items: center;
-    gap: 6px;
+    gap: 7px;
     width: ${ARCHITECTURE_NODE_COMPACT_WIDTH}px;
     min-height: ${ARCHITECTURE_NODE_COMPACT_HEIGHT}px;
-    padding: 4px;
+    padding: 8px 6px;
     border-color: transparent;
     background: transparent;
     box-shadow: none;
   }
 
+  &[data-display="compact"]::before {
+    display: none;
+  }
+
   &[data-selected="true"] {
-    border-color: rgba(251, 191, 36, 0.68);
-    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18), 0 12px 30px rgba(0, 0, 0, 0.24);
+    border-color: rgba(var(--node-accent), 0.7);
+    box-shadow:
+      0 0 0 1px rgba(var(--node-accent), 0.35),
+      0 0 0 4px rgba(var(--node-accent), 0.12),
+      0 8px 24px rgba(2, 6, 23, 0.48);
   }
 
   &[data-display="compact"][data-selected="true"] {
-    border-color: rgba(251, 191, 36, 0.42);
-    background: rgba(15, 23, 42, 0.28);
-    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.12);
+    border-color: rgba(var(--node-accent), 0.4);
+    background: rgba(15, 23, 42, 0.32);
+    box-shadow: 0 0 0 3px rgba(var(--node-accent), 0.14);
   }
 
   .react-flow__handle {
-    width: 9px;
-    height: 9px;
-    border: 1px solid rgba(2, 6, 23, 0.9);
-    background: rgba(125, 211, 252, 0.95);
-  }
-
-  &[data-display="compact"] .react-flow__handle {
-    width: 7px;
-    height: 7px;
+    width: 6px;
+    height: 6px;
+    border: 0;
+    opacity: 0;
+    background: rgba(var(--node-accent), 0.9);
+    pointer-events: none;
   }
 `;
 
 const ArchitectureNodeIcon = styled.span`
   display: inline-grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
-  border: 1px solid rgba(125, 211, 252, 0.36);
-  border-radius: 7px;
-  color: rgba(248, 250, 252, 0.92);
-  background: rgba(14, 165, 233, 0.18);
-  font-size: 6px;
-  font-weight: 900;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(var(--node-accent, 125, 211, 252), 0.34);
+  border-radius: 9px;
+  color: rgba(248, 250, 252, 0.95);
+  background: rgba(var(--node-accent, 125, 211, 252), 0.14);
+  font-size: 7px;
+  font-weight: 800;
   line-height: 1;
   overflow: hidden;
 
   svg {
     display: block;
-    width: 16px;
-    height: 16px;
-    max-width: 18px;
-    max-height: 18px;
+    width: 17px;
+    height: 17px;
+    max-width: 19px;
+    max-height: 19px;
     color: currentColor;
   }
 
   &[data-source="likec4"],
   &[data-source="styled"] {
-    border-color: rgba(226, 232, 240, 0.2);
+    border-color: rgba(226, 232, 240, 0.16);
     color: rgba(248, 250, 252, 0.96);
-    background: rgba(248, 250, 252, 0.08);
-    box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.04), 0 5px 14px rgba(0, 0, 0, 0.14);
+    background: rgba(248, 250, 252, 0.07);
+    box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.04);
   }
 
   &[data-source="likec4"] svg {
@@ -12004,62 +11523,23 @@ const ArchitectureNodeIcon = styled.span`
 
   &[data-source="label"] {
     letter-spacing: 0;
-    font-size: 7px;
-  }
-
-  &[data-kind="client"] {
-    border-color: rgba(251, 191, 36, 0.42);
-    background: rgba(217, 119, 6, 0.22);
-  }
-
-  &[data-kind="client"][data-source="likec4"],
-  &[data-kind="client"][data-source="styled"] {
-    border-color: rgba(254, 240, 138, 0.26);
-    background: rgba(217, 119, 6, 0.16);
+    font-size: 8px;
   }
 
   &[data-kind="database"] {
-    border-color: rgba(52, 211, 153, 0.44);
     border-radius: 50%;
-    background: rgba(5, 150, 105, 0.22);
-  }
-
-  &[data-kind="database"][data-source="likec4"],
-  &[data-kind="database"][data-source="styled"] {
-    border-color: rgba(167, 243, 208, 0.28);
-    background: rgba(5, 150, 105, 0.16);
-  }
-
-  &[data-kind="external"] {
-    border-color: rgba(244, 114, 182, 0.42);
-    background: rgba(190, 24, 93, 0.22);
-  }
-
-  &[data-kind="external"][data-source="likec4"],
-  &[data-kind="external"][data-source="styled"] {
-    border-color: rgba(251, 207, 232, 0.28);
-    background: rgba(190, 24, 93, 0.16);
-  }
-
-  &[data-kind="queue"] {
-    border-color: rgba(167, 139, 250, 0.42);
-    background: rgba(109, 40, 217, 0.22);
-  }
-
-  &[data-kind="queue"][data-source="likec4"],
-  &[data-kind="queue"][data-source="styled"] {
-    border-color: rgba(221, 214, 254, 0.28);
-    background: rgba(109, 40, 217, 0.16);
   }
 
   &[data-kind="group"] {
-    border-radius: 7px;
+    border-radius: 9px;
   }
 
   ${ArchitectureCanvasNodeShell}[data-display="compact"] & {
-    width: 34px;
-    height: 34px;
-    border-radius: 11px;
+    width: 38px;
+    height: 38px;
+    border-radius: 12px;
+    border-color: rgba(var(--node-accent, 125, 211, 252), 0.42);
+    background: rgba(var(--node-accent, 125, 211, 252), 0.16);
     font-size: 8px;
   }
 
@@ -12068,10 +11548,10 @@ const ArchitectureNodeIcon = styled.span`
   }
 
   ${ArchitectureCanvasNodeShell}[data-display="compact"] & svg {
-    width: 21px;
-    height: 21px;
-    max-width: 23px;
-    max-height: 23px;
+    width: 22px;
+    height: 22px;
+    max-width: 24px;
+    max-height: 24px;
   }
 `;
 
@@ -12089,15 +11569,18 @@ const ArchitectureNodeText = styled.div`
   }
 
   strong {
-    color: rgba(248, 250, 252, 0.95);
-    font-size: 12px;
-    font-weight: 900;
+    color: rgba(248, 250, 252, 0.97);
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
   }
 
   span {
-    color: rgba(203, 213, 225, 0.74);
-    font-size: 10px;
-    font-weight: 760;
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
 
   ${ArchitectureCanvasNodeShell}[data-display="compact"] & {
@@ -12110,91 +11593,54 @@ const ArchitectureNodeText = styled.div`
     max-width: ${ARCHITECTURE_NODE_COMPACT_WIDTH - 4}px;
     color: rgba(248, 250, 252, 0.94);
     font-size: 10px;
-    font-weight: 860;
+    font-weight: 650;
+    letter-spacing: 0;
   }
 `;
 
 const ArchitectureCanvasGroupShell = styled.div`
+  --node-accent: 148, 163, 184;
   width: 100%;
   height: 100%;
-  padding: 16px;
-  border: 1px dashed rgba(148, 163, 184, 0.38);
-  border-radius: 8px;
-  color: rgba(226, 232, 240, 0.88);
+  padding: 18px;
+  border: 1px solid rgba(var(--node-accent), 0.26);
+  border-radius: 18px;
+  color: rgba(226, 232, 240, 0.9);
   background:
-    linear-gradient(180deg, rgba(15, 23, 42, 0.28), rgba(2, 6, 23, 0.16)),
-    rgba(15, 23, 42, 0.18);
-  box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.025);
+    radial-gradient(130% 90% at 0% 0%, rgba(var(--node-accent), 0.08), rgba(var(--node-accent), 0) 58%),
+    rgba(13, 19, 33, 0.32);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
 
-  &[data-intent="api-pathway"] {
-    border-color: rgba(125, 211, 252, 0.42);
-    background:
-      linear-gradient(180deg, rgba(14, 165, 233, 0.12), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
-
-  &[data-intent="api-corridor"] {
-    border-color: rgba(45, 212, 191, 0.42);
-    background:
-      linear-gradient(180deg, rgba(13, 148, 136, 0.12), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
-
-  &[data-intent="data-flow"] {
-    border-color: rgba(52, 211, 153, 0.38);
-    background:
-      linear-gradient(180deg, rgba(5, 150, 105, 0.12), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
-
-  &[data-intent="control-graph"] {
-    border-color: rgba(251, 191, 36, 0.42);
-    background:
-      linear-gradient(180deg, rgba(217, 119, 6, 0.12), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
-
-  &[data-intent="state-machine"] {
-    border-color: rgba(167, 139, 250, 0.42);
-    background:
-      linear-gradient(180deg, rgba(124, 58, 237, 0.12), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
-
-  &[data-intent="dependency-graph"] {
-    border-color: rgba(244, 114, 182, 0.38);
-    background:
-      linear-gradient(180deg, rgba(190, 24, 93, 0.1), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
-
-  &[data-intent="deployment"] {
-    border-color: rgba(45, 212, 191, 0.38);
-    background:
-      linear-gradient(180deg, rgba(13, 148, 136, 0.1), rgba(2, 6, 23, 0.16)),
-      rgba(15, 23, 42, 0.18);
-  }
+  &[data-intent="api-pathway"] { --node-accent: 125, 211, 252; }
+  &[data-intent="api-corridor"] { --node-accent: 45, 212, 191; }
+  &[data-intent="data-flow"] { --node-accent: 52, 211, 153; }
+  &[data-intent="control-graph"] { --node-accent: 251, 191, 36; }
+  &[data-intent="state-machine"] { --node-accent: 167, 139, 250; }
+  &[data-intent="dependency-graph"] { --node-accent: 244, 114, 182; }
+  &[data-intent="deployment"] { --node-accent: 45, 212, 191; }
 
   &[data-selected="true"] {
-    border-color: rgba(251, 191, 36, 0.68);
-    background:
-      linear-gradient(180deg, rgba(120, 53, 15, 0.16), rgba(2, 6, 23, 0.18)),
-      rgba(15, 23, 42, 0.18);
+    border-color: rgba(var(--node-accent), 0.6);
+    box-shadow:
+      inset 0 0 0 1px rgba(var(--node-accent), 0.16),
+      0 0 0 3px rgba(var(--node-accent), 0.1);
   }
 
   .react-flow__handle {
-    width: 9px;
-    height: 9px;
-    border: 1px solid rgba(2, 6, 23, 0.9);
-    background: rgba(251, 191, 36, 0.95);
+    width: 6px;
+    height: 6px;
+    border: 0;
+    opacity: 0;
+    background: rgba(var(--node-accent), 0.9);
+    pointer-events: none;
   }
 `;
 
 const ArchitectureGroupHeader = styled.div`
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr);
+  grid-template-columns: 30px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   max-width: calc(100% - 14px);
   padding: 1px 0 0;
 `;
@@ -12213,15 +11659,18 @@ const ArchitectureGroupText = styled.div`
   }
 
   strong {
-    color: rgba(248, 250, 252, 0.92);
-    font-size: 12px;
-    font-weight: 900;
+    color: rgba(248, 250, 252, 0.95);
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
   }
 
   span {
-    color: rgba(148, 163, 184, 0.75);
-    font-size: 10px;
-    font-weight: 760;
+    color: rgba(148, 163, 184, 0.78);
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
   }
 `;
 
@@ -12229,15 +11678,16 @@ const ArchitectureEdgeLabel = styled.div`
   position: absolute;
   z-index: 3;
   max-width: var(--edge-label-max-width, 156px);
-  padding: 3px 8px;
+  padding: 3px 9px;
   overflow: hidden;
-  border: 1px solid rgba(125, 211, 252, 0.22);
+  border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 999px;
-  color: rgba(224, 242, 254, 0.92);
-  background: rgba(2, 6, 23, 0.76);
-  box-shadow: 0 0 0 1px rgba(2, 6, 23, 0.38);
+  color: rgba(203, 213, 225, 0.9);
+  background: rgba(9, 13, 24, 0.82);
+  box-shadow: 0 4px 12px rgba(2, 6, 23, 0.4);
   font-size: 8.5px;
-  font-weight: 850;
+  font-weight: 650;
+  letter-spacing: 0.02em;
   line-height: 1.15;
   pointer-events: none;
   text-overflow: ellipsis;

@@ -37,6 +37,7 @@ import { Folder } from "@styled-icons/material-rounded/Folder";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import styled, { createGlobalStyle, keyframes } from "styled-components";
+import { accountAssetFanoutFromValue } from "../assets/accountAssetV2.js";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
@@ -347,36 +348,12 @@ function numberValue(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-function collectSnipAssetRows(value, depth = 0) {
-  const object = jsonObject(value);
-  if (!object || depth > 5) return [];
-  const rows = [];
-  const addAsset = (asset) => {
-    if (jsonObject(asset) && text(asset.assetId || asset.asset_id || asset.id)) rows.push(asset);
-  };
-  jsonArray(object.items).forEach(addAsset);
-  jsonArray(object.assets).forEach(addAsset);
-  addAsset(object.asset);
-  addAsset(object.item);
-  ["data", "payload", "result", "stored", "account_assets", "accountAssets"].forEach((key) => {
-    rows.push(...collectSnipAssetRows(object[key], depth + 1));
-  });
-  return rows;
+function collectSnipAssetRows(value) {
+  return accountAssetFanoutFromValue(value)?.items || [];
 }
 
-function collectSnipTransferRows(value, depth = 0) {
-  const object = jsonObject(value);
-  if (!object || depth > 5) return [];
-  const rows = [];
-  const addTransfer = (transfer) => {
-    if (jsonObject(transfer) && text(transfer.transferId || transfer.transfer_id || transfer.id)) rows.push(transfer);
-  };
-  jsonArray(object.transfers).forEach(addTransfer);
-  addTransfer(object.transfer);
-  ["data", "payload", "result", "stored", "account_assets", "accountAssets"].forEach((key) => {
-    rows.push(...collectSnipTransferRows(object[key], depth + 1));
-  });
-  return rows;
+function collectSnipTransferRows(value) {
+  return accountAssetFanoutFromValue(value)?.transfers || [];
 }
 
 function snipAssetId(asset) {

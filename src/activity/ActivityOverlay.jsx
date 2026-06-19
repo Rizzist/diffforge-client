@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { createGlobalStyle, keyframes } from "styled-components";
+import { accountAssetFanoutFromValue } from "../assets/accountAssetV2.js";
 
 export const ACTIVITY_OVERLAY_HASH = "#/activity-overlay";
 export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.context";
@@ -919,13 +920,15 @@ function normalizeTerminalTodoStates(status) {
 
 function assetLibraryTransfers(value) {
   const data = dataValue(value);
-  return jsonArray(data.transfers);
+  const fanout = accountAssetFanoutFromValue(data);
+  return fanout ? jsonArray(fanout.transfers) : jsonArray(data.transfers);
 }
 
 function assetItemsById(value) {
   const data = dataValue(value);
+  const fanout = accountAssetFanoutFromValue(data);
   const byId = new Map();
-  [...jsonArray(data.items), ...jsonArray(data.assets)].forEach((asset) => {
+  jsonArray(fanout ? fanout.items : data.items).forEach((asset) => {
     const object = jsonObject(asset);
     const id = firstText(object?.assetId, object?.asset_id, object?.id);
     if (object && id) {

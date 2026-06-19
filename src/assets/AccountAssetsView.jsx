@@ -34,6 +34,7 @@ import HyperframeEditor, {
   assetLooksLikeHyperframe,
   loadHyperframeAsset,
 } from "./HyperframeEditor.jsx";
+import { accountAssetFanoutFromValue } from "./accountAssetV2.js";
 import { assetIdentityKeys } from "./useAccountAssetsLibrary.js";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
@@ -77,12 +78,16 @@ function shortLabel(value, maxLength = 30) {
 function assetLibraryItems(value) {
   const object = jsonObject(value) || {};
   const data = jsonObject(object.data) || object;
-  return jsonArray(data.items).length ? jsonArray(data.items) : jsonArray(data.assets);
+  const fanout = accountAssetFanoutFromValue(data);
+  if (fanout) return jsonArray(fanout.items);
+  return jsonArray(data.items);
 }
 
 function assetLibraryTransfers(value) {
   const object = jsonObject(value) || {};
   const data = jsonObject(object.data) || object;
+  const fanout = accountAssetFanoutFromValue(data);
+  if (fanout) return jsonArray(fanout.transfers);
   return jsonArray(data.transfers);
 }
 
@@ -95,7 +100,10 @@ function assetLibraryAggregate(value) {
 function assetLibraryClouds(value) {
   const object = jsonObject(value) || {};
   const data = jsonObject(object.data) || object;
-  const direct = jsonArray(data.clouds).length
+  const fanout = accountAssetFanoutFromValue(data);
+  const direct = jsonArray(fanout?.clouds).length
+    ? jsonArray(fanout.clouds)
+    : jsonArray(data.clouds).length
     ? jsonArray(data.clouds)
     : jsonArray(data.assetClouds).length
       ? jsonArray(data.assetClouds)

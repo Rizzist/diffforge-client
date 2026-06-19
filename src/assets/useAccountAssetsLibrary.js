@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { accountAssetFanoutFromValue } from "./accountAssetV2.js";
 
 const ASSETS_UPDATED_EVENT = "cloud-mcp-account-assets-updated";
 const DEFAULT_ASSET_LIBRARY_LIMIT = 500;
@@ -59,40 +60,6 @@ function jsonObject(value) {
 
 function text(value) {
   return String(value ?? "").trim();
-}
-
-function collectAssetRows(value, depth = 0) {
-  const object = jsonObject(value);
-  if (!object || depth > 5) return [];
-  const rows = [];
-  const addAsset = (item) => {
-    if (jsonObject(item) && text(item.assetId || item.asset_id)) rows.push(item);
-  };
-  jsonArray(object.items).forEach(addAsset);
-  jsonArray(object.assets).forEach(addAsset);
-  addAsset(object.asset);
-  addAsset(object.item);
-  ["data", "payload", "result", "stored", "account_assets", "accountAssets"].forEach((key) => {
-    rows.push(...collectAssetRows(object[key], depth + 1));
-  });
-  return rows;
-}
-
-function collectTransferRows(value, depth = 0) {
-  const object = jsonObject(value);
-  if (!object || depth > 5) return [];
-  const rows = [];
-  const addTransfer = (transfer) => {
-    if (jsonObject(transfer) && text(transfer.transferId || transfer.transfer_id || transfer.id)) {
-      rows.push(transfer);
-    }
-  };
-  jsonArray(object.transfers).forEach(addTransfer);
-  addTransfer(object.transfer);
-  ["data", "payload", "result", "stored", "account_assets", "accountAssets"].forEach((key) => {
-    rows.push(...collectTransferRows(object[key], depth + 1));
-  });
-  return rows;
 }
 
 export function assetIdentityKeys(asset) {
@@ -182,15 +149,19 @@ function dedupeTransferRows(transfers) {
 
 function normalizeAssetsLibrary(library) {
   if (!library || typeof library !== "object") return library;
-  const items = dedupeAssetRows(jsonArray(library.items).length ? library.items : library.assets);
-  const transfers = dedupeTransferRows(library.transfers);
-  const clouds = jsonArray(library.clouds).length
-    ? jsonArray(library.clouds)
-    : jsonArray(library.assetClouds).length
-      ? jsonArray(library.assetClouds)
-      : jsonArray(library.asset_clouds);
+  const fanout = accountAssetFanoutFromValue(library);
+  const items = dedupeAssetRows(fanout ? fanout.items : jsonArray(library.items));
+  const transfers = dedupeTransferRows(fanout ? fanout.transfers : jsonArray(library.transfers));
+  const clouds = jsonArray(fanout?.clouds).length
+    ? jsonArray(fanout.clouds)
+    : jsonArray(library.clouds).length
+      ? jsonArray(library.clouds)
+      : jsonArray(library.assetClouds).length
+        ? jsonArray(library.assetClouds)
+        : jsonArray(library.asset_clouds);
   return {
     ...library,
+    ...(fanout || {}),
     items,
     assets: items,
     clouds,
@@ -202,20 +173,24 @@ function normalizeAssetsLibrary(library) {
 }
 
 function mergeAssetsLibraryEvent(library, eventPayload) {
-  const items = collectAssetRows(eventPayload);
-  const transfers = collectTransferRows(eventPayload);
-  if (!items.length && !transfers.length) return library;
+  const fanout = accountAssetFanoutFromValue(eventPayload);
+  const items = fanout?.items || [];
+  const transfers = fanout?.transfers || [];
+  const removedAssets = fanout?.removedAssets || fanout?.removed_assets || [];
+  if (!items.length && !transfers.length && !removedAssets.length) return library;
   const current = normalizeAssetsLibrary(library || {});
+  const removedIds = new Set(removedAssets.map((row) => text(row.assetId || row.asset_id || row.id)).filter(Boolean));
   const nextItems = dedupeAssetRows([
     ...jsonArray(current?.items),
     ...items,
-  ]);
+  ]).filter((item) => !removedIds.has(text(item.assetId || item.asset_id || item.id)));
   const nextTransfers = dedupeTransferRows([
     ...jsonArray(current?.transfers),
     ...transfers,
-  ]);
+  ]).filter((transfer) => !removedIds.has(text(transfer.assetId || transfer.asset_id)));
   return normalizeAssetsLibrary({
     ...(current || {}),
+    ...(fanout || {}),
     items: nextItems,
     assets: nextItems,
     transfers: nextTransfers,
