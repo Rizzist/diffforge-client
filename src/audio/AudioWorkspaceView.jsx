@@ -576,17 +576,18 @@ const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
 // the same pill (the window morphs to it in place, then morphs back).
 const AUDIO_WIDGET_BAR_NOTICE_SIZE = { width: 392, height: 52 };
 const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 6;
-// Idle: a thin line hugging the bottom; the window stays this small dock
-// zone so hovering it can reveal the round record button + shortcut hint.
-const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
+// Idle: keep the native hover target close to the visible line. It grows to
+// the reveal size only after the pointer is actually on that collapsed line.
+const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 84, height: 18 };
+const AUDIO_WIDGET_BAR_IDLE_HOVER_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
 const AUDIO_WIDGET_CLOUD_STATUS_POLL_MS = 5000;
 const AUDIO_WIDGET_BAR_HOVER_IDLE_RECHECK_MS = 140;
 const AUDIO_WIDGET_BAR_HOVER_ACTIVE_RECHECK_MS = 80;
-const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 34;
-const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP = 14;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT = 18;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP = 0;
 const AUDIO_WIDGET_ERROR_OVERLAY_SIZE = { width: 432, height: 64 };
 const AUDIO_WIDGET_ERROR_OVERLAY_GAP = 6;
 // Extra window height for the small error card shown above the bubble; the
@@ -834,7 +835,7 @@ const AudioDictionaryBottomJumpButton = styled.button`
   }
 `;
 
-function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible) {
+function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover) {
   if (cancelNoticeActive) {
     return {
       key: "notice",
@@ -852,9 +853,9 @@ function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible) {
   }
 
   return {
-    key: "idle",
+    key: barIdleHover ? "idle-hover" : "idle",
     margin: AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN,
-    size: AUDIO_WIDGET_BAR_IDLE_SIZE,
+    size: barIdleHover ? AUDIO_WIDGET_BAR_IDLE_HOVER_SIZE : AUDIO_WIDGET_BAR_IDLE_SIZE,
   };
 }
 
@@ -6932,7 +6933,7 @@ export function AudioWidgetWindow() {
     key: barGeometryKey,
     margin: barGeometryMargin,
     size: barGeometrySize,
-  } = getAudioWidgetBarGeometry(cancelNoticeActive, barVisible);
+  } = getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover);
   const barGeometryReady = !usesBottomAnchoredStyle || barPlacementReadyKey === barGeometryKey;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.

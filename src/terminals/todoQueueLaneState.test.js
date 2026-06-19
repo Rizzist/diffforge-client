@@ -79,6 +79,68 @@ test("accepted queued prompt is not complete just because input is fresh again",
   assert.equal(evaluation.releaseReason, "");
 });
 
+test("terminal-direct Codex prompt completes from matching input-ready without closed turn", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "idle",
+    effectiveLatestTurnState: "completed",
+    hookManaged: true,
+    inFlightPrompt: {
+      accepted: false,
+      itemId: "terminal-direct-todo-drop-prompt-1",
+      lifecycleSource: "tui-terminal-direct-input",
+      promptId: "todo-drop-prompt-1",
+      promptText: "i want to make some pages",
+      source: "tui-terminal-direct-input",
+      startedAtMs: submittedAtMs,
+      submittedAt,
+      submittedAtMs,
+      terminalInstanceId: 4,
+      threadId: "thread-1",
+    },
+    liveTerminal: {
+      activityStatus: "idle",
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:35:12.000Z",
+      instanceId: 4,
+      promptEventId: "todo-drop-prompt-1",
+      status: "idle",
+      threadId: "thread-1",
+    },
+    terminalGroundTruth: {
+      agentInputReady: true,
+      completedTurnLooksSendable: true,
+      effectiveActivityStatus: "idle",
+      effectiveLatestTurnState: "completed",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: true,
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "transcript-stale-message",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-thread-1-stale",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.completedMatchingTurn, false);
+  assert.equal(evaluation.promptTurnMatches, false);
+  assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.terminalReadinessMatchesPrompt, true);
+  assert.equal(evaluation.terminalDirectReadyFinished, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
 test("queued prompt is released when its terminal closes before acceptance", () => {
   const evaluation = baseEvaluation({
     effectiveActivityStatus: "idle",

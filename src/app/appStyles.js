@@ -3014,6 +3014,67 @@ export const WorkspaceSettingsButton = styled.button`
   }
 `;
 
+export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
+  right: auto;
+  left: 2px;
+  border-radius: 7px;
+  color: #d7e7ff;
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.96), rgba(5, 6, 7, 0.98)),
+    #050607;
+  transform: translate(-4px, -50%) scale(0.92);
+
+  &[data-runtime="closed"] {
+    color: #8fb7ff;
+  }
+
+  &[data-runtime="activating"] {
+    color: #ffe2a8;
+    border-color: rgba(216, 179, 106, 0.42);
+  }
+
+  &[data-runtime="activated"] {
+    color: #ffc7c7;
+    border-color: rgba(248, 113, 113, 0.26);
+  }
+
+  &:hover {
+    color: #ffffff;
+    border-color: rgba(125, 176, 255, 0.38);
+    background:
+      linear-gradient(180deg, rgba(23, 35, 58, 0.98), rgba(8, 10, 14, 0.98)),
+      #080a0e;
+  }
+
+  &[data-runtime="activated"]:hover {
+    border-color: rgba(248, 113, 113, 0.42);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface);
+  }
+
+  ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}:focus-within & {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(-50%) scale(1);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:focus-within & {
+    opacity: 0;
+    pointer-events: none;
+    transform: translate(-8px, -50%) scale(0.86);
+  }
+`;
+
 export const WorkspaceAccent = styled.span`
   align-self: center;
   justify-self: center;

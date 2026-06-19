@@ -3843,6 +3843,7 @@ fn cloud_mcp_sync_activity_live_state_key(raw: &str) -> bool {
     raw.contains("live_state")
         || raw.contains("account_live_state")
         || raw.contains("device_live_state")
+        || raw.contains("device_workspaces_snapshot")
         || raw.contains("account_device_live_state")
         || raw.contains("web_presence")
         || raw.contains("terminal_presence_snapshot")
@@ -5316,6 +5317,7 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
         }
     }
     if row.event_kind == "device_live_state_snapshot"
+        || row.event_kind == "device_workspaces_snapshot"
         || cloud_mcp_device_live_unit_event_kind(&row.event_kind)
     {
         if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
@@ -5527,7 +5529,9 @@ fn cloud_mcp_outbox_priority_for_event(event_kind: &str) -> u8 {
         | "device_agent_installation_status"
         | "workspace_mcp_server_status"
         | "provider_account_identity" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
-        "device_live_state_snapshot" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        "device_live_state_snapshot" | "device_workspaces_snapshot" => {
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
+        }
         "checkpoint" | "checkpoint_recorded" | "subtask_checkpoint" => {
             CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
         }
@@ -30674,6 +30678,21 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                     "createdAt",
                 ],
             );
+            let inputs = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "in",
+                &["inputs", "todoInputs", "todo_inputs"],
+            );
+            let input_count = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "ic",
+                &[
+                    "input_count",
+                    "inputCount",
+                    "todo_input_count",
+                    "todoInputCount",
+                ],
+            );
             let mut payload = serde_json::Map::new();
             payload.insert("id".to_string(), json!(todo_id.clone()));
             payload.insert("todo_id".to_string(), json!(todo_id.clone()));
@@ -30741,6 +30760,27 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             if !updated_at.is_null() {
                 payload.insert("updated_at".to_string(), updated_at.clone());
                 payload.insert("updatedAt".to_string(), updated_at);
+            }
+            if let Some(items) = inputs.as_array().filter(|items| !items.is_empty()) {
+                let inputs_value = Value::Array(items.clone());
+                payload.insert("inputs".to_string(), inputs_value.clone());
+                payload.insert("todoInputs".to_string(), inputs_value.clone());
+                payload.insert("todo_inputs".to_string(), inputs_value);
+                let count = input_count
+                    .as_i64()
+                    .or_else(|| input_count.as_u64().map(|value| value as i64))
+                    .or_else(|| input_count.as_str()?.trim().parse::<i64>().ok())
+                    .unwrap_or(items.len() as i64)
+                    .max(items.len() as i64);
+                payload.insert("input_count".to_string(), json!(count));
+                payload.insert("inputCount".to_string(), json!(count));
+                payload.insert("todo_input_count".to_string(), json!(count));
+                payload.insert("todoInputCount".to_string(), json!(count));
+            } else if !input_count.is_null() {
+                payload.insert("input_count".to_string(), input_count.clone());
+                payload.insert("inputCount".to_string(), input_count.clone());
+                payload.insert("todo_input_count".to_string(), input_count.clone());
+                payload.insert("todoInputCount".to_string(), input_count);
             }
             if !content_hash.trim().is_empty() {
                 payload.insert("content_hash".to_string(), json!(content_hash.clone()));
@@ -38306,6 +38346,64 @@ mod cloud_mcp_tests {
             )
             .unwrap();
         assert!(payload_json.contains("next-diffforge-dashboard"));
+    }
+
+    #[test]
+    fn account_todo_delta_preserves_compact_inputs() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let delta = json!({
+            "kind": "todo.sync",
+            "contract": "diffforge.todo.sync.v2",
+            "c": "todo.sync",
+            "m": "delta",
+            "accountId": "account-1",
+            "aseq": 11,
+            "ops": [
+                ["u", 11, "todo-multi-input", "peer-device", "workspace-peer", "running", "hash-inputs", {
+                    "t": "first prompt",
+                    "in": [
+                        {"id": "input-1", "text": "first prompt", "kind": "direct_terminal_input"},
+                        {"id": "input-2", "text": "follow-up prompt", "kind": "direct_terminal_input"}
+                    ],
+                    "ic": 2,
+                    "updatedAt": "2026-06-10T00:00:00Z"
+                }]
+            ]
+        });
+
+        let result = cloud_mcp_apply_account_todo_delta_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            &delta,
+            "local-device",
+        )
+        .unwrap();
+
+        assert_eq!(result.applied, 1);
+        let payload_json: String = conn
+            .query_row(
+                "SELECT payload_json FROM account_todo_inbound_cache WHERE todo_id='todo-multi-input'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["inputs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["todoInputs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["inputCount"], json!(2));
+
+        let row_json: String = conn
+            .query_row(
+                "SELECT row_json FROM workspace_todo_mirror_rows WHERE todo_id='todo-multi-input'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let row: Value = serde_json::from_str(&row_json).unwrap();
+        assert_eq!(row["inputs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(row["todoInputCount"], json!(2));
     }
 
     #[test]

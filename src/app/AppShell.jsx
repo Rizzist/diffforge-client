@@ -249,6 +249,7 @@ import {
   WorkspaceCompactGlyph,
   WorkspaceNotificationBadge,
   WorkspaceSettingsButton,
+  WorkspaceLifecycleButton,
   WorkspaceAccent,
   WorkspaceMuted,
   RailFooter,
@@ -437,20 +438,6 @@ import {
   WorkspaceSettingsSelect,
   WorkspaceSettingsSelectIcon,
   WorkspaceSettingsSelectShell,
-  TerminalCountGrid,
-  TerminalCountButton,
-  TerminalCountMeta,
-  TerminalLayoutPreview,
-  TerminalLayoutPreviewRow,
-  TerminalLayoutPreviewCell,
-  TerminalRoleSummary,
-  TerminalRoleSliderGrid,
-  TerminalRoleSliderRow,
-  TerminalRoleRange,
-  TerminalRoleGrid,
-  TerminalRoleCard,
-  TerminalRoleButtonGroup,
-  TerminalRoleButton,
   AgentSettingsPanel,
   AgentPanelActions,
   AgentReadyPill,
@@ -3664,10 +3651,6 @@ const GENERIC_TERMINAL_AGENT = {
   version: "Local shell",
   authMessage: "Plain terminal",
 };
-const WORKSPACE_TERMINAL_COUNT_OPTIONS = Array.from(
-  { length: MAX_WORKSPACE_TERMINAL_COUNT },
-  (_, index) => index + MIN_WORKSPACE_TERMINAL_COUNT,
-);
 const AGENT_INSTALL_GUIDES = {
   codex: {
     nativeInstallUrl: "https://github.com/openai/codex/releases/latest",
@@ -4102,6 +4085,81 @@ function WorkspaceCreateAgentGlyph({ roleId }) {
   return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
 }
 
+function WorkspaceAgentCountCards({
+  agentStatuses = [],
+  counts = {},
+  disabled = false,
+  minimumTotal = 0,
+  onAdjust,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  totalCount = 0,
+}) {
+  const installedAgentById = useMemo(() => {
+    const byId = new Map();
+    (Array.isArray(agentStatuses) ? agentStatuses : []).forEach((agent) => {
+      if (agent?.id) {
+        byId.set(agent.id, agent);
+      }
+    });
+    return byId;
+  }, [agentStatuses]);
+
+  return (
+    <WorkspaceCreateAgentGrid>
+      {roleOptions.map((option) => {
+        const agent = option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+          ? GENERIC_TERMINAL_AGENT
+          : installedAgentById.get(option.id);
+        const agentState = getWorkspaceCreateAgentState(option, agent);
+        const count = Math.max(0, Number(counts[option.id]) || 0);
+        const unavailable = !agentState.available;
+        const canRemoveAgent = !disabled && count > 0 && totalCount > minimumTotal;
+        const canAddAgent = !disabled
+          && agentState.available
+          && count < WORKSPACE_CREATE_AGENT_ROLE_CAP
+          && totalCount < MAX_WORKSPACE_TERMINAL_COUNT;
+
+        return (
+          <WorkspaceCreateAgentCard
+            $active={count > 0}
+            data-unavailable={unavailable ? "true" : undefined}
+            key={option.id}
+          >
+            <WorkspaceCreateAgentIcon data-agent={option.id}>
+              <WorkspaceCreateAgentGlyph roleId={option.id} />
+            </WorkspaceCreateAgentIcon>
+            <WorkspaceCreateAgentStatus>{agentState.statusLabel}</WorkspaceCreateAgentStatus>
+            <WorkspaceCreateAgentBody>
+              <WorkspaceCreateAgentLabel>
+                <strong>{option.label}</strong>
+              </WorkspaceCreateAgentLabel>
+            </WorkspaceCreateAgentBody>
+            <WorkspaceCreateAgentStepper>
+              <WorkspaceCreateAgentStepButton
+                aria-label={`Remove one ${option.label} terminal`}
+                disabled={!canRemoveAgent}
+                onClick={() => onAdjust?.(option.id, -1)}
+                type="button"
+              >
+                -
+              </WorkspaceCreateAgentStepButton>
+              <strong>{count}</strong>
+              <WorkspaceCreateAgentStepButton
+                aria-label={`Add one ${option.label} terminal`}
+                disabled={!canAddAgent}
+                onClick={() => onAdjust?.(option.id, 1)}
+                type="button"
+              >
+                +
+              </WorkspaceCreateAgentStepButton>
+            </WorkspaceCreateAgentStepper>
+          </WorkspaceCreateAgentCard>
+        );
+      })}
+    </WorkspaceCreateAgentGrid>
+  );
+}
+
 
 /**
  * Inline create-workspace panel rendered in the main area right of the
@@ -4465,56 +4523,14 @@ function WorkspaceCreatePanel({
             Pick how many of each agent open with this workspace. Drag the
             counts up for parallel agents of the same kind.
           </SettingsHint>
-          <WorkspaceCreateAgentGrid>
-            {roleOptions.map((option) => {
-              const agent = option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
-                ? GENERIC_TERMINAL_AGENT
-                : installedAgentById.get(option.id);
-              const agentState = getWorkspaceCreateAgentState(option, agent);
-              const count = Math.max(0, Number(availableAgentCounts[option.id]) || 0);
-              const unavailable = !agentState.available;
-              const canAddAgent = !creating
-                && agentState.available
-                && count < WORKSPACE_CREATE_AGENT_ROLE_CAP
-                && terminalRoles.length < MAX_WORKSPACE_TERMINAL_COUNT;
-              return (
-                <WorkspaceCreateAgentCard
-                  $active={count > 0}
-                  data-unavailable={unavailable ? "true" : undefined}
-                  key={option.id}
-                >
-                  <WorkspaceCreateAgentIcon data-agent={option.id}>
-                    <WorkspaceCreateAgentGlyph roleId={option.id} />
-                  </WorkspaceCreateAgentIcon>
-                  <WorkspaceCreateAgentStatus>{agentState.statusLabel}</WorkspaceCreateAgentStatus>
-                  <WorkspaceCreateAgentBody>
-                    <WorkspaceCreateAgentLabel>
-                      <strong>{option.label}</strong>
-                    </WorkspaceCreateAgentLabel>
-                  </WorkspaceCreateAgentBody>
-                  <WorkspaceCreateAgentStepper>
-                    <WorkspaceCreateAgentStepButton
-                      aria-label={`Remove one ${option.label} terminal`}
-                      disabled={creating || count === 0}
-                      onClick={() => adjustAgentCount(option.id, -1)}
-                      type="button"
-                    >
-                      -
-                    </WorkspaceCreateAgentStepButton>
-                    <strong>{count}</strong>
-                    <WorkspaceCreateAgentStepButton
-                      aria-label={`Add one ${option.label} terminal`}
-                      disabled={!canAddAgent}
-                      onClick={() => adjustAgentCount(option.id, 1)}
-                      type="button"
-                    >
-                      +
-                    </WorkspaceCreateAgentStepButton>
-                  </WorkspaceCreateAgentStepper>
-                </WorkspaceCreateAgentCard>
-              );
-            })}
-          </WorkspaceCreateAgentGrid>
+          <WorkspaceAgentCountCards
+            agentStatuses={agentStatuses}
+            counts={availableAgentCounts}
+            disabled={creating}
+            onAdjust={adjustAgentCount}
+            roleOptions={roleOptions}
+            totalCount={terminalRoles.length}
+          />
         </WorkspaceCreateSection>
 
         {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
@@ -7197,61 +7213,37 @@ function buildWorkspaceTerminalRolesFromCounts(
   return nextRoles.slice(0, terminalCount);
 }
 
-function rebalanceWorkspaceTerminalRoleCounts(
+function adjustWorkspaceAgentCardRoles(
   roles,
   targetRole,
-  targetCount,
-  count,
+  delta,
   roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  options = {},
 ) {
-  const terminalCount = normalizeWorkspaceTerminalCount(count);
-  const roleId = normalizeWorkspaceTerminalRole(targetRole, "codex", roleOptions);
-  const counts = getWorkspaceTerminalRoleCountMap(
-    normalizeWorkspaceTerminalRoles(roles, terminalCount, "codex", roleOptions),
-    roleOptions,
+  const maxTotal = Math.max(
+    MIN_WORKSPACE_TERMINAL_COUNT,
+    Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Number(options.maxTotal) || MAX_WORKSPACE_TERMINAL_COUNT),
   );
-  const requestedCount = Math.max(0, Math.min(terminalCount, Number.parseInt(targetCount, 10) || 0));
-  const previousCount = counts[roleId] || 0;
-  const delta = requestedCount - previousCount;
+  const minimumTotal = Math.max(0, Math.min(maxTotal, Number(options.minimumTotal) || 0));
+  const roleId = normalizeWorkspaceTerminalRole(targetRole, WORKSPACE_TERMINAL_ROLE_GENERIC, roleOptions);
+  const normalizedRoles = (Array.isArray(roles) ? roles : [])
+    .map((role) => normalizeWorkspaceTerminalRole(role, WORKSPACE_TERMINAL_ROLE_GENERIC, roleOptions))
+    .slice(0, maxTotal);
+  const counts = getWorkspaceTerminalRoleCountMap(normalizedRoles, roleOptions);
+  const currentRoleCount = Math.max(0, counts[roleId] || 0);
+  const totalOther = Math.max(0, normalizedRoles.length - currentRoleCount);
+  const maxForRole = Math.min(WORKSPACE_CREATE_AGENT_ROLE_CAP, maxTotal - totalOther);
+  const nextRoleCount = Math.max(0, Math.min(maxForRole, currentRoleCount + Number(delta || 0)));
 
-  counts[roleId] = requestedCount;
+  counts[roleId] = nextRoleCount;
 
-  if (delta > 0) {
-    let remaining = delta;
-    const drainOrder = [
-      WORKSPACE_TERMINAL_ROLE_GENERIC,
-      ...roleOptions
-        .filter((option) => option.id !== WORKSPACE_TERMINAL_ROLE_GENERIC)
-        .map((option) => option.id)
-        .reverse(),
-    ].filter((otherRole) => otherRole !== roleId);
-
-    drainOrder.forEach((otherRole) => {
-      if (remaining <= 0) {
-        return;
-      }
-
-      const removed = Math.min(counts[otherRole] || 0, remaining);
-      counts[otherRole] = (counts[otherRole] || 0) - removed;
-      remaining -= removed;
-    });
-
-    counts[roleId] -= remaining;
-  } else if (delta < 0) {
-    const recipientRole = roleId === WORKSPACE_TERMINAL_ROLE_GENERIC
-      ? getWorkspaceTerminalFallbackRole(roleOptions, "codex")
-      : WORKSPACE_TERMINAL_ROLE_GENERIC;
-    counts[recipientRole] = (counts[recipientRole] || 0) + Math.abs(delta);
+  const nextRoles = expandWorkspaceCreateAgentCounts(roleOptions, counts).slice(0, maxTotal);
+  const fallbackRole = getWorkspaceTerminalFallbackRole(roleOptions, "codex");
+  while (nextRoles.length < minimumTotal) {
+    nextRoles.push(fallbackRole);
   }
 
-  return buildWorkspaceTerminalRolesFromCounts(counts, terminalCount, roleOptions);
-}
-
-function getWorkspaceTerminalRoleSummaryText(roles, roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
-  return getWorkspaceTerminalRoleCounts(roles, roleOptions)
-    .filter((role) => role.count > 0)
-    .map((role) => `${role.shortLabel} ${role.count}`)
-    .join(" / ") || `${getTerminalRoleOption("codex", roleOptions).shortLabel} 1`;
+  return nextRoles;
 }
 
 function getWorkspaceTerminalPaneAgentId(role) {
@@ -7266,110 +7258,6 @@ function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
   }
 
   return getReadyAgent(agentStatuses, roleId);
-}
-
-function TerminalLayoutMiniature({ count, roleOptions, roles = [] }) {
-  const rows = getTerminalPanelRows(getDefaultTerminalIndexes(count));
-  const fallbackRole = getWorkspaceTerminalFallbackRole(roleOptions);
-  const previewRoles = normalizeWorkspaceTerminalRoles(roles, count, fallbackRole, roleOptions);
-
-  return (
-    <TerminalLayoutPreview aria-hidden="true">
-      {rows.map((row) => (
-        <TerminalLayoutPreviewRow
-          key={`preview-row-${count}-${row.rowIndex}`}
-          style={{ "--preview-columns": row.terminalIndexes.length }}
-        >
-          {row.terminalIndexes.map((terminalIndex) => (
-            <TerminalLayoutPreviewCell
-              data-slot={previewRoles[terminalIndex] || "codex"}
-              key={`preview-cell-${count}-${terminalIndex}`}
-            />
-          ))}
-        </TerminalLayoutPreviewRow>
-      ))}
-    </TerminalLayoutPreview>
-  );
-}
-
-function WorkspaceTerminalCountPicker({ disabled = false, onChange, roleOptions, roles, value }) {
-  const selectedCount = normalizeWorkspaceTerminalCount(value);
-
-  return (
-    <TerminalCountGrid aria-label="Terminal count">
-      {WORKSPACE_TERMINAL_COUNT_OPTIONS.map((count) => (
-        <TerminalCountButton
-          aria-pressed={count === selectedCount}
-          data-selected={count === selectedCount}
-          disabled={disabled}
-          key={count}
-          onClick={() => onChange(String(count))}
-          title={`${count} ${count === 1 ? "terminal" : "terminals"}`}
-          type="button"
-        >
-          <TerminalCountMeta>
-            <strong>{count}</strong>
-            <span>{count === 1 ? "terminal" : "terminals"}</span>
-          </TerminalCountMeta>
-          <TerminalLayoutMiniature count={count} roleOptions={roleOptions} roles={roles} />
-        </TerminalCountButton>
-      ))}
-    </TerminalCountGrid>
-  );
-}
-
-function WorkspaceTerminalRolePicker({
-  count,
-  disabled = false,
-  onChange,
-  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
-  value,
-}) {
-  const terminalCount = normalizeWorkspaceTerminalCount(count);
-  const fallbackRole = getWorkspaceTerminalFallbackRole(roleOptions);
-  const roles = normalizeWorkspaceTerminalRoles(value, terminalCount, fallbackRole, roleOptions);
-  const roleCounts = getWorkspaceTerminalRoleCounts(roles, roleOptions);
-
-  return (
-    <>
-      <TerminalRoleSummary aria-label="Terminal role counts">
-        {roleCounts.map((role) => (
-          <WorkspaceSettingsMetaPill key={role.id}>
-            <span>{role.shortLabel}</span>
-            <strong>{role.count}</strong>
-          </WorkspaceSettingsMetaPill>
-        ))}
-      </TerminalRoleSummary>
-      <TerminalRoleSliderGrid aria-label="Terminal role distribution">
-        {roleCounts.map((role) => (
-          <TerminalRoleSliderRow data-role={role.id} key={role.id}>
-            <span>
-              <strong>{role.label}</strong>
-              <em>{role.count}</em>
-            </span>
-            <TerminalRoleRange
-              aria-label={`${role.label} terminal count`}
-              data-role={role.id}
-              disabled={disabled}
-              max={terminalCount}
-              min="0"
-              onChange={(event) => {
-                onChange(rebalanceWorkspaceTerminalRoleCounts(
-                  roles,
-                  role.id,
-                  event.target.value,
-                  terminalCount,
-                  roleOptions,
-                ));
-              }}
-              type="range"
-              value={role.count}
-            />
-          </TerminalRoleSliderRow>
-        ))}
-      </TerminalRoleSliderGrid>
-    </>
-  );
 }
 
 function NetworkingInspector({
@@ -8886,6 +8774,7 @@ export default function App() {
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [rustTerminalAuthoritySnapshot, setRustTerminalAuthoritySnapshot] = useState(null);
+  const [workspaceTerminalsLiveSyncRevision, setWorkspaceTerminalsLiveSyncRevision] = useState(0);
   const [workspaceMcpRegistries, setWorkspaceMcpRegistries] = useState({});
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
@@ -10898,6 +10787,7 @@ export default function App() {
     invoke("terminal_live_sessions")
       .then((payload) => {
         setRustTerminalAuthoritySnapshot(payload || null);
+        setWorkspaceTerminalsLiveSyncRevision((revision) => revision + 1);
         logTerminalStatus("frontend.terminal_authority.refresh_done", {
           reason: safeReason,
           sessionCount: Array.isArray(payload?.sessions)
@@ -12572,10 +12462,27 @@ export default function App() {
       workspaceName: workspace.name || "",
     });
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
-    requestWorkspaceActivation(workspace.id, "workspace_rail");
+    cancelDeferredWorkspaceActivation();
+    setWorkspacePendingActivationId("");
+    workspacePendingActivationIdRef.current = "";
+    selectedWorkspaceIdRef.current = workspace.id;
+    setSelectedWorkspaceId(workspace.id);
+    setWorkspaceCreateModalOpen(false);
+    setWorkspaceSettingsModalId(workspaceAlreadyActive ? "" : workspace.id);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    setWorkspaceDeleteConfirmId("");
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: workspaceAlreadyActive
+        ? "workspace_rail_select_active"
+        : "workspace_rail_select_inactive",
+      telemetryWorkspaceId: workspace.id,
+    });
   }, [
+    cancelDeferredWorkspaceActivation,
     logWorkspaceActivationTrace,
-    requestWorkspaceActivation,
+    showView,
     workspaces,
   ]);
 
@@ -12692,11 +12599,16 @@ export default function App() {
         setActivatedWorkspaceId(nextActivatedWorkspaceId);
       }
       if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
-        setSelectedWorkspaceId("");
+        selectedWorkspaceIdRef.current = targetWorkspaceId;
+        setSelectedWorkspaceId(targetWorkspaceId);
+        setWorkspaceCreateModalOpen(false);
+        setWorkspaceSettingsModalId(targetWorkspaceId);
+        showView(DEFAULT_WORKSPACE_VIEW, {
+          immediate: true,
+          telemetrySource: `${source}_workspace_deactivated`,
+          telemetryWorkspaceId: targetWorkspaceId,
+        });
       }
-      setWorkspaceSettingsModalId((currentModalId) => (
-        currentModalId === targetWorkspaceId ? "" : currentModalId
-      ));
 
       workspaceDeactivationInFlightRef.current = "";
       setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
@@ -12705,6 +12617,7 @@ export default function App() {
     clearPreparedWorkspaceTerminals,
     defaultWorkingDirectory,
     setWorkspaceAgentBatchSentLaunchKey,
+    showView,
     updateWorkspaceLifecycleSettings,
   ]);
 
@@ -13710,17 +13623,15 @@ export default function App() {
       const existingEnabledWorkspaceIds = configuredEnabledWorkspaceIds.filter((workspaceId) => (
         Boolean(findWorkspaceById(nextWorkspaces, workspaceId))
       ));
-      const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId)
-        || defaultWorkspace
+      const nextActivated = (
+        currentActivatedId && existingEnabledWorkspaceIds.includes(currentActivatedId)
+          ? findWorkspaceById(nextWorkspaces, currentActivatedId)
+          : null
+      ) || existingEnabledWorkspaceIds
+        .map((workspaceId) => findWorkspaceById(nextWorkspaces, workspaceId))
+        .find(Boolean)
         || null;
-      const nextEnabledWorkspaceIds = (() => {
-        if (nextActivated?.id) {
-          return existingEnabledWorkspaceIds.includes(nextActivated.id)
-            ? existingEnabledWorkspaceIds
-            : [...existingEnabledWorkspaceIds, nextActivated.id];
-        }
-        return [];
-      })();
+      const nextEnabledWorkspaceIds = existingEnabledWorkspaceIds;
 
       if (
         (configuredDefaultWorkspaceId && !nextDefaultWorkspaceId)
@@ -14000,8 +13911,8 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
+    const cleanedRoot = cleanWorkspaceRootDirectory(currentRootDirectory);
     const currentAgentSessionMode = getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id);
     const requestedAgentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft);
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
@@ -14039,17 +13950,8 @@ export default function App() {
     setWorkspaceSettingsMessage("");
 
     try {
-      if (cleanedRoot) {
-      }
-
-      const rootValidationPath = cleanedRoot || defaultWorkingDirectory;
-      const normalizedRoot = rootValidationPath
-        ? await invoke("validate_workspace_root_directory", { path: rootValidationPath })
-        : null;
-      const rootDirectory = cleanedRoot ? normalizedRoot?.workingDirectory || "" : "";
-      const rootGitRepository = rootDirectory
-        ? Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository)
-        : false;
+      const rootDirectory = cleanedRoot;
+      const rootGitRepository = getWorkspaceRootGitRepository(workspaceSettings, selectedWorkspace.id);
       const agentSessionMode = normalizeAgentSessionMode(
         requestedAgentSessionMode,
         false,
@@ -14074,19 +13976,17 @@ export default function App() {
         selectedWorkspace.id,
         currentTerminalCount,
       );
-      const nextTerminalIndexes = rootDirectory !== currentRootDirectory
+      const rootChanged = false;
+      const nextTerminalIndexes = rootChanged
         ? getDefaultTerminalIndexes(terminalCount)
         : reconcileWorkspaceTerminalSlotIndexes(currentTerminalIndexes, terminalCount);
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, terminalRoles[index]]
       )));
-      const rootChanged = rootDirectory !== currentRootDirectory;
       const gitWorktreesChanged = agentSessionMode !== currentAgentSessionMode;
       const rootWasEmptyAtSelection = rootDirectory
-        ? rootChanged
-          ? Boolean(normalizedRoot?.emptyDirectory)
-          : getWorkspaceRootWasEmptyAtSelection(workspaceSettings, selectedWorkspace.id)
+        ? getWorkspaceRootWasEmptyAtSelection(workspaceSettings, selectedWorkspace.id)
         : false;
       const previousMcpRepoPath = currentRootDirectory || defaultWorkingDirectory;
       const nextMcpRepoPath = rootDirectory || defaultWorkingDirectory;
@@ -14283,7 +14183,6 @@ export default function App() {
     authState,
     expireDesktopSession,
     workspaceNameDraft,
-    workspaceRootDraft,
     workspaceAgentSessionModeDraft,
     workspaceTerminalCountDraft,
     workspaceTerminalRolesDraft,
@@ -15242,32 +15141,6 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
-
-  const useDefaultWorkspaceRoot = useCallback(() => {
-    setWorkspaceRootDraft(defaultWorkingDirectory);
-    setWorkspaceSettingsError("");
-    setWorkspaceSettingsMessage("");
-  }, [defaultWorkingDirectory]);
-
-  const chooseWorkspaceRootDirectory = useCallback(async () => {
-    setWorkspaceSettingsError("");
-    setWorkspaceSettingsMessage("");
-
-    try {
-      const selected = await openDialog({
-        directory: true,
-        multiple: false,
-        title: "Choose workspace root directory",
-      });
-      const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-
-      if (typeof selectedPath === "string" && selectedPath.trim()) {
-        setWorkspaceRootDraft(selectedPath);
-      }
-    } catch (error) {
-      setWorkspaceSettingsError(getErrorMessage(error, "Unable to choose root directory."));
-    }
-  }, []);
 
   const useDefaultNewWorkspaceRoot = useCallback(() => {
     setNewWorkspaceRootDraft(defaultWorkingDirectory);
@@ -17621,15 +17494,17 @@ export default function App() {
     const workspaceId = String(options.workspaceId || event.workspaceId || "").trim();
     const paneId = String(options.paneId || event.paneId || event.pane_id || "").trim();
     const threadId = String(options.threadId || event.threadId || event.thread_id || "").trim();
+    const reason = options.reason || event.source || eventType;
     workspaceTerminalsSyncKeyRef.current = "";
+    refreshRustTerminalAuthoritySnapshot(`terminal_status:${String(reason || eventType).trim() || eventType}`);
     logTerminalStatus("frontend.terminal_status.workspace_snapshot_invalidated", {
       eventType,
       paneId,
-      reason: options.reason || event.source || eventType,
+      reason,
       threadId,
       workspaceId,
     });
-  }, []);
+  }, [refreshRustTerminalAuthoritySnapshot]);
   useEffect(() => {
     terminalStatusEventEmitterRef.current = emitTerminalStatusEvent;
   }, [emitTerminalStatusEvent]);
@@ -17812,7 +17687,7 @@ export default function App() {
     }
     let disposed = false;
     const reason = "device_workspaces_changed";
-    const syncKey = `${workspaceCatalogSyncKey}:${reason}:${cloudLiveSyncEpoch}`;
+    const syncKey = `${workspaceCatalogSyncKey}:${reason}:${cloudLiveSyncEpoch}:${workspaceTerminalsLiveSyncRevision}`;
     if (workspaceTerminalsSyncKeyRef.current === syncKey) {
       return undefined;
     }
@@ -17861,7 +17736,6 @@ export default function App() {
           workspaceTerminalsSyncTimerRef.current = window.setTimeout(flushPresence, 0);
         }
       };
-      window.setTimeout(releasePresenceSyncGate, 0);
       invoke("cloud_mcp_sync_device_workspaces_snapshot", {
         workspaces: pending.workspaces,
         reason: pending.reason,
@@ -17937,6 +17811,7 @@ export default function App() {
     user,
     workspaceHydrationReady,
     cloudLiveSyncEpoch,
+    workspaceTerminalsLiveSyncRevision,
     workspaceSyncState,
   ]);
 
@@ -23967,10 +23842,6 @@ export default function App() {
       });
       return;
     }
-    refreshRustTerminalAuthoritySnapshot(
-      `thread_lifecycle:${String(event.source || event.type || "terminal").trim() || "terminal"}`,
-    );
-
     let lifecycleEvent = event;
     if (event.type === "message-submitted") {
       const existingThread = event.threadId
@@ -26424,6 +26295,38 @@ export default function App() {
     ? Math.min(100, Math.round((workspaceDeactivateClosed / workspaceDeactivateTotal) * 100))
     : 0;
   const workspaceDeactivateTerminalLabel = workspaceDeactivateTotal === 1 ? "terminal" : "terminals";
+  const workspaceSettingsTerminalRoles = useMemo(() => (
+    normalizeWorkspaceTerminalRoles(
+      workspaceTerminalRolesDraft,
+      workspaceTerminalCountDraft,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    )
+  ), [
+    workspaceTerminalCountDraft,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+    workspaceTerminalRolesDraft,
+  ]);
+  const workspaceSettingsAgentCounts = useMemo(() => (
+    getWorkspaceTerminalRoleCountMap(workspaceSettingsTerminalRoles, workspaceTerminalRoleOptions)
+  ), [workspaceSettingsTerminalRoles, workspaceTerminalRoleOptions]);
+  const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
+    const nextRoles = adjustWorkspaceAgentCardRoles(
+      workspaceSettingsTerminalRoles,
+      roleId,
+      delta,
+      workspaceTerminalRoleOptions,
+      { minimumTotal: MIN_WORKSPACE_TERMINAL_COUNT },
+    );
+    setWorkspaceTerminalCountDraft(String(nextRoles.length));
+    setWorkspaceTerminalRolesDraft(nextRoles);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, [
+    workspaceSettingsTerminalRoles,
+    workspaceTerminalRoleOptions,
+  ]);
   const isWorkspaceStartupOverlayVisible = shouldShowStartupPhases && workspaceState !== "ready";
   const settingsPermissionsAreLoading = settingsPermissionState.status === "loading";
   const settingsAudioInputPermission = settingsPermissionState.audioInput;
@@ -26695,13 +26598,16 @@ export default function App() {
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
                       const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
-                      const workspaceRuntimeState = workspace.id === activatedWorkspaceId
-                        ? workspaceState === "ready"
-                          ? "activated"
-                          : "activating"
-                        : workspaceIsRuntimeEnabled
-                          ? "activated"
-                          : "closed";
+                      const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
+                      const workspaceRuntimeState = workspaceIsPendingActivation
+                        ? "activating"
+                        : workspace.id === activatedWorkspaceId
+                          ? workspaceState === "ready"
+                            ? "activated"
+                            : "activating"
+                          : workspaceIsRuntimeEnabled
+                            ? "activated"
+                            : "closed";
                       const notificationSummary = workspaceNotificationSummaries[workspace.id] || {};
                       const notificationBadgeText = formatWorkspaceNotificationBadgeCount(
                         notificationSummary.badgeCount,
@@ -26715,6 +26621,16 @@ export default function App() {
                       const workspaceButtonLabel = notificationLabel
                         ? `${workspace.name}, ${notificationLabel}`
                         : workspace.name;
+                      const workspaceLifecycleBusy = Boolean(
+                        workspaceIsPendingActivation
+                          || (workspaceDeactivationState.isActive
+                            && workspaceDeactivationState.workspaceId === workspace.id),
+                      );
+                      const workspaceLifecycleLabel = workspaceIsRuntimeEnabled
+                        ? `Deactivate ${workspace.name}`
+                        : workspaceIsPendingActivation
+                          ? `Opening ${workspace.name}`
+                          : `Activate ${workspace.name}`;
 
                       return (
                         <WorkspaceRow
@@ -26750,9 +26666,33 @@ export default function App() {
                               </WorkspaceNotificationBadge>
                             )}
                           </WorkspaceButton>
+                          <WorkspaceLifecycleButton
+                            aria-label={workspaceLifecycleLabel}
+                            data-runtime={workspaceRuntimeState}
+                            disabled={workspaceLifecycleBusy}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              if (workspaceIsRuntimeEnabled) {
+                                void deactivateWorkspace(workspace.id, "workspace_rail_toggle");
+                                return;
+                              }
+                              requestWorkspaceActivation(workspace.id, "workspace_rail_toggle");
+                            }}
+                            title={workspaceLifecycleLabel}
+                            type="button"
+                          >
+                            {workspaceIsRuntimeEnabled ? (
+                              <ButtonCloseIcon aria-hidden="true" />
+                            ) : (
+                              <ButtonTerminalIcon aria-hidden="true" />
+                            )}
+                          </WorkspaceLifecycleButton>
                           <WorkspaceSettingsButton
                             aria-label={`Open settings for ${workspace.name}`}
-                            onClick={() => openWorkspaceSettings(workspace.id)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openWorkspaceSettings(workspace.id);
+                            }}
                             title="Workspace settings"
                             type="button"
                           >
@@ -27105,43 +27045,37 @@ export default function App() {
                               <PanelKicker>Workspace settings</PanelKicker>
                               <PanelHeading>{selectedWorkspace.name}</PanelHeading>
                             </div>
-                            <WorkspaceModalCloseButton
-                              aria-label="Close workspace settings"
-                              disabled={isWorkspaceSettingsBusy}
-                              onClick={closeWorkspaceSettings}
-                              title="Close"
-                              type="button"
-                            >
-                              <ButtonCloseIcon aria-hidden="true" />
-                            </WorkspaceModalCloseButton>
+                            <WorkspaceSettingsHeaderActions>
+                              {isSelectedWorkspaceActivated ? (
+                                <SecondaryButton
+                                  disabled={isWorkspaceSettingsBusy}
+                                  onClick={() => deactivateWorkspace(selectedWorkspace.id, "workspace_settings_header")}
+                                  type="button"
+                                >
+                                  <ButtonCloseIcon aria-hidden="true" />
+                                  <span>{isWorkspaceSettingsDeactivating ? "Deactivating..." : "Deactivate"}</span>
+                                </SecondaryButton>
+                              ) : (
+                                <SecondaryButton
+                                  disabled={isWorkspaceSettingsBusy}
+                                  onClick={() => requestWorkspaceActivation(selectedWorkspace.id, "workspace_settings_header")}
+                                  type="button"
+                                >
+                                  <ButtonTerminalIcon aria-hidden="true" />
+                                  <span>Reactivate</span>
+                                </SecondaryButton>
+                              )}
+                              <WorkspaceModalCloseButton
+                                aria-label="Close workspace settings"
+                                disabled={isWorkspaceSettingsBusy}
+                                onClick={closeWorkspaceSettings}
+                                title="Close"
+                                type="button"
+                              >
+                                <ButtonCloseIcon aria-hidden="true" />
+                              </WorkspaceModalCloseButton>
+                            </WorkspaceSettingsHeaderActions>
                           </WorkspaceCreateHeader>
-
-                          <WorkspaceSettingsHeaderMeta aria-label="Workspace summary">
-                            <WorkspaceSettingsMetaPill>
-                              <span>Runtime</span>
-                              <strong>{isSelectedWorkspaceActivated ? "Active" : "Idle"}</strong>
-                            </WorkspaceSettingsMetaPill>
-                            <WorkspaceSettingsMetaPill>
-                              <span>Terminals</span>
-                              <strong>
-                                {normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft)}
-                                {" "}
-                                {getWorkspaceTerminalRoleSummaryText(
-                                  normalizeWorkspaceTerminalRoles(
-                                    workspaceTerminalRolesDraft,
-                                    normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft),
-                                    workspaceTerminalFallbackRole,
-                                    workspaceTerminalRoleOptions,
-                                  ),
-                                  workspaceTerminalRoleOptions,
-                                )}
-                              </strong>
-                            </WorkspaceSettingsMetaPill>
-                            <WorkspaceSettingsMetaPill>
-                              <span>Default</span>
-                              <strong>{isSelectedWorkspaceDefault ? "On" : "Off"}</strong>
-                            </WorkspaceSettingsMetaPill>
-                          </WorkspaceSettingsHeaderMeta>
 
                           <WorkspaceCreateSection>
                             <SettingsLabel>Name</SettingsLabel>
@@ -27168,59 +27102,22 @@ export default function App() {
                                 <WorkspaceCreatePathBadge $tone="good">git</WorkspaceCreatePathBadge>
                               )}
                             </WorkspaceCreatePathBar>
-                            <WorkspaceCreateFooter>
-                              <SecondaryButton
-                                disabled={isWorkspaceSettingsBusy}
-                                onClick={chooseWorkspaceRootDirectory}
-                                type="button"
-                              >
-                                <ButtonFolderIcon aria-hidden="true" />
-                                <span>Choose directory</span>
-                              </SecondaryButton>
-                              <SecondaryButton
-                                disabled={!defaultWorkingDirectory || isWorkspaceSettingsBusy}
-                                onClick={useDefaultWorkspaceRoot}
-                                type="button"
-                              >
-                                <ButtonFolderIcon aria-hidden="true" />
-                                <span>Use app dir</span>
-                              </SecondaryButton>
-                            </WorkspaceCreateFooter>
                           </WorkspaceCreateSection>
 
                           <WorkspaceCreateSection>
-                            <SettingsLabel>Terminal layout</SettingsLabel>
-                            <SettingsHint>Choose the total, then distribute panes across installed agent CLIs and plain terminals.</SettingsHint>
-                            <WorkspaceTerminalCountPicker
+                            <SettingsLabel>Coding agents</SettingsLabel>
+                            <SettingsHint>
+                              Pick how many of each agent open with this workspace. Drag the
+                              counts up for parallel agents of the same kind.
+                            </SettingsHint>
+                            <WorkspaceAgentCountCards
+                              agentStatuses={agentStatuses}
+                              counts={workspaceSettingsAgentCounts}
                               disabled={isWorkspaceSettingsBusy}
-                              onChange={(count) => {
-                                const nextCount = normalizeWorkspaceTerminalCount(count);
-                                setWorkspaceTerminalCountDraft(count);
-                                setWorkspaceTerminalRolesDraft((roles) => (
-                                  normalizeWorkspaceTerminalRoles(
-                                    roles,
-                                    nextCount,
-                                    workspaceTerminalFallbackRole,
-                                    workspaceTerminalRoleOptions,
-                                  )
-                                ));
-                                setWorkspaceSettingsError("");
-                                setWorkspaceSettingsMessage("");
-                              }}
+                              minimumTotal={MIN_WORKSPACE_TERMINAL_COUNT}
+                              onAdjust={updateWorkspaceSettingsAgentCount}
                               roleOptions={workspaceTerminalRoleOptions}
-                              roles={workspaceTerminalRolesDraft}
-                              value={workspaceTerminalCountDraft}
-                            />
-                            <WorkspaceTerminalRolePicker
-                              count={workspaceTerminalCountDraft}
-                              disabled={isWorkspaceSettingsBusy}
-                              onChange={(roles) => {
-                                setWorkspaceTerminalRolesDraft(roles);
-                                setWorkspaceSettingsError("");
-                                setWorkspaceSettingsMessage("");
-                              }}
-                              roleOptions={workspaceTerminalRoleOptions}
-                              value={workspaceTerminalRolesDraft}
+                              totalCount={workspaceSettingsTerminalRoles.length}
                             />
                           </WorkspaceCreateSection>
 
@@ -27272,50 +27169,6 @@ export default function App() {
                             </AgentSafetyModeGroup>
                           </WorkspaceCreateSection>
 
-                          <WorkspaceCreateSection>
-                            <SettingsLabel>Workspace state</SettingsLabel>
-                            <WorkspaceCreateFooter>
-                              {isSelectedWorkspaceActivated ? (
-                                <SecondaryButton
-                                  disabled={isWorkspaceSettingsBusy}
-                                  onClick={() => deactivateWorkspace(selectedWorkspace.id, "workspace_settings")}
-                                  type="button"
-                                >
-                                  <ButtonCloseIcon aria-hidden="true" />
-                                  <span>{isWorkspaceSettingsDeactivating ? "Deactivating..." : "Deactivate"}</span>
-                                </SecondaryButton>
-                              ) : (
-                                <SecondaryButton
-                                  disabled={isWorkspaceSettingsBusy}
-                                  onClick={() => requestWorkspaceActivation(selectedWorkspace.id, "workspace_settings")}
-                                  type="button"
-                                >
-                                  <ButtonTerminalIcon aria-hidden="true" />
-                                  <span>Activate</span>
-                                </SecondaryButton>
-                              )}
-                              {isSelectedWorkspaceDefault ? (
-                                <SecondaryButton
-                                  disabled={isWorkspaceSettingsBusy}
-                                  onClick={() => setDefaultWorkspace("", "workspace_settings")}
-                                  type="button"
-                                >
-                                  <ButtonCloseIcon aria-hidden="true" />
-                                  <span>No default</span>
-                                </SecondaryButton>
-                              ) : (
-                                <SecondaryButton
-                                  disabled={isWorkspaceSettingsBusy}
-                                  onClick={() => setDefaultWorkspace(selectedWorkspace.id, "workspace_settings")}
-                                  type="button"
-                                >
-                                  <ButtonCheckIcon aria-hidden="true" />
-                                  <span>Set default</span>
-                                </SecondaryButton>
-                              )}
-                            </WorkspaceCreateFooter>
-                          </WorkspaceCreateSection>
-
                           {workspaceSettingsError && <FormMessage $state="error">{workspaceSettingsError}</FormMessage>}
                           {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
 
@@ -27334,6 +27187,25 @@ export default function App() {
                                     : "Delete from Diff Forge"}
                               </span>
                             </PrimaryDangerButton>
+                            {isSelectedWorkspaceDefault ? (
+                              <SecondaryButton
+                                disabled={isWorkspaceSettingsBusy}
+                                onClick={() => setDefaultWorkspace("", "workspace_settings")}
+                                type="button"
+                              >
+                                <ButtonCloseIcon aria-hidden="true" />
+                                <span>No default</span>
+                              </SecondaryButton>
+                            ) : (
+                              <SecondaryButton
+                                disabled={isWorkspaceSettingsBusy}
+                                onClick={() => setDefaultWorkspace(selectedWorkspace.id, "workspace_settings")}
+                                type="button"
+                              >
+                                <ButtonCheckIcon aria-hidden="true" />
+                                <span>Set default</span>
+                              </SecondaryButton>
+                            )}
                             <PrimaryButton disabled={isWorkspaceSettingsBusy} type="submit">
                               <ButtonCheckIcon aria-hidden="true" />
                               <span>{workspaceSettingsState === "saving" ? "Saving..." : "Save"}</span>

@@ -10942,7 +10942,13 @@ function getTodoQueueItemWithoutPersistedQueueState(item) {
   if (!item || typeof item !== "object") {
     return item;
   }
-  const { queueState: _queueState, queue_state: _queueStateSnake, ...rest } = item;
+  const {
+    queueState: _queueState,
+    queue_state: _queueStateSnake,
+    queuedAt: _queuedAt,
+    queued_at: _queuedAtSnake,
+    ...rest
+  } = item;
   return rest;
 }
 
@@ -11091,6 +11097,59 @@ function getTodoQueueItemStorageUpdatedMs(item) {
   );
 }
 
+function getTodoQueueItemCreatedMs(item) {
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  return (
+    Date.parse(String(item?.createdAt || item?.created_at || "")) || 0
+  ) || (
+    Date.parse(String(queueState.createdAt || queueState.created_at || "")) || 0
+  ) || (
+    Date.parse(String(queueState.queuedAt || queueState.queued_at || "")) || 0
+  ) || 0;
+}
+
+function getTodoQueueItemQueuedMs(item) {
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  const status = getTodoQueueCanonicalLifecycleStatus(item);
+  const queueLike = Boolean(
+    queueState.phase
+      || queueState.state
+      || (status && !["deleted", "listed"].includes(status)),
+  );
+  const queuedMs = queueLike
+    ? (
+      Date.parse(String(item?.queuedAt || item?.queued_at || "")) || 0
+    ) || (
+      Date.parse(String(queueState.queuedAt || queueState.queued_at || "")) || 0
+    ) || (
+      Date.parse(String(queueState.createdAt || queueState.created_at || "")) || 0
+    )
+    : 0;
+  return queuedMs || getTodoQueueItemCreatedMs(item);
+}
+
+function getTodoQueueItemQueuedAt(item) {
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  return String(
+    item?.queuedAt
+      || item?.queued_at
+      || queueState.queuedAt
+      || queueState.queued_at
+      || queueState.createdAt
+      || queueState.created_at
+      || "",
+  ).trim();
+}
+
+function compareTodoQueueItemsByQueuedAt(left, right) {
+  const leftQueued = getTodoQueueItemQueuedMs(left) || Number.MAX_SAFE_INTEGER;
+  const rightQueued = getTodoQueueItemQueuedMs(right) || Number.MAX_SAFE_INTEGER;
+  if (leftQueued !== rightQueued) {
+    return leftQueued - rightQueued;
+  }
+  return String(left?.id || "").localeCompare(String(right?.id || ""));
+}
+
 function preferTodoQueueStorageItem(existing, candidate) {
   if (!existing) {
     return candidate;
@@ -11103,6 +11162,22 @@ function preferTodoQueueStorageItem(existing, candidate) {
   return getTodoQueueItemStorageUpdatedMs(candidate) >= getTodoQueueItemStorageUpdatedMs(existing)
     ? candidate
     : existing;
+}
+
+function mergeTodoQueueStorageItems(existing, candidate) {
+  if (!existing) {
+    return candidate;
+  }
+  if (!candidate) {
+    return existing;
+  }
+  const preferred = preferTodoQueueStorageItem(existing, candidate);
+  const secondary = preferred === candidate ? existing : candidate;
+  return getTodoQueueItemInputs(secondary).reduce((merged, input) => (
+    getTodoQueueItemWithAppendedInput(merged, input, {
+      updatedAt: secondary.updatedAt || secondary.updated_at || merged.updatedAt || "",
+    })
+  ), preferred);
 }
 
 function todoQueueItemShouldPersistToStorage(item) {
@@ -11175,11 +11250,20 @@ function todoQueueRemoteItemsMatch(left, right) {
 function todoQueueSendTargetMatchesIdentity(candidate, targetTerminalId, targetThreadId) {
   const requestedTerminalId = normalizeTodoTerminalIdentity(targetTerminalId);
   const requestedThreadId = normalizeTodoTerminalIdentity(targetThreadId);
+  const candidateThreadIds = [
+    candidate?.targetThreadId,
+    candidate?.threadId,
+    candidate?.targetBinding?.threadId,
+    candidate?.targetProviderBinding?.threadId,
+    candidate?.targetProviderBinding?.terminalBinding?.threadId,
+    candidate?.liveTerminal?.threadId,
+    candidate?.liveTerminal?.thread_id,
+    candidate?.targetThread?.id,
+    candidate?.targetThread?.threadId,
+  ].map(normalizeTodoTerminalIdentity).filter(Boolean);
+  const threadMatches = !requestedThreadId || candidateThreadIds.includes(requestedThreadId);
   if (!requestedTerminalId) {
-    if (requestedThreadId) {
-      return false;
-    }
-    return true;
+    return threadMatches;
   }
   const candidateTerminalIds = [
     candidate?.paneId,
@@ -11190,6 +11274,26 @@ function todoQueueSendTargetMatchesIdentity(candidate, targetTerminalId, targetT
     candidate?.terminalAgent?.paneId,
   ].map(normalizeTodoTerminalIdentity).filter(Boolean);
   return candidateTerminalIds.includes(requestedTerminalId);
+}
+
+function todoQueueSendTargetMatchesName(candidate, targetTerminalName) {
+  const requestedName = normalizeTodoTerminalName(targetTerminalName).toLowerCase();
+  if (!requestedName) {
+    return true;
+  }
+  const candidateNames = [
+    candidate?.targetTerminalName,
+    candidate?.targetName,
+    candidate?.name,
+    candidate?.label,
+    candidate?.liveTerminal?.targetTerminalName,
+    candidate?.liveTerminal?.target_terminal_name,
+    candidate?.liveTerminal?.name,
+    candidate?.liveTerminal?.label,
+    candidate?.terminalAgent?.name,
+    candidate?.terminalAgent?.label,
+  ].map((value) => normalizeTodoTerminalName(value).toLowerCase()).filter(Boolean);
+  return candidateNames.includes(requestedName);
 }
 
 function getTodoQueueAgentAccentColor(agentId) {
@@ -11577,9 +11681,187 @@ function getTodoQueueRawQueueState(item) {
   return null;
 }
 
+function normalizeTodoQueueInputEntry(input) {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+  const text = normalizeTodoQueueText(
+    input.text
+      || input.message
+      || input.promptText
+      || input.prompt_text
+      || input.userMessage
+      || input.user_message
+      || "",
+  );
+  const promptId = String(
+    input.promptEventId
+      || input.prompt_event_id
+      || input.promptId
+      || input.prompt_id
+      || input.inputId
+      || input.input_id
+      || input.id
+      || "",
+  ).trim();
+  if (!text && !promptId) {
+    return null;
+  }
+  const submittedAt = String(
+    input.submittedAt
+      || input.submitted_at
+      || input.createdAt
+      || input.created_at
+      || input.updatedAt
+      || input.updated_at
+      || "",
+  ).trim();
+  const inputId = String(input.inputId || input.input_id || input.id || promptId || "").trim();
+  const source = normalizeTodoQueueSource(input.source || input.source_kind || input.sourceKind || "");
+  const paneId = normalizeTodoTerminalIdentity(
+    input.paneId
+      || input.pane_id
+      || input.targetTerminalId
+      || input.target_terminal_id
+      || "",
+  );
+  const targetTerminalIndex = normalizeTodoTerminalIndex(
+    input.targetTerminalIndex
+      ?? input.target_terminal_index
+      ?? input.terminalIndex
+      ?? input.terminal_index,
+  );
+  const threadId = normalizeTodoTerminalIdentity(
+    input.threadId
+      || input.thread_id
+      || input.targetThreadId
+      || input.target_thread_id
+      || "",
+  );
+  const targetAgentId = normalizeTodoTerminalAgentId(
+    input.targetAgentId
+      || input.target_agent_id
+      || input.agentId
+      || input.agent_id
+      || "",
+  );
+  return {
+    ...(inputId ? { id: inputId, inputId } : {}),
+    kind: "input",
+    ...(source ? { source } : {}),
+    ...(text ? { text } : {}),
+    ...(promptId ? { promptEventId: promptId, promptId } : {}),
+    ...(submittedAt ? { submittedAt, createdAt: submittedAt } : {}),
+    ...(paneId ? { paneId, targetTerminalId: paneId } : {}),
+    ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(threadId ? { threadId, targetThreadId: threadId } : {}),
+    ...(targetAgentId ? { targetAgentId } : {}),
+  };
+}
+
+function getTodoQueueItemInputs(item) {
+  const rawInputs = Array.isArray(item?.inputs)
+    ? item.inputs
+    : Array.isArray(item?.todoInputs)
+      ? item.todoInputs
+      : Array.isArray(item?.todo_inputs)
+        ? item.todo_inputs
+        : [];
+  const keyed = new Map();
+  const unkeyed = [];
+  rawInputs
+    .map(normalizeTodoQueueInputEntry)
+    .filter(Boolean)
+    .forEach((input) => {
+      const key = String(input.promptEventId || input.promptId || input.inputId || input.id || "").trim();
+      if (!key) {
+        unkeyed.push(input);
+        return;
+      }
+      keyed.set(key, input);
+    });
+  return [...keyed.values(), ...unkeyed];
+}
+
+function createTodoQueuePrimaryInputFromItem(item) {
+  const text = normalizeTodoQueueText(item?.text || item?.message || "");
+  if (!text) {
+    return null;
+  }
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  return normalizeTodoQueueInputEntry({
+    id: String(item?.promptEventId || item?.prompt_event_id || queueState.promptId || queueState.promptEventId || "").trim(),
+    promptEventId: item?.promptEventId || item?.prompt_event_id || queueState.promptId || queueState.promptEventId || "",
+    source: item?.source || queueState.source || "",
+    text,
+    submittedAt: item?.createdAt || item?.created_at || queueState.queuedAt || queueState.queued_at || "",
+    paneId: getTodoQueueTargetTerminalId(item),
+    targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+    threadId: getTodoQueueTargetThreadId(item),
+    targetAgentId: getTodoQueueTargetAgentId(item),
+  });
+}
+
+function todoQueueInputMatches(input, promptId = "", text = "") {
+  const normalized = normalizeTodoQueueInputEntry(input);
+  if (!normalized) {
+    return false;
+  }
+  const requestedPromptId = String(promptId || "").trim();
+  const requestedText = normalizeTodoQueueText(text);
+  const candidatePromptIds = [
+    normalized.promptEventId,
+    normalized.promptId,
+    normalized.inputId,
+    normalized.id,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  if (requestedPromptId) {
+    return candidatePromptIds.includes(requestedPromptId);
+  }
+  return Boolean(requestedText && normalizeTodoQueueText(normalized.text) === requestedText);
+}
+
+function getTodoQueueItemWithAppendedInput(item, input, fields = {}) {
+  if (!item || typeof item !== "object") {
+    return item;
+  }
+  const normalizedInput = normalizeTodoQueueInputEntry(input);
+  if (!normalizedInput) {
+    return item;
+  }
+  const promptId = String(normalizedInput.promptEventId || normalizedInput.promptId || "").trim();
+  const text = normalizeTodoQueueText(normalizedInput.text);
+  let inputs = getTodoQueueItemInputs(item);
+  if (!inputs.length) {
+    const primary = createTodoQueuePrimaryInputFromItem(item);
+    if (primary) {
+      inputs = [primary];
+    }
+  }
+  if (!inputs.some((existing) => todoQueueInputMatches(existing, promptId, text))) {
+    inputs = inputs.concat([normalizedInput]);
+  }
+  const updatedAt = String(fields.updatedAt || normalizedInput.submittedAt || new Date().toISOString());
+  return {
+    ...item,
+    inputs,
+    todoInputs: inputs,
+    inputCount: inputs.length,
+    updatedAt,
+    ...(fields.reason ? { statusReason: String(fields.reason), todoStatusReason: String(fields.reason) } : {}),
+  };
+}
+
+function getTodoQueueLatestInput(item) {
+  const inputs = getTodoQueueItemInputs(item);
+  return inputs.length ? inputs[inputs.length - 1] : null;
+}
+
 function createTodoQueueItem(text, options = {}) {
   const createdAt = typeof options.createdAt === "string" && options.createdAt.trim()
     ? options.createdAt
+    : typeof options.created_at === "string" && options.created_at.trim()
+    ? options.created_at
     : new Date().toISOString();
   const id = typeof options.id === "string" && options.id.trim()
     ? options.id.trim()
@@ -11617,6 +11899,8 @@ function createTodoQueueItem(text, options = {}) {
     ? { ...options.remoteCommand }
     : null;
   const queueState = normalizeTodoQueuePersistedQueueState(options);
+  const queuedAt = getTodoQueueItemQueuedAt({ ...options, queueState });
+  const inputs = getTodoQueueItemInputs(options);
   const agentSessionMetadata = getTodoQueueAgentSessionMetadata(options);
   const canonicalLifecycle = getTodoQueueCanonicalLifecycle(options);
   const todoStatus = canonicalLifecycle.status;
@@ -11646,6 +11930,8 @@ function createTodoQueueItem(text, options = {}) {
     ...(source ? { source } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
+    ...(queuedAt ? { queuedAt } : {}),
+    ...(inputs.length ? { inputs, todoInputs: inputs, inputCount: inputs.length } : {}),
     ...agentSessionMetadata,
     ...(todoStatus && todoStatus !== "listed" ? { status: todoStatus, todoStatus } : {}),
     ...(todoStatusUpdatedAt ? { todoStatusUpdatedAt } : {}),
@@ -11676,6 +11962,11 @@ function normalizeTodoQueueItem(item) {
     return null;
   }
 
+  const createdAt = typeof item.createdAt === "string" && item.createdAt.trim()
+    ? item.createdAt
+    : typeof item.created_at === "string" && item.created_at.trim()
+    ? item.created_at
+    : new Date().toISOString();
   const text = normalizeTodoQueueText(item.text);
   const images = getTodoQueueItemImages(item);
   const image = images[0] || null;
@@ -11708,6 +11999,8 @@ function normalizeTodoQueueItem(item) {
       ? { ...item.remote_command }
       : null;
   const queueState = normalizeTodoQueuePersistedQueueState(item);
+  const queuedAt = getTodoQueueItemQueuedAt({ ...item, queueState });
+  const inputs = getTodoQueueItemInputs(item);
   const agentSessionMetadata = getTodoQueueAgentSessionMetadata(item);
   const canonicalLifecycle = getTodoQueueCanonicalLifecycle(item);
   const todoStatus = canonicalLifecycle.status;
@@ -11729,7 +12022,7 @@ function normalizeTodoQueueItem(item) {
   }
 
   return {
-    createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+    createdAt,
     id: typeof item.id === "string" && item.id.trim()
       ? item.id
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -11742,6 +12035,8 @@ function normalizeTodoQueueItem(item) {
     ...(source ? { source } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
+    ...(queuedAt ? { queuedAt } : {}),
+    ...(inputs.length ? { inputs, todoInputs: inputs, inputCount: inputs.length } : {}),
     ...agentSessionMetadata,
     ...(todoStatus && todoStatus !== "listed" ? { status: todoStatus, todoStatus } : {}),
     ...(todoStatusUpdatedAt ? { todoStatusUpdatedAt } : {}),
@@ -11779,9 +12074,11 @@ function normalizeTodoQueueItems(items) {
         unkeyed.push(item);
         return;
       }
-      keyed.set(key, preferTodoQueueStorageItem(keyed.get(key), item));
+      keyed.set(key, mergeTodoQueueStorageItems(keyed.get(key), item));
     });
-  return [...keyed.values(), ...unkeyed].slice(0, TODO_QUEUE_MAX_ITEMS);
+  return [...keyed.values(), ...unkeyed]
+    .sort(compareTodoQueueItemsByQueuedAt)
+    .slice(0, TODO_QUEUE_MAX_ITEMS);
 }
 
 function normalizeTodoQueueItemsForWorkspace(items, workspaceId = "", deviceId = "") {
@@ -11874,6 +12171,7 @@ function buildTodoQueueCloudSyncItem(item, {
   const image = images[0] || null;
   const note = getTodoQueueItemNote(normalizedItem);
   const queueState = normalizeTodoQueuePersistedQueueState(normalizedItem);
+  const queuedAt = getTodoQueueItemQueuedAt(normalizedItem);
   const agentSessionFields = getTodoQueueAgentSessionCloudFields(normalizedItem);
   const providerSessionCleared = Boolean(
     clearProviderSessionId
@@ -11893,6 +12191,7 @@ function buildTodoQueueCloudSyncItem(item, {
     status: cloudStatus,
     text: normalizeTodoQueueText(normalizedItem.text),
     createdAt: normalizedItem.createdAt || "",
+    ...(queuedAt ? { queuedAt, queued_at: queuedAt } : {}),
     updatedAt: normalizedItem.todoStatusUpdatedAt || new Date().toISOString(),
     ...(normalizedItem.todoCompletedAt ? { completedAt: normalizedItem.todoCompletedAt } : {}),
     ...(normalizedItem.todoCancelledAt ? { cancelledAt: normalizedItem.todoCancelledAt } : {}),
@@ -11985,6 +12284,8 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
     }
     const status = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status || item.status) || "listed";
     const text = normalizeTodoQueueText(item.text || item.body || "");
+    const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+    const queuedAt = String(item.queuedAt || item.queued_at || queueState.queuedAt || queueState.queued_at || "").trim();
     const meta = {
       ...baseMeta,
       created_at: item.createdAt || item.created_at || nowIso,
@@ -11994,6 +12295,7 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
       title: String(item.title || text).slice(0, 120),
       updated_at: item.updatedAt || item.updated_at || nowIso,
       updatedAt: item.updatedAt || item.updated_at || nowIso,
+      ...(queuedAt ? { queued_at: queuedAt, queuedAt } : {}),
       ...(item.source ? { source: item.source, source_kind: item.source, sourceKind: item.source } : {}),
       ...(item.lastDispatchId ? { last_dispatch_id: item.lastDispatchId, lastDispatchId: item.lastDispatchId } : {}),
       ...(item.targetAgentId ? { target_agent_id: item.targetAgentId, targetAgentId: item.targetAgentId } : {}),
@@ -12847,8 +13149,16 @@ function createTodoQueueItemFromWorkspaceTodo(item, workspaceId, hydratedText = 
   if (!todoId || !text) {
     return null;
   }
+  const queuedAt = String(
+    item?.queuedAt
+      || item?.queued_at
+      || item?.queueState?.queuedAt
+      || item?.queue_state?.queued_at
+      || "",
+  ).trim();
   return normalizeTodoQueueItem({
     createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
+    ...(queuedAt ? { queuedAt } : {}),
     id: todoId,
     kind: "todo",
     ...getTodoQueueAgentSessionMetadata(item),
@@ -12943,10 +13253,18 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
   if (!commandId || !text) {
     return null;
   }
+  const queuedAt = String(
+    item?.queuedAt
+      || item?.queued_at
+      || item?.createdAt
+      || item?.created_at
+      || new Date().toISOString(),
+  ).trim();
   const dispatchSource = item?.dispatchSource || item?.dispatch_source || null;
   const dispatchTarget = item?.dispatchTarget || item?.dispatch_target || null;
   return normalizeTodoQueueItem({
     createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
+    queuedAt,
     id: commandId,
     kind: "todo",
     ...getTodoQueueAgentSessionMetadata(item),
@@ -12964,6 +13282,14 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
     text,
     todoStatus: "queued",
     todoStatusReason: item?.statusReason || item?.status_reason || "",
+    queueState: {
+      dispatchId,
+      phase: "queued",
+      queuedAt,
+      state: "queued",
+      todoDispatchId: dispatchId,
+      todoId,
+    },
     workspaceId,
     targetAgentId: item?.targetAgentId || item?.target_agent_id || "",
     targetTerminalId: item?.targetTerminalId || item?.target_terminal_id || "",
@@ -13152,6 +13478,7 @@ function normalizeWorkspaceTodoMirrorItems(items = [], selection = null, options
       return {
         cloudTodoId: todoId,
         createdAt: item?.createdAt || item?.created_at || "",
+        queuedAt: item?.queuedAt || item?.queued_at || item?.queueState?.queuedAt || item?.queue_state?.queued_at || "",
         deviceId,
         displayDeviceName: deviceName,
         displayStatus: status,
@@ -13168,6 +13495,7 @@ function normalizeWorkspaceTodoMirrorItems(items = [], selection = null, options
       };
     })
     .filter(Boolean)
+    .sort(compareTodoQueueItemsByQueuedAt)
     .slice(0, 80);
 }
 
@@ -23129,8 +23457,127 @@ function TerminalView({
     // ONE todo instead of three id families for the same prompt.
     const itemId = String(event.directTodoItemId || event.direct_todo_item_id || "").trim()
       || getTodoQueueTerminalDirectItemId(promptId);
+    const paneId = eventPaneId || getTerminalPaneId(targetTerminalIndex);
+    const targetThread = getTerminalThread(targetTerminalIndex) || null;
+    const targetThreadId = String(targetThread?.id || targetThread?.threadId || "").trim();
+    const threadId = normalizeTodoTerminalIdentity(event.threadId || event.thread_id || targetThreadId || "");
+    const workspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
+    const targetColorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
+    const targetTerminalColor = terminalColorForSlot(targetColorSlot ?? targetTerminalIndex);
+    const terminalAssignmentFields = {
+      targetAgentId: agentId,
+      targetColorSlot,
+      targetTerminalColor,
+      targetTerminalId: paneId,
+      targetTerminalIndex,
+      targetThreadId: threadId,
+    };
+    const directInput = normalizeTodoQueueInputEntry({
+      id: promptId,
+      promptEventId: promptId,
+      source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+      submittedAt,
+      text,
+      paneId,
+      targetTerminalIndex,
+      threadId,
+      targetAgentId: agentId,
+    });
 
     if (terminalDirectTodoPromptIdsRef.current.has(promptId)) {
+      return;
+    }
+
+    const activeInFlightForTerminal = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalIndex) || null;
+    const activeInFlightItemId = String(activeInFlightForTerminal?.itemId || "").trim();
+    const activeItemForPane = todoQueueItemsRef.current
+      .filter((candidate) => {
+        const candidateId = String(candidate?.id || "").trim();
+        if (!candidateId || candidateId === itemId) {
+          return false;
+        }
+        const status = getTodoQueueCanonicalLifecycleStatus(candidate);
+        if (!["sending", "submitted", "running", "dispatching", "paused"].includes(status)) {
+          return false;
+        }
+        const candidatePaneId = normalizeTodoTerminalIdentity(getTodoQueueTargetTerminalId(candidate));
+        const candidateIndex = getTodoQueueTargetTerminalIndex(candidate);
+        return Boolean(
+          (paneId && candidatePaneId && candidatePaneId === paneId)
+            || (Number.isInteger(candidateIndex) && candidateIndex === targetTerminalIndex)
+        );
+      })
+      .sort((left, right) => getTodoQueueItemStorageUpdatedMs(right) - getTodoQueueItemStorageUpdatedMs(left))[0] || null;
+    const appendParentItemId = activeInFlightItemId && activeInFlightItemId !== itemId
+      ? activeInFlightItemId
+      : String(activeItemForPane?.id || "").trim();
+    if (appendParentItemId && directInput) {
+      terminalDirectTodoPromptIdsRef.current.add(promptId);
+      updateTodoQueueItems((currentItems) => currentItems.map((item) => (
+        String(item?.id || "").trim() === appendParentItemId
+          ? getTodoQueueItemWithAppendedInput(item, directInput, {
+            reason: "terminal_direct_input_appended",
+            updatedAt: submittedAt,
+          })
+          : item
+      )), {
+        force: true,
+        immediate: true,
+        reason: "terminal_direct_input_appended",
+      });
+      const pendingItem = todoQueuePendingItemsRef.current[appendParentItemId] || null;
+      if (pendingItem) {
+        setTodoQueueItemPending(appendParentItemId, {
+          ...pendingItem,
+          item: pendingItem.item || null,
+          paneId,
+          promptId,
+          reason: "terminal_direct_input_appended",
+          source: pendingItem.source || TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+          submitConfirmed: true,
+          targetAgentId: pendingItem.targetAgentId || agentId,
+          targetColorSlot: pendingItem.targetColorSlot ?? targetColorSlot,
+          targetTerminalColor: pendingItem.targetTerminalColor || targetTerminalColor,
+          targetTerminalId: pendingItem.targetTerminalId || paneId,
+          targetRole: pendingItem.targetRole || agentId,
+          targetTerminalIndex,
+          targetThreadId: pendingItem.targetThreadId || threadId,
+          timeoutMs: pendingItem.timeoutMs || TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
+          workspaceId: pendingItem.workspaceId || workspaceId,
+        });
+      }
+      const nextInFlight = {
+        ...(activeInFlightForTerminal || {}),
+        agentId: activeInFlightForTerminal?.agentId || agentId,
+        itemId: appendParentItemId,
+        lifecycleSource: activeInFlightForTerminal?.lifecycleSource || TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+        paneId,
+        promptId,
+        promptEventSubmittedAt: submittedAt,
+        promptText: text,
+        source: activeInFlightForTerminal?.source || TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+        startedAtMs: activeInFlightForTerminal?.startedAtMs || Date.parse(submittedAt) || Date.now(),
+        submittedAt,
+        submittedAtMs: Date.parse(submittedAt) || Date.now(),
+        targetTerminalIndex,
+        terminalInstanceId: event.instanceId || event.instance_id || activeInFlightForTerminal?.terminalInstanceId || "",
+        terminalText: String(event.expectedUserMessage || event.expected_user_message || text),
+        threadMessageText: text,
+        threadId,
+        workspaceId,
+      };
+      todoQueueTerminalInFlightPromptsRef.current.set(targetTerminalIndex, nextInFlight);
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+      logTerminalStatus("frontend.todo_queue.terminal_direct_input_appended", {
+        agentId,
+        itemId: appendParentItemId,
+        paneId,
+        promptEventId: promptId,
+        source: event.source || event.messageSource || "",
+        targetTerminalIndex,
+        threadId,
+        workspaceId,
+      });
       return;
     }
 
@@ -23155,27 +23602,13 @@ function TerminalView({
     }
     terminalDirectTodoPromptIdsRef.current.add(promptId);
 
-    const paneId = eventPaneId || getTerminalPaneId(targetTerminalIndex);
-    const targetThread = getTerminalThread(targetTerminalIndex) || null;
-    const targetThreadId = String(targetThread?.id || targetThread?.threadId || "").trim();
-    const threadId = normalizeTodoTerminalIdentity(event.threadId || event.thread_id || targetThreadId || "");
-    const workspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
-    const targetColorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
-    const targetTerminalColor = terminalColorForSlot(targetColorSlot ?? targetTerminalIndex);
-    const terminalAssignmentFields = {
-      targetAgentId: agentId,
-      targetColorSlot,
-      targetTerminalColor,
-      targetTerminalId: paneId,
-      targetTerminalIndex,
-      targetThreadId: threadId,
-    };
     const directPromptSafeId = String(itemId).replace(/^terminal-direct-/, "");
     const directDispatchId = `terminal-direct-dispatch-${directPromptSafeId}`;
     const directCommandId = `terminal-direct-command-${directPromptSafeId}`;
     const baseItem = createTodoQueueItem(text, {
       createdAt: submittedAt,
       id: itemId,
+      inputs: directInput ? [directInput] : [],
       source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
       todoStatus: "running",
       todoStatusReason: "terminal_prompt_submitted",
@@ -23333,6 +23766,61 @@ function TerminalView({
     ).trim();
     const eventPromptEpoch = Number(event.promptEpoch ?? event.prompt_epoch ?? 0);
     const readinessText = getTodoQueueTerminalDirectLifecycleText(event);
+    const inputReadyAt = String(event.inputReadyAt || event.input_ready_at || new Date().toISOString()).trim()
+      || new Date().toISOString();
+    const inputReadyAtMs = Date.parse(inputReadyAt) || Date.now();
+    const eventWorkspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
+    const eventThreadId = String(event.threadId || event.thread_id || "").trim();
+    const backendPaneId = eventPaneId || getTerminalPaneId(targetTerminalIndex);
+    const completionSignal = event.completionInferred === true || event.completion_inferred === true
+      ? "terminal_input_ready_inferred"
+      : "terminal_input_ready";
+    const settleBackendInputReady = ({
+      backendOnly = false,
+      promptEventId = eventPromptId,
+      promptText = readinessText,
+    } = {}) => {
+      const workspaceId = eventWorkspaceId || terminalWorkspace?.id || "";
+      if (!workspaceId || !backendPaneId) {
+        return;
+      }
+      void invoke("todo_dispatch_settle_terminal_input_ready", {
+        request: {
+          inputReadyAt,
+          paneId: backendPaneId,
+          promptEventId,
+          promptText,
+          reason: completionSignal,
+          workspaceId,
+        },
+      }).then((result) => {
+        const settledCount = Number(result?.settledCount ?? result?.settled_count ?? 0);
+        if (!backendOnly || settledCount <= 0) {
+          return;
+        }
+        triggerTodoCompletionFlash(backendPaneId);
+        window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {
+          detail: {
+            agentId: normalizeTodoTerminalAgentId(
+              event.agentId
+                || event.agent_id
+                || event.agentKind
+                || event.agent_kind
+                || getTerminalRole(targetTerminalIndex),
+            ),
+            itemId: "",
+            paneId: backendPaneId,
+            queueDrained: false,
+            terminalIndex: targetTerminalIndex,
+            threadId: eventThreadId,
+            todoText: String(promptText || readinessText || "").slice(0, 200),
+            todoTitle: "",
+            turnId: String(promptEventId || eventPromptEpoch || inputReadyAt || "").trim(),
+            workspaceId,
+          },
+        }));
+      }).catch(() => {});
+    };
     let inFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalIndex);
     if (!inFlightPrompt && (eventPromptId || readinessText)) {
       const candidateItem = todoQueueItemsRef.current.find((item) => {
@@ -23407,6 +23895,9 @@ function TerminalView({
       }
     }
     if (!inFlightPrompt) {
+      if (eventPromptId || readinessText) {
+        settleBackendInputReady({ backendOnly: true });
+      }
       return;
     }
     const inFlightSource = normalizeTodoQueueSource(inFlightPrompt.source || inFlightPrompt.lifecycleSource || "");
@@ -23426,7 +23917,6 @@ function TerminalView({
       return;
     }
 
-    const eventWorkspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
     if (
       eventWorkspaceId
       && inFlightPrompt.workspaceId
@@ -23434,7 +23924,6 @@ function TerminalView({
     ) {
       return;
     }
-    const eventThreadId = String(event.threadId || event.thread_id || "").trim();
     if (
       eventThreadId
       && inFlightPrompt.threadId
@@ -23481,9 +23970,6 @@ function TerminalView({
         || Date.parse(inFlightPrompt.submittedAt || "")
         || 0,
     );
-    const inputReadyAt = String(event.inputReadyAt || event.input_ready_at || new Date().toISOString()).trim()
-      || new Date().toISOString();
-    const inputReadyAtMs = Date.parse(inputReadyAt) || Date.now();
     if (
       submittedAtMs > 0
       && inputReadyAtMs > 0
@@ -23516,9 +24002,10 @@ function TerminalView({
         || getProviderSessionId(inFlightPrompt)
         || "",
     };
-    const completionSignal = event.completionInferred === true || event.completion_inferred === true
-      ? "terminal_input_ready_inferred"
-      : "terminal_input_ready";
+    settleBackendInputReady({
+      promptEventId: eventPromptId || inFlightPromptId,
+      promptText: readinessText || expectedText,
+    });
     logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
       agentId,
       completionEvidence: event.completionEvidence || event.completion_evidence || "",
@@ -23549,6 +24036,7 @@ function TerminalView({
     getTerminalRole,
     logicalTerminalIndexes,
     settleTodoQueueInFlightPrompt,
+    triggerTodoCompletionFlash,
     terminalWorkspace?.id,
   ]);
 
@@ -26401,8 +26889,8 @@ function TerminalView({
     setTodoQueueItemPending(safeItemId, {
       item: getTodoQueueItemLogSummary([item])[0] || null,
       phase: "queued",
-      source,
       workspaceId: item.workspaceId || terminalWorkspace?.id || "",
+      ...getTodoQueuePendingFieldsFromItem(item, source),
     });
     const planTask = getTodoQueueItemPlanTask(item);
     if (planTask) {
@@ -27306,7 +27794,7 @@ function TerminalView({
         const settledStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "timed_out"]);
         const updatesByItemId = new Map();
         const removedItemIds = new Set();
-        const createdItems = [];
+        const journalItems = [];
         entries.forEach((entry) => {
           const itemId = String(entry?.itemId || "").trim();
           const commandId = String(entry?.commandId || "").trim();
@@ -27318,9 +27806,9 @@ function TerminalView({
             removedItemIds.add(itemId);
             return;
           }
-          if (entryKind === "remote_todo_created") {
+          if (entryKind === "remote_todo_created" || entryKind === "remote_todo_updated") {
             if (entry?.item && typeof entry.item === "object") {
-              createdItems.push(entry.item);
+              journalItems.push(entry.item);
             }
             return;
           }
@@ -27333,27 +27821,35 @@ function TerminalView({
             status: settledStatuses.has(receiptStatus) ? receiptStatus : "running",
           });
         });
-        if (!updatesByItemId.size && !removedItemIds.size && !createdItems.length) return;
+        if (!updatesByItemId.size && !removedItemIds.size && !journalItems.length) return;
         updateTodoQueueItems((currentItems) => {
-          const existingIds = new Set(currentItems.map((item) => String(item?.id || "").trim()));
-          const adoptedItems = createdItems
+          const normalizedJournalItems = journalItems
             .map((item) => normalizeTodoQueueItems([item])[0])
-            .filter((item) => item && !existingIds.has(String(item.id || "").trim())
-              && !removedItemIds.has(String(item.id || "").trim()));
-          return [
-            ...currentItems
-              .filter((item) => !removedItemIds.has(String(item?.id || "").trim()))
-              .map((item) => {
-                const update = updatesByItemId.get(String(item?.id || "").trim());
-                if (!update) return item;
-                return getTodoQueueItemWithCloudStatus(
-                  getTodoQueueItemWithoutPersistedQueueState(item),
-                  update.status,
-                  { reason: update.reason },
-                );
-              }),
-            ...adoptedItems,
-          ];
+            .filter((item) => item && !removedItemIds.has(String(item.id || "").trim()));
+          const journalById = new Map(normalizedJournalItems.map((item) => [String(item.id || "").trim(), item]));
+          const seenIds = new Set();
+          const nextItems = currentItems
+            .filter((item) => !removedItemIds.has(String(item?.id || "").trim()))
+            .map((item) => {
+              const itemId = String(item?.id || "").trim();
+              seenIds.add(itemId);
+              const journalItem = journalById.get(itemId);
+              const mergedItem = journalItem ? mergeTodoQueueStorageItems(item, journalItem) : item;
+              const update = updatesByItemId.get(itemId);
+              if (!update) return mergedItem;
+              return getTodoQueueItemWithCloudStatus(
+                getTodoQueueItemWithoutPersistedQueueState(mergedItem),
+                update.status,
+                { reason: update.reason },
+              );
+            });
+          normalizedJournalItems.forEach((item) => {
+            const itemId = String(item?.id || "").trim();
+            if (itemId && !seenIds.has(itemId)) {
+              nextItems.push(item);
+            }
+          });
+          return nextItems;
         }, {
           force: true,
           immediate: true,
@@ -27388,14 +27884,49 @@ function TerminalView({
         if (cancelled) return;
         const normalized = normalizeTodoQueueItems([candidateItem || item])[0];
         if (!normalized) return;
+        const itemId = String(normalized.id || "").trim();
+        const latestInput = getTodoQueueLatestInput(normalized);
+        const latestPromptId = String(
+          latestInput?.promptEventId
+            || latestInput?.promptId
+            || latestInput?.inputId
+            || latestInput?.id
+            || "",
+        ).trim();
+        const latestText = normalizeTodoQueueText(latestInput?.text || "");
+        const terminalIndex = getTodoQueueTargetTerminalIndex(normalized);
+        if (itemId && latestInput && Number.isInteger(terminalIndex)) {
+          const currentInFlight = todoQueueTerminalInFlightPromptsRef.current.get(terminalIndex) || null;
+          if (String(currentInFlight?.itemId || "").trim() === itemId) {
+            todoQueueTerminalInFlightPromptsRef.current.set(terminalIndex, {
+              ...currentInFlight,
+              ...(latestPromptId ? { promptId: latestPromptId } : {}),
+              ...(latestText ? {
+                promptText: latestText,
+                terminalText: latestText,
+                threadMessageText: latestText,
+              } : {}),
+              submittedAt: latestInput.submittedAt || currentInFlight.submittedAt || "",
+              submittedAtMs: Date.parse(latestInput.submittedAt || "") || currentInFlight.submittedAtMs || Date.now(),
+            });
+            setTodoQueueDispatchRevision((revision) => revision + 1);
+          }
+        }
         updateTodoQueueItems((currentItems) => {
-          const itemId = String(normalized.id || "").trim();
           // Identity-only dedupe: the Rust capture and the webview
           // materialization share one item id per prompt submission.
-          if (!itemId || currentItems.some((current) => String(current?.id || "").trim() === itemId)) {
+          if (!itemId) {
             return currentItems;
           }
-          return [...currentItems, normalized];
+          let found = false;
+          const nextItems = currentItems.map((current) => {
+            if (String(current?.id || "").trim() !== itemId) {
+              return current;
+            }
+            found = true;
+            return mergeTodoQueueStorageItems(current, normalized);
+          });
+          return found ? nextItems : [...currentItems, normalized];
         }, {
           force: true,
           immediate: true,
@@ -27784,8 +28315,8 @@ function TerminalView({
       setTodoQueueItemPending(item.id, {
         item: getTodoQueueItemLogSummary([item])[0] || null,
         phase: "queued",
-        source,
         workspaceId: item.workspaceId || terminalWorkspace?.id || "",
+        ...getTodoQueuePendingFieldsFromItem(item, source),
       });
       const planTask = getTodoQueueItemPlanTask(item);
       if (planTask) {
@@ -28948,11 +29479,17 @@ function TerminalView({
       const requestedTargetThreadId = explicitTargetInfo.requestedTargetThreadId || "";
 
       if (hasExplicitTerminalTarget) {
-        if (!requestedTargetTerminalId) {
+        const canResolveExplicitTarget = Boolean(
+          requestedTargetTerminalId
+            || Number.isInteger(requestedTargetTerminalIndex)
+            || requestedTargetTerminalName
+            || requestedTargetThreadId,
+        );
+        if (!canResolveExplicitTarget) {
           return {
             available: false,
             hasExplicitTerminalTarget,
-            reason: "target_terminal_id_required",
+            reason: "target_terminal_reference_required",
             requestedTargetAgentId,
             requestedTargetTerminalId,
             requestedTargetTerminalIndex,
@@ -28962,7 +29499,9 @@ function TerminalView({
             unavailable: null,
           };
         }
-        const candidateIndexes = logicalTerminalIndexes;
+        const candidateIndexes = Number.isInteger(requestedTargetTerminalIndex)
+          ? [requestedTargetTerminalIndex]
+          : logicalTerminalIndexes;
         let matchedUnavailableTarget = null;
         for (const terminalIndex of candidateIndexes) {
           if (!logicalTerminalIndexes.includes(terminalIndex)) {
@@ -28974,7 +29513,19 @@ function TerminalView({
             requireFreshAgentInputReady: true,
             reservationItemId: item.id,
           });
-          if (!todoQueueSendTargetMatchesIdentity(candidate, requestedTargetTerminalId, requestedTargetThreadId)) {
+          if (
+            (requestedTargetTerminalId || requestedTargetThreadId)
+            && !todoQueueSendTargetMatchesIdentity(candidate, requestedTargetTerminalId, requestedTargetThreadId)
+          ) {
+            continue;
+          }
+          const targetNeedsNameMatch = Boolean(
+            requestedTargetTerminalName
+              && !requestedTargetTerminalId
+              && !requestedTargetThreadId
+              && !Number.isInteger(requestedTargetTerminalIndex),
+          );
+          if (targetNeedsNameMatch && !todoQueueSendTargetMatchesName(candidate, requestedTargetTerminalName)) {
             continue;
           }
           const candidateRole = normalizeTodoTerminalAgentId(candidate.targetRole);

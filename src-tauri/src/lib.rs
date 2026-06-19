@@ -4742,6 +4742,7 @@ pub fn run() {
             todo_dispatch_receipts_import,
             todo_dispatch_notify_queue_drained,
             todo_dispatch_queue_sync,
+            todo_dispatch_settle_terminal_input_ready,
             todo_dispatch_dispatcher_heartbeat,
             todo_dispatch_startup_reconciliation_state,
             todo_dispatch_backend_submit_now,

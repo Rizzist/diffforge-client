@@ -4380,8 +4380,10 @@ const AUDIO_WIDGET_BAR_ERROR_WIDTH: f64 = 320.0;
 const AUDIO_WIDGET_BAR_ERROR_HEIGHT: f64 = 112.0;
 const AUDIO_WIDGET_BAR_NOTICE_WIDTH: f64 = 392.0;
 const AUDIO_WIDGET_BAR_NOTICE_HEIGHT: f64 = 52.0;
-const AUDIO_WIDGET_BAR_IDLE_WIDTH: f64 = 200.0;
-const AUDIO_WIDGET_BAR_IDLE_HEIGHT: f64 = 96.0;
+const AUDIO_WIDGET_BAR_IDLE_WIDTH: f64 = 84.0;
+const AUDIO_WIDGET_BAR_IDLE_HEIGHT: f64 = 18.0;
+const AUDIO_WIDGET_BAR_IDLE_HOVER_WIDTH: f64 = 200.0;
+const AUDIO_WIDGET_BAR_IDLE_HOVER_HEIGHT: f64 = 96.0;
 const AUDIO_WIDGET_BUBBLE_COMPACT_WIDTH: f64 = 64.0;
 const AUDIO_WIDGET_BUBBLE_COMPACT_HEIGHT: f64 = 64.0;
 const AUDIO_WIDGET_BUBBLE_HISTORY_WIDTH: f64 = 64.0;
@@ -4407,23 +4409,39 @@ fn audio_widget_bar_frame_is_idle_size(width: f64, height: f64) -> bool {
     )
 }
 
-fn audio_widget_bar_frame_is_whole_hover_size(width: f64, height: f64) -> bool {
+fn audio_widget_bar_frame_is_idle_hover_size(width: f64, height: f64) -> bool {
     audio_widget_bar_frame_matches_size(
+        width,
+        height,
+        AUDIO_WIDGET_BAR_IDLE_HOVER_WIDTH,
+        AUDIO_WIDGET_BAR_IDLE_HOVER_HEIGHT,
+    )
+}
+
+fn audio_widget_bar_frame_is_whole_hover_size(width: f64, height: f64) -> bool {
+    let active_size = audio_widget_bar_frame_matches_size(
         width,
         height,
         AUDIO_WIDGET_BAR_ACTIVE_WIDTH,
         AUDIO_WIDGET_BAR_ACTIVE_HEIGHT,
-    ) || audio_widget_bar_frame_matches_size(
+    );
+    let error_size = audio_widget_bar_frame_matches_size(
         width,
         height,
         AUDIO_WIDGET_BAR_ERROR_WIDTH,
         AUDIO_WIDGET_BAR_ERROR_HEIGHT,
-    ) || audio_widget_bar_frame_matches_size(
+    );
+    let notice_size = audio_widget_bar_frame_matches_size(
         width,
         height,
         AUDIO_WIDGET_BAR_NOTICE_WIDTH,
         AUDIO_WIDGET_BAR_NOTICE_HEIGHT,
-    )
+    );
+
+    audio_widget_bar_frame_is_idle_hover_size(width, height)
+        || active_size
+        || error_size
+        || notice_size
 }
 
 fn audio_widget_bar_hover_from_top_left(
@@ -5169,8 +5187,8 @@ fn audio_widget_status_for(app: &AppHandle) -> Result<AudioWidgetVisibility, Str
     Ok(visibility)
 }
 
-const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT: f64 = 34.0;
-const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP: f64 = 14.0;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVATE_HIT_HEIGHT: f64 = 18.0;
+const AUDIO_WIDGET_BAR_IDLE_ACTIVE_HIT_TOP: f64 = 0.0;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", default)]

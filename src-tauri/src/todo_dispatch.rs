@@ -3183,6 +3183,13 @@ fn todo_dispatch_queue_item_active_for_settlement(item: &Value) -> bool {
     )
 }
 
+fn todo_dispatch_queue_item_owns_terminal_input(item: &Value) -> bool {
+    matches!(
+        todo_store_item_status(item).as_str(),
+        "sending" | "submitted" | "running" | "dispatching" | "paused"
+    )
+}
+
 fn todo_dispatch_receipt_active_for_settlement(receipt: &Value) -> bool {
     todo_dispatch_status_is_active(
         receipt
@@ -3251,6 +3258,122 @@ fn todo_dispatch_active_queue_item_ids_for_pane(workspace_id: &str, pane_id: &st
         return Vec::new();
     };
     todo_dispatch_active_queue_item_ids_for_pane_from_items(items, pane_id)
+}
+
+fn todo_dispatch_prompt_identity_matches_value(
+    value: &Value,
+    prompt_event_id: &str,
+    prompt_text: &str,
+) -> bool {
+    if todo_dispatch_prompt_identity_matches_single_value(value, prompt_event_id, prompt_text) {
+        return true;
+    }
+
+    todo_dispatch_value_inputs(value)
+        .iter()
+        .any(|input| todo_dispatch_prompt_identity_matches_single_value(input, prompt_event_id, prompt_text))
+}
+
+fn todo_dispatch_prompt_identity_matches_single_value(
+    value: &Value,
+    prompt_event_id: &str,
+    prompt_text: &str,
+) -> bool {
+    let prompt_event_id = prompt_event_id.trim();
+    let prompt_text_key = todo_dispatch_direct_prompt_text_key(prompt_text);
+    if prompt_event_id.is_empty() && prompt_text_key.is_empty() {
+        return true;
+    }
+
+    if !prompt_event_id.is_empty() {
+        let direct_item_id = todo_dispatch_direct_prompt_item_id(Some(prompt_event_id));
+        if todo_store_history_item_tokens(value).iter().any(|token| {
+            token == prompt_event_id || token == &direct_item_id
+        }) {
+            return true;
+        }
+        let prompt_ref = todo_dispatch_text(
+            value,
+            &[
+                "promptEventId",
+                "prompt_event_id",
+                "promptId",
+                "prompt_id",
+                "pendingPromptId",
+                "pending_prompt_id",
+                "providerTurnId",
+                "provider_turn_id",
+                "turnId",
+                "turn_id",
+                "messageId",
+                "message_id",
+            ],
+        );
+        if prompt_ref == prompt_event_id {
+            return true;
+        }
+    }
+
+    if !prompt_text_key.is_empty() {
+        let value_text = todo_dispatch_text(
+            value,
+            &[
+                "text",
+                "todoText",
+                "todo_text",
+                "message",
+                "userMessage",
+                "user_message",
+                "promptText",
+                "prompt_text",
+                "terminalPrompt",
+                "terminal_prompt",
+            ],
+        );
+        return todo_dispatch_direct_prompt_text_key(&value_text) == prompt_text_key;
+    }
+
+    false
+}
+
+fn todo_dispatch_active_queue_item_ids_for_pane_matching(
+    workspace_id: &str,
+    pane_id: &str,
+    prompt_event_id: &str,
+    prompt_text: &str,
+) -> Vec<String> {
+    if workspace_id.trim().is_empty() {
+        return Vec::new();
+    }
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        return Vec::new();
+    };
+    let snapshot = todo_dispatch_queue_read(&path);
+    let Some(items) = snapshot.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let has_identity = !prompt_event_id.trim().is_empty()
+        || !todo_dispatch_direct_prompt_text_key(prompt_text).is_empty();
+    let mut matches = items
+        .iter()
+        .filter(|item| {
+            todo_dispatch_queue_item_active_for_settlement(item)
+                && todo_store_item_pane_id(item) == pane_id.trim()
+                && todo_dispatch_prompt_identity_matches_value(item, prompt_event_id, prompt_text)
+        })
+        .map(|item| {
+            (
+                todo_store_item_updated_ms(item),
+                todo_dispatch_queue_item_command_id(item),
+            )
+        })
+        .filter(|(_, id)| !id.is_empty())
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(updated_ms, _)| std::cmp::Reverse(*updated_ms));
+    if !has_identity {
+        matches.truncate(1);
+    }
+    matches.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Settlement bridge from receipts into the queue snapshot. Every settled
@@ -3432,6 +3555,166 @@ pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
     settled.len()
 }
 
+fn todo_dispatch_mark_active_for_pane_completed(
+    app: &AppHandle,
+    workspace_id: &str,
+    pane_id: &str,
+    prompt_event_id: &str,
+    prompt_text: &str,
+    completed_at: &str,
+    reason: &str,
+) -> usize {
+    let workspace_id = workspace_id.trim();
+    let pane_id = pane_id.trim();
+    if workspace_id.is_empty() || pane_id.is_empty() {
+        return 0;
+    }
+
+    let completed_at = completed_at.trim();
+    let completed_at = if completed_at.is_empty() {
+        chrono_like_now_iso()
+    } else {
+        completed_at.to_string()
+    };
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "terminal_input_ready"
+    } else {
+        reason
+    };
+    let has_identity = !prompt_event_id.trim().is_empty()
+        || !todo_dispatch_direct_prompt_text_key(prompt_text).is_empty();
+    let mut settled = HashSet::<String>::new();
+
+    let receipts = todo_dispatch_load(workspace_id);
+    if let Some(entries) = receipts.as_object() {
+        let mut receipt_matches = entries
+            .iter()
+            .filter(|(_, receipt)| {
+                todo_dispatch_receipt_active_for_settlement(receipt)
+                    && todo_dispatch_text(receipt, &["paneId", "pane_id"]) == pane_id
+                    && todo_dispatch_prompt_identity_matches_value(
+                        receipt,
+                        prompt_event_id,
+                        prompt_text,
+                    )
+            })
+            .map(|(command_id, receipt)| {
+                (
+                    command_id.clone(),
+                    receipt.clone(),
+                    todo_dispatch_receipt_submitted_at_ms(receipt),
+                )
+            })
+            .collect::<Vec<_>>();
+        receipt_matches.sort_by_key(|(_, _, submitted_at)| std::cmp::Reverse(*submitted_at));
+        if !has_identity {
+            receipt_matches.truncate(1);
+        }
+        for (command_id, mut receipt, _) in receipt_matches {
+            if let Some(object) = receipt.as_object_mut() {
+                object.insert("status".to_string(), json!("completed"));
+                object.insert("statusReason".to_string(), json!(reason));
+                object.insert("completedAt".to_string(), json!(completed_at.clone()));
+                object.insert("todoCompletedAt".to_string(), json!(completed_at.clone()));
+                object.insert("updatedAt".to_string(), json!(completed_at.clone()));
+                object.insert("updatedAtMs".to_string(), json!(todo_dispatch_now_ms()));
+            }
+            let _ = todo_dispatch_record_receipt_internal(
+                Some(app),
+                workspace_id,
+                receipt,
+                "terminal_input_ready_settled",
+            );
+            if !command_id.trim().is_empty() {
+                todo_dispatch_queue_mark_settled(
+                    Some(app),
+                    workspace_id,
+                    &command_id,
+                    "completed",
+                );
+                settled.insert(command_id);
+            }
+        }
+    }
+
+    for command_id in todo_dispatch_active_queue_item_ids_for_pane_matching(
+        workspace_id,
+        pane_id,
+        prompt_event_id,
+        prompt_text,
+    ) {
+        if command_id.trim().is_empty() || settled.contains(&command_id) {
+            continue;
+        }
+        todo_dispatch_queue_mark_settled(Some(app), workspace_id, &command_id, "completed");
+        settled.insert(command_id);
+    }
+
+    log_terminal_status_event(
+        if settled.is_empty() {
+            "backend.todo_dispatch.terminal_input_ready_settle_skip"
+        } else {
+            "backend.todo_dispatch.terminal_input_ready_settled"
+        },
+        json!({
+            "count": settled.len(),
+            "has_identity": has_identity,
+            "pane_id": pane_id,
+            "prompt_event_id": prompt_event_id.trim(),
+            "prompt_text_len": prompt_text.trim().len(),
+            "reason": reason,
+            "workspace_id": workspace_id,
+        }),
+    );
+
+    settled.len()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TodoDispatchTerminalInputReadySettleRequest {
+    workspace_id: String,
+    pane_id: String,
+    prompt_event_id: Option<String>,
+    prompt_text: Option<String>,
+    input_ready_at: Option<String>,
+    reason: Option<String>,
+}
+
+#[tauri::command]
+async fn todo_dispatch_settle_terminal_input_ready(
+    app: AppHandle,
+    request: TodoDispatchTerminalInputReadySettleRequest,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_id = request.workspace_id.trim().to_string();
+        let pane_id = request.pane_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err("workspace_id is required.".to_string());
+        }
+        if pane_id.is_empty() {
+            return Err("pane_id is required.".to_string());
+        }
+        let settled_count = todo_dispatch_mark_active_for_pane_completed(
+            &app,
+            &workspace_id,
+            &pane_id,
+            request.prompt_event_id.as_deref().unwrap_or_default(),
+            request.prompt_text.as_deref().unwrap_or_default(),
+            request.input_ready_at.as_deref().unwrap_or_default(),
+            request.reason.as_deref().unwrap_or("terminal_input_ready"),
+        );
+        Ok(json!({
+            "paneId": pane_id,
+            "settledCount": settled_count,
+            "workspaceId": workspace_id,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo input-ready settlement worker failed: {error}"))?
+}
+
 fn chrono_like_now_iso() -> String {
     // kernel::now_rfc3339 returns "<epoch_secs>.<millis>Z", which Date.parse
     // rejects; captured todos flow into the webview/cloud where createdAt
@@ -3555,6 +3838,109 @@ mod todo_store_tests {
             todo_dispatch_active_queue_item_ids_for_pane_from_items(&items, "pane-a"),
             vec!["command-new".to_string(), "old-running".to_string()]
         );
+    }
+
+    #[test]
+    fn input_ready_prompt_identity_matches_direct_id_and_text() {
+        let item = json!({
+            "id": "terminal-direct-terminal-prompt-abc",
+            "status": "running",
+            "targetTerminalId": "pane-a",
+            "text": "ship the fix",
+        });
+        assert!(todo_dispatch_prompt_identity_matches_value(
+            &item,
+            "terminal-prompt-abc",
+            "",
+        ));
+        assert!(todo_dispatch_prompt_identity_matches_value(
+            &item,
+            "",
+            "ship   the\nfix",
+        ));
+        assert!(!todo_dispatch_prompt_identity_matches_value(
+            &item,
+            "terminal-prompt-other",
+            "different prompt",
+        ));
+    }
+
+    #[test]
+    fn direct_prompt_inputs_append_and_match_latest_prompt() {
+        let mut item = json!({
+            "id": "terminal-direct-prompt-1",
+            "status": "running",
+            "targetTerminalId": "pane-a",
+            "text": "first message",
+            "promptEventId": "prompt-1",
+            "createdAt": "2026-06-19T00:00:00Z",
+        });
+        let second = todo_dispatch_direct_prompt_input_entry(
+            "second message",
+            Some("prompt-2"),
+            "2026-06-19T00:01:00Z",
+            "pane-a",
+            1,
+            "thread-a",
+            "codex",
+        );
+        assert!(todo_dispatch_append_input_to_value(&mut item, &second));
+        let inputs = todo_dispatch_value_inputs(&item);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(item["inputCount"].as_u64(), Some(2));
+        assert!(todo_dispatch_prompt_identity_matches_value(
+            &item,
+            "prompt-1",
+            "",
+        ));
+        assert!(todo_dispatch_prompt_identity_matches_value(
+            &item,
+            "prompt-2",
+            "",
+        ));
+    }
+
+    #[test]
+    fn direct_prompt_inputs_keep_repeated_text_when_prompt_ids_differ() {
+        let mut item = json!({
+            "id": "terminal-direct-prompt-1",
+            "status": "running",
+            "targetTerminalId": "pane-a",
+            "text": "repeat this",
+            "promptEventId": "prompt-1",
+            "createdAt": "2026-06-19T00:00:00Z",
+        });
+        let second = todo_dispatch_direct_prompt_input_entry(
+            "repeat this",
+            Some("prompt-2"),
+            "2026-06-19T00:01:00Z",
+            "pane-a",
+            1,
+            "thread-a",
+            "codex",
+        );
+        assert!(todo_dispatch_append_input_to_value(&mut item, &second));
+        let duplicate_second = todo_dispatch_direct_prompt_input_entry(
+            "repeat this",
+            Some("prompt-2"),
+            "2026-06-19T00:01:01Z",
+            "pane-a",
+            1,
+            "thread-a",
+            "codex",
+        );
+        assert!(!todo_dispatch_append_input_to_value(&mut item, &duplicate_second));
+        let third = todo_dispatch_direct_prompt_input_entry(
+            "repeat this",
+            Some("prompt-3"),
+            "2026-06-19T00:02:00Z",
+            "pane-a",
+            1,
+            "thread-a",
+            "codex",
+        );
+        assert!(todo_dispatch_append_input_to_value(&mut item, &third));
+        assert_eq!(todo_dispatch_value_inputs(&item).len(), 3);
     }
 
     #[test]
@@ -4047,6 +4433,239 @@ fn todo_dispatch_direct_prompt_text_key(prompt: &str) -> String {
         .collect()
 }
 
+fn todo_dispatch_direct_prompt_input_id(prompt_event_id: Option<&str>, prompt: &str) -> String {
+    if let Some(prompt_event_id) = prompt_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return prompt_event_id.to_string();
+    }
+    let prompt_key = todo_dispatch_direct_prompt_text_key(prompt);
+    if prompt_key.is_empty() {
+        format!("direct-input-{}", todo_dispatch_now_ms())
+    } else {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in prompt_key.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("direct-input-{hash:016x}")
+    }
+}
+
+fn todo_dispatch_direct_prompt_input_entry(
+    prompt: &str,
+    prompt_event_id: Option<&str>,
+    submitted_at: &str,
+    pane_id: &str,
+    terminal_index: u64,
+    thread_id: &str,
+    agent_kind: &str,
+) -> Value {
+    let prompt_event_id = prompt_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let input_id = todo_dispatch_direct_prompt_input_id(prompt_event_id.as_deref(), prompt);
+    json!({
+        "id": input_id,
+        "inputId": input_id,
+        "input_id": input_id,
+        "kind": "input",
+        "source": "terminal_direct",
+        "text": prompt,
+        "promptEventId": prompt_event_id.clone(),
+        "prompt_event_id": prompt_event_id.clone(),
+        "submittedAt": submitted_at,
+        "submitted_at": submitted_at,
+        "createdAt": submitted_at,
+        "created_at": submitted_at,
+        "paneId": pane_id,
+        "pane_id": pane_id,
+        "targetTerminalId": pane_id,
+        "target_terminal_id": pane_id,
+        "targetTerminalIndex": terminal_index,
+        "target_terminal_index": terminal_index,
+        "threadId": thread_id,
+        "thread_id": thread_id,
+        "targetThreadId": thread_id,
+        "target_thread_id": thread_id,
+        "targetAgentId": agent_kind,
+        "target_agent_id": agent_kind,
+    })
+}
+
+fn todo_dispatch_value_inputs(value: &Value) -> Vec<Value> {
+    for key in ["inputs", "todoInputs", "todo_inputs"] {
+        if let Some(inputs) = value.get(key).and_then(Value::as_array) {
+            return inputs
+                .iter()
+                .filter(|input| input.is_object())
+                .cloned()
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn todo_dispatch_primary_input_from_value(value: &Value) -> Option<Value> {
+    let text = todo_dispatch_text(
+        value,
+        &[
+            "text",
+            "todoText",
+            "todo_text",
+            "message",
+            "userMessage",
+            "user_message",
+            "promptText",
+            "prompt_text",
+            "terminalPrompt",
+            "terminal_prompt",
+        ],
+    );
+    if text.is_empty() {
+        return None;
+    }
+    let submitted_at = todo_dispatch_text(
+        value,
+        &[
+            "submittedAt",
+            "submitted_at",
+            "createdAt",
+            "created_at",
+            "updatedAt",
+            "updated_at",
+        ],
+    );
+    let submitted_at = if submitted_at.is_empty() {
+        chrono_like_now_iso()
+    } else {
+        submitted_at
+    };
+    let prompt_event_id = todo_dispatch_text(
+        value,
+        &[
+            "promptEventId",
+            "prompt_event_id",
+            "promptId",
+            "prompt_id",
+            "pendingPromptId",
+            "pending_prompt_id",
+            "providerTurnId",
+            "provider_turn_id",
+            "turnId",
+            "turn_id",
+            "messageId",
+            "message_id",
+        ],
+    );
+    let pane_id = todo_dispatch_text(
+        value,
+        &[
+            "targetTerminalId",
+            "target_terminal_id",
+            "paneId",
+            "pane_id",
+        ],
+    );
+    let thread_id = todo_dispatch_text(
+        value,
+        &[
+            "targetThreadId",
+            "target_thread_id",
+            "threadId",
+            "thread_id",
+        ],
+    );
+    let agent_kind = todo_dispatch_text(
+        value,
+        &[
+            "targetAgentId",
+            "target_agent_id",
+            "agentId",
+            "agent_id",
+        ],
+    );
+    let terminal_index = value
+        .get("targetTerminalIndex")
+        .or_else(|| value.get("target_terminal_index"))
+        .or_else(|| value.get("terminalIndex"))
+        .or_else(|| value.get("terminal_index"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(todo_dispatch_direct_prompt_input_entry(
+        &text,
+        (!prompt_event_id.is_empty()).then_some(prompt_event_id.as_str()),
+        &submitted_at,
+        &pane_id,
+        terminal_index,
+        &thread_id,
+        &agent_kind,
+    ))
+}
+
+fn todo_dispatch_set_value_inputs(value: &mut Value, inputs: Vec<Value>) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("inputs".to_string(), json!(inputs));
+        object.insert(
+            "inputCount".to_string(),
+            json!(object
+                .get("inputs")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0)),
+        );
+        if let Some(inputs) = object.get("inputs").cloned() {
+            object.insert("todoInputs".to_string(), inputs.clone());
+            object.insert("todo_inputs".to_string(), inputs);
+        }
+    }
+}
+
+fn todo_dispatch_append_input_to_value(value: &mut Value, input: &Value) -> bool {
+    if !value.is_object() || !input.is_object() {
+        return false;
+    }
+    let prompt_event_id = todo_dispatch_text(
+        input,
+        &[
+            "promptEventId",
+            "prompt_event_id",
+            "promptId",
+            "prompt_id",
+            "inputId",
+            "input_id",
+            "id",
+        ],
+    );
+    let prompt_text = todo_dispatch_text(input, &["text", "message", "promptText", "prompt_text"]);
+    let mut inputs = todo_dispatch_value_inputs(value);
+    let mut changed = false;
+    if inputs.is_empty() {
+        if let Some(primary) = todo_dispatch_primary_input_from_value(value) {
+            inputs.push(primary);
+            changed = true;
+        }
+    }
+    let duplicate = inputs.iter().any(|existing| {
+        if !prompt_event_id.is_empty() {
+            todo_dispatch_prompt_identity_matches_value(existing, &prompt_event_id, "")
+        } else {
+            todo_dispatch_prompt_identity_matches_value(existing, "", &prompt_text)
+        }
+    });
+    if duplicate {
+        if changed {
+            todo_dispatch_set_value_inputs(value, inputs);
+        }
+        return changed;
+    }
+    inputs.push(input.clone());
+    todo_dispatch_set_value_inputs(value, inputs);
+    true
+}
+
 fn todo_dispatch_find_recent_settled_direct_prompt(
     items: &[Value],
     pane_id: &str,
@@ -4149,10 +4768,23 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         // The user already deleted this exact prompt's todo: never re-create.
         return None;
     }
+    let input_entry = todo_dispatch_direct_prompt_input_entry(
+        prompt,
+        prompt_event_id_value.as_deref(),
+        &now_iso,
+        pane_id,
+        terminal_index,
+        thread_id,
+        canonical_agent_kind,
+    );
     let item = json!({
         "id": item_id,
         "kind": "todo",
         "text": prompt,
+        "inputs": [input_entry.clone()],
+        "todoInputs": [input_entry.clone()],
+        "todo_inputs": [input_entry.clone()],
+        "inputCount": 1,
         "todoStatus": "running",
         "status": "running",
         // The stamp gives the running status LWW teeth against webview
@@ -4217,6 +4849,121 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         // prompt never sits status-less in history while the agent works.
         let mut wrote = false;
         let mut sync_item: Option<Value> = None;
+        let active_parent_index = items
+            .iter()
+            .enumerate()
+            .filter(|(_, existing)| {
+                todo_dispatch_queue_item_owns_terminal_input(existing)
+                    && todo_store_item_pane_id(existing) == pane_id
+                    && !todo_store_item_matches_id(existing, &item_id)
+            })
+            .map(|(index, existing)| (todo_store_item_updated_ms(existing), index))
+            .max_by_key(|(updated_ms, _)| *updated_ms)
+            .map(|(_, index)| index);
+        if let Some(parent_index) = active_parent_index {
+            let parent_command_id;
+            let parent_item_id;
+            {
+                let parent = &mut items[parent_index];
+                parent_command_id = todo_dispatch_queue_item_command_id(parent);
+                parent_item_id = parent
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(parent_command_id.as_str())
+                    .to_string();
+                if let Some(object) = parent.as_object_mut() {
+                    object.insert("updatedAt".to_string(), json!(now_iso.clone()));
+                    object.insert("updatedAtMs".to_string(), json!(now_ms));
+                    object.insert("lastPromptEventId".to_string(), json!(prompt_event_id_value.clone()));
+                    object.insert("last_prompt_event_id".to_string(), json!(prompt_event_id_value.clone()));
+                    object.insert("lastInputAt".to_string(), json!(now_iso.clone()));
+                    object.insert("last_input_at".to_string(), json!(now_iso.clone()));
+                }
+                let _ = todo_dispatch_append_input_to_value(parent, &input_entry);
+                capture_item = parent.clone();
+            }
+            todo_dispatch_queue_write(workspace_id, &items);
+            todo_store_push_items(
+                app,
+                workspace_id,
+                vec![capture_item.clone()],
+                "terminal_direct_input_appended",
+            );
+            let mut receipt = todo_dispatch_load(workspace_id)
+                .get(&parent_command_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "commandId": parent_command_id,
+                        "itemId": parent_item_id,
+                        "paneId": pane_id,
+                        "status": "running",
+                        "text": todo_dispatch_text(&capture_item, &["text"]),
+                        "workspaceId": workspace_id,
+                        "workspaceName": workspace_name,
+                    })
+                });
+            if let Some(object) = receipt.as_object_mut() {
+                object.insert("commandId".to_string(), json!(parent_command_id.clone()));
+                object.insert("itemId".to_string(), json!(parent_item_id.clone()));
+                object.insert("paneId".to_string(), json!(pane_id));
+                object.insert("status".to_string(), json!("running"));
+                object.insert("updatedAt".to_string(), json!(now_iso.clone()));
+                object.insert("lastPromptEventId".to_string(), json!(prompt_event_id_value.clone()));
+                object.insert("last_prompt_event_id".to_string(), json!(prompt_event_id_value.clone()));
+                object.insert("lastInputAt".to_string(), json!(now_iso.clone()));
+                object.insert("last_input_at".to_string(), json!(now_iso.clone()));
+            }
+            let _ = todo_dispatch_append_input_to_value(&mut receipt, &input_entry);
+            let _ = todo_dispatch_record_receipt_internal(
+                Some(app),
+                workspace_id,
+                receipt,
+                "terminal_direct_input_appended",
+            );
+            todo_dispatch_journal_append(
+                workspace_id,
+                json!({
+                    "kind": "remote_todo_updated",
+                    "itemId": parent_item_id,
+                    "commandId": parent_command_id,
+                    "item": capture_item,
+                    "at": now_iso,
+                    "reason": "terminal_direct_input_appended",
+                }),
+            );
+            let _ = app.emit(
+                TODO_DISPATCH_DIRECT_CAPTURE_EVENT,
+                json!({
+                    "workspaceId": workspace_id,
+                    "item": capture_item,
+                    "appendedInput": input_entry,
+                    "appended_input": input_entry,
+                }),
+            );
+            todo_store_emit_changed(app, workspace_id, "terminal_direct_input_appended", "store");
+            if !todo_dispatch_webview_dispatcher_active() {
+                todo_dispatch_push_queue_snapshot(
+                    app,
+                    workspace_id,
+                    Vec::new(),
+                    "terminal_direct_input_appended",
+                );
+            }
+            log_terminal_status_event(
+                "backend.todo_dispatch.direct_capture_input_appended",
+                json!({
+                    "item_id": parent_item_id,
+                    "pane_id": pane_id,
+                    "prompt_event_id": prompt_event_id_value.as_deref().unwrap_or_default(),
+                    "prompt_len": prompt.len(),
+                    "workspace_id": workspace_id,
+                }),
+            );
+            return Some(parent_item_id);
+        }
         if let Some(existing) = items
             .iter_mut()
             .find(|existing| todo_store_item_matches_id(existing, &item_id))
@@ -4235,12 +4982,21 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
                 );
                 return Some(item_id);
             }
+            let inputs_changed = todo_dispatch_append_input_to_value(existing, &input_entry);
             if todo_store_status_rank(&existing_status) < todo_store_status_rank("running") {
                 todo_store_set_item_status(existing, "running", "todo_queue_backend_submit");
                 sync_item = Some(existing.clone());
                 capture_item = existing.clone();
                 wrote = true;
             } else {
+                if inputs_changed {
+                    if let Some(object) = existing.as_object_mut() {
+                        object.insert("updatedAt".to_string(), json!(now_iso.clone()));
+                        object.insert("updatedAtMs".to_string(), json!(now_ms));
+                    }
+                    sync_item = Some(existing.clone());
+                    wrote = true;
+                }
                 capture_item = existing.clone();
             }
         } else {
@@ -4667,7 +5423,8 @@ async fn todo_dispatch_backend_submissions_drain(workspace_id: String) -> Result
         let entries = entries
             .into_iter()
             .filter(|entry| {
-                if entry.get("kind").and_then(Value::as_str) != Some("remote_todo_created") {
+                let kind = entry.get("kind").and_then(Value::as_str).unwrap_or_default();
+                if !matches!(kind, "remote_todo_created" | "remote_todo_updated") {
                     return true;
                 }
                 let item_id = entry

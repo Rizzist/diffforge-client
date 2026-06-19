@@ -26,6 +26,24 @@ function normalizeTurnState(value) {
   return cleanText(value).toLowerCase();
 }
 
+function normalizePromptSource(value) {
+  return cleanText(value).toLowerCase().replace(/[_\s]+/g, "-");
+}
+
+function promptSourceIsTerminalDirect(value) {
+  const source = normalizePromptSource(value);
+  return source === "terminal-direct"
+    || source === "terminal-direct-input"
+    || source === "tui-terminal-direct-input"
+    || source.startsWith("tui-terminal-direct");
+}
+
+function inFlightPromptIsTerminalDirect(inFlightPrompt) {
+  return promptSourceIsTerminalDirect(inFlightPrompt?.source)
+    || promptSourceIsTerminalDirect(inFlightPrompt?.lifecycleSource)
+    || promptSourceIsTerminalDirect(inFlightPrompt?.lifecycle_source);
+}
+
 function getProviderTurnReleaseReason(turnState) {
   const state = normalizeTurnState(turnState);
   if (["cancelled", "canceled", "interrupted"].includes(state)) {
@@ -346,7 +364,12 @@ export function evaluateTodoQueueInFlightPrompt({
       && promptTurnMatches
       && latestTurnClosed
   );
-  const terminalConfirmedFinished = completedMatchingTurn;
+  const terminalDirectReadyFinished = Boolean(
+    inFlightPromptIsTerminalDirect(inFlightPrompt)
+      && terminalReadyForNextPrompt
+      && terminalReadinessMatchesPrompt
+  );
+  const terminalConfirmedFinished = completedMatchingTurn || terminalDirectReadyFinished;
   const promptInstanceId = Number.parseInt(inFlightPrompt?.terminalInstanceId, 10);
   const liveInstanceId = Number.parseInt(liveTerminal?.instanceId, 10);
   const terminalInstanceChanged = Boolean(
@@ -417,6 +440,7 @@ export function evaluateTodoQueueInFlightPrompt({
     submittedAtMs,
     terminalConfirmedFinished,
     terminalClosed,
+    terminalDirectReadyFinished,
     terminalInputReady,
     terminalInputReadyAtMs,
     terminalInstanceChanged,
