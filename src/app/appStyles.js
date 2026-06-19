@@ -110,6 +110,14 @@ export const GlobalStyle = createGlobalStyle`
     --forge-text-disabled: #505966;
     --forge-blue: #3b82f6;
     --forge-blue-soft: #7db0ff;
+    --forge-accent: #3b82f6;
+    --forge-accent-soft: #7db0ff;
+    --forge-accent-blue: var(--forge-accent);
+    --forge-accent-rgb: 59, 130, 246;
+    --forge-accent-soft-rgb: 125, 176, 255;
+    --forge-accent-selected-bg: rgba(59, 130, 246, 0.08);
+    --forge-accent-selected-border: rgba(125, 176, 255, 0.5);
+    --forge-accent-selected-ring: rgba(79, 163, 255, 0.24);
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
@@ -147,6 +155,14 @@ export const GlobalStyle = createGlobalStyle`
     --forge-text-disabled: #505966;
     --forge-blue: #3b82f6;
     --forge-blue-soft: #7db0ff;
+    --forge-accent: #3b82f6;
+    --forge-accent-soft: #7db0ff;
+    --forge-accent-blue: var(--forge-accent);
+    --forge-accent-rgb: 59, 130, 246;
+    --forge-accent-soft-rgb: 125, 176, 255;
+    --forge-accent-selected-bg: rgba(59, 130, 246, 0.08);
+    --forge-accent-selected-border: rgba(125, 176, 255, 0.5);
+    --forge-accent-selected-ring: rgba(79, 163, 255, 0.24);
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
@@ -170,6 +186,14 @@ export const GlobalStyle = createGlobalStyle`
     --forge-text-disabled: #a1a1a6;
     --forge-blue: #0066cc;
     --forge-blue-soft: #0071e3;
+    --forge-accent: #0066cc;
+    --forge-accent-soft: #0071e3;
+    --forge-accent-blue: var(--forge-accent);
+    --forge-accent-rgb: 0, 102, 204;
+    --forge-accent-soft-rgb: 0, 113, 227;
+    --forge-accent-selected-bg: rgba(0, 102, 204, 0.1);
+    --forge-accent-selected-border: rgba(0, 102, 204, 0.46);
+    --forge-accent-selected-ring: rgba(0, 102, 204, 0.18);
     --forge-amber: #8b5a00;
     --forge-ember: #0066cc;
     --forge-green: #0a7f45;
@@ -205,6 +229,44 @@ export const GlobalStyle = createGlobalStyle`
 
   html[data-forge-theme="light"] *::-webkit-scrollbar-corner {
     background: #f5f5f7;
+  }
+
+  html[data-forge-space="loopspaces"] {
+    --forge-surface-selected: rgba(245, 158, 11, 0.13);
+    --forge-blue: #f59e0b;
+    --forge-blue-soft: #ffd166;
+    --forge-accent: #f59e0b;
+    --forge-accent-soft: #ffd166;
+    --forge-accent-rgb: 245, 158, 11;
+    --forge-accent-soft-rgb: 255, 209, 102;
+    --forge-accent-selected-bg: rgba(245, 158, 11, 0.105);
+    --forge-accent-selected-border: rgba(255, 209, 102, 0.5);
+    --forge-accent-selected-ring: rgba(245, 158, 11, 0.22);
+    --forge-amber: #ffd166;
+    --forge-ember: #f59e0b;
+  }
+
+  html[data-forge-theme="light"][data-forge-space="loopspaces"] {
+    --forge-surface-selected: rgba(181, 106, 0, 0.12);
+    --forge-blue: #b56a00;
+    --forge-blue-soft: #c88000;
+    --forge-accent: #b56a00;
+    --forge-accent-soft: #c88000;
+    --forge-accent-rgb: 181, 106, 0;
+    --forge-accent-soft-rgb: 200, 128, 0;
+    --forge-accent-selected-bg: rgba(181, 106, 0, 0.1);
+    --forge-accent-selected-border: rgba(181, 106, 0, 0.42);
+    --forge-accent-selected-ring: rgba(181, 106, 0, 0.16);
+    --forge-amber: #8b5a00;
+    --forge-ember: #b56a00;
+  }
+
+  html[data-forge-space="loopspaces"] * {
+    scrollbar-color: rgba(var(--forge-accent-rgb), 0.52) rgba(14, 10, 5, 0.86);
+  }
+
+  html[data-forge-theme="light"][data-forge-space="loopspaces"] * {
+    scrollbar-color: rgba(var(--forge-accent-rgb), 0.34) rgba(245, 245, 247, 0.9);
   }
 
   * {
@@ -2376,20 +2438,36 @@ export const RailHeader = styled.div`
   }
 `;
 
-export const RailSectionTitle = styled.p`
+export const RailSectionTitle = styled.button`
   max-width: 120px;
   margin: 0;
+  padding: 0;
+  border: 0;
   color: var(--forge-text-disabled);
+  background: transparent;
+  cursor: pointer;
   font-size: 10px;
   font-weight: 760;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   overflow: hidden;
+  text-align: left;
   white-space: nowrap;
   transition:
+    color 160ms ease,
     max-width 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     opacity 150ms ease,
     transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  &:hover,
+  &:focus-visible {
+    color: var(--forge-accent-soft);
+    outline: none;
+  }
+
+  &[data-mode="loopspaces"] {
+    color: var(--forge-amber);
+  }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     max-width: 0;
@@ -2437,10 +2515,10 @@ export const RailCollapseButton = styled.button`
   }
 
   &:hover {
-    border-color: rgba(98, 160, 255, 0.22);
+    border-color: rgba(var(--forge-accent-rgb), 0.22);
     color: var(--forge-text);
     background:
-      linear-gradient(90deg, rgba(47, 128, 255, 0.09), rgba(255, 122, 24, 0.025)),
+      linear-gradient(90deg, rgba(var(--forge-accent-rgb), 0.09), rgba(var(--forge-accent-soft-rgb), 0.025)),
       rgba(13, 17, 23, 0.58);
     box-shadow: none;
   }
@@ -2453,7 +2531,7 @@ export const RailCollapseButton = styled.button`
   }
 
   html[data-forge-theme="light"] &:hover {
-    border-color: rgba(0, 102, 204, 0.28);
+    border-color: rgba(var(--forge-accent-rgb), 0.28);
     color: var(--forge-blue);
     background: var(--forge-surface);
     box-shadow: none;
@@ -2539,9 +2617,9 @@ export const WorkspaceRow = styled.div`
   }
 
   &::before {
-    border: 1px solid rgba(125, 176, 255, 0.32);
+    border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.32);
     background:
-      linear-gradient(90deg, rgba(47, 128, 255, 0.08), rgba(255, 122, 24, 0.07)),
+      linear-gradient(90deg, rgba(var(--forge-accent-rgb), 0.08), rgba(var(--forge-accent-soft-rgb), 0.07)),
       rgba(230, 236, 245, 0.025);
     z-index: 0;
   }
@@ -2552,9 +2630,9 @@ export const WorkspaceRow = styled.div`
     background: linear-gradient(
       90deg,
       transparent 0%,
-      rgba(125, 176, 255, 0.04) 35%,
+      rgba(var(--forge-accent-soft-rgb), 0.04) 35%,
       rgba(255, 190, 96, 0.2) 50%,
-      rgba(125, 176, 255, 0.04) 65%,
+      rgba(var(--forge-accent-soft-rgb), 0.04) 65%,
       transparent 100%
     );
     z-index: 1;
@@ -2578,9 +2656,9 @@ export const WorkspaceButton = styled.button`
   --workspace-card-status-border: rgba(144, 155, 170, 0.24);
   --workspace-card-hover-bg: rgba(230, 236, 245, 0.04);
   --workspace-card-hover-border: rgba(230, 236, 245, 0.08);
-  --workspace-card-selected-bg: rgba(59, 130, 246, 0.08);
-  --workspace-card-selected-border: rgba(125, 176, 255, 0.5);
-  --workspace-card-selected-ring: rgba(79, 163, 255, 0.24);
+  --workspace-card-selected-bg: var(--forge-accent-selected-bg);
+  --workspace-card-selected-border: var(--forge-accent-selected-border);
+  --workspace-card-selected-ring: var(--forge-accent-selected-ring);
 
   position: relative;
   display: grid;
@@ -2647,7 +2725,7 @@ export const WorkspaceButton = styled.button`
     --workspace-card-text: #dbe7f6;
     --workspace-card-muted: #8797aa;
     --workspace-card-status: var(--forge-blue-soft);
-    --workspace-card-status-border: rgba(125, 176, 255, 0.42);
+    --workspace-card-status-border: rgba(var(--forge-accent-soft-rgb), 0.42);
     --workspace-card-hover-bg: rgba(125, 160, 205, 0.055);
     --workspace-card-hover-border: rgba(125, 160, 205, 0.16);
   }
@@ -2659,9 +2737,9 @@ export const WorkspaceButton = styled.button`
     --workspace-card-status-border: rgba(0, 0, 0, 0.12);
     --workspace-card-hover-bg: rgba(0, 0, 0, 0.035);
     --workspace-card-hover-border: rgba(0, 0, 0, 0.08);
-    --workspace-card-selected-bg: rgba(0, 102, 204, 0.08);
-    --workspace-card-selected-border: rgba(0, 102, 204, 0.46);
-    --workspace-card-selected-ring: rgba(0, 102, 204, 0.18);
+    --workspace-card-selected-bg: var(--forge-accent-selected-bg);
+    --workspace-card-selected-border: var(--forge-accent-selected-border);
+    --workspace-card-selected-ring: var(--forge-accent-selected-ring);
   }
 
   html[data-forge-theme="light"] &[data-runtime="closed"] {
@@ -2684,9 +2762,9 @@ export const WorkspaceButton = styled.button`
     --workspace-card-text: #1d1d1f;
     --workspace-card-muted: #5f6f85;
     --workspace-card-status: var(--forge-blue);
-    --workspace-card-status-border: rgba(0, 102, 204, 0.34);
-    --workspace-card-hover-bg: rgba(0, 102, 204, 0.06);
-    --workspace-card-hover-border: rgba(0, 102, 204, 0.18);
+    --workspace-card-status-border: rgba(var(--forge-accent-rgb), 0.34);
+    --workspace-card-hover-bg: rgba(var(--forge-accent-rgb), 0.06);
+    --workspace-card-hover-border: rgba(var(--forge-accent-rgb), 0.18);
   }
 
   &:hover,
@@ -2702,7 +2780,7 @@ export const WorkspaceButton = styled.button`
     background: var(--workspace-card-selected-bg);
     box-shadow:
       0 0 0 1px var(--workspace-card-selected-ring),
-      inset 0 0 0 1px rgba(125, 176, 255, 0.08);
+      inset 0 0 0 1px rgba(var(--forge-accent-soft-rgb), 0.08);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
@@ -2984,7 +3062,7 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   html[data-forge-theme="light"] &:hover {
-    border-color: rgba(0, 102, 204, 0.22);
+    border-color: rgba(var(--forge-accent-rgb), 0.22);
     color: var(--forge-blue);
     background: var(--forge-surface-control);
   }
@@ -3040,7 +3118,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
 
   &:hover {
     color: #ffffff;
-    border-color: rgba(125, 176, 255, 0.38);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.38);
     background:
       linear-gradient(180deg, rgba(23, 35, 58, 0.98), rgba(8, 10, 14, 0.98)),
       #080a0e;
@@ -3101,7 +3179,7 @@ export const WorkspaceAccent = styled.span`
   ${WorkspaceButton}[data-runtime="activated"] & {
     border-color: var(--workspace-card-status-border);
     background: var(--workspace-card-status);
-    box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+    box-shadow: 0 0 10px rgba(var(--forge-accent-rgb), 0.2);
     transform: scale(1.08);
   }
 
@@ -3258,18 +3336,18 @@ export const RailActionButton = styled.button`
   }
 
   &[data-active="true"] {
-    border-color: rgba(125, 160, 205, 0.28);
-    background: rgba(125, 160, 205, 0.12);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
+    background: rgba(var(--forge-accent-soft-rgb), 0.12);
   }
 
   &[data-active="true"]::before {
-    background: var(--forge-blue-soft);
-    box-shadow: 0 0 10px rgba(59, 130, 246, 0.22);
+    background: var(--forge-accent-soft);
+    box-shadow: 0 0 10px rgba(var(--forge-accent-rgb), 0.22);
   }
 
   &[data-active="true"] svg,
   &:hover svg {
-    color: var(--forge-blue-soft);
+    color: var(--forge-accent-soft);
   }
 
   html[data-forge-theme="light"] & {
@@ -3282,24 +3360,24 @@ export const RailActionButton = styled.button`
 
   html[data-forge-theme="light"] &[data-active="true"],
   html[data-forge-theme="light"] &:hover {
-    border-color: rgba(0, 102, 204, 0.2);
+    border-color: rgba(var(--forge-accent-rgb), 0.2);
     color: var(--forge-text);
-    background: rgba(0, 102, 204, 0.08);
+    background: rgba(var(--forge-accent-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-active="true"] {
-    border-color: rgba(0, 102, 204, 0.28);
-    background: rgba(0, 102, 204, 0.1);
+    border-color: rgba(var(--forge-accent-rgb), 0.28);
+    background: rgba(var(--forge-accent-rgb), 0.1);
   }
 
   html[data-forge-theme="light"] &[data-active="true"]::before {
-    background: var(--forge-blue);
+    background: var(--forge-accent);
     box-shadow: none;
   }
 
   html[data-forge-theme="light"] &[data-active="true"] svg,
   html[data-forge-theme="light"] &:hover svg {
-    color: var(--forge-blue);
+    color: var(--forge-accent);
   }
 
   &[data-scope="global"] {
@@ -3341,19 +3419,19 @@ export const RailActionButton = styled.button`
 
   html[data-forge-theme="light"] &[data-scope="global"]:hover,
   html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] {
-    border-color: rgba(0, 102, 204, 0.22);
+    border-color: rgba(var(--forge-accent-rgb), 0.22);
     color: var(--forge-text);
-    background: rgba(0, 102, 204, 0.08);
+    background: rgba(var(--forge-accent-rgb), 0.08);
   }
 
   html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] {
-    border-color: rgba(0, 102, 204, 0.3);
-    background: rgba(0, 102, 204, 0.11);
+    border-color: rgba(var(--forge-accent-rgb), 0.3);
+    background: rgba(var(--forge-accent-rgb), 0.11);
   }
 
   html[data-forge-theme="light"] &[data-scope="global"]:hover svg,
   html[data-forge-theme="light"] &[data-scope="global"][data-active="true"] svg {
-    color: var(--forge-blue);
+    color: var(--forge-accent);
   }
 
   &[data-variant="signout"] {

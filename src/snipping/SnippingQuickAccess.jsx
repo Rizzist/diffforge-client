@@ -661,7 +661,15 @@ async function copySnipToClipboard(snip) {
 
 async function copyTextToClipboard(value) {
   const normalized = text(value);
-  if (!normalized || !navigator?.clipboard?.writeText) return false;
+  if (!normalized) return false;
+  try {
+    await invoke("snipping_copy_text_to_clipboard", { text: normalized });
+    return true;
+  } catch {
+    // Fall back to the Web Clipboard API for webview contexts where the native
+    // command is unavailable.
+  }
+  if (!navigator?.clipboard?.writeText) return false;
   try {
     await navigator.clipboard.writeText(normalized);
     return true;
@@ -673,10 +681,10 @@ async function copyTextToClipboard(value) {
 /**
  * Upload-button state machine shared by the floating preview and the strip
  * tile: idle -> uploading -> private for private snip uploads, or idle ->
- * uploading -> done when the snip upload-public setting mints a link during
- * upload. The primary button is then "Unupload" for private copies and
- * "Copy URL" for public links; the single CloudOff delete path removes both
- * private sync storage and any public copy/link.
+ * uploading -> done when the snip upload-public setting mints and copies a
+ * link during upload. The primary button is then "Unupload" for private
+ * copies and "Copy URL" for public links; the single CloudOff delete path
+ * removes both private sync storage and any public copy/link.
  * A different adopted snip or an annotation save resets to idle because the
  * uploaded asset no longer matches the visible pixels.
  */
@@ -782,9 +790,23 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     }
   }, []);
 
+  const setCopiedFeedback = useCallback((copied) => {
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = 0;
+    }
+    setUrlCopied(Boolean(copied));
+    if (!copied) return;
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = 0;
+      setUrlCopied(false);
+    }, 1400);
+  }, []);
+
   const uploadToCloud = useCallback(async () => {
     setUploadState("uploading");
     setUploadPercent(null);
+    setUrlCopied(false);
     try {
       const result = await invoke("snipping_upload_untracked_asset_to_cloud", {
         request: {
@@ -799,7 +821,9 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
         setPublicUrl(url);
         setUploadState("done");
         setUploadPercent(100);
-        showStatus("Uploaded");
+        const copied = await copyTextToClipboard(url);
+        setCopiedFeedback(copied);
+        showStatus(copied ? "URL copied" : "Public URL ready");
       } else {
         setUploadState("private");
         setUploadPercent(100);
@@ -810,7 +834,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
       setUploadPercent(null);
       throw error;
     }
-  }, [localPath, name, showStatus]);
+  }, [localPath, name, setCopiedFeedback, showStatus]);
 
   const makePublic = useCallback(async () => {
     if (!assetId) return;
@@ -855,16 +879,8 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
   const copyPublicUrl = useCallback(async () => {
     const copied = await copyTextToClipboard(publicUrl);
     showStatus(copied ? "URL copied" : "Clipboard is not available in this webview.");
-    if (!copied) return;
-    setUrlCopied(true);
-    if (copiedTimerRef.current) {
-      window.clearTimeout(copiedTimerRef.current);
-    }
-    copiedTimerRef.current = window.setTimeout(() => {
-      copiedTimerRef.current = 0;
-      setUrlCopied(false);
-    }, 1400);
-  }, [publicUrl, showStatus]);
+    setCopiedFeedback(copied);
+  }, [publicUrl, setCopiedFeedback, showStatus]);
 
   return {
     copyPublicUrl,

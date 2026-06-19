@@ -160,14 +160,11 @@ function accountToolsEventHasKnownPayload(payload) {
       && typeof candidate === "object"
       && !Array.isArray(candidate)
       && (
-        candidate.contract === "diffforge.account_skills.v1"
+        candidate.contract === "diffforge.skills_doc.v1"
         || candidate.contract === "diffforge.account_clis.v1"
         || candidate.contract === "diffforge.account_mcps.v1"
-        || candidate.kind === "account_skill_changed"
         || candidate.kind === "account_cli_changed"
         || candidate.kind === "account_mcp_changed"
-        || candidate.event_kind === "account_skill_changed"
-        || candidate.eventKind === "account_skill_changed"
         || candidate.skill
         || candidate.skill_units
         || candidate.skillUnits
@@ -183,7 +180,7 @@ function accountToolsEventHasKnownPayload(payload) {
 function accountToolsSkillsFromEventPayload(payload) {
   const candidates = accountToolsEventCandidates(payload);
   for (const candidate of candidates) {
-    const skills = candidate?.skills || candidate?.account_skills || candidate?.accountSkills;
+    const skills = candidate?.skills;
     const skillsMd = skills?.skills_md ?? skills?.skillsMd;
     if (skillsMd != null) {
       return String(skillsMd);
@@ -197,8 +194,7 @@ function accountToolsSkillUnitFromEventPayload(payload) {
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
     const contract = candidate.contract;
-    const kind = candidate.kind || candidate.event_kind || candidate.eventKind;
-    const skill = candidate.skill || candidate.account_skill || candidate.accountSkill;
+    const skill = candidate.skill;
     if (skill && typeof skill === "object" && !Array.isArray(skill)) {
       return skill;
     }
@@ -206,7 +202,7 @@ function accountToolsSkillUnitFromEventPayload(payload) {
     if (Array.isArray(units) && units.length) {
       return units[0];
     }
-    if (contract === "diffforge.account_skills.v1" || kind === "account_skill_changed") {
+    if (contract === "diffforge.skills_doc.v1") {
       const nested = candidate.payload?.skill || candidate.data?.skill;
       if (nested && typeof nested === "object" && !Array.isArray(nested)) {
         return nested;

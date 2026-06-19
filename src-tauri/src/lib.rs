@@ -4656,6 +4656,7 @@ pub fn run() {
             snipping_dispatch_targets,
             snipping_open_annotation_editor_batch,
             snipping_copy_untracked_asset_to_clipboard,
+            snipping_copy_text_to_clipboard,
             snipping_cancel_area_snip,
             audio_widget_status,
             audio_widget_bar_hover_snapshot,

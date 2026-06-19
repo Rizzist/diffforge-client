@@ -4738,6 +4738,22 @@ fn snipping_copy_untracked_asset_to_clipboard_for(path: String) -> Result<Value,
     diffforge_copy_image_file_to_clipboard(&file)
 }
 
+fn snipping_copy_text_to_clipboard_for(value: String) -> Result<Value, String> {
+    let normalized = value.trim().to_string();
+    if normalized.is_empty() {
+        return Err("Nothing to copy.".to_string());
+    }
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("Unable to open system clipboard: {error}"))?;
+    clipboard
+        .set_text(normalized.clone())
+        .map_err(|error| format!("Unable to copy text to clipboard: {error}"))?;
+    Ok(json!({
+        "kind": "snipping_text_copied",
+        "text": normalized,
+    }))
+}
+
 fn snipping_url_token(value: &str) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
 }
@@ -10480,6 +10496,11 @@ fn snipping_open_annotation_editor_batch(
 #[tauri::command]
 fn snipping_copy_untracked_asset_to_clipboard(path: String) -> Result<Value, String> {
     snipping_copy_untracked_asset_to_clipboard_for(path)
+}
+
+#[tauri::command]
+fn snipping_copy_text_to_clipboard(text: String) -> Result<Value, String> {
+    snipping_copy_text_to_clipboard_for(text)
 }
 
 #[tauri::command]

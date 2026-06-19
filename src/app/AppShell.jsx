@@ -1176,9 +1176,17 @@ const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_THEME_DARK = "dark";
 const APP_THEME_LIGHT = "light";
 const APP_THEME_DEFAULT = APP_THEME_DARK;
+const APP_SPACE_MODE_WORKSPACES = "workspaces";
+const APP_SPACE_MODE_LOOPSPACES = "loopspaces";
+const APP_SPACE_MODE_DEFAULT = APP_SPACE_MODE_WORKSPACES;
+const LOOPSPACES_STORAGE_KEY = "diffforge.loopspaces.v1";
 const APP_THEME_META_COLORS = {
   [APP_THEME_DARK]: "#030508",
   [APP_THEME_LIGHT]: "#f5f5f7",
+};
+const APP_LOOPSPACE_THEME_META_COLORS = {
+  [APP_THEME_DARK]: "#120b02",
+  [APP_THEME_LIGHT]: "#fff8ea",
 };
 const APP_THEME_OPTIONS = [
   {
@@ -4018,6 +4026,75 @@ function WorkspaceIdleState({
         )}
       </WorkspaceIdlePanel>
     </WorkspaceIdleSurface>
+  );
+}
+
+
+function LoopspaceCreatePanel({
+  loopspaceError,
+  loopspaceName,
+  loopspaceState,
+  onClose,
+  onSubmit,
+  setLoopspaceName,
+}) {
+  const creating = loopspaceState === "creating";
+  const canCreate = Boolean(!creating && loopspaceName.trim());
+
+  return (
+    <WorkspaceCreateSurface>
+      <WorkspaceCreateCard
+        aria-busy={creating}
+        aria-label="Create loop"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (canCreate) {
+            onSubmit(event);
+          }
+        }}
+      >
+        <WorkspaceCreateHeader>
+          <div>
+            <PanelKicker>New loop</PanelKicker>
+            <PanelHeading>Create loop</PanelHeading>
+          </div>
+          <WorkspaceModalCloseButton
+            aria-label="Close create loop"
+            disabled={creating}
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </WorkspaceModalCloseButton>
+        </WorkspaceCreateHeader>
+
+        <WorkspaceCreateSection>
+          <SettingsLabel>Name</SettingsLabel>
+          <WorkspaceSettingsInput
+            autoFocus
+            autoComplete="off"
+            autoCorrect="off"
+            disabled={creating}
+            maxLength={80}
+            onChange={(event) => setLoopspaceName(event.target.value)}
+            placeholder="My loop"
+            spellCheck={false}
+            value={loopspaceName}
+          />
+        </WorkspaceCreateSection>
+
+        {loopspaceError && <FormMessage $state="error">{loopspaceError}</FormMessage>}
+
+        <WorkspaceCreateFooter>
+          <span />
+          <PrimaryButton disabled={!canCreate} type="submit">
+            <ButtonAddIcon aria-hidden="true" />
+            <span>{creating ? "Creating..." : "Create loop"}</span>
+          </PrimaryButton>
+        </WorkspaceCreateFooter>
+      </WorkspaceCreateCard>
+    </WorkspaceCreateSurface>
   );
 }
 
@@ -7693,6 +7770,11 @@ function normalizeAppTheme(value) {
   return theme === APP_THEME_LIGHT ? APP_THEME_LIGHT : APP_THEME_DEFAULT;
 }
 
+function normalizeAppSpaceMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  return mode === APP_SPACE_MODE_LOOPSPACES ? APP_SPACE_MODE_LOOPSPACES : APP_SPACE_MODE_DEFAULT;
+}
+
 function normalizeAppAppearanceSettings(value) {
   if (typeof value === "string") {
     return { theme: normalizeAppTheme(value) };
@@ -7731,18 +7813,23 @@ function persistAppAppearanceSettings(settings) {
   }
 }
 
-function applyForgeThemePreference(theme) {
+function applyForgeThemePreference(theme, spaceMode = APP_SPACE_MODE_DEFAULT) {
   if (typeof document === "undefined") {
     return normalizeAppTheme(theme);
   }
 
   const normalizedTheme = normalizeAppTheme(theme);
+  const normalizedSpaceMode = normalizeAppSpaceMode(spaceMode);
   document.documentElement.dataset.forgeTheme = normalizedTheme;
+  document.documentElement.dataset.forgeSpace = normalizedSpaceMode;
   if (document.body) {
     document.body.dataset.forgeTheme = normalizedTheme;
+    document.body.dataset.forgeSpace = normalizedSpaceMode;
   }
 
-  const themeColor = APP_THEME_META_COLORS[normalizedTheme] || APP_THEME_META_COLORS[APP_THEME_DEFAULT];
+  const themeColor = normalizedSpaceMode === APP_SPACE_MODE_LOOPSPACES
+    ? APP_LOOPSPACE_THEME_META_COLORS[normalizedTheme] || APP_LOOPSPACE_THEME_META_COLORS[APP_THEME_DEFAULT]
+    : APP_THEME_META_COLORS[normalizedTheme] || APP_THEME_META_COLORS[APP_THEME_DEFAULT];
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", themeColor);
 
   return normalizedTheme;
@@ -7752,11 +7839,22 @@ function findWorkspaceById(workspaces, workspaceId) {
   return workspaces.find((workspace) => workspace.id === workspaceId) || null;
 }
 
+function findLoopspaceById(loopspaces, loopspaceId) {
+  return loopspaces.find((loopspace) => loopspace.id === loopspaceId) || null;
+}
+
 function mintLocalWorkspaceId() {
   const uuid = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
     ? crypto.randomUUID()
     : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}-${Math.random().toString(16).slice(2, 10)}`;
   return `ws-${uuid}`;
+}
+
+function mintLocalLoopspaceId() {
+  const uuid = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+    ? crypto.randomUUID()
+    : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}-${Math.random().toString(16).slice(2, 10)}`;
+  return `loop-${uuid}`;
 }
 
 function normalizeCatalogWorkspaceEntry(entry) {
@@ -7777,6 +7875,70 @@ function normalizeCatalogWorkspaceEntry(entry) {
     pendingDelete: catalogWorkspaceEntryIsDeleted(entry),
     syncState: entry?.syncState === "pending" || entry?.syncState === "error" ? entry.syncState : "synced",
   };
+}
+
+function normalizeLoopspaceEntry(entry) {
+  const id = String(entry?.id || entry?.loopspace_id || entry?.loopspaceId || "").trim();
+  if (!id) {
+    return null;
+  }
+  const name = String(entry?.name || entry?.loopspace_name || entry?.loopspaceName || id).trim() || id;
+  return {
+    id,
+    name,
+    createdAt: String(entry?.createdAt || entry?.created_at || ""),
+    updatedAt: String(entry?.updatedAt || entry?.updated_at || ""),
+  };
+}
+
+function normalizeLoopspaces(value) {
+  const rawItems = Array.isArray(value)
+    ? value
+    : Array.isArray(value?.loopspaces)
+      ? value.loopspaces
+      : [];
+  const seen = new Set();
+  return rawItems
+    .map(normalizeLoopspaceEntry)
+    .filter((loopspace) => {
+      if (!loopspace || seen.has(loopspace.id)) {
+        return false;
+      }
+      seen.add(loopspace.id);
+      return true;
+    });
+}
+
+function readLoopspaces() {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+
+  try {
+    return normalizeLoopspaces(JSON.parse(window.localStorage.getItem(LOOPSPACES_STORAGE_KEY) || "[]"));
+  } catch {
+    return [];
+  }
+}
+
+function persistLoopspaces(loopspaces) {
+  const normalized = normalizeLoopspaces(loopspaces);
+  if (typeof window === "undefined" || !window.localStorage) {
+    return normalized;
+  }
+
+  try {
+    window.localStorage.setItem(
+      LOOPSPACES_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        loopspaces: normalized,
+      }),
+    );
+  } catch {
+    // Loopspaces are local-only in this pass; the UI can keep running without persistence.
+  }
+  return normalized;
 }
 
 function catalogWorkspaceEntryIsDeleted(entry) {
@@ -8759,6 +8921,13 @@ export default function App() {
   const [workspaceGraphState, setWorkspaceGraphState] = useState({});
   const [workspaceArchitectureTerminalActivity, setWorkspaceArchitectureTerminalActivity] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
+  const [spaceMode, setSpaceMode] = useState(APP_SPACE_MODE_DEFAULT);
+  const [loopspaces, setLoopspaces] = useState(readLoopspaces);
+  const [selectedLoopspaceId, setSelectedLoopspaceId] = useState("");
+  const [loopspaceCreatePanelOpen, setLoopspaceCreatePanelOpen] = useState(false);
+  const [loopspaceName, setLoopspaceName] = useState("");
+  const [loopspaceState, setLoopspaceState] = useState("idle");
+  const [loopspaceError, setLoopspaceError] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
   const [workspaceHydrationReady, setWorkspaceHydrationReady] = useState(false);
@@ -11252,8 +11421,8 @@ export default function App() {
   }, [workspaceLifecycleSettings]);
 
   useEffect(() => {
-    applyForgeThemePreference(appAppearanceSettings.theme);
-  }, [appAppearanceSettings.theme]);
+    applyForgeThemePreference(appAppearanceSettings.theme, spaceMode);
+  }, [appAppearanceSettings.theme, spaceMode]);
 
   useEffect(() => {
     if (!agentStatusCacheHitRef.current) {
@@ -11323,6 +11492,7 @@ export default function App() {
   }, []);
   const selectedWorkspace = findWorkspaceById(workspaces, selectedWorkspaceId);
   const activatedWorkspace = findWorkspaceById(workspaces, activatedWorkspaceId);
+  const selectedLoopspace = findLoopspaceById(loopspaces, selectedLoopspaceId);
 
   const applyWindowFrameState = useCallback((nextFrameState) => {
     setWindowFrameState((currentFrameState) => (
@@ -11891,6 +12061,9 @@ export default function App() {
 
     setSelectedWorkspaceId("");
     setWorkspaceSettingsModalId("");
+    if (spaceMode === APP_SPACE_MODE_LOOPSPACES) {
+      setSelectedLoopspaceId("");
+    }
     if (DEVICE_LEVEL_APP_VIEW_IDS.has(activeViewRef.current) || DEVICE_LEVEL_APP_VIEW_IDS.has(visibleViewRef.current)) {
       showView(DEFAULT_WORKSPACE_VIEW, {
         immediate: true,
@@ -11898,7 +12071,7 @@ export default function App() {
         telemetryWorkspaceId: activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current,
       });
     }
-  }, [showView]);
+  }, [showView, spaceMode]);
 
   useEffect(() => () => {
     window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
@@ -11963,10 +12136,10 @@ export default function App() {
       });
 
       persistAppAppearanceSettings(nextSettings);
-      applyForgeThemePreference(nextSettings.theme);
+      applyForgeThemePreference(nextSettings.theme, spaceMode);
       return nextSettings;
     });
-  }, []);
+  }, [spaceMode]);
 
   const cancelDeferredWorkspaceActivation = useCallback(() => {
     const pending = deferredWorkspaceActivationRef.current;
@@ -12373,6 +12546,10 @@ export default function App() {
 
     setSelectedWorkspaceId(workspace.id);
     selectedWorkspaceIdRef.current = workspace.id;
+    setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+    setSelectedLoopspaceId("");
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
     setWorkspaceSettingsModalId("");
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
@@ -12467,6 +12644,10 @@ export default function App() {
     workspacePendingActivationIdRef.current = "";
     selectedWorkspaceIdRef.current = workspace.id;
     setSelectedWorkspaceId(workspace.id);
+    setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+    setSelectedLoopspaceId("");
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
     setWorkspaceCreateModalOpen(false);
     setWorkspaceSettingsModalId(workspaceAlreadyActive ? "" : workspace.id);
     setWorkspaceSettingsError("");
@@ -12485,6 +12666,67 @@ export default function App() {
     showView,
     workspaces,
   ]);
+
+  const enterLoopspacesMode = useCallback((source = "workspace_rail_title") => {
+    cancelDeferredWorkspaceActivation();
+    selectedWorkspaceIdRef.current = "";
+    workspacePendingActivationIdRef.current = "";
+    setSelectedWorkspaceId("");
+    setWorkspacePendingActivationId("");
+    setWorkspaceSettingsModalId("");
+    setWorkspaceCreateModalOpen(false);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    setWorkspaceDeleteConfirmId("");
+    setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: `${source}_loopspaces`,
+      telemetryWorkspaceId: activatedWorkspaceIdRef.current || "",
+    });
+  }, [cancelDeferredWorkspaceActivation, showView]);
+
+  const exitLoopspacesMode = useCallback((source = "workspace_rail_title") => {
+    setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+    setSelectedLoopspaceId("");
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: `${source}_workspaces`,
+      telemetryWorkspaceId: activatedWorkspaceIdRef.current || "",
+    });
+  }, [showView]);
+
+  const toggleRailSpaceMode = useCallback(() => {
+    if (spaceMode === APP_SPACE_MODE_LOOPSPACES) {
+      exitLoopspacesMode();
+      return;
+    }
+    enterLoopspacesMode();
+  }, [enterLoopspacesMode, exitLoopspacesMode, spaceMode]);
+
+  const selectLoopspaceFromRail = useCallback((loopspaceId) => {
+    const loopspace = findLoopspaceById(loopspaces, loopspaceId);
+    if (!loopspace) {
+      return;
+    }
+    cancelDeferredWorkspaceActivation();
+    selectedWorkspaceIdRef.current = "";
+    workspacePendingActivationIdRef.current = "";
+    setSelectedWorkspaceId("");
+    setWorkspacePendingActivationId("");
+    setWorkspaceSettingsModalId("");
+    setWorkspaceCreateModalOpen(false);
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
+    setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+    setSelectedLoopspaceId(loopspace.id);
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: "loopspace_rail_select",
+    });
+  }, [cancelDeferredWorkspaceActivation, loopspaces, showView]);
 
   const deactivateWorkspace = useCallback(async (workspaceId, source = "manual") => {
     const targetWorkspaceId = workspaceId || activatedWorkspaceIdRef.current;
@@ -13715,6 +13957,10 @@ export default function App() {
   }, [activeAccountScopeKey, authState, loadWorkspaces]);
 
   const openCreateWorkspaceModal = useCallback(() => {
+    setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+    setSelectedLoopspaceId("");
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
     setWorkspaceName("");
     setNewWorkspaceRootDraft(defaultWorkingDirectory || "");
     setWorkspaceError("");
@@ -13725,6 +13971,59 @@ export default function App() {
       telemetrySource: "workspace_create_panel",
     });
   }, [defaultWorkingDirectory, showView]);
+
+  const openCreateLoopspacePanel = useCallback(() => {
+    enterLoopspacesMode("loopspace_create_panel");
+    setLoopspaceName("");
+    setLoopspaceError("");
+    setLoopspaceState("idle");
+    setSelectedLoopspaceId("");
+    setLoopspaceCreatePanelOpen(true);
+  }, [enterLoopspacesMode]);
+
+  const closeCreateLoopspacePanel = useCallback(() => {
+    if (loopspaceState === "creating") {
+      return;
+    }
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
+  }, [loopspaceState]);
+
+  const createLoopspace = useCallback((event) => {
+    event.preventDefault();
+    const name = loopspaceName.trim();
+    if (!name) {
+      setLoopspaceError("Loop name is required.");
+      return;
+    }
+
+    setLoopspaceState("creating");
+    setLoopspaceError("");
+
+    const nowIso = new Date().toISOString();
+    const loopspace = {
+      id: mintLocalLoopspaceId(),
+      name,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    setLoopspaces((current) => {
+      const nextLoopspaces = persistLoopspaces([
+        ...(Array.isArray(current) ? current : []),
+        loopspace,
+      ]);
+      return nextLoopspaces;
+    });
+    setSelectedLoopspaceId(loopspace.id);
+    setLoopspaceName("");
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceState("idle");
+    setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: "loopspace_created",
+    });
+  }, [loopspaceName, showView]);
 
   const closeCreateWorkspaceModal = useCallback(() => {
     if (workspaceSyncState === "creating") {
@@ -13827,6 +14126,9 @@ export default function App() {
       setWorkspaceSettings(nextWorkspaceSettings);
       workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
+      setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+      setSelectedLoopspaceId("");
+      setLoopspaceCreatePanelOpen(false);
       setSelectedWorkspaceId(workspace.id);
       activatedWorkspaceIdRef.current = workspace.id;
       setActivatedWorkspaceId(workspace.id);
@@ -13867,6 +14169,10 @@ export default function App() {
   ]);
 
   const openWorkspaceSettings = useCallback((workspaceId) => {
+    setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+    setSelectedLoopspaceId("");
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceError("");
     setSelectedWorkspaceId(workspaceId);
     setWorkspaceSettingsModalId(workspaceId);
     setWorkspaceSettingsError("");
@@ -18521,6 +18827,15 @@ export default function App() {
     workspaces,
   ]);
   const hasSelectedWorkspace = Boolean(selectedWorkspace);
+  const loopspacesModeActive = spaceMode === APP_SPACE_MODE_LOOPSPACES;
+  const railSpaceModeLabel = loopspacesModeActive ? "Loopspaces" : "Workspaces";
+  const railSpaceModeTitle = loopspacesModeActive ? "Show workspaces" : "Enter Loopspaces";
+  const loopspaceIdleTitle = selectedLoopspace?.name || "Loopspaces";
+  const loopspaceIdleDetail = selectedLoopspace
+    ? "No loop content yet."
+    : loopspaces.length
+      ? "No loop selected."
+      : "No loops yet.";
   const shouldKeepWorkspaceTerminalMounted = Boolean(
     enabledWorkspaceRuntimeDescriptors.length > 0,
   );
@@ -26557,274 +26872,332 @@ export default function App() {
               <DashboardShell
                 aria-hidden={isWorkspaceStartupOverlayVisible}
                 data-rail-collapsed={workspaceRailCollapsed}
+                data-space-mode={spaceMode}
                 data-startup={isWorkspaceStartupOverlayVisible}
                 ref={dashboardShellRef}
               >
-              <WorkspaceRail
-                aria-label="Workspace navigation"
-                data-collapsed={workspaceRailCollapsed}
-                onClick={clearWorkspaceSelectionFromRail}
-                ref={workspaceRailRef}
-              >
-                <RailTop>
-                  <RailHeader>
-                    <RailSectionTitle>Workspaces</RailSectionTitle>
-                    <RailCreateWorkspaceButton
-                      aria-label="Create workspace"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        openCreateWorkspaceModal();
-                      }}
-                      title="Create workspace"
-                      type="button"
-                    >
-                      <ButtonAddIcon aria-hidden="true" />
-                    </RailCreateWorkspaceButton>
-                    <RailCollapseButton
-                      aria-label={workspaceRailCollapsed ? "Expand workspace drawer" : "Collapse workspace drawer"}
-                      aria-pressed={workspaceRailCollapsed}
-                      onClick={toggleWorkspaceRailCollapsed}
-                      title={workspaceRailCollapsed ? "Expand drawer" : "Drawer smaller"}
-                      type="button"
-                    >
-                      {workspaceRailCollapsed ? (
-                        <ButtonRailExpandIcon aria-hidden="true" />
-                      ) : (
-                        <ButtonRailCollapseIcon aria-hidden="true" />
-                      )}
-                    </RailCollapseButton>
-                  </RailHeader>
-                  <WorkspaceList>
-                    {workspaces.map((workspace) => {
-                      const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
-                      const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
-                      const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
-                      const workspaceRuntimeState = workspaceIsPendingActivation
-                        ? "activating"
-                        : workspace.id === activatedWorkspaceId
-                          ? workspaceState === "ready"
-                            ? "activated"
-                            : "activating"
-                          : workspaceIsRuntimeEnabled
-                            ? "activated"
-                            : "closed";
-                      const notificationSummary = workspaceNotificationSummaries[workspace.id] || {};
-                      const notificationBadgeText = formatWorkspaceNotificationBadgeCount(
-                        notificationSummary.badgeCount,
-                      );
-                      const hasNotificationBadge = Boolean(notificationBadgeText);
-                      const notificationLabel = notificationSummary.pendingActionCount
-                        ? `${notificationSummary.pendingActionCount} action${notificationSummary.pendingActionCount === 1 ? "" : "s"} required`
-                        : notificationSummary.unreadCount
-                          ? `${notificationSummary.unreadCount} unread notification${notificationSummary.unreadCount === 1 ? "" : "s"}`
-                          : "";
-                      const workspaceButtonLabel = notificationLabel
-                        ? `${workspace.name}, ${notificationLabel}`
-                        : workspace.name;
-                      const workspaceLifecycleBusy = Boolean(
-                        workspaceIsPendingActivation
-                          || (workspaceDeactivationState.isActive
-                            && workspaceDeactivationState.workspaceId === workspace.id),
-                      );
-                      const workspaceLifecycleLabel = workspaceIsRuntimeEnabled
-                        ? `Deactivate ${workspace.name}`
-                        : workspaceIsPendingActivation
-                          ? `Opening ${workspace.name}`
-                          : `Activate ${workspace.name}`;
-
-                      return (
-                        <WorkspaceRow
-                          data-notification-highlight={workspaceNotificationHighlights[workspace.id] ? "true" : undefined}
-                          data-runtime={workspaceRuntimeState}
-                          data-selected={workspace.id === selectedWorkspaceId}
-                          key={workspace.id}
-                        >
-                          <WorkspaceButton
-                            aria-label={workspaceButtonLabel}
-                            data-runtime={workspaceRuntimeState}
-                            data-selected={workspace.id === selectedWorkspaceId}
-                            onClick={() => {
-                              selectWorkspaceFromRail(workspace.id);
-                            }}
-                            title={notificationLabel ? `${workspace.name} - ${notificationLabel}` : workspace.name}
-                            type="button"
-                          >
-                            <WorkspaceAccent aria-hidden="true" />
-                            <WorkspaceLabel>
-                              <WorkspaceCompactGlyph aria-hidden="true">
-                                {getWorkspaceRailInitials(workspace.name)}
-                              </WorkspaceCompactGlyph>
-                              <strong>{workspace.name}</strong>
-                              <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
-                            </WorkspaceLabel>
-                            {hasNotificationBadge && (
-                              <WorkspaceNotificationBadge
-                                aria-hidden="true"
-                                data-variant={notificationSummary.badgeVariant}
+                <WorkspaceRail
+                  aria-label="Workspace navigation"
+                  data-collapsed={workspaceRailCollapsed}
+                  data-space-mode={spaceMode}
+                  onClick={clearWorkspaceSelectionFromRail}
+                  ref={workspaceRailRef}
+                >
+                  <RailTop>
+                    <RailHeader>
+                      <RailSectionTitle
+                        aria-label={railSpaceModeTitle}
+                        aria-pressed={loopspacesModeActive}
+                        data-mode={spaceMode}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleRailSpaceMode();
+                        }}
+                        title={railSpaceModeTitle}
+                        type="button"
+                      >
+                        {railSpaceModeLabel}
+                      </RailSectionTitle>
+                      <RailCreateWorkspaceButton
+                        aria-label={loopspacesModeActive ? "Create loop" : "Create workspace"}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          if (loopspacesModeActive) {
+                            openCreateLoopspacePanel();
+                            return;
+                          }
+                          openCreateWorkspaceModal();
+                        }}
+                        title={loopspacesModeActive ? "Create loop" : "Create workspace"}
+                        type="button"
+                      >
+                        <ButtonAddIcon aria-hidden="true" />
+                      </RailCreateWorkspaceButton>
+                      <RailCollapseButton
+                        aria-label={workspaceRailCollapsed ? "Expand workspace drawer" : "Collapse workspace drawer"}
+                        aria-pressed={workspaceRailCollapsed}
+                        onClick={toggleWorkspaceRailCollapsed}
+                        title={workspaceRailCollapsed ? "Expand drawer" : "Drawer smaller"}
+                        type="button"
+                      >
+                        {workspaceRailCollapsed ? (
+                          <ButtonRailExpandIcon aria-hidden="true" />
+                        ) : (
+                          <ButtonRailCollapseIcon aria-hidden="true" />
+                        )}
+                      </RailCollapseButton>
+                    </RailHeader>
+                    <WorkspaceList>
+                      {loopspacesModeActive ? (
+                        <>
+                          {loopspaces.map((loopspace) => {
+                            const selected = loopspace.id === selectedLoopspaceId;
+                            return (
+                              <WorkspaceRow
+                                data-runtime={selected ? "activated" : "closed"}
+                                data-selected={selected}
+                                key={loopspace.id}
                               >
-                                {notificationBadgeText}
-                              </WorkspaceNotificationBadge>
-                            )}
-                          </WorkspaceButton>
-                          <WorkspaceLifecycleButton
-                            aria-label={workspaceLifecycleLabel}
-                            data-runtime={workspaceRuntimeState}
-                            disabled={workspaceLifecycleBusy}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              if (workspaceIsRuntimeEnabled) {
-                                void deactivateWorkspace(workspace.id, "workspace_rail_toggle");
-                                return;
-                              }
-                              requestWorkspaceActivation(workspace.id, "workspace_rail_toggle");
-                            }}
-                            title={workspaceLifecycleLabel}
-                            type="button"
-                          >
-                            {workspaceIsRuntimeEnabled ? (
-                              <ButtonCloseIcon aria-hidden="true" />
-                            ) : (
-                              <ButtonTerminalIcon aria-hidden="true" />
-                            )}
-                          </WorkspaceLifecycleButton>
-                          <WorkspaceSettingsButton
-                            aria-label={`Open settings for ${workspace.name}`}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              openWorkspaceSettings(workspace.id);
-                            }}
-                            title="Workspace settings"
-                            type="button"
-                          >
-                            <ButtonSettingsIcon aria-hidden="true" />
-                          </WorkspaceSettingsButton>
-                        </WorkspaceRow>
-                      );
-                    })}
-                    {workspaceSyncState === "loading" && (
-                      <WorkspaceMuted>Loading...</WorkspaceMuted>
-                    )}
-                  </WorkspaceList>
-                </RailTop>
+                                <WorkspaceButton
+                                  aria-label={loopspace.name}
+                                  data-runtime={selected ? "activated" : "closed"}
+                                  data-selected={selected}
+                                  onClick={() => {
+                                    selectLoopspaceFromRail(loopspace.id);
+                                  }}
+                                  title={loopspace.name}
+                                  type="button"
+                                >
+                                  <WorkspaceAccent aria-hidden="true" />
+                                  <WorkspaceLabel>
+                                    <WorkspaceCompactGlyph aria-hidden="true">
+                                      {getWorkspaceRailInitials(loopspace.name)}
+                                    </WorkspaceCompactGlyph>
+                                    <strong>{loopspace.name}</strong>
+                                    <span>loop</span>
+                                  </WorkspaceLabel>
+                                </WorkspaceButton>
+                              </WorkspaceRow>
+                            );
+                          })}
+                          {!loopspaces.length && (
+                            <WorkspaceMuted>No loops</WorkspaceMuted>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          {workspaces.map((workspace) => {
+                            const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
+                            const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
+                            const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
+                            const workspaceRuntimeState = workspaceIsPendingActivation
+                              ? "activating"
+                              : workspace.id === activatedWorkspaceId
+                                ? workspaceState === "ready"
+                                  ? "activated"
+                                  : "activating"
+                                : workspaceIsRuntimeEnabled
+                                  ? "activated"
+                                  : "closed";
+                            const notificationSummary = workspaceNotificationSummaries[workspace.id] || {};
+                            const notificationBadgeText = formatWorkspaceNotificationBadgeCount(
+                              notificationSummary.badgeCount,
+                            );
+                            const hasNotificationBadge = Boolean(notificationBadgeText);
+                            const notificationLabel = notificationSummary.pendingActionCount
+                              ? `${notificationSummary.pendingActionCount} action${notificationSummary.pendingActionCount === 1 ? "" : "s"} required`
+                              : notificationSummary.unreadCount
+                                ? `${notificationSummary.unreadCount} unread notification${notificationSummary.unreadCount === 1 ? "" : "s"}`
+                                : "";
+                            const workspaceButtonLabel = notificationLabel
+                              ? `${workspace.name}, ${notificationLabel}`
+                              : workspace.name;
+                            const workspaceLifecycleBusy = Boolean(
+                              workspaceIsPendingActivation
+                                || (workspaceDeactivationState.isActive
+                                  && workspaceDeactivationState.workspaceId === workspace.id),
+                            );
+                            const workspaceLifecycleLabel = workspaceIsRuntimeEnabled
+                              ? `Deactivate ${workspace.name}`
+                              : workspaceIsPendingActivation
+                                ? `Opening ${workspace.name}`
+                                : `Activate ${workspace.name}`;
 
-                <RailFooter>
-                  {shouldShowTerminalNav && (
-                    <RailActionButton
-                      aria-label="Terminals"
-                      data-active={activeView === DEFAULT_WORKSPACE_VIEW}
-                      onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
-                      title="Terminals"
-                      type="button"
-                    >
-                      <ButtonTerminalIcon aria-hidden="true" />
-                      <span>Terminals</span>
-                    </RailActionButton>
-                  )}
-                  {shouldShowWorkspaceDetailNav && (
-                    <>
+                            return (
+                              <WorkspaceRow
+                                data-notification-highlight={workspaceNotificationHighlights[workspace.id] ? "true" : undefined}
+                                data-runtime={workspaceRuntimeState}
+                                data-selected={workspace.id === selectedWorkspaceId}
+                                key={workspace.id}
+                              >
+                                <WorkspaceButton
+                                  aria-label={workspaceButtonLabel}
+                                  data-runtime={workspaceRuntimeState}
+                                  data-selected={workspace.id === selectedWorkspaceId}
+                                  onClick={() => {
+                                    selectWorkspaceFromRail(workspace.id);
+                                  }}
+                                  title={notificationLabel ? `${workspace.name} - ${notificationLabel}` : workspace.name}
+                                  type="button"
+                                >
+                                  <WorkspaceAccent aria-hidden="true" />
+                                  <WorkspaceLabel>
+                                    <WorkspaceCompactGlyph aria-hidden="true">
+                                      {getWorkspaceRailInitials(workspace.name)}
+                                    </WorkspaceCompactGlyph>
+                                    <strong>{workspace.name}</strong>
+                                    <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
+                                  </WorkspaceLabel>
+                                  {hasNotificationBadge && (
+                                    <WorkspaceNotificationBadge
+                                      aria-hidden="true"
+                                      data-variant={notificationSummary.badgeVariant}
+                                    >
+                                      {notificationBadgeText}
+                                    </WorkspaceNotificationBadge>
+                                  )}
+                                </WorkspaceButton>
+                                <WorkspaceLifecycleButton
+                                  aria-label={workspaceLifecycleLabel}
+                                  data-runtime={workspaceRuntimeState}
+                                  disabled={workspaceLifecycleBusy}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    if (workspaceIsRuntimeEnabled) {
+                                      void deactivateWorkspace(workspace.id, "workspace_rail_toggle");
+                                      return;
+                                    }
+                                    requestWorkspaceActivation(workspace.id, "workspace_rail_toggle");
+                                  }}
+                                  title={workspaceLifecycleLabel}
+                                  type="button"
+                                >
+                                  {workspaceIsRuntimeEnabled ? (
+                                    <ButtonCloseIcon aria-hidden="true" />
+                                  ) : (
+                                    <ButtonTerminalIcon aria-hidden="true" />
+                                  )}
+                                </WorkspaceLifecycleButton>
+                                <WorkspaceSettingsButton
+                                  aria-label={`Open settings for ${workspace.name}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    openWorkspaceSettings(workspace.id);
+                                  }}
+                                  title="Workspace settings"
+                                  type="button"
+                                >
+                                  <ButtonSettingsIcon aria-hidden="true" />
+                                </WorkspaceSettingsButton>
+                              </WorkspaceRow>
+                            );
+                          })}
+                          {workspaceSyncState === "loading" && (
+                            <WorkspaceMuted>Loading...</WorkspaceMuted>
+                          )}
+                        </>
+                      )}
+                    </WorkspaceList>
+                  </RailTop>
+
+                  <RailFooter>
+                    {shouldShowTerminalNav && (
                       <RailActionButton
-                        aria-label="Files"
-                        data-active={activeView === "files"}
-                        onClick={() => showView("files")}
-                        title="Files"
+                        aria-label="Terminals"
+                        data-active={activeView === DEFAULT_WORKSPACE_VIEW}
+                        onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                        title="Terminals"
                         type="button"
                       >
-                        <ButtonFolderIcon aria-hidden="true" />
-                        <span>Files</span>
+                        <ButtonTerminalIcon aria-hidden="true" />
+                        <span>Terminals</span>
                       </RailActionButton>
+                    )}
+                    {shouldShowWorkspaceDetailNav && (
+                      <>
+                        <RailActionButton
+                          aria-label="Files"
+                          data-active={activeView === "files"}
+                          onClick={() => showView("files")}
+                          title="Files"
+                          type="button"
+                        >
+                          <ButtonFolderIcon aria-hidden="true" />
+                          <span>Files</span>
+                        </RailActionButton>
+                        <RailActionButton
+                          aria-label="History"
+                          data-active={activeView === "architecture"}
+                          onClick={() => showView("architecture")}
+                          title="Todo, task, and scan history"
+                          type="button"
+                        >
+                          <ButtonForgeIcon aria-hidden="true" />
+                          <span>History</span>
+                        </RailActionButton>
+                      </>
+                    )}
+                    <RailGlobalActions aria-label="Global controls">
                       <RailActionButton
-                        aria-label="History"
-                        data-active={activeView === "architecture"}
-                        onClick={() => showView("architecture")}
-                        title="Todo, task, and scan history"
+                        aria-label="Tools"
+                        data-active={GLOBAL_TOOLS_VIEWS.has(activeView)}
+                        data-scope="global"
+                        onClick={() => showView("tools")}
+                        title="Architectures, MCPs, Skills & CLIs"
                         type="button"
                       >
-                        <ButtonForgeIcon aria-hidden="true" />
-                        <span>History</span>
+                        <ButtonHubIcon aria-hidden="true" />
+                        <span>Tools</span>
                       </RailActionButton>
-                    </>
-                  )}
-                  <RailGlobalActions aria-label="Global controls">
-                    <RailActionButton
-                      aria-label="Tools"
-                      data-active={GLOBAL_TOOLS_VIEWS.has(activeView)}
-                      data-scope="global"
-                      onClick={() => showView("tools")}
-                      title="Architectures, MCPs, Skills & CLIs"
-                      type="button"
-                    >
-                      <ButtonHubIcon aria-hidden="true" />
-                      <span>Tools</span>
-                    </RailActionButton>
-                    <RailActionButton
-                      aria-label="Assets"
-                      data-active={activeView === "assets"}
-                      data-scope="global"
-                      onClick={() => showView("assets")}
-                      title="Assets"
-                      type="button"
-                    >
-                      <ButtonAssetsIcon aria-hidden="true" />
-                      <span>Assets</span>
-                    </RailActionButton>
-                    <RailActionButton
-                      aria-label="Snipping"
-                      data-active={activeView === "snipping"}
-                      data-scope="global"
-                      onClick={() => showView("snipping")}
-                      title="Snipping"
-                      type="button"
-                    >
-                      <ButtonSnippingIcon aria-hidden="true" />
-                      <span>Snipping</span>
-                    </RailActionButton>
-                    <RailActionButton
-                      aria-label="Audio"
-                      data-active={activeView === "audio"}
-                      data-scope="global"
-                      onClick={() => showView("audio")}
-                      title="Audio"
-                      type="button"
-                    >
-                      <ButtonMicIcon aria-hidden="true" />
-                      <span>Audio</span>
-                    </RailActionButton>
-                    <RailActionButton
-                      aria-label="Tokenomics"
-                      data-active={activeView === "tokenomics"}
-                      data-scope="global"
-                      onClick={() => showView("tokenomics")}
-                      title="Tokenomics"
-                      type="button"
-                    >
-                      <ButtonBrowserIcon aria-hidden="true" />
-                      <span>Tokenomics</span>
-                    </RailActionButton>
-                    <RailActionButton
-                      aria-label="Settings"
-                      data-active={activeView === "settings"}
-                      data-scope="global"
-                      onClick={() => showView("settings")}
-                      title="Settings"
-                      type="button"
-                    >
-                      <ButtonSettingsIcon aria-hidden="true" />
-                      <span>Settings</span>
-                    </RailActionButton>
-                    <RailActionButton
-                      aria-label="Sign out"
-                      data-scope="global"
-                      data-variant="signout"
-                      onClick={logout}
-                      title="Sign out"
-                      type="button"
-                    >
-                      <ButtonLogoutIcon aria-hidden="true" />
-                      <span>Sign out</span>
-                    </RailActionButton>
-                  </RailGlobalActions>
-                </RailFooter>
-              </WorkspaceRail>
+                      <RailActionButton
+                        aria-label="Assets"
+                        data-active={activeView === "assets"}
+                        data-scope="global"
+                        onClick={() => showView("assets")}
+                        title="Assets"
+                        type="button"
+                      >
+                        <ButtonAssetsIcon aria-hidden="true" />
+                        <span>Assets</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        aria-label="Snipping"
+                        data-active={activeView === "snipping"}
+                        data-scope="global"
+                        onClick={() => showView("snipping")}
+                        title="Snipping"
+                        type="button"
+                      >
+                        <ButtonSnippingIcon aria-hidden="true" />
+                        <span>Snipping</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        aria-label="Audio"
+                        data-active={activeView === "audio"}
+                        data-scope="global"
+                        onClick={() => showView("audio")}
+                        title="Audio"
+                        type="button"
+                      >
+                        <ButtonMicIcon aria-hidden="true" />
+                        <span>Audio</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        aria-label="Tokenomics"
+                        data-active={activeView === "tokenomics"}
+                        data-scope="global"
+                        onClick={() => showView("tokenomics")}
+                        title="Tokenomics"
+                        type="button"
+                      >
+                        <ButtonBrowserIcon aria-hidden="true" />
+                        <span>Tokenomics</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        aria-label="Settings"
+                        data-active={activeView === "settings"}
+                        data-scope="global"
+                        onClick={() => showView("settings")}
+                        title="Settings"
+                        type="button"
+                      >
+                        <ButtonSettingsIcon aria-hidden="true" />
+                        <span>Settings</span>
+                      </RailActionButton>
+                      <RailActionButton
+                        aria-label="Sign out"
+                        data-scope="global"
+                        data-variant="signout"
+                        onClick={logout}
+                        title="Sign out"
+                        type="button"
+                      >
+                        <ButtonLogoutIcon aria-hidden="true" />
+                        <span>Sign out</span>
+                      </RailActionButton>
+                    </RailGlobalActions>
+                  </RailFooter>
+                </WorkspaceRail>
 
               <WorkspaceAppToolLayout
                 data-workspace-tool-fullscreen={workspaceToolPaneVisible && workspaceToolPaneFullscreen ? "true" : "false"}
@@ -26848,7 +27221,7 @@ export default function App() {
                   aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                   data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                 >
-                  {shouldShowWorkspaceSetup ? (
+                  {!loopspacesModeActive && shouldShowWorkspaceSetup ? (
                     <WorkspaceRuntimeLayer
                       aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
@@ -26927,13 +27300,13 @@ export default function App() {
                             terminalWorkspace={runtimeWorkspace}
                             terminalRenderAgentsByIndex={runtimeDescriptor.terminalRenderAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
-	                            terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
-	                            terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
-	                            terminalWorkspaceCoordinationTargets={getWorkspaceCoordinationTargetsForRoot(
-	                              workspaceCoordinationTargetsByRoot,
-	                              runtimeDescriptor.workingDirectory,
-	                            )}
-	                            terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
+                            terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
+                            terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
+                            terminalWorkspaceCoordinationTargets={getWorkspaceCoordinationTargetsForRoot(
+                              workspaceCoordinationTargetsByRoot,
+                              runtimeDescriptor.workingDirectory,
+                            )}
+                            terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
                             agentStatusError={agentStatusError}
                             agentStatuses={agentStatuses}
@@ -26994,7 +27367,26 @@ export default function App() {
                       );
                     })
                   )}
-                  {shouldShowDefaultWorkspaceIdle && (
+                  {loopspacesModeActive && (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
+                      data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
+                    >
+                      <WorkspaceIdleState
+                        actionLabel={selectedLoopspace ? "" : "Create Loop"}
+                        detail={loopspaceIdleDetail}
+                        flameActive={
+                          visibleView === DEFAULT_WORKSPACE_VIEW
+                            && !loopspaceCreatePanelOpen
+                        }
+                        onAction={openCreateLoopspacePanel}
+                        plan={billingPlanNameFromStatus(billingStatus, user)}
+                        title={loopspaceIdleTitle}
+                        viewMotion={viewMotion}
+                      />
+                    </WorkspaceRuntimeLayer>
+                  )}
+                  {!loopspacesModeActive && shouldShowDefaultWorkspaceIdle && (
                     <WorkspaceRuntimeLayer
                       aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
@@ -27007,10 +27399,10 @@ export default function App() {
                     </WorkspaceRuntimeLayer>
                   )}
                   <WorkspaceCreateLayer
-                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !workspaceCreateModalOpen}
-                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && workspaceCreateModalOpen}
+                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || loopspacesModeActive || !workspaceCreateModalOpen}
+                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && !loopspacesModeActive && workspaceCreateModalOpen}
                   >
-                    {workspaceCreateModalOpen && (
+                    {!loopspacesModeActive && workspaceCreateModalOpen && (
                       <WorkspaceCreatePanel
                         agentStatuses={agentStatuses}
                         chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
@@ -27030,10 +27422,25 @@ export default function App() {
                     )}
                   </WorkspaceCreateLayer>
                   <WorkspaceCreateLayer
-                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !isWorkspaceSettingsOpen}
-                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && isWorkspaceSettingsOpen}
+                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !loopspaceCreatePanelOpen}
+                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && loopspaceCreatePanelOpen}
                   >
-                    {isWorkspaceSettingsOpen && (
+                    {loopspaceCreatePanelOpen && (
+                      <LoopspaceCreatePanel
+                        loopspaceError={loopspaceError}
+                        loopspaceName={loopspaceName}
+                        loopspaceState={loopspaceState}
+                        onClose={closeCreateLoopspacePanel}
+                        onSubmit={createLoopspace}
+                        setLoopspaceName={setLoopspaceName}
+                      />
+                    )}
+                  </WorkspaceCreateLayer>
+                  <WorkspaceCreateLayer
+                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || loopspacesModeActive || !isWorkspaceSettingsOpen}
+                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && !loopspacesModeActive && isWorkspaceSettingsOpen}
+                  >
+                    {!loopspacesModeActive && isWorkspaceSettingsOpen && (
                       <WorkspaceCreateSurface>
                         <WorkspaceCreateCard
                           aria-busy={isWorkspaceSettingsBusy}

@@ -4054,7 +4054,7 @@ fn cloud_mcp_sync_activity_for_endpoint(
         "/v1/tokenomics/reset-device" => ("tokenomics", "up", "active"),
         "/v1/cloud/repo-catalog" => ("catalog", "down", "applying"),
         "/v1/tools/account" => ("tools", "down", "applying"),
-        "/v1/tools/skills" | "/v1/tools/cli-snapshot" => ("tools", "up", "active"),
+        "/v1/tools/cli-snapshot" => ("tools", "up", "active"),
         "/v1/cloud/server-reset" => ("system", "control", "active"),
         _ => return None,
     };
@@ -10835,6 +10835,9 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
         "domains": {
             "todos": todo_domain,
             "architectures": {
+                "c": "doc.sync",
+                "d": "architectures",
+                "contract": "diffforge.arch_doc.v1",
                 "m": "delta",
                 "v": 2,
                 "h": architecture_have,
@@ -10844,7 +10847,16 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
                 "source": "rust-diffforge-account-sync-resume",
             },
             "assets": assets,
-            "skills": { "enabled": true, "store_empty": skills_store_empty, "storeEmpty": skills_store_empty },
+            "skills": {
+                "c": "doc.sync",
+                "d": "skills",
+                "contract": "diffforge.skills_doc.v1",
+                "enabled": true,
+                "m": "delta",
+                "v": 1,
+                "store_empty": skills_store_empty,
+                "storeEmpty": skills_store_empty
+            },
             "clis": { "enabled": true },
             "mcps": { "enabled": true },
         },
@@ -10910,20 +10922,17 @@ async fn cloud_mcp_apply_account_sync_resume_response(
     }
     if let Some(architectures) = cloud_mcp_account_sync_resume_domain(
         response,
-        &[
-            "architectures",
-            "architecture",
-            "account_architectures",
-            "accountArchitectures",
-        ],
+        &["architectures"],
     ) {
         let hydrated = cloud_mcp_apply_architecture_sync_data(state, &architectures)
             .await
             .unwrap_or_else(|_| architectures.clone());
         let _ = state.global_ws_events.send(json!({
-            "kind": "account_architectures_sync",
-            "event_kind": "account_architectures_sync",
-            "contract": "diffforge.architectures.v2",
+            "kind": "doc.sync",
+            "event_kind": "doc.sync",
+            "contract": "diffforge.arch_doc.v1",
+            "c": "doc.sync",
+            "d": "architectures",
             "reason": reason,
             "payload": hydrated,
         }));
@@ -10932,10 +10941,10 @@ async fn cloud_mcp_apply_account_sync_resume_response(
         (
             cloud_mcp_account_sync_resume_domain(
                 response,
-                &["skills", "skill", "account_skills", "accountSkills"],
+                &["skills"],
             ),
-            "account_skills_snapshot",
-            "diffforge.account_skills.v1",
+            "doc.sync",
+            "diffforge.skills_doc.v1",
         ),
         (
             cloud_mcp_account_sync_resume_domain(
@@ -11020,7 +11029,7 @@ async fn cloud_mcp_emit_initial_account_tools_snapshot(
     payload: Value,
 ) {
     let mut payload = payload;
-    if contract == "diffforge.account_skills.v1" {
+    if contract == "diffforge.skills_doc.v1" {
         match cloud_mcp_hydrate_account_skill_payload(state, payload.clone()).await {
             Ok(hydrated) => {
                 if let Some(skills_md) = hydrated
@@ -11040,14 +11049,21 @@ async fn cloud_mcp_emit_initial_account_tools_snapshot(
             }
         }
     }
-    let _ = state.global_ws_events.send(json!({
+    let mut event = json!({
         "kind": event_kind,
         "event_kind": event_kind,
         "eventKind": event_kind,
         "contract": contract,
         "reason": "global_ws_ready",
         "payload": payload,
-    }));
+    });
+    if contract == "diffforge.skills_doc.v1" {
+        if let Some(object) = event.as_object_mut() {
+            object.insert("c".to_string(), json!("doc.sync"));
+            object.insert("d".to_string(), json!("skills"));
+        }
+    }
+    let _ = state.global_ws_events.send(event);
 }
 
 async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
@@ -11206,15 +11222,6 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             (
                 cloud_mcp_initial_account_snapshot(
                     &message,
-                    "initial_account_skills",
-                    "initialAccountSkills",
-                ),
-                "account_skills_snapshot",
-                "diffforge.account_skills.v1",
-            ),
-            (
-                cloud_mcp_initial_account_snapshot(
-                    &message,
                     "initial_account_clis",
                     "initialAccountClis",
                 ),
@@ -11257,31 +11264,6 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 "global_ws_ready:account_device_live_state_snapshot",
             )
             .await;
-        }
-        if let Some(initial_account_architectures) = message
-            .get("initial_account_architectures")
-            .or_else(|| message.get("initialAccountArchitectures"))
-            .or_else(|| message.get("initial_architecture_catalog"))
-            .or_else(|| message.get("initialArchitectureCatalog"))
-            .cloned()
-            .filter(|value| !value.is_null())
-        {
-            let state_for_hydration = state.clone();
-            tauri::async_runtime::spawn(async move {
-                let hydrated = cloud_mcp_apply_architecture_sync_data(
-                    &state_for_hydration,
-                    &initial_account_architectures,
-                )
-                .await
-                .unwrap_or_else(|_| initial_account_architectures.clone());
-                let _ = state_for_hydration.global_ws_events.send(json!({
-                    "kind": "account_architectures_sync",
-                    "event_kind": "account_architectures_sync",
-                    "contract": "diffforge.architectures.v2",
-                    "reason": "global_ws_ready",
-                    "payload": hydrated,
-                }));
-            });
         }
         cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_ready");
         cloud_mcp_record_signin_diagnostic(
@@ -12398,15 +12380,14 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             if matches!(
                 contract.as_str(),
-                "diffforge.account_skills.v1"
+                "diffforge.skills_doc.v1"
                     | "diffforge.account_clis.v1"
                     | "diffforge.account_mcps.v1"
             ) || matches!(
                 event_kind.as_str(),
-                "account_skill_changed" | "account_cli_changed" | "account_mcp_changed"
+                "account_cli_changed" | "account_mcp_changed"
             ) {
-                let is_skill_event = contract == "diffforge.account_skills.v1"
-                    || event_kind == "account_skill_changed";
+                let is_skill_event = contract == "diffforge.skills_doc.v1";
                 let event_to_emit = if is_skill_event {
                     match cloud_mcp_hydrate_account_skill_payload(&state_clone, event.clone()).await
                     {
@@ -12484,7 +12465,10 @@ async fn cloud_mcp_start_remote_command_listener(
                 // Skip our own architecture pushes echoed back by the server;
                 // re-waking on them creates a refresh -> sync -> echo flicker loop.
                 if !cloud_mcp_event_originated_from_this_device(&event) {
-                    if event_kind == "account_architectures_sync" {
+                    if cloud_mcp_doc_wire_text(&event, "contract").as_deref()
+                        == Some("diffforge.arch_doc.v1")
+                        || cloud_mcp_doc_domain(&event).as_deref() == Some("architectures")
+                    {
                         let _ = cloud_mcp_apply_architecture_sync_data(&state_clone, &event).await;
                     }
                     let _ = app.emit(
@@ -13901,13 +13885,33 @@ fn cloud_mcp_event_originated_from_this_device(event: &Value) -> bool {
     .any(|value| value == event_device_id)
 }
 
+fn cloud_mcp_doc_wire_text(event: &Value, key: &str) -> Option<String> {
+    cloud_mcp_payload_text(event, &[key])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", key]))
+        .or_else(|| cloud_mcp_payload_text(event, &["data", key]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cloud_mcp_doc_domain(event: &Value) -> Option<String> {
+    cloud_mcp_doc_wire_text(event, "d")
+        .or_else(|| cloud_mcp_doc_wire_text(event, "doc_domain"))
+        .or_else(|| cloud_mcp_doc_wire_text(event, "docDomain"))
+        .map(|value| value.to_ascii_lowercase())
+}
+
 fn cloud_mcp_is_architecture_sync_wake_event(event_kind: &str, event: &Value) -> bool {
-    if matches!(event_kind, "account_architectures_sync") {
+    let contract = cloud_mcp_doc_wire_text(event, "contract");
+    if contract.as_deref() == Some("diffforge.arch_doc.v1") {
         return true;
     }
-    if cloud_mcp_payload_text(event, &["contract"]).as_deref() == Some("diffforge.architectures.v2")
-    {
-        return true;
+    let wire_kind = if event_kind.trim().is_empty() {
+        cloud_mcp_doc_wire_text(event, "c").unwrap_or_default()
+    } else {
+        event_kind.trim().to_string()
+    };
+    if matches!(wire_kind.as_str(), "doc.sync" | "doc.content") {
+        return cloud_mcp_doc_domain(event).as_deref() == Some("architectures");
     }
     false
 }
@@ -17638,7 +17642,6 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/tokenomics/reset-device" => Some("tokenomics_reset_device_cloud"),
         "/v1/cloud/server-reset" => Some("server_reset_cloud_state"),
         "/v1/cloud/repo-catalog" => Some("account_repo_catalog"),
-        "/v1/tools/skills" => Some("account_skills_set"),
         "/v1/tools/cli-snapshot" => Some("account_clis_snapshot"),
         _ => None,
     }
@@ -23414,6 +23417,12 @@ async fn cloud_mcp_prepare_account_skill_unit_assets(
             })?;
         }
         let metadata = json!({
+            "doc_domain": "skills",
+            "docDomain": "skills",
+            "doc_id": skill_id,
+            "docId": skill_id,
+            "sync_contract": "diffforge.skills_doc.v1",
+            "syncContract": "diffforge.skills_doc.v1",
             "tool_unit": "skill",
             "toolUnit": "skill",
             "skill_id": skill_id,
@@ -23688,12 +23697,10 @@ async fn cloud_mcp_hydrate_account_skill_payload_shallow(
     state: &CloudMcpState,
     mut value: Value,
 ) -> Result<Value, String> {
-    for key in ["skills", "account_skills", "accountSkills"] {
-        if let Some(skills) = value.get(key).filter(|item| item.is_object()).cloned() {
-            let hydrated = cloud_mcp_hydrate_account_skills_object(state, skills).await?;
-            if let Some(object) = value.as_object_mut() {
-                object.insert(key.to_string(), hydrated);
-            }
+    if let Some(skills) = value.get("skills").filter(|item| item.is_object()).cloned() {
+        let hydrated = cloud_mcp_hydrate_account_skills_object(state, skills).await?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("skills".to_string(), hydrated);
         }
     }
     for key in ["skill_units", "skillUnits"] {
@@ -23704,12 +23711,35 @@ async fn cloud_mcp_hydrate_account_skill_payload_shallow(
             }
         }
     }
-    for key in ["skill", "account_skill", "accountSkill"] {
-        if let Some(skill) = value.get(key).filter(|item| item.is_object()).cloned() {
-            let hydrated = cloud_mcp_hydrate_account_skill_unit(state, skill).await?;
+    if value.get("skills").is_none() {
+        let units = value
+            .get("skill_units")
+            .or_else(|| value.get("skillUnits"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !units.is_empty() {
+            let preamble = cloud_mcp_account_skills_preamble(&value);
+            let skills_md = cloud_mcp_account_skills_markdown_from_units(&units, &preamble);
+            let revision = value.get("revision").cloned().unwrap_or(Value::Null);
             if let Some(object) = value.as_object_mut() {
-                object.insert(key.to_string(), hydrated);
+                object.insert(
+                    "skills".to_string(),
+                    json!({
+                        "skills_md": skills_md.clone(),
+                        "skillsMd": skills_md,
+                        "skill_units": units.clone(),
+                        "skillUnits": units,
+                        "revision": revision,
+                    }),
+                );
             }
+        }
+    }
+    if let Some(skill) = value.get("skill").filter(|item| item.is_object()).cloned() {
+        let hydrated = cloud_mcp_hydrate_account_skill_unit(state, skill).await?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("skill".to_string(), hydrated);
         }
     }
     Ok(value)
@@ -23750,7 +23780,15 @@ fn cloud_mcp_tools_base_payload(source: &str) -> Value {
 #[tauri::command]
 async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<Value, String> {
     let payload = cloud_mcp_tools_base_payload("rust-diffforge-account-tools");
-    let skills = cloud_mcp_ws_request(state.inner(), "account_skills_get", &payload)
+    let mut skills_payload = payload.clone();
+    if let Some(object) = skills_payload.as_object_mut() {
+        object.insert("m".to_string(), json!("delta"));
+        object.insert("c".to_string(), json!("doc.sync"));
+        object.insert("d".to_string(), json!("skills"));
+        object.insert("v".to_string(), json!(1));
+        object.insert("contract".to_string(), json!("diffforge.skills_doc.v1"));
+    }
+    let skills = cloud_mcp_ws_request(state.inner(), "doc.sync", &skills_payload)
         .await
         .map(|response| cloud_mcp_response_data(&response));
     let clis = cloud_mcp_ws_request(state.inner(), "account_clis_get", &payload)
@@ -23833,7 +23871,7 @@ async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<
 
     Ok(json!({
         "kind": "account_tools",
-        "contract": "diffforge.account_skills.v1+diffforge.account_clis.v1+diffforge.account_mcps.v1",
+        "contract": "diffforge.skills_doc.v1+diffforge.account_clis.v1+diffforge.account_mcps.v1",
         "split": true,
         "skills": skills.get("skills").cloned().unwrap_or_else(|| json!({})),
         "skill_units": skills.get("skill_units").or_else(|| skills.get("skillUnits")).cloned().unwrap_or_else(|| json!([])),
@@ -23858,6 +23896,11 @@ async fn cloud_mcp_save_account_skills(
 ) -> Result<Value, String> {
     let prepared_skill_units =
         cloud_mcp_prepare_account_skill_unit_assets(state.inner(), skill_units).await?;
+    let prepared_skill_ops = prepared_skill_units
+        .iter()
+        .cloned()
+        .map(|skill| json!({"op": "u", "skill": skill}))
+        .collect::<Vec<_>>();
     let mut payload = cloud_mcp_tools_base_payload("rust-diffforge-account-skills");
     if let Some(object) = payload.as_object_mut() {
         let cloud_skills_md = if prepared_skill_units.is_empty() {
@@ -23874,18 +23917,25 @@ async fn cloud_mcp_save_account_skills(
                 "skill_units".to_string(),
                 json!(prepared_skill_units.clone()),
             );
-            object.insert("skillUnits".to_string(), json!(prepared_skill_units));
-            object.insert("authoritative".to_string(), json!(true));
-            object.insert("snapshot_full".to_string(), json!(true));
-            object.insert("snapshotFull".to_string(), json!(true));
+            object.insert("skillUnits".to_string(), json!(prepared_skill_units.clone()));
+            object.insert("ops".to_string(), json!(prepared_skill_ops.clone()));
+        } else {
+            object.insert("ops".to_string(), json!([]));
         }
+        object.insert("authoritative".to_string(), json!(true));
+        object.insert("snapshot_full".to_string(), json!(true));
+        object.insert("snapshotFull".to_string(), json!(true));
+        object.insert("m".to_string(), json!("commit"));
+        object.insert("c".to_string(), json!("doc.sync"));
+        object.insert("d".to_string(), json!("skills"));
+        object.insert("v".to_string(), json!(1));
+        object.insert("contract".to_string(), json!("diffforge.skills_doc.v1"));
         if let Some(base_revision) = base_revision {
             object.insert("base_revision".to_string(), json!(base_revision));
             object.insert("baseRevision".to_string(), json!(base_revision));
         }
     }
-    let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/tools/skills", &payload).await?;
+    let response = cloud_mcp_ws_request(state.inner(), "doc.sync", &payload).await?;
     cloud_mcp_cache_account_skills(&skills_md);
     cloud_mcp_hydrate_account_skill_payload(state.inner(), cloud_mcp_response_data(&response)).await
 }
@@ -24145,6 +24195,9 @@ fn cloud_mcp_architecture_payload_base(
     let mut payload = json!({
         "source": "rust-diffforge-architecture",
         "reason": reason,
+        "contract": "diffforge.arch_doc.v1",
+        "c": "doc.sync",
+        "d": "architectures",
         "scope": "account",
         "architecture_scope": "global",
         "architectureScope": "global",
@@ -24389,6 +24442,12 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
     }
 
     let metadata = json!({
+        "doc_domain": "architectures",
+        "docDomain": "architectures",
+        "doc_id": graph_id,
+        "docId": graph_id,
+        "sync_contract": "diffforge.arch_doc.v1",
+        "syncContract": "diffforge.arch_doc.v1",
         "tool_unit": "architecture",
         "toolUnit": "architecture",
         "architecture_id": graph_id,
@@ -24918,12 +24977,11 @@ fn cloud_mcp_architecture_sync_payload(base: &Value, graph: Value) -> Option<Val
         format!("architecture-graph:{scope_key}:{device_id}:{graph_id}:{content_hash}");
     let mut payload = base.clone();
     if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "event_kind".to_string(),
-            json!("account_architectures_sync"),
-        );
-        object.insert("eventKind".to_string(), json!("account_architectures_sync"));
-        object.insert("contract".to_string(), json!("diffforge.architectures.v2"));
+        object.insert("event_kind".to_string(), json!("doc.sync"));
+        object.insert("eventKind".to_string(), json!("doc.sync"));
+        object.insert("c".to_string(), json!("doc.sync"));
+        object.insert("d".to_string(), json!("architectures"));
+        object.insert("contract".to_string(), json!("diffforge.arch_doc.v1"));
         object.insert("graph_id".to_string(), json!(graph_id.clone()));
         object.insert("content_hash".to_string(), json!(content_hash.clone()));
         object.insert("payload_hash".to_string(), json!(content_hash.clone()));
@@ -25098,7 +25156,7 @@ fn cloud_mcp_architecture_local_index(reason: &str) -> Result<Value, String> {
     if let Some(object) = data.as_object_mut() {
         object.insert("kind".to_string(), json!("architecture_sync_index"));
         object.insert("scope".to_string(), json!("account"));
-        object.insert("contract".to_string(), json!("diffforge.architectures.v2"));
+        object.insert("contract".to_string(), json!("diffforge.arch_doc.v1"));
         object.insert("version".to_string(), json!(2));
         object.insert("reason".to_string(), json!(reason));
         object.insert("architecture_scope".to_string(), json!("global"));
@@ -25214,7 +25272,7 @@ async fn cloud_mcp_architecture_sync_index_v2(
         object.insert("v".to_string(), json!(2));
         object.insert("h".to_string(), json!(have));
     }
-    let response = cloud_mcp_ws_request(state, "account_architectures_sync", &payload).await?;
+    let response = cloud_mcp_ws_request(state, "doc.sync", &payload).await?;
     let data = response.get("data").cloned().unwrap_or(response);
     let _ = cloud_mcp_apply_architecture_sync_data(state, &data).await?;
     tauri::async_runtime::spawn_blocking({
@@ -25223,6 +25281,42 @@ async fn cloud_mcp_architecture_sync_index_v2(
     })
     .await
     .map_err(|error| format!("Architecture local index worker failed: {error}"))?
+}
+
+pub(crate) async fn cloud_mcp_delete_account_architecture_graph(
+    state: &CloudMcpState,
+    graph_id: String,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let graph_id = graph_id.trim().to_string();
+    if graph_id.is_empty() {
+        return Err("Architecture delete requires a graph id.".to_string());
+    }
+    let req = cloud_mcp_repo_request(
+        String::new(),
+        Some(ARCHITECTURE_GLOBAL_WORKSPACE_ID.to_string()),
+        Some("Global".to_string()),
+    );
+    let mut payload = cloud_mcp_architecture_payload_base(
+        &req,
+        ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        Some("Global"),
+        reason.as_deref().unwrap_or("architecture_graph_delete"),
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event_kind".to_string(), json!("doc.sync"));
+        object.insert("eventKind".to_string(), json!("doc.sync"));
+        object.insert("contract".to_string(), json!("diffforge.arch_doc.v1"));
+        object.insert("c".to_string(), json!("doc.sync"));
+        object.insert("d".to_string(), json!("architectures"));
+        object.insert("m".to_string(), json!("commit"));
+        object.insert("v".to_string(), json!(2));
+        object.insert("graph_id".to_string(), json!(graph_id.clone()));
+        object.insert("graphId".to_string(), json!(graph_id.clone()));
+        object.insert("ops".to_string(), json!([["d", graph_id, cloud_mcp_now_ms()]]));
+    }
+    let response = cloud_mcp_ws_request(state, "doc.sync", &payload).await?;
+    Ok(cloud_mcp_response_data(&response))
 }
 
 fn cloud_mcp_architecture_hydrated_graph(mut item: Value) -> Option<Value> {
@@ -25306,7 +25400,11 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
     let refs_array = cloud_mcp_architecture_refs_array(&refs);
     if refs_array.is_empty() {
         return Ok(json!({
-            "kind": "account_architectures_content",
+            "kind": "doc.content",
+            "event_kind": "doc.content",
+            "eventKind": "doc.content",
+            "c": "doc.content",
+            "d": "architectures",
             "items": [],
             "missing": [],
             "hydratedCount": 0,
@@ -25326,6 +25424,8 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
     );
     if let Some(object) = payload.as_object_mut() {
         object.insert("m".to_string(), json!("hydrate"));
+        object.insert("c".to_string(), json!("doc.content"));
+        object.insert("d".to_string(), json!("architectures"));
         object.insert("v".to_string(), json!(2));
         object.insert(
             "h".to_string(),
@@ -25351,7 +25451,7 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
                 .collect::<Vec<_>>()),
         );
     }
-    let response = cloud_mcp_ws_request(state, "account_architectures_content", &payload).await?;
+    let response = cloud_mcp_ws_request(state, "doc.content", &payload).await?;
     let mut data = response.get("data").cloned().unwrap_or(response);
     let hydrated_items = data
         .get("items")
@@ -25532,18 +25632,16 @@ pub(crate) async fn cloud_mcp_sync_architectures_internal(
         if !ops.is_empty() {
             let mut commit_payload = payload.clone();
             if let Some(object) = commit_payload.as_object_mut() {
-                object.insert(
-                    "event_kind".to_string(),
-                    json!("account_architectures_sync"),
-                );
-                object.insert("eventKind".to_string(), json!("account_architectures_sync"));
-                object.insert("contract".to_string(), json!("diffforge.architectures.v2"));
+                object.insert("event_kind".to_string(), json!("doc.sync"));
+                object.insert("eventKind".to_string(), json!("doc.sync"));
+                object.insert("contract".to_string(), json!("diffforge.arch_doc.v1"));
+                object.insert("c".to_string(), json!("doc.sync"));
+                object.insert("d".to_string(), json!("architectures"));
                 object.insert("m".to_string(), json!("commit"));
                 object.insert("v".to_string(), json!(2));
                 object.insert("ops".to_string(), json!(ops));
             }
-            let response =
-                cloud_mcp_ws_request(state, "account_architectures_sync", &commit_payload).await?;
+            let response = cloud_mcp_ws_request(state, "doc.sync", &commit_payload).await?;
             sent_count = sent_count.saturating_add(sync_payloads.len());
             for sync_payload in &sync_payloads {
                 let _ = cloud_mcp_architecture_mark_sync_acked_from_payload(
@@ -25558,9 +25656,11 @@ pub(crate) async fn cloud_mcp_sync_architectures_internal(
     Ok(json!({
         "ok": true,
         "kind": "architecture_graph_sync_result",
-        "event_kind": "account_architectures_sync",
-        "eventKind": "account_architectures_sync",
-        "contract": "diffforge.architectures.v2",
+        "event_kind": "doc.sync",
+        "eventKind": "doc.sync",
+        "c": "doc.sync",
+        "d": "architectures",
+        "contract": "diffforge.arch_doc.v1",
         "sync_unit": "architecture_graph",
         "syncUnit": "architecture_graph",
         "graph_count": total_count,
