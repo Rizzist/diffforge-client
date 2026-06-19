@@ -1244,7 +1244,6 @@ const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
-const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT = "cloud-mcp-account-usage";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
@@ -6210,6 +6209,40 @@ function cleanAppCloseText(value, fallback = "") {
   return text || fallback;
 }
 
+function terminalNameGenericKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\d+$/g, "")
+    .replace(/[^a-z]/g, "");
+}
+
+function terminalNameIsGenericFallback(value, agentId = "") {
+  const key = terminalNameGenericKey(value);
+  if (!key) {
+    return true;
+  }
+  const agentLabelKey = terminalNameGenericKey(getManagedAgentLabel(agentId));
+  return [
+    "agent",
+    "terminal",
+    "prewarm",
+    "prewarmpty",
+    "codingagent",
+    "codex",
+    "claude",
+    "claudecode",
+    "openai",
+    "opencode",
+  ].includes(key) || (agentLabelKey && key === agentLabelKey);
+}
+
+function terminalRealNameFromCandidates(agentId, ...candidates) {
+  return candidates
+    .map((value) => cleanAppCloseText(value))
+    .find((value) => value && !terminalNameIsGenericFallback(value, agentId)) || "";
+}
+
 function normalizeAppCloseTerminalIndex(value) {
   const terminalIndex = Number.parseInt(value, 10);
   return Number.isInteger(terminalIndex) && terminalIndex >= 0 ? terminalIndex : null;
@@ -6305,10 +6338,20 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           session.terminalLifecycle || session.terminal_lifecycle,
           terminalStatus === "closed" ? "closed" : "open",
         );
-        const terminalNickname = cleanAppCloseText(session.terminalNickname || session.terminal_nickname);
-        const terminalName = cleanAppCloseText(
-          session.terminalName || session.terminal_name || session.displayName || session.display_name,
-          terminalNickname || cleanAppCloseText(session.agentKind || session.agent_kind, "Terminal"),
+        const sessionAgentId = cleanAppCloseText(
+          session.agentId || session.agent_id || session.agentKind || session.agent_kind,
+        );
+        const terminalNickname = terminalRealNameFromCandidates(
+          sessionAgentId,
+          session.terminalNickname,
+          session.terminal_nickname,
+        );
+        const terminalName = terminalNickname || terminalRealNameFromCandidates(
+          sessionAgentId,
+          session.terminalName,
+          session.terminal_name,
+          session.displayName,
+          session.display_name,
         );
         return {
           activeTask,
@@ -6317,7 +6360,7 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           activityStatus: cleanAppCloseText(session.activityStatus || session.activity_status),
           commandPhase: cleanAppCloseText(session.commandPhase || session.command_phase),
           coordination,
-          displayName: cleanAppCloseText(session.displayName || session.display_name, terminalName),
+          displayName: terminalName,
           executionPhase,
           fileAuthority: cleanAppCloseText(session.fileAuthority || session.file_authority),
           hasActiveTask: session.hasActiveTask === true || session.has_active_task === true || Boolean(activeTask),
@@ -6361,6 +6404,7 @@ function buildRustTerminalAuthorityWorkspaces({
   defaultWorkingDirectory,
   enabledRuntimeWorkspaceIds,
   workspaceSidebarOrderById,
+  workspaceThreads,
 } = {}) {
   const liveSnapshot = normalizeTerminalLiveSessionsPayload(payload);
   const workspaceById = new Map((workspaces || []).map((workspace) => [
@@ -6380,6 +6424,7 @@ function buildRustTerminalAuthorityWorkspaces({
       return;
     }
     const workspaceRuntimeEnabled = enabledWorkspaceIds.has(workspaceId);
+    const workspaceRuntimeCommandable = true;
     const workspaceRecord = workspaceById.get(workspaceId) || null;
     const repoPath = cleanWorkspaceRootDirectory(
       session.workingDirectory
@@ -6393,12 +6438,12 @@ function buildRustTerminalAuthorityWorkspaces({
 
     if (!grouped.has(workspaceId)) {
       grouped.set(workspaceId, {
-        commandable: workspaceRuntimeEnabled,
-        lastKnownRuntime: !workspaceRuntimeEnabled,
-        last_known_runtime: !workspaceRuntimeEnabled,
+        commandable: workspaceRuntimeCommandable,
+        lastKnownRuntime: false,
+        last_known_runtime: false,
         repoPath,
-        runtimeReadOnly: !workspaceRuntimeEnabled,
-        runtime_read_only: !workspaceRuntimeEnabled,
+        runtimeReadOnly: false,
+        runtime_read_only: false,
         terminalClearReason: "",
         terminal_clear_reason: "",
         terminalListAuthoritative: true,
@@ -6424,6 +6469,33 @@ function buildRustTerminalAuthorityWorkspaces({
       || session.agentId
       || session.agentKind
       || WORKSPACE_TERMINAL_ROLE_GENERIC;
+    const workspaceThread = getWorkspaceThreadForTerminalIndex(workspaceThreads, workspaceId, terminalIndex);
+    const providerBinding = getWorkspaceThreadProviderBinding(
+      workspaceThread,
+      workspaceThread?.currentAgent || agentId,
+    );
+    const terminalRecord = workspaceThreads?.[workspaceId]?.terminals?.[String(terminalIndex)] || null;
+    const terminalNickname = terminalRealNameFromCandidates(
+      agentId,
+      getWorkspaceThreadTerminalNickname(workspaceThread, providerBinding, terminalRecord),
+      session.terminalNickname,
+      session.terminal_nickname,
+    );
+    const terminalName = terminalNickname || terminalRealNameFromCandidates(
+      agentId,
+      session.terminalName,
+      session.terminal_name,
+      session.displayName,
+      session.display_name,
+      terminalRecord?.terminalName,
+      terminalRecord?.terminal_name,
+      terminalRecord?.displayName,
+      terminalRecord?.display_name,
+      workspaceThread?.terminalName,
+      workspaceThread?.terminal_name,
+      providerBinding?.terminalName,
+      providerBinding?.terminal_name,
+    );
     const colorSlot = getTerminalAgentColorSlot(terminalIndex);
     const color = TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "";
     const terminalStatus = normalizeTerminalNativeRailState(session.terminalStatus || session.status, "idle");
@@ -6454,7 +6526,6 @@ function buildRustTerminalAuthorityWorkspaces({
         turnStatus,
       }),
     );
-    const terminalName = session.terminalName || session.displayName || getManagedAgentLabel(agentId);
     grouped.get(workspaceId).terminals.push({
       agentId,
       agentKind: agentId,
@@ -6469,23 +6540,23 @@ function buildRustTerminalAuthorityWorkspaces({
       colorSlot,
       commandPhase: session.commandPhase || "",
       command_phase: session.commandPhase || "",
-      commandable: workspaceRuntimeEnabled,
-      connected: workspaceRuntimeEnabled,
+      commandable: workspaceRuntimeCommandable,
+      connected: workspaceRuntimeCommandable,
       displayStatus: nativeRailFields.nativeRailLabel,
       display_status: nativeRailFields.nativeRailLabel,
       executionPhase,
       execution_phase: executionPhase,
       inputReady: session.inputReady === true || readiness === "ready",
-      lastKnownRuntime: !workspaceRuntimeEnabled,
-      last_known_runtime: !workspaceRuntimeEnabled,
+      lastKnownRuntime: false,
+      last_known_runtime: false,
       ...nativeRailFields,
-      nativeConnected: workspaceRuntimeEnabled,
-      native_connected: workspaceRuntimeEnabled,
+      nativeConnected: workspaceRuntimeCommandable,
+      native_connected: workspaceRuntimeCommandable,
       pane_id: session.paneId,
       paneId: session.paneId,
       readiness,
-      runtimeReadOnly: !workspaceRuntimeEnabled,
-      runtime_read_only: !workspaceRuntimeEnabled,
+      runtimeReadOnly: false,
+      runtime_read_only: false,
       sessionState: session.sessionState || "session_attached",
       session_state: session.sessionState || "session_attached",
       status: terminalStatus,
@@ -6505,8 +6576,8 @@ function buildRustTerminalAuthorityWorkspaces({
       displayName: terminalName,
       terminalName,
       terminal_name: terminalName,
-      terminalNickname: session.terminalNickname || "",
-      terminal_nickname: session.terminalNickname || "",
+      terminalNickname: terminalNickname || terminalName,
+      terminal_nickname: terminalNickname || terminalName,
       threadId: session.threadId || createWorkspaceThreadId(workspaceId, terminalIndex),
       turnId: session.turnId || "",
       turnStatus,
@@ -7837,52 +7908,6 @@ function catalogWorkspaceEntryIsDeleted(entry) {
 // workspaces. Local rows that the cloud acked before but no longer lists were
 // deleted from another device; local "pending" rows survive offline creation
 // and are re-pushed.
-function reconcileWorkspaceCatalog(localItems, cloudItems) {
-  const cloudById = new Map();
-  cloudItems.forEach((entry) => {
-    if (entry?.id && !entry.pendingDelete) {
-      cloudById.set(entry.id, entry);
-    }
-  });
-  const workspaces = [];
-  const pendingUpserts = [];
-  const pendingDeletes = [];
-  const seen = new Set();
-  (Array.isArray(localItems) ? localItems : []).forEach((rawLocal) => {
-    const local = normalizeCatalogWorkspaceEntry(rawLocal);
-    if (!local || seen.has(local.id)) {
-      return;
-    }
-    seen.add(local.id);
-    const cloud = cloudById.get(local.id);
-    if (local.pendingDelete) {
-      cloudById.delete(local.id);
-      pendingDeletes.push(local.id);
-      return;
-    }
-    if (!cloud) {
-      if (local.syncState === "pending" || local.syncState === "error") {
-        workspaces.push({ ...local, syncState: "pending" });
-        pendingUpserts.push(local);
-      }
-      return;
-    }
-    cloudById.delete(local.id);
-    const localNewer = local.syncState !== "synced"
-      && String(local.updatedAt || "") > String(cloud.updatedAt || "");
-    if (localNewer) {
-      workspaces.push({ ...local, syncState: "pending" });
-      pendingUpserts.push(local);
-    } else {
-      workspaces.push(cloud);
-    }
-  });
-  cloudById.forEach((cloud) => {
-    workspaces.push(cloud);
-  });
-  return { workspaces, pendingUpserts, pendingDeletes };
-}
-
 function graphText(value, fallback = "") {
   if (value === undefined || value === null) {
     return fallback;
@@ -8861,6 +8886,7 @@ export default function App() {
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [rustTerminalAuthoritySnapshot, setRustTerminalAuthoritySnapshot] = useState(null);
+  const [workspaceMcpRegistries, setWorkspaceMcpRegistries] = useState({});
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
@@ -8933,7 +8959,6 @@ export default function App() {
   const workspaceToolLayoutRef = useRef(null);
   const workspaceToolPanelRef = useRef(null);
   const workspaceToolMainPanelRef = useRef(null);
-  const workspaceAppContextSyncKeyRef = useRef("");
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
@@ -9067,15 +9092,9 @@ export default function App() {
   const rustTerminalAuthorityRefreshPendingRef = useRef("");
   const workspaceTerminalExplicitEmptyRef = useRef(new Set());
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
-  const terminalStatusEventSeqRef = useRef(new Map());
-  const terminalStatusEventDedupRef = useRef(new Map());
   const terminalStatusEventEmitterRef = useRef(null);
-  const terminalStatusEventSyncQueueRef = useRef(new Map());
-  const terminalStatusEventSyncTimersRef = useRef(new Map());
-  const terminalStatusEventSyncInFlightRef = useRef(new Set());
   const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
-  const workspaceCatalogSyncKeyRef = useRef("");
   const cloudMcpSessionContextSyncKeyRef = useRef("");
 
   useEffect(() => {
@@ -9382,7 +9401,6 @@ export default function App() {
     cloudMcpSessionContextSyncKeyRef.current = sessionContextKey;
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
-    workspaceCatalogSyncKeyRef.current = "";
     void refreshCloudMcpSessionContext({
       accountScope: activeAccountScope,
       billingStatus,
@@ -11487,8 +11505,6 @@ export default function App() {
     agentInitialStatusUserRef.current = "";
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
-    workspaceCatalogSyncKeyRef.current = "";
-    workspaceAppContextSyncKeyRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
     setStartupAgentGateState("idle");
@@ -11530,8 +11546,6 @@ export default function App() {
     }
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
-    workspaceCatalogSyncKeyRef.current = "";
-    workspaceAppContextSyncKeyRef.current = "";
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
@@ -12814,7 +12828,6 @@ export default function App() {
     workspaceMcpStartupIndexEmptyKeyRef.current = "";
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
-    workspaceCatalogSyncKeyRef.current = "";
 
     if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
       const nextActivatedWorkspace = nextEnabledWorkspaceIds
@@ -12849,19 +12862,6 @@ export default function App() {
         await workspaceSettingsPersistPromise;
       } catch (error) {
         warnings.push(`Workspace settings cleanup warning: ${getErrorMessage(error, "Unable to persist workspace settings cleanup.")}`);
-      }
-
-      try {
-        // Durable cloud delete: hard-deletes the catalog rows, writes the
-        // deleted-ids ledger, and broadcasts workspace_catalog_changed to
-        // every device. Offline it queues on the outbox and drains later.
-        await invoke("cloud_mcp_workspace_catalog_delete", {
-          workspaceId: targetWorkspaceId,
-          reason: "workspace_deleted",
-          scopeKey: deleteScopeKey,
-        });
-      } catch (error) {
-        warnings.push(`Cloud catalog cleanup warning: ${getErrorMessage(error, "Unable to delete cloud workspace.")}`);
       }
 
       try {
@@ -13759,8 +13759,8 @@ export default function App() {
       setActivatedWorkspaceId(nextActivatedWorkspaceId);
     };
 
-    // Local-first: the on-disk catalog renders immediately; the cloud catalog
-    // reconciles in the background and pushes any offline edits back up.
+    // Local-first: the on-disk catalog renders immediately. Cloud learns the
+    // current workspace set through the authoritative live workspace snapshot.
     let localItems = [];
     try {
       const local = await invoke("local_workspaces_load", { scopeKey });
@@ -13768,77 +13768,13 @@ export default function App() {
     } catch {
       localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
     }
-    // Legacy stores may still hold pendingDelete tombstone rows from before
-    // catalog deletes became Rust-owned and durable. Migrate them: the durable
-    // delete removes the row from the store and queues the cloud delete on
-    // the outbox, so no tombstone bookkeeping survives.
-    localItems.forEach((rawItem) => {
-      const normalized = normalizeCatalogWorkspaceEntry(rawItem);
-      if (normalized?.pendingDelete && normalized.id) {
-        void invoke("cloud_mcp_workspace_catalog_delete", {
-          workspaceId: normalized.id,
-          reason: "workspace_deleted_offline",
-          scopeKey,
-        }).catch(() => {});
-      }
-    });
     localItems = localItems
       .map(normalizeCatalogWorkspaceEntry)
       .filter((workspace) => workspace && !workspace.pendingDelete);
     applyLoadedWorkspaces(localItems);
     setWorkspaceSyncState("idle");
     setWorkspaceListHydrated(true);
-
-    void (async () => {
-      try {
-        // The Rust list command already filters out workspaces whose catalog
-        // delete is still queued in the outbox.
-        const result = await invoke("cloud_mcp_workspace_catalog_list", {
-          scopeKey,
-          scopeType: activeWorkspaceScopePayload.scopeType,
-          teamId: activeWorkspaceScopePayload.teamId,
-        });
-        if (activeAccountScopeKey !== scopeKey) {
-          return;
-        }
-        const resultScopeKey = String(result?.scopeKey || result?.scope_key || "").trim();
-        if (resultScopeKey !== scopeKey) {
-          return;
-        }
-        const cloudItems = (Array.isArray(result?.workspaces) ? result.workspaces : [])
-          .map(normalizeCatalogWorkspaceEntry)
-          .filter(Boolean);
-        const { workspaces: merged, pendingUpserts } = reconcileWorkspaceCatalog(
-          localItems,
-          cloudItems,
-        );
-        applyLoadedWorkspaces(merged);
-        try {
-          await invoke("local_workspaces_store", { scopeKey, workspaces: merged });
-        } catch {
-          // Local persistence is best effort; cloud remains authoritative.
-        }
-        for (const pending of pendingUpserts) {
-          try {
-            await invoke("cloud_mcp_workspace_catalog_upsert", {
-              scopeKey,
-              workspace: {
-                workspace_id: pending.id,
-                workspace_name: pending.name,
-                created_at: pending.createdAt,
-                updated_at: pending.updatedAt,
-              },
-            });
-          } catch {
-            // Retried on the next reconcile pass.
-          }
-        }
-      } catch {
-        // Offline or cloud unavailable: the local list stands until the
-        // websocket reconnects and the catalog broadcast refreshes us.
-      }
-    })();
-  }, [activeAccountScopeKey, activeWorkspaceScopePayload, expireDesktopSession]);
+  }, [activeAccountScopeKey, expireDesktopSession]);
 
   useEffect(() => {
     if (!previousAccountScopeKeyRef.current) {
@@ -13866,71 +13802,6 @@ export default function App() {
     setWorkspaceHydrationReady(false);
     loadWorkspaces();
   }, [activeAccountScopeKey, authState, loadWorkspaces]);
-
-  // Cross-device workspace sync: cloud-diffforge broadcasts the full active
-  // catalog whenever any device creates, renames, or deletes a workspace.
-  useEffect(() => {
-    if (authState !== "authenticated" || !accountIsPaid) {
-      return undefined;
-    }
-
-    let disposed = false;
-    let unlisten = null;
-    const scopeKey = activeAccountScopeKey;
-
-    void listen(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, (event) => {
-      if (disposed) {
-        return;
-      }
-      const payload = event?.payload || {};
-      if (!Array.isArray(payload.workspaces)) {
-        return;
-      }
-      const payloadScopeKey = String(payload.scopeKey || payload.scope_key || "").trim();
-      if (payloadScopeKey !== scopeKey || activeAccountScopeKey !== scopeKey) {
-        return;
-      }
-      // The Rust event forwarder already drops workspaces whose catalog
-      // delete is still queued in the outbox.
-      const cloudItems = payload.workspaces
-        .map(normalizeCatalogWorkspaceEntry)
-        .filter(Boolean);
-      const localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
-      const { workspaces: merged } = reconcileWorkspaceCatalog(localItems, cloudItems);
-      workspacesRef.current = merged;
-      setWorkspaces(merged);
-      if (activatedWorkspaceIdRef.current
-        && !findWorkspaceById(merged, activatedWorkspaceIdRef.current)) {
-        const nextActivatedWorkspaceId = merged[0]?.id || "";
-        activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
-        setActivatedWorkspaceId(nextActivatedWorkspaceId);
-      }
-      setSelectedWorkspaceId((currentSelectedId) => {
-        // A cross-device catalog broadcast must never ghost-reselect a
-        // workspace: preserve an intentional deselection, and if the selected
-        // workspace was deleted elsewhere just clear it rather than jumping to
-        // the first row.
-        if (!currentSelectedId) {
-          return "";
-        }
-        return findWorkspaceById(merged, currentSelectedId) ? currentSelectedId : "";
-      });
-      void invoke("local_workspaces_store", { scopeKey, workspaces: merged }).catch(() => {});
-    }).then((dispose) => {
-      if (disposed) {
-        dispose();
-      } else {
-        unlisten = dispose;
-      }
-    }).catch(() => {});
-
-    return () => {
-      disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
-    };
-  }, [activeAccountScopeKey, authState, user]);
 
   const openCreateWorkspaceModal = useCallback(() => {
     setWorkspaceName("");
@@ -14064,37 +13935,7 @@ export default function App() {
         agentSessionMode: AGENT_SESSION_MODE_COORDINATED,
       }).catch(() => {});
 
-      void (async () => {
-        let catalogSynced = false;
-        try {
-          const catalogResponse = await invoke("cloud_mcp_workspace_catalog_upsert", {
-            scopeKey,
-            workspace: {
-              workspace_id: workspace.id,
-              workspace_name: workspace.name,
-              created_at: workspace.createdAt,
-              updated_at: workspace.updatedAt,
-            },
-          });
-          // queued means the durable outbox holds it (offline); the row stays
-          // pending until the cloud list or broadcast confirms it.
-          catalogSynced = !catalogResponse?.queued;
-        } catch (catalogError) {
-          setWorkspaceError(
-            `Workspace created locally; cloud sync is pending: ${getErrorMessage(
-              catalogError,
-              "Unable to sync workspace to cloud.",
-            )}`,
-          );
-        }
-        if (catalogSynced) {
-          const syncedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-            .map((item) => (item.id === workspace.id ? { ...item, syncState: "synced" } : item));
-          workspacesRef.current = syncedWorkspaces;
-          setWorkspaces(syncedWorkspaces);
-          void invoke("local_workspaces_store", { scopeKey, workspaces: syncedWorkspaces }).catch(() => {});
-        }
-      })();
+      workspaceTerminalsSyncKeyRef.current = "";
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -14378,32 +14219,7 @@ export default function App() {
           scopeKey: renameScopeKey,
           workspaces: renamedWorkspaces,
         }).catch(() => {});
-        void invoke("cloud_mcp_workspace_catalog_upsert", {
-          scopeKey: renameScopeKey,
-          workspace: {
-            workspace_id: nextWorkspace.id,
-            workspace_name: nextWorkspace.name,
-            updated_at: renamedAtIso,
-          },
-        }).then((response) => {
-          if (response?.queued) {
-            // Offline: the rename rides the durable outbox; it stays pending
-            // until the cloud confirms via list or broadcast.
-            return;
-          }
-          const syncedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-            .map((workspace) => (
-              workspace.id === nextWorkspace.id ? { ...workspace, syncState: "synced" } : workspace
-            ));
-          workspacesRef.current = syncedWorkspaces;
-          setWorkspaces(syncedWorkspaces);
-          void invoke("local_workspaces_store", {
-            scopeKey: renameScopeKey,
-            workspaces: syncedWorkspaces,
-          }).catch(() => {});
-        }).catch(() => {
-          // The next catalog reconcile re-pushes pending renames.
-        });
+        workspaceTerminalsSyncKeyRef.current = "";
       }
 
       setWorkspaceSettings((settings) => {
@@ -16447,36 +16263,9 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("diffforge:cloud-device-live-initial-sync", {
         detail: { epoch: nextEpoch },
       }));
-      const terminalWorkspaces = Array.isArray(workspaceTerminalsWorkspacesRef.current)
-        ? workspaceTerminalsWorkspacesRef.current
-        : [];
-      if (authState === "authenticated" && accountIsPaid && terminalWorkspaces.length > 0) {
-        const terminalCount = terminalWorkspaces.reduce(
-          (sum, workspace) => sum + (Array.isArray(workspace?.terminals) ? workspace.terminals.length : 0),
-          0,
-        );
-        void invoke("cloud_mcp_sync_device_live_terminals", {
-          workspaces: terminalWorkspaces,
-          reason: "cloud_reconnect_initial_terminal_snapshot",
-        }).catch((error) => {
-          logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_terminals_reconnect_sync.failed", {
-            message: getErrorMessage(error, "Unable to sync workspace terminals after reconnect."),
-            terminalCount,
-            workspaceCount: terminalWorkspaces.length,
-          });
-          void recordCloudConnectionDiagnostic({
-            channel: "rust-client-sync",
-            step: "rust.sync.workspace_terminals.reconnect",
-            status: "error",
-            message: getErrorMessage(error, "Unable to sync workspace terminals after reconnect."),
-            details: {
-              reason: "cloud_reconnect_initial_terminal_snapshot",
-              terminalCount,
-              workspaceCount: terminalWorkspaces.length,
-            },
-          });
-        });
-      }
+      logBigViewSyncDiagnosticEvent("cloud_mcp.device_workspaces_reconnect_sync.requested", {
+        reason: "cloud_reconnect_initial_workspace_snapshot",
+      });
     }
     if (connection !== "connected" || previous === "connected" || !previous) {
       return;
@@ -16775,6 +16564,12 @@ export default function App() {
       || !user
       || workspaceState !== "idle"
     ) {
+      return undefined;
+    }
+    if (!workspaceMcpSyncTargets.length) {
+      workspaceMcpSyncKeyRef.current = "";
+      setWorkspaceMcpRegistries({});
+      workspaceTerminalsSyncKeyRef.current = "";
       return undefined;
     }
 
@@ -17515,6 +17310,7 @@ export default function App() {
       payload: rustTerminalAuthoritySnapshot,
       workspaceSettings,
       workspaceSidebarOrderById,
+      workspaceThreads,
       workspaces,
     })
   ), [
@@ -17523,6 +17319,7 @@ export default function App() {
     rustTerminalAuthoritySnapshot,
     workspaceSettings,
     workspaceSidebarOrderById,
+    workspaceThreads,
     workspaces,
   ]);
   const workspaceTerminalsWorkspaces = useMemo(() => {
@@ -17580,11 +17377,12 @@ export default function App() {
               ? thread.latestTurn
               : {};
             const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
-            const liveTerminalOpen = Boolean(
-              liveTerminal && !["closed", "closing", "exited", "offline"].includes(liveStatus),
-            );
+            const stoppedTerminalStatuses = ["closed", "closing", "exited", "offline", "terminated"];
+            const stoppedLiveStatus = stoppedTerminalStatuses.includes(liveStatus) ? liveStatus : "";
+            const hasVisibleTerminalPane = Boolean(liveTerminal || terminalBinding || thread);
+            const liveTerminalOpen = Boolean(liveTerminal && !stoppedLiveStatus);
             const terminalLifecycle = liveTerminalOpen ? "open" : "closed";
-            if (!liveTerminalOpen) {
+            if (!hasVisibleTerminalPane) {
               return null;
             }
             const liveRailActivity = String(
@@ -17600,18 +17398,18 @@ export default function App() {
             const statusActivity = rawActivity
               || (liveStatus === "error" ? "error" : "")
               || (liveStatus === "starting" ? "starting" : "");
-            const status = workspaceTerminalStatusFromActivityStatus(statusActivity, {
-              fallbackStatus: "idle",
-              liveStatus: ["closed", "closing", "exited", "offline"].includes(liveStatus)
-                ? liveStatus
-                : "",
-              terminalIsParked: terminalGroundTruth.terminalIsParked,
-              terminalIsPromptingUser: terminalGroundTruth.terminalIsPromptingUser,
-              terminalLifecycle,
-            });
+            const status = stoppedLiveStatus || (terminalLifecycle === "closed"
+              ? "exited"
+              : workspaceTerminalStatusFromActivityStatus(statusActivity, {
+                fallbackStatus: "idle",
+                liveStatus: "",
+                terminalIsParked: terminalGroundTruth.terminalIsParked,
+                terminalIsPromptingUser: terminalGroundTruth.terminalIsPromptingUser,
+                terminalLifecycle,
+              }));
             const readiness = terminalReadinessFromPresenceStatus(status);
             const turnStatus = terminalTurnStatusFromActivityStatus(statusActivity || status, status);
-            const nativeRailState = ["closed", "closing", "exited", "offline"].includes(status)
+            const nativeRailState = stoppedTerminalStatuses.includes(status)
               ? status
               : terminalRailStateFromActivityStatus(statusActivity || status, status);
             const nativeRailFields = getTerminalNativeRailStateFields(nativeRailState);
@@ -17633,18 +17431,21 @@ export default function App() {
                 || agentType
                 || "",
             ).trim();
-            const terminalNickname = getWorkspaceThreadTerminalNickname(thread, providerBinding, liveTerminal);
-            const terminalName = String(
-              terminalNickname
-                || liveTerminal?.terminalName
-                || liveTerminal?.terminal_name
-                || liveTerminal?.displayName
-                || liveTerminal?.display_name
-                || providerBinding?.terminalName
-                || providerBinding?.terminal_name
-                || agentDisplayName
-                || agentLabel,
-            ).trim();
+            const terminalNickname = terminalRealNameFromCandidates(
+              normalizedRole,
+              getWorkspaceThreadTerminalNickname(thread, providerBinding, liveTerminal),
+            );
+            const terminalName = terminalNickname || terminalRealNameFromCandidates(
+              normalizedRole,
+              liveTerminal?.terminalName,
+              liveTerminal?.terminal_name,
+              liveTerminal?.displayName,
+              liveTerminal?.display_name,
+              providerBinding?.terminalName,
+              providerBinding?.terminal_name,
+              agentDisplayName,
+              agentLabel,
+            );
             const terminalInstanceId = terminalBinding?.instanceId || liveTerminal?.instanceId || "";
             const paneId = terminalBinding?.paneId
               || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole);
@@ -17712,13 +17513,11 @@ export default function App() {
             };
           })
           .filter(Boolean);
-        const terminalListExplicitlyEmpty = workspaceTerminalExplicitEmptyRef.current.has(workspaceId);
         let terminals = liveTerminals;
-        let terminalListAuthoritative = false;
+        const terminalListAuthoritative = true;
+        const terminalListEmptyAuthoritative = terminals.length === 0;
         if (liveTerminals.length) {
           workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
-        } else if (terminalListExplicitlyEmpty) {
-          terminalListAuthoritative = true;
         }
 
         return {
@@ -17730,12 +17529,12 @@ export default function App() {
           runtime_read_only: false,
           terminalCount: terminals.length,
           terminal_count: terminals.length,
-          terminalClearReason: terminalListAuthoritative ? "all_terminals_closed" : "",
-          terminal_clear_reason: terminalListAuthoritative ? "all_terminals_closed" : "",
+          terminalClearReason: terminalListEmptyAuthoritative ? "all_terminals_closed" : "",
+          terminal_clear_reason: terminalListEmptyAuthoritative ? "all_terminals_closed" : "",
           terminalListAuthoritative,
           terminal_list_authoritative: terminalListAuthoritative,
-          terminalListEmptyAuthoritative: terminalListAuthoritative,
-          terminal_list_empty_authoritative: terminalListAuthoritative,
+          terminalListEmptyAuthoritative,
+          terminal_list_empty_authoritative: terminalListEmptyAuthoritative,
           workspaceActive: true,
           workspace_active: true,
           workspaceId,
@@ -17788,10 +17587,6 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
-  const workspaceTerminalsSyncKey = useMemo(
-    () => JSON.stringify(workspaceTerminalsWorkspaces),
-    [workspaceTerminalsWorkspaces],
-  );
   const selectedWorkspaceTerminalOptions = useMemo(() => {
     const presenceWorkspace = workspaceTerminalsWorkspaces.find((candidate) => (
       String(candidate?.workspaceId || "").trim() === String(selectedWorkspaceId || "").trim()
@@ -17821,588 +17616,20 @@ export default function App() {
   useEffect(() => {
     workspaceTerminalsWorkspacesRef.current = workspaceTerminalsWorkspaces;
   }, [workspaceTerminalsWorkspaces]);
-  const nextTerminalStatusEventSeq = useCallback((terminalKey, candidateSeq = 0) => {
-    const key = String(terminalKey || "terminal").trim() || "terminal";
-    const previousSeq = Number(terminalStatusEventSeqRef.current.get(key) || 0);
-    const candidate = Number(candidateSeq || 0);
-    const wallClock = Date.now();
-    const nextSeq = Math.max(previousSeq + 1, candidate + 1, wallClock);
-    terminalStatusEventSeqRef.current.set(key, nextSeq);
-    return nextSeq;
-  }, []);
-
-  function scheduleTerminalStatusEventSyncFlush(syncKey, delayMs = 0) {
-    const key = String(syncKey || "").trim();
-    if (!key || typeof window === "undefined") {
-      return;
-    }
-    const timers = terminalStatusEventSyncTimersRef.current;
-    const existingTimer = timers.get(key);
-    if (existingTimer) {
-      window.clearTimeout(existingTimer);
-    }
-    const timer = window.setTimeout(() => {
-      timers.delete(key);
-      flushTerminalStatusEventSync(key);
-    }, Math.max(0, Number(delayMs) || 0));
-    timers.set(key, timer);
-  }
-
-  function sendTerminalStatusEventSync(item = {}) {
-    const syncKey = String(item.syncKey || "").trim();
-    if (syncKey) {
-      terminalStatusEventSyncInFlightRef.current.add(syncKey);
-    }
-    logTerminalStatus("frontend.terminal_status.event_sync.send", {
-      agentId: item.agentId,
-      coalesced: item.coalesced === true,
-      eventType: item.eventType,
-      commandPhase: item.commandPhase,
-      executionPhase: item.executionPhase,
-      paneId: item.paneId,
-      readinessAfter: item.readinessAfter,
-      reason: item.reason,
-      statusAfter: item.statusAfter,
-      statusSeq: item.statusSeq,
-      terminalIndex: item.terminalIndex,
-      threadId: item.threadId,
-      workspaceId: item.workspaceId,
-    });
-    const releaseStatusSyncGate = () => {
-      if (!syncKey) {
-        return;
-      }
-      terminalStatusEventSyncInFlightRef.current.delete(syncKey);
-      if (terminalStatusEventSyncQueueRef.current.has(syncKey)) {
-        scheduleTerminalStatusEventSyncFlush(syncKey, 0);
-      }
-    };
-    void invoke("cloud_mcp_sync_terminal_status_event", {
-      workspace: item.workspacePayload,
-      terminal: item.terminalPayload,
-      reason: item.reason,
-    }).catch((error) => {
-      logTerminalStatus("frontend.terminal_status.event_sync.error", {
-        agentId: item.agentId,
-        eventType: item.eventType,
-        message: getErrorMessage(error, "Unable to sync terminal status event."),
-        paneId: item.paneId,
-        statusAfter: item.statusAfter,
-        statusSeq: item.statusSeq,
-        terminalIndex: item.terminalIndex,
-        threadId: item.threadId,
-        workspaceId: item.workspaceId,
-      });
-      void recordCloudConnectionDiagnostic({
-        channel: "rust-client-sync",
-        step: "rust.sync.terminal_status_event",
-        status: "error",
-        message: getErrorMessage(error, "Unable to sync terminal status event."),
-        details: {
-          eventType: item.eventType,
-          statusAfter: item.statusAfter,
-          statusSeq: item.statusSeq,
-          terminalIndex: item.terminalIndex,
-          workspaceId: item.workspaceId,
-        },
-      });
-    }).finally(() => {
-      releaseStatusSyncGate();
-    });
-    return Promise.resolve({ queued: true });
-  }
-
-  function flushTerminalStatusEventSync(syncKey) {
-    const key = String(syncKey || "").trim();
-    if (!key) {
-      return;
-    }
-    if (terminalStatusEventSyncInFlightRef.current.has(key)) {
-      scheduleTerminalStatusEventSyncFlush(key, 0);
-      return;
-    }
-    const item = terminalStatusEventSyncQueueRef.current.get(key);
-    if (!item) {
-      return;
-    }
-    terminalStatusEventSyncQueueRef.current.delete(key);
-    void sendTerminalStatusEventSync({
-      ...item,
-      coalesced: true,
-    });
-  }
-
-  useEffect(() => () => {
-    terminalStatusEventSyncTimersRef.current.forEach((timer) => {
-      window.clearTimeout(timer);
-    });
-    terminalStatusEventSyncTimersRef.current.clear();
-    terminalStatusEventSyncQueueRef.current.clear();
-    terminalStatusEventSyncInFlightRef.current.clear();
-  }, []);
-
   const emitTerminalStatusEvent = useCallback((event = {}, options = {}) => {
-    const earlyEventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
-    if (
-      authState !== "authenticated"
-      || !accountIsPaid
-      || !workspaceHydrationReady
-      || shouldShowWorkspaceSetup
-      || workspaceSyncState === "loading"
-    ) {
-      if (earlyEventType === "provider-turn-completed") {
-        logTerminalStatus("frontend.terminal_status.event_sync.skip", {
-          authState,
-          eventType: earlyEventType,
-          isPaidUser: accountIsPaid,
-          paneId: options.paneId || event.paneId || "",
-          reason: "app_not_ready_for_status_sync",
-          shouldShowWorkspaceSetup,
-          threadId: options.threadId || event.threadId || "",
-          workspaceHydrationReady,
-          workspaceId: options.workspaceId || event.workspaceId || "",
-          workspaceSyncState,
-        });
-      }
-      return;
-    }
-    const workspaceId = String(options.workspaceId || event.workspaceId || "").trim();
-    if (!workspaceId) {
-      return;
-    }
     const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
-    const statusSyncReason = options.reason || event.source || eventType;
-    const hookStatusSyncedByRust = Boolean(
-      options.cloudStatusSyncedByRust === true
-        || event.cloudStatusSyncedByRust === true
-    );
-    if (hookStatusSyncedByRust) {
-      logTerminalStatus("frontend.terminal_status.event_sync.skip", {
-        eventType,
-        paneId: options.paneId || event.paneId || "",
-        reason: "hook_lifecycle_synced_by_rust",
-        source: statusSyncReason,
-        threadId: options.threadId || event.threadId || "",
-        workspaceId,
-      });
-      return;
-    }
-
-    const requestedTerminalIndex = Number.parseInt(
-      options.terminalIndex ?? event.terminalIndex ?? "",
-      10,
-    );
-    const hasRequestedTerminalIndex = Number.isInteger(requestedTerminalIndex) && requestedTerminalIndex >= 0;
-    const presenceWorkspace = workspaceTerminalsWorkspacesRef.current.find((workspace) => (
-      String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
-    ));
-    const eventPaneId = String(options.paneId || event.paneId || event.pane_id || "").trim();
-    const eventThreadId = String(options.threadId || event.threadId || event.thread_id || "").trim();
-    let presenceTerminal = null;
-    if (eventPaneId || eventThreadId) {
-      presenceTerminal = (presenceWorkspace?.terminals || []).find((terminal) => (
-        (eventPaneId && String(terminal?.paneId || terminal?.pane_id || "").trim() === eventPaneId)
-          || (eventThreadId && String(terminal?.threadId || terminal?.thread_id || "").trim() === eventThreadId)
-      )) || null;
-    }
-    if (!presenceTerminal && hasRequestedTerminalIndex) {
-      presenceTerminal = (presenceWorkspace?.terminals || []).find((terminal) => (
-        Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? -1) === requestedTerminalIndex
-      )) || null;
-    }
-    const presenceTerminalIndex = Number(presenceTerminal?.terminalIndex ?? presenceTerminal?.terminal_index);
-    const safeTerminalIndex = hasRequestedTerminalIndex
-      ? requestedTerminalIndex
-      : Number.isInteger(presenceTerminalIndex) && presenceTerminalIndex >= 0
-        ? presenceTerminalIndex
-        : 0;
-    const workspaceRecord = workspaces.find((workspace) => String(workspace?.id || "").trim() === workspaceId);
-    const repoPath = String(
-      presenceWorkspace?.repoPath
-        || presenceWorkspace?.repo_path
-        || getWorkspaceRootDirectory(workspaceSettings, workspaceId)
-        || selectedWorkspaceRootDirectory
-        || defaultWorkingDirectory
-        || "",
-    ).trim();
-    if (!repoPath) {
-      return;
-    }
-
-    const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
-    const parkedStatusEvent = terminalStatusEventIndicatesParked(event, options);
-    const permissionPromptStatusEvent = terminalStatusEventHasExplicitPermissionPrompt(event, options);
-    const pausedStatusEvent = Boolean(
-      terminalStatusEventIndicatesPaused(event, options)
-        && (parkedStatusEvent || permissionPromptStatusEvent)
-    );
-    const idleStatusEvent = terminalStatusEventForcesIdle(eventType) && !pausedStatusEvent;
-    const eventActivityStatus = idleStatusEvent
-      ? ""
-      : String(options.activityStatus || event.activityStatus || "").trim().toLowerCase();
-    const statusLifecycleHint = (
-      ["closed", "exited"].includes(eventType)
-        ? "closed"
-        : eventType === "closing" || rawStatus === "closing"
-          ? "closing"
-          : "open"
-    );
-    const statusActivity = (
-      eventType === "provider-turn-interrupted"
-        ? "interrupted"
-        : idleStatusEvent
-          ? "idle"
-          : eventActivityStatus
-    )
-      || (
-        eventType === "provider-turn-completed"
-          ? "idle"
-          : ""
-      )
-      || (
-        eventType === "message-submitted"
-        || eventType === "provider-turn-started"
-        || eventType === "thread-starting"
-        || eventType === "agent-output"
-          ? "thinking"
-          : ""
-      )
-      || rawStatus
-      || "";
-    const statusAfter = (() => {
-      if (["closed", "exited"].includes(eventType)) return "closed";
-      if (eventType === "closing" || rawStatus === "closing") return "closing";
-      if (eventType === "provider-turn-error" || rawStatus === "error" || rawStatus === "failed") return "error";
-      return workspaceTerminalStatusFromActivityStatus(statusActivity, {
-        fallbackStatus: "idle",
-        liveStatus: ["closed", "closing", "exited", "offline"].includes(rawStatus)
-          ? rawStatus
-          : "",
-        terminalIsParked: parkedStatusEvent,
-        terminalIsPromptingUser: permissionPromptStatusEvent,
-        terminalLifecycle: statusLifecycleHint,
-      });
-    })();
-    const rawReadinessAfter = String(options.readiness || options.readinessAfter || "").trim().toLowerCase();
-    const readinessAfter = (rawReadinessAfter === "needs_input" && !pausedStatusEvent ? "" : rawReadinessAfter) || (() => {
-      return terminalReadinessFromPresenceStatus(statusAfter);
-    })();
-    const turnStatus = String(options.turnStatus || event.turnStatus || "").trim().toLowerCase() || (() => {
-      if (eventType === "provider-turn-interrupted") return "interrupted";
-      return terminalTurnStatusFromActivityStatus(statusActivity || statusAfter, statusAfter);
-    })();
-    const commandPhase = terminalCommandPhaseFromLifecycleEvent(eventType, {
-      commandPhase: options.commandPhase || options.command_phase || event.commandPhase || event.command_phase,
-      readiness: readinessAfter,
-      status: statusAfter,
-      turnStatus,
-    });
-    const executionPhase = terminalExecutionPhaseFromState({
-      activityStatus: statusActivity,
-      commandPhase,
-      eventType,
-      readiness: readinessAfter,
-      status: statusAfter,
-      terminalLifecycle: statusLifecycleHint,
-      turnStatus,
-    });
-    const canonicalRailState = terminalRailStateFromExecutionPhase(
-      executionPhase,
-      statusActivity || statusAfter || "idle",
-    );
-    const agentId = String(
-      options.agentId
-        || event.agentId
-        || presenceTerminal?.agentId
-        || presenceTerminal?.agentKind
-        || presenceTerminal?.agent_kind
-        || "",
-    ).trim().toLowerCase() || "terminal";
-    const agentLabel = String(
-      options.agentLabel
-        || options.agent_label
-        || event.agentLabel
-        || event.agent_label
-        || presenceTerminal?.agentLabel
-        || presenceTerminal?.agent_label
-        || getManagedAgentLabel(agentId),
-    ).trim() || getManagedAgentLabel(agentId);
-    const agentType = String(
-      options.agentType
-        || options.agent_type
-        || event.agentType
-        || event.agent_type
-        || presenceTerminal?.agentType
-        || presenceTerminal?.agent_type
-        || "",
-    ).trim();
-    const agentDisplayName = String(
-      options.agentDisplayName
-        || options.agent_display_name
-        || event.agentDisplayName
-        || event.agent_display_name
-        || presenceTerminal?.agentDisplayName
-        || presenceTerminal?.agent_display_name
-        || agentType
-        || "",
-    ).trim();
-    const terminalNickname = String(
-      options.terminalNickname
-        || options.terminal_nickname
-        || event.terminalNickname
-        || event.terminal_nickname
-        || presenceTerminal?.terminalNickname
-        || presenceTerminal?.terminal_nickname
-        || "",
-    ).trim();
-    const terminalName = String(
-      terminalNickname
-        || options.terminalName
-        || options.terminal_name
-        || options.displayName
-        || options.display_name
-        || event.terminalName
-        || event.terminal_name
-        || event.displayName
-        || event.display_name
-        || presenceTerminal?.terminalName
-        || presenceTerminal?.terminal_name
-        || presenceTerminal?.displayName
-        || presenceTerminal?.display_name
-        || agentDisplayName
-        || agentLabel,
-    ).trim();
-    const paneId = String(
-      options.paneId
-        || event.paneId
-        || presenceTerminal?.paneId
-        || presenceTerminal?.pane_id
-        || getWorkspaceTerminalPaneId(workspaceId, safeTerminalIndex, agentId),
-    ).trim();
-    const terminalInstanceId = event.instanceId
-      || event.terminalInstanceId
-      || presenceTerminal?.terminalInstanceId
-      || presenceTerminal?.terminal_instance_id
-      || "";
-    const threadId = String(
-      options.threadId
-        || event.threadId
-        || presenceTerminal?.threadId
-        || presenceTerminal?.thread_id
-        || createWorkspaceThreadId(workspaceId, safeTerminalIndex),
-    ).trim();
-    const terminalKey = [
-      workspaceId,
-      paneId,
-      terminalInstanceId || "0",
-      threadId,
-      safeTerminalIndex,
-    ].join(":");
-    const statusSeq = nextTerminalStatusEventSeq(
-      terminalKey,
-      Number(options.statusSeq || event.statusSeq || presenceTerminal?.statusSeq || presenceTerminal?.status_seq || 0),
-    );
-    const dedupKey = [
-      workspaceId,
-      paneId,
-      threadId,
-      eventType,
-      statusAfter,
-      readinessAfter,
-      turnStatus,
-    ].join(":");
-    const previousDedup = terminalStatusEventDedupRef.current.get(dedupKey) || 0;
-    const observedAtMs = Date.now();
-    if (observedAtMs - previousDedup < 120) {
-      return;
-    }
-    terminalStatusEventDedupRef.current.set(dedupKey, observedAtMs);
-
-    const workspacePayload = {
-      repoPath,
-      workspaceActive: true,
-      workspaceId,
-      workspaceName: presenceWorkspace?.workspaceName
-        || presenceWorkspace?.workspace_name
-        || workspaceRecord?.name
-        || workspaceId,
-      workspaceStatus: "active",
-    };
-    const terminalLifecycle = statusAfter === "closed"
-      ? "closed"
-      : statusAfter === "closing"
-        ? "closing"
-        : "open";
-    const explicitNativeRailState = String(
-      options.nativeRailState
-        || options.native_rail_state
-        || event.nativeRailState
-        || event.native_rail_state
-        || "",
-    ).trim().toLowerCase();
-    const safeExplicitNativeRailState = idleStatusEvent && terminalActivityStatusIsBusy(explicitNativeRailState)
-      ? ""
-      : explicitNativeRailState;
-    const nativeRailState = safeExplicitNativeRailState || (
-      ["closed", "closing", "exited", "offline"].includes(statusAfter)
-        ? statusAfter
-        : canonicalRailState || terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter)
-    );
-    const visibleActivityStatus = canonicalRailState || terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter);
-    const explicitNativeRailLabel = String(
-      options.nativeRailLabel
-        || options.native_rail_label
-        || event.nativeRailLabel
-        || event.native_rail_label
-        || "",
-    ).trim();
-    const safeExplicitNativeRailLabel = idleStatusEvent && terminalActivityStatusIsBusy(explicitNativeRailLabel)
-      ? ""
-      : explicitNativeRailLabel;
-    const nativeRailFields = getTerminalNativeRailStateFields(
-      nativeRailState,
-      safeExplicitNativeRailLabel,
-    );
-    const parkedPromptTitle = String(
-      options.parkedPromptTitle
-        || options.parked_prompt_title
-        || options.parkedTitle
-        || options.parked_title
-        || event.parkedPromptTitle
-        || event.parked_prompt_title
-        || event.parkedTitle
-        || event.parked_title
-        || event.title
-        || "",
-    ).trim();
-    const waitingOn = Array.isArray(options.waitingOn || options.waiting_on)
-      ? (options.waitingOn || options.waiting_on)
-      : Array.isArray(event.waitingOn || event.waiting_on)
-        ? (event.waitingOn || event.waiting_on)
-        : [];
-    const explicitlyClearsParked = Boolean(
-      options.clearsParked === true
-        || options.clears_parked === true
-        || options.clearParked === true
-        || options.clear_parked === true
-        || event.clearsParked === true
-        || event.clears_parked === true
-        || event.clearParked === true
-        || event.clear_parked === true,
-    );
-    const terminalPayload = {
-      agentId,
-      agentKind: agentId,
-      agentLabel,
-      agentDisplayName,
-      agent_display_name: agentDisplayName,
-      agentType,
-      agent_type: agentType,
-      activityStatus: visibleActivityStatus,
-      activity_status: visibleActivityStatus,
-      color: presenceTerminal?.color || "",
-      colorSlot: presenceTerminal?.colorSlot ?? presenceTerminal?.color_slot ?? getTerminalAgentColorSlot(safeTerminalIndex),
-      eventId: `${terminalKey}:${statusSeq}`,
-      eventType,
-      commandPhase,
-      command_phase: commandPhase,
-      displayStatus: visibleActivityStatus,
-      display_status: visibleActivityStatus,
-      executionPhase,
-      execution_phase: executionPhase,
-      inputReady: readinessAfter === "ready",
-      ...nativeRailFields,
-      observedAtMs,
-      paneId,
-      parked: pausedStatusEvent ? true : explicitlyClearsParked ? false : undefined,
-      parkedPromptTitle: parkedPromptTitle || undefined,
-      parked_prompt_title: parkedPromptTitle || undefined,
-      readiness: readinessAfter,
-      readinessAfter,
-      sessionState: statusAfter === "closed" ? "no_session" : "session_attached",
-      status: statusAfter,
-      statusAfter,
-      statusSeq,
-      terminalEpoch: `${paneId}:${terminalInstanceId || "0"}`,
-      terminalId: paneId,
-      terminalIndex: safeTerminalIndex,
-      terminalInstanceId,
-      terminalLifecycle,
-      displayName: terminalName,
-      terminalName,
-      terminal_name: terminalName,
-      terminalNickname,
-      terminal_nickname: terminalNickname,
-      threadId,
-      turnId: event.turnId || event.activeTurnId || presenceTerminal?.turnId || presenceTerminal?.turn_id || "",
-      turnStatus,
-      waitingOn,
-      waiting_on: waitingOn,
-    };
-
-    const statusSyncKey = terminalKey;
-    if (eventType === "provider-turn-completed") {
-      logTerminalStatus("frontend.terminal_status.event_sync.completion_decision", {
-        activityStatus: statusActivity,
-        agentId,
-        commandPhase,
-        eventType,
-        executionPhase,
-        nativeRailState,
-        paneId,
-        readinessAfter,
-        reason: statusSyncReason,
-        statusAfter,
-        terminalIndex: safeTerminalIndex,
-        threadId,
-        turnStatus,
-        visibleActivityStatus,
-        workspaceId,
-      });
-    }
-    const terminalStatusSyncItem = {
-      agentId,
-      commandPhase,
-      eventType,
-      executionPhase,
-      paneId,
-      readinessAfter,
-      reason: statusSyncReason,
-      statusAfter,
-      statusSeq,
-      syncKey: statusSyncKey,
-      terminalIndex: safeTerminalIndex,
-      terminalPayload,
-      threadId,
-      workspacePayload,
-      workspaceId,
-    };
-    const statusSyncDelayMs = 0;
-    terminalStatusEventSyncQueueRef.current.set(statusSyncKey, terminalStatusSyncItem);
-    scheduleTerminalStatusEventSyncFlush(statusSyncKey, statusSyncDelayMs);
-    logTerminalStatus("frontend.terminal_status.event_sync.coalesced", {
-      agentId,
+    const workspaceId = String(options.workspaceId || event.workspaceId || "").trim();
+    const paneId = String(options.paneId || event.paneId || event.pane_id || "").trim();
+    const threadId = String(options.threadId || event.threadId || event.thread_id || "").trim();
+    workspaceTerminalsSyncKeyRef.current = "";
+    logTerminalStatus("frontend.terminal_status.workspace_snapshot_invalidated", {
       eventType,
       paneId,
-      reason: statusSyncReason,
-      statusAfter,
-      statusSeq,
-      terminalIndex: safeTerminalIndex,
+      reason: options.reason || event.source || eventType,
       threadId,
       workspaceId,
     });
-  }, [
-    authState,
-    defaultWorkingDirectory,
-    nextTerminalStatusEventSeq,
-    selectedWorkspaceRootDirectory,
-    shouldShowWorkspaceSetup,
-    user,
-    workspaceHydrationReady,
-    workspaceSettings,
-    workspaceSyncState,
-    workspaces,
-  ]);
+  }, []);
   useEffect(() => {
     terminalStatusEventEmitterRef.current = emitTerminalStatusEvent;
   }, [emitTerminalStatusEvent]);
@@ -18414,9 +17641,6 @@ export default function App() {
     const targets = [];
     const seen = new Set();
     const activeWorkspaceIds = new Set(enabledRuntimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()));
-    // Stable terminal identity (names/colors/agents — not volatile statuses)
-    // rides along with the catalog so other devices and the web dashboard keep
-    // last-known terminal labels even after this device disconnects.
     const presenceTerminalsByWorkspaceId = new Map();
     workspaceTerminalsWorkspaces.forEach((presenceWorkspace) => {
       const presenceWorkspaceId = String(presenceWorkspace?.workspaceId || "").trim();
@@ -18426,25 +17650,33 @@ export default function App() {
       presenceTerminalsByWorkspaceId.set(
         presenceWorkspaceId,
         presenceWorkspace.terminals.slice(0, 32).map((terminal) => ({
-          activityStatus: String(terminal?.activityStatus || terminal?.activity_status || ""),
           agentDisplayName: String(terminal?.agentDisplayName || terminal?.agent_display_name || ""),
           agentId: String(terminal?.agentId || terminal?.agent_id || terminal?.agentKind || ""),
           agentKind: String(terminal?.agentKind || terminal?.agent_id || terminal?.agentId || ""),
           agentLabel: String(terminal?.agentLabel || ""),
           agentType: String(terminal?.agentType || terminal?.agent_type || ""),
+          commandPhase: String(terminal?.commandPhase || terminal?.command_phase || ""),
+          commandable: terminal?.commandable === false ? false : true,
+          connected: terminal?.connected === false ? false : true,
           color: String(terminal?.color || ""),
           colorSlot: Number(terminal?.colorSlot ?? terminal?.color_slot ?? 0),
           displayName: String(terminal?.displayName || terminal?.display_name || terminal?.terminalName || ""),
-          displayStatus: String(terminal?.displayStatus || terminal?.display_status || ""),
+          displayStatus: String(terminal?.displayStatus || terminal?.display_status || terminal?.status || ""),
+          dotColor: String(terminal?.dotColor || terminal?.dot_color || terminal?.color || ""),
+          executionPhase: String(terminal?.executionPhase || terminal?.execution_phase || ""),
+          inputReady: terminal?.inputReady === true || terminal?.input_ready === true,
+          lastKnownRuntime: false,
+          last_known_runtime: false,
           nativeRailLabel: String(terminal?.nativeRailLabel || terminal?.native_rail_label || ""),
           nativeRailState: String(terminal?.nativeRailState || terminal?.native_rail_state || ""),
+          nativeConnected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
+          native_connected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
           paneId: String(terminal?.paneId || terminal?.pane_id || terminal?.terminalId || ""),
           readiness: String(terminal?.readiness || ""),
-          sessionState: String(terminal?.sessionState || terminal?.session_state || ""),
-          status: String(terminal?.status || terminal?.terminalStatus || ""),
-          statusSeq: Number(terminal?.statusSeq ?? terminal?.status_seq ?? 0),
+          runtimeReadOnly: false,
+          runtime_read_only: false,
+          status: String(terminal?.status || ""),
           targetTerminalId: String(terminal?.targetTerminalId || terminal?.target_terminal_id || terminal?.paneId || terminal?.terminalId || ""),
-          terminalEpoch: String(terminal?.terminalEpoch || terminal?.terminal_epoch || ""),
           terminalId: String(terminal?.terminalId || terminal?.terminal_id || terminal?.paneId || ""),
           terminalIndex: Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? 0),
           terminalInstanceId: String(terminal?.terminalInstanceId || terminal?.terminal_instance_id || ""),
@@ -18453,7 +17685,6 @@ export default function App() {
           terminalNickname: String(terminal?.terminalNickname || terminal?.terminal_nickname || ""),
           terminalStatus: String(terminal?.terminalStatus || terminal?.terminal_status || terminal?.status || ""),
           threadId: String(terminal?.threadId || terminal?.thread_id || ""),
-          turnId: String(terminal?.turnId || terminal?.turn_id || ""),
           turnStatus: String(terminal?.turnStatus || terminal?.turn_status || ""),
         })),
       );
@@ -18476,8 +17707,14 @@ export default function App() {
       const workspaceActive = activeOverride === null
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
-      const terminalListAuthoritative = workspaceTerminalExplicitEmptyRef.current.has(workspaceId);
       const terminals = presenceTerminalsByWorkspaceId.get(workspaceId) || [];
+      const selected = String(selectedWorkspace?.id || "").trim() === workspaceId;
+      const terminalListAuthoritative = true;
+      const terminalListEmptyAuthoritative = terminals.length === 0;
+      const workspaceMcpRegistry = workspaceMcpRegistries[workspaceId] || null;
+      const workspaceMcpServers = safeCloudMcpArray(workspaceMcpRegistry?.servers)
+        .map(sanitizeWorkspaceMcpServerForCloud)
+        .filter(Boolean);
       targets.push({
         dashboardWorkspace: true,
         displaySurface: "dashboard_workspace",
@@ -18485,10 +17722,13 @@ export default function App() {
         mountId: "",
         projectName: "",
         repoPath: rootDirectory,
-        terminalClearReason: terminalListAuthoritative ? "all_terminals_closed" : "",
-        terminalListEmptyAuthoritative: terminalListAuthoritative,
-        terminalListAuthoritative,
+        selected,
+        servers: workspaceMcpServers,
+        terminalClearReason: terminalListEmptyAuthoritative ? "all_terminals_closed" : "",
+        terminalCount: terminals.length,
         terminals,
+        terminalListEmptyAuthoritative,
+        terminalListAuthoritative,
         workspaceActive,
         workspaceId,
         workspaceIndex,
@@ -18503,11 +17743,6 @@ export default function App() {
     workspaces.forEach((workspace, workspaceIndex) => {
       const workspaceId = String(workspace?.id || "").trim();
       if (!workspaceId) {
-        return;
-      }
-      // Durable workspace catalog rows sync through per-workspace mutations.
-      // Live state only needs currently active or terminal-present workspaces.
-      if (!activeWorkspaceIds.has(workspaceId) && !presenceTerminalsByWorkspaceId.has(workspaceId)) {
         return;
       }
       addTarget(
@@ -18526,6 +17761,7 @@ export default function App() {
     shouldShowWorkspaceSetup,
     workspaceTerminalsWorkspaces,
     workspaceSettings,
+    workspaceMcpRegistries,
     workspaces,
   ]);
   const workspaceCatalogSyncKey = useMemo(
@@ -18567,135 +17803,6 @@ export default function App() {
       authState !== "authenticated"
       || !accountIsPaid
       || !workspaceHydrationReady
-      || workspaceSyncState === "loading"
-      || workspaceSyncState === "creating"
-    ) {
-      return undefined;
-    }
-
-    const targets = workspaceCatalogSyncTargets.filter((target) => target?.workspaceId);
-    if (shouldShowWorkspaceSetup && targets.length > 0) {
-      return undefined;
-    }
-
-    const accountKey = authAccountKey || user?.id || user?.email || "paid-user";
-    const syncKey = JSON.stringify({
-      accountKey,
-      scopeKey: activeAccountScopeKey,
-      targets: targets.map((target) => ({
-        active: Boolean(target.workspaceActive),
-        terminals: Array.isArray(target.terminals) ? target.terminals : [],
-        terminalListEmptyAuthoritative: Boolean(target.terminalListEmptyAuthoritative),
-        terminalListAuthoritative: Boolean(target.terminalListAuthoritative),
-        workspaceId: target.workspaceId,
-        workspaceName: target.workspaceName || "",
-      })),
-    });
-
-    if (workspaceCatalogSyncKeyRef.current === syncKey) {
-      return undefined;
-    }
-
-    let disposed = false;
-    let syncTimer = 0;
-    const syncWorkspaceCatalog = async () => {
-      workspaceCatalogSyncKeyRef.current = syncKey;
-      void recordCloudConnectionDiagnostic({
-        channel: "rust-client-sync",
-        step: "rust.sync.workspace_catalog",
-        status: "start",
-        message: "Rust client is syncing the desktop workspace catalog to cloud.",
-        details: {
-          scopeKey: activeAccountScopeKey,
-          workspaceCount: targets.length,
-        },
-      });
-
-      try {
-        const cloudWorkspaces = targets.map((target) => ({
-          dashboardWorkspace: true,
-          displaySurface: target.displaySurface || "dashboard_workspace",
-          terminals: Array.isArray(target.terminals) ? target.terminals : [],
-          terminalClearReason: target.terminalClearReason || "",
-          terminalListEmptyAuthoritative: Boolean(target.terminalListEmptyAuthoritative),
-          terminalListAuthoritative: Boolean(target.terminalListAuthoritative),
-          workspaceActive: Boolean(target.workspaceActive),
-          workspaceId: target.workspaceId,
-          workspaceIndex: Number(target.workspaceIndex ?? 0),
-          workspaceName: target.workspaceName || target.workspaceId,
-          workspaceOrder: Number(target.workspaceOrder ?? target.workspaceIndex ?? 0),
-          workspaceRole: target.workspaceRole || "desktop_workspace",
-          workspaceStatus: target.workspaceStatus || (target.workspaceActive ? "active" : "deactivated"),
-        }));
-        await invoke("cloud_mcp_sync_device_live_workspaces", {
-          reason: "desktop_workspace_catalog",
-          workspaces: cloudWorkspaces,
-        });
-        if (disposed) {
-          return;
-        }
-        await recordCloudConnectionDiagnostic({
-          channel: "rust-client-sync",
-          step: "rust.sync.workspace_catalog",
-          status: "ok",
-          message: "Rust client workspace catalog sync completed.",
-          details: {
-            scopeKey: activeAccountScopeKey,
-            workspaceCount: targets.length,
-          },
-        });
-      } catch (error) {
-        if (!disposed) {
-          workspaceCatalogSyncKeyRef.current = "";
-          logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_catalog_sync.failed", {
-            message: getErrorMessage(error, "Unable to sync workspace catalog."),
-            workspaceCount: targets.length,
-            scopeKey: activeAccountScopeKey,
-          });
-          await recordCloudConnectionDiagnostic({
-            channel: "rust-client-sync",
-            step: "rust.sync.workspace_catalog",
-            status: "error",
-            message: getErrorMessage(error, "Unable to sync workspace catalog."),
-            details: {
-              scopeKey: activeAccountScopeKey,
-              workspaceCount: targets.length,
-            },
-          });
-        }
-      }
-    };
-
-    syncTimer = window.setTimeout(() => {
-      syncTimer = 0;
-      void syncWorkspaceCatalog();
-    }, 0);
-
-    return () => {
-      disposed = true;
-      if (syncTimer) {
-        window.clearTimeout(syncTimer);
-      }
-    };
-  }, [
-    authState,
-    authAccountKey,
-    activeAccountScopeKey,
-    shouldShowWorkspaceSetup,
-    user,
-    workspaceCatalogSyncKey,
-    workspaceCatalogSyncTargets,
-    workspaceHydrationReady,
-    workspaceActivationDeferred,
-    workspaceSyncState,
-  ]);
-
-
-  useEffect(() => {
-    if (
-      authState !== "authenticated"
-      || !accountIsPaid
-      || !workspaceHydrationReady
       || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
@@ -18704,21 +17811,23 @@ export default function App() {
       return undefined;
     }
     let disposed = false;
-    const reason = "device_live_state_snapshot";
-    const syncKey = `${workspaceTerminalsSyncKey}:${reason}:${cloudLiveSyncEpoch}`;
+    const reason = "device_workspaces_changed";
+    const syncKey = `${workspaceCatalogSyncKey}:${reason}:${cloudLiveSyncEpoch}`;
     if (workspaceTerminalsSyncKeyRef.current === syncKey) {
       return undefined;
     }
 
+    const workspaceCount = workspaceCatalogSyncTargets.length;
+    const terminalCount = workspaceCatalogSyncTargets.reduce(
+      (sum, workspace) => sum + (Array.isArray(workspace?.terminals) ? workspace.terminals.length : 0),
+      0,
+    );
     workspaceTerminalsSyncPendingRef.current = {
       reason,
       syncKey,
-      terminalCount: workspaceTerminalsWorkspaces.reduce(
-        (sum, workspace) => sum + (Array.isArray(workspace?.terminals) ? workspace.terminals.length : 0),
-        0,
-      ),
-      workspaces: workspaceTerminalsWorkspaces,
-      workspaceCount: workspaceTerminalsWorkspaces.length,
+      terminalCount,
+      workspaces: workspaceCatalogSyncTargets,
+      workspaceCount,
     };
 
     const flushPresence = () => {
@@ -18753,7 +17862,7 @@ export default function App() {
         }
       };
       window.setTimeout(releasePresenceSyncGate, 0);
-      invoke("cloud_mcp_sync_device_live_terminals", {
+      invoke("cloud_mcp_sync_device_workspaces_snapshot", {
         workspaces: pending.workspaces,
         reason: pending.reason,
       })
@@ -18763,19 +17872,21 @@ export default function App() {
             ? responseData.stored
             : responseData;
           const storedCount = Number(stored?.stored_count ?? responseData?.stored_count ?? 0);
-          if (storedCount >= pending.terminalCount) {
+          const storedWorkspaceCount = Number(stored?.workspace_count ?? responseData?.workspace_count ?? 0);
+          if (storedWorkspaceCount >= pending.workspaceCount) {
             return;
           }
           const closedCount = Number(stored?.closed_count ?? responseData?.closed_count ?? 0);
           const inputTerminalCount = Number(stored?.input_terminal_count ?? responseData?.input_terminal_count ?? 0);
           const fallbackTerminalCount = Number(stored?.fallback_terminal_count ?? responseData?.fallback_terminal_count ?? 0);
           const responseWorkspaceCount = Number(stored?.workspace_count ?? responseData?.workspace_count ?? 0);
-          logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_terminals_sync.partial", {
+          logBigViewSyncDiagnosticEvent("cloud_mcp.device_workspaces_sync.partial", {
             closedCount,
             fallbackTerminalCount,
             inputTerminalCount,
             reason: pending.reason,
             responseWorkspaceCount,
+            storedWorkspaceCount,
             storedCount,
             terminalCount: pending.terminalCount,
             workspaceCount: pending.workspaceCount,
@@ -18783,17 +17894,17 @@ export default function App() {
         })
         .catch((error) => {
           if (!disposed) {
-            logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_terminals_sync.failed", {
-              message: getErrorMessage(error, "Unable to sync workspace terminals."),
+            logBigViewSyncDiagnosticEvent("cloud_mcp.device_workspaces_sync.failed", {
+              message: getErrorMessage(error, "Unable to sync device workspaces."),
               reason: pending.reason,
               workspaceCount: pending.workspaceCount,
             });
           }
           void recordCloudConnectionDiagnostic({
             channel: "rust-client-sync",
-            step: "rust.sync.workspace_terminals",
+            step: "rust.sync.device_workspaces",
             status: "error",
-            message: getErrorMessage(error, "Unable to sync workspace terminals."),
+            message: getErrorMessage(error, "Unable to sync device workspaces."),
             details: {
               reason: pending.reason,
               terminalCount: pending.terminalCount,
@@ -18821,8 +17932,8 @@ export default function App() {
   }, [
     authState,
     shouldShowWorkspaceSetup,
-    workspaceTerminalsSyncKey,
-    workspaceTerminalsWorkspaces,
+    workspaceCatalogSyncKey,
+    workspaceCatalogSyncTargets,
     user,
     workspaceHydrationReady,
     cloudLiveSyncEpoch,
@@ -18841,11 +17952,6 @@ export default function App() {
     ) {
       return undefined;
     }
-    if (!workspaceMcpSyncTargets.length) {
-      workspaceMcpSyncKeyRef.current = "";
-      return undefined;
-    }
-
     let disposed = false;
     let syncTimer = 0;
     const scheduleWorkspaceMcpSync = (reason, delayMs = 0) => {
@@ -18865,7 +17971,7 @@ export default function App() {
         return;
       }
       const syncKey = `${workspaceMcpSyncTargetKey}:${reason}`;
-      if (reason === "device_live_state_snapshot" && workspaceMcpSyncKeyRef.current === syncKey) {
+      if (workspaceMcpSyncKeyRef.current === syncKey) {
         return;
       }
       try {
@@ -18873,7 +17979,7 @@ export default function App() {
           channel: "rust-client-sync",
           step: "rust.sync.workspace_servers",
           status: "start",
-          message: "Rust client is collecting workspace MCP settings for cloud sync.",
+          message: "Rust client is collecting workspace MCP settings for the device workspace snapshot.",
           details: {
             reason,
             workspaceCount: workspaceMcpSyncTargets.length,
@@ -18889,18 +17995,20 @@ export default function App() {
             return sanitizeWorkspaceMcpRegistryForCloud(response, target);
           }),
         );
-        const syncResponse = await invoke("cloud_mcp_sync_device_live_workspace_servers", {
-          workspaces: workspacesForCloud,
-          reason,
+        if (disposed) {
+          return;
+        }
+        setWorkspaceMcpRegistries((previous) => {
+          const next = {};
+          workspacesForCloud.forEach((workspace) => {
+            const workspaceId = String(workspace?.workspaceId || workspace?.workspace_id || "").trim();
+            if (workspaceId) {
+              next[workspaceId] = workspace;
+            }
+          });
+          return next;
         });
-        const responseData = unwrapCloudCommandData(syncResponse, {});
-        const stored = responseData?.stored && typeof responseData.stored === "object"
-          ? responseData.stored
-          : responseData;
-        const storedCount = Number(stored?.stored_count ?? responseData?.stored_count ?? 0);
-        const enabledCount = Number(stored?.enabled_count ?? responseData?.enabled_count ?? 0);
-        const declaredServerCount = Number(stored?.declared_server_count ?? responseData?.declared_server_count ?? 0);
-        const responseWorkspaceCount = Number(stored?.workspace_count ?? responseData?.workspace_count ?? 0);
+        workspaceTerminalsSyncKeyRef.current = "";
         const serverCount = workspacesForCloud.reduce(
           (sum, workspace) => sum + (Array.isArray(workspace?.servers) ? workspace.servers.length : 0),
           0,
@@ -18908,17 +18016,11 @@ export default function App() {
         await recordCloudConnectionDiagnostic({
           channel: "rust-client-sync",
           step: "rust.sync.workspace_servers",
-          status: storedCount < serverCount ? "warn" : "ok",
-          message: storedCount < serverCount
-            ? "Rust client workspace MCP sync stored fewer servers than expected."
-            : "Rust client workspace MCP sync completed.",
+          status: "ok",
+          message: "Rust client workspace MCP settings were folded into the workspace snapshot.",
           details: {
-            declaredServerCount,
-            enabledCount,
             reason,
-            responseWorkspaceCount,
             serverCount,
-            storedCount,
             workspaceCount: workspacesForCloud.length,
           },
         });
@@ -18946,7 +18048,7 @@ export default function App() {
       }
     };
 
-    scheduleWorkspaceMcpSync("device_live_state_snapshot", 0);
+    scheduleWorkspaceMcpSync("device_workspaces_snapshot", 0);
     const handleWorkspaceMcpRegistryUpdated = () => {
       scheduleWorkspaceMcpSync("workspace_mcp_registry_updated", 0);
     };
@@ -18966,6 +18068,7 @@ export default function App() {
     };
   }, [
     authState,
+    accountIsPaid,
     shouldShowWorkspaceSetup,
     user,
     workspaceMcpSyncTargetKey,
@@ -19952,43 +19055,8 @@ export default function App() {
       return undefined;
     }
 
-    const selectedContext = selectedWorkspace?.id
-      ? {
-        activated: Boolean(selectedWorkspaceIsActivated),
-        root_directory: selectedWorkspaceFileRoot || "",
-        workspace_id: selectedWorkspace.id,
-        workspace_name: selectedWorkspace.name || "",
-      }
-      : null;
-    const appContext = {
-      active_view: activeView,
-      activated_workspace_id: activatedWorkspaceId || "",
-      selected_workspace: selectedContext,
-      visible_view: visibleView,
-    };
-    const syncKey = JSON.stringify({
-      activeView,
-      activatedWorkspaceId,
-      cloudLiveSyncEpoch,
-      selectedContext,
-      visibleView,
-    });
-    if (workspaceAppContextSyncKeyRef.current === syncKey) {
-      return undefined;
-    }
-    workspaceAppContextSyncKeyRef.current = syncKey;
-    invoke("cloud_mcp_sync_device_live_app_context", {
-      appContext,
-      reason: "app_context_changed",
-    }).catch((error) => {
-      workspaceAppContextSyncKeyRef.current = "";
-      logBigViewSyncDiagnosticEvent("cloud_mcp.app_context_sync.failed", {
-        activeView,
-        message: getErrorMessage(error, "Unable to sync app context."),
-        selectedWorkspaceId: selectedWorkspace?.id || "",
-        visibleView,
-      });
-    });
+    // App view changes stay local. The cloud-visible workspace selection rides
+    // with the authoritative device workspace snapshot instead.
     return undefined;
   }, [
     activeView,
@@ -21687,28 +20755,11 @@ export default function App() {
       ];
     };
     const syncRemoteControlState = async (reason, lifecycleOverride = null) => {
-      const workspacesSnapshot = Array.isArray(workspaceTerminalsWorkspacesRef.current)
-        ? workspaceTerminalsWorkspacesRef.current
-        : [];
-      const catalogTargets = remoteControlWorkspaceCatalogTargets(lifecycleOverride);
-      const adjustedWorkspaces = applyRemoteControlWorkspaceOverride(workspacesSnapshot, lifecycleOverride);
-      if (adjustedWorkspaces.length > 0) {
-        await invoke("cloud_mcp_sync_device_live_terminals", {
-          reason,
-          workspaces: adjustedWorkspaces,
-        }).catch(() => {});
-      }
-      if (catalogTargets.length > 0) {
-        await invoke("cloud_mcp_sync_device_live_workspaces", {
-          reason,
-          workspaces: catalogTargets,
-        }).catch(() => {});
-      }
-      if (!lifecycleOverride) {
-        await invoke("cloud_mcp_sync_device_live_state_snapshot", {
-          reason,
-        }).catch(() => {});
-      }
+      workspaceTerminalsSyncKeyRef.current = "";
+      logBigViewSyncDiagnosticEvent("cloud_mcp.device_workspaces_sync.requested", {
+        reason,
+        lifecycleOverride: lifecycleOverride || null,
+      });
     };
     const remoteControlTerminalText = (terminal, keys) => {
       for (const key of keys) {
@@ -22196,9 +21247,14 @@ export default function App() {
           return;
         }
         if (remoteControlTerminalLooksClosed(terminal)) {
-          await recordRemoteCommandStatus(event, "completed", "Terminal is already closed.", {
+          const result = await closeRemoteControlTerminal(workspaceId, terminal, target);
+          await syncRemoteControlState("remote_terminal_closed_slot_removed");
+          await recordRemoteCommandStatus(event, result.closed ? "completed" : "failed", result.closed
+            ? "Terminal process was already closed; removed its workspace slot."
+            : "Terminal process was already closed, but its workspace slot could not be removed.", {
             commandId,
             commandKind,
+            result,
             terminal: remoteControlTerminalSummary(terminal, target),
             workspaceId,
           });

@@ -270,6 +270,7 @@ const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
 const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
 const TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT = "todo-store-cancel-requested";
+const TODO_DISPATCH_STARTUP_RECONCILE_TAURI_EVENT = "todo-dispatch-startup-reconcile";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const REMOTE_TODO_REQUEUE_EVENT = "diffforge:remote-todo-requeue";
 const REMOTE_TERMINAL_WINDOW_EVENT = "diffforge:remote-terminal-window";
@@ -11636,6 +11637,7 @@ function createTodoQueueItem(text, options = {}) {
   return {
     createdAt,
     id,
+    ...(options.updatedAt || options.updated_at ? { updatedAt: String(options.updatedAt || options.updated_at) } : {}),
     ...(image ? { image } : {}),
     ...(images.length > 1 ? { images } : {}),
     kind,
@@ -11731,6 +11733,7 @@ function normalizeTodoQueueItem(item) {
     id: typeof item.id === "string" && item.id.trim()
       ? item.id
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    ...(item.updatedAt || item.updated_at ? { updatedAt: String(item.updatedAt || item.updated_at) } : {}),
     ...(image ? { image } : {}),
     ...(images.length > 1 ? { images } : {}),
     kind,
@@ -11940,6 +11943,107 @@ function buildTodoQueueCloudSyncItem(item, {
     ...(normalizedItem.targetThreadId ? { targetThreadId: normalizedItem.targetThreadId } : {}),
     ...(Number.isInteger(normalizedItem.targetColorSlot) ? { targetColorSlot: normalizedItem.targetColorSlot } : {}),
     ...(normalizedItem.targetTerminalColor ? { targetTerminalColor: normalizedItem.targetTerminalColor } : {}),
+  };
+}
+
+function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
+  deviceId = "",
+  repoPath = "",
+  source = "rust-diffforge-terminal",
+  workspaceId = "",
+  workspaceName = "",
+} = {}) {
+  const safeDeviceId = normalizeWorkspaceTodoDeviceId(deviceId);
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  if (!safeDeviceId || !safeWorkspaceId || !syncPayload || typeof syncPayload !== "object") {
+    return null;
+  }
+
+  const nowIso = new Date().toISOString();
+  const baseMeta = {
+    source,
+    source_device_id: safeDeviceId,
+    sourceDeviceId: safeDeviceId,
+    source_workspace_id: safeWorkspaceId,
+    sourceWorkspaceId: safeWorkspaceId,
+    target_device_id: safeDeviceId,
+    targetDeviceId: safeDeviceId,
+    target_workspace_id: safeWorkspaceId,
+    targetWorkspaceId: safeWorkspaceId,
+    workspace_name: workspaceName || "",
+    workspaceName: workspaceName || "",
+  };
+  const ops = [];
+
+  (Array.isArray(syncPayload.todos) ? syncPayload.todos : []).forEach((item) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+    const todoId = String(item.id || item.todoId || item.todo_id || "").trim();
+    if (!todoId) {
+      return;
+    }
+    const status = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status || item.status) || "listed";
+    const text = normalizeTodoQueueText(item.text || item.body || "");
+    const meta = {
+      ...baseMeta,
+      created_at: item.createdAt || item.created_at || nowIso,
+      createdAt: item.createdAt || item.created_at || nowIso,
+      kind: item.kind || "todo",
+      reason: item.reason || item.todoStatusReason || item.statusReason || syncPayload.reason || "todo_queue_sync",
+      title: String(item.title || text).slice(0, 120),
+      updated_at: item.updatedAt || item.updated_at || nowIso,
+      updatedAt: item.updatedAt || item.updated_at || nowIso,
+      ...(item.source ? { source: item.source, source_kind: item.source, sourceKind: item.source } : {}),
+      ...(item.lastDispatchId ? { last_dispatch_id: item.lastDispatchId, lastDispatchId: item.lastDispatchId } : {}),
+      ...(item.targetAgentId ? { target_agent_id: item.targetAgentId, targetAgentId: item.targetAgentId } : {}),
+      ...(item.targetTerminalId ? { target_terminal_id: item.targetTerminalId, targetTerminalId: item.targetTerminalId } : {}),
+      ...(Number.isInteger(item.targetTerminalIndex) ? { target_terminal_index: item.targetTerminalIndex, targetTerminalIndex: item.targetTerminalIndex } : {}),
+      ...(item.targetTerminalName ? { target_terminal_name: item.targetTerminalName, targetTerminalName: item.targetTerminalName } : {}),
+      ...(item.targetThreadId ? { target_thread_id: item.targetThreadId, targetThreadId: item.targetThreadId } : {}),
+      ...(Number.isInteger(item.targetColorSlot) ? { target_color_slot: item.targetColorSlot, targetColorSlot: item.targetColorSlot } : {}),
+      ...(item.targetTerminalColor ? { target_terminal_color: item.targetTerminalColor, targetTerminalColor: item.targetTerminalColor } : {}),
+      ...(item.providerSessionId ? { provider_session_id: item.providerSessionId, providerSessionId: item.providerSessionId } : {}),
+      ...(item.terminalId ? { terminal_id: item.terminalId, terminalId: item.terminalId } : {}),
+      ...(item.terminalInstanceId ? { terminal_instance_id: item.terminalInstanceId, terminalInstanceId: item.terminalInstanceId } : {}),
+      ...(Number.isInteger(item.terminalIndex) ? { terminal_index: item.terminalIndex, terminalIndex: item.terminalIndex } : {}),
+      ...(item.threadId ? { thread_id: item.threadId, threadId: item.threadId } : {}),
+      ...(item.agentKind ? { agent_kind: item.agentKind, agentKind: item.agentKind } : {}),
+      ...(item.provider ? { provider: item.provider } : {}),
+    };
+    if (["deleted", "removed", "archived"].includes(status)) {
+      ops.push(["d", todoId, meta]);
+      return;
+    }
+    ops.push(["u", todoId, status, text, meta]);
+  });
+
+  (Array.isArray(syncPayload.removedTodoIds) ? syncPayload.removedTodoIds : []).forEach((todoId) => {
+    const safeTodoId = String(todoId || "").trim();
+    if (safeTodoId) {
+      ops.push(["d", safeTodoId, { ...baseMeta, reason: syncPayload.reason || "todo_removed" }]);
+    }
+  });
+
+  if (!ops.length) {
+    return null;
+  }
+
+  return {
+    c: "todo.sync",
+    cid: `rust-terminal-todos-${safeWorkspaceId}-${Date.now()}`,
+    device_id: safeDeviceId,
+    deviceId: safeDeviceId,
+    did: safeDeviceId,
+    m: "commit",
+    ops,
+    repo_path: repoPath || "",
+    source,
+    v: 2,
+    workspace_id: safeWorkspaceId,
+    workspaceId: safeWorkspaceId,
+    workspace_name: workspaceName || "",
+    workspaceName: workspaceName || "",
   };
 }
 
@@ -12752,6 +12856,7 @@ function createTodoQueueItemFromWorkspaceTodo(item, workspaceId, hydratedText = 
     text,
     todoStatus: "listed",
     todoStatusReason: item?.todoStatusReason || item?.todo_status_reason || item?.statusReason || item?.status_reason || "",
+    updatedAt: item?.updatedAt || item?.updated_at || item?.lastSeenAt || item?.last_seen_at || item?.createdAt || item?.created_at || "",
     workspaceId,
   });
 }
@@ -12771,7 +12876,15 @@ function listedWorkspaceTodosForCurrentDevice(workspaceTodos, workspaceId, deskt
         return false;
       }
       const sourceKind = String(item.sourceKind || item.source_kind || item.source || "").trim();
-      if (!sourceKind.startsWith("cloud-")) {
+      const sourceMarker = sourceKind.toLowerCase();
+      if (
+        sourceMarker
+        && !sourceMarker.startsWith("cloud-")
+        && !sourceMarker.includes("next")
+        && !sourceMarker.includes("dashboard")
+        && !sourceMarker.includes("web")
+        && !sourceMarker.includes("todo.sync")
+      ) {
         return false;
       }
       return normalizeWorkspaceTodoDeviceId(getWorkspaceTodoDeviceId(item)) === safeDeviceId;
@@ -13029,6 +13142,13 @@ function normalizeWorkspaceTodoMirrorItems(items = [], selection = null, options
         return null;
       }
       const status = getWorkspaceTodoStatus(item);
+      // Cloud mirrors the full todo lifecycle so history and device state stay
+      // durable. The live backlog panel should still only show actionable
+      // backlog rows; active/completed work is represented by the terminal and
+      // Todos History.
+      if (["completed", "deleted", "running"].includes(status)) {
+        return null;
+      }
       return {
         cloudTodoId: todoId,
         createdAt: item?.createdAt || item?.created_at || "",
@@ -16993,6 +17113,7 @@ function TerminalView({
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
+  const [todoDispatchStartupReconcileActive, setTodoDispatchStartupReconcileActive] = useState(true);
   const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
   const [appBackgroundMode, setAppBackgroundMode] = useState(false);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
@@ -17071,6 +17192,8 @@ function TerminalView({
   const todoQueueLiveTerminalsRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
   const todoQueueTerminalResumeLocksRef = useRef(new Map());
+  const todoDispatchStartupReconcileActiveRef = useRef(true);
+  const todoDispatchStartupReconcileTimerRef = useRef(0);
   const todoQueueRehydratedAtMsRef = useRef(0);
   const todoQueueRehydratedStorageKeyRef = useRef("");
   const todoQueueCloudSyncTimerRef = useRef(0);
@@ -17324,6 +17447,12 @@ function TerminalView({
     const send = () => {
       todoQueueCloudSyncTimerRef.current = 0;
       todoQueueCloudSyncSignatureRef.current = signature;
+      const todoSyncCommitPayload = buildTodoQueueTodoSyncCommitPayload(payload, {
+        deviceId: cloudDesktopDeviceId,
+        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        workspaceId,
+        workspaceName: terminalWorkspace?.name || "",
+      });
       // Write-through to the authoritative Rust store: removals become
       // terminal tombstones there, and the store rejects any item a tombstone
       // already covers — prune those locally so ghosts can't linger.
@@ -17355,6 +17484,19 @@ function TerminalView({
           return nextItems;
         });
       }).catch(() => {});
+      if (todoSyncCommitPayload) {
+        void invoke("cloud_mcp_commit_workspace_todo_sync", {
+          payload: todoSyncCommitPayload,
+        }).catch((error) => {
+          logTerminalStatus("frontend.todo_queue.todo_sync_commit_error", {
+            message: error?.message || String(error || ""),
+            reason: payload.reason,
+            todoCount: payload.todos.length,
+            removedCount: payload.removedTodoIds.length,
+            workspaceId,
+          });
+        });
+      }
     };
 
     if (todoQueueCloudSyncTimerRef.current) {
@@ -17368,7 +17510,11 @@ function TerminalView({
     todoQueueCloudSyncTimerRef.current = window.setTimeout(send, TODO_QUEUE_CLOUD_SYNC_DEBOUNCE_MS);
   }, [
     buildTodoQueueCloudSyncPayload,
+    cloudDesktopDeviceId,
+    defaultWorkingDirectory,
     terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
   ]);
 
   useEffect(() => () => {
@@ -17376,6 +17522,59 @@ function TerminalView({
       window.clearTimeout(todoQueueCloudSyncTimerRef.current);
       todoQueueCloudSyncTimerRef.current = 0;
     }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenStartupReconcile = null;
+
+    const clearRefreshTimer = () => {
+      if (todoDispatchStartupReconcileTimerRef.current) {
+        window.clearTimeout(todoDispatchStartupReconcileTimerRef.current);
+        todoDispatchStartupReconcileTimerRef.current = 0;
+      }
+    };
+
+    const applyStartupReconcileState = (payload = {}) => {
+      if (cancelled) return;
+      const active = payload?.active === true;
+      const wasActive = todoDispatchStartupReconcileActiveRef.current === true;
+      todoDispatchStartupReconcileActiveRef.current = active;
+      setTodoDispatchStartupReconcileActive(active);
+      if (wasActive !== active) {
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+      }
+      clearRefreshTimer();
+      if (active) {
+        const remainingMs = Number(payload?.remainingMs || payload?.remaining_ms || 0);
+        const delayMs = Math.max(250, Math.min(1000, Number.isFinite(remainingMs) && remainingMs > 0 ? remainingMs : 1000));
+        todoDispatchStartupReconcileTimerRef.current = window.setTimeout(refreshStartupReconcileState, delayMs);
+      }
+    };
+
+    const refreshStartupReconcileState = () => {
+      if (cancelled) return;
+      invoke("todo_dispatch_startup_reconciliation_state")
+        .then((payload) => applyStartupReconcileState(payload))
+        .catch(() => applyStartupReconcileState({ active: false }));
+    };
+
+    refreshStartupReconcileState();
+    listen(TODO_DISPATCH_STARTUP_RECONCILE_TAURI_EVENT, (event) => {
+      applyStartupReconcileState(event?.payload || {});
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenStartupReconcile = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      clearRefreshTimer();
+      if (unlistenStartupReconcile) unlistenStartupReconcile();
+    };
   }, []);
 
   useEffect(() => {
@@ -18220,6 +18419,7 @@ function TerminalView({
     const runtimeProviderSessionId = getProviderSessionId(runtimeTerminal);
     const workspaceProviderSessionId = getProviderSessionId(workspaceLiveTerminal);
     const providerSessionId = runtimeProviderSessionId || workspaceProviderSessionId;
+    const runtimeStateWins = Boolean(workspaceLooksStarting || runtimeIsNewer);
     const inputReadyAt = runtimeStatusMs > workspaceStatusMs
       ? runtimeInputReadyAt || workspaceInputReadyAt
       : workspaceInputReadyAt || runtimeInputReadyAt;
@@ -18255,7 +18455,9 @@ function TerminalView({
       coordination,
       inputReady: Boolean(workspaceLiveTerminal?.inputReady || runtimeTerminal?.inputReady),
       inputReadyAt,
-      instanceId: workspaceLiveTerminal?.instanceId || runtimeTerminal?.instanceId || "",
+      instanceId: runtimeStateWins
+        ? runtimeTerminal?.instanceId || workspaceLiveTerminal?.instanceId || ""
+        : workspaceLiveTerminal?.instanceId || runtimeTerminal?.instanceId || "",
       paneId: workspaceLiveTerminal?.paneId || runtimeTerminal?.paneId || paneId,
       nativeSessionId: providerSessionId,
       native_session_id: providerSessionId,
@@ -19756,6 +19958,7 @@ function TerminalView({
     const itemId = String(options.reservationItemId || item?.id || item?.itemId || "").trim();
     const allowGeneric = options.allowGeneric !== false;
     const allowSendableActivityAgentReadyFallback = options.allowSendableActivityAgentReadyFallback === true;
+    const requireFreshAgentInputReady = options.requireFreshAgentInputReady === true;
     const requireAvailable = Boolean(options.requireAvailable);
     const baseWorkspaceId = String(item?.workspaceId || terminalWorkspace?.id || "");
     const logAvailability = (available, reason, message, fields = {}) => {
@@ -19888,6 +20091,7 @@ function TerminalView({
       effectiveActivityStatus,
       effectiveLatestTurnState,
       inputReadyAt,
+      inputReadyAtMs,
       inputReadyIsFreshForTurn,
       latestTurnState,
       orphanRunningLooksIdle,
@@ -19918,13 +20122,43 @@ function TerminalView({
         && targetRole
         && !["generic", "terminal", "shell"].includes(targetRole),
     );
-    const rustBackendSubmitAvailable = Boolean(
+    const runtimeInputReadyAtMs = todoQueueTimestampMs(
+      runtimeTerminal?.inputReadyAt
+        || runtimeTerminal?.input_ready_at
+        || "",
+    );
+    const runtimeInstanceId = String(runtimeTerminal?.instanceId || runtimeTerminal?.instance_id || "").trim();
+    const targetInstanceId = String(resolvedBinding?.instanceId || liveTerminal?.instanceId || "").trim();
+    const runtimeInstanceMatchesTarget = Boolean(
+      !runtimeInstanceId
+        || !targetInstanceId
+        || runtimeInstanceId === targetInstanceId
+    );
+    const strictAgentInputReady = Boolean(
+      requireFreshAgentInputReady
+        && targetUsesActivityHooks
+        && shouldAutoSubmit
+    );
+    const runtimeFreshAgentInputReadyForSubmit = Boolean(
+      runtimeTerminal
+        && (runtimeTerminal.inputReady === true || runtimeTerminal.input_ready === true)
+        && runtimeInputReadyAtMs > 0
+        && runtimeInstanceMatchesTarget
+    );
+    const rustBackendSubmitCapable = Boolean(
       shouldAutoSubmit
         && targetUsesActivityHooks
         && TODO_QUEUE_AGENT_ROLES.has(targetRole)
         && liveTerminal
         && resolvedBinding?.paneId
         && resolvedBinding?.instanceId
+    );
+    const rustBackendSubmitAvailable = Boolean(
+      rustBackendSubmitCapable
+    );
+    const freshAgentInputReadyForSubmit = Boolean(
+      runtimeFreshAgentInputReadyForSubmit
+        || rustBackendSubmitAvailable
     );
     const sendableActivityAgentReadyFallback = Boolean(
       allowSendableActivityAgentReadyFallback
@@ -19944,6 +20178,7 @@ function TerminalView({
       image,
       hookManaged: targetUsesActivityHooks,
       inputReadyAt,
+      inputReadyAtMs,
       rawAgentInputReady: agentInputReady,
       latestTurnState,
       effectiveLatestTurnState,
@@ -19964,6 +20199,8 @@ function TerminalView({
       sendableActivityAgentReadyFallback,
       shouldAutoSubmit,
       rustBackendSubmitAvailable,
+      rustBackendSubmitCapable,
+      strictAgentInputReady,
       syncKey,
       targetBinding: resolvedBinding,
       targetProviderBinding,
@@ -19975,6 +20212,12 @@ function TerminalView({
       terminalGroundTruthStatus,
       terminalIsParked,
       terminalStatus,
+      runtimeInputReadyAtMs,
+      runtimeInstanceId,
+      runtimeInstanceMatchesTarget,
+      runtimeFreshAgentInputReadyForSubmit,
+      targetInstanceId,
+      freshAgentInputReadyForSubmit,
       turnStartedAt,
       workspaceId,
     };
@@ -20249,6 +20492,13 @@ function TerminalView({
     }
     if (terminalActivityStatusIsBusy(effectiveActivityStatus)) {
       return unavailable("busy_activity", "This agent is already working.", targetFields);
+    }
+    if (strictAgentInputReady && !freshAgentInputReadyForSubmit) {
+      return unavailable(
+        "target_terminal_not_input_ready",
+        "This terminal is still starting.",
+        targetFields,
+      );
     }
     if (requiresAgentInputReady && !queueAgentInputReady && !sendableActivityAgentReadyFallback) {
       return unavailable("agent_not_ready", "This agent is still starting.", targetFields);
@@ -22158,8 +22408,9 @@ function TerminalView({
       return;
     }
     updateTodoQueueItems((currentItems) => currentItems, {
+      force: true,
+      immediate: true,
       reason: "todo_queue_identity_normalized",
-      skipCloudSync: true,
     });
   }, [cloudDesktopDeviceId, terminalWorkspace?.id, updateTodoQueueItems]);
 
@@ -22368,17 +22619,12 @@ function TerminalView({
     if (!workspaceId || !cloudDesktopDeviceId || !listedTodos.length) {
       return;
     }
-    const existingIds = new Set(
-      todoQueueItemsRef.current
-        .map((item) => String(item?.id || "").trim())
-        .filter(Boolean),
-    );
     const deletedReceipts = readTodoQueueDeletedReceipts(todoQueueDeletedReceiptStorageKey);
     const importCandidates = listedTodos.filter((item) => {
       const todoId = getWorkspaceTodoIdentity(item);
       // Locally deleted todos must never re-import from a stale cloud or
       // mirror snapshot: local deletion has priority over remote state.
-      return todoId && !existingIds.has(todoId) && !deletedReceipts[todoId];
+      return todoId && !deletedReceipts[todoId];
     });
     if (!importCandidates.length) {
       return;
@@ -22426,20 +22672,40 @@ function TerminalView({
         return;
       }
       updateTodoQueueItems((currentItems) => {
-        const currentIds = new Set(
-          currentItems
-            .map((item) => String(item?.id || "").trim())
-            .filter(Boolean),
+        let changed = false;
+        const importedById = new Map(
+          importedItems
+            .map((item) => [String(item?.id || "").trim(), item])
+            .filter(([id]) => Boolean(id)),
         );
-        const additions = importedItems.filter((item) => !currentIds.has(item.id));
-        if (!additions.length) {
+        const nextItems = currentItems.map((item) => {
+          const itemId = String(item?.id || "").trim();
+          const importedItem = itemId ? importedById.get(itemId) : null;
+          if (!importedItem) {
+            return item;
+          }
+          importedById.delete(itemId);
+          const preferred = preferTodoQueueStorageItem(item, importedItem);
+          if (preferred !== item) {
+            changed = true;
+            return preferred;
+          }
+          return item;
+        });
+        const additions = [...importedById.values()];
+        if (additions.length) {
+          changed = true;
+          nextItems.push(...additions);
+        }
+        if (!changed) {
           return currentItems;
         }
         logTerminalStatus("frontend.todo_queue.cloud_listed_imported", {
           itemCount: additions.length,
+          updatedCount: importedItems.length - additions.length,
           workspaceId,
         });
-        return currentItems.concat(additions);
+        return nextItems;
       }, {
         // The cloud already owns these todos; echo-syncing them back would
         // resurrect server tombstones and feed the ghost loop.
@@ -24480,6 +24746,7 @@ function TerminalView({
     focusReason = "todo_dropdown_drop",
     item,
     requireAvailable = false,
+    requireFreshAgentInputReady = false,
     reservationItemId = "",
     source = "tui-todo-drop",
     targetTerminalIndex,
@@ -24490,6 +24757,7 @@ function TerminalView({
       allowSendableActivityAgentReadyFallback,
       allowGeneric,
       requireAvailable,
+      requireFreshAgentInputReady,
       reservationItemId,
     });
     const itemImages = getTodoQueueItemImages(currentItem);
@@ -26059,7 +26327,11 @@ function TerminalView({
     }
     updateTodoQueueItems(
       (currentItems) => currentItems.concat(nextItems),
-      { reason: "todo_queue_draft_submitted" },
+      {
+        force: true,
+        immediate: true,
+        reason: "todo_queue_draft_submitted",
+      },
     );
     setTodoDropError("");
     setTodoQueueDraft("");
@@ -26683,7 +26955,9 @@ function TerminalView({
           .map((item) => normalizeTodoQueueItems([item])[0])
           .filter(Boolean);
         const storeById = new Map(storeItems.map((item) => [String(item.id || "").trim(), item]));
+        const activeStoreStatuses = new Set(["running"]);
         const settledStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "timed_out"]);
+        const hiddenStoreStatuses = new Set([...activeStoreStatuses, ...settledStatuses]);
         if (tombstonedIds.size) {
           recordTodoQueueDeletedReceipts(
             getTodoQueueDeletedReceiptStorageKey(storeWorkspaceId),
@@ -26706,8 +26980,19 @@ function TerminalView({
             if (storeItem) {
               const storeStatus = getTodoQueueCanonicalLifecycleStatus(storeItem);
               const localStatus = getTodoQueueCanonicalLifecycleStatus(item);
-              // Adopt settled flips from the store (sweep/cancel corrections);
-              // live lifecycle (queued/sending/running) stays webview-owned.
+              // Adopt Rust-authoritative active/settled flips from the store.
+              // A backend-dispatched todo becomes running before any webview
+              // pending state exists, so keeping the old local queued row would
+              // leave a stale card visible while the terminal is already working.
+              if (activeStoreStatuses.has(storeStatus) && storeStatus !== localStatus) {
+                changed = true;
+                nextItems.push(getTodoQueueItemWithCloudStatus(item, storeStatus, {
+                  reason: String(storeItem.todoStatusReason || storeItem.statusReason || "todo_store_reconcile"),
+                  updatedAt: storeItem.updatedAt || storeItem.updated_at || storeItem.todoStatusUpdatedAt || storeItem.todo_status_updated_at,
+                }));
+                return;
+              }
+              // Adopt settled flips from the store (sweep/cancel corrections).
               if (settledStatuses.has(storeStatus) && storeStatus !== localStatus) {
                 changed = true;
                 if (storeStatus === "completed") {
@@ -26826,10 +27111,11 @@ function TerminalView({
             if (!itemId || seenIds.has(itemId)) {
               return;
             }
-            // The store retains settled rows as todo history; those belong to
-            // the Todos History view, never to the live queue list.
+            // The store retains active/settled rows as todo history; those
+            // belong to the terminal/history surfaces, never to the visible
+            // backlog queue list.
             const storeStatus = getTodoQueueCanonicalLifecycleStatus(storeItem);
-            if (settledStatuses.has(storeStatus)) {
+            if (hiddenStoreStatuses.has(storeStatus)) {
               return;
             }
             changed = true;
@@ -28525,12 +28811,13 @@ function TerminalView({
 
   const updateTodoQueueItemText = useCallback((itemId, nextText) => {
     const text = normalizeTodoQueueText(nextText);
+    const updatedAt = new Date().toISOString();
 
     updateTodoQueueItems((currentItems) => (
       currentItems
         .map((item) => (
           item.id === itemId
-            ? { ...item, text }
+            ? { ...item, text, updatedAt }
             : item
         ))
         .filter((item) => (
@@ -28538,7 +28825,11 @@ function TerminalView({
           || getTodoQueueItemImage(item)
           || getTodoQueueItemNote(item)
       ))
-    ));
+    ), {
+      force: true,
+      immediate: true,
+      reason: "todo_queue_item_text_updated",
+    });
   }, [updateTodoQueueItems]);
 
   const removeTodoQueueItemAttachment = useCallback((itemId, attachment = {}) => {
@@ -28632,6 +28923,16 @@ function TerminalView({
       });
       return;
     }
+    if (todoDispatchStartupReconcileActive) {
+      logTerminalStatus("frontend.todo_queue.dispatch_wait", {
+        item: getTodoQueueItemLogSummary(firstQueuedItem ? [firstQueuedItem] : [])[0] || null,
+        pendingCount: Object.keys(todoQueuePendingItemsRef.current || {}).length,
+        queueItemCount: todoQueueItems.length,
+        reason: "startup_reconciliation_active",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return;
+    }
 
     const resolveQueuedItemDispatchTarget = (item) => {
       const requestedTargetAgentId = getTodoQueueTargetAgentId(item);
@@ -28670,6 +28971,7 @@ function TerminalView({
           const candidate = getTodoQueueTerminalSendTarget(terminalIndex, item, {
             allowGeneric: false,
             requireAvailable: true,
+            requireFreshAgentInputReady: true,
             reservationItemId: item.id,
           });
           if (!todoQueueSendTargetMatchesIdentity(candidate, requestedTargetTerminalId, requestedTargetThreadId)) {
@@ -28717,6 +29019,7 @@ function TerminalView({
         const candidate = getTodoQueueTerminalSendTarget(terminalIndex, item, {
           allowGeneric: false,
           requireAvailable: true,
+          requireFreshAgentInputReady: true,
           reservationItemId: item.id,
         });
         const candidateRole = normalizeTodoTerminalAgentId(candidate.targetRole);
@@ -28885,6 +29188,7 @@ function TerminalView({
         const candidate = getTodoQueueTerminalSendTarget(terminalIndex, queuedItem, {
           allowGeneric: false,
           requireAvailable: true,
+          requireFreshAgentInputReady: true,
           reservationItemId: queuedItem.id,
         });
         return !candidate.available && busyReasons.has(String(candidate.reason || ""));
@@ -28958,6 +29262,7 @@ function TerminalView({
       focusReason: "todo_auto_queue",
       item: queuedItem,
       requireAvailable: true,
+      requireFreshAgentInputReady: true,
       reservationItemId: queuedItem.id,
       source,
       targetTerminalIndex,
@@ -29170,6 +29475,7 @@ function TerminalView({
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
+    todoDispatchStartupReconcileActive,
     todoQueueItems,
     updateTodoQueueItems,
   ]);

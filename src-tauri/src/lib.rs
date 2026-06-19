@@ -3826,154 +3826,12 @@ async fn local_workspaces_store(
     .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
 }
 
-fn local_workspace_catalog_read_items(
-    app: &AppHandle,
-    scope_key: &str,
-) -> Result<Vec<Value>, String> {
-    let path = local_workspace_store_path(app, scope_key)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
-    let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
-    Ok(value
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default())
-}
-
-fn local_workspace_catalog_write_items_to_path(path: &Path, items: &[Value]) -> Result<(), String> {
-    let payload = json!({
-        "version": 1,
-        "workspaces": items,
-    });
-    let serialized = serde_json::to_vec_pretty(&payload)
-        .map_err(|error| format!("Unable to serialize local workspace catalog: {error}"))?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, serialized)
-        .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
-    fs::rename(&temp_path, path)
-        .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
-    Ok(())
-}
-
-fn local_workspace_catalog_write_items(
-    app: &AppHandle,
-    scope_key: &str,
-    items: &[Value],
-) -> Result<(), String> {
-    let path = local_workspace_store_path(app, scope_key)?;
-    local_workspace_catalog_write_items_to_path(&path, items)?;
-    local_workspace_catalog_prune_orphan_workspace_settings(app)?;
-    Ok(())
-}
-
 fn local_workspace_catalog_text(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-/// Rust-owned local catalog mutation: upserts a row in the scope store using
-/// the webview row schema. Runs without the webview so background flows
-/// (remote workspace management, outbox-driven sync) can commit locally.
-pub(crate) fn local_workspace_catalog_apply_upsert(
-    app: &AppHandle,
-    scope_key: &str,
-    workspace: &Value,
-) -> Result<(), String> {
-    let workspace_id =
-        local_workspace_catalog_text(workspace, &["workspace_id", "workspaceId", "id"])
-            .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
-    let workspace_name =
-        local_workspace_catalog_text(workspace, &["workspace_name", "workspaceName", "name"]);
-    let created_at = local_workspace_catalog_text(workspace, &["created_at", "createdAt"]);
-    let updated_at = local_workspace_catalog_text(workspace, &["updated_at", "updatedAt"])
-        .unwrap_or_else(cloud_mcp_rfc3339_now);
-    let mut items = local_workspace_catalog_read_items(app, scope_key)?;
-    let mut found = false;
-    for item in items.iter_mut() {
-        let item_id = local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]);
-        if item_id.as_deref() != Some(workspace_id.as_str()) {
-            continue;
-        }
-        found = true;
-        if let Some(object) = item.as_object_mut() {
-            if let Some(name) = workspace_name.clone() {
-                object.insert("name".to_string(), json!(name));
-            }
-            object.insert("updatedAt".to_string(), json!(updated_at.clone()));
-            object.insert("syncState".to_string(), json!("pending"));
-            object.remove("pendingDelete");
-        }
-    }
-    if !found {
-        items.push(json!({
-            "id": workspace_id,
-            "name": workspace_name.unwrap_or_else(|| "Workspace".to_string()),
-            "createdAt": created_at.unwrap_or_else(|| updated_at.clone()),
-            "updatedAt": updated_at,
-            "syncState": "pending",
-        }));
-    }
-    local_workspace_catalog_write_items(app, scope_key, &items)
-}
-
-pub(crate) fn local_workspace_catalog_apply_delete_all_scopes(
-    app: &AppHandle,
-    workspace_id: &str,
-) -> Result<usize, String> {
-    let workspace_id = workspace_id.trim();
-    if workspace_id.is_empty() {
-        return Err("Workspace delete requires a workspace id.".to_string());
-    }
-    let store_dir = local_workspace_store_dir(app)?;
-    let mut removed_total = 0usize;
-    let entries = match fs::read_dir(&store_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            local_workspace_catalog_prune_orphan_workspace_settings(app)?;
-            return Ok(0);
-        }
-        Err(error) => {
-            return Err(format!(
-                "Unable to read local workspace catalog directory: {error}"
-            ));
-        }
-    };
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("Unable to read workspace catalog entry: {error}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let text = fs::read_to_string(&path)
-            .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
-        let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
-        let mut items = value
-            .get("workspaces")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let before = items.len();
-        items.retain(|item| {
-            local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]).as_deref()
-                != Some(workspace_id)
-        });
-        let removed = before.saturating_sub(items.len());
-        if removed > 0 {
-            local_workspace_catalog_write_items_to_path(&path, &items)?;
-            removed_total = removed_total.saturating_add(removed);
-        }
-    }
-    local_workspace_catalog_prune_orphan_workspace_settings(app)?;
-    Ok(removed_total)
 }
 
 fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<String>, String> {
@@ -4037,37 +3895,6 @@ fn local_workspace_catalog_prune_orphan_workspace_settings(
     Ok(removed)
 }
 
-fn local_workspace_catalog_normalize_cloud_entry(entry: &Value) -> Option<Value> {
-    if local_workspace_catalog_entry_is_deleted(entry) {
-        return None;
-    }
-    let id = local_workspace_catalog_text(entry, &["workspace_id", "workspaceId", "id"])?;
-    let name = local_workspace_catalog_text(entry, &["workspace_name", "workspaceName", "name"])
-        .unwrap_or_else(|| "Workspace".to_string());
-    let created_at =
-        local_workspace_catalog_text(entry, &["created_at", "createdAt"]).unwrap_or_default();
-    let updated_at =
-        local_workspace_catalog_text(entry, &["updated_at", "updatedAt"]).unwrap_or_default();
-    let origin_device_id = local_workspace_catalog_text(
-        entry,
-        &[
-            "origin_device_id",
-            "originDeviceId",
-            "device_id",
-            "deviceId",
-        ],
-    )
-    .unwrap_or_default();
-    Some(json!({
-        "id": id,
-        "name": name,
-        "createdAt": created_at,
-        "updatedAt": updated_at,
-        "originDeviceId": origin_device_id,
-        "syncState": "synced",
-    }))
-}
-
 fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     if entry
         .get("pendingDelete")
@@ -4100,97 +3927,6 @@ fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
     local_workspace_catalog_text(entry, &["status", "workspace_status"])
         .map(|status| matches!(status.as_str(), "deleted" | "archived" | "removed"))
         .unwrap_or(false)
-}
-
-/// Headless catalog down-sync: applies a server-authoritative catalog
-/// broadcast to the scope store without the webview. Cloud rows win; local
-/// rows still pending in the sync outbox survive until the cloud confirms;
-/// synced rows the cloud no longer lists were deleted remotely and drop.
-pub(crate) fn local_workspace_catalog_apply_cloud_merge(
-    app: &AppHandle,
-    scope_key: &str,
-    cloud_items: &[Value],
-) -> Result<(), String> {
-    let mut cloud_by_id = std::collections::BTreeMap::new();
-    for entry in cloud_items {
-        if let Some(normalized) = local_workspace_catalog_normalize_cloud_entry(entry) {
-            let id = normalized["id"].as_str().unwrap_or_default().to_string();
-            cloud_by_id.insert(id, normalized);
-        }
-    }
-    let local_items = local_workspace_catalog_read_items(app, scope_key)?;
-    let mut next_items = Vec::new();
-    for item in local_items {
-        let Some(id) = local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
-        else {
-            continue;
-        };
-        let sync_state = local_workspace_catalog_text(&item, &["syncState"]).unwrap_or_default();
-        let local_pending = sync_state == "pending" || sync_state == "error";
-        if let Some(cloud_row) = cloud_by_id.remove(&id) {
-            let local_updated =
-                local_workspace_catalog_text(&item, &["updatedAt"]).unwrap_or_default();
-            let cloud_updated = cloud_row["updatedAt"].as_str().unwrap_or_default();
-            if local_pending && local_updated.as_str() > cloud_updated {
-                next_items.push(item);
-            } else {
-                next_items.push(cloud_row);
-            }
-        } else if local_pending {
-            next_items.push(item);
-        }
-    }
-    next_items.extend(cloud_by_id.into_values());
-    local_workspace_catalog_write_items(app, scope_key, &next_items)
-}
-
-/// Applies one server-authoritative catalog delta without requiring a full list
-/// refresh. Full-list merges remain available for bootstrap/reconnect.
-pub(crate) fn local_workspace_catalog_apply_cloud_delta(
-    app: &AppHandle,
-    scope_key: &str,
-    cloud_entry: &Value,
-) -> Result<(), String> {
-    let workspace_id =
-        local_workspace_catalog_text(cloud_entry, &["workspace_id", "workspaceId", "id"])
-            .ok_or_else(|| "Workspace catalog delta requires a workspace id.".to_string())?;
-    if local_workspace_catalog_entry_is_deleted(cloud_entry) {
-        let mut items = local_workspace_catalog_read_items(app, scope_key)?;
-        items.retain(|item| {
-            local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"])
-                .map(|id| id != workspace_id)
-                .unwrap_or(true)
-        });
-        return local_workspace_catalog_write_items(app, scope_key, &items);
-    }
-
-    let Some(cloud_row) = local_workspace_catalog_normalize_cloud_entry(cloud_entry) else {
-        return Ok(());
-    };
-    let cloud_updated = cloud_row["updatedAt"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let mut items = local_workspace_catalog_read_items(app, scope_key)?;
-    let mut found = false;
-    for item in items.iter_mut() {
-        let item_id = local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]);
-        if item_id.as_deref() != Some(workspace_id.as_str()) {
-            continue;
-        }
-        found = true;
-        let sync_state = local_workspace_catalog_text(item, &["syncState"]).unwrap_or_default();
-        let local_pending = sync_state == "pending" || sync_state == "error";
-        let local_updated = local_workspace_catalog_text(item, &["updatedAt"]).unwrap_or_default();
-        if local_pending && local_updated.as_str() > cloud_updated.as_str() {
-            continue;
-        }
-        *item = cloud_row.clone();
-    }
-    if !found {
-        items.push(cloud_row);
-    }
-    local_workspace_catalog_write_items(app, scope_key, &items)
 }
 
 /// Rust-owned app-local state files (app-data/app-state/<key>.json). These
@@ -4744,28 +4480,11 @@ pub fn run() {
             background_tray_create(app.handle());
             todo_store_orphan_sweep_start(app.handle().clone());
             agent_accounts_capture_watch_start(app.handle().clone());
-            {
-                // Crash recovery: anything still marked in-flight in the todo
-                // ledger is a leftover from a previous process and gets
-                // labelled interrupted (resume-pending) before the UI loads.
-                let sweep_app = app.handle().clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let marked = todo_dispatch_mark_active_receipts_interrupted(
-                        Some(&sweep_app),
-                        "app_crash_recovered",
-                    );
-                    if marked > 0 {
-                        log_terminal_status_event(
-                            "backend.todo_dispatch.crash_sweep",
-                            json!({ "marked": marked }),
-                        );
-                    }
-                    // Queued/running todos from the previous process can never
-                    // dispatch again: flip them to interrupted before the UI
-                    // imports them as live work.
-                    todo_store_startup_sweep(&sweep_app);
-                });
-            }
+            // Startup todo recovery is bounded, not destructive: queued work
+            // survives app startup, while ambiguous in-flight rows wait for
+            // Rust terminal/workspace evidence or a 45s timeout before being
+            // reclassified.
+            todo_store_startup_sweep(app.handle());
             register_terminal_input_event_listener(app);
             register_terminal_coordination_event_bridge(app);
 
@@ -4968,9 +4687,7 @@ pub fn run() {
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
             cloud_mcp_sync_agent_installations,
-            cloud_mcp_sync_device_live_terminals,
-            cloud_mcp_sync_terminal_status_event,
-            cloud_mcp_sync_device_live_workspace_servers,
+            cloud_mcp_sync_device_workspaces_snapshot,
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
             cloud_mcp_schedule_tokenomics_sync,
@@ -4991,14 +4708,8 @@ pub fn run() {
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
-            cloud_mcp_sync_device_live_workspaces,
-            cloud_mcp_workspace_catalog_upsert,
-            cloud_mcp_workspace_catalog_delete,
-            cloud_mcp_workspace_catalog_list,
             cloud_mcp_get_audio_preferences,
             cloud_mcp_set_audio_preferences,
-            cloud_mcp_sync_device_live_state_snapshot,
-            cloud_mcp_sync_device_live_app_context,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_update_voice_plan_steps,
             cloud_mcp_get_architectures,
@@ -5032,6 +4743,7 @@ pub fn run() {
             todo_dispatch_notify_queue_drained,
             todo_dispatch_queue_sync,
             todo_dispatch_dispatcher_heartbeat,
+            todo_dispatch_startup_reconciliation_state,
             todo_dispatch_backend_submit_now,
             todo_dispatch_backend_submissions_drain,
             todo_dispatch_overview,

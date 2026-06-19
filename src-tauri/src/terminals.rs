@@ -533,7 +533,9 @@ fn terminal_project_runtime(
         || terminal_projection_state_is_error(&runtime.status)
     {
         "error".to_string()
-    } else if terminal_projection_state_is_busy(&raw_activity) {
+    } else if terminal_projection_state_is_busy(&raw_activity)
+        || terminal_projection_state_is_busy(&raw_command_phase)
+    {
         "thinking".to_string()
     } else if terminal_projection_state_is_idle(&raw_activity) || runtime.input_ready {
         "idle".to_string()
@@ -9159,6 +9161,11 @@ fn emit_terminal_prompt_submitted_activity_started(
     };
     terminal_runtime_apply_activity_payload(instance, &payload);
     todo_dispatch_observe_activity_hook(app, &payload);
+    let cloud_payload = payload.clone();
+    let cloud_state = app.state::<CloudMcpState>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_sync_terminal_activity_hook_delta(&cloud_state, &cloud_payload).await;
+    });
     let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
 }
 
@@ -14642,6 +14649,64 @@ mod terminal_tests {
             true,
             Some("what else is there"),
         ));
+    }
+
+    fn terminal_projection_test_metadata() -> TerminalInstanceMetadata {
+        TerminalInstanceMetadata {
+            pane_id: "pane-1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace".to_string(),
+            terminal_index: Some(0),
+            thread_id: "thread-1".to_string(),
+            agent_id: "codex".to_string(),
+            agent_kind: "codex".to_string(),
+            terminal_name: "Codex".to_string(),
+            terminal_nickname: String::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_projection_running_command_phase_overrides_stale_input_ready() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "idle".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: true,
+            input_ready_at: Some("2026-06-19T00:00:00Z".to_string()),
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: None,
+            native_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "test".to_string(),
+            event_type: "message-submitted".to_string(),
+            hook_event_name: "BackendPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+
+        let projected =
+            terminal_project_runtime(&terminal_projection_test_metadata(), &runtime, false);
+
+        assert_eq!(projected.readiness, "busy");
+        assert_eq!(projected.terminal_status, "thinking");
+        assert_eq!(projected.terminal_work_state, "running");
+        assert_eq!(projected.execution_phase, "running");
+        assert_eq!(projected.native_rail_state, "thinking");
+    }
+
+    #[test]
+    fn terminal_projection_idle_requires_ready_command_phase() {
+        let runtime = TerminalRuntimeSnapshot::opened_idle(None);
+
+        let projected =
+            terminal_project_runtime(&terminal_projection_test_metadata(), &runtime, false);
+
+        assert_eq!(projected.readiness, "ready");
+        assert_eq!(projected.terminal_status, "idle");
+        assert_eq!(projected.terminal_work_state, "complete");
+        assert_eq!(projected.execution_phase, "idle");
+        assert_eq!(projected.native_rail_state, "idle");
     }
 
     #[test]
