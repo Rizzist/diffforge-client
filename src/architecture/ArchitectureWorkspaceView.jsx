@@ -96,6 +96,35 @@ function text(value, fallback = "") {
   return normalized || fallback;
 }
 
+function architectureErrorText(value, fallback = "") {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!value || typeof value !== "object") return fallback;
+  const direct = [value.error, value.message, value.reason, value.detail]
+    .find((item) => typeof item === "string" && item.trim());
+  if (direct) return direct.trim();
+  const item = value.item && typeof value.item === "object" ? value.item : null;
+  const itemLabel = text(
+    item?.architecture_id
+      || item?.architectureId
+      || item?.graph_id
+      || item?.graphId
+      || item?.id,
+  );
+  const itemHash = text(item?.content_hash || item?.contentHash);
+  if (itemLabel || itemHash) {
+    return [
+      itemLabel ? `graph ${itemLabel}` : "",
+      itemHash ? `hash ${itemHash.slice(0, 12)}` : "",
+    ].filter(Boolean).join(" / ");
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized && serialized !== "{}" ? serialized.slice(0, 240) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function architectureWorkspaceOptionLabelRenderer(option) {
   return (
     <ArchitectureTargetOptionLabel>
@@ -184,6 +213,60 @@ function jsonArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function architectureGraphIdsFromCloudEvent(event) {
+  const ids = new Set();
+  const pushGraphId = (value) => {
+    const graphId = architectureGraphId(value) || architectureGraphCloudId(value);
+    if (graphId) ids.add(graphId);
+  };
+  const visitGraphLike = (value) => {
+    const object = jsonObject(value);
+    if (!object) return;
+    pushGraphId(object);
+    [
+      object.graph,
+      object.g,
+      object.item,
+      object.architecture,
+      object.doc,
+    ].forEach((nested) => {
+      const nestedObject = jsonObject(nested);
+      if (nestedObject) pushGraphId(nestedObject);
+    });
+  };
+  const visitPayload = (value, depth = 0) => {
+    if (depth > 4) return;
+    const object = jsonObject(value);
+    if (!object) return;
+    [
+      object.ops,
+      object.operations,
+      object.o,
+      object.graphs,
+      object.remoteGraphs,
+      object.remote_graphs,
+      object.hydratedGraphs,
+      object.hydrated_graphs,
+      object.items,
+    ].forEach((list) => jsonArray(list).forEach(visitGraphLike));
+    [
+      object.graph,
+      object.g,
+      object.item,
+      object.architecture,
+      object.doc,
+    ].forEach(visitGraphLike);
+    [
+      object.payload,
+      object.data,
+      object.result,
+      object.stored,
+    ].forEach((nested) => visitPayload(nested, depth + 1));
+  };
+  visitPayload(event);
+  return Array.from(ids);
+}
+
 function architectureRepoPathKey(value) {
   return text(value).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
@@ -202,7 +285,25 @@ function architectureGraphListCacheEntry(graphLists, repoPath) {
 }
 
 function architectureGraphContentHash(graph) {
-  return text(graph?.contentHash || graph?.content_hash || graph?.hash);
+  return text(
+    graph?.contentHash
+      || graph?.content_hash
+      || graph?.contentRevision
+      || graph?.content_revision
+      || graph?.syncContentHash
+      || graph?.sync_content_hash
+      || graph?.hash,
+  );
+}
+
+function architectureGraphLocalUnsaved(graph) {
+  return Boolean(
+    graph?.localUnsaved
+      || graph?.local_unsaved
+      || graph?.dirty
+      || graph?.syncState === "local_unsaved"
+      || graph?.sync_state === "local_unsaved",
+  );
 }
 
 function architectureGraphListSameContent(left, right) {
@@ -215,25 +316,75 @@ function architectureGraphListSameContent(left, right) {
       && text(graph?.title) === text(other?.title)
       && text(graph?.updatedAt || graph?.updated_at) === text(other?.updatedAt || other?.updated_at)
       && architectureGraphContentHash(graph) === architectureGraphContentHash(other)
+      && text(graph?.architectureId || graph?.architecture_id) === text(other?.architectureId || other?.architecture_id)
+      && text(graph?.filePath || graph?.file_path) === text(other?.filePath || other?.file_path)
+      && Boolean(graph?.cloudOnly || graph?.cloud_only) === Boolean(other?.cloudOnly || other?.cloud_only)
+      && Boolean(graph?.cloudNeedsHydration || graph?.cloud_needs_hydration) === Boolean(other?.cloudNeedsHydration || other?.cloud_needs_hydration)
+      && architectureGraphLocalUnsaved(graph) === architectureGraphLocalUnsaved(other)
+      && Boolean(graph?.localAvailable ?? graph?.local_available ?? true) === Boolean(other?.localAvailable ?? other?.local_available ?? true)
+      && Boolean(graph?.hydrated ?? true) === Boolean(other?.hydrated ?? true)
       && Number(graph?.nodeCount || 0) === Number(other?.nodeCount || 0)
       && text(graph?.syncState || graph?.sync_state) === text(other?.syncState || other?.sync_state);
   });
 }
 
+function architectureGraphCloudId(graph) {
+  return text(
+    graph?.cloudArchitectureId
+      || graph?.cloud_architecture_id
+      || graph?.cloudGraphId
+      || graph?.cloud_graph_id
+      || graph?.architectureId
+      || graph?.architecture_id
+      || graph?.graphId
+      || graph?.graph_id
+      || graph?.docId
+      || graph?.doc_id
+      || graph?.id,
+  );
+}
+
 function architectureGraphCloudRef(graph) {
   const cloudGraph = graph?.cloudGraph || graph?.cloud_graph || graph;
-  const graphId = text(cloudGraph?.id || cloudGraph?.architectureId || cloudGraph?.architecture_id || graph?.id);
+  const graphId = architectureGraphCloudId(cloudGraph) || architectureGraphCloudId(graph);
   if (!graphId) return null;
+  const contentHash = architectureGraphContentHash(cloudGraph) || architectureGraphContentHash(graph);
+  const assetId = text(cloudGraph?.assetId || cloudGraph?.asset_id || graph?.assetId || graph?.asset_id);
   return {
     id: graphId,
     architectureId: graphId,
-    contentHash: architectureGraphContentHash(cloudGraph) || architectureGraphContentHash(graph),
-    contentRevision: text(cloudGraph?.contentRevision || cloudGraph?.content_revision || graph?.contentRevision || graph?.content_revision),
+    architecture_id: graphId,
+    graphId,
+    graph_id: graphId,
+    docId: graphId,
+    doc_id: graphId,
+    contentHash,
+    content_hash: contentHash,
+    contentRevision: contentHash,
+    content_revision: contentHash,
+    ...(assetId ? {
+      assetId,
+      asset_id: assetId,
+    } : {}),
+    blobId: text(cloudGraph?.blobId || cloudGraph?.blob_id || graph?.blobId || graph?.blob_id),
+    blob_id: text(cloudGraph?.blob_id || cloudGraph?.blobId || graph?.blob_id || graph?.blobId),
+    sha256: text(cloudGraph?.sha256 || graph?.sha256),
+    sourceFormat: text(cloudGraph?.sourceFormat || cloudGraph?.source_format || graph?.sourceFormat || graph?.source_format, "eraserDsl"),
+    source_format: text(cloudGraph?.source_format || cloudGraph?.sourceFormat || graph?.source_format || graph?.sourceFormat, "eraserDsl"),
   };
 }
 
 function architectureGraphNeedsCloudHydration(graph) {
-  return Boolean(graph?.cloudOnly || graph?.cloudNeedsHydration || graph?.cloud_needs_hydration);
+  if (architectureGraphLocalUnsaved(graph)) return false;
+  return Boolean(
+    graph?.cloudOnly
+      || graph?.cloud_only
+      || graph?.cloudNeedsHydration
+      || graph?.cloud_needs_hydration
+      || graph?.localAvailable === false
+      || graph?.local_available === false
+      || (graph?.cloudAvailable && graph?.hydrated === false),
+  );
 }
 
 function architectureGraphNotFoundError(value) {
@@ -241,7 +392,17 @@ function architectureGraphNotFoundError(value) {
 }
 
 function architectureGraphId(graph) {
-  return text(graph?.id || graph?.graphId || graph?.graph_id || graph?.architectureId || graph?.architecture_id);
+  return text(
+    graph?.localGraphId
+      || graph?.local_graph_id
+      || graph?.architectureId
+      || graph?.architecture_id
+      || graph?.graphId
+      || graph?.graph_id
+      || graph?.docId
+      || graph?.doc_id
+      || graph?.id,
+  );
 }
 
 function architectureHydratedGraph(result, graphId = "") {
@@ -272,6 +433,7 @@ function architectureRevisionTimestamp(revision) {
 
 const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
 const ARCHITECTURE_CLOUD_UPDATED_EVENT = "cloud-mcp-workspace-architectures-updated";
+const ARCHITECTURE_FILE_WRITE_SUPPRESSION_MS = 7000;
 const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
@@ -5469,6 +5631,8 @@ function ArchitecturesPanel({
   const [saveState, setSaveState] = useState("idle");
   const [agentEditMarkers, setAgentEditMarkers] = useState([]);
   const [selectedGraphDirty, setSelectedGraphDirty] = useState(false);
+  const [selectedGraphExternalDirty, setSelectedGraphExternalDirty] = useState(false);
+  const [externalDirtyGraphIds, setExternalDirtyGraphIds] = useState(() => new Set());
   const [revisionBrowser, setRevisionBrowser] = useState({ graphId: "", open: false });
   const [, setDragGraph] = useState(null);
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -5479,6 +5643,46 @@ function ArchitecturesPanel({
   const selectedGraphDirtyRef = useRef(false);
   const selectedGraphLoadedKeyRef = useRef("");
   const hydratedListRefreshKeysRef = useRef(new Set());
+  const suppressedExternalGraphWritesRef = useRef(new Map());
+
+  const suppressExternalGraphWrites = useCallback((graphIds = []) => {
+    const expiresAt = Date.now() + ARCHITECTURE_FILE_WRITE_SUPPRESSION_MS;
+    graphIds
+      .map((graphId) => text(graphId))
+      .filter(Boolean)
+      .forEach((graphId) => suppressedExternalGraphWritesRef.current.set(graphId, expiresAt));
+  }, []);
+
+  const isExternalGraphWriteSuppressed = useCallback((graphId) => {
+    const normalizedGraphId = text(graphId);
+    if (!normalizedGraphId) return false;
+    const now = Date.now();
+    suppressedExternalGraphWritesRef.current.forEach((expiresAt, currentGraphId) => {
+      if (expiresAt <= now) {
+        suppressedExternalGraphWritesRef.current.delete(currentGraphId);
+      }
+    });
+    const expiresAt = suppressedExternalGraphWritesRef.current.get(normalizedGraphId);
+    if (!expiresAt || expiresAt <= now) {
+      suppressedExternalGraphWritesRef.current.delete(normalizedGraphId);
+      return false;
+    }
+    return true;
+  }, []);
+
+  const markSelectedGraphExternallyDirty = useCallback((graphId = selectedGraphId) => {
+    const dirtyGraphId = text(graphId);
+    if (!dirtyGraphId) return;
+    selectedGraphDirtyRef.current = true;
+    setSelectedGraphDirty(true);
+    setSelectedGraphExternalDirty(true);
+    setExternalDirtyGraphIds((currentIds) => {
+      if (currentIds.has(dirtyGraphId)) return currentIds;
+      const nextIds = new Set(currentIds);
+      nextIds.add(dirtyGraphId);
+      return nextIds;
+    });
+  }, [selectedGraphId]);
 
   useEffect(() => {
     selectedGraphDirtyRef.current = selectedGraphDirty;
@@ -5719,6 +5923,7 @@ function ArchitecturesPanel({
       ) {
         return;
       }
+      suppressExternalGraphWrites(architectureGraphIdsFromCloudEvent(event?.payload || event));
       void loadGraphList(selectedRepoPath, {
         refresh: true,
         silent: true,
@@ -5735,21 +5940,27 @@ function ArchitecturesPanel({
       cancelled = true;
       if (unlistenArchitecture) unlistenArchitecture();
     };
-  }, [loadGraphList, selectedRepoPath, syncWorkspaceId, syncWorkspaceName]);
+  }, [loadGraphList, selectedRepoPath, suppressExternalGraphWrites, syncWorkspaceId, syncWorkspaceName]);
 
   const selectedGraphSummary = useMemo(
     () => graphs.find((graph) => architectureGraphId(graph) === selectedGraphId) || null,
     [graphs, selectedGraphId],
   );
+  const selectedGraphFileDirty = selectedGraphExternalDirty
+    || externalDirtyGraphIds.has(selectedGraphId)
+    || (!selectedGraphDirty && architectureGraphLocalUnsaved(selectedGraphSummary));
 
   useEffect(() => {
     let cancelled = false;
+    let retryTimer = null;
     if (!selectedRepoPath || !selectedGraphId) {
       selectedGraphLoadedKeyRef.current = "";
       setSelectedGraph(null);
       setSelectedGraphDirty(false);
+      setSelectedGraphExternalDirty(false);
       return () => {
         cancelled = true;
+        if (retryTimer) window.clearTimeout(retryTimer);
       };
     }
 
@@ -5759,6 +5970,7 @@ function ArchitecturesPanel({
     if (selectedGraphLoadedKeyRef.current !== loadedKey) {
       setGraphState("loading");
       setError("");
+      setSelectedGraphExternalDirty(false);
     }
     const hydrateRef = architectureGraphNeedsCloudHydration(selectedGraphSummary)
       ? architectureGraphCloudRef(selectedGraphSummary)
@@ -5768,20 +5980,52 @@ function ArchitecturesPanel({
       graphId: selectedGraphId,
       repoPath: selectedRepoPath,
     });
-    const hydrateGraph = (ref) => invoke("cloud_mcp_hydrate_architecture", {
-      refs: [ref],
-      repoPath: selectedRepoPath,
-      workspaceId: syncWorkspaceId,
-      workspaceName: syncWorkspaceName,
-      ...(syncScopeRepoId ? {
-        scopeRepoId: syncScopeRepoId,
-        scopeGitRepoIdentityId: syncScopeGitRepoIdentityId,
-      } : {}),
-    }).then((result) => {
-      const hydratedGraph = architectureHydratedGraph(result, selectedGraphId);
-      if (hydratedGraph) return hydratedGraph;
-      return readLocalGraph();
-    });
+    const hydrateGraph = (ref) => {
+      suppressExternalGraphWrites([
+        selectedGraphId,
+        architectureGraphCloudId(ref),
+      ]);
+      return invoke("cloud_mcp_hydrate_architecture", {
+        refs: [ref],
+        repoPath: selectedRepoPath,
+        workspaceId: syncWorkspaceId,
+        workspaceName: syncWorkspaceName,
+        ...(syncScopeRepoId ? {
+          scopeRepoId: syncScopeRepoId,
+          scopeGitRepoIdentityId: syncScopeGitRepoIdentityId,
+        } : {}),
+      }).then((result) => {
+        suppressExternalGraphWrites([
+          selectedGraphId,
+          architectureGraphCloudId(ref),
+          ...architectureGraphIdsFromCloudEvent(result),
+        ]);
+        const hydratedGraph = architectureHydratedGraph(result, selectedGraphId);
+        if (hydratedGraph) return hydratedGraph;
+        const skipped = jsonArray(result?.skipped);
+        if (skipped.length) {
+          return readLocalGraph();
+        }
+        const failures = jsonArray(result?.failed).concat(jsonArray(result?.missing));
+        if (failures.length) {
+          const firstFailure = failures[0];
+          throw new Error(architectureErrorText(
+            firstFailure?.error
+              || firstFailure?.message
+              || firstFailure,
+            "Architecture graph hydration failed.",
+          ));
+        }
+        return loadGraphList(selectedRepoPath, { refresh: true, silent: true })
+          .then(() => readLocalGraph())
+          .catch((readError) => {
+            if (architectureGraphNotFoundError(readError)) {
+              throw new Error("Architecture graph is still hydrating from cloud.");
+            }
+            throw readError;
+          });
+        });
+    };
     const readPromise = hydrateRef
       ? hydrateGraph(hydrateRef)
       : readLocalGraph().catch((readError) => {
@@ -5804,15 +6048,23 @@ function ArchitecturesPanel({
       .then((graph) => {
         if (cancelled) return;
         if (selectedGraphDirtyRef.current) return;
+        const alreadyLoadedSelectedGraph = selectedGraphLoadedKeyRef.current === loadedKey;
         selectedGraphLoadedKeyRef.current = loadedKey;
-        setSelectedGraph((current) => (
-          current
-            && text(current?.id) === text(graph?.id)
+        setSelectedGraph((current) => {
+          const sameGraph = current && text(current?.id) === text(graph?.id);
+          const sameContent = sameGraph
             && text(current?.source) === text(graph?.source)
-            && text(current?.updatedAt) === text(graph?.updatedAt)
-            ? current
-            : graph
-        ));
+            && text(current?.updatedAt) === text(graph?.updatedAt);
+          if (
+            alreadyLoadedSelectedGraph
+            && sameGraph
+            && !sameContent
+            && !isExternalGraphWriteSuppressed(selectedGraphId)
+          ) {
+            markSelectedGraphExternallyDirty(selectedGraphId);
+          }
+          return sameContent ? current : graph;
+        });
         setGraphState("ready");
         setError("");
         // One post-hydration list refresh per graph. Without this guard a
@@ -5830,16 +6082,32 @@ function ArchitecturesPanel({
       })
       .catch((nextError) => {
         if (cancelled) return;
+        const message = nextError?.message || String(nextError || "Unable to read architecture graph.");
+        if (hydrateRef && message.toLowerCase().includes("still hydrating from cloud")) {
+          setSelectedGraph(null);
+          setGraphState("loading");
+          setError("");
+          retryTimer = window.setTimeout(() => {
+            if (!cancelled) {
+              void loadGraphList(selectedRepoPath, { refresh: true, silent: true });
+            }
+          }, 1000);
+          return;
+        }
         setSelectedGraph(null);
         setGraphState("error");
-        setError(nextError?.message || String(nextError || "Unable to read architecture graph."));
+        setError(message);
       });
 
     return () => {
       cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
     };
   }, [
     loadGraphList,
+    isExternalGraphWriteSuppressed,
+    markSelectedGraphExternallyDirty,
+    suppressExternalGraphWrites,
     selectedGraphId,
     selectedGraphSummary,
     selectedRepoPath,
@@ -5855,7 +6123,7 @@ function ArchitecturesPanel({
     }
     let cancelled = false;
     let unlisten = null;
-    const rereadSelectedGraph = () => {
+    const rereadSelectedGraph = ({ allowDirtyRefresh = false } = {}) => {
       invoke("architecture_graph_read", {
         graphId: selectedGraphId,
         repoPath: selectedRepoPath,
@@ -5867,12 +6135,16 @@ function ArchitecturesPanel({
             const nextSource = text(graph?.source);
             const currentUpdatedAt = text(current?.updatedAt);
             const nextUpdatedAt = text(graph?.updatedAt);
-            if (selectedGraphDirtyRef.current) {
+            if (selectedGraphDirtyRef.current && !allowDirtyRefresh) {
               return current;
             }
             if (currentSource === nextSource && currentUpdatedAt === nextUpdatedAt) {
               return current;
             }
+            if (isExternalGraphWriteSuppressed(selectedGraphId)) {
+              return graph;
+            }
+            markSelectedGraphExternallyDirty(selectedGraphId);
             return graph;
           });
         })
@@ -5882,9 +6154,19 @@ function ArchitecturesPanel({
     // "architecture-store-changed" (debounced) on any graph file write —
     // including server-synced architectures — so re-read only then. The open
     // graph also loads on selection elsewhere. Zero idle wake-ups while idle.
-    listen("architecture-store-changed", () => {
+    listen("architecture-store-changed", (event) => {
       if (!cancelled) {
-        rereadSelectedGraph();
+        const payload = event?.payload || {};
+        const changedGraphIds = jsonArray(payload.graphIds || payload.graph_ids)
+          .map((item) => text(item))
+          .filter(Boolean);
+        if (!changedGraphIds.length || changedGraphIds.includes(selectedGraphId)) {
+          const suppressed = isExternalGraphWriteSuppressed(selectedGraphId);
+          if (!suppressed) {
+            markSelectedGraphExternallyDirty(selectedGraphId);
+          }
+          rereadSelectedGraph({ allowDirtyRefresh: !suppressed });
+        }
       }
     }).then((fn) => {
       if (cancelled) {
@@ -5899,7 +6181,7 @@ function ArchitecturesPanel({
         unlisten();
       }
     };
-  }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
+  }, [creatingGraph, isExternalGraphWriteSuppressed, markSelectedGraphExternallyDirty, saveState, selectedGraphId, selectedRepoPath]);
 
   const selectedRepo = repositories.find((repo) => (
     architectureRepoPathKey(architectureRepoPathFromEntry(repo)) === architectureRepoPathKey(selectedRepoPath)
@@ -6095,9 +6377,8 @@ function ArchitecturesPanel({
         const nextGraph = result?.graph || graph;
         setSelectedGraph(nextGraph);
         setSelectedGraphId(result?.graphId || nextGraph.id);
-        setSaveState("idle");
-        if (syncWorkspaceId) {
-          void invoke("cloud_mcp_sync_architecture", {
+        const syncPromise = syncWorkspaceId
+          ? invoke("cloud_mcp_sync_architecture", {
             graph: nextGraph,
             reason: "architecture_graph_save",
             repoPath: selectedRepoPath,
@@ -6107,10 +6388,23 @@ function ArchitecturesPanel({
               scopeRepoId: selectedRepoSyncContext.scopeRepoId,
               scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
             } : {}),
-          }).catch(() => {});
-        }
-        void loadGraphList(selectedRepoPath, { refresh: true });
-        return nextGraph;
+          })
+          : Promise.resolve(null);
+        return syncPromise.then(() => {
+          setSelectedGraphDirty(false);
+          selectedGraphDirtyRef.current = false;
+          setSelectedGraphExternalDirty(false);
+          setExternalDirtyGraphIds((currentIds) => {
+            const savedGraphId = architectureGraphId(nextGraph) || result?.graphId || result?.graph_id;
+            if (!savedGraphId || !currentIds.has(savedGraphId)) return currentIds;
+            const nextIds = new Set(currentIds);
+            nextIds.delete(savedGraphId);
+            return nextIds;
+          });
+          setSaveState("idle");
+          void loadGraphList(selectedRepoPath, { refresh: true });
+          return nextGraph;
+        });
       })
       .catch((nextError) => {
         setSaveState("idle");
@@ -6137,6 +6431,13 @@ function ArchitecturesPanel({
       .then((result) => {
         setSelectedGraphDirty(false);
         selectedGraphDirtyRef.current = false;
+        setSelectedGraphExternalDirty(false);
+        setExternalDirtyGraphIds((currentIds) => {
+          if (!currentIds.has(graphId)) return currentIds;
+          const nextIds = new Set(currentIds);
+          nextIds.delete(graphId);
+          return nextIds;
+        });
         setRevisionBrowser((current) => (
           text(current.graphId) === graphId ? { graphId: "", open: false } : { ...current, open: false }
         ));
@@ -6162,6 +6463,15 @@ function ArchitecturesPanel({
     if (nextGraphId) setSelectedGraphId(nextGraphId);
     setCreatingGraph(false);
     setSelectedGraphDirty(false);
+    setSelectedGraphExternalDirty(false);
+    if (nextGraphId) {
+      setExternalDirtyGraphIds((currentIds) => {
+        if (!currentIds.has(nextGraphId)) return currentIds;
+        const nextIds = new Set(currentIds);
+        nextIds.delete(nextGraphId);
+        return nextIds;
+      });
+    }
     if (syncWorkspaceId && nextGraph) {
       void invoke("cloud_mcp_sync_architecture", {
         graph: nextGraph,
@@ -6210,6 +6520,9 @@ function ArchitecturesPanel({
 
         const rowMarker = architectureAgentEditMarkerForGraph(row.graph, visibleAgentEditMarkers);
         const rowMarkerTitle = architectureAgentEditMarkerTitle(rowMarker);
+        const rowDirty = architectureGraphLocalUnsaved(row.graph)
+          || externalDirtyGraphIds.has(row.graph.id)
+          || (row.graph.id === selectedGraphId && selectedGraphDirty);
         const graphFileName = architectureGraphFileName(row.graph);
         const draggable = typeof onCopyGraph === "function";
         return (
@@ -6218,6 +6531,7 @@ function ArchitecturesPanel({
               $depth={row.depth}
               data-agent-edit={rowMarker ? rowMarker.status : undefined}
               data-architecture-row="graph"
+              data-local-unsaved={rowDirty ? "true" : undefined}
               data-selected={row.graph.id === selectedGraphId && !creatingGraph ? "true" : undefined}
               draggable={draggable || undefined}
               onClick={() => {
@@ -6250,6 +6564,7 @@ function ArchitecturesPanel({
                 row.graph.title && row.graph.title !== graphFileName ? row.graph.title : "",
                 row.graph.filePath,
                 rowMarkerTitle,
+                rowDirty ? "Unsaved local changes" : "",
               ].filter(Boolean).join("\n")}
               type="button"
             >
@@ -6263,12 +6578,13 @@ function ArchitecturesPanel({
               </ArchitectureFileKindIcon>
               <FileTreeName>{graphFileName}</FileTreeName>
               <ArchitectureFileStatusMark
-                aria-hidden={!rowMarker}
+                aria-hidden={!rowMarker && !rowDirty}
                 data-agent-edit={rowMarker ? rowMarker.status : undefined}
+                data-local-unsaved={rowDirty ? "true" : undefined}
                 style={rowMarker ? { "--agent-edit-color": rowMarker.agentColor } : undefined}
-                title={rowMarkerTitle || undefined}
+                title={rowMarkerTitle || (rowDirty ? "Unsaved local changes" : undefined)}
               >
-                {rowMarker ? <i /> : null}
+                {rowMarker || rowDirty ? <i /> : null}
               </ArchitectureFileStatusMark>
             </ArchitectureFileTreeButton>
           </FileTreeItem>
@@ -6282,7 +6598,9 @@ function ArchitecturesPanel({
     beginCreateGraph,
     creatingGraph,
     onCopyGraph,
+    externalDirtyGraphIds,
     selectedGraphId,
+    selectedGraphDirty,
     selectedRepoPath,
     showEmptyGraphList,
     treeRows,
@@ -6551,6 +6869,7 @@ function ArchitecturesPanel({
           ) : (
             <ArchitectureGraphEditor
               agentEditMarker={selectedAgentEditMarker}
+              externalDirty={selectedGraphFileDirty}
               graph={selectedGraph}
               onAgentEditQueued={recordAgentEditQueued}
               onDeleteGraph={deleteGraph}
@@ -6679,6 +6998,7 @@ function ArchitectureGraphResolvingSurface({
 
 function ArchitectureGraphEditor({
   agentEditMarker = null,
+  externalDirty = false,
   graph,
   onAgentEditQueued = () => {},
   onDeleteGraph = null,
@@ -6772,11 +7092,11 @@ function ArchitectureGraphEditor({
     setDraftGraph(jsonObject(graph) || {});
     setExpandedCorridorId("");
     setRunSelections({});
-    setDirty(false);
+    setDirty(Boolean(externalDirty));
     setLocalError("");
     setAgentCommandDraft("");
     setAgentCommandNotice("");
-  }, [graph, setEdges, setNodes]);
+  }, [externalDirty, graph, setEdges, setNodes]);
 
   useEffect(() => {
     setAgentTargetWorkspaceId((current) => {
@@ -9788,6 +10108,10 @@ const ArchitectureFileTreeButton = styled(FileTreeButton)`
   &[data-agent-edit] {
     color: var(--files-vscode-text);
   }
+
+  &[data-local-unsaved="true"] {
+    color: var(--files-vscode-text);
+  }
 `;
 
 const ArchitectureFileKindIcon = styled(FileKindIcon)`
@@ -9810,6 +10134,10 @@ const ArchitectureFileStatusMark = styled(FileGitStatusMark)`
 
   &[data-agent-edit] {
     color: var(--agent-edit-color, #60a5fa);
+  }
+
+  &[data-local-unsaved="true"] {
+    color: #fbbf24;
   }
 
   i {

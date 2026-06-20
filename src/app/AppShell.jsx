@@ -525,6 +525,8 @@ import {
   TitleCloseIcon,
   ButtonRefreshIcon,
   ButtonAddIcon,
+  ButtonArchiveIcon,
+  ButtonBackIcon,
   ButtonLoginIcon,
   ButtonBrowserIcon,
   ButtonAssetsIcon,
@@ -578,6 +580,12 @@ import {
   WorkspaceCreateAgentStepper,
   WorkspaceCreateAgentStepButton,
   WorkspaceCreateFooter,
+  WorkspaceArchiveList,
+  WorkspaceArchiveRow,
+  WorkspaceArchiveMain,
+  WorkspaceArchiveTitle,
+  WorkspaceArchivePath,
+  WorkspaceArchiveActions,
   VIEW_TRANSITION_MS
 } from "./appStyles";
 import { PlanFlame } from "./PlanFlame.jsx";
@@ -4253,16 +4261,21 @@ function WorkspaceAgentCountCards({
  */
 function WorkspaceCreatePanel({
   agentStatuses,
+  archivedWorkspaces = [],
   chooseNativeDirectory,
   defaultWorkingDirectory,
   fallbackRole,
+  onDeleteArchivedWorkspace,
   onClose,
+  onRestoreArchivedWorkspace,
   onSubmit,
   roleOptions,
   rootDraft,
   setRootDraft,
   setWorkspaceName,
   visible,
+  workspaceArchiveState = "idle",
+  workspaceDeleteConfirmId = "",
   workspaceError,
   workspaceName,
   workspaceSyncState,
@@ -4271,9 +4284,12 @@ function WorkspaceCreatePanel({
   const [browseError, setBrowseError] = useState("");
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
+  const [panelView, setPanelView] = useState("create");
   const browseSeqRef = useRef(0);
   const browseRef = useRef(null);
   const creating = workspaceSyncState === "creating";
+  const archiveBusy = ["archiving", "restoring", "deleting", "saving"].includes(workspaceArchiveState);
+  const archivedRows = Array.isArray(archivedWorkspaces) ? archivedWorkspaces : [];
 
   const browseTo = useCallback(async (path, options = {}) => {
     const seq = browseSeqRef.current + 1;
@@ -4310,6 +4326,7 @@ function WorkspaceCreatePanel({
     }
     setCdDraft("");
     setBrowseError("");
+    setPanelView("create");
     setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
     void browseTo(rootDraft || defaultWorkingDirectory || "");
     // Reset only when the panel opens; rootDraft changes are handled below.
@@ -4465,6 +4482,94 @@ function WorkspaceCreatePanel({
       && terminalRoles.length > 0,
   );
 
+  if (panelView === "archived") {
+    return (
+      <WorkspaceCreateSurface>
+        <WorkspaceCreateCard
+          aria-busy={archiveBusy}
+          aria-label="Archived workspaces"
+          onSubmit={(event) => event.preventDefault()}
+        >
+          <WorkspaceCreateHeader>
+            <div>
+              <PanelKicker>Local archive</PanelKicker>
+              <PanelHeading>Archived workspaces</PanelHeading>
+            </div>
+            <WorkspaceSettingsHeaderActions>
+              <SecondaryButton
+                disabled={archiveBusy}
+                onClick={() => setPanelView("create")}
+                type="button"
+              >
+                <ButtonBackIcon aria-hidden="true" />
+                <span>Create</span>
+              </SecondaryButton>
+              {onClose && (
+                <WorkspaceModalCloseButton
+                  aria-label="Close archived workspaces"
+                  disabled={archiveBusy}
+                  onClick={onClose}
+                  title="Close"
+                  type="button"
+                >
+                  <ButtonCloseIcon aria-hidden="true" />
+                </WorkspaceModalCloseButton>
+              )}
+            </WorkspaceSettingsHeaderActions>
+          </WorkspaceCreateHeader>
+
+          <WorkspaceCreateSection>
+            <WorkspaceArchiveList>
+              {archivedRows.map((workspace) => {
+                const workspacePath = workspaceCatalogEntryRootDirectory(
+                  workspace,
+                  {},
+                  defaultWorkingDirectory,
+                );
+                const confirmingDelete = workspaceDeleteConfirmId === workspace.id;
+                return (
+                  <WorkspaceArchiveRow key={workspace.id}>
+                    <WorkspaceArchiveMain>
+                      <WorkspaceArchiveTitle title={workspace.name}>
+                        {workspace.name}
+                      </WorkspaceArchiveTitle>
+                      <WorkspaceArchivePath title={workspacePath}>
+                        {workspacePath || "No saved path"}
+                      </WorkspaceArchivePath>
+                    </WorkspaceArchiveMain>
+                    <WorkspaceArchiveActions>
+                      <SecondaryButton
+                        disabled={archiveBusy}
+                        onClick={() => onRestoreArchivedWorkspace?.(workspace.id)}
+                        type="button"
+                      >
+                        <ButtonArchiveIcon aria-hidden="true" />
+                        <span>{workspaceArchiveState === "restoring" ? "Restoring..." : "Unarchive"}</span>
+                      </SecondaryButton>
+                      <PrimaryDangerButton
+                        disabled={archiveBusy}
+                        onClick={() => onDeleteArchivedWorkspace?.(workspace.id)}
+                        type="button"
+                      >
+                        <ButtonDeleteIcon aria-hidden="true" />
+                        <span>{confirmingDelete ? "Confirm delete" : "Delete"}</span>
+                      </PrimaryDangerButton>
+                    </WorkspaceArchiveActions>
+                  </WorkspaceArchiveRow>
+                );
+              })}
+              {!archivedRows.length && (
+                <SettingsHint>No archived workspaces.</SettingsHint>
+              )}
+            </WorkspaceArchiveList>
+          </WorkspaceCreateSection>
+
+          {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
+        </WorkspaceCreateCard>
+      </WorkspaceCreateSurface>
+    );
+  }
+
   return (
     <WorkspaceCreateSurface>
       <WorkspaceCreateCard
@@ -4483,17 +4588,27 @@ function WorkspaceCreatePanel({
             <PanelKicker>New workspace</PanelKicker>
             <PanelHeading>Create workspace</PanelHeading>
           </div>
-          {onClose && (
-            <WorkspaceModalCloseButton
-              aria-label="Close create workspace"
+          <WorkspaceSettingsHeaderActions>
+            <SecondaryButton
               disabled={creating}
-              onClick={onClose}
-              title="Close"
+              onClick={() => setPanelView("archived")}
               type="button"
             >
-              <ButtonCloseIcon aria-hidden="true" />
-            </WorkspaceModalCloseButton>
-          )}
+              <ButtonArchiveIcon aria-hidden="true" />
+              <span>Archived {archivedRows.length}</span>
+            </SecondaryButton>
+            {onClose && (
+              <WorkspaceModalCloseButton
+                aria-label="Close create workspace"
+                disabled={creating}
+                onClick={onClose}
+                title="Close"
+                type="button"
+              >
+                <ButtonCloseIcon aria-hidden="true" />
+              </WorkspaceModalCloseButton>
+            )}
+          </WorkspaceSettingsHeaderActions>
         </WorkspaceCreateHeader>
 
         <WorkspaceCreateSection>
@@ -7868,6 +7983,9 @@ function applyForgeThemePreference(theme, spaceMode = APP_SPACE_MODE_DEFAULT) {
 }
 
 function findWorkspaceById(workspaces, workspaceId) {
+  if (!Array.isArray(workspaces)) {
+    return null;
+  }
   return workspaces.find((workspace) => workspace.id === workspaceId) || null;
 }
 
@@ -7896,6 +8014,28 @@ function normalizeCatalogWorkspaceEntry(entry) {
   }
   const name = String(entry?.name || entry?.workspace_name || entry?.workspaceName || id).trim() || id;
   const deviceIds = entry?.device_ids || entry?.deviceIds;
+  const rootDirectory = cleanWorkspaceRootDirectory(
+    entry?.rootDirectory
+      || entry?.root_directory
+      || entry?.workspaceRoot
+      || entry?.workspace_root
+      || entry?.repoPath
+      || entry?.repo_path,
+  );
+  const rootIdentity = getWorkspaceRootIdentity(
+    entry?.rootIdentity
+      || entry?.root_identity
+      || entry?.workspaceRootIdentity
+      || entry?.workspace_root_identity
+      || rootDirectory,
+  );
+  const localArchivedAt = String(
+    entry?.localArchivedAt
+      || entry?.local_archived_at
+      || entry?.locallyArchivedAt
+      || entry?.locally_archived_at
+      || "",
+  ).trim();
   return {
     id,
     name,
@@ -7904,9 +8044,110 @@ function normalizeCatalogWorkspaceEntry(entry) {
     originDeviceId: String(entry?.originDeviceId || entry?.origin_device_id || entry?.device_id || ""),
     deviceIds: Array.isArray(deviceIds) ? deviceIds.map((value) => String(value)).filter(Boolean) : [],
     deletedAt: String(entry?.deletedAt || entry?.deleted_at || ""),
+    rootDirectory,
+    rootIdentity,
+    localArchived: Boolean(
+      entry?.localArchived
+        || entry?.local_archived
+        || entry?.locallyArchived
+        || entry?.locally_archived
+        || localArchivedAt,
+    ),
+    localArchivedAt,
     pendingDelete: catalogWorkspaceEntryIsDeleted(entry),
     syncState: entry?.syncState === "pending" || entry?.syncState === "error" ? entry.syncState : "synced",
   };
+}
+
+function workspaceIsLocallyArchived(entry) {
+  if (!entry || typeof entry !== "object") {
+    return false;
+  }
+  return Boolean(
+    entry.localArchived
+      || entry.local_archived
+      || entry.locallyArchived
+      || entry.locally_archived
+      || String(
+        entry.localArchivedAt
+          || entry.local_archived_at
+          || entry.locallyArchivedAt
+          || entry.locally_archived_at
+          || "",
+      ).trim(),
+  );
+}
+
+function workspaceCatalogEntryRootDirectory(entry, workspaceSettings, defaultWorkingDirectory = "") {
+  const workspaceId = String(entry?.id || entry?.workspace_id || entry?.workspaceId || "").trim();
+  return cleanWorkspaceRootDirectory(
+    entry?.rootDirectory
+      || entry?.root_directory
+      || entry?.workspaceRoot
+      || entry?.workspace_root
+      || entry?.repoPath
+      || entry?.repo_path
+      || getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+      || defaultWorkingDirectory,
+  );
+}
+
+function enrichCatalogWorkspaceEntry(entry, workspaceSettings, defaultWorkingDirectory = "") {
+  const normalized = normalizeCatalogWorkspaceEntry(entry);
+  if (!normalized) {
+    return null;
+  }
+  const rootDirectory = workspaceCatalogEntryRootDirectory(
+    normalized,
+    workspaceSettings,
+    defaultWorkingDirectory,
+  );
+  const rootIdentity = normalized.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
+  return {
+    ...normalized,
+    rootDirectory,
+    rootIdentity,
+  };
+}
+
+function normalizeWorkspaceCatalog(value, workspaceSettings = {}, defaultWorkingDirectory = "") {
+  const rawItems = Array.isArray(value)
+    ? value
+    : Array.isArray(value?.workspaces)
+      ? value.workspaces
+      : [];
+  const seen = new Set();
+  return rawItems
+    .map((entry) => enrichCatalogWorkspaceEntry(entry, workspaceSettings, defaultWorkingDirectory))
+    .filter((workspace) => {
+      if (!workspace || seen.has(workspace.id)) {
+        return false;
+      }
+      seen.add(workspace.id);
+      return true;
+    });
+}
+
+function visibleWorkspaceCatalog(workspaces) {
+  return (Array.isArray(workspaces) ? workspaces : [])
+    .filter((workspace) => workspace && !workspace.pendingDelete && !workspaceIsLocallyArchived(workspace));
+}
+
+function archivedWorkspaceCatalog(workspaces) {
+  return (Array.isArray(workspaces) ? workspaces : [])
+    .filter((workspace) => workspace && !workspace.pendingDelete && workspaceIsLocallyArchived(workspace));
+}
+
+function updateCatalogWorkspace(workspaceCatalog, workspace) {
+  const nextWorkspace = normalizeCatalogWorkspaceEntry(workspace);
+  if (!nextWorkspace) {
+    return Array.isArray(workspaceCatalog) ? workspaceCatalog : [];
+  }
+  const existing = Array.isArray(workspaceCatalog) ? workspaceCatalog : [];
+  return [
+    ...existing.filter((item) => item.id !== nextWorkspace.id),
+    nextWorkspace,
+  ];
 }
 
 function normalizeLoopspaceEntry(entry) {
@@ -7998,6 +8239,35 @@ function graphText(value, fallback = "") {
   return normalized || fallback;
 }
 
+function graphErrorText(value, fallback = "") {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!value || typeof value !== "object") return fallback;
+  const direct = [value.error, value.message, value.reason, value.detail]
+    .find((item) => typeof item === "string" && item.trim());
+  if (direct) return direct.trim();
+  const item = value.item && typeof value.item === "object" ? value.item : null;
+  const itemLabel = graphText(
+    item?.architecture_id
+      || item?.architectureId
+      || item?.graph_id
+      || item?.graphId
+      || item?.id,
+  );
+  const itemHash = graphText(item?.content_hash || item?.contentHash);
+  if (itemLabel || itemHash) {
+    return [
+      itemLabel ? `graph ${itemLabel}` : "",
+      itemHash ? `hash ${itemHash.slice(0, 12)}` : "",
+    ].filter(Boolean).join(" / ");
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized && serialized !== "{}" ? serialized.slice(0, 240) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function normalizeGraphWorkspacePath(value) {
   return String(value || "")
     .replace(/\\/g, "/")
@@ -8072,20 +8342,30 @@ function workspaceArchitectureGraphId(graph) {
   return graphText(
     graph?.localGraphId
       || graph?.local_graph_id
-      || graph?.id
       || graph?.architectureId
       || graph?.architecture_id
       || graph?.graphId
-      || graph?.graph_id,
+      || graph?.graph_id
+      || graph?.docId
+      || graph?.doc_id
+      || graph?.id,
   );
 }
 
-function workspaceArchitectureCloudSyncSignature(graphs) {
-  return JSON.stringify((Array.isArray(graphs) ? graphs : []).map((graph) => [
-    workspaceArchitectureGraphId(graph),
-    graphText(graph?.updatedAt || graph?.updated_at),
-    graphText(graph?.contentHash || graph?.content_hash),
-  ]));
+function workspaceArchitectureGraphCloudId(graph) {
+  return graphText(
+    graph?.cloudArchitectureId
+      || graph?.cloud_architecture_id
+      || graph?.cloudGraphId
+      || graph?.cloud_graph_id
+      || graph?.architectureId
+      || graph?.architecture_id
+      || graph?.graphId
+      || graph?.graph_id
+      || graph?.docId
+      || graph?.doc_id
+      || graph?.id,
+  );
 }
 
 function workspaceArchitectureGraphFilePath(graph) {
@@ -8170,41 +8450,79 @@ function workspaceArchitectureGraphUpdatedMs(graph) {
 }
 
 function workspaceArchitectureGraphContentHash(graph) {
-  return graphText(graph?.contentHash || graph?.content_hash || graph?.hash);
+  return graphText(
+    graph?.contentHash
+      || graph?.content_hash
+      || graph?.contentRevision
+      || graph?.content_revision
+      || graph?.syncContentHash
+      || graph?.sync_content_hash
+      || graph?.hash,
+  );
+}
+
+function workspaceArchitectureGraphLocalUnsaved(graph) {
+  return Boolean(
+    graph?.localUnsaved
+      || graph?.local_unsaved
+      || graph?.dirty
+      || graph?.syncState === "local_unsaved"
+      || graph?.sync_state === "local_unsaved",
+  );
 }
 
 function workspaceArchitectureGraphCloudRef(graph) {
   const cloudGraph = graph?.cloudGraph || graph?.cloud_graph || graph;
-  const graphId = workspaceArchitectureGraphId(cloudGraph) || workspaceArchitectureGraphId(graph);
+  const graphId = workspaceArchitectureGraphCloudId(cloudGraph) || workspaceArchitectureGraphCloudId(graph);
   if (!graphId) return null;
+  const contentHash = workspaceArchitectureGraphContentHash(cloudGraph) || workspaceArchitectureGraphContentHash(graph);
+  const assetId = graphText(cloudGraph?.assetId || cloudGraph?.asset_id || graph?.assetId || graph?.asset_id);
   return {
     id: graphId,
     architectureId: graphId,
     architecture_id: graphId,
-    contentHash: workspaceArchitectureGraphContentHash(cloudGraph) || workspaceArchitectureGraphContentHash(graph),
-    content_hash: workspaceArchitectureGraphContentHash(cloudGraph) || workspaceArchitectureGraphContentHash(graph),
-    contentRevision: graphText(
-      cloudGraph?.contentRevision
-        || cloudGraph?.content_revision
-        || graph?.contentRevision
-        || graph?.content_revision,
-    ),
+    graphId,
+    graph_id: graphId,
+    docId: graphId,
+    doc_id: graphId,
+    contentHash,
+    content_hash: contentHash,
+    contentRevision: contentHash,
+    content_revision: contentHash,
+    ...(assetId ? {
+      assetId,
+      asset_id: assetId,
+    } : {}),
+    blobId: graphText(cloudGraph?.blobId || cloudGraph?.blob_id || graph?.blobId || graph?.blob_id),
+    blob_id: graphText(cloudGraph?.blob_id || cloudGraph?.blobId || graph?.blob_id || graph?.blobId),
+    sha256: graphText(cloudGraph?.sha256 || graph?.sha256),
+    sourceFormat: graphText(cloudGraph?.sourceFormat || cloudGraph?.source_format || graph?.sourceFormat || graph?.source_format, "eraserDsl"),
+    source_format: graphText(cloudGraph?.source_format || cloudGraph?.sourceFormat || graph?.source_format || graph?.sourceFormat, "eraserDsl"),
   };
 }
 
 function workspaceArchitectureGraphNeedsCloudHydration(graph) {
-  return Boolean(graph?.cloudOnly || graph?.cloudNeedsHydration || graph?.cloud_needs_hydration);
+  if (workspaceArchitectureGraphLocalUnsaved(graph)) return false;
+  return Boolean(
+    graph?.cloudOnly
+      || graph?.cloud_only
+      || graph?.cloudNeedsHydration
+      || graph?.cloud_needs_hydration
+      || graph?.localAvailable === false
+      || graph?.local_available === false
+      || (graph?.cloudAvailable && graph?.hydrated === false),
+  );
 }
 
 function workspaceArchitectureHydrationKey(repoPath, ref) {
   return [
     workspaceArchitectureRepoKey(repoPath),
-    graphText(ref?.id || ref?.architectureId || ref?.architecture_id),
-    graphText(ref?.contentHash || ref?.content_hash || ref?.contentRevision || ref?.content_revision),
+    graphText(ref?.architectureId || ref?.architecture_id || ref?.graphId || ref?.graph_id || ref?.docId || ref?.doc_id || ref?.id),
+    graphText(ref?.contentHash || ref?.content_hash || ref?.contentRevision || ref?.content_revision || ref?.syncContentHash || ref?.sync_content_hash),
   ].join("::");
 }
 
-function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs) {
+function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs, options = {}) {
   const merged = new Map();
   jsonArray(localGraphs).forEach((graph) => {
     const graphId = workspaceArchitectureGraphId(graph);
@@ -8216,20 +8534,30 @@ function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs) {
       cloudNeedsHydration: false,
       hydrated: true,
       localAvailable: true,
+      localUnsaved: false,
     });
   });
 
+  const cloudAware = Boolean(options.cloudAware);
+  const seenCloudGraphIds = new Set();
   jsonArray(cloudGraphs).forEach((cloudGraph) => {
     const graphId = workspaceArchitectureGraphId(cloudGraph);
     if (!graphId) return;
+    seenCloudGraphIds.add(graphId);
     const existing = merged.get(graphId);
     const cloudHash = workspaceArchitectureGraphContentHash(cloudGraph);
     const localHash = workspaceArchitectureGraphContentHash(existing);
     const cloudUpdatedMs = workspaceArchitectureGraphUpdatedMs(cloudGraph);
     const localUpdatedMs = workspaceArchitectureGraphUpdatedMs(existing);
+    const hashMismatch = Boolean(cloudHash && localHash && cloudHash !== localHash);
     const cloudNewer = !existing
-      || (cloudUpdatedMs && localUpdatedMs && cloudUpdatedMs > localUpdatedMs)
-      || (cloudHash && localHash && cloudHash !== localHash);
+      || (hashMismatch && cloudUpdatedMs && localUpdatedMs && cloudUpdatedMs > localUpdatedMs)
+      || (cloudHash && !localHash);
+    const localUnsaved = Boolean(
+      existing
+        && hashMismatch
+        && !cloudNewer,
+    );
     if (!existing) {
       merged.set(graphId, {
         ...cloudGraph,
@@ -8240,6 +8568,7 @@ function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs) {
         cloudOnly: true,
         hydrated: false,
         localAvailable: false,
+        localUnsaved: false,
       });
       return;
     }
@@ -8253,12 +8582,27 @@ function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs) {
       cloudAvailable: true,
       cloudContentHash: cloudHash,
       cloudGraph,
-      cloudNeedsHydration: cloudNewer,
+      cloudNeedsHydration: !localUnsaved && cloudNewer,
       cloudUpdatedAt: cloudGraph.updatedAt || cloudGraph.updated_at || "",
-      hydrated: !cloudNewer,
+      hydrated: localUnsaved || !cloudNewer,
       localAvailable: true,
+      localUnsaved,
+      syncState: localUnsaved ? "local_unsaved" : existing.syncState,
+      sync_state: localUnsaved ? "local_unsaved" : existing.sync_state,
     });
   });
+
+  if (cloudAware) {
+    merged.forEach((graph, graphId) => {
+      if (seenCloudGraphIds.has(graphId) || graph?.cloudAvailable) return;
+      merged.set(graphId, {
+        ...graph,
+        localUnsaved: true,
+        syncState: "local_unsaved",
+        sync_state: "local_unsaved",
+      });
+    });
+  }
 
   return Array.from(merged.values()).sort((left, right) => (
     workspaceArchitectureGraphUpdatedMs(right) - workspaceArchitectureGraphUpdatedMs(left)
@@ -8579,10 +8923,14 @@ function findWorkspaceByEffectiveRoot(
       return false;
     }
 
-    const candidateRoot = getWorkspaceRootDirectory(workspaceSettings, workspaceId)
-      || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
+    const candidateRoot = workspaceCatalogEntryRootDirectory(
+      workspace,
+      workspaceSettings,
+      defaultWorkingDirectory,
+    );
+    const candidateIdentity = workspace.rootIdentity || getWorkspaceRootIdentity(candidateRoot);
 
-    return getWorkspaceRootIdentity(candidateRoot) === targetIdentity;
+    return candidateIdentity === targetIdentity;
   }) || null;
 }
 
@@ -8981,6 +9329,7 @@ export default function App() {
   const [audioDownloadProgress, setAudioDownloadProgress] = useState(null);
   const [audioWidgetVisible, setAudioWidgetVisible] = useState(false);
   const [workspaces, setWorkspaces] = useState([]);
+  const [workspaceCatalog, setWorkspaceCatalog] = useState([]);
   const [workspaceGraphState, setWorkspaceGraphState] = useState({});
   const [workspaceArchitectureTerminalActivity, setWorkspaceArchitectureTerminalActivity] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
@@ -9140,14 +9489,11 @@ export default function App() {
   const workspaceGraphStateRef = useRef(workspaceGraphState);
   const workspaceArchitectureScanInFlightRef = useRef(new Set());
   const workspaceArchitectureGraphListInFlightRef = useRef(new Set());
-  // repoKey -> signature of the last graph list pushed to cloud. Prevents
-  // re-pushing identical snapshots on every list refresh, which the server
-  // would echo back as wake events and create a refresh/flicker loop.
-  const architectureCloudSyncSignatureRef = useRef({});
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const mainWindowFocusedRef = useRef(mainWindowFocused);
   const workspacesRef = useRef(workspaces);
+  const workspaceCatalogRef = useRef(workspaceCatalog);
   const workspaceSettingsRef = useRef(workspaceSettings);
   const defaultWorkingDirectoryRef = useRef(defaultWorkingDirectory);
   const workspaceThreadsRef = useRef(workspaceThreads);
@@ -10102,21 +10448,10 @@ export default function App() {
       .then(([result, cloudResult]) => {
         const localGraphs = Array.isArray(result?.graphs) ? result.graphs : [];
         const cloudGraphs = jsonArray(cloudResult?.graphs);
-        const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
+        const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs, {
+          cloudAware: !options.localOnly && Boolean(cloudResult),
+        });
         const completedAt = Date.now();
-        if (!options.localOnly && localGraphs.length) {
-          const syncSignature = workspaceArchitectureCloudSyncSignature(localGraphs);
-          if (architectureCloudSyncSignatureRef.current[repoKey] !== syncSignature) {
-            architectureCloudSyncSignatureRef.current[repoKey] = syncSignature;
-            invoke("cloud_mcp_sync_architectures", {
-              graphs: localGraphs,
-              reason: options.reason || "architecture_graph_list_sync",
-              repoPath: safeRepoPath,
-              workspaceId: safeWorkspaceId,
-              workspaceName,
-            }).catch(() => {});
-          }
-        }
         setWorkspaceGraphState((current) => {
           const previous = current[stateKey] || {};
           const previousLists = previous.architectureGraphLists || {};
@@ -10361,7 +10696,7 @@ export default function App() {
     const uniqueRefs = [];
     const seenKeys = new Set();
     jsonArray(refs).forEach((ref) => {
-      const graphId = graphText(ref?.id || ref?.architectureId || ref?.architecture_id);
+      const graphId = graphText(ref?.architectureId || ref?.architecture_id || ref?.graphId || ref?.graph_id || ref?.docId || ref?.doc_id || ref?.id);
       if (!graphId) return;
       const key = workspaceArchitectureHydrationKey(safeRepoPath, ref);
       if (!key || seenKeys.has(key) || architectureHubHydratedRefsRef.current.has(key) || architectureHubHydratingRefsRef.current.has(key)) {
@@ -10390,7 +10725,7 @@ export default function App() {
 
     for (let index = 0; index < uniqueRefs.length; index += 1) {
       const { key, ref } = uniqueRefs[index];
-      const graphId = graphText(ref?.id || ref?.architectureId || ref?.architecture_id, `graph ${index + 1}`);
+      const graphId = graphText(ref?.architectureId || ref?.architecture_id || ref?.graphId || ref?.graph_id || ref?.docId || ref?.doc_id || ref?.id, `graph ${index + 1}`);
       if (architectureHubHydrationRunRef.current === runId) {
         setArchitectureHubHydration({
           error: "",
@@ -10412,10 +10747,43 @@ export default function App() {
             scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
           } : {}),
         });
-        hydrated.push(...jsonArray(result?.items));
-        architectureHubHydratedRefsRef.current.add(key);
+        const resultItems = jsonArray(result?.items);
+        const resultSkipped = jsonArray(result?.skipped);
+        const resultFailures = jsonArray(result?.failed).concat(jsonArray(result?.missing));
+        if (resultFailures.length || (!resultItems.length && !resultSkipped.length)) {
+          const firstFailure = resultFailures[0];
+          throw new Error(graphErrorText(
+            firstFailure?.error
+              || firstFailure?.message
+              || firstFailure,
+            `Unable to hydrate ${graphId}.`,
+          ));
+        }
+        hydrated.push(...resultItems);
+        if (resultItems.length) {
+          architectureHubHydratedRefsRef.current.add(key);
+        }
       } catch (error) {
-        failed.push(getErrorMessage(error, `Unable to hydrate ${graphId}.`));
+        const message = getErrorMessage(error, `Unable to hydrate ${graphId}.`);
+        const notFound = message.toLowerCase().includes("not_found")
+          || message.toLowerCase().includes("not found");
+        let localGraphFound = false;
+        if (notFound) {
+          try {
+            const localResult = await invoke("architecture_graphs_list", { repoPath: safeRepoPath });
+            const localGraph = jsonArray(localResult?.graphs)
+              .find((graph) => workspaceArchitectureGraphId(graph) === graphId);
+            if (localGraph) {
+              hydrated.push(localGraph);
+              localGraphFound = true;
+            }
+          } catch {
+            localGraphFound = false;
+          }
+        }
+        if (!localGraphFound && !notFound) {
+          failed.push(message);
+        }
       } finally {
         architectureHubHydratingRefsRef.current.delete(key);
       }
@@ -10482,7 +10850,11 @@ export default function App() {
     const repoKey = workspaceArchitectureRepoKey(safeRepoPath);
     const existingEntry = (architectureHubGraphStateRef.current.architectureGraphLists || {})[repoKey] || null;
     const existingGraphs = Array.isArray(existingEntry?.graphs) ? existingEntry.graphs : [];
-    if (!options.refresh && existingEntry?.state === "ready") {
+    if (
+      !options.refresh
+      && existingEntry?.state === "ready"
+      && (existingGraphs.length || options.localOnly)
+    ) {
       return Promise.resolve(existingGraphs);
     }
     // Error entries are cached too: without a retry-after window, every
@@ -10535,31 +10907,37 @@ export default function App() {
       .then(([result, cloudResult]) => {
         const localGraphs = jsonArray(result?.graphs);
         const cloudGraphs = jsonArray(cloudResult?.graphs);
-        const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
+        const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs, {
+          cloudAware: !options.localOnly && Boolean(cloudResult),
+        });
+        const cloudHydrateResult = cloudResult?.hydrateResult || cloudResult?.hydrate_result || {};
+        const localGraphIds = new Set(
+          localGraphs
+            .map(workspaceArchitectureGraphId)
+            .filter(Boolean),
+        );
+        const cloudRemoteCount = Number(cloudResult?.remoteGraphCount ?? cloudResult?.remote_graph_count ?? cloudGraphs.length);
+        const hydrateRequested = Number(cloudHydrateResult?.requestedCount ?? cloudHydrateResult?.requested_count ?? 0);
+        const hydrateFailed = Number(cloudHydrateResult?.failedCount ?? cloudHydrateResult?.failed_count ?? 0);
+        const emptyCloudAwareResult = !options.localOnly
+          && !graphs.length
+          && (cloudRemoteCount > 0 || hydrateRequested > 0 || hydrateFailed > 0);
         if (!options.localOnly) {
-          const hydrateRefs = graphs
+          const remoteHydrateSources = [
+            ...jsonArray(cloudResult?.remoteGraphs),
+            ...jsonArray(cloudResult?.remote_graphs),
+          ];
+          const remoteCandidates = remoteHydrateSources.length ? remoteHydrateSources : cloudGraphs;
+          const hydrateRefs = remoteCandidates
+            .filter((graph) => {
+              const graphId = workspaceArchitectureGraphId(graph);
+              return graphId && !localGraphIds.has(graphId);
+            })
             .filter(workspaceArchitectureGraphNeedsCloudHydration)
             .map(workspaceArchitectureGraphCloudRef)
             .filter(Boolean);
           if (hydrateRefs.length) {
             void hydrateArchitectureHubGraphRefs(safeRepoPath, hydrateRefs, context);
-          }
-        }
-        if (!options.localOnly && localGraphs.length && context.workspaceId) {
-          const syncSignature = workspaceArchitectureCloudSyncSignature(localGraphs);
-          if (architectureCloudSyncSignatureRef.current[repoKey] !== syncSignature) {
-            architectureCloudSyncSignatureRef.current[repoKey] = syncSignature;
-            invoke("cloud_mcp_sync_architectures", {
-              graphs: localGraphs,
-              reason: options.reason || "architecture_hub_graph_list_sync",
-              repoPath: safeRepoPath,
-              workspaceId: context.workspaceId,
-              workspaceName: context.workspaceName,
-              ...(context.scopeRepoId ? {
-                scopeRepoId: context.scopeRepoId,
-                scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
-              } : {}),
-            }).catch(() => {});
           }
         }
         setArchitectureHubGraphState((current) => ({
@@ -10572,7 +10950,7 @@ export default function App() {
               navTree: graphs,
               repoPath: safeRepoPath,
               requestedAt,
-              state: "ready",
+              state: emptyCloudAwareResult ? "loading" : "ready",
               updatedAt: Date.now(),
             }),
           },
@@ -10605,6 +10983,37 @@ export default function App() {
     hydrateArchitectureHubGraphRefs,
     refreshWorkspaceArchitectureGraphList,
     resolveArchitectureHubSyncContext,
+  ]);
+
+  useEffect(() => {
+    if (authState !== "authenticated" || visibleView !== "architectures") {
+      return undefined;
+    }
+    let cancelled = false;
+    void refreshArchitectureHubCatalog({ localOnly: false, refresh: true }).then((catalog) => {
+      if (cancelled || !catalog || typeof catalog !== "object") return;
+      const repoPath = graphText(
+        architectureHubGraphStateRef.current.architectureSelectedRepoPath
+          || catalog.global?.path
+          || catalog.global?.rootDirectory
+          || catalog.global?.root_directory,
+      );
+      if (!repoPath) return;
+      void refreshArchitectureHubGraphList(repoPath, {
+        localOnly: false,
+        refresh: true,
+        reason: "architecture_hub_visible_refresh",
+        silent: true,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authState,
+    refreshArchitectureHubCatalog,
+    refreshArchitectureHubGraphList,
+    visibleView,
   ]);
 
   const architectureHubGraphLists = useMemo(() => {
@@ -11220,6 +11629,10 @@ export default function App() {
   useEffect(() => {
     workspacesRef.current = workspaces;
   }, [workspaces]);
+
+  useEffect(() => {
+    workspaceCatalogRef.current = workspaceCatalog;
+  }, [workspaceCatalog]);
 
   useEffect(() => {
     let cancelled = false;
@@ -11858,6 +12271,10 @@ export default function App() {
   }, []);
   const selectedWorkspace = findWorkspaceById(workspaces, selectedWorkspaceId);
   const activatedWorkspace = findWorkspaceById(workspaces, activatedWorkspaceId);
+  const archivedWorkspaces = useMemo(
+    () => archivedWorkspaceCatalog(workspaceCatalog),
+    [workspaceCatalog],
+  );
   const selectedLoopspace = findLoopspaceById(loopspaces, selectedLoopspaceId);
 
   const applyWindowFrameState = useCallback((nextFrameState) => {
@@ -11908,6 +12325,9 @@ export default function App() {
     setViewMotion("entered");
     setWorkspaceState("idle");
     setWorkspaces([]);
+    setWorkspaceCatalog([]);
+    workspacesRef.current = [];
+    workspaceCatalogRef.current = [];
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     activatedWorkspaceIdRef.current = "";
@@ -13265,34 +13685,44 @@ export default function App() {
 
   const deleteWorkspaceFromForge = useCallback(async (workspaceId) => {
     const targetWorkspaceId = String(workspaceId || "").trim();
-    const targetWorkspace = findWorkspaceById(workspacesRef.current, targetWorkspaceId);
+    const targetWorkspace = findWorkspaceById(workspaceCatalogRef.current, targetWorkspaceId)
+      || findWorkspaceById(workspacesRef.current, targetWorkspaceId);
 
     if (!targetWorkspaceId || !targetWorkspace) {
       setWorkspaceSettingsError("Choose a workspace before deleting it.");
+      setWorkspaceError("Choose a workspace before deleting it.");
       return;
     }
 
     if (workspaceDeactivationInFlightRef.current || workspaceSettingsState === "deleting") {
       setWorkspaceSettingsError("Workspace delete is already running.");
+      setWorkspaceError("Workspace delete is already running.");
       return;
     }
 
     const workspaceName = String(targetWorkspace.name || targetWorkspaceId).trim();
-    const repoPath = getWorkspaceRootDirectory(workspaceSettingsRef.current, targetWorkspaceId)
-      || defaultWorkingDirectoryRef.current;
+    const repoPath = workspaceCatalogEntryRootDirectory(
+      targetWorkspace,
+      workspaceSettingsRef.current,
+      defaultWorkingDirectoryRef.current,
+    );
     if (!repoPath) {
       setWorkspaceSettingsError("Workspace root is missing. Choose a root before deleting this workspace.");
+      setWorkspaceError("Workspace root is missing. Choose a root before deleting this workspace.");
       return;
     }
 
     if (workspaceDeleteConfirmId !== targetWorkspaceId) {
       setWorkspaceDeleteConfirmId(targetWorkspaceId);
       setWorkspaceSettingsError("");
+      setWorkspaceError("");
       setWorkspaceSettingsMessage(`Click "Confirm delete" to remove "${workspaceName}" from Diff Forge. Project files stay on disk.`);
       return;
     }
 
+    setWorkspaceSettingsState("deleting");
     setWorkspaceSettingsError("");
+    setWorkspaceError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceDeleteConfirmId("");
     clearPreparedWorkspaceTerminals(targetWorkspaceId);
@@ -13307,15 +13737,18 @@ export default function App() {
     // sync outbox, so it survives offline stretches and background mode, and
     // the Rust side filters the id out of stale lists/broadcasts until the
     // delete drains.
-    const nextWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+    const nextCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
       .filter((workspace) => workspace.id !== targetWorkspaceId);
+    const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+    workspaceCatalogRef.current = nextCatalog;
+    setWorkspaceCatalog(nextCatalog);
     workspacesRef.current = nextWorkspaces;
     setWorkspaces(nextWorkspaces);
 
     const deleteScopeKey = activeAccountScopeKey;
     const localCatalogStorePromise = invoke("local_workspaces_store", {
       scopeKey: deleteScopeKey,
-      workspaces: nextWorkspaces,
+      workspaces: nextCatalog,
     });
 
     const nextSettings = { ...(workspaceSettingsRef.current || {}) };
@@ -13479,6 +13912,269 @@ export default function App() {
     showView,
     updateWorkspaceLifecycleSettings,
     workspaceDeleteConfirmId,
+    workspaceSettingsState,
+  ]);
+
+  const archiveWorkspaceLocally = useCallback(async (workspaceId) => {
+    const targetWorkspaceId = String(workspaceId || "").trim();
+    const targetWorkspace = findWorkspaceById(workspaceCatalogRef.current, targetWorkspaceId)
+      || findWorkspaceById(workspacesRef.current, targetWorkspaceId);
+
+    if (!targetWorkspaceId || !targetWorkspace) {
+      setWorkspaceSettingsError("Choose a workspace before archiving it.");
+      return;
+    }
+
+    if (
+      workspaceDeactivationInFlightRef.current
+      || ["archiving", "deleting", "restoring", "saving"].includes(workspaceSettingsState)
+    ) {
+      setWorkspaceSettingsError("Another workspace action is already running.");
+      return;
+    }
+
+    const repoPath = workspaceCatalogEntryRootDirectory(
+      targetWorkspace,
+      workspaceSettingsRef.current,
+      defaultWorkingDirectoryRef.current,
+    );
+    if (!repoPath) {
+      setWorkspaceSettingsError("Workspace root is missing. Choose a root before archiving this workspace.");
+      return;
+    }
+
+    setWorkspaceSettingsState("archiving");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+    setWorkspaceError("");
+    clearPreparedWorkspaceTerminals(targetWorkspaceId);
+    workspaceAgentLaunchKeyRef.current = "";
+    workspaceAgentBatchInFlightKeyRef.current = "";
+    workspaceAgentBatchStartedSessionKeysRef.current.clear();
+    workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+    setWorkspaceAgentBatchSentLaunchKey("");
+
+    const warnings = [];
+    try {
+      if (
+        activatedWorkspaceIdRef.current === targetWorkspaceId
+        || normalizeEnabledWorkspaceIds(workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds)
+          .includes(targetWorkspaceId)
+      ) {
+        await withTimeout(
+          invoke("deactivate_workspace_runtime", {
+            repoPath,
+            reason: "workspace_archive",
+            workspaceId: targetWorkspaceId,
+          }),
+          WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS,
+          "Workspace runtime cleanup timed out.",
+        );
+        const runtimeKey = workspaceRuntimeActivationKey(targetWorkspaceId, repoPath);
+        if (runtimeKey) {
+          sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
+        }
+      }
+    } catch (error) {
+      warnings.push(getErrorMessage(error, "Unable to stop workspace runtime cleanly."));
+    }
+
+    const archivedAtIso = new Date().toISOString();
+    const nextCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
+      .map((workspace) => (
+        workspace.id === targetWorkspaceId
+          ? {
+            ...workspace,
+            rootDirectory: workspaceCatalogEntryRootDirectory(
+              workspace,
+              workspaceSettingsRef.current,
+              defaultWorkingDirectoryRef.current,
+            ),
+            rootIdentity: workspace.rootIdentity || getWorkspaceRootIdentity(
+              workspaceCatalogEntryRootDirectory(
+                workspace,
+                workspaceSettingsRef.current,
+                defaultWorkingDirectoryRef.current,
+              ),
+            ),
+            localArchived: true,
+            localArchivedAt: archivedAtIso,
+          }
+          : workspace
+      ));
+    const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+
+    workspaceCatalogRef.current = nextCatalog;
+    setWorkspaceCatalog(nextCatalog);
+    workspacesRef.current = nextWorkspaces;
+    setWorkspaces(nextWorkspaces);
+
+    const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+    const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+      previousLifecycleSettings.enabledWorkspaceIds,
+    ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
+    updateWorkspaceLifecycleSettings({
+      defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
+        ? ""
+        : previousLifecycleSettings.defaultWorkspaceId,
+      enabledWorkspaceIds: nextEnabledWorkspaceIds,
+    });
+
+    if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
+      const nextActivatedWorkspaceId = nextEnabledWorkspaceIds
+        .map((enabledWorkspaceId) => findWorkspaceById(nextWorkspaces, enabledWorkspaceId))
+        .find(Boolean)?.id || "";
+      activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
+      setActivatedWorkspaceId(nextActivatedWorkspaceId);
+    }
+
+    if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
+      selectedWorkspaceIdRef.current = "";
+      setSelectedWorkspaceId("");
+    }
+
+    setWorkspaceSettingsModalId("");
+    setWorkspaceDeleteConfirmId("");
+    setWorkspaceCreateModalOpen(false);
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      telemetrySource: "workspace_archived",
+      telemetryWorkspaceId: targetWorkspaceId,
+    });
+
+    try {
+      await invoke("local_workspaces_store", {
+        scopeKey: activeAccountScopeKey,
+        workspaces: nextCatalog,
+      });
+      setWorkspaceSettingsMessage(warnings.length
+        ? `Workspace archived. Runtime warning: ${warnings.join(" ")}`
+        : "Workspace archived locally.");
+    } catch (error) {
+      const message = getErrorMessage(error, "Workspace was archived in this window, but the local catalog could not be saved.");
+      setWorkspaceSettingsError(message);
+      setWorkspaceError(message);
+    } finally {
+      setWorkspaceSettingsState("idle");
+      workspaceTerminalsSyncKeyRef.current = "";
+      workspaceMcpSyncKeyRef.current = "";
+    }
+  }, [
+    activeAccountScopeKey,
+    clearPreparedWorkspaceTerminals,
+    setWorkspaceAgentBatchSentLaunchKey,
+    showView,
+    updateWorkspaceLifecycleSettings,
+    workspaceSettingsState,
+  ]);
+
+  const restoreArchivedWorkspace = useCallback(async (workspaceId) => {
+    const targetWorkspaceId = String(workspaceId || "").trim();
+    const targetWorkspace = findWorkspaceById(workspaceCatalogRef.current, targetWorkspaceId);
+
+    if (!targetWorkspaceId || !targetWorkspace || !workspaceIsLocallyArchived(targetWorkspace)) {
+      setWorkspaceError("Choose an archived workspace to restore.");
+      return;
+    }
+
+    if (
+      workspaceDeactivationInFlightRef.current
+      || ["archiving", "deleting", "restoring", "saving"].includes(workspaceSettingsState)
+    ) {
+      setWorkspaceError("Another workspace action is already running.");
+      return;
+    }
+
+    const requestedRoot = workspaceCatalogEntryRootDirectory(
+      targetWorkspace,
+      workspaceSettingsRef.current,
+      defaultWorkingDirectoryRef.current,
+    );
+    if (!requestedRoot) {
+      setWorkspaceError("Workspace root is missing. Delete this archived workspace or recreate it with a directory.");
+      return;
+    }
+
+    setWorkspaceSettingsState("restoring");
+    setWorkspaceError("");
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+
+    try {
+      const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
+      const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
+
+      if (!rootDirectory) {
+        throw new Error("Workspace root directory was not returned by validation.");
+      }
+
+      const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+        workspaceCatalogRef.current,
+        workspaceSettingsRef.current,
+        rootDirectory,
+        defaultWorkingDirectoryRef.current,
+        targetWorkspaceId,
+      );
+
+      if (duplicateWorkspace) {
+        throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
+      }
+
+      const restoredAtIso = new Date().toISOString();
+      const restoredWorkspace = {
+        ...targetWorkspace,
+        rootDirectory,
+        rootIdentity,
+        localArchived: false,
+        localArchivedAt: "",
+        locallyArchived: false,
+        locallyArchivedAt: "",
+        updatedAt: restoredAtIso,
+      };
+      const nextCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
+        .map((workspace) => (workspace.id === targetWorkspaceId ? restoredWorkspace : workspace));
+      const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+      const rootWasEmptyAtSelection = Boolean(normalizedRoot?.emptyDirectory);
+      const rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+      const nextSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, targetWorkspaceId, {
+        rootDirectory,
+        rootWasEmptyAtSelection,
+        rootGitRepository,
+      });
+
+      workspaceSettingsRef.current = nextSettings;
+      await persistWorkspaceSettings(nextSettings);
+      setWorkspaceSettings(nextSettings);
+      workspaceCatalogRef.current = nextCatalog;
+      setWorkspaceCatalog(nextCatalog);
+      workspacesRef.current = nextWorkspaces;
+      setWorkspaces(nextWorkspaces);
+      await invoke("local_workspaces_store", {
+        scopeKey: activeAccountScopeKey,
+        workspaces: nextCatalog,
+      });
+
+      setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+      setSelectedLoopspaceId("");
+      setLoopspaceCreatePanelOpen(false);
+      setSelectedWorkspaceId(targetWorkspaceId);
+      setWorkspaceSettingsModalId(targetWorkspaceId);
+      setWorkspaceCreateModalOpen(false);
+      setWorkspaceSettingsMessage("Workspace restored.");
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        telemetrySource: "workspace_restored",
+        telemetryWorkspaceId: targetWorkspaceId,
+      });
+      workspaceTerminalsSyncKeyRef.current = "";
+      workspaceMcpSyncKeyRef.current = "";
+    } catch (error) {
+      setWorkspaceError(getErrorMessage(error, "Unable to restore workspace."));
+    } finally {
+      setWorkspaceSettingsState("idle");
+    }
+  }, [
+    activeAccountScopeKey,
+    showView,
     workspaceSettingsState,
   ]);
 
@@ -14319,12 +15015,19 @@ export default function App() {
       const local = await invoke("local_workspaces_load", { scopeKey });
       localItems = Array.isArray(local?.workspaces) ? local.workspaces : [];
     } catch {
-      localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
+      localItems = Array.isArray(workspaceCatalogRef.current)
+        ? workspaceCatalogRef.current
+        : workspacesRef.current;
     }
-    localItems = localItems
-      .map(normalizeCatalogWorkspaceEntry)
-      .filter((workspace) => workspace && !workspace.pendingDelete);
-    applyLoadedWorkspaces(localItems);
+    const nextCatalog = normalizeWorkspaceCatalog(
+      localItems,
+      workspaceSettingsRef.current,
+      defaultWorkingDirectoryRef.current,
+    ).filter((workspace) => workspace && !workspace.pendingDelete);
+    const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+    workspaceCatalogRef.current = nextCatalog;
+    setWorkspaceCatalog(nextCatalog);
+    applyLoadedWorkspaces(nextWorkspaces);
     setWorkspaceSyncState("idle");
     setWorkspaceListHydrated(true);
   }, [activeAccountScopeKey, expireDesktopSession]);
@@ -14347,6 +15050,8 @@ export default function App() {
 
     setWorkspaces([]);
     workspacesRef.current = [];
+    setWorkspaceCatalog([]);
+    workspaceCatalogRef.current = [];
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     activatedWorkspaceIdRef.current = "";
@@ -14432,6 +15137,7 @@ export default function App() {
 
     setWorkspaceCreateModalOpen(false);
     setWorkspaceError("");
+    setWorkspaceDeleteConfirmId("");
     // Closing the create panel lands on the neutral no-workspace-selected
     // view instead of jumping back into the previously selected workspace.
     setSelectedWorkspaceId("");
@@ -14470,6 +15176,7 @@ export default function App() {
     try {
       const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
       const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
       const rootWasEmptyAtSelection = Boolean(normalizedRoot?.emptyDirectory);
       const rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
 
@@ -14478,7 +15185,7 @@ export default function App() {
       }
 
       const duplicateWorkspace = findWorkspaceByEffectiveRoot(
-        workspacesRef.current,
+        workspaceCatalogRef.current,
         workspaceSettingsRef.current,
         rootDirectory,
         defaultWorkingDirectoryRef.current,
@@ -14496,14 +15203,16 @@ export default function App() {
         name,
         createdAt: nowIso,
         updatedAt: nowIso,
+        rootDirectory,
+        rootIdentity,
+        localArchived: false,
+        localArchivedAt: "",
         syncState: "pending",
       };
 
-      const existingWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
-      const nextWorkspaces = [
-        ...existingWorkspaces.filter((item) => item.id !== workspace.id),
-        workspace,
-      ];
+      const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
+      const nextCatalog = updateCatalogWorkspace(existingCatalog, workspace);
+      const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
       const terminalRoles = Array.isArray(requestedTerminalRoles) && requestedTerminalRoles.length
         ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
         : null;
@@ -14524,6 +15233,8 @@ export default function App() {
       workspaceSettingsRef.current = nextWorkspaceSettings;
       persistWorkspaceSettings(nextWorkspaceSettings);
       setWorkspaceSettings(nextWorkspaceSettings);
+      workspaceCatalogRef.current = nextCatalog;
+      setWorkspaceCatalog(nextCatalog);
       workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
       setSpaceMode(APP_SPACE_MODE_WORKSPACES);
@@ -14542,7 +15253,7 @@ export default function App() {
       setWorkspaceSyncState("idle");
 
       const scopeKey = activeAccountScopeKey;
-      void invoke("local_workspaces_store", { scopeKey, workspaces: nextWorkspaces }).catch(() => {});
+      void invoke("local_workspaces_store", { scopeKey, workspaces: nextCatalog }).catch(() => {});
       void invoke("coordination_bootstrap_workspace", {
         repoPath: rootDirectory,
         agentSessionMode: AGENT_SESSION_MODE_COORDINATED,
@@ -14666,7 +15377,7 @@ export default function App() {
       const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
       const effectiveRootDirectory = rootDirectory || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
       const duplicateWorkspace = findWorkspaceByEffectiveRoot(
-        workspacesRef.current,
+        workspaceCatalogRef.current,
         workspaceSettingsRef.current,
         effectiveRootDirectory,
         defaultWorkingDirectoryRef.current,
@@ -14816,14 +15527,17 @@ export default function App() {
           updatedAt: renamedAtIso,
           syncState: "pending",
         };
-        const renamedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-          .map((workspace) => (workspace.id === nextWorkspace.id ? nextWorkspace : workspace));
+        const renamedCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
+          .map((workspace) => (workspace.id === nextWorkspace.id ? { ...workspace, ...nextWorkspace } : workspace));
+        const renamedWorkspaces = visibleWorkspaceCatalog(renamedCatalog);
+        workspaceCatalogRef.current = renamedCatalog;
+        setWorkspaceCatalog(renamedCatalog);
         workspacesRef.current = renamedWorkspaces;
         setWorkspaces(renamedWorkspaces);
         const renameScopeKey = activeAccountScopeKey;
         void invoke("local_workspaces_store", {
           scopeKey: renameScopeKey,
-          workspaces: renamedWorkspaces,
+          workspaces: renamedCatalog,
         }).catch(() => {});
         workspaceTerminalsSyncKeyRef.current = "";
       }
@@ -16051,11 +16765,14 @@ export default function App() {
     const grouped = new Map();
 
     const findPresenceWorkspace = (session) => presenceWorkspaces.find((workspace) => (
-      (session.workspaceId && workspace.workspaceId === session.workspaceId)
+      workspace
+      && (
+        (session.workspaceId && workspace.workspaceId === session.workspaceId)
       || (
         session.workingDirectory
         && workspace.repoPath
         && cleanWorkspaceRootDirectory(workspace.repoPath) === cleanWorkspaceRootDirectory(session.workingDirectory)
+      )
       )
     )) || null;
 
@@ -16881,14 +17598,16 @@ export default function App() {
           pendingActivationWorkspaceId: null,
           pendingActivationReason: null,
           pendingActivationAtMs: null,
+          pendingActivationSelectWorkspace: null,
+          pendingActivationWorkspaceTab: null,
         },
       }).catch(() => {});
-      activateWorkspace(pendingWorkspaceId, "remote_control_resume");
+      requestWorkspaceActivation(pendingWorkspaceId, "remote_control_resume");
     }).catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [activateWorkspace, authState, workspaceState]);
+  }, [authState, requestWorkspaceActivation, workspaceState]);
 
   useEffect(() => {
     const connection = cloudSyncStatus?.connection || "";
@@ -17025,6 +17744,9 @@ export default function App() {
 
     setWorkspaceState("idle");
     setWorkspaces([]);
+    setWorkspaceCatalog([]);
+    workspacesRef.current = [];
+    workspaceCatalogRef.current = [];
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
     activatedWorkspaceIdRef.current = "";
@@ -18522,7 +19244,7 @@ export default function App() {
       });
     };
 
-    workspaces.forEach((workspace, workspaceIndex) => {
+    visibleWorkspaceCatalog(workspaces).forEach((workspace, workspaceIndex) => {
       const workspaceId = String(workspace?.id || "").trim();
       if (!workspaceId) {
         return;
@@ -20002,11 +20724,14 @@ export default function App() {
   ]);
   const cloudSqliteResetWorkspace = useMemo(() => {
     const selectedResetWorkspaceId = String(cloudSqliteResetSelectedWorkspaceId || "").trim();
+    const workspaceIdMatches = (workspace, workspaceId) => (
+      String(workspace?.workspaceId || "").trim() === String(workspaceId || "").trim()
+    );
     return (
-      cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === selectedResetWorkspaceId)
-      || cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === selectedWorkspace?.id)
-      || cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === activatedWorkspace?.id)
-      || cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === defaultWorkspace?.id)
+      cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, selectedResetWorkspaceId))
+      || cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, selectedWorkspace?.id))
+      || cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, activatedWorkspace?.id))
+      || cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, defaultWorkspace?.id))
       || cloudSqliteResetWorkspaces[0]
       || null
     );
@@ -20590,9 +21315,11 @@ export default function App() {
       && workspaceDeactivationState.workspaceId === selectedWorkspace.id,
   );
   const isWorkspaceSettingsDeleting = workspaceSettingsState === "deleting";
+  const isWorkspaceSettingsArchiving = workspaceSettingsState === "archiving";
   const isWorkspaceSettingsBusy = workspaceSettingsState === "saving"
     || isWorkspaceSettingsDeactivating
-    || isWorkspaceSettingsDeleting;
+    || isWorkspaceSettingsDeleting
+    || isWorkspaceSettingsArchiving;
   const isWorkspaceDeleteConfirming = Boolean(
     selectedWorkspace && workspaceDeleteConfirmId === selectedWorkspace.id,
   );
@@ -22160,8 +22887,21 @@ export default function App() {
         });
         return;
       }
-      if (normalizedKind === "workspace_activate" || normalizedKind === "activate_workspace") {
-        const activated = activateWorkspace(workspaceId, "remote_control");
+      if ([
+        "workspace_activate",
+        "activate_workspace",
+        "open_workspace",
+        "workspace_open",
+      ].includes(normalizedKind)) {
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const rawShowWindow = event?.show_window ?? event?.showWindow ?? payload.show_window ?? payload.showWindow;
+        const shouldShowWindow = typeof rawShowWindow === "undefined"
+          ? true
+          : remoteCommandBooleanField(event, ["show_window", "showWindow"]);
+        if (shouldShowWindow) {
+          void invoke("app_exit_background").catch(() => {});
+        }
+        const activated = requestWorkspaceActivation(workspaceId, "remote_control_activate");
         if (!activated) {
           await recordRemoteCommandStatus(event, "blocked", "Workspace could not be activated on this desktop.", {
             commandId,
@@ -22177,18 +22917,22 @@ export default function App() {
         const lifecycleDetails = remoteControlWorkspaceLifecycleDetails(workspaceId, true, "state_changed", {
           commandId,
           commandKind,
+          selected: true,
+          selected_workspace_id: workspaceId,
+          selectedWorkspaceId: workspaceId,
+          view: DEFAULT_WORKSPACE_VIEW,
         });
         await recordRemoteCommandStatus(
           event,
           "state_changed",
-          "Workspace activated on this desktop; syncing live state.",
+          "Workspace activated and selected on this desktop; syncing live state.",
           lifecycleDetails,
         );
         completeRemoteControlStateSync(
           event,
           "remote_workspace_activate",
           lifecycleOverride,
-          "Workspace activation synced from this desktop.",
+          "Workspace activation and selection synced from this desktop.",
           lifecycleDetails,
         );
         return;
@@ -22304,9 +23048,30 @@ export default function App() {
         const rawOpenMode = remoteCommandStringField(event, ["open_mode", "openMode", "mode"])
           .trim().toLowerCase();
         const openAction = rawOpenMode === "spawn_count" ? "spawn_count" : "ensure_count";
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const rawShowWindow = event?.show_window ?? event?.showWindow ?? payload.show_window ?? payload.showWindow;
+        const shouldShowWindow = typeof rawShowWindow === "undefined"
+          ? true
+          : remoteCommandBooleanField(event, ["show_window", "showWindow"]);
+        if (shouldShowWindow) {
+          void invoke("app_exit_background").catch(() => {});
+        }
+        const activated = requestWorkspaceActivation(workspaceId, "remote_control_terminal_open");
+        if (!activated) {
+          await recordRemoteCommandStatus(event, "blocked", "Workspace could not be selected before opening terminals.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
         await recordRemoteCommandStatus(event, "running", `Opening coding-agent terminals (${openAction} ${count}).`, {
           commandId,
           commandKind,
+          selected: true,
+          selected_workspace_id: workspaceId,
+          selectedWorkspaceId: workspaceId,
+          view: DEFAULT_WORKSPACE_VIEW,
           workspaceId,
         });
         try {
@@ -22322,6 +23087,10 @@ export default function App() {
             commandId,
             commandKind,
             result: result || null,
+            selected: true,
+            selected_workspace_id: workspaceId,
+            selectedWorkspaceId: workspaceId,
+            view: DEFAULT_WORKSPACE_VIEW,
             workspaceId,
           });
         } catch (error) {
@@ -28127,6 +28896,7 @@ export default function App() {
                             isWorkspaceSurfaceVisible={visibleView === DEFAULT_WORKSPACE_VIEW && runtimeVisible}
                             isWorkspaceRuntimeDeactivating={runtimeIsDeactivating}
                             manageWorkspaceAgents={manageWorkspaceAgents}
+                            onShowWorkspaceTerminals={requestWorkspaceActivation}
                             onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
                             onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
                             onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
@@ -28204,16 +28974,21 @@ export default function App() {
                     {!loopspacesModeActive && workspaceCreateModalOpen && (
                       <WorkspaceCreatePanel
                         agentStatuses={agentStatuses}
+                        archivedWorkspaces={archivedWorkspaces}
                         chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
                         defaultWorkingDirectory={defaultWorkingDirectory}
                         fallbackRole={workspaceTerminalFallbackRole}
+                        onDeleteArchivedWorkspace={deleteWorkspaceFromForge}
                         onClose={closeCreateWorkspaceModal}
+                        onRestoreArchivedWorkspace={restoreArchivedWorkspace}
                         onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
                         roleOptions={WORKSPACE_TERMINAL_ROLE_OPTIONS}
                         rootDraft={newWorkspaceRootDraft}
                         setRootDraft={setNewWorkspaceRootDraft}
                         setWorkspaceName={setWorkspaceName}
                         visible={workspaceCreateModalOpen}
+                        workspaceArchiveState={workspaceSettingsState}
+                        workspaceDeleteConfirmId={workspaceDeleteConfirmId}
                         workspaceError={workspaceError}
                         workspaceName={workspaceName}
                         workspaceSyncState={workspaceSyncState}
@@ -28379,6 +29154,14 @@ export default function App() {
                           {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
 
                           <WorkspaceCreateFooter>
+                            <SecondaryButton
+                              disabled={isWorkspaceSettingsBusy}
+                              onClick={() => archiveWorkspaceLocally(selectedWorkspace.id)}
+                              type="button"
+                            >
+                              <ButtonArchiveIcon aria-hidden="true" />
+                              <span>{isWorkspaceSettingsArchiving ? "Archiving..." : "Archive locally"}</span>
+                            </SecondaryButton>
                             <PrimaryDangerButton
                               disabled={isWorkspaceSettingsBusy}
                               onClick={() => deleteWorkspaceFromForge(selectedWorkspace.id)}
@@ -28420,24 +29203,40 @@ export default function App() {
                         </WorkspaceCreateCard>
                       </WorkspaceCreateSurface>
                     )}
-                    {isWorkspaceSettingsOpen && (isWorkspaceSettingsDeactivating || isWorkspaceSettingsDeleting) && (
+                    {isWorkspaceSettingsOpen && (isWorkspaceSettingsDeactivating || isWorkspaceSettingsDeleting || isWorkspaceSettingsArchiving) && (
                       <WorkspaceSettingsBusyOverlay aria-live="polite" role="status">
-                        <WorkspaceSettingsBusyPanel aria-label={isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}>
+                        <WorkspaceSettingsBusyPanel
+                          aria-label={
+                            isWorkspaceSettingsDeleting
+                              ? "Deleting workspace"
+                              : isWorkspaceSettingsArchiving
+                                ? "Archiving workspace"
+                                : "Deactivating workspace"
+                          }
+                        >
                           <WorkspaceCloseSpinner aria-hidden="true" />
                           <WorkspaceCloseTitle>
-                            {isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}
+                            {isWorkspaceSettingsDeleting
+                              ? "Deleting workspace"
+                              : isWorkspaceSettingsArchiving
+                                ? "Archiving workspace"
+                                : "Deactivating workspace"}
                           </WorkspaceCloseTitle>
                           <WorkspaceCloseDetail>
                             {isWorkspaceSettingsDeleting
                               ? "Stopping workspace services, removing cloud live state, and cleaning Diff Forge metadata."
-                              : "Stopping file watchers, terminals, and workspace services before the runtime is released."}
+                              : isWorkspaceSettingsArchiving
+                                ? "Stopping workspace services and hiding this workspace from the rail. Project files and local settings stay available."
+                                : "Stopping file watchers, terminals, and workspace services before the runtime is released."}
                           </WorkspaceCloseDetail>
                           <WorkspaceCloseCounter>
                             {isWorkspaceSettingsDeleting
                               ? "Project files stay on disk"
-                              : workspaceDeactivateTotal > 0
-                              ? `${workspaceDeactivateClosed}/${workspaceDeactivateTotal} ${workspaceDeactivateTerminalLabel}`
-                              : "Stopping workspace runtime"}
+                              : isWorkspaceSettingsArchiving
+                                ? "Can be restored from Create workspace"
+                                : workspaceDeactivateTotal > 0
+                                  ? `${workspaceDeactivateClosed}/${workspaceDeactivateTotal} ${workspaceDeactivateTerminalLabel}`
+                                  : "Stopping workspace runtime"}
                           </WorkspaceCloseCounter>
                           <WorkspaceCloseProgressTrack aria-hidden="true">
                             <WorkspaceCloseProgressBar $progress={workspaceDeactivateProgress} />
@@ -28851,7 +29650,7 @@ export default function App() {
                           >
                             {cloudSqliteResetWorkspaces.length === 0 ? (
                               <option value="">No workspaces found</option>
-                            ) : cloudSqliteResetWorkspaces.map((workspace) => (
+                            ) : cloudSqliteResetWorkspaces.filter(Boolean).map((workspace) => (
                               <option key={workspace.workspaceId} value={workspace.workspaceId}>
                                 {workspace.workspaceName}
                               </option>
@@ -29607,63 +30406,73 @@ export default function App() {
                           aria-hidden={workspaceToolPaneVisible ? undefined : "true"}
                         >
                           {shouldRenderAccountToolPanel ? (
-                            workspaceToolPaneMinimized ? (
-                              <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
-                                <WorkspaceAppToolRailControls>
-                                  <WorkspaceAppToolRailButton
-                                    aria-label="Unminimize app tools"
-                                    onClick={restoreWorkspaceToolPane}
-                                    title="Unminimize"
-                                    type="button"
-                                  >
-                                    <TitleRestoreIcon aria-hidden="true" />
-                                  </WorkspaceAppToolRailButton>
-                                </WorkspaceAppToolRailControls>
-                                <WorkspaceAppToolRailLabel>Tools</WorkspaceAppToolRailLabel>
-                              </WorkspaceAppToolMinimizedRail>
-                            ) : (
-                              <TodoQueuePanel
-                                accountKey={authAccountKey || user?.id || user?.email || ""}
-                                agentStatuses={agentStatuses}
-                                billingStatus={billingStatus}
-                                connectedDevices={cloudWorkspaceProgress.connectedDevices}
-                                coordinationTargets={selectedWorkspace
-                                  ? getWorkspaceCoordinationTargetsForRoot(
-                                    workspaceCoordinationTargetsByRoot,
-                                    selectedWorkspaceFileRoot,
-                                  )
-                                  : []}
-                                defaultWorkingDirectory={defaultWorkingDirectory}
-                                deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
-                                draft={accountToolDraft}
-                                items={accountToolItems}
-                                knownDevices={cloudWorkspaceProgress.knownDevices}
-                                localDesktopProfile={cloudDesktopDeviceProfile}
-                                onDraftChange={setAccountToolDraft}
-                                onMinimizePane={minimizeWorkspaceToolPane}
-                                onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
-                                onQueueItem={queueAccountToolTodo}
-                                onRemoveItem={removeAccountToolTodo}
-                                onSubmitDraft={submitAccountToolDraft}
-                                onToggleTerminalBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleTerminalBreakout}
-                                onToggleWindowBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleWindowBreakout}
-                                onToggleFullscreenPane={toggleFullscreenWorkspaceToolPane}
-                                onUpdateItem={updateAccountToolTodoText}
-                                onVoiceAgentToolCall={selectedWorkspaceToolRuntimeBridge?.onVoiceAgentToolCall}
-                                onVoicePlanServerResult={selectedWorkspaceToolRuntimeBridge?.onVoicePlanServerResult}
-                                paneMode={workspaceToolPaneMode}
-                                pendingItems={{}}
-                                queueItems={accountToolItems}
-                                rootDirectory={selectedWorkspaceFileRoot || defaultWorkingDirectory}
-                                storageUsage={cloudWorkspaceProgress.storageUsage}
-                                terminalBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.terminalBreakoutActive)}
-                                workspace={selectedWorkspace || null}
-                                workspaceId={selectedWorkspace?.id || ""}
-                                workspaceScopedTabsEnabled={Boolean(selectedWorkspace)}
-                                workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
-                                windowBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.windowBreakoutActive)}
-                              />
-                            )
+                            <>
+                              {workspaceToolPaneMinimized ? (
+                                <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
+                                  <WorkspaceAppToolRailControls>
+                                    <WorkspaceAppToolRailButton
+                                      aria-label="Unminimize app tools"
+                                      onClick={restoreWorkspaceToolPane}
+                                      title="Unminimize"
+                                      type="button"
+                                    >
+                                      <TitleRestoreIcon aria-hidden="true" />
+                                    </WorkspaceAppToolRailButton>
+                                  </WorkspaceAppToolRailControls>
+                                  <WorkspaceAppToolRailLabel>Tools</WorkspaceAppToolRailLabel>
+                                </WorkspaceAppToolMinimizedRail>
+                              ) : null}
+                              <div
+                                aria-hidden={workspaceToolPaneMinimized ? "true" : undefined}
+                                style={{
+                                  display: workspaceToolPaneMinimized ? "none" : "block",
+                                  height: "100%",
+                                  minHeight: 0,
+                                }}
+                              >
+                                <TodoQueuePanel
+                                  accountKey={authAccountKey || user?.id || user?.email || ""}
+                                  agentStatuses={agentStatuses}
+                                  billingStatus={billingStatus}
+                                  connectedDevices={cloudWorkspaceProgress.connectedDevices}
+                                  coordinationTargets={selectedWorkspace
+                                    ? getWorkspaceCoordinationTargetsForRoot(
+                                      workspaceCoordinationTargetsByRoot,
+                                      selectedWorkspaceFileRoot,
+                                    )
+                                    : []}
+                                  defaultWorkingDirectory={defaultWorkingDirectory}
+                                  deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
+                                  draft={accountToolDraft}
+                                  items={accountToolItems}
+                                  knownDevices={cloudWorkspaceProgress.knownDevices}
+                                  localDesktopProfile={cloudDesktopDeviceProfile}
+                                  onDraftChange={setAccountToolDraft}
+                                  onMinimizePane={minimizeWorkspaceToolPane}
+                                  onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
+                                  onQueueItem={queueAccountToolTodo}
+                                  onRemoveItem={removeAccountToolTodo}
+                                  onSubmitDraft={submitAccountToolDraft}
+                                  onToggleTerminalBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleTerminalBreakout}
+                                  onToggleWindowBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleWindowBreakout}
+                                  onToggleFullscreenPane={toggleFullscreenWorkspaceToolPane}
+                                  onUpdateItem={updateAccountToolTodoText}
+                                  onVoiceAgentToolCall={selectedWorkspaceToolRuntimeBridge?.onVoiceAgentToolCall}
+                                  onVoicePlanServerResult={selectedWorkspaceToolRuntimeBridge?.onVoicePlanServerResult}
+                                  paneMode={workspaceToolPaneMode}
+                                  pendingItems={{}}
+                                  queueItems={accountToolItems}
+                                  rootDirectory={selectedWorkspaceFileRoot || defaultWorkingDirectory}
+                                  storageUsage={cloudWorkspaceProgress.storageUsage}
+                                  terminalBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.terminalBreakoutActive)}
+                                  workspace={selectedWorkspace || null}
+                                  workspaceId={selectedWorkspace?.id || ""}
+                                  workspaceScopedTabsEnabled={Boolean(selectedWorkspace)}
+                                  workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
+                                  windowBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.windowBreakoutActive)}
+                                />
+                              </div>
+                            </>
                           ) : null}
                         </WorkspaceAppToolPortalHost>
                       </ResizePanel>
@@ -29943,15 +30752,15 @@ export default function App() {
 
               {!appCloseConfirmState.error && appCloseConfirmHasBlockingTerminals && (
                 <AppCloseList>
-                  {appCloseConfirmState.workspaces.map((workspace) => (
+                  {appCloseConfirmState.workspaces.filter(Boolean).map((workspace) => (
                     <CrashRecoveryItem key={workspace.workspaceId || workspace.repoPath || workspace.workspaceName}>
                       <CrashRecoveryItemTitle>
                         {workspace.workspaceName}
                       </CrashRecoveryItemTitle>
                       <CrashRecoveryItemBody>
-                        {workspace.terminals.length} non-idle {workspace.terminals.length === 1 ? "terminal" : "terminals"}
+                        {(workspace.terminals || []).length} non-idle {(workspace.terminals || []).length === 1 ? "terminal" : "terminals"}
                       </CrashRecoveryItemBody>
-                      {workspace.terminals.map((terminal) => (
+                      {(workspace.terminals || []).map((terminal) => (
                         <CrashRecoveryMeta key={`${terminal.paneId}:${terminal.instanceId}`}>
                           <span>{terminal.terminalLabel}</span>
                           <span>{terminal.agentLabel}</span>

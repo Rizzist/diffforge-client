@@ -53,8 +53,8 @@ function architectureTodoText(item) {
 function skillTodoText(entry) {
   const body = text(entry.body).slice(0, 4000);
   return body
-    ? `Apply the "${entry.title}" skill from the account SKILLS.md:\n\n${body}`
-    : `Apply the "${entry.title}" skill from the account SKILLS.md.`;
+    ? `Apply the "${entry.title}" account skill:\n\n${body}`
+    : `Apply the "${entry.title}" account skill.`;
 }
 
 /**
@@ -235,7 +235,7 @@ export default function WorkspaceToolsDragPanel({
         {toolsLoaded && !visibleArchitectures.length && !visibleSkills.length && (
           <Empty>
             {filter === "skills"
-              ? "No skills yet — write SKILLS.md in the Tools tab."
+              ? "No skills yet — create one in the Tools tab."
               : filter === "architectures"
                 ? "No architecture graphs in this workspace yet."
                 : "No architectures or skills yet."}

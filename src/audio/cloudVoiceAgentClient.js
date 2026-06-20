@@ -8,6 +8,37 @@ const CLOUD_VOICE_AGENT_PREWARM_FRESH_MS = 15_000;
 let cloudVoiceAgentPrewarmPromise = null;
 let cloudVoiceAgentPrewarmReadyAt = 0;
 
+function cleanVoiceControlText(value, maxLength = 180) {
+  return String(value ?? "").trim().slice(0, maxLength);
+}
+
+function normalizeVoiceControlRequest(request = {}) {
+  const ownerId = cleanVoiceControlText(
+    request?.ownerId
+      || request?.owner_id
+      || request?.owner
+      || "",
+    120,
+  );
+  const clientSessionId = cleanVoiceControlText(
+    request?.clientSessionId
+      || request?.client_session_id
+      || "",
+    180,
+  );
+  const voiceSessionId = cleanVoiceControlText(
+    request?.voiceSessionId
+      || request?.voice_session_id
+      || "",
+    180,
+  );
+  return {
+    clientSessionId,
+    ownerId,
+    voiceSessionId,
+  };
+}
+
 export function cloudVoiceAgentEventKind(event) {
   return String(event?.kind || event?.event_kind || event?.eventKind || event?.type || "").trim();
 }
@@ -113,9 +144,10 @@ export async function prewarmCloudVoiceAgentStream(options = {}) {
     });
 }
 
-export function stopCloudVoiceAgentStream() {
+export function stopCloudVoiceAgentStream(request = {}) {
+  const controlRequest = normalizeVoiceControlRequest(request);
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.stop_stream.invoke");
-  return invoke("stop_cloud_voice_agent_stream")
+  return invoke("stop_cloud_voice_agent_stream", { request: controlRequest })
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.stop_stream.ok");
       return result;
@@ -128,9 +160,10 @@ export function stopCloudVoiceAgentStream() {
     });
 }
 
-export function finishCloudVoiceAgentInput() {
+export function finishCloudVoiceAgentInput(request = {}) {
+  const controlRequest = normalizeVoiceControlRequest(request);
   logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.finish_input.invoke");
-  return invoke("finish_cloud_voice_agent_input")
+  return invoke("finish_cloud_voice_agent_input", { request: controlRequest })
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.finish_input.ok");
       return result;

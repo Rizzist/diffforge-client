@@ -58,6 +58,7 @@ struct ForgeVoiceCachedRoute {
 
 static FORGE_VOICE_ROUTE_CACHE: OnceLock<StdMutex<HashMap<String, ForgeVoiceCachedRoute>>> =
     OnceLock::new();
+static AUDIO_INPUT_DEVICE_CACHE: OnceLock<StdMutex<Vec<AudioInputDeviceSummary>>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
 #[link(name = "AVFoundation", kind = "framework")]
@@ -1054,6 +1055,59 @@ fn open_audio_input_permissions_for_platform() -> Result<AudioInputPermissionSta
 
 fn cpal_host() -> cpal::Host {
     cpal::default_host()
+}
+
+fn audio_input_device_cache() -> &'static StdMutex<Vec<AudioInputDeviceSummary>> {
+    AUDIO_INPUT_DEVICE_CACHE.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+fn audio_input_device_cache_store(devices: &[AudioInputDeviceSummary]) {
+    if devices.is_empty() {
+        return;
+    }
+
+    if let Ok(mut cache) = audio_input_device_cache().lock() {
+        *cache = devices.to_vec();
+    }
+}
+
+fn cached_audio_input_devices() -> Vec<AudioInputDeviceSummary> {
+    audio_input_device_cache()
+        .lock()
+        .map(|cache| cache.clone())
+        .unwrap_or_default()
+}
+
+fn fallback_audio_input_devices() -> Vec<AudioInputDeviceSummary> {
+    vec![AudioInputDeviceSummary {
+        device_id: "default".to_string(),
+        label: "Default microphone".to_string(),
+        is_default: true,
+    }]
+}
+
+fn audio_input_devices_probe_fallback(reason: &str) -> Vec<AudioInputDeviceSummary> {
+    let cached = cached_audio_input_devices();
+    if !cached.is_empty() {
+        log_audio_diagnostic_event(
+            "audio.input.devices.cached_fallback",
+            json!({
+                "reason": reason,
+                "device_count": cached.len(),
+            }),
+        );
+        return cached;
+    }
+
+    let fallback = fallback_audio_input_devices();
+    log_audio_diagnostic_event(
+        "audio.input.devices.default_fallback",
+        json!({
+            "reason": reason,
+            "device_count": fallback.len(),
+        }),
+    );
+    fallback
 }
 
 fn audio_input_devices_for_host(host: &cpal::Host) -> Result<Vec<AudioInputDeviceSummary>, String> {
@@ -6935,12 +6989,15 @@ async fn audio_input_devices() -> Result<Vec<AudioInputDeviceSummary>, String> {
     )
     .await
     {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(format!("Unable to list audio input sources: {error}")),
-        Err(_) => Err(
-            "Audio input source check timed out. The OS audio device service did not respond."
-                .to_string(),
-        ),
+        Ok(Ok(Ok(devices))) => {
+            audio_input_device_cache_store(&devices);
+            Ok(devices)
+        }
+        Ok(Ok(Err(error))) => Err(format!("Unable to list audio input sources: {error}")),
+        Ok(Err(error)) => Ok(audio_input_devices_probe_fallback(&format!(
+            "join_error:{error}"
+        ))),
+        Err(_) => Ok(audio_input_devices_probe_fallback("timeout")),
     }
 }
 
@@ -7996,7 +8053,6 @@ async fn run_cloud_voice_agent_stream(
                                 );
                             }
                         }
-                        break;
                     }
                     Some(CloudVoiceAgentControl::Stop) | None => {
                         if ready_tx.is_some() {
@@ -8062,6 +8118,7 @@ async fn run_cloud_voice_agent_stream(
                     break;
                 };
                 if !audio_bytes.is_empty() {
+                    input_finished_sent = false;
                     if ready_tx.is_some() {
                         continue;
                     }
@@ -8647,6 +8704,8 @@ async fn start_cloud_voice_agent_stream(
 ) -> Result<CloudVoiceAgentStartStatus, String> {
     log_audio_diagnostic_event("audio.cloud_voice.start.command", json!({}));
     let CloudVoiceAgentStartRequest {
+        client_session_id,
+        owner_id,
         repo_id,
         submission_mode,
         workspace_id,
@@ -8655,6 +8714,18 @@ async fn start_cloud_voice_agent_stream(
         realtime,
     } = request;
     let realtime_engine = realtime.unwrap_or(false);
+    let owner_id = clean_cloud_voice_agent_text(owner_id, 120);
+    let owner_id = if owner_id.is_empty() {
+        "unscoped".to_string()
+    } else {
+        owner_id
+    };
+    let client_session_id = clean_cloud_voice_agent_text(client_session_id, 180);
+    let client_session_id = if client_session_id.is_empty() {
+        format!("client-{}", uuid::Uuid::new_v4())
+    } else {
+        client_session_id
+    };
     let submission_mode = normalize_cloud_voice_agent_submission_mode(submission_mode);
     let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
     let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
@@ -8682,6 +8753,8 @@ async fn start_cloud_voice_agent_stream(
         &workspace_id,
         &repo_id,
         json!({
+            "client_session_id": client_session_id.clone(),
+            "owner_id": owner_id.clone(),
             "submission_mode": submission_mode.clone(),
             "workspace_name": workspace_name.clone(),
             "workspace_root": workspace_root.clone(),
@@ -8879,6 +8952,8 @@ async fn start_cloud_voice_agent_stream(
                 "openai_close_grace_ms": CLOUD_VOICE_AGENT_SERVER_RECONNECT_GRACE_MS,
             },
             "voice_session_id": voice_session_id.clone(),
+            "client_session_id": client_session_id.clone(),
+            "owner_id": owner_id.clone(),
             "device_id": device_profile["device_id"].clone(),
             "machine_id": device_profile["device_id"].clone(),
             "device": device_profile,
@@ -8973,8 +9048,10 @@ async fn start_cloud_voice_agent_stream(
         ));
         *session_guard = Some(CloudVoiceAgentSession {
             audio_tx: session_audio_tx,
+            client_session_id: client_session_id.clone(),
             control_tx,
             finished_rx,
+            owner_id: owner_id.clone(),
             voice_session_id: voice_session_id.clone(),
         });
         status
@@ -9073,10 +9150,39 @@ async fn start_cloud_voice_agent_stream(
 
     Ok(CloudVoiceAgentStartStatus {
         active: true,
+        client_session_id,
+        owner_id,
         repo_id,
         sample_rate: status.sample_rate,
+        voice_session_id,
         workspace_id,
     })
+}
+
+fn cloud_voice_agent_control_value(value: Option<String>, max_chars: usize) -> String {
+    clean_cloud_voice_agent_text(value, max_chars)
+}
+
+fn cloud_voice_agent_session_matches_control(
+    session: &CloudVoiceAgentSession,
+    request: Option<&CloudVoiceAgentControlRequest>,
+) -> bool {
+    let Some(request) = request else {
+        return true;
+    };
+    let owner_id = cloud_voice_agent_control_value(request.owner_id.clone(), 120);
+    let client_session_id = cloud_voice_agent_control_value(request.client_session_id.clone(), 180);
+    let voice_session_id = cloud_voice_agent_control_value(request.voice_session_id.clone(), 180);
+    if !owner_id.is_empty() && owner_id != session.owner_id {
+        return false;
+    }
+    if !client_session_id.is_empty() && client_session_id != session.client_session_id {
+        return false;
+    }
+    if !voice_session_id.is_empty() && voice_session_id != session.voice_session_id {
+        return false;
+    }
+    true
 }
 
 #[tauri::command]
@@ -9405,13 +9511,27 @@ async fn send_cloud_voice_agent_text_message(
 }
 
 #[tauri::command]
-async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Result<(), String> {
+async fn stop_cloud_voice_agent_stream(
+    audio_state: State<'_, AudioState>,
+    request: Option<CloudVoiceAgentControlRequest>,
+) -> Result<(), String> {
     log_audio_diagnostic_event("audio.cloud_voice.stop.command", json!({}));
-    #[cfg(target_os = "macos")]
-    macos_voice_playback_clear();
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let session = {
         let mut session_guard = audio_state.cloud_voice_agent_stream.lock().await;
+        if let Some(session) = session_guard.as_ref() {
+            if !cloud_voice_agent_session_matches_control(session, request.as_ref()) {
+                log_audio_diagnostic_event(
+                    "audio.cloud_voice.stop.ignored_session_mismatch",
+                    json!({
+                        "active_client_session_id": session.client_session_id,
+                        "active_owner_id": session.owner_id,
+                        "active_voice_session_id": session.voice_session_id,
+                    }),
+                );
+                return Ok(());
+            }
+        }
         session_guard.take()
     };
     let Some(session) = session else {
@@ -9422,6 +9542,8 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
         return Ok(());
     };
 
+    #[cfg(target_os = "macos")]
+    macos_voice_playback_clear();
     audio_state
         .cloud_voice_agent_input_enabled
         .store(false, Ordering::SeqCst);
@@ -9442,7 +9564,10 @@ async fn stop_cloud_voice_agent_stream(audio_state: State<'_, AudioState>) -> Re
 }
 
 #[tauri::command]
-async fn finish_cloud_voice_agent_input(audio_state: State<'_, AudioState>) -> Result<(), String> {
+async fn finish_cloud_voice_agent_input(
+    audio_state: State<'_, AudioState>,
+    request: Option<CloudVoiceAgentControlRequest>,
+) -> Result<(), String> {
     log_audio_diagnostic_event("audio.cloud_voice.finish_input.command", json!({}));
     let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let control_tx = {
@@ -9454,6 +9579,17 @@ async fn finish_cloud_voice_agent_input(audio_state: State<'_, AudioState>) -> R
             log_audio_diagnostic_event("audio.cloud_voice.finish_input.inactive", json!({}));
             return Ok(());
         };
+        if !cloud_voice_agent_session_matches_control(session, request.as_ref()) {
+            log_audio_diagnostic_event(
+                "audio.cloud_voice.finish_input.ignored_session_mismatch",
+                json!({
+                    "active_client_session_id": session.client_session_id,
+                    "active_owner_id": session.owner_id,
+                    "active_voice_session_id": session.voice_session_id,
+                }),
+            );
+            return Ok(());
+        }
         session.control_tx.clone()
     };
 

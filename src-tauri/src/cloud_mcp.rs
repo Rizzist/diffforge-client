@@ -31,6 +31,7 @@ const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT: &str = "cloud-mcp-account-devic
 const CLOUD_MCP_AUDIO_PREFERENCES_CHANGED_EVENT: &str = "forge-audio-preferences-changed";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT: &str = "cloud-mcp-account-usage";
 const CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT: &str = "cloud-mcp-account-tools-updated";
+const CLOUD_MCP_ACCOUNT_SKILLS_UPDATED_EVENT: &str = "cloud-mcp-account-skills-updated";
 const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions-updated";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT: &str =
@@ -200,7 +201,6 @@ static CLOUD_MCP_GIT_REPO_IDENTITY_CACHE: OnceLock<
 > = OnceLock::new();
 static CLOUD_MCP_ASSET_LOCAL_EVENT_SENDER: OnceLock<tokio::sync::broadcast::Sender<Value>> =
     OnceLock::new();
-static CLOUD_MCP_ARCHITECTURE_CLOUD_APPLIED_SIGNATURE: OnceLock<StdMutex<String>> = OnceLock::new();
 const CLOUD_MCP_TOKENOMICS_ACTIVITY_SOURCE: &str = "tokenomics:background";
 const CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY: &str = "tokenomics:up:tokenomics:background";
 const CLOUD_MCP_TOKENOMICS_ACTIVITY_TOTAL: u64 = 4;
@@ -3512,17 +3512,33 @@ fn cloud_mcp_todo_sync_outbox_idempotency_key(
     }
     let cid = cloud_mcp_payload_text(
         payload,
-        &["cid", "client_request_id", "clientRequestId", "request_id", "requestId"],
+        &[
+            "cid",
+            "client_request_id",
+            "clientRequestId",
+            "request_id",
+            "requestId",
+        ],
     )
     .unwrap_or_default();
     let device_id = cloud_mcp_payload_text(
         payload,
-        &["device_id", "deviceId", "source_device_id", "sourceDeviceId"],
+        &[
+            "device_id",
+            "deviceId",
+            "source_device_id",
+            "sourceDeviceId",
+        ],
     )
     .unwrap_or_default();
     let workspace_id = cloud_mcp_payload_text(
         payload,
-        &["workspace_id", "workspaceId", "source_workspace_id", "sourceWorkspaceId"],
+        &[
+            "workspace_id",
+            "workspaceId",
+            "source_workspace_id",
+            "sourceWorkspaceId",
+        ],
     )
     .unwrap_or_default();
     let ops_fragment = payload
@@ -7417,12 +7433,22 @@ fn cloud_mcp_tokenomics_limit_samples(summary: &Value, now_ms: u64) -> Vec<Value
             .unwrap_or(0);
         let sample_bucket_start_ms = cloud_mcp_payload_i64(
             &row,
-            &["sample_bucket_start_ms", "sampleBucketStartMs", "bucket_start_ms", "bucketStartMs"],
+            &[
+                "sample_bucket_start_ms",
+                "sampleBucketStartMs",
+                "bucket_start_ms",
+                "bucketStartMs",
+            ],
         )
         .or_else(|| {
             cloud_mcp_payload_text(
                 &row,
-                &["sample_bucket_start", "sampleBucketStart", "bucket_start", "bucketStart"],
+                &[
+                    "sample_bucket_start",
+                    "sampleBucketStart",
+                    "bucket_start",
+                    "bucketStart",
+                ],
             )
             .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
         })
@@ -11160,7 +11186,8 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
         object.insert("storeEmpty".to_string(), json!(todo_store_empty));
     }
     let architecture_store_empty = architecture_have.is_empty();
-    let skills_store_empty = cloud_mcp_cached_account_skills().trim().is_empty();
+    let skills_have = cloud_mcp_cached_account_skill_have_entries();
+    let skills_store_empty = skills_have.is_empty();
     json!({
         "kind": "account_sync_resume",
         "contract": "diffforge.account_sync.v1",
@@ -11194,7 +11221,8 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
                 "contract": "diffforge.skills_doc.v1",
                 "enabled": true,
                 "m": "delta",
-                "v": 1,
+                "v": 2,
+                "h": skills_have,
                 "store_empty": skills_store_empty,
                 "storeEmpty": skills_store_empty
             },
@@ -11257,7 +11285,7 @@ async fn cloud_mcp_apply_account_sync_resume_response(
     }
     if let Some(architectures) = cloud_mcp_account_sync_resume_domain(response, &["architectures"])
     {
-        let hydrated = cloud_mcp_apply_architecture_sync_data(state, &architectures)
+        let hydrated = cloud_mcp_apply_architecture_sync_data(state, &architectures, false)
             .await
             .unwrap_or_else(|_| architectures.clone());
         let _ = state.global_ws_events.send(json!({
@@ -11432,16 +11460,9 @@ async fn cloud_mcp_emit_initial_account_tools_snapshot(
     if contract == "diffforge.skills_doc.v1" {
         match cloud_mcp_hydrate_account_skill_payload(state, payload.clone()).await {
             Ok(hydrated) => {
-                if !cloud_mcp_account_skills_has_hydration_error(&hydrated) {
-                    if let Some(skills_md) = hydrated
-                        .get("skills")
-                        .and_then(|row| row.get("skills_md").or_else(|| row.get("skillsMd")))
-                        .and_then(Value::as_str)
-                    {
-                        cloud_mcp_cache_account_skills(skills_md);
-                    }
-                }
-                payload = hydrated;
+                let projection = cloud_mcp_account_skill_units_projection_with_pending(hydrated);
+                cloud_mcp_cache_account_skill_units_payload(&projection);
+                payload = projection;
             }
             Err(error) => {
                 log_cloud_sync_event(
@@ -11616,6 +11637,15 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             }));
         }
         for (payload, event_kind, contract) in [
+            (
+                cloud_mcp_initial_account_snapshot(
+                    &message,
+                    "initial_account_skills",
+                    "initialAccountSkills",
+                ),
+                "account_skills_snapshot",
+                "diffforge.skills_doc.v1",
+            ),
             (
                 cloud_mcp_initial_account_snapshot(
                     &message,
@@ -12799,10 +12829,23 @@ async fn cloud_mcp_start_remote_command_listener(
                 "account_cli_changed" | "account_mcp_changed"
             ) {
                 let is_skill_event = contract == "diffforge.skills_doc.v1";
+                let is_initial_skill_snapshot = is_skill_event
+                    && cloud_mcp_payload_text(&event, &["reason"]).as_deref()
+                        == Some("global_ws_ready");
                 let event_to_emit = if is_skill_event {
                     match cloud_mcp_hydrate_account_skill_payload(&state_clone, event.clone()).await
                     {
-                        Ok(hydrated) => hydrated,
+                        Ok(hydrated) => {
+                            if !is_initial_skill_snapshot {
+                                cloud_mcp_clear_account_skill_pending_push();
+                            }
+                            cloud_mcp_cache_account_skill_units_payload(&hydrated);
+                            if is_initial_skill_snapshot {
+                                cloud_mcp_account_skill_units_projection_with_pending(hydrated)
+                            } else {
+                                hydrated
+                            }
+                        }
                         Err(error) => {
                             log_cloud_sync_event(
                                 "account_skills.event_hydrate_error",
@@ -12817,7 +12860,11 @@ async fn cloud_mcp_start_remote_command_listener(
                 } else {
                     event.clone()
                 };
-                let _ = app.emit(CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT, event_to_emit);
+                if is_skill_event {
+                    let _ = app.emit(CLOUD_MCP_ACCOUNT_SKILLS_UPDATED_EVENT, event_to_emit);
+                } else {
+                    let _ = app.emit(CLOUD_MCP_ACCOUNT_TOOLS_UPDATED_EVENT, event_to_emit);
+                }
                 continue;
             }
             if event_kind == "tokenomics_refresh_requested" {
@@ -12880,7 +12927,9 @@ async fn cloud_mcp_start_remote_command_listener(
                         == Some("diffforge.arch_doc.v1")
                         || cloud_mcp_doc_domain(&event).as_deref() == Some("architectures")
                     {
-                        let _ = cloud_mcp_apply_architecture_sync_data(&state_clone, &event).await;
+                        let _ =
+                            cloud_mcp_apply_architecture_sync_data(&state_clone, &event, true)
+                                .await;
                     }
                     let _ = app.emit(
                         CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT,
@@ -12986,7 +13035,7 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
         return;
     }
     match command_kind.as_str() {
-        "workspace_activate" | "activate_workspace" => {
+        "workspace_activate" | "activate_workspace" | "open_workspace" | "workspace_open" => {
             let _ = app_local_state_merge(
                 app,
                 "remote-intents",
@@ -12994,6 +13043,8 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
                     "pendingActivationWorkspaceId": workspace_id,
                     "pendingActivationReason": "remote_control_headless",
                     "pendingActivationAtMs": cloud_mcp_now_ms(),
+                    "pendingActivationSelectWorkspace": true,
+                    "pendingActivationWorkspaceTab": "terminals",
                 }),
             );
             let state = state.clone();
@@ -13077,88 +13128,10 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
     }
 }
 
-/// Headless architecture sync: while no webview dispatcher is alive, scan the
-/// account-global architecture root for graph changes and push only changed
-/// graph-file deltas through the durable outbox. The webview owns the same
-/// detection when it is open.
-const CLOUD_MCP_ARCHITECTURE_STORE_CHANGED_EVENT: &str = "architecture-store-changed";
-const CLOUD_MCP_ARCHITECTURE_EVENT_SYNC_DEBOUNCE_MS: u64 = 900;
-
-fn cloud_mcp_architecture_store_event_includes_global(value: &Value) -> bool {
-    let Some(slugs) = value.get("slugs").and_then(Value::as_array) else {
-        return true;
-    };
-    if slugs.is_empty() {
-        return true;
-    }
-    slugs.iter().filter_map(Value::as_str).any(|slug| {
-        let slug = slug.trim();
-        slug.is_empty() || slug == "global" || slug == ARCHITECTURE_GLOBAL_REPO_ID
-    })
-}
-
-/// Event-driven architecture sync: the native architecture-store watcher emits
-/// one debounced `architecture-store-changed` event per graph-file burst. This
-/// listener syncs only those events, with a content-signature guard before any
-/// websocket write. There is no idle timer here; server fanout handles remote
-/// device updates.
+/// Architecture file changes are local drafts. The webview listens to the store
+/// event for live preview/dirty state, and explicit Save owns Cloud fanout.
 pub(crate) fn cloud_mcp_start_architecture_event_sync(app: AppHandle, state: CloudMcpState) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    app.listen(CLOUD_MCP_ARCHITECTURE_STORE_CHANGED_EVENT, move |event| {
-        let payload = serde_json::from_str::<Value>(event.payload()).unwrap_or_else(|_| {
-            json!({
-                "source": "architecture_store_changed_unparsed",
-            })
-        });
-        let _ = tx.send(payload);
-    });
-
-    tauri::async_runtime::spawn(async move {
-        let mut last_signature = String::new();
-        while let Some(first_event) = rx.recv().await {
-            let mut should_sync = cloud_mcp_architecture_store_event_includes_global(&first_event);
-            sleep(Duration::from_millis(
-                CLOUD_MCP_ARCHITECTURE_EVENT_SYNC_DEBOUNCE_MS,
-            ))
-            .await;
-            while let Ok(event) = rx.try_recv() {
-                should_sync |= cloud_mcp_architecture_store_event_includes_global(&event);
-            }
-            if !should_sync {
-                continue;
-            }
-            if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
-                continue;
-            }
-            let graphs = tauri::async_runtime::spawn_blocking(move || {
-                let _span = BackendCpuSpan::new("cloud_mcp.architecture_event.collect_graphs");
-                cloud_mcp_collect_account_architecture_graphs(Value::Null)
-            })
-            .await
-            .unwrap_or_default();
-            let signature = cloud_mcp_architecture_graphs_signature(&graphs);
-            if last_signature == signature {
-                continue;
-            }
-            let cloud_applied_signature = cloud_mcp_take_architecture_cloud_applied_signature();
-            if !cloud_applied_signature.is_empty() && cloud_applied_signature == signature {
-                last_signature = signature;
-                continue;
-            }
-            last_signature = signature;
-            let _ = cloud_mcp_sync_architectures_internal(
-                &state,
-                String::new(),
-                ARCHITECTURE_GLOBAL_WORKSPACE_ID.to_string(),
-                Some("Global".to_string()),
-                json!(graphs),
-                Some("architecture_store_changed_event".to_string()),
-                None,
-                None,
-            )
-            .await;
-        }
-    });
+    let _ = (app, state);
 }
 
 const CLOUD_MCP_AGENT_INVENTORY_EVENT: &str = "agent-inventory-changed";
@@ -13506,7 +13479,10 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         | "spawn_terminals" => "defer_open",
         "todo_requeue" | "requeue_todo" | "todo_retry" | "retry_todo" => "defer_requeue",
         "todo_queue" | "queue_todo" | "workspace_todo_queue" => "defer_queue",
-        "todo_unqueue" | "unqueue_todo" | "workspace_todo_unqueue" | "todo_dequeue"
+        "todo_unqueue"
+        | "unqueue_todo"
+        | "workspace_todo_unqueue"
+        | "todo_dequeue"
         | "dequeue_todo" => "defer_unqueue",
         "terminal_window_breakout"
         | "breakout_terminal"
@@ -21985,6 +21961,46 @@ fn cloud_mcp_coding_agent_label(agent_id: &str) -> &'static str {
     }
 }
 
+fn cloud_mcp_workspace_snapshot_is_locally_archived(workspace: &Value) -> bool {
+    let bool_flag = [
+        "localArchived",
+        "local_archived",
+        "locallyArchived",
+        "locally_archived",
+    ]
+    .iter()
+    .any(|key| {
+        workspace
+            .get(*key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    if bool_flag {
+        return true;
+    }
+
+    let archive_timestamp = cloud_mcp_payload_text(
+        workspace,
+        &[
+            "localArchivedAt",
+            "local_archived_at",
+            "locallyArchivedAt",
+            "locally_archived_at",
+        ],
+    )
+    .is_some();
+    if archive_timestamp {
+        return true;
+    }
+
+    cloud_mcp_payload_text(
+        workspace,
+        &["status", "workspace_status", "workspaceStatus"],
+    )
+    .map(|status| status.eq_ignore_ascii_case("archived"))
+    .unwrap_or(false)
+}
+
 #[tauri::command]
 async fn cloud_mcp_sync_device_workspaces_snapshot(
     state: State<'_, CloudMcpState>,
@@ -22001,9 +22017,17 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         .as_array()
         .ok_or_else(|| "Device workspace snapshot sync requires a workspaces array.".to_string())?;
     let mut normalized_workspaces = Vec::new();
+    let mut selected_workspace_id: Option<String> = None;
+    let mut selected_workspace_name: Option<String> = None;
+    let mut skipped_archived_count = 0usize;
     let device_profile = cloud_mcp_desktop_device_profile();
 
     for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
+        if cloud_mcp_workspace_snapshot_is_locally_archived(workspace) {
+            skipped_archived_count += 1;
+            continue;
+        }
+
         let Some(workspace_id) =
             cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
                 .filter(|value| !value.trim().is_empty())
@@ -22013,6 +22037,18 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
                 .unwrap_or_else(|| workspace_id.clone());
+        let workspace_selected = workspace
+            .get("selected")
+            .or_else(|| workspace.get("is_selected"))
+            .or_else(|| workspace.get("isSelected"))
+            .or_else(|| workspace.get("workspace_selected"))
+            .or_else(|| workspace.get("workspaceSelected"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if workspace_selected {
+            selected_workspace_id = Some(workspace_id.clone());
+            selected_workspace_name = Some(workspace_name.clone());
+        }
         let workspace_active = workspace
             .get("workspace_active")
             .or_else(|| workspace.get("workspaceActive"))
@@ -22295,6 +22331,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             "workspace_active": workspace_active,
             "workspace_id": workspace_id,
             "workspace_name": workspace_name,
+            "selected": workspace_selected,
+            "workspace_selected": workspace_selected,
             "workspace_status": workspace_status,
             "workspace_runtime_seq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
@@ -22343,6 +22381,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 .unwrap_or_default()
         })
         .sum::<usize>();
+    let selected_workspace = selected_workspace_id
+        .as_ref()
+        .map(|workspace_id| {
+            json!({
+                "workspace_id": workspace_id,
+                "workspace_name": selected_workspace_name.as_deref().unwrap_or(workspace_id),
+            })
+        })
+        .unwrap_or(Value::Null);
+    let selected_workspace_id_value = selected_workspace_id.clone();
 
     let reason_for_ack = reason.clone();
     let payload = json!({
@@ -22368,8 +22416,13 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         "workspace_snapshot_authoritative": true,
         "workspaceSnapshotAuthoritative": true,
         "workspace_count": workspace_count,
+        "skipped_archived_workspace_count": skipped_archived_count,
+        "skippedArchivedWorkspaceCount": skipped_archived_count,
         "terminal_count": terminal_count,
         "server_count": server_count,
+        "selected_workspace_id": selected_workspace_id_value,
+        "selectedWorkspaceId": selected_workspace_id,
+        "selected_workspace": selected_workspace,
         "workspaces": normalized_workspaces,
         "summary": "Desktop workspace and terminal state synced as the authoritative device workspace snapshot.",
         "ts_ms": cloud_mcp_now_ms(),
@@ -22449,6 +22502,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             "skip_reason": skipped_reason,
             "stored": {
                 "stored_count": workspace_count,
+                "skipped_archived_workspace_count": skipped_archived_count,
+                "skippedArchivedWorkspaceCount": skipped_archived_count,
                 "server_count": server_count,
                 "terminal_count": terminal_count,
                 "workspace_count": workspace_count,
@@ -23818,31 +23873,85 @@ async fn cloud_mcp_account_repo_catalog(state: State<'_, CloudMcpState>) -> Resu
     Ok(cloud_mcp_response_data(&response))
 }
 
-fn cloud_mcp_account_skills_cache_path() -> Option<PathBuf> {
-    cloud_mcp_local_data_file_path("account-skills.md")
-}
-
-fn cloud_mcp_cache_account_skills(skills_md: &str) {
-    if let Some(path) = cloud_mcp_account_skills_cache_path() {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(path, skills_md);
-    }
-}
-
-fn cloud_mcp_cached_account_skills() -> String {
-    cloud_mcp_account_skills_cache_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .unwrap_or_default()
-}
-
 fn cloud_mcp_account_skill_text(skill: &Value, keys: &[&str]) -> String {
     keys.iter()
         .find_map(|key| skill.get(*key).and_then(Value::as_str))
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+fn cloud_mcp_account_skill_filename_stem(raw: &str, fallback: &str) -> String {
+    let normalize = |value: &str| {
+        let mut stem = String::new();
+        let mut last_separator = false;
+        for character in value.trim().chars() {
+            if character.is_ascii_alphanumeric() {
+                stem.push(character);
+                last_separator = false;
+            } else if !stem.is_empty() && !last_separator {
+                stem.push('_');
+                last_separator = true;
+            }
+        }
+        while stem.ends_with('_') {
+            stem.pop();
+        }
+        let mut stem = stem.chars().take(96).collect::<String>();
+        while stem.ends_with('_') {
+            stem.pop();
+        }
+        stem
+    };
+    let stem = normalize(raw);
+    if !stem.is_empty() {
+        return stem;
+    }
+    let stem = normalize(fallback);
+    if stem.is_empty() {
+        "skill".to_string()
+    } else {
+        stem
+    }
+}
+
+fn cloud_mcp_account_skill_units_scope_key() -> String {
+    let raw = cloud_mcp_process_account_scope_key();
+    cloud_mcp_account_skill_filename_stem(&raw, "personal")
+}
+
+fn cloud_mcp_account_skill_units_legacy_cache_path() -> Option<PathBuf> {
+    cloud_mcp_local_data_file_path("account-skill-units.json")
+}
+
+fn cloud_mcp_account_skill_units_cache_path() -> Option<PathBuf> {
+    cloud_mcp_local_data_file_path(&format!(
+        "account-skills/{}/skill-units.json",
+        cloud_mcp_account_skill_units_scope_key()
+    ))
+}
+
+fn cloud_mcp_account_skill_units_pending_push_path() -> Option<PathBuf> {
+    cloud_mcp_local_data_file_path(&format!(
+        "account-skills/{}/pending-push.json",
+        cloud_mcp_account_skill_units_scope_key()
+    ))
+}
+
+fn cloud_mcp_read_account_skill_units_payload_from_path(path: PathBuf) -> Option<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+}
+
+fn cloud_mcp_account_skill_title(skill: &Value, skill_id: &str) -> String {
+    let title = cloud_mcp_account_skill_text(skill, &["title", "name", "label"]);
+    if title.is_empty() {
+        skill_id.to_string()
+    } else {
+        title
+    }
 }
 
 fn cloud_mcp_account_skill_units_from_input(skill_units: Option<Value>) -> Vec<Value> {
@@ -23864,6 +23973,7 @@ fn cloud_mcp_account_skill_units_from_input(skill_units: Option<Value>) -> Vec<V
     raw_units
         .into_iter()
         .filter(|unit| unit.is_object())
+        .map(cloud_mcp_account_skill_normalized_unit)
         .take(500)
         .collect()
 }
@@ -23876,42 +23986,880 @@ fn cloud_mcp_account_skill_id(skill: &Value) -> String {
     } else {
         raw.as_str()
     };
-    cloud_mcp_sanitize_asset_id(source)
+    if source.trim().is_empty() {
+        String::new()
+    } else {
+        cloud_mcp_account_skill_filename_stem(source, "skill")
+    }
+}
+
+fn cloud_mcp_account_skill_normalized_unit(mut unit: Value) -> Value {
+    let skill_id = cloud_mcp_account_skill_id(&unit);
+    let title = cloud_mcp_account_skill_title(&unit, &skill_id);
+    if let Some(object) = unit.as_object_mut() {
+        object.remove("description");
+        object.remove("summary");
+        if !skill_id.is_empty() {
+            object.insert("skill_id".to_string(), json!(skill_id.clone()));
+            object.insert("skillId".to_string(), json!(skill_id.clone()));
+            object.insert("id".to_string(), json!(skill_id));
+            object.insert("title".to_string(), json!(title));
+        }
+    }
+    unit
+}
+
+fn cloud_mcp_account_skill_units_from_payload_value(value: &Value) -> Vec<Value> {
+    fn collect(candidate: &Value, units: &mut Vec<Value>) {
+        if !candidate.is_object() {
+            return;
+        }
+        for key in ["skill_units", "skillUnits"] {
+            if let Some(rows) = candidate.get(key).and_then(Value::as_array) {
+                units.extend(rows.iter().filter(|unit| unit.is_object()).cloned());
+            }
+        }
+        if let Some(skill) = candidate.get("skill").filter(|skill| skill.is_object()) {
+            units.push(skill.clone());
+        }
+        if let Some(ops) = candidate.get("ops").and_then(Value::as_array) {
+            for op in ops {
+                let tag = cloud_mcp_payload_text(op, &["op", "operation", "action"])
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if matches!(
+                    tag.as_str(),
+                    "d" | "delete" | "remove" | "removed" | "tombstone"
+                ) {
+                    continue;
+                }
+                if let Some(skill) = op
+                    .get("skill")
+                    .or_else(|| op.get("unit"))
+                    .or_else(|| op.get("skill_unit"))
+                    .or_else(|| op.get("skillUnit"))
+                    .filter(|skill| skill.is_object())
+                {
+                    units.push(skill.clone());
+                }
+            }
+        }
+        if let Some(skills) = candidate.get("skills") {
+            if let Some(rows) = skills.as_array() {
+                units.extend(rows.iter().filter(|unit| unit.is_object()).cloned());
+            } else if skills.is_object() {
+                collect(skills, units);
+            }
+        }
+    }
+
+    let mut units = Vec::new();
+    collect(value, &mut units);
+    for key in ["payload", "data", "event", "result"] {
+        if let Some(child) = value.get(key) {
+            collect(child, &mut units);
+        }
+    }
+    let mut seen = HashSet::new();
+    units
+        .into_iter()
+        .map(cloud_mcp_account_skill_normalized_unit)
+        .filter(|unit| {
+            let skill_id = cloud_mcp_account_skill_id(unit);
+            !skill_id.is_empty() && seen.insert(skill_id)
+        })
+        .take(500)
+        .collect()
+}
+
+fn cloud_mcp_account_skill_ids_from_input(value: Option<Value>) -> HashSet<String> {
+    fn collect(candidate: &Value, ids: &mut HashSet<String>) {
+        if let Some(raw) = candidate.as_str() {
+            if raw.trim().is_empty() {
+                return;
+            }
+            let normalized = cloud_mcp_account_skill_filename_stem(raw, "skill");
+            if !normalized.is_empty() {
+                ids.insert(normalized);
+            }
+            return;
+        }
+        if let Some(items) = candidate.as_array() {
+            for item in items {
+                collect(item, ids);
+            }
+            return;
+        }
+        if candidate.is_object() {
+            let skill_id = cloud_mcp_account_skill_id(candidate);
+            if !skill_id.is_empty() {
+                ids.insert(skill_id);
+            }
+            for key in [
+                "pending_skill_ids",
+                "pendingSkillIds",
+                "skill_ids",
+                "skillIds",
+                "ids",
+            ] {
+                if let Some(child) = candidate.get(key) {
+                    collect(child, ids);
+                }
+            }
+        }
+    }
+
+    let mut ids = HashSet::new();
+    if let Some(value) = value {
+        collect(&value, &mut ids);
+    }
+    ids
+}
+
+fn cloud_mcp_account_removed_skill_units_from_payload_value(value: &Value) -> Vec<Value> {
+    fn collect(candidate: &Value, units: &mut Vec<Value>) {
+        if !candidate.is_object() {
+            return;
+        }
+        for key in [
+            "removed_skill_units",
+            "removedSkillUnits",
+            "deleted_skill_units",
+            "deletedSkillUnits",
+        ] {
+            if let Some(rows) = candidate.get(key).and_then(Value::as_array) {
+                units.extend(rows.iter().filter(|unit| unit.is_object()).cloned());
+            }
+        }
+        if let Some(ops) = candidate.get("ops").and_then(Value::as_array) {
+            for op in ops {
+                let tag = op
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| cloud_mcp_payload_text(op, &["op", "operation", "action"]))
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if !matches!(
+                    tag.as_str(),
+                    "d" | "delete" | "remove" | "removed" | "tombstone"
+                ) {
+                    continue;
+                }
+                if let Some(skill_id) = op
+                    .as_array()
+                    .and_then(|items| items.get(1))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    units.push(json!({
+                        "skill_id": skill_id,
+                        "skillId": skill_id,
+                        "id": skill_id,
+                        "deleted": true,
+                        "current": false,
+                    }));
+                } else if let Some(skill) = op
+                    .get("skill")
+                    .or_else(|| op.get("unit"))
+                    .or_else(|| op.get("skill_unit"))
+                    .or_else(|| op.get("skillUnit"))
+                    .filter(|skill| skill.is_object())
+                {
+                    units.push(skill.clone());
+                } else if op.is_object() {
+                    units.push(op.clone());
+                }
+            }
+        }
+    }
+
+    let mut units = Vec::new();
+    collect(value, &mut units);
+    for key in ["payload", "data", "event", "result"] {
+        if let Some(child) = value.get(key) {
+            collect(child, &mut units);
+        }
+    }
+    units
+}
+
+fn cloud_mcp_account_skill_unit_removed(unit: &Value) -> bool {
+    unit.get("deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || unit
+            .get("tombstoned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || unit
+            .get("current")
+            .and_then(Value::as_bool)
+            .map(|current| !current)
+            .unwrap_or(false)
+}
+
+fn cloud_mcp_account_skills_payload_has_full_units(value: &Value) -> bool {
+    fn has_full(candidate: &Value) -> bool {
+        if !candidate.is_object() {
+            return false;
+        }
+        let flag = |key: &str| candidate.get(key).and_then(Value::as_bool).unwrap_or(false);
+        if flag("authoritative") || flag("snapshot_full") || flag("snapshotFull") {
+            return true;
+        }
+        if candidate
+            .get("skills")
+            .filter(|skills| skills.is_object())
+            .map(has_full)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        ["payload", "data", "event", "result"]
+            .iter()
+            .any(|key| candidate.get(*key).map(has_full).unwrap_or(false))
+    }
+
+    has_full(value)
+}
+
+fn cloud_mcp_account_skills_payload_text(value: &Value, keys: &[&str]) -> Option<String> {
+    cloud_mcp_payload_text(value, keys)
+        .or_else(|| {
+            value
+                .get("skills")
+                .and_then(|skills| cloud_mcp_payload_text(skills, keys))
+        })
+        .or_else(|| {
+            ["payload", "data", "event", "result"]
+                .iter()
+                .find_map(|key| {
+                    value
+                        .get(*key)
+                        .and_then(|child| cloud_mcp_account_skills_payload_text(child, keys))
+                })
+        })
+}
+
+fn cloud_mcp_account_skills_payload_has_direct_document_marker(value: &Value) -> bool {
+    if !value.is_object() {
+        return false;
+    }
+    let contract = cloud_mcp_payload_text(value, &["contract"]).unwrap_or_default();
+    if contract == "diffforge.skills_doc.v1" {
+        return true;
+    }
+    let c = cloud_mcp_payload_text(value, &["c", "kind", "event_kind", "eventKind"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let d = cloud_mcp_payload_text(value, &["d"]).unwrap_or_default();
+    matches!(
+        c.as_str(),
+        "doc.sync" | "doc_sync" | "account_skills_local_projection"
+    ) && d == "skills"
+}
+
+fn cloud_mcp_account_skills_payload_revision(value: &Value) -> Value {
+    if let Some(revision) = value
+        .get("revision")
+        .or_else(|| value.get("rev"))
+        .or_else(|| {
+            value
+                .get("skills")
+                .and_then(|skills| skills.get("revision").or_else(|| skills.get("rev")))
+        })
+        .cloned()
+    {
+        return revision;
+    }
+    for key in ["payload", "data", "event", "result"] {
+        if let Some(child) = value.get(key) {
+            let revision = cloud_mcp_account_skills_payload_revision(child);
+            if !revision.is_null() {
+                return revision;
+            }
+        }
+    }
+    if cloud_mcp_account_skills_payload_has_direct_document_marker(value) {
+        if let Some(seq) = value
+            .get("seq")
+            .or_else(|| value.get("skills").and_then(|skills| skills.get("seq")))
+            .cloned()
+        {
+            return seq;
+        }
+    }
+    Value::Null
+}
+
+fn cloud_mcp_account_skills_payload_has_document_marker(value: &Value) -> bool {
+    if cloud_mcp_account_skills_payload_has_direct_document_marker(value) {
+        return true;
+    }
+    ["payload", "data", "event", "result"].iter().any(|key| {
+        value
+            .get(*key)
+            .map(cloud_mcp_account_skills_payload_has_document_marker)
+            .unwrap_or(false)
+    })
+}
+
+fn cloud_mcp_account_skill_cache_empty_unversioned(value: &Value) -> bool {
+    if cloud_mcp_account_skills_payload_has_document_marker(value) {
+        return false;
+    }
+    cloud_mcp_account_skill_units_from_payload_value(value).is_empty()
+        && cloud_mcp_account_skills_payload_revision(value)
+            .as_i64()
+            .unwrap_or(0)
+            <= 0
+        && cloud_mcp_account_skills_payload_text(value, &["updated_at", "updatedAt"])
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        && cloud_mcp_account_skills_payload_text(value, &["sync_status", "syncStatus"])
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+}
+
+fn cloud_mcp_account_skill_title_from_markdown(markdown: &str, fallback: &str) -> String {
+    markdown
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix("# ")
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn cloud_mcp_account_skill_recover_units_from_local_assets() -> Vec<Value> {
+    let Ok(asset_root) = cloud_mcp_managed_asset_root() else {
+        return Vec::new();
+    };
+    let skills_root = asset_root.join(CLOUD_MCP_ASSET_FOLDER_SKILLS);
+    let Ok(asset_dirs) = fs::read_dir(skills_root) else {
+        return Vec::new();
+    };
+    let mut by_id: HashMap<String, (u128, Value)> = HashMap::new();
+    for asset_dir in asset_dirs.flatten() {
+        let Ok(asset_type) = asset_dir.file_type() else {
+            continue;
+        };
+        if !asset_type.is_dir() {
+            continue;
+        }
+        let asset_id = asset_dir.file_name().to_string_lossy().trim().to_string();
+        if asset_id.is_empty() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(asset_dir.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(extension.as_str(), "md" | "markdown") {
+                continue;
+            }
+            let Ok(markdown) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let fallback_title = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("skill");
+            let title = cloud_mcp_account_skill_title_from_markdown(&markdown, fallback_title);
+            let skill_id = cloud_mcp_account_skill_filename_stem(&title, fallback_title);
+            if skill_id.is_empty() {
+                continue;
+            }
+            let metadata = fs::metadata(&path).ok();
+            let modified_ms = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0);
+            let size_bytes = metadata
+                .as_ref()
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let content = cloud_mcp_account_skill_markdown_body(&markdown);
+            let content_hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
+            let updated_at = cloud_mcp_rfc3339_now();
+            let unit = cloud_mcp_account_skill_normalized_unit(json!({
+                "asset_id": asset_id.clone(),
+                "assetId": asset_id.clone(),
+                "content": content.clone(),
+                "content_md": content.clone(),
+                "contentMd": content,
+                "content_hash": content_hash.clone(),
+                "contentHash": content_hash.clone(),
+                "hash": content_hash.clone(),
+                "sha256": content_hash,
+                "id": skill_id.clone(),
+                "skill_id": skill_id.clone(),
+                "skillId": skill_id.clone(),
+                "mime_type": "text/markdown",
+                "mimeType": "text/markdown",
+                "size_bytes": size_bytes,
+                "sizeBytes": size_bytes,
+                "source": "custom",
+                "title": title,
+                "updated_at": updated_at.clone(),
+                "updatedAt": updated_at,
+                "recovered_from_local_asset": true,
+                "recoveredFromLocalAsset": true,
+            }));
+            let replace = by_id
+                .get(&skill_id)
+                .map(|(existing_ms, _)| modified_ms >= *existing_ms)
+                .unwrap_or(true);
+            if replace {
+                by_id.insert(skill_id, (modified_ms, unit));
+            }
+        }
+    }
+    let mut units = by_id
+        .into_values()
+        .map(|(_, unit)| unit)
+        .collect::<Vec<_>>();
+    units.sort_by(|left, right| {
+        cloud_mcp_account_skill_text(
+            left,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        )
+        .cmp(&cloud_mcp_account_skill_text(
+            right,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        ))
+    });
+    units
+}
+
+fn cloud_mcp_account_skill_units_projection_from_rows(
+    skill_units: Vec<Value>,
+    revision: Value,
+    updated_at: String,
+    sync_status: String,
+    last_sync_error: String,
+) -> Value {
+    json!({
+        "kind": "account_skills_local_projection",
+        "contract": "diffforge.skills_doc.v1",
+        "updated_at": updated_at,
+        "updatedAt": updated_at,
+        "sync_status": sync_status,
+        "syncStatus": sync_status,
+        "last_sync_error": last_sync_error,
+        "lastSyncError": last_sync_error,
+        "revision": revision,
+        "skills": {
+            "skill_units": skill_units.clone(),
+            "skillUnits": skill_units.clone(),
+            "revision": revision,
+            "updated_at": updated_at,
+            "updatedAt": updated_at,
+            "sync_status": sync_status,
+            "syncStatus": sync_status,
+            "last_sync_error": last_sync_error,
+            "lastSyncError": last_sync_error,
+        },
+        "skill_units": skill_units.clone(),
+        "skillUnits": skill_units,
+    })
+}
+
+fn cloud_mcp_read_account_skill_pending_push_payload() -> Option<Value> {
+    cloud_mcp_account_skill_units_pending_push_path()
+        .and_then(cloud_mcp_read_account_skill_units_payload_from_path)
+}
+
+fn cloud_mcp_account_skill_pending_push_units() -> Vec<Value> {
+    cloud_mcp_read_account_skill_pending_push_payload()
+        .map(|value| cloud_mcp_account_skill_units_from_payload_value(&value))
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_account_skill_pending_push_ids() -> HashSet<String> {
+    cloud_mcp_account_skill_pending_push_units()
+        .into_iter()
+        .filter_map(|unit| {
+            let skill_id = cloud_mcp_account_skill_id(&unit);
+            if skill_id.is_empty() {
+                None
+            } else {
+                Some(skill_id)
+            }
+        })
+        .collect()
+}
+
+fn cloud_mcp_mark_account_skill_unit_pending(unit: &mut Value, local_saved_at: &str) {
+    let skill_id = cloud_mcp_account_skill_id(unit);
+    if let Some(object) = unit.as_object_mut() {
+        object.insert("pending_push".to_string(), json!(true));
+        object.insert("pendingPush".to_string(), json!(true));
+        object.insert("sync_status".to_string(), json!("local_pending"));
+        object.insert("syncStatus".to_string(), json!("local_pending"));
+        object.insert("local_saved_at".to_string(), json!(local_saved_at));
+        object.insert("localSavedAt".to_string(), json!(local_saved_at));
+        if !skill_id.is_empty() {
+            object.insert("skill_id".to_string(), json!(skill_id.clone()));
+            object.insert("skillId".to_string(), json!(skill_id.clone()));
+            object.insert("id".to_string(), json!(skill_id));
+        }
+    }
+}
+
+fn cloud_mcp_write_account_skill_pending_push_payload(
+    skill_units: &[Value],
+    pending_ids: &HashSet<String>,
+    base_revision: Value,
+    local_saved_at: &str,
+) {
+    let mut pending_units = Vec::new();
+    for unit in skill_units {
+        let skill_id = cloud_mcp_account_skill_id(unit);
+        if skill_id.is_empty() || !pending_ids.contains(&skill_id) {
+            continue;
+        }
+        let mut pending = unit.clone();
+        cloud_mcp_mark_account_skill_unit_pending(&mut pending, local_saved_at);
+        pending_units.push(pending);
+    }
+    if pending_units.is_empty() {
+        cloud_mcp_clear_account_skill_pending_push();
+        return;
+    }
+    pending_units.sort_by(|left, right| {
+        cloud_mcp_account_skill_text(
+            left,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        )
+        .cmp(&cloud_mcp_account_skill_text(
+            right,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        ))
+    });
+    let pending_skill_ids = pending_units
+        .iter()
+        .filter_map(|unit| {
+            let skill_id = cloud_mcp_account_skill_id(unit);
+            if skill_id.is_empty() {
+                None
+            } else {
+                Some(skill_id)
+            }
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "kind": "account_skills_pending_push",
+        "event_kind": "account_skills_pending_push",
+        "eventKind": "account_skills_pending_push",
+        "contract": "diffforge.skills_doc.v1",
+        "pending_push": true,
+        "pendingPush": true,
+        "pending_push_count": pending_units.len(),
+        "pendingPushCount": pending_units.len(),
+        "pending_skill_ids": pending_skill_ids.clone(),
+        "pendingSkillIds": pending_skill_ids,
+        "base_revision": base_revision,
+        "baseRevision": base_revision,
+        "local_saved_at": local_saved_at,
+        "localSavedAt": local_saved_at,
+        "updated_at": local_saved_at,
+        "updatedAt": local_saved_at,
+        "sync_status": "local_pending",
+        "syncStatus": "local_pending",
+        "skills": {
+            "skill_units": pending_units.clone(),
+            "skillUnits": pending_units.clone(),
+        },
+        "skill_units": pending_units.clone(),
+        "skillUnits": pending_units,
+    });
+    if let Some(path) = cloud_mcp_account_skill_units_pending_push_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&payload) {
+            let _ = fs::write(path, text);
+        }
+    }
+}
+
+fn cloud_mcp_clear_account_skill_pending_push() {
+    if let Some(path) = cloud_mcp_account_skill_units_pending_push_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn cloud_mcp_account_skill_units_projection_with_pending(projection: Value) -> Value {
+    let pending_units = cloud_mcp_account_skill_pending_push_units();
+    if pending_units.is_empty() {
+        return projection;
+    }
+    let pending_payload = cloud_mcp_read_account_skill_pending_push_payload().unwrap_or_else(|| json!({}));
+    let mut rows = HashMap::new();
+    for unit in cloud_mcp_account_skill_units_from_payload_value(&projection) {
+        let skill_id = cloud_mcp_account_skill_id(&unit);
+        if skill_id.is_empty() || cloud_mcp_account_skill_unit_removed(&unit) {
+            continue;
+        }
+        rows.insert(skill_id, unit);
+    }
+    let mut pending_ids = Vec::new();
+    for mut unit in pending_units {
+        let skill_id = cloud_mcp_account_skill_id(&unit);
+        if skill_id.is_empty() || cloud_mcp_account_skill_unit_removed(&unit) {
+            continue;
+        }
+        let local_saved_at = cloud_mcp_account_skills_payload_text(
+            &unit,
+            &["local_saved_at", "localSavedAt", "updated_at", "updatedAt"],
+        )
+        .or_else(|| {
+            cloud_mcp_account_skills_payload_text(
+                &pending_payload,
+                &["local_saved_at", "localSavedAt", "updated_at", "updatedAt"],
+            )
+        })
+        .unwrap_or_else(cloud_mcp_rfc3339_now);
+        cloud_mcp_mark_account_skill_unit_pending(&mut unit, &local_saved_at);
+        pending_ids.push(skill_id.clone());
+        rows.insert(skill_id, unit);
+    }
+    if pending_ids.is_empty() {
+        return projection;
+    }
+    pending_ids.sort();
+    pending_ids.dedup();
+    let mut skill_units = rows.into_values().collect::<Vec<_>>();
+    skill_units.sort_by(|left, right| {
+        cloud_mcp_account_skill_text(
+            left,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        )
+        .cmp(&cloud_mcp_account_skill_text(
+            right,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        ))
+    });
+    let revision = cloud_mcp_account_skills_payload_revision(&projection);
+    let updated_at = cloud_mcp_account_skills_payload_text(&projection, &["updated_at", "updatedAt"])
+        .or_else(|| {
+            cloud_mcp_account_skills_payload_text(
+                &pending_payload,
+                &["local_saved_at", "localSavedAt", "updated_at", "updatedAt"],
+            )
+        })
+        .unwrap_or_default();
+    let last_sync_error = cloud_mcp_account_skills_payload_text(
+        &projection,
+        &["last_sync_error", "lastSyncError", "error"],
+    )
+    .unwrap_or_default();
+    let mut overlaid = cloud_mcp_account_skill_units_projection_from_rows(
+        skill_units,
+        revision,
+        updated_at,
+        "local_pending".to_string(),
+        last_sync_error,
+    );
+    let offline = projection
+        .get("offline")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(object) = overlaid.as_object_mut() {
+        object.insert("authoritative".to_string(), json!(true));
+        object.insert("snapshot_full".to_string(), json!(true));
+        object.insert("snapshotFull".to_string(), json!(true));
+        object.insert("offline".to_string(), json!(offline));
+        object.insert("pending_push".to_string(), json!(true));
+        object.insert("pendingPush".to_string(), json!(true));
+        object.insert("pending_push_count".to_string(), json!(pending_ids.len()));
+        object.insert("pendingPushCount".to_string(), json!(pending_ids.len()));
+        object.insert("pending_skill_ids".to_string(), json!(pending_ids.clone()));
+        object.insert("pendingSkillIds".to_string(), json!(pending_ids.clone()));
+    }
+    if let Some(skills) = overlaid.get_mut("skills").and_then(Value::as_object_mut) {
+        skills.insert("authoritative".to_string(), json!(true));
+        skills.insert("snapshot_full".to_string(), json!(true));
+        skills.insert("snapshotFull".to_string(), json!(true));
+        skills.insert("pending_push".to_string(), json!(true));
+        skills.insert("pendingPush".to_string(), json!(true));
+        skills.insert("pending_push_count".to_string(), json!(pending_ids.len()));
+        skills.insert("pendingPushCount".to_string(), json!(pending_ids.len()));
+        skills.insert("pending_skill_ids".to_string(), json!(pending_ids.clone()));
+        skills.insert("pendingSkillIds".to_string(), json!(pending_ids));
+    }
+    overlaid
+}
+
+fn cloud_mcp_write_account_skill_units_payload(value: &Value) {
+    if let Some(path) = cloud_mcp_account_skill_units_cache_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(value) {
+            let _ = fs::write(path, text);
+        }
+    }
+}
+
+fn cloud_mcp_cached_account_skill_units_payload() -> Value {
+    let cached = cloud_mcp_account_skill_units_cache_path()
+        .and_then(cloud_mcp_read_account_skill_units_payload_from_path)
+        .or_else(|| {
+            cloud_mcp_account_skill_units_legacy_cache_path()
+                .and_then(cloud_mcp_read_account_skill_units_payload_from_path)
+        })
+        .unwrap_or_else(|| json!({}));
+    if !cloud_mcp_account_skill_cache_empty_unversioned(&cached) {
+        return cached;
+    }
+    let recovered = cloud_mcp_account_skill_recover_units_from_local_assets();
+    if recovered.is_empty() {
+        return cached;
+    }
+    let projection = cloud_mcp_account_skill_units_projection_from_rows(
+        recovered,
+        Value::Null,
+        cloud_mcp_rfc3339_now(),
+        "recovered_local".to_string(),
+        String::new(),
+    );
+    cloud_mcp_write_account_skill_units_payload(&projection);
+    projection
+}
+
+fn cloud_mcp_cache_account_skill_units_payload(value: &Value) {
+    let incoming = cloud_mcp_account_skill_units_from_payload_value(value);
+    let removed = cloud_mcp_account_removed_skill_units_from_payload_value(value);
+    let cached = cloud_mcp_cached_account_skill_units_payload();
+    let mut rows = HashMap::new();
+    if !cloud_mcp_account_skills_payload_has_full_units(value) {
+        for unit in cloud_mcp_account_skill_units_from_payload_value(&cached) {
+            let skill_id = cloud_mcp_account_skill_id(&unit);
+            if !skill_id.is_empty() && !cloud_mcp_account_skill_unit_removed(&unit) {
+                rows.insert(skill_id, unit);
+            }
+        }
+    }
+    for unit in incoming {
+        let skill_id = cloud_mcp_account_skill_id(&unit);
+        if skill_id.is_empty() {
+            continue;
+        }
+        if cloud_mcp_account_skill_unit_removed(&unit) {
+            rows.remove(&skill_id);
+        } else {
+            rows.insert(skill_id, unit);
+        }
+    }
+    for unit in removed {
+        let skill_id = cloud_mcp_account_skill_id(&unit);
+        if !skill_id.is_empty() {
+            rows.remove(&skill_id);
+        }
+    }
+    let mut skill_units = rows.into_values().collect::<Vec<_>>();
+    skill_units.sort_by(|left, right| {
+        cloud_mcp_account_skill_text(
+            left,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        )
+        .cmp(&cloud_mcp_account_skill_text(
+            right,
+            &["title", "name", "label", "skill_id", "skillId", "id"],
+        ))
+    });
+    let revision = cloud_mcp_account_skills_payload_revision(value);
+    let updated_at = cloud_mcp_account_skills_payload_text(value, &["updated_at", "updatedAt"])
+        .unwrap_or_default();
+    let sync_status = cloud_mcp_account_skills_payload_text(value, &["sync_status", "syncStatus"])
+        .unwrap_or_default();
+    let last_sync_error = cloud_mcp_account_skills_payload_text(
+        value,
+        &["last_sync_error", "lastSyncError", "error"],
+    )
+    .unwrap_or_default();
+    let projection = cloud_mcp_account_skill_units_projection_from_rows(
+        skill_units,
+        revision,
+        updated_at,
+        sync_status,
+        last_sync_error,
+    );
+    cloud_mcp_write_account_skill_units_payload(&projection);
+}
+
+fn cloud_mcp_cached_account_skill_units() -> Vec<Value> {
+    cloud_mcp_account_skill_units_from_payload_value(&cloud_mcp_cached_account_skill_units_payload())
+}
+
+fn cloud_mcp_cached_account_skill_units_projection(error: Option<String>) -> Value {
+    let cached = cloud_mcp_cached_account_skill_units_payload();
+    let skill_units = cloud_mcp_account_skill_units_from_payload_value(&cached);
+    let revision = cloud_mcp_account_skills_payload_revision(&cached);
+    let projection = json!({
+        "offline": error.is_some(),
+        "error": error.unwrap_or_default(),
+        "skills": {
+            "skill_units": skill_units.clone(),
+            "skillUnits": skill_units.clone(),
+            "revision": revision,
+        },
+        "skill_units": skill_units.clone(),
+        "skillUnits": skill_units,
+    });
+    cloud_mcp_account_skill_units_projection_with_pending(projection)
+}
+
+fn cloud_mcp_cached_account_skill_have_entries() -> Vec<Value> {
+    cloud_mcp_cached_account_skill_units()
+        .into_iter()
+        .filter_map(|unit| {
+            let skill_id = cloud_mcp_account_skill_id(&unit);
+            if skill_id.is_empty() {
+                return None;
+            }
+            let hash = cloud_mcp_account_skill_text(
+                &unit,
+                &["content_hash", "contentHash", "hash", "sha256"],
+            );
+            let aux =
+                cloud_mcp_account_skill_text(&unit, &["asset_id", "assetId", "blob_id", "blobId"]);
+            Some(json!([skill_id, hash, aux]))
+        })
+        .collect()
 }
 
 fn cloud_mcp_account_skill_markdown(skill: &Value, skill_id: &str) -> String {
-    let title = cloud_mcp_account_skill_text(skill, &["title", "name", "label"]);
+    let title = cloud_mcp_account_skill_title(skill, skill_id);
     let content =
         cloud_mcp_account_skill_text(skill, &["content_md", "contentMd", "content", "body"]);
-    let meta = json!({
-        "id": skill_id,
-        "description": cloud_mcp_account_skill_text(skill, &["description", "summary"]),
-        "icon": cloud_mcp_account_skill_text(skill, &["icon"]),
-        "source": cloud_mcp_account_skill_text(skill, &["source"]),
-        "tone": cloud_mcp_account_skill_text(skill, &["tone"]),
-        "updatedAt": cloud_mcp_account_skill_text(skill, &["updated_at", "updatedAt"]),
-    });
-    let meta_text = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        "# {}\n\n<!-- diffforge-skill {} -->\n\n{}\n",
-        if title.is_empty() {
-            skill_id
-        } else {
-            title.as_str()
-        },
-        meta_text,
-        content
-    )
+    format!("# {}\n\n{}\n", title, content.trim())
 }
 
 fn cloud_mcp_account_skill_asset_name(skill: &Value, skill_id: &str) -> String {
-    let title = cloud_mcp_account_skill_text(skill, &["title", "name", "label"]);
-    let fallback = format!("{skill_id}.md");
-    let stem = if title.is_empty() {
-        skill_id.to_string()
-    } else {
-        title
-    };
+    let stem = cloud_mcp_account_skill_title(skill, skill_id);
+    let fallback = format!(
+        "{}.md",
+        cloud_mcp_account_skill_filename_stem(skill_id, "skill")
+    );
     let mut name = cloud_mcp_sanitize_asset_filename(&format!("{stem}.md"), &fallback);
     if Path::new(&name).extension().is_none() {
         name = format!("{name}.md");
@@ -23935,6 +24883,7 @@ async fn cloud_mcp_prepare_account_skill_unit_assets(
         if skill_id.is_empty() {
             continue;
         }
+        let skill_title = cloud_mcp_account_skill_title(&unit, &skill_id);
         let filename = cloud_mcp_account_skill_asset_name(&unit, &skill_id);
         let markdown = cloud_mcp_account_skill_markdown(&unit, &skill_id);
         let markdown_hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
@@ -23984,8 +24933,7 @@ async fn cloud_mcp_prepare_account_skill_unit_assets(
             "toolUnit": "skill",
             "skill_id": skill_id,
             "skillId": skill_id,
-            "title": cloud_mcp_account_skill_text(&unit, &["title", "name", "label"]),
-            "description": cloud_mcp_account_skill_text(&unit, &["description", "summary"]),
+            "title": skill_title,
             "icon": cloud_mcp_account_skill_text(&unit, &["icon"]),
             "source": cloud_mcp_account_skill_text(&unit, &["source"]),
             "tone": cloud_mcp_account_skill_text(&unit, &["tone"]),
@@ -24020,9 +24968,17 @@ async fn cloud_mcp_prepare_account_skill_unit_assets(
         let uploaded = cloud_mcp_asset_row_from_file(&asset_id).unwrap_or(row);
         let mut prepared = unit.clone();
         if let Some(object) = prepared.as_object_mut() {
-            for key in ["content", "content_md", "contentMd", "body"] {
+            for key in [
+                "content",
+                "content_md",
+                "contentMd",
+                "body",
+                "description",
+                "summary",
+            ] {
                 object.remove(key);
             }
+            object.insert("title".to_string(), json!(skill_title.clone()));
             object.insert("skill_id".to_string(), json!(skill_id.clone()));
             object.insert("skillId".to_string(), json!(skill_id.clone()));
             object.insert("id".to_string(), json!(skill_id));
@@ -24073,6 +25029,163 @@ async fn cloud_mcp_prepare_account_skill_unit_assets(
     Ok(prepared_units)
 }
 
+fn cloud_mcp_prepare_account_skill_unit_assets_local(
+    skill_units: Option<Value>,
+) -> Result<Vec<Value>, String> {
+    let units = cloud_mcp_account_skill_units_from_input(skill_units);
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    let req = cloud_mcp_asset_scope_request();
+    let asset_root = cloud_mcp_managed_asset_root()?;
+    let mut prepared_units = Vec::new();
+    for unit in units {
+        let skill_id = cloud_mcp_account_skill_id(&unit);
+        if skill_id.is_empty() {
+            continue;
+        }
+        let skill_title = cloud_mcp_account_skill_title(&unit, &skill_id);
+        let filename = cloud_mcp_account_skill_asset_name(&unit, &skill_id);
+        let markdown = cloud_mcp_account_skill_markdown(&unit, &skill_id);
+        let markdown_hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
+        let content = cloud_mcp_account_skill_markdown_body(&markdown);
+        let asset_id = format!(
+            "asset-account-skill-{}-{}",
+            cloud_mcp_short_hash(&skill_id),
+            markdown_hash.chars().take(12).collect::<String>()
+        );
+        let target_dir =
+            cloud_mcp_asset_dir_for_folder(&asset_root, CLOUD_MCP_ASSET_FOLDER_SKILLS, &asset_id);
+        diffforge_reject_untracked_asset_path_for_tracking(
+            &target_dir,
+            "save an account skill locally",
+        )?;
+        fs::create_dir_all(&target_dir).map_err(|error| {
+            format!(
+                "Unable to create local account skill asset directory {}: {error}",
+                target_dir.display()
+            )
+        })?;
+        let target_path = target_dir.join(&filename);
+        let should_write = fs::read_to_string(&target_path)
+            .map(|existing| existing != markdown)
+            .unwrap_or(true);
+        if should_write {
+            fs::write(&target_path, markdown).map_err(|error| {
+                format!(
+                    "Unable to write local account skill asset {}: {error}",
+                    target_path.display()
+                )
+            })?;
+        }
+        let metadata = json!({
+            "doc_domain": "skills",
+            "docDomain": "skills",
+            "folder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "group": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "asset_folder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "assetFolder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "asset_group": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "assetGroup": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "doc_id": skill_id,
+            "docId": skill_id,
+            "sync_contract": "diffforge.skills_doc.v1",
+            "syncContract": "diffforge.skills_doc.v1",
+            "tool_unit": "skill",
+            "toolUnit": "skill",
+            "skill_id": skill_id,
+            "skillId": skill_id,
+            "title": skill_title,
+            "icon": cloud_mcp_account_skill_text(&unit, &["icon"]),
+            "source": cloud_mcp_account_skill_text(&unit, &["source"]),
+            "tone": cloud_mcp_account_skill_text(&unit, &["tone"]),
+            "local_only": true,
+            "localOnly": true,
+        });
+        let input = json!({
+            "asset_id": asset_id,
+            "assetId": asset_id,
+            "name": filename,
+            "filename": filename,
+            "mime_type": "text/markdown",
+            "mimeType": "text/markdown",
+            "kind": "file",
+            "folder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "group": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "asset_folder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "assetFolder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+            "source_kind": "account_skill",
+            "sourceKind": "account_skill",
+            "metadata": metadata,
+        });
+        let row = cloud_mcp_asset_local_row_with_input(
+            &req,
+            "",
+            req.workspace_name.as_deref(),
+            &target_path,
+            &input,
+        )?;
+        cloud_mcp_asset_store_local_row(&row)?;
+        let mut prepared = unit.clone();
+        if let Some(object) = prepared.as_object_mut() {
+            object.insert("title".to_string(), json!(skill_title.clone()));
+            object.insert("skill_id".to_string(), json!(skill_id.clone()));
+            object.insert("skillId".to_string(), json!(skill_id.clone()));
+            object.insert("id".to_string(), json!(skill_id.clone()));
+            object.insert("content".to_string(), json!(content.clone()));
+            object.insert("content_md".to_string(), json!(content.clone()));
+            object.insert("contentMd".to_string(), json!(content));
+            object.insert("content_hash".to_string(), json!(markdown_hash.clone()));
+            object.insert("contentHash".to_string(), json!(markdown_hash.clone()));
+            object.insert("hash".to_string(), json!(markdown_hash.clone()));
+            object.insert("sha256".to_string(), json!(markdown_hash.clone()));
+            object.insert("asset_id".to_string(), json!(asset_id.clone()));
+            object.insert("assetId".to_string(), json!(asset_id.clone()));
+            object.insert("mime_type".to_string(), json!("text/markdown"));
+            object.insert("mimeType".to_string(), json!("text/markdown"));
+            object.insert("local_only".to_string(), json!(true));
+            object.insert("localOnly".to_string(), json!(true));
+            object.insert(
+                "local_path".to_string(),
+                json!(target_path.display().to_string()),
+            );
+            object.insert(
+                "localPath".to_string(),
+                json!(target_path.display().to_string()),
+            );
+            if let Some(size_bytes) = row.get("size_bytes").or_else(|| row.get("sizeBytes")) {
+                object.insert("size_bytes".to_string(), size_bytes.clone());
+                object.insert("sizeBytes".to_string(), size_bytes.clone());
+            }
+            object.insert(
+                "manifest".to_string(),
+                json!({
+                    "asset_id": asset_id,
+                    "assetId": asset_id,
+                    "sha256": markdown_hash,
+                    "mime_type": "text/markdown",
+                    "mimeType": "text/markdown",
+                    "source_kind": "account_skill",
+                    "sourceKind": "account_skill",
+                    "folder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+                    "asset_folder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+                    "assetFolder": CLOUD_MCP_ASSET_FOLDER_SKILLS,
+                    "local_only": true,
+                    "localOnly": true,
+                }),
+            );
+            object.insert(
+                "metadata".to_string(),
+                row.get("metadata")
+                    .cloned()
+                    .unwrap_or_else(|| input["metadata"].clone()),
+            );
+        }
+        prepared_units.push(prepared);
+    }
+    Ok(prepared_units)
+}
+
 fn cloud_mcp_account_skill_markdown_body(markdown: &str) -> String {
     let lines = markdown.lines().collect::<Vec<_>>();
     let mut index = 0usize;
@@ -24096,67 +25209,6 @@ fn cloud_mcp_account_skill_markdown_body(markdown: &str) -> String {
         index += 1;
     }
     lines[index..].join("\n").trim().to_string()
-}
-
-fn cloud_mcp_account_skills_preamble(skills: &Value) -> String {
-    let skills_md = cloud_mcp_payload_text(skills, &["skills_md", "skillsMd"]).unwrap_or_default();
-    let mut preamble = Vec::new();
-    for line in skills_md.lines() {
-        if line.trim_start().starts_with("## ") {
-            break;
-        }
-        preamble.push(line);
-    }
-    let preamble = preamble.join("\n").trim().to_string();
-    if preamble.is_empty() {
-        "# Skills".to_string()
-    } else {
-        preamble
-    }
-}
-
-fn cloud_mcp_account_skills_markdown_from_units(units: &[Value], preamble: &str) -> String {
-    let mut sections = Vec::new();
-    for unit in units {
-        let skill_id = cloud_mcp_account_skill_id(unit);
-        if skill_id.is_empty() {
-            continue;
-        }
-        let title = cloud_mcp_account_skill_text(unit, &["title", "name", "label"]);
-        let content =
-            cloud_mcp_account_skill_text(unit, &["content_md", "contentMd", "content", "body"]);
-        let meta = json!({
-            "id": skill_id,
-            "description": cloud_mcp_account_skill_text(unit, &["description", "summary"]),
-            "icon": cloud_mcp_account_skill_text(unit, &["icon"]),
-            "source": cloud_mcp_account_skill_text(unit, &["source"]),
-            "tone": cloud_mcp_account_skill_text(unit, &["tone"]),
-            "updatedAt": cloud_mcp_account_skill_text(unit, &["updated_at", "updatedAt"]),
-        });
-        let meta_text = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
-        sections.push(format!(
-            "## {}\n\n<!-- diffforge-skill {} -->\n\n{}",
-            if title.is_empty() {
-                skill_id.as_str()
-            } else {
-                title.as_str()
-            },
-            meta_text,
-            content.trim()
-        ));
-    }
-    let mut output = String::new();
-    output.push_str(if preamble.trim().is_empty() {
-        "# Skills"
-    } else {
-        preamble.trim()
-    });
-    if !sections.is_empty() {
-        output.push_str("\n\n");
-        output.push_str(&sections.join("\n\n"));
-    }
-    output.push('\n');
-    output
 }
 
 fn cloud_mcp_account_skill_local_markdown(asset_id: &str) -> Option<String> {
@@ -24200,10 +25252,10 @@ async fn cloud_mcp_hydrate_account_skill_unit(
     let has_content =
         cloud_mcp_payload_text(&unit, &["content_md", "contentMd", "content", "body"]).is_some();
     if has_content {
-        return Ok(unit);
+        return Ok(cloud_mcp_account_skill_normalized_unit(unit));
     }
     let Some(asset_id) = cloud_mcp_payload_text(&unit, &["asset_id", "assetId"]) else {
-        return Ok(unit);
+        return Ok(cloud_mcp_account_skill_normalized_unit(unit));
     };
     let markdown = cloud_mcp_account_skill_asset_markdown(state, &asset_id).await?;
     let content = cloud_mcp_account_skill_markdown_body(&markdown);
@@ -24215,7 +25267,7 @@ async fn cloud_mcp_hydrate_account_skill_unit(
         object.insert("hydrated_from_asset".to_string(), json!(true));
         object.insert("hydratedFromAsset".to_string(), json!(true));
     }
-    Ok(unit)
+    Ok(cloud_mcp_account_skill_normalized_unit(unit))
 }
 
 async fn cloud_mcp_hydrate_account_skill_units(
@@ -24283,14 +25335,10 @@ async fn cloud_mcp_hydrate_account_skills_object(
     if units.is_empty() {
         return Ok(skills);
     }
-    let preamble = cloud_mcp_account_skills_preamble(&skills);
     let hydrated_units = cloud_mcp_hydrate_account_skill_units(state, units).await?;
-    let skills_md = cloud_mcp_account_skills_markdown_from_units(&hydrated_units, &preamble);
     if let Some(object) = skills.as_object_mut() {
         object.insert("skill_units".to_string(), json!(hydrated_units.clone()));
         object.insert("skillUnits".to_string(), json!(hydrated_units));
-        object.insert("skills_md".to_string(), json!(skills_md.clone()));
-        object.insert("skillsMd".to_string(), json!(skills_md));
         object.insert("hydrated".to_string(), json!(true));
         object.insert("hydrated_from_assets".to_string(), json!(true));
         object.insert("hydratedFromAssets".to_string(), json!(true));
@@ -24340,15 +25388,11 @@ async fn cloud_mcp_hydrate_account_skill_payload_shallow(
             .cloned()
             .unwrap_or_default();
         if !units.is_empty() {
-            let preamble = cloud_mcp_account_skills_preamble(&value);
-            let skills_md = cloud_mcp_account_skills_markdown_from_units(&units, &preamble);
             let revision = value.get("revision").cloned().unwrap_or(Value::Null);
             if let Some(object) = value.as_object_mut() {
                 object.insert(
                     "skills".to_string(),
                     json!({
-                        "skills_md": skills_md.clone(),
-                        "skillsMd": skills_md,
                         "skill_units": units.clone(),
                         "skillUnits": units,
                         "revision": revision,
@@ -24392,20 +25436,60 @@ fn cloud_mcp_tools_base_payload(source: &str) -> Value {
     })
 }
 
-#[tauri::command]
-async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<Value, String> {
-    let payload = cloud_mcp_tools_base_payload("rust-diffforge-account-tools");
-    let mut skills_payload = payload.clone();
-    if let Some(object) = skills_payload.as_object_mut() {
+async fn cloud_mcp_fetch_account_skills(
+    state: &CloudMcpState,
+    source: &str,
+) -> Result<Value, String> {
+    let mut payload = cloud_mcp_tools_base_payload(source);
+    let have = cloud_mcp_cached_account_skill_have_entries();
+    if let Some(object) = payload.as_object_mut() {
         object.insert("m".to_string(), json!("delta"));
         object.insert("c".to_string(), json!("doc.sync"));
         object.insert("d".to_string(), json!("skills"));
-        object.insert("v".to_string(), json!(1));
+        object.insert("v".to_string(), json!(2));
         object.insert("contract".to_string(), json!("diffforge.skills_doc.v1"));
+        object.insert("h".to_string(), json!(have.clone()));
+        object.insert("store_empty".to_string(), json!(have.is_empty()));
+        object.insert("storeEmpty".to_string(), json!(have.is_empty()));
     }
-    let skills = cloud_mcp_ws_request(state.inner(), "doc.sync", &skills_payload)
-        .await
-        .map(|response| cloud_mcp_response_data(&response));
+
+    let response = match cloud_mcp_ws_request(state, "doc.sync", &payload).await {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(cloud_mcp_cached_account_skill_units_projection(Some(error)));
+        }
+    };
+    let data = cloud_mcp_response_data(&response);
+    let hydrated = match cloud_mcp_hydrate_account_skill_payload(state, data).await {
+        Ok(hydrated) => hydrated,
+        Err(error) => {
+            log_cloud_sync_event(
+                "account_skills.hydrate_error",
+                json!({"error": clean_terminal_telemetry_text(&error)}),
+            );
+            return Ok(cloud_mcp_cached_account_skill_units_projection(Some(error)));
+        }
+    };
+    cloud_mcp_cache_account_skill_units_payload(&hydrated);
+    let mut projection = cloud_mcp_cached_account_skill_units_projection(None);
+    if let Some(object) = projection.as_object_mut() {
+        object.insert("offline".to_string(), json!(false));
+        object.insert("source_response".to_string(), hydrated.clone());
+        object.insert("sourceResponse".to_string(), hydrated);
+    }
+    Ok(projection)
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_account_skills(state: State<'_, CloudMcpState>) -> Result<Value, String> {
+    cloud_mcp_fetch_account_skills(state.inner(), "rust-diffforge-account-skills").await
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<Value, String> {
+    let payload = cloud_mcp_tools_base_payload("rust-diffforge-account-tools");
+    let skills =
+        cloud_mcp_fetch_account_skills(state.inner(), "rust-diffforge-account-tools").await;
     let clis = cloud_mcp_ws_request(state.inner(), "account_clis_get", &payload)
         .await
         .map(|response| cloud_mcp_response_data(&response));
@@ -24419,72 +25503,26 @@ async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<
             .or_else(|| clis.err())
             .or_else(|| mcps.err())
             .unwrap_or_else(|| "Cloud account tools are unavailable.".to_string());
-        let cached = cloud_mcp_cached_account_skills();
+        let cached = cloud_mcp_cached_account_skill_units_projection(Some(error.clone()));
         return Ok(json!({
             "kind": "account_tools",
             "offline": true,
             "error": error,
-            "skills": {
-                "skills_md": cached.clone(),
-                "skillsMd": cached,
-                "revision": Value::Null,
-            },
-            "skill_units": [],
-            "skillUnits": [],
+            "skills": cached.get("skills").cloned().unwrap_or_else(|| json!({})),
+            "skill_units": cached.get("skill_units").or_else(|| cached.get("skillUnits")).cloned().unwrap_or_else(|| json!([])),
+            "skillUnits": cached.get("skillUnits").or_else(|| cached.get("skill_units")).cloned().unwrap_or_else(|| json!([])),
             "clis": [],
             "mcps": [],
             "servers": [],
         }));
     }
 
-    let skills = skills.unwrap_or_else(|error| {
-        let cached = cloud_mcp_cached_account_skills();
-        json!({
-            "error": error,
-            "offline": true,
-            "skills": {
-                "skills_md": cached.clone(),
-                "skillsMd": cached,
-                "revision": Value::Null,
-            },
-            "skill_units": [],
-            "skillUnits": [],
-        })
-    });
-    let skills = match cloud_mcp_hydrate_account_skill_payload(state.inner(), skills).await {
-        Ok(hydrated) => hydrated,
-        Err(error) => {
-            log_cloud_sync_event(
-                "account_skills.hydrate_error",
-                json!({"error": clean_terminal_telemetry_text(&error)}),
-            );
-            json!({
-                "error": error,
-                "offline": true,
-                "skills": {
-                    "skills_md": cloud_mcp_cached_account_skills(),
-                    "skillsMd": cloud_mcp_cached_account_skills(),
-                    "revision": Value::Null,
-                },
-                "skill_units": [],
-                "skillUnits": [],
-            })
-        }
-    };
+    let skills =
+        skills.unwrap_or_else(|error| cloud_mcp_cached_account_skill_units_projection(Some(error)));
     let clis = clis.unwrap_or_else(|error| json!({"error": error, "offline": true, "clis": []}));
     let mcps = mcps.unwrap_or_else(
         |error| json!({"error": error, "offline": true, "mcps": [], "servers": []}),
     );
-
-    if !cloud_mcp_account_skills_has_hydration_error(&skills) {
-        if let Some(skills_md) = skills
-            .get("skills")
-            .and_then(|row| row.get("skills_md").or_else(|| row.get("skillsMd")))
-            .and_then(Value::as_str)
-        {
-            cloud_mcp_cache_account_skills(skills_md);
-        }
-    }
 
     Ok(json!({
         "kind": "account_tools",
@@ -24504,31 +25542,295 @@ async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<
     }))
 }
 
+fn cloud_mcp_emit_account_skills_updated(app: &AppHandle, payload: Value) {
+    let _ = app.emit(CLOUD_MCP_ACCOUNT_SKILLS_UPDATED_EVENT, payload);
+}
+
+#[tauri::command]
+async fn cloud_mcp_save_account_skills_local(
+    app: AppHandle,
+    base_revision: Option<i64>,
+    pending_skill_ids: Option<Value>,
+    skill_units: Option<Value>,
+) -> Result<Value, String> {
+    let skill_units_provided = skill_units.is_some();
+    if !skill_units_provided {
+        return Err("Local skill saves require skillUnits metadata.".to_string());
+    }
+    let prepared_units = cloud_mcp_prepare_account_skill_unit_assets_local(skill_units)?;
+    let current_ids = prepared_units
+        .iter()
+        .filter_map(|unit| {
+            let skill_id = cloud_mcp_account_skill_id(unit);
+            if skill_id.is_empty() {
+                None
+            } else {
+                Some(skill_id)
+            }
+        })
+        .collect::<HashSet<_>>();
+    let mut pending_ids = cloud_mcp_account_skill_pending_push_ids()
+        .into_iter()
+        .filter(|skill_id| current_ids.contains(skill_id))
+        .collect::<HashSet<_>>();
+    pending_ids.extend(
+        cloud_mcp_account_skill_ids_from_input(pending_skill_ids)
+            .into_iter()
+            .filter(|skill_id| current_ids.contains(skill_id)),
+    );
+    for unit in &prepared_units {
+        let requested_pending = unit
+            .get("pending_push")
+            .or_else(|| unit.get("pendingPush"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !requested_pending {
+            continue;
+        }
+        let skill_id = cloud_mcp_account_skill_id(unit);
+        if !skill_id.is_empty() && current_ids.contains(&skill_id) {
+            pending_ids.insert(skill_id);
+        }
+    }
+    if pending_ids.is_empty() {
+        pending_ids = current_ids.clone();
+    }
+    let local_saved_at = cloud_mcp_rfc3339_now();
+    let mut local_units = Vec::with_capacity(prepared_units.len());
+    for mut unit in prepared_units {
+        let skill_id = cloud_mcp_account_skill_id(&unit);
+        if !skill_id.is_empty() && pending_ids.contains(&skill_id) {
+            cloud_mcp_mark_account_skill_unit_pending(&mut unit, &local_saved_at);
+        }
+        local_units.push(unit);
+    }
+    let base_revision_value = base_revision.map(|value| json!(value)).unwrap_or(Value::Null);
+    cloud_mcp_write_account_skill_pending_push_payload(
+        &local_units,
+        &pending_ids,
+        base_revision_value.clone(),
+        &local_saved_at,
+    );
+    let mut pending_skill_ids = pending_ids.into_iter().collect::<Vec<_>>();
+    pending_skill_ids.sort();
+    let mut projection = cloud_mcp_account_skill_units_projection_from_rows(
+        local_units.clone(),
+        base_revision_value.clone(),
+        local_saved_at.clone(),
+        "local_pending".to_string(),
+        String::new(),
+    );
+    if let Some(object) = projection.as_object_mut() {
+        object.insert("authoritative".to_string(), json!(skill_units_provided));
+        object.insert("snapshot_full".to_string(), json!(skill_units_provided));
+        object.insert("snapshotFull".to_string(), json!(skill_units_provided));
+        object.insert("pending_push".to_string(), json!(!pending_skill_ids.is_empty()));
+        object.insert("pendingPush".to_string(), json!(!pending_skill_ids.is_empty()));
+        object.insert(
+            "pending_push_count".to_string(),
+            json!(pending_skill_ids.len()),
+        );
+        object.insert(
+            "pendingPushCount".to_string(),
+            json!(pending_skill_ids.len()),
+        );
+        object.insert(
+            "pending_skill_ids".to_string(),
+            json!(pending_skill_ids.clone()),
+        );
+        object.insert(
+            "pendingSkillIds".to_string(),
+            json!(pending_skill_ids.clone()),
+        );
+        object.insert("local_saved_at".to_string(), json!(local_saved_at.clone()));
+        object.insert("localSavedAt".to_string(), json!(local_saved_at.clone()));
+    }
+    if let Some(skills) = projection.get_mut("skills").and_then(Value::as_object_mut) {
+        skills.insert("authoritative".to_string(), json!(skill_units_provided));
+        skills.insert("snapshot_full".to_string(), json!(skill_units_provided));
+        skills.insert("snapshotFull".to_string(), json!(skill_units_provided));
+        skills.insert("pending_push".to_string(), json!(!pending_skill_ids.is_empty()));
+        skills.insert("pendingPush".to_string(), json!(!pending_skill_ids.is_empty()));
+        skills.insert(
+            "pending_push_count".to_string(),
+            json!(pending_skill_ids.len()),
+        );
+        skills.insert(
+            "pendingPushCount".to_string(),
+            json!(pending_skill_ids.len()),
+        );
+        skills.insert(
+            "pending_skill_ids".to_string(),
+            json!(pending_skill_ids.clone()),
+        );
+        skills.insert("pendingSkillIds".to_string(), json!(pending_skill_ids));
+        skills.insert("local_saved_at".to_string(), json!(local_saved_at.clone()));
+        skills.insert("localSavedAt".to_string(), json!(local_saved_at.clone()));
+    }
+    cloud_mcp_cache_account_skill_units_payload(&projection);
+    cloud_mcp_emit_account_skills_updated(
+        &app,
+        json!({
+            "kind": "account_skills_local_projection",
+            "event_kind": "account_skills_local_projection",
+            "eventKind": "account_skills_local_projection",
+            "contract": "diffforge.skills_doc.v1",
+            "reason": "local_save_pending_push",
+            "c": "doc.sync",
+            "d": "skills",
+            "payload": projection.clone(),
+        }),
+    );
+    Ok(projection)
+}
+
 #[tauri::command]
 async fn cloud_mcp_save_account_skills(
+    app: AppHandle,
     state: State<'_, CloudMcpState>,
-    skills_md: String,
     base_revision: Option<i64>,
     skill_units: Option<Value>,
 ) -> Result<Value, String> {
     let skill_units_provided = skill_units.is_some();
-    if !skill_units_provided
-        && skills_md
-            .lines()
-            .any(|line| line.trim_start().starts_with("## "))
-    {
+    if !skill_units_provided {
         return Err(
-            "Account skill saves require per-skill metadata units so content can upload through the asset transfer path."
+            "Account skill saves require skillUnits metadata so content can upload through the asset transfer path."
                 .to_string(),
         );
     }
+    let requested_skill_units = cloud_mcp_account_skill_units_from_input(skill_units.clone());
+    let preparing_projection = json!({
+        "kind": "account_skills_local_projection",
+        "event_kind": "account_skills_local_projection",
+        "eventKind": "account_skills_local_projection",
+        "contract": "diffforge.skills_doc.v1",
+        "c": "doc.sync",
+        "d": "skills",
+        "m": "local",
+        "v": 2,
+        "authoritative": skill_units_provided,
+        "snapshot_full": skill_units_provided,
+        "snapshotFull": skill_units_provided,
+        "sync_status": "preparing",
+        "syncStatus": "preparing",
+        "skills": {
+            "skill_units": requested_skill_units.clone(),
+            "skillUnits": requested_skill_units.clone(),
+            "revision": base_revision,
+            "sync_status": "preparing",
+            "syncStatus": "preparing",
+        },
+        "skill_units": requested_skill_units.clone(),
+        "skillUnits": requested_skill_units,
+    });
+    cloud_mcp_cache_account_skill_units_payload(&preparing_projection);
+    cloud_mcp_emit_account_skills_updated(
+        &app,
+        json!({
+            "kind": "account_skills_local_projection",
+            "event_kind": "account_skills_local_projection",
+            "eventKind": "account_skills_local_projection",
+            "contract": "diffforge.skills_doc.v1",
+            "reason": "local_save_preparing",
+            "c": "doc.sync",
+            "d": "skills",
+            "payload": preparing_projection,
+        }),
+    );
     let prepared_skill_units =
-        cloud_mcp_prepare_account_skill_unit_assets(state.inner(), skill_units).await?;
+        match cloud_mcp_prepare_account_skill_unit_assets(state.inner(), skill_units).await {
+            Ok(units) => units,
+            Err(error) => {
+                let failed_projection = json!({
+                    "kind": "account_skills_local_projection",
+                    "event_kind": "account_skills_local_projection",
+                    "eventKind": "account_skills_local_projection",
+                    "contract": "diffforge.skills_doc.v1",
+                    "c": "doc.sync",
+                    "d": "skills",
+                    "m": "local",
+                    "v": 2,
+                    "authoritative": skill_units_provided,
+                    "snapshot_full": skill_units_provided,
+                    "snapshotFull": skill_units_provided,
+                    "sync_status": "sync_failed",
+                    "syncStatus": "sync_failed",
+                    "last_sync_error": error.clone(),
+                    "lastSyncError": error.clone(),
+                    "skills": {
+                        "skill_units": requested_skill_units.clone(),
+                        "skillUnits": requested_skill_units.clone(),
+                        "revision": base_revision,
+                        "sync_status": "sync_failed",
+                        "syncStatus": "sync_failed",
+                        "last_sync_error": error.clone(),
+                        "lastSyncError": error.clone(),
+                    },
+                    "skill_units": requested_skill_units.clone(),
+                    "skillUnits": requested_skill_units.clone(),
+                });
+                cloud_mcp_cache_account_skill_units_payload(&failed_projection);
+                cloud_mcp_emit_account_skills_updated(
+                    &app,
+                    json!({
+                        "kind": "account_skills_local_projection",
+                        "event_kind": "account_skills_local_projection",
+                        "eventKind": "account_skills_local_projection",
+                        "contract": "diffforge.skills_doc.v1",
+                        "reason": "local_save_prepare_failed",
+                        "c": "doc.sync",
+                        "d": "skills",
+                        "payload": failed_projection,
+                    }),
+                );
+                return Err(error);
+            }
+        };
+    let local_skill_units =
+        cloud_mcp_hydrate_account_skill_units(state.inner(), prepared_skill_units.clone()).await?;
     let prepared_skill_ops = prepared_skill_units
         .iter()
         .cloned()
         .map(|skill| json!({"op": "u", "skill": skill}))
         .collect::<Vec<_>>();
+    let local_projection = json!({
+        "kind": "account_skills_local_projection",
+        "event_kind": "account_skills_local_projection",
+        "eventKind": "account_skills_local_projection",
+        "contract": "diffforge.skills_doc.v1",
+        "c": "doc.sync",
+        "d": "skills",
+        "m": "local",
+        "v": 2,
+        "authoritative": skill_units_provided,
+        "snapshot_full": skill_units_provided,
+        "snapshotFull": skill_units_provided,
+        "sync_status": "syncing",
+        "syncStatus": "syncing",
+        "skills": {
+            "skill_units": local_skill_units.clone(),
+            "skillUnits": local_skill_units.clone(),
+            "revision": base_revision,
+            "sync_status": "syncing",
+            "syncStatus": "syncing",
+        },
+        "skill_units": local_skill_units.clone(),
+        "skillUnits": local_skill_units.clone(),
+    });
+    cloud_mcp_cache_account_skill_units_payload(&local_projection);
+    cloud_mcp_emit_account_skills_updated(
+        &app,
+        json!({
+            "kind": "account_skills_local_projection",
+            "event_kind": "account_skills_local_projection",
+            "eventKind": "account_skills_local_projection",
+            "contract": "diffforge.skills_doc.v1",
+            "reason": "local_save",
+            "c": "doc.sync",
+            "d": "skills",
+            "payload": local_projection.clone(),
+        }),
+    );
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
@@ -24540,23 +25842,15 @@ async fn cloud_mcp_save_account_skills(
     let idempotency_key = format!("account-skill:{scope_key}:{device_id}:{payload_hash}");
     let mut payload = cloud_mcp_tools_base_payload("rust-diffforge-account-skills");
     if let Some(object) = payload.as_object_mut() {
-        let preamble = cloud_mcp_account_skills_preamble(&json!({ "skills_md": skills_md.clone() }));
-        let cloud_skills_md = format!("{}\n", preamble.trim());
-        object.insert("skills_md".to_string(), json!(cloud_skills_md.clone()));
-        object.insert("skillsMd".to_string(), json!(cloud_skills_md));
-        if skill_units_provided {
-            object.insert(
-                "skill_units".to_string(),
-                json!(prepared_skill_units.clone()),
-            );
-            object.insert(
-                "skillUnits".to_string(),
-                json!(prepared_skill_units.clone()),
-            );
-            object.insert("ops".to_string(), json!(prepared_skill_ops.clone()));
-        } else {
-            object.insert("ops".to_string(), json!([]));
-        }
+        object.insert(
+            "skill_units".to_string(),
+            json!(prepared_skill_units.clone()),
+        );
+        object.insert(
+            "skillUnits".to_string(),
+            json!(prepared_skill_units.clone()),
+        );
+        object.insert("ops".to_string(), json!(prepared_skill_ops.clone()));
         object.insert("authoritative".to_string(), json!(skill_units_provided));
         object.insert("snapshot_full".to_string(), json!(skill_units_provided));
         object.insert("snapshotFull".to_string(), json!(skill_units_provided));
@@ -24569,30 +25863,108 @@ async fn cloud_mcp_save_account_skills(
         object.insert("contract".to_string(), json!("diffforge.skills_doc.v1"));
         object.insert("sync_unit".to_string(), json!("account_skill"));
         object.insert("syncUnit".to_string(), json!("account_skill"));
-        object.insert("skill_unit_count".to_string(), json!(prepared_skill_units.len()));
-        object.insert("skillUnitCount".to_string(), json!(prepared_skill_units.len()));
-        object.insert("changed_count".to_string(), json!(prepared_skill_units.len()));
-        object.insert("changedCount".to_string(), json!(prepared_skill_units.len()));
+        object.insert(
+            "skill_unit_count".to_string(),
+            json!(prepared_skill_units.len()),
+        );
+        object.insert(
+            "skillUnitCount".to_string(),
+            json!(prepared_skill_units.len()),
+        );
+        object.insert(
+            "changed_count".to_string(),
+            json!(prepared_skill_units.len()),
+        );
+        object.insert(
+            "changedCount".to_string(),
+            json!(prepared_skill_units.len()),
+        );
         object.insert("payload_hash".to_string(), json!(payload_hash.clone()));
         object.insert("payloadHash".to_string(), json!(payload_hash));
-        object.insert("idempotency_key".to_string(), json!(idempotency_key.clone()));
+        object.insert(
+            "idempotency_key".to_string(),
+            json!(idempotency_key.clone()),
+        );
         object.insert("idempotencyKey".to_string(), json!(idempotency_key));
         object.insert("source_device_id".to_string(), json!(device_id.clone()));
         object.insert("sourceDeviceId".to_string(), json!(device_id.clone()));
         object.insert("device_id".to_string(), json!(device_id.clone()));
         object.insert("deviceId".to_string(), json!(device_id));
-        if let Some(device_name) = device_profile.get("device_name").or_else(|| device_profile.get("deviceName")) {
+        if let Some(device_name) = device_profile
+            .get("device_name")
+            .or_else(|| device_profile.get("deviceName"))
+        {
             object.insert("source_device_name".to_string(), device_name.clone());
             object.insert("sourceDeviceName".to_string(), device_name.clone());
         }
-        if let Some(base_revision) = base_revision {
-            object.insert("base_revision".to_string(), json!(base_revision));
-            object.insert("baseRevision".to_string(), json!(base_revision));
-        }
     }
-    let response = cloud_mcp_ws_request(state.inner(), "doc.sync", &payload).await?;
-    cloud_mcp_cache_account_skills(&skills_md);
-    cloud_mcp_hydrate_account_skill_payload(state.inner(), cloud_mcp_response_data(&response)).await
+    let response = match cloud_mcp_ws_request(state.inner(), "doc.sync", &payload).await {
+        Ok(response) => response,
+        Err(error) => {
+            let failed_projection = json!({
+                "kind": "account_skills_local_projection",
+                "event_kind": "account_skills_local_projection",
+                "eventKind": "account_skills_local_projection",
+                "contract": "diffforge.skills_doc.v1",
+                "c": "doc.sync",
+                "d": "skills",
+                "m": "local",
+                "v": 2,
+                "authoritative": skill_units_provided,
+                "snapshot_full": skill_units_provided,
+                "snapshotFull": skill_units_provided,
+                "sync_status": "sync_failed",
+                "syncStatus": "sync_failed",
+                "last_sync_error": error.clone(),
+                "lastSyncError": error.clone(),
+                "skills": {
+                    "skill_units": local_skill_units.clone(),
+                    "skillUnits": local_skill_units.clone(),
+                    "revision": base_revision,
+                    "sync_status": "sync_failed",
+                    "syncStatus": "sync_failed",
+                    "last_sync_error": error.clone(),
+                    "lastSyncError": error.clone(),
+                },
+                "skill_units": local_skill_units.clone(),
+                "skillUnits": local_skill_units.clone(),
+            });
+            cloud_mcp_cache_account_skill_units_payload(&failed_projection);
+            cloud_mcp_emit_account_skills_updated(
+                &app,
+                json!({
+                    "kind": "account_skills_local_projection",
+                    "event_kind": "account_skills_local_projection",
+                    "eventKind": "account_skills_local_projection",
+                    "contract": "diffforge.skills_doc.v1",
+                    "reason": "local_save_failed",
+                    "c": "doc.sync",
+                    "d": "skills",
+                    "payload": failed_projection,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    cloud_mcp_clear_account_skill_pending_push();
+    let hydrated =
+        cloud_mcp_hydrate_account_skill_payload(state.inner(), cloud_mcp_response_data(&response))
+            .await?;
+    cloud_mcp_cache_account_skill_units_payload(&hydrated);
+    cloud_mcp_emit_account_skills_updated(
+        &app,
+        json!({
+            "kind": "account_skills_snapshot",
+            "event_kind": "account_skills_snapshot",
+            "eventKind": "account_skills_snapshot",
+            "contract": "diffforge.skills_doc.v1",
+            "reason": "local_save_accepted",
+            "c": "doc.sync",
+            "d": "skills",
+            "payload": hydrated.clone(),
+        }),
+    );
+    Ok(hydrated)
 }
 
 #[tauri::command]
@@ -24885,11 +26257,15 @@ fn cloud_mcp_architecture_graph_id(graph: &Value) -> String {
     cloud_mcp_payload_text(
         graph,
         &[
-            "id",
+            "local_graph_id",
+            "localGraphId",
             "architecture_id",
             "architectureId",
             "graph_id",
             "graphId",
+            "doc_id",
+            "docId",
+            "id",
         ],
     )
     .unwrap_or_default()
@@ -25326,6 +26702,10 @@ fn cloud_mcp_prepare_architecture_graph(mut graph: Value) -> Value {
     let hash = graph
         .get("contentHash")
         .or_else(|| graph.get("content_hash"))
+        .or_else(|| graph.get("contentRevision"))
+        .or_else(|| graph.get("content_revision"))
+        .or_else(|| graph.get("syncContentHash"))
+        .or_else(|| graph.get("sync_content_hash"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
@@ -25360,14 +26740,25 @@ fn cloud_mcp_prepare_architecture_graph(mut graph: Value) -> Value {
 }
 
 fn cloud_mcp_architecture_graph_content_hash(graph: &Value) -> String {
-    cloud_mcp_payload_text(graph, &["content_hash", "contentHash", "hash"])
-        .or_else(|| {
-            graph
-                .get("source")
-                .and_then(Value::as_str)
-                .map(architecture_content_hash)
-        })
-        .unwrap_or_else(|| cloud_mcp_outbox_payload_hash(graph))
+    cloud_mcp_payload_text(
+        graph,
+        &[
+            "content_hash",
+            "contentHash",
+            "content_revision",
+            "contentRevision",
+            "sync_content_hash",
+            "syncContentHash",
+            "hash",
+        ],
+    )
+    .or_else(|| {
+        graph
+            .get("source")
+            .and_then(Value::as_str)
+            .map(architecture_content_hash)
+    })
+    .unwrap_or_else(|| cloud_mcp_outbox_payload_hash(graph))
 }
 
 fn cloud_mcp_architecture_graph_from_payload(payload: &Value) -> &Value {
@@ -25640,6 +27031,159 @@ fn cloud_mcp_architecture_sync_decision(
     Ok(CloudMcpArchitectureGraphSyncDecision::Enqueue)
 }
 
+fn cloud_mcp_architecture_current_device_id() -> String {
+    cloud_mcp_desktop_device_profile()["device_id"]
+        .as_str()
+        .unwrap_or("rust-diffforge-desktop")
+        .to_string()
+}
+
+fn cloud_mcp_architecture_graph_has_cloud_ack(graph_id: &str) -> bool {
+    let graph_id = graph_id.trim();
+    if graph_id.is_empty() {
+        return false;
+    }
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return false;
+    };
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let device_id = cloud_mcp_architecture_current_device_id();
+    conn.query_row(
+        &format!(
+            "SELECT acked_at_ms
+             FROM {CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}
+             WHERE scope_key=?1 AND device_id=?2 AND graph_id=?3
+             LIMIT 1"
+        ),
+        rusqlite::params![scope_key, device_id, graph_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|acked_at_ms| acked_at_ms > 0)
+    .unwrap_or(false)
+}
+
+fn cloud_mcp_architecture_graph_acked_content_hash(graph_id: &str) -> Option<String> {
+    let graph_id = graph_id.trim();
+    if graph_id.is_empty() {
+        return None;
+    }
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return None;
+    };
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let device_id = cloud_mcp_architecture_current_device_id();
+    conn.query_row(
+        &format!(
+            "SELECT content_hash
+             FROM {CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}
+             WHERE scope_key=?1 AND device_id=?2 AND graph_id=?3 AND acked_at_ms>0
+             LIMIT 1"
+        ),
+        rusqlite::params![scope_key, device_id, graph_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|hash| hash.trim().to_string())
+    .filter(|hash| !hash.is_empty())
+}
+
+fn cloud_mcp_architecture_local_content_hash(repo_path: &str, graph_id: &str) -> Option<String> {
+    architecture_graph_read_blocking(repo_path.to_string(), graph_id.to_string())
+        .ok()
+        .and_then(|graph| {
+            cloud_mcp_payload_text(
+                &graph,
+                &[
+                    "content_hash",
+                    "contentHash",
+                    "content_revision",
+                    "contentRevision",
+                    "sync_content_hash",
+                    "syncContentHash",
+                    "hash",
+                ],
+            )
+            .or_else(|| {
+                graph
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(architecture_content_hash)
+            })
+        })
+        .map(|hash| hash.trim().to_string())
+        .filter(|hash| !hash.is_empty())
+}
+
+fn cloud_mcp_architecture_hydrate_skip_reason(repo_path: &str, graph: &Value) -> Option<String> {
+    let graph_id = cloud_mcp_architecture_graph_id(graph);
+    if graph_id.is_empty() {
+        return Some("Hydrated architecture graph did not include an id.".to_string());
+    }
+    let incoming_hash = cloud_mcp_architecture_graph_content_hash(graph);
+    let Some(local_hash) = cloud_mcp_architecture_local_content_hash(repo_path, &graph_id) else {
+        return None;
+    };
+    if local_hash == incoming_hash {
+        return None;
+    }
+    let Some(acked_hash) = cloud_mcp_architecture_graph_acked_content_hash(&graph_id) else {
+        return Some(format!(
+            "Local architecture graph {graph_id} has not been saved to Cloud yet; skipped Cloud hydration."
+        ));
+    };
+    if local_hash == acked_hash {
+        return None;
+    }
+    Some(format!(
+        "Local architecture graph {graph_id} has unsaved changes; skipped Cloud hydration."
+    ))
+}
+
+fn cloud_mcp_architecture_mark_graph_cloud_acked(graph: &Value) -> Result<bool, String> {
+    let graph = cloud_mcp_prepare_architecture_graph(cloud_mcp_architecture_graph_for_global_sync(
+        graph.clone(),
+    ));
+    let graph_id = cloud_mcp_architecture_graph_id(&graph);
+    if graph_id.is_empty() {
+        return Ok(false);
+    }
+    let content_hash = cloud_mcp_architecture_graph_content_hash(&graph);
+    let payload_hash = cloud_mcp_outbox_payload_hash(&graph);
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let device_id = cloud_mcp_architecture_current_device_id();
+    let idempotency_key = format!(
+        "architecture-graph:{scope_key}:{device_id}:{graph_id}:{content_hash}:{payload_hash}"
+    );
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "INSERT INTO {CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}(
+                scope_key, device_id, graph_id, content_hash, payload_hash,
+                idempotency_key, server_cursor, acked_at_ms, updated_at_ms
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?7)
+             ON CONFLICT(scope_key, device_id, graph_id) DO UPDATE SET
+                content_hash=excluded.content_hash,
+                payload_hash=excluded.payload_hash,
+                idempotency_key=excluded.idempotency_key,
+                acked_at_ms=excluded.acked_at_ms,
+                updated_at_ms=excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            scope_key,
+            device_id,
+            graph_id,
+            content_hash,
+            payload_hash,
+            idempotency_key,
+            now,
+        ],
+    )
+    .map_err(|error| format!("Unable to mark architecture graph cloud-acked: {error}"))?;
+    Ok(true)
+}
+
 fn cloud_mcp_architecture_sync_payload(base: &Value, graph: Value) -> Option<Value> {
     let graph =
         cloud_mcp_prepare_architecture_graph(cloud_mcp_architecture_graph_for_global_sync(graph));
@@ -25738,11 +27282,13 @@ fn cloud_mcp_architecture_sync_op_id(op: &Value) -> Option<String> {
             cloud_mcp_payload_text(
                 op,
                 &[
-                    "id",
                     "architecture_id",
                     "architectureId",
                     "graph_id",
                     "graphId",
+                    "doc_id",
+                    "docId",
+                    "id",
                 ],
             )
         })
@@ -25755,7 +27301,165 @@ fn cloud_mcp_architecture_sync_op_content_hash(op: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| cloud_mcp_payload_text(op, &["content_hash", "contentHash", "hash", "ch"]))
+        .or_else(|| {
+            cloud_mcp_payload_text(
+                op,
+                &[
+                    "content_hash",
+                    "contentHash",
+                    "content_revision",
+                    "contentRevision",
+                    "sync_content_hash",
+                    "syncContentHash",
+                    "hash",
+                    "ch",
+                ],
+            )
+        })
+}
+
+fn cloud_mcp_architecture_sync_op_authoritative_delete(op: &Value) -> bool {
+    if op.as_array().map(|items| items.len() > 2).unwrap_or(false) {
+        return true;
+    }
+    [
+        "deleted_at",
+        "deletedAt",
+        "delete_at",
+        "deleteAt",
+        "tombstone_at",
+        "tombstoneAt",
+        "server_cursor",
+        "serverCursor",
+    ]
+    .iter()
+    .any(|key| op.get(*key).is_some())
+}
+
+fn cloud_mcp_architecture_sync_op_array_text(op: &Value, index: usize) -> String {
+    op.as_array()
+        .and_then(|items| items.get(index))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn cloud_mcp_architecture_sync_op_array_i64(op: &Value, index: usize) -> i64 {
+    op.as_array()
+        .and_then(|items| items.get(index))
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_architecture_sync_op_graph(op: &Value) -> Option<Value> {
+    if let Some(graph) = op
+        .get("graph")
+        .filter(|value| value.is_object())
+        .or_else(|| op.get("architecture").filter(|value| value.is_object()))
+    {
+        return Some(graph.clone());
+    }
+    if op.is_object() {
+        let graph_id = cloud_mcp_architecture_sync_op_id(op)?;
+        let mut graph = op.clone();
+        if let Some(object) = graph.as_object_mut() {
+            object.insert("id".to_string(), json!(graph_id.clone()));
+            object.insert("architecture_id".to_string(), json!(graph_id.clone()));
+            object.insert("architectureId".to_string(), json!(graph_id.clone()));
+            object.insert("graph_id".to_string(), json!(graph_id.clone()));
+            object.insert("graphId".to_string(), json!(graph_id));
+        }
+        return Some(graph);
+    }
+    let items = op.as_array()?;
+    if items.first().and_then(Value::as_str).map(str::trim) != Some("u") {
+        return None;
+    }
+    let graph_id = cloud_mcp_architecture_sync_op_array_text(op, 1);
+    if graph_id.is_empty() {
+        return None;
+    }
+    let source_format = cloud_mcp_architecture_sync_op_array_text(op, 10);
+    let asset_id = cloud_mcp_architecture_sync_op_array_text(op, 11);
+    Some(json!({
+        "id": graph_id,
+        "architecture_id": graph_id,
+        "architectureId": graph_id,
+        "graph_id": graph_id,
+        "graphId": graph_id,
+        "meta_hash": cloud_mcp_architecture_sync_op_array_text(op, 2),
+        "content_hash": cloud_mcp_architecture_sync_op_array_text(op, 3),
+        "contentHash": cloud_mcp_architecture_sync_op_array_text(op, 3),
+        "content_length": cloud_mcp_architecture_sync_op_array_i64(op, 4),
+        "contentLength": cloud_mcp_architecture_sync_op_array_i64(op, 4),
+        "node_count": cloud_mcp_architecture_sync_op_array_i64(op, 5),
+        "nodeCount": cloud_mcp_architecture_sync_op_array_i64(op, 5),
+        "edge_count": cloud_mcp_architecture_sync_op_array_i64(op, 6),
+        "edgeCount": cloud_mcp_architecture_sync_op_array_i64(op, 6),
+        "title": cloud_mcp_architecture_sync_op_array_text(op, 7),
+        "folder_path": cloud_mcp_architecture_sync_op_array_text(op, 8),
+        "folderPath": cloud_mcp_architecture_sync_op_array_text(op, 8),
+        "file_path": cloud_mcp_architecture_sync_op_array_text(op, 9),
+        "filePath": cloud_mcp_architecture_sync_op_array_text(op, 9),
+        "source_format": if source_format.is_empty() { "eraserDsl".to_string() } else { source_format.clone() },
+        "sourceFormat": if source_format.is_empty() { "eraserDsl".to_string() } else { source_format },
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "blob_id": cloud_mcp_architecture_sync_op_array_text(op, 12),
+        "blobId": cloud_mcp_architecture_sync_op_array_text(op, 12),
+        "sha256": cloud_mcp_architecture_sync_op_array_text(op, 13),
+        "size_bytes": cloud_mcp_architecture_sync_op_array_i64(op, 14),
+        "sizeBytes": cloud_mcp_architecture_sync_op_array_i64(op, 14),
+        "mime_type": cloud_mcp_architecture_sync_op_array_text(op, 15),
+        "mimeType": cloud_mcp_architecture_sync_op_array_text(op, 15),
+    }))
+}
+
+fn cloud_mcp_architecture_compact_content_items(value: &Value) -> Vec<Value> {
+    value
+        .get("it")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| {
+            let parts = item.as_array()?;
+            if parts.first().and_then(Value::as_str) != Some("a") {
+                return None;
+            }
+            let content_hash = parts.get(1).and_then(Value::as_str).unwrap_or_default();
+            let source_format = parts
+                .get(2)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("eraserDsl");
+            let asset_id = parts.get(3).and_then(Value::as_str).unwrap_or_default();
+            let graph_id = parts.get(4).and_then(Value::as_str).unwrap_or_default();
+            if graph_id.trim().is_empty() || asset_id.trim().is_empty() {
+                return None;
+            }
+            Some(json!({
+                "id": graph_id,
+                "architecture_id": graph_id,
+                "architectureId": graph_id,
+                "graph_id": graph_id,
+                "graphId": graph_id,
+                "content_hash": content_hash,
+                "contentHash": content_hash,
+                "source_format": source_format,
+                "sourceFormat": source_format,
+                "asset_id": asset_id,
+                "assetId": asset_id,
+                "blob_id": parts.get(5).and_then(Value::as_str).unwrap_or_default(),
+                "blobId": parts.get(5).and_then(Value::as_str).unwrap_or_default(),
+                "sha256": parts.get(6).and_then(Value::as_str).unwrap_or_default(),
+                "size_bytes": parts.get(7).and_then(Value::as_i64).unwrap_or_default(),
+                "sizeBytes": parts.get(7).and_then(Value::as_i64).unwrap_or_default(),
+                "mime_type": parts.get(8).and_then(Value::as_str).unwrap_or_default(),
+                "mimeType": parts.get(8).and_then(Value::as_str).unwrap_or_default(),
+            }))
+        })
+        .collect()
 }
 
 fn cloud_mcp_architecture_local_meta_hash(graph: &Value) -> String {
@@ -25815,28 +27519,6 @@ fn cloud_mcp_architecture_local_have_refs() -> Vec<Value> {
         .collect()
 }
 
-fn cloud_mcp_architecture_graphs_signature(graphs: &[Value]) -> String {
-    let signature_body = serde_json::to_string(graphs).unwrap_or_default();
-    format!("{:x}", Sha256::digest(signature_body.as_bytes()))
-}
-
-fn cloud_mcp_set_architecture_cloud_applied_signature(signature: String) {
-    let lock =
-        CLOUD_MCP_ARCHITECTURE_CLOUD_APPLIED_SIGNATURE.get_or_init(|| StdMutex::new(String::new()));
-    if let Ok(mut value) = lock.lock() {
-        *value = signature;
-    }
-}
-
-fn cloud_mcp_take_architecture_cloud_applied_signature() -> String {
-    let lock =
-        CLOUD_MCP_ARCHITECTURE_CLOUD_APPLIED_SIGNATURE.get_or_init(|| StdMutex::new(String::new()));
-    let Ok(mut value) = lock.lock() else {
-        return String::new();
-    };
-    std::mem::take(&mut *value)
-}
-
 fn cloud_mcp_architecture_local_index(reason: &str) -> Result<Value, String> {
     let global_root = architecture_global_root_dir()?;
     let mut data = architecture_graphs_list_value(workspace_path_display(&global_root))?;
@@ -25868,9 +27550,92 @@ fn cloud_mcp_architecture_local_index(reason: &str) -> Result<Value, String> {
     Ok(data)
 }
 
+fn cloud_mcp_architecture_cloud_only_graph(graph: Value) -> Value {
+    let graph =
+        cloud_mcp_prepare_architecture_graph(cloud_mcp_architecture_graph_for_global_sync(graph));
+    let graph_id = cloud_mcp_architecture_graph_id(&graph);
+    let mut graph = graph;
+    if let Some(object) = graph.as_object_mut() {
+        object.insert("id".to_string(), json!(graph_id.clone()));
+        object.insert("architecture_id".to_string(), json!(graph_id.clone()));
+        object.insert("architectureId".to_string(), json!(graph_id.clone()));
+        object.insert("graph_id".to_string(), json!(graph_id.clone()));
+        object.insert("graphId".to_string(), json!(graph_id));
+        object.insert("cloudAvailable".to_string(), json!(true));
+        object.insert("cloud_available".to_string(), json!(true));
+        object.insert("cloudNeedsHydration".to_string(), json!(true));
+        object.insert("cloud_needs_hydration".to_string(), json!(true));
+        object.insert("cloudOnly".to_string(), json!(true));
+        object.insert("cloud_only".to_string(), json!(true));
+        object.insert("hydrated".to_string(), json!(false));
+        object.insert("localAvailable".to_string(), json!(false));
+        object.insert("local_available".to_string(), json!(false));
+        object.insert("syncState".to_string(), json!("needs_hydration"));
+        object.insert("sync_state".to_string(), json!("needs_hydration"));
+    }
+    graph
+}
+
+fn cloud_mcp_architecture_composite_index(
+    reason: &str,
+    sync_payload: &Value,
+) -> Result<Value, String> {
+    let mut data = cloud_mcp_architecture_local_index(reason)?;
+    let mut graphs = data
+        .get("graphs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut seen = graphs
+        .iter()
+        .filter_map(|graph| {
+            let graph_id = cloud_mcp_architecture_graph_id(graph);
+            (!graph_id.is_empty()).then_some(graph_id)
+        })
+        .collect::<HashSet<_>>();
+
+    for graph in sync_payload
+        .get("remote_graphs")
+        .or_else(|| sync_payload.get("remoteGraphs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let graph_id = cloud_mcp_architecture_graph_id(&graph);
+        if graph_id.is_empty() || !seen.insert(graph_id) {
+            continue;
+        }
+        graphs.push(cloud_mcp_architecture_cloud_only_graph(graph));
+    }
+
+    if let Some(object) = data.as_object_mut() {
+        let count = graphs.len();
+        let remote_graphs = sync_payload
+            .get("remote_graphs")
+            .or_else(|| sync_payload.get("remoteGraphs"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let hydrate_result = sync_payload
+            .get("hydrate_result")
+            .or_else(|| sync_payload.get("hydrateResult"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        object.insert("graphs".to_string(), json!(graphs));
+        object.insert("count".to_string(), json!(count));
+        object.insert("graph_count".to_string(), json!(count));
+        object.insert("graphCount".to_string(), json!(count));
+        object.insert("remote_graphs".to_string(), remote_graphs.clone());
+        object.insert("remoteGraphs".to_string(), remote_graphs);
+        object.insert("hydrate_result".to_string(), hydrate_result.clone());
+        object.insert("hydrateResult".to_string(), hydrate_result);
+    }
+    Ok(data)
+}
+
 async fn cloud_mcp_apply_architecture_sync_data(
     state: &CloudMcpState,
     event: &Value,
+    apply_to_local: bool,
 ) -> Result<Value, String> {
     let payload = event
         .get("payload")
@@ -25881,28 +27646,57 @@ async fn cloud_mcp_apply_architecture_sync_data(
         return Ok(payload.clone());
     }
 
+    let mut remote_graphs = Vec::new();
+    let mut hydrate_items = Vec::new();
     let mut hydrate_refs = Vec::new();
     let mut delete_ids = Vec::new();
+    let mut skipped_unacked_delete_ids = Vec::new();
     for op in &ops {
         match cloud_mcp_architecture_sync_op_tag(op).as_str() {
             "u" | "upsert" | "save" => {
-                if let Some(graph_id) = cloud_mcp_architecture_sync_op_id(op) {
-                    hydrate_refs.push(json!({
+                if let Some(graph) = cloud_mcp_architecture_sync_op_graph(op) {
+                    remote_graphs.push(cloud_mcp_architecture_cloud_only_graph(graph.clone()));
+                    hydrate_items.push(graph);
+                } else if let Some(graph_id) = cloud_mcp_architecture_sync_op_id(op) {
+                    let ref_graph = json!({
                         "architecture_id": graph_id,
                         "content_hash": cloud_mcp_architecture_sync_op_content_hash(op).unwrap_or_default(),
-                    }));
+                    });
+                    remote_graphs.push(cloud_mcp_architecture_cloud_only_graph(ref_graph.clone()));
+                    hydrate_refs.push(ref_graph);
                 }
             }
             "d" | "delete" | "del" => {
                 if let Some(graph_id) = cloud_mcp_architecture_sync_op_id(op) {
-                    delete_ids.push(graph_id);
+                    let authoritative_delete =
+                        cloud_mcp_architecture_sync_op_authoritative_delete(op);
+                    if authoritative_delete || cloud_mcp_architecture_graph_has_cloud_ack(&graph_id)
+                    {
+                        delete_ids.push(graph_id);
+                    } else {
+                        skipped_unacked_delete_ids.push(graph_id);
+                    }
                 }
             }
             _ => {}
         }
     }
-    let had_delete_ops = !delete_ids.is_empty();
-    let had_hydrate_ops = !hydrate_refs.is_empty();
+    let had_delete_ops = apply_to_local && !delete_ids.is_empty();
+    let hydrate_requested_count = if apply_to_local {
+        hydrate_items.len() + hydrate_refs.len()
+    } else {
+        0
+    };
+
+    if !skipped_unacked_delete_ids.is_empty() {
+        log_cloud_sync_event(
+            "architecture.delete_skip_unacked_local",
+            json!({
+                "count": skipped_unacked_delete_ids.len(),
+                "graph_ids": skipped_unacked_delete_ids,
+            }),
+        );
+    }
 
     if had_delete_ops {
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
@@ -25917,28 +27711,150 @@ async fn cloud_mcp_apply_architecture_sync_data(
         .map_err(|error| format!("Architecture delete apply worker failed: {error}"))??;
     }
 
-    if had_hydrate_ops {
-        let _ = cloud_mcp_hydrate_account_architecture_refs(state, json!(hydrate_refs)).await?;
+    let mut hydrate_saved_count = 0usize;
+    let mut hydrate_failed_count = 0usize;
+    let mut hydrate_skipped_count = 0usize;
+    let mut hydrated_graphs = Vec::new();
+    let mut hydrate_failed = Vec::new();
+    let mut hydrate_skipped = Vec::new();
+    if apply_to_local && !hydrate_items.is_empty() {
+        let hydrate_result =
+            cloud_mcp_hydrate_account_architecture_items(state, hydrate_items, "doc.sync").await?;
+        hydrated_graphs.extend(
+            hydrate_result
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        hydrate_failed.extend(
+            hydrate_result
+                .get("failed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        hydrate_skipped.extend(
+            hydrate_result
+                .get("skipped")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        hydrate_saved_count += hydrate_result
+            .get("hydrated_count")
+            .or_else(|| hydrate_result.get("hydratedCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        hydrate_failed_count += hydrate_result
+            .get("failed_count")
+            .or_else(|| hydrate_result.get("failedCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        hydrate_skipped_count += hydrate_result
+            .get("skipped_count")
+            .or_else(|| hydrate_result.get("skippedCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
     }
-    if had_delete_ops || had_hydrate_ops {
-        let signature = tauri::async_runtime::spawn_blocking(|| {
-            cloud_mcp_architecture_graphs_signature(&cloud_mcp_collect_account_architecture_graphs(
-                Value::Null,
-            ))
-        })
-        .await
-        .unwrap_or_default();
-        if !signature.is_empty() {
-            cloud_mcp_set_architecture_cloud_applied_signature(signature);
-        }
+    if apply_to_local && !hydrate_refs.is_empty() {
+        let hydrate_result =
+            cloud_mcp_hydrate_account_architecture_refs(state, json!(hydrate_refs)).await?;
+        hydrated_graphs.extend(
+            hydrate_result
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        hydrate_failed.extend(
+            hydrate_result
+                .get("failed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        hydrate_skipped.extend(
+            hydrate_result
+                .get("skipped")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        hydrate_saved_count += hydrate_result
+            .get("hydrated_count")
+            .or_else(|| hydrate_result.get("hydratedCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        hydrate_failed_count += hydrate_result
+            .get("failed_count")
+            .or_else(|| hydrate_result.get("failedCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        hydrate_skipped_count += hydrate_result
+            .get("skipped_count")
+            .or_else(|| hydrate_result.get("skippedCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+    }
+    let hydrate_complete = hydrate_requested_count == 0
+        || (hydrate_failed_count == 0
+            && hydrate_saved_count.saturating_add(hydrate_skipped_count)
+                >= hydrate_requested_count);
+    if !hydrate_complete && hydrate_requested_count > 0 {
+        log_cloud_sync_event(
+            "architecture.hydrate_incomplete",
+            json!({
+                "requested": hydrate_requested_count,
+                "saved": hydrate_saved_count,
+                "failed": hydrate_failed_count,
+                "skipped": hydrate_skipped_count,
+            }),
+        );
     }
 
-    Ok(payload.clone())
+    let mut output = payload.clone();
+    if let Some(object) = output.as_object_mut() {
+        object.insert("remote_graphs".to_string(), json!(remote_graphs.clone()));
+        object.insert("remoteGraphs".to_string(), json!(remote_graphs));
+        object.insert(
+            "hydrated_graphs".to_string(),
+            json!(hydrated_graphs.clone()),
+        );
+        object.insert("hydratedGraphs".to_string(), json!(hydrated_graphs));
+        object.insert("hydrate_failed".to_string(), json!(hydrate_failed.clone()));
+        object.insert("hydrateFailed".to_string(), json!(hydrate_failed));
+        object.insert("hydrate_skipped".to_string(), json!(hydrate_skipped.clone()));
+        object.insert("hydrateSkipped".to_string(), json!(hydrate_skipped));
+        let hydrate_result = json!({
+            "requested_count": hydrate_requested_count,
+            "requestedCount": hydrate_requested_count,
+            "hydrated_count": hydrate_saved_count,
+            "hydratedCount": hydrate_saved_count,
+            "failed_count": hydrate_failed_count,
+            "failedCount": hydrate_failed_count,
+            "skipped_count": hydrate_skipped_count,
+            "skippedCount": hydrate_skipped_count,
+            "complete": hydrate_complete,
+        });
+        object.insert("hydrate_result".to_string(), hydrate_result.clone());
+        object.insert("hydrateResult".to_string(), hydrate_result);
+        object.insert(
+            "skipped_unacked_delete_ids".to_string(),
+            json!(skipped_unacked_delete_ids.clone()),
+        );
+        object.insert(
+            "skippedUnackedDeleteIds".to_string(),
+            json!(skipped_unacked_delete_ids),
+        );
+    }
+    Ok(output)
 }
 
 async fn cloud_mcp_architecture_sync_index_v2(
     state: &CloudMcpState,
     reason: &str,
+    apply_to_local: bool,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(
         String::new(),
@@ -25961,10 +27877,10 @@ async fn cloud_mcp_architecture_sync_index_v2(
     }
     let response = cloud_mcp_ws_request(state, "doc.sync", &payload).await?;
     let data = response.get("data").cloned().unwrap_or(response);
-    let _ = cloud_mcp_apply_architecture_sync_data(state, &data).await?;
+    let sync_payload = cloud_mcp_apply_architecture_sync_data(state, &data, apply_to_local).await?;
     tauri::async_runtime::spawn_blocking({
         let reason = reason.to_string();
-        move || cloud_mcp_architecture_local_index(&reason)
+        move || cloud_mcp_architecture_composite_index(&reason, &sync_payload)
     })
     .await
     .map_err(|error| format!("Architecture local index worker failed: {error}"))?
@@ -26014,11 +27930,13 @@ fn cloud_mcp_architecture_hydrated_graph(mut item: Value) -> Option<Value> {
     let graph_id = cloud_mcp_payload_text(
         &item,
         &[
-            "id",
             "architecture_id",
             "architectureId",
             "graph_id",
             "graphId",
+            "doc_id",
+            "docId",
+            "id",
         ],
     )?;
     let local_graph_id = cloud_mcp_payload_text(&item, &["local_graph_id", "localGraphId"])
@@ -26083,6 +28001,128 @@ async fn cloud_mcp_architecture_item_with_asset_source(
     Ok(item)
 }
 
+async fn cloud_mcp_hydrate_account_architecture_items(
+    state: &CloudMcpState,
+    hydrated_items: Vec<Value>,
+    reason: &str,
+) -> Result<Value, String> {
+    if hydrated_items.is_empty() {
+        return Ok(json!({
+            "kind": "architecture_hydrate",
+            "reason": reason,
+            "items": [],
+            "failed": [],
+            "requested_count": 0,
+            "requestedCount": 0,
+            "hydrated_count": 0,
+            "hydratedCount": 0,
+            "failed_count": 0,
+            "failedCount": 0,
+        }));
+    }
+    let repo_for_write = tauri::async_runtime::spawn_blocking(architecture_global_root_dir)
+        .await
+        .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
+    let repo_for_write = workspace_path_display(&repo_for_write);
+    let requested_count = hydrated_items.len();
+    let mut saved_items = Vec::new();
+    let mut failed_items = Vec::new();
+    let mut skipped_items = Vec::new();
+    for item in hydrated_items {
+        let item_identity = json!({
+            "architecture_id": cloud_mcp_payload_text(&item, &[
+                "architecture_id",
+                "architectureId",
+                "graph_id",
+                "graphId",
+                "id",
+            ]).unwrap_or_default(),
+            "content_hash": cloud_mcp_payload_text(&item, &["content_hash", "contentHash"]).unwrap_or_default(),
+            "asset_id": cloud_mcp_payload_text(&item, &["asset_id", "assetId"]).unwrap_or_default(),
+        });
+        let item = match cloud_mcp_architecture_item_with_asset_source(state, item).await {
+            Ok(item) => item,
+            Err(error) => {
+                let error = clean_terminal_telemetry_text(&error);
+                log_cloud_sync_event(
+                    "architecture.asset_hydrate_error",
+                    json!({
+                        "reason": reason,
+                        "error": error,
+                        "item": item_identity,
+                    }),
+                );
+                failed_items.push(json!({
+                    "item": item_identity,
+                    "error": error,
+                }));
+                continue;
+            }
+        };
+        let Some(graph) = cloud_mcp_architecture_hydrated_graph(item.clone()) else {
+            failed_items.push(json!({
+                "item": item_identity,
+                "error": "Hydrated architecture item could not be converted into a graph.",
+            }));
+            continue;
+        };
+        let repo_path = repo_for_write.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            if let Some(reason) = cloud_mcp_architecture_hydrate_skip_reason(&repo_path, &graph) {
+                return Ok((None, reason));
+            }
+            architecture_graph_write_cloud_arch_blocking(repo_path, graph)
+                .map(|saved| (Some(saved), String::new()))
+        })
+        .await
+        {
+            Ok(Ok((Some(saved), _))) => {
+                let _ = cloud_mcp_architecture_mark_graph_cloud_acked(&saved.graph);
+                saved_items.push(saved.graph);
+            }
+            Ok(Ok((None, reason))) => {
+                skipped_items.push(json!({
+                    "item": item_identity,
+                    "reason": clean_terminal_telemetry_text(&reason),
+                    "skipped": true,
+                    "local_dirty": true,
+                    "localDirty": true,
+                }));
+            }
+            Ok(Err(error)) => {
+                failed_items.push(json!({
+                    "item": item_identity,
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
+            }
+            Err(error) => {
+                failed_items.push(json!({
+                    "item": item_identity,
+                    "error": format!("Architecture hydration worker failed: {error}"),
+                }));
+            }
+        }
+    }
+    let saved_count = saved_items.len();
+    let failed_count = failed_items.len();
+    let skipped_count = skipped_items.len();
+    Ok(json!({
+        "kind": "architecture_hydrate",
+        "reason": reason,
+        "items": saved_items,
+        "failed": failed_items,
+        "skipped": skipped_items,
+        "requested_count": requested_count,
+        "requestedCount": requested_count,
+        "hydrated_count": saved_count,
+        "hydratedCount": saved_count,
+        "failed_count": failed_count,
+        "failedCount": failed_count,
+        "skipped_count": skipped_count,
+        "skippedCount": skipped_count,
+    }))
+}
+
 async fn cloud_mcp_hydrate_account_architecture_refs(
     state: &CloudMcpState,
     refs: Value,
@@ -26100,6 +28140,76 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
             "hydratedCount": 0,
             "hydrated_count": 0,
         }));
+    }
+    let mut direct_hydrate_items = Vec::new();
+    let mut content_refs = Vec::new();
+    for item in refs_array.iter().cloned() {
+        let has_direct_content =
+            cloud_mcp_payload_text(&item, &["source", "source_text", "sourceText"]).is_some()
+                || cloud_mcp_payload_text(&item, &["asset_id", "assetId"]).is_some();
+        if has_direct_content {
+            direct_hydrate_items.push(item);
+        } else {
+            content_refs.push(item);
+        }
+    }
+    let direct_result = cloud_mcp_hydrate_account_architecture_items(
+        state,
+        direct_hydrate_items,
+        "architecture_metadata_hydrate",
+    )
+    .await?;
+    if content_refs.is_empty() {
+        let mut data = json!({
+            "kind": "doc.content",
+            "event_kind": "doc.content",
+            "eventKind": "doc.content",
+            "c": "doc.content",
+            "d": "architectures",
+            "items": direct_result
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "failed": direct_result
+                .get("failed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "skipped": direct_result
+                .get("skipped")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "missing": [],
+        });
+        if let Some(object) = data.as_object_mut() {
+            let saved_count = object
+                .get("items")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            let failed_count = object
+                .get("failed")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            let skipped_count = object
+                .get("skipped")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            object.insert("hydrated_count".to_string(), json!(saved_count));
+            object.insert("hydratedCount".to_string(), json!(saved_count));
+            object.insert("failed_count".to_string(), json!(failed_count));
+            object.insert("failedCount".to_string(), json!(failed_count));
+            object.insert("skipped_count".to_string(), json!(skipped_count));
+            object.insert("skippedCount".to_string(), json!(skipped_count));
+            object.insert("requested_count".to_string(), json!(refs_array.len()));
+            object.insert("requestedCount".to_string(), json!(refs_array.len()));
+            object.insert("complete".to_string(), json!(failed_count == 0));
+        }
+        return Ok(data);
     }
     let req = cloud_mcp_repo_request(
         String::new(),
@@ -26119,7 +28229,7 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
         object.insert("v".to_string(), json!(2));
         object.insert(
             "h".to_string(),
-            json!(refs_array
+            json!(content_refs
                 .iter()
                 .map(|item| {
                     json!([
@@ -26130,12 +28240,25 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
                                 "architectureId",
                                 "graph_id",
                                 "graphId",
+                                "doc_id",
+                                "docId",
                                 "id",
                             ],
                         )
                         .unwrap_or_default(),
-                        cloud_mcp_payload_text(item, &["content_hash", "contentHash", "hash"])
-                            .unwrap_or_default(),
+                        cloud_mcp_payload_text(
+                            item,
+                            &[
+                                "content_hash",
+                                "contentHash",
+                                "content_revision",
+                                "contentRevision",
+                                "sync_content_hash",
+                                "syncContentHash",
+                                "hash",
+                            ],
+                        )
+                        .unwrap_or_default(),
                     ])
                 })
                 .collect::<Vec<_>>()),
@@ -26143,43 +28266,79 @@ async fn cloud_mcp_hydrate_account_architecture_refs(
     }
     let response = cloud_mcp_ws_request(state, "doc.content", &payload).await?;
     let mut data = response.get("data").cloned().unwrap_or(response);
-    let hydrated_items = data
+    let mut hydrated_items = data
         .get("items")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut saved_items = Vec::new();
-    for item in hydrated_items {
-        let item = match cloud_mcp_architecture_item_with_asset_source(state, item).await {
-            Ok(item) => item,
-            Err(error) => {
-                log_cloud_sync_event(
-                    "architecture.asset_hydrate_error",
-                    json!({"error": clean_terminal_telemetry_text(&error)}),
-                );
-                continue;
-            }
-        };
-        let Some(graph) = cloud_mcp_architecture_hydrated_graph(item.clone()) else {
-            saved_items.push(item);
-            continue;
-        };
-        let repo_for_write = tauri::async_runtime::spawn_blocking(architecture_global_root_dir)
-            .await
-            .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
-        let repo_for_write = workspace_path_display(&repo_for_write);
-        let saved = tauri::async_runtime::spawn_blocking(move || {
-            architecture_graph_write_cloud_arch_blocking(repo_for_write, graph)
-        })
-        .await
-        .map_err(|error| format!("Architecture hydration worker failed: {error}"))??;
-        saved_items.push(saved.graph);
+    if hydrated_items.is_empty() {
+        hydrated_items = cloud_mcp_architecture_compact_content_items(&data);
     }
+    let hydrate_result = cloud_mcp_hydrate_account_architecture_items(
+        state,
+        hydrated_items,
+        "architecture_content_hydrate",
+    )
+    .await?;
+    let mut saved_items = direct_result
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    saved_items.extend(
+        hydrate_result
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let mut failed_items = direct_result
+        .get("failed")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    failed_items.extend(
+        hydrate_result
+            .get("failed")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let mut skipped_items = direct_result
+        .get("skipped")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    skipped_items.extend(
+        hydrate_result
+            .get("skipped")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let missing_items = data
+        .get("missing")
+        .or_else(|| data.get("miss"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    failed_items.extend(missing_items);
     if let Some(object) = data.as_object_mut() {
         let saved_count = saved_items.len();
+        let failed_count = failed_items.len();
+        let skipped_count = skipped_items.len();
         object.insert("items".to_string(), json!(saved_items.clone()));
+        object.insert("failed".to_string(), json!(failed_items));
+        object.insert("skipped".to_string(), json!(skipped_items));
         object.insert("hydrated_count".to_string(), json!(saved_count));
         object.insert("hydratedCount".to_string(), json!(saved_count));
+        object.insert("failed_count".to_string(), json!(failed_count));
+        object.insert("failedCount".to_string(), json!(failed_count));
+        object.insert("skipped_count".to_string(), json!(skipped_count));
+        object.insert("skippedCount".to_string(), json!(skipped_count));
+        object.insert("requested_count".to_string(), json!(refs_array.len()));
+        object.insert("requestedCount".to_string(), json!(refs_array.len()));
+        object.insert("complete".to_string(), json!(failed_count == 0));
     }
     Ok(data)
 }
@@ -26200,7 +28359,7 @@ async fn cloud_mcp_get_architectures(
         scope_repo_id,
         scope_git_repo_identity_id,
     );
-    cloud_mcp_architecture_sync_index_v2(state.inner(), "architecture_index_pull").await
+    cloud_mcp_architecture_sync_index_v2(state.inner(), "architecture_index_pull", false).await
 }
 
 #[tauri::command]
@@ -26421,33 +28580,13 @@ async fn cloud_mcp_architecture_hub_catalog(
     local_only: Option<bool>,
 ) -> Result<Value, String> {
     let built_at_ms = cloud_mcp_now_ms();
-    let global_entry_base = tauri::async_runtime::spawn_blocking(architecture_global_root_value)
-        .await
-        .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
-    let global_root_display =
-        cloud_mcp_payload_text(&global_entry_base, &["rootDirectory", "root_directory"])
-            .unwrap_or_default();
-    let global_entry = json!({
-        "id": "global-architectures",
-        "name": "Global",
-        "path": global_root_display,
-        "relativePath": ".",
-        "hasGit": false,
-        "architectureRoot": global_entry_base["architectureRoot"].clone(),
-        "graphCount": global_entry_base["graphCount"].clone(),
-        "scopeKind": "global",
-        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
-        "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
-        "workspaceName": "Global",
-    });
-
     let _ = (&terminal_state, &workspaces);
 
     let local_only = local_only.unwrap_or(false);
     let account_list = if local_only {
         None
     } else {
-        cloud_mcp_architecture_sync_index_v2(state.inner(), "architecture_hub_catalog")
+        cloud_mcp_architecture_sync_index_v2(state.inner(), "architecture_hub_catalog", false)
             .await
             .ok()
     };
@@ -26456,6 +28595,37 @@ async fn cloud_mcp_architecture_hub_catalog(
         cloud_error = "Cloud architecture index is unavailable; showing the local global catalog."
             .to_string();
     }
+
+    let global_entry_base = tauri::async_runtime::spawn_blocking(architecture_global_root_value)
+        .await
+        .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
+    let global_root_display =
+        cloud_mcp_payload_text(&global_entry_base, &["rootDirectory", "root_directory"])
+            .unwrap_or_default();
+    let graph_count = account_list
+        .as_ref()
+        .and_then(|list| list.get("graphs").and_then(Value::as_array).map(Vec::len))
+        .or_else(|| {
+            global_entry_base
+                .get("graphCount")
+                .or_else(|| global_entry_base.get("graph_count"))
+                .and_then(Value::as_u64)
+                .map(|count| count as usize)
+        })
+        .unwrap_or_default();
+    let global_entry = json!({
+        "id": "global-architectures",
+        "name": "Global",
+        "path": global_root_display,
+        "relativePath": ".",
+        "hasGit": false,
+        "architectureRoot": global_entry_base["architectureRoot"].clone(),
+        "graphCount": graph_count,
+        "scopeKind": "global",
+        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
+        "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        "workspaceName": "Global",
+    });
 
     Ok(json!({
         "kind": "architecture_hub_catalog",
@@ -27610,14 +29780,19 @@ fn cloud_mcp_asset_delete_local_cache_row(asset_id: &str) -> Result<(), String> 
         "DELETE FROM account_asset_transfers WHERE asset_id=?1",
         [asset_id],
     )
-    .map_err(|error| format!("Unable to remove local asset transfer rows for {asset_id}: {error}"))?;
+    .map_err(|error| {
+        format!("Unable to remove local asset transfer rows for {asset_id}: {error}")
+    })?;
     conn.execute(
         "DELETE FROM account_asset_device_sync_state WHERE asset_id=?1",
         [asset_id],
     )
     .map_err(|error| format!("Unable to remove local asset sync state for {asset_id}: {error}"))?;
-    conn.execute("DELETE FROM account_asset_items WHERE asset_id=?1", [asset_id])
-        .map_err(|error| format!("Unable to remove local asset row {asset_id}: {error}"))?;
+    conn.execute(
+        "DELETE FROM account_asset_items WHERE asset_id=?1",
+        [asset_id],
+    )
+    .map_err(|error| format!("Unable to remove local asset row {asset_id}: {error}"))?;
     Ok(())
 }
 
@@ -28242,6 +30417,27 @@ async fn cloud_mcp_send_asset_request_with_outbox(
     }
 }
 
+async fn cloud_mcp_register_account_asset_row(
+    state: &CloudMcpState,
+    row: &Value,
+    reason: &str,
+) -> Value {
+    let payload = cloud_mcp_asset_registration_payload_from_row(reason, row);
+    match cloud_mcp_send_asset_request_with_outbox(
+        state,
+        "account_assets_register",
+        &payload,
+        reason,
+    )
+    .await
+    {
+        Ok(response) => {
+            json!({"ok": true, "response": response.get("data").cloned().unwrap_or(response)})
+        }
+        Err(error) => json!({"ok": false, "queued": true, "error": error}),
+    }
+}
+
 fn cloud_mcp_account_asset_inventory_payloads(reason: &str) -> Vec<Value> {
     let library = cloud_mcp_asset_library_from_file(CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS);
     cloud_mcp_asset_items_from_response(&library)
@@ -28382,20 +30578,8 @@ async fn cloud_mcp_register_account_asset(
     let req = cloud_mcp_asset_scope_request();
     let row = cloud_mcp_asset_local_row(&req, "", None, Path::new(&path), metadata)?;
     cloud_mcp_asset_store_local_row(&row)?;
-    let payload = cloud_mcp_asset_registration_payload_from_row("asset_register", &row);
-    let cloud = match cloud_mcp_send_asset_request_with_outbox(
-        state.inner(),
-        "account_assets_register",
-        &payload,
-        "asset_register",
-    )
-    .await
-    {
-        Ok(response) => {
-            json!({"ok": true, "response": response.get("data").cloned().unwrap_or(response)})
-        }
-        Err(error) => json!({"ok": false, "queued": true, "error": error}),
-    };
+    let cloud =
+        cloud_mcp_register_account_asset_row(state.inner(), &row, "asset_register").await;
     if upload.unwrap_or(false) {
         let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
         return cloud_mcp_upload_account_asset(state, asset_id, None).await;
@@ -38796,6 +40980,123 @@ mod cloud_mcp_tests {
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
     #[test]
+    fn account_skill_markdown_preserves_caps_and_uses_content_only() {
+        let skill = json!({
+            "skill_id": "Review Skill",
+            "title": "Review Skill",
+            "description": "Old one-line summary",
+            "summary": "Legacy summary",
+            "content_md": "Check diffs and tests.",
+        });
+
+        assert_eq!(cloud_mcp_account_skill_id(&skill), "Review_Skill");
+        assert_eq!(
+            cloud_mcp_account_skill_asset_name(&skill, "Review_Skill"),
+            "Review Skill.md"
+        );
+        assert_eq!(
+            cloud_mcp_account_skill_markdown(&skill, "Review_Skill"),
+            "# Review Skill\n\nCheck diffs and tests.\n"
+        );
+
+        let normalized = cloud_mcp_account_skill_normalized_unit(skill);
+        assert_eq!(normalized["id"], "Review_Skill");
+        assert_eq!(normalized["title"], "Review Skill");
+        assert!(normalized.get("description").is_none());
+        assert!(normalized.get("summary").is_none());
+    }
+
+    #[test]
+    fn account_skill_nested_units_are_not_full_snapshot_without_flag() {
+        assert!(!cloud_mcp_account_skills_payload_has_full_units(&json!({
+            "contract": "diffforge.skills_doc.v1",
+            "c": "doc.sync",
+            "d": "skills",
+            "m": "delta",
+            "skills": {
+                "skill_units": [],
+                "skillUnits": [],
+            },
+            "skill_units": [],
+            "skillUnits": [],
+        })));
+        assert!(cloud_mcp_account_skills_payload_has_full_units(&json!({
+            "contract": "diffforge.skills_doc.v1",
+            "c": "doc.sync",
+            "d": "skills",
+            "snapshot_full": true,
+            "skill_units": [],
+        })));
+    }
+
+    #[test]
+    fn account_skill_cache_preserves_rows_on_empty_delta() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("diffforge-skill-cache-delta");
+        let _data_dir = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &root);
+        cloud_mcp_cache_account_skill_units_payload(&json!({
+            "contract": "diffforge.skills_doc.v1",
+            "authoritative": true,
+            "snapshot_full": true,
+            "skill_units": [{
+                "skill_id": "review",
+                "title": "Review",
+                "content": "Check carefully.",
+            }],
+        }));
+        cloud_mcp_cache_account_skill_units_payload(&json!({
+            "contract": "diffforge.skills_doc.v1",
+            "c": "doc.sync",
+            "d": "skills",
+            "m": "delta",
+            "skill_units": [],
+            "skillUnits": [],
+            "skills": {
+                "skill_units": [],
+                "skillUnits": [],
+            },
+        }));
+
+        let cached = cloud_mcp_cached_account_skill_units();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cloud_mcp_account_skill_id(&cached[0]), "review");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_skill_cache_allows_explicit_full_empty_snapshot() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("diffforge-skill-cache-empty");
+        let _data_dir = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &root);
+        cloud_mcp_cache_account_skill_units_payload(&json!({
+            "contract": "diffforge.skills_doc.v1",
+            "authoritative": true,
+            "snapshot_full": true,
+            "skill_units": [{
+                "skill_id": "review",
+                "title": "Review",
+                "content": "Check carefully.",
+            }],
+        }));
+        cloud_mcp_cache_account_skill_units_payload(&json!({
+            "contract": "diffforge.skills_doc.v1",
+            "authoritative": true,
+            "snapshot_full": true,
+            "skill_units": [],
+            "skillUnits": [],
+        }));
+
+        assert!(cloud_mcp_cached_account_skill_units().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn route_token_expiry_decodes_and_gates_last_direct_route_reuse() {
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -39735,7 +42036,10 @@ mod cloud_mcp_tests {
 
         let deleted = cloud_mcp_delete_local_asset_copy(asset_id, true).unwrap();
         assert!(!local_path.exists());
-        assert_eq!(deleted["removed_assets"][0]["asset_id"].as_str(), Some(asset_id));
+        assert_eq!(
+            deleted["removed_assets"][0]["asset_id"].as_str(),
+            Some(asset_id)
+        );
         assert_eq!(deleted["assets"].as_array().map(Vec::len), Some(0));
 
         let conn = cloud_mcp_open_asset_library_conn().unwrap();

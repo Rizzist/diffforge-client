@@ -935,8 +935,10 @@ struct CloudVoiceAgentSession {
     // Kept so mic arbitration can re-attach the agent's audio feed after a
     // dictation session that borrowed the microphone finishes.
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    client_session_id: String,
     control_tx: mpsc::UnboundedSender<CloudVoiceAgentControl>,
     finished_rx: oneshot::Receiver<Result<(), String>>,
+    owner_id: String,
     voice_session_id: String,
 }
 
@@ -1713,6 +1715,7 @@ struct SavedTodoTextAttachment {
 #[serde(rename_all = "camelCase")]
 struct ForgeWorkingDirectory {
     working_directory: String,
+    root_identity: String,
     empty_directory: bool,
     git_repository: bool,
     workspace_kind: String,
@@ -1754,6 +1757,7 @@ struct WorkspaceDirectoryListing {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceRootBrowse {
     working_directory: String,
+    root_identity: String,
     parent_directory: Option<String>,
     directories: Vec<String>,
     truncated: bool,
@@ -2344,6 +2348,8 @@ struct DeepgramRealtimeStartStatus {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartRequest {
+    client_session_id: Option<String>,
+    owner_id: Option<String>,
     repo_id: Option<String>,
     submission_mode: Option<String>,
     workspace_id: Option<String>,
@@ -2352,6 +2358,14 @@ struct CloudVoiceAgentStartRequest {
     /// GPT-Realtime engine opt-in: one native speech-to-speech session on the
     /// cloud instead of the STT → LLM → TTS pipeline.
     realtime: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudVoiceAgentControlRequest {
+    client_session_id: Option<String>,
+    owner_id: Option<String>,
+    voice_session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2369,8 +2383,11 @@ struct CloudVoiceAgentTextMessageRequest {
 #[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartStatus {
     active: bool,
+    client_session_id: String,
+    owner_id: String,
     repo_id: String,
     sample_rate: u32,
+    voice_session_id: String,
     workspace_id: String,
 }
 
@@ -3809,7 +3826,11 @@ async fn local_workspaces_store(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = local_workspace_store_path(&app, &scope_key)?;
-        let items = workspaces.as_array().cloned().unwrap_or_default();
+        let workspace_settings = app_local_state_read(&app, "workspace-settings");
+        let items = local_workspace_catalog_normalize_items(
+            workspaces.as_array().cloned().unwrap_or_default(),
+            &workspace_settings,
+        )?;
         let payload = json!({
             "version": 1,
             "workspaces": items,
@@ -3839,6 +3860,104 @@ fn local_workspace_catalog_text(value: &Value, keys: &[&str]) -> Option<String> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn local_workspace_catalog_root_text(entry: &Value, workspace_settings: &Value) -> Option<String> {
+    let workspace_id = local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"]);
+    let settings = workspace_id
+        .as_deref()
+        .and_then(|id| workspace_settings.get(id));
+    local_workspace_catalog_text(
+        entry,
+        &[
+            "rootDirectory",
+            "root_directory",
+            "workspaceRoot",
+            "workspace_root",
+            "repoPath",
+            "repo_path",
+        ],
+    )
+    .or_else(|| {
+        settings.and_then(|settings| {
+            local_workspace_catalog_text(settings, &["rootDirectory", "root_directory"])
+        })
+    })
+}
+
+fn local_workspace_catalog_root_identity(
+    entry: &Value,
+    workspace_settings: &Value,
+) -> Option<(String, Option<String>)> {
+    let explicit_identity = local_workspace_catalog_text(
+        entry,
+        &[
+            "rootIdentity",
+            "root_identity",
+            "workspaceRootIdentity",
+            "workspace_root_identity",
+        ],
+    )
+    .map(|value| normalized_literal_path_key(&value))
+    .filter(|value| !value.is_empty());
+    if let Some(identity) = explicit_identity {
+        return Some((
+            identity,
+            local_workspace_catalog_root_text(entry, workspace_settings),
+        ));
+    }
+
+    let root_text = local_workspace_catalog_root_text(entry, workspace_settings)?;
+    let root = PathBuf::from(&root_text);
+    let identity = root
+        .canonicalize()
+        .map(|canonical| normalized_path_key(&visible_workspace_root_for_directory(&canonical)))
+        .unwrap_or_else(|_| normalized_literal_path_key(&root_text));
+    (!identity.is_empty()).then_some((identity, Some(root_text)))
+}
+
+fn local_workspace_catalog_normalize_items(
+    items: Vec<Value>,
+    workspace_settings: &Value,
+) -> Result<Vec<Value>, String> {
+    let mut root_owners: HashMap<String, String> = HashMap::new();
+    let mut normalized_items = Vec::with_capacity(items.len());
+
+    for item in items {
+        let workspace_id =
+            local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
+                .unwrap_or_default();
+        let root_details = local_workspace_catalog_root_identity(&item, workspace_settings);
+
+        if !local_workspace_catalog_entry_is_deleted(&item) {
+            if let (Some((root_identity, _)), true) = (&root_details, !workspace_id.is_empty()) {
+                if let Some(existing_id) = root_owners.get(root_identity) {
+                    if existing_id != &workspace_id {
+                        return Err(format!(
+                            "Workspace root is already attached to workspace {existing_id}."
+                        ));
+                    }
+                } else {
+                    root_owners.insert(root_identity.clone(), workspace_id.clone());
+                }
+            }
+        }
+
+        match (item, root_details) {
+            (Value::Object(mut object), Some((root_identity, root_directory))) => {
+                object.insert("rootIdentity".to_string(), json!(root_identity));
+                if !object.contains_key("rootDirectory") {
+                    if let Some(root_directory) = root_directory {
+                        object.insert("rootDirectory".to_string(), json!(root_directory));
+                    }
+                }
+                normalized_items.push(Value::Object(object));
+            }
+            (item, _) => normalized_items.push(item),
+        }
+    }
+
+    Ok(normalized_items)
 }
 
 fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<String>, String> {
@@ -4804,7 +4923,9 @@ pub fn run() {
             tokenomics_record_usage,
             cloud_mcp_reset_server_state,
             cloud_mcp_account_repo_catalog,
+            cloud_mcp_get_account_skills,
             cloud_mcp_get_account_tools,
+            cloud_mcp_save_account_skills_local,
             cloud_mcp_save_account_skills,
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,

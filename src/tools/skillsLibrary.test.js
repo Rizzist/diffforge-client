@@ -2,63 +2,66 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  parseSkillsLibrary,
-  serializeSkillsLibrary,
+  mergeSkillUnits,
   skillSlug,
+  skillsFromUnits,
+  skillsToSkillUnits,
+  skillsToToolEntries,
 } from "./skillsLibrary.js";
 
-test("skills library round-trips structured skills through markdown", () => {
-  const skills = [
-    {
-      content: "Use `type(scope): summary`.\n\n- One change per commit.",
-      description: "Structured commit messages.",
-      icon: "codicon:git-commit",
-      id: "conventional-commits",
-      source: "catalog",
-      title: "Conventional Commits",
-      tone: "amber",
-      updatedAt: "2026-06-10T00:00:00.000Z",
-    },
-    {
-      content: "My own workflow notes.",
-      description: "Personal notes.",
-      icon: "",
-      id: "my-workflow",
-      source: "custom",
-      title: "My Workflow",
-      tone: "",
-      updatedAt: "",
-    },
-  ];
-  const markdown = serializeSkillsLibrary(skills, "# Skills");
-  const parsed = parseSkillsLibrary(markdown);
+test("skills normalize from unit metadata", () => {
+  const skills = skillsFromUnits([{
+    asset_id: "asset-review",
+    content_md: "Check the diff and tests.",
+    local_saved_at: "2026-06-20T12:00:00.000Z",
+    pending_push: true,
+    sha256: "abc",
+    skill_id: "review",
+    sync_status: "local_pending",
+    title: "Review",
+  }]);
 
-  assert.equal(parsed.preamble, "# Skills");
-  assert.equal(parsed.skills.length, 2);
-  assert.deepEqual(parsed.skills[0], skills[0]);
-  assert.equal(parsed.skills[1].title, "My Workflow");
-  assert.equal(parsed.skills[1].source, "custom");
-  assert.equal(parsed.skills[1].content, "My own workflow notes.");
+  assert.equal(skills.length, 1);
+  assert.equal(skills[0].id, "review");
+  assert.equal(skills[0].assetId, "asset-review");
+  assert.equal(skills[0].content, "Check the diff and tests.");
+  assert.equal(skills[0].pendingPush, true);
+  assert.equal(skills[0].localSavedAt, "2026-06-20T12:00:00.000Z");
+  assert.equal(skills[0].syncStatus, "local_pending");
 });
 
-test("legacy SKILLS.md without sections becomes a single custom skill", () => {
-  const parsed = parseSkillsLibrary("# Team playbook\n\nAlways run the linter before pushing.");
-  assert.equal(parsed.skills.length, 1);
-  assert.equal(parsed.skills[0].title, "Team playbook");
-  assert.equal(parsed.skills[0].source, "custom");
-  assert.match(parsed.skills[0].content, /linter before pushing/);
+test("skill unit merge removes tombstoned rows", () => {
+  const current = skillsFromUnits([
+    { skillId: "review", title: "Review" },
+    { skillId: "ship", title: "Ship" },
+  ]);
+  const merged = mergeSkillUnits(current, [{ skill_id: "review", deleted: true }]);
+
+  assert.deepEqual(merged.map((skill) => skill.id), ["ship"]);
 });
 
-test("legacy heading sections parse without meta comments", () => {
-  const parsed = parseSkillsLibrary("# Skills\n\n## Deploys\nUse the deploy script.\n\n## Reviews\nBe kind.");
-  assert.equal(parsed.skills.length, 2);
-  assert.equal(parsed.skills[0].id, "deploys");
-  assert.equal(parsed.skills[0].description, "Use the deploy script.");
-  assert.equal(parsed.skills[1].title, "Reviews");
+test("skills serialize to unit sync payloads", () => {
+  const units = skillsToSkillUnits([{
+    content: "Use `type(scope): summary`.",
+    id: "conventional-commits",
+    source: "catalog",
+    title: "Conventional Commits",
+    updatedAt: "2026-06-10T00:00:00.000Z",
+  }]);
+
+  assert.equal(units.length, 1);
+  assert.equal(units[0].skillId, "conventional-commits");
+  assert.equal(units[0].contentMd, "Use `type(scope): summary`.");
+  assert.equal(Object.prototype.hasOwnProperty.call(units[0], "description"), false);
+});
+
+test("skills expose drag-panel entries", () => {
+  const entries = skillsToToolEntries([{ id: "review", title: "Review", content: "Read carefully." }]);
+  assert.deepEqual(entries, [{ title: "Review", body: "Read carefully." }]);
 });
 
 test("skill slugs dedupe against existing ids", () => {
-  const existing = new Set(["my-skill"]);
-  assert.equal(skillSlug("My Skill!", existing), "my-skill-2");
+  const existing = new Set(["My_Skill"]);
+  assert.equal(skillSlug("My Skill!", existing), "My_Skill_2");
   assert.equal(skillSlug("", new Set()), "skill");
 });

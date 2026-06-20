@@ -67,6 +67,7 @@ import {
   finishCloudVoiceAgentInput,
   prewarmCloudVoiceAgentStream,
   sendCloudVoiceAgentTextMessage,
+  setCloudVoiceAgentInputEnabled,
   startCloudVoiceAgentStream,
   stopCloudVoiceAgentStream,
   subscribeCloudVoiceAgentEvents,
@@ -303,6 +304,14 @@ const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
 const VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT = "diffforge:voice-agent-open-coding-agents-result";
 const VOICE_AGENT_HIGHLIGHT_TERMINAL_RESULT_EVENT = "diffforge:voice-agent-highlight-terminal-result";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
+const orchestratorVoiceSharedSession = {
+  active: false,
+  clientSessionId: "",
+  inputEnabled: false,
+  realtime: false,
+  state: "idle",
+  voiceSessionId: "",
+};
 const ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS = 60000;
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
 const ORCHESTRATOR_VOICE_RING_CENTER = 50;
@@ -14388,7 +14397,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
   useEffect(() => {
     prewarmCloudVoiceAgentStream().catch(() => {});
-  }, [orchestratorPanelWorkspaceId]);
+  }, []);
 
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
   const [editingItemId, setEditingItemId] = useState("");
@@ -14440,7 +14449,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     if (orchestratorVoiceState === "idle") {
       setOrchestratorVoiceMicBorrowed(false);
       setOrchestratorVoiceInputEnabled(false);
-      setOrchestratorVoiceRealtimeSession(false);
     }
   }, [orchestratorVoiceState]);
   const [orchestratorVoiceStats, setOrchestratorVoiceStats] = useState(EMPTY_ORCHESTRATOR_VOICE_STATS);
@@ -14451,9 +14459,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const [reorderingItemId, setReorderingItemId] = useState("");
   const orchestratorVoiceEventsActiveRef = useRef(false);
   const orchestratorVoiceInputFinishRequestedRef = useRef(false);
+  const orchestratorVoiceEventRuntimeRef = useRef({});
   const orchestratorVoiceMonitorRef = useRef(null);
   const orchestratorVoiceRunRef = useRef(0);
   const orchestratorVoiceSessionRef = useRef(Date.now());
+  const orchestratorVoiceClientSessionIdRef = useRef("");
+  const orchestratorVoiceServerSessionIdRef = useRef("");
   const orchestratorVoiceHistoryItemsRef = useRef([]);
   const orchestratorVoiceTurnTimeoutsRef = useRef(new Map());
   const orchestratorVoiceTtsPlayerRef = useRef(null);
@@ -14594,6 +14605,24 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   );
   const displayedTodoQueuePendingItems = todoSelectionEditable ? pendingItems : {};
   const workspaceTodoPeerItems = todoSelectionEditable && Array.isArray(peerItems) ? peerItems : [];
+
+  const getOrchestratorVoiceControlRequest = useCallback(() => ({
+    clientSessionId: orchestratorVoiceClientSessionIdRef.current,
+    ownerId: ORCHESTRATOR_VOICE_OWNER,
+    voiceSessionId: orchestratorVoiceServerSessionIdRef.current,
+  }), []);
+
+  useEffect(() => {
+    if (!orchestratorVoiceSharedSession.active) {
+      return;
+    }
+    orchestratorVoiceEventsActiveRef.current = true;
+    orchestratorVoiceClientSessionIdRef.current = orchestratorVoiceSharedSession.clientSessionId;
+    orchestratorVoiceServerSessionIdRef.current = orchestratorVoiceSharedSession.voiceSessionId;
+    setOrchestratorVoiceRealtimeSession(Boolean(orchestratorVoiceSharedSession.realtime));
+    setOrchestratorVoiceInputEnabled(Boolean(orchestratorVoiceSharedSession.inputEnabled));
+    setOrchestratorVoiceState(orchestratorVoiceSharedSession.state || "idle");
+  }, []);
 
   const updateVoiceHistoryTurn = useCallback((turnKey, updater) => {
     const safeTurnKey = String(turnKey || "").trim();
@@ -14891,6 +14920,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
   useEffect(() => {
     let disposed = false;
+    if (orchestratorVoiceEventsActiveRef.current) {
+      return undefined;
+    }
+
     clearAllVoiceHistoryTurnTimeouts();
     orchestratorVoiceHistoryStoreKeyRef.current = orchestratorVoiceHistoryStoreKey;
     orchestratorVoiceHistoryLoadedRef.current = false;
@@ -14913,7 +14946,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     return () => {
       disposed = true;
     };
-  }, [clearAllVoiceHistoryTurnTimeouts, orchestratorPanelWorkspaceId, orchestratorVoiceHistoryStoreKey, rootDirectory]);
+  }, [clearAllVoiceHistoryTurnTimeouts, orchestratorPanelWorkspaceId, orchestratorVoiceHistoryStoreKey, orchestratorVoiceState, rootDirectory]);
 
   useEffect(() => {
     if (!orchestratorVoiceHistoryLoadedRef.current) {
@@ -15358,13 +15391,21 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceFeedback("");
     setOrchestratorVoiceInputEnabled(false);
     setOrchestratorVoiceRealtimeSession(false);
+    orchestratorVoiceSharedSession.active = false;
+    orchestratorVoiceSharedSession.clientSessionId = "";
+    orchestratorVoiceSharedSession.inputEnabled = false;
+    orchestratorVoiceSharedSession.realtime = false;
+    orchestratorVoiceSharedSession.state = "idle";
+    orchestratorVoiceSharedSession.voiceSessionId = "";
     setOrchestratorChatSubmitting(false);
     await ttsPlayer?.close?.().catch(() => {});
-    await stopCloudVoiceAgentStream().catch(() => {});
+    await stopCloudVoiceAgentStream(getOrchestratorVoiceControlRequest()).catch(() => {});
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, markPendingVoiceHistoryTurnsTerminal]);
+    orchestratorVoiceClientSessionIdRef.current = "";
+    orchestratorVoiceServerSessionIdRef.current = "";
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, getOrchestratorVoiceControlRequest, markPendingVoiceHistoryTurnsTerminal]);
 
   const finishOrchestratorVoiceInput = useCallback(async () => {
     orchestratorVoiceInputFinishRequestedRef.current = true;
@@ -15374,7 +15415,9 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
     setOrchestratorVoiceError("");
     setOrchestratorVoiceInputEnabled(false);
-    await finishCloudVoiceAgentInput().catch((error) => {
+    orchestratorVoiceSharedSession.inputEnabled = false;
+    orchestratorVoiceSharedSession.state = "processing";
+    await finishCloudVoiceAgentInput(getOrchestratorVoiceControlRequest()).catch((error) => {
       logBigViewSyncDiagnosticEvent("tui.voice_agent.finish_input_error", {
         message: getAudioInputErrorMessage(error, "Unable to finish voice input."),
         surface: "tui_voice_agent",
@@ -15383,7 +15426,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     });
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
-  }, [orchestratorPanelWorkspaceId]);
+  }, [getOrchestratorVoiceControlRequest, orchestratorPanelWorkspaceId]);
 
   const cancelOrchestratorVoiceSubmission = useCallback(async () => {
     const hadActiveEvents = orchestratorVoiceEventsActiveRef.current;
@@ -15409,12 +15452,20 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceFeedback("");
     setOrchestratorVoiceInputEnabled(false);
     setOrchestratorVoiceRealtimeSession(false);
+    orchestratorVoiceSharedSession.active = false;
+    orchestratorVoiceSharedSession.clientSessionId = "";
+    orchestratorVoiceSharedSession.inputEnabled = false;
+    orchestratorVoiceSharedSession.realtime = false;
+    orchestratorVoiceSharedSession.state = "idle";
+    orchestratorVoiceSharedSession.voiceSessionId = "";
     setOrchestratorChatSubmitting(false);
     await ttsPlayer?.close?.().catch(() => {});
-    await stopCloudVoiceAgentStream().catch(() => {});
+    await stopCloudVoiceAgentStream(getOrchestratorVoiceControlRequest()).catch(() => {});
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
-  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, markPendingVoiceHistoryTurnsTerminal]);
+    orchestratorVoiceClientSessionIdRef.current = "";
+    orchestratorVoiceServerSessionIdRef.current = "";
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, getOrchestratorVoiceControlRequest, markPendingVoiceHistoryTurnsTerminal]);
 
   const completeOrchestratorVoiceSession = useCallback(async () => {
     orchestratorVoiceRunRef.current += 1;
@@ -15429,12 +15480,20 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     setOrchestratorVoiceFeedback("");
     setOrchestratorVoiceInputEnabled(false);
     setOrchestratorVoiceRealtimeSession(false);
+    orchestratorVoiceSharedSession.active = false;
+    orchestratorVoiceSharedSession.clientSessionId = "";
+    orchestratorVoiceSharedSession.inputEnabled = false;
+    orchestratorVoiceSharedSession.realtime = false;
+    orchestratorVoiceSharedSession.state = "idle";
+    orchestratorVoiceSharedSession.voiceSessionId = "";
     setOrchestratorChatSubmitting(false);
-    await stopCloudVoiceAgentStream().catch(() => {});
+    await stopCloudVoiceAgentStream(getOrchestratorVoiceControlRequest()).catch(() => {});
     await monitor?.finishCapture?.().catch(() => null);
     await monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts]);
+    orchestratorVoiceClientSessionIdRef.current = "";
+    orchestratorVoiceServerSessionIdRef.current = "";
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, getOrchestratorVoiceControlRequest]);
 
   const startOrchestratorVoiceMonitor = useCallback(async () => {
     const runId = orchestratorVoiceRunRef.current + 1;
@@ -15469,10 +15528,19 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     let monitor = null;
     let captureStarted = false;
     let cloudStarted = false;
+    const clientSessionId = `orchestrator-${Date.now()}-${runId}`;
+    orchestratorVoiceClientSessionIdRef.current = clientSessionId;
+    orchestratorVoiceServerSessionIdRef.current = "";
+    orchestratorVoiceSharedSession.active = true;
+    orchestratorVoiceSharedSession.clientSessionId = clientSessionId;
+    orchestratorVoiceSharedSession.inputEnabled = false;
+    orchestratorVoiceSharedSession.realtime = realtimeMode;
+    orchestratorVoiceSharedSession.state = "starting";
+    orchestratorVoiceSharedSession.voiceSessionId = "";
 
     const cleanupStartedMonitor = async () => {
       if (cloudStarted) {
-        await stopCloudVoiceAgentStream().catch(() => {});
+        await stopCloudVoiceAgentStream(getOrchestratorVoiceControlRequest()).catch(() => {});
       }
       if (captureStarted) {
         await monitor?.finishCapture?.().catch(() => null);
@@ -15501,11 +15569,19 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       }
 
       orchestratorVoiceMonitorRef.current = monitor;
-      await startCloudVoiceAgentStream({
+      const startResult = await startCloudVoiceAgentStream({
         ...getCloudVoiceAgentRequestContext(),
+        clientSessionId,
+        ownerId: ORCHESTRATOR_VOICE_OWNER,
         submissionMode,
         realtime: realtimeMode,
       });
+      orchestratorVoiceServerSessionIdRef.current = String(
+        startResult?.voiceSessionId
+          || startResult?.voice_session_id
+          || "",
+      ).trim();
+      orchestratorVoiceSharedSession.voiceSessionId = orchestratorVoiceServerSessionIdRef.current;
       cloudStarted = true;
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
@@ -15518,6 +15594,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       setOrchestratorVoiceInputEnabled(true);
       setOrchestratorVoiceState("listening");
       setOrchestratorVoiceFeedback("");
+      orchestratorVoiceSharedSession.inputEnabled = true;
+      orchestratorVoiceSharedSession.state = "listening";
       if (orchestratorVoiceRunRef.current !== runId) {
         orchestratorVoiceMonitorRef.current = null;
         await cleanupStartedMonitor();
@@ -15532,7 +15610,9 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         setOrchestratorVoiceState("processing");
         setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
         setOrchestratorVoiceInputEnabled(false);
-        await finishCloudVoiceAgentInput().catch(() => {});
+        orchestratorVoiceSharedSession.inputEnabled = false;
+        orchestratorVoiceSharedSession.state = "processing";
+        await finishCloudVoiceAgentInput(getOrchestratorVoiceControlRequest()).catch(() => {});
         await ownedMonitor?.finishCapture?.().catch(() => null);
         await ownedMonitor?.close?.().catch(() => {});
         return;
@@ -15540,6 +15620,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
       setOrchestratorVoiceState("listening");
       setOrchestratorVoiceFeedback("");
+      orchestratorVoiceSharedSession.inputEnabled = true;
+      orchestratorVoiceSharedSession.state = "listening";
     } catch (error) {
       if (orchestratorVoiceRunRef.current !== runId) {
         await cleanupStartedMonitor();
@@ -15554,12 +15636,98 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       setOrchestratorVoiceRealtimeSession(false);
       await cleanupStartedMonitor();
       orchestratorVoiceEventsActiveRef.current = false;
+      orchestratorVoiceClientSessionIdRef.current = "";
+      orchestratorVoiceServerSessionIdRef.current = "";
+      orchestratorVoiceSharedSession.active = false;
+      orchestratorVoiceSharedSession.clientSessionId = "";
+      orchestratorVoiceSharedSession.inputEnabled = false;
+      orchestratorVoiceSharedSession.realtime = false;
+      orchestratorVoiceSharedSession.state = "idle";
+      orchestratorVoiceSharedSession.voiceSessionId = "";
       setOrchestratorVoiceError(getAudioInputErrorMessage(
         error,
         "Unable to start the cloud voice agent.",
       ));
     }
-  }, [clearAllVoiceHistoryTurnTimeouts, getCloudVoiceAgentRequestContext, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate]);
+  }, [clearAllVoiceHistoryTurnTimeouts, getCloudVoiceAgentRequestContext, getOrchestratorVoiceControlRequest, orchestratorPanelWorkspaceId, resetOrchestratorFastResponseGate]);
+
+  const resumeOrchestratorVoiceMonitor = useCallback(async () => {
+    if (!orchestratorVoiceSharedSession.active || !orchestratorVoiceSharedSession.realtime) {
+      void startOrchestratorVoiceMonitor();
+      return;
+    }
+
+    const runId = orchestratorVoiceRunRef.current + 1;
+    orchestratorVoiceRunRef.current = runId;
+    clearAllVoiceHistoryTurnTimeouts();
+    resetOrchestratorFastResponseGate();
+    orchestratorVoiceInputFinishRequestedRef.current = false;
+    orchestratorVoiceEventsActiveRef.current = true;
+    orchestratorVoiceClientSessionIdRef.current = orchestratorVoiceSharedSession.clientSessionId;
+    orchestratorVoiceServerSessionIdRef.current = orchestratorVoiceSharedSession.voiceSessionId;
+    setOrchestratorVoiceState("starting");
+    setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+    setOrchestratorVoiceError("");
+    setOrchestratorVoiceFeedback("Listening...");
+    setOrchestratorVoiceInputEnabled(false);
+    setOrchestratorVoiceRealtimeSession(true);
+    orchestratorVoiceSharedSession.state = "starting";
+    orchestratorVoiceSharedSession.inputEnabled = false;
+
+    let monitor = null;
+    let captureStarted = false;
+    try {
+      monitor = await startLowPowerAudioBuffer({
+        deviceId: readSelectedAudioInputDeviceId(),
+        owner: ORCHESTRATOR_VOICE_OWNER,
+        onStats: (stats) => {
+          if (orchestratorVoiceRunRef.current === runId) {
+            setOrchestratorVoiceStats({
+              ...EMPTY_ORCHESTRATOR_VOICE_STATS,
+              ...(stats || {}),
+            });
+          }
+        },
+      });
+      if (orchestratorVoiceRunRef.current !== runId) {
+        await monitor?.close?.().catch(() => {});
+        return;
+      }
+      orchestratorVoiceMonitorRef.current = monitor;
+      await setCloudVoiceAgentInputEnabled(true);
+      if (orchestratorVoiceRunRef.current !== runId) {
+        orchestratorVoiceMonitorRef.current = null;
+        await monitor?.close?.().catch(() => {});
+        return;
+      }
+      await monitor.beginCapture();
+      captureStarted = true;
+      setOrchestratorVoiceInputEnabled(true);
+      setOrchestratorVoiceState("listening");
+      setOrchestratorVoiceFeedback("");
+      orchestratorVoiceSharedSession.inputEnabled = true;
+      orchestratorVoiceSharedSession.state = "listening";
+    } catch (error) {
+      if (captureStarted) {
+        await monitor?.finishCapture?.().catch(() => null);
+      }
+      await monitor?.close?.().catch(() => {});
+      if (orchestratorVoiceRunRef.current !== runId) {
+        return;
+      }
+      orchestratorVoiceMonitorRef.current = null;
+      setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+      setOrchestratorVoiceState("error");
+      setOrchestratorVoiceFeedback("");
+      setOrchestratorVoiceInputEnabled(false);
+      orchestratorVoiceSharedSession.inputEnabled = false;
+      orchestratorVoiceSharedSession.state = "idle";
+      setOrchestratorVoiceError(getAudioInputErrorMessage(
+        error,
+        "Unable to resume the cloud voice agent.",
+      ));
+    }
+  }, [clearAllVoiceHistoryTurnTimeouts, resetOrchestratorFastResponseGate, startOrchestratorVoiceMonitor]);
 
   const handleOrchestratorChatSubmit = useCallback(async (event) => {
     event?.preventDefault?.();
@@ -15671,11 +15839,21 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
 
+    if (
+      orchestratorVoiceRealtimeSession
+      && orchestratorVoiceState === "idle"
+      && orchestratorVoiceSharedSession.active
+    ) {
+      void resumeOrchestratorVoiceMonitor();
+      return;
+    }
+
     void startOrchestratorVoiceMonitor();
   }, [
     finishOrchestratorVoiceInput,
     orchestratorVoiceRealtimeSession,
     orchestratorVoiceState,
+    resumeOrchestratorVoiceMonitor,
     startOrchestratorVoiceMonitor,
     stopOrchestratorVoiceMonitor,
   ]);
@@ -16066,12 +16244,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }
   }, [clearItemEdit, editingItemId, items, todoSelectionEditable]);
 
-  useEffect(() => {
-    if (activeWorkspaceTool !== "orchestrator") {
-      void stopOrchestratorVoiceMonitor();
-    }
-  }, [activeWorkspaceTool, stopOrchestratorVoiceMonitor]);
-
   useEffect(() => () => {
     orchestratorVoiceRunRef.current += 1;
     cancelOrchestratorFastResponseGate("unmount");
@@ -16081,12 +16253,43 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     orchestratorVoiceMonitorRef.current = null;
     const ttsPlayer = orchestratorVoiceTtsPlayerRef.current;
     orchestratorVoiceTtsPlayerRef.current = null;
-    stopCloudVoiceAgentStream().catch(() => {});
+    const keepRealtimeSessionAlive = orchestratorVoiceSharedSession.active
+      && orchestratorVoiceSharedSession.realtime;
+    if (keepRealtimeSessionAlive) {
+      if (orchestratorVoiceSharedSession.inputEnabled) {
+        orchestratorVoiceSharedSession.inputEnabled = false;
+        orchestratorVoiceSharedSession.state = "processing";
+        finishCloudVoiceAgentInput(getOrchestratorVoiceControlRequest()).catch(() => {});
+      }
+    } else {
+      stopCloudVoiceAgentStream(getOrchestratorVoiceControlRequest()).catch(() => {});
+    }
     ttsPlayer?.close?.().catch(() => {});
     monitor?.finishCapture?.().catch(() => null);
     monitor?.close?.().catch(() => {});
     orchestratorVoiceEventsActiveRef.current = false;
-  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts]);
+    orchestratorVoiceClientSessionIdRef.current = "";
+    orchestratorVoiceServerSessionIdRef.current = "";
+  }, [cancelOrchestratorFastResponseGate, clearAllVoiceHistoryTurnTimeouts, getOrchestratorVoiceControlRequest]);
+
+  useEffect(() => {
+    orchestratorVoiceEventRuntimeRef.current = {
+      bufferOrReleaseOrchestratorFastResponseEvent,
+      cancelOrchestratorFastResponseGate,
+      completeOrchestratorVoiceSession,
+      markPendingVoiceHistoryTurnsTerminal,
+      markVoiceHistoryTurnTerminal,
+      onVoiceAgentToolCall,
+      onVoicePlanServerResult,
+      orchestratorPanelWorkspaceId,
+      recordVoiceHistoryLlmFeedback,
+      recordVoiceHistoryPlanSnapshot,
+      recordVoiceHistoryToolCall,
+      recordVoiceHistoryTranscript,
+      stopOrchestratorVoiceMonitor,
+      updateVoiceHistoryTurn,
+    };
+  });
 
   useEffect(() => {
     let disposed = false;
@@ -16097,6 +16300,21 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         return;
       }
 
+      const runtime = orchestratorVoiceEventRuntimeRef.current || {};
+      const bufferOrReleaseOrchestratorFastResponseEvent = runtime.bufferOrReleaseOrchestratorFastResponseEvent || (() => {});
+      const cancelOrchestratorFastResponseGate = runtime.cancelOrchestratorFastResponseGate || (() => {});
+      const completeOrchestratorVoiceSession = runtime.completeOrchestratorVoiceSession || (() => Promise.resolve());
+      const markPendingVoiceHistoryTurnsTerminal = runtime.markPendingVoiceHistoryTurnsTerminal || (() => {});
+      const markVoiceHistoryTurnTerminal = runtime.markVoiceHistoryTurnTerminal || (() => {});
+      const onVoiceAgentToolCall = runtime.onVoiceAgentToolCall;
+      const onVoicePlanServerResult = runtime.onVoicePlanServerResult;
+      const recordVoiceHistoryLlmFeedback = runtime.recordVoiceHistoryLlmFeedback || (() => {});
+      const recordVoiceHistoryPlanSnapshot = runtime.recordVoiceHistoryPlanSnapshot || (() => {});
+      const recordVoiceHistoryToolCall = runtime.recordVoiceHistoryToolCall || (() => {});
+      const recordVoiceHistoryTranscript = runtime.recordVoiceHistoryTranscript || (() => {});
+      const stopOrchestratorVoiceMonitor = runtime.stopOrchestratorVoiceMonitor || (() => Promise.resolve());
+      const updateVoiceHistoryTurn = runtime.updateVoiceHistoryTurn || (() => {});
+      const currentWorkspaceId = runtime.orchestratorPanelWorkspaceId || "";
       const kind = cloudVoiceAgentEventKind(event);
       if (kind === "voice_agent_error") {
         if (!orchestratorVoiceEventsActiveRef.current) {
@@ -16118,7 +16336,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           code: String(event?.error?.code || event?.code || "").trim(),
           hasTurnIndex,
           message,
-          workspaceId: orchestratorPanelWorkspaceId,
+          workspaceId: currentWorkspaceId,
         });
         void stopOrchestratorVoiceMonitor().finally(() => {
           if (disposed) {
@@ -16198,7 +16416,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           message: String(event?.error?.message || event?.message || "Voice response playback failed."),
           phase: String(event?.phase || ""),
           surface: "tui_voice_agent",
-          workspaceId: orchestratorPanelWorkspaceId,
+          workspaceId: currentWorkspaceId,
         });
         return;
       }
@@ -16212,13 +16430,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           active: Boolean(orchestratorVoiceEventsActiveRef.current),
           releasedTaskCount: getVoicePlanReleasedTasksFromPayload(event).length,
           snapshot: getVoicePlanSnapshotLogSummary(getVoicePlanSnapshotFromPayload(event)),
-          workspaceId: orchestratorPanelWorkspaceId,
+          workspaceId: currentWorkspaceId,
         });
         recordVoiceHistoryPlanSnapshot(event);
         const handledPlanResult = onVoicePlanServerResult?.(event);
         logTerminalStatus("frontend.voice_agent.plan_snapshot_routed", {
           handledPlanResult: Boolean(handledPlanResult),
-          workspaceId: orchestratorPanelWorkspaceId,
+          workspaceId: currentWorkspaceId,
         });
         const snapshot = getVoicePlanSnapshotFromPayload(event);
         if (snapshot) {
@@ -16266,7 +16484,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             kind,
             reason: "orchestrator_voice_events_inactive",
             toolName: String(event?.name || event?.tool_name || event?.toolName || "").trim(),
-            workspaceId: orchestratorPanelWorkspaceId,
+            workspaceId: currentWorkspaceId,
           });
           return;
         }
@@ -16275,7 +16493,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         if (toolName === "queue" || toolName === "open_coding_agents" || toolName === "highlight_terminal" || toolName === "create_plan") {
           logTerminalStatus("frontend.voice_agent.tool_call_arrived", {
             toolName,
-            workspaceId: orchestratorPanelWorkspaceId,
+            workspaceId: currentWorkspaceId,
           });
           recordVoiceHistoryToolCall(event);
           onVoiceAgentToolCall?.(event);
@@ -16290,6 +16508,25 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                   : "Queued voice todo.",
           );
         }
+        return;
+      }
+
+      if (kind === "voice_agent_turn_finished" && orchestratorVoiceEventsActiveRef.current) {
+        cancelOrchestratorFastResponseGate("turn_finished");
+        orchestratorVoiceInputFinishRequestedRef.current = false;
+        const monitor = orchestratorVoiceMonitorRef.current;
+        orchestratorVoiceMonitorRef.current = null;
+        void monitor?.finishCapture?.().catch(() => null);
+        void monitor?.close?.().catch(() => {});
+        setOrchestratorVoiceState("idle");
+        setOrchestratorVoiceStats(EMPTY_ORCHESTRATOR_VOICE_STATS);
+        setOrchestratorVoiceInputEnabled(false);
+        setOrchestratorVoiceRealtimeSession(true);
+        setOrchestratorVoiceFeedback("");
+        orchestratorVoiceSharedSession.active = true;
+        orchestratorVoiceSharedSession.inputEnabled = false;
+        orchestratorVoiceSharedSession.realtime = true;
+        orchestratorVoiceSharedSession.state = "idle";
         return;
       }
 
@@ -16313,22 +16550,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       disposed = true;
       unlisten?.();
     };
-  }, [
-    onVoiceAgentToolCall,
-    bufferOrReleaseOrchestratorFastResponseEvent,
-    cancelOrchestratorFastResponseGate,
-    recordVoiceHistoryLlmFeedback,
-    recordVoiceHistoryPlanSnapshot,
-    recordVoiceHistoryToolCall,
-    recordVoiceHistoryTranscript,
-    onVoicePlanServerResult,
-    markPendingVoiceHistoryTurnsTerminal,
-    markVoiceHistoryTurnTerminal,
-    completeOrchestratorVoiceSession,
-    stopOrchestratorVoiceMonitor,
-    orchestratorPanelWorkspaceId,
-    updateVoiceHistoryTurn,
-  ]);
+  }, []);
 
   useEffect(() => {
     const handleVoicePlanSnapshot = (event) => {
@@ -17790,6 +18012,7 @@ function TerminalView({
   isWorkspaceSurfaceVisible = true,
   isWorkspaceRuntimeDeactivating = false,
   manageWorkspaceAgents,
+  onShowWorkspaceTerminals = null,
   onOpenWorkspaceSettings,
   onArchiveWorkspaceThread,
   onSelectWorkspaceThread,
@@ -29391,6 +29614,7 @@ function TerminalView({
     const action = normalizeVoiceAgentOpenCodingAgentsAction(args.action);
     const agentType = normalizeVoiceAgentManagementAgent(args.agent_type);
     const count = Math.max(1, Math.min(12, Number.parseInt(args.count, 10) || 1));
+    const workspaceId = terminalWorkspace?.id || "";
     const sessionContext = args.session_context && typeof args.session_context === "object"
       ? args.session_context
       : args.sessionContext && typeof args.sessionContext === "object"
@@ -29416,6 +29640,13 @@ function TerminalView({
     );
 
     try {
+      if (workspaceId && typeof onShowWorkspaceTerminals === "function") {
+        try {
+          onShowWorkspaceTerminals(workspaceId, "voice_agent_open_coding_agents");
+        } catch {
+          // Opening terminals should still continue if the view switch fails.
+        }
+      }
       const result = await manageWorkspaceAgents?.({
         action,
         agentType,
@@ -29424,7 +29655,7 @@ function TerminalView({
         sessionContext,
         ...sessionMetadata,
         source: "voice-agent-open-coding-agents",
-        workspaceId: terminalWorkspace?.id || "",
+        workspaceId,
       });
       const message = result?.message || "Coding-agent terminals updated.";
       window.dispatchEvent(new CustomEvent(VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT, {
@@ -29432,7 +29663,7 @@ function TerminalView({
           message,
           status: "ready",
           toolCall,
-          workspaceId: terminalWorkspace?.id || "",
+          workspaceId,
         },
       }));
       logBigViewSyncDiagnosticEvent("tui.voice_agent.open_coding_agents", {
@@ -29442,7 +29673,7 @@ function TerminalView({
         providerSessionPresent: Boolean(sessionMetadata.providerSessionId),
         result,
         surface: "tui_orchestrator_voice",
-        workspaceId: terminalWorkspace?.id || "",
+        workspaceId,
       });
       return result;
     } catch (error) {
@@ -29452,7 +29683,7 @@ function TerminalView({
           message,
           status: "error",
           toolCall,
-          workspaceId: terminalWorkspace?.id || "",
+          workspaceId,
         },
       }));
       logBigViewSyncDiagnosticEvent("tui.voice_agent.open_coding_agents_error", {
@@ -29461,12 +29692,13 @@ function TerminalView({
         count,
         message,
         surface: "tui_orchestrator_voice",
-        workspaceId: terminalWorkspace?.id || "",
+        workspaceId,
       });
       return null;
     }
   }, [
     manageWorkspaceAgents,
+    onShowWorkspaceTerminals,
     terminalWorkspace?.id,
   ]);
 

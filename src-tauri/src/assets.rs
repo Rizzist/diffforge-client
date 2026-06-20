@@ -960,6 +960,16 @@ fn diffforge_promote_untracked_asset(
         &input,
     )?;
     cloud_mcp_asset_store_local_row(&row)?;
+    let cloud_state = app.state::<CloudMcpState>().inner().clone();
+    let cloud_row = row.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = cloud_mcp_register_account_asset_row(
+            &cloud_state,
+            &cloud_row,
+            "asset_promote_untracked",
+        )
+        .await;
+    });
     let removed_source = if delete_source.unwrap_or(true) {
         fs::remove_file(&source).map_err(|error| {
             format!(
@@ -985,6 +995,11 @@ fn diffforge_promote_untracked_asset(
                 "kind": "asset_library_local_registered",
                 "asset": row.clone(),
                 "assets": [row.clone()],
+                "cloud": {
+                    "ok": false,
+                    "queued": true,
+                    "reason": "asset_promote_untracked",
+                },
             }
         }),
     );
@@ -1008,6 +1023,11 @@ fn diffforge_promote_untracked_asset(
         "sourcePath": source.display().to_string(),
         "source_removed": removed_source,
         "sourceRemoved": removed_source,
+        "cloud": {
+            "ok": false,
+            "queued": true,
+            "reason": "asset_promote_untracked",
+        },
         "library": diffforge_untracked_asset_library(None)?,
     }))
 }

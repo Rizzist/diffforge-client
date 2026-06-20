@@ -1645,12 +1645,13 @@ function collectionForWorkspace(workspaceTodos, workspaceId, directKeys = [], by
 }
 
 export function workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection = {}) {
-  const workspaceId = normalizeWorkspaceId(selection.workspaceId);
-  const deviceId = normalizeTodoQueueSwitcherId(selection.deviceId);
+  const safeSelection = selection && typeof selection === "object" ? selection : {};
+  const workspaceId = normalizeWorkspaceId(safeSelection.workspaceId);
+  const deviceId = normalizeTodoQueueSwitcherId(safeSelection.deviceId);
   if (!workspaceId || !deviceId) {
     return [];
   }
-  const selectionDeviceAliases = new Set(uniqueDeviceAliases(selection.deviceAliases, deviceId));
+  const selectionDeviceAliases = new Set(uniqueDeviceAliases(safeSelection.deviceAliases, deviceId));
   const todoCollection = collectionForWorkspace(
     workspaceTodos,
     workspaceId,

@@ -832,6 +832,7 @@ fn workspace_root_basic_kind(root: &Path) -> String {
 fn workspace_root_basic_response(root: &Path) -> ForgeWorkingDirectory {
     ForgeWorkingDirectory {
         working_directory: workspace_path_display(root),
+        root_identity: normalized_path_key(root),
         empty_directory: workspace_directory_is_empty(root),
         git_repository: workspace_is_exact_git_root(root),
         workspace_kind: workspace_root_basic_kind(root),
@@ -847,6 +848,7 @@ fn workspace_root_response(root: &Path) -> ForgeWorkingDirectory {
     let workspace_mounts = workspace_mount_manifest_from_projects(root, &mounts);
     ForgeWorkingDirectory {
         working_directory: workspace_path_display(root),
+        root_identity: normalized_path_key(root),
         empty_directory: workspace_directory_is_empty(root),
         git_repository: workspace_is_exact_git_root(root),
         workspace_kind: workspace_kind_for_mounts(root, &mounts),

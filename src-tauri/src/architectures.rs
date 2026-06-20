@@ -2318,25 +2318,43 @@ async fn architecture_graph_delete(
 const ARCHITECTURE_STORE_CHANGED_EVENT: &str = "architecture-store-changed";
 
 /// One recursive watcher over the centralized architecture store keeps the
-/// Architecture tab auto-synced: any graph source change — in-app saves,
+/// Architecture tab live-refreshed: any graph source change — in-app saves,
 /// agent edits from terminals, direct file edits — emits a debounced
 /// `architecture-store-changed` event the webview reacts to. Only paths under
 /// a `graphs/` directory count, so generated files (index.json, AGENTS.md,
 /// icon-aliases.json, revisions) written during listing cannot self-trigger.
-fn architecture_store_changed_slug(root: &Path, path: &Path) -> Option<String> {
+fn architecture_store_changed_scope(root: &Path, path: &Path) -> Option<(String, String)> {
     let relative = path.strip_prefix(root).ok()?;
     let components = relative
         .components()
         .filter_map(|component| component.as_os_str().to_str())
         .collect::<Vec<_>>();
-    if !components.iter().any(|component| *component == "graphs") {
+    let Some(graphs_index) = components.iter().position(|component| *component == "graphs") else {
         return None;
-    }
-    match components.first().copied() {
+    };
+    let graph_id = components
+        .get(graphs_index + 1)
+        .and_then(|name| {
+            let path = Path::new(name);
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if extension != "arch" && extension != "json" {
+                return None;
+            }
+            path.file_stem()
+        })
+        .and_then(|value| value.to_str())
+        .map(architecture_slug)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let slug = match components.first().copied() {
         Some("repos") => components.get(1).map(|slug| slug.to_string()),
         Some("global") => Some(ARCHITECTURE_GLOBAL_REPO_ID.to_string()),
         _ => None,
-    }
+    }?;
+    Some((slug, graph_id))
 }
 
 pub(crate) fn architecture_store_watcher_start(app: AppHandle) {
@@ -2358,27 +2376,35 @@ pub(crate) fn architecture_store_watcher_start(app: AppHandle) {
         {
             return;
         }
-        let collect = |event: notify::Result<notify::Event>, slugs: &mut HashSet<String>| {
+        let collect = |
+            event: notify::Result<notify::Event>,
+            slugs: &mut HashSet<String>,
+            graph_ids: &mut HashSet<String>,
+        | {
             let Ok(event) = event else {
                 return;
             };
             for path in &event.paths {
-                if let Some(slug) = architecture_store_changed_slug(&root, path) {
+                if let Some((slug, graph_id)) = architecture_store_changed_scope(&root, path) {
                     slugs.insert(slug);
+                    if !graph_id.is_empty() {
+                        graph_ids.insert(graph_id);
+                    }
                 }
             }
         };
         loop {
             let mut pending_slugs = HashSet::new();
+            let mut pending_graph_ids = HashSet::new();
             let Ok(first) = rx.recv() else {
                 return;
             };
-            collect(first, &mut pending_slugs);
+            collect(first, &mut pending_slugs, &mut pending_graph_ids);
             // Quiet-window debounce: keep absorbing the burst until 600ms of
             // silence, then emit one change event for the whole batch.
             loop {
                 match rx.recv_timeout(Duration::from_millis(600)) {
-                    Ok(event) => collect(event, &mut pending_slugs),
+                    Ok(event) => collect(event, &mut pending_slugs, &mut pending_graph_ids),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
@@ -2387,10 +2413,13 @@ pub(crate) fn architecture_store_watcher_start(app: AppHandle) {
                 continue;
             }
             let slugs = pending_slugs.into_iter().collect::<Vec<_>>();
+            let graph_ids = pending_graph_ids.into_iter().collect::<Vec<_>>();
             let _ = app.emit(
                 ARCHITECTURE_STORE_CHANGED_EVENT,
                 json!({
                     "slugs": slugs,
+                    "graphIds": graph_ids.clone(),
+                    "graph_ids": graph_ids,
                     "changedAtMs": architecture_now_millis(),
                 }),
             );

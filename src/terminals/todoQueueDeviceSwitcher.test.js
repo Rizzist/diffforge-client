@@ -996,6 +996,24 @@ test("workspaceTodos filtering accepts selected device aliases", () => {
   assert.equal(items[0].todoId, "todo-local");
 });
 
+test("workspaceTodos filtering ignores null device selections", () => {
+  const items = workspaceTodoItemsForDeviceWorkspace({
+    itemsByWorkspace: {
+      "ws-local": [
+        {
+          deviceId: "desktop-local",
+          status: "listed",
+          text: "Local todo",
+          todoId: "todo-local",
+          workspaceId: "ws-local",
+        },
+      ],
+    },
+  }, null);
+
+  assert.deepEqual(items, []);
+});
+
 test("only local device current workspace selections are editable", () => {
   assert.equal(todoQueueDeviceSelectionIsLocalEditable({
     deviceKind: "desktop",

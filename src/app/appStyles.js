@@ -2,6 +2,7 @@ import styled, { createGlobalStyle, keyframes } from "styled-components";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { Archive } from "@styled-icons/material-rounded/Archive";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { AutoFixHigh } from "@styled-icons/material-rounded/AutoFixHigh";
@@ -16451,6 +16452,10 @@ export const ButtonAddIcon = styled(Add)`
   ${buttonIconSize}
 `;
 
+export const ButtonArchiveIcon = styled(Archive)`
+  ${buttonIconSize}
+`;
+
 export const ButtonBackIcon = styled(ArrowBack)`
   ${buttonIconSize}
 `;
@@ -16978,4 +16983,61 @@ export const WorkspaceCreateFooter = styled.div`
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+`;
+
+export const WorkspaceArchiveList = styled.div`
+  display: grid;
+  gap: 9px;
+`;
+
+export const WorkspaceArchiveRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--forge-border);
+  border-radius: 10px;
+  background: var(--forge-surface-raised);
+
+  @media (max-width: 640px) {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+`;
+
+export const WorkspaceArchiveMain = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+`;
+
+export const WorkspaceArchiveTitle = styled.strong`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text);
+  font-size: 13px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+export const WorkspaceArchivePath = styled.code`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text-muted);
+  direction: rtl;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+`;
+
+export const WorkspaceArchiveActions = styled.div`
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 `;

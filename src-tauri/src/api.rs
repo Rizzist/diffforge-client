@@ -2205,6 +2205,7 @@ async fn browse_workspace_root_directory(
         let rejection_reason = workspace_root_rejection_reason(&canonical);
         Ok(WorkspaceRootBrowse {
             working_directory: workspace_path_display(&canonical),
+            root_identity: normalized_path_key(&canonical),
             parent_directory: canonical
                 .parent()
                 .map(|parent| workspace_path_display(parent)),

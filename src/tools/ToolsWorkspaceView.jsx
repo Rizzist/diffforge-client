@@ -8,12 +8,13 @@ import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
 import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
 import {
-  parseSkillsLibrary,
-  serializeSkillsLibrary,
+  mergeSkillUnits,
+  skillsFromUnits,
+  skillsToSkillUnits,
   skillSlug,
   skillToneColor,
 } from "./skillsLibrary.js";
-import { noteAccountSkillsMarkdown } from "./workspaceToolsStore.js";
+import { noteAccountSkillUnits } from "./workspaceToolsStore.js";
 
 const SECTIONS = [
   { id: "architectures", label: "Architectures" },
@@ -76,8 +77,10 @@ function accountToolsEventHasKnownPayload(payload) {
         || candidate.skill
         || candidate.skill_units
         || candidate.skillUnits
+        || candidate.ops
         || candidate.delta === true
-        || candidate.skills
+        || candidate.skills?.skill_units
+        || candidate.skills?.skillUnits
         || candidate.clis
         || candidate.mcps
         || candidate.servers
@@ -85,52 +88,106 @@ function accountToolsEventHasKnownPayload(payload) {
   ));
 }
 
-function accountToolsSkillsFromEventPayload(payload) {
-  const candidates = accountToolsEventCandidates(payload);
-  for (const candidate of candidates) {
-    const skills = candidate?.skills;
-    if (skills?.skills_md != null || skills?.skillsMd != null) {
-      return skills;
-    }
-  }
-  return null;
+function accountToolsSkillPayloadIsFull(payload) {
+  return accountToolsEventCandidates(payload).some((candidate) => (
+    candidate
+      && typeof candidate === "object"
+      && !Array.isArray(candidate)
+      && (
+        candidate.authoritative === true
+        || candidate.snapshot_full === true
+        || candidate.snapshotFull === true
+      )
+  ));
 }
 
-function accountToolsSkillUnitFromEventPayload(payload) {
+function accountToolsSkillUnitsFromEventPayload(payload) {
   const candidates = accountToolsEventCandidates(payload);
+  const units = [];
+  const pushUnit = (unit, removed = false) => {
+    if (!unit || typeof unit !== "object" || Array.isArray(unit)) return;
+    units.push(removed ? { ...unit, current: false, deleted: true } : unit);
+  };
+  const pushOps = (ops) => {
+    (Array.isArray(ops) ? ops : []).forEach((op) => {
+      if (!op || typeof op !== "object" || Array.isArray(op)) return;
+      const kind = text(op.op || op.operation || op.action).toLowerCase();
+      const removed = ["d", "delete", "remove", "removed", "tombstone"].includes(kind);
+      pushUnit(op.skill || op.unit || op.skill_unit || op.skillUnit || op, removed);
+    });
+  };
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
     const contract = candidate.contract;
-    const skill = candidate.skill;
-    if (skill && typeof skill === "object" && !Array.isArray(skill)) {
-      return skill;
-    }
-    const units = candidate.skill_units || candidate.skillUnits;
-    if (Array.isArray(units) && units.length) {
-      return units[0];
+    pushUnit(candidate.skill);
+    (candidate.skill_units || candidate.skillUnits || []).forEach((unit) => pushUnit(unit));
+    (candidate.removed_skill_units || candidate.removedSkillUnits || []).forEach((unit) => pushUnit(unit, true));
+    pushOps(candidate.ops);
+    const skills = candidate.skills;
+    if (skills && typeof skills === "object" && !Array.isArray(skills)) {
+      (skills.skill_units || skills.skillUnits || []).forEach((unit) => pushUnit(unit));
+      (skills.removed_skill_units || skills.removedSkillUnits || []).forEach((unit) => pushUnit(unit, true));
+      pushOps(skills.ops);
     }
     if (contract === "diffforge.skills_doc.v1") {
       const nested = candidate.payload?.skill || candidate.data?.skill;
-      if (nested && typeof nested === "object" && !Array.isArray(nested)) {
-        return nested;
-      }
+      pushUnit(nested);
     }
   }
-  return null;
+  const byId = new Map();
+  units.forEach((unit) => {
+    const id = text(unit?.skill_id || unit?.skillId || unit?.id);
+    if (id) byId.set(id, unit);
+  });
+  return Array.from(byId.values());
 }
 
-function skillFromUnit(unit) {
-  const id = text(unit?.skill_id || unit?.skillId || unit?.id);
-  if (!id) return null;
+function accountToolsSkillMetaFromEventPayload(payload) {
+  const meta = { error: "", revision: null, updatedAt: "", updatedBy: "" };
+  const applyMeta = (source) => {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return;
+    if (meta.revision === null && source.revision !== undefined && source.revision !== null) {
+      const revision = Number(source.revision);
+      if (Number.isFinite(revision)) meta.revision = revision;
+    }
+    meta.updatedAt = text(meta.updatedAt, text(source.updated_at || source.updatedAt));
+    meta.updatedBy = text(meta.updatedBy, text(source.updated_by_device_name || source.updatedByDeviceName));
+    meta.error = text(meta.error, text(source.last_sync_error || source.lastSyncError || source.error));
+  };
+  accountToolsEventCandidates(payload).forEach((candidate) => {
+    applyMeta(candidate);
+    applyMeta(candidate?.skills);
+  });
+  return meta;
+}
+
+function applySkillUnitsToLibrary(library, units) {
   return {
-    content: String(unit?.content_md ?? unit?.contentMd ?? unit?.content ?? ""),
-    description: text(unit?.description || unit?.summary),
-    icon: text(unit?.icon),
-    id,
-    source: text(unit?.source, "custom"),
-    title: text(unit?.title || unit?.name || unit?.label, id),
-    tone: text(unit?.tone),
-    updatedAt: text(unit?.updated_at || unit?.updatedAt),
+    skills: mergeSkillUnits(library?.skills || [], units),
+  };
+}
+
+function replaceSkillUnitsInLibrary(units) {
+  return {
+    skills: skillsFromUnits(units),
+  };
+}
+
+function withLocalPendingSkill(skill, localSavedAt = new Date().toISOString()) {
+  return {
+    ...skill,
+    localSavedAt,
+    pendingPush: true,
+    syncStatus: "local_pending",
+  };
+}
+
+function clearLocalPendingSkill(skill) {
+  return {
+    ...skill,
+    localSavedAt: "",
+    pendingPush: false,
+    syncStatus: skill?.syncStatus === "local_pending" ? "" : text(skill?.syncStatus),
   };
 }
 
@@ -159,21 +216,6 @@ function cliSnapshotFromStatuses(statuses) {
     updateAvailable: Boolean(status?.npmUpdateAvailable || status?.npm_update_available),
     activeModel: text(status?.activeModel || status?.active_model),
   }));
-}
-
-function skillUnitsForSync(skills) {
-  return (Array.isArray(skills) ? skills : []).map((skill) => ({
-    skillId: text(skill?.id),
-    id: text(skill?.id),
-    title: text(skill?.title, "Untitled skill"),
-    description: text(skill?.description),
-    contentMd: String(skill?.content || "").trim(),
-    content: String(skill?.content || "").trim(),
-    icon: text(skill?.icon),
-    source: text(skill?.source, "custom"),
-    tone: text(skill?.tone),
-    updatedAt: text(skill?.updatedAt),
-  })).filter((skill) => skill.id && skill.title);
 }
 
 function SkillIconGlyph({ icon, title }) {
@@ -285,9 +327,8 @@ export default function ToolsWorkspaceView({
   const mcpScopeReady = activeMcpScope !== GLOBAL_MCP_DEFAULTS_SCOPE
     || (globalMcpDefaults.state === "ready" && Boolean(globalMcpDefaults.rootDirectory));
 
-  // ---- Skills (account-level structured library; the cloud document is
-  // still the SKILLS.md blob, synced + offline-cached headlessly by Rust) ----
-  const [skillsLibrary, setSkillsLibrary] = useState({ preamble: "", skills: [] });
+  // ---- Skills (account-level structured library backed by per-skill units) ----
+  const [skillsLibrary, setSkillsLibrary] = useState({ skills: [] });
   const [skillsRevision, setSkillsRevision] = useState(null);
   const [skillsMeta, setSkillsMeta] = useState({ updatedAt: "", updatedBy: "", offline: false });
   const [skillsState, setSkillsState] = useState("loading");
@@ -304,7 +345,7 @@ export default function ToolsWorkspaceView({
   const [skillsQuery, setSkillsQuery] = useState("");
   // "library:<id>" or "catalog:<id>" — selecting a skill shows its contents.
   const [selectedSkillKey, setSelectedSkillKey] = useState("");
-  // { id: ""|skillId, title, description, content } while creating/editing.
+  // { id: ""|skillId, title, content } while creating/editing.
   const [skillEditor, setSkillEditor] = useState(null);
   const [skillEditorTheme, setSkillEditorTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
@@ -364,12 +405,16 @@ export default function ToolsWorkspaceView({
     setSkillsState((current) => (current === "ready" ? "refreshing" : "loading"));
     setSkillsError("");
     try {
-      const data = await invoke("cloud_mcp_get_account_tools");
+      const data = await invoke("cloud_mcp_get_account_skills");
       const skills = data?.skills || {};
-      const skillsMd = text(skills.skills_md ?? skills.skillsMd, "");
-      const parsedSkillsLibrary = parseSkillsLibrary(skillsMd);
+      const units = Array.isArray(data?.skill_units)
+        ? data.skill_units
+        : Array.isArray(data?.skillUnits)
+          ? data.skillUnits
+          : accountToolsSkillUnitsFromEventPayload(skills);
+      const parsedSkillsLibrary = { skills: skillsFromUnits(units) };
       setSkillsLibrary(parsedSkillsLibrary);
-      noteAccountSkillsMarkdown(skillsMd);
+      noteAccountSkillUnits(parsedSkillsLibrary.skills);
       setSkillsRevision(
         Number.isFinite(Number(skills.revision)) && skills.revision !== null
           ? Number(skills.revision)
@@ -382,11 +427,6 @@ export default function ToolsWorkspaceView({
       });
       setSkillsState("ready");
       if (skillsHydrationRunRef.current === hydrationRunId) {
-        const units = Array.isArray(data?.skill_units)
-          ? data.skill_units
-          : Array.isArray(data?.skillUnits)
-            ? data.skillUnits
-            : [];
         const hydratedUnits = units.filter((unit) => (
           text(unit?.content_md ?? unit?.contentMd ?? unit?.content).length
         ));
@@ -487,58 +527,36 @@ export default function ToolsWorkspaceView({
   useEffect(() => {
     let disposed = false;
     let unlisten = null;
-    void listen("cloud-mcp-account-tools-updated", (event) => {
+    void listen("cloud-mcp-account-skills-updated", (event) => {
       if (disposed) {
         return;
       }
-      const skills = accountToolsSkillsFromEventPayload(event?.payload);
-      if (skills) {
-        const skillsMd = text(skills.skills_md ?? skills.skillsMd, "");
-        setSkillsLibrary(parseSkillsLibrary(skillsMd));
-        noteAccountSkillsMarkdown(skillsMd);
-        setSkillsRevision(
-          Number.isFinite(Number(skills.revision)) && skills.revision !== null
-            ? Number(skills.revision)
-            : null,
-        );
-        setSkillsMeta({
-          updatedAt: text(skills.updated_at || skills.updatedAt),
-          updatedBy: text(skills.updated_by_device_name || skills.updatedByDeviceName),
-          offline: false,
-        });
-        setSkillsState("ready");
-        setSkillsError("");
-        return;
-      }
-      const skillUnit = accountToolsSkillUnitFromEventPayload(event?.payload);
-      const skill = skillFromUnit(skillUnit);
-      if (skill) {
-        const removed = skillUnit?.deleted === true
-          || skillUnit?.current === false
-          || skillUnit?.tombstoned === true;
+      const skillUnits = accountToolsSkillUnitsFromEventPayload(event?.payload);
+      const replaceSkills = accountToolsSkillPayloadIsFull(event?.payload);
+      if (skillUnits.length || replaceSkills) {
+        const skillMeta = accountToolsSkillMetaFromEventPayload(event?.payload);
         setSkillsLibrary((current) => {
-          const nextSkills = removed
-            ? current.skills.filter((entry) => entry.id !== skill.id)
-            : [
-              ...current.skills.filter((entry) => entry.id !== skill.id),
-              skill,
-            ].sort((left, right) => left.title.localeCompare(right.title));
-          const nextLibrary = { preamble: current.preamble, skills: nextSkills };
-          noteAccountSkillsMarkdown(serializeSkillsLibrary(nextLibrary.skills, nextLibrary.preamble));
+          const nextLibrary = replaceSkills
+            ? replaceSkillUnitsInLibrary(skillUnits)
+            : applySkillUnitsToLibrary(current, skillUnits);
+          noteAccountSkillUnits(nextLibrary.skills);
           return nextLibrary;
         });
-        setSkillsRevision(
-          Number.isFinite(Number(skillUnit?.revision)) && skillUnit?.revision !== null
-            ? Number(skillUnit.revision)
-            : skillsRevision,
-        );
+        const revisionUnit = skillUnits.find((unit) => unit?.revision != null);
+        const revision = Number.isFinite(Number(skillMeta.revision))
+          ? Number(skillMeta.revision)
+          : Number(revisionUnit?.revision);
+        setSkillsRevision((current) => (Number.isFinite(revision) ? revision : current));
+        const updatedUnit = skillUnits.find((unit) => unit?.updated_at || unit?.updatedAt);
+        const errorUnit = skillUnits.find((unit) => unit?.last_sync_error || unit?.lastSyncError || unit?.error);
         setSkillsMeta((current) => ({
           ...current,
-          updatedAt: text(skillUnit?.updated_at || skillUnit?.updatedAt, current.updatedAt),
+          updatedAt: text(skillMeta.updatedAt || updatedUnit?.updated_at || updatedUnit?.updatedAt, current.updatedAt),
+          updatedBy: text(skillMeta.updatedBy, current.updatedBy),
           offline: false,
         }));
         setSkillsState("ready");
-        setSkillsError("");
+        setSkillsError(text(skillMeta.error || errorUnit?.last_sync_error || errorUnit?.lastSyncError || errorUnit?.error));
         return;
       }
       if (!accountToolsEventHasKnownPayload(event?.payload)) {
@@ -589,22 +607,18 @@ export default function ToolsWorkspaceView({
     };
   }, []);
 
-  // Applies the next skill list locally right away, then syncs the serialized
-  // SKILLS.md through Rust in the background (Rust owns the HTTP call and the
-  // offline cache, so the save completes even if the user navigates away).
+  // Applies the next skill list locally right away, then syncs per-skill units
+  // through Rust in the background.
   const persistSkillsLibrary = useCallback(async (nextSkills) => {
-    const nextLibrary = { preamble: skillsLibrary.preamble, skills: nextSkills };
-    const serializedSkillsMd = serializeSkillsLibrary(nextLibrary.skills, nextLibrary.preamble);
+    const nextLibrary = { skills: nextSkills };
+    const skillUnits = skillsToSkillUnits(nextLibrary.skills);
     setSkillsLibrary(nextLibrary);
     setSkillsState("saving");
     setSkillsError("");
-    // Keep the orchestrator Tools tab cache in lockstep with the edit.
-    noteAccountSkillsMarkdown(serializedSkillsMd);
+    noteAccountSkillUnits(nextLibrary.skills);
     try {
       const result = await invoke("cloud_mcp_save_account_skills", {
-        skillsMd: serializedSkillsMd,
-        baseRevision: skillsRevision,
-        skillUnits: skillUnitsForSync(nextLibrary.skills),
+        skillUnits,
       });
       setSkillsRevision(
         Number.isFinite(Number(result?.revision)) ? Number(result.revision) : skillsRevision,
@@ -614,30 +628,74 @@ export default function ToolsWorkspaceView({
         updatedAt: text(result?.updated_at || result?.updatedAt, current.updatedAt),
         offline: false,
       }));
+      const syncedLibrary = { skills: nextLibrary.skills.map(clearLocalPendingSkill) };
+      setSkillsLibrary(syncedLibrary);
+      noteAccountSkillUnits(syncedLibrary.skills);
       setSkillsState("ready");
       return true;
     } catch (error) {
       // Stale revision or offline: the local list keeps the change so nothing
-      // is lost; the next successful save syncs the whole document.
+      // is lost; the next successful save syncs the full unit set.
       setSkillsError(getErrorMessage(error, "Unable to sync skills."));
       setSkillsState("ready");
       return false;
     }
-  }, [skillsLibrary.preamble, skillsRevision]);
+  }, [skillsRevision]);
+
+  const saveSkillsLibraryLocal = useCallback(async (nextSkills, pendingSkillIds = []) => {
+    const pendingIds = new Set((Array.isArray(pendingSkillIds) ? pendingSkillIds : []).map(text).filter(Boolean));
+    const localSavedAt = new Date().toISOString();
+    const nextLibrary = {
+      skills: nextSkills.map((skill) => (
+        pendingIds.has(skill.id) ? withLocalPendingSkill(skill, localSavedAt) : skill
+      )),
+    };
+    const skillUnits = skillsToSkillUnits(nextLibrary.skills);
+    setSkillsLibrary(nextLibrary);
+    setSkillsState("savingLocal");
+    setSkillsError("");
+    noteAccountSkillUnits(nextLibrary.skills);
+    try {
+      const result = await invoke("cloud_mcp_save_account_skills_local", {
+        baseRevision: skillsRevision,
+        pendingSkillIds: Array.from(pendingIds),
+        skillUnits,
+      });
+      setSkillsRevision(
+        Number.isFinite(Number(result?.revision)) ? Number(result.revision) : skillsRevision,
+      );
+      setSkillsMeta((current) => ({
+        ...current,
+        updatedAt: text(result?.local_saved_at || result?.localSavedAt || current.updatedAt),
+        offline: false,
+      }));
+      setSkillsState("ready");
+      return true;
+    } catch (error) {
+      setSkillsError(getErrorMessage(error, "Unable to save skill locally."));
+      setSkillsState("ready");
+      return false;
+    }
+  }, [skillsRevision]);
 
   const addCatalogSkill = useCallback((entry) => {
     const existingIds = new Set(skillsLibrary.skills.map((skill) => skill.id));
+    const preferredId = skillSlug(entry.title || entry.id);
+    if (existingIds.has(preferredId)) {
+      setSelectedSkillKey(`library:${preferredId}`);
+      return;
+    }
     if (existingIds.has(entry.id)) {
       setSelectedSkillKey(`library:${entry.id}`);
       return;
     }
+    const skillId = skillSlug(entry.title || entry.id, existingIds);
     const skill = {
       content: String(entry.content || "").trim(),
-      description: text(entry.description),
       icon: text(entry.icon),
-      id: entry.id,
+      id: skillId,
       source: text(entry.source, "catalog"),
-      title: text(entry.title, entry.id),
+      title: skillId,
       tone: text(entry.tone),
       updatedAt: new Date().toISOString(),
     };
@@ -655,8 +713,9 @@ export default function ToolsWorkspaceView({
     setSelectedSkillKey("");
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
-  const saveSkillEditor = useCallback(() => {
+  const saveSkillEditor = useCallback((mode = "push") => {
     if (!skillEditor || !text(skillEditor.title)) return;
+    const normalizedTitle = skillSlug(skillEditor.title);
     const existing = skillEditor.id
       ? skillsLibrary.skills.find((entry) => entry.id === skillEditor.id)
       : null;
@@ -669,8 +728,7 @@ export default function ToolsWorkspaceView({
         ? {
           ...entry,
           content: String(skillEditor.content || "").trim(),
-          description: text(skillEditor.description),
-          title: text(skillEditor.title),
+          title: normalizedTitle,
           updatedAt,
         }
         : entry));
@@ -678,19 +736,22 @@ export default function ToolsWorkspaceView({
       savedId = skillSlug(skillEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id)));
       nextSkills = [...skillsLibrary.skills, {
         content: String(skillEditor.content || "").trim(),
-        description: text(skillEditor.description),
         icon: "",
         id: savedId,
         source: "custom",
-        title: text(skillEditor.title),
+        title: savedId,
         tone: "",
         updatedAt,
       }];
     }
-    void persistSkillsLibrary(nextSkills);
+    if (mode === "local") {
+      void saveSkillsLibraryLocal(nextSkills, [savedId]);
+    } else {
+      void persistSkillsLibrary(nextSkills);
+    }
     setSkillEditor(null);
     setSelectedSkillKey(`library:${savedId}`);
-  }, [persistSkillsLibrary, skillEditor, skillsLibrary.skills]);
+  }, [persistSkillsLibrary, saveSkillsLibraryLocal, skillEditor, skillsLibrary.skills]);
 
   const runCliAction = useCallback(async (provider, action) => {
     const key = `${provider}:${action}`;
@@ -802,16 +863,27 @@ export default function ToolsWorkspaceView({
     }
   }, [runCatalogAction, runCliAction]);
 
+  const pendingSkillCount = useMemo(
+    () => skillsLibrary.skills.filter((skill) => skill?.pendingPush === true).length,
+    [skillsLibrary.skills],
+  );
+
+  const skillsStatusTone = skillsMeta.offline || pendingSkillCount > 0 ? "warn" : "good";
+
   const skillsStatusLabel = useMemo(() => {
     if (skillsState === "loading") return "Loading…";
     if (skillsState === "saving") return "Syncing…";
+    if (skillsState === "savingLocal") return "Saving locally…";
+    if (pendingSkillCount > 0) {
+      return `${pendingSkillCount} local change${pendingSkillCount === 1 ? "" : "s"} pending push`;
+    }
     if (skillsMeta.offline) return "Offline — showing cached copy";
     const parts = [];
     if (skillsRevision !== null) parts.push(`rev ${skillsRevision}`);
     if (skillsMeta.updatedAt) parts.push(`updated ${timeAgo(skillsMeta.updatedAt)}`);
     if (skillsMeta.updatedBy) parts.push(`by ${skillsMeta.updatedBy}`);
     return parts.join(" · ") || "Synced to your account";
-  }, [skillsMeta, skillsRevision, skillsState]);
+  }, [pendingSkillCount, skillsMeta, skillsRevision, skillsState]);
 
   // One merged list (like the CLIs section): personal skills lead, catalog
   // entries the user hasn't added follow, with skills for installed CLIs
@@ -827,7 +899,7 @@ export default function ToolsWorkspaceView({
       searchLabel: `personal yours ${skill.source === "cli" ? "cli" : skill.source === "catalog" ? "curated" : "custom"}`,
     }));
     const catalogRows = SKILLS_CATALOG
-      .filter((entry) => !ownedIds.has(entry.id))
+      .filter((entry) => !ownedIds.has(entry.id) && !ownedIds.has(skillSlug(entry.title || entry.id)))
       .map((entry) => {
         const cliInstalled = Boolean(catalogChecks?.[skillCliBinary(entry)]?.installed);
         return {
@@ -846,7 +918,7 @@ export default function ToolsWorkspaceView({
     return [...ownedRows, ...catalogRows].filter((row) => (
       !query
         || row.title.toLowerCase().includes(query)
-        || String(row.description || "").toLowerCase().includes(query)
+        || String(row.content || "").toLowerCase().includes(query)
         || row.searchLabel.includes(query)
     ));
   }, [catalogChecks, skillsLibrary.skills, skillsQuery]);
@@ -964,7 +1036,7 @@ export default function ToolsWorkspaceView({
                           </ToolsPanelHint>
                         </SkillDocumentToolbarCopy>
                         <SkillDocumentToolbarControls>
-                          <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : "good"}>
+                          <ToolsStatusPill data-tone={skillsStatusTone}>
                             {skillsStatusLabel}
                           </ToolsStatusPill>
                           <SkillDocumentThemeSwitch aria-label="Skill editor page theme">
@@ -987,14 +1059,8 @@ export default function ToolsWorkspaceView({
                           <SkillDocumentTitleInput
                             aria-label="Skill title"
                             onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
-                            placeholder="Untitled skill"
+                            placeholder="skill_title"
                             value={skillEditor.title}
-                          />
-                          <SkillDocumentDescriptionInput
-                            aria-label="Skill description"
-                            onChange={(event) => setSkillEditor((current) => ({ ...current, description: event.target.value }))}
-                            placeholder="One-line description"
-                            value={skillEditor.description}
                           />
                           <ToolsSkillsEditor
                             aria-label="Skill content"
@@ -1011,12 +1077,19 @@ export default function ToolsWorkspaceView({
                       <ToolsGhostButton onClick={() => setSkillEditor(null)} type="button">
                         Cancel
                       </ToolsGhostButton>
-                      <ToolsPrimaryButton
-                        disabled={!text(skillEditor.title) || skillsState === "saving"}
-                        onClick={saveSkillEditor}
+                      <ToolsGhostButton
+                        disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
+                        onClick={() => saveSkillEditor("local")}
                         type="button"
                       >
-                        {skillsState === "saving" ? "Syncing…" : "Save skill"}
+                        {skillsState === "savingLocal" ? "Saving locally…" : "Save Local"}
+                      </ToolsGhostButton>
+                      <ToolsPrimaryButton
+                        disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
+                        onClick={() => saveSkillEditor("push")}
+                        type="button"
+                      >
+                        {skillsState === "saving" ? "Syncing…" : "Push Save"}
                       </ToolsPrimaryButton>
                     </SkillDocumentActions>
                   </>
@@ -1032,7 +1105,6 @@ export default function ToolsWorkspaceView({
                             <ToolsGhostButton
                               onClick={() => setSkillEditor({
                                 content: selectedSkill.content,
-                                description: selectedSkill.description,
                                 id: selectedSkill.id,
                                 title: selectedSkill.title,
                               })}
@@ -1068,7 +1140,6 @@ export default function ToolsWorkspaceView({
                       </SkillRowIcon>
                       <div>
                         <strong>{selectedSkill.title}</strong>
-                        <span>{selectedSkill.description}</span>
                       </div>
                     </SkillDetailTitle>
                     <SkillDetailMeta>
@@ -1081,6 +1152,9 @@ export default function ToolsWorkspaceView({
                       </SkillSourceBadge>
                       {selectedSkill.owned && selectedSkill.updatedAt && (
                         <span>updated {timeAgo(selectedSkill.updatedAt)}</span>
+                      )}
+                      {selectedSkill.owned && selectedSkill.pendingPush && (
+                        <SkillSourceBadge data-source="pending">Pending push</SkillSourceBadge>
                       )}
                       {!selectedSkill.owned && <span>preview — not in your library yet</span>}
                     </SkillDetailMeta>
@@ -1098,12 +1172,12 @@ export default function ToolsWorkspaceView({
                         value={skillsQuery}
                       />
                       <ToolsGhostButton
-                        onClick={() => setSkillEditor({ content: "", description: "", id: "", title: "" })}
+                        onClick={() => setSkillEditor({ content: "", id: "", title: "" })}
                         type="button"
                       >
                         New skill
                       </ToolsGhostButton>
-                      <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : "good"}>
+                      <ToolsStatusPill data-tone={skillsStatusTone}>
                         {skillsStatusLabel}
                       </ToolsStatusPill>
                     </CliSearchRow>
@@ -1128,7 +1202,7 @@ export default function ToolsWorkspaceView({
                               </SkillRowIcon>
                               <SkillRowCopy>
                                 <strong>{row.title}</strong>
-                                <span>{row.description || "No description"}</span>
+                                <span>{String(row.content || "").split("\n").find(Boolean) || "No content yet"}</span>
                               </SkillRowCopy>
                               <SkillRowSide>
                                 {row.owned ? (
@@ -1136,6 +1210,9 @@ export default function ToolsWorkspaceView({
                                     <SkillSourceBadge data-source={row.source}>
                                       Personal
                                     </SkillSourceBadge>
+                                    {row.pendingPush && (
+                                      <SkillSourceBadge data-source="pending">Pending</SkillSourceBadge>
+                                    )}
                                     <SkillRowChevron aria-hidden="true">›</SkillRowChevron>
                                   </>
                                 ) : (
@@ -1678,26 +1755,6 @@ const SkillDocumentTitleInput = styled.input`
   }
 `;
 
-const SkillDocumentDescriptionInput = styled.input`
-  width: 100%;
-  min-width: 0;
-  margin-top: 12px;
-  padding: 0 0 18px;
-  border: 0;
-  border-bottom: 1px solid var(--skill-editor-page-rule);
-  color: var(--skill-editor-page-muted);
-  background: transparent;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 14px;
-  font-weight: 640;
-  line-height: 1.45;
-  outline: none;
-
-  &::placeholder {
-    color: var(--skill-editor-page-placeholder);
-  }
-`;
-
 const ToolsSkillsEditor = styled.textarea`
   width: 100%;
   min-width: 0;
@@ -2100,6 +2157,11 @@ const SkillSourceBadge = styled.span`
   &[data-source="cli"] {
     border-color: rgba(60, 203, 127, 0.3);
     color: rgba(150, 230, 185, 0.92);
+  }
+
+  &[data-source="pending"] {
+    border-color: rgba(223, 165, 90, 0.32);
+    color: rgba(240, 200, 140, 0.94);
   }
 `;
 

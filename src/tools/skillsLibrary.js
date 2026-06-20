@@ -1,19 +1,3 @@
-/**
- * The account skill library is stored in the existing cloud-synced SKILLS.md
- * blob (Rust owns the HTTP call, offline cache, and revision conflicts), so
- * no new sync plumbing is needed. Each skill is one `## Title` markdown
- * section with a meta comment carrying the structured fields:
- *
- *   ## Conventional Commits
- *   <!-- diffforge-skill {"id":"conventional-commits","tone":"amber",...} -->
- *   content…
- *
- * Agents and the drag panel keep reading the same markdown; this module just
- * gives the Tools tab a structured view of it.
- */
-
-const SKILL_META_PATTERN = /^<!--\s*diffforge-skill\s+(\{.*\})\s*-->$/u;
-
 export const SKILL_TONES = {
   amber: "#cca700",
   blue: "#3794ff",
@@ -44,138 +28,104 @@ export function skillToneColor(tone, seed = "") {
 
 export function skillSlug(title, existingIds = new Set()) {
   const base = text(title)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/gu, "-")
-    .replace(/^-+|-+$/gu, "")
+    .replace(/[^A-Za-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "")
     .slice(0, 64) || "skill";
   let id = base;
   let suffix = 2;
   while (existingIds.has(id)) {
-    id = `${base}-${suffix}`;
+    id = `${base}_${suffix}`;
     suffix += 1;
   }
   return id;
 }
 
-export function isSkillMetaLine(line) {
-  return SKILL_META_PATTERN.test(String(line || "").trim());
+export function skillFromUnit(unit) {
+  const id = text(unit?.skill_id || unit?.skillId || unit?.id);
+  if (!id) return null;
+  return {
+    assetId: text(unit?.asset_id || unit?.assetId),
+    blobId: text(unit?.blob_id || unit?.blobId),
+    content: String(unit?.content_md ?? unit?.contentMd ?? unit?.content ?? unit?.body ?? ""),
+    contentHash: text(unit?.content_hash || unit?.contentHash || unit?.hash || unit?.sha256),
+    icon: text(unit?.icon),
+    id,
+    mimeType: text(unit?.mime_type || unit?.mimeType),
+    localSavedAt: text(unit?.local_saved_at || unit?.localSavedAt),
+    pendingPush: unit?.pending_push === true || unit?.pendingPush === true,
+    sha256: text(unit?.sha256),
+    sizeBytes: Number.isFinite(Number(unit?.size_bytes ?? unit?.sizeBytes))
+      ? Number(unit?.size_bytes ?? unit?.sizeBytes)
+      : 0,
+    source: text(unit?.source, "custom"),
+    syncStatus: text(unit?.sync_status || unit?.syncStatus),
+    title: text(unit?.title || unit?.name || unit?.label, id),
+    tone: text(unit?.tone),
+    updatedAt: text(unit?.updated_at || unit?.updatedAt),
+  };
 }
 
-function parseMetaLine(line) {
-  const match = String(line || "").trim().match(SKILL_META_PATTERN);
-  if (!match) return null;
-  try {
-    const parsed = JSON.parse(match[1]);
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function firstContentLine(content) {
-  return text(
-    String(content || "")
-      .split("\n")
-      .map((line) => line.trim())
-      .find((line) => line && !line.startsWith("#") && !line.startsWith("<!--")),
-  ).slice(0, 160);
-}
-
-/**
- * Parses the cloud skills markdown into { preamble, skills }. Sections start
- * at `## ` headings; documents without any become a single custom skill so
- * legacy SKILLS.md content survives the migration untouched.
- */
-export function parseSkillsLibrary(skillsMd) {
-  const source = String(skillsMd || "");
-  if (!source.trim()) {
-    return { preamble: "", skills: [] };
-  }
-  const lines = source.split("\n");
-  const sections = [];
-  let preambleLines = [];
-  let current = null;
-  lines.forEach((line) => {
-    const heading = line.match(/^##\s+(.+)$/u);
-    if (heading) {
-      if (current) sections.push(current);
-      current = { bodyLines: [], title: heading[1].trim() };
-      return;
-    }
-    if (current) {
-      current.bodyLines.push(line);
+export function skillsFromUnits(units) {
+  const byId = new Map();
+  (Array.isArray(units) ? units : []).forEach((unit) => {
+    const skill = skillFromUnit(unit);
+    if (!skill) return;
+    const removed = unit?.deleted === true || unit?.current === false || unit?.tombstoned === true;
+    if (removed) {
+      byId.delete(skill.id);
     } else {
-      preambleLines.push(line);
+      byId.set(skill.id, skill);
     }
   });
-  if (current) sections.push(current);
-
-  if (!sections.length) {
-    const titleMatch = source.match(/^#\s+(.+)$/mu);
-    return {
-      preamble: "",
-      skills: [{
-        content: source.trim(),
-        description: firstContentLine(source.replace(/^#\s+.+$/mu, "")),
-        icon: "",
-        id: "my-skills",
-        source: "custom",
-        title: text(titleMatch?.[1], "My skills"),
-        tone: "",
-        updatedAt: "",
-      }],
-    };
-  }
-
-  const seenIds = new Set();
-  const skills = sections.map((section) => {
-    let meta = null;
-    const contentLines = [];
-    section.bodyLines.forEach((line) => {
-      if (!meta) {
-        const parsed = parseMetaLine(line);
-        if (parsed) {
-          meta = parsed;
-          return;
-        }
-      }
-      contentLines.push(line);
-    });
-    const content = contentLines.join("\n").trim();
-    const id = skillSlug(text(meta?.id, section.title), seenIds);
-    seenIds.add(id);
-    return {
-      content,
-      description: text(meta?.description, firstContentLine(content)),
-      icon: text(meta?.icon),
-      id,
-      source: text(meta?.source, "custom"),
-      title: section.title,
-      tone: text(meta?.tone),
-      updatedAt: text(meta?.updatedAt),
-    };
-  });
-
-  return { preamble: preambleLines.join("\n").trim(), skills };
+  return Array.from(byId.values()).sort((left, right) => left.title.localeCompare(right.title));
 }
 
-export function serializeSkillsLibrary(skills, preamble = "") {
-  const safePreamble = text(preamble, "# Skills");
-  const sections = (Array.isArray(skills) ? skills : []).map((skill) => {
-    const meta = {
-      id: text(skill?.id),
-      description: text(skill?.description),
+export function mergeSkillUnits(currentSkills, units) {
+  const byId = new Map((Array.isArray(currentSkills) ? currentSkills : []).map((skill) => [skill.id, skill]));
+  (Array.isArray(units) ? units : []).forEach((unit) => {
+    const skill = skillFromUnit(unit);
+    if (!skill) return;
+    const removed = unit?.deleted === true || unit?.current === false || unit?.tombstoned === true;
+    if (removed) {
+      byId.delete(skill.id);
+    } else {
+      const existing = byId.get(skill.id) || {};
+      byId.set(skill.id, {
+        ...existing,
+        ...skill,
+        content: skill.content || existing.content || "",
+      });
+    }
+  });
+  return Array.from(byId.values()).sort((left, right) => left.title.localeCompare(right.title));
+}
+
+export function skillsToSkillUnits(skills) {
+  return (Array.isArray(skills) ? skills : [])
+    .map((skill) => ({
+      assetId: text(skill?.assetId),
+      blobId: text(skill?.blobId),
+      content: String(skill?.content || "").trim(),
+      contentMd: String(skill?.content || "").trim(),
       icon: text(skill?.icon),
+      id: text(skill?.id),
+      mimeType: text(skill?.mimeType),
+      sha256: text(skill?.sha256),
+      sizeBytes: Number.isFinite(Number(skill?.sizeBytes)) ? Number(skill.sizeBytes) : 0,
+      skillId: text(skill?.id),
       source: text(skill?.source, "custom"),
+      title: text(skill?.title, "Untitled skill"),
       tone: text(skill?.tone),
       updatedAt: text(skill?.updatedAt),
-    };
-    return [
-      `## ${text(skill?.title, "Untitled skill")}`,
-      `<!-- diffforge-skill ${JSON.stringify(meta)} -->`,
-      "",
-      String(skill?.content || "").trim(),
-    ].join("\n").trimEnd();
-  });
-  return [safePreamble, ...sections].join("\n\n").trim() + "\n";
+    }))
+    .filter((skill) => skill.id && skill.title);
+}
+
+export function skillsToToolEntries(skills) {
+  return (Array.isArray(skills) ? skills : [])
+    .map((skill) => ({
+      body: String(skill?.content || ""),
+      title: text(skill?.title || skill?.id),
+    }))
+    .filter((entry) => entry.title || entry.body.trim());
 }
