@@ -273,6 +273,7 @@ const TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT = "todo-store-cancel-requested";
 const TODO_DISPATCH_STARTUP_RECONCILE_TAURI_EVENT = "todo-dispatch-startup-reconcile";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const REMOTE_TODO_REQUEUE_EVENT = "diffforge:remote-todo-requeue";
+const REMOTE_TODO_UNQUEUE_EVENT = "diffforge:remote-todo-unqueue";
 const REMOTE_TERMINAL_WINDOW_EVENT = "diffforge:remote-terminal-window";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
@@ -8425,7 +8426,17 @@ function getVoiceAgentHighlightStringValues(...values) {
           || value.targetTerminalId
           || value.pane_id
           || value.paneId
+          || value.terminal_name
+          || value.terminalName
+          || value.terminal_nickname
+          || value.terminalNickname
+          || value.target_terminal_name
+          || value.targetTerminalName
+          || value.display_name
+          || value.displayName
           || value.name
+          || value.label
+          || value.title
           || "",
       );
       return;
@@ -8438,6 +8449,31 @@ function getVoiceAgentHighlightStringValues(...values) {
   };
   values.forEach(append);
   return Array.from(new Set(result));
+}
+
+function getVoiceAgentHighlightTerminalNameValues(...sources) {
+  return getVoiceAgentHighlightStringValues(
+    ...sources.flatMap((source) => {
+      if (!source || typeof source !== "object") {
+        return [source];
+      }
+      return [
+        source.terminalName,
+        source.terminal_name,
+        source.terminalNickname,
+        source.terminal_nickname,
+        source.targetTerminalName,
+        source.target_terminal_name,
+        source.displayName,
+        source.display_name,
+        source.name,
+        source.label,
+        source.title,
+        source.agentDisplayName,
+        source.agent_display_name,
+      ];
+    }),
+  ).map((value) => normalizeTodoTerminalName(value));
 }
 
 function getVoiceAgentHighlightIntegerValues(...values) {
@@ -8530,14 +8566,18 @@ function getVoiceAgentHighlightSessionSummaryRefs(summary) {
   const session = summary?.session || summary?.sessionRef || summary?.session_ref || {};
   return {
     sessionIds: getVoiceAgentHighlightStringValues(
-      summary?.providerSessionId,
-      summary?.provider_session_id,
-      summary?.sessionId,
-      summary?.session_id,
-      session?.providerSessionId,
-      session?.provider_session_id,
-      session?.sessionId,
-      session?.session_id,
+	      summary?.providerSessionId,
+	      summary?.provider_session_id,
+	      summary?.nativeSessionId,
+	      summary?.native_session_id,
+	      summary?.sessionId,
+	      summary?.session_id,
+	      session?.providerSessionId,
+	      session?.provider_session_id,
+	      session?.nativeSessionId,
+	      session?.native_session_id,
+	      session?.sessionId,
+	      session?.session_id,
     ),
     terminalIds: getVoiceAgentHighlightStringValues(
       summary?.terminalId,
@@ -8549,16 +8589,7 @@ function getVoiceAgentHighlightSessionSummaryRefs(summary) {
       session?.targetTerminalId,
       session?.target_terminal_id,
     ),
-    threadIds: getVoiceAgentHighlightStringValues(
-      summary?.threadId,
-      summary?.thread_id,
-      summary?.targetThreadId,
-      summary?.target_thread_id,
-      session?.threadId,
-      session?.thread_id,
-      session?.targetThreadId,
-      session?.target_thread_id,
-    ),
+    terminalNames: getVoiceAgentHighlightTerminalNameValues(summary, session),
     terminalIndex: normalizeTodoTerminalIndex(
       summary?.terminalIndex
         ?? summary?.terminal_index
@@ -8747,22 +8778,30 @@ function getVoiceAgentQueueTargetFields(args = {}) {
       ?? args.lane_index
       ?? args.laneIndex,
   );
-  const targetTerminalId = normalizeTodoTerminalIdentity(
-    args.target_terminal_id
-      || args.targetTerminalId
-      || args.terminal_id
+	  const targetTerminalId = normalizeTodoTerminalIdentity(
+	    args.target_terminal_id
+	      || args.targetTerminalId
+	      || args.terminal_id
       || args.terminalId
       || args.pane_id
       || args.paneId
-      || "",
-  );
-  const targetThreadId = normalizeTodoTerminalIdentity(
-    args.target_thread_id
-      || args.targetThreadId
-      || args.thread_id
-      || args.threadId
-      || "",
-  );
+	      || "",
+	  );
+	  const providerSessionId = normalizeTodoTerminalIdentity(
+	    args.provider_session_id
+	      || args.providerSessionId
+	      || args.native_session_id
+	      || args.nativeSessionId
+	      || args.session_id
+	      || args.sessionId
+	      || args.target_session_id
+	      || args.targetSessionId
+	      || args.target_thread_id
+	      || args.targetThreadId
+	      || args.thread_id
+	      || args.threadId
+	      || "",
+	  );
   const targetTerminalName = normalizeTodoTerminalName(
     args.target_terminal_name
       || args.targetTerminalName
@@ -8789,24 +8828,24 @@ function getVoiceAgentQueueTargetFields(args = {}) {
   );
   const targetExplicit = Boolean(
     targetAgentId
-      || targetTerminalId
-      || Number.isInteger(targetTerminalIndex)
-      || targetTerminalName
-      || targetThreadId
-      || Number.isInteger(targetColorSlot)
-      || targetTerminalColor,
-  );
-  return {
-    targetAgentId,
-    targetColorSlot,
-    targetExplicit,
-    targetTerminalColor,
-    targetTerminalId,
-    targetTerminalIndex,
-    targetTerminalName,
-    targetThreadId,
-  };
-}
+	      || targetTerminalId
+	      || Number.isInteger(targetTerminalIndex)
+	      || targetTerminalName
+	      || providerSessionId
+	      || Number.isInteger(targetColorSlot)
+	      || targetTerminalColor,
+	  );
+	  return {
+	    providerSessionId,
+	    targetAgentId,
+	    targetColorSlot,
+	    targetExplicit,
+	    targetTerminalColor,
+	    targetTerminalId,
+	    targetTerminalIndex,
+	    targetTerminalName,
+	  };
+	}
 
 function createTodoQueueItemsFromVoiceAgentToolCall(toolCall, options = {}) {
   const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
@@ -8874,13 +8913,18 @@ function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs 
         targetAgentId: targetFields.targetAgentId,
         targetColorSlot: targetFields.targetColorSlot,
         targetExplicit: true,
-        targetTerminalColor: targetFields.targetTerminalColor,
-        targetTerminalId: targetFields.targetTerminalId,
-        targetTerminalIndex: targetFields.targetTerminalIndex,
-        targetTerminalName: targetFields.targetTerminalName,
-        targetThreadId: targetFields.targetThreadId,
-      },
-    } : {}),
+	        targetTerminalColor: targetFields.targetTerminalColor,
+	        targetTerminalId: targetFields.targetTerminalId,
+	        targetTerminalIndex: targetFields.targetTerminalIndex,
+	        targetTerminalName: targetFields.targetTerminalName,
+	        ...(targetFields.providerSessionId ? {
+	          providerSessionId: targetFields.providerSessionId,
+	          provider_session_id: targetFields.providerSessionId,
+	          sessionId: targetFields.providerSessionId,
+	          session_id: targetFields.providerSessionId,
+	        } : {}),
+	      },
+	    } : {}),
   });
 }
 
@@ -19827,6 +19871,39 @@ function TerminalView({
         || existing.agent_display_name
         || "",
     ).trim();
+    const terminalDisplayName = normalizeTodoTerminalName(
+      event.terminalName
+        || event.terminal_name
+        || event.terminalNickname
+        || event.terminal_nickname
+        || event.targetTerminalName
+        || event.target_terminal_name
+        || event.displayName
+        || event.display_name
+        || event.name
+        || existing.terminalName
+        || existing.terminal_name
+        || existing.terminalNickname
+        || existing.terminal_nickname
+        || existing.targetTerminalName
+        || existing.target_terminal_name
+        || existing.displayName
+        || existing.display_name
+        || existing.name
+        || "",
+    );
+    const terminalNickname = normalizeTodoTerminalName(
+      event.terminalNickname
+        || event.terminal_nickname
+        || event.terminalName
+        || event.terminal_name
+        || existing.terminalNickname
+        || existing.terminal_nickname
+        || existing.terminalName
+        || existing.terminal_name
+        || terminalDisplayName
+        || "",
+    );
     const nextTerminal = {
       activeTask: event.activeTask || event.active_task || existing.activeTask || existing.active_task || null,
       active_task: event.activeTask || event.active_task || existing.activeTask || existing.active_task || null,
@@ -19859,6 +19936,15 @@ function TerminalView({
       sessionId: providerSessionId,
       session_id: providerSessionId,
       taskId: event.taskId || event.task_id || existing.taskId || existing.task_id || "",
+      displayName: terminalDisplayName,
+      display_name: terminalDisplayName,
+      name: terminalDisplayName,
+      targetTerminalName: terminalDisplayName,
+      target_terminal_name: terminalDisplayName,
+      terminalName: terminalDisplayName,
+      terminal_name: terminalDisplayName,
+      terminalNickname: terminalNickname,
+      terminal_nickname: terminalNickname,
       terminalIndex,
       threadId: event.threadId || existing.threadId || getTerminalThread(terminalIndex)?.id || "",
       updatedAt: nowIso,
@@ -19876,6 +19962,8 @@ function TerminalView({
       || String(existing.provider || "") !== String(nextTerminal.provider || "")
       || String(existing.status || "") !== String(nextTerminal.status || "")
       || String(existing.taskId || existing.task_id || "") !== String(nextTerminal.taskId || "")
+      || String(existing.terminalName || existing.terminal_name || "") !== String(nextTerminal.terminalName || nextTerminal.terminal_name || "")
+      || String(existing.terminalNickname || existing.terminal_nickname || "") !== String(nextTerminal.terminalNickname || nextTerminal.terminal_nickname || "")
       || String(existing.threadId || "") !== String(nextTerminal.threadId || "");
     todoQueueLiveTerminalsRef.current.set(terminalIndex, nextTerminal);
     if (changed || marksReady || marksBusy || eventType === "opened") {
@@ -28562,34 +28650,22 @@ function TerminalView({
         workspaceLiveTerminal?.targetTerminalId,
         workspaceLiveTerminal?.target_terminal_id,
       ));
-      const threadIds = new Set(getVoiceAgentHighlightStringValues(
-        thread?.id,
-        liveTerminal?.threadId,
-        liveTerminal?.thread_id,
-        liveTerminal?.targetThreadId,
-        liveTerminal?.target_thread_id,
-        workspaceLiveTerminal?.threadId,
-        workspaceLiveTerminal?.thread_id,
-      ));
       const sessionIds = new Set(getVoiceAgentHighlightStringValues(
         liveTerminal?.providerSessionId,
         liveTerminal?.provider_session_id,
+        liveTerminal?.nativeSessionId,
+        liveTerminal?.native_session_id,
         liveTerminal?.sessionId,
         liveTerminal?.session_id,
         workspaceLiveTerminal?.providerSessionId,
         workspaceLiveTerminal?.provider_session_id,
+        workspaceLiveTerminal?.nativeSessionId,
+        workspaceLiveTerminal?.native_session_id,
         workspaceLiveTerminal?.sessionId,
         workspaceLiveTerminal?.session_id,
       ));
       const terminalNames = new Set(getVoiceAgentHighlightStringValues(
-        liveTerminal?.name,
-        liveTerminal?.label,
-        liveTerminal?.title,
-        liveTerminal?.targetTerminalName,
-        liveTerminal?.target_terminal_name,
-        workspaceLiveTerminal?.name,
-        workspaceLiveTerminal?.label,
-        workspaceLiveTerminal?.title,
+        getVoiceAgentHighlightTerminalNameValues(liveTerminal, workspaceLiveTerminal, thread),
         getTerminalTabAgentMeta(getTerminalRole(terminalIndex))?.label,
       ).map((value) => value.toLowerCase()));
       return {
@@ -28599,7 +28675,6 @@ function TerminalView({
         terminalIds,
         terminalIndex,
         terminalNames,
-        threadIds,
       };
     }).filter(Boolean);
   }, [
@@ -28685,7 +28760,19 @@ function TerminalView({
         terminalIndexes.add(terminalNumber - 1);
       }
     });
-    const threadIds = stringSet(
+    const sessionIds = stringSet(
+      args.provider_session_id,
+      args.providerSessionId,
+      args.provider_session_ids,
+      args.providerSessionIds,
+      args.native_session_id,
+      args.nativeSessionId,
+      args.native_session_ids,
+      args.nativeSessionIds,
+      args.session_id,
+      args.sessionId,
+      args.session_ids,
+      args.sessionIds,
       args.thread_id,
       args.threadId,
       args.thread_ids,
@@ -28695,20 +28782,9 @@ function TerminalView({
       args.target_thread_ids,
       args.targetThreadIds,
     );
-    const sessionIds = stringSet(
-      args.provider_session_id,
-      args.providerSessionId,
-      args.provider_session_ids,
-      args.providerSessionIds,
-      args.session_id,
-      args.sessionId,
-      args.session_ids,
-      args.sessionIds,
-    );
     const hasExplicitTarget = terminalIds.size > 0
       || terminalNames.size > 0
       || terminalIndexes.size > 0
-      || threadIds.size > 0
       || sessionIds.size > 0;
 
     if (voiceAgentHighlightScopeIsAll(args)) {
@@ -28726,13 +28802,11 @@ function TerminalView({
         const matchesTerminalId = [...terminalIds].some((terminalId) => candidate.terminalIds.has(terminalId));
         const matchesTerminalName = [...terminalNames].some((terminalName) => candidate.terminalNames.has(terminalName));
         const matchesTerminalIndex = terminalIndexes.has(candidate.terminalIndex);
-        const matchesThreadId = [...threadIds].some((threadId) => candidate.threadIds.has(threadId));
         const matchesSessionId = [...sessionIds].some((sessionId) => candidate.sessionIds.has(sessionId));
         if (
           matchesTerminalId
           || matchesTerminalName
           || matchesTerminalIndex
-          || matchesThreadId
           || matchesSessionId
         ) {
           addCandidate(candidate, "explicit_target");
@@ -28776,11 +28850,19 @@ function TerminalView({
         };
         const itemTerminalId = getTodoQueueTargetTerminalId(item) || metadata.terminalId || "";
         const itemTerminalIndex = getTodoQueueTargetTerminalIndex(item) ?? metadata.terminalIndex;
-        const itemThreadId = getTodoQueueTargetThreadId(item) || metadata.threadId || "";
+        const itemTerminalNames = getVoiceAgentHighlightTerminalNameValues(
+          item,
+          item?.remoteCommand,
+          item?.remote_command,
+          item?.target,
+          metadata,
+        ).map((value) => value.toLowerCase());
         const itemSessionIds = getVoiceAgentHighlightStringValues(
           metadata.providerSessionId,
           item?.providerSessionId,
           item?.provider_session_id,
+          item?.nativeSessionId,
+          item?.native_session_id,
           item?.sessionId,
           item?.session_id,
         );
@@ -28788,7 +28870,7 @@ function TerminalView({
           const matchesTodoTarget = Boolean(
             (itemTerminalId && candidate.terminalIds.has(itemTerminalId))
               || (Number.isInteger(itemTerminalIndex) && candidate.terminalIndex === itemTerminalIndex)
-              || (itemThreadId && candidate.threadIds.has(itemThreadId))
+              || itemTerminalNames.some((terminalName) => candidate.terminalNames.has(terminalName))
               || itemSessionIds.some((sessionId) => candidate.sessionIds.has(sessionId)),
           );
           if (matchesTodoTarget) {
@@ -28805,7 +28887,7 @@ function TerminalView({
           const matchesSessionSummary = Boolean(
             refs.terminalIds.some((terminalId) => candidate.terminalIds.has(terminalId))
               || (Number.isInteger(refs.terminalIndex) && candidate.terminalIndex === refs.terminalIndex)
-              || refs.threadIds.some((threadId) => candidate.threadIds.has(threadId))
+              || refs.terminalNames.some((terminalName) => candidate.terminalNames.has(terminalName.toLowerCase()))
               || refs.sessionIds.some((sessionId) => candidate.sessionIds.has(sessionId)),
           );
           if (matchesSessionSummary) {
@@ -28847,11 +28929,10 @@ function TerminalView({
     const sessionMetadata = getTodoQueueAgentSessionMetadata({
       agentKind: args.agent_kind || args.agentKind || args.agent_type || args.agentType || sessionContext?.agentKind || sessionContext?.agent_kind || "",
       provider: args.provider || sessionContext?.provider || "",
-      providerSessionId: args.provider_session_id || args.providerSessionId || args.session_id || args.sessionId || sessionContext?.providerSessionId || sessionContext?.provider_session_id || "",
+      providerSessionId: args.provider_session_id || args.providerSessionId || args.native_session_id || args.nativeSessionId || args.session_id || args.sessionId || sessionContext?.providerSessionId || sessionContext?.provider_session_id || sessionContext?.nativeSessionId || sessionContext?.native_session_id || sessionContext?.sessionId || sessionContext?.session_id || args.thread_id || args.threadId || args.target_thread_id || args.targetThreadId || sessionContext?.threadId || sessionContext?.thread_id || "",
       terminalId: args.terminal_id || args.terminalId || args.target_terminal_id || args.targetTerminalId || sessionContext?.terminalId || sessionContext?.terminal_id || "",
       terminalIndex: args.terminal_index ?? args.terminalIndex ?? sessionContext?.terminalIndex ?? sessionContext?.terminal_index,
       terminalInstanceId: args.terminal_instance_id || args.terminalInstanceId || sessionContext?.terminalInstanceId || sessionContext?.terminal_instance_id || "",
-      threadId: args.thread_id || args.threadId || sessionContext?.threadId || sessionContext?.thread_id || "",
     });
     const contextPrompt = normalizeTodoQueueText(
       args.context_prompt
@@ -29404,7 +29485,24 @@ function TerminalView({
       if (!todoId) {
         return;
       }
-      const item = todoQueueItemsRef.current.find((candidate) => candidate.id === todoId);
+      let item = todoQueueItemsRef.current.find((candidate) => candidate.id === todoId);
+      if (!item && detail.item && typeof detail.item === "object") {
+        const normalizedItem = normalizeTodoQueueItem({
+          ...detail.item,
+          id: todoId,
+          kind: "todo",
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          workspaceId: eventWorkspaceId,
+        });
+        if (normalizedItem) {
+          item = normalizedItem;
+          updateTodoQueueItems((currentItems) => (
+            currentItems
+              .filter((candidate) => candidate.id !== normalizedItem.id)
+              .concat([normalizedItem])
+          ));
+        }
+      }
       if (!item) {
         logTerminalStatus("frontend.todo_queue.remote_requeue_missing", {
           commandId: detail.commandId || todoId,
@@ -29431,20 +29529,93 @@ function TerminalView({
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         workspaceId: terminalWorkspace.id,
       });
+      const targetTerminalIndex = normalizeTodoTerminalIndex(
+        detail.targetTerminalIndex
+          ?? detail.item?.targetTerminalIndex
+          ?? detail.item?.target_terminal_index,
+      );
+      if (targetTerminalIndex != null || detail.generic === true) {
+        applyTodoHistoryTarget(item.id, targetTerminalIndex);
+      }
       const remoteTargetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
       setTodoQueueItemPending(item.id, {
         item: getTodoQueueItemLogSummary([item])[0] || null,
+        commandId: detail.commandId || item.remoteCommand?.commandId || "",
         phase: "queued",
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
-        targetRole: getTodoQueueTargetAgentId(item),
-        targetColorSlot: getTodoQueueTargetColorSlot(item),
-        targetTerminalColor: getTodoQueueTargetTerminalColor(item),
-        targetTerminalId: getTodoQueueTargetTerminalId(item),
-        targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
-        targetTerminalName: getTodoQueueTargetTerminalName(item),
-        targetThreadId: getTodoQueueTargetThreadId(item),
-        targetExplicit: remoteTargetInfo.hasExplicitTerminalTarget,
+        targetRole: detail.targetAgentId || getTodoQueueTargetAgentId(item),
+        targetColorSlot: detail.targetColorSlot ?? getTodoQueueTargetColorSlot(item),
+        targetTerminalColor: detail.targetTerminalColor || getTodoQueueTargetTerminalColor(item),
+        targetTerminalId: detail.targetTerminalId || getTodoQueueTargetTerminalId(item),
+        targetTerminalIndex: detail.targetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
+        targetTerminalName: detail.targetTerminalName || getTodoQueueTargetTerminalName(item),
+        targetThreadId: detail.targetThreadId || getTodoQueueTargetThreadId(item),
+        targetExplicit: remoteTargetInfo.hasExplicitTerminalTarget || Boolean(detail.targetTerminalId),
         workspaceId: terminalWorkspace.id,
+      });
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+    };
+
+    const handleRemoteTodoUnqueueEvent = (event) => {
+      const detail = event?.detail || {};
+      const eventWorkspaceId = String(detail.workspaceId || "").trim();
+      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const todoId = String(detail.todoId || detail.itemId || "").trim();
+      if (!todoId) {
+        return;
+      }
+      const item = todoQueueItemsRef.current.find((candidate) => candidate.id === todoId);
+      if (!item) {
+        logTerminalStatus("frontend.todo_queue.remote_unqueue_missing", {
+          commandId: detail.commandId || todoId,
+          itemId: todoId,
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          workspaceId: terminalWorkspace.id,
+        });
+        void invoke("todo_store_set_status", {
+          commandId: String(detail.commandId || "").trim() || null,
+          reason: "remote_todo_unqueue",
+          status: "listed",
+          todoId,
+          workspaceId: terminalWorkspace.id,
+        }).catch(() => {});
+        return;
+      }
+      const pendingItem = todoQueuePendingItemsRef.current[item.id] || null;
+      if (pendingItem && getTodoQueuePendingPhase(pendingItem) !== "queued") {
+        logTerminalStatus("frontend.todo_queue.remote_unqueue_skip", {
+          commandId: detail.commandId || todoId,
+          itemId: todoId,
+          pendingPhase: getTodoQueuePendingPhase(pendingItem),
+          reason: "already_sending",
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          workspaceId: terminalWorkspace.id,
+        });
+        return;
+      }
+      logTerminalStatus("frontend.todo_queue.remote_unqueue", {
+        commandId: detail.commandId || todoId,
+        itemId: todoId,
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        workspaceId: terminalWorkspace.id,
+      });
+      clearTodoQueueItemPending(item.id, "unqueued", {
+        commandId: detail.commandId || "",
+        reason: "remote_todo_unqueue",
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+      });
+      updateTodoQueueItems((currentItems) => currentItems.map((candidate) => (
+        String(candidate?.id || "").trim() === item.id
+          ? getTodoQueueItemWithCloudStatus(candidate, "listed", {
+            reason: "remote_todo_unqueue",
+          })
+          : candidate
+      )), {
+        force: true,
+        immediate: true,
+        reason: "remote_todo_unqueue",
       });
       setTodoQueueDispatchRevision((revision) => revision + 1);
     };
@@ -29452,12 +29623,16 @@ function TerminalView({
     window.addEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
     window.addEventListener(REMOTE_TODO_DELETE_EVENT, handleRemoteTodoDeleteEvent);
     window.addEventListener(REMOTE_TODO_REQUEUE_EVENT, handleRemoteTodoRequeueEvent);
+    window.addEventListener(REMOTE_TODO_UNQUEUE_EVENT, handleRemoteTodoUnqueueEvent);
     return () => {
       window.removeEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
       window.removeEventListener(REMOTE_TODO_DELETE_EVENT, handleRemoteTodoDeleteEvent);
       window.removeEventListener(REMOTE_TODO_REQUEUE_EVENT, handleRemoteTodoRequeueEvent);
+      window.removeEventListener(REMOTE_TODO_UNQUEUE_EVENT, handleRemoteTodoUnqueueEvent);
     };
   }, [
+    applyTodoHistoryTarget,
+    clearTodoQueueItemPending,
     recordTodoQueueRemoteCommandReceipt,
     removeTodoQueueItem,
     setTodoQueueItemPending,

@@ -91,6 +91,7 @@ const CLOUD_MCP_ASSET_FOLDER_SKILLS: &str = "account-skills";
 const CLOUD_MCP_ASSET_FOLDER_ARCHITECTURES: &str = "account-architectures";
 const CLOUD_MCP_ASSET_DOC_SOURCE_KINDS: [&str; 2] = ["account_skill", "account_architecture"];
 const CLOUD_MCP_ASSET_DOC_DOMAINS: [&str; 2] = ["skills", "architectures"];
+const CLOUD_MCP_ARCHITECTURE_INLINE_SOURCE_FALLBACK_BYTES: usize = 64 * 1024;
 const CLOUD_MCP_LOCAL_HOME_ENV: &str = "RUST_DIFFFORGE_HOME";
 const CLOUD_MCP_LOCAL_CACHE_DIR_ENV: &str = "RUST_DIFFFORGE_CACHE_DIR";
 const CLOUD_MCP_LOCAL_DATA_DIR_ENV: &str = "RUST_DIFFFORGE_DATA_DIR";
@@ -13298,6 +13299,9 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         "terminal_open" | "open_terminal" | "open_terminals" | "terminal_spawn"
         | "spawn_terminals" => "defer_open",
         "todo_requeue" | "requeue_todo" | "todo_retry" | "retry_todo" => "defer_requeue",
+        "todo_queue" | "queue_todo" | "workspace_todo_queue" => "defer_queue",
+        "todo_unqueue" | "unqueue_todo" | "workspace_todo_unqueue" | "todo_dequeue"
+        | "dequeue_todo" => "defer_unqueue",
         "terminal_window_breakout"
         | "breakout_terminal"
         | "breakout_terminals"
@@ -13359,7 +13363,12 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
     tauri::async_runtime::spawn(async move {
         if matches!(
             action.as_str(),
-            "relaunch" | "defer_open" | "defer_requeue" | "defer_window"
+            "relaunch"
+                | "defer_open"
+                | "defer_requeue"
+                | "defer_queue"
+                | "defer_unqueue"
+                | "defer_window"
         ) {
             if action == "relaunch" && target_terminal_id.is_empty() {
                 let _ = cloud_mcp_send_remote_command_status_event(
@@ -13390,6 +13399,12 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
                 }
                 "defer_requeue" => {
                     "Todo requeue queued; it completes when the desktop window next opens."
+                }
+                "defer_queue" => {
+                    "Todo queue command queued; it completes when the desktop window next opens."
+                }
+                "defer_unqueue" => {
+                    "Todo unqueue command queued; it completes when the desktop window next opens."
                 }
                 "defer_window" => {
                     "Terminal window breakout queued; it completes when the desktop window next opens."
@@ -15294,12 +15309,13 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
         ),
         ("status", &["status", "state"][..]),
         ("commandable", &["commandable"][..]),
-        ("thread_id", &["thread_id", "threadId"][..]),
         (
             "session_id",
             &[
                 "provider_session_id",
                 "providerSessionId",
+                "native_session_id",
+                "nativeSessionId",
                 "session_id",
                 "sessionId",
             ][..],
@@ -19628,6 +19644,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
     coordination: Option<&TerminalCoordinationSession>,
     session_mode: TerminalSessionMode,
     metadata: &TerminalInstanceMetadata,
+    provider_session_id: Option<&str>,
     reason: &str,
 ) {
     let repo_root = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
@@ -19654,7 +19671,9 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         })
         .or_else(|| (!metadata.agent_id.trim().is_empty()).then_some(metadata.agent_id.as_str()))
         .unwrap_or("terminal");
-    let thread_id = metadata.thread_id.trim();
+    let provider_session_id = provider_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let terminal_nickname = cloud_mcp_clean_terminal_nickname(metadata.terminal_nickname.trim())
         .or_else(|| cloud_mcp_clean_terminal_nickname(metadata.terminal_name.trim()));
     let terminal_display_name = terminal_nickname
@@ -19714,7 +19733,12 @@ pub(crate) async fn cloud_mcp_mark_terminal_opened(
         "input_ready": false,
         "session_mode": session_mode.as_str(),
         "session_state": "session_attached",
-        "thread_id": (!thread_id.is_empty()).then_some(thread_id),
+        "provider_session_id": provider_session_id,
+        "providerSessionId": provider_session_id,
+        "native_session_id": provider_session_id,
+        "nativeSessionId": provider_session_id,
+        "session_id": provider_session_id,
+        "sessionId": provider_session_id,
         "status_seq": status_seq,
         "observed_at_ms": now_ms,
         "reason": reason,
@@ -19998,13 +20022,6 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
     let terminal_index = context_entry
         .and_then(|entry| entry.terminal_index)
         .or(close_context.metadata.terminal_index);
-    let thread_id = context_entry
-        .and_then(|entry| entry.thread_id.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            (!close_context.metadata.thread_id.trim().is_empty())
-                .then_some(close_context.metadata.thread_id.as_str())
-        });
     let last_prompt = context_entry
         .map(|entry| entry.last_prompt.as_str())
         .filter(|value| !value.trim().is_empty());
@@ -20076,7 +20093,6 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
         "task_id": local_task_id,
         "run_id": local_task_id,
         "last_prompt": last_prompt,
-        "thread_id": thread_id,
         "status_seq": status_seq,
         "observed_at_ms": now_ms,
         "reason": reason,
@@ -21889,6 +21905,17 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     &["terminal_status", "terminalStatus", "reported_status", "reportedStatus"],
                 )
                 .unwrap_or_else(|| status.clone());
+                let provider_session_id = cloud_mcp_payload_text(
+                    terminal,
+                    &[
+                        "provider_session_id",
+                        "providerSessionId",
+                        "native_session_id",
+                        "nativeSessionId",
+                        "session_id",
+                        "sessionId",
+                    ],
+                );
                 let session_state =
                     cloud_mcp_payload_text(terminal, &["session_state", "sessionState"])
                         .unwrap_or_else(|| "unknown".to_string());
@@ -21973,7 +22000,12 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     "pane_id": pane_id,
                     "terminal_id": terminal_id.clone(),
                     "target_terminal_id": terminal_id,
-                    "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
+                    "provider_session_id": provider_session_id.clone(),
+                    "providerSessionId": provider_session_id.clone(),
+                    "native_session_id": provider_session_id.clone(),
+                    "nativeSessionId": provider_session_id.clone(),
+                    "session_id": provider_session_id.clone(),
+                    "sessionId": provider_session_id,
                     "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
                     "dot_color": cloud_mcp_payload_text(terminal, &["dot_color", "dotColor", "color", "accent", "accentColor"]),
                     "dotColor": cloud_mcp_payload_text(terminal, &["dot_color", "dotColor", "color", "accent", "accentColor"]),
@@ -22738,6 +22770,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         cloud_mcp_next_workspace_runtime_seq(state, Some(payload.observed_at_ms));
     let workspace_runtime_epoch = cloud_mcp_workspace_runtime_epoch(state);
     let reason = payload.source.as_str();
+    let provider_session_id = payload.provider_session_id.clone();
     let delta = json!({
         "source": "rust-diffforge-activity-hook",
         "event_kind": "terminal_state_update",
@@ -22801,7 +22834,12 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "hook_timestamp_ms": payload.hook_timestamp_ms,
         "turn_id": payload.turn_id,
         "provider_turn_id": payload.provider_turn_id,
-        "provider_session_id": payload.provider_session_id,
+        "provider_session_id": provider_session_id.clone(),
+        "providerSessionId": provider_session_id.clone(),
+        "native_session_id": provider_session_id.clone(),
+        "nativeSessionId": provider_session_id.clone(),
+        "session_id": provider_session_id.clone(),
+        "sessionId": provider_session_id,
         "prompt_event_id": prompt_event_id,
         "promptEventId": prompt_event_id,
         "todo_id": direct_prompt_refs.as_ref().map(|refs| refs.todo_id.as_str()),
@@ -22810,7 +22848,6 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "todoDispatchId": direct_prompt_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
         "command_id": direct_prompt_refs.as_ref().map(|refs| refs.command_id.as_str()),
         "commandId": direct_prompt_refs.as_ref().map(|refs| refs.command_id.as_str()),
-        "thread_id": payload.thread_id,
         "reason": reason,
         "summary": format!("Terminal {}.", state_value),
         "ts_ms": cloud_mcp_now_ms(),
@@ -24746,6 +24783,12 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
     } else {
         return Ok(graph);
     };
+    let inline_source_fallback = source
+        .as_deref()
+        .filter(|value| {
+            value.as_bytes().len() <= CLOUD_MCP_ARCHITECTURE_INLINE_SOURCE_FALLBACK_BYTES
+        })
+        .map(ToOwned::to_owned);
     let asset_id = format!(
         "asset-account-architecture-{}-{}",
         cloud_mcp_short_hash(&graph_id),
@@ -24853,6 +24896,14 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
     let asset_id = cloud_mcp_asset_row_text(&row, &["asset_id", "assetId", "id"]);
     let _upload_result = cloud_mcp_upload_account_asset_once(state, asset_id.clone(), None).await?;
     let uploaded = cloud_mcp_asset_row_from_file(&asset_id).unwrap_or(row);
+    let uploaded_asset_id =
+        cloud_mcp_payload_text(&uploaded, &["asset_id", "assetId", "id"]).unwrap_or_default();
+    let has_uploaded_asset = !uploaded_asset_id.trim().is_empty();
+    if !has_uploaded_asset && inline_source_fallback.is_none() {
+        return Err(format!(
+            "Architecture graph {graph_id} did not produce a cloud asset or inline source fallback."
+        ));
+    }
 
     if let Some(object) = graph.as_object_mut() {
         object.insert("sourceFormat".to_string(), json!(source_format.clone()));
@@ -24917,11 +24968,15 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
                 .cloned()
                 .unwrap_or_else(|| input["metadata"].clone()),
         );
-        object.remove("source");
-        object.remove("source_text");
-        object.remove("sourceText");
-        object.remove("content");
-        object.remove("dsl");
+        if let Some(source) = inline_source_fallback {
+            object.insert("source".to_string(), json!(source));
+        } else if has_uploaded_asset {
+            object.remove("source");
+            object.remove("source_text");
+            object.remove("sourceText");
+            object.remove("content");
+            object.remove("dsl");
+        }
     }
     Ok(graph)
 }
@@ -25267,7 +25322,7 @@ fn cloud_mcp_architecture_mark_sync_acked_from_payload(
 fn cloud_mcp_architecture_sync_decision(
     payload: &Value,
 ) -> Result<CloudMcpArchitectureGraphSyncDecision, String> {
-    let Some((scope_key, device_id, graph_id, content_hash, _payload_hash, idempotency_key)) =
+    let Some((scope_key, device_id, graph_id, content_hash, payload_hash, idempotency_key)) =
         cloud_mcp_architecture_sync_identity_from_payload(payload)
     else {
         return Ok(CloudMcpArchitectureGraphSyncDecision::Enqueue);
@@ -25276,7 +25331,7 @@ fn cloud_mcp_architecture_sync_decision(
     let state = conn
         .query_row(
             &format!(
-                "SELECT content_hash, idempotency_key, acked_at_ms
+                "SELECT content_hash, payload_hash, idempotency_key, acked_at_ms
                  FROM {CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}
                  WHERE scope_key=?1 AND device_id=?2 AND graph_id=?3"
             ),
@@ -25285,13 +25340,16 @@ fn cloud_mcp_architecture_sync_decision(
                 Ok((
                     row.get::<_, String>(0).unwrap_or_default(),
                     row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, i64>(2).unwrap_or(0).max(0),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0).max(0),
                 ))
             },
         )
         .ok();
-    if let Some((state_content_hash, state_idempotency_key, acked_at_ms)) = state {
-        if state_content_hash == content_hash {
+    if let Some((state_content_hash, state_payload_hash, state_idempotency_key, acked_at_ms)) =
+        state
+    {
+        if state_content_hash == content_hash && state_payload_hash == payload_hash {
             if acked_at_ms > 0 {
                 return Ok(CloudMcpArchitectureGraphSyncDecision::CurrentAcked);
             }
@@ -25343,8 +25401,10 @@ fn cloud_mcp_architecture_sync_payload(base: &Value, graph: Value) -> Option<Val
                     .unwrap_or("rust-diffforge-desktop")
                     .to_string()
             });
-    let idempotency_key =
-        format!("architecture-graph:{scope_key}:{device_id}:{graph_id}:{content_hash}");
+    let payload_hash = cloud_mcp_outbox_payload_hash(&graph);
+    let idempotency_key = format!(
+        "architecture-graph:{scope_key}:{device_id}:{graph_id}:{content_hash}:{payload_hash}"
+    );
     let mut payload = base.clone();
     if let Some(object) = payload.as_object_mut() {
         object.insert("event_kind".to_string(), json!("doc.sync"));
@@ -25354,7 +25414,7 @@ fn cloud_mcp_architecture_sync_payload(base: &Value, graph: Value) -> Option<Val
         object.insert("contract".to_string(), json!("diffforge.arch_doc.v1"));
         object.insert("graph_id".to_string(), json!(graph_id.clone()));
         object.insert("content_hash".to_string(), json!(content_hash.clone()));
-        object.insert("payload_hash".to_string(), json!(content_hash.clone()));
+        object.insert("payload_hash".to_string(), json!(payload_hash));
         object.insert("idempotency_key".to_string(), json!(idempotency_key));
         object.insert("sync_unit".to_string(), json!("architecture_graph"));
         object.insert("graph".to_string(), graph);

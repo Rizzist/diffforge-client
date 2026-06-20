@@ -5277,6 +5277,7 @@ async fn terminal_open(
         terminal_coordination.as_ref(),
         effective_session_mode,
         &terminal_metadata_for_log,
+        runtime_snapshot.provider_session_id.as_deref(),
         "terminal_open",
     )
     .await;

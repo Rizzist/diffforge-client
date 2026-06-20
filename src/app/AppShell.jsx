@@ -1236,6 +1236,7 @@ const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-promp
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const REMOTE_TODO_REQUEUE_EVENT = "diffforge:remote-todo-requeue";
+const REMOTE_TODO_UNQUEUE_EVENT = "diffforge:remote-todo-unqueue";
 const REMOTE_TERMINAL_WINDOW_EVENT = "diffforge:remote-terminal-window";
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
@@ -17538,6 +17539,11 @@ export default function App() {
             thread?.activityStatus || "",
             currentAgent,
             thread?.transcriptSessionId || "",
+            providerBinding?.nativeSessionId
+              || providerBinding?.native_session_id
+              || providerBinding?.providerSessionId
+              || providerBinding?.provider_session_id
+              || "",
             thread?.latestTurn?.state || "",
             thread?.updatedAt || "",
             thread?.terminalNickname || thread?.terminal_nickname || "",
@@ -17955,6 +17961,20 @@ export default function App() {
               agentLabel,
             );
             const terminalInstanceId = terminalBinding?.instanceId || liveTerminal?.instanceId || "";
+            const providerSessionId = String(
+              providerBinding?.nativeSessionId
+                || providerBinding?.native_session_id
+                || providerBinding?.providerSessionId
+                || providerBinding?.provider_session_id
+                || thread?.transcriptSessionId
+                || liveTerminal?.providerSessionId
+                || liveTerminal?.provider_session_id
+                || liveTerminal?.nativeSessionId
+                || liveTerminal?.native_session_id
+                || liveTerminal?.sessionId
+                || liveTerminal?.session_id
+                || "",
+            ).trim();
             const paneId = terminalBinding?.paneId
               || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole);
             const statusSeq = Number(
@@ -17992,11 +18012,17 @@ export default function App() {
               ...nativeRailFields,
               nativeConnected: true,
               native_connected: true,
+              nativeSessionId: providerSessionId,
+              native_session_id: providerSessionId,
               pane_id: paneId,
               paneId,
+              providerSessionId,
+              provider_session_id: providerSessionId,
               readiness,
               runtimeReadOnly: false,
               runtime_read_only: false,
+              sessionId: providerSessionId,
+              session_id: providerSessionId,
               sessionState: terminalLifecycle === "open" ? "session_attached" : "no_session",
               status,
               statusSeq,
@@ -18159,44 +18185,60 @@ export default function App() {
       }
       presenceTerminalsByWorkspaceId.set(
         presenceWorkspaceId,
-        presenceWorkspace.terminals.slice(0, 32).map((terminal) => ({
-          agentDisplayName: String(terminal?.agentDisplayName || terminal?.agent_display_name || ""),
-          agentId: String(terminal?.agentId || terminal?.agent_id || terminal?.agentKind || ""),
-          agentKind: String(terminal?.agentKind || terminal?.agent_id || terminal?.agentId || ""),
-          agentLabel: String(terminal?.agentLabel || ""),
-          agentType: String(terminal?.agentType || terminal?.agent_type || ""),
-          commandPhase: String(terminal?.commandPhase || terminal?.command_phase || ""),
-          commandable: terminal?.commandable === false ? false : true,
-          connected: terminal?.connected === false ? false : true,
-          color: String(terminal?.color || ""),
-          colorSlot: Number(terminal?.colorSlot ?? terminal?.color_slot ?? 0),
-          displayName: String(terminal?.displayName || terminal?.display_name || terminal?.terminalName || ""),
-          displayStatus: String(terminal?.displayStatus || terminal?.display_status || terminal?.status || ""),
-          dotColor: String(terminal?.dotColor || terminal?.dot_color || terminal?.color || ""),
-          executionPhase: String(terminal?.executionPhase || terminal?.execution_phase || ""),
-          inputReady: terminal?.inputReady === true || terminal?.input_ready === true,
-          lastKnownRuntime: false,
-          last_known_runtime: false,
-          nativeRailLabel: String(terminal?.nativeRailLabel || terminal?.native_rail_label || ""),
-          nativeRailState: String(terminal?.nativeRailState || terminal?.native_rail_state || ""),
-          nativeConnected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
-          native_connected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
-          paneId: String(terminal?.paneId || terminal?.pane_id || terminal?.terminalId || ""),
-          readiness: String(terminal?.readiness || ""),
-          runtimeReadOnly: false,
-          runtime_read_only: false,
-          status: String(terminal?.status || ""),
-          targetTerminalId: String(terminal?.targetTerminalId || terminal?.target_terminal_id || terminal?.paneId || terminal?.terminalId || ""),
-          terminalId: String(terminal?.terminalId || terminal?.terminal_id || terminal?.paneId || ""),
-          terminalIndex: Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? 0),
-          terminalInstanceId: String(terminal?.terminalInstanceId || terminal?.terminal_instance_id || ""),
-          terminalLifecycle: String(terminal?.terminalLifecycle || terminal?.terminal_lifecycle || ""),
-          terminalName: String(terminal?.terminalName || terminal?.terminal_name || terminal?.displayName || ""),
-          terminalNickname: String(terminal?.terminalNickname || terminal?.terminal_nickname || ""),
-          terminalStatus: String(terminal?.terminalStatus || terminal?.terminal_status || terminal?.status || ""),
-          threadId: String(terminal?.threadId || terminal?.thread_id || ""),
-          turnStatus: String(terminal?.turnStatus || terminal?.turn_status || ""),
-        })),
+        presenceWorkspace.terminals.slice(0, 32).map((terminal) => {
+          const providerSessionId = String(
+            terminal?.providerSessionId
+              || terminal?.provider_session_id
+              || terminal?.nativeSessionId
+              || terminal?.native_session_id
+              || terminal?.sessionId
+              || terminal?.session_id
+              || "",
+          ).trim();
+          return {
+            agentDisplayName: String(terminal?.agentDisplayName || terminal?.agent_display_name || ""),
+            agentId: String(terminal?.agentId || terminal?.agent_id || terminal?.agentKind || ""),
+            agentKind: String(terminal?.agentKind || terminal?.agent_id || terminal?.agentId || ""),
+            agentLabel: String(terminal?.agentLabel || ""),
+            agentType: String(terminal?.agentType || terminal?.agent_type || ""),
+            commandPhase: String(terminal?.commandPhase || terminal?.command_phase || ""),
+            commandable: terminal?.commandable === false ? false : true,
+            connected: terminal?.connected === false ? false : true,
+            color: String(terminal?.color || ""),
+            colorSlot: Number(terminal?.colorSlot ?? terminal?.color_slot ?? 0),
+            displayName: String(terminal?.displayName || terminal?.display_name || terminal?.terminalName || ""),
+            displayStatus: String(terminal?.displayStatus || terminal?.display_status || terminal?.status || ""),
+            dotColor: String(terminal?.dotColor || terminal?.dot_color || terminal?.color || ""),
+            executionPhase: String(terminal?.executionPhase || terminal?.execution_phase || ""),
+            inputReady: terminal?.inputReady === true || terminal?.input_ready === true,
+            lastKnownRuntime: false,
+            last_known_runtime: false,
+            nativeRailLabel: String(terminal?.nativeRailLabel || terminal?.native_rail_label || ""),
+            nativeRailState: String(terminal?.nativeRailState || terminal?.native_rail_state || ""),
+            nativeConnected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
+            native_connected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
+            nativeSessionId: providerSessionId,
+            native_session_id: providerSessionId,
+            paneId: String(terminal?.paneId || terminal?.pane_id || terminal?.terminalId || ""),
+            providerSessionId,
+            provider_session_id: providerSessionId,
+            readiness: String(terminal?.readiness || ""),
+            runtimeReadOnly: false,
+            runtime_read_only: false,
+            sessionId: providerSessionId,
+            session_id: providerSessionId,
+            status: String(terminal?.status || ""),
+            targetTerminalId: String(terminal?.targetTerminalId || terminal?.target_terminal_id || terminal?.paneId || terminal?.terminalId || ""),
+            terminalId: String(terminal?.terminalId || terminal?.terminal_id || terminal?.paneId || ""),
+            terminalIndex: Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? 0),
+            terminalInstanceId: String(terminal?.terminalInstanceId || terminal?.terminal_instance_id || ""),
+            terminalLifecycle: String(terminal?.terminalLifecycle || terminal?.terminal_lifecycle || ""),
+            terminalName: String(terminal?.terminalName || terminal?.terminal_name || terminal?.displayName || ""),
+            terminalNickname: String(terminal?.terminalNickname || terminal?.terminal_nickname || ""),
+            terminalStatus: String(terminal?.terminalStatus || terminal?.terminal_status || terminal?.status || ""),
+            turnStatus: String(terminal?.turnStatus || terminal?.turn_status || ""),
+          };
+        }),
       );
     });
     const addTarget = (workspace, activeOverride = null, workspaceIndex = 0) => {
@@ -21673,6 +21715,117 @@ export default function App() {
         await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
           commandId,
           commandKind,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "todo_queue",
+        "queue_todo",
+        "workspace_todo_queue",
+      ].includes(normalizedKind)) {
+        const todoId = remoteCommandStringField(event, [
+          "todo_id",
+          "todoId",
+          "item_id",
+          "itemId",
+          "target_todo_id",
+          "targetTodoId",
+        ]);
+        if (!todoId) {
+          await recordRemoteCommandStatus(event, "failed", "Todo queue command did not include a todo id.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const todoText = remoteCommandText(event) || remoteCommandStringField(event, [
+          "todo_text",
+          "todoText",
+          "title",
+        ]);
+        window.dispatchEvent(new CustomEvent(REMOTE_TODO_REQUEUE_EVENT, {
+          detail: {
+            commandId,
+            item: {
+              createdAt: event.created_at || event.createdAt || new Date().toISOString(),
+              id: todoId,
+              kind: "todo",
+              remoteCommand: {
+                commandId,
+                source: event.source || "next-diffforge",
+                targetAgentId: agentId || "",
+                targetTerminalId,
+                targetTerminalIndex,
+                targetTerminalName,
+                targetThreadId,
+                todoId,
+              },
+              source: "next-remote-control",
+              targetAgentId: agentId || "",
+              targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+              targetTerminalId,
+              targetTerminalIndex,
+              targetTerminalName,
+              targetThreadId,
+              text: todoText,
+              workspaceId,
+            },
+            targetAgentId: agentId || "",
+            targetTerminalId,
+            targetTerminalIndex,
+            targetTerminalName,
+            targetThreadId,
+            todoId,
+            workspaceId,
+          },
+        }));
+        await recordRemoteCommandStatus(event, "completed", "Todo queued for dispatch on the desktop.", {
+          commandId,
+          commandKind,
+          targetTerminalId,
+          targetTerminalIndex,
+          targetTerminalName,
+          todoId,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "todo_unqueue",
+        "unqueue_todo",
+        "workspace_todo_unqueue",
+        "todo_dequeue",
+        "dequeue_todo",
+      ].includes(normalizedKind)) {
+        const todoId = remoteCommandStringField(event, [
+          "todo_id",
+          "todoId",
+          "item_id",
+          "itemId",
+          "target_todo_id",
+          "targetTodoId",
+        ]);
+        if (!todoId) {
+          await recordRemoteCommandStatus(event, "failed", "Todo unqueue command did not include a todo id.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        window.dispatchEvent(new CustomEvent(REMOTE_TODO_UNQUEUE_EVENT, {
+          detail: {
+            commandId,
+            todoId,
+            workspaceId,
+          },
+        }));
+        await recordRemoteCommandStatus(event, "completed", "Todo unqueued on the desktop.", {
+          commandId,
+          commandKind,
+          todoId,
           workspaceId,
         });
         return;

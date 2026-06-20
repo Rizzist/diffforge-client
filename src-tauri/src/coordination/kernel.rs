@@ -5990,9 +5990,11 @@ impl CoordinationKernel {
         session_id: Option<&str>,
         agent_id: Option<&str>,
         workspace_id: Option<&str>,
+        pane_id: Option<&str>,
     ) -> Result<Value, String> {
         let task_target = task_id.map(str::trim).filter(|value| !value.is_empty());
         let session_target = session_id.map(str::trim).filter(|value| !value.is_empty());
+        let pane_target = pane_id.map(str::trim).filter(|value| !value.is_empty());
         let workspace_target = workspace_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -6025,7 +6027,7 @@ impl CoordinationKernel {
             None
         };
         let lineage_history_rows = if task_target.is_none() {
-            session_target
+            let session_lineage_rows = session_target
                 .map(|session_id| {
                     self.terminal_todo_plan_history_rows_for_session_lineage(
                         session_id,
@@ -6033,12 +6035,30 @@ impl CoordinationKernel {
                     )
                 })
                 .transpose()?
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if !session_lineage_rows.is_empty() {
+                session_lineage_rows
+            } else {
+                pane_target
+                    .map(|pane_id| {
+                        self.terminal_todo_plan_history_rows_for_terminal_lineage(
+                            pane_id,
+                            agent_id,
+                            workspace_target.as_deref(),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default()
+            }
         } else {
             Vec::new()
         };
         let history_scope = if !lineage_history_rows.is_empty() {
-            "session_lineage"
+            if session_target.is_some() {
+                "session_lineage"
+            } else {
+                "terminal_lineage"
+            }
         } else if task_target.is_some() || session_target.is_some() {
             "target"
         } else if agent_id
@@ -6229,6 +6249,66 @@ impl CoordinationKernel {
         }
 
         Ok(Vec::new())
+    }
+
+    fn terminal_todo_plan_history_rows_for_terminal_lineage(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<Value>, String> {
+        let pane_id = pane_id.trim();
+        if pane_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fresh_pty_prefix = format!("{pane_id}-fresh-%");
+        let agent_id = agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
+
+        if let Some(workspace_id) = workspace_id {
+            self.query_json(
+                "SELECT p.*
+                     FROM terminal_todo_plans p
+                     LEFT JOIN agent_sessions s ON s.id=p.session_id
+                     LEFT JOIN agents session_agent ON session_agent.id=s.agent_id
+                     LEFT JOIN agents plan_agent ON plan_agent.id=p.agent_id
+                     WHERE (s.pty_id=?1 OR s.pty_id LIKE ?2)
+                       AND (
+                            ?3=''
+                         OR p.agent_id=?3
+                         OR s.agent_id=?3
+                         OR LOWER(COALESCE(plan_agent.kind, ''))=LOWER(?3)
+                         OR LOWER(COALESCE(session_agent.kind, ''))=LOWER(?3)
+                         OR LOWER(COALESCE(plan_agent.name, ''))=LOWER(?3)
+                         OR LOWER(COALESCE(session_agent.name, ''))=LOWER(?3)
+                       )
+                       AND (p.workspace_id=?4 OR p.workspace_id IS NULL OR p.workspace_id='')
+                     ORDER BY p.updated_at DESC LIMIT 25",
+                &[&pane_id, &fresh_pty_prefix, &agent_id, &workspace_id],
+            )
+        } else {
+            self.query_json(
+                "SELECT p.*
+                     FROM terminal_todo_plans p
+                     LEFT JOIN agent_sessions s ON s.id=p.session_id
+                     LEFT JOIN agents session_agent ON session_agent.id=s.agent_id
+                     LEFT JOIN agents plan_agent ON plan_agent.id=p.agent_id
+                     WHERE (s.pty_id=?1 OR s.pty_id LIKE ?2)
+                       AND (
+                            ?3=''
+                         OR p.agent_id=?3
+                         OR s.agent_id=?3
+                         OR LOWER(COALESCE(plan_agent.kind, ''))=LOWER(?3)
+                         OR LOWER(COALESCE(session_agent.kind, ''))=LOWER(?3)
+                         OR LOWER(COALESCE(plan_agent.name, ''))=LOWER(?3)
+                         OR LOWER(COALESCE(session_agent.name, ''))=LOWER(?3)
+                       )
+                     ORDER BY p.updated_at DESC LIMIT 25",
+                &[&pane_id, &fresh_pty_prefix, &agent_id],
+            )
+        }
     }
 
     fn terminal_todo_plan_compact_for_plan_ref(
@@ -28226,7 +28306,7 @@ mod tests {
             .contains_key("task_id"));
 
         let snapshot = kernel
-            .terminal_todo_plan_snapshot(None, None, Some("codex"), Some("workspace-test"))
+            .terminal_todo_plan_snapshot(None, None, Some("codex"), Some("workspace-test"), None)
             .unwrap();
         assert_eq!(
             snapshot["data"]["selected_plan"]["plan_id"].as_str(),
@@ -28314,7 +28394,7 @@ mod tests {
 
         // Session-targeted snapshot resolves the newest native plan.
         let snapshot = kernel
-            .terminal_todo_plan_snapshot(None, Some("session-native"), None, None)
+            .terminal_todo_plan_snapshot(None, Some("session-native"), None, None, None)
             .unwrap();
         assert_eq!(
             snapshot["data"]["selected_plan"]["plan_id"].as_str(),
@@ -28617,7 +28697,13 @@ mod tests {
         let restarted_session_id = restarted_session["id"].as_str().unwrap();
 
         let snapshot = kernel
-            .terminal_todo_plan_snapshot(None, Some(restarted_session_id), Some("codex"), None)
+            .terminal_todo_plan_snapshot(
+                None,
+                Some(restarted_session_id),
+                Some("codex"),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(
             snapshot["data"]["history_scope"].as_str(),
@@ -28630,6 +28716,58 @@ mod tests {
         assert_eq!(
             snapshot["data"]["selected_plan"]["status"].as_str(),
             Some("completed")
+        );
+    }
+
+    #[test]
+    fn terminal_todo_plan_snapshot_uses_pane_lineage_without_session_id() {
+        let repo = init_git_repo("terminal_plan_pane_lineage");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel
+            .create_or_get_agent("Claude", "claude", None)
+            .unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let pane_id = "workspace-terminal-test-2-claude";
+
+        let first_session = kernel
+            .create_session_for_slot_key(
+                "3",
+                "Claude 3",
+                "claude",
+                None,
+                None,
+                Some(pane_id),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let first_session_id = first_session["id"].as_str().unwrap().to_string();
+        let task = kernel
+            .create_task("Pane lineage plan", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let plan_id = seed_terminal_todo_plan_for_test(
+            &kernel,
+            task_id,
+            Some(agent_id),
+            Some(&first_session_id),
+            "Pane lineage plan",
+            &["Inspect", "Patch"],
+            0,
+        );
+
+        let snapshot = kernel
+            .terminal_todo_plan_snapshot(None, None, Some("claude"), None, Some(pane_id))
+            .unwrap();
+
+        assert_eq!(
+            snapshot["data"]["history_scope"].as_str(),
+            Some("terminal_lineage")
+        );
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["plan_id"].as_str(),
+            Some(plan_id.as_str())
         );
     }
 

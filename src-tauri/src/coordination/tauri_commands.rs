@@ -469,6 +469,11 @@ pub fn coordination_terminal_todo_plan_snapshot(
     let agent_id = input["agent_id"]
         .as_str()
         .or_else(|| input["agentId"].as_str());
+    let pane_id = input["pane_id"]
+        .as_str()
+        .or_else(|| input["paneId"].as_str())
+        .or_else(|| input["terminal_id"].as_str())
+        .or_else(|| input["terminalId"].as_str());
     let workspace_id = input["workspace_id"]
         .as_str()
         .or_else(|| input["workspaceId"].as_str());
@@ -491,6 +496,7 @@ pub fn coordination_terminal_todo_plan_snapshot(
             session_id,
             agent_id,
             workspace_id,
+            pane_id,
         ));
     }
 
@@ -499,6 +505,7 @@ pub fn coordination_terminal_todo_plan_snapshot(
         session_id,
         agent_id,
         workspace_id,
+        pane_id,
     ))
 }
 
