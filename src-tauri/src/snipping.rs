@@ -7,6 +7,7 @@ use image::ImageFormat as SnippingImageFormat;
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
 const SNIPPING_PERMISSION_ATTENTION_EVENT: &str = "forge-snipping-permission-attention";
+const SNIPPING_CAPTURE_ATTENTION_EVENT: &str = "forge-snipping-capture-attention";
 const SNIPPING_SOURCE_UPDATED_EVENT: &str = "forge-snip-source-updated";
 const SNIPPING_CLOUD_UPLOAD_EVENT: &str = "forge-snip-cloud-upload";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
@@ -28,11 +29,17 @@ const SNIPPING_DESKTOP_ICONS_MARKER_FILE: &str = "snipping-desktop-icons-hidden.
 /// so captures never double-hide and never touch a user's own icons-off setup.
 static SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP: AtomicBool = AtomicBool::new(false);
 static SNIPPING_AREA_BEGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static SNIPPING_AREA_BEGIN_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static SNIPPING_AREA_BEGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_CURSOR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS: AtomicU64 = AtomicU64::new(0);
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_SCAP_CAPTURE_FPS: u32 = 60;
 const SNIPPING_SCAP_WARM_CAPTURE_FPS: u32 = 30;
+const SNIPPING_SCAP_CAPTURE_TIMEOUT_MS: u64 = 4_500;
+const SNIPPING_SCAP_TARGET_SIZE_TIMEOUT_MS: u64 = 1_200;
+const SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS: u64 = 5_500;
+const SNIPPING_AREA_BEGIN_STALE_MS: u64 = SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS + 3_000;
 const SNIPPING_STARTUP_PREWARM_ENABLED: bool = false;
 const SNIPPING_WARM_CAPTURE_ENABLED: bool = false;
 const SNIPPING_RECORDING_FPS: u32 = 30;
@@ -487,6 +494,11 @@ struct SnippingState {
     /// Preview window label -> asset path currently shown in that window
     /// (retargeted when an annotated copy takes over the preview).
     preview_paths: Arc<StdMutex<HashMap<String, String>>>,
+    /// Old snip path -> promoted tracked asset path. The recent strip may
+    /// still ask to open the source path after promotion; aliases keep that
+    /// request attached to the already-awake preview instead of spawning a
+    /// duplicate.
+    preview_path_aliases: Arc<StdMutex<HashMap<String, String>>>,
     /// Preview window label -> outer position when the user grabbed it.
     /// Presence marks an in-flight user drag; the start position separates
     /// real drags from plain clicks when the drag settles.
@@ -558,6 +570,7 @@ impl SnippingState {
             preview_restack_deadline_ms: Arc::new(AtomicU64::new(0)),
             preview_restack_watcher_active: Arc::new(AtomicBool::new(false)),
             preview_paths: Arc::new(StdMutex::new(HashMap::new())),
+            preview_path_aliases: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
             preview_detached_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_post_release_settling_labels: Arc::new(StdMutex::new(HashSet::new())),
@@ -895,6 +908,7 @@ struct SnippingAreaCursorLogRequest {
 #[serde(rename_all = "camelCase")]
 struct SnippingUploadAssetRequest {
     path: String,
+    asset_id: Option<String>,
     name: Option<String>,
     group: Option<String>,
 }
@@ -1604,6 +1618,38 @@ fn emit_snipping_permission_attention(
     );
 }
 
+fn emit_snipping_capture_attention(app: &AppHandle, reason: &str, shortcut: &str, error: &str) {
+    if !snipping_reason_is_hotkey(reason) {
+        return;
+    }
+
+    focus_main_window_for_snipping_permission(app);
+    emit_snipping_shortcuts_changed(app);
+    let _ = app.emit_to(
+        "main",
+        SNIPPING_CAPTURE_ATTENTION_EVENT,
+        json!({
+            "id": current_time_ms(),
+            "reason": reason,
+            "shortcut": shortcut,
+            "message": error,
+        }),
+    );
+}
+
+fn emit_snipping_hotkey_failure_attention(
+    app: &AppHandle,
+    reason: &str,
+    shortcut: &str,
+    error: &str,
+) {
+    if snipping_error_is_screen_capture_permission(error) {
+        emit_snipping_permission_attention(app, reason, shortcut, error);
+    } else {
+        emit_snipping_capture_attention(app, reason, shortcut, error);
+    }
+}
+
 fn register_snipping_shortcut_handler(
     app: &AppHandle,
     action: SnippingShortcutAction,
@@ -1622,24 +1668,49 @@ fn register_snipping_shortcut_handler(
             match action {
                 SnippingShortcutAction::FullScreenshot => {
                     thread::spawn(move || {
-                        let _ = snipping_capture_full_for(&app_handle, "shortcut", shortcut_text);
+                        let result =
+                            snipping_capture_full_for(&app_handle, "shortcut", shortcut_text.clone());
+                        if let Err(error) = result {
+                            emit_snipping_hotkey_failure_attention(
+                                &app_handle,
+                                "shortcut",
+                                &shortcut_text,
+                                &error,
+                            );
+                        }
                     });
                 }
                 SnippingShortcutAction::AreaSnip => {
                     // Capture + overlay prep must never block the shortcut
                     // dispatch thread, or the overlay appears with a visible lag.
                     thread::spawn(move || {
-                        let _ =
-                            snipping_begin_area_snip_for(&app_handle, "shortcut", shortcut_text);
+                        let result =
+                            snipping_begin_area_snip_for(&app_handle, "shortcut", shortcut_text.clone());
+                        if let Err(error) = result {
+                            emit_snipping_hotkey_failure_attention(
+                                &app_handle,
+                                "shortcut",
+                                &shortcut_text,
+                                &error,
+                            );
+                        }
                     });
                 }
                 SnippingShortcutAction::AreaRecording => {
                     thread::spawn(move || {
-                        let _ = snipping_toggle_area_recording_shortcut_for(
+                        let result = snipping_toggle_area_recording_shortcut_for(
                             &app_handle,
                             "shortcut",
-                            shortcut_text,
+                            shortcut_text.clone(),
                         );
+                        if let Err(error) = result {
+                            emit_snipping_hotkey_failure_attention(
+                                &app_handle,
+                                "shortcut",
+                                &shortcut_text,
+                                &error,
+                            );
+                        }
                     });
                 }
             }
@@ -1783,21 +1854,22 @@ extern "C" fn snipping_macos_event_tap_callback(
     }
 
     thread::spawn(move || {
+        let shortcut_text = action.default_shortcut();
         let result = match action {
             SnippingShortcutAction::FullScreenshot => snipping_capture_full_for(
                 &app,
                 "macos-default-override",
-                SnippingShortcutAction::FullScreenshot.default_shortcut(),
+                shortcut_text.clone(),
             ),
             SnippingShortcutAction::AreaSnip => snipping_begin_area_snip_for(
                 &app,
                 "macos-default-override",
-                SnippingShortcutAction::AreaSnip.default_shortcut(),
+                shortcut_text.clone(),
             ),
             SnippingShortcutAction::AreaRecording => snipping_toggle_area_recording_shortcut_for(
                 &app,
                 "macos-default-override",
-                SnippingShortcutAction::AreaRecording.default_shortcut(),
+                shortcut_text.clone(),
             ),
         };
         if let Err(error) = result {
@@ -1807,6 +1879,12 @@ extern "C" fn snipping_macos_event_tap_callback(
                     "action": action.label(),
                     "error": error,
                 }),
+            );
+            emit_snipping_hotkey_failure_attention(
+                &app,
+                "macos-default-override",
+                &shortcut_text,
+                &error,
             );
         }
     });
@@ -2603,7 +2681,13 @@ fn snipping_stop_warm_capture(app: &AppHandle) {
 }
 
 fn snipping_scap_display_targets() -> Vec<scap::Target> {
-    std::panic::catch_unwind(scap::get_all_targets)
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let targets = std::panic::catch_unwind(scap::get_all_targets).unwrap_or_default();
+        let _ = sender.send(targets);
+    });
+    receiver
+        .recv_timeout(Duration::from_millis(SNIPPING_SCAP_TARGET_SIZE_TIMEOUT_MS))
         .unwrap_or_default()
         .into_iter()
         .filter(|target| matches!(target, scap::Target::Display(_)))
@@ -2612,9 +2696,17 @@ fn snipping_scap_display_targets() -> Vec<scap::Target> {
 
 #[cfg(not(target_os = "linux"))]
 fn snipping_scap_main_display_target() -> Option<scap::Target> {
-    std::panic::catch_unwind(scap::get_main_display)
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let target = std::panic::catch_unwind(scap::get_main_display)
+            .ok()
+            .map(scap::Target::Display);
+        let _ = sender.send(target);
+    });
+    receiver
+        .recv_timeout(Duration::from_millis(SNIPPING_SCAP_TARGET_SIZE_TIMEOUT_MS))
         .ok()
-        .map(scap::Target::Display)
+        .flatten()
 }
 
 #[cfg(target_os = "linux")]
@@ -2623,21 +2715,33 @@ fn snipping_scap_main_display_target() -> Option<scap::Target> {
 }
 
 fn snipping_scap_display_target_output_size(target: &scap::Target) -> Option<(u32, u32)> {
-    let options = scap::capturer::Options {
-        fps: SNIPPING_SCAP_CAPTURE_FPS,
-        show_cursor: false,
-        show_highlight: false,
-        target: Some(target.clone()),
-        crop_area: None,
-        output_type: scap::frame::FrameType::BGRAFrame,
-        output_resolution: scap::capturer::Resolution::Captured,
-        excluded_targets: None,
-        captures_audio: false,
-        exclude_current_process_audio: true,
-    };
-    let [width, height] =
-        std::panic::catch_unwind(|| scap::capturer::get_output_frame_size(&options)).ok()?;
-    (width > 0 && height > 0).then_some((width, height))
+    let target = target.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let options = scap::capturer::Options {
+            fps: SNIPPING_SCAP_CAPTURE_FPS,
+            show_cursor: false,
+            show_highlight: false,
+            target: Some(target),
+            crop_area: None,
+            output_type: scap::frame::FrameType::BGRAFrame,
+            output_resolution: scap::capturer::Resolution::Captured,
+            excluded_targets: None,
+            captures_audio: false,
+            exclude_current_process_audio: true,
+        };
+        let result = std::panic::catch_unwind(|| {
+            let [width, height] = scap::capturer::get_output_frame_size(&options);
+            (width > 0 && height > 0).then_some((width, height))
+        })
+        .ok()
+        .flatten();
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(Duration::from_millis(SNIPPING_SCAP_TARGET_SIZE_TIMEOUT_MS))
+        .ok()
+        .flatten()
 }
 
 fn snipping_scap_display_target_for_area_monitor(
@@ -2737,31 +2841,7 @@ fn snipping_prewarm_capture_session_blocking() -> bool {
     // Prefer a concrete display target like the real capture paths do; fall back
     // to the scap default if enumeration comes up empty.
     let target = snipping_scap_display_targets().into_iter().next();
-    let options = scap::capturer::Options {
-        fps: 1,
-        show_cursor: false,
-        show_highlight: false,
-        target,
-        crop_area: None,
-        output_type: scap::frame::FrameType::BGRAFrame,
-        output_resolution: scap::capturer::Resolution::Captured,
-        excluded_targets: None,
-        captures_audio: false,
-        exclude_current_process_audio: true,
-    };
-    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scap::capturer::Capturer::build(options)
-    }));
-    let Ok(Ok(mut capturer)) = built else {
-        return false;
-    };
-    let established = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        capturer.start_capture();
-        // Pull a single frame so the OS fully establishes the session, then stop.
-        let _ = capturer.get_next_frame();
-        capturer.stop_capture();
-    }))
-    .is_ok();
+    let established = snipping_scap_capture_image(target, None, "prewarming screen capture").is_ok();
     if established {
         snipping_mark_screen_capture_confirmed();
     }
@@ -3089,10 +3169,26 @@ fn snipping_scap_capture_image(
     crop_area: Option<scap::capturer::Area>,
     context: &str,
 ) -> Result<image::RgbaImage, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        snipping_scap_capture_image_inner(target, crop_area)
-    }))
-    .map_err(|_| format!("Screen capture backend panicked while {context}."))?
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let context_for_worker = context.to_string();
+    thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            snipping_scap_capture_image_inner(target, crop_area)
+        }))
+        .map_err(|_| format!("Screen capture backend panicked while {context_for_worker}."))
+        .and_then(|result| result);
+        let _ = sender.send(result);
+    });
+
+    match receiver.recv_timeout(Duration::from_millis(SNIPPING_SCAP_CAPTURE_TIMEOUT_MS)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "Timed out while {context}. Try the snip again; if it keeps happening, reopen Screen Recording permission for Diff Forge AI."
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("Screen capture backend stopped while {context}."))
+        }
+    }
 }
 
 /// Full-monitor capture for snips. Tauri supplies monitor geometry; scap
@@ -5176,10 +5272,7 @@ fn snipping_capture_full_for(
     snipping_restore_desktop_icons_after_capture(app);
     let image = match image_result {
         Ok(image) => image,
-        Err(error) => {
-            emit_snipping_permission_attention(app, reason, &shortcut, &error);
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     snipping_save_image(app, image, "full", reason, shortcut)
 }
@@ -6172,19 +6265,80 @@ fn snipping_area_session_active(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-struct SnippingAreaBeginGuard;
+struct SnippingAreaBeginGuard {
+    generation: u64,
+}
 
-impl Drop for SnippingAreaBeginGuard {
-    fn drop(&mut self) {
-        SNIPPING_AREA_BEGIN_IN_FLIGHT.store(false, Ordering::Release);
+impl SnippingAreaBeginGuard {
+    fn is_current(&self) -> bool {
+        SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire)
+            && SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire) == self.generation
     }
 }
 
+impl Drop for SnippingAreaBeginGuard {
+    fn drop(&mut self) {
+        if SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire) == self.generation {
+            SNIPPING_AREA_BEGIN_STARTED_AT_MS.store(0, Ordering::Release);
+            SNIPPING_AREA_BEGIN_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn snipping_area_begin_age_ms(now_ms: u64) -> Option<u64> {
+    if !SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire) {
+        return None;
+    }
+    let started_at = SNIPPING_AREA_BEGIN_STARTED_AT_MS.load(Ordering::Acquire);
+    if started_at == 0 {
+        return None;
+    }
+    Some(now_ms.saturating_sub(started_at))
+}
+
+fn snipping_clear_stale_area_begin_if_needed(
+    app: &AppHandle,
+    reason: &str,
+    shortcut: &str,
+) -> bool {
+    let now = current_time_ms();
+    let Some(age_ms) = snipping_area_begin_age_ms(now) else {
+        return false;
+    };
+    if age_ms < SNIPPING_AREA_BEGIN_STALE_MS || snipping_area_session_active(app) {
+        return false;
+    }
+    if SNIPPING_AREA_BEGIN_IN_FLIGHT
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    SNIPPING_AREA_BEGIN_STARTED_AT_MS.store(0, Ordering::Release);
+    log_snipping_area_cursor_debug_event(
+        "native.begin_stale_cleared",
+        json!({
+            "reason": reason,
+            "shortcut": shortcut,
+            "age_ms": age_ms,
+            "stale_after_ms": SNIPPING_AREA_BEGIN_STALE_MS,
+            "cursor_position": snipping_app_cursor_position_debug_value(app),
+        }),
+    );
+    true
+}
+
 fn snipping_try_begin_area_snip() -> Option<SnippingAreaBeginGuard> {
-    SNIPPING_AREA_BEGIN_IN_FLIGHT
+    if SNIPPING_AREA_BEGIN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .ok()
-        .map(|_| SnippingAreaBeginGuard)
+        .is_err()
+    {
+        return None;
+    }
+
+    let generation = SNIPPING_AREA_BEGIN_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    SNIPPING_AREA_BEGIN_STARTED_AT_MS.store(current_time_ms(), Ordering::Release);
+    Some(SnippingAreaBeginGuard { generation })
 }
 
 fn snipping_area_already_active_payload(reason: &str, shortcut: String) -> Value {
@@ -6294,6 +6448,7 @@ fn snipping_begin_area_for(
             "cursor_position": snipping_app_cursor_position_debug_value(app),
             "area_session_active": snipping_area_session_active(app),
             "begin_in_flight": SNIPPING_AREA_BEGIN_IN_FLIGHT.load(Ordering::Acquire),
+            "begin_in_flight_age_ms": snipping_area_begin_age_ms(current_time_ms()),
         }),
     );
     ensure_snipping_enabled(app)?;
@@ -6308,12 +6463,14 @@ fn snipping_begin_area_for(
         );
         return Ok(snipping_area_already_active_payload(reason, shortcut));
     }
-    let Some(_begin_guard) = snipping_try_begin_area_snip() else {
+    snipping_clear_stale_area_begin_if_needed(app, reason, &shortcut);
+    let Some(begin_guard) = snipping_try_begin_area_snip() else {
         log_snipping_area_cursor_debug_event(
             "native.begin_in_flight",
             json!({
                 "reason": reason,
                 "shortcut": &shortcut,
+                "age_ms": snipping_area_begin_age_ms(current_time_ms()),
                 "cursor_position": snipping_app_cursor_position_debug_value(app),
             }),
         );
@@ -6350,25 +6507,59 @@ fn snipping_begin_area_for(
     // latency is the slowest single display, same as one display before.
     let exclude_desktop_icons = snipping_should_hide_desktop_icons(app);
     snipping_hide_desktop_icons_for_capture(app);
-    let mut capture_handles = Vec::new();
+    let capture_count = monitors.len();
+    let (capture_sender, capture_receiver) = std::sync::mpsc::channel();
     for (index, monitor) in monitors.into_iter().enumerate() {
         let app_for_capture = app.clone();
-        capture_handles.push(thread::spawn(
-            move || -> (usize, SnippingAreaMonitor, Result<image::RgbaImage, String>) {
-                let result =
-                    snipping_capture_monitor_full_image(&app_for_capture, &monitor, exclude_desktop_icons);
-                (index, monitor, result)
-            },
-        ));
+        let capture_sender = capture_sender.clone();
+        thread::spawn(move || {
+            let result =
+                snipping_capture_monitor_full_image(&app_for_capture, &monitor, exclude_desktop_icons);
+            let _ = capture_sender.send((index, monitor, result));
+        });
     }
+    drop(capture_sender);
 
     let mut sessions = HashMap::new();
     let mut ordered: Vec<(String, SnippingAreaMonitor, Arc<image::RgbaImage>)> = Vec::new();
+    let mut captured: Vec<(usize, String, SnippingAreaMonitor, Arc<image::RgbaImage>)> = Vec::new();
     let mut first_error: Option<String> = None;
-    for handle in capture_handles {
-        let Ok((index, mut monitor, result)) = handle.join() else {
-            continue;
+    let capture_started_at = Instant::now();
+    let capture_deadline = Duration::from_millis(SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS);
+    let mut received_count = 0usize;
+    while received_count < capture_count {
+        let elapsed = capture_started_at.elapsed();
+        if elapsed >= capture_deadline {
+            if first_error.is_none() {
+                first_error = Some(format!(
+                    "Timed out preparing snip overlays after {}ms.",
+                    SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS
+                ));
+            }
+            log_snipping_area_cursor_debug_event(
+                "native.begin_capture_timeout",
+                json!({
+                    "reason": reason,
+                    "shortcut": &shortcut,
+                    "monitor_count": capture_count,
+                    "received_count": received_count,
+                    "timeout_ms": SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS,
+                    "cursor_position": snipping_app_cursor_position_debug_value(app),
+                }),
+            );
+            break;
+        }
+
+        let wait_for = capture_deadline
+            .checked_sub(elapsed)
+            .unwrap_or_else(|| Duration::from_millis(0));
+        let Ok((index, mut monitor, result)) = capture_receiver.recv_timeout(wait_for) else {
+            if first_error.is_none() {
+                first_error = Some("Timed out preparing snip overlays.".to_string());
+            }
+            break;
         };
+        received_count += 1;
         match result {
             Ok(image) => {
                 let image = Arc::new(image);
@@ -6384,7 +6575,7 @@ fn snipping_begin_area_for(
                         snapshot: Some(Arc::clone(&image)),
                     },
                 );
-                ordered.push((label, monitor, image));
+                captured.push((index, label, monitor, image));
             }
             Err(error) => {
                 // A display that cannot be captured (mirroring quirks, ...)
@@ -6394,6 +6585,25 @@ fn snipping_begin_area_for(
                 }
             }
         }
+    }
+    captured.sort_by_key(|(index, _, _, _)| *index);
+    ordered.extend(
+        captured
+            .into_iter()
+            .map(|(_, label, monitor, image)| (label, monitor, image)),
+    );
+
+    if !begin_guard.is_current() {
+        log_snipping_area_cursor_debug_event(
+            "native.begin_replaced",
+            json!({
+                "reason": reason,
+                "shortcut": &shortcut,
+                "cursor_position": snipping_app_cursor_position_debug_value(app),
+            }),
+        );
+        snipping_restore_desktop_icons_after_capture(app);
+        return Err("A newer snip attempt replaced this startup.".to_string());
     }
 
     if ordered.is_empty() {
@@ -6408,7 +6618,6 @@ fn snipping_begin_area_for(
         snipping_restore_desktop_icons_after_capture(app);
         let error = first_error
             .unwrap_or_else(|| "Unable to capture screen for area snip.".to_string());
-        emit_snipping_permission_attention(app, reason, &shortcut, &error);
         return Err(error);
     }
 
@@ -7283,26 +7492,12 @@ async fn snipping_delete_uploaded_asset_from_cloud(
     }))
 }
 
-/// Full snip share chain for the preview/strip upload button: promote the
-/// untracked snip into the tracked library, upload it to the cloud, and —
-/// when the snip upload-public setting is on — publish a public link so the
-/// button can flip straight to "Copy URL". With the setting off the upload
-/// stays private and the button flips to "Make public" instead. Assets are
-/// account-level, so the whole chain runs in the fixed account scope with no
-/// workspace selection. Every step is idempotent (deterministic asset id,
-/// prepare-upload dedupe, publish returns the existing link), so retrying
-/// after a mid-chain failure is safe.
-#[tauri::command]
-async fn snipping_upload_untracked_asset_to_cloud(
-    app: AppHandle,
-    request: SnippingUploadAssetRequest,
+async fn snipping_upload_known_asset_to_cloud(
+    app: &AppHandle,
+    asset_id: String,
+    local_path: String,
+    source_path: String,
 ) -> Result<Value, String> {
-    let requested_path = request.path.clone();
-    let promoted = snipping_upload_untracked_asset_for(&app, request)?;
-    let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId"])
-        .ok_or_else(|| "Snip was tracked, but no asset id was returned.".to_string())?;
-    let local_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
-        .unwrap_or_else(|| requested_path.clone());
     let _ = app.emit(
         SNIPPING_CLOUD_UPLOAD_EVENT,
         json!({
@@ -7311,9 +7506,9 @@ async fn snipping_upload_untracked_asset_to_cloud(
             "asset_id": asset_id.clone(),
             "assetId": asset_id.clone(),
             "local_path": local_path.clone(),
-            "localPath": local_path,
-            "source_path": requested_path.clone(),
-            "sourcePath": requested_path.clone(),
+            "localPath": local_path.clone(),
+            "source_path": source_path.clone(),
+            "sourcePath": source_path.clone(),
         }),
     );
 
@@ -7330,9 +7525,11 @@ async fn snipping_upload_untracked_asset_to_cloud(
                 "kind": "snip_cloud_upload_failed",
                 "status": "failed",
                 "asset_id": asset_id.clone(),
-                "assetId": asset_id,
-                "source_path": requested_path.clone(),
-                "sourcePath": requested_path.clone(),
+                "assetId": asset_id.clone(),
+                "local_path": local_path.clone(),
+                "localPath": local_path,
+                "source_path": source_path.clone(),
+                "sourcePath": source_path,
                 "error": error.clone(),
             }),
         );
@@ -7346,29 +7543,76 @@ async fn snipping_upload_untracked_asset_to_cloud(
             "status": "completed",
             "asset_id": asset_id.clone(),
             "assetId": asset_id.clone(),
-            "source_path": requested_path.clone(),
-            "sourcePath": requested_path.clone(),
+            "local_path": local_path.clone(),
+            "localPath": local_path.clone(),
+            "source_path": source_path.clone(),
+            "sourcePath": source_path,
         }),
     );
 
-    if !snipping_upload_public_enabled(&app) {
+    if !snipping_upload_public_enabled(app) {
         return Ok(json!({
             "kind": "snip_uploaded_to_cloud",
             "asset_id": asset_id.clone(),
             "assetId": asset_id,
+            "local_path": local_path.clone(),
+            "localPath": local_path,
             "published": false,
         }));
     }
 
-    let public_url = snipping_publish_uploaded_asset_to_cloud(&app, asset_id.clone()).await?;
+    let public_url = snipping_publish_uploaded_asset_to_cloud(app, asset_id.clone()).await?;
     Ok(json!({
         "kind": "snip_uploaded_to_cloud",
         "asset_id": asset_id.clone(),
         "assetId": asset_id,
+        "local_path": local_path.clone(),
+        "localPath": local_path,
         "published": true,
         "public_url": public_url.clone(),
         "publicUrl": public_url,
     }))
+}
+
+/// Full snip share chain for the preview/strip upload button: promote the
+/// untracked snip into the tracked library, upload it to the cloud, and —
+/// when the snip upload-public setting is on — publish a public link so the
+/// button can flip straight to "Copy URL". With the setting off the upload
+/// stays private and the button flips to "Make public" instead. Assets are
+/// account-level, so the whole chain runs in the fixed account scope with no
+/// workspace selection. Every step is idempotent (deterministic asset id,
+/// prepare-upload dedupe, publish returns the existing link), so retrying
+/// after a mid-chain failure is safe.
+#[tauri::command]
+async fn snipping_upload_untracked_asset_to_cloud(
+    app: AppHandle,
+    request: SnippingUploadAssetRequest,
+) -> Result<Value, String> {
+    let requested_path = request.path.clone();
+    if let Some(asset_id) = request
+        .asset_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    {
+        let local_path = snipping_preview_current_path_string(&app, &requested_path)
+            .unwrap_or_else(|_| requested_path.clone());
+        return snipping_upload_known_asset_to_cloud(
+            &app,
+            asset_id,
+            local_path,
+            requested_path,
+        )
+        .await;
+    }
+
+    let promoted = snipping_upload_untracked_asset_for(&app, request)?;
+    let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId"])
+        .ok_or_else(|| "Snip was tracked, but no asset id was returned.".to_string())?;
+    let local_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+        .unwrap_or_else(|| requested_path.clone());
+    snipping_upload_known_asset_to_cloud(&app, asset_id, local_path, requested_path).await
 }
 
 #[tauri::command]
@@ -9181,7 +9425,8 @@ fn snipping_open_snip_preview_window_for_with_size(
     focused: bool,
     initial_size: Option<(f64, f64)>,
 ) -> Result<Value, String> {
-    let file = diffforge_local_asset_file(path)?;
+    let resolved_path = snipping_preview_current_path_string(app, path)?;
+    let file = diffforge_local_asset_file(&resolved_path)?;
     let (width, height) =
         initial_size.unwrap_or((SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT));
     let path_string = file.display().to_string();
@@ -10258,12 +10503,109 @@ fn snipping_open_snip_float_for_drag(
     Ok(opened)
 }
 
+fn snipping_preview_alias_target(app: &AppHandle, path: &str) -> Option<String> {
+    let requested = path.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    let state = app.state::<SnippingState>();
+    let aliases = state.preview_path_aliases.lock().ok()?;
+    if let Some(target) = aliases.get(requested) {
+        return Some(target.clone());
+    }
+    let canonical = diffforge_local_asset_file(requested)
+        .ok()
+        .map(|file| file.display().to_string())?;
+    aliases.get(&canonical).cloned()
+}
+
+fn snipping_preview_current_path_string(app: &AppHandle, path: &str) -> Result<String, String> {
+    if let Some(target) = snipping_preview_alias_target(app, path) {
+        return Ok(diffforge_local_asset_file(&target)?.display().to_string());
+    }
+    Ok(diffforge_local_asset_file(path)?.display().to_string())
+}
+
+fn snipping_handle_promoted_untracked_asset(
+    app: &AppHandle,
+    source_path: &str,
+    target_path: &str,
+    asset_id: &str,
+    asset: &Value,
+    source_removed: bool,
+) {
+    let source_path = source_path.trim().to_string();
+    let target_path = target_path.trim().to_string();
+    if source_path.is_empty() || target_path.is_empty() {
+        return;
+    }
+
+    let state = app.state::<SnippingState>();
+    if let Ok(mut aliases) = state.preview_path_aliases.lock() {
+        aliases.insert(source_path.clone(), target_path.clone());
+    }
+
+    let closing_labels = snipping_preview_closing_labels(app);
+    if let Ok(mut paths) = state.preview_paths.lock() {
+        let mut retargeted = false;
+        for (label, open_path) in paths.iter_mut() {
+            if open_path == &source_path && !closing_labels.contains(label) {
+                *open_path = target_path.clone();
+                retargeted = true;
+            }
+        }
+        let preview_label = format!(
+            "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+            snipping_window_token(Path::new(&source_path))
+        );
+        if !retargeted
+            && !closing_labels.contains(&preview_label)
+            && app.get_webview_window(&preview_label).is_some()
+        {
+            paths.insert(preview_label, target_path.clone());
+        }
+    }
+
+    if let Ok(mut editors) = state.editor_paths.lock() {
+        for open_paths in editors.values_mut() {
+            if open_paths.iter().any(|open_path| open_path == &source_path)
+                && !open_paths.iter().any(|open_path| open_path == &target_path)
+            {
+                open_paths.push(target_path.clone());
+            }
+        }
+    }
+
+    let _ = app.emit(
+        SNIPPING_SOURCE_UPDATED_EVENT,
+        json!({
+            "kind": "snip_asset_promoted",
+            "asset_id": asset_id,
+            "assetId": asset_id,
+            "asset": asset,
+            "original_path": source_path,
+            "originalPath": source_path,
+            "source_path": source_path,
+            "sourcePath": source_path,
+            "edited_path": target_path,
+            "editedPath": target_path,
+            "local_path": target_path,
+            "localPath": target_path,
+            "path": target_path,
+            "source_removed": source_removed,
+            "sourceRemoved": source_removed,
+            "in_place": false,
+            "inPlace": false,
+        }),
+    );
+    snipping_emit_floats_changed(app);
+}
+
 /// Every preview window label currently showing this snip. The path registry is
 /// authoritative because pooled windows are retargeted and direct labels include
 /// a random token that cannot be reconstructed later.
 fn snipping_float_labels_for_path(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
-    let file = diffforge_local_asset_file(path)?;
-    let path_string = file.display().to_string();
+    let path_string = snipping_preview_current_path_string(app, path)?;
     let mut labels = Vec::new();
     if let Ok(paths) = app.state::<SnippingState>().preview_paths.lock() {
         for (label, open_path) in paths.iter() {

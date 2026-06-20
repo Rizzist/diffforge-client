@@ -186,6 +186,23 @@ const buildFlameFragmentSource = (quality) => `
     return smoothstep(0.22 + rnd * 0.12, 0.0, d) * blink;
   }
 
+  float flareEmber(vec2 uv, float t, float seed) {
+    float cycle = t * (0.42 + hash(vec2(seed, 2.7)) * 0.14) + seed;
+    float id = floor(cycle);
+    float life = fract(cycle);
+    float angle = hash(vec2(id, seed + 3.0)) * 6.2831853;
+    float x = mix(0.12, 0.88, hash(vec2(id + seed, 7.1)));
+    float y = mix(0.06, 0.74, life);
+    x += sin(life * 5.4 + angle) * 0.045;
+
+    vec2 delta = vec2((uv.x - x) * 1.7, uv.y - y);
+    float d = length(delta);
+    float core = 1.0 - smoothstep(0.0, 0.034, d);
+    float halo = (1.0 - smoothstep(0.0, 0.08, d)) * 0.28;
+    float fade = smoothstep(0.0, 0.18, life) * (1.0 - smoothstep(0.78, 1.0, life));
+    return (core + halo) * fade;
+  }
+
   void main() {
     vec2 uv = v_uv;
     float t = u_time;
@@ -247,14 +264,17 @@ const buildFlameFragmentSource = (quality) => `
     #ifdef DETAIL
     ember += emberLayer(p, t, 13.0, 0.85, 23.0) * 0.8;
     #endif
+    float flareSpark = flareEmber(uv, t, 4.0);
     float emberMask = smoothstep(0.03, 0.15, uv.y) * (1.0 - smoothstep(0.7, 1.0, uv.y));
-    ember *= emberMask * u_sparks * (0.35 + 0.65 * flare + 0.4 * pulse);
+    ember *= emberMask * u_sparks * (0.35 + 0.4 * pulse);
+    flareSpark *= emberMask * u_sparks * (0.55 + 0.45 * flare + 0.25 * pulse);
     color += (mix(u_accent, u_core, 0.5) + 0.35) * ember;
+    color += (mix(u_accent, u_core, 0.72) + 0.45) * flareSpark;
 
     float glow = (1.0 - smoothstep(0.0, ceiling + 0.4, uv.y))
       * smoothstep(0.05, 0.4, heat) * 0.3;
 
-    float alpha = fire * (0.8 + 0.35 * turb) + glow + ember;
+    float alpha = fire * (0.8 + 0.35 * turb) + glow + ember + flareSpark;
     alpha *= u_intensity * pulse;
     // The ceiling compressor keeps fire below 0.88, so this fade only grazes
     // embers and glow instead of flattening flame tips.

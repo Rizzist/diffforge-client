@@ -39,6 +39,7 @@ export const SNIPPING_RECORDING_CONTROLS_HASH = "#/snipping-recording-controls";
 const SNIPPING_SHORTCUTS_CHANGED_EVENT = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 export const SNIPPING_PERMISSION_ATTENTION_EVENT = "forge-snipping-permission-attention";
+export const SNIPPING_CAPTURE_ATTENTION_EVENT = "forge-snipping-capture-attention";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED = true;
@@ -400,6 +401,7 @@ export default function SnippingWorkspaceView({
   untrackedLoading = false,
   onUntrackedRefresh = null,
   permissionAttentionId = 0,
+  captureAttention = null,
 }) {
   const [status, setStatus] = useState(fallbackSnippingStatus);
   const [error, setError] = useState("");
@@ -634,9 +636,20 @@ export default function SnippingWorkspaceView({
   }, [loadStatus, permissionAttentionId]);
 
   useEffect(() => {
+    const attentionId = Number(captureAttention?.id || 0);
+    if (!attentionId) return;
+
+    const message = text(captureAttention?.message, "Unable to start snipping.");
+    setError(message);
+    setActionState("idle");
+    loadStatus();
+  }, [captureAttention, loadStatus]);
+
+  useEffect(() => {
     let cancelled = false;
     let unlistenShortcuts = null;
     let unlistenCaptures = null;
+    let unlistenCaptureAttention = null;
 
     listen(SNIPPING_SHORTCUTS_CHANGED_EVENT, (event) => {
       if (!cancelled) {
@@ -663,10 +676,25 @@ export default function SnippingWorkspaceView({
       }
     }).catch(() => {});
 
+    listen(SNIPPING_CAPTURE_ATTENTION_EVENT, (event) => {
+      if (!cancelled) {
+        const message = text(event?.payload?.message, "Unable to start snipping.");
+        setError(message);
+        setActionState("idle");
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+      } else {
+        unlistenCaptureAttention = unlisten;
+      }
+    }).catch(() => {});
+
     return () => {
       cancelled = true;
       unlistenShortcuts?.();
       unlistenCaptures?.();
+      unlistenCaptureAttention?.();
     };
   }, [onUntrackedRefresh]);
 

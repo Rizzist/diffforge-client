@@ -601,6 +601,7 @@ import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalW
 import SnippingWorkspaceView, {
   SnippingOverlayWindow,
   SnippingRecordingControlsWindow,
+  SNIPPING_CAPTURE_ATTENTION_EVENT,
   SNIPPING_OVERLAY_HASH,
   SNIPPING_PERMISSION_ATTENTION_EVENT,
   SNIPPING_RECORDING_CONTROLS_HASH,
@@ -646,6 +647,7 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
+const MAIN_WINDOW_CURSOR_EVENT = "forge-main-window-cursor";
 const SETTINGS_TAB_GENERAL = "general";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
 const SETTINGS_PERMISSION_HIGHLIGHT_MS = 4200;
@@ -9005,6 +9007,7 @@ export default function App() {
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
   const [snippingPermissionAttentionId, setSnippingPermissionAttentionId] = useState(0);
+  const [snippingCaptureAttention, setSnippingCaptureAttention] = useState(null);
   const [audioHotkeyAttention, setAudioHotkeyAttention] = useState(null);
   const [settingsTab, setSettingsTab] = useState(SETTINGS_TAB_GENERAL);
   const [settingsPermissionState, setSettingsPermissionState] = useState({
@@ -9024,6 +9027,7 @@ export default function App() {
   const [workspaceTerminalNotificationAttention, setWorkspaceTerminalNotificationAttention] = useState({});
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
+  const [workspaceRailNativeHoverKey, setWorkspaceRailNativeHoverKey] = useState("");
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
   const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState({});
   const [workspaceTerminalDisplayLayouts, setWorkspaceTerminalDisplayLayouts] = useState({});
@@ -9113,6 +9117,7 @@ export default function App() {
   const dashboardShellRef = useRef(null);
   const workspaceRailRef = useRef(null);
   const workspaceRailAnimationFrameRef = useRef(0);
+  const workspaceRailNativeHoverFrameRef = useRef(0);
   const workspaceGitPullPromptCheckRef = useRef("");
   const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
@@ -11146,6 +11151,85 @@ export default function App() {
   }, [workspaces]);
 
   useEffect(() => {
+    let cancelled = false;
+    let unlistenMainWindowCursor = null;
+
+    const clearNativeHover = () => {
+      if (workspaceRailNativeHoverFrameRef.current) {
+        window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
+        workspaceRailNativeHoverFrameRef.current = 0;
+      }
+      setWorkspaceRailNativeHoverKey("");
+    };
+
+    const scheduleNativeHoverFromPoint = (clientX, clientY) => {
+      const x = Number(clientX);
+      const y = Number(clientY);
+      if (
+        !Number.isFinite(x)
+        || !Number.isFinite(y)
+        || typeof document === "undefined"
+        || typeof document.elementFromPoint !== "function"
+      ) {
+        clearNativeHover();
+        return;
+      }
+
+      if (workspaceRailNativeHoverFrameRef.current) {
+        window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
+      }
+
+      workspaceRailNativeHoverFrameRef.current = window.requestAnimationFrame(() => {
+        workspaceRailNativeHoverFrameRef.current = 0;
+        if (cancelled) {
+          return;
+        }
+        const rail = workspaceRailRef.current;
+        if (!rail) {
+          setWorkspaceRailNativeHoverKey("");
+          return;
+        }
+
+        const target = document.elementFromPoint(x, y);
+        const row = target?.closest?.("[data-workspace-rail-row-key]");
+        const nextKey = row && rail.contains(row)
+          ? String(row.getAttribute("data-workspace-rail-row-key") || "")
+          : "";
+        setWorkspaceRailNativeHoverKey((current) => (current === nextKey ? current : nextKey));
+      });
+    };
+
+    listen(MAIN_WINDOW_CURSOR_EVENT, (event) => {
+      if (cancelled) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (payload.hovered !== true) {
+        clearNativeHover();
+        return;
+      }
+      scheduleNativeHoverFromPoint(payload.clientX ?? payload.client_x, payload.clientY ?? payload.client_y);
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenMainWindowCursor = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (typeof unlistenMainWindowCursor === "function") {
+        unlistenMainWindowCursor();
+      }
+      if (workspaceRailNativeHoverFrameRef.current) {
+        window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
+        workspaceRailNativeHoverFrameRef.current = 0;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
   }, [workspaceSettings]);
 
@@ -12138,6 +12222,40 @@ export default function App() {
       }
     };
   }, [highlightSettingsPermission, showView]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenSnippingCaptureAttention = null;
+    listen(SNIPPING_CAPTURE_ATTENTION_EVENT, (attentionEvent) => {
+      if (cancelled) {
+        return;
+      }
+      const payload = attentionEvent?.payload || {};
+      const eventId = Number(payload?.id || 0) || Date.now();
+      setSnippingCaptureAttention({
+        id: eventId,
+        message: getErrorMessage(payload?.message, "Unable to start snipping."),
+        reason: String(payload?.reason || ""),
+        shortcut: String(payload?.shortcut || ""),
+      });
+      showView("snipping", {
+        immediate: true,
+        telemetrySource: "snipping_capture_attention",
+      });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSnippingCaptureAttention = unlisten;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenSnippingCaptureAttention) {
+        unlistenSnippingCaptureAttention();
+      }
+    };
+  }, [showView]);
 
   useEffect(() => {
     let cancelled = false;
@@ -18194,9 +18312,9 @@ export default function App() {
     if (
       authState !== "authenticated"
       || !accountIsPaid
-      || !workspaceHydrationReady
+      || !workspaceListHydrated
+      || workspaceState !== "ready"
       || workspaceActivationDeferred
-      || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
     ) {
@@ -18322,11 +18440,13 @@ export default function App() {
     };
   }, [
     authState,
-    shouldShowWorkspaceSetup,
+    accountIsPaid,
     workspaceCatalogSyncKey,
     workspaceCatalogSyncTargets,
     user,
-    workspaceHydrationReady,
+    workspaceActivationDeferred,
+    workspaceListHydrated,
+    workspaceState,
     cloudLiveSyncEpoch,
     workspaceTerminalsLiveSyncRevision,
     workspaceSyncState,
@@ -27191,10 +27311,13 @@ export default function App() {
                         <>
                           {loopspaces.map((loopspace) => {
                             const selected = loopspace.id === selectedLoopspaceId;
+                            const loopspaceHoverKey = `loopspace:${loopspace.id}`;
                             return (
                               <WorkspaceRow
+                                data-native-hovered={workspaceRailNativeHoverKey === loopspaceHoverKey ? "true" : undefined}
                                 data-runtime={selected ? "activated" : "closed"}
                                 data-selected={selected}
+                                data-workspace-rail-row-key={loopspaceHoverKey}
                                 key={loopspace.id}
                               >
                                 <WorkspaceButton
@@ -27227,6 +27350,7 @@ export default function App() {
                         <>
                           {workspaces.map((workspace) => {
                             const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
+                            const workspaceHoverKey = `workspace:${workspace.id}`;
                             const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
                             const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
                             const workspaceRuntimeState = workspaceIsPendingActivation
@@ -27264,9 +27388,11 @@ export default function App() {
 
                             return (
                               <WorkspaceRow
+                                data-native-hovered={workspaceRailNativeHoverKey === workspaceHoverKey ? "true" : undefined}
                                 data-notification-highlight={workspaceNotificationHighlights[workspace.id] ? "true" : undefined}
                                 data-runtime={workspaceRuntimeState}
                                 data-selected={workspace.id === selectedWorkspaceId}
+                                data-workspace-rail-row-key={workspaceHoverKey}
                                 key={workspace.id}
                               >
                                 <WorkspaceButton
@@ -28918,6 +29044,7 @@ export default function App() {
                     untrackedLoading={untrackedAssetsLibrary.loading || untrackedAssetsLibrary.syncing}
                     onUntrackedRefresh={untrackedAssetsLibrary.refresh}
                     permissionAttentionId={snippingPermissionAttentionId}
+                    captureAttention={snippingCaptureAttention}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (

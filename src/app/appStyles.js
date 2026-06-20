@@ -2829,6 +2829,7 @@ export const WorkspaceButton = styled.button`
 
   &:hover,
   ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}[data-native-hovered="true"] &,
   ${WorkspaceRow}:focus-within & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
@@ -2867,6 +2868,7 @@ export const WorkspaceButton = styled.button`
 
     &:hover,
     ${WorkspaceRow}:hover &,
+    ${WorkspaceRow}[data-native-hovered="true"] &,
     ${WorkspaceRow}:focus-within & {
       padding-right: 34px;
     }
@@ -3032,6 +3034,7 @@ export const WorkspaceNotificationBadge = styled.span`
     top 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}[data-native-hovered="true"] &,
   ${WorkspaceRow}:focus-within & {
     right: 36px;
   }
@@ -3074,6 +3077,7 @@ export const WorkspaceNotificationBadge = styled.span`
     font-size: 9px;
 
     ${WorkspaceRow}:hover &,
+    ${WorkspaceRow}[data-native-hovered="true"] &,
     ${WorkspaceRow}:focus-within & {
       right: 36px;
     }
@@ -3128,6 +3132,7 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}[data-native-hovered="true"] &,
   ${WorkspaceRow}:focus-within & {
     opacity: 1;
     pointer-events: auto;
@@ -3136,6 +3141,7 @@ export const WorkspaceSettingsButton = styled.button`
 
   ${WorkspaceRail}[data-collapsed="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-native-hovered="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:focus-within & {
     opacity: 0;
     pointer-events: none;
@@ -3144,6 +3150,7 @@ export const WorkspaceSettingsButton = styled.button`
 
   @media (max-width: 760px) {
     ${WorkspaceRow}:hover &,
+    ${WorkspaceRow}[data-native-hovered="true"] &,
     ${WorkspaceRow}:focus-within & {
       opacity: 1;
       pointer-events: auto;
@@ -3198,6 +3205,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
   }
 
   ${WorkspaceRow}:hover &,
+  ${WorkspaceRow}[data-native-hovered="true"] &,
   ${WorkspaceRow}:focus-within & {
     opacity: 1;
     pointer-events: auto;
@@ -3206,6 +3214,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
 
   ${WorkspaceRail}[data-collapsed="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-native-hovered="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:focus-within & {
     opacity: 0;
     pointer-events: none;

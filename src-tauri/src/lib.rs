@@ -202,6 +202,9 @@ const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const TERMINAL_TODO_PLAN_UPDATED_EVENT: &str = "forge-terminal-todo-plan-updated";
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
+const MAIN_WINDOW_CURSOR_EVENT: &str = "forge-main-window-cursor";
+const MAIN_WINDOW_CURSOR_POLL_MS: u64 = 33;
+const MAIN_WINDOW_CURSOR_IDLE_POLL_MS: u64 = 250;
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_ERROR_WINDOW_LABEL: &str = "audio-widget-error";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
@@ -359,6 +362,7 @@ static AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = Onc
 static MAIN_WINDOW_RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MAIN_WINDOW_MINIMIZE_REQUESTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static MAIN_WINDOW_CURSOR_WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 const WINDOWS_APP_ICON_RESOURCE_ID: u16 = 32512;
@@ -4102,6 +4106,97 @@ fn restore_main_window(app: &AppHandle) -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
+fn main_window_apply_macos_mouse_moved_style(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("main_window_apply_mouse_moved_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &objc2_app_kit::NSWindow =
+                unsafe { &*ns_window.cast::<objc2_app_kit::NSWindow>() };
+            ns_window.setAcceptsMouseMovedEvents(true);
+        });
+    });
+}
+
+fn start_main_window_cursor_watcher(app: &AppHandle) {
+    if MAIN_WINDOW_CURSOR_WATCHER_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut last_snapshot: Option<(bool, i32, i32, bool)> = None;
+
+        loop {
+            let Some(window) = app.get_webview_window("main") else {
+                last_snapshot = None;
+                sleep(Duration::from_millis(MAIN_WINDOW_CURSOR_IDLE_POLL_MS)).await;
+                continue;
+            };
+
+            let visible = window.is_visible().unwrap_or(false);
+            let focused = window.is_focused().unwrap_or(false);
+            let cursor_snapshot = if visible {
+                app.cursor_position()
+                    .ok()
+                    .and_then(|cursor| {
+                        let position = window.outer_position().ok()?;
+                        let size = window.outer_size().ok()?;
+                        let scale = window.scale_factor().unwrap_or(1.0).max(0.1);
+                        let client_x = (cursor.x - f64::from(position.x)) / scale;
+                        let client_y = (cursor.y - f64::from(position.y)) / scale;
+                        let logical_width = f64::from(size.width.max(1)) / scale;
+                        let logical_height = f64::from(size.height.max(1)) / scale;
+                        let hovered = client_x >= 0.0
+                            && client_x <= logical_width
+                            && client_y >= 0.0
+                            && client_y <= logical_height;
+                        Some((hovered, client_x, client_y))
+                    })
+                    .unwrap_or((false, -1.0, -1.0))
+            } else {
+                (false, -1.0, -1.0)
+            };
+
+            let (hovered, client_x, client_y) = cursor_snapshot;
+            let rounded_x = if hovered { client_x.round() as i32 } else { -1 };
+            let rounded_y = if hovered { client_y.round() as i32 } else { -1 };
+            let snapshot = (hovered, rounded_x, rounded_y, focused);
+
+            if last_snapshot != Some(snapshot) {
+                let payload = if hovered {
+                    json!({
+                        "hovered": true,
+                        "focused": focused,
+                        "clientX": client_x,
+                        "clientY": client_y,
+                    })
+                } else {
+                    json!({
+                        "hovered": false,
+                        "focused": focused,
+                    })
+                };
+                let _ = window.emit(MAIN_WINDOW_CURSOR_EVENT, payload);
+                last_snapshot = Some(snapshot);
+            }
+
+            sleep(Duration::from_millis(if visible {
+                MAIN_WINDOW_CURSOR_POLL_MS
+            } else {
+                MAIN_WINDOW_CURSOR_IDLE_POLL_MS
+            }))
+            .await;
+        }
+    });
+}
+
 fn deep_link_urls_from_args(args: &[String]) -> Vec<String> {
     args.iter()
         .filter_map(|arg| {
@@ -4516,8 +4611,10 @@ pub fn run() {
             {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+                    main_window_apply_macos_mouse_moved_style(&window);
                 }
             }
+            start_main_window_cursor_watcher(app.handle());
 
             Ok(())
         })

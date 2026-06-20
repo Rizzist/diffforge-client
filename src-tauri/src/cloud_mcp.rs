@@ -2661,14 +2661,22 @@ fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
         .and_then(|payload| {
             cloud_mcp_tokenomics_response_text(payload, &["ph", "payload_hash", "payloadHash"])
         })
-        .or_else(|| cloud_mcp_tokenomics_response_text(response, &["ph", "payload_hash", "payloadHash"]))
+        .or_else(|| {
+            cloud_mcp_tokenomics_response_text(response, &["ph", "payload_hash", "payloadHash"])
+        })
         .unwrap_or_default();
     let idempotency_key = source_payload
         .and_then(|payload| {
-            cloud_mcp_tokenomics_response_text(payload, &["pid", "idempotency_key", "idempotencyKey"])
+            cloud_mcp_tokenomics_response_text(
+                payload,
+                &["pid", "idempotency_key", "idempotencyKey"],
+            )
         })
         .or_else(|| {
-            cloud_mcp_tokenomics_response_text(response, &["pid", "idempotency_key", "idempotencyKey"])
+            cloud_mcp_tokenomics_response_text(
+                response,
+                &["pid", "idempotency_key", "idempotencyKey"],
+            )
         })
         .unwrap_or_default();
     let server_cursor = cloud_mcp_tokenomics_server_cursor_from_value(response).unwrap_or_default();
@@ -3004,8 +3012,7 @@ fn cloud_mcp_tokenomics_cursor_response_has_state(value: &Value) -> bool {
 }
 
 fn cloud_mcp_tokenomics_strict_ingest_ack_response(value: &Value) -> bool {
-    let compact_contract = cloud_mcp_tokenomics_response_text(value, &["c"])
-        .as_deref()
+    let compact_contract = cloud_mcp_tokenomics_response_text(value, &["c"]).as_deref()
         == Some(CLOUD_MCP_TOKENOMICS_CONTRACT);
     let compact_mode = cloud_mcp_tokenomics_response_text(value, &["m"]).unwrap_or_default();
     if compact_contract
@@ -3107,13 +3114,21 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
         .and_then(|payload| {
             cloud_mcp_tokenomics_response_text(payload, &["ph", "payload_hash", "payloadHash"])
         })
-        .or_else(|| cloud_mcp_tokenomics_response_text(response, &["ph", "payload_hash", "payloadHash"]));
+        .or_else(|| {
+            cloud_mcp_tokenomics_response_text(response, &["ph", "payload_hash", "payloadHash"])
+        });
     let idempotency_key = source_payload
         .and_then(|payload| {
-            cloud_mcp_tokenomics_response_text(payload, &["pid", "idempotency_key", "idempotencyKey"])
+            cloud_mcp_tokenomics_response_text(
+                payload,
+                &["pid", "idempotency_key", "idempotencyKey"],
+            )
         })
         .or_else(|| {
-            cloud_mcp_tokenomics_response_text(response, &["pid", "idempotency_key", "idempotencyKey"])
+            cloud_mcp_tokenomics_response_text(
+                response,
+                &["pid", "idempotency_key", "idempotencyKey"],
+            )
         });
 
     let conn = cloud_mcp_open_outbox_conn()?;
@@ -3369,9 +3384,10 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
             &["did", "device_id", "deviceId", "machine_id", "machineId"],
         )
         .unwrap_or_default();
-        let scope_key = cloud_mcp_payload_text(payload, &["sk", "billing_scope_key", "billingScopeKey"])
-            .or_else(|| cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"]))
-            .unwrap_or_default();
+        let scope_key =
+            cloud_mcp_payload_text(payload, &["sk", "billing_scope_key", "billingScopeKey"])
+                .or_else(|| cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"]))
+                .unwrap_or_default();
         if device_id.is_empty() || scope_key.is_empty() {
             return None;
         }
@@ -3410,7 +3426,9 @@ fn cloud_mcp_outbox_idempotency_key(
     payload_hash: &str,
     coalesce_key: Option<&str>,
 ) -> String {
-    if let Some(key) = cloud_mcp_payload_text(payload, &["pid", "idempotency_key", "idempotencyKey"]) {
+    if let Some(key) =
+        cloud_mcp_payload_text(payload, &["pid", "idempotency_key", "idempotencyKey"])
+    {
         return key;
     }
     if let Some(key) = cloud_mcp_payload_text(payload, &["client_request_id", "clientRequestId"]) {
@@ -6639,6 +6657,7 @@ fn cloud_mcp_tokenomics_day_content_hash(
     provider_accounts: &[Value],
     limits: &[Value],
     latest_windows: &[Value],
+    limit_samples: &[Value],
     device_aliases: &Value,
 ) -> String {
     let hourly_summary = json!({ "hourly": hourly_rows });
@@ -6648,8 +6667,47 @@ fn cloud_mcp_tokenomics_day_content_hash(
         "provider_accounts": cloud_mcp_tokenomics_sorted_values(provider_accounts),
         "limits": cloud_mcp_tokenomics_sorted_values(limits),
         "latest_windows": cloud_mcp_tokenomics_sorted_values(latest_windows),
+        "limit_samples": cloud_mcp_tokenomics_sorted_values(limit_samples),
         "device_aliases": device_aliases,
     })))
+}
+
+fn cloud_mcp_tokenomics_limit_sample_ms(row: &Value, fallback_ms: u64) -> Option<i64> {
+    cloud_mcp_payload_i64(
+        row,
+        &[
+            "sample_at_ms",
+            "sampleAtMs",
+            "sample_observed_at_ms",
+            "sampleObservedAtMs",
+            "limit_observed_at_ms",
+            "limitObservedAtMs",
+            "observed_at_ms",
+            "observedAtMs",
+            "updated_at_ms",
+            "updatedAtMs",
+        ],
+    )
+    .or_else(|| {
+        cloud_mcp_payload_text(
+            row,
+            &[
+                "sample_at",
+                "sampleAt",
+                "sample_observed_at",
+                "sampleObservedAt",
+                "limit_observed_at",
+                "limitObservedAt",
+                "observed_at",
+                "observedAt",
+                "updated_at",
+                "updatedAt",
+            ],
+        )
+        .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
+    })
+    .or_else(|| Some(fallback_ms.min(i64::MAX as u64) as i64))
+    .filter(|value| *value > 0)
 }
 
 fn cloud_mcp_tokenomics_day_buckets(
@@ -6701,6 +6759,24 @@ fn cloud_mcp_tokenomics_day_buckets(
                 !cloud_mcp_tokenomics_provider_account_key_is_unknown(&key)
             })
             .collect::<Vec<_>>();
+    let mut limit_samples_by_day = HashMap::<i64, Vec<Value>>::new();
+    for row in cloud_mcp_tokenomics_summary_array(summary, &["limit_samples", "limitSamples"]) {
+        let key = cloud_mcp_tokenomics_provider_account_key(&row);
+        if cloud_mcp_tokenomics_provider_account_key_is_unknown(&key) {
+            continue;
+        }
+        let Some(sample_ms) = cloud_mcp_tokenomics_limit_sample_ms(&row, now_ms) else {
+            continue;
+        };
+        let day_start_ms = cloud_mcp_tokenomics_day_start_ms(sample_ms);
+        if day_start_ms < oldest_day_start || day_start_ms > current_day_start {
+            continue;
+        }
+        limit_samples_by_day
+            .entry(day_start_ms)
+            .or_default()
+            .push(row);
+    }
     let device_aliases = summary
         .get("device_aliases")
         .or_else(|| summary.get("deviceAliases"))
@@ -6708,9 +6784,15 @@ fn cloud_mcp_tokenomics_day_buckets(
         .unwrap_or_else(|| json!([]));
 
     if rows_by_day.is_empty()
-        && (!limits.is_empty() || !latest_windows.is_empty() || !provider_accounts.is_empty())
+        && (!limits.is_empty()
+            || !latest_windows.is_empty()
+            || !provider_accounts.is_empty()
+            || !limit_samples_by_day.is_empty())
     {
         rows_by_day.entry(current_day_start).or_default();
+    }
+    for day_start_ms in limit_samples_by_day.keys() {
+        rows_by_day.entry(*day_start_ms).or_default();
     }
 
     let mut day_entries = rows_by_day.into_iter().collect::<Vec<_>>();
@@ -6750,11 +6832,15 @@ fn cloud_mcp_tokenomics_day_buckets(
             } else {
                 Vec::new()
             };
+            let limit_samples_for_day = limit_samples_by_day
+                .remove(&day_start_ms)
+                .unwrap_or_default();
             let content_hash = cloud_mcp_tokenomics_day_content_hash(
                 &hourly_rows,
                 &provider_accounts_for_day,
                 &limits_for_day,
                 &latest_windows_for_day,
+                &limit_samples_for_day,
                 &device_aliases,
             );
             let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
@@ -6798,6 +6884,7 @@ fn cloud_mcp_tokenomics_day_buckets(
                 json!(provider_accounts_for_day),
             );
             object.insert("latest_windows".to_string(), json!(latest_windows_for_day));
+            object.insert("limit_samples".to_string(), json!(limit_samples_for_day));
             object.insert("limits".to_string(), json!(limits_for_day));
             object.insert("device_aliases".to_string(), device_aliases.clone());
             CloudMcpTokenomicsDayBucket {
@@ -7166,6 +7253,71 @@ fn cloud_mcp_tokenomics_windows(summary: &Value, now_ms: u64) -> Vec<Value> {
     windows
 }
 
+fn cloud_mcp_tokenomics_limit_samples(summary: &Value, now_ms: u64) -> Vec<Value> {
+    let mut samples = Vec::new();
+    for row in cloud_mcp_tokenomics_summary_array(summary, &["limit_samples", "limitSamples"]) {
+        let window = cloud_mcp_payload_text(
+            &row,
+            &["window_kind", "windowKind", "limit_kind", "limitKind"],
+        )
+        .unwrap_or_else(|| "session_5h".to_string());
+        if window != "5_hour" && window != "session_5h" && window != "weekly" {
+            continue;
+        }
+        let normalized_window = if window == "5_hour" {
+            "session_5h"
+        } else {
+            window.as_str()
+        };
+        let provider_account_key = cloud_mcp_tokenomics_provider_account_key(&row);
+        if cloud_mcp_tokenomics_provider_account_key_is_unknown(&provider_account_key) {
+            continue;
+        }
+        let Some(observed_at_ms) = cloud_mcp_tokenomics_limit_sample_ms(&row, now_ms) else {
+            continue;
+        };
+        let reset_at_ms = cloud_mcp_payload_i64(&row, &["reset_at_ms", "resetAtMs"])
+            .or_else(|| {
+                cloud_mcp_payload_text(
+                    &row,
+                    &["reset_at", "resetAt", "limit_resets_at", "limitResetsAt"],
+                )
+                .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
+            })
+            .unwrap_or(0);
+        let sample_bucket_start_ms = cloud_mcp_payload_i64(
+            &row,
+            &["sample_bucket_start_ms", "sampleBucketStartMs", "bucket_start_ms", "bucketStartMs"],
+        )
+        .or_else(|| {
+            cloud_mcp_payload_text(
+                &row,
+                &["sample_bucket_start", "sampleBucketStart", "bucket_start", "bucketStart"],
+            )
+            .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
+        })
+        .unwrap_or_else(|| cloud_mcp_tokenomics_day_start_ms(observed_at_ms));
+        samples.push(json!({
+            "provider_account_key": provider_account_key,
+            "provider_account_label": cloud_mcp_payload_text(&row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+            "provider": cloud_mcp_payload_text(&row, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
+            "agent_kind": cloud_mcp_payload_text(&row, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
+            "window": normalized_window,
+            "used_percent": row.get("used_percent").or_else(|| row.get("usedPercent")).or_else(|| row.get("limit_used_percent")).or_else(|| row.get("limitUsedPercent")).or_else(|| row.get("used")).cloned().unwrap_or(Value::Null),
+            "remaining_percent": row.get("remaining_percent").or_else(|| row.get("remainingPercent")).or_else(|| row.get("remaining")).cloned().unwrap_or(Value::Null),
+            "reset_at_ms": reset_at_ms,
+            "resetAtMs": reset_at_ms,
+            "observed_at_ms": observed_at_ms,
+            "observedAtMs": observed_at_ms,
+            "sample_bucket_start_ms": sample_bucket_start_ms,
+            "sampleBucketStartMs": sample_bucket_start_ms,
+            "source": cloud_mcp_payload_text(&row, &["limit_source", "limitSource", "source"]).unwrap_or_else(|| "provider_usage_api".to_string()),
+            "confidence": cloud_mcp_payload_text(&row, &["confidence", "pace_confidence", "paceConfidence"]).unwrap_or_else(|| "sampled".to_string())
+        }));
+    }
+    samples
+}
+
 fn cloud_mcp_compact_tokenomics_device(device: &Value) -> Value {
     json!({
         "id": cloud_mcp_payload_text(device, &["device_id", "deviceId", "machine_id", "machineId"]).unwrap_or_default(),
@@ -7245,6 +7397,23 @@ fn cloud_mcp_compact_tokenomics_window(window: &Value) -> Value {
     })
 }
 
+fn cloud_mcp_compact_tokenomics_limit_sample(sample: &Value) -> Value {
+    json!({
+        "a": cloud_mcp_tokenomics_provider_account_key(sample),
+        "l": cloud_mcp_payload_text(sample, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+        "p": cloud_mcp_payload_text(sample, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
+        "g": cloud_mcp_payload_text(sample, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
+        "wk": cloud_mcp_payload_text(sample, &["window", "window_kind", "windowKind", "limit_kind", "limitKind"]).unwrap_or_else(|| "session_5h".to_string()),
+        "up": sample.get("used_percent").or_else(|| sample.get("usedPercent")).or_else(|| sample.get("used")).cloned().unwrap_or(Value::Null),
+        "rp": sample.get("remaining_percent").or_else(|| sample.get("remainingPercent")).or_else(|| sample.get("remaining")).cloned().unwrap_or(Value::Null),
+        "ram": cloud_mcp_payload_i64(sample, &["reset_at_ms", "resetAtMs"]).unwrap_or(0),
+        "o": cloud_mcp_payload_i64(sample, &["observed_at_ms", "observedAtMs"]).unwrap_or(0),
+        "sbm": cloud_mcp_payload_i64(sample, &["sample_bucket_start_ms", "sampleBucketStartMs", "bucket_start_ms", "bucketStartMs"]).unwrap_or(0),
+        "src": cloud_mcp_payload_text(sample, &["source", "limit_source", "limitSource"]).unwrap_or_else(|| "provider_usage_api".to_string()),
+        "cf": cloud_mcp_payload_text(sample, &["confidence", "pace_confidence", "paceConfidence"]).unwrap_or_else(|| "sampled".to_string()),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cloud_mcp_tokenomics_device_packet_payload(
     summary: &Value,
@@ -7277,11 +7446,13 @@ fn cloud_mcp_tokenomics_device_packet_payload(
     let provider_accounts = cloud_mcp_tokenomics_provider_accounts(summary, now_ms);
     let hourly_groups = cloud_mcp_tokenomics_hourly_groups(summary, now_ms);
     let windows = cloud_mcp_tokenomics_windows(summary, now_ms);
+    let limit_samples = cloud_mcp_tokenomics_limit_samples(summary, now_ms);
     let hourly_count = hourly_groups
         .iter()
         .filter_map(|group| group.get("rows").and_then(Value::as_array).map(Vec::len))
         .sum::<usize>();
     let window_count = windows.len();
+    let limit_sample_count = limit_samples.len();
     let snapshot = event_kind == CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT;
     let compact_kind = if snapshot { "snapshot" } else { "delta" };
     let mut payload = json!({
@@ -7309,8 +7480,10 @@ fn cloud_mcp_tokenomics_device_packet_payload(
         "pa": provider_accounts.iter().map(cloud_mcp_compact_tokenomics_provider_account).collect::<Vec<_>>(),
         "hg": hourly_groups.iter().map(cloud_mcp_compact_tokenomics_hourly_group).collect::<Vec<_>>(),
         "w": windows.iter().map(cloud_mcp_compact_tokenomics_window).collect::<Vec<_>>(),
+        "ls": limit_samples.iter().map(cloud_mcp_compact_tokenomics_limit_sample).collect::<Vec<_>>(),
         "hc": hourly_count,
         "wc": window_count,
+        "lsc": limit_sample_count,
         "tms": now_ms,
     });
     if let Some(bucket) = packet_bucket {
@@ -7810,9 +7983,11 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         let payload_hash =
             cloud_mcp_payload_text(&storage_payload, &["ph", "payload_hash", "payloadHash"])
                 .unwrap_or_default();
-        let idempotency_key =
-            cloud_mcp_payload_text(&storage_payload, &["pid", "idempotency_key", "idempotencyKey"])
-                .unwrap_or_default();
+        let idempotency_key = cloud_mcp_payload_text(
+            &storage_payload,
+            &["pid", "idempotency_key", "idempotencyKey"],
+        )
+        .unwrap_or_default();
         if let Err(error) = cloud_mcp_tokenomics_mark_day_pending(
             &device_id,
             &tokenomics_scope_key,
@@ -10949,10 +11124,8 @@ async fn cloud_mcp_apply_account_sync_resume_response(
             .global_ws_events
             .send(cloud_mcp_account_asset_local_projection_event(reason));
     }
-    if let Some(architectures) = cloud_mcp_account_sync_resume_domain(
-        response,
-        &["architectures"],
-    ) {
+    if let Some(architectures) = cloud_mcp_account_sync_resume_domain(response, &["architectures"])
+    {
         let hydrated = cloud_mcp_apply_architecture_sync_data(state, &architectures)
             .await
             .unwrap_or_else(|_| architectures.clone());
@@ -10968,10 +11141,7 @@ async fn cloud_mcp_apply_account_sync_resume_response(
     }
     for (payload, event_kind, contract) in [
         (
-            cloud_mcp_account_sync_resume_domain(
-                response,
-                &["skills"],
-            ),
+            cloud_mcp_account_sync_resume_domain(response, &["skills"]),
             "doc.sync",
             "diffforge.skills_doc.v1",
         ),
@@ -11061,12 +11231,14 @@ async fn cloud_mcp_emit_initial_account_tools_snapshot(
     if contract == "diffforge.skills_doc.v1" {
         match cloud_mcp_hydrate_account_skill_payload(state, payload.clone()).await {
             Ok(hydrated) => {
-                if let Some(skills_md) = hydrated
-                    .get("skills")
-                    .and_then(|row| row.get("skills_md").or_else(|| row.get("skillsMd")))
-                    .and_then(Value::as_str)
-                {
-                    cloud_mcp_cache_account_skills(skills_md);
+                if !cloud_mcp_account_skills_has_hydration_error(&hydrated) {
+                    if let Some(skills_md) = hydrated
+                        .get("skills")
+                        .and_then(|row| row.get("skills_md").or_else(|| row.get("skillsMd")))
+                        .and_then(Value::as_str)
+                    {
+                        cloud_mcp_cache_account_skills(skills_md);
+                    }
                 }
                 payload = hydrated;
             }
@@ -11209,7 +11381,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             );
             let _ = state
                 .global_ws_events
-                .send(cloud_mcp_account_asset_local_projection_event("global_ws_ready"));
+                .send(cloud_mcp_account_asset_local_projection_event(
+                    "global_ws_ready",
+                ));
             cloud_mcp_clear_sync_activity_key(&activity_key);
         }
         if let Some(initial_account_usage) = message
@@ -12007,17 +12181,19 @@ fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
 
 fn cloud_mcp_tokenomics_wake_receipt_key(event: &Value) -> Option<String> {
     let event_kind = cloud_mcp_tokenomics_event_kind_from_value(event);
-    let packet_id =
-        cloud_mcp_tokenomics_response_text(event, &["pid", "packet_id", "packetId"]).unwrap_or_default();
+    let packet_id = cloud_mcp_tokenomics_response_text(event, &["pid", "packet_id", "packetId"])
+        .unwrap_or_default();
     let source_device_id =
         cloud_mcp_tokenomics_response_text(event, &["sdid", "source_device_id", "sourceDeviceId"])
             .unwrap_or_default();
     let day_start_ms = cloud_mcp_tokenomics_day_start_from_value(event)
         .map(|value| value.to_string())
         .unwrap_or_default();
-    let sync_day =
-        cloud_mcp_tokenomics_response_text(event, &["sd", "sync_day", "syncDay", "day_key", "dayKey"])
-            .unwrap_or_default();
+    let sync_day = cloud_mcp_tokenomics_response_text(
+        event,
+        &["sd", "sync_day", "syncDay", "day_key", "dayKey"],
+    )
+    .unwrap_or_default();
     let content_hash = cloud_mcp_tokenomics_day_content_hash_from_value(event).unwrap_or_default();
     let server_cursor = cloud_mcp_tokenomics_server_cursor_from_value(event).unwrap_or_default();
     if packet_id.is_empty()
@@ -12981,10 +13157,7 @@ fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value)
 }
 
 fn cloud_mcp_terminal_agent_identity(value: &str) -> String {
-    let normalized = value
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['_', ' '], "-");
+    let normalized = value.trim().to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
         "claude-code" => "claude".to_string(),
         "plain-shell" | "generic-shell" | "terminal" => "shell".to_string(),
@@ -13020,7 +13193,11 @@ fn cloud_mcp_terminal_identity_values(workspace_id: &str, terminal: &Value) -> V
             cloud_mcp_payload_i64(terminal, &["terminal_index", "terminalIndex", "index"])
         {
             if terminal_index >= 0 {
-                let base_id = format!("workspace-terminal-{}-{}", workspace_id.trim(), terminal_index);
+                let base_id = format!(
+                    "workspace-terminal-{}-{}",
+                    workspace_id.trim(),
+                    terminal_index
+                );
                 push(base_id.clone());
                 if let Some(agent_id) = cloud_mcp_payload_text(
                     terminal,
@@ -18142,8 +18319,7 @@ fn cloud_mcp_terminal_name_placeholder(value: &str) -> bool {
     }
     matches!(
         key.as_str(),
-        ""
-            | "agent"
+        "" | "agent"
             | "terminal"
             | "prewarm"
             | "prewarmpty"
@@ -18179,9 +18355,7 @@ fn cloud_mcp_terminal_nickname_text(payload: &Value, path: &[&str]) -> Option<St
     for key in path {
         current = current.get(*key)?;
     }
-    current
-        .as_str()
-        .and_then(cloud_mcp_clean_terminal_nickname)
+    current.as_str().and_then(cloud_mcp_clean_terminal_nickname)
 }
 
 fn cloud_mcp_payload_object(payload: &Value, path: &[&str]) -> Option<Value> {
@@ -18319,11 +18493,9 @@ fn cloud_mcp_normalize_workspace_mcp_servers_for_snapshot(workspace: &Value) -> 
             if server_key == "secrets" {
                 return None;
             }
-            let name = cloud_mcp_payload_text(
-                server,
-                &["name", "label", "display_name", "displayName"],
-            )
-            .unwrap_or_else(|| server_key.clone());
+            let name =
+                cloud_mcp_payload_text(server, &["name", "label", "display_name", "displayName"])
+                    .unwrap_or_else(|| server_key.clone());
             let name = name
                 .chars()
                 .take(CLOUD_MCP_WORKSPACE_MCP_TEXT_LIMIT)
@@ -19836,11 +20008,10 @@ async fn cloud_mcp_enqueue_terminal_closed_delta(
     let last_prompt = context_entry
         .map(|entry| entry.last_prompt.as_str())
         .filter(|value| !value.trim().is_empty());
-    let terminal_nickname =
-        cloud_mcp_clean_terminal_nickname(close_context.metadata.terminal_nickname.trim())
-            .or_else(|| {
-                cloud_mcp_clean_terminal_nickname(close_context.metadata.terminal_name.trim())
-            });
+    let terminal_nickname = cloud_mcp_clean_terminal_nickname(
+        close_context.metadata.terminal_nickname.trim(),
+    )
+    .or_else(|| cloud_mcp_clean_terminal_nickname(close_context.metadata.terminal_name.trim()));
     let terminal_display_name = terminal_nickname
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -23260,6 +23431,8 @@ fn cloud_mcp_tag_tokenomics_summary_device(summary: &mut Value, device_profile: 
     for key in [
         "hourly",
         "limits",
+        "limit_samples",
+        "limitSamples",
         "provider_accounts",
         "providerAccounts",
         "latest_windows",
@@ -23794,9 +23967,50 @@ async fn cloud_mcp_hydrate_account_skill_units(
 ) -> Result<Vec<Value>, String> {
     let mut hydrated = Vec::with_capacity(units.len());
     for unit in units {
-        hydrated.push(cloud_mcp_hydrate_account_skill_unit(state, unit).await?);
+        match cloud_mcp_hydrate_account_skill_unit(state, unit.clone()).await {
+            Ok(unit) => hydrated.push(unit),
+            Err(error) => {
+                let mut fallback = unit;
+                if let Some(object) = fallback.as_object_mut() {
+                    object.insert("hydrated".to_string(), json!(false));
+                    object.insert("hydrate_error".to_string(), json!(error.clone()));
+                    object.insert("hydrateError".to_string(), json!(error.clone()));
+                    object.insert("hydrated_from_asset".to_string(), json!(false));
+                    object.insert("hydratedFromAsset".to_string(), json!(false));
+                }
+                log_cloud_sync_event(
+                    "account_skills.unit_hydrate_error",
+                    json!({"error": clean_terminal_telemetry_text(&error)}),
+                );
+                hydrated.push(fallback);
+            }
+        }
     }
     Ok(hydrated)
+}
+
+fn cloud_mcp_account_skills_has_hydration_error(value: &Value) -> bool {
+    fn unit_has_error(unit: &Value) -> bool {
+        unit.get("hydrate_error")
+            .or_else(|| unit.get("hydrateError"))
+            .and_then(Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }
+    value
+        .get("skill_units")
+        .or_else(|| value.get("skillUnits"))
+        .and_then(Value::as_array)
+        .is_some_and(|units| units.iter().any(unit_has_error))
+        || value
+            .get("skills")
+            .and_then(|skills| {
+                skills
+                    .get("skill_units")
+                    .or_else(|| skills.get("skillUnits"))
+                    .and_then(Value::as_array)
+            })
+            .is_some_and(|units| units.iter().any(unit_has_error))
 }
 
 async fn cloud_mcp_hydrate_account_skills_object(
@@ -23995,12 +24209,14 @@ async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<
         |error| json!({"error": error, "offline": true, "mcps": [], "servers": []}),
     );
 
-    if let Some(skills_md) = skills
-        .get("skills")
-        .and_then(|row| row.get("skills_md").or_else(|| row.get("skillsMd")))
-        .and_then(Value::as_str)
-    {
-        cloud_mcp_cache_account_skills(skills_md);
+    if !cloud_mcp_account_skills_has_hydration_error(&skills) {
+        if let Some(skills_md) = skills
+            .get("skills")
+            .and_then(|row| row.get("skills_md").or_else(|| row.get("skillsMd")))
+            .and_then(Value::as_str)
+        {
+            cloud_mcp_cache_account_skills(skills_md);
+        }
     }
 
     Ok(json!({
@@ -24051,7 +24267,10 @@ async fn cloud_mcp_save_account_skills(
                 "skill_units".to_string(),
                 json!(prepared_skill_units.clone()),
             );
-            object.insert("skillUnits".to_string(), json!(prepared_skill_units.clone()));
+            object.insert(
+                "skillUnits".to_string(),
+                json!(prepared_skill_units.clone()),
+            );
             object.insert("ops".to_string(), json!(prepared_skill_ops.clone()));
         } else {
             object.insert("ops".to_string(), json!([]));
@@ -25464,7 +25683,10 @@ pub(crate) async fn cloud_mcp_delete_account_architecture_graph(
         object.insert("v".to_string(), json!(2));
         object.insert("graph_id".to_string(), json!(graph_id.clone()));
         object.insert("graphId".to_string(), json!(graph_id.clone()));
-        object.insert("ops".to_string(), json!([["d", graph_id, cloud_mcp_now_ms()]]));
+        object.insert(
+            "ops".to_string(),
+            json!([["d", graph_id, cloud_mcp_now_ms()]]),
+        );
     }
     let response = cloud_mcp_ws_request(state, "doc.sync", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
@@ -26308,15 +26530,19 @@ fn cloud_mcp_asset_source_kind_text(row: &Value) -> String {
 fn cloud_mcp_asset_doc_domain_text(row: &Value) -> String {
     cloud_mcp_payload_text(row, &["dom", "doc_domain", "docDomain"])
         .or_else(|| {
-            row.get("metadata")
-                .and_then(|metadata| cloud_mcp_payload_text(metadata, &["dom", "doc_domain", "docDomain"]))
+            row.get("metadata").and_then(|metadata| {
+                cloud_mcp_payload_text(metadata, &["dom", "doc_domain", "docDomain"])
+            })
         })
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
 }
 
-fn cloud_mcp_asset_folder_for_doc_source(source_kind: &str, doc_domain: &str) -> Option<&'static str> {
+fn cloud_mcp_asset_folder_for_doc_source(
+    source_kind: &str,
+    doc_domain: &str,
+) -> Option<&'static str> {
     match (source_kind, doc_domain) {
         ("account_skill", _) | (_, "skills") => Some(CLOUD_MCP_ASSET_FOLDER_SKILLS),
         ("account_architecture", _) | (_, "architectures") => {
@@ -26403,7 +26629,11 @@ fn cloud_mcp_asset_folder_from_path(path: &Path) -> Option<String> {
     }
 }
 
-fn cloud_mcp_asset_folder_from_row_or_path(row: &Value, path: Option<&Path>, fallback: &str) -> String {
+fn cloud_mcp_asset_folder_from_row_or_path(
+    row: &Value,
+    path: Option<&Path>,
+    fallback: &str,
+) -> String {
     let source_kind = cloud_mcp_asset_source_kind_text(row);
     let doc_domain = cloud_mcp_asset_doc_domain_text(row);
     if let Some(folder) = cloud_mcp_asset_folder_for_doc_source(&source_kind, &doc_domain) {
@@ -26418,7 +26648,10 @@ fn cloud_mcp_asset_folder_from_row_or_path(row: &Value, path: Option<&Path>, fal
 
 fn cloud_mcp_asset_dir_for_folder(asset_root: &Path, folder: &str, asset_id: &str) -> PathBuf {
     asset_root
-        .join(cloud_mcp_asset_sanitize_folder(folder, CLOUD_MCP_ASSET_FOLDER_DEFAULT))
+        .join(cloud_mcp_asset_sanitize_folder(
+            folder,
+            CLOUD_MCP_ASSET_FOLDER_DEFAULT,
+        ))
         .join(cloud_mcp_sanitize_asset_id(asset_id))
 }
 
@@ -26675,9 +26908,13 @@ fn cloud_mcp_asset_local_row(
         "cloudStatus": "local_only",
         "local_status": "local_available",
         "localStatus": "local_available",
+        "local_available": true,
+        "localAvailable": true,
         "local_path": canonical.display().to_string(),
         "localPath": canonical.display().to_string(),
         "path": canonical.display().to_string(),
+        "can_upload": true,
+        "canUpload": true,
         "metadata": metadata,
         "created_at": now,
         "createdAt": now,
@@ -26737,11 +26974,8 @@ fn cloud_mcp_asset_local_row_with_input(
             cloud_mcp_strip_asset_workspace_identity_inner(metadata);
         }
     }
-    let folder = cloud_mcp_asset_folder_from_row_or_path(
-        &row,
-        Some(path),
-        CLOUD_MCP_ASSET_FOLDER_DEFAULT,
-    );
+    let folder =
+        cloud_mcp_asset_folder_from_row_or_path(&row, Some(path), CLOUD_MCP_ASSET_FOLDER_DEFAULT);
     cloud_mcp_asset_attach_folder_fields(&mut row, &folder);
     Ok(row)
 }
@@ -26782,12 +27016,22 @@ fn cloud_mcp_asset_overlay_local_columns(row: &mut Value, local_path: &str, loca
         .unwrap_or_default();
     let json_path_is_file = !json_path.trim().is_empty() && Path::new(json_path.trim()).is_file();
     let local_path_is_file = !local_path.is_empty() && Path::new(local_path).is_file();
-    if !local_path.is_empty()
-        && (json_path.trim().is_empty() || (local_path_is_file && !json_path_is_file))
-    {
-        object.insert("local_path".to_string(), json!(local_path));
-        object.insert("localPath".to_string(), json!(local_path));
-        object.insert("path".to_string(), json!(local_path));
+    let effective_local_path = if local_path_is_file {
+        local_path.to_string()
+    } else if json_path_is_file {
+        json_path.trim().to_string()
+    } else if json_path.trim().is_empty() {
+        local_path.to_string()
+    } else {
+        json_path.trim().to_string()
+    };
+    if !effective_local_path.is_empty() {
+        object.insert(
+            "local_path".to_string(),
+            json!(effective_local_path.clone()),
+        );
+        object.insert("localPath".to_string(), json!(effective_local_path.clone()));
+        object.insert("path".to_string(), json!(effective_local_path));
     }
     let json_status = object
         .get("local_status")
@@ -26797,8 +27041,10 @@ fn cloud_mcp_asset_overlay_local_columns(row: &mut Value, local_path: &str, loca
     let local_status = local_status.trim();
     let normalized_local_status = cloud_mcp_asset_normalized_status(local_status);
     let normalized_json_status = cloud_mcp_asset_normalized_status(json_status);
-    let local_status_is_available =
-        matches!(normalized_local_status.as_str(), "local-available" | "available");
+    let local_status_is_available = matches!(
+        normalized_local_status.as_str(),
+        "local-available" | "available"
+    );
     if !local_status.is_empty()
         && normalized_local_status != "unknown"
         && (normalized_json_status.is_empty()
@@ -26808,9 +27054,11 @@ fn cloud_mcp_asset_overlay_local_columns(row: &mut Value, local_path: &str, loca
         object.insert("local_status".to_string(), json!(local_status));
         object.insert("localStatus".to_string(), json!(local_status));
     }
-    if local_status_is_available && local_path_is_file {
+    if local_status_is_available && (local_path_is_file || json_path_is_file) {
         object.insert("local_available".to_string(), json!(true));
         object.insert("localAvailable".to_string(), json!(true));
+        object.insert("can_upload".to_string(), json!(true));
+        object.insert("canUpload".to_string(), json!(true));
     }
 }
 
@@ -27037,9 +27285,84 @@ fn cloud_mcp_asset_replace_local_row(asset_id: &str, row: &Value) -> Result<(), 
     Ok(())
 }
 
+fn cloud_mcp_asset_delete_local_cache_row(asset_id: &str) -> Result<(), String> {
+    let conn = cloud_mcp_open_asset_library_conn()?;
+    cloud_mcp_asset_library_init_conn(&conn)
+        .map_err(|error| format!("Unable to initialize asset cache: {error}"))?;
+    conn.execute(
+        "DELETE FROM account_asset_transfers WHERE asset_id=?1",
+        [asset_id],
+    )
+    .map_err(|error| format!("Unable to remove local asset transfer rows for {asset_id}: {error}"))?;
+    conn.execute(
+        "DELETE FROM account_asset_device_sync_state WHERE asset_id=?1",
+        [asset_id],
+    )
+    .map_err(|error| format!("Unable to remove local asset sync state for {asset_id}: {error}"))?;
+    conn.execute("DELETE FROM account_asset_items WHERE asset_id=?1", [asset_id])
+        .map_err(|error| format!("Unable to remove local asset row {asset_id}: {error}"))?;
+    Ok(())
+}
+
+fn cloud_mcp_asset_removed_tombstone(asset_id: &str, reason: &str) -> Value {
+    let now = cloud_mcp_rfc3339_now();
+    json!({
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "id": asset_id,
+        "deleted": true,
+        "status": "deleted",
+        "local_status": "local_deleted",
+        "localStatus": "local_deleted",
+        "delete_reason": reason,
+        "deleteReason": reason,
+        "deleted_at": now,
+        "deletedAt": now,
+        "updated_at": now,
+        "updatedAt": now,
+    })
+}
+
+fn cloud_mcp_asset_local_removed_response(
+    asset_id: &str,
+    local_path: &str,
+    removed_file: bool,
+    reason: &str,
+) -> Value {
+    let tombstone = cloud_mcp_asset_removed_tombstone(asset_id, reason);
+    json!({
+        "kind": "asset_library_local_deleted",
+        "source": "local_asset_library",
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "local_path": local_path,
+        "localPath": local_path,
+        "file_removed": removed_file,
+        "fileRemoved": removed_file,
+        "removed_assets": [tombstone.clone()],
+        "removedAssets": [tombstone],
+        "assets": [],
+        "items": [],
+    })
+}
+
 fn cloud_mcp_delete_local_asset_copy(asset_id: &str, delete_file: bool) -> Result<Value, String> {
-    let mut row = cloud_mcp_asset_row_with_local_copy(asset_id)
-        .or_else(|_| cloud_mcp_asset_row_from_file(asset_id))?;
+    let mut row = match cloud_mcp_asset_row_with_local_copy(asset_id)
+        .or_else(|_| cloud_mcp_asset_row_from_file(asset_id))
+    {
+        Ok(row) => row,
+        Err(_) => {
+            let _ = cloud_mcp_asset_delete_local_cache_row(asset_id);
+            return Ok(cloud_mcp_asset_local_removed_response(
+                asset_id,
+                "",
+                false,
+                "local_row_not_registered",
+            ));
+        }
+    };
+    let keep_metadata_row =
+        cloud_mcp_asset_cloud_copy_available(&row) || cloud_mcp_asset_remote_copy_available(&row);
     let mut local_path =
         cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"]).unwrap_or_default();
     if local_path.trim().is_empty()
@@ -27060,6 +27383,15 @@ fn cloud_mcp_delete_local_asset_copy(asset_id: &str, delete_file: bool) -> Resul
             })?;
             removed_file = true;
         }
+    }
+    if !keep_metadata_row {
+        let _ = cloud_mcp_asset_delete_local_cache_row(asset_id);
+        return Ok(cloud_mcp_asset_local_removed_response(
+            asset_id,
+            &local_path,
+            removed_file,
+            "last_local_copy_deleted",
+        ));
     }
     let now = cloud_mcp_rfc3339_now();
     let cloud_status = cloud_mcp_payload_text(&row, &["cloud_status", "cloudStatus", "status"])
@@ -28215,7 +28547,11 @@ async fn cloud_mcp_download_account_asset_once(
         object.insert("updated_at".to_string(), json!(cloud_mcp_rfc3339_now()));
         object.insert("updatedAt".to_string(), json!(cloud_mcp_rfc3339_now()));
     }
-    let folder = cloud_mcp_asset_folder_from_row_or_path(&local_asset, Some(&target_path), CLOUD_MCP_ASSET_FOLDER_DOWNLOADS);
+    let folder = cloud_mcp_asset_folder_from_row_or_path(
+        &local_asset,
+        Some(&target_path),
+        CLOUD_MCP_ASSET_FOLDER_DOWNLOADS,
+    );
     cloud_mcp_asset_attach_folder_fields(&mut local_asset, &folder);
     cloud_mcp_asset_store_local_row(&local_asset)?;
     Ok(json!({
@@ -29325,7 +29661,8 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
             if blob_id.is_empty() || cloud_id.is_empty() {
                 continue;
             }
-            let status = cloud_mcp_asset_row_text(&row, &["st", "status", "cloud_status", "cloudStatus"]);
+            let status =
+                cloud_mcp_asset_row_text(&row, &["st", "status", "cloud_status", "cloudStatus"]);
             let cloud_available =
                 cloud_mcp_asset_cloud_value_available(&json!({"status": status.clone()}));
             let cloud = json!({
@@ -29351,7 +29688,8 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
             if asset_id.is_empty() || device_id.is_empty() {
                 continue;
             }
-            let status = cloud_mcp_asset_row_text(&row, &["st", "status", "local_status", "localStatus"]);
+            let status =
+                cloud_mcp_asset_row_text(&row, &["st", "status", "local_status", "localStatus"]);
             let local_available =
                 cloud_mcp_asset_device_local_available(&json!({"status": status.clone()}));
             let device = json!({
@@ -29373,20 +29711,21 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
         for row in cloud_mcp_asset_v2_rows(
             &payload,
             "a",
-            &["aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom"],
+            &[
+                "aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom",
+            ],
         ) {
             let asset_id = cloud_mcp_asset_row_text(&row, &["aid", "asset_id", "assetId", "id"]);
             if asset_id.is_empty() {
                 continue;
             }
             let blob_id = cloud_mcp_asset_row_text(&row, &["bid", "blob_id", "blobId"]);
-            let status = cloud_mcp_asset_row_text(&row, &["st", "status", "cloud_status", "cloudStatus"]);
+            let status =
+                cloud_mcp_asset_row_text(&row, &["st", "status", "cloud_status", "cloudStatus"]);
             let source_kind =
                 cloud_mcp_asset_row_text(&row, &["src", "source_kind", "sourceKind", "source"]);
-            let folder =
-                cloud_mcp_asset_folder_from_value(&row, CLOUD_MCP_ASSET_FOLDER_DEFAULT);
-            let doc_domain =
-                cloud_mcp_asset_row_text(&row, &["dom", "doc_domain", "docDomain"]);
+            let folder = cloud_mcp_asset_folder_from_value(&row, CLOUD_MCP_ASSET_FOLDER_DEFAULT);
+            let doc_domain = cloud_mcp_asset_row_text(&row, &["dom", "doc_domain", "docDomain"]);
             items_by_id.insert(
                 asset_id.clone(),
                 json!({
@@ -29439,7 +29778,9 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
         for row in cloud_mcp_asset_v2_rows(
             &payload,
             "x",
-            &["tid", "aid", "dir", "dev", "cid", "st", "dn", "tot", "err", "ut"],
+            &[
+                "tid", "aid", "dir", "dev", "cid", "st", "dn", "tot", "err", "ut",
+            ],
         ) {
             let transfer_id =
                 cloud_mcp_asset_row_text(&row, &["tid", "transfer_id", "transferId", "id"]);
@@ -29472,7 +29813,9 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
             &cloud_mcp_payload_text(&payload, &["t"]).unwrap_or_default(),
         );
         if matches!(token.as_str(), "asset-tx" | "asset-terminal") {
-            if let Some(transfer_id) = cloud_mcp_payload_text(&payload, &["tid", "transfer_id", "transferId"]) {
+            if let Some(transfer_id) =
+                cloud_mcp_payload_text(&payload, &["tid", "transfer_id", "transferId"])
+            {
                 transfers.push(json!({
                     "transfer_id": transfer_id.clone(),
                     "transferId": transfer_id.clone(),
@@ -29603,7 +29946,8 @@ fn cloud_mcp_asset_v2_state_from_rows(
     let transfer_rows = transfers
         .iter()
         .filter_map(|transfer| {
-            let transfer_id = cloud_mcp_asset_row_text(transfer, &["transfer_id", "transferId", "id"]);
+            let transfer_id =
+                cloud_mcp_asset_row_text(transfer, &["transfer_id", "transferId", "id"]);
             if transfer_id.is_empty() {
                 return None;
             }
@@ -29701,10 +30045,7 @@ fn cloud_mcp_asset_item_shaped(item: &Value) -> bool {
     item.is_object() && cloud_mcp_payload_text(item, &["asset_id", "assetId"]).is_some()
 }
 
-fn cloud_mcp_asset_items_from_response(value: &Value) -> Vec<Value> {
-    if let Some(expanded) = cloud_mcp_asset_v2_expanded_from_response(value) {
-        return expanded.items;
-    }
+fn cloud_mcp_direct_asset_items_from_response(value: &Value) -> Vec<Value> {
     let mut items = Vec::new();
     for key in ["items", "assets"] {
         if let Some(array) = value.get(key).and_then(Value::as_array) {
@@ -29733,10 +30074,28 @@ fn cloud_mcp_asset_items_from_response(value: &Value) -> Vec<Value> {
         "accountAssets",
     ] {
         if let Some(child) = value.get(key) {
-            items.extend(cloud_mcp_asset_items_from_response(child));
+            items.extend(cloud_mcp_direct_asset_items_from_response(child));
         }
     }
+    let mut seen = HashSet::new();
     items
+        .into_iter()
+        .filter(|item| {
+            let asset_id = cloud_mcp_asset_row_text(item, &["asset_id", "assetId", "id"]);
+            !asset_id.is_empty() && seen.insert(asset_id)
+        })
+        .collect()
+}
+
+fn cloud_mcp_asset_items_from_response(value: &Value) -> Vec<Value> {
+    let direct_items = cloud_mcp_direct_asset_items_from_response(value);
+    if !direct_items.is_empty() {
+        return direct_items;
+    }
+    if let Some(expanded) = cloud_mcp_asset_v2_expanded_from_response(value) {
+        return expanded.items;
+    }
+    Vec::new()
 }
 
 fn cloud_mcp_asset_transfers_from_response(value: &Value) -> Vec<Value> {
@@ -30241,11 +30600,16 @@ fn cloud_mcp_update_asset_library_conn_inner(
     response: &Value,
 ) -> Result<(), String> {
     let now_ms = cloud_mcp_now_ms() as i64;
+    let direct_asset_items = cloud_mcp_direct_asset_items_from_response(response);
     let compact = cloud_mcp_asset_v2_expanded_from_response(response);
-    let asset_items = compact
-        .as_ref()
-        .map(|expanded| expanded.items.clone())
-        .unwrap_or_else(|| cloud_mcp_asset_items_from_response(response));
+    let asset_items = if !direct_asset_items.is_empty() {
+        direct_asset_items
+    } else {
+        compact
+            .as_ref()
+            .map(|expanded| expanded.items.clone())
+            .unwrap_or_else(|| cloud_mcp_asset_items_from_response(response))
+    };
     let transfers = compact
         .as_ref()
         .map(|expanded| expanded.transfers.clone())
@@ -30598,7 +30962,8 @@ fn cloud_mcp_asset_library_rows_from_conn(
         if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
             cloud_mcp_asset_overlay_local_columns(&mut value, &local_path, &local_status);
             let mut local_path = cloud_mcp_asset_local_path_text(&value);
-            let mut local_status = cloud_mcp_asset_row_text(&value, &["local_status", "localStatus"]);
+            let mut local_status =
+                cloud_mcp_asset_row_text(&value, &["local_status", "localStatus"]);
             if local_path.is_empty()
                 && cloud_mcp_asset_apply_recovered_managed_path(&mut value, &asset_id, false)
             {
@@ -30621,8 +30986,7 @@ fn cloud_mcp_asset_library_rows_from_conn(
                 local_status = "local_available".to_string();
                 let _ = cloud_mcp_asset_replace_local_row(&asset_id, &value);
             }
-            if ((local_path.is_empty()
-                && cloud_mcp_asset_local_unavailable_status(&local_status))
+            if ((local_path.is_empty() && cloud_mcp_asset_local_unavailable_status(&local_status))
                 || (!local_path.is_empty() && !Path::new(&local_path).is_file()))
                 && cloud_mcp_asset_apply_recovered_managed_path(&mut value, &asset_id, false)
             {
@@ -30899,14 +31263,8 @@ fn cloud_mcp_asset_library_generic_projection(mut library: Value) -> Value {
             aggregate.insert("failed_transfers".to_string(), json!(failed_transfers));
             aggregate.insert("failedTransfers".to_string(), json!(failed_transfers));
         }
-        object.insert(
-            "generic_assets_only".to_string(),
-            json!(true),
-        );
-        object.insert(
-            "genericAssetsOnly".to_string(),
-            json!(true),
-        );
+        object.insert("generic_assets_only".to_string(), json!(true));
+        object.insert("genericAssetsOnly".to_string(), json!(true));
     }
     cloud_mcp_asset_library_attach_current_device(&mut library);
     cloud_mcp_asset_library_attach_compact_state(&mut library, false);
@@ -30953,7 +31311,13 @@ fn cloud_mcp_asset_library_attach_compact_state(library: &mut Value, default_sna
         .unwrap_or_else(|| json!({}));
     let cursor = cloud_mcp_asset_row_text(
         &Value::Object(object.clone()),
-        &["sync_cursor", "syncCursor", "server_cursor", "serverCursor", "revision"],
+        &[
+            "sync_cursor",
+            "syncCursor",
+            "server_cursor",
+            "serverCursor",
+            "revision",
+        ],
     );
     let snapshot_full = object
         .get("snapshot_full")
@@ -31083,15 +31447,26 @@ fn cloud_mcp_asset_library_merge_local(mut remote: Value, local: Value) -> Value
             .unwrap_or(false);
         let cursor = cloud_mcp_asset_row_text(
             &Value::Object(object.clone()),
-            &["sync_cursor", "syncCursor", "server_cursor", "serverCursor", "revision"],
+            &[
+                "sync_cursor",
+                "syncCursor",
+                "server_cursor",
+                "serverCursor",
+                "revision",
+            ],
         );
         let merged_items = object
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let compact_state =
-            cloud_mcp_asset_v2_state_from_rows(&merged_items, &transfers, &aggregate_value, &cursor, snapshot_full);
+        let compact_state = cloud_mcp_asset_v2_state_from_rows(
+            &merged_items,
+            &transfers,
+            &aggregate_value,
+            &cursor,
+            snapshot_full,
+        );
         object.insert("asset_state".to_string(), compact_state.clone());
         object.insert("assetState".to_string(), compact_state);
     }
@@ -31866,8 +32241,11 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 cloud_mcp_payload_text(source, &["aseq", "server_seq", "serverSeq", "seq"])
                     .and_then(|value| value.trim().parse::<u64>().ok())
                     .or_else(|| {
-                        cloud_mcp_payload_text(&compact_payload, &["aseq", "server_seq", "serverSeq", "seq"])
-                            .and_then(|value| value.trim().parse::<u64>().ok())
+                        cloud_mcp_payload_text(
+                            &compact_payload,
+                            &["aseq", "server_seq", "serverSeq", "seq"],
+                        )
+                        .and_then(|value| value.trim().parse::<u64>().ok())
                     })
                     .unwrap_or(0)
             };
@@ -31906,7 +32284,17 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 )
                 .or_else(|| {
                     if matches!(code.as_str(), "s" | "send" | "q" | "queue") {
-                        cloud_mcp_todo_sync_op_text(op, 3, &["target_device_id", "targetDeviceId", "device_id", "deviceId", "did"])
+                        cloud_mcp_todo_sync_op_text(
+                            op,
+                            3,
+                            &[
+                                "target_device_id",
+                                "targetDeviceId",
+                                "device_id",
+                                "deviceId",
+                                "did",
+                            ],
+                        )
                     } else {
                         None
                     }
@@ -31957,7 +32345,17 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 )
                 .or_else(|| {
                     if matches!(code.as_str(), "s" | "send" | "q" | "queue") {
-                        cloud_mcp_todo_sync_op_text(op, 4, &["target_workspace_id", "targetWorkspaceId", "workspace_id", "workspaceId", "wid"])
+                        cloud_mcp_todo_sync_op_text(
+                            op,
+                            4,
+                            &[
+                                "target_workspace_id",
+                                "targetWorkspaceId",
+                                "workspace_id",
+                                "workspaceId",
+                                "wid",
+                            ],
+                        )
                     } else {
                         None
                     }
@@ -32010,7 +32408,12 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 "listed".to_string()
             } else {
                 cloud_mcp_todo_sync_op_text(op, 2, &["status", "todo_status", "todoStatus", "s"])
-                    .or_else(|| cloud_mcp_payload_text(&compact_payload, &["status", "todo_status", "todoStatus", "s"]))
+                    .or_else(|| {
+                        cloud_mcp_payload_text(
+                            &compact_payload,
+                            &["status", "todo_status", "todoStatus", "s"],
+                        )
+                    })
                     .unwrap_or_else(|| "listed".to_string())
             };
             let content_hash =
@@ -37744,8 +38147,11 @@ pub(crate) async fn cloud_mcp_enqueue_workspace_todo_sync_commit(
 
     let workspace_id = cloud_mcp_payload_text(&request_value, &["workspace_id", "workspaceId"])
         .unwrap_or_else(|| "workspace".to_string());
-    let cid = cloud_mcp_payload_text(&request_value, &["cid", "client_request_id", "clientRequestId"])
-        .unwrap_or_else(|| format!("todo-sync-{}", cloud_mcp_now_ms()));
+    let cid = cloud_mcp_payload_text(
+        &request_value,
+        &["cid", "client_request_id", "clientRequestId"],
+    )
+    .unwrap_or_else(|| format!("todo-sync-{}", cloud_mcp_now_ms()));
     let key = format!("todo.sync:{workspace_id}:{cid}");
     cloud_mcp_enqueue_background_sync(
         state,
@@ -38914,7 +39320,8 @@ mod cloud_mcp_tests {
         let mut keep = json!({ "localPath": "/existing.png", "local_status": "local_available" });
         cloud_mcp_asset_overlay_local_columns(&mut keep, "/tmp/other.png", "unknown");
         assert_eq!(keep["localPath"], json!("/existing.png"));
-        assert!(keep.get("local_path").is_none());
+        assert_eq!(keep["local_path"], json!("/existing.png"));
+        assert_eq!(keep["path"], json!("/existing.png"));
     }
 
     #[test]
@@ -38973,6 +39380,57 @@ mod cloud_mcp_tests {
         assert!(deleted["asset"].get("repoId").is_none());
         assert!(deleted["asset"].get("workspace_id").is_none());
         assert!(deleted["asset"].get("workspaceId").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_local_only_account_asset_removes_tracked_row() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("asset-delete-local-only-row");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let local_path = root.join("local-only.png");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&local_path, b"fake png payload").unwrap();
+
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        let asset_id = "asset-snip-delete-local-only";
+        cloud_mcp_asset_store_local_row(&json!({
+            "asset_id": asset_id,
+            "assetId": asset_id,
+            "name": "local-only.png",
+            "kind": "image",
+            "mime_type": "image/png",
+            "size_bytes": 16,
+            "sha256": "fake-sha",
+            "cloud_status": "local_only",
+            "local_status": "local_available",
+            "local_path": local_path.to_str().unwrap(),
+            "updated_at": "2026-06-14T00:00:00.000Z"
+        }))
+        .unwrap();
+
+        let deleted = cloud_mcp_delete_local_asset_copy(asset_id, true).unwrap();
+        assert!(!local_path.exists());
+        assert_eq!(deleted["removed_assets"][0]["asset_id"].as_str(), Some(asset_id));
+        assert_eq!(deleted["assets"].as_array().map(Vec::len), Some(0));
+
+        let conn = cloud_mcp_open_asset_library_conn().unwrap();
+        cloud_mcp_asset_library_init_conn(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_asset_items WHERE asset_id=?1",
+                [asset_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -40039,10 +40497,7 @@ mod cloud_mcp_tests {
             .unwrap()
             .starts_with("tokenomics:v3:personal:device-a:tokenomics_device_delta:7:"));
         assert_eq!(packet["hc"].as_u64(), Some(1));
-        assert_eq!(
-            packet["hg"][0]["r"].as_array().map(Vec::len),
-            Some(1)
-        );
+        assert_eq!(packet["hg"][0]["r"].as_array().map(Vec::len), Some(1));
         assert!(packet.get("providerAccounts").is_none());
         assert!(packet.get("hourlyGroups").is_none());
         assert!(packet.get("deviceAliases").is_none());
@@ -40139,10 +40594,7 @@ mod cloud_mcp_tests {
         .unwrap();
         let provider_accounts = packet["pa"].as_array().unwrap();
         assert_eq!(provider_accounts.len(), 1);
-        assert_eq!(
-            provider_accounts[0]["a"].as_str(),
-            Some("openai:codex:pro")
-        );
+        assert_eq!(provider_accounts[0]["a"].as_str(), Some("openai:codex:pro"));
         assert_eq!(packet["hc"].as_u64(), Some(1));
         assert_eq!(packet["wc"].as_u64(), Some(1));
         assert_eq!(
@@ -40350,7 +40802,10 @@ mod cloud_mcp_tests {
         assert_eq!(packet["h"].as_str(), Some("content-hash-a"));
         let expected_idempotency_key =
             format!("tokenomics:v3:personal:device-a:day:{day_key}:content-hash-a");
-        assert_eq!(packet["pid"].as_str(), Some(expected_idempotency_key.as_str()));
+        assert_eq!(
+            packet["pid"].as_str(),
+            Some(expected_idempotency_key.as_str())
+        );
         let next_seq_packet = cloud_mcp_tokenomics_device_packet_payload(
             &summary,
             &device,
@@ -40365,14 +40820,8 @@ mod cloud_mcp_tests {
             Some(&bucket),
         )
         .unwrap();
-        assert_eq!(
-            next_seq_packet["pid"].as_str(),
-            packet["pid"].as_str()
-        );
-        assert_eq!(
-            next_seq_packet["ph"].as_str(),
-            packet["ph"].as_str()
-        );
+        assert_eq!(next_seq_packet["pid"].as_str(), packet["pid"].as_str());
+        assert_eq!(next_seq_packet["ph"].as_str(), packet["ph"].as_str());
         assert_eq!(packet["ph"].as_str(), Some("content-hash-a"));
         assert_eq!(
             cloud_mcp_outbox_snapshot_coalesce_key(
@@ -40441,6 +40890,7 @@ mod cloud_mcp_tests {
             &provider_accounts,
             &[],
             &[],
+            &[],
             &json!([]),
         );
         let second = cloud_mcp_tokenomics_day_content_hash(
@@ -40448,11 +40898,13 @@ mod cloud_mcp_tests {
             &provider_accounts,
             &[],
             &[],
+            &[],
             &json!([]),
         );
         let changed = cloud_mcp_tokenomics_day_content_hash(
             &changed_hourly,
             &provider_accounts,
+            &[],
             &[],
             &[],
             &json!([]),
@@ -40691,6 +41143,51 @@ mod cloud_mcp_tests {
         assert_eq!(rows[0]["local_available"].as_bool(), Some(true));
         assert_eq!(rows[0]["local_status"].as_str(), Some("local_available"));
         assert_eq!(rows[0]["folder"].as_str(), Some(folder));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generic_asset_projection_prefers_full_local_rows_over_compact_state() {
+        let root = test_cloud_root("asset-generic-projection-direct-first");
+        fs::create_dir_all(&root).unwrap();
+        let local_path = root.join("image.png");
+        fs::write(&local_path, b"fake png payload").unwrap();
+        let (sha256, size_bytes) = cloud_mcp_file_sha256_and_size(&local_path).unwrap();
+        let response = cloud_mcp_asset_library_response_from_rows(
+            vec![json!({
+                "asset_id": "asset-direct-first",
+                "assetId": "asset-direct-first",
+                "name": "image.png",
+                "size_bytes": size_bytes,
+                "sizeBytes": size_bytes,
+                "sha256": sha256,
+                "local_path": local_path.to_str().unwrap(),
+                "localPath": local_path.to_str().unwrap(),
+                "path": local_path.to_str().unwrap(),
+                "local_status": "local_available",
+                "localStatus": "local_available",
+                "local_available": true,
+                "localAvailable": true,
+                "cloud_status": "local_only",
+                "cloudStatus": "local_only",
+            })],
+            Vec::new(),
+            None,
+        );
+        assert!(response.get("asset_state").is_some());
+
+        let projected = cloud_mcp_asset_library_generic_projection(response);
+        let rows = projected
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(projected["count"].as_u64(), Some(1));
+        assert_eq!(rows[0]["local_path"].as_str(), local_path.to_str());
+        assert_eq!(rows[0]["localPath"].as_str(), local_path.to_str());
+        assert_eq!(rows[0]["path"].as_str(), local_path.to_str());
+        assert_eq!(rows[0]["local_available"].as_bool(), Some(true));
         let _ = fs::remove_dir_all(root);
     }
 

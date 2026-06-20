@@ -988,6 +988,14 @@ fn diffforge_promote_untracked_asset(
             }
         }),
     );
+    snipping_handle_promoted_untracked_asset(
+        &app,
+        &source.display().to_string(),
+        &target_path.display().to_string(),
+        &asset_id,
+        &row,
+        removed_source,
+    );
     Ok(json!({
         "kind": "untracked_asset_promoted",
         "source": "untracked_assets",

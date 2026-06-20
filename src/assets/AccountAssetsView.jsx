@@ -29,13 +29,8 @@ import { CloudQueue } from "@styled-icons/material-rounded/CloudQueue";
 import { Computer } from "@styled-icons/material-rounded/Computer";
 import { Devices } from "@styled-icons/material-rounded/Devices";
 import MediaTranscriptChip from "./MediaTranscriptChip.jsx";
-import HyperframeEditor, {
-  assetCanContainHyperframe,
-  assetLooksLikeHyperframe,
-  loadHyperframeAsset,
-} from "./HyperframeEditor.jsx";
 import { accountAssetFanoutFromValue } from "./accountAssetV2.js";
-import { assetIdentityKeys } from "./useAccountAssetsLibrary.js";
+import { adoptAccountAssetsLibraryEvent } from "./useAccountAssetsLibrary.js";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 const DEFAULT_ASSET_CLOUD_ID = "diffforge-ai-cloud";
@@ -610,7 +605,6 @@ function assetPreviewUrl(asset) {
 }
 
 function assetFileTypeLabel(asset) {
-  if (assetLooksLikeHyperframe(asset)) return "HYPER";
   const extension = assetFileExtension(asset);
   if (extension) return shortLabel(extension.toUpperCase(), 8);
   const kind = assetKind(asset);
@@ -708,7 +702,6 @@ async function copyTextToClipboard(value) {
 }
 
 export default function AccountAssetsView({
-  assetWorkspaces = [],
   defaultWorkingDirectory = "",
   error = "",
   library = null,
@@ -729,83 +722,20 @@ export default function AccountAssetsView({
   void rootDirectory;
   void defaultWorkingDirectory;
   const [assetMode, setAssetMode] = useState("tracked");
-  const [hyperframeEditor, setHyperframeEditor] = useState(null);
   const trackedItems = useMemo(() => assetLibraryItems(library), [library]);
   const untrackedItems = useMemo(() => assetLibraryItems(untrackedLibrary), [untrackedLibrary]);
-  const allAssetItems = useMemo(() => {
-    // Multi-key identity dedupe (asset id, blob, object key, sha+size, local
-    // path) so a freshly uploading file never renders twice while the local
-    // row and the cloud row are still learning each other's identifiers.
-    const indexByKey = new Map();
-    const rows = [];
-    [...trackedItems, ...untrackedItems].forEach((asset, index) => {
-      if (!asset || typeof asset !== "object") return;
-      const keys = assetIdentityKeys(asset);
-      if (!keys.length) keys.push(`fallback:${assetName(asset, "asset")}:${index}`);
-      const existingIndex = keys.map((key) => indexByKey.get(key)).find((found) => found !== undefined);
-      if (existingIndex === undefined) {
-        const rowIndex = rows.length;
-        rows.push(asset);
-        keys.forEach((key) => indexByKey.set(key, rowIndex));
-        return;
-      }
-      // Tracked items come first and win; later duplicates only contribute
-      // their extra identity keys so further variants collapse too.
-      keys.forEach((key) => {
-        if (!indexByKey.has(key)) indexByKey.set(key, existingIndex);
-      });
-    });
-    return rows;
-  }, [trackedItems, untrackedItems]);
   const trackedCount = trackedItems.length;
   const untrackedCount = untrackedItems.length;
 
-  const openHyperframeAsset = useCallback(async (asset) => {
-    if (!assetLocalPath(asset) || !assetCanContainHyperframe(asset)) return false;
-    try {
-      const loaded = await loadHyperframeAsset(asset);
-      if (!loaded.isHyperframe) return false;
-      setHyperframeEditor({
-        ...loaded,
-        asset,
-        assetKey: assetId(asset) || assetLocalPath(asset),
-      });
-      return true;
-    } catch (nextError) {
-      if (!assetLooksLikeHyperframe(asset)) return false;
-      setHyperframeEditor({
-        asset,
-        assetKey: assetId(asset) || assetLocalPath(asset),
-        error: nextError?.message || String(nextError || "Unable to open Hyperframe."),
-        html: "",
-        isHyperframe: true,
-        manifest: null,
-      });
-      return true;
-    }
-  }, []);
-
   return (
     <AssetsSurface aria-label="Account Assets" data-state={loading ? "loading" : "ready"}>
-      {hyperframeEditor ? (
-        <HyperframeEditor
-          asset={hyperframeEditor.asset}
-          assets={allAssetItems}
-          initialDocument={hyperframeEditor}
-          onBack={() => setHyperframeEditor(null)}
-          onRefreshTracked={onRefresh}
-          onRefreshUntracked={onUntrackedRefresh}
-          workspaces={assetWorkspaces}
-        />
-      ) : assetMode === "untracked" ? (
+      {assetMode === "untracked" ? (
         <UntrackedAssetsPanel
           assetMode={assetMode}
-          assetWorkspaces={assetWorkspaces}
           error={untrackedError}
           library={untrackedLibrary}
           loading={untrackedLoading}
           onAssetModeChange={setAssetMode}
-          onOpenHyperframeAsset={openHyperframeAsset}
           onDelete={onUntrackedDelete}
           onPromote={onUntrackedPromote}
           onRefresh={onUntrackedRefresh}
@@ -823,7 +753,6 @@ export default function AccountAssetsView({
           loading={loading}
           onAssetModeChange={setAssetMode}
           onLoadCached={onLoadCached}
-          onOpenHyperframeAsset={openHyperframeAsset}
           onRefresh={onRefresh}
           repoLabel="Assets"
           syncing={syncing}
@@ -918,7 +847,6 @@ function AssetsPanel({
   loading = false,
   onAssetModeChange,
   onLoadCached,
-  onOpenHyperframeAsset,
   onRefresh,
   repoLabel,
   syncing = false,
@@ -1263,9 +1191,6 @@ function AssetsPanel({
       const key = `${action}:${id || localPath}`;
       setBusyKey(key);
       try {
-        if (typeof onOpenHyperframeAsset === "function" && await onOpenHyperframeAsset(asset)) {
-          return;
-        }
         await openPath(localPath);
       } catch (nextError) {
         const message = nextError?.message || String(nextError || "Unable to open asset.");
@@ -1334,16 +1259,18 @@ function AssetsPanel({
         // Untracking only moves the local copy back to scratch; cloud copies
         // stay until the CloudOff action removes private and public storage.
         if (!localPath) return;
-        await invoke("diffforge_untrack_account_asset", {
+        const response = await invoke("diffforge_untrack_account_asset", {
           assetId: id,
           name,
           path: localPath,
         });
+        adoptAccountAssetsLibraryEvent(response);
       } else if (action === "publish") {
         const response = await invoke("cloud_mcp_publish_account_asset", {
           assetId: id,
           cloudId: effectiveCloudId,
         });
+        adoptAccountAssetsLibraryEvent(response);
         const publicUrl = text(
           response?.publicUrl
             || response?.public_url
@@ -1367,11 +1294,12 @@ function AssetsPanel({
             : action === "deleteLocal"
               ? "cloud_mcp_delete_local_account_asset"
               : "cloud_mcp_delete_cloud_account_asset";
-        await invoke(command, {
+        const response = await invoke(command, {
           assetId: id,
           cloudId: ["upload", "download", "deleteCloud"].includes(action) ? effectiveCloudId : undefined,
           deleteFile: action === "deleteLocal" ? true : undefined,
         });
+        adoptAccountAssetsLibraryEvent(response);
         if (action === "upload") {
           setOptimisticUploadTransfer(asset, effectiveCloudId, "completed");
           await refresh({ silent: true, force: true });
@@ -1415,7 +1343,6 @@ function AssetsPanel({
     clearOptimisticUploadTransfer,
     currentDeviceId,
     effectiveCloudId,
-    onOpenHyperframeAsset,
     refresh,
     selectedCloudLabel,
     setOptimisticUploadTransfer,
@@ -1469,10 +1396,11 @@ function AssetsPanel({
             continue;
           }
           if (availability.hasLocal) {
-            await invoke("cloud_mcp_delete_local_account_asset", {
+            const response = await invoke("cloud_mcp_delete_local_account_asset", {
               assetId: id,
               deleteFile: true,
             });
+            adoptAccountAssetsLibraryEvent(response);
             deletedCount += 1;
           }
         }
@@ -1583,6 +1511,10 @@ function AssetsPanel({
       <AssetSelectionDock
         busy={Boolean(busyKey)}
         count={selectedAssets.length}
+        deleteCount={selectedAssets.filter((asset) => {
+          const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel, currentDeviceId);
+          return availability.hasLocal && Boolean(assetLocalPath(asset));
+        }).length}
         imageCount={selectedImageAssets.length}
         onAnnotate={() => runSelectedAssetAction("annotate")}
         onClear={clearSelectedAssets}
@@ -1614,12 +1546,11 @@ function AssetsPanel({
             const showRemoteDeviceLine = remoteDeviceNames.length > 0;
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
             const localPath = availability.hasLocal ? assetLocalPath(asset) : "";
-            const previewUrl = assetPreviewUrl(asset);
+            const previewUrl = localPath ? assetPreviewUrl(asset) : "";
             const publicUrl = assetPublicUrl(asset);
             const isPublic = Boolean(publicUrl);
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
-            const shouldOpenHyperframeEditor = !shouldShowImagePreview && assetCanContainHyperframe(asset) && Boolean(localPath);
             // Assets are account-level: actions only need the asset id, so
             // nothing is gated on a resolvable workspace/repo anymore.
             const canRunAssetAction = Boolean(id);
@@ -1643,6 +1574,13 @@ function AssetsPanel({
             const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canUntrack = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
             const showInfoAction = !availability.hasLocal || availability.hasCloud || availability.hasRemote;
+            const previewTitle = localPath
+              ? shouldShowImagePreview
+                ? "Double-click to open big view and annotate"
+                : "Double-click to open file"
+              : availability.hasCloud
+                ? "No local copy downloaded"
+                : "No local copy";
             const primaryCloudAction = availability.hasCloud && availability.hasLocal
               ? "deleteCloud"
               : availability.hasCloud
@@ -1683,10 +1621,10 @@ function AssetsPanel({
               <AssetCard data-selected={selected ? "true" : "false"} data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
                 <AssetCardMedia>
                 <AssetCardPreview
-                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
+                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
                   onDoubleClick={() => runAssetAction(shouldShowImagePreview ? "view" : "open", asset)}
-                  title={shouldShowImagePreview ? "Double-click to open big view and annotate" : shouldOpenHyperframeEditor ? "Double-click to open Hyperframe editor" : "Double-click to open file"}
+                  title={previewTitle}
                   type="button"
                 >
                   {shouldShowImagePreview ? (
@@ -1852,16 +1790,18 @@ function AssetsPanel({
                   >
                     {showInfoAction ? <Info aria-hidden="true" /> : <ModeEdit aria-hidden="true" />}
                   </AssetIconButton>
-                  <AssetIconButton
-                    aria-label={`Delete local copy of ${name}`}
-                    data-danger="true"
-                    disabled={!canBottomDelete || bottomDeleteBusy || Boolean(busyKey && !bottomDeleteBusy)}
-                    onClick={() => bottomDeleteAction && runAssetAction(bottomDeleteAction, asset)}
-                    title={bottomDeleteTitle}
-                    type="button"
-                  >
-                    <Delete aria-hidden="true" />
-                  </AssetIconButton>
+                  {canDeleteLocal && (
+                    <AssetIconButton
+                      aria-label={`Delete local copy of ${name}`}
+                      data-danger="true"
+                      disabled={!canBottomDelete || bottomDeleteBusy || Boolean(busyKey && !bottomDeleteBusy)}
+                      onClick={() => bottomDeleteAction && runAssetAction(bottomDeleteAction, asset)}
+                      title={bottomDeleteTitle}
+                      type="button"
+                    >
+                      <Delete aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
                 </AssetCardActions>
                 </AssetCardMedia>
                 <AssetCardCaption>
@@ -2395,13 +2335,11 @@ function AssetPinButton({ localPath, name, disabled, onToggle }) {
 
 function UntrackedAssetsPanel({
   assetMode = "untracked",
-  assetWorkspaces = [],
   error = "",
   library = null,
   loading = false,
   onAssetModeChange,
   onDelete,
-  onOpenHyperframeAsset,
   onPromote,
   onRefresh,
   onRename,
@@ -2487,9 +2425,6 @@ function UntrackedAssetsPanel({
     setBusyKey(key);
     try {
       if (action === "open") {
-        if (typeof onOpenHyperframeAsset === "function" && await onOpenHyperframeAsset(asset)) {
-          return;
-        }
         await openPath(localPath);
       } else if (action === "view") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
@@ -2519,11 +2454,12 @@ function UntrackedAssetsPanel({
       } else if (action === "track") {
         if (typeof onPromote !== "function") return;
         // Tracking is account-level: no workspace/repo scope on the asset.
-        await onPromote({
+        const result = await onPromote({
           deleteSource: true,
           name,
           path: localPath,
         });
+        adoptAccountAssetsLibraryEvent(result);
         await trackedRefresh({ silent: true, force: true });
         showAssetToast("success", "Asset tracked", "Moved into tracked assets.", [name]);
       }
@@ -2533,7 +2469,7 @@ function UntrackedAssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [onDelete, onOpenHyperframeAsset, onPromote, onRename, showAssetToast, trackedRefresh]);
+  }, [onDelete, onPromote, onRename, showAssetToast, trackedRefresh]);
 
   const runSelectedUntrackedAction = useCallback(async (action) => {
     if (!selectedAssets.length) return;
@@ -2642,7 +2578,6 @@ function UntrackedAssetsPanel({
             const previewUrl = assetPreviewUrl(asset);
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
-            const shouldOpenHyperframeEditor = !shouldShowImagePreview && assetCanContainHyperframe(asset) && Boolean(localPath);
             const openBusy = busyKey === `open:${id}`;
             const viewBusy = busyKey === `view:${id}`;
             const copyBusy = busyKey === `copy:${id}`;
@@ -2658,10 +2593,10 @@ function UntrackedAssetsPanel({
               <AssetCard data-selected={selected ? "true" : "false"} data-status="parked" key={id} title={localPath || name}>
                 <AssetCardMedia>
                 <AssetCardPreview
-                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
+                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
                   onDoubleClick={() => runUntrackedAction(shouldShowImagePreview ? "view" : "open", asset)}
-                  title={shouldShowImagePreview ? "Double-click to open big view and annotate" : shouldOpenHyperframeEditor ? "Double-click to open Hyperframe editor" : "Double-click to open file"}
+                  title={shouldShowImagePreview ? "Double-click to open big view and annotate" : "Double-click to open file"}
                   type="button"
                 >
                   {shouldShowImagePreview ? (
@@ -3365,18 +3300,19 @@ const AssetSelectionDockBar = styled.div`
 function AssetSelectionDock({
   busy,
   count,
+  deleteCount = count,
   deleteLabel = "Delete",
   imageCount,
   onAnnotate,
   onClear,
   onDelete,
 }) {
-  const lastCountsRef = useRef({ count: 0, imageCount: 0 });
+  const lastCountsRef = useRef({ count: 0, deleteCount: 0, imageCount: 0 });
   if (count > 0) {
-    lastCountsRef.current = { count, imageCount };
+    lastCountsRef.current = { count, deleteCount, imageCount };
   }
   const visible = count > 0;
-  const shown = visible ? { count, imageCount } : lastCountsRef.current;
+  const shown = visible ? { count, deleteCount, imageCount } : lastCountsRef.current;
   return (
     <AssetSelectionDockBar
       aria-hidden={visible ? "false" : "true"}
@@ -3393,15 +3329,17 @@ function AssetSelectionDock({
         <ModeEdit aria-hidden="true" />
         <span>Annotation</span>
       </AssetBatchButton>
-      <AssetBatchButton
-        data-danger="true"
-        disabled={!visible || busy}
-        onClick={onDelete}
-        type="button"
-      >
-        <Delete aria-hidden="true" />
-        <span>{deleteLabel}</span>
-      </AssetBatchButton>
+      {shown.deleteCount > 0 && (
+        <AssetBatchButton
+          data-danger="true"
+          disabled={!visible || busy}
+          onClick={onDelete}
+          type="button"
+        >
+          <Delete aria-hidden="true" />
+          <span>{deleteLabel}</span>
+        </AssetBatchButton>
+      )}
       <AssetBatchButton disabled={!visible || busy} onClick={onClear} type="button">
         Clear
       </AssetBatchButton>

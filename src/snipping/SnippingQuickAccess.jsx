@@ -75,6 +75,7 @@ const STRIP_THUMBNAIL_MAX_CONCURRENT_READS = 3;
 const stripThumbnailCache = new Map();
 const stripThumbnailInflight = new Map();
 const stripThumbnailQueue = [];
+const snipAssetBindingsByPath = new Map();
 let stripThumbnailActiveReads = 0;
 
 
@@ -348,16 +349,83 @@ function numberValue(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function snipAssetId(asset) {
+  return text(asset?.assetId || asset?.asset_id || asset?.id);
+}
+
+function snipAssetLooksLikeAsset(row) {
+  if (!jsonObject(row) || !snipAssetId(row)) return false;
+  if (snipTransferDirection(row) || text(row?.transferId || row?.transfer_id)) return false;
+  return Boolean(
+    assetLocalPath(row)
+      || row?.localAvailable != null
+      || row?.local_available != null
+      || row?.cloudAvailable != null
+      || row?.cloud_available != null
+      || row?.clouds
+      || row?.cloudStatuses
+      || row?.cloud_statuses
+      || row?.publicUrl
+      || row?.public_url
+      || row?.publicLink
+      || row?.public_link
+      || row?.blobId
+      || row?.blob_id
+      || row?.kind
+      || row?.mimeType
+      || row?.mime_type
+      || row?.name
+  );
+}
+
+function collectLegacySnipAssetRows(value, depth = 0, seen = new Set()) {
+  const object = jsonObject(value);
+  if (!object || depth > 7 || seen.has(object)) return [];
+  seen.add(object);
+  const rows = [];
+  if (snipAssetLooksLikeAsset(object)) {
+    rows.push(object);
+  }
+  [
+    "asset",
+    "item",
+    "payload",
+    "result",
+    "stored",
+    "data",
+  ].forEach((key) => {
+    rows.push(...collectLegacySnipAssetRows(object[key], depth + 1, seen));
+  });
+  [
+    "assets",
+    "items",
+  ].forEach((key) => {
+    jsonArray(object[key]).forEach((row) => {
+      rows.push(...collectLegacySnipAssetRows(row, depth + 1, seen));
+    });
+  });
+  return rows;
+}
+
+function mergeSnipAssetRows(rows) {
+  const byId = new Map();
+  rows.filter(snipAssetLooksLikeAsset).forEach((row) => {
+    const id = snipAssetId(row);
+    if (!id) return;
+    byId.set(id, { ...(byId.get(id) || {}), ...row });
+  });
+  return [...byId.values()];
+}
+
 function collectSnipAssetRows(value) {
-  return accountAssetFanoutFromValue(value)?.items || [];
+  return mergeSnipAssetRows([
+    ...(accountAssetFanoutFromValue(value)?.items || []),
+    ...collectLegacySnipAssetRows(value),
+  ]);
 }
 
 function collectSnipTransferRows(value) {
   return accountAssetFanoutFromValue(value)?.transfers || [];
-}
-
-function snipAssetId(asset) {
-  return text(asset?.assetId || asset?.asset_id || asset?.id);
 }
 
 function snipTransferAssetId(transfer) {
@@ -393,11 +461,136 @@ function snipUploadEventPaths(payload) {
     payload?.path,
     payload?.sourcePath,
     payload?.source_path,
+    payload?.originalPath,
+    payload?.original_path,
+    payload?.editedPath,
+    payload?.edited_path,
+    payload?.targetPath,
+    payload?.target_path,
   ].map((value) => text(value)).filter(Boolean);
 }
 
 function assetLocalPath(asset) {
   return text(asset?.localPath || asset?.local_path || asset?.path);
+}
+
+function snipAssetPublicUrl(asset) {
+  const publicLink = jsonObject(asset?.publicLink || asset?.public_link);
+  return text(
+    asset?.publicUrl
+      || asset?.public_url
+      || publicLink?.publicUrl
+      || publicLink?.public_url
+      || publicLink?.url,
+  );
+}
+
+function snipAssetCloudState(asset) {
+  const maps = [
+    jsonObject(asset?.cloudStatusByCloud),
+    jsonObject(asset?.cloud_status_by_cloud),
+  ].filter(Boolean);
+  for (const map of maps) {
+    const first = Object.values(map).find(Boolean);
+    if (first) return jsonObject(first) || first;
+  }
+  return [
+    ...jsonArray(asset?.clouds),
+    ...jsonArray(asset?.cloudStatuses),
+    ...jsonArray(asset?.cloud_statuses),
+  ].find(Boolean) || null;
+}
+
+function snipCloudStatusToken(value) {
+  return text(value).toLowerCase().replace(/[_\s]+/gu, "-");
+}
+
+function snipAssetCloudAvailable(asset) {
+  const cloudState = snipAssetCloudState(asset);
+  if (cloudState) {
+    const explicit = cloudState.cloudAvailable ?? cloudState.cloud_available;
+    if (typeof explicit === "boolean") return explicit;
+    const status = snipCloudStatusToken(cloudState.cloudStatus || cloudState.cloud_status || cloudState.status);
+    if (["complete", "cloud-available", "available", "ready", "synced", "uploaded"].includes(status)) return true;
+    if (["deleted", "cloud-deleted-local-kept", "local-only", "missing", "not-found", "unavailable"].includes(status)) return false;
+  }
+  const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
+  if (typeof explicit === "boolean") return explicit;
+  const status = snipCloudStatusToken(
+    asset?.cloudStatus || asset?.cloud_status || asset?.status || asset?.assetStatus || asset?.asset_status,
+  );
+  if (["cloud-deleted-local-kept", "deleted", "local-only", "missing", "not-found", "unavailable"].includes(status)) {
+    return false;
+  }
+  if (["available", "cloud-available", "cloud-only", "complete", "completed", "ready", "synced", "uploaded"].includes(status)) {
+    return true;
+  }
+  return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
+}
+
+function snipAssetPaths(asset) {
+  const metadata = jsonObject(asset?.metadata) || {};
+  return [
+    assetLocalPath(asset),
+    asset?.sourcePath,
+    asset?.source_path,
+    asset?.originalPath,
+    asset?.original_path,
+    metadata.sourcePath,
+    metadata.source_path,
+    metadata.originalPath,
+    metadata.original_path,
+  ].map((value) => text(value)).filter(Boolean);
+}
+
+function snipAssetMatchesPath(asset, localPath) {
+  const path = text(localPath);
+  return Boolean(path && snipAssetPaths(asset).includes(path));
+}
+
+function snipAssetPresentation(asset) {
+  if (!asset) return null;
+  const id = snipAssetId(asset);
+  if (!id) return null;
+  const publicUrl = snipAssetPublicUrl(asset);
+  const hasCloud = snipAssetCloudAvailable(asset) || Boolean(publicUrl);
+  return {
+    asset,
+    assetId: id,
+    hasCloud,
+    publicUrl,
+    uploadState: publicUrl ? "done" : hasCloud ? "private" : "idle",
+  };
+}
+
+function rememberSnipAssetBindings(payload) {
+  const assets = collectSnipAssetRows(payload);
+  if (!assets.length) return;
+  const payloadPaths = snipUploadEventPaths(payload);
+  const now = Date.now();
+  assets.forEach((asset) => {
+    const binding = snipAssetPresentation(asset);
+    if (!binding) return;
+    const paths = [...new Set([...payloadPaths, ...snipAssetPaths(asset)])];
+    paths.forEach((path) => {
+      snipAssetBindingsByPath.set(path, { ...binding, updatedAt: now });
+    });
+  });
+  while (snipAssetBindingsByPath.size > 256) {
+    const oldest = snipAssetBindingsByPath.keys().next().value;
+    if (!oldest) break;
+    snipAssetBindingsByPath.delete(oldest);
+  }
+}
+
+function snipAssetBindingForPath(localPath) {
+  const binding = snipAssetBindingsByPath.get(text(localPath));
+  if (!binding) return null;
+  if (Date.now() - binding.updatedAt > 10 * 60 * 1000) {
+    snipAssetBindingsByPath.delete(text(localPath));
+    return null;
+  }
+  return binding;
 }
 
 function assetIsVideoPath(localPath) {
@@ -682,9 +875,9 @@ async function copyTextToClipboard(value) {
  * Upload-button state machine shared by the floating preview and the strip
  * tile: idle -> uploading -> private for private snip uploads, or idle ->
  * uploading -> done when the snip upload-public setting mints and copies a
- * link during upload. The primary button is then "Unupload" for private
- * copies and "Copy URL" for public links; the single CloudOff delete path
- * removes both private sync storage and any public copy/link.
+ * link during upload. The primary button is then "Make public" for private
+ * copies and "Copy URL" for public links; the secondary CloudOff path removes
+ * both private sync storage and any public copy/link.
  * A different adopted snip or an annotation save resets to idle because the
  * uploaded asset no longer matches the visible pixels.
  */
@@ -697,13 +890,30 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
   const copiedTimerRef = useRef(0);
   const assetIdRef = useRef("");
 
+  const applyAssetPresentation = useCallback((presentation, options = {}) => {
+    if (!presentation?.assetId) return;
+    const nextState = presentation.uploadState || "idle";
+    assetIdRef.current = presentation.assetId;
+    setAssetId(presentation.assetId);
+    setPublicUrl(presentation.publicUrl || "");
+    if (nextState === "done" || nextState === "private") {
+      setUploadPercent(100);
+    }
+    setUploadState((current) => {
+      const busyState = ["uploading", "publishing", "deleting"].includes(current);
+      if (busyState && nextState === "idle" && !options.allowIdleDuringBusy) return current;
+      return nextState;
+    });
+  }, []);
+
   useEffect(() => {
     setUploadState("idle");
     setAssetId("");
     setPublicUrl("");
     setUploadPercent(null);
     setUrlCopied(false);
-  }, [imageVersion, localPath]);
+    applyAssetPresentation(snipAssetBindingForPath(localPath), { allowIdleDuringBusy: true });
+  }, [applyAssetPresentation, imageVersion, localPath]);
 
   useEffect(() => {
     assetIdRef.current = assetId;
@@ -719,16 +929,19 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
       setAssetId(nextAssetId);
     };
     const updateFromTransfer = (transfer) => {
-      if (!transfer || snipTransferDirection(transfer) !== "upload") return;
+      if (!transfer || snipTransferDirection(transfer) !== "upload") return "";
       const percent = snipTransferPercent(transfer);
       if (percent != null) setUploadPercent(percent);
       const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
       if (["failed", "interrupted", "cancelled", "canceled"].includes(status)) {
         setUploadState("idle");
         setUploadPercent(null);
+        return "terminal";
       } else if (["queued", "prepared", "preparing", "uploading", "committing", "verifying"].includes(status)) {
         setUploadState((current) => (["private", "done", "publishing", "deleting"].includes(current) ? current : "uploading"));
+        return "active";
       }
+      return status === "completed" ? "completed" : "";
     };
     const bindStartedUpload = (payload) => {
       if (!snipUploadEventPaths(payload).includes(localPath)) return;
@@ -745,9 +958,17 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
       }
     };
     const bindAccountAssetEvent = (payload) => {
+      rememberSnipAssetBindings(payload);
+      const assets = collectSnipAssetRows(payload);
+      const payloadMatchesPath = snipUploadEventPaths(payload).includes(localPath);
       let currentAssetId = assetIdRef.current;
+      let asset = currentAssetId
+        ? assets.find((row) => snipAssetId(row) === currentAssetId)
+        : null;
       if (!currentAssetId) {
-        const asset = collectSnipAssetRows(payload).find((row) => assetLocalPath(row) === localPath);
+        asset = assets.find((row) => snipAssetMatchesPath(row, localPath))
+          || (payloadMatchesPath ? assets[0] : null)
+          || snipAssetBindingForPath(localPath)?.asset;
         currentAssetId = snipAssetId(asset);
         applyUploadAssetId(currentAssetId);
       }
@@ -756,7 +977,12 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
         .filter((row) => snipTransferAssetId(row) === currentAssetId)
         .filter((row) => snipTransferDirection(row) === "upload")
         .sort((left, right) => snipTransferUpdatedAt(right) - snipTransferUpdatedAt(left))[0];
-      updateFromTransfer(transfer);
+      const transferState = updateFromTransfer(transfer);
+      if (transferState !== "active") {
+        const presentation = snipAssetPresentation(asset)
+          || (payloadMatchesPath ? snipAssetBindingForPath(localPath) : null);
+        applyAssetPresentation(presentation);
+      }
     };
 
     listen(SNIPPING_CLOUD_UPLOAD_EVENT, (event) => {
@@ -766,6 +992,12 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
       else unlisteners.push(unlisten);
     }).catch(() => {});
     listen(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, (event) => {
+      if (!cancelled) bindAccountAssetEvent(event?.payload);
+    }).then((unlisten) => {
+      if (cancelled) unlisten();
+      else unlisteners.push(unlisten);
+    }).catch(() => {});
+    listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
       if (!cancelled) bindAccountAssetEvent(event?.payload);
     }).then((unlisten) => {
       if (cancelled) unlisten();
@@ -782,7 +1014,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
         }
       });
     };
-  }, [localPath]);
+  }, [applyAssetPresentation, localPath]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) {
@@ -810,6 +1042,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     try {
       const result = await invoke("snipping_upload_untracked_asset_to_cloud", {
         request: {
+          assetId: assetId || undefined,
           group: "snips",
           name,
           path: localPath,
@@ -834,7 +1067,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
       setUploadPercent(null);
       throw error;
     }
-  }, [localPath, name, setCopiedFeedback, showStatus]);
+  }, [assetId, localPath, name, setCopiedFeedback, showStatus]);
 
   const makePublic = useCallback(async () => {
     if (!assetId) return;
@@ -914,8 +1147,8 @@ function SnipUploadButtonBody({ uploadPercent, uploadState, urlCopied }) {
   if (uploadState === "private") {
     return (
       <>
-        <CloudOff aria-hidden="true" />
-        <span>Unupload</span>
+        <Public aria-hidden="true" />
+        <span>Make public</span>
       </>
     );
   }
@@ -960,7 +1193,7 @@ function snipUploadButtonTitle(uploadState, name) {
   if (uploadState === "uploading") return `Uploading ${name}`;
   if (uploadState === "publishing") return `Publishing ${name}`;
   if (uploadState === "deleting") return `Removing ${name} from Cloud`;
-  if (uploadState === "private") return `Remove Cloud upload of ${name}`;
+  if (uploadState === "private") return `Make ${name} public`;
   if (uploadState === "done") return `Copy public URL for ${name}`;
   return `Upload ${name}`;
 }
@@ -1364,7 +1597,7 @@ export function SnippingFloatWindow() {
         if (uploadState === "done") {
           await copyPublicUrl();
         } else if (uploadState === "private") {
-          await deleteCloudUpload();
+          await makePublic();
         } else {
           await uploadToCloud();
         }
@@ -1538,15 +1771,15 @@ export function SnippingFloatWindow() {
           )}
           {uploadState === "private" && (
             <FloatUploadSideButton
-              aria-label={`Make ${name} public`}
-              data-primary="true"
+              aria-label={`Remove Cloud upload of ${name}`}
+              data-danger="true"
               disabled={busy || closing}
-              {...hoverControlProps("publish")}
-              onClick={() => runAction("publish")}
-              title="Make public"
+              {...hoverControlProps("delete-cloud")}
+              onClick={() => runAction("deleteCloud")}
+              title="Remove Cloud upload"
               type="button"
             >
-              <Public aria-hidden="true" />
+              <CloudOff aria-hidden="true" />
             </FloatUploadSideButton>
           )}
           <FloatUploadButton
@@ -2113,7 +2346,31 @@ function StripSnipTile({
   onReorderStart,
   railRef,
 }) {
-  const localPath = assetLocalPath(item);
+  const itemLocalPath = assetLocalPath(item);
+  const [localPath, setLocalPath] = useState(itemLocalPath);
+  useEffect(() => {
+    setLocalPath(itemLocalPath);
+  }, [itemLocalPath]);
+  useEffect(() => {
+    if (!localPath) return undefined;
+    let disposed = false;
+    let unlisten = () => {};
+    listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const original = text(payload.originalPath || payload.original_path || payload.sourcePath || payload.source_path);
+      const promoted = text(payload.editedPath || payload.edited_path || payload.localPath || payload.local_path || payload.path);
+      if (!promoted || localPath !== original) return;
+      setLocalPath(promoted);
+    }).then((nextUnlisten) => {
+      if (disposed) nextUnlisten();
+      else unlisten = nextUnlisten;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [localPath]);
   const name = useMemo(() => assetName(item), [item]);
   const imageVersion = useMemo(() => Number(item?.modifiedMs || item?.modified_ms || 0) || 0, [item]);
   const isVideo = useMemo(() => assetIsVideoPath(localPath), [localPath]);
@@ -2200,7 +2457,7 @@ function StripSnipTile({
         if (uploadState === "done") {
           await copyPublicUrl();
         } else if (uploadState === "private") {
-          await deleteCloudUpload();
+          await makePublic();
         } else {
           await uploadToCloud();
         }
@@ -2392,14 +2649,14 @@ function StripSnipTile({
         )}
         {uploadState === "private" && (
           <StripUploadSideButton
-            aria-label={`Make ${name} public`}
-            data-primary="true"
+            aria-label={`Remove Cloud upload of ${name}`}
+            data-danger="true"
             disabled={busy}
-            onClick={() => runAction("publish")}
-            title="Make public"
+            onClick={() => runAction("deleteCloud")}
+            title="Remove Cloud upload"
             type="button"
           >
-            <Public aria-hidden="true" />
+            <CloudOff aria-hidden="true" />
           </StripUploadSideButton>
         )}
         <StripTileUploadButton

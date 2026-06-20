@@ -58,8 +58,12 @@ function jsonObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
-function text(value) {
-  return String(value ?? "").trim();
+function text(...values) {
+  for (const value of values) {
+    const next = String(value ?? "").trim();
+    if (next) return next;
+  }
+  return "";
 }
 
 function assetLibraryPayload(value, depth = 0) {
@@ -76,13 +80,155 @@ function assetLocalPath(asset) {
   return text(asset?.localPath || asset?.local_path || asset?.path);
 }
 
+function assetRowShaped(asset) {
+  return Boolean(jsonObject(asset) && text(asset?.assetId || asset?.asset_id || asset?.id));
+}
+
+function normalizedStatus(value) {
+  return text(value).toLowerCase().replace(/[_\s.]+/gu, "-");
+}
+
+const LOCAL_UNAVAILABLE_STATUSES = new Set([
+  "deleted",
+  "local-deleted",
+  "local-missing",
+  "missing",
+  "not-found",
+  "unavailable",
+]);
+
+const CLOUD_AVAILABLE_STATUSES = new Set([
+  "available",
+  "cloud-available",
+  "cloud-only",
+  "complete",
+  "completed",
+  "ready",
+  "synced",
+  "uploaded",
+]);
+
+const CLOUD_UNAVAILABLE_STATUSES = new Set([
+  "cloud-deleted",
+  "cloud-deleted-local-kept",
+  "deleted",
+  "local-only",
+  "missing",
+  "not-found",
+  "unavailable",
+]);
+
+function assetIdText(asset) {
+  if (typeof asset === "string") return text(asset);
+  return text(asset?.assetId || asset?.asset_id || asset?.id);
+}
+
+function assetDeviceRows(asset) {
+  return [
+    ...jsonArray(asset?.devices),
+    ...jsonArray(asset?.assetDevices),
+    ...jsonArray(asset?.asset_devices),
+    ...jsonArray(asset?.localCopies),
+    ...jsonArray(asset?.local_copies),
+    ...jsonArray(asset?.locations),
+  ].filter((device) => device && typeof device === "object");
+}
+
+function assetDeviceLocalAvailable(device) {
+  const explicit = device?.localAvailable ?? device?.local_available ?? device?.available;
+  if (typeof explicit === "boolean") return explicit;
+  const status = normalizedStatus(device?.localStatus || device?.local_status || device?.status || device?.availability);
+  return ["available", "local-available", "present", "ready", "synced"].includes(status);
+}
+
+function assetCloudCopyAvailable(asset) {
+  const cloudStates = [
+    ...jsonArray(asset?.clouds),
+    ...jsonArray(asset?.cloudStatuses),
+    ...jsonArray(asset?.cloud_statuses),
+  ];
+  let sawUnavailableCloudState = false;
+  for (const cloudState of cloudStates) {
+    const explicit = cloudState?.cloudAvailable ?? cloudState?.cloud_available;
+    if (explicit === true) return true;
+    if (explicit === false) {
+      sawUnavailableCloudState = true;
+      continue;
+    }
+    const status = normalizedStatus(cloudState?.cloudStatus || cloudState?.cloud_status || cloudState?.status);
+    if (CLOUD_AVAILABLE_STATUSES.has(status)) return true;
+    if (CLOUD_UNAVAILABLE_STATUSES.has(status)) sawUnavailableCloudState = true;
+  }
+  if (sawUnavailableCloudState) return false;
+  const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
+  if (typeof explicit === "boolean") return explicit;
+  const status = normalizedStatus(
+    asset?.cloudStatus || asset?.cloud_status || asset?.status || asset?.assetStatus || asset?.asset_status,
+  );
+  if (CLOUD_UNAVAILABLE_STATUSES.has(status)) return false;
+  if (CLOUD_AVAILABLE_STATUSES.has(status)) return true;
+  return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
+}
+
+function assetRemoteCopyAvailable(asset) {
+  return assetDeviceRows(asset).some((device) => {
+    if (!assetDeviceLocalAvailable(device)) return false;
+    return !(
+      device?.current
+      || device?.isCurrent
+      || device?.is_current
+      || device?.currentDevice
+      || device?.current_device
+    );
+  });
+}
+
+function removedAssetClearsOnlyLocal(removed) {
+  const row = jsonObject(removed);
+  if (!row) return false;
+  if (row.cloudRemoved === true || row.cloud_removed === true) return false;
+  const cloudStatus = normalizedStatus(
+    row.cloudStatus || row.cloud_status || row.assetStatus || row.asset_status || row.status,
+  );
+  if (CLOUD_UNAVAILABLE_STATUSES.has(cloudStatus) && !LOCAL_UNAVAILABLE_STATUSES.has(cloudStatus)) {
+    return false;
+  }
+  const localStatus = normalizedStatus(row.local_status || row.localStatus);
+  if (LOCAL_UNAVAILABLE_STATUSES.has(localStatus)) return true;
+  if (row.local_available === false || row.localAvailable === false) return true;
+  const reason = normalizedStatus(row.delete_reason || row.deleteReason || row.reason);
+  return reason.includes("local") && !reason.includes("cloud");
+}
+
+function assetLocalDeletedPatch(removed, assetId) {
+  return {
+    ...(jsonObject(removed) || {}),
+    asset_id: assetId,
+    assetId,
+    id: assetId,
+    local_available: false,
+    localAvailable: false,
+    local_path: "",
+    localPath: "",
+    path: "",
+    local_status: "local_deleted",
+    localStatus: "local_deleted",
+    can_upload: false,
+    canUpload: false,
+  };
+}
+
 export function assetIdentityKeys(asset) {
   const keys = [];
   const add = (prefix, value) => {
     const key = text(value);
     if (key) keys.push(`${prefix}:${key.toLowerCase()}`);
   };
-  add("asset", asset?.assetId || asset?.asset_id || asset?.id);
+  const assetId = assetIdText(asset);
+  if (assetId) {
+    add("asset", assetId);
+    return keys;
+  }
   add("blob", asset?.blobId || asset?.blob_id);
   add("object", asset?.objectKey || asset?.object_key);
   const sha = text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
@@ -92,46 +238,60 @@ export function assetIdentityKeys(asset) {
   return keys;
 }
 
+function assetIncomingClearsLocal(incoming) {
+  const incomingObject = jsonObject(incoming) || {};
+  const localStatus = normalizedStatus(incomingObject.local_status || incomingObject.localStatus);
+  if (LOCAL_UNAVAILABLE_STATUSES.has(localStatus)) return true;
+  if (
+    incomingObject.local_available === false
+    || incomingObject.localAvailable === false
+  ) {
+    const hasPathKey = ["local_path", "localPath", "path"].some((key) => (
+      Object.prototype.hasOwnProperty.call(incomingObject, key)
+    ));
+    return hasPathKey ? !assetLocalPath(incomingObject) : Boolean(localStatus);
+  }
+  return false;
+}
+
 function mergeAssetRows(existing, incoming) {
   if (!existing) return incoming;
+  if (!incoming) return existing;
+  const clearsLocal = assetIncomingClearsLocal(incoming);
   const merged = { ...existing };
   Object.entries(incoming || {}).forEach(([key, value]) => {
     const current = merged[key];
     const incomingText = typeof value === "string" ? value.trim() : "";
     const currentText = typeof current === "string" ? current.trim() : "";
-    const existingPath = assetLocalPath(merged);
-    const incomingPath = assetLocalPath(incoming);
     if ((value === null || value === undefined || incomingText === "") && currentText) {
+      if (clearsLocal && ["local_path", "localPath", "path"].includes(key)) {
+        merged[key] = "";
+      }
       return;
     }
-    if (["local_path", "localPath", "path"].includes(key) && !incomingText && existingPath) {
+    if (["local_path", "localPath", "path"].includes(key) && !incomingText && !clearsLocal) {
       return;
     }
     if (
       ["local_status", "localStatus", "cloud_status", "cloudStatus"].includes(key)
-      && ["", "unknown"].includes(incomingText.toLowerCase())
+      && ["", "unknown"].includes(normalizedStatus(incomingText))
       && currentText
-    ) {
-      return;
-    }
-    if (
-      ["local_status", "localStatus"].includes(key)
-      && existingPath
-      && !incomingPath
-      && ["deleted", "local-deleted", "local-missing", "missing", "not-found", "unavailable"].includes(incomingText.toLowerCase().replace(/[_\s]+/gu, "-"))
-    ) {
-      return;
-    }
-    if (
-      ["local_available", "localAvailable"].includes(key)
-      && value === false
-      && existingPath
-      && !incomingPath
     ) {
       return;
     }
     merged[key] = value;
   });
+  if (clearsLocal) {
+    merged.local_path = "";
+    merged.localPath = "";
+    merged.path = "";
+    merged.local_available = false;
+    merged.localAvailable = false;
+    merged.local_status = text(incoming.local_status, incoming.localStatus, "local_deleted");
+    merged.localStatus = merged.local_status;
+    merged.can_upload = false;
+    merged.canUpload = false;
+  }
   return merged;
 }
 
@@ -164,7 +324,8 @@ function assetHiddenFromGenericLibrary(asset) {
     metadata.source_kind,
     metadata.source,
   ).toLowerCase();
-  if (sourceKind === "account_skill" || sourceKind === "account-architecture" || sourceKind === "account_architecture") {
+  const sourceToken = sourceKind.replace(/[-\s.]+/gu, "_");
+  if (sourceToken === "account_skill" || sourceToken === "account_architecture") {
     return true;
   }
   const docDomain = text(
@@ -211,9 +372,11 @@ function normalizeAssetsLibrary(library) {
   const directItems = jsonArray(payload.items).length
     ? jsonArray(payload.items)
     : jsonArray(payload.assets);
+  const singularItems = [payload.asset, payload.item].filter(assetRowShaped);
   const items = dedupeAssetRows([
     ...(fanout?.items || []),
     ...directItems,
+    ...singularItems,
   ]).filter((item) => !assetHiddenFromGenericLibrary(item));
   const visibleIds = new Set(items.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
   const transfers = dedupeTransferRows([
@@ -240,18 +403,85 @@ function normalizeAssetsLibrary(library) {
   };
 }
 
-function mergeAssetsLibraryEvent(library, eventPayload) {
-  const fanout = accountAssetFanoutFromValue(eventPayload);
-  const normalizedEvent = normalizeAssetsLibrary(assetLibraryPayload(eventPayload));
-  const items = normalizedEvent?.items || fanout?.items || [];
-  const transfers = normalizedEvent?.transfers || fanout?.transfers || [];
-  const removedAssets = fanout?.removedAssets || fanout?.removed_assets || [];
-  if (!items.length && !transfers.length && !removedAssets.length) return library;
+function mergeAssetsLibrarySnapshot(library, snapshot) {
+  const normalizedSnapshot = normalizeAssetsLibrary(snapshot);
+  if (!normalizedSnapshot) return library;
+  const snapshotPayload = assetLibraryPayload(snapshot);
+  const snapshotIsFull = Boolean(
+    normalizedSnapshot?.snapshotFull
+      || normalizedSnapshot?.snapshot_full
+      || snapshotPayload?.snapshotFull
+      || snapshotPayload?.snapshot_full
+      || snapshotPayload?.source === "local_asset_library"
+      || snapshotPayload?.kind === "account_assets",
+  );
+  if (!library || !normalizeAssetsLibrary(library)?.items?.length || snapshotIsFull) {
+    return normalizedSnapshot;
+  }
   const current = normalizeAssetsLibrary(library || {});
-  const removedIds = new Set(removedAssets.map((row) => text(row.assetId || row.asset_id || row.id)).filter(Boolean));
   const nextItems = dedupeAssetRows([
     ...jsonArray(current?.items),
+    ...jsonArray(normalizedSnapshot?.items),
+  ]).filter((item) => !assetHiddenFromGenericLibrary(item));
+  const visibleIds = new Set(nextItems.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
+  const nextTransfers = dedupeTransferRows([
+    ...jsonArray(current?.transfers),
+    ...jsonArray(normalizedSnapshot?.transfers),
+  ]).filter((transfer) => visibleIds.has(text(transfer.assetId || transfer.asset_id)));
+  const clouds = jsonArray(normalizedSnapshot?.clouds).length
+    ? jsonArray(normalizedSnapshot.clouds)
+    : jsonArray(current?.clouds);
+  return normalizeAssetsLibrary({
+    ...(current || {}),
+    ...(normalizedSnapshot || {}),
+    items: nextItems,
+    assets: nextItems,
+    clouds,
+    assetClouds: clouds,
+    asset_clouds: clouds,
+    transfers: nextTransfers,
+  });
+}
+
+function mergeAssetsLibraryEvent(library, eventPayload) {
+  const fanout = accountAssetFanoutFromValue(eventPayload);
+  const payload = assetLibraryPayload(eventPayload);
+  const normalizedEvent = normalizeAssetsLibrary(payload);
+  const items = normalizedEvent?.items || fanout?.items || [];
+  const transfers = normalizedEvent?.transfers || fanout?.transfers || [];
+  const removedAssets = [
+    ...jsonArray(fanout?.removedAssets || fanout?.removed_assets),
+    ...jsonArray(payload?.removed_assets),
+    ...jsonArray(payload?.removedAssets),
+  ];
+  if (!items.length && !transfers.length && !removedAssets.length) return library;
+  const current = normalizeAssetsLibrary(library || {});
+  const currentItems = jsonArray(current?.items);
+  const currentItemsById = new Map(
+    currentItems
+      .map((item) => [assetIdText(item), item])
+      .filter(([id]) => Boolean(id)),
+  );
+  const removedIds = new Set();
+  const localDeletedItems = [];
+  removedAssets.forEach((removed) => {
+    const id = assetIdText(removed);
+    if (!id) return;
+    const existing = currentItemsById.get(id);
+    if (
+      existing
+      && removedAssetClearsOnlyLocal(removed)
+      && (assetCloudCopyAvailable(existing) || assetRemoteCopyAvailable(existing))
+    ) {
+      localDeletedItems.push(assetLocalDeletedPatch(removed, id));
+      return;
+    }
+    removedIds.add(id);
+  });
+  const nextItems = dedupeAssetRows([
+    ...currentItems,
     ...items,
+    ...localDeletedItems,
   ])
     .filter((item) => !assetHiddenFromGenericLibrary(item))
     .filter((item) => !removedIds.has(text(item.assetId || item.asset_id || item.id)));
@@ -289,7 +519,9 @@ function loadCachedAssetsLibrary() {
   )
     .then((library) => {
       if (library) {
-        updateAssetsLibraryStore({ library: normalizeAssetsLibrary(library) });
+        updateAssetsLibraryStore((previous) => ({
+          library: mergeAssetsLibrarySnapshot(previous.library, library),
+        }));
       }
       return library;
     })
@@ -316,11 +548,11 @@ function refreshAssetsLibrary({ silent = false, force = false } = {}) {
     assetLibraryRequestOptions(),
   )
     .then((library) => {
-      updateAssetsLibraryStore({
+      updateAssetsLibraryStore((previous) => ({
         error: "",
-        library: normalizeAssetsLibrary(library),
+        library: mergeAssetsLibrarySnapshot(previous.library, library),
         loading: false,
-      });
+      }));
       return library;
     })
     .catch((error) => {
@@ -337,6 +569,13 @@ function refreshAssetsLibrary({ silent = false, force = false } = {}) {
     });
 
   return assetsLibraryStore.refreshPromise;
+}
+
+export function adoptAccountAssetsLibraryEvent(eventPayload) {
+  updateAssetsLibraryStore((previous) => ({
+    library: mergeAssetsLibraryEvent(previous.library, eventPayload),
+    loading: false,
+  }));
 }
 
 function ensureAssetsLibraryListener() {
