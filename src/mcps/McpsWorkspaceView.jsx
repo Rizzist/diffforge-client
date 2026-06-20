@@ -870,11 +870,24 @@ export default function McpsWorkspaceView({
   const [secretValueDrafts, setSecretValueDrafts] = useState({});
   const [actionState, setActionState] = useState("idle");
   const [actionContext, setActionContext] = useState({});
+  const scrollRef = useRef(null);
+  const screenRef = useRef(screen);
   const selectedIdRef = useRef(selectedId);
+
+  useEffect(() => {
+    screenRef.current = screen;
+  }, [screen]);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
+
+  useEffect(() => {
+    const scrollNode = scrollRef.current;
+    if (!scrollNode) return;
+    scrollNode.scrollTop = 0;
+    scrollNode.scrollLeft = 0;
+  }, [listTab, scopeValue, screen, selectedId]);
 
   const beginAction = useCallback((nextState, nextContext = {}) => {
     setActionContext(nextContext);
@@ -910,6 +923,9 @@ export default function McpsWorkspaceView({
       const servers = asArray(data.servers);
       if (!servers.some((server) => server.id === selectedIdRef.current)) {
         setSelectedId(servers[0]?.id || "coordination-kernel");
+        if (screenRef.current === "detail") {
+          setScreen("list");
+        }
       }
     } catch (caught) {
       if (!silent) {
@@ -927,7 +943,7 @@ export default function McpsWorkspaceView({
   const marketplaces = asArray(registry?.marketplaces);
   const catalog = asArray(registry?.available_catalog);
   const pendingMcpWork = hasPendingMcpWork(registry);
-  const selectedServer = servers.find((server) => server.id === selectedId) || servers[0] || null;
+  const selectedServer = servers.find((server) => server.id === selectedId) || null;
   const selectedStatus = serverStatus(selectedServer, configDraft);
   const parsedMarketplace = parseMarketplaceCommand(
     marketplaceDraft.provider,
@@ -1865,6 +1881,7 @@ export default function McpsWorkspaceView({
           <Select
             classNamePrefix="mcp-source-select"
             isSearchable={false}
+            menuPosition="fixed"
             menuPortalTarget={selectPortalTarget()}
             onChange={(option) =>
               setMarketplaceDraft((draft) => ({
@@ -2454,14 +2471,23 @@ export default function McpsWorkspaceView({
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs" data-screen={screen}>
       {/* One compact bar holds every selection: scope, list view, search,
-          and the secondary actions — no second selector row. The detail
-          screen hides it so the editor gets the whole area. */}
-      {screen !== "detail" && (
+          and the secondary actions — no second selector row. Detail keeps a
+          compact escape hatch so a stale selection can never trap the user. */}
       <McpHubTopBar>
-        {scopeOptions.length > 0 && typeof onScopeChange === "function" && (
+        {screen === "detail" ? (
+          <>
+            <McpHubGhostButton onClick={() => setScreen("list")} type="button">
+              ‹ MCPs
+            </McpHubGhostButton>
+            <McpHubDetailCrumb title={selectedServer?.name || "MCP settings"}>
+              {selectedServer?.name || "MCP settings"}
+            </McpHubDetailCrumb>
+          </>
+        ) : scopeOptions.length > 0 && typeof onScopeChange === "function" && (
           <Select
             aria-label="MCP scope"
             isSearchable={scopeOptions.length > 6}
+            menuPosition="fixed"
             menuPortalTarget={selectPortalTarget()}
             onChange={(option) => onScopeChange(option?.value || "")}
             options={scopeOptions}
@@ -2473,6 +2499,7 @@ export default function McpsWorkspaceView({
           <Select
             aria-label="MCP list view"
             isSearchable={false}
+            menuPosition="fixed"
             menuPortalTarget={selectPortalTarget()}
             onChange={(option) => setListTab(option?.value || "installed")}
             options={listViewOptions}
@@ -2480,29 +2507,33 @@ export default function McpsWorkspaceView({
             value={optionForValue(listViewOptions, listTab)}
           />
         )}
-        <McpHubSearchInput
-          aria-label="Search MCPs"
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search MCPs…"
-          type="search"
-          value={search}
-        />
-        <McpHubGhostButton
-          disabled={isBusy}
-          onClick={() => setScreen("manual")}
-          title="Paste a codex/claude mcp add command"
-          type="button"
-        >
-          Add custom
-        </McpHubGhostButton>
-        <McpHubGhostButton
-          disabled={isBusy}
-          onClick={() => setScreen("sources")}
-          title="Marketplace sources and discovered MCPs"
-          type="button"
-        >
-          Sources
-        </McpHubGhostButton>
+        {screen !== "detail" && (
+          <>
+            <McpHubSearchInput
+              aria-label="Search MCPs"
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search MCPs…"
+              type="search"
+              value={search}
+            />
+            <McpHubGhostButton
+              disabled={isBusy}
+              onClick={() => setScreen("manual")}
+              title="Paste a codex/claude mcp add command"
+              type="button"
+            >
+              Add custom
+            </McpHubGhostButton>
+            <McpHubGhostButton
+              disabled={isBusy}
+              onClick={() => setScreen("sources")}
+              title="Marketplace sources and discovered MCPs"
+              type="button"
+            >
+              Sources
+            </McpHubGhostButton>
+          </>
+        )}
         <McpHubGhostButton disabled={isBusy} onClick={refresh} type="button">
           {buttonContent(isLoading && !isActionBusy, "Refresh", "Refreshing")}
         </McpHubGhostButton>
@@ -2515,9 +2546,8 @@ export default function McpsWorkspaceView({
           </McpActionStatus>
         )}
       </McpHubTopBar>
-      )}
 
-      <McpHubScroll>
+      <McpHubScroll ref={scrollRef}>
         {error && screen !== "detail" && <McpEmptyAccess role="alert">{error}</McpEmptyAccess>}
         {status === "missing_workspace" ? (
           <McpEmptyAccess>The MCP registry needs a saved workspace before it can load.</McpEmptyAccess>
@@ -2562,6 +2592,16 @@ const McpHubSearchInput = styled(McpInput)`
   flex: 1 1 160px;
   min-width: 140px;
   width: 100%;
+`;
+
+const McpHubDetailCrumb = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text-soft, #b6c0cc);
+  font-size: 12px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 const McpHubGhostButton = styled.button`

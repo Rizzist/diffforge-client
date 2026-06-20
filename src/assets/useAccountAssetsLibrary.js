@@ -201,8 +201,15 @@ function removedAssetClearsOnlyLocal(removed) {
 }
 
 function assetLocalDeletedPatch(removed, assetId) {
+  const patch = { ...(jsonObject(removed) || {}) };
+  delete patch.deleted;
+  delete patch.status;
+  delete patch.assetStatus;
+  delete patch.asset_status;
+  delete patch.deleted_at;
+  delete patch.deletedAt;
   return {
-    ...(jsonObject(removed) || {}),
+    ...patch,
     asset_id: assetId,
     assetId,
     id: assetId,

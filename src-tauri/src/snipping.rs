@@ -3863,6 +3863,74 @@ fn snipping_clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+// BT.709 limited-range RGB->YCbCr coefficients. U/V sums stay zero so gray remains neutral.
+const SNIPPING_BT709_LIMITED_SCALE_BITS: i32 = 16;
+const SNIPPING_BT709_LIMITED_ROUNDING: i32 = 1 << (SNIPPING_BT709_LIMITED_SCALE_BITS - 1);
+const SNIPPING_BT709_LIMITED_Y_R: i32 = 11_966;
+const SNIPPING_BT709_LIMITED_Y_G: i32 = 40_254;
+const SNIPPING_BT709_LIMITED_Y_B: i32 = 4_064;
+const SNIPPING_BT709_LIMITED_U_R: i32 = -6_596;
+const SNIPPING_BT709_LIMITED_U_G: i32 = -22_189;
+const SNIPPING_BT709_LIMITED_U_B: i32 = 28_785;
+const SNIPPING_BT709_LIMITED_V_R: i32 = 28_784;
+const SNIPPING_BT709_LIMITED_V_G: i32 = -26_145;
+const SNIPPING_BT709_LIMITED_V_B: i32 = -2_639;
+
+fn snipping_bt709_limited_component(
+    red: i32,
+    green: i32,
+    blue: i32,
+    red_coeff: i32,
+    green_coeff: i32,
+    blue_coeff: i32,
+    offset: i32,
+) -> u8 {
+    snipping_clamp_u8(
+        (((red_coeff * red)
+            + (green_coeff * green)
+            + (blue_coeff * blue)
+            + SNIPPING_BT709_LIMITED_ROUNDING)
+            >> SNIPPING_BT709_LIMITED_SCALE_BITS)
+            + offset,
+    )
+}
+
+fn snipping_bt709_limited_y(red: i32, green: i32, blue: i32) -> u8 {
+    snipping_bt709_limited_component(
+        red,
+        green,
+        blue,
+        SNIPPING_BT709_LIMITED_Y_R,
+        SNIPPING_BT709_LIMITED_Y_G,
+        SNIPPING_BT709_LIMITED_Y_B,
+        16,
+    )
+}
+
+fn snipping_bt709_limited_u(red: i32, green: i32, blue: i32) -> u8 {
+    snipping_bt709_limited_component(
+        red,
+        green,
+        blue,
+        SNIPPING_BT709_LIMITED_U_R,
+        SNIPPING_BT709_LIMITED_U_G,
+        SNIPPING_BT709_LIMITED_U_B,
+        128,
+    )
+}
+
+fn snipping_bt709_limited_v(red: i32, green: i32, blue: i32) -> u8 {
+    snipping_bt709_limited_component(
+        red,
+        green,
+        blue,
+        SNIPPING_BT709_LIMITED_V_R,
+        SNIPPING_BT709_LIMITED_V_G,
+        SNIPPING_BT709_LIMITED_V_B,
+        128,
+    )
+}
+
 fn snipping_bgra_to_i420(
     bgra: &[u8],
     width: u32,
@@ -3903,8 +3971,7 @@ fn snipping_bgra_to_i420(
             let blue = i32::from(bgra[pixel_offset]);
             let green = i32::from(bgra[pixel_offset + 1]);
             let red = i32::from(bgra[pixel_offset + 2]);
-            y_plane[row_base + col] =
-                snipping_clamp_u8(((66 * red + 129 * green + 25 * blue) >> 8) + 16);
+            y_plane[row_base + col] = snipping_bt709_limited_y(red, green, blue);
         }
     }
 
@@ -3926,10 +3993,8 @@ fn snipping_bgra_to_i420(
             let green = (green_sum + 2) / 4;
             let red = (red_sum + 2) / 4;
             let uv_index = (row / 2) * half_width + (col / 2);
-            u_plane[uv_index] =
-                snipping_clamp_u8(((-38 * red - 74 * green + 112 * blue) >> 8) + 128);
-            v_plane[uv_index] =
-                snipping_clamp_u8(((112 * red - 94 * green - 18 * blue) >> 8) + 128);
+            u_plane[uv_index] = snipping_bt709_limited_u(red, green, blue);
+            v_plane[uv_index] = snipping_bt709_limited_v(red, green, blue);
         }
     }
 
@@ -4118,7 +4183,7 @@ fn snipping_recording_encoder_config(
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
             SNIPPING_RECORDING_FPS.saturating_mul(2),
         ))
-        .vui(openh264::encoder::VuiConfig::srgb())
+        .vui(openh264::encoder::VuiConfig::bt709())
 }
 
 fn snipping_recording_active(app: &AppHandle) -> bool {
@@ -11027,6 +11092,36 @@ mod snipping_recording_mp4_tests {
         ));
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn solid_bgra(red: u8, green: u8, blue: u8, pixels: usize) -> Vec<u8> {
+        let mut bgra = Vec::with_capacity(pixels.saturating_mul(4));
+        for _ in 0..pixels {
+            bgra.extend_from_slice(&[blue, green, red, 255]);
+        }
+        bgra
+    }
+
+    #[test]
+    fn recording_bgra_to_i420_uses_bt709_limited_range() {
+        let cases = [
+            ("black", 0, 0, 0, 16, 128, 128),
+            ("white", 255, 255, 255, 235, 128, 128),
+            ("red", 255, 0, 0, 63, 102, 240),
+            ("green", 0, 255, 0, 173, 42, 26),
+            ("blue", 0, 0, 255, 32, 240, 118),
+        ];
+
+        for (name, red, green, blue, expected_y, expected_u, expected_v) in cases {
+            let bgra = solid_bgra(red, green, blue, 4);
+            let mut yuv = Vec::new();
+
+            snipping_bgra_to_i420(&bgra, 2, 2, &mut yuv).unwrap();
+
+            assert_eq!(&yuv[..4], &[expected_y; 4], "Y plane for {name}");
+            assert_eq!(yuv[4], expected_u, "U plane for {name}");
+            assert_eq!(yuv[5], expected_v, "V plane for {name}");
+        }
     }
 
     #[test]

@@ -91,7 +91,6 @@ const CLOUD_MCP_ASSET_FOLDER_SKILLS: &str = "account-skills";
 const CLOUD_MCP_ASSET_FOLDER_ARCHITECTURES: &str = "account-architectures";
 const CLOUD_MCP_ASSET_DOC_SOURCE_KINDS: [&str; 2] = ["account_skill", "account_architecture"];
 const CLOUD_MCP_ASSET_DOC_DOMAINS: [&str; 2] = ["skills", "architectures"];
-const CLOUD_MCP_ARCHITECTURE_INLINE_SOURCE_FALLBACK_BYTES: usize = 64 * 1024;
 const CLOUD_MCP_LOCAL_HOME_ENV: &str = "RUST_DIFFFORGE_HOME";
 const CLOUD_MCP_LOCAL_CACHE_DIR_ENV: &str = "RUST_DIFFFORGE_CACHE_DIR";
 const CLOUD_MCP_LOCAL_DATA_DIR_ENV: &str = "RUST_DIFFFORGE_DATA_DIR";
@@ -24793,12 +24792,6 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
     } else {
         return Ok(graph);
     };
-    let inline_source_fallback = source
-        .as_deref()
-        .filter(|value| {
-            value.as_bytes().len() <= CLOUD_MCP_ARCHITECTURE_INLINE_SOURCE_FALLBACK_BYTES
-        })
-        .map(ToOwned::to_owned);
     let asset_id = format!(
         "asset-account-architecture-{}-{}",
         cloud_mcp_short_hash(&graph_id),
@@ -24909,9 +24902,9 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
     let uploaded_asset_id =
         cloud_mcp_payload_text(&uploaded, &["asset_id", "assetId", "id"]).unwrap_or_default();
     let has_uploaded_asset = !uploaded_asset_id.trim().is_empty();
-    if !has_uploaded_asset && inline_source_fallback.is_none() {
+    if !has_uploaded_asset {
         return Err(format!(
-            "Architecture graph {graph_id} did not produce a cloud asset or inline source fallback."
+            "Architecture graph {graph_id} did not produce a cloud asset."
         ));
     }
 
@@ -24978,9 +24971,7 @@ async fn cloud_mcp_prepare_account_architecture_graph_asset(
                 .cloned()
                 .unwrap_or_else(|| input["metadata"].clone()),
         );
-        if let Some(source) = inline_source_fallback {
-            object.insert("source".to_string(), json!(source));
-        } else if has_uploaded_asset {
+        if has_uploaded_asset {
             object.remove("source");
             object.remove("source_text");
             object.remove("sourceText");
@@ -39540,6 +39531,29 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn local_deleted_registration_payload_preserves_cloud_metadata_for_device_delete() {
+        let payload = cloud_mcp_asset_local_deleted_registration_payload(
+            "asset_local_deleted",
+            &json!({
+                "asset_id": "asset-snip-delete-local",
+                "assetId": "asset-snip-delete-local",
+                "name": "snip.png",
+                "local_path": "/tmp/tracked/snip.png",
+                "local_status": "local_available",
+                "local_available": true,
+                "cloud_status": "cloud_available",
+            }),
+        );
+
+        assert_eq!(payload["reason"].as_str(), Some("asset_local_deleted"));
+        assert_eq!(payload["local_status"].as_str(), Some("local_deleted"));
+        assert_eq!(payload["local_available"].as_bool(), Some(false));
+        assert_eq!(payload["delete_scope"].as_str(), Some("device_local"));
+        assert_eq!(payload["preserve_cloud_metadata"].as_bool(), Some(true));
+        assert_eq!(payload["cloud_copy_unchanged"].as_bool(), Some(true));
+    }
+
+    #[test]
     fn account_asset_requests_are_websocket_outbox_replay_kinds() {
         assert!(cloud_mcp_is_account_asset_request_kind(
             "account_assets_register"
@@ -42325,6 +42339,17 @@ fn cloud_mcp_asset_local_deleted_registration_payload(reason: &str, row: &Value)
     let mut payload = cloud_mcp_asset_registration_payload_from_row(reason, row);
     let now = cloud_mcp_rfc3339_now();
     if let Some(object) = payload.as_object_mut() {
+        if cloud_mcp_asset_normalized_status(reason) == "asset-local-deleted"
+            && (cloud_mcp_asset_cloud_copy_available(row)
+                || cloud_mcp_asset_remote_copy_available(row))
+        {
+            object.insert("delete_scope".to_string(), json!("device_local"));
+            object.insert("deleteScope".to_string(), json!("device_local"));
+            object.insert("preserve_cloud_metadata".to_string(), json!(true));
+            object.insert("preserveCloudMetadata".to_string(), json!(true));
+            object.insert("cloud_copy_unchanged".to_string(), json!(true));
+            object.insert("cloudCopyUnchanged".to_string(), json!(true));
+        }
         object.insert("local_status".to_string(), json!("local_deleted"));
         object.insert("local_available".to_string(), json!(false));
         object.insert("local_path".to_string(), json!(""));

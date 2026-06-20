@@ -148,6 +148,21 @@ function architectureGraphNeedsCloudHydration(graph) {
   return Boolean(graph?.cloudOnly || graph?.cloudNeedsHydration || graph?.cloud_needs_hydration);
 }
 
+function architectureGraphNotFoundError(value) {
+  return text(value?.message || value).toLowerCase().includes("architecture graph was not found");
+}
+
+function architectureGraphId(graph) {
+  return text(graph?.id || graph?.graphId || graph?.graph_id || graph?.architectureId || graph?.architecture_id);
+}
+
+function architectureHydratedGraph(result, graphId = "") {
+  const items = jsonArray(result?.items);
+  if (!items.length) return null;
+  const normalizedGraphId = text(graphId);
+  return items.find((item) => architectureGraphId(item) === normalizedGraphId) || items[0] || null;
+}
+
 function architectureRevisionGraphId(revision) {
   return text(revision?.graphId || revision?.graph_id);
 }
@@ -5404,6 +5419,8 @@ function ArchitecturesPanel({
   );
   const syncWorkspaceId = selectedRepoSyncContext.workspaceId;
   const syncWorkspaceName = selectedRepoSyncContext.workspaceName;
+  const syncScopeRepoId = selectedRepoSyncContext.scopeRepoId;
+  const syncScopeGitRepoIdentityId = selectedRepoSyncContext.scopeGitRepoIdentityId;
   const dispatchWorkspaceId = selectedRepoSyncContext.queueWorkspaceId;
   const dispatchWorkspaceName = selectedRepoSyncContext.queueWorkspaceName;
 
@@ -5621,6 +5638,11 @@ function ArchitecturesPanel({
     };
   }, [loadGraphList, selectedRepoPath, syncWorkspaceId, syncWorkspaceName]);
 
+  const selectedGraphSummary = useMemo(
+    () => graphs.find((graph) => architectureGraphId(graph) === selectedGraphId) || null,
+    [graphs, selectedGraphId],
+  );
+
   useEffect(() => {
     let cancelled = false;
     if (!selectedRepoPath || !selectedGraphId) {
@@ -5637,33 +5659,48 @@ function ArchitecturesPanel({
     const loadedKey = `${architectureRepoPathKey(selectedRepoPath)}::${selectedGraphId}`;
     if (selectedGraphLoadedKeyRef.current !== loadedKey) {
       setGraphState("loading");
+      setError("");
     }
-    const selectedSummary = graphs.find((graph) => text(graph?.id) === selectedGraphId) || null;
-    const hydrateRef = architectureGraphNeedsCloudHydration(selectedSummary)
-      ? architectureGraphCloudRef(selectedSummary)
+    const hydrateRef = architectureGraphNeedsCloudHydration(selectedGraphSummary)
+      ? architectureGraphCloudRef(selectedGraphSummary)
       : null;
+
+    const readLocalGraph = () => invoke("architecture_graph_read", {
+      graphId: selectedGraphId,
+      repoPath: selectedRepoPath,
+    });
+    const hydrateGraph = (ref) => invoke("cloud_mcp_hydrate_architecture", {
+      refs: [ref],
+      repoPath: selectedRepoPath,
+      workspaceId: syncWorkspaceId,
+      workspaceName: syncWorkspaceName,
+      ...(syncScopeRepoId ? {
+        scopeRepoId: syncScopeRepoId,
+        scopeGitRepoIdentityId: syncScopeGitRepoIdentityId,
+      } : {}),
+    }).then((result) => {
+      const hydratedGraph = architectureHydratedGraph(result, selectedGraphId);
+      if (hydratedGraph) return hydratedGraph;
+      return readLocalGraph();
+    });
     const readPromise = hydrateRef
-      ? invoke("cloud_mcp_hydrate_architecture", {
-        refs: [hydrateRef],
-        repoPath: selectedRepoPath,
-        workspaceId: syncWorkspaceId,
-        workspaceName: syncWorkspaceName,
-        ...(selectedRepoSyncContext.scopeRepoId ? {
-          scopeRepoId: selectedRepoSyncContext.scopeRepoId,
-          scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
-        } : {}),
-      }).then((result) => {
-        const hydratedGraph = jsonArray(result?.items)[0];
-        if (hydratedGraph) return hydratedGraph;
-        return invoke("architecture_graph_read", {
-          graphId: selectedGraphId,
-          repoPath: selectedRepoPath,
+      ? hydrateGraph(hydrateRef)
+      : readLocalGraph().catch((readError) => {
+        if (!architectureGraphNotFoundError(readError) || !selectedGraphSummary) {
+          throw readError;
+        }
+        const fallbackHydrateRef = architectureGraphCloudRef(selectedGraphSummary);
+        if (!fallbackHydrateRef) {
+          throw readError;
+        }
+        return hydrateGraph(fallbackHydrateRef).catch((hydrateError) => {
+          if (!architectureGraphNotFoundError(hydrateError)) {
+            throw hydrateError;
+          }
+          return loadGraphList(selectedRepoPath, { refresh: true, silent: true }).then(() => readLocalGraph());
         });
-      })
-      : invoke("architecture_graph_read", {
-        graphId: selectedGraphId,
-        repoPath: selectedRepoPath,
       });
+
     readPromise
       .then((graph) => {
         if (cancelled) return;
@@ -5678,6 +5715,7 @@ function ArchitecturesPanel({
             : graph
         ));
         setGraphState("ready");
+        setError("");
         // One post-hydration list refresh per graph. Without this guard a
         // graph the cloud keeps reporting as hydration-pending re-triggers
         // refresh -> new list -> hydrate -> refresh forever, which is what
@@ -5702,12 +5740,14 @@ function ArchitecturesPanel({
       cancelled = true;
     };
   }, [
-    graphs,
     loadGraphList,
-    queueWorkspaceId,
-    queueWorkspaceName,
     selectedGraphId,
+    selectedGraphSummary,
     selectedRepoPath,
+    syncScopeGitRepoIdentityId,
+    syncScopeRepoId,
+    syncWorkspaceId,
+    syncWorkspaceName,
   ]);
 
   useEffect(() => {
@@ -6084,6 +6124,10 @@ function ArchitecturesPanel({
               onClick={() => {
                 setSelectedGraphId(row.graph.id);
                 setCreatingGraph(false);
+                setError("");
+                if (row.graph.id !== selectedGraphId) {
+                  setGraphState("loading");
+                }
                 setRevisionBrowser((current) => ({ ...current, open: false }));
               }}
               onDragEnd={draggable ? () => setDragGraph(null) : undefined}
@@ -6206,6 +6250,8 @@ function ArchitecturesPanel({
     closeNavContextMenu();
     beginCreateFolder();
   }, [beginCreateFolder, closeNavContextMenu]);
+
+  const selectedListedGraphPending = Boolean(selectedGraphId && selectedGraphSummary && !selectedGraph && !creatingGraph);
 
   return (
     <ArchitecturesShell data-nav-collapsed={navCollapsed ? "true" : "false"}>
@@ -6383,6 +6429,11 @@ function ArchitecturesPanel({
               repoPath={selectedRepoPath}
               selectedGraphId={selectedGraphId}
             />
+          ) : selectedListedGraphPending ? (
+            <ArchitectureGraphResolvingSurface
+              graph={selectedGraphSummary}
+              graphState={graphState}
+            />
           ) : creatingGraph || !selectedGraph ? (
             <ArchitectureCreateSurface
               canCancel={creatingGraph && Boolean(selectedGraph)}
@@ -6503,6 +6554,24 @@ function ArchitectureCreateSurface({
             {saveState === "saving" ? "Creating..." : "Create Graph"}
           </ArchitecturePrimaryButton>
         </ArchitectureCreateActions>
+      </ArchitectureCreateDialog>
+    </ArchitectureCreateSurfaceShell>
+  );
+}
+
+function ArchitectureGraphResolvingSurface({
+  graph,
+  graphState,
+}) {
+  const isError = graphState === "error";
+  const graphTitle = text(graph?.title || graph?.name || architectureGraphId(graph), "Architecture graph");
+  return (
+    <ArchitectureCreateSurfaceShell>
+      <ArchitectureCreateDialog aria-label="Loading architecture graph">
+        <ArchitectureResolvingMessage data-state={isError ? "error" : "loading"}>
+          <strong>{isError ? "Architecture graph unavailable" : "Loading architecture graph"}</strong>
+          <span>{graphTitle}</span>
+        </ArchitectureResolvingMessage>
       </ArchitectureCreateDialog>
     </ArchitectureCreateSurfaceShell>
   );
@@ -10338,6 +10407,32 @@ const ArchitectureCreateDialog = styled.div`
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.46);
   box-shadow: 0 18px 46px rgba(0, 0, 0, 0.26);
+`;
+
+const ArchitectureResolvingMessage = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: rgba(148, 163, 184, 0.84);
+
+  strong {
+    color: var(--forge-text);
+    font-size: 15px;
+    font-weight: 900;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 760;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-state="error"] strong {
+    color: #fecaca;
+  }
 `;
 
 const ArchitectureLocationToggle = styled.div`

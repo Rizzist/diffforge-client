@@ -29813,7 +29813,15 @@ function TerminalView({
         currentItems
           .filter((candidate) => candidate.id !== item.id)
           .concat([item])
-      ));
+      ), {
+        force: true,
+        immediate: true,
+        reason: detail.source === "snipping-annotation"
+          || item.source === "snipping-annotation"
+          || item.remoteCommand?.source === "snipping-annotation"
+          ? "snipping_annotation_todo_queued"
+          : "remote_todo_queue",
+      });
       setTodoDropError("");
       const remoteTargetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
       setTodoQueueItemPending(item.id, {

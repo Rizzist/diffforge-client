@@ -39,6 +39,10 @@ import Select from "react-select";
 import styled, { createGlobalStyle, keyframes } from "styled-components";
 import { accountAssetFanoutFromValue } from "../assets/accountAssetV2.js";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
+import {
+  buildSnippingAnnotationTargetFields,
+  normalizeSnippingDispatchTargets,
+} from "./snippingAnnotationTargets.js";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
@@ -314,34 +318,6 @@ function jsonObject(value) {
 
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
-}
-
-function normalizeSnippingDispatchTargets(value) {
-  return jsonArray(value)
-    .map((target) => {
-      const workspaceId = text(target?.workspaceId || target?.workspace_id);
-      if (!workspaceId) return null;
-      const threads = jsonArray(target?.threads)
-        .map((thread, index) => {
-          const threadId = text(thread?.threadId || thread?.thread_id || thread?.id);
-          if (!threadId) return null;
-          const terminalIndex = Number(thread?.terminalIndex ?? thread?.terminal_index);
-          return {
-            color: text(thread?.color),
-            label: text(thread?.label || thread?.name, threadId),
-            terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : index,
-            threadId,
-          };
-        })
-        .filter(Boolean);
-      if (!threads.length) return null;
-      return {
-        workspaceId,
-        workspaceName: text(target?.workspaceName || target?.workspace_name, workspaceId),
-        threads,
-      };
-    })
-    .filter(Boolean);
 }
 
 function numberValue(value, fallback = 0) {
@@ -4180,11 +4156,16 @@ export function SnippingAnnotationEditorWindow() {
   const threadOptions = useMemo(() => [
     { color: "", label: "Any terminal", value: "" },
     ...(targetWorkspace?.threads || []).map((thread, index) => ({
+      ...thread,
       color: sanitizeTerminalColor(
-        thread.color,
-        Number.isInteger(thread.terminalIndex) ? thread.terminalIndex : index,
+        thread.targetTerminalColor || thread.color,
+        Number.isInteger(thread.targetColorSlot)
+          ? thread.targetColorSlot
+          : Number.isInteger(thread.terminalIndex)
+            ? thread.terminalIndex
+            : index,
       ),
-      label: text(thread.label, thread.threadId),
+      label: text(thread.label || thread.targetTerminalName, thread.threadId),
       value: thread.threadId,
     })),
   ], [targetWorkspace]);
@@ -5069,6 +5050,10 @@ export function SnippingAnnotationEditorWindow() {
           type: "image/png",
         };
       }));
+      const targetFields = buildSnippingAnnotationTargetFields({
+        targetThreadId,
+        targetWorkspace,
+      });
       await emit(SNIPPING_ANNOTATION_TODO_EVENT, {
         createdAt: new Date().toISOString(),
         images,
@@ -5076,7 +5061,7 @@ export function SnippingAnnotationEditorWindow() {
         sourceName: name,
         sourcePath: activePath,
         sourcePaths: localPaths,
-        targetThreadId,
+        ...targetFields,
         text,
         workspaceId: targetWorkspaceId,
         workspaceName: String(targetWorkspace?.workspaceName || "").trim(),

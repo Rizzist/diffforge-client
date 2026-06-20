@@ -83,6 +83,10 @@ import {
 import {
   isTerminalControlHistoryPrompt,
 } from "../threads/terminalControlPrompts.js";
+import {
+  buildSnippingAnnotationTargetFields,
+  normalizeSnippingDispatchTargetThread,
+} from "../snipping/snippingAnnotationTargets.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView, {
   TODO_QUEUE_PANE_MODE_FULLSCREEN,
@@ -19105,12 +19109,25 @@ export default function App() {
                 || terminal?.agentLabel
                 || "",
             ).trim();
-            return {
+            const paneId = String(
+              terminal?.paneId
+                || terminal?.pane_id
+                || terminal?.terminalId
+                || terminal?.terminal_id
+                || (Number.isInteger(terminalIndex)
+                  ? getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId)
+                  : "")
+                || "",
+            ).trim();
+            return normalizeSnippingDispatchTargetThread({
+              agentId,
+              agentLabel: String(terminal?.agentDisplayName || terminal?.agentLabel || agentId).trim(),
               color: String(terminal?.color || "").trim(),
               label: label || `Terminal ${Number.isInteger(terminalIndex) ? terminalIndex + 1 : ""}`.trim(),
+              paneId,
               terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
               threadId,
-            };
+            }, Number.isInteger(terminalIndex) ? terminalIndex : null);
           })
           .filter(Boolean)
           .slice(0, 24);
@@ -19178,10 +19195,18 @@ export default function App() {
         : Array.isArray(payload.source_paths)
           ? payload.source_paths
           : undefined;
+      const targetThreadId = String(payload.targetThreadId || payload.target_thread_id || "").trim();
+      const targetFields = buildSnippingAnnotationTargetFields({
+        targetThreadId,
+        targetWorkspace: {
+          threads: targetThreadId ? [payload] : [],
+        },
+      });
 
       window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
         detail: {
           commandId: baseCommandId,
+          ...targetFields,
           item: {
             createdAt,
             id: baseCommandId,
@@ -19195,11 +19220,10 @@ export default function App() {
               sourceName: String(payload.name || payload.sourceName || "").trim(),
               sourcePath: String(payload.sourcePath || payload.source_path || "").trim(),
               sourcePaths,
+              ...targetFields,
             },
             source: "snipping-annotation",
-            ...(String(payload.targetThreadId || payload.target_thread_id || "").trim()
-              ? { targetThreadId: String(payload.targetThreadId || payload.target_thread_id).trim() }
-              : {}),
+            ...targetFields,
             text,
             workspaceId,
           },

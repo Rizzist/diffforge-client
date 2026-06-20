@@ -11345,11 +11345,6 @@ export const McpWorkspaceSurface = styled.section`
   overflow: hidden;
   padding: 12px 16px 16px;
 
-  /* Detail screen hides the top bar; collapse to one bounded row so the
-     editor fills the whole area instead of sizing in the auto row. */
-  &[data-screen="detail"] {
-    grid-template-rows: minmax(0, 1fr);
-  }
   background:
     linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
     linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
