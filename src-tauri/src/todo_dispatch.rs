@@ -2438,7 +2438,9 @@ pub(crate) fn todo_store_delete_internal(
     // Client-authoritative: purge the local mirror right away so every view
     // converges instantly; the cloud removal below syncs in the background.
     let purged = cloud_mcp_todo_mirror_purge_todo_ids(&all_ids);
-    todo_store_enqueue_delete_todo_sync_commit(app, workspace_id, &all_ids, reason, origin);
+    if !tombstoned.is_empty() {
+        todo_store_enqueue_delete_todo_sync_commit(app, workspace_id, &tombstoned, reason, origin);
+    }
     todo_store_push_removals(app, workspace_id, all_ids, reason);
     todo_store_emit_changed(app, workspace_id, reason, "store");
     if purged > 0 {
@@ -5656,8 +5658,8 @@ async fn todo_dispatch_queue_sync(
             return Err("workspace_id is required.".to_string());
         }
         let reason = reason.unwrap_or_default();
-        // Webview removals become terminal tombstones first, so the incoming
-        // snapshot (and every later writer) can never resurrect them.
+        // Webview removals use the same Rust-authoritative delete funnel as
+        // direct deletes, so Cloud and peers see the tombstone immediately.
         let removed_ids = removed_ids
             .unwrap_or_default()
             .into_iter()
@@ -5665,7 +5667,7 @@ async fn todo_dispatch_queue_sync(
             .filter(|id| !id.is_empty())
             .collect::<Vec<_>>();
         if !removed_ids.is_empty() {
-            todo_store_add_tombstones(&workspace_id, &removed_ids, &reason, "webview_sync");
+            todo_store_delete_internal(&app, &workspace_id, &removed_ids, &reason, "webview_sync");
         }
         let tombstoned = todo_store_tombstone_ids(&workspace_id);
         let items = items

@@ -9007,6 +9007,7 @@ export default function App() {
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [rustTerminalAuthoritySnapshot, setRustTerminalAuthoritySnapshot] = useState(null);
   const [workspaceTerminalsLiveSyncRevision, setWorkspaceTerminalsLiveSyncRevision] = useState(0);
+  const [workspaceVisibleTerminalRevision, setWorkspaceVisibleTerminalRevision] = useState(0);
   const [workspaceMcpRegistries, setWorkspaceMcpRegistries] = useState({});
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
@@ -9047,7 +9048,7 @@ export default function App() {
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
   const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
-  const [workspaceToolPortalHost, setWorkspaceToolPortalHost] = useState(null);
+  const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const [accountToolDraft, setAccountToolDraft] = useState("");
   const [accountToolItems, setAccountToolItems] = useState([]);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
@@ -9214,12 +9215,71 @@ export default function App() {
   const rustTerminalAuthoritySnapshotRef = useRef(null);
   const rustTerminalAuthorityRefreshInFlightRef = useRef(false);
   const rustTerminalAuthorityRefreshPendingRef = useRef("");
+  const workspaceVisibleTerminalStatusRef = useRef(new Map());
   const workspaceTerminalExplicitEmptyRef = useRef(new Set());
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
   const terminalStatusEventEmitterRef = useRef(null);
   const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const cloudMcpSessionContextSyncKeyRef = useRef("");
+
+  const recordWorkspaceVisibleTerminalStatus = useCallback((event = {}) => {
+    const workspaceId = String(event.workspaceId || event.workspace_id || "").trim();
+    const terminalIndex = Number(event.terminalIndex ?? event.terminal_index);
+    if (!workspaceId || !Number.isInteger(terminalIndex)) {
+      return;
+    }
+
+    const type = String(event.type || event.eventType || event.event_type || "").trim().toLowerCase();
+    const rawStatus = String(
+      event.status
+        || event.terminalStatus
+        || event.terminal_status
+        || event.nativeRailState
+        || event.native_rail_state
+        || event.activityStatus
+        || event.activity_status
+        || type
+        || "",
+    ).trim().toLowerCase();
+    const key = `${workspaceId}:${terminalIndex}`;
+    if (["deleted", "removed", "tombstoned"].includes(type || rawStatus)) {
+      if (workspaceVisibleTerminalStatusRef.current.delete(key)) {
+        setWorkspaceVisibleTerminalRevision((revision) => revision + 1);
+      }
+      return;
+    }
+
+    const status = rawStatus || "idle";
+    const previous = workspaceVisibleTerminalStatusRef.current.get(key) || {};
+    const next = {
+      ...previous,
+      activityStatus: String(
+        event.activityStatus
+          || event.activity_status
+          || event.nativeRailState
+          || event.native_rail_state
+          || status,
+      ).trim(),
+      agentId: String(event.agentId || event.agent_id || event.currentAgent || event.current_agent || previous.agentId || "").trim(),
+      instanceId: event.instanceId ?? event.instance_id ?? previous.instanceId ?? "",
+      nativeRailLabel: String(event.nativeRailLabel || event.native_rail_label || previous.nativeRailLabel || "").trim(),
+      nativeRailState: String(event.nativeRailState || event.native_rail_state || event.activityStatus || event.activity_status || status).trim(),
+      paneId: String(event.paneId || event.pane_id || previous.paneId || "").trim(),
+      status,
+      terminalIndex,
+      threadId: String(event.threadId || event.thread_id || previous.threadId || "").trim(),
+      type,
+      updatedAtMs: Date.now(),
+      workspaceId,
+    };
+    const previousKey = JSON.stringify(previous);
+    const nextKey = JSON.stringify(next);
+    if (previousKey !== nextKey) {
+      workspaceVisibleTerminalStatusRef.current.set(key, next);
+      setWorkspaceVisibleTerminalRevision((revision) => revision + 1);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -17938,6 +17998,7 @@ export default function App() {
             const providerBinding = getWorkspaceThreadProviderBinding(thread, normalizedRole);
             const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding || null;
             const liveTerminalCandidate = descriptor.terminalsByIndex?.[terminalIndex] || null;
+            const visibleTerminalStatus = workspaceVisibleTerminalStatusRef.current.get(`${workspaceId}:${terminalIndex}`) || null;
             const liveTerminalAgent = normalizeWorkspaceTerminalRole(
               liveTerminalCandidate?.agentId || normalizedRole,
               workspaceTerminalFallbackRole,
@@ -17960,18 +18021,29 @@ export default function App() {
             const latestTurn = thread?.latestTurn && typeof thread.latestTurn === "object"
               ? thread.latestTurn
               : {};
-            const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
             const stoppedTerminalStatuses = ["closed", "closing", "exited", "offline", "terminated"];
-            const stoppedLiveStatus = stoppedTerminalStatuses.includes(liveStatus) ? liveStatus : "";
-            const hasVisibleTerminalPane = Boolean(liveTerminal || terminalBinding || thread);
-            const liveTerminalOpen = Boolean(liveTerminal && !stoppedLiveStatus);
-            const terminalLifecycle = liveTerminalOpen ? "open" : "closed";
-            if (!hasVisibleTerminalPane) {
-              return null;
-            }
+            const visibleStatus = String(
+              visibleTerminalStatus?.status
+                || visibleTerminalStatus?.type
+                || "",
+            ).trim().toLowerCase();
+            const threadStatus = String(thread?.status || providerBinding?.status || "").trim().toLowerCase();
+            const liveStatus = String(liveTerminal?.status || visibleStatus || threadStatus || "").trim().toLowerCase();
+            const stoppedLiveStatus = stoppedTerminalStatuses.includes(liveStatus)
+              ? liveStatus
+              : stoppedTerminalStatuses.includes(visibleStatus)
+                ? visibleStatus
+                : stoppedTerminalStatuses.includes(threadStatus)
+                  ? threadStatus
+                  : "";
+            const terminalLifecycle = stoppedLiveStatus ? "closed" : "open";
             const liveRailActivity = String(
               liveTerminal?.activityStatus
                 || liveTerminal?.activity_status
+                || visibleTerminalStatus?.activityStatus
+                || visibleTerminalStatus?.activity_status
+                || thread?.activityStatus
+                || thread?.activity_status
                 || "",
             ).trim().toLowerCase();
             const rawActivity = String(
@@ -18018,6 +18090,8 @@ export default function App() {
             const terminalNickname = terminalRealNameFromCandidates(
               normalizedRole,
               getWorkspaceThreadTerminalNickname(thread, providerBinding, liveTerminal),
+              visibleTerminalStatus?.terminalNickname,
+              visibleTerminalStatus?.terminal_nickname,
             );
             const terminalName = terminalNickname || terminalRealNameFromCandidates(
               normalizedRole,
@@ -18025,12 +18099,16 @@ export default function App() {
               liveTerminal?.terminal_name,
               liveTerminal?.displayName,
               liveTerminal?.display_name,
+              visibleTerminalStatus?.terminalName,
+              visibleTerminalStatus?.terminal_name,
+              visibleTerminalStatus?.displayName,
+              visibleTerminalStatus?.display_name,
               providerBinding?.terminalName,
               providerBinding?.terminal_name,
               agentDisplayName,
               agentLabel,
             );
-            const terminalInstanceId = terminalBinding?.instanceId || liveTerminal?.instanceId || "";
+            const terminalInstanceId = terminalBinding?.instanceId || liveTerminal?.instanceId || visibleTerminalStatus?.instanceId || "";
             const providerSessionId = String(
               providerBinding?.nativeSessionId
                 || providerBinding?.native_session_id
@@ -18043,11 +18121,22 @@ export default function App() {
                 || liveTerminal?.native_session_id
                 || liveTerminal?.sessionId
                 || liveTerminal?.session_id
+                || visibleTerminalStatus?.providerSessionId
+                || visibleTerminalStatus?.provider_session_id
+                || visibleTerminalStatus?.nativeSessionId
+                || visibleTerminalStatus?.native_session_id
+                || visibleTerminalStatus?.sessionId
+                || visibleTerminalStatus?.session_id
                 || "",
             ).trim();
             const paneId = terminalBinding?.paneId
+              || visibleTerminalStatus?.paneId
               || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole);
             const statusSeq = Number(
+              visibleTerminalStatus?.updatedAtMs
+                || visibleTerminalStatus?.updated_at_ms
+                || 0,
+            ) || Number(
               thread?.projectionEventCount
                 || thread?.revision
                 || latestTurn?.sequence
@@ -18060,6 +18149,7 @@ export default function App() {
                 || latestTurn?.createdAt
                 || "",
             ) || 0;
+            const terminalConnected = Boolean(terminalLifecycle === "open" && stoppedLiveStatus === "");
             return {
               agentId: normalizedRole,
               agentKind: normalizedRole,
@@ -18072,16 +18162,16 @@ export default function App() {
               activity_status: nativeRailState,
               color,
               colorSlot,
-              commandable: true,
-              connected: true,
+              commandable: terminalConnected,
+              connected: terminalConnected,
               displayStatus: nativeRailState,
               display_status: nativeRailState,
               inputReady: Boolean(terminalLifecycle === "open" && readiness === "ready"),
               lastKnownRuntime: false,
               last_known_runtime: false,
               ...nativeRailFields,
-              nativeConnected: true,
-              native_connected: true,
+              nativeConnected: terminalConnected,
+              native_connected: terminalConnected,
               nativeSessionId: providerSessionId,
               native_session_id: providerSessionId,
               pane_id: paneId,
@@ -18095,6 +18185,8 @@ export default function App() {
               session_id: providerSessionId,
               sessionState: terminalLifecycle === "open" ? "session_attached" : "no_session",
               status,
+              statusSource: stoppedLiveStatus ? "desktop_visible_terminal_lifecycle" : "desktop_visible_workspace",
+              status_source: stoppedLiveStatus ? "desktop_visible_terminal_lifecycle" : "desktop_visible_workspace",
               statusSeq,
               targetTerminalId: paneId,
               target_terminal_id: paneId,
@@ -18114,6 +18206,8 @@ export default function App() {
               threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
               turnId: latestTurn?.id || latestTurn?.turnId || "",
               turnStatus,
+              visibleTerminal: true,
+              visible_terminal: true,
             };
           })
           .filter(Boolean);
@@ -18159,10 +18253,71 @@ export default function App() {
       if (!rustWorkspace) {
         return workspace;
       }
+      const visibleTerminals = Array.isArray(workspace?.terminals) ? workspace.terminals : [];
+      const rustTerminals = Array.isArray(rustWorkspace?.terminals) ? rustWorkspace.terminals : [];
+      const rustTerminalsByIndex = new Map(rustTerminals.map((terminal, index) => [
+        Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? index),
+        terminal,
+      ]).filter(([terminalIndex]) => Number.isInteger(terminalIndex)));
+      const stoppedTerminalStatuses = new Set(["closed", "closing", "exited", "offline", "terminated"]);
+      const terminals = visibleTerminals.map((visibleTerminal, index) => {
+        const terminalIndex = Number(visibleTerminal?.terminalIndex ?? visibleTerminal?.terminal_index ?? index);
+        const rustTerminal = Number.isInteger(terminalIndex)
+          ? rustTerminalsByIndex.get(terminalIndex)
+          : null;
+        if (!rustTerminal) {
+          return visibleTerminal;
+        }
+        const visibleStatus = String(
+          visibleTerminal?.status
+            || visibleTerminal?.terminalStatus
+            || visibleTerminal?.terminal_status
+            || "",
+        ).trim().toLowerCase();
+        const visibleStopped = stoppedTerminalStatuses.has(visibleStatus);
+        const merged = {
+          ...visibleTerminal,
+          ...rustTerminal,
+          statusSource: visibleTerminal?.statusSource || visibleTerminal?.status_source || rustTerminal?.statusSource || rustTerminal?.status_source,
+          status_source: visibleTerminal?.status_source || visibleTerminal?.statusSource || rustTerminal?.status_source || rustTerminal?.statusSource,
+          visibleTerminal: true,
+          visible_terminal: true,
+        };
+        if (visibleStopped) {
+          merged.activityStatus = visibleTerminal.activityStatus || visibleTerminal.activity_status || visibleStatus;
+          merged.activity_status = visibleTerminal.activity_status || visibleTerminal.activityStatus || visibleStatus;
+          merged.commandable = false;
+          merged.connected = false;
+          merged.displayStatus = visibleTerminal.displayStatus || visibleTerminal.display_status || visibleStatus;
+          merged.display_status = visibleTerminal.display_status || visibleTerminal.displayStatus || visibleStatus;
+          merged.nativeConnected = false;
+          merged.native_connected = false;
+          merged.nativeRailState = visibleTerminal.nativeRailState || visibleTerminal.native_rail_state || visibleStatus;
+          merged.native_rail_state = visibleTerminal.native_rail_state || visibleTerminal.nativeRailState || visibleStatus;
+          merged.readiness = visibleTerminal.readiness || visibleStatus;
+          merged.sessionState = "no_session";
+          merged.session_state = "no_session";
+          merged.status = visibleTerminal.status || visibleStatus;
+          merged.terminalLifecycle = "closed";
+          merged.terminal_lifecycle = "closed";
+          merged.terminalStatus = visibleTerminal.terminalStatus || visibleTerminal.terminal_status || visibleTerminal.status || visibleStatus;
+          merged.terminal_status = visibleTerminal.terminal_status || visibleTerminal.terminalStatus || visibleTerminal.status || visibleStatus;
+        }
+        return merged;
+      });
       return {
         ...workspace,
         ...rustWorkspace,
         repoPath: rustWorkspace.repoPath || workspace.repoPath,
+        terminalClearReason: terminals.length ? "" : workspace.terminalClearReason,
+        terminal_clear_reason: terminals.length ? "" : workspace.terminal_clear_reason,
+        terminalCount: terminals.length,
+        terminal_count: terminals.length,
+        terminalListAuthoritative: true,
+        terminal_list_authoritative: true,
+        terminalListEmptyAuthoritative: terminals.length === 0,
+        terminal_list_empty_authoritative: terminals.length === 0,
+        terminals,
         workspaceActive: true,
         workspace_active: true,
         workspaceName: rustWorkspace.workspaceName || workspace.workspaceName,
@@ -18188,6 +18343,7 @@ export default function App() {
     enabledWorkspaceRuntimeDescriptors,
     rustTerminalAuthorityWorkspaces,
     workspaceSidebarOrderById,
+    workspaceVisibleTerminalRevision,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
@@ -18298,6 +18454,8 @@ export default function App() {
             sessionId: providerSessionId,
             session_id: providerSessionId,
             status: String(terminal?.status || ""),
+            statusSource: String(terminal?.statusSource || terminal?.status_source || ""),
+            status_source: String(terminal?.status_source || terminal?.statusSource || ""),
             targetTerminalId: String(terminal?.targetTerminalId || terminal?.target_terminal_id || terminal?.paneId || terminal?.terminalId || ""),
             terminalId: String(terminal?.terminalId || terminal?.terminal_id || terminal?.paneId || ""),
             terminalIndex: Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? 0),
@@ -18307,6 +18465,8 @@ export default function App() {
             terminalNickname: String(terminal?.terminalNickname || terminal?.terminal_nickname || ""),
             terminalStatus: String(terminal?.terminalStatus || terminal?.terminal_status || terminal?.status || ""),
             turnStatus: String(terminal?.turnStatus || terminal?.turn_status || ""),
+            visibleTerminal: terminal?.visibleTerminal === true || terminal?.visible_terminal === true,
+            visible_terminal: terminal?.visibleTerminal === true || terminal?.visible_terminal === true,
           };
         }),
       );
@@ -19327,20 +19487,11 @@ export default function App() {
     : hasSelectedWorkspace
       ? "No active workspace."
       : "No workspace selected.";
-  const selectedWorkspaceHasMountedRuntime = Boolean(
-    selectedWorkspace?.id
-      && enabledWorkspaceRuntimeDescriptors.some((runtimeDescriptor) => (
-        runtimeDescriptor.workspace?.id === selectedWorkspace.id
-      )),
-  );
   const workspaceToolPaneHasWidth = workspaceToolLayoutWidth === 0
     || workspaceToolLayoutWidth >= WORKSPACE_TOOL_VISIBLE_MIN_WIDTH;
-  const workspaceToolPaneAllowedOnView = !DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
-  const workspaceToolPaneVisible = workspaceToolPaneHasWidth && workspaceToolPaneAllowedOnView;
+  const workspaceToolPaneVisible = workspaceToolPaneHasWidth;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
-  const deviceLevelViewActive = DEVICE_LEVEL_APP_VIEW_IDS.has(activeView)
-    || DEVICE_LEVEL_APP_VIEW_IDS.has(visibleView);
   const workspaceToolMinimizedSize = workspaceToolLayoutWidth > 0
     ? Math.min(4, Math.max(2.8, (WORKSPACE_TOOL_MINIMIZED_WIDTH_PX / workspaceToolLayoutWidth) * 100))
     : 3.2;
@@ -19368,27 +19519,53 @@ export default function App() {
   const workspaceMainPanelMinSize = workspaceToolPaneVisible
     ? workspaceToolPaneMinimized ? 72 : 30
     : 100;
-  const workspaceToolPortalOwnedByWorkspace = Boolean(
-    workspaceToolPortalHost
-      && selectedWorkspace?.id
-      && selectedWorkspaceHasMountedRuntime,
-  );
-  const shouldRenderAccountToolPanel = Boolean(
-    !workspaceToolPortalOwnedByWorkspace || !hasSelectedWorkspace,
-  );
-  const showNoWorkspaceSelectedFromWorkspaceTool = useCallback((telemetrySource = "workspace_tool") => {
-    cancelDeferredWorkspaceActivation();
-    selectedWorkspaceIdRef.current = "";
-    workspacePendingActivationIdRef.current = "";
-    setSelectedWorkspaceId("");
-    setWorkspacePendingActivationId("");
-    setWorkspaceCreateModalOpen(false);
-    setWorkspaceSettingsModalId("");
-    showView(DEFAULT_WORKSPACE_VIEW, {
-      immediate: true,
-      telemetrySource,
+  const shouldRenderAccountToolPanel = true;
+  const selectedWorkspaceToolRuntimeBridge = selectedWorkspace?.id
+    ? workspaceToolRuntimeBridges[selectedWorkspace.id] || null
+    : null;
+  const updateWorkspaceToolRuntimeBridge = useCallback((workspaceId, bridge) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      return;
+    }
+
+    setWorkspaceToolRuntimeBridges((currentBridges) => {
+      if (!bridge) {
+        if (!currentBridges[safeWorkspaceId]) {
+          return currentBridges;
+        }
+        const nextBridges = { ...currentBridges };
+        delete nextBridges[safeWorkspaceId];
+        return nextBridges;
+      }
+
+      const nextBridge = {
+        onToggleTerminalBreakout: bridge.onToggleTerminalBreakout,
+        onToggleWindowBreakout: bridge.onToggleWindowBreakout,
+        onVoiceAgentToolCall: bridge.onVoiceAgentToolCall,
+        onVoicePlanServerResult: bridge.onVoicePlanServerResult,
+        terminalBreakoutActive: Boolean(bridge.terminalBreakoutActive),
+        windowBreakoutActive: Boolean(bridge.windowBreakoutActive),
+        workspaceId: safeWorkspaceId,
+      };
+      const previousBridge = currentBridges[safeWorkspaceId] || null;
+      if (
+        previousBridge
+        && previousBridge.onToggleTerminalBreakout === nextBridge.onToggleTerminalBreakout
+        && previousBridge.onToggleWindowBreakout === nextBridge.onToggleWindowBreakout
+        && previousBridge.onVoiceAgentToolCall === nextBridge.onVoiceAgentToolCall
+        && previousBridge.onVoicePlanServerResult === nextBridge.onVoicePlanServerResult
+        && previousBridge.terminalBreakoutActive === nextBridge.terminalBreakoutActive
+        && previousBridge.windowBreakoutActive === nextBridge.windowBreakoutActive
+      ) {
+        return currentBridges;
+      }
+      return {
+        ...currentBridges,
+        [safeWorkspaceId]: nextBridge,
+      };
     });
-  }, [cancelDeferredWorkspaceActivation, showView]);
+  }, []);
   const openNetworkingOverlay = useCallback(() => {
     setNetworkingOverlayOpen(true);
     void refreshNetworkingDiagnostics({ quiet: Boolean(networkingDiagnostics) });
@@ -19441,20 +19618,14 @@ export default function App() {
   }, []);
   const restoreWorkspaceToolPane = useCallback(() => {
     setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
-    if (deviceLevelViewActive) {
-      showNoWorkspaceSelectedFromWorkspaceTool("workspace_tool_restore_from_device_view");
-    }
-  }, [deviceLevelViewActive, showNoWorkspaceSelectedFromWorkspaceTool]);
+  }, []);
   const toggleFullscreenWorkspaceToolPane = useCallback(() => {
     setWorkspaceToolPaneMode((currentMode) => (
       currentMode === TODO_QUEUE_PANE_MODE_FULLSCREEN
         ? TODO_QUEUE_PANE_MODE_NORMAL
         : TODO_QUEUE_PANE_MODE_FULLSCREEN
     ));
-    if (deviceLevelViewActive) {
-      showNoWorkspaceSelectedFromWorkspaceTool("workspace_tool_fullscreen_from_device_view");
-    }
-  }, [deviceLevelViewActive, showNoWorkspaceSelectedFromWorkspaceTool]);
+  }, []);
   const accountToolTodoDeviceId = cloudDesktopDeviceProfile?.device_id
     || cloudDesktopDeviceProfile?.deviceId
     || cloudDesktopDeviceProfile?.machine_id
@@ -24825,6 +24996,7 @@ export default function App() {
         };
       }
     }
+    recordWorkspaceVisibleTerminalStatus(lifecycleEvent);
 
     const lifecycleAgentId = String(
       lifecycleEvent.agentId || lifecycleEvent.currentAgent || "",
@@ -25806,6 +25978,7 @@ export default function App() {
     }
   }, [
     rejectWorkspacePromptDeliveriesForThread,
+    recordWorkspaceVisibleTerminalStatus,
     requestWorkspaceThreadTranscript,
     refreshRustTerminalAuthoritySnapshot,
     settleWorkspacePromptDelivery,
@@ -27921,13 +28094,7 @@ export default function App() {
                             workspaceScopedToolTabsEnabled={Boolean(selectedWorkspace)}
                             workspaceToolPaneMode={workspaceToolPaneMode}
                             workspaceToolPaneVisible={workspaceToolPaneVisible}
-                            workspaceToolPortalTarget={
-                              workspaceToolPortalHost
-                                && runtimeWorkspace.id === selectedWorkspace?.id
-                                && selectedWorkspaceHasMountedRuntime
-                                ? workspaceToolPortalHost
-                                : null
-                            }
+                            workspaceToolPortalTarget={null}
                             terminalWorkspace={runtimeWorkspace}
                             terminalRenderAgentsByIndex={runtimeDescriptor.terminalRenderAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
@@ -27969,6 +28136,7 @@ export default function App() {
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
                             onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
                             onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
+                            onWorkspaceToolRuntimeBridgeChange={updateWorkspaceToolRuntimeBridge}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
                             onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
                             refreshAgentStatuses={refreshAgentStatuses}
@@ -29437,7 +29605,6 @@ export default function App() {
                       >
                         <WorkspaceAppToolPortalHost
                           aria-hidden={workspaceToolPaneVisible ? undefined : "true"}
-                          ref={setWorkspaceToolPortalHost}
                         >
                           {shouldRenderAccountToolPanel ? (
                             workspaceToolPaneMinimized ? (
@@ -29478,17 +29645,23 @@ export default function App() {
                                 onQueueItem={queueAccountToolTodo}
                                 onRemoveItem={removeAccountToolTodo}
                                 onSubmitDraft={submitAccountToolDraft}
+                                onToggleTerminalBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleTerminalBreakout}
+                                onToggleWindowBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleWindowBreakout}
                                 onToggleFullscreenPane={toggleFullscreenWorkspaceToolPane}
                                 onUpdateItem={updateAccountToolTodoText}
+                                onVoiceAgentToolCall={selectedWorkspaceToolRuntimeBridge?.onVoiceAgentToolCall}
+                                onVoicePlanServerResult={selectedWorkspaceToolRuntimeBridge?.onVoicePlanServerResult}
                                 paneMode={workspaceToolPaneMode}
                                 pendingItems={{}}
                                 queueItems={accountToolItems}
                                 rootDirectory={selectedWorkspaceFileRoot || defaultWorkingDirectory}
                                 storageUsage={cloudWorkspaceProgress.storageUsage}
+                                terminalBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.terminalBreakoutActive)}
                                 workspace={selectedWorkspace || null}
                                 workspaceId={selectedWorkspace?.id || ""}
                                 workspaceScopedTabsEnabled={Boolean(selectedWorkspace)}
                                 workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
+                                windowBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.windowBreakoutActive)}
                               />
                             )
                           ) : null}

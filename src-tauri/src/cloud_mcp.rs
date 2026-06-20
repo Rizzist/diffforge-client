@@ -3420,6 +3420,131 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
     ))
 }
 
+fn cloud_mcp_todo_sync_op_idempotency_fragment(op: &Value, index: usize) -> Option<String> {
+    let op_array = op.as_array()?;
+    let op_code = op_array
+        .first()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("u")
+        .to_ascii_lowercase();
+    let todo_id = op_array
+        .get(1)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| cloud_mcp_payload_text(op, &["todo_id", "todoId", "id"]))?;
+    let is_delete = matches!(op_code.as_str(), "d" | "del" | "delete" | "removed");
+    let status = if is_delete {
+        "deleted".to_string()
+    } else {
+        op_array
+            .get(2)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| cloud_mcp_payload_text(op, &["status", "todo_status", "todoStatus"]))
+            .unwrap_or_else(|| "upsert".to_string())
+    };
+    let metadata = if is_delete {
+        op_array.get(2)
+    } else {
+        op_array
+            .get(4)
+            .filter(|value| value.is_object())
+            .or_else(|| op_array.get(7).filter(|value| value.is_object()))
+    };
+    let rust_todo_seq = metadata
+        .and_then(|value| {
+            cloud_mcp_payload_i64(
+                value,
+                &[
+                    "rust_todo_seq",
+                    "rustTodoSeq",
+                    "todo_seq",
+                    "todoSeq",
+                    "rseq",
+                    "dseq",
+                ],
+            )
+        })
+        .or_else(|| {
+            cloud_mcp_payload_i64(
+                op,
+                &[
+                    "rust_todo_seq",
+                    "rustTodoSeq",
+                    "todo_seq",
+                    "todoSeq",
+                    "rseq",
+                    "dseq",
+                ],
+            )
+        })
+        .unwrap_or(0)
+        .max(0);
+    Some(format!(
+        "{}:{}:{}:{}:{}",
+        index, op_code, todo_id, status, rust_todo_seq
+    ))
+}
+
+fn cloud_mcp_todo_sync_outbox_idempotency_key(
+    event_kind: &str,
+    payload: &Value,
+    payload_hash: &str,
+    coalesce_key: Option<&str>,
+) -> Option<String> {
+    if !event_kind.trim().eq_ignore_ascii_case("todo.sync")
+        && !payload
+            .get("c")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("todo.sync"))
+        && !payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("todo.sync"))
+    {
+        return None;
+    }
+    let cid = cloud_mcp_payload_text(
+        payload,
+        &["cid", "client_request_id", "clientRequestId", "request_id", "requestId"],
+    )
+    .unwrap_or_default();
+    let device_id = cloud_mcp_payload_text(
+        payload,
+        &["device_id", "deviceId", "source_device_id", "sourceDeviceId"],
+    )
+    .unwrap_or_default();
+    let workspace_id = cloud_mcp_payload_text(
+        payload,
+        &["workspace_id", "workspaceId", "source_workspace_id", "sourceWorkspaceId"],
+    )
+    .unwrap_or_default();
+    let ops_fragment = payload
+        .get("ops")
+        .and_then(Value::as_array)
+        .map(|ops| {
+            ops.iter()
+                .enumerate()
+                .filter_map(|(index, op)| cloud_mcp_todo_sync_op_idempotency_fragment(op, index))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .unwrap_or_default();
+    if cid.is_empty() && ops_fragment.is_empty() {
+        return None;
+    }
+    let coalesce = coalesce_key.unwrap_or_default();
+    Some(format!(
+        "todo.sync:{device_id}:{workspace_id}:{cid}:{ops_fragment}:{coalesce}:{payload_hash}"
+    ))
+}
+
 fn cloud_mcp_outbox_idempotency_key(
     event_kind: &str,
     payload: &Value,
@@ -3428,6 +3553,11 @@ fn cloud_mcp_outbox_idempotency_key(
 ) -> String {
     if let Some(key) =
         cloud_mcp_payload_text(payload, &["pid", "idempotency_key", "idempotencyKey"])
+    {
+        return key;
+    }
+    if let Some(key) =
+        cloud_mcp_todo_sync_outbox_idempotency_key(event_kind, payload, payload_hash, coalesce_key)
     {
         return key;
     }
@@ -22005,6 +22135,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     .or_else(|| terminal.get("statusSeq"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                let status_source = terminal
+                    .get("status_source")
+                    .or_else(|| terminal.get("statusSource"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let visible_terminal = terminal
+                    .get("visible_terminal")
+                    .or_else(|| terminal.get("visibleTerminal"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let input_ready = terminal
                     .get("input_ready")
                     .or_else(|| terminal.get("inputReady"))
@@ -22052,6 +22192,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     "native_rail_label": native_rail_label,
                     "readiness": cloud_mcp_payload_text(terminal, &["readiness", "terminal_readiness", "terminalReadiness"]),
                     "terminal_status": terminal_status,
+                    "status_source": status_source.clone(),
+                    "statusSource": status_source,
+                    "visible_terminal": visible_terminal.clone(),
+                    "visibleTerminal": visible_terminal,
                     "command_phase": cloud_mcp_payload_text(terminal, &["command_phase", "commandPhase"]),
                     "execution_phase": cloud_mcp_payload_text(terminal, &["execution_phase", "executionPhase"]),
                     "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId"]),
@@ -40603,6 +40747,72 @@ mod cloud_mcp_tests {
             cloud_mcp_outbox_priority_for_event("todo.sync"),
             CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
         );
+    }
+
+    #[test]
+    fn todo_sync_idempotency_key_tracks_cid_op_and_rust_seq() {
+        let upsert = json!({
+            "c": "todo.sync",
+            "cid": "cid-1",
+            "device_id": "device-a",
+            "workspace_id": "workspace-a",
+            "ops": [
+                ["u", "todo-1", "listed", "Write tests", {
+                    "rust_todo_seq": 7,
+                    "attempt_id": "attempt-a"
+                }]
+            ]
+        });
+        let edited = json!({
+            "c": "todo.sync",
+            "cid": "cid-1",
+            "device_id": "device-a",
+            "workspace_id": "workspace-a",
+            "ops": [
+                ["u", "todo-1", "listed", "Write better tests", {
+                    "rust_todo_seq": 8,
+                    "attempt_id": "attempt-a"
+                }]
+            ]
+        });
+        let deleted = json!({
+            "c": "todo.sync",
+            "cid": "cid-1",
+            "device_id": "device-a",
+            "workspace_id": "workspace-a",
+            "ops": [
+                ["d", "todo-1", {
+                    "rust_todo_seq": 9,
+                    "attempt_id": "todo-delete-todo-1"
+                }]
+            ]
+        });
+
+        let upsert_key = cloud_mcp_outbox_idempotency_key(
+            "todo.sync",
+            &upsert,
+            "hash-upsert",
+            Some("todo.sync:workspace-a:cid-1"),
+        );
+        let edited_key = cloud_mcp_outbox_idempotency_key(
+            "todo.sync",
+            &edited,
+            "hash-edited",
+            Some("todo.sync:workspace-a:cid-1"),
+        );
+        let deleted_key = cloud_mcp_outbox_idempotency_key(
+            "todo.sync",
+            &deleted,
+            "hash-deleted",
+            Some("todo.sync:workspace-a:cid-1"),
+        );
+
+        assert!(upsert_key.starts_with("todo.sync:device-a:workspace-a:cid-1:"));
+        assert!(upsert_key.contains("0:u:todo-1:listed:7"));
+        assert!(edited_key.contains("0:u:todo-1:listed:8"));
+        assert!(deleted_key.contains("0:d:todo-1:deleted:9"));
+        assert_ne!(upsert_key, edited_key);
+        assert_ne!(edited_key, deleted_key);
     }
 
     #[test]

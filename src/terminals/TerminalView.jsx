@@ -17780,6 +17780,7 @@ function TerminalView({
   onMinimizeWorkspaceToolPane = null,
   onRestoreWorkspaceToolPane = null,
   onToggleFullscreenWorkspaceToolPane = null,
+  onWorkspaceToolRuntimeBridgeChange = null,
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -17902,6 +17903,7 @@ function TerminalView({
   const [appBackgroundMode, setAppBackgroundMode] = useState(false);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const workspaceToolPortaled = Boolean(workspaceToolPortalTarget);
+  const workspaceToolOwnedByAppShell = Boolean(workspaceToolPaneVisible && !workspaceToolPortaled);
   const effectiveTodoQueuePaneMode = workspaceToolPaneMode || todoQueuePaneMode;
   // No terminal tabs: every terminal is always visible in the resize grid
   // (rows split vertically, terminals within a row split horizontally) and
@@ -17912,7 +17914,8 @@ function TerminalView({
   const tabVisibilityByTerminal = useMemo(() => new Map(), []);
   const visibleTabTerminalIndexes = logicalTerminalIndexes;
   const todoQueueVisible = Boolean(
-    hasVisibleWorkspaceTerminalPanes
+    !workspaceToolOwnedByAppShell
+    && hasVisibleWorkspaceTerminalPanes
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
   );
   const effectiveTodoQueueVisible = workspaceToolPortaled
@@ -29670,6 +29673,35 @@ function TerminalView({
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
+  ]);
+
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!workspaceId || typeof onWorkspaceToolRuntimeBridgeChange !== "function") {
+      return undefined;
+    }
+
+    onWorkspaceToolRuntimeBridgeChange(workspaceId, {
+      onToggleTerminalBreakout: toggleTerminalBreakout,
+      onToggleWindowBreakout: toggleWindowBreakout,
+      onVoiceAgentToolCall: handleVoiceAgentToolCall,
+      onVoicePlanServerResult: handleVoicePlanServerResult,
+      terminalBreakoutActive: terminalBreakoutVisible,
+      windowBreakoutActive,
+    });
+
+    return () => {
+      onWorkspaceToolRuntimeBridgeChange(workspaceId, null);
+    };
+  }, [
+    handleVoiceAgentToolCall,
+    handleVoicePlanServerResult,
+    onWorkspaceToolRuntimeBridgeChange,
+    terminalBreakoutVisible,
+    terminalWorkspace?.id,
+    toggleTerminalBreakout,
+    toggleWindowBreakout,
+    windowBreakoutActive,
   ]);
 
   useEffect(() => {
