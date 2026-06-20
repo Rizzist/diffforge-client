@@ -479,6 +479,14 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     }
     let text = todo_dispatch_text(event, &["body", "message", "prompt", "text"]);
     let workspace_name = todo_dispatch_text(event, &["workspace_name", "workspaceName"]);
+    let requested_status = todo_dispatch_normalize_status(
+        &todo_dispatch_text(event, &["todo_status", "todoStatus", "status", "mode"]),
+    );
+    let intake_status = if requested_status == "queued" {
+        "queued"
+    } else {
+        "listed"
+    };
     let origin_device_id = todo_dispatch_text(
         event,
         &[
@@ -494,7 +502,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         "commandId": command_id,
         "itemId": command_id,
         "originDeviceId": origin_device_id,
-        "status": "queued",
+        "status": intake_status,
         "text": text.chars().take(180).collect::<String>(),
         "workspaceName": workspace_name.clone(),
     });
@@ -530,8 +538,8 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                 "id": command_id,
                 "kind": "todo",
                 "text": text,
-                "todoStatus": "queued",
-                "status": "queued",
+                "todoStatus": intake_status,
+                "status": intake_status,
                 "createdAt": now_iso,
                 "updatedAt": now_iso,
                 "workspaceId": workspace_id,
@@ -1797,6 +1805,73 @@ fn todo_store_set_item_status(item: &mut Value, status: &str, reason: &str) {
     }
 }
 
+fn todo_store_item_attempt_id(item: &Value, todo_id: &str) -> String {
+    let attempt_id = todo_dispatch_text(
+        item,
+        &[
+            "attemptId",
+            "attempt_id",
+            "lastDispatchId",
+            "last_dispatch_id",
+            "dispatchId",
+            "dispatch_id",
+            "promptEventId",
+            "prompt_event_id",
+            "commandId",
+            "command_id",
+        ],
+    );
+    if attempt_id.is_empty() {
+        format!("todo-attempt-{todo_id}")
+    } else {
+        attempt_id
+    }
+}
+
+fn todo_store_item_run_id(item: &Value, attempt_id: &str) -> String {
+    let run_id = todo_dispatch_text(
+        item,
+        &[
+            "runId",
+            "run_id",
+            "providerTurnId",
+            "provider_turn_id",
+            "turnId",
+            "turn_id",
+            "promptEventId",
+            "prompt_event_id",
+        ],
+    );
+    if run_id.is_empty() {
+        attempt_id.to_string()
+    } else {
+        run_id
+    }
+}
+
+fn todo_store_authority_key(todo_id: &str, attempt_id: &str) -> String {
+    format!("{todo_id}::{attempt_id}")
+}
+
+fn todo_store_next_authority_seq(workspace_id: &str, todo_id: &str, attempt_id: &str) -> u64 {
+    let Some(path) = todo_dispatch_data_path("authority", workspace_id) else {
+        return todo_dispatch_now_ms();
+    };
+    let key = todo_store_authority_key(todo_id, attempt_id);
+    let mut state = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let previous = state.get(&key).and_then(Value::as_u64).unwrap_or(0);
+    let next = previous.saturating_add(1);
+    state.insert(key, json!(next));
+    if let Ok(bytes) = serde_json::to_vec(&Value::Object(state)) {
+        let _ = fs::write(path, bytes);
+    }
+    next
+}
+
 fn todo_store_item_sync_id(item: &Value) -> String {
     todo_dispatch_text(
         item,
@@ -1903,7 +1978,18 @@ fn todo_dispatch_todo_sync_commit_payload(
     } else {
         item_source
     };
+    let attempt_id = todo_store_item_attempt_id(item, &todo_id);
+    let run_id = todo_store_item_run_id(item, &attempt_id);
+    let rust_todo_seq = todo_store_next_authority_seq(workspace_id, &todo_id, &attempt_id);
     let mut meta = json!({
+        "rust_authoritative": true,
+        "rustAuthoritative": true,
+        "rust_todo_seq": rust_todo_seq,
+        "rustTodoSeq": rust_todo_seq,
+        "attempt_id": attempt_id.clone(),
+        "attemptId": attempt_id.clone(),
+        "run_id": run_id.clone(),
+        "runId": run_id.clone(),
         "source": source_kind,
         "source_kind": source_kind,
         "sourceKind": source_kind,
@@ -1960,10 +2046,14 @@ fn todo_dispatch_todo_sync_commit_payload(
     todo_dispatch_copy_todo_input_aliases(item, &mut meta);
     Some(json!({
         "c": "todo.sync",
-        "cid": format!("rust-todo-dispatch-{todo_id}-{status}-{}", todo_dispatch_now_ms()),
+        "cid": format!("rust-todo-dispatch-{todo_id}-{status}-{rust_todo_seq}"),
         "device_id": device_id,
         "deviceId": device_id,
         "did": device_id,
+        "rust_authoritative": true,
+        "rustAuthoritative": true,
+        "rust_todo_seq": rust_todo_seq,
+        "rustTodoSeq": rust_todo_seq,
         "m": "commit",
         "ops": [
             ["u", todo_id, status, text, meta],
@@ -2010,10 +2100,21 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
     let ops = safe_todo_ids
         .iter()
         .map(|todo_id| {
+            let attempt_id = format!("todo-delete-{todo_id}");
+            let run_id = attempt_id.clone();
+            let rust_todo_seq = todo_store_next_authority_seq(workspace_id, todo_id, &attempt_id);
             json!([
                 "d",
                 todo_id,
                 {
+                    "rust_authoritative": true,
+                    "rustAuthoritative": true,
+                    "rust_todo_seq": rust_todo_seq,
+                    "rustTodoSeq": rust_todo_seq,
+                    "attempt_id": attempt_id.clone(),
+                    "attemptId": attempt_id.clone(),
+                    "run_id": run_id.clone(),
+                    "runId": run_id.clone(),
                     "source": "rust-diffforge-todo-store",
                     "source_kind": "rust-diffforge-todo-store",
                     "sourceKind": "rust-diffforge-todo-store",
@@ -2041,6 +2142,8 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
         "device_id": device_id,
         "deviceId": device_id,
         "did": device_id,
+        "rust_authoritative": true,
+        "rustAuthoritative": true,
         "m": "commit",
         "ops": ops,
         "source": "rust-diffforge-todo-store",
@@ -2205,16 +2308,25 @@ fn todo_store_changed_items_for_sync(previous: &[Value], next: &[Value]) -> Vec<
 }
 
 fn todo_store_push_items(app: &AppHandle, workspace_id: &str, items: Vec<Value>, reason: &str) {
-    let item_count = items
+    let items = items
         .into_iter()
         .filter(|item| item.is_object() && !todo_store_item_sync_id(item).is_empty())
-        .count();
-    if item_count == 0 {
+        .collect::<Vec<_>>();
+    if items.is_empty() {
         return;
     }
-    let _ = app;
+    let item_count = items.len();
+    for item in items {
+        todo_store_enqueue_item_todo_sync_commit(
+            app,
+            workspace_id,
+            item,
+            reason,
+            "rust-diffforge-todo-store",
+        );
+    }
     log_terminal_status_event(
-        "backend.todo_store.cloud_push_retired",
+        "backend.todo_store.cloud_push_enqueued",
         json!({
             "itemCount": item_count,
             "reason": reason,
@@ -5427,9 +5539,18 @@ fn todo_dispatch_push_queue_snapshot(
     if items.is_empty() && removed_todo_ids.is_empty() {
         return;
     }
-    let _ = app;
+    todo_store_push_items(app, workspace_id, items.clone(), reason);
+    if !removed_todo_ids.is_empty() {
+        todo_store_enqueue_delete_todo_sync_commit(
+            app,
+            workspace_id,
+            &removed_todo_ids,
+            reason,
+            "todo_dispatch_push_queue_snapshot",
+        );
+    }
     log_terminal_status_event(
-        "backend.todo_dispatch.cloud_snapshot_retired",
+        "backend.todo_dispatch.cloud_snapshot_enqueued",
         json!({
             "itemCount": items.len(),
             "reason": reason,
@@ -5979,6 +6100,26 @@ mod todo_dispatch_backend_tests {
     }
 }
 
+fn todo_dispatch_backend_item_has_image_attachment(item: &Value) -> bool {
+    [
+        "image",
+        "images",
+        "imageAttachments",
+        "image_attachments",
+        "imageDataUrl",
+        "image_data_url",
+        "imageSrc",
+        "image_src",
+    ]
+    .iter()
+    .any(|key| match item.get(*key) {
+        Some(Value::Null) | None => false,
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(_) => true,
+    })
+}
+
 fn todo_dispatch_backend_item_dispatchable(item: &Value) -> bool {
     let status = item
         .get("todoStatus")
@@ -5990,7 +6131,7 @@ fn todo_dispatch_backend_item_dispatchable(item: &Value) -> bool {
         return false;
     }
     // Background policy: text-only todos (image attachments need the webview).
-    if item.get("image").is_some() || item.get("images").is_some() {
+    if todo_dispatch_backend_item_has_image_attachment(item) {
         return false;
     }
     !todo_dispatch_backend_item_text(item).is_empty()
@@ -6010,6 +6151,9 @@ fn todo_dispatch_prepare_immediate_backend_item(
     let item_id = todo_store_item_sync_id(&item);
     if item_id.is_empty() {
         return Err("Todo item id is required.".to_string());
+    }
+    if todo_dispatch_backend_item_has_image_attachment(&item) {
+        return Err("image_todo_requires_webview_submission".to_string());
     }
     if todo_dispatch_backend_item_text(&item).is_empty() {
         return Err("Todo text is required.".to_string());

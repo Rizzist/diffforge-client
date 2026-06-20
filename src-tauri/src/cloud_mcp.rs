@@ -11109,6 +11109,7 @@ async fn cloud_mcp_apply_account_sync_resume_response(
                 );
             }
         }
+        cloud_mcp_apply_account_sync_resume_remote_commands(state, &todos, reason).await;
     }
     if let Some(assets) = cloud_mcp_account_sync_resume_domain(
         response,
@@ -11167,6 +11168,76 @@ async fn cloud_mcp_apply_account_sync_resume_response(
                 .await;
         }
     }
+}
+
+async fn cloud_mcp_apply_account_sync_resume_remote_commands(
+    state: &CloudMcpState,
+    todos: &Value,
+    reason: &str,
+) {
+    let events = [
+        todos.get("remote_command_events"),
+        todos.get("remoteCommandEvents"),
+        todos.get("pending_remote_command_events"),
+        todos.get("pendingRemoteCommandEvents"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_array)
+    .flat_map(|items| items.iter())
+    .filter(|value| value.is_object())
+    .cloned()
+    .collect::<Vec<_>>();
+    if events.is_empty() {
+        return;
+    }
+    let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() else {
+        log_cloud_sync_event(
+            "account_sync_resume.remote_commands_no_app",
+            json!({
+                "reason": reason,
+                "count": events.len(),
+            }),
+        );
+        return;
+    };
+    let mut applied = 0usize;
+    let mut duplicate = 0usize;
+    let mut skipped_device = 0usize;
+    for event in events {
+        if !cloud_mcp_remote_command_matches_device(&event) {
+            skipped_device += 1;
+            continue;
+        }
+        if !cloud_mcp_claim_remote_command_receipt(state, &event).await {
+            duplicate += 1;
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                &event,
+                "duplicate_ignored",
+                "Duplicate remote command ignored by desktop.",
+                None,
+            )
+            .await;
+            continue;
+        }
+        let _ = app.emit(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, event.clone());
+        todo_dispatch_record_remote_intake(&app, &event);
+        todo_dispatch_apply_remote_delete(&app, &event);
+        if !cloud_mcp_remote_command_is_rust_owned(&event) {
+            let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
+        }
+        applied += 1;
+    }
+    log_cloud_sync_event(
+        "account_sync_resume.remote_commands_applied",
+        json!({
+            "reason": reason,
+            "applied": applied,
+            "duplicate": duplicate,
+            "skipped_device": skipped_device,
+        }),
+    );
 }
 
 fn cloud_mcp_spawn_account_sync_resume(state: &CloudMcpState, reason: &'static str) {
@@ -12166,15 +12237,21 @@ fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
     let client_id = cloud_mcp_payload_text(event, &["client_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["clientId"]))
         .unwrap_or_default();
+    let command_kind = cloud_mcp_payload_text(event, &["command_kind"])
+        .or_else(|| cloud_mcp_payload_text(event, &["commandKind"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_kind"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandKind"]))
+        .unwrap_or_default();
     let workspace_id = cloud_mcp_payload_text(event, &["workspace_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["workspaceId"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"]))
         .unwrap_or_default();
     Some(format!(
-        "{}::{}::{}",
+        "{}::{}::{}::{}",
         client_id.trim(),
         workspace_id.trim(),
+        command_kind.trim(),
         command_id
     ))
 }
@@ -24290,6 +24367,17 @@ async fn cloud_mcp_save_account_skills(
     base_revision: Option<i64>,
     skill_units: Option<Value>,
 ) -> Result<Value, String> {
+    let skill_units_provided = skill_units.is_some();
+    if !skill_units_provided
+        && skills_md
+            .lines()
+            .any(|line| line.trim_start().starts_with("## "))
+    {
+        return Err(
+            "Account skill saves require per-skill metadata units so content can upload through the asset transfer path."
+                .to_string(),
+        );
+    }
     let prepared_skill_units =
         cloud_mcp_prepare_account_skill_unit_assets(state.inner(), skill_units).await?;
     let prepared_skill_ops = prepared_skill_units
@@ -24297,18 +24385,22 @@ async fn cloud_mcp_save_account_skills(
         .cloned()
         .map(|skill| json!({"op": "u", "skill": skill}))
         .collect::<Vec<_>>();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let payload_hash = cloud_mcp_outbox_payload_hash(&json!({
+        "skill_units": prepared_skill_units.clone(),
+        "authoritative": skill_units_provided,
+    }));
+    let idempotency_key = format!("account-skill:{scope_key}:{device_id}:{payload_hash}");
     let mut payload = cloud_mcp_tools_base_payload("rust-diffforge-account-skills");
     if let Some(object) = payload.as_object_mut() {
-        let cloud_skills_md = if prepared_skill_units.is_empty() {
-            skills_md.clone()
-        } else {
-            let preamble =
-                cloud_mcp_account_skills_preamble(&json!({ "skills_md": skills_md.clone() }));
-            format!("{}\n", preamble.trim())
-        };
+        let preamble = cloud_mcp_account_skills_preamble(&json!({ "skills_md": skills_md.clone() }));
+        let cloud_skills_md = format!("{}\n", preamble.trim());
         object.insert("skills_md".to_string(), json!(cloud_skills_md.clone()));
         object.insert("skillsMd".to_string(), json!(cloud_skills_md));
-        if !prepared_skill_units.is_empty() {
+        if skill_units_provided {
             object.insert(
                 "skill_units".to_string(),
                 json!(prepared_skill_units.clone()),
@@ -24321,14 +24413,34 @@ async fn cloud_mcp_save_account_skills(
         } else {
             object.insert("ops".to_string(), json!([]));
         }
-        object.insert("authoritative".to_string(), json!(true));
-        object.insert("snapshot_full".to_string(), json!(true));
-        object.insert("snapshotFull".to_string(), json!(true));
+        object.insert("authoritative".to_string(), json!(skill_units_provided));
+        object.insert("snapshot_full".to_string(), json!(skill_units_provided));
+        object.insert("snapshotFull".to_string(), json!(skill_units_provided));
+        object.insert("event_kind".to_string(), json!("doc.sync"));
+        object.insert("eventKind".to_string(), json!("doc.sync"));
         object.insert("m".to_string(), json!("commit"));
         object.insert("c".to_string(), json!("doc.sync"));
         object.insert("d".to_string(), json!("skills"));
-        object.insert("v".to_string(), json!(1));
+        object.insert("v".to_string(), json!(2));
         object.insert("contract".to_string(), json!("diffforge.skills_doc.v1"));
+        object.insert("sync_unit".to_string(), json!("account_skill"));
+        object.insert("syncUnit".to_string(), json!("account_skill"));
+        object.insert("skill_unit_count".to_string(), json!(prepared_skill_units.len()));
+        object.insert("skillUnitCount".to_string(), json!(prepared_skill_units.len()));
+        object.insert("changed_count".to_string(), json!(prepared_skill_units.len()));
+        object.insert("changedCount".to_string(), json!(prepared_skill_units.len()));
+        object.insert("payload_hash".to_string(), json!(payload_hash.clone()));
+        object.insert("payloadHash".to_string(), json!(payload_hash));
+        object.insert("idempotency_key".to_string(), json!(idempotency_key.clone()));
+        object.insert("idempotencyKey".to_string(), json!(idempotency_key));
+        object.insert("source_device_id".to_string(), json!(device_id.clone()));
+        object.insert("sourceDeviceId".to_string(), json!(device_id.clone()));
+        object.insert("device_id".to_string(), json!(device_id.clone()));
+        object.insert("deviceId".to_string(), json!(device_id));
+        if let Some(device_name) = device_profile.get("device_name").or_else(|| device_profile.get("deviceName")) {
+            object.insert("source_device_name".to_string(), device_name.clone());
+            object.insert("sourceDeviceName".to_string(), device_name.clone());
+        }
         if let Some(base_revision) = base_revision {
             object.insert("base_revision".to_string(), json!(base_revision));
             object.insert("baseRevision".to_string(), json!(base_revision));
@@ -41551,16 +41663,27 @@ mod cloud_mcp_tests {
             "client_id": "client-1",
             "workspace_id": "workspace-1",
             "command_id": "remote-command-123",
+            "command_kind": "todo_create",
             "event_kind": "remote_command_requested",
         });
 
         assert!(cloud_mcp_claim_remote_command_receipt(&state, &event).await);
         assert!(!cloud_mcp_claim_remote_command_receipt(&state, &event).await);
 
+        let same_todo_delete = json!({
+            "client_id": "client-1",
+            "workspace_id": "workspace-1",
+            "command_id": "remote-command-123",
+            "command_kind": "todo_delete",
+            "event_kind": "remote_command_requested",
+        });
+        assert!(cloud_mcp_claim_remote_command_receipt(&state, &same_todo_delete).await);
+
         let other_workspace = json!({
             "client_id": "client-1",
             "workspace_id": "workspace-2",
             "command_id": "remote-command-123",
+            "command_kind": "todo_create",
             "event_kind": "remote_command_requested",
         });
         assert!(cloud_mcp_claim_remote_command_receipt(&state, &other_workspace).await);

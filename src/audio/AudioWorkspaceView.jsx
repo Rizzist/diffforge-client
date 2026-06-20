@@ -530,6 +530,7 @@ const AUDIO_CANCEL_EVENT = "forge-audio-cancel";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT = "forge-audio-dictation-raw-result";
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT = "forge-audio-widget-bubble-hover-changed";
+const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT = "forge-floating-layout-changed";
 const CLOUD_MCP_SYNC_STATUS_EVENT = "cloud-mcp-sync-status";
 const AUDIO_WIDGET_BUBBLE_PLACEMENT_STORAGE_KEY = "diffforge.audio.widgetBubblePlacement.v1";
 const AUDIO_SHORTCUTS_CHANGED_EVENT = "forge-audio-shortcuts-changed";
@@ -5993,6 +5994,8 @@ export function AudioWidgetWindow() {
   const barPositionAnimationRef = useRef({ frame: 0, token: 0 });
   const barPlacementGenerationRef = useRef(0);
   const barPlacementReadyKeyRef = useRef("");
+  const barNativePlacementPendingRef = useRef(null);
+  const barNativePlacementFallbackTimerRef = useRef(0);
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
@@ -6842,7 +6845,8 @@ export function AudioWidgetWindow() {
 
     cancelBarPositionAnimation();
     try {
-      return await invoke("audio_widget_position_bottom_bar", { request });
+      await invoke("audio_widget_position_bottom_bar", { request });
+      return { queued: true };
     } catch {
       return null;
     }
@@ -6851,6 +6855,20 @@ export function AudioWidgetWindow() {
   useEffect(() => () => {
     cancelBarPositionAnimation();
   }, [cancelBarPositionAnimation]);
+
+  const clearBarNativePlacementFallback = useCallback(() => {
+    if (barNativePlacementFallbackTimerRef.current) {
+      window.clearTimeout(barNativePlacementFallbackTimerRef.current);
+      barNativePlacementFallbackTimerRef.current = 0;
+    }
+  }, []);
+
+  const markBarPlacementReady = useCallback((targetKey) => {
+    barPlacementReadyKeyRef.current = targetKey;
+    setBarPlacementReadyKey((currentKey) => (
+      currentKey === targetKey ? currentKey : targetKey
+    ));
+  }, []);
 
   const scheduleWidgetDragFinish = useCallback((delayMs = 240) => {
     if (widgetDragSettleTimerRef.current) {
@@ -7370,6 +7388,13 @@ export function AudioWidgetWindow() {
         && !modeGeometryChanged
         && !noticeGeometryChanged;
       const nativeOwnsBarPlacement = isMacPlatform();
+      if (nativeOwnsBarPlacement) {
+        clearBarNativePlacementFallback();
+        barNativePlacementPendingRef.current = {
+          generation: placementGeneration,
+          key: targetKey,
+        };
+      }
       const nativePlacement = await positionAudioBarWindowNatively({
         width: target.width,
         height: target.height,
@@ -7377,20 +7402,38 @@ export function AudioWidgetWindow() {
         animate: shouldAnimatePlacement,
       });
       if (!isCurrentPlacement()) {
+        const pending = barNativePlacementPendingRef.current;
+        if (pending?.generation === placementGeneration) {
+          barNativePlacementPendingRef.current = null;
+          clearBarNativePlacementFallback();
+        }
         return;
       }
       if (nativePlacement) {
-        barPlacementReadyKeyRef.current = targetKey;
-        setBarPlacementReadyKey((currentKey) => (
-          currentKey === targetKey ? currentKey : targetKey
-        ));
+        const pending = barNativePlacementPendingRef.current;
+        if (!pending || pending.generation !== placementGeneration || pending.key !== targetKey) {
+          return;
+        }
+        barNativePlacementFallbackTimerRef.current = window.setTimeout(() => {
+          const fallbackPending = barNativePlacementPendingRef.current;
+          if (
+            !fallbackPending
+            || fallbackPending.generation !== placementGeneration
+            || fallbackPending.key !== targetKey
+            || !isCurrentPlacement()
+          ) {
+            return;
+          }
+          barNativePlacementPendingRef.current = null;
+          barNativePlacementFallbackTimerRef.current = 0;
+          markBarPlacementReady(targetKey);
+        }, 180);
         return;
       }
       if (nativeOwnsBarPlacement) {
-        barPlacementReadyKeyRef.current = targetKey;
-        setBarPlacementReadyKey((currentKey) => (
-          currentKey === targetKey ? currentKey : targetKey
-        ));
+        barNativePlacementPendingRef.current = null;
+        clearBarNativePlacementFallback();
+        markBarPlacementReady(targetKey);
         return;
       }
 
@@ -7423,26 +7466,71 @@ export function AudioWidgetWindow() {
         if (!isCurrentPlacement()) {
           return;
         }
-        barPlacementReadyKeyRef.current = targetKey;
-        setBarPlacementReadyKey((currentKey) => (
-          currentKey === targetKey ? currentKey : targetKey
-        ));
+        markBarPlacementReady(targetKey);
       } else {
-        barPlacementReadyKeyRef.current = targetKey;
-        setBarPlacementReadyKey((currentKey) => (
-          currentKey === targetKey ? currentKey : targetKey
-        ));
+        markBarPlacementReady(targetKey);
       }
     });
   }, [
     barGeometryKey,
     barGeometryMargin,
     barGeometrySize,
+    clearBarNativePlacementFallback,
+    markBarPlacementReady,
     positionAudioBarWindowNatively,
     runWidgetWindowAction,
     setAudioBarWindowPosition,
     usesBottomAnchoredStyle,
   ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenLayout = () => {};
+
+    listen(FLOATING_SURFACE_LAYOUT_CHANGED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+
+      const payload = event?.payload || {};
+      if (
+        payload.source !== "audio_widget_bottom_bar"
+        || payload.surface !== "audio-widget"
+        || payload.layout !== "bottom-bar"
+      ) {
+        return;
+      }
+
+      const pending = barNativePlacementPendingRef.current;
+      if (
+        !pending
+        || barPlacementGenerationRef.current !== pending.generation
+        || widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR
+      ) {
+        return;
+      }
+
+      barNativePlacementPendingRef.current = null;
+      clearBarNativePlacementFallback();
+      markBarPlacementReady(pending.key);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+
+        unlistenLayout = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlistenLayout();
+      barNativePlacementPendingRef.current = null;
+      clearBarNativePlacementFallback();
+    };
+  }, [clearBarNativePlacementFallback, markBarPlacementReady]);
 
   // The bar style reports its geometry to native code on macOS; Rust owns the
   // actual HUD frame so browser timers cannot fight AppKit during Space swaps.
@@ -7450,6 +7538,8 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
       barPlacementReadyKeyRef.current = "";
+      barNativePlacementPendingRef.current = null;
+      clearBarNativePlacementFallback();
       setBarPlacementReadyKey("");
       invoke("audio_widget_clear_bottom_bar_position").catch(() => {});
       publishAudioWidgetErrorOverlay(null);
@@ -7494,6 +7584,7 @@ export function AudioWidgetWindow() {
     positionBottomAnchoredWidget();
   }, [
     cancelBarPositionAnimation,
+    clearBarNativePlacementFallback,
     positionBottomAnchoredWidget,
     runWidgetWindowAction,
     usesBottomAnchoredStyle,

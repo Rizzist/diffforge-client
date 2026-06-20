@@ -902,6 +902,7 @@ export default function ToolsWorkspaceView({
                 resolveRepoSyncContext={architectures.resolveRepoSyncContext}
                 selectedGraphId={architectures.selectedGraphId}
                 selectedRepoPath={architectures.selectedRepoPath}
+                workspaceDispatchTargets={architectures.workspaceDispatchTargets}
               />
             </ToolsHubStack>
           ) : (

@@ -10619,12 +10619,13 @@ export default function App() {
     const staggerTimers = new Set();
     const unlisteners = [];
 
-    const runAutoRefresh = () => {
+    const runAutoRefresh = (sourceEvent = "") => {
       debounceTimer = 0;
       if (disposed) {
         return;
       }
-      void refreshArchitectureHubCatalog({ localOnly: true, refresh: true });
+      const cloudAware = sourceEvent === "cloud-mcp-workspace-architectures-updated";
+      void refreshArchitectureHubCatalog({ localOnly: !cloudAware, refresh: true });
       const cachedLists = {};
       Object.values(workspaceGraphStateRef.current || {}).forEach((stateEntry) => {
         Object.assign(cachedLists, stateEntry?.architectureGraphLists || {});
@@ -10638,21 +10639,26 @@ export default function App() {
         const timer = window.setTimeout(() => {
           staggerTimers.delete(timer);
           if (!disposed) {
-            void refreshArchitectureHubGraphList(repoPath, { localOnly: true, refresh: true, silent: true });
+            void refreshArchitectureHubGraphList(repoPath, {
+              localOnly: !cloudAware,
+              refresh: true,
+              silent: true,
+            });
           }
         }, 120 * index);
         staggerTimers.add(timer);
       });
     };
 
-    const scheduleAutoRefresh = () => {
+    const scheduleAutoRefresh = (event) => {
       if (disposed) {
         return;
       }
       if (debounceTimer) {
         window.clearTimeout(debounceTimer);
       }
-      debounceTimer = window.setTimeout(runAutoRefresh, 800);
+      const sourceEvent = graphText(event?.event || event?.type);
+      debounceTimer = window.setTimeout(() => runAutoRefresh(sourceEvent), 800);
     };
 
     ["architecture-store-changed", "cloud-mcp-workspace-architectures-updated"].forEach((eventName) => {
@@ -10708,7 +10714,7 @@ export default function App() {
         const timer = window.setTimeout(() => {
           prefetchTimers.delete(timer);
           if (!cancelled) {
-            void refreshArchitectureHubGraphList(repoPath, { localOnly: true, refresh: true, silent: true });
+            void refreshArchitectureHubGraphList(repoPath, { localOnly: false, refresh: true, silent: true });
           }
         }, 150 * index);
         prefetchTimers.add(timer);
@@ -19053,7 +19059,7 @@ export default function App() {
     workspaceSettings,
     workspaces,
   ]);
-  useEffect(() => {
+  const workspaceTerminalDispatchTargets = useMemo(() => {
     // Publish only active workspace terminals backed by coding agents so the
     // annotation editor never queues against a dormant workspace or plain shell.
     const workspaceById = new Map((Array.isArray(workspaces) ? workspaces : [])
@@ -19138,8 +19144,11 @@ export default function App() {
         };
       })
       .filter((target) => target && target.threads.length > 0);
-    invoke("snipping_set_dispatch_targets", { targets }).catch(() => {});
+    return targets;
   }, [workspaceTerminalsWorkspaces, workspaces]);
+  useEffect(() => {
+    invoke("snipping_set_dispatch_targets", { targets: workspaceTerminalDispatchTargets }).catch(() => {});
+  }, [workspaceTerminalDispatchTargets]);
   useEffect(() => {
     let disposed = false;
     let unlistenAnnotationTodo = null;
@@ -29239,6 +29248,7 @@ export default function App() {
                       resolveRepoSyncContext: resolveArchitectureHubSyncContext,
                       selectedGraphId: architectureHubGraphState.architectureSelectedGraphId,
                       selectedRepoPath: architectureHubGraphState.architectureSelectedRepoPath,
+                      workspaceDispatchTargets: workspaceTerminalDispatchTargets,
                     }}
                     defaultWorkingDirectory={defaultWorkingDirectory}
                     initialSection={visibleView === "mcps" ? "mcps" : "architectures"}

@@ -85,12 +85,100 @@ import {
   FileTreeEmpty,
   PanelKicker,
 } from "../app/appStyles.js";
+import {
+  buildSnippingAnnotationTargetFields,
+  normalizeSnippingDispatchTargets,
+} from "../snipping/snippingAnnotationTargets.js";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
   return normalized || fallback;
 }
+
+function architectureWorkspaceOptionLabelRenderer(option) {
+  return (
+    <ArchitectureTargetOptionLabel>
+      <Folder aria-hidden="true" />
+      <span>{option.label}</span>
+    </ArchitectureTargetOptionLabel>
+  );
+}
+
+function architectureTerminalOptionLabelRenderer(option) {
+  return (
+    <ArchitectureTargetOptionLabel
+      data-any={option.value === "" ? "true" : "false"}
+      style={option.color ? { "--architecture-target-option-dot": option.color } : undefined}
+    >
+      <i aria-hidden="true" />
+      <span>{option.label}</span>
+    </ArchitectureTargetOptionLabel>
+  );
+}
+
+const ARCHITECTURE_TARGET_SELECT_STYLES = {
+  container: (base) => ({
+    ...base,
+    minWidth: 0,
+    width: "100%",
+  }),
+  control: (base, state) => ({
+    ...base,
+    minHeight: 30,
+    height: 30,
+    borderRadius: 999,
+    borderColor: state.isFocused ? "rgba(125, 176, 255, 0.58)" : "rgba(230, 236, 245, 0.11)",
+    backgroundColor: "rgba(21, 27, 36, 0.92)",
+    boxShadow: "none",
+    color: "#eef4ff",
+    cursor: "pointer",
+  }),
+  dropdownIndicator: (base) => ({
+    ...base,
+    color: "#8d9aac",
+    padding: "0 7px",
+  }),
+  indicatorSeparator: () => ({ display: "none" }),
+  menu: (base) => ({
+    ...base,
+    zIndex: 40,
+    overflow: "hidden",
+    border: "1px solid rgba(230, 236, 245, 0.12)",
+    borderRadius: 12,
+    backgroundColor: "rgba(8, 12, 18, 0.98)",
+  }),
+  menuPortal: (base) => ({ ...base, zIndex: 10000 }),
+  option: (base, state) => ({
+    ...base,
+    color: state.isSelected ? "#f8fbff" : "#b7c4d8",
+    backgroundColor: state.isSelected
+      ? "rgba(96, 165, 250, 0.22)"
+      : state.isFocused
+        ? "rgba(148, 163, 184, 0.12)"
+        : "transparent",
+    cursor: "pointer",
+    fontSize: 11,
+    fontWeight: 820,
+  }),
+  placeholder: (base) => ({
+    ...base,
+    color: "#657386",
+    fontSize: 11,
+    fontWeight: 780,
+  }),
+  singleValue: (base) => ({
+    ...base,
+    color: "#eef4ff",
+    fontSize: 11,
+    fontWeight: 860,
+  }),
+  valueContainer: (base) => ({
+    ...base,
+    height: 30,
+    padding: "0 4px 0 10px",
+  }),
+};
 
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
@@ -4113,10 +4201,12 @@ function architectureQueueAgentTodo({
   runEnvironment = "",
   runMode = "",
   runTarget = null,
+  targetFields = {},
   workspaceId,
   workspaceName,
 }) {
   const safeWorkspaceId = text(workspaceId);
+  const safeTargetFields = jsonObject(targetFields) || {};
   const commandId = architectureTodoCommandId();
   const now = new Date().toISOString();
   const identity = architectureGraphIdentity(graph);
@@ -4139,6 +4229,7 @@ function architectureQueueAgentTodo({
     createdAt: now,
     id: commandId,
     kind: "todo",
+    ...safeTargetFields,
     queueState: {
       phase: "queued",
       queuedAt: now,
@@ -4154,6 +4245,7 @@ function architectureQueueAgentTodo({
       graphId: identity.graphId,
       graphTitle: identity.graphTitle,
       source: "architecture-tab",
+      ...safeTargetFields,
     },
     source: ARCHITECTURE_TODO_QUEUE_SOURCE,
     text: architectureAgentTaskText({
@@ -5251,6 +5343,7 @@ export function ArchitectureHubView({
   resolveRepoSyncContext = null,
   selectedGraphId = "",
   selectedRepoPath = "",
+  workspaceDispatchTargets = [],
 }) {
   const repositoryGroups = useMemo(() => {
     if (!catalog || typeof catalog !== "object") return [];
@@ -5327,6 +5420,7 @@ export function ArchitectureHubView({
         repositoryScanError={catalogError}
         repositoryScanState={scanState}
         resolveRepoSyncContext={resolveRepoSyncContext}
+        workspaceDispatchTargets={workspaceDispatchTargets}
         workspaceSelectedGraphId={selectedGraphId}
         workspaceSelectedRepoPath={selectedRepoPath}
       />
@@ -5356,6 +5450,7 @@ function ArchitecturesPanel({
   resolveRepoSyncContext = null,
   workspaceSelectedGraphId = "",
   workspaceSelectedRepoPath = "",
+  workspaceDispatchTargets = [],
   tasks = [],
 }) {
   const [repositories, setRepositories] = useState([]);
@@ -5423,6 +5518,10 @@ function ArchitecturesPanel({
   const syncScopeGitRepoIdentityId = selectedRepoSyncContext.scopeGitRepoIdentityId;
   const dispatchWorkspaceId = selectedRepoSyncContext.queueWorkspaceId;
   const dispatchWorkspaceName = selectedRepoSyncContext.queueWorkspaceName;
+  const normalizedWorkspaceDispatchTargets = useMemo(
+    () => normalizeSnippingDispatchTargets(workspaceDispatchTargets),
+    [workspaceDispatchTargets],
+  );
 
   useEffect(() => {
     const nextRepositories = jsonArray(repositoryScan?.repositories);
@@ -6460,6 +6559,7 @@ function ArchitecturesPanel({
               onSave={saveGraph}
               queueWorkspaceId={dispatchWorkspaceId}
               queueWorkspaceName={dispatchWorkspaceName}
+              workspaceDispatchTargets={normalizedWorkspaceDispatchTargets}
               saveState={saveState}
               selectedRepo={selectedRepo}
             />
@@ -6589,6 +6689,7 @@ function ArchitectureGraphEditor({
   queueWorkspaceName = "",
   saveState,
   selectedRepo,
+  workspaceDispatchTargets = [],
 }) {
   const initialFlow = useMemo(() => architectureGraphToFlow(graph), [graph]);
   const [nodes, setNodes, handleNodesChange] = useNodesState(initialFlow.nodes);
@@ -6596,6 +6697,8 @@ function ArchitectureGraphEditor({
   const [draftGraph, setDraftGraph] = useState(() => jsonObject(graph) || {});
   const [agentCommandDraft, setAgentCommandDraft] = useState("");
   const [agentCommandNotice, setAgentCommandNotice] = useState("");
+  const [agentTargetWorkspaceId, setAgentTargetWorkspaceId] = useState("");
+  const [agentTargetThreadId, setAgentTargetThreadId] = useState("");
   const [dirty, setDirty] = useState(false);
   const [localError, setLocalError] = useState("");
   const [expandedCorridorId, setExpandedCorridorId] = useState("");
@@ -6630,6 +6733,36 @@ function ArchitectureGraphEditor({
     () => architectureValidateSemanticGraph(draftGraph, nodes, edges),
     [draftGraph, edges, nodes],
   );
+  const dispatchTargets = useMemo(
+    () => normalizeSnippingDispatchTargets(workspaceDispatchTargets),
+    [workspaceDispatchTargets],
+  );
+  const agentTargetWorkspace = useMemo(
+    () => dispatchTargets.find((target) => target.workspaceId === agentTargetWorkspaceId) || null,
+    [agentTargetWorkspaceId, dispatchTargets],
+  );
+  const agentWorkspaceOptions = useMemo(() => dispatchTargets.map((target) => ({
+    label: text(target.workspaceName, target.workspaceId),
+    value: target.workspaceId,
+  })), [dispatchTargets]);
+  const agentTerminalOptions = useMemo(() => [
+    { color: "", label: "Any terminal", value: "" },
+    ...(agentTargetWorkspace?.threads || []).map((thread, index) => ({
+      ...thread,
+      color: sanitizeTerminalColor(
+        thread.targetTerminalColor || thread.color,
+        Number.isInteger(thread.targetColorSlot)
+          ? thread.targetColorSlot
+          : Number.isInteger(thread.terminalIndex)
+            ? thread.terminalIndex
+            : index,
+      ),
+      label: text(thread.label || thread.targetTerminalName, thread.threadId),
+      value: thread.threadId,
+    })),
+  ], [agentTargetWorkspace]);
+  const activeQueueWorkspaceId = text(agentTargetWorkspace?.workspaceId || queueWorkspaceId);
+  const activeQueueWorkspaceName = text(agentTargetWorkspace?.workspaceName || queueWorkspaceName);
 
   useEffect(() => {
     const nextFlow = architectureGraphToFlow(graph);
@@ -6644,6 +6777,24 @@ function ArchitectureGraphEditor({
     setAgentCommandDraft("");
     setAgentCommandNotice("");
   }, [graph, setEdges, setNodes]);
+
+  useEffect(() => {
+    setAgentTargetWorkspaceId((current) => {
+      if (current && dispatchTargets.some((target) => target.workspaceId === current)) return current;
+      if (queueWorkspaceId && dispatchTargets.some((target) => target.workspaceId === queueWorkspaceId)) {
+        return queueWorkspaceId;
+      }
+      return text(dispatchTargets[0]?.workspaceId);
+    });
+  }, [dispatchTargets, queueWorkspaceId]);
+
+  useEffect(() => {
+    setAgentTargetThreadId((current) => {
+      if (!current) return current;
+      const threads = agentTargetWorkspace?.threads || [];
+      return threads.some((thread) => thread.threadId === current) ? current : "";
+    });
+  }, [agentTargetWorkspace]);
 
   useEffect(() => {
     onDirtyChange(dirty);
@@ -6681,22 +6832,36 @@ function ArchitectureGraphEditor({
     event.preventDefault();
     const prompt = text(agentCommandDraft);
     if (!prompt) return;
-    if (!queueWorkspaceId) {
-      setLocalError("Open a workspace before queueing an architecture task.");
+    if (!activeQueueWorkspaceId || !agentTargetWorkspace) {
+      setLocalError("Pick a workspace before queueing an architecture task.");
       return;
     }
+    const targetFields = buildSnippingAnnotationTargetFields({
+      targetThreadId: agentTargetThreadId,
+      targetWorkspace: agentTargetWorkspace,
+    });
     const queuedItem = architectureQueueAgentTodo({
       graph: draftGraph,
       prompt,
       repoPath: selectedRepo?.path || "",
-      workspaceId: queueWorkspaceId,
-      workspaceName: queueWorkspaceName,
+      targetFields,
+      workspaceId: activeQueueWorkspaceId,
+      workspaceName: activeQueueWorkspaceName,
     });
     setAgentCommandDraft("");
     setAgentCommandNotice(queuedItem ? "Queued for coding agents" : "Queued locally");
     if (queuedItem) onAgentEditQueued(queuedItem);
     setLocalError("");
-  }, [agentCommandDraft, draftGraph, onAgentEditQueued, selectedRepo?.path, queueWorkspaceId, queueWorkspaceName]);
+  }, [
+    activeQueueWorkspaceId,
+    activeQueueWorkspaceName,
+    agentCommandDraft,
+    agentTargetThreadId,
+    agentTargetWorkspace,
+    draftGraph,
+    onAgentEditQueued,
+    selectedRepo?.path,
+  ]);
 
   const updateRunSelection = useCallback((targetId, patch) => {
     const safeTargetId = text(targetId);
@@ -6718,12 +6883,16 @@ function ArchitectureGraphEditor({
       setLocalError("Save this architecture graph before running a target.");
       return;
     }
-    if (!queueWorkspaceId) {
-      setLocalError("Open a workspace before running an architecture target.");
+    if (!activeQueueWorkspaceId || !agentTargetWorkspace) {
+      setLocalError("Pick a workspace before running an architecture target.");
       return;
     }
     const selection = architectureRunTargetSelection(runTarget, runSelections);
     const prompt = architectureRunPrompt(runTarget, selection.env, selection.mode);
+    const targetFields = buildSnippingAnnotationTargetFields({
+      targetThreadId: agentTargetThreadId,
+      targetWorkspace: agentTargetWorkspace,
+    });
     const queuedItem = architectureQueueAgentTodo({
       graph: draftGraph,
       prompt,
@@ -6731,24 +6900,30 @@ function ArchitectureGraphEditor({
       runEnvironment: selection.env,
       runMode: selection.mode,
       runTarget,
-      workspaceId: queueWorkspaceId,
-      workspaceName: queueWorkspaceName,
+      targetFields,
+      workspaceId: activeQueueWorkspaceId,
+      workspaceName: activeQueueWorkspaceName,
     });
     setAgentCommandNotice(queuedItem ? `Queued ${runTarget.label}` : "Queued locally");
     if (queuedItem) onAgentEditQueued(queuedItem);
     setLocalError("");
   }, [
+    activeQueueWorkspaceId,
+    activeQueueWorkspaceName,
+    agentTargetThreadId,
+    agentTargetWorkspace,
     dirty,
     draftGraph,
     onAgentEditQueued,
-    queueWorkspaceId,
-    queueWorkspaceName,
     runSelections,
     selectedRepo?.path,
   ]);
 
-  const agentCommandReady = Boolean(text(agentCommandDraft));
-  const agentCommandStatus = localError || agentCommandNotice || (dirty ? "Unsaved changes" : "Press Enter to queue");
+  const agentDispatchReady = dispatchTargets.length > 0;
+  const agentCommandReady = Boolean(text(agentCommandDraft)) && agentDispatchReady;
+  const agentCommandStatus = localError
+    || agentCommandNotice
+    || (dirty ? "Unsaved changes" : agentDispatchReady ? "Press Enter to queue" : "Open an active coding-agent terminal");
   const agentEditBlurb = architectureAgentEditMarkerBlurb(agentEditMarker);
   const agentEditTitle = architectureAgentEditMarkerTitle(agentEditMarker);
 
@@ -6811,7 +6986,7 @@ function ArchitectureGraphEditor({
           {runTargets.length > 0 && (
             <ArchitectureRunTargetsBar
               aria-label="Architecture run targets"
-              data-disabled={dirty || saveState === "saving" ? "true" : "false"}
+              data-disabled={dirty || saveState === "saving" || !agentDispatchReady ? "true" : "false"}
             >
               {runTargets.slice(0, 4).map((target) => {
                 const selection = architectureRunTargetSelection(target, runSelections);
@@ -6825,7 +7000,7 @@ function ArchitectureGraphEditor({
                     <ArchitectureRunButton
                       data-action={target.action}
                       data-risk={risk}
-                      disabled={dirty || saveState === "saving"}
+                      disabled={dirty || saveState === "saving" || !agentDispatchReady}
                       onClick={() => queueArchitectureRunTarget(target)}
                       type="button"
                     >
@@ -6833,7 +7008,7 @@ function ArchitectureGraphEditor({
                     </ArchitectureRunButton>
                     <ArchitectureRunSelect
                       aria-label={`${target.label} environment`}
-                      disabled={dirty || saveState === "saving"}
+                      disabled={dirty || saveState === "saving" || !agentDispatchReady}
                       onChange={(event) => updateRunSelection(target.id, { env: event.target.value })}
                       value={selection.env}
                     >
@@ -6843,7 +7018,7 @@ function ArchitectureGraphEditor({
                     </ArchitectureRunSelect>
                     <ArchitectureRunSelect
                       aria-label={`${target.label} mode`}
-                      disabled={dirty || saveState === "saving"}
+                      disabled={dirty || saveState === "saving" || !agentDispatchReady}
                       onChange={(event) => updateRunSelection(target.id, { mode: event.target.value })}
                       value={selection.mode}
                     >
@@ -6893,9 +7068,43 @@ function ArchitectureGraphEditor({
                 setAgentCommandDraft(event.target.value);
                 if (agentCommandNotice) setAgentCommandNotice("");
               }}
-              placeholder="Ask a coding agent to update this architecture graph..."
+              placeholder={agentDispatchReady
+                ? "Ask a coding agent to update this architecture graph..."
+                : "Open an active coding-agent terminal to queue a graph task..."}
               value={agentCommandDraft}
             />
+            <ArchitectureAgentCommandControls>
+              <ArchitectureAgentCommandSelectSlot data-kind="workspace">
+                <Select
+                  aria-label="Target workspace"
+                  formatOptionLabel={architectureWorkspaceOptionLabelRenderer}
+                  isDisabled={!agentDispatchReady}
+                  isSearchable={false}
+                  menuPlacement="top"
+                  menuPortalTarget={typeof document !== "undefined" ? document.body : null}
+                  onChange={(option) => setAgentTargetWorkspaceId(option?.value || "")}
+                  options={agentWorkspaceOptions}
+                  placeholder="Workspace"
+                  styles={ARCHITECTURE_TARGET_SELECT_STYLES}
+                  value={agentWorkspaceOptions.find((option) => option.value === agentTargetWorkspaceId) || null}
+                />
+              </ArchitectureAgentCommandSelectSlot>
+              <ArchitectureAgentCommandSelectSlot data-kind="terminal">
+                <Select
+                  aria-label="Target terminal"
+                  formatOptionLabel={architectureTerminalOptionLabelRenderer}
+                  isDisabled={!agentDispatchReady || !(agentTargetWorkspace?.threads || []).length}
+                  isSearchable={false}
+                  menuPlacement="top"
+                  menuPortalTarget={typeof document !== "undefined" ? document.body : null}
+                  onChange={(option) => setAgentTargetThreadId(option?.value || "")}
+                  options={agentTerminalOptions}
+                  placeholder="Any terminal"
+                  styles={ARCHITECTURE_TARGET_SELECT_STYLES}
+                  value={agentTerminalOptions.find((option) => option.value === agentTargetThreadId) || agentTerminalOptions[0] || null}
+                />
+              </ArchitectureAgentCommandSelectSlot>
+            </ArchitectureAgentCommandControls>
             <ArchitectureAgentCommandSubmitButton
               aria-label="Queue architecture task"
               data-ready={agentCommandReady ? "true" : undefined}
@@ -11380,10 +11589,9 @@ const ArchitectureAgentCommandForm = styled.form`
   bottom: 12px;
   z-index: 8;
   display: flex;
-  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 6px;
-  width: min(520px, calc(100% - 28px));
+  width: min(760px, calc(100% - 28px));
   min-width: 0;
   min-height: 40px;
   padding: 5px 6px 5px 14px;
@@ -11406,6 +11614,12 @@ const ArchitectureAgentCommandForm = styled.form`
   &[data-state="notice"] {
     border-color: rgba(45, 212, 191, 0.32);
   }
+
+  @media (max-width: 720px) {
+    flex-wrap: wrap;
+    border-radius: 18px;
+    padding: 7px;
+  }
 `;
 
 const ArchitectureAgentCommandInput = styled.input`
@@ -11423,6 +11637,67 @@ const ArchitectureAgentCommandInput = styled.input`
 
   &::placeholder {
     color: #657386;
+  }
+`;
+
+const ArchitectureAgentCommandControls = styled.div`
+  display: grid;
+  flex: 0 1 318px;
+  grid-template-columns: minmax(112px, 1fr) minmax(112px, 1fr);
+  gap: 6px;
+  min-width: min(318px, 100%);
+
+  @media (max-width: 720px) {
+    flex: 1 1 100%;
+    order: 3;
+  }
+`;
+
+const ArchitectureAgentCommandSelectSlot = styled.div`
+  min-width: 0;
+
+  &[data-kind="workspace"] {
+    min-width: 126px;
+  }
+
+  &[data-kind="terminal"] {
+    min-width: 126px;
+  }
+`;
+
+const ArchitectureTargetOptionLabel = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+
+  i {
+    display: block;
+    width: 9px;
+    height: 9px;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--architecture-target-option-dot, #60a5fa);
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.14);
+  }
+
+  &[data-any="true"] i {
+    border: 1.5px solid rgba(148, 163, 184, 0.55);
+    background: transparent;
+    box-shadow: none;
+  }
+
+  svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+    color: rgba(148, 163, 184, 0.86);
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 `;
 

@@ -165,6 +165,7 @@ import {
   isWorkspaceFileDragTransfer,
   requestTerminalSubmitDiagnosticSnapshot,
   setActiveWorkspaceFileDrag,
+  setWorkspaceThreadComposerAttachments,
   setWorkspaceThreadComposerDraft,
   subscribeWorkspaceThreadComposerAttachments,
   subscribeWorkspaceThreadComposerDrafts,
@@ -18230,12 +18231,6 @@ function TerminalView({
     const send = () => {
       todoQueueCloudSyncTimerRef.current = 0;
       todoQueueCloudSyncSignatureRef.current = signature;
-      const todoSyncCommitPayload = buildTodoQueueTodoSyncCommitPayload(payload, {
-        deviceId: cloudDesktopDeviceId,
-        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
-        workspaceId,
-        workspaceName: terminalWorkspace?.name || "",
-      });
       // Write-through to the authoritative Rust store: removals become
       // terminal tombstones there, and the store rejects any item a tombstone
       // already covers — prune those locally so ghosts can't linger.
@@ -18267,19 +18262,6 @@ function TerminalView({
           return nextItems;
         });
       }).catch(() => {});
-      if (todoSyncCommitPayload) {
-        void invoke("cloud_mcp_commit_workspace_todo_sync", {
-          payload: todoSyncCommitPayload,
-        }).catch((error) => {
-          logTerminalStatus("frontend.todo_queue.todo_sync_commit_error", {
-            message: error?.message || String(error || ""),
-            reason: payload.reason,
-            todoCount: payload.todos.length,
-            removedCount: payload.removedTodoIds.length,
-            workspaceId,
-          });
-        });
-      }
     };
 
     if (todoQueueCloudSyncTimerRef.current) {
@@ -18293,11 +18275,7 @@ function TerminalView({
     todoQueueCloudSyncTimerRef.current = window.setTimeout(send, TODO_QUEUE_CLOUD_SYNC_DEBOUNCE_MS);
   }, [
     buildTodoQueueCloudSyncPayload,
-    cloudDesktopDeviceId,
-    defaultWorkingDirectory,
     terminalWorkspace?.id,
-    terminalWorkspace?.name,
-    terminalWorkspaceWorkingDirectory,
   ]);
 
   useEffect(() => () => {
@@ -21016,8 +20994,7 @@ function TerminalView({
     );
     const queueAgentInputReady = Boolean(agentInputReady || sendableByCompletedIdleTerminal);
     const shouldAutoSubmit = Boolean(
-      !image
-        && targetRole
+      targetRole
         && !["generic", "terminal", "shell"].includes(targetRole),
     );
     const runtimeInputReadyAtMs = todoQueueTimestampMs(
@@ -21045,6 +21022,7 @@ function TerminalView({
     );
     const rustBackendSubmitCapable = Boolean(
       shouldAutoSubmit
+        && !image
         && targetUsesActivityHooks
         && TODO_QUEUE_AGENT_ROLES.has(targetRole)
         && liveTerminal
@@ -26172,8 +26150,9 @@ function TerminalView({
       .map((nextImage, imageIndex) => todoImageToComposerAttachment(nextImage, imageIndex, attachmentSource))
       .filter(Boolean);
     const queuedAttachment = queuedAttachments[0] || null;
+    const hasQueuedImages = queuedAttachments.length > 0;
 
-    if (queuedAttachments.length && syncKey) {
+    if (hasQueuedImages && syncKey) {
       appendWorkspaceThreadComposerAttachments(syncKey, queuedAttachments, {
         fields: {
           image: getTodoImageLogSummary([image])[0] || null,
@@ -26189,7 +26168,7 @@ function TerminalView({
         source: attachmentSource,
       });
     }
-    if (queuedAttachments.length && !syncKey) {
+    if (hasQueuedImages && !syncKey) {
       logBigViewSyncDiagnosticEvent("tui.image.drop_attachment_skip", {
         image: getTodoImageLogSummary([image])[0] || null,
         imageCount: queuedAttachments.length,
@@ -26207,7 +26186,7 @@ function TerminalView({
     let dropResult = null;
     let draftTransaction = null;
     let draftTransactionId = "";
-    if (!terminalText && queuedAttachments.length) {
+    if (!terminalText && hasQueuedImages && !shouldAutoSubmit) {
       if (!syncKey) {
         throw new Error("Unable to queue images because this terminal has no thread composer.");
       }
@@ -26235,7 +26214,7 @@ function TerminalView({
         threadMessageText,
       };
     } else {
-      if (!terminalText) {
+      if (!terminalText && !hasQueuedImages) {
         throw new Error("Add text, an image, or a pasted note before sending this todo to a terminal.");
       }
 
@@ -26251,8 +26230,18 @@ function TerminalView({
           && targetBinding?.instanceId
           && todoQueueAgentUsesBackendHookSubmit(targetAgentKind)
       );
+      const canUseWebviewImageSubmit = Boolean(
+        shouldAutoSubmit
+          && hasQueuedImages
+          && terminalSubmitSequence
+          && targetThreadId
+          && paneId
+          && targetBinding?.instanceId
+          && syncKey
+      );
       const shouldConfirmAutoSubmit = Boolean(
         canUseBackendHookSubmit
+          || canUseWebviewImageSubmit
           || (
             shouldAutoSubmit
               && !image
@@ -26265,12 +26254,15 @@ function TerminalView({
       const shouldUseBackendHookSubmit = Boolean(
         canUseBackendHookSubmit
       );
+      const shouldUseWebviewImageSubmit = Boolean(canUseWebviewImageSubmit);
       if (shouldAutoSubmit && !shouldConfirmAutoSubmit) {
         logBigViewSyncDiagnosticEvent("tui.text.drop_submit_blocked", {
           hasInstanceId: Boolean(targetBinding?.instanceId),
           hasPaneId: Boolean(paneId),
           hasSubmitSequence: Boolean(terminalSubmitSequence),
+          hasSyncKey: Boolean(syncKey),
           hasTargetThread: Boolean(targetThreadId),
+          imageSubmitRequested: hasQueuedImages,
           paneId,
           reason: !terminalSubmitSequence
             ? "missing_submit_sequence"
@@ -26278,7 +26270,9 @@ function TerminalView({
               ? "missing_thread"
               : !paneId
                 ? "missing_pane"
-                : "missing_instance",
+                : !targetBinding?.instanceId
+                  ? "missing_instance"
+                  : "missing_sync_key",
           source,
           surface: "tui_terminal_grid",
           targetRole,
@@ -26313,7 +26307,7 @@ function TerminalView({
           threadId: targetThreadId || "",
         });
       }
-      if (syncKey && !shouldUseBackendHookSubmit) {
+      if (syncKey && !shouldUseBackendHookSubmit && !shouldUseWebviewImageSubmit) {
         draftTransaction = setWorkspaceThreadComposerDraft(syncKey, terminalText, {
           source: shouldConfirmAutoSubmit ? "todo_queue_submit_sync" : "todo_queue_draft_sync",
           transactionId: draftTransactionId,
@@ -26328,6 +26322,7 @@ function TerminalView({
         paneId,
         shouldAutoSubmit,
         backendHookSubmit: shouldUseBackendHookSubmit,
+        webviewImageSubmit: shouldUseWebviewImageSubmit,
         sharedDraftSynced: Boolean(syncKey && draftTransaction),
         source,
         submitConfirmationRequired: shouldConfirmAutoSubmit,
@@ -26399,15 +26394,15 @@ function TerminalView({
             paneId,
             promptId,
             promptEventSubmittedAt: submittedAt,
-            promptText: terminalText,
+            promptText: submittedTerminalText,
             source,
             startedAtMs: Date.now(),
             submittedAt,
             submittedAtMs: Date.parse(submittedAt) || Date.now(),
             targetTerminalIndex: target.targetTerminalIndex,
             terminalInstanceId: targetBinding?.instanceId || "",
-            terminalText,
-            threadMessageText,
+            terminalText: submittedTerminalText,
+            threadMessageText: submittedThreadMessageText,
             threadId: targetThreadId,
             workspaceId,
           });
@@ -26446,18 +26441,49 @@ function TerminalView({
           });
         };
         const clearInFlightPromptOnError = (reason) => clearInFlightPrompt(reason);
+        let submittedTerminalText = terminalText;
+        let submittedThreadMessageText = threadMessageText;
+        let webviewImageBlock = "";
+        if (shouldUseWebviewImageSubmit) {
+          const savedImages = await saveTodoQueueImageAttachments(images);
+          webviewImageBlock = formatSavedTodoImageAttachments(savedImages);
+          submittedTerminalText = [terminalText, webviewImageBlock].filter(Boolean).join("\n\n");
+          submittedThreadMessageText = submittedTerminalText;
+          if (!submittedTerminalText) {
+            throw new Error("Unable to prepare image attachment.");
+          }
+          draftTransaction = setWorkspaceThreadComposerDraft(syncKey, submittedTerminalText, {
+            source: "todo_queue_image_submit_sync_full",
+            transactionId: draftTransactionId,
+          });
+          logBigViewSyncDiagnosticEvent("tui.image.drop_submit_prepared", {
+            agentId: targetRole,
+            attachmentCount: queuedAttachments.length,
+            draftRevision: draftTransaction?.revision || 0,
+            imageBlockLength: webviewImageBlock.length,
+            messageLength: submittedTerminalText.length,
+            paneId,
+            promptId,
+            source,
+            syncKey,
+            surface: "tui_terminal_grid",
+            targetTerminalIndex: targetLogIndex,
+            threadId: targetThreadId,
+            workspaceId,
+          });
+        }
         const syncData = shouldUseBackendHookSubmit
           ? ""
-          : buildTerminalComposerDraftInput(previousDraft, terminalText, true);
+          : buildTerminalComposerDraftInput(previousDraft, submittedTerminalText, true);
         const directSubmitData = shouldUseBackendHookSubmit
           ? ""
-          : `${buildTerminalComposerDraftInput("", terminalText, true)}${terminalSubmitSequence}`;
+          : `${buildTerminalComposerDraftInput("", submittedTerminalText, true)}${terminalSubmitSequence}`;
         const requestDropSubmitSnapshot = (reason, delayMs = 0, extraFields = {}) => {
           requestTerminalSubmitDiagnosticSnapshot({
             agentId: targetRole,
             delayMs,
-            expectedPrompt: terminalText,
-            expectedPromptLength: terminalText.length,
+            expectedPrompt: submittedTerminalText,
+            expectedPromptLength: submittedTerminalText.length,
             paneId,
             promptId,
             reason,
@@ -26482,7 +26508,7 @@ function TerminalView({
           syncKey,
           surface: "tui_terminal_grid",
           targetTerminalIndex: targetLogIndex,
-          terminalText: getBigViewTextDiagnosticFields(terminalText),
+          terminalText: getBigViewTextDiagnosticFields(submittedTerminalText),
           threadId: targetThreadId,
           workspaceId,
         });
@@ -26568,7 +26594,7 @@ function TerminalView({
         }
         const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
           agentId: targetRole,
-          expectedPrompt: terminalText,
+          expectedPrompt: submittedTerminalText,
           promptId,
           threadId: targetThreadId,
           timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
@@ -26579,7 +26605,7 @@ function TerminalView({
             return;
           }
           const clearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
-            expectedValue: terminalText,
+            expectedValue: submittedTerminalText,
             source: "todo_queue_unconfirmed_clear",
             transactionId: draftTransactionId,
           });
@@ -26598,7 +26624,7 @@ function TerminalView({
             return;
           }
 
-          const clearInputData = buildTerminalComposerDraftInput(terminalText, "", true);
+          const clearInputData = buildTerminalComposerDraftInput(submittedTerminalText, "", true);
           if (!clearInputData) {
             return;
           }
@@ -26630,6 +26656,7 @@ function TerminalView({
         };
         try {
           let submittedAt = new Date().toISOString();
+          let webviewImageDraftClearResult = null;
           const promptEventSource = shouldUseBackendHookSubmit
             ? "todo-queue-backend"
             : getTodoQueuePromptEventSource(source, currentItem);
@@ -26676,17 +26703,17 @@ function TerminalView({
               });
             }
             const currentDraft = shouldUseBackendHookSubmit
-              ? terminalText
+              ? submittedTerminalText
               : syncKey
               ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
-              : terminalText;
+              : submittedTerminalText;
             const currentDraftRecord = shouldUseBackendHookSubmit
-              ? { revision: draftTransaction?.revision || 0, value: terminalText }
+              ? { revision: draftTransaction?.revision || 0, value: submittedTerminalText }
               : syncKey
               ? getWorkspaceThreadComposerDraftRecord(syncKey)
-              : { revision: draftTransaction?.revision || 0, value: terminalText };
+              : { revision: draftTransaction?.revision || 0, value: submittedTerminalText };
             const draftStillMatchesTransaction = shouldUseBackendHookSubmit || Boolean(
-              currentDraft === terminalText
+              currentDraft === submittedTerminalText
                 && (
                   !syncKey
                     || !draftTransaction?.revision
@@ -26708,7 +26735,7 @@ function TerminalView({
               : await createTerminalPromptSubmittedWaiter({
                 allowObservedInputGateForHookManaged: true,
                 agentId: targetRole,
-                expectedPrompt: terminalText,
+                expectedPrompt: submittedTerminalText,
                 instanceId: targetBinding?.instanceId,
                 paneId,
                 promptId,
@@ -26732,7 +26759,7 @@ function TerminalView({
               syncKey,
               surface: "tui_terminal_grid",
               targetTerminalIndex: targetLogIndex,
-              terminalText: getBigViewTextDiagnosticFields(terminalText),
+              terminalText: getBigViewTextDiagnosticFields(submittedTerminalText),
               threadId: targetThreadId,
               workspaceId,
             });
@@ -26748,7 +26775,7 @@ function TerminalView({
               promptEventId: promptId,
               promptEventSource,
               promptEventSubmittedAt: attemptSubmittedAt,
-              promptTextLength: terminalText.length,
+              promptTextLength: submittedTerminalText.length,
               retry: isRetry,
               submitSequenceLength: terminalSubmitSequence.length,
               syncDataLength: syncData.length,
@@ -26775,7 +26802,7 @@ function TerminalView({
                   promptEventId: promptId,
                   promptEventSource,
                   promptEventSubmittedAt: attemptSubmittedAt,
-                  promptEventText: terminalText,
+                  promptEventText: submittedTerminalText,
                   todoAction,
                   todoCommandId,
                   todoDispatchId,
@@ -26796,7 +26823,7 @@ function TerminalView({
                 promptEventId: promptId,
                 promptEventSource,
                 promptEventSubmittedAt: attemptSubmittedAt,
-                promptTextLength: terminalText.length,
+                promptTextLength: submittedTerminalText.length,
                 retry: isRetry,
                 submitSequenceLength: terminalSubmitSequence.length,
                 syncDataLength: syncData.length,
@@ -26843,7 +26870,7 @@ function TerminalView({
                 promptEventId: promptId,
                 promptEventSource,
                 promptEventSubmittedAt: attemptSubmittedAt,
-                promptTextLength: terminalText.length,
+                promptTextLength: submittedTerminalText.length,
                 retry: isRetry,
                 submitSequenceLength: terminalSubmitSequence.length,
                 threadId: targetThreadId,
@@ -26895,12 +26922,59 @@ function TerminalView({
             threadId: targetThreadId,
             workspaceId,
           });
+          if (shouldUseWebviewImageSubmit && syncKey) {
+            setWorkspaceThreadComposerAttachments(syncKey, [], {
+              fields: {
+                agentId: targetRole,
+                attachmentCount: queuedAttachments.length,
+                imageBlockLength: webviewImageBlock.length,
+                paneId,
+                promptId,
+                surface: "tui_terminal_grid",
+                targetTerminalIndex: targetLogIndex,
+                threadId: targetThreadId || "",
+                workspaceId,
+              },
+              reason: "todo_queue_image_submit_done_clear",
+              source: "tui_terminal_grid",
+            });
+            webviewImageDraftClearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
+              expectedValue: submittedTerminalText,
+              source: "todo_queue_image_submit_done_clear",
+              transactionId: draftTransactionId,
+            });
+            logTerminalStatus("frontend.todo_queue.terminal_write.image_draft_clear", {
+              ...terminalWriteLogBase,
+              cleared: Boolean(webviewImageDraftClearResult?.cleared),
+              currentDraftLength: String(webviewImageDraftClearResult?.value || "").length,
+              currentDraftRevision: webviewImageDraftClearResult?.revision || 0,
+              expectedDraftRevision: draftTransaction?.revision || 0,
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              reason: webviewImageDraftClearResult?.reason || "todo_queue_image_submit_done_clear",
+              threadId: targetThreadId,
+            });
+            logBigViewSyncDiagnosticEvent("tui.image.drop_submit_done", {
+              agentId: targetRole,
+              attachmentCount: queuedAttachments.length,
+              imageBlockLength: webviewImageBlock.length,
+              messageLength: submittedTerminalText.length,
+              paneId,
+              promptId,
+              source,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetLogIndex,
+              threadId: targetThreadId,
+              workspaceId,
+            });
+          }
           const lifecycleDispatchedAtSubmit = dispatchThreadMessageLifecycle({
             promptId,
             reason: "submit_observed",
             submittedAt,
-            terminalText,
-            threadMessageText,
+            terminalText: submittedTerminalText,
+            threadMessageText: submittedThreadMessageText,
           });
           if (lifecycleDispatchedAtSubmit) {
             const targetTerminalNumber = Number(target.targetTerminalIndex);
@@ -26921,7 +26995,7 @@ function TerminalView({
             }
 
             const clearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
-              expectedValue: terminalText,
+              expectedValue: submittedTerminalText,
               source: reason,
               transactionId: draftTransactionId,
             });
@@ -26990,8 +27064,8 @@ function TerminalView({
                 promptId,
                 reason: "session_accepted",
                 submittedAt,
-                terminalText,
-                threadMessageText,
+                terminalText: submittedTerminalText,
+                threadMessageText: submittedThreadMessageText,
               });
             const providerSessionLifecycleDispatched = lifecycleWasAlreadyDispatched
               ? dispatchAcceptedProviderSessionLifecycle({
@@ -27107,7 +27181,8 @@ function TerminalView({
             draftClearedOnAcceptance: Boolean(
               backendSubmitDraftPreClearResult?.cleared
                 || acceptedDraftClearResult?.cleared
-                || backendSubmitDraftClearResult?.cleared,
+                || backendSubmitDraftClearResult?.cleared
+                || webviewImageDraftClearResult?.cleared
             ),
             draftClearedBeforeSubmit: Boolean(backendSubmitDraftPreClearResult?.cleared),
             draftRevision: draftTransaction?.revision || 0,
@@ -27119,9 +27194,10 @@ function TerminalView({
             syncKey,
             targetBinding,
             targetThread,
-            terminalText,
-            threadMessageText,
+            terminalText: submittedTerminalText,
+            threadMessageText: submittedThreadMessageText,
             writeResult,
+            webviewImageSubmit: shouldUseWebviewImageSubmit,
           };
         } catch (submitError) {
           clearInFlightPromptOnError("submit_error");
@@ -27134,8 +27210,8 @@ function TerminalView({
           }
           requestTerminalSubmitDiagnosticSnapshot({
             agentId: targetRole,
-            expectedPrompt: terminalText,
-            expectedPromptLength: terminalText.length,
+            expectedPrompt: submittedTerminalText,
+            expectedPromptLength: submittedTerminalText.length,
             paneId,
             promptId,
             reason: "tui.text.drop_submit_confirm_error_snapshot",
