@@ -24096,6 +24096,22 @@ async fn cloud_mcp_hydrate_account_skill_payload_shallow(
             }
         }
     }
+    if let Some(skill) = value.get("skill").filter(|item| item.is_object()).cloned() {
+        let hydrated = cloud_mcp_hydrate_account_skill_unit(state, skill).await?;
+        let should_insert_units = value
+            .get("skill_units")
+            .or_else(|| value.get("skillUnits"))
+            .and_then(Value::as_array)
+            .map(|units| units.is_empty())
+            .unwrap_or(true);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("skill".to_string(), hydrated.clone());
+            if should_insert_units {
+                object.insert("skill_units".to_string(), json!([hydrated.clone()]));
+                object.insert("skillUnits".to_string(), json!([hydrated]));
+            }
+        }
+    }
     if value.get("skills").is_none() {
         let units = value
             .get("skill_units")
@@ -24119,12 +24135,6 @@ async fn cloud_mcp_hydrate_account_skill_payload_shallow(
                     }),
                 );
             }
-        }
-    }
-    if let Some(skill) = value.get("skill").filter(|item| item.is_object()).cloned() {
-        let hydrated = cloud_mcp_hydrate_account_skill_unit(state, skill).await?;
-        if let Some(object) = value.as_object_mut() {
-            object.insert("skill".to_string(), hydrated);
         }
     }
     Ok(value)

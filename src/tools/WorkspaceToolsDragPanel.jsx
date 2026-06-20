@@ -18,6 +18,7 @@ const FILTERS = [
 
 const FILTER_STORAGE_PREFIX = "diffforge.workspaceTools.filter";
 const SEND_STORAGE_PREFIX = "diffforge.workspaceTools.sendOnDrop";
+export const WORKSPACE_TOOL_TODO_DRAG_MIME = "application/x-diffforge-workspace-tool-todo";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -130,17 +131,10 @@ export default function WorkspaceToolsDragPanel({
   }, [onAddToolTodo, sendOnDrop]);
 
   const handleDragStart = useCallback((event, todoText) => {
+    event.dataTransfer.setData(WORKSPACE_TOOL_TODO_DRAG_MIME, JSON.stringify({ text: todoText }));
     event.dataTransfer.setData("text/plain", todoText);
     event.dataTransfer.effectAllowed = "copy";
   }, []);
-
-  const handleDragEnd = useCallback((event, todoText) => {
-    // With send-on-drop enabled, a completed drop queues the todo directly;
-    // otherwise the native text drop into the composer is the whole gesture.
-    if (!sendOnDrop) return;
-    if (event.dataTransfer.dropEffect === "none") return;
-    handleAdd(todoText, { forceSend: true });
-  }, [handleAdd, sendOnDrop]);
 
   const visibleArchitectures = filter === "skills" ? [] : architectures;
   const visibleSkills = filter === "architectures" ? [] : skills;
@@ -168,8 +162,8 @@ export default function WorkspaceToolsDragPanel({
             data-active={sendOnDrop ? "true" : "false"}
             onClick={toggleSendOnDrop}
             title={sendOnDrop
-              ? "Dropping or clicking queues the todo immediately"
-              : "Dropping or clicking adds the todo without sending"}
+              ? "Clicking queues immediately; dropping sends only over a terminal"
+              : "Clicking adds without sending; dropping sends only over a terminal"}
             type="button"
           >
             <SendToggleKnob aria-hidden="true" data-active={sendOnDrop ? "true" : "false"} />
@@ -189,9 +183,8 @@ export default function WorkspaceToolsDragPanel({
                 <ToolRow
                   draggable
                   key={`${item.repoPath}:${item.graphId}`}
-                  onDragEnd={(event) => handleDragEnd(event, todoText)}
                   onDragStart={(event) => handleDragStart(event, todoText)}
-                  title="Drag into the composer, or click + to add"
+                  title="Drag onto a terminal, or click + to add"
                 >
                   <ToolGlyph aria-hidden="true" data-kind="architecture">⌬</ToolGlyph>
                   <ToolCopy>
@@ -219,9 +212,8 @@ export default function WorkspaceToolsDragPanel({
                 <ToolRow
                   draggable
                   key={`skill:${entry.title}`}
-                  onDragEnd={(event) => handleDragEnd(event, todoText)}
                   onDragStart={(event) => handleDragStart(event, todoText)}
-                  title="Drag into the composer, or click + to add"
+                  title="Drag onto a terminal, or click + to add"
                 >
                   <ToolGlyph aria-hidden="true" data-kind="skill">✦</ToolGlyph>
                   <ToolCopy>

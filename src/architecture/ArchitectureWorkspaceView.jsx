@@ -5980,6 +5980,42 @@ function ArchitecturesPanel({
       });
   }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
 
+  const deleteGraph = useCallback((graph) => {
+    if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
+    const graphId = text(graph?.id || selectedGraphId);
+    if (!graphId) return Promise.reject(new Error("Select an architecture graph first."));
+    const graphTitle = text(graph?.title || graph?.name || selectedGraph?.title || graphId, graphId);
+    const confirmed = typeof window === "undefined" || window.confirm(
+      `Delete "${graphTitle}"?\n\nThis will remove the architecture graph and its revision history, then sync the delete to every client.`,
+    );
+    if (!confirmed) return Promise.resolve(false);
+    setSaveState("saving");
+    setError("");
+    return invoke("architecture_graph_delete", {
+      graphId,
+      repoPath: selectedRepoPath,
+    })
+      .then((result) => {
+        setSelectedGraphDirty(false);
+        selectedGraphDirtyRef.current = false;
+        setRevisionBrowser((current) => (
+          text(current.graphId) === graphId ? { graphId: "", open: false } : { ...current, open: false }
+        ));
+        setCreatingGraph(false);
+        setSelectedGraphId("");
+        setSelectedGraph(null);
+        setSaveState("idle");
+        hydratedListRefreshKeysRef.current.delete(`${architectureRepoPathKey(selectedRepoPath)}::${graphId}`);
+        void loadGraphList(selectedRepoPath, { refresh: true });
+        return result;
+      })
+      .catch((nextError) => {
+        setSaveState("idle");
+        setError(nextError?.message || String(nextError || "Unable to delete architecture graph."));
+        throw nextError;
+      });
+  }, [loadGraphList, selectedGraph?.title, selectedGraphId, selectedRepoPath]);
+
   const handleRevisionRestored = useCallback((result) => {
     const nextGraph = result?.graph || null;
     const nextGraphId = text(result?.graphId || result?.graph_id || nextGraph?.id);
@@ -6052,7 +6088,12 @@ function ArchitecturesPanel({
               }}
               onDragEnd={draggable ? () => setDragGraph(null) : undefined}
               onDragStart={draggable ? (event) => {
-                const payload = { graphId: row.graph.id, sourceRepoPath: selectedRepoPath };
+                const payload = {
+                  filePath: row.graph.filePath || `.agents/architectures/graphs/${row.graph.id}.arch`,
+                  graphId: row.graph.id,
+                  sourceRepoPath: selectedRepoPath,
+                  title: row.graph.title || graphFileName,
+                };
                 setDragGraph(payload);
                 try {
                   event.dataTransfer.setData("application/x-diffforge-architecture-graph", JSON.stringify(payload));
@@ -6362,6 +6403,7 @@ function ArchitecturesPanel({
               agentEditMarker={selectedAgentEditMarker}
               graph={selectedGraph}
               onAgentEditQueued={recordAgentEditQueued}
+              onDeleteGraph={deleteGraph}
               onDirtyChange={setSelectedGraphDirty}
               onOpenRevisions={openRevisionBrowser}
               onSave={saveGraph}
@@ -6470,6 +6512,7 @@ function ArchitectureGraphEditor({
   agentEditMarker = null,
   graph,
   onAgentEditQueued = () => {},
+  onDeleteGraph = null,
   onDirtyChange = () => {},
   onOpenRevisions = null,
   onSave,
@@ -6485,8 +6528,6 @@ function ArchitectureGraphEditor({
   const [agentCommandDraft, setAgentCommandDraft] = useState("");
   const [agentCommandNotice, setAgentCommandNotice] = useState("");
   const [dirty, setDirty] = useState(false);
-  const [selectedNodes, setSelectedNodes] = useState([]);
-  const [selectedEdges, setSelectedEdges] = useState([]);
   const [localError, setLocalError] = useState("");
   const [expandedCorridorId, setExpandedCorridorId] = useState("");
   const [runSelections, setRunSelections] = useState({});
@@ -6527,8 +6568,6 @@ function ArchitectureGraphEditor({
     setNodes(nextFlow.nodes);
     setEdges(nextFlow.edges);
     setDraftGraph(jsonObject(graph) || {});
-    setSelectedNodes([]);
-    setSelectedEdges([]);
     setExpandedCorridorId("");
     setRunSelections({});
     setDirty(false);
@@ -6551,31 +6590,6 @@ function ArchitectureGraphEditor({
     handleEdgesChange(changes);
   }, [handleEdgesChange]);
 
-  const deleteSelected = useCallback(() => {
-    const nodeIds = new Set(selectedNodes.map((node) => node.id));
-    const edgeIds = new Set(selectedEdges.map((edge) => edge.id));
-    if (!nodeIds.size && !edgeIds.size) return;
-    let expanded = true;
-    while (expanded) {
-      expanded = false;
-      nodes.forEach((node) => {
-        if (!nodeIds.has(node.id) && nodeIds.has(node.parentId)) {
-          nodeIds.add(node.id);
-          expanded = true;
-        }
-      });
-    }
-    setNodes((currentNodes) => currentNodes.filter((node) => !nodeIds.has(node.id)));
-    setEdges((currentEdges) => currentEdges.filter((edge) => (
-      !edgeIds.has(edge.id)
-      && !nodeIds.has(edge.source)
-      && !nodeIds.has(edge.target)
-    )));
-    setSelectedNodes([]);
-    setSelectedEdges([]);
-    setDirty(true);
-  }, [nodes, selectedEdges, selectedNodes, setEdges, setNodes]);
-
   const save = useCallback(() => {
     const nextGraph = architectureGraphFromFlow(draftGraph, nodes, edges);
     setLocalError("");
@@ -6585,6 +6599,14 @@ function ArchitectureGraphEditor({
         setLocalError(nextError?.message || String(nextError || "Unable to save graph."));
       });
   }, [draftGraph, edges, nodes, onSave]);
+
+  const requestDeleteGraph = useCallback(() => {
+    if (typeof onDeleteGraph !== "function") return;
+    setLocalError("");
+    Promise.resolve(onDeleteGraph(draftGraph || graph)).catch((nextError) => {
+      setLocalError(nextError?.message || String(nextError || "Unable to delete graph."));
+    });
+  }, [draftGraph, graph, onDeleteGraph]);
 
   const queueArchitectureAgentCommand = useCallback((event) => {
     event.preventDefault();
@@ -6775,8 +6797,9 @@ function ArchitectureGraphEditor({
               History
             </ArchitectureFloatingButton>
             <ArchitectureFloatingDangerButton
-              disabled={!selectedNodes.length && !selectedEdges.length}
-              onClick={deleteSelected}
+              disabled={!text(draftGraph?.id || graph?.id) || saveState === "saving"}
+              onClick={requestDeleteGraph}
+              title="Delete this architecture graph"
               type="button"
             >
               Delete

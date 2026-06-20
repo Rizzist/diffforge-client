@@ -15053,7 +15053,21 @@ export default function App() {
     workspaceTerminalRoleOptions,
   ]);
 
-  const addWorkspaceTerminal = useCallback(({ role = "", workspaceId } = {}) => {
+  const addWorkspaceTerminal = useCallback(({
+    model = "",
+    nativeSessionId = "",
+    native_session_id = "",
+    providerSessionId = "",
+    provider_session_id = "",
+    role = "",
+    sessionId = "",
+    sessionTitle = "",
+    session_id = "",
+    source = "",
+    text = "",
+    title = "",
+    workspaceId,
+  } = {}) => {
     if (!workspaceId) {
       return null;
     }
@@ -15100,6 +15114,15 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
+    const requestedProviderSessionId = String(
+      providerSessionId
+        || provider_session_id
+        || nativeSessionId
+        || native_session_id
+        || sessionId
+        || session_id
+        || "",
+    ).trim();
     const nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...currentIndexes, nextTerminalIndex]);
     const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => (
@@ -15135,12 +15158,49 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalRoles);
     }
 
+    const restoredThreadId = requestedProviderSessionId && AGENT_PROVIDERS.some((provider) => provider.id === nextRole)
+      ? createWorkspaceThreadId(workspaceId, nextTerminalIndex)
+      : "";
+    if (restoredThreadId) {
+      const rootDirectory = getWorkspaceRootDirectory(currentSettings, workspaceId) || defaultWorkingDirectory || "";
+      const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
+      const paneId = getWorkspaceTerminalPaneId(
+        workspaceId,
+        nextTerminalIndex,
+        getWorkspaceTerminalPaneAgentId(nextRole),
+      );
+      const threadTitle = String(sessionTitle || title || text || "Restored session").trim();
+
+      setWorkspaceThreads((threads) => materializeWorkspaceThreadForTerminal(threads, {
+        agentId: nextRole,
+        model: String(model || "").trim(),
+        nativeSessionId: requestedProviderSessionId,
+        nativeSessionKind: "session",
+        nativeSessionSource: String(source || "plans-session-relaunch").trim(),
+        paneId,
+        providerSessionId: requestedProviderSessionId,
+        repoPath: rootDirectory,
+        slotKey: String(nextTerminalIndex + 1),
+        status: "starting",
+        terminalIndex: nextTerminalIndex,
+        threadId: restoredThreadId,
+        title: threadTitle,
+        transcriptHydrationMode: "session-only",
+        type: "thread-starting",
+        workspaceId,
+        workspaceName: targetWorkspace?.name || "",
+      }));
+    }
+
     return {
+      providerSessionId: requestedProviderSessionId,
       terminalIndex: nextTerminalIndex,
       terminalRole: nextRole,
+      threadId: restoredThreadId,
       workspaceId,
     };
   }, [
+    defaultWorkingDirectory,
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,

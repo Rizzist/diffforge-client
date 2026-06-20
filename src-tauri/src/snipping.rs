@@ -43,6 +43,7 @@ const SNIPPING_AREA_BEGIN_STALE_MS: u64 = SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS
 const SNIPPING_STARTUP_PREWARM_ENABLED: bool = false;
 const SNIPPING_WARM_CAPTURE_ENABLED: bool = false;
 const SNIPPING_RECORDING_FPS: u32 = 30;
+const SNIPPING_RECORDING_MAX_SAMPLE_DURATION_MS: u32 = 45_000;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
@@ -457,6 +458,7 @@ impl SnippingWarmCaptureState {
 struct SnippingRecordingSession {
     id: String,
     stop: Arc<AtomicBool>,
+    stop_requested_at_ms: Arc<AtomicU64>,
     target_path: PathBuf,
     tmp_path: PathBuf,
     started_at_ms: u64,
@@ -3019,9 +3021,10 @@ fn snipping_scap_video_frame_to_rgba(
 
 fn snipping_scap_video_frame_to_bgra_bytes(
     frame: scap::frame::VideoFrame,
-) -> Result<(Vec<u8>, u32, u32), String> {
+) -> Result<(Vec<u8>, u32, u32, SystemTime), String> {
     match frame {
         scap::frame::VideoFrame::BGRA(frame) => {
+            let display_time = frame.display_time;
             let (width, height, pixels) =
                 snipping_scap_frame_pixel_count(frame.width, frame.height, "scap BGRA")?;
             let expected_len = pixels
@@ -3032,28 +3035,33 @@ fn snipping_scap_video_frame_to_bgra_bytes(
             }
             let mut data = frame.data;
             data.truncate(expected_len);
-            Ok((data, width, height))
+            Ok((data, width, height, display_time))
         }
         scap::frame::VideoFrame::BGR0(frame) => {
-            snipping_scap_bgra_from_four_channel_frame(
+            let display_time = frame.display_time;
+            let (data, width, height) = snipping_scap_bgra_from_four_channel_frame(
                 frame.width,
                 frame.height,
                 frame.data,
                 "scap BGR0",
                 |pixel| pixel[3] = 255,
-            )
+            )?;
+            Ok((data, width, height, display_time))
         }
         scap::frame::VideoFrame::BGRx(frame) => {
-            snipping_scap_bgra_from_four_channel_frame(
+            let display_time = frame.display_time;
+            let (data, width, height) = snipping_scap_bgra_from_four_channel_frame(
                 frame.width,
                 frame.height,
                 frame.data,
                 "scap BGRx",
                 |pixel| pixel[3] = 255,
-            )
+            )?;
+            Ok((data, width, height, display_time))
         }
         scap::frame::VideoFrame::RGBx(frame) => {
-            snipping_scap_bgra_from_four_channel_frame(
+            let display_time = frame.display_time;
+            let (data, width, height) = snipping_scap_bgra_from_four_channel_frame(
                 frame.width,
                 frame.height,
                 frame.data,
@@ -3062,10 +3070,12 @@ fn snipping_scap_video_frame_to_bgra_bytes(
                     pixel.swap(0, 2);
                     pixel[3] = 255;
                 },
-            )
+            )?;
+            Ok((data, width, height, display_time))
         }
         scap::frame::VideoFrame::XBGR(frame) => {
-            snipping_scap_bgra_from_four_channel_frame(
+            let display_time = frame.display_time;
+            let (data, width, height) = snipping_scap_bgra_from_four_channel_frame(
                 frame.width,
                 frame.height,
                 frame.data,
@@ -3079,9 +3089,11 @@ fn snipping_scap_video_frame_to_bgra_bytes(
                     pixel[2] = red;
                     pixel[3] = 255;
                 },
-            )
+            )?;
+            Ok((data, width, height, display_time))
         }
         scap::frame::VideoFrame::RGB(frame) => {
+            let display_time = frame.display_time;
             let (width, height, pixels) =
                 snipping_scap_frame_pixel_count(frame.width, frame.height, "scap RGB")?;
             let expected_len = pixels
@@ -3094,7 +3106,7 @@ fn snipping_scap_video_frame_to_bgra_bytes(
             for pixel in frame.data[..expected_len].chunks_exact(3) {
                 bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
             }
-            Ok((bgra, width, height))
+            Ok((bgra, width, height, display_time))
         }
         scap::frame::VideoFrame::YUVFrame(_) => {
             Err("scap returned YUV data for a BGRA recording request.".to_string())
@@ -3794,11 +3806,57 @@ fn snipping_recording_bitrate_bps(width: u32, height: u32) -> u32 {
     bitrate.clamp(1_500_000, 20_000_000) as u32
 }
 
-fn snipping_recording_frame_duration_ms(frame_index: u64) -> u32 {
-    let start = frame_index.saturating_mul(1_000) / u64::from(SNIPPING_RECORDING_FPS);
-    let end = frame_index.saturating_add(1).saturating_mul(1_000)
-        / u64::from(SNIPPING_RECORDING_FPS);
-    end.saturating_sub(start).max(1) as u32
+fn snipping_recording_default_frame_duration_ms() -> u32 {
+    (1_000 / SNIPPING_RECORDING_FPS).max(1)
+}
+
+fn snipping_recording_sample_duration_ms(start_ms: u64, end_ms: u64) -> u32 {
+    let duration = end_ms
+        .saturating_sub(start_ms)
+        .max(1)
+        .min(u64::from(SNIPPING_RECORDING_MAX_SAMPLE_DURATION_MS));
+    u32::try_from(duration).unwrap_or(SNIPPING_RECORDING_MAX_SAMPLE_DURATION_MS)
+}
+
+fn snipping_recording_system_time_ms(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn snipping_recording_frame_pts_ms(
+    frame_epoch_ms: u64,
+    first_frame_epoch_ms: &mut Option<u64>,
+    last_frame_pts_ms: &mut Option<u64>,
+) -> u64 {
+    let first_epoch_ms = *first_frame_epoch_ms.get_or_insert(frame_epoch_ms);
+    let mut pts_ms = frame_epoch_ms.saturating_sub(first_epoch_ms);
+    if let Some(previous_pts_ms) = *last_frame_pts_ms {
+        if pts_ms <= previous_pts_ms {
+            pts_ms = previous_pts_ms.saturating_add(1);
+        }
+    }
+    *last_frame_pts_ms = Some(pts_ms);
+    pts_ms
+}
+
+fn snipping_recording_final_sample_duration_ms(
+    first_frame_epoch_ms: Option<u64>,
+    pending_pts_ms: u64,
+    stop_requested_at_ms: u64,
+) -> u32 {
+    let Some(first_frame_epoch_ms) = first_frame_epoch_ms else {
+        return snipping_recording_default_frame_duration_ms();
+    };
+    if stop_requested_at_ms == 0 {
+        return snipping_recording_default_frame_duration_ms();
+    }
+    let stop_pts_ms = stop_requested_at_ms.saturating_sub(first_frame_epoch_ms);
+    if stop_pts_ms <= pending_pts_ms {
+        return snipping_recording_default_frame_duration_ms();
+    }
+    snipping_recording_sample_duration_ms(pending_pts_ms, stop_pts_ms)
 }
 
 fn snipping_clamp_u8(value: i32) -> u8 {
@@ -4292,6 +4350,13 @@ fn snipping_stop_recording_for(app: &AppHandle, reason: &str) -> Result<Value, S
         .map_err(|_| "Unable to lock screen recording state.".to_string())?
         .clone();
     if let Some(session) = session {
+        let stop_requested_at_ms = current_time_ms();
+        let _ = session.stop_requested_at_ms.compare_exchange(
+            0,
+            stop_requested_at_ms,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         session.stop.store(true, Ordering::Release);
         snipping_hide_recording_controls(app);
         return Ok(json!({
@@ -4439,7 +4504,11 @@ fn snipping_recording_loop_inner(
     muxer.set_video_track(session.width, session.height, mp4e::Codec::AVC);
 
     capturer.start_capture();
-    let mut frame_count = 0_u64;
+    let mut sample_count = 0_u64;
+    let mut first_frame_epoch_ms = None;
+    let mut last_frame_pts_ms = None;
+    let mut pending_h264_frame: Option<Vec<u8>> = None;
+    let mut pending_h264_pts_ms = 0_u64;
     let mut yuv_frame = Vec::new();
     let mut h264_frame = Vec::new();
     let write_result = (|| -> Result<(), String> {
@@ -4449,8 +4518,15 @@ fn snipping_recording_loop_inner(
                 .map_err(|error| format!("Unable to receive screen recording frame: {error}"))?
             {
                 scap::frame::Frame::Video(frame) => {
-                    let (bytes, frame_width, frame_height) =
+                    let (bytes, frame_width, frame_height, display_time) =
                         snipping_scap_video_frame_to_bgra_bytes(frame)?;
+                    let frame_epoch_ms =
+                        snipping_recording_system_time_ms(display_time).unwrap_or_else(current_time_ms);
+                    let frame_pts_ms = snipping_recording_frame_pts_ms(
+                        frame_epoch_ms,
+                        &mut first_frame_epoch_ms,
+                        &mut last_frame_pts_ms,
+                    );
                     let frame_bytes =
                         if frame_width == session.width && frame_height == session.height {
                             bytes
@@ -4511,12 +4587,10 @@ fn snipping_recording_loop_inner(
                             (session.width / 2) as usize,
                         ),
                     );
-                    let timestamp_ms = frame_count.saturating_mul(1_000)
-                        / u64::from(SNIPPING_RECORDING_FPS);
                     let bitstream = encoder
                         .encode_at(
                             &yuv_source,
-                            openh264::Timestamp::from_millis(timestamp_ms),
+                            openh264::Timestamp::from_millis(frame_pts_ms),
                         )
                         .map_err(|error| format!("Unable to encode recording frame: {error}"))?;
                     let has_video_slice =
@@ -4524,22 +4598,40 @@ fn snipping_recording_loop_inner(
                     if h264_frame.is_empty() {
                         continue;
                     }
-                    let duration_ms = if has_video_slice {
-                        snipping_recording_frame_duration_ms(frame_count)
-                    } else {
-                        0
-                    };
-                    muxer
-                        .encode_video(&h264_frame, duration_ms)
-                        .map_err(|error| format!("Unable to write recording frame: {error}"))?;
-                    if has_video_slice {
-                        frame_count = frame_count.saturating_add(1);
+                    if !has_video_slice {
+                        muxer
+                            .encode_video(&h264_frame, 0)
+                            .map_err(|error| format!("Unable to write recording frame: {error}"))?;
+                        continue;
                     }
+                    if let Some(pending_frame) = pending_h264_frame.take() {
+                        let duration_ms = snipping_recording_sample_duration_ms(
+                            pending_h264_pts_ms,
+                            frame_pts_ms,
+                        );
+                        muxer
+                            .encode_video(&pending_frame, duration_ms)
+                            .map_err(|error| format!("Unable to write recording frame: {error}"))?;
+                        sample_count = sample_count.saturating_add(1);
+                    }
+                    pending_h264_pts_ms = frame_pts_ms;
+                    pending_h264_frame = Some(std::mem::take(&mut h264_frame));
                 }
                 scap::frame::Frame::Audio(_) => {}
             }
         }
-        if frame_count == 0 {
+        if let Some(pending_frame) = pending_h264_frame.take() {
+            let duration_ms = snipping_recording_final_sample_duration_ms(
+                first_frame_epoch_ms,
+                pending_h264_pts_ms,
+                session.stop_requested_at_ms.load(Ordering::Acquire),
+            );
+            muxer
+                .encode_video(&pending_frame, duration_ms)
+                .map_err(|error| format!("Unable to write recording frame: {error}"))?;
+            sample_count = sample_count.saturating_add(1);
+        }
+        if sample_count == 0 {
             return Err("Recording stopped before any frames were captured.".to_string());
         }
         muxer
@@ -4577,7 +4669,13 @@ fn snipping_recording_loop_inner(
         )
     })?;
 
-    let duration_ms = current_time_ms().saturating_sub(session.started_at_ms);
+    let stopped_at_ms = session.stop_requested_at_ms.load(Ordering::Acquire);
+    let duration_ms = if stopped_at_ms > 0 {
+        stopped_at_ms
+    } else {
+        current_time_ms()
+    }
+    .saturating_sub(session.started_at_ms);
     snipping_emit_untracked_video_saved_with_toast(
         app,
         &session.target_path,
@@ -4760,6 +4858,7 @@ fn snipping_start_area_recording_for(
     let session = SnippingRecordingSession {
         id: uuid::Uuid::new_v4().to_string(),
         stop: Arc::new(AtomicBool::new(false)),
+        stop_requested_at_ms: Arc::new(AtomicU64::new(0)),
         target_path,
         tmp_path,
         started_at_ms: current_time_ms(),
@@ -10950,6 +11049,52 @@ mod snipping_recording_mp4_tests {
 
         let _ = fs::remove_file(path);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn recording_frame_pts_tracks_real_capture_time() {
+        let mut first_frame_epoch_ms = None;
+        let mut last_frame_pts_ms = None;
+
+        assert_eq!(
+            snipping_recording_frame_pts_ms(
+                1_000,
+                &mut first_frame_epoch_ms,
+                &mut last_frame_pts_ms,
+            ),
+            0
+        );
+        assert_eq!(
+            snipping_recording_frame_pts_ms(
+                1_066,
+                &mut first_frame_epoch_ms,
+                &mut last_frame_pts_ms,
+            ),
+            66
+        );
+        assert_eq!(
+            snipping_recording_frame_pts_ms(
+                1_066,
+                &mut first_frame_epoch_ms,
+                &mut last_frame_pts_ms,
+            ),
+            67
+        );
+    }
+
+    #[test]
+    fn recording_final_sample_extends_to_stop_request() {
+        assert_eq!(
+            snipping_recording_final_sample_duration_ms(Some(1_000), 800, 3_000),
+            1_200
+        );
+    }
+
+    #[test]
+    fn recording_system_time_ms_reads_epoch_milliseconds() {
+        let timestamp = UNIX_EPOCH + Duration::from_millis(12_345);
+
+        assert_eq!(snipping_recording_system_time_ms(timestamp), Some(12_345));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

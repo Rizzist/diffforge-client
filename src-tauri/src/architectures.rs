@@ -1955,19 +1955,23 @@ fn architecture_graph_delete_blocking(
     if graph_id.is_empty() {
         return Err("Architecture graph id is required.".to_string());
     }
-    let deleted_revision =
-        architecture_revision_snapshot_existing(&repo, &graph_id, "delete", true, None)?;
-    if deleted_revision.is_none() {
-        return Err("Architecture graph was not found.".to_string());
-    }
-    for path in [
+    let graph_paths = [
         architecture_arch_path(&repo, &graph_id),
         architecture_json_path(&repo, &graph_id),
-    ] {
+    ];
+    let revision_dir = architecture_revision_graph_dir(&repo, &graph_id, false)?;
+    if !graph_paths.iter().any(|path| path.exists()) && !revision_dir.exists() {
+        return Err("Architecture graph was not found.".to_string());
+    }
+    for path in graph_paths {
         if path.exists() {
             fs::remove_file(&path)
                 .map_err(|error| format!("Unable to delete architecture graph: {error}"))?;
         }
+    }
+    if revision_dir.exists() {
+        fs::remove_dir_all(&revision_dir)
+            .map_err(|error| format!("Unable to delete architecture revision history: {error}"))?;
     }
     let graphs = architecture_graph_summaries(&repo)?;
     let _ = architecture_write_index(&repo, &graphs);
@@ -2129,7 +2133,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             "storage": ".agents/architectures/revisions/<graph-id>/manifest.json plus local snapshot files",
             "localOnly": true,
             "latestPolicy": "Latest graph reads use only globalGraphsRoot and never fall back to revisions.",
-            "deletedPolicy": "Deleted graph snapshots remain recoverable through explicit revision tools but are excluded from architecture_context graph summaries."
+            "deletedPolicy": "Deleting a graph removes the latest files and the graph revision directory; restore is only available before delete."
         },
         "dsl": {
             "title": "title \"Human-readable graph name\"",

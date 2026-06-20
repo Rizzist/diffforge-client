@@ -1883,7 +1883,7 @@ export function getDraggedTodoPrompt(dataTransfer) {
 
 export function isTodoDragTransfer(dataTransfer) {
   const transferTypes = Array.from(dataTransfer?.types || []);
-  return transferTypes.includes(TODO_DRAG_MIME) || transferTypes.includes("text/plain");
+  return transferTypes.includes(TODO_DRAG_MIME);
 }
 
 export const WORKSPACE_FILE_DRAG_MIME = "application/x-diffforge-workspace-file";

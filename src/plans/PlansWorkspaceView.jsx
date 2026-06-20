@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { RestartAlt } from "@styled-icons/material-rounded/RestartAlt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
@@ -237,6 +238,15 @@ function receiptDurationParts(item, nowMs) {
     return label ? { label, prefix: "running" } : null;
   }
   return null;
+}
+
+function todoReceiptSessionId(item) {
+  return Array.from(sessionRefValues(item))[0] || "";
+}
+
+function todoSessionDiffersFromTerminal(item, terminalSessionId) {
+  const itemSessionId = todoReceiptSessionId(item);
+  return Boolean(itemSessionId && itemSessionId !== cleanText(terminalSessionId));
 }
 
 function sessionRefValues(value) {
@@ -645,6 +655,7 @@ function timestampLabel(value) {
 
 export default function PlansWorkspaceView({
   onResumePlan,
+  onResumeTodoSession,
   repoTargets = [],
   rootDirectory = "",
   selectedTerminal = EMPTY_TARGET,
@@ -807,7 +818,29 @@ export default function PlansWorkspaceView({
   const displayedPlan = openedTodo ? openedTodoPlan : fallbackPlan;
   const displayedPlanId = planIdentity(displayedPlan);
   const displayedPlanCanContinue = planCanContinue(displayedPlan);
+  const openedTodoSessionId = todoReceiptSessionId(openedTodo);
+  const openedTodoCanRelaunch = todoSessionDiffersFromTerminal(openedTodo, snapshotSessionId);
   const titleMaxChars = Number(scopedSnapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
+
+  const resumeTodoSession = useCallback((item, event = null) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!item || typeof onResumeTodoSession !== "function") {
+      return;
+    }
+    onResumeTodoSession(item);
+  }, [onResumeTodoSession]);
+
+  const handleHistoryRowKeyDown = useCallback((event, commandId) => {
+    if (event.defaultPrevented || event.target !== event.currentTarget || !commandId) {
+      return;
+    }
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    event.preventDefault();
+    setSelectedTodoKey(commandId);
+  }, []);
 
   const setPendingStepSaveRecord = useCallback((key, record) => {
     if (!key || !record) {
@@ -1273,9 +1306,22 @@ export default function PlansWorkspaceView({
           <TodoCard>
             <TodoCardHeader>
               <TodoCardLabel>{openedTodoIsNewest ? "Current todo" : "Todo"}</TodoCardLabel>
-              <TodoBadge data-kind={receiptStatusKind(openedTodo.status)}>
-                {receiptStatusLabel(openedTodo.status)}
-              </TodoBadge>
+              <TodoCardActions>
+                {openedTodoCanRelaunch && (
+                  <SessionButton
+                    aria-label={`Relaunch terminal with session ${openedTodoSessionId}`}
+                    onClick={(event) => resumeTodoSession(openedTodo, event)}
+                    title={`Relaunch terminal with session ${openedTodoSessionId}`}
+                    type="button"
+                  >
+                    <RestartAlt aria-hidden="true" />
+                    <span>Relaunch</span>
+                  </SessionButton>
+                )}
+                <TodoBadge data-kind={receiptStatusKind(openedTodo.status)}>
+                  {receiptStatusLabel(openedTodo.status)}
+                </TodoBadge>
+              </TodoCardActions>
             </TodoCardHeader>
             <TodoCardText>{openedTodo.text || "(no todo text)"}</TodoCardText>
             <TodoCardMeta>
@@ -1411,17 +1457,32 @@ export default function PlansWorkspaceView({
                 const duration = receiptDurationParts(item, nowMs);
                 const hasPlan = Boolean(planForTodo(item))
                   || (index === 0 && Boolean(fallbackPlan && !planIsTerminal(fallbackPlan)));
+                const itemSessionId = todoReceiptSessionId(item);
+                const canRelaunchSession = todoSessionDiffersFromTerminal(item, snapshotSessionId);
                 return (
                   <HistoryRow
                     data-selected={openedTodo === item ? "true" : "false"}
                     key={item.commandId}
                     onClick={() => setSelectedTodoKey(item.commandId)}
-                    type="button"
+                    onKeyDown={(event) => handleHistoryRowKeyDown(event, item.commandId)}
+                    role="button"
+                    tabIndex={0}
                   >
                     <HistoryRowTop>
                       <HistoryStatusDot aria-hidden="true" data-kind={kind} />
                       <HistoryRowText>{item.text || "(no todo text)"}</HistoryRowText>
                       {hasPlan && <HistoryPlanChip>Plan</HistoryPlanChip>}
+                      {canRelaunchSession && (
+                        <SessionButton
+                          aria-label={`Relaunch terminal with session ${itemSessionId}`}
+                          onClick={(event) => resumeTodoSession(item, event)}
+                          title={`Relaunch terminal with session ${itemSessionId}`}
+                          type="button"
+                        >
+                          <RestartAlt aria-hidden="true" />
+                          <span>Relaunch</span>
+                        </SessionButton>
+                      )}
                     </HistoryRowTop>
                     <HistoryRowMeta>
                       <HistoryBadge data-kind={kind}>{receiptStatusLabel(item.status)}</HistoryBadge>
@@ -1501,6 +1562,14 @@ const TodoCardHeader = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
+`;
+
+const TodoCardActions = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
 `;
 
@@ -1596,7 +1665,7 @@ const HistoryList = styled.div`
   min-width: 0;
 `;
 
-const HistoryRow = styled.button`
+const HistoryRow = styled.div`
   display: grid;
   gap: 5px;
   min-width: 0;
@@ -1610,6 +1679,11 @@ const HistoryRow = styled.button`
 
   &:hover {
     border-color: rgba(125, 176, 255, 0.28);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(116, 171, 255, 0.5);
+    outline-offset: 2px;
   }
 
   &[data-selected="true"] {
@@ -1687,6 +1761,41 @@ const HistoryRowMeta = styled.div`
 const HistoryBadge = styled(TodoBadge)`
   padding: 2px 7px;
   font-size: 10px;
+`;
+
+const SessionButton = styled.button`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  height: 24px;
+  border: 1px solid rgba(116, 171, 255, 0.28);
+  border-radius: 7px;
+  padding: 0 7px;
+  color: #d8e8ff;
+  background: rgba(50, 124, 245, 0.14);
+  font-size: 10.5px;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+
+  svg {
+    flex: 0 0 auto;
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover {
+    border-color: rgba(142, 192, 255, 0.42);
+    background: rgba(61, 140, 255, 0.2);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(116, 171, 255, 0.5);
+    outline-offset: 2px;
+  }
 `;
 
 const IconButton = styled.button`
