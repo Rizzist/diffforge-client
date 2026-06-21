@@ -1117,6 +1117,88 @@ const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
 const TERMINAL_THREAD_PROMPT_ECHO_READY_SUPPRESS_MS = 2500;
 const TERMINAL_THREAD_PROMPT_ECHO_MIN_SUPPRESS_MS = 600;
 const TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
+const SHELL_LAUNCHER_MODE_TERMINAL = "generic";
+const SHELL_LAUNCHER_AGENT_OPTIONS = Object.freeze([
+  { id: SHELL_LAUNCHER_MODE_TERMINAL, label: "Terminal", command: "" },
+  { id: "codex", label: "Codex", command: "codex" },
+  { id: "claude", label: "Claude Code", command: "claude" },
+  { id: "opencode", label: "OpenCode", command: "opencode" },
+]);
+const SHELL_LAUNCHER_AGENT_IDS = new Set(SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => option.id));
+const SHELL_LAUNCHER_AGENT_COMMAND_DELAY_MS = 950;
+
+function normalizeShellLauncherAgentId(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (normalized === "terminal" || normalized === "shell" || normalized === "generic") {
+    return SHELL_LAUNCHER_MODE_TERMINAL;
+  }
+  if (normalized === "claude" || normalized === "claude-code" || normalized === "claudecode") {
+    return "claude";
+  }
+  if (normalized === "opencode" || normalized === "open-code" || normalized === "opencode-ai" || normalized === "open-code-ai") {
+    return "opencode";
+  }
+  if (normalized === "codex" || normalized === "openai-codex") {
+    return "codex";
+  }
+  return SHELL_LAUNCHER_MODE_TERMINAL;
+}
+
+function getShellLauncherAgentOption(agentId) {
+  const safeAgentId = normalizeShellLauncherAgentId(agentId);
+  return SHELL_LAUNCHER_AGENT_OPTIONS.find((option) => option.id === safeAgentId)
+    || SHELL_LAUNCHER_AGENT_OPTIONS[0];
+}
+
+function shellLauncherAgentReady(agentStatuses, agentId) {
+  const safeAgentId = normalizeShellLauncherAgentId(agentId);
+  if (safeAgentId === SHELL_LAUNCHER_MODE_TERMINAL) {
+    return true;
+  }
+  const status = (Array.isArray(agentStatuses) ? agentStatuses : [])
+    .find((candidate) => candidate?.id === safeAgentId);
+  return status ? status.installed === true && status.authenticated === true : true;
+}
+
+function shellLauncherAgentStatusLabel(agentStatuses, agentId) {
+  const safeAgentId = normalizeShellLauncherAgentId(agentId);
+  if (safeAgentId === SHELL_LAUNCHER_MODE_TERMINAL) {
+    return "Shell input";
+  }
+  const status = (Array.isArray(agentStatuses) ? agentStatuses : [])
+    .find((candidate) => candidate?.id === safeAgentId);
+  if (!status) {
+    return "Ready";
+  }
+  if (!status.installed) {
+    return "Unavailable";
+  }
+  if (!status.authenticated) {
+    return "Sign in required";
+  }
+  return "Ready";
+}
+
+function shellLauncherPlainTextFromPaste(event) {
+  return String(event?.clipboardData?.getData?.("text/plain") || "");
+}
+
+function shellLauncherEventIsPlainTextKey(event) {
+  return Boolean(
+    event
+      && typeof event.key === "string"
+      && event.key.length === 1
+      && !event.altKey
+      && !event.ctrlKey
+      && !event.metaKey
+  );
+}
+
+function shellLauncherDelay(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, ms));
+  });
+}
 
 function normalizeTerminalPromptEpoch(value) {
   const numericValue = Number(value || 0);
@@ -1905,6 +1987,9 @@ function WorkspaceTerminal({
   agentStatuses,
   agentStatusError,
   agentStatusState,
+  appControlMcp = false,
+  defaultSessionMode = "",
+  dockedChrome = false,
   fullscreenState = "idle",
   isActive = false,
   isFullscreen = false,
@@ -1946,9 +2031,12 @@ function WorkspaceTerminal({
   workspaces = [],
   selectedWorkspaceThreadId = "",
   selectedWorkspaceThreadIdOverride = false,
+  paneIdOverride = "",
 }) {
   const containerRef = useRef(null);
   const restartMenuRef = useRef(null);
+  const shellLauncherMenuRef = useRef(null);
+  const shellLauncherInputRef = useRef(null);
   const resizeControllerRef = useRef(null);
   const windowBreakoutHostedRef = useRef(windowBreakoutHosted);
 
@@ -2063,6 +2151,12 @@ function WorkspaceTerminal({
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
+  const [shellLauncherAgentId, setShellLauncherAgentId] = useState(SHELL_LAUNCHER_MODE_TERMINAL);
+  const [shellLauncherDraft, setShellLauncherDraft] = useState("");
+  const [shellLauncherError, setShellLauncherError] = useState("");
+  const [shellLauncherMenuOpen, setShellLauncherMenuOpen] = useState(false);
+  const [shellLauncherSending, setShellLauncherSending] = useState(false);
+  const [shellLauncherLaunchedAgentId, setShellLauncherLaunchedAgentId] = useState("");
   const [terminalUiComposerFocusToken, setTerminalUiComposerFocusToken] = useState(0);
   const terminalUiViewActiveRef = useRef(false);
   useEffect(() => {
@@ -2101,10 +2195,12 @@ function WorkspaceTerminal({
     observer.observe(root, { attributes: true, attributeFilter: ["data-forge-theme"] });
     return () => observer.disconnect();
   }, [applyCurrentTerminalTheme]);
+  const terminalChromeDocked = Boolean(dockedChrome);
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
-  const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const paneId = String(paneIdOverride || "").trim()
+    || getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
   const terminalSelectsOnPointerDown = terminalSelectionMode !== "pointerup";
   const terminalThreadId = thread?.id || "";
   const terminalThreadSlotKey = thread?.slotKey
@@ -2126,6 +2222,45 @@ function WorkspaceTerminal({
   const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
   const terminalUsesActivityHooks = !isGenericTerminal && terminalAgentUsesActivityHooks(terminalAgentKind);
+  const shellLauncherSelectedAgentId = normalizeShellLauncherAgentId(shellLauncherAgentId);
+  const shellLauncherSelectedOption = getShellLauncherAgentOption(shellLauncherSelectedAgentId);
+  const shellLauncherSelectedReady = shellLauncherAgentReady(agentStatuses, shellLauncherSelectedAgentId);
+  const shellLauncherSelectedStatus = shellLauncherAgentStatusLabel(agentStatuses, shellLauncherSelectedAgentId);
+  const shellLauncherReadyToLaunch = Boolean(
+    isGenericTerminal
+      && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
+      && !shellLauncherLaunchedAgentId
+      && shellLauncherSelectedReady,
+  );
+  const shellLauncherHasLaunched = Boolean(
+    isGenericTerminal
+      && shellLauncherLaunchedAgentId
+      && shellLauncherLaunchedAgentId === shellLauncherSelectedAgentId,
+  );
+  useEffect(() => {
+    if (isGenericTerminal) {
+      return;
+    }
+    setShellLauncherAgentId(SHELL_LAUNCHER_MODE_TERMINAL);
+    setShellLauncherDraft("");
+    setShellLauncherError("");
+    setShellLauncherMenuOpen(false);
+    setShellLauncherSending(false);
+    setShellLauncherLaunchedAgentId("");
+  }, [isGenericTerminal]);
+  useEffect(() => {
+    if (shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL) {
+      return;
+    }
+    setShellLauncherError("");
+    setShellLauncherLaunchedAgentId("");
+  }, [shellLauncherSelectedAgentId]);
+  useEffect(() => {
+    if (!isGenericTerminal || terminalState === "running") {
+      return;
+    }
+    setShellLauncherLaunchedAgentId("");
+  }, [isGenericTerminal, terminalState]);
   const shouldDelayInitialPtyReveal = Boolean(agent && !isGenericTerminal && prewarmShell && !agentLaunchReady);
   const [terminalPtyRevealReady, setTerminalPtyRevealReady] = useState(!shouldDelayInitialPtyReveal);
   const terminalPtyRevealReadyRef = useRef(!shouldDelayInitialPtyReveal);
@@ -2148,7 +2283,10 @@ function WorkspaceTerminal({
 
     setTerminalPtyRevealReadyState(true);
   }, [setTerminalPtyRevealReadyState, shouldDelayInitialPtyReveal, terminalState]);
-  const terminalDefaultSessionMode = defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady);
+  const terminalDefaultSessionMode = normalizeTerminalSessionMode(
+    defaultSessionMode,
+    defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady),
+  );
   const [, setTerminalSessionMode] = useState(terminalDefaultSessionMode);
   const terminalSessionModeRef = useRef(terminalDefaultSessionMode);
   const terminalSessionModeExplicitRef = useRef(false);
@@ -2956,6 +3094,200 @@ function WorkspaceTerminal({
       // Terminal may have been disposed between activation and the focus request.
     }
   }, []);
+  const focusShellLauncherInput = useCallback(() => {
+    const focusInput = () => {
+      shellLauncherInputRef.current?.focus?.({ preventScroll: true });
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(focusInput);
+      return;
+    }
+    window.setTimeout(focusInput, 0);
+  }, []);
+  const chooseShellLauncherAgent = useCallback((nextAgentId) => {
+    const nextId = normalizeShellLauncherAgentId(nextAgentId);
+    if (!SHELL_LAUNCHER_AGENT_IDS.has(nextId)) {
+      return;
+    }
+    if (nextId !== shellLauncherSelectedAgentId) {
+      setShellLauncherDraft("");
+      setShellLauncherError("");
+      setShellLauncherLaunchedAgentId("");
+    }
+    setShellLauncherAgentId(nextId);
+    setShellLauncherMenuOpen(false);
+    if (nextId !== SHELL_LAUNCHER_MODE_TERMINAL) {
+      terminalUiViewActiveRef.current = true;
+      setTerminalUiViewActive(true);
+      focusShellLauncherInput();
+    }
+  }, [focusShellLauncherInput, shellLauncherSelectedAgentId]);
+  const submitShellLauncherPrompt = useCallback(async (promptOverride = "") => {
+    const prompt = String(promptOverride || shellLauncherDraft || "").trim();
+    const targetAgentId = shellLauncherSelectedAgentId;
+    const targetOption = getShellLauncherAgentOption(targetAgentId);
+    if (!isGenericTerminal || targetAgentId === SHELL_LAUNCHER_MODE_TERMINAL || !targetOption.command) {
+      return;
+    }
+    if (!prompt) {
+      focusShellLauncherInput();
+      return;
+    }
+    if (!shellLauncherSelectedReady) {
+      setShellLauncherError(`${targetOption.label} is not ready.`);
+      focusShellLauncherInput();
+      return;
+    }
+    const instanceId = terminalInstanceIdRef.current || 0;
+    if (!paneId || !instanceId || terminalClosed || terminalClosing || terminalState !== "running") {
+      setShellLauncherError("Terminal is not ready yet.");
+      focusShellLauncherInput();
+      return;
+    }
+
+    setShellLauncherSending(true);
+    setShellLauncherError("");
+    try {
+      logBigViewSyncDiagnosticEvent("tui.shell_launcher.start", {
+        agentId: targetAgentId,
+        command: targetOption.command,
+        instanceId,
+        paneId,
+        prompt: getBigViewTextDiagnosticFields(prompt),
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+      await invoke("terminal_write", {
+        data: `${targetOption.command}\r`,
+        instanceId,
+        paneId,
+      });
+      await shellLauncherDelay(SHELL_LAUNCHER_AGENT_COMMAND_DELAY_MS);
+      await invoke("terminal_write", {
+        data: buildTerminalSubmittedInput(prompt, targetAgentId, false),
+        instanceId,
+        paneId,
+      });
+      setShellLauncherDraft("");
+      setShellLauncherLaunchedAgentId(targetAgentId);
+      terminalUiViewActiveRef.current = false;
+      setTerminalUiViewActive(false);
+      focusTerminalKeyboardInput(true);
+      logBigViewSyncDiagnosticEvent("tui.shell_launcher.done", {
+        agentId: targetAgentId,
+        command: targetOption.command,
+        instanceId,
+        paneId,
+        promptLength: prompt.length,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+    } catch (error) {
+      const message = getErrorMessage(error, `Unable to launch ${targetOption.label}.`);
+      setShellLauncherError(message);
+      logBigViewSyncDiagnosticEvent("tui.shell_launcher.error", {
+        agentId: targetAgentId,
+        command: targetOption.command,
+        instanceId,
+        message,
+        paneId,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+      focusShellLauncherInput();
+    } finally {
+      setShellLauncherSending(false);
+    }
+  }, [
+    focusShellLauncherInput,
+    focusTerminalKeyboardInput,
+    isGenericTerminal,
+    paneId,
+    shellLauncherDraft,
+    shellLauncherSelectedAgentId,
+    shellLauncherSelectedReady,
+    terminalClosed,
+    terminalClosing,
+    terminalIndex,
+    terminalState,
+    workspace?.id,
+  ]);
+  const appendShellLauncherDraftFromTerminal = useCallback((text) => {
+    const safeText = String(text || "");
+    if (!safeText) {
+      return;
+    }
+    setShellLauncherError("");
+    setShellLauncherDraft((current) => `${current}${safeText}`);
+    terminalUiViewActiveRef.current = true;
+    setTerminalUiViewActive(true);
+    focusShellLauncherInput();
+  }, [focusShellLauncherInput]);
+  const handleShellLauncherKeyDown = useCallback((event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void submitShellLauncherPrompt();
+    }
+  }, [submitShellLauncherPrompt]);
+  const handleShellLauncherXtermKeyDownCapture = useCallback((event) => {
+    if (
+      !shellLauncherReadyToLaunch
+      || shellLauncherSending
+      || terminalUiViewActive
+      || terminalClosed
+      || terminalClosing
+      || isTerminalControlEventTarget(event.target)
+    ) {
+      return;
+    }
+    if (shellLauncherEventIsPlainTextKey(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      appendShellLauncherDraftFromTerminal(event.key);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      terminalUiViewActiveRef.current = true;
+      setTerminalUiViewActive(true);
+      focusShellLauncherInput();
+    }
+  }, [
+    appendShellLauncherDraftFromTerminal,
+    focusShellLauncherInput,
+    shellLauncherReadyToLaunch,
+    shellLauncherSending,
+    terminalClosed,
+    terminalClosing,
+    terminalUiViewActive,
+  ]);
+  const handleShellLauncherXtermPasteCapture = useCallback((event) => {
+    if (
+      !shellLauncherReadyToLaunch
+      || shellLauncherSending
+      || terminalUiViewActive
+      || terminalClosed
+      || terminalClosing
+      || isTerminalControlEventTarget(event.target)
+    ) {
+      return;
+    }
+    const pastedText = shellLauncherPlainTextFromPaste(event);
+    if (!pastedText) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    appendShellLauncherDraftFromTerminal(pastedText);
+  }, [
+    appendShellLauncherDraftFromTerminal,
+    shellLauncherReadyToLaunch,
+    shellLauncherSending,
+    terminalClosed,
+    terminalClosing,
+    terminalUiViewActive,
+  ]);
   const recordSubmittedAgentMessage = useCallback((instanceId, userMessage = "", options = {}) => {
     if (isGenericTerminal) {
       logThreadBridgeDiagnostic("frontend.thread_terminal_observed_prompt.skip", {
@@ -4833,6 +5165,41 @@ function WorkspaceTerminal({
     };
   }, [restartRoleMenuOpen]);
 
+  useEffect(() => {
+    if (!shellLauncherMenuOpen) {
+      return undefined;
+    }
+
+    const handleShellLauncherMenuPointerDown = (event) => {
+      const menu = shellLauncherMenuRef.current;
+
+      if (
+        menu
+        && typeof Node !== "undefined"
+        && event.target instanceof Node
+        && menu.contains(event.target)
+      ) {
+        return;
+      }
+
+      setShellLauncherMenuOpen(false);
+    };
+
+    const handleShellLauncherMenuKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setShellLauncherMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", handleShellLauncherMenuPointerDown, true);
+    document.addEventListener("keydown", handleShellLauncherMenuKeyDown, true);
+
+    return () => {
+      document.removeEventListener("pointerdown", handleShellLauncherMenuPointerDown, true);
+      document.removeEventListener("keydown", handleShellLauncherMenuKeyDown, true);
+    };
+  }, [shellLauncherMenuOpen]);
+
   const materializeFreshThreadForTerminalSession = useCallback((target = {}) => {
     const targetWorkspaceId = String(target.workspaceId || workspace?.id || "").trim();
     const targetTerminalIndex = Number.parseInt(target.terminalIndex ?? terminalIndex, 10);
@@ -5204,8 +5571,12 @@ function WorkspaceTerminal({
       ? ""
       : providerSessionOverrideForThisStart || threadProviderSessionId;
     const startupDefaultModel = isGenericTerminal ? "" : getTerminalStartupDefaultModel(terminalAgentKind);
-    const startupThreadProviderModel = isGenericTerminal ? "" : threadProviderModel || startupDefaultModel;
-    const startupThreadProviderModelSource = threadProviderModel
+    const startupThreadProviderModel = isGenericTerminal
+      ? ""
+      : startupThreadProviderSessionId
+        ? startupDefaultModel
+        : threadProviderModel || startupDefaultModel;
+    const startupThreadProviderModelSource = threadProviderModel && !startupThreadProviderSessionId
       ? "session-restore"
       : startupThreadProviderModel
         ? "app-default"
@@ -12826,6 +13197,7 @@ function WorkspaceTerminal({
               workspaceName: workspace?.name || "",
               terminalName: terminalRailAgentLabel,
               terminalNickname,
+              appControlMcp: Boolean(appControlMcp && !isGenericTerminal),
               cols: initialSize.cols,
               rows: initialSize.rows,
               outputTransport: outputTransportPreferred,
@@ -12889,6 +13261,14 @@ function WorkspaceTerminal({
         const openedNativeSessionId = String(openResult?.nativeSessionId || openedProviderSessionId).trim();
         const openedActivityStatus = String(openResult?.activityStatus || "idle").trim() || "idle";
         const openedCommandPhase = String(openResult?.commandPhase || "ready").trim() || "ready";
+        const backendOpenedModel = String(openResult?.model || "").trim();
+        const backendOpenedModelSource = String(openResult?.modelSource || "").trim();
+        const openedProviderModel = backendOpenedModel || startupThreadProviderModel;
+        const openedProviderModelSource = openedProviderModel
+          ? backendOpenedModelSource === "request"
+            ? startupThreadProviderModelSource || "request"
+            : backendOpenedModelSource || startupThreadProviderModelSource
+          : "";
         const openedInputReady = typeof openResult?.inputReady === "boolean"
           ? openResult.inputReady
           : !shouldPrewarmShell;
@@ -12902,6 +13282,8 @@ function WorkspaceTerminal({
           preserveCoordinationForThisStart,
           sessionMode: openResult?.sessionMode || sessionModeForThisStart,
           providerSessionOverridePresent: Boolean(providerSessionOverrideForThisStart),
+          openedProviderModel,
+          openedProviderModelSource,
           startupThreadProviderModel: startupThreadProviderModel || "",
           startupThreadProviderModelSource,
           startupThreadId: startupThreadId || "",
@@ -12923,8 +13305,8 @@ function WorkspaceTerminal({
           inputReadyAt: openedInputReadyAt,
           inputReadyConfidence: openedInputReady ? "terminal-open" : "",
           instanceId: terminalInstanceId,
-          model: startupThreadProviderModel,
-          modelSource: startupThreadProviderModelSource,
+          model: openedProviderModel,
+          modelSource: openedProviderModelSource,
           nativeSessionId: openedNativeSessionId,
           nativeSessionKind: openedNativeSessionId ? "session" : "",
           nativeSessionSource: openedNativeSessionId ? "session-restore" : "",
@@ -14629,7 +15011,10 @@ function WorkspaceTerminal({
   ]);
 
   const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
-  const canOpenTerminalUiView = !threadsViewActive && !terminalClosed && !terminalClosing && Boolean(thread);
+  const canOpenTerminalUiView = !threadsViewActive
+    && !terminalClosed
+    && !terminalClosing
+    && (Boolean(thread) || isGenericTerminal);
   const fullscreenThreadUiViewActive = Boolean(isFullscreen && terminalUiViewActive && !threadsViewActive);
   const selectCurrentTerminalThreadForFullscreenView = useCallback(() => {
     if (!isFullscreen || !workspace?.id || !terminalThreadId) {
@@ -14672,6 +15057,9 @@ function WorkspaceTerminal({
     activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
     if (nextUiViewActive) {
       selectCurrentTerminalThreadForFullscreenView();
+      if (isGenericTerminal) {
+        focusShellLauncherInput();
+      }
     }
     terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
@@ -14681,7 +15069,9 @@ function WorkspaceTerminal({
   }, [
     activateTerminalPane,
     canOpenTerminalUiView,
+    focusShellLauncherInput,
     focusTerminalKeyboardInputAfterUiHide,
+    isGenericTerminal,
     selectCurrentTerminalThreadForFullscreenView,
     terminalUiViewActive,
   ]);
@@ -14703,6 +15093,9 @@ function WorkspaceTerminal({
     terminalUiViewActiveRef.current = nextUiViewActive;
     if (nextUiViewActive) {
       selectCurrentTerminalThreadForFullscreenView();
+      if (isGenericTerminal) {
+        focusShellLauncherInput();
+      }
     }
     setTerminalUiViewActive(nextUiViewActive);
     if (!nextUiViewActive) {
@@ -14712,7 +15105,9 @@ function WorkspaceTerminal({
   }, [
     activateTerminalPane,
     canOpenTerminalUiView,
+    focusShellLauncherInput,
     focusTerminalKeyboardInputAfterUiHide,
+    isGenericTerminal,
     selectCurrentTerminalThreadForFullscreenView,
   ]);
   const closeFullscreenThreadUiView = useCallback(() => {
@@ -14766,10 +15161,11 @@ function WorkspaceTerminal({
     terminalClosing,
   ]);
   useEffect(() => {
-    if (!thread || terminalClosed || terminalClosing) {
+    if ((!thread && !isGenericTerminal) || terminalClosed || terminalClosing) {
+      terminalUiViewActiveRef.current = false;
       setTerminalUiViewActive(false);
     }
-  }, [terminalClosed, terminalClosing, thread]);
+  }, [isGenericTerminal, terminalClosed, terminalClosing, thread]);
   useEffect(() => {
     if (!fullscreenThreadUiViewActive || !workspace?.id || !terminalThreadId) {
       return;
@@ -15052,7 +15448,9 @@ function WorkspaceTerminal({
       onDragOver={handleTerminalTodoDragOver}
       onDropCapture={handleTerminalRawDropCapture}
       onDrop={handleTerminalTodoDrop}
+      onKeyDownCapture={handleShellLauncherXtermKeyDownCapture}
       onPaste={(event) => queueClipboardImagesForCurrentTerminal(event, "xterm_surface")}
+      onPasteCapture={handleShellLauncherXtermPasteCapture}
       ref={containerRef}
     />
   );
@@ -15061,13 +15459,42 @@ function WorkspaceTerminal({
       && !terminalClosed
       && !terminalClosing,
   );
+  const shellLauncherUiViewShouldRender = Boolean(isGenericTerminal)
+    && !terminalClosed
+    && !terminalClosing
+    && terminalUiViewActive
+    && !fullscreenThreadUiViewActive;
   const terminalUiViewShouldRender = Boolean(thread)
+    && !isGenericTerminal
     && !terminalClosed
     && !terminalClosing
     && terminalUiViewActive
     && !fullscreenThreadUiViewActive;
   const restartMenuAgentKind = terminalAgentKind;
   const restartRoleOptions = getTerminalRoleSwitchOptions(agentStatuses);
+  const shellLauncherRailAgentKind = isGenericTerminal
+    && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
+      ? shellLauncherSelectedAgentId
+      : terminalAgentKind;
+  const shellLauncherRailAgentTitle = isGenericTerminal
+    ? `Shell terminal mode: ${shellLauncherSelectedOption.label}`
+    : terminalRailAgentTitle;
+  const shellLauncherRailStateLabel = isGenericTerminal
+    && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
+      ? shellLauncherSending
+        ? "launching"
+        : shellLauncherHasLaunched
+          ? "running"
+          : shellLauncherSelectedReady
+            ? "ready"
+            : shellLauncherSelectedStatus
+      : terminalStateDebugLabel;
+  const shellLauncherRailDotStyle = isGenericTerminal
+    && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
+      ? {
+        "--terminal-slot-accent": shellLauncherHasLaunched ? "#3ccb7f" : "#f2c24e",
+      }
+      : undefined;
 
   return (
     <TerminalWorkspaceSurface
@@ -15084,47 +15511,142 @@ function WorkspaceTerminal({
       ref={surfaceRef}
     >
       <TerminalRestartPill data-terminal-control="true">
-        <TerminalRailIdentity>
-          {/* Drag handle lives at the far left of the rail, away from the
-              destructive close button on the right. */}
-          <TerminalRestartButton
-            aria-label="Drag terminal"
-            data-terminal-drag-handle="true"
-            disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
-            onPointerDown={beginTerminalDrag}
-            title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
-            type="button"
-          >
-            <ButtonDragIcon aria-hidden="true" />
-          </TerminalRestartButton>
-          <TerminalAgentDot
-            aria-hidden="true"
-            data-agent={terminalAgentKind}
-            data-slot={getTerminalAgentColorSlot(terminalIndex)}
-            title={terminalRailAgentTitle}
-          />
-          <TerminalAgentLabel title={terminalRailAgentTitle}>
-            {terminalRailAgentLabel}
-          </TerminalAgentLabel>
-          <TerminalStateDebugBadge title={`Terminal state: ${terminalStateDebugLabel}`}>
-            {terminalStateDebugLabel}
-          </TerminalStateDebugBadge>
-          <TerminalAccountStaleChip agentKind={terminalAgentKind} paneId={paneId} />
+        <TerminalRailIdentity data-docked={terminalChromeDocked ? "true" : undefined}>
+          {!terminalChromeDocked && (
+            <>
+              {/* Drag handle lives at the far left of the rail, away from the
+                  destructive close button on the right. */}
+              <TerminalRestartButton
+                aria-label="Drag terminal"
+                data-terminal-drag-handle="true"
+                disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
+                onPointerDown={beginTerminalDrag}
+                title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
+                type="button"
+              >
+                <ButtonDragIcon aria-hidden="true" />
+              </TerminalRestartButton>
+              <TerminalAgentDot
+                aria-hidden="true"
+                data-agent={shellLauncherRailAgentKind}
+                data-slot={getTerminalAgentColorSlot(terminalIndex)}
+                style={shellLauncherRailDotStyle}
+                title={shellLauncherRailAgentTitle}
+              />
+              <TerminalAgentLabel title={terminalRailAgentTitle}>
+                {terminalRailAgentLabel}
+              </TerminalAgentLabel>
+            </>
+          )}
+          {isGenericTerminal && !terminalChromeDocked && (
+            <TerminalRestartMenu
+              data-terminal-control="true"
+              ref={shellLauncherMenuRef}
+              style={{ marginLeft: 3 }}
+            >
+              <TerminalRestartButton
+                aria-expanded={shellLauncherMenuOpen ? "true" : "false"}
+                aria-haspopup="menu"
+                aria-label="Choose terminal mode"
+                disabled={terminalClosed || terminalClosing}
+                onClick={() => setShellLauncherMenuOpen((isOpen) => !isOpen)}
+                style={{
+                  width: "auto",
+                  minWidth: 104,
+                  height: 22,
+                  gap: 6,
+                  padding: "0 8px",
+                  border: "1px solid rgba(148, 163, 184, 0.22)",
+                  borderRadius: 999,
+                  background: shellLauncherSelectedAgentId === SHELL_LAUNCHER_MODE_TERMINAL
+                    ? "rgba(148, 163, 184, 0.1)"
+                    : "rgba(242, 194, 78, 0.12)",
+                }}
+                title={`Terminal mode: ${shellLauncherSelectedOption.label}`}
+                type="button"
+              >
+                <span
+                  style={{
+                    display: "inline-block",
+                    maxWidth: 92,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {shellLauncherSelectedOption.label}
+                </span>
+                <FileChevronIcon
+                  aria-hidden="true"
+                  style={{
+                    width: 14,
+                    height: 14,
+                    transform: shellLauncherMenuOpen ? "rotate(-90deg)" : "rotate(90deg)",
+                  }}
+                />
+              </TerminalRestartButton>
+              <TerminalRestartDropdown
+                data-open={shellLauncherMenuOpen ? "true" : "false"}
+                role="menu"
+                style={{ left: 0, right: "auto", minWidth: 190 }}
+              >
+                {SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => {
+                  const optionSelected = option.id === shellLauncherSelectedAgentId;
+                  const optionReady = shellLauncherAgentReady(agentStatuses, option.id);
+                  return (
+                    <TerminalRestartOption
+                      data-role={option.id}
+                      data-selected={optionSelected ? "true" : "false"}
+                      disabled={!optionReady}
+                      key={option.id}
+                      onClick={() => chooseShellLauncherAgent(option.id)}
+                      role="menuitem"
+                      title={optionReady ? option.label : `${option.label}: ${shellLauncherAgentStatusLabel(agentStatuses, option.id)}`}
+                      type="button"
+                    >
+                      <strong>{option.label}</strong>
+                      <span
+                        style={{
+                          flex: "0 0 auto",
+                          color: "var(--forge-text-muted)",
+                          fontSize: 10,
+                          fontWeight: 800,
+                          lineHeight: 1,
+                        }}
+                      >
+                        {shellLauncherAgentStatusLabel(agentStatuses, option.id)}
+                      </span>
+                    </TerminalRestartOption>
+                  );
+                })}
+              </TerminalRestartDropdown>
+            </TerminalRestartMenu>
+          )}
+          {!terminalChromeDocked && (
+            <>
+              <TerminalStateDebugBadge title={`Terminal state: ${shellLauncherRailStateLabel}`}>
+                {shellLauncherRailStateLabel}
+              </TerminalStateDebugBadge>
+              <TerminalAccountStaleChip agentKind={terminalAgentKind} paneId={paneId} />
+            </>
+          )}
         </TerminalRailIdentity>
         <TerminalRailControls data-rail-row="primary">
-          <TerminalCloseButton
-            aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
-            disabled={terminalClosed || terminalClosing}
-            onClick={handleTerminalCloseButtonClick}
-            title={threadsViewActive ? "Exit threads view" : "Close terminal"}
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
+          {!terminalChromeDocked && (
+            <TerminalCloseButton
+              aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
+              disabled={terminalClosed || terminalClosing}
+              onClick={handleTerminalCloseButtonClick}
+              title={threadsViewActive ? "Exit threads view" : "Close terminal"}
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </TerminalCloseButton>
+          )}
         </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
           <TerminalRestartButton
-            aria-label={terminalUiViewActive ? "Show terminal view" : "Show UI view"}
+            aria-label={terminalUiViewActive ? "Show terminal view" : isGenericTerminal ? "Show terminal launcher" : "Show UI view"}
             aria-pressed={terminalUiViewActive ? "true" : "false"}
             data-active={terminalUiViewActive ? "true" : undefined}
             disabled={!canOpenTerminalUiView && !terminalUiViewActive}
@@ -15133,7 +15655,9 @@ function WorkspaceTerminal({
               terminalUiViewActive
                 ? "Show terminal view"
                 : canOpenTerminalUiView
-                  ? "Show UI view"
+                  ? isGenericTerminal
+                    ? "Show terminal launcher"
+                    : "Show UI view"
                   : threadsViewActive
                     ? "Exit threads view first"
                     : "No thread available"
@@ -15142,28 +15666,30 @@ function WorkspaceTerminal({
           >
             <ButtonBrowserIcon aria-hidden="true" />
           </TerminalRestartButton>
-          <TerminalRestartButton
-            aria-label="Open this terminal in its own window"
-            disabled={
-              terminalClosed
-              || terminalClosing
-              || threadsViewActive
-              || windowBreakoutHosted
-              || !paneId
-              || typeof onPopOutTerminalWindow !== "function"
-            }
-            onClick={() => onPopOutTerminalWindow?.(terminalIndex, paneId)}
-            title={
-              windowBreakoutHosted
-                ? "Already open in its own window"
-                : threadsViewActive
-                  ? "Exit threads view to pop out"
-                  : "Open this terminal in its own window"
-            }
-            type="button"
-          >
-            <ButtonPopOutIcon aria-hidden="true" />
-          </TerminalRestartButton>
+          {!terminalChromeDocked && (
+            <TerminalRestartButton
+              aria-label="Open this terminal in its own window"
+              disabled={
+                terminalClosed
+                || terminalClosing
+                || threadsViewActive
+                || windowBreakoutHosted
+                || !paneId
+                || typeof onPopOutTerminalWindow !== "function"
+              }
+              onClick={() => onPopOutTerminalWindow?.(terminalIndex, paneId)}
+              title={
+                windowBreakoutHosted
+                  ? "Already open in its own window"
+                  : threadsViewActive
+                    ? "Exit threads view to pop out"
+                    : "Open this terminal in its own window"
+              }
+              type="button"
+            >
+              <ButtonPopOutIcon aria-hidden="true" />
+            </TerminalRestartButton>
+          )}
           <TerminalRestartButton
             aria-label="Decrease terminal font size"
             disabled={
@@ -15192,37 +15718,41 @@ function WorkspaceTerminal({
           >
             <ButtonFontPlusIcon aria-hidden="true" />
           </TerminalRestartButton>
-          <TerminalRestartButton
-            aria-label="Split terminal horizontally"
-            disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
-            onClick={splitTerminalHorizontal}
-            title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
-            type="button"
-          >
-            <ButtonSplitHorizontalIcon aria-hidden="true" />
-          </TerminalRestartButton>
-          <TerminalRestartButton
-            aria-label="Split terminal vertically"
-            disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
-            onClick={splitTerminalVertical}
-            title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
-            type="button"
-          >
-            <ButtonSplitVerticalIcon aria-hidden="true" />
-          </TerminalRestartButton>
-          <TerminalRestartButton
-            aria-label={isFullscreen ? "Restore terminal" : "Maximize terminal"}
-            disabled={terminalClosed || terminalClosing}
-            onClick={toggleTerminalFullscreen}
-            title={isFullscreen ? "Restore terminal" : "Maximize terminal"}
-            type="button"
-          >
-            {isFullscreen ? (
-              <ButtonFullscreenExitIcon aria-hidden="true" />
-            ) : (
-              <ButtonFullscreenIcon aria-hidden="true" />
-            )}
-          </TerminalRestartButton>
+          {!terminalChromeDocked && (
+            <>
+              <TerminalRestartButton
+                aria-label="Split terminal horizontally"
+                disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
+                onClick={splitTerminalHorizontal}
+                title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
+                type="button"
+              >
+                <ButtonSplitHorizontalIcon aria-hidden="true" />
+              </TerminalRestartButton>
+              <TerminalRestartButton
+                aria-label="Split terminal vertically"
+                disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
+                onClick={splitTerminalVertical}
+                title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
+                type="button"
+              >
+                <ButtonSplitVerticalIcon aria-hidden="true" />
+              </TerminalRestartButton>
+              <TerminalRestartButton
+                aria-label={isFullscreen ? "Restore terminal" : "Maximize terminal"}
+                disabled={terminalClosed || terminalClosing}
+                onClick={toggleTerminalFullscreen}
+                title={isFullscreen ? "Restore terminal" : "Maximize terminal"}
+                type="button"
+              >
+                {isFullscreen ? (
+                  <ButtonFullscreenExitIcon aria-hidden="true" />
+                ) : (
+                  <ButtonFullscreenIcon aria-hidden="true" />
+                )}
+              </TerminalRestartButton>
+            </>
+          )}
           <TerminalRestartMenu
             data-terminal-control="true"
             ref={restartMenuRef}
@@ -15286,6 +15816,227 @@ function WorkspaceTerminal({
         ) : (
           <>
             {xtermSurface}
+            {shellLauncherUiViewShouldRender && (
+              <TerminalInlineUiView
+                aria-hidden={terminalUiViewActive ? undefined : "true"}
+                data-active={terminalUiViewActive ? "true" : "false"}
+                data-terminal-control="true"
+                onFocusCapture={handleTerminalUiViewFocusCapture}
+                onPointerDownCapture={handleTerminalUiViewPointerDownCapture}
+              >
+                <div
+                  style={{
+                    display: "grid",
+                    width: "100%",
+                    height: "100%",
+                    minWidth: 0,
+                    minHeight: 0,
+                    placeItems: "center",
+                    padding: "clamp(18px, 5vw, 56px)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "grid",
+                      width: "min(620px, 100%)",
+                      minWidth: 0,
+                      justifyItems: "center",
+                      gap: 14,
+                    }}
+                  >
+                    <div
+                      aria-label="Terminal mode"
+                      data-terminal-control="true"
+                      role="group"
+                      style={{
+                        display: "flex",
+                        width: "min(100%, 520px)",
+                        minWidth: 0,
+                        flexWrap: "wrap",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: 6,
+                        padding: 4,
+                        border: "1px solid rgba(148, 163, 184, 0.2)",
+                        borderRadius: 999,
+                        background: "rgba(15, 23, 42, 0.36)",
+                      }}
+                    >
+                      {SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => {
+                        const optionSelected = option.id === shellLauncherSelectedAgentId;
+                        const optionReady = shellLauncherAgentReady(agentStatuses, option.id);
+                        return (
+                          <button
+                            aria-pressed={optionSelected ? "true" : "false"}
+                            data-terminal-control="true"
+                            disabled={!optionReady || shellLauncherSending}
+                            key={option.id}
+                            onClick={() => chooseShellLauncherAgent(option.id)}
+                            style={{
+                              minWidth: 92,
+                              height: 32,
+                              flex: "1 1 112px",
+                              padding: "0 12px",
+                              overflow: "hidden",
+                              border: "1px solid",
+                              borderColor: optionSelected
+                                ? option.id === SHELL_LAUNCHER_MODE_TERMINAL
+                                  ? "rgba(203, 213, 225, 0.34)"
+                                  : "rgba(242, 194, 78, 0.46)"
+                                : "transparent",
+                              borderRadius: 999,
+                              color: optionSelected ? "#ffffff" : "rgba(226, 232, 240, 0.74)",
+                              background: optionSelected
+                                ? option.id === SHELL_LAUNCHER_MODE_TERMINAL
+                                  ? "rgba(148, 163, 184, 0.18)"
+                                  : "rgba(242, 194, 78, 0.14)"
+                                : "transparent",
+                              cursor: optionReady && !shellLauncherSending ? "pointer" : "not-allowed",
+                              fontSize: 12,
+                              fontWeight: 850,
+                              lineHeight: 1,
+                              opacity: optionReady ? 1 : 0.42,
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                            title={optionReady ? option.label : `${option.label}: ${shellLauncherAgentStatusLabel(agentStatuses, option.id)}`}
+                            type="button"
+                          >
+                            {option.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL && (
+                      <div
+                        data-terminal-control="true"
+                        style={{
+                          display: "grid",
+                          width: "min(100%, 560px)",
+                          minWidth: 0,
+                          gap: 10,
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "grid",
+                            minWidth: 0,
+                            gap: 10,
+                            padding: 14,
+                            border: "1px solid rgba(148, 163, 184, 0.24)",
+                            borderRadius: 18,
+                            background: "rgba(2, 6, 23, 0.62)",
+                            boxShadow: "0 22px 58px rgba(0, 0, 0, 0.28)",
+                          }}
+                        >
+                          <textarea
+                            aria-label={`Ask ${shellLauncherSelectedOption.label}`}
+                            data-terminal-control="true"
+                            disabled={shellLauncherSending || !shellLauncherSelectedReady}
+                            onChange={(event) => {
+                              setShellLauncherError("");
+                              setShellLauncherDraft(event.target.value);
+                            }}
+                            onKeyDown={handleShellLauncherKeyDown}
+                            placeholder={`Ask ${shellLauncherSelectedOption.label}`}
+                            ref={shellLauncherInputRef}
+                            rows={4}
+                            style={{
+                              width: "100%",
+                              minWidth: 0,
+                              minHeight: 104,
+                              maxHeight: "32vh",
+                              padding: "12px 13px",
+                              border: "1px solid rgba(148, 163, 184, 0.22)",
+                              borderRadius: 14,
+                              color: "#f8fafc",
+                              background: "rgba(15, 23, 42, 0.74)",
+                              boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.04)",
+                              font: "inherit",
+                              fontSize: 14,
+                              fontWeight: 650,
+                              lineHeight: 1.4,
+                              outline: "none",
+                              resize: "vertical",
+                            }}
+                            value={shellLauncherDraft}
+                          />
+                          <div
+                            style={{
+                              display: "flex",
+                              minWidth: 0,
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 10,
+                            }}
+                          >
+                            <span
+                              aria-live="polite"
+                              style={{
+                                minWidth: 0,
+                                overflow: "hidden",
+                                color: shellLauncherError || !shellLauncherSelectedReady
+                                  ? "#fca5a5"
+                                  : "rgba(203, 213, 225, 0.68)",
+                                fontSize: 11,
+                                fontWeight: 800,
+                                lineHeight: 1.25,
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {shellLauncherError
+                                || (!shellLauncherSelectedReady ? shellLauncherSelectedStatus : "")}
+                            </span>
+                            <button
+                              aria-label={`Send to ${shellLauncherSelectedOption.label}`}
+                              data-terminal-control="true"
+                              disabled={
+                                shellLauncherSending
+                                || !shellLauncherSelectedReady
+                                || !shellLauncherDraft.trim()
+                              }
+                              onClick={() => {
+                                void submitShellLauncherPrompt();
+                              }}
+                              style={{
+                                display: "inline-flex",
+                                minWidth: 92,
+                                height: 36,
+                                alignItems: "center",
+                                justifyContent: "center",
+                                gap: 7,
+                                flex: "0 0 auto",
+                                padding: "0 14px",
+                                border: "1px solid rgba(242, 194, 78, 0.36)",
+                                borderRadius: 999,
+                                color: "#111827",
+                                background: shellLauncherSending
+                                  ? "rgba(242, 194, 78, 0.58)"
+                                  : "#f2c24e",
+                                cursor: shellLauncherSending || !shellLauncherSelectedReady || !shellLauncherDraft.trim()
+                                  ? "not-allowed"
+                                  : "pointer",
+                                fontSize: 12,
+                                fontWeight: 900,
+                                lineHeight: 1,
+                                opacity: shellLauncherSending || !shellLauncherSelectedReady || !shellLauncherDraft.trim()
+                                  ? 0.58
+                                  : 1,
+                              }}
+                              type="button"
+                            >
+                              <ButtonCodeIcon aria-hidden="true" />
+                              <span>{shellLauncherSending ? "Starting" : "Send"}</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </TerminalInlineUiView>
+            )}
             {terminalUiViewShouldRender && (
               <TerminalInlineUiView
                 aria-hidden={terminalUiViewActive ? undefined : "true"}

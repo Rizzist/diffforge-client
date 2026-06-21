@@ -5983,6 +5983,7 @@ export function AudioWidgetWindow() {
   const widgetManualPolishingEnabled = readAudioManualPolishingEnabled();
   const [forgeCloudConnected, setForgeCloudConnected] = useState(false);
   const [barIdleHover, setBarIdleHover] = useState(false);
+  const [bubbleHover, setBubbleHover] = useState(false);
   const [barPlacementReadyKey, setBarPlacementReadyKey] = useState("");
   const audioBufferRef = useRef(null);
   const audioBufferGenerationRef = useRef(0);
@@ -6019,6 +6020,7 @@ export function AudioWidgetWindow() {
   const bubbleHistoryTrayCloseDeferredRef = useRef(false);
   const widgetDraggingRef = useRef(false);
   const barIdleHoverRef = useRef(false);
+  const bubbleHoverRef = useRef(false);
   const barIdleModeRef = useRef(false);
   const canUseBubbleHistoryTrayRef = useRef(false);
   const widgetDragSettleTimerRef = useRef(0);
@@ -6043,6 +6045,12 @@ export function AudioWidgetWindow() {
     const hovering = Boolean(nextHovering);
     barIdleHoverRef.current = hovering;
     setBarIdleHover((current) => (current === hovering ? current : hovering));
+  }, []);
+
+  const setBubbleHoverState = useCallback((nextHovering) => {
+    const hovering = Boolean(nextHovering);
+    bubbleHoverRef.current = hovering;
+    setBubbleHover((current) => (current === hovering ? current : hovering));
   }, []);
 
   const setForgeCloudConnectionState = useCallback((connected) => {
@@ -6070,6 +6078,10 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     barIdleHoverRef.current = barIdleHover;
   }, [barIdleHover]);
+
+  useEffect(() => {
+    bubbleHoverRef.current = bubbleHover;
+  }, [bubbleHover]);
 
   useEffect(() => {
     recorderModeRef.current = recorderMode;
@@ -7210,6 +7222,16 @@ export function AudioWidgetWindow() {
     scheduleBubbleHistoryTrayClose();
   }, [clearBubbleHistoryTrayCloseTimer, scheduleBubbleHistoryTrayClose]);
 
+  const handleBubbleHoverEnter = useCallback(() => {
+    setBubbleHoverState(true);
+    openBubbleHistoryTray();
+  }, [openBubbleHistoryTray, setBubbleHoverState]);
+
+  const handleBubbleHoverLeave = useCallback(() => {
+    setBubbleHoverState(false);
+    closeBubbleHistoryTray();
+  }, [closeBubbleHistoryTray, setBubbleHoverState]);
+
   const updateBarIdleHoverFromPointer = useCallback((event) => {
     setBarIdleHoverState(audioBarIdlePointerEventIsHovering(event, barIdleHoverRef.current));
   }, [setBarIdleHoverState]);
@@ -7245,10 +7267,11 @@ export function AudioWidgetWindow() {
     bubbleHistoryTrayHoverRef.current = false;
     bubbleHistoryTrayPolishPinnedRef.current = false;
     bubbleHistoryTrayCloseDeferredRef.current = false;
+    setBubbleHoverState(false);
 
     setHistoryTrayOpen(false);
     return undefined;
-  }, [canUseBubbleHistoryTray]);
+  }, [canUseBubbleHistoryTray, setBubbleHoverState]);
 
   useEffect(() => {
     if (bubbleHistoryTrayActive) {
@@ -7752,7 +7775,9 @@ export function AudioWidgetWindow() {
         return;
       }
 
-      if (Boolean(event?.payload?.hovering)) {
+      const hovering = Boolean(event?.payload?.hovering);
+      setBubbleHoverState(hovering);
+      if (hovering) {
         openBubbleHistoryTray();
       } else {
         closeBubbleHistoryTray();
@@ -7772,7 +7797,7 @@ export function AudioWidgetWindow() {
       disposed = true;
       unlistenHover();
     };
-  }, [closeBubbleHistoryTray, openBubbleHistoryTray]);
+  }, [closeBubbleHistoryTray, openBubbleHistoryTray, setBubbleHoverState]);
 
   useEffect(() => {
     if (!canUseBubbleHistoryTray) {
@@ -7799,7 +7824,9 @@ export function AudioWidgetWindow() {
           },
         });
         if (!disposed) {
-          if (snapshot?.hovering) {
+          const hovering = Boolean(snapshot?.hovering);
+          setBubbleHoverState(hovering);
+          if (hovering) {
             openBubbleHistoryTray();
           } else {
             closeBubbleHistoryTray();
@@ -7834,7 +7861,7 @@ export function AudioWidgetWindow() {
         },
       }).catch(() => {});
     };
-  }, [canUseBubbleHistoryTray, closeBubbleHistoryTray, openBubbleHistoryTray]);
+  }, [canUseBubbleHistoryTray, closeBubbleHistoryTray, openBubbleHistoryTray, setBubbleHoverState]);
 
   // Bubble history controls use the same stable-anchor idea as the error
   // popover: resize the native frame in one direction while leaving the
@@ -8129,6 +8156,7 @@ export function AudioWidgetWindow() {
     widgetDragReleaseSeenRef.current = false;
     widgetDraggingRef.current = true;
     setWidgetDragging(true);
+    setBubbleHoverState(false);
     bubbleHistoryTrayHoverRef.current = false;
     bubbleHistoryTrayCloseDeferredRef.current = false;
     bubbleHistoryTrayActiveRef.current = false;
@@ -8172,7 +8200,7 @@ export function AudioWidgetWindow() {
         });
       }
     });
-  }, [runWidgetWindowAction, scheduleWidgetDragFinish, startWidgetDragPositionSample]);
+  }, [runWidgetWindowAction, scheduleWidgetDragFinish, setBubbleHoverState, startWidgetDragPositionSample]);
 
   const minimizeWidget = useCallback(() => {
     runWidgetWindowAction((windowHandle) => windowHandle.minimize());
@@ -9925,13 +9953,17 @@ export function AudioWidgetWindow() {
         data-error-frame={errorFrameActive ? "true" : undefined}
         data-focus={isFocusedWidget ? "true" : undefined}
         data-handoff={isCompactHandoff ? "true" : undefined}
+        data-hover={bubbleHover && !widgetDragging ? "true" : undefined}
         data-opening={isOpeningFocus ? "true" : undefined}
         data-state={widgetState}
         data-theme={audioWidgetTheme}
         data-history-tray={bubbleHistoryTrayActive ? "true" : undefined}
-        onMouseEnter={openBubbleHistoryTray}
-        onMouseLeave={closeBubbleHistoryTray}
+        onMouseEnter={handleBubbleHoverEnter}
+        onMouseLeave={handleBubbleHoverLeave}
+        onPointerCancel={handleBubbleHoverLeave}
         onPointerDown={dragWidget}
+        onPointerEnter={handleBubbleHoverEnter}
+        onPointerLeave={handleBubbleHoverLeave}
       >
         <AudioWidgetFocusStage
           aria-label={widgetLabel}

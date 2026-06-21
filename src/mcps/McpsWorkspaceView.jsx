@@ -119,10 +119,10 @@ const MCP_SELECT_STYLES = {
     minHeight: 40,
     borderRadius: 8,
     borderColor: state.isFocused
-      ? "rgba(125, 160, 205, 0.44)"
+      ? "rgba(var(--forge-accent-soft-rgb), 0.44)"
       : "var(--forge-border-strong)",
     backgroundColor: "rgba(13, 17, 23, 0.92)",
-    boxShadow: state.isFocused ? "0 0 0 3px rgba(125, 160, 205, 0.12)" : "none",
+    boxShadow: state.isFocused ? "0 0 0 3px rgba(var(--forge-accent-rgb), 0.12)" : "none",
     cursor: "default",
   }),
   valueContainer: (base) => ({
@@ -166,7 +166,7 @@ const MCP_SELECT_STYLES = {
     borderRadius: 6,
     color: state.isSelected ? "var(--forge-text)" : "var(--forge-text-soft)",
     backgroundColor: state.isSelected
-      ? "rgba(59, 130, 246, 0.18)"
+      ? "rgba(var(--forge-accent-rgb), 0.18)"
       : state.isFocused
         ? "var(--forge-surface-selected)"
         : "transparent",
@@ -194,7 +194,7 @@ const MCP_BAR_SELECT_STYLES = {
     height: 34,
     backgroundColor: "rgba(230, 236, 245, 0.05)",
     borderColor: state.isFocused
-      ? "rgba(147, 197, 253, 0.44)"
+      ? "rgba(var(--forge-accent-soft-rgb), 0.44)"
       : "var(--forge-border, rgba(230, 236, 245, 0.12))",
     cursor: "pointer",
   }),
@@ -2762,17 +2762,17 @@ const McpHubRowHint = styled.span`
 
 const McpHubRowButtonAction = styled.button`
   padding: 5px 12px;
-  border: 1px solid rgba(125, 176, 255, 0.3);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.3);
   border-radius: 7px;
-  color: rgba(200, 222, 255, 0.95);
-  background: rgba(59, 130, 246, 0.12);
+  color: var(--forge-accent-soft, rgba(200, 222, 255, 0.95));
+  background: rgba(var(--forge-accent-rgb), 0.12);
   font-size: 11px;
   font-weight: 750;
   cursor: pointer;
   white-space: nowrap;
 
   &:hover:not(:disabled) {
-    background: rgba(59, 130, 246, 0.24);
+    background: rgba(var(--forge-accent-rgb), 0.24);
   }
 
   &:disabled {

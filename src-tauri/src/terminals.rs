@@ -905,7 +905,7 @@ fn terminal_launch(
     model: Option<String>,
     provider_session_id: Option<String>,
     working_directory: &str,
-) -> Result<(Vec<String>, Vec<String>, String, Option<String>), String> {
+) -> Result<(Vec<String>, Vec<String>, String, Option<String>, Option<String>, Option<String>), String> {
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
     let requested_resume_session_id = provider_session_id
@@ -939,13 +939,21 @@ fn terminal_launch(
         .as_deref()
         .and_then(|session_id| agent_session_last_model(provider, session_id))
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
-    let launch_model = match session_model {
-        Some(model) => Some(model),
-        None => normalize_forge_model(model)?,
+    let request_model = normalize_forge_model(model)?;
+    let (launch_model, launch_model_source) = match session_model {
+        Some(model) => (Some(model), Some("session-current".to_string())),
+        None => {
+            let source = if request_model.is_some() {
+                Some("request".to_string())
+            } else {
+                None
+            };
+            (request_model, source)
+        }
     };
-    if let Some(model) = launch_model {
+    if let Some(model) = launch_model.as_ref() {
         args.push("--model".to_string());
-        args.push(model);
+        args.push(model.clone());
     }
 
     Ok((
@@ -953,6 +961,8 @@ fn terminal_launch(
         args,
         definition.label.to_string(),
         codex_resume_home,
+        launch_model,
+        launch_model_source,
     ))
 }
 
@@ -4846,6 +4856,7 @@ async fn terminal_open(
     app: AppHandle,
     state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
+    app_control_mcp_state: State<'_, AppControlMcpState>,
     request: TerminalOpenRequest,
     output_channel: Channel<InvokeResponseBody>,
 ) -> Result<TerminalOpenResult, String> {
@@ -4884,6 +4895,7 @@ async fn terminal_open(
     let terminal_index = request.terminal_index;
     let thread_id = request.thread_id;
     let requested_slot_key = request.slot_key;
+    let app_control_mcp_requested = request.app_control_mcp.unwrap_or(false);
     let prefer_output_transport = request.output_transport.unwrap_or(false);
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
@@ -4920,6 +4932,7 @@ async fn terminal_open(
                 .map(clean_terminal_diagnostic_log_text),
             "workspace_root_was_empty_at_selection": workspace_root_was_empty_at_selection,
             "output_transport": prefer_output_transport,
+            "app_control_mcp_requested": app_control_mcp_requested,
             "provider_session_id_present": requested_provider_session_id.is_some(),
         }),
     );
@@ -4982,8 +4995,8 @@ async fn terminal_open(
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
         None;
 
-    let (command_candidates, args, label, codex_resume_home) = if is_prewarm_pty || plain_shell {
-        (Vec::new(), Vec::new(), "Prepared PTY".to_string(), None)
+    let (command_candidates, args, label, codex_resume_home, launch_model, launch_model_source) = if is_prewarm_pty || plain_shell {
+        (Vec::new(), Vec::new(), "Prepared PTY".to_string(), None, None, None)
     } else {
         terminal_launch(
             &kind,
@@ -5146,13 +5159,29 @@ async fn terminal_open(
             workspace_id.as_deref(),
             terminal_index,
         );
-        let launch_args = terminal_args_with_codex_mcp_identity(
+        let mut launch_args = terminal_args_with_codex_mcp_identity(
             launch_provider_id,
             &args,
             terminal_coordination.as_ref(),
             &pane_id,
             instance_id,
         );
+        let app_control_mcp_launch = if app_control_mcp_requested {
+            let endpoint =
+                app_control_mcp_endpoint_for_state(app.clone(), app_control_mcp_state.inner())
+                    .await?;
+            let app_control_command = app_control_mcp_command();
+            let app_control_args = app_control_mcp_args_for_endpoint(&endpoint);
+            launch_args = terminal_args_with_app_control_mcp_identity(
+                launch_provider_id,
+                &launch_args,
+                &app_control_command,
+                &app_control_args,
+            )?;
+            Some((app_control_command, app_control_args))
+        } else {
+            None
+        };
         validate_terminal_agent_launch_args_for_platform(launch_provider_id, &launch_args)?;
         let mut coordination_env_vars = terminal_coordination
             .as_ref()
@@ -5171,8 +5200,16 @@ async fn terminal_open(
             activity_transport.as_ref(),
         );
         coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
-        let launch_env_vars =
+        let mut launch_env_vars =
             terminal_env_vars_with_opencode_tui_config(launch_provider_id, &coordination_env_vars)?;
+        if let Some((app_control_command, app_control_args)) = app_control_mcp_launch.as_ref() {
+            launch_env_vars = terminal_env_vars_with_app_control_mcp_identity(
+                launch_provider_id,
+                &launch_env_vars,
+                app_control_command,
+                app_control_args,
+            )?;
+        }
 
         let warm_pty = match create_agent_terminal_pty(
             size,
@@ -5447,6 +5484,8 @@ async fn terminal_open(
         provider_session_id: runtime_snapshot.provider_session_id.clone(),
         native_session_id: runtime_snapshot.native_session_id.clone(),
         requested_provider_session_id,
+        model: launch_model,
+        model_source: launch_model_source,
         activity_status: runtime_snapshot.activity_status,
         command_phase: runtime_snapshot.command_phase,
         input_ready: runtime_snapshot.input_ready,
@@ -5876,6 +5915,8 @@ async fn start_terminal_agent_in_prepared_pty(
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id,
+            model: None,
+            model_source: None,
             started: false,
             skipped: true,
             message: app_shutdown_blocked_message("terminal agent batch start"),
@@ -5886,6 +5927,8 @@ async fn start_terminal_agent_in_prepared_pty(
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id,
+            model: None,
+            model_source: None,
             started: false,
             skipped: true,
             message: error,
@@ -5898,6 +5941,8 @@ async fn start_terminal_agent_in_prepared_pty(
             return TerminalStartAgentPaneResult {
                 pane_id,
                 instance_id,
+                model: None,
+                model_source: None,
                 started: false,
                 skipped: true,
                 message: error,
@@ -5917,6 +5962,8 @@ async fn start_terminal_agent_in_prepared_pty(
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id,
+            model: None,
+            model_source: None,
             started: false,
             skipped: true,
             message: "Terminal session is not running.".to_string(),
@@ -5952,32 +5999,42 @@ async fn start_terminal_agent_in_prepared_pty(
         .as_deref()
         .and_then(|session_id| agent_session_last_model(provider, session_id))
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
-    let request_model = if session_model.is_some() {
-        Ok(session_model)
-    } else {
-        normalize_forge_model(request.model)
-    };
-    match request_model {
-        Ok(Some(model)) => {
-            args.push("--model".to_string());
-            args.push(model);
-        }
-        Ok(None) => {}
+    let request_model = match normalize_forge_model(request.model) {
+        Ok(model) => model,
         Err(error) => {
             return TerminalStartAgentPaneResult {
                 pane_id,
                 instance_id,
+                model: None,
+                model_source: None,
                 started: false,
                 skipped: true,
                 message: error,
             };
         }
+    };
+    let (launch_model, launch_model_source) = match session_model {
+        Some(model) => (Some(model), Some("session-current".to_string())),
+        None => {
+            let source = if request_model.is_some() {
+                Some("request".to_string())
+            } else {
+                None
+            };
+            (request_model, source)
+        }
+    };
+    if let Some(model) = launch_model.as_ref() {
+        args.push("--model".to_string());
+        args.push(model.clone());
     }
 
     if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id,
+            model: None,
+            model_source: None,
             started: false,
             skipped: true,
             message: "Terminal session was replaced before agent start.".to_string(),
@@ -5988,6 +6045,8 @@ async fn start_terminal_agent_in_prepared_pty(
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id: Some(instance.id),
+            model: None,
+            model_source: None,
             started: false,
             skipped: true,
             message:
@@ -6002,6 +6061,8 @@ async fn start_terminal_agent_in_prepared_pty(
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id: Some(instance.id),
+            model: None,
+            model_source: None,
             started: false,
             skipped: true,
             message: "Terminal agent has already been started.".to_string(),
@@ -6016,6 +6077,8 @@ async fn start_terminal_agent_in_prepared_pty(
             return TerminalStartAgentPaneResult {
                 pane_id,
                 instance_id: Some(instance.id),
+                model: None,
+                model_source: None,
                 started: false,
                 skipped: false,
                 message: format!(
@@ -6045,6 +6108,8 @@ async fn start_terminal_agent_in_prepared_pty(
             return TerminalStartAgentPaneResult {
                 pane_id,
                 instance_id: Some(instance.id),
+                model: None,
+                model_source: None,
                 started: false,
                 skipped: false,
                 message: error,
@@ -6095,6 +6160,8 @@ async fn start_terminal_agent_in_prepared_pty(
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
+                    model: None,
+                    model_source: None,
                     started: false,
                     skipped: false,
                     message: error,
@@ -6110,6 +6177,8 @@ async fn start_terminal_agent_in_prepared_pty(
                     return TerminalStartAgentPaneResult {
                         pane_id,
                         instance_id: Some(instance.id),
+                        model: None,
+                        model_source: None,
                         started: false,
                         skipped: false,
                         message: error,
@@ -6127,6 +6196,8 @@ async fn start_terminal_agent_in_prepared_pty(
             return TerminalStartAgentPaneResult {
                 pane_id,
                 instance_id: Some(instance.id),
+                model: None,
+                model_source: None,
                 started: false,
                 skipped: false,
                 message: "Terminal launch input is too large.".to_string(),
@@ -6171,6 +6242,8 @@ async fn start_terminal_agent_in_prepared_pty(
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
+                    model: launch_model,
+                    model_source: launch_model_source,
                     started: true,
                     skipped: false,
                     message: "Agent started.".to_string(),
@@ -6180,6 +6253,8 @@ async fn start_terminal_agent_in_prepared_pty(
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
+                    model: None,
+                    model_source: None,
                     started: false,
                     skipped: false,
                     message: error,
@@ -6190,6 +6265,8 @@ async fn start_terminal_agent_in_prepared_pty(
     TerminalStartAgentPaneResult {
         pane_id,
         instance_id: Some(instance.id),
+        model: None,
+        model_source: None,
         started: false,
         skipped: true,
         message: "Terminal shell is not available for deferred agent launch.".to_string(),
@@ -6242,6 +6319,8 @@ async fn terminal_start_agent_many(
             Err(error) => results.push(TerminalStartAgentPaneResult {
                 pane_id: String::new(),
                 instance_id: None,
+                model: None,
+                model_source: None,
                 started: false,
                 skipped: false,
                 message: format!("Unable to join terminal agent start task: {error}"),

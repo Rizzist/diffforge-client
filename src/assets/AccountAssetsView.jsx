@@ -2819,18 +2819,18 @@ const AssetModeTab = styled.button`
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.24);
-    color: rgba(224, 242, 254, 0.94);
-    background: rgba(14, 165, 233, 0.1);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.24);
+    color: var(--forge-accent-soft, rgba(224, 242, 254, 0.94));
+    background: rgba(var(--forge-accent-rgb), 0.1);
   }
 
   &[data-active="true"] {
-    border-color: rgba(45, 212, 191, 0.26);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.16);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.16);
 
     span {
-      color: rgba(204, 251, 241, 0.78);
+      color: var(--forge-accent-soft, rgba(204, 251, 241, 0.78));
     }
   }
 `;
@@ -2872,10 +2872,10 @@ const AssetSyncPill = styled.span`
   gap: 4px;
   min-height: 20px;
   padding: 0 7px;
-  border: 1px solid rgba(96, 165, 250, 0.22);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
   border-radius: 7px;
-  color: rgba(191, 219, 254, 0.86);
-  background: rgba(30, 64, 175, 0.14);
+  color: var(--forge-accent-soft, rgba(191, 219, 254, 0.86));
+  background: rgba(var(--forge-accent-rgb), 0.14);
   font-size: 8px;
   font-weight: 850;
   line-height: 1;
@@ -2961,15 +2961,15 @@ const AssetCloudButton = styled.button`
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    color: rgba(224, 242, 254, 0.94);
-    background: rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(224, 242, 254, 0.94));
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 
   &[data-active="true"] {
-    border-color: rgba(45, 212, 191, 0.34);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.2);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.42);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.2);
   }
 `;
 
@@ -3062,12 +3062,12 @@ const AssetCloudRow = styled.div`
   > svg {
     width: 16px;
     height: 16px;
-    color: rgba(125, 211, 252, 0.78);
+    color: rgba(var(--forge-accent-soft-rgb), 0.78);
   }
 
   &[data-active="true"] {
-    border-color: rgba(45, 212, 191, 0.26);
-    background: rgba(13, 148, 136, 0.12);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.32);
+    background: rgba(var(--forge-accent-rgb), 0.12);
   }
 `;
 
@@ -3136,9 +3136,9 @@ const AssetProviderButton = styled.button`
   &[data-active="true"],
   &:hover,
   &:focus-visible {
-    border-color: rgba(45, 212, 191, 0.26);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.18);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.18);
   }
 `;
 
@@ -3167,7 +3167,7 @@ const AssetCloudInput = styled.input`
   outline: none;
 
   &:focus {
-    border-color: rgba(125, 211, 252, 0.42);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.42);
   }
 
   &::placeholder {
@@ -3205,15 +3205,15 @@ const AssetMiniButton = styled.button`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    color: rgba(224, 242, 254, 0.94);
-    background: rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(224, 242, 254, 0.94));
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 
   &[data-primary="true"] {
-    border-color: rgba(45, 212, 191, 0.26);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.16);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.16);
   }
 
   &[data-danger="true"] {
@@ -3369,15 +3369,15 @@ const AssetBatchButton = styled.button`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    color: rgba(224, 242, 254, 0.95);
-    background: rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(224, 242, 254, 0.95));
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 
   &[data-primary="true"] {
-    border-color: rgba(45, 212, 191, 0.26);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.16);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.16);
   }
 
   &[data-danger="true"] {
@@ -3578,7 +3578,7 @@ const AssetCard = styled.article`
 
   &:hover,
   &:focus-within {
-    border-color: rgba(125, 211, 252, 0.36);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
     box-shadow: 0 12px 28px rgba(2, 6, 23, 0.34);
     transform: translateY(-1px);
 
@@ -3612,14 +3612,14 @@ const AssetCard = styled.article`
   }
 
   &[data-status="active"] {
-    border-color: rgba(96, 165, 250, 0.3);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.3);
   }
 
   &[data-selected="true"] {
-    border-color: rgba(45, 212, 191, 0.5);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.5);
     box-shadow:
       0 12px 28px rgba(2, 6, 23, 0.34),
-      0 0 0 1px rgba(45, 212, 191, 0.22);
+      0 0 0 1px rgba(var(--forge-accent-rgb), 0.22);
   }
 
   @media (hover: none) {
@@ -3669,7 +3669,7 @@ const AssetCardPreview = styled.button`
   cursor: pointer;
 
   &:focus-visible {
-    outline: 2px solid rgba(125, 211, 252, 0.46);
+    outline: 2px solid rgba(var(--forge-accent-soft-rgb), 0.46);
     outline-offset: -3px;
   }
 
@@ -3748,7 +3748,7 @@ const AssetPreviewPlaceholder = styled.div`
   overflow: hidden;
   pointer-events: none;
   background:
-    radial-gradient(circle at 24% 28%, rgba(125, 176, 255, 0.16), transparent 30%),
+    radial-gradient(circle at 24% 28%, rgba(var(--forge-accent-soft-rgb), 0.16), transparent 30%),
     linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 41, 59, 0.7));
 
   &::after {
@@ -3830,13 +3830,13 @@ const AssetCardStatus = styled.span`
   }
 
   &[data-status="remote"] {
-    border-color: rgba(125, 176, 255, 0.28);
-    color: rgba(191, 219, 254, 0.9);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
+    color: var(--forge-accent-soft, rgba(191, 219, 254, 0.9));
   }
 
   &[data-status="active"] {
-    border-color: rgba(96, 165, 250, 0.24);
-    color: rgba(191, 219, 254, 0.88);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.24);
+    color: var(--forge-accent-soft, rgba(191, 219, 254, 0.88));
   }
 
   &[data-status="parked"] {
@@ -3901,9 +3901,9 @@ const AssetAvailabilityBadge = styled.span`
   }
 
   &[data-kind="remote"] {
-    border-color: rgba(125, 176, 255, 0.28);
-    color: rgba(207, 227, 255, 0.94);
-    background: rgba(37, 64, 110, 0.26);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
+    color: var(--forge-accent-soft, rgba(207, 227, 255, 0.94));
+    background: rgba(var(--forge-accent-rgb), 0.18);
   }
 
   &[data-kind="unavailable"] {
@@ -3942,9 +3942,9 @@ const AssetShareButton = styled.button`
   align-items: center;
   gap: 5px;
   padding: 0 8px;
-  border: 1px solid rgba(125, 176, 255, 0.28);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.28);
   border-radius: 999px;
-  color: rgba(219, 234, 254, 0.94);
+  color: var(--forge-accent-soft, rgba(219, 234, 254, 0.94));
   background: rgba(7, 10, 16, 0.88);
   font: inherit;
   font-size: 9px;
@@ -3969,16 +3969,16 @@ const AssetShareButton = styled.button`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 176, 255, 0.6);
-    color: #06121f;
-    background: #7db0ff;
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.6);
+    color: var(--forge-bg-deep, #06121f);
+    background: var(--forge-accent-soft, #7db0ff);
     transform: translateX(-1px);
   }
 
   &[data-primary="true"] {
-    border-color: rgba(45, 212, 191, 0.32);
-    color: rgba(204, 251, 241, 0.98);
-    background: rgba(13, 148, 136, 0.22);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.98));
+    background: rgba(var(--forge-accent-rgb), 0.22);
   }
 
   &[data-warning="true"] {
@@ -4037,15 +4037,15 @@ const AssetUtilityButton = styled.button`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 176, 255, 0.55);
-    background: rgba(23, 37, 62, 0.92);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.55);
+    background: rgba(var(--forge-accent-rgb), 0.2);
     transform: scale(1.05);
   }
 
   &[data-primary="true"] {
-    border-color: rgba(45, 212, 191, 0.28);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.18);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.18);
   }
 
   &[data-warning="true"] {
@@ -4061,9 +4061,9 @@ const AssetUtilityButton = styled.button`
   }
 
   &[data-pinned="true"] {
-    border-color: rgba(125, 176, 255, 0.5);
-    color: #cfe3ff;
-    background: rgba(37, 64, 110, 0.9);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.5);
+    color: var(--forge-accent-soft, #cfe3ff);
+    background: rgba(var(--forge-accent-rgb), 0.26);
   }
 
   &:disabled {
@@ -4077,16 +4077,16 @@ const AssetTopActionButton = styled(AssetUtilityButton).attrs({ "data-asset-uplo
   top: 8px;
   right: 42px;
   z-index: 5;
-  border-color: rgba(125, 176, 255, 0.34);
-  color: #cfe3ff;
+  border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+  color: var(--forge-accent-soft, #cfe3ff);
   opacity: 0;
   pointer-events: none;
   transform: translateY(-3px);
 
   &:hover:not(:disabled),
   &:focus-visible {
-    color: #06121f;
-    background: #7db0ff;
+    color: var(--forge-bg-deep, #06121f);
+    background: var(--forge-accent-soft, #7db0ff);
     border-color: transparent;
   }
 
@@ -4119,8 +4119,8 @@ const AssetTopActionButton = styled(AssetUtilityButton).attrs({ "data-asset-uplo
 const AssetFloatPinButton = styled(AssetUtilityButton).attrs({ "data-asset-pin": "true" })``;
 
 const AssetTrackButton = styled(AssetUtilityButton).attrs({ "data-asset-track": "true" })`
-  border-color: rgba(125, 176, 255, 0.34);
-  color: #cfe3ff;
+  border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+  color: var(--forge-accent-soft, #cfe3ff);
 `;
 
 const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
@@ -4152,9 +4152,9 @@ const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
   &:hover:not(:disabled),
   &:focus-visible,
   &[data-selected="true"] {
-    border-color: rgba(45, 212, 191, 0.36);
-    color: rgba(204, 251, 241, 0.96);
-    background: rgba(13, 148, 136, 0.2);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.42);
+    color: var(--forge-accent-soft, rgba(204, 251, 241, 0.96));
+    background: rgba(var(--forge-accent-rgb), 0.2);
     opacity: 1;
     pointer-events: auto;
     transform: translateY(0);
@@ -4222,12 +4222,12 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   button:focus-visible {
     border: 0;
     color: #ffffff;
-    background: rgba(125, 176, 255, 0.22);
+    background: rgba(var(--forge-accent-rgb), 0.22);
   }
 
   button[data-primary="true"]:hover:not(:disabled) {
-    color: #06121f;
-    background: rgba(45, 212, 191, 0.85);
+    color: var(--forge-bg-deep, #06121f);
+    background: rgba(var(--forge-accent-soft-rgb), 0.85);
   }
 
   button[data-warning="true"]:hover:not(:disabled) {
@@ -4352,9 +4352,9 @@ const AssetInfoCloseButton = styled.button`
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    color: rgba(224, 242, 254, 0.94);
-    background: rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(224, 242, 254, 0.94));
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 `;
 
@@ -4423,12 +4423,12 @@ const AssetInfoStatusCard = styled.div`
   }
 
   &[data-active="true"][data-kind="remote"] {
-    border-color: rgba(59, 130, 246, 0.36);
-    background: rgba(59, 130, 246, 0.13);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
+    background: rgba(var(--forge-accent-rgb), 0.13);
 
     svg,
     strong {
-      color: #93c5fd;
+      color: var(--forge-accent-soft, #93c5fd);
     }
   }
 `;
@@ -4490,14 +4490,14 @@ const AssetInfoDeviceRow = styled.div`
   align-items: center;
   min-width: 0;
   padding: 8px;
-  border: 1px solid rgba(125, 176, 255, 0.16);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.16);
   border-radius: 7px;
   background: rgba(30, 41, 59, 0.32);
 
   svg {
     width: 16px;
     height: 16px;
-    color: rgba(191, 219, 254, 0.9);
+    color: var(--forge-accent-soft, rgba(191, 219, 254, 0.9));
   }
 
   div {
@@ -4545,7 +4545,7 @@ const AssetTransferOverlay = styled.div`
   align-items: center;
   gap: 6px;
   padding: 5px 6px;
-  border: 1px solid rgba(96, 165, 250, 0.22);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
   border-radius: 7px;
   background: rgba(2, 6, 23, 0.88);
   backdrop-filter: blur(8px);
@@ -4560,7 +4560,7 @@ const AssetTransferInfo = styled.div`
 
 const AssetTransferLabel = styled.span`
   overflow: hidden;
-  color: rgba(191, 219, 254, 0.9);
+  color: var(--forge-accent-soft, rgba(191, 219, 254, 0.9));
   font-size: 8px;
   font-weight: 850;
   line-height: 1;
@@ -4580,7 +4580,7 @@ const AssetTransferFill = styled.div`
   height: 100%;
   min-width: 4%;
   border-radius: inherit;
-  background: rgba(96, 165, 250, 0.92);
+  background: rgba(var(--forge-accent-soft-rgb), 0.92);
   transition: width 200ms ease;
 `;
 
@@ -4774,9 +4774,9 @@ const AssetIconButton = styled.button`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    color: rgba(224, 242, 254, 0.94);
-    background: rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    color: var(--forge-accent-soft, rgba(224, 242, 254, 0.94));
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 
   &:disabled {

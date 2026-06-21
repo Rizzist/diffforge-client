@@ -4,13 +4,18 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Background,
   BaseEdge,
+  Controls,
   EdgeLabelRenderer,
+  getConnectedEdges,
   Handle,
   MarkerType,
+  MiniMap,
   Position,
   ReactFlow,
+  ReactFlowProvider,
   useEdgesState,
   useNodesState,
+  useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import styled, { keyframes } from "styled-components";
@@ -157,7 +162,7 @@ const ARCHITECTURE_TARGET_SELECT_STYLES = {
     minHeight: 30,
     height: 30,
     borderRadius: 999,
-    borderColor: state.isFocused ? "rgba(125, 176, 255, 0.58)" : "rgba(230, 236, 245, 0.11)",
+    borderColor: state.isFocused ? "rgba(var(--forge-accent-soft-rgb), 0.58)" : "rgba(230, 236, 245, 0.11)",
     backgroundColor: "rgba(21, 27, 36, 0.92)",
     boxShadow: "none",
     color: "#eef4ff",
@@ -182,7 +187,7 @@ const ARCHITECTURE_TARGET_SELECT_STYLES = {
     ...base,
     color: state.isSelected ? "#f8fbff" : "#b7c4d8",
     backgroundColor: state.isSelected
-      ? "rgba(96, 165, 250, 0.22)"
+      ? "rgba(var(--forge-accent-rgb), 0.22)"
       : state.isFocused
         ? "rgba(148, 163, 184, 0.12)"
         : "transparent",
@@ -497,8 +502,8 @@ const ARCHITECTURE_EDGE_LABEL_ROUTE_PADDING = 6;
 const ARCHITECTURE_EDGE_LABEL_OWN_ROUTE_PADDING = 1;
 const ARCHITECTURE_NODE_CARD_WIDTH = 184;
 const ARCHITECTURE_NODE_CARD_HEIGHT = 76;
-const ARCHITECTURE_NODE_COMPACT_WIDTH = 88;
-const ARCHITECTURE_NODE_COMPACT_HEIGHT = 70;
+const ARCHITECTURE_NODE_COMPACT_WIDTH = 100;
+const ARCHITECTURE_NODE_COMPACT_HEIGHT = 80;
 
 function jsonObject(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -2970,10 +2975,10 @@ function architectureLayoutGraph(graph) {
   const groupPadBottom = 48;
   const rootPadX = 80;
   const rootPadY = 70;
-  const rankGap = 176;
-  const rowGap = 54;
-  const groupRankGap = 116;
-  const groupRowGap = 46;
+  const rankGap = 150;
+  const rowGap = 58;
+  const groupRankGap = 104;
+  const groupRowGap = 44;
   const edges = jsonArray(graph.edges)
     .map((edge) => ({
       source: text(edge?.source || edge?.from),
@@ -3050,8 +3055,237 @@ function architectureLayoutGraph(graph) {
     return childRanks.length ? Math.min(...childRanks) : rankById.get(entity.id) || 0;
   }
 
+  // Map each edge leaf endpoint id to the scope-level box id that contains it,
+  // so inter-group edges influence ordering/alignment at the parent scope.
+  function buildEndpointToBoxMap(scopeBoxes) {
+    const map = new Map();
+    scopeBoxes.forEach((box) => {
+      if (box.node?.type === "group") {
+        descendantNodeIds(box.id).forEach((leafId) => map.set(leafId, box.id));
+      } else {
+        map.set(box.id, box.id);
+      }
+    });
+    return map;
+  }
+
+  function countInversions(values) {
+    const work = values.slice();
+    const tmp = new Array(work.length);
+    let count = 0;
+    const sort = (lo, hi) => {
+      if (hi - lo <= 1) return;
+      const mid = (lo + hi) >> 1;
+      sort(lo, mid);
+      sort(mid, hi);
+      let i = lo;
+      let j = mid;
+      let k = lo;
+      while (i < mid && j < hi) {
+        if (work[i] <= work[j]) {
+          tmp[k] = work[i];
+          i += 1;
+        } else {
+          tmp[k] = work[j];
+          j += 1;
+          count += mid - i;
+        }
+        k += 1;
+      }
+      while (i < mid) { tmp[k] = work[i]; i += 1; k += 1; }
+      while (j < hi) { tmp[k] = work[j]; j += 1; k += 1; }
+      for (let t = lo; t < hi; t += 1) work[t] = tmp[t];
+    };
+    sort(0, work.length);
+    return count;
+  }
+
+  // Sugiyama median crossing-minimization within ranks. Returns a global
+  // ordinal map; deterministic (seeded from DSL order, tie-broken by it).
+  function orderRanksByMedian(scopeBoxes) {
+    const ids = new Set(scopeBoxes.map((box) => box.id));
+    if (ids.size <= 2) return new Map();
+    const rankOf = new Map(scopeBoxes.map((box) => [box.id, numberValue(box.rank, 0)]));
+    const dslOrder = new Map(scopeBoxes.map((box) => [box.id, numberValue(box.order, 0)]));
+    const endpointBox = buildEndpointToBoxMap(scopeBoxes);
+    const downAdj = new Map([...ids].map((id) => [id, []]));
+    const upAdj = new Map([...ids].map((id) => [id, []]));
+    edges.forEach((edge) => {
+      const sourceBox = endpointBox.get(edge.source);
+      const targetBox = endpointBox.get(edge.target);
+      if (!sourceBox || !targetBox || sourceBox === targetBox) return;
+      if (!ids.has(sourceBox) || !ids.has(targetBox)) return;
+      const sourceRank = rankOf.get(sourceBox);
+      const targetRank = rankOf.get(targetBox);
+      if (sourceRank === targetRank) return;
+      const [low, high] = sourceRank < targetRank ? [sourceBox, targetBox] : [targetBox, sourceBox];
+      downAdj.get(low).push(high);
+      upAdj.get(high).push(low);
+    });
+
+    const rankKeys = [...new Set(scopeBoxes.map((box) => numberValue(box.rank, 0)))]
+      .sort((left, right) => left - right);
+    if (reverseRanks) rankKeys.reverse();
+    let layers = rankKeys.map((rank) => scopeBoxes
+      .filter((box) => numberValue(box.rank, 0) === rank)
+      .sort((left, right) => dslOrder.get(left.id) - dslOrder.get(right.id)
+        || text(left.id).localeCompare(text(right.id)))
+      .map((box) => box.id));
+
+    const medianValue = (neighbors, pos) => {
+      const positions = neighbors
+        .map((neighbor) => pos.get(neighbor))
+        .filter((value) => value !== undefined)
+        .sort((left, right) => left - right);
+      if (!positions.length) return -1;
+      const mid = Math.floor(positions.length / 2);
+      if (positions.length % 2 === 1) return positions[mid];
+      if (positions.length === 2) return (positions[0] + positions[1]) / 2;
+      const left = positions[mid - 1] - positions[0];
+      const right = positions[positions.length - 1] - positions[mid];
+      if (left + right === 0) return (positions[mid - 1] + positions[mid]) / 2;
+      return (positions[mid - 1] * right + positions[mid] * left) / (left + right);
+    };
+
+    const sortLayer = (layer, adj, pos) => {
+      const measure = new Map(layer.map((id) => [id, medianValue(adj.get(id) || [], pos)]));
+      const fixed = layer.map((id) => measure.get(id) === -1);
+      const movable = layer
+        .filter((id) => measure.get(id) !== -1)
+        .sort((left, right) => measure.get(left) - measure.get(right)
+          || dslOrder.get(left) - dslOrder.get(right)
+          || text(left).localeCompare(text(right)));
+      const result = [];
+      let cursor = 0;
+      layer.forEach((id, index) => {
+        result.push(fixed[index] ? id : movable[cursor++]);
+      });
+      return result;
+    };
+
+    const buildPos = (currentLayers) => {
+      const pos = new Map();
+      currentLayers.forEach((layer) => layer.forEach((id, index) => pos.set(id, index)));
+      return pos;
+    };
+
+    const crossingsBetween = (upper, lower) => {
+      const lowerPos = new Map(lower.map((id, index) => [id, index]));
+      const sequence = [];
+      upper.forEach((id, upperIndex) => {
+        (downAdj.get(id) || []).forEach((neighbor) => {
+          if (lowerPos.has(neighbor)) sequence.push([upperIndex, lowerPos.get(neighbor)]);
+        });
+      });
+      sequence.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+      return countInversions(sequence.map((pair) => pair[1]));
+    };
+
+    const totalCrossings = (currentLayers) => {
+      let total = 0;
+      for (let index = 0; index + 1 < currentLayers.length; index += 1) {
+        total += crossingsBetween(currentLayers[index], currentLayers[index + 1]);
+      }
+      return total;
+    };
+
+    let best = layers.map((layer) => [...layer]);
+    let bestCrossings = totalCrossings(layers);
+    for (let sweep = 0; sweep < 8 && bestCrossings > 0; sweep += 1) {
+      const pos = buildPos(layers);
+      if (sweep % 2 === 0) {
+        for (let index = 1; index < layers.length; index += 1) {
+          layers[index] = sortLayer(layers[index], upAdj, pos);
+          layers[index].forEach((id, idx) => pos.set(id, idx));
+        }
+      } else {
+        for (let index = layers.length - 2; index >= 0; index -= 1) {
+          layers[index] = sortLayer(layers[index], downAdj, pos);
+          layers[index].forEach((id, idx) => pos.set(id, idx));
+        }
+      }
+      const crossings = totalCrossings(layers);
+      if (crossings < bestCrossings) {
+        bestCrossings = crossings;
+        best = layers.map((layer) => [...layer]);
+      }
+    }
+
+    const orderMap = new Map();
+    let ordinal = 0;
+    best.forEach((layer) => layer.forEach((id) => orderMap.set(id, ordinal++)));
+    return orderMap;
+  }
+
+  // Pull each box's cross-axis coordinate toward the median of its neighbors'
+  // centers so chains straighten. Order-preserving (no new crossings).
+  function alignCrossAxis(placed, gap) {
+    if (placed.length <= 1) return;
+    const crossKey = horizontal ? "y" : "x";
+    const sizeKey = horizontal ? "height" : "width";
+    const boxById = new Map(placed.map((box) => [box.id, box]));
+    const endpointBox = buildEndpointToBoxMap(placed);
+    const neighbors = new Map(placed.map((box) => [box.id, []]));
+    edges.forEach((edge) => {
+      const sourceBox = endpointBox.get(edge.source);
+      const targetBox = endpointBox.get(edge.target);
+      if (!sourceBox || !targetBox || sourceBox === targetBox) return;
+      if (!boxById.has(sourceBox) || !boxById.has(targetBox)) return;
+      if (numberValue(boxById.get(sourceBox).rank, 0) === numberValue(boxById.get(targetBox).rank, 0)) return;
+      neighbors.get(sourceBox).push(targetBox);
+      neighbors.get(targetBox).push(sourceBox);
+    });
+
+    const byRank = new Map();
+    placed.forEach((box) => {
+      const rank = numberValue(box.rank, 0);
+      if (!byRank.has(rank)) byRank.set(rank, []);
+      byRank.get(rank).push(box);
+    });
+    const rankKeys = [...byRank.keys()].sort((left, right) => left - right);
+    const layers = rankKeys.map((rank) => byRank.get(rank));
+
+    const centerOf = (box) => box[crossKey] + numberValue(box[sizeKey], 0) / 2;
+    const desiredCenter = (box) => {
+      const centers = (neighbors.get(box.id) || [])
+        .map((id) => centerOf(boxById.get(id)))
+        .sort((left, right) => left - right);
+      if (!centers.length) return null;
+      const mid = Math.floor(centers.length / 2);
+      return centers.length % 2 === 1 ? centers[mid] : (centers[mid - 1] + centers[mid]) / 2;
+    };
+
+    const passLayer = (layer) => {
+      for (let index = 0; index < layer.length; index += 1) {
+        const box = layer[index];
+        const want = desiredCenter(box);
+        if (want === null) continue;
+        const halfSize = numberValue(box[sizeKey], 0) / 2;
+        let low = -Infinity;
+        let high = Infinity;
+        if (index > 0) {
+          const prev = layer[index - 1];
+          low = prev[crossKey] + numberValue(prev[sizeKey], 0) + gap + halfSize;
+        }
+        if (index < layer.length - 1) {
+          const next = layer[index + 1];
+          high = next[crossKey] - gap - halfSize;
+        }
+        if (low > high) continue;
+        const clamped = Math.max(low, Math.min(high, want));
+        box[crossKey] = Math.round(clamped - halfSize);
+      }
+    };
+
+    for (let round = 0; round < 2; round += 1) {
+      for (let index = 0; index < layers.length; index += 1) passLayer(layers[index]);
+      for (let index = layers.length - 1; index >= 0; index -= 1) passLayer(layers[index]);
+    }
+  }
+
   function layoutRankedBoxes(boxes, options = {}) {
     const safeBoxes = boxes.filter(Boolean);
+    const medianOrder = orderRanksByMedian(safeBoxes);
     const paddingLeft = numberValue(options.paddingLeft, 0);
     const paddingTop = numberValue(options.paddingTop, 0);
     const paddingRight = numberValue(options.paddingRight, paddingLeft);
@@ -3075,6 +3309,8 @@ function architectureLayoutGraph(graph) {
     safeBoxes
       .sort((left, right) => (
         numberValue(left.rank, 0) - numberValue(right.rank, 0)
+          || (medianOrder.get(left.id) ?? numberValue(left.order, 0))
+            - (medianOrder.get(right.id) ?? numberValue(right.order, 0))
           || numberValue(left.order, 0) - numberValue(right.order, 0)
           || text(left.id).localeCompare(text(right.id))
       ))
@@ -3127,6 +3363,26 @@ function architectureLayoutGraph(graph) {
         height = Math.max(height, y + rowHeight + paddingBottom);
         y += rowHeight + localRankGap;
       });
+    }
+
+    alignCrossAxis(placed, localRowGap);
+    if (placed.length) {
+      const crossKey = horizontal ? "y" : "x";
+      const padStart = horizontal ? paddingTop : paddingLeft;
+      const minCross = Math.min(...placed.map((box) => box[crossKey]));
+      const shift = padStart - minCross;
+      if (shift > 0.5) {
+        const delta = Math.round(shift);
+        placed.forEach((box) => { box[crossKey] += delta; });
+      }
+      let maxRight = 0;
+      let maxBottom = 0;
+      placed.forEach((box) => {
+        maxRight = Math.max(maxRight, box.x + numberValue(box.width, nodeWidth));
+        maxBottom = Math.max(maxBottom, box.y + numberValue(box.height, nodeHeight));
+      });
+      width = Math.max(width, maxRight + paddingRight);
+      height = Math.max(height, maxBottom + paddingBottom);
     }
 
     return {
@@ -6337,8 +6593,10 @@ function ArchitecturesPanel({
     })
       .then((result) => {
         const nextGraph = result?.graph || graph;
+        const savedGraphId = architectureGraphId(nextGraph) || result?.graphId || result?.graph_id || graph.id;
+        suppressExternalGraphWrites([savedGraphId]);
         setSelectedGraph(nextGraph);
-        setSelectedGraphId(result?.graphId || graph.id);
+        setSelectedGraphId(savedGraphId || graph.id);
         setCreatingGraph(false);
         setDraftTitle("");
         setDraftLocationMode("root");
@@ -6363,7 +6621,7 @@ function ArchitecturesPanel({
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
       });
-  }, [draftFolderPath, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
+  }, [draftFolderPath, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath, selectedRepoSyncContext, suppressExternalGraphWrites, syncWorkspaceId, syncWorkspaceName]);
 
   const saveGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -6375,10 +6633,23 @@ function ArchitecturesPanel({
     })
       .then((result) => {
         const nextGraph = result?.graph || graph;
+        const savedGraphId = architectureGraphId(nextGraph) || result?.graphId || result?.graph_id;
+        suppressExternalGraphWrites([savedGraphId]);
         setSelectedGraph(nextGraph);
-        setSelectedGraphId(result?.graphId || nextGraph.id);
-        const syncPromise = syncWorkspaceId
-          ? invoke("cloud_mcp_sync_architecture", {
+        setSelectedGraphId(savedGraphId || nextGraph.id);
+        setSelectedGraphDirty(false);
+        selectedGraphDirtyRef.current = false;
+        setSelectedGraphExternalDirty(false);
+        setExternalDirtyGraphIds((currentIds) => {
+          if (!savedGraphId || !currentIds.has(savedGraphId)) return currentIds;
+          const nextIds = new Set(currentIds);
+          nextIds.delete(savedGraphId);
+          return nextIds;
+        });
+        setSaveState("idle");
+        void loadGraphList(selectedRepoPath, { refresh: true });
+        if (syncWorkspaceId) {
+          void invoke("cloud_mcp_sync_architecture", {
             graph: nextGraph,
             reason: "architecture_graph_save",
             repoPath: selectedRepoPath,
@@ -6388,30 +6659,16 @@ function ArchitecturesPanel({
               scopeRepoId: selectedRepoSyncContext.scopeRepoId,
               scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
             } : {}),
-          })
-          : Promise.resolve(null);
-        return syncPromise.then(() => {
-          setSelectedGraphDirty(false);
-          selectedGraphDirtyRef.current = false;
-          setSelectedGraphExternalDirty(false);
-          setExternalDirtyGraphIds((currentIds) => {
-            const savedGraphId = architectureGraphId(nextGraph) || result?.graphId || result?.graph_id;
-            if (!savedGraphId || !currentIds.has(savedGraphId)) return currentIds;
-            const nextIds = new Set(currentIds);
-            nextIds.delete(savedGraphId);
-            return nextIds;
-          });
-          setSaveState("idle");
-          void loadGraphList(selectedRepoPath, { refresh: true });
-          return nextGraph;
-        });
+          }).catch(() => {});
+        }
+        return nextGraph;
       })
       .catch((nextError) => {
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to save architecture graph."));
         throw nextError;
       });
-  }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
+  }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, suppressExternalGraphWrites, syncWorkspaceId, syncWorkspaceName]);
 
   const deleteGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -6459,6 +6716,7 @@ function ArchitecturesPanel({
   const handleRevisionRestored = useCallback((result) => {
     const nextGraph = result?.graph || null;
     const nextGraphId = text(result?.graphId || result?.graph_id || nextGraph?.id);
+    suppressExternalGraphWrites([nextGraphId]);
     if (nextGraph) setSelectedGraph(nextGraph);
     if (nextGraphId) setSelectedGraphId(nextGraphId);
     setCreatingGraph(false);
@@ -6486,7 +6744,7 @@ function ArchitecturesPanel({
       }).catch(() => {});
     }
     void loadGraphList(selectedRepoPath, { refresh: true });
-  }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
+  }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, suppressExternalGraphWrites, syncWorkspaceId, syncWorkspaceName]);
 
   const renderTreeRows = useCallback((emptyDepth = 0) => (
     <>
@@ -6996,7 +7254,15 @@ function ArchitectureGraphResolvingSurface({
   );
 }
 
-function ArchitectureGraphEditor({
+function ArchitectureGraphEditor(props) {
+  return (
+    <ReactFlowProvider>
+      <ArchitectureGraphEditorView {...props} />
+    </ReactFlowProvider>
+  );
+}
+
+function ArchitectureGraphEditorView({
   agentEditMarker = null,
   externalDirty = false,
   graph,
@@ -7024,9 +7290,56 @@ function ArchitectureGraphEditor({
   const [expandedCorridorId, setExpandedCorridorId] = useState("");
   const [runSelections, setRunSelections] = useState({});
   const routeCacheRef = useRef(new Map());
+  const colorMode = useForgeThemeMode();
+  const reactFlow = useReactFlow();
+  const [searchQuery, setSearchQuery] = useState("");
+  const [focusedNodeId, setFocusedNodeId] = useState("");
+  const activeFocusId = focusedNodeId;
   const runTargets = useMemo(() => architectureRunTargetsFromGraph(draftGraph), [draftGraph]);
+  const highlightSets = useMemo(() => {
+    if (!activeFocusId) return null;
+    const focusNode = nodes.find((node) => node.id === activeFocusId);
+    if (!focusNode) return null;
+    const connected = getConnectedEdges([focusNode], edges);
+    const nodeIds = new Set([activeFocusId]);
+    const edgeIds = new Set();
+    connected.forEach((edge) => {
+      nodeIds.add(edge.source);
+      nodeIds.add(edge.target);
+      if (edge.id) edgeIds.add(edge.id);
+    });
+    [...nodeIds].forEach((id) => {
+      const parentId = nodes.find((node) => node.id === id)?.parentId;
+      if (parentId) nodeIds.add(parentId);
+    });
+    return { edgeIds, nodeIds };
+  }, [activeFocusId, edges, nodes]);
+  const focusNode = useCallback((id) => {
+    if (!id) return;
+    setFocusedNodeId(id);
+    if (reactFlow?.fitView) {
+      reactFlow.fitView({ duration: 420, maxZoom: 1.2, nodes: [{ id }], padding: 0.5 });
+    }
+  }, [reactFlow]);
+  const searchResults = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return [];
+    return nodes
+      .filter((node) => node.type !== "architectureGroup")
+      .filter((node) => architectureFlowNodeTitle(node).toLowerCase().includes(query)
+        || text(node.data?.role).toLowerCase().includes(query)
+        || text(node.data?.kind).toLowerCase().includes(query))
+      .slice(0, 8);
+  }, [nodes, searchQuery]);
   const renderNodes = useMemo(() => architectureOrderFlowNodes(nodes).map((node) => {
-    if (node.type !== "architectureCorridor") return node;
+    const dimmed = highlightSets && !highlightSets.nodeIds.has(node.id);
+    const focused = Boolean(activeFocusId) && node.id === activeFocusId;
+    const className = [dimmed ? "arch-dim" : "", focused ? "arch-focus" : ""]
+      .filter(Boolean)
+      .join(" ") || undefined;
+    if (node.type !== "architectureCorridor") {
+      return className ? { ...node, className } : node;
+    }
     const expanded = expandedCorridorId === node.id;
     const horizontal = text(node.data?.orientation, "horizontal") === "horizontal";
     const stepCount = jsonArray(node.data?.steps).length;
@@ -7034,6 +7347,7 @@ function ArchitectureGraphEditor({
     const expandedWidth = horizontal ? 640 : 390;
     return {
       ...node,
+      className,
       data: {
         ...(node.data || {}),
         expanded,
@@ -7045,10 +7359,28 @@ function ArchitectureGraphEditor({
         width: expanded ? expandedWidth : numberValue(node.style?.width, horizontal ? 340 : 260),
       },
     };
-  }), [expandedCorridorId, nodes]);
-  const renderEdges = useMemo(() => architectureEdgesWithRoutingData(edges, renderNodes, {
-    routeCache: routeCacheRef.current,
-  }), [edges, renderNodes]);
+  }), [activeFocusId, expandedCorridorId, highlightSets, nodes]);
+  const renderEdges = useMemo(() => {
+    const routed = architectureEdgesWithRoutingData(edges, renderNodes, {
+      routeCache: routeCacheRef.current,
+    });
+    const focusActive = Boolean(highlightSets);
+    return routed.map((edge) => {
+      const focused = focusActive && Boolean(edge.id && highlightSets.edgeIds.has(edge.id));
+      const dimmed = focusActive && !focused;
+      const className = dimmed
+        ? (edge.className ? `${edge.className} arch-dim` : "arch-dim")
+        : edge.className;
+      const role = architectureEdgeRole(edge.data?.role || edge.data?.kind);
+      const strokeColor = architectureEdgeStrokeColor(role, false, colorMode);
+      return {
+        ...edge,
+        className,
+        markerEnd: { ...(edge.markerEnd || {}), color: strokeColor, type: MarkerType.ArrowClosed },
+        data: { ...(edge.data || {}), colorMode, dimmed, focusActive, focused },
+      };
+    });
+  }, [colorMode, edges, highlightSets, renderNodes]);
   const semanticWarnings = useMemo(
     () => architectureValidateSemanticGraph(draftGraph, nodes, edges),
     [draftGraph, edges, nodes],
@@ -7252,10 +7584,10 @@ function ArchitectureGraphEditor({
       <ArchitectureEditorBody>
         <ArchitectureCanvasViewport>
           <ReactFlow
-            colorMode="dark"
+            colorMode={colorMode}
             defaultEdgeOptions={{
               markerEnd: {
-                color: "rgba(125, 211, 252, 0.88)",
+                color: colorMode === "light" ? "#6b7280" : "rgba(148, 163, 184, 0.6)",
                 type: MarkerType.ArrowClosed,
               },
               type: "architectureEdge",
@@ -7275,15 +7607,64 @@ function ArchitectureGraphEditor({
             nodesDraggable={false}
             nodesFocusable={false}
             onEdgesChange={onEdgesChange}
+            onNodeClick={(_, node) => {
+              if (node.type === "architectureGroup") {
+                setFocusedNodeId("");
+                return;
+              }
+              setFocusedNodeId((current) => (current === node.id ? "" : node.id));
+            }}
             onNodesChange={onNodesChange}
+            onPaneClick={() => { setFocusedNodeId(""); }}
             panOnDrag
             panOnScroll
             proOptions={{ hideAttribution: true }}
             selectionOnDrag={false}
             zoomOnDoubleClick={false}
           >
-            <Background color="rgba(148, 163, 184, 0.16)" gap={26} size={1.4} />
+            <Background
+              color={colorMode === "light" ? "rgba(0, 0, 0, 0.1)" : "rgba(148, 163, 184, 0.16)"}
+              gap={26}
+              size={1.4}
+            />
+            <MiniMap
+              maskColor={colorMode === "light" ? "rgba(0, 0, 0, 0.08)" : "rgba(2, 6, 23, 0.6)"}
+              nodeColor={architectureMiniMapNodeColor}
+              nodeStrokeWidth={2}
+              pannable
+              position="bottom-right"
+              zoomable
+            />
+            <Controls position="bottom-left" showInteractive={false} />
           </ReactFlow>
+          <ArchitectureSearchBar
+            data-active={searchQuery ? "true" : "false"}
+            onSubmit={(event) => {
+              event.preventDefault();
+              focusNode(searchResults[0]?.id);
+            }}
+          >
+            <input
+              aria-label="Find a node"
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Find a node..."
+              value={searchQuery}
+            />
+            {searchResults.length > 0 && (
+              <ArchitectureSearchResults>
+                {searchResults.map((node) => (
+                  <button
+                    key={node.id}
+                    onClick={() => { focusNode(node.id); setSearchQuery(""); }}
+                    type="button"
+                  >
+                    <strong>{architectureFlowNodeTitle(node)}</strong>
+                    <span>{text(node.data?.role || node.data?.kind)}</span>
+                  </button>
+                ))}
+              </ArchitectureSearchResults>
+            )}
+          </ArchitectureSearchBar>
           {agentEditMarker && (
             <ArchitectureAgentEditStatus
               aria-live="polite"
@@ -7888,7 +8269,7 @@ function architectureEndpointFanOffset(index, count) {
   return Math.max(-90, Math.min(90, offset));
 }
 
-function architectureEndpointFanOffsets(edges) {
+function architectureEndpointFanOffsets(edges, nodeById = new Map(), positionCache = new Map()) {
   const bySource = new Map();
   const byTarget = new Map();
   const offsets = new Map();
@@ -7898,17 +8279,43 @@ function architectureEndpointFanOffsets(edges) {
     groupMap.get(key).push(entry);
   };
 
+  // Cross-axis center of a node, picking the axis its handles fan along.
+  const crossCenter = (nodeId, handleHint) => {
+    const node = nodeById.get(nodeId);
+    if (!node) return 0;
+    const rect = architectureNodeRect(node, nodeById, positionCache);
+    const side = architectureEdgeSide(handleHint || node.sourcePosition || node.targetPosition);
+    return side === "left" || side === "right"
+      ? rect.y + rect.height / 2
+      : rect.x + rect.width / 2;
+  };
+
   edges.forEach((edge, index) => {
     const key = architectureEdgeRenderKey(edge, index);
     offsets.set(key, { source: 0, target: 0 });
-    addToGroup(bySource, text(edge.source), { edge, index, key, sortKey: text(edge.target) });
-    addToGroup(byTarget, text(edge.target), { edge, index, key, sortKey: text(edge.source) });
+    const sourceNode = nodeById.get(text(edge.source));
+    const targetNode = nodeById.get(text(edge.target));
+    addToGroup(bySource, text(edge.source), {
+      edge,
+      index,
+      key,
+      sortKey: crossCenter(text(edge.target), sourceNode?.sourcePosition),
+      tieId: text(edge.target),
+    });
+    addToGroup(byTarget, text(edge.target), {
+      edge,
+      index,
+      key,
+      sortKey: crossCenter(text(edge.source), targetNode?.targetPosition),
+      tieId: text(edge.source),
+    });
   });
 
   const assign = (groupMap, offsetKey) => {
     groupMap.forEach((items) => {
       const sorted = [...items].sort((left, right) => (
-        left.sortKey.localeCompare(right.sortKey)
+        left.sortKey - right.sortKey
+          || left.tieId.localeCompare(right.tieId)
           || left.index - right.index
       ));
       sorted.forEach((item, index) => {
@@ -7986,7 +8393,7 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
     });
   const obstacleRects = [...nodeRects, ...groupHeaderRects];
   const obstacleHash = architectureRectsRoutingHash(obstacleRects);
-  const endpointFanOffsets = architectureEndpointFanOffsets(edges);
+  const endpointFanOffsets = architectureEndpointFanOffsets(edges, nodeById, positionCache);
 
   const routedEdges = edges.map((edge, index) => {
     const sourceNode = nodeById.get(edge.source);
@@ -8889,15 +9296,48 @@ function architectureOrthogonalEdgePath({
   ];
 }
 
-function architectureEdgeStrokeColor(role, selected = false) {
-  if (selected) return "rgba(251, 191, 36, 0.95)";
+function readForgeThemeMode() {
+  if (typeof document === "undefined") return "dark";
+  return document.documentElement.dataset.forgeTheme === "light" ? "light" : "dark";
+}
+
+function useForgeThemeMode() {
+  const [mode, setMode] = useState(readForgeThemeMode);
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const el = document.documentElement;
+    const sync = () => setMode(readForgeThemeMode());
+    sync();
+    const observer = new MutationObserver(sync);
+    observer.observe(el, { attributeFilter: ["data-forge-theme"] });
+    return () => observer.disconnect();
+  }, []);
+  return mode;
+}
+
+function architectureEdgeStrokeColor(role, selected = false, mode = "dark") {
+  const light = mode === "light";
+  if (selected) return light ? "#b45309" : "rgba(251, 191, 36, 0.95)";
   const edgeRole = architectureEdgeRole(role);
-  if (edgeRole === "writes" || edgeRole === "publishes") return "rgba(52, 211, 153, 0.86)";
-  if (edgeRole === "reads" || edgeRole === "subscribes") return "rgba(251, 191, 36, 0.84)";
-  if (edgeRole === "transitions" || edgeRole === "guards") return "rgba(167, 139, 250, 0.88)";
-  if (edgeRole === "depends-on") return "rgba(244, 114, 182, 0.8)";
-  if (edgeRole === "fails-to" || edgeRole === "retries") return "rgba(251, 113, 133, 0.86)";
-  return "rgba(125, 211, 252, 0.8)";
+  // Neutral-first: only high-signal semantics carry color; calls / resolves-to
+  // / render / reads stay neutral gray so the canvas reads calm and accurate.
+  if (edgeRole === "writes" || edgeRole === "publishes") return light ? "#057a55" : "rgba(52, 211, 153, 0.85)";
+  if (edgeRole === "transitions" || edgeRole === "guards") return light ? "#6d28d9" : "rgba(167, 139, 250, 0.88)";
+  if (edgeRole === "depends-on") return light ? "#be185d" : "rgba(244, 114, 182, 0.82)";
+  if (edgeRole === "fails-to" || edgeRole === "retries") return light ? "#be123c" : "rgba(248, 113, 113, 0.88)";
+  return light ? "#6b7280" : "rgba(148, 163, 184, 0.5)";
+}
+
+function architectureMiniMapNodeColor(node) {
+  if (node?.type === "architectureGroup") return "rgba(148, 163, 184, 0.5)";
+  const kind = text(node?.data?.kind);
+  const role = architectureNodeRole(node?.data?.role || kind);
+  if (kind === "database") return "rgb(52, 211, 153)";
+  if (kind === "queue" || role === "state") return "rgb(167, 139, 250)";
+  if (kind === "client" || role === "decision" || role === "actor") return "rgb(251, 191, 36)";
+  if (kind === "external" || role === "dependency" || role === "package") return "rgb(244, 114, 182)";
+  if (role === "terminal") return "rgb(248, 113, 113)";
+  return "rgb(96, 165, 250)";
 }
 
 function architectureEdgeStrokeDash(role, kind = "") {
@@ -8923,6 +9363,19 @@ function ArchitectureCanvasEdge({
   const kind = text(data?.kind, "calls");
   const role = architectureEdgeRole(data?.role || kind);
   const label = text(data?.label);
+  const colorMode = data?.colorMode === "light" ? "light" : "dark";
+  const dimmed = Boolean(data?.dimmed);
+  const focused = Boolean(data?.focused);
+  const focusActive = Boolean(data?.focusActive);
+  // resolves-to is the high-volume "routing table" fan; calm it at rest.
+  const isRoutingRole = role === "resolves-to";
+  const strokeWidth = dimmed
+    ? 1
+    : focused || selected
+      ? 3
+      : isRoutingRole
+        ? 1.4
+        : 1.9;
   const [edgePath, labelX, labelY, labelPlacement] = architectureOrthogonalEdgePath({
     avoidanceRects: data?.avoidanceRects,
     id,
@@ -8937,6 +9390,12 @@ function ArchitectureCanvasEdge({
     targetX,
     targetY,
   });
+  // Labels: never on dimmed edges; at rest hide the routing-fan noise; on
+  // focus only the selected node's edges show their labels.
+  const showLabel = Boolean(label)
+    && !labelPlacement?.hidden
+    && !dimmed
+    && (focusActive ? focused : !isRoutingRole);
 
   return (
     <>
@@ -8945,14 +9404,14 @@ function ArchitectureCanvasEdge({
         markerEnd={markerEnd}
         path={edgePath}
         style={{
-          stroke: architectureEdgeStrokeColor(role, selected),
+          stroke: architectureEdgeStrokeColor(role, selected, colorMode),
           strokeDasharray: architectureEdgeStrokeDash(role, kind),
           strokeLinecap: "round",
           strokeLinejoin: "round",
-          strokeWidth: selected ? 2.6 : 1.7,
+          strokeWidth,
         }}
       />
-      {label && !labelPlacement?.hidden && (
+      {showLabel && (
         <EdgeLabelRenderer>
           <ArchitectureEdgeLabel
             data-kind={role}
@@ -9022,7 +9481,7 @@ const TODO_TARGET_SELECT_STYLES = {
       borderColor: accent
         ? todoTargetColorAlpha(accent, state.isFocused ? 0.68 : 0.4)
         : state.isFocused
-          ? "rgba(147, 197, 253, 0.44)"
+          ? "rgba(var(--forge-accent-soft-rgb), 0.44)"
           : "rgba(148, 163, 184, 0.24)",
       backgroundColor: "rgba(2, 6, 23, 0.85)",
       boxShadow: state.isFocused ? `0 0 0 3px ${todoTargetColorAlpha(accent, 0.14)}` : "none",
@@ -9069,7 +9528,7 @@ const TODO_TARGET_SELECT_STYLES = {
     padding: "6px 8px",
     color: state.isSelected ? "rgba(240, 244, 255, 0.98)" : "rgba(203, 213, 225, 0.92)",
     backgroundColor: state.isSelected
-      ? todoTargetColorAlpha(state.data?.color, 0.2)
+      ? (state.data?.color ? todoTargetColorAlpha(state.data.color, 0.2) : "rgba(var(--forge-accent-rgb), 0.18)")
       : state.isFocused
         ? "rgba(148, 163, 184, 0.12)"
         : "transparent",
@@ -10243,8 +10702,8 @@ const ArchitectureNavToggleButton = styled(ArchitectureIconButton)`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    background: rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 
   svg {
@@ -10273,7 +10732,7 @@ const ArchitectureFolderCreateForm = styled.form`
   }
 
   input:focus-visible {
-    outline: 2px solid rgba(94, 234, 212, 0.32);
+    outline: 2px solid rgba(var(--forge-accent-soft-rgb), 0.32);
     outline-offset: -1px;
   }
 
@@ -10365,8 +10824,8 @@ const ArchitectureTreeRow = styled.button`
   cursor: pointer;
 
   &[data-drop-enabled="true"] {
-    border-color: rgba(56, 189, 248, 0.45);
-    background: rgba(56, 189, 248, 0.08);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.45);
+    background: rgba(var(--forge-accent-rgb), 0.08);
   }
 
   span {
@@ -10413,19 +10872,19 @@ const ArchitectureTreeRow = styled.button`
   }
 
   &[data-agent-edit] {
-    border-color: rgba(125, 211, 252, 0.16);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.16);
   }
 
   &:hover,
   &[data-active="true"] {
-    border-color: rgba(125, 211, 252, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.14);
     background: rgba(148, 163, 184, 0.08);
   }
 
   &[data-active="true"] {
     color: rgba(248, 250, 252, 0.96);
-    background: rgba(14, 165, 233, 0.13);
-    box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.72);
+    background: rgba(var(--forge-accent-rgb), 0.13);
+    box-shadow: inset 2px 0 0 rgba(var(--forge-accent-soft-rgb), 0.72);
   }
 `;
 
@@ -10467,8 +10926,8 @@ const ArchitectureTreeGlyph = styled.i`
   background: rgba(148, 163, 184, 0.08);
 
   &[data-kind="repo"] {
-    border-color: rgba(125, 211, 252, 0.32);
-    background: rgba(14, 165, 233, 0.15);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.32);
+    background: rgba(var(--forge-accent-rgb), 0.15);
   }
 
   &[data-kind="folder"] {
@@ -10591,7 +11050,7 @@ const ArchitectureRepoButton = styled.button`
   }
 
   em {
-    color: rgba(125, 211, 252, 0.78);
+    color: rgba(var(--forge-accent-soft-rgb), 0.78);
     font-size: 9px;
     font-style: normal;
     font-weight: 820;
@@ -10599,12 +11058,12 @@ const ArchitectureRepoButton = styled.button`
 
   &:hover,
   &[data-active="true"] {
-    border-color: rgba(125, 211, 252, 0.24);
-    background: rgba(14, 165, 233, 0.12);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.24);
+    background: rgba(var(--forge-accent-rgb), 0.12);
   }
 
   &[data-active="true"] {
-    box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.72);
+    box-shadow: inset 2px 0 0 rgba(var(--forge-accent-soft-rgb), 0.72);
   }
 `;
 
@@ -10645,8 +11104,8 @@ const ArchitectureInput = styled.input`
   outline: none;
 
   &:focus {
-    border-color: rgba(125, 211, 252, 0.52);
-    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.14);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.52);
+    box-shadow: 0 0 0 2px rgba(var(--forge-accent-rgb), 0.14);
   }
 `;
 
@@ -10696,8 +11155,8 @@ const ArchitectureSmallButton = styled.button`
 
   &:hover:not(:disabled),
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.34);
-    background: rgba(14, 165, 233, 0.13);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    background: rgba(var(--forge-accent-rgb), 0.13);
   }
 
   &:disabled {
@@ -10873,9 +11332,9 @@ const ArchitectureRestoreNavButton = styled.button`
   width: 34px;
   height: 32px;
   padding: 0;
-  border: 1px solid rgba(125, 211, 252, 0.28);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.28);
   border-radius: 8px;
-  color: rgba(224, 242, 254, 0.9);
+  color: var(--forge-accent-soft, rgba(224, 242, 254, 0.9));
   background: rgba(15, 23, 42, 0.72);
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
   backdrop-filter: blur(10px);
@@ -10890,8 +11349,8 @@ const ArchitectureRestoreNavButton = styled.button`
 
   &:hover,
   &:focus-visible {
-    border-color: rgba(125, 211, 252, 0.46);
-    background: rgba(14, 165, 233, 0.18);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.46);
+    background: rgba(var(--forge-accent-rgb), 0.18);
   }
 `;
 
@@ -11329,9 +11788,8 @@ const ArchitectureCanvasViewport = styled.div`
   border: 0;
   border-radius: 0;
   background:
-    radial-gradient(120% 80% at 50% -10%, rgba(30, 41, 59, 0.5), rgba(2, 6, 23, 0) 60%),
-    linear-gradient(180deg, rgba(9, 13, 24, 0.6), rgba(2, 6, 23, 0.6)),
-    rgba(4, 7, 16, 0.92);
+    radial-gradient(120% 80% at 50% -10%, var(--arch-canvas-glow), transparent 60%),
+    var(--arch-canvas-bg);
 
   .react-flow {
     width: 100%;
@@ -11343,6 +11801,128 @@ const ArchitectureCanvasViewport = styled.div`
     shape-rendering: geometricPrecision;
   }
 
+  .react-flow__node,
+  .react-flow__edge {
+    transition: opacity 140ms ease;
+  }
+
+  .react-flow__node.arch-dim,
+  .react-flow__edge.arch-dim {
+    opacity: 0.12;
+    pointer-events: none;
+  }
+
+  .react-flow__node.arch-focus {
+    z-index: 10 !important;
+  }
+
+  .react-flow__node.arch-focus > * {
+    box-shadow:
+      0 0 0 2px var(--arch-focus-ring),
+      var(--arch-node-shadow) !important;
+  }
+
+  .react-flow__minimap {
+    --xy-minimap-background-color: var(--arch-node-bg);
+    border: 1px solid var(--arch-node-border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .react-flow__controls {
+    --xy-controls-button-background-color: var(--arch-node-bg);
+    --xy-controls-button-background-color-hover: var(--arch-icon-tile-bg);
+    --xy-controls-button-color: var(--arch-node-text);
+    --xy-controls-button-color-hover: var(--arch-node-text);
+    --xy-controls-button-border-color: var(--arch-node-border);
+    border-radius: 10px;
+    box-shadow: var(--arch-node-shadow);
+    overflow: hidden;
+  }
+
+`;
+
+const ArchitectureSearchBar = styled.form`
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 9;
+  display: grid;
+  gap: 6px;
+  width: 248px;
+  pointer-events: auto;
+  opacity: 0.82;
+  transition: opacity 120ms ease;
+
+  &:focus-within,
+  &[data-active="true"] {
+    opacity: 1;
+  }
+
+  input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 12px;
+    border: 1px solid var(--arch-node-border);
+    border-radius: 10px;
+    color: var(--arch-node-text);
+    background: var(--arch-node-bg);
+    box-shadow: var(--arch-node-shadow);
+    font-size: 12px;
+    font-weight: 600;
+    outline: none;
+  }
+
+  input::placeholder {
+    color: var(--arch-node-text-muted);
+  }
+
+  input:focus {
+    border-color: rgba(var(--forge-accent-rgb), 0.6);
+  }
+`;
+
+const ArchitectureSearchResults = styled.div`
+  display: grid;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--arch-node-border);
+  border-radius: 10px;
+  background: var(--arch-node-bg);
+  box-shadow: var(--arch-node-shadow);
+
+  button {
+    display: grid;
+    gap: 1px;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: 7px;
+    text-align: left;
+    color: var(--arch-node-text);
+    background: transparent;
+    cursor: pointer;
+  }
+
+  button:hover {
+    background: var(--arch-icon-tile-bg);
+  }
+
+  button strong {
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button span {
+    color: var(--arch-node-text-muted);
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
 `;
 
 const ArchitectureFloatingActions = styled.div`
@@ -11931,7 +12511,7 @@ const ArchitectureAgentCommandForm = styled.form`
   transform: translateX(-50%);
 
   &:focus-within {
-    border-color: rgba(125, 176, 255, 0.45);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.45);
     background: rgba(8, 12, 18, 0.92);
   }
 
@@ -12005,8 +12585,8 @@ const ArchitectureTargetOptionLabel = styled.span`
     height: 9px;
     flex: 0 0 auto;
     border-radius: 999px;
-    background: var(--architecture-target-option-dot, #60a5fa);
-    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.14);
+    background: var(--architecture-target-option-dot, var(--forge-accent-soft, #60a5fa));
+    box-shadow: 0 0 0 2px rgba(var(--forge-accent-rgb), 0.14);
   }
 
   &[data-any="true"] i {
@@ -12119,7 +12699,7 @@ const ArchitectureInspectorMeta = styled.div`
 `;
 
 const ArchitectureCanvasNodeShell = styled.div`
-  --node-accent: 125, 211, 252;
+  --node-accent: 96, 165, 250;
   box-sizing: border-box;
   position: relative;
   display: grid;
@@ -12129,15 +12709,11 @@ const ArchitectureCanvasNodeShell = styled.div`
   width: ${ARCHITECTURE_NODE_CARD_WIDTH}px;
   min-height: ${ARCHITECTURE_NODE_CARD_HEIGHT}px;
   padding: 12px 15px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--arch-node-border);
   border-radius: 14px;
-  color: var(--forge-text);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 42%),
-    rgba(15, 23, 42, 0.72);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.05),
-    0 8px 24px rgba(2, 6, 23, 0.42);
+  color: var(--arch-node-text);
+  background: var(--arch-node-bg);
+  box-shadow: var(--arch-node-shadow);
 
   &::before {
     content: "";
@@ -12147,8 +12723,12 @@ const ArchitectureCanvasNodeShell = styled.div`
     bottom: 13px;
     width: 3px;
     border-radius: 0 3px 3px 0;
-    background: rgba(var(--node-accent), 0.92);
-    box-shadow: 0 0 14px rgba(var(--node-accent), 0.55);
+    background: rgba(var(--node-accent), 0.95);
+    box-shadow: 0 0 10px rgba(var(--node-accent), 0.45);
+  }
+
+  html[data-forge-theme="light"] &::before {
+    box-shadow: none;
   }
 
   &[data-kind="client"] { --node-accent: 251, 191, 36; }
@@ -12157,13 +12737,31 @@ const ArchitectureCanvasNodeShell = styled.div`
   &[data-kind="queue"] { --node-accent: 167, 139, 250; }
   &[data-role="state"] { --node-accent: 167, 139, 250; }
   &[data-role="decision"] { --node-accent: 251, 191, 36; }
-  &[data-role="terminal"] { --node-accent: 251, 113, 133; }
+  &[data-role="terminal"] { --node-accent: 248, 113, 113; }
+  &[data-role="actor"] { --node-accent: 251, 191, 36; }
   &[data-role="dependency"],
   &[data-role="package"] { --node-accent: 244, 114, 182; }
+
+  html[data-forge-theme="light"] & { --node-accent: 37, 99, 235; }
+  html[data-forge-theme="light"] &[data-kind="client"] { --node-accent: 180, 83, 9; }
+  html[data-forge-theme="light"] &[data-kind="database"] { --node-accent: 5, 122, 85; }
+  html[data-forge-theme="light"] &[data-kind="external"] { --node-accent: 190, 24, 93; }
+  html[data-forge-theme="light"] &[data-kind="queue"] { --node-accent: 109, 40, 217; }
+  html[data-forge-theme="light"] &[data-role="state"] { --node-accent: 109, 40, 217; }
+  html[data-forge-theme="light"] &[data-role="decision"] { --node-accent: 180, 83, 9; }
+  html[data-forge-theme="light"] &[data-role="terminal"] { --node-accent: 190, 18, 60; }
+  html[data-forge-theme="light"] &[data-role="actor"] { --node-accent: 180, 83, 9; }
+  html[data-forge-theme="light"] &[data-role="dependency"],
+  html[data-forge-theme="light"] &[data-role="package"] { --node-accent: 190, 24, 93; }
 
   &[data-lifecycle="start"]::before {
     background: rgba(52, 211, 153, 0.95);
     box-shadow: 0 0 16px rgba(52, 211, 153, 0.6);
+  }
+
+  html[data-forge-theme="light"] &[data-lifecycle="start"]::before {
+    background: rgba(5, 122, 85, 0.95);
+    box-shadow: none;
   }
 
   &[data-display="compact"] {
@@ -12174,9 +12772,9 @@ const ArchitectureCanvasNodeShell = styled.div`
     width: ${ARCHITECTURE_NODE_COMPACT_WIDTH}px;
     min-height: ${ARCHITECTURE_NODE_COMPACT_HEIGHT}px;
     padding: 8px 6px;
-    border-color: transparent;
-    background: transparent;
-    box-shadow: none;
+    border-color: var(--arch-node-border);
+    background: var(--arch-node-bg);
+    box-shadow: var(--arch-node-shadow);
   }
 
   &[data-display="compact"]::before {
@@ -12192,9 +12790,9 @@ const ArchitectureCanvasNodeShell = styled.div`
   }
 
   &[data-display="compact"][data-selected="true"] {
-    border-color: rgba(var(--node-accent), 0.4);
-    background: rgba(15, 23, 42, 0.32);
-    box-shadow: 0 0 0 3px rgba(var(--node-accent), 0.14);
+    border-color: rgba(var(--node-accent), 0.5);
+    background: var(--arch-node-bg);
+    box-shadow: 0 0 0 3px rgba(var(--node-accent), 0.18);
   }
 
   .react-flow__handle {
@@ -12212,10 +12810,10 @@ const ArchitectureNodeIcon = styled.span`
   place-items: center;
   width: 30px;
   height: 30px;
-  border: 1px solid rgba(var(--node-accent, 125, 211, 252), 0.34);
+  border: 1px solid rgba(var(--node-accent, 125, 211, 252), 0.42);
   border-radius: 9px;
-  color: rgba(248, 250, 252, 0.95);
-  background: rgba(var(--node-accent, 125, 211, 252), 0.14);
+  color: var(--arch-icon-mono);
+  background: rgba(var(--node-accent, 125, 211, 252), 0.16);
   font-size: 7px;
   font-weight: 800;
   line-height: 1;
@@ -12223,23 +12821,31 @@ const ArchitectureNodeIcon = styled.span`
 
   svg {
     display: block;
-    width: 17px;
-    height: 17px;
-    max-width: 19px;
-    max-height: 19px;
+    width: 18px;
+    height: 18px;
+    max-width: 20px;
+    max-height: 20px;
     color: currentColor;
   }
 
   &[data-source="likec4"],
   &[data-source="styled"] {
-    border-color: rgba(226, 232, 240, 0.16);
-    color: rgba(248, 250, 252, 0.96);
-    background: rgba(248, 250, 252, 0.07);
-    box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.04);
+    border-color: var(--arch-icon-tile-border);
+    color: var(--arch-icon-mono);
+    background: var(--arch-icon-tile-bg);
+    box-shadow: none;
+  }
+
+  &[data-source="styled"] svg {
+    color: inherit;
   }
 
   &[data-source="likec4"] svg {
     filter: brightness(0) invert(1);
+  }
+
+  html[data-forge-theme="light"] &[data-source="likec4"] svg {
+    filter: brightness(0);
   }
 
   &[data-source="label"] {
@@ -12290,15 +12896,15 @@ const ArchitectureNodeText = styled.div`
   }
 
   strong {
-    color: rgba(248, 250, 252, 0.97);
-    font-size: 12.5px;
+    color: var(--arch-node-text);
+    font-size: 14px;
     font-weight: 700;
     letter-spacing: -0.01em;
   }
 
   span {
-    color: rgba(148, 163, 184, 0.82);
-    font-size: 9.5px;
+    color: var(--arch-node-text-muted);
+    font-size: 10.5px;
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -12312,8 +12918,8 @@ const ArchitectureNodeText = styled.div`
 
   ${ArchitectureCanvasNodeShell}[data-display="compact"] & strong {
     max-width: ${ARCHITECTURE_NODE_COMPACT_WIDTH - 4}px;
-    color: rgba(248, 250, 252, 0.94);
-    font-size: 10px;
+    color: var(--arch-node-text);
+    font-size: 11px;
     font-weight: 650;
     letter-spacing: 0;
   }
@@ -12324,21 +12930,30 @@ const ArchitectureCanvasGroupShell = styled.div`
   width: 100%;
   height: 100%;
   padding: 18px;
-  border: 1px solid rgba(var(--node-accent), 0.26);
+  border: 1px solid var(--arch-group-border);
   border-radius: 18px;
-  color: rgba(226, 232, 240, 0.9);
+  color: var(--arch-node-text);
   background:
-    radial-gradient(130% 90% at 0% 0%, rgba(var(--node-accent), 0.08), rgba(var(--node-accent), 0) 58%),
-    rgba(13, 19, 33, 0.32);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+    radial-gradient(130% 90% at 0% 0%, rgba(var(--node-accent), 0.1), rgba(var(--node-accent), 0) 58%),
+    var(--arch-group-bg);
+  box-shadow: none;
 
-  &[data-intent="api-pathway"] { --node-accent: 125, 211, 252; }
+  &[data-intent="api-pathway"] { --node-accent: 96, 165, 250; }
   &[data-intent="api-corridor"] { --node-accent: 45, 212, 191; }
   &[data-intent="data-flow"] { --node-accent: 52, 211, 153; }
   &[data-intent="control-graph"] { --node-accent: 251, 191, 36; }
   &[data-intent="state-machine"] { --node-accent: 167, 139, 250; }
   &[data-intent="dependency-graph"] { --node-accent: 244, 114, 182; }
   &[data-intent="deployment"] { --node-accent: 45, 212, 191; }
+
+  html[data-forge-theme="light"] & { --node-accent: 71, 85, 105; }
+  html[data-forge-theme="light"] &[data-intent="api-pathway"] { --node-accent: 37, 99, 235; }
+  html[data-forge-theme="light"] &[data-intent="api-corridor"] { --node-accent: 13, 148, 136; }
+  html[data-forge-theme="light"] &[data-intent="data-flow"] { --node-accent: 5, 122, 85; }
+  html[data-forge-theme="light"] &[data-intent="control-graph"] { --node-accent: 180, 83, 9; }
+  html[data-forge-theme="light"] &[data-intent="state-machine"] { --node-accent: 109, 40, 217; }
+  html[data-forge-theme="light"] &[data-intent="dependency-graph"] { --node-accent: 190, 24, 93; }
+  html[data-forge-theme="light"] &[data-intent="deployment"] { --node-accent: 13, 148, 136; }
 
   &[data-selected="true"] {
     border-color: rgba(var(--node-accent), 0.6);
@@ -12380,15 +12995,15 @@ const ArchitectureGroupText = styled.div`
   }
 
   strong {
-    color: rgba(248, 250, 252, 0.95);
-    font-size: 12.5px;
+    color: var(--arch-node-text);
+    font-size: 14px;
     font-weight: 700;
     letter-spacing: -0.01em;
   }
 
   span {
-    color: rgba(148, 163, 184, 0.78);
-    font-size: 9.5px;
+    color: var(--arch-node-text-muted);
+    font-size: 10.5px;
     font-weight: 600;
     letter-spacing: 0.05em;
     text-transform: uppercase;
@@ -12401,12 +13016,12 @@ const ArchitectureEdgeLabel = styled.div`
   max-width: var(--edge-label-max-width, 156px);
   padding: 3px 9px;
   overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--arch-edge-label-border);
   border-radius: 999px;
-  color: rgba(203, 213, 225, 0.9);
-  background: rgba(9, 13, 24, 0.82);
-  box-shadow: 0 4px 12px rgba(2, 6, 23, 0.4);
-  font-size: 8.5px;
+  color: var(--arch-edge-label-text);
+  background: var(--arch-edge-label-bg);
+  box-shadow: 0 2px 8px rgba(2, 6, 23, 0.18);
+  font-size: 10px;
   font-weight: 650;
   letter-spacing: 0.02em;
   line-height: 1.15;
@@ -12419,12 +13034,6 @@ const ArchitectureEdgeLabel = styled.div`
   &[data-kind="publishes"] {
     border-color: rgba(52, 211, 153, 0.24);
     color: rgba(209, 250, 229, 0.92);
-  }
-
-  &[data-kind="reads"],
-  &[data-kind="subscribes"] {
-    border-color: rgba(251, 191, 36, 0.24);
-    color: rgba(254, 243, 199, 0.92);
   }
 
   &[data-kind="transitions"],
@@ -12442,6 +13051,29 @@ const ArchitectureEdgeLabel = styled.div`
   &[data-kind="retries"] {
     border-color: rgba(251, 113, 133, 0.28);
     color: rgba(254, 205, 211, 0.94);
+  }
+
+  html[data-forge-theme="light"] &[data-kind="writes"],
+  html[data-forge-theme="light"] &[data-kind="publishes"] {
+    border-color: rgba(5, 122, 85, 0.45);
+    color: #05653b;
+  }
+
+  html[data-forge-theme="light"] &[data-kind="transitions"],
+  html[data-forge-theme="light"] &[data-kind="guards"] {
+    border-color: rgba(109, 40, 217, 0.45);
+    color: #5b21b6;
+  }
+
+  html[data-forge-theme="light"] &[data-kind="depends-on"] {
+    border-color: rgba(190, 24, 93, 0.45);
+    color: #9d174d;
+  }
+
+  html[data-forge-theme="light"] &[data-kind="fails-to"],
+  html[data-forge-theme="light"] &[data-kind="retries"] {
+    border-color: rgba(190, 18, 60, 0.45);
+    color: #9f1239;
   }
 `;
 

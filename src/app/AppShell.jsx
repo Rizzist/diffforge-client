@@ -273,6 +273,13 @@ import {
   WorkspaceIdleLogo,
   WorkspaceIdleTitle,
   WorkspaceIdleDetail,
+  LoopspaceRuntimeSurface,
+  LoopspaceRuntimeToolbar,
+  LoopspaceRuntimeNameInput,
+  LoopspaceRuntimeIconButton,
+  LoopspaceRuntimeDangerButton,
+  LoopspaceRuntimeStage,
+  LoopspaceRuntimeError,
   ForgeWorkspace,
   TerminalWorkspaceSurface,
   WorkspaceTerminalPanels,
@@ -690,6 +697,8 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
   "app_navigate",
   "app_open_view",
 ]);
+const APP_CONTROL_MCP_REQUEST_EVENT = "forge-app-control-mcp-request";
+const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
 const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
 const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
 const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 300;
@@ -775,6 +784,38 @@ function normalizeAccountAppViewId(value) {
     return "settings";
   }
   return ACCOUNT_APP_VIEW_IDS.has(normalized) ? normalized : "";
+}
+
+function normalizeAppControlTabId(value) {
+  const normalized = normalizeRemoteCommandName(value);
+  if (!normalized) {
+    return null;
+  }
+  const workspaceTab = normalizeWorkspaceTabId(normalized);
+  if (workspaceTab) {
+    return {
+      id: workspaceTab,
+      scope: "workspace",
+      view: WORKSPACE_TAB_VIEW_BY_ID[workspaceTab] || DEFAULT_WORKSPACE_VIEW,
+    };
+  }
+  if (normalized === "architecture" || normalized === "workspace_architecture") {
+    return { id: "history", scope: "workspace", view: "architecture" };
+  }
+  if (normalized === "architectures" || normalized === "architecture_hub") {
+    return { id: "architectures", scope: "global", view: "architectures" };
+  }
+  if (normalized === "mcp" || normalized === "mcps" || normalized === "mcp_servers") {
+    return { id: "mcps", scope: "global", view: "mcps" };
+  }
+  if (normalized === "tool" || normalized === "tools") {
+    return { id: "tools", scope: "global", view: "tools" };
+  }
+  const appView = normalizeAccountAppViewId(normalized);
+  if (appView) {
+    return { id: appView, scope: "global", view: appView };
+  }
+  return null;
 }
 
 function workspaceGitPullPromptCheckKey(workspaceId, rootDirectory) {
@@ -1193,7 +1234,6 @@ const APP_THEME_DEFAULT = APP_THEME_DARK;
 const APP_SPACE_MODE_WORKSPACES = "workspaces";
 const APP_SPACE_MODE_LOOPSPACES = "loopspaces";
 const APP_SPACE_MODE_DEFAULT = APP_SPACE_MODE_WORKSPACES;
-const LOOPSPACES_STORAGE_KEY = "diffforge.loopspaces.v1";
 const APP_THEME_META_COLORS = {
   [APP_THEME_DARK]: "#030508",
   [APP_THEME_LIGHT]: "#f5f5f7",
@@ -1256,6 +1296,7 @@ const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live-state";
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT = "cloud-mcp-account-usage";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
+const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT = "cloud-mcp-loopspaces-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 const TODO_QUEUE_WORKSPACE_STORAGE_PREFIX = "diffforge.todoQueue.";
@@ -4110,6 +4151,67 @@ function LoopspaceCreatePanel({
         </WorkspaceCreateFooter>
       </WorkspaceCreateCard>
     </WorkspaceCreateSurface>
+  );
+}
+
+function LoopspaceRuntimeView({
+  actionState,
+  error,
+  loopspace,
+  nameDraft,
+  onBack,
+  onDelete,
+  onRename,
+  setNameDraft,
+}) {
+  const renaming = actionState === "renaming";
+  const deleting = actionState === "deleting";
+  const busy = renaming || deleting;
+  const canRename = Boolean(loopspace?.id && nameDraft.trim() && nameDraft.trim() !== loopspace.name && !busy);
+
+  return (
+    <LoopspaceRuntimeSurface aria-label={loopspace?.name || "Loop"}>
+      <LoopspaceRuntimeToolbar onSubmit={onRename}>
+        <LoopspaceRuntimeIconButton
+          aria-label="Unselect loop"
+          disabled={busy}
+          onClick={onBack}
+          title="Unselect"
+          type="button"
+        >
+          <ButtonBackIcon aria-hidden="true" />
+        </LoopspaceRuntimeIconButton>
+        <LoopspaceRuntimeNameInput
+          aria-label="Loop name"
+          autoComplete="off"
+          autoCorrect="off"
+          disabled={deleting}
+          maxLength={80}
+          onChange={(event) => setNameDraft(event.target.value)}
+          spellCheck={false}
+          value={nameDraft}
+        />
+        <LoopspaceRuntimeIconButton
+          aria-label="Rename loop"
+          disabled={!canRename}
+          title="Rename"
+          type="submit"
+        >
+          {renaming ? <PendingIcon aria-hidden="true" /> : <ButtonCheckIcon aria-hidden="true" />}
+        </LoopspaceRuntimeIconButton>
+        <LoopspaceRuntimeDangerButton
+          aria-label="Delete loop"
+          disabled={busy}
+          onClick={onDelete}
+          title="Delete"
+          type="button"
+        >
+          <ButtonDeleteIcon aria-hidden="true" />
+        </LoopspaceRuntimeDangerButton>
+      </LoopspaceRuntimeToolbar>
+      <LoopspaceRuntimeStage aria-hidden="true" />
+      {error && <LoopspaceRuntimeError>{error}</LoopspaceRuntimeError>}
+    </LoopspaceRuntimeSurface>
   );
 }
 
@@ -8000,13 +8102,6 @@ function mintLocalWorkspaceId() {
   return `ws-${uuid}`;
 }
 
-function mintLocalLoopspaceId() {
-  const uuid = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
-    ? crypto.randomUUID()
-    : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}-${Math.random().toString(16).slice(2, 10)}`;
-  return `loop-${uuid}`;
-}
-
 function normalizeCatalogWorkspaceEntry(entry) {
   const id = String(entry?.id || entry?.workspace_id || entry?.workspaceId || "").trim();
   if (!id) {
@@ -8161,14 +8256,16 @@ function normalizeLoopspaceEntry(entry) {
     name,
     createdAt: String(entry?.createdAt || entry?.created_at || ""),
     updatedAt: String(entry?.updatedAt || entry?.updated_at || ""),
+    revision: Number(entry?.revision || entry?.server_seq || entry?.serverSeq || 0) || 0,
   };
 }
 
 function normalizeLoopspaces(value) {
+  const source = value?.sync || value?.payload || value?.data || value;
   const rawItems = Array.isArray(value)
     ? value
-    : Array.isArray(value?.loopspaces)
-      ? value.loopspaces
+    : Array.isArray(source?.loopspaces)
+      ? source.loopspaces
       : [];
   const seen = new Set();
   return rawItems
@@ -8183,35 +8280,7 @@ function normalizeLoopspaces(value) {
 }
 
 function readLoopspaces() {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return [];
-  }
-
-  try {
-    return normalizeLoopspaces(JSON.parse(window.localStorage.getItem(LOOPSPACES_STORAGE_KEY) || "[]"));
-  } catch {
-    return [];
-  }
-}
-
-function persistLoopspaces(loopspaces) {
-  const normalized = normalizeLoopspaces(loopspaces);
-  if (typeof window === "undefined" || !window.localStorage) {
-    return normalized;
-  }
-
-  try {
-    window.localStorage.setItem(
-      LOOPSPACES_STORAGE_KEY,
-      JSON.stringify({
-        version: 1,
-        loopspaces: normalized,
-      }),
-    );
-  } catch {
-    // Loopspaces are local-only in this pass; the UI can keep running without persistence.
-  }
-  return normalized;
+  return [];
 }
 
 function catalogWorkspaceEntryIsDeleted(entry) {
@@ -9340,6 +9409,8 @@ export default function App() {
   const [loopspaceName, setLoopspaceName] = useState("");
   const [loopspaceState, setLoopspaceState] = useState("idle");
   const [loopspaceError, setLoopspaceError] = useState("");
+  const [loopspaceRenameDraft, setLoopspaceRenameDraft] = useState("");
+  const [loopspaceActionState, setLoopspaceActionState] = useState("idle");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
   const [workspaceHydrationReady, setWorkspaceHydrationReady] = useState(false);
@@ -12276,6 +12347,83 @@ export default function App() {
     [workspaceCatalog],
   );
   const selectedLoopspace = findLoopspaceById(loopspaces, selectedLoopspaceId);
+  const applyLoopspaceSnapshot = useCallback((value) => {
+    const nextLoopspaces = normalizeLoopspaces(value);
+    setLoopspaces(nextLoopspaces);
+    setSelectedLoopspaceId((currentId) => {
+      if (!currentId) {
+        return "";
+      }
+      return nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : "";
+    });
+    return nextLoopspaces;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadLoopspaces = async () => {
+      try {
+        const local = await invoke("cloud_mcp_get_loopspaces");
+        if (!cancelled) {
+          applyLoopspaceSnapshot(local);
+        }
+      } catch {
+        if (!cancelled) {
+          applyLoopspaceSnapshot([]);
+        }
+      }
+
+      if (authState !== "authenticated") {
+        return;
+      }
+
+      try {
+        const synced = await invoke("cloud_mcp_sync_loopspaces");
+        if (!cancelled) {
+          applyLoopspaceSnapshot(synced);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setLoopspaceError(String(error || "Unable to sync loops."));
+        }
+      }
+    };
+
+    loadLoopspaces();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeAccountScopeKey, applyLoopspaceSnapshot, authState]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenLoopspaces = null;
+
+    listen(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
+      if (!disposed) {
+        applyLoopspaceSnapshot(event?.payload || event);
+      }
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenLoopspaces = unlisten;
+      }
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (unlistenLoopspaces) {
+        unlistenLoopspaces();
+      }
+    };
+  }, [applyLoopspaceSnapshot]);
+
+  useEffect(() => {
+    setLoopspaceRenameDraft(selectedLoopspace?.name || "");
+    setLoopspaceActionState("idle");
+  }, [selectedLoopspace?.id, selectedLoopspace?.name]);
 
   const applyWindowFrameState = useCallback((nextFrameState) => {
     setWindowFrameState((currentFrameState) => (
@@ -13370,6 +13518,7 @@ export default function App() {
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
     setLoopspaceError("");
+    setLoopspaceActionState("idle");
     setWorkspaceSettingsModalId("");
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
@@ -13468,6 +13617,7 @@ export default function App() {
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
     setLoopspaceError("");
+    setLoopspaceActionState("idle");
     setWorkspaceCreateModalOpen(false);
     setWorkspaceSettingsModalId(workspaceAlreadyActive ? "" : workspace.id);
     setWorkspaceSettingsError("");
@@ -13511,6 +13661,7 @@ export default function App() {
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
     setLoopspaceError("");
+    setLoopspaceActionState("idle");
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
       telemetrySource: `${source}_workspaces`,
@@ -13540,6 +13691,7 @@ export default function App() {
     setWorkspaceCreateModalOpen(false);
     setLoopspaceCreatePanelOpen(false);
     setLoopspaceError("");
+    setLoopspaceActionState("idle");
     setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
     setSelectedLoopspaceId(loopspace.id);
     showView(DEFAULT_WORKSPACE_VIEW, {
@@ -15082,6 +15234,7 @@ export default function App() {
     setLoopspaceName("");
     setLoopspaceError("");
     setLoopspaceState("idle");
+    setLoopspaceActionState("idle");
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(true);
   }, [enterLoopspacesMode]);
@@ -15094,7 +15247,7 @@ export default function App() {
     setLoopspaceError("");
   }, [loopspaceState]);
 
-  const createLoopspace = useCallback((event) => {
+  const createLoopspace = useCallback(async (event) => {
     event.preventDefault();
     const name = loopspaceName.trim();
     if (!name) {
@@ -15105,30 +15258,88 @@ export default function App() {
     setLoopspaceState("creating");
     setLoopspaceError("");
 
-    const nowIso = new Date().toISOString();
-    const loopspace = {
-      id: mintLocalLoopspaceId(),
-      name,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-    setLoopspaces((current) => {
-      const nextLoopspaces = persistLoopspaces([
-        ...(Array.isArray(current) ? current : []),
-        loopspace,
-      ]);
-      return nextLoopspaces;
-    });
-    setSelectedLoopspaceId(loopspace.id);
-    setLoopspaceName("");
-    setLoopspaceCreatePanelOpen(false);
-    setLoopspaceState("idle");
-    setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
-    showView(DEFAULT_WORKSPACE_VIEW, {
-      immediate: true,
-      telemetrySource: "loopspace_created",
-    });
-  }, [loopspaceName, showView]);
+    try {
+      const result = await invoke("cloud_mcp_create_loopspace", { name });
+      const nextLoopspaces = applyLoopspaceSnapshot(result);
+      const changedLoopspace = normalizeLoopspaces(result?.response || result?.sync || result)[0]
+        || nextLoopspaces.find((loopspace) => loopspace.name === name)
+        || null;
+      if (changedLoopspace?.id) {
+        setSelectedLoopspaceId(changedLoopspace.id);
+      }
+      setLoopspaceName("");
+      setLoopspaceCreatePanelOpen(false);
+      setLoopspaceState("idle");
+      setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        immediate: true,
+        telemetrySource: "loopspace_created",
+      });
+    } catch (error) {
+      setLoopspaceState("idle");
+      setLoopspaceError(String(error || "Unable to create loop."));
+    }
+  }, [applyLoopspaceSnapshot, loopspaceName, showView]);
+
+  const unselectLoopspace = useCallback(() => {
+    setSelectedLoopspaceId("");
+    setLoopspaceError("");
+    setLoopspaceActionState("idle");
+  }, []);
+
+  const renameSelectedLoopspace = useCallback(async (event) => {
+    event.preventDefault();
+    if (!selectedLoopspace?.id || loopspaceActionState === "deleting") {
+      return;
+    }
+    const name = loopspaceRenameDraft.trim();
+    if (!name) {
+      setLoopspaceError("Loop name is required.");
+      return;
+    }
+    if (name === selectedLoopspace.name) {
+      setLoopspaceError("");
+      return;
+    }
+    setLoopspaceActionState("renaming");
+    setLoopspaceError("");
+    try {
+      const result = await invoke("cloud_mcp_rename_loopspace", {
+        loopspaceId: selectedLoopspace.id,
+        name,
+      });
+      applyLoopspaceSnapshot(result);
+      setLoopspaceActionState("idle");
+    } catch (error) {
+      setLoopspaceActionState("idle");
+      setLoopspaceError(String(error || "Unable to rename loop."));
+    }
+  }, [applyLoopspaceSnapshot, loopspaceActionState, loopspaceRenameDraft, selectedLoopspace]);
+
+  const deleteSelectedLoopspace = useCallback(async () => {
+    if (!selectedLoopspace?.id || loopspaceActionState === "renaming") {
+      return;
+    }
+    const confirmed = typeof window === "undefined"
+      ? true
+      : window.confirm(`Delete "${selectedLoopspace.name}"?`);
+    if (!confirmed) {
+      return;
+    }
+    setLoopspaceActionState("deleting");
+    setLoopspaceError("");
+    try {
+      const result = await invoke("cloud_mcp_delete_loopspace", {
+        loopspaceId: selectedLoopspace.id,
+      });
+      applyLoopspaceSnapshot(result);
+      setSelectedLoopspaceId("");
+      setLoopspaceActionState("idle");
+    } catch (error) {
+      setLoopspaceActionState("idle");
+      setLoopspaceError(String(error || "Unable to delete loop."));
+    }
+  }, [applyLoopspaceSnapshot, loopspaceActionState, selectedLoopspace]);
 
   const closeCreateWorkspaceModal = useCallback(() => {
     if (workspaceSyncState === "creating") {
@@ -16185,8 +16396,12 @@ export default function App() {
     ).trim();
     const existingModel = String(existingProviderBinding?.modelId || "").trim();
     const startupDefaultModel = getWorkspaceAgentStartupModel(agentId, agentStatuses);
-    const model = requestedModel || existingModel || startupDefaultModel;
-    const modelSource = requestedModel
+    const model = providerSessionId
+      ? startupDefaultModel
+      : requestedModel || existingModel || startupDefaultModel;
+    const modelSource = providerSessionId
+      ? model ? "app-default" : ""
+      : requestedModel
       ? "new-chat"
       : existingModel
         ? existingProviderBinding?.modelSource || "existing-thread"
@@ -23796,6 +24011,916 @@ export default function App() {
     };
   }, [activateWorkspace, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, showView, syncAgentInstallationsToCloud, workspaces]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    const activeRuntimeWorkspaceIds = new Set(
+      normalizeEnabledWorkspaceIds(workspaceLifecycleSettings?.enabledWorkspaceIds),
+    );
+    if (activatedWorkspaceId) {
+      activeRuntimeWorkspaceIds.add(activatedWorkspaceId);
+    }
+    const workspaceSummary = (workspace) => ({
+      id: workspace.id,
+      name: workspace.name || "",
+      rootDirectory: getWorkspaceRootDirectory(workspaceSettings, workspace.id) || defaultWorkingDirectory || "",
+      active: activeRuntimeWorkspaceIds.has(workspace.id),
+      selected: selectedWorkspaceId === workspace.id,
+    });
+    const resolveWorkspaceForAppControl = (input = {}) => {
+      const rawId = String(input.workspaceId || input.workspace_id || input.id || "").trim();
+      if (rawId) {
+        return findWorkspaceById(workspaces, rawId) || null;
+      }
+      const rawName = String(input.workspaceName || input.workspace_name || input.name || "").trim().toLowerCase();
+      if (rawName) {
+        return workspaces.find((workspace) => String(workspace.name || "").trim().toLowerCase() === rawName) || null;
+      }
+      return selectedWorkspace || null;
+    };
+    const collectAppControlValues = (...values) => {
+      const collected = [];
+      const visit = (value) => {
+        if (Array.isArray(value)) {
+          value.forEach(visit);
+          return;
+        }
+        if (typeof value === "string" && value.includes(",")) {
+          value.split(",").forEach(visit);
+          return;
+        }
+        if (value !== undefined && value !== null && String(value).trim() !== "") {
+          collected.push(value);
+        }
+      };
+      values.forEach(visit);
+      return collected;
+    };
+    const appControlIntegerValues = (...values) => {
+      const seen = new Set();
+      return collectAppControlValues(...values).reduce((indexes, value) => {
+        const index = Number.parseInt(value, 10);
+        if (Number.isInteger(index) && index >= 0 && !seen.has(index)) {
+          seen.add(index);
+          indexes.push(index);
+        }
+        return indexes;
+      }, []);
+    };
+    const appControlStringValues = (...values) => {
+      const seen = new Set();
+      return collectAppControlValues(...values).reduce((strings, value) => {
+        const text = String(value || "").trim();
+        if (text && !seen.has(text)) {
+          seen.add(text);
+          strings.push(text);
+        }
+        return strings;
+      }, []);
+    };
+    const appControlBooleanValue = (value, fallback = false) => {
+      if (typeof value === "boolean") {
+        return value;
+      }
+      const text = String(value ?? "").trim().toLowerCase();
+      if (["1", "true", "yes", "y", "on"].includes(text)) {
+        return true;
+      }
+      if (["0", "false", "no", "n", "off"].includes(text)) {
+        return false;
+      }
+      return fallback;
+    };
+    const normalizeAppControlTerminalRole = (...values) => {
+      for (const value of collectAppControlValues(...values)) {
+        const rawText = String(value || "").trim();
+        const token = rawText.toLowerCase().replace(/[\s_]+/g, "-");
+        if (["generic", "plain-shell", "sh", "shell", "terminal"].includes(token)) {
+          return WORKSPACE_TERMINAL_ROLE_GENERIC;
+        }
+        if (["anthropic", "anthropic-claude", "claude", "claude-code", "cloud-code", "cloudcode"].includes(token)) {
+          return "claude";
+        }
+        if (["code-x", "codex", "openai-codex"].includes(token)) {
+          return "codex";
+        }
+        if (["open-code", "opencode", "sst-opencode"].includes(token)) {
+          return "opencode";
+        }
+        const liveAgentId = normalizeWorkspaceLiveTerminalAgentId(rawText);
+        if (liveAgentId) {
+          return liveAgentId;
+        }
+      }
+      return "";
+    };
+    const appControlTerminalText = (terminal, keys) => {
+      for (const key of keys) {
+        const text = String(terminal?.[key] || "").trim();
+        if (text) return text;
+      }
+      return "";
+    };
+    const appControlTerminalNumber = (terminal, keys) => {
+      for (const key of keys) {
+        const number = Number.parseInt(terminal?.[key], 10);
+        if (Number.isInteger(number) && number >= 0) return number;
+      }
+      return null;
+    };
+    const appControlTerminalStatusValues = (terminal) => [
+      terminal?.nativeRailState,
+      terminal?.native_rail_state,
+      terminal?.activityStatus,
+      terminal?.activity_status,
+      terminal?.executionPhase,
+      terminal?.execution_phase,
+      terminal?.turnStatus,
+      terminal?.turn_status,
+      terminal?.readiness,
+      terminal?.terminalReadiness,
+      terminal?.terminal_readiness,
+      terminal?.status,
+      terminal?.statusAfter,
+      terminal?.terminalLifecycle,
+      terminal?.terminal_lifecycle,
+      terminal?.sessionState,
+      terminal?.session_state,
+    ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+    const appControlTerminalLooksClosed = (terminal) => (
+      appControlTerminalStatusValues(terminal).some((status) => (
+        ["closed", "closing", "deactivated", "disabled", "exited", "no_session", "offline", "terminated"].includes(status)
+      ))
+    );
+    const assessAppControlTerminalIdle = (terminal, configuredOnly = false) => {
+      if (configuredOnly) {
+        return { idle: true, reason: "not_live" };
+      }
+      if (!terminal) {
+        return { idle: false, reason: "unknown" };
+      }
+      if (appControlTerminalLooksClosed(terminal)) {
+        return { idle: true, reason: "already_closed" };
+      }
+      const statuses = appControlTerminalStatusValues(terminal);
+      const errorStatus = statuses.find((status) => ["error", "failed", "timeout"].includes(status));
+      if (errorStatus) {
+        return { idle: false, reason: errorStatus };
+      }
+      const busyStatus = statuses.find((status) => (
+        terminalActivityStatusIsBusy(status)
+          || terminalActivityStatusIsPaused(status)
+          || ["busy", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
+      ));
+      if (busyStatus) {
+        return { idle: false, reason: busyStatus };
+      }
+      const idleStatus = statuses.find((status) => (
+        terminalActivityStatusIsSendable(status)
+          || ["cancelled", "canceled", "complete", "completed", "done", "idle", "input_ready", "interrupted", "ready"].includes(status)
+      ));
+      if (idleStatus) {
+        return { idle: true, reason: idleStatus };
+      }
+      return { idle: false, reason: "unknown" };
+    };
+    const getAppControlPresenceWorkspace = (workspaceId) => (
+      (workspaceTerminalsWorkspacesRef.current || []).find((workspace) => (
+        String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
+      )) || null
+    );
+    const appControlTerminalIdentityValues = (workspaceId, terminal) => {
+      const values = new Set();
+      const append = (value) => {
+        const text = String(value || "").trim();
+        if (text) {
+          values.add(text);
+        }
+      };
+      [
+        "id",
+        "paneId",
+        "pane_id",
+        "terminalId",
+        "terminal_id",
+        "targetTerminalId",
+        "target_terminal_id",
+      ].forEach((key) => append(terminal?.[key]));
+      const terminalIndex = appControlTerminalNumber(terminal, [
+        "terminalIndex",
+        "terminal_index",
+        "index",
+      ]);
+      const agentId = normalizeAppControlTerminalRole(
+        terminal?.agentId,
+        terminal?.agent_id,
+        terminal?.agentKind,
+        terminal?.agent_kind,
+        terminal?.agentType,
+        terminal?.agent_type,
+        terminal?.agent,
+        terminal?.provider,
+        terminal?.role,
+      );
+      const safeWorkspaceId = String(workspaceId || "").trim();
+      if (safeWorkspaceId && Number.isInteger(terminalIndex)) {
+        const baseId = `workspace-terminal-${safeWorkspaceId}-${terminalIndex}`;
+        append(baseId);
+        if (agentId) {
+          append(`${baseId}-${agentId}`);
+        }
+      }
+      return values;
+    };
+    const summarizeAppControlTerminal = ({
+      configured = false,
+      presence = null,
+      role = "",
+      terminalIndex = null,
+      workspace,
+    }) => {
+      const workspaceId = workspace?.id || "";
+      const presenceIndex = appControlTerminalNumber(presence, ["terminalIndex", "terminal_index", "index"]);
+      const safeTerminalIndex = Number.isInteger(terminalIndex) ? terminalIndex : presenceIndex;
+      const rawPresenceRole = appControlTerminalText(presence, [
+        "agentId",
+        "agent_id",
+        "agentKind",
+        "agent_kind",
+        "agentType",
+        "agent_type",
+        "agent",
+        "provider",
+        "role",
+      ]);
+      const terminalRole = normalizeAppControlTerminalRole(rawPresenceRole, role)
+        || normalizeWorkspaceTerminalRole(role, workspaceTerminalFallbackRole, workspaceTerminalRoleOptions)
+        || WORKSPACE_TERMINAL_ROLE_GENERIC;
+      const paneId = appControlTerminalText(presence, ["paneId", "pane_id", "terminalId", "terminal_id"])
+        || (Number.isInteger(safeTerminalIndex)
+          ? getWorkspaceTerminalPaneId(workspaceId, safeTerminalIndex, getWorkspaceTerminalPaneAgentId(terminalRole))
+          : "");
+      const thread = Number.isInteger(safeTerminalIndex)
+        ? getWorkspaceThreadForTerminalIndex(workspaceThreadsRef.current, workspaceId, safeTerminalIndex)
+        : null;
+      const threadId = appControlTerminalText(presence, ["threadId", "thread_id"]) || thread?.id || "";
+      const statuses = appControlTerminalStatusValues(presence);
+      const idleAssessment = assessAppControlTerminalIdle(presence, configured && !presence);
+      const agentLabel = terminalRole === WORKSPACE_TERMINAL_ROLE_GENERIC
+        ? "Terminal"
+        : getManagedAgentLabel(terminalRole);
+      const terminalName = appControlTerminalText(presence, [
+        "terminalNickname",
+        "terminal_nickname",
+        "terminalName",
+        "terminal_name",
+        "displayName",
+        "display_name",
+        "agentDisplayName",
+        "agent_display_name",
+      ]) || (Number.isInteger(safeTerminalIndex) ? `${agentLabel} ${safeTerminalIndex + 1}` : agentLabel);
+
+      return {
+        agentId: terminalRole,
+        agentLabel,
+        configured: Boolean(configured),
+        idle: idleAssessment.idle,
+        idleReason: idleAssessment.reason,
+        inputReady: Boolean(
+          presence?.inputReady
+            || presence?.input_ready
+            || statuses.some((status) => terminalActivityStatusIsSendable(status)),
+        ),
+        live: Boolean(presence),
+        paneId,
+        instanceId: appControlTerminalText(presence, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]),
+        role: terminalRole,
+        status: statuses[0] || (presence ? "unknown" : "configured"),
+        statuses,
+        terminalIndex: Number.isInteger(safeTerminalIndex) ? safeTerminalIndex : null,
+        terminalName,
+        terminalNumber: Number.isInteger(safeTerminalIndex) ? safeTerminalIndex + 1 : null,
+        threadId,
+        workspaceId,
+        workspaceName: workspace?.name || "",
+      };
+    };
+    const buildAppControlTerminalSnapshot = (workspace) => {
+      const workspaceId = workspace?.id || "";
+      const currentSettings = workspaceSettingsRef.current;
+      const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+      const logicalIndexes = getWorkspaceLogicalTerminalIndexes(
+        workspaceTerminalLogicalIndexesRef.current,
+        workspaceId,
+        terminalCount,
+      );
+      const terminalRoles = getWorkspaceTerminalRoles(
+        currentSettings,
+        workspaceId,
+        terminalCount,
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      );
+      const presenceWorkspace = getAppControlPresenceWorkspace(workspaceId);
+      const presenceTerminals = Array.isArray(presenceWorkspace?.terminals)
+        ? presenceWorkspace.terminals
+        : [];
+      const presenceByIndex = new Map();
+      presenceTerminals.forEach((terminal) => {
+        const terminalIndex = appControlTerminalNumber(terminal, ["terminalIndex", "terminal_index", "index"]);
+        if (Number.isInteger(terminalIndex) && !presenceByIndex.has(terminalIndex)) {
+          presenceByIndex.set(terminalIndex, terminal);
+        }
+      });
+      const configuredPanes = new Set();
+      const configuredIndexes = new Set(logicalIndexes);
+      const terminals = logicalIndexes.map((terminalIndex, roleIndex) => {
+        const terminal = summarizeAppControlTerminal({
+          configured: true,
+          presence: presenceByIndex.get(terminalIndex) || null,
+          role: terminalRoles[roleIndex] || workspaceTerminalFallbackRole,
+          terminalIndex,
+          workspace,
+        });
+        configuredPanes.add(terminal.paneId);
+        return terminal;
+      });
+      presenceTerminals.forEach((presence) => {
+        const terminalIndex = appControlTerminalNumber(presence, ["terminalIndex", "terminal_index", "index"]);
+        const paneId = appControlTerminalText(presence, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+        if ((Number.isInteger(terminalIndex) && configuredIndexes.has(terminalIndex)) || (paneId && configuredPanes.has(paneId))) {
+          return;
+        }
+        terminals.push(summarizeAppControlTerminal({
+          configured: false,
+          presence,
+          role: normalizeAppControlTerminalRole(
+            presence?.agentId,
+            presence?.agent_id,
+            presence?.agentKind,
+            presence?.agent_kind,
+            presence?.agentType,
+            presence?.agent_type,
+            presence?.agent,
+            presence?.provider,
+            presence?.role,
+          ) || WORKSPACE_TERMINAL_ROLE_GENERIC,
+          terminalIndex,
+          workspace,
+        }));
+      });
+
+      return {
+        configuredCount: logicalIndexes.length,
+        terminalLimit: MAX_WORKSPACE_TERMINAL_COUNT,
+        terminals,
+        totalTerminals: terminals.length,
+        workspace: workspaceSummary(workspace),
+      };
+    };
+    const resolveAppControlTerminalTargets = (workspace, input = {}, options = {}) => {
+      const snapshot = buildAppControlTerminalSnapshot(workspace);
+      const indexes = new Set(appControlIntegerValues(
+        input.terminalIndex,
+        input.terminal_index,
+        input.index,
+        input.indexes,
+        input.terminalIndexes,
+        input.terminal_indices,
+        input.terminalNumbers,
+      ));
+      appControlIntegerValues(input.terminalNumber, input.terminal_number).forEach((number) => {
+        if (number > 0) {
+          indexes.add(number - 1);
+        }
+      });
+      const paneIds = new Set(appControlStringValues(
+        input.paneId,
+        input.pane_id,
+        input.paneIds,
+        input.pane_ids,
+        input.terminalId,
+        input.terminal_id,
+        input.terminalIds,
+        input.terminal_ids,
+        input.targetTerminalId,
+        input.target_terminal_id,
+      ));
+      const role = normalizeAppControlTerminalRole(input.agent, input.agentType, input.agent_type, input.provider, input.role);
+      const all = appControlBooleanValue(input.all, false)
+        || ["all", "workspace"].includes(String(input.scope || "").trim().toLowerCase());
+      const hasSelector = all || indexes.size > 0 || paneIds.size > 0 || Boolean(role);
+      if (!hasSelector && options.requireTarget) {
+        throw new Error("Choose a terminal by index, pane id, agent type, or all=true.");
+      }
+      let targets = snapshot.terminals.filter((terminal) => {
+        if (all) return true;
+        if (Number.isInteger(terminal.terminalIndex) && indexes.has(terminal.terminalIndex)) return true;
+        if (role && terminal.role === role) return true;
+        if (paneIds.size > 0) {
+          const identities = appControlTerminalIdentityValues(snapshot.workspace.id, terminal);
+          return Array.from(paneIds).some((paneId) => identities.has(paneId));
+        }
+        return false;
+      });
+      const count = Math.max(0, Math.min(
+        MAX_WORKSPACE_TERMINAL_COUNT,
+        Number.parseInt(input.count ?? input.amount ?? input.limit, 10) || 0,
+      ));
+      if (count > 0) {
+        targets = targets.slice(0, count);
+      }
+      return {
+        all,
+        count,
+        indexes: Array.from(indexes),
+        paneIds: Array.from(paneIds),
+        role,
+        snapshot,
+        targets,
+      };
+    };
+    const showAppControlWorkspaceTerminals = (workspace, reason) => {
+      const activated = requestWorkspaceActivation(workspace.id, reason);
+      if (activated) {
+        showView(DEFAULT_WORKSPACE_VIEW, {
+          immediate: true,
+          telemetrySource: reason,
+          telemetryWorkspaceId: workspace.id,
+        });
+      }
+      return activated;
+    };
+    const dispatchAppControlTerminalFocus = (workspace, terminal) => {
+      if (!workspace?.id || !terminal || !Number.isInteger(terminal.terminalIndex)) {
+        return;
+      }
+      const detail = {
+        paneId: terminal.paneId || getWorkspaceTerminalPaneId(
+          workspace.id,
+          terminal.terminalIndex,
+          getWorkspaceTerminalPaneAgentId(terminal.role),
+        ),
+        reason: "app_control_mcp_focus",
+        terminalIndex: terminal.terminalIndex,
+        workspaceId: workspace.id,
+      };
+      const dispatch = () => {
+        window.dispatchEvent(new CustomEvent(APP_CONTROL_TERMINAL_FOCUS_EVENT, { detail }));
+      };
+      dispatch();
+      window.setTimeout(dispatch, 80);
+    };
+    const listAppControlTerminals = (input = {}) => {
+      const hasWorkspaceSelector = Boolean(
+        String(input.workspaceId || input.workspace_id || input.id || input.workspaceName || input.workspace_name || input.name || "").trim(),
+      );
+      const targetWorkspaces = hasWorkspaceSelector
+        ? [resolveWorkspaceForAppControl(input)].filter(Boolean)
+        : workspaces;
+      if (hasWorkspaceSelector && targetWorkspaces.length === 0) {
+        throw new Error("No matching workspace was found.");
+      }
+      const workspaceSnapshots = targetWorkspaces.map(buildAppControlTerminalSnapshot);
+      return {
+        terminals: workspaceSnapshots.flatMap((snapshot) => snapshot.terminals),
+        workspaces: workspaceSnapshots,
+      };
+    };
+    const openAppControlTerminals = (input = {}) => {
+      const workspace = resolveWorkspaceForAppControl(input);
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const requestedRole = normalizeAppControlTerminalRole(input.agent, input.agentType, input.agent_type, input.provider, input.role);
+      const fallbackReadyAgent = getReadyAgent(Array.isArray(agentStatuses) ? agentStatuses : [], workspaceTerminalFallbackRole);
+      const role = requestedRole
+        || fallbackReadyAgent?.id
+        || WORKSPACE_TERMINAL_ROLE_GENERIC;
+      const label = role === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(role);
+      if (role !== WORKSPACE_TERMINAL_ROLE_GENERIC) {
+        const status = (Array.isArray(agentStatuses) ? agentStatuses : []).find((agent) => agent.id === role);
+        if (!status?.installed) {
+          throw new Error(`${label} is not installed on this machine.`);
+        }
+        if (!status?.authenticated) {
+          throw new Error(`${label} is installed but not signed in.`);
+        }
+      }
+
+      const mode = String(input.mode || input.openMode || input.open_mode || input.action || "spawn").trim().toLowerCase();
+      const ensureMode = ["ensure", "ensure_count", "ensure-count", "at_least", "at-least"].includes(mode);
+      const requestedCount = Math.max(1, Math.min(
+        MAX_WORKSPACE_TERMINAL_COUNT,
+        Number.parseInt(input.count ?? input.amount ?? input.number, 10) || 1,
+      ));
+      const before = buildAppControlTerminalSnapshot(workspace);
+      const existingCount = before.terminals.filter((terminal) => terminal.configured && terminal.role === role).length;
+      const desiredAddCount = ensureMode
+        ? Math.max(0, requestedCount - existingCount)
+        : requestedCount;
+      const added = [];
+      workspaceTerminalExplicitEmptyRef.current.delete(workspace.id);
+      for (let index = 0; index < desiredAddCount; index += 1) {
+        const result = addWorkspaceTerminal({
+          role,
+          source: "app_control_mcp_open_terminals",
+          workspaceId: workspace.id,
+        });
+        if (!result || !Number.isInteger(result.terminalIndex)) {
+          break;
+        }
+        added.push(result);
+      }
+      const after = buildAppControlTerminalSnapshot(workspace);
+      const addedIndexes = new Set(added.map((terminal) => terminal.terminalIndex));
+      const addedTerminals = after.terminals.filter((terminal) => addedIndexes.has(terminal.terminalIndex));
+      const shouldFocus = appControlBooleanValue(
+        input.focus ?? input.select ?? input.activate,
+        true,
+      );
+      let activated = false;
+      let focusTarget = addedTerminals[addedTerminals.length - 1]
+        || after.terminals.find((terminal) => terminal.role === role)
+        || null;
+      if (shouldFocus) {
+        activated = showAppControlWorkspaceTerminals(workspace, "app_control_mcp_open_terminals");
+        if (activated && focusTarget) {
+          dispatchAppControlTerminalFocus(workspace, focusTarget);
+        }
+      }
+
+      return {
+        activated,
+        addedCount: added.length,
+        addedTerminals,
+        agent: role,
+        agentLabel: label,
+        capacityReached: added.length < desiredAddCount,
+        existingCount,
+        focusTarget,
+        mode: ensureMode ? "ensure_count" : "spawn_count",
+        requestedCount,
+        workspace: workspaceSummary(workspace),
+        workspaceTerminals: after,
+      };
+    };
+    const closeAppControlTerminals = async (input = {}) => {
+      const workspace = resolveWorkspaceForAppControl(input);
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const {
+        snapshot,
+        targets,
+      } = resolveAppControlTerminalTargets(workspace, input, { requireTarget: true });
+      const force = appControlBooleanValue(input.force, false);
+      const onlyIdle = appControlBooleanValue(input.onlyIdle ?? input.only_idle, false);
+      const closed = [];
+      const skipped = [];
+      for (const terminal of targets) {
+        if (!Number.isInteger(terminal.terminalIndex)) {
+          skipped.push({ reason: "missing_terminal_index", terminal });
+          continue;
+        }
+        if (onlyIdle && !terminal.idle) {
+          skipped.push({ reason: terminal.idleReason || "busy", terminal });
+          continue;
+        }
+        if (!force && !terminal.idle) {
+          skipped.push({ reason: `busy:${terminal.idleReason || "unknown"}`, terminal });
+          continue;
+        }
+        if (terminal.configured) {
+          closeWorkspaceTerminal({
+            terminalIndex: terminal.terminalIndex,
+            threadId: terminal.threadId || "",
+            workspaceId: workspace.id,
+          });
+        } else if (terminal.paneId) {
+          await invoke("terminal_close", {
+            paneId: terminal.paneId,
+            instanceId: terminal.instanceId || undefined,
+            waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP || undefined,
+          });
+        } else {
+          skipped.push({ reason: "missing_pane_id", terminal });
+          continue;
+        }
+        terminalStatusEventEmitterRef.current?.({
+          activityStatus: "closed",
+          agentId: terminal.agentId || "",
+          commandPhase: "completed",
+          executionPhase: "completed",
+          paneId: terminal.paneId || "",
+          readiness: "closed",
+          source: "app-control-mcp-close",
+          status: "closed",
+          terminalIndex: terminal.terminalIndex,
+          threadId: terminal.threadId || "",
+          type: "app-control-mcp-close",
+          workspaceId: workspace.id,
+          workspaceName: workspace.name || "",
+        }, {
+          commandPhase: "completed",
+          executionPhase: "completed",
+          reason: "app-control-mcp-close",
+          status: "closed",
+        });
+        closed.push(terminal);
+      }
+      const after = buildAppControlTerminalSnapshot(workspace);
+      return {
+        closed,
+        closedCount: closed.length,
+        skipped,
+        skippedCount: skipped.length,
+        targetCount: targets.length,
+        workspace: snapshot.workspace,
+        workspaceTerminals: after,
+      };
+    };
+    const focusAppControlTerminal = (input = {}) => {
+      const workspace = resolveWorkspaceForAppControl(input);
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const resolved = resolveAppControlTerminalTargets(workspace, input, { requireTarget: false });
+      const hasSelector = resolved.all
+        || resolved.indexes.length > 0
+        || resolved.paneIds.length > 0
+        || Boolean(resolved.role);
+      const terminal = resolved.targets[0] || (!hasSelector ? resolved.snapshot.terminals[0] : null);
+      if (!terminal) {
+        throw new Error("No matching terminal was found.");
+      }
+      const activated = showAppControlWorkspaceTerminals(workspace, "app_control_mcp_focus_terminal");
+      if (activated) {
+        dispatchAppControlTerminalFocus(workspace, terminal);
+      }
+      return {
+        activated,
+        terminal,
+        workspace: workspaceSummary(workspace),
+      };
+    };
+    const sendAppControlReply = (requestId, response) => {
+      if (!requestId) {
+        return;
+      }
+      invoke("app_control_mcp_reply", {
+        requestId,
+        response,
+      }).catch((error) => {
+        logBigViewSyncDiagnosticEvent("app_control_mcp.reply_error", {
+          message: getErrorMessage(error, "Unable to reply to app-control MCP request."),
+          requestId,
+        });
+      });
+    };
+    const buildAppControlState = () => ({
+      activeView,
+      visibleView,
+      selectedWorkspace: selectedWorkspace ? workspaceSummary(selectedWorkspace) : null,
+      activatedWorkspace: activatedWorkspace ? workspaceSummary(activatedWorkspace) : null,
+      workspaces: workspaces.map(workspaceSummary),
+      availableTabs: [
+        "terminals",
+        "files",
+        "history",
+        "tools",
+        "architectures",
+        "mcps",
+        "assets",
+        "audio",
+        "tokenomics",
+        "snipping",
+        "settings",
+      ],
+    });
+    const handleAppControlRequest = async (event) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      const tool = String(payload.tool || "").trim();
+      const input = payload.input && typeof payload.input === "object" ? payload.input : {};
+      try {
+        if (tool === "get_state") {
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: buildAppControlState(),
+          });
+          return;
+        }
+
+        if (tool === "select_workspace") {
+          const workspace = resolveWorkspaceForAppControl(input);
+          if (!workspace) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "workspace_not_found",
+                message: "No matching workspace was found.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const shouldActivate = input.active !== false;
+          if (shouldActivate) {
+            const activated = requestWorkspaceActivation(workspace.id, "app_control_mcp");
+            sendAppControlReply(requestId, {
+              ok: activated,
+              ...(activated ? {} : {
+                error: {
+                  code: "workspace_activation_blocked",
+                  message: "Workspace could not be activated.",
+                },
+              }),
+              data: {
+                workspace: workspaceSummary(workspace),
+                state: buildAppControlState(),
+              },
+            });
+            return;
+          }
+          await deactivateWorkspace(workspace.id, "app_control_mcp");
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              workspace: workspaceSummary(workspace),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "select_tab") {
+          const tab = normalizeAppControlTabId(input.tab || input.view || input.tabId || input.viewId);
+          if (!tab) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "unsupported_tab",
+                message: "The requested tab is not supported.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          let workspace = null;
+          if (tab.scope === "workspace") {
+            workspace = resolveWorkspaceForAppControl(input);
+            if (!workspace) {
+              sendAppControlReply(requestId, {
+                ok: false,
+                error: {
+                  code: "workspace_required",
+                  message: "A workspace must be selected before opening that tab.",
+                },
+                data: buildAppControlState(),
+              });
+              return;
+            }
+            const activated = requestWorkspaceActivation(workspace.id, "app_control_mcp_tab");
+            if (!activated) {
+              sendAppControlReply(requestId, {
+                ok: false,
+                error: {
+                  code: "workspace_activation_blocked",
+                  message: "Workspace could not be selected for that tab.",
+                },
+                data: buildAppControlState(),
+              });
+              return;
+            }
+          }
+          showView(tab.view, {
+            immediate: true,
+            telemetrySource: "app_control_mcp",
+            telemetryWorkspaceId: workspace?.id || selectedWorkspaceId || "",
+          });
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              selectedTab: tab.id,
+              view: tab.view,
+              scope: tab.scope,
+              workspace: workspace ? workspaceSummary(workspace) : null,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "list_terminals") {
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...listAppControlTerminals(input),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "open_terminals") {
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...openAppControlTerminals(input),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "close_terminals") {
+          const result = await closeAppControlTerminals(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "focus_terminal") {
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...focusAppControlTerminal(input),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        sendAppControlReply(requestId, {
+          ok: false,
+          error: {
+            code: "unknown_tool",
+            message: `Unknown app-control tool: ${tool}`,
+          },
+          data: buildAppControlState(),
+        });
+      } catch (error) {
+        sendAppControlReply(requestId, {
+          ok: false,
+          error: {
+            code: "tool_failed",
+            message: getErrorMessage(error, "Unable to handle app-control MCP request."),
+          },
+          data: buildAppControlState(),
+        });
+      }
+    };
+
+    listen(APP_CONTROL_MCP_REQUEST_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      void handleAppControlRequest(event);
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch((error) => {
+      logBigViewSyncDiagnosticEvent("app_control_mcp.listen_error", {
+        message: getErrorMessage(error, "Unable to listen for app-control MCP requests."),
+      });
+    });
+
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, [
+    addWorkspaceTerminal,
+    activeView,
+    activatedWorkspace,
+    activatedWorkspaceId,
+    agentStatuses,
+    closeWorkspaceTerminal,
+    deactivateWorkspace,
+    defaultWorkingDirectory,
+    requestWorkspaceActivation,
+    selectedWorkspace,
+    selectedWorkspaceId,
+    showView,
+    visibleView,
+    workspaceLifecycleSettings,
+    workspaceSettings,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+    workspaces,
+  ]);
+
   const openSelectedWorkspaceSettings = useCallback(() => {
     if (selectedWorkspace) {
       openWorkspaceSettings(selectedWorkspace.id);
@@ -27552,12 +28677,21 @@ export default function App() {
             || "",
         ).trim();
         const storedModel = String(session.model || providerBinding?.modelId || "").trim();
-        const model = storedModel || getWorkspaceAgentStartupModel(session.agentId, agentStatuses);
+        const startupDefaultModel = getWorkspaceAgentStartupModel(session.agentId, agentStatuses);
+        const model = providerSessionId ? startupDefaultModel : storedModel || startupDefaultModel;
+        const modelSource = providerSessionId
+          ? model ? "app-default" : ""
+          : storedModel
+            ? providerBinding?.modelSource || "session-restore"
+            : model
+              ? "agent-default"
+              : "";
 
         return {
           instanceId: session.instanceId,
           agentStarted: session.agentStarted === true,
           model,
+          modelSource,
           needsAgentStart: session.needsAgentStart === true,
           paneId: session.paneId,
           provider: session.agentId,
@@ -27783,10 +28917,21 @@ export default function App() {
             return;
           }
 
+          const startedModel = String(paneResult.model || request.model || "").trim();
+          const startedModelSourceRaw = String(paneResult.modelSource || "").trim();
+          const startedModelSource = startedModel
+            ? startedModelSourceRaw === "request"
+              ? request.modelSource || (request.model ? "session-restore" : "")
+              : startedModelSourceRaw || request.modelSource || (request.model ? "session-restore" : "")
+            : "";
+
           logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_pane_started", {
             hasProviderSessionId: Boolean(request.providerSessionId),
             instanceId: paneResult.instanceId || request.instanceId || "",
-            model: request.model || "",
+            model: startedModel,
+            modelSource: startedModelSource,
+            requestModel: request.model || "",
+            requestModelSource: request.modelSource || "",
             paneId: paneResult.paneId || request.paneId || "",
             provider: request.provider || "",
             terminalIndex: request.terminalIndex ?? "",
@@ -27797,7 +28942,9 @@ export default function App() {
             hasProviderSessionId: Boolean(request.providerSessionId),
             instanceId: paneResult.instanceId || request.instanceId || "",
             launchKey: workspaceAgentLaunchKey,
-            model: request.model || "",
+            model: startedModel,
+            modelSource: startedModelSource,
+            requestModel: request.model || "",
             paneId: paneResult.paneId || request.paneId || "",
             provider: request.provider || "",
             terminalIndex: request.terminalIndex ?? "",
@@ -27812,8 +28959,8 @@ export default function App() {
             inputReadyAt: new Date().toISOString(),
             inputReadyConfidence: "terminal-start-agent",
             instanceId: paneResult.instanceId,
-            model: request.model || "",
-            modelSource: request.model ? "session-restore" : "",
+            model: startedModel,
+            modelSource: startedModelSource,
             nativeSessionId: request.providerSessionId || "",
             nativeSessionKind: request.providerSessionId ? "session" : "",
             nativeSessionSource: request.providerSessionId ? "session-restore" : "",
@@ -28941,18 +30088,31 @@ export default function App() {
                       aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                     >
-                      <WorkspaceIdleState
-                        actionLabel={selectedLoopspace ? "" : "Create Loop"}
-                        detail={loopspaceIdleDetail}
-                        flameActive={
-                          visibleView === DEFAULT_WORKSPACE_VIEW
-                            && !loopspaceCreatePanelOpen
-                        }
-                        onAction={openCreateLoopspacePanel}
-                        plan={billingPlanNameFromStatus(billingStatus, user)}
-                        title={loopspaceIdleTitle}
-                        viewMotion={viewMotion}
-                      />
+                      {selectedLoopspace ? (
+                        <LoopspaceRuntimeView
+                          actionState={loopspaceActionState}
+                          error={loopspaceError}
+                          loopspace={selectedLoopspace}
+                          nameDraft={loopspaceRenameDraft}
+                          onBack={unselectLoopspace}
+                          onDelete={deleteSelectedLoopspace}
+                          onRename={renameSelectedLoopspace}
+                          setNameDraft={setLoopspaceRenameDraft}
+                        />
+                      ) : (
+                        <WorkspaceIdleState
+                          actionLabel="Create Loop"
+                          detail={loopspaceIdleDetail}
+                          flameActive={
+                            visibleView === DEFAULT_WORKSPACE_VIEW
+                              && !loopspaceCreatePanelOpen
+                          }
+                          onAction={openCreateLoopspacePanel}
+                          plan={billingPlanNameFromStatus(billingStatus, user)}
+                          title={loopspaceIdleTitle}
+                          viewMotion={viewMotion}
+                        />
+                      )}
                     </WorkspaceRuntimeLayer>
                   )}
                   {!loopspacesModeActive && shouldShowDefaultWorkspaceIdle && (

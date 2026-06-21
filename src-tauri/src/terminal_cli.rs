@@ -793,6 +793,178 @@ const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "secrets__get",
     "secrets__write_env_file",
 ];
+const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
+    "get_state",
+    "select_workspace",
+    "select_tab",
+    "list_terminals",
+    "open_terminals",
+    "close_terminals",
+    "focus_terminal",
+];
+const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+fn terminal_args_with_app_control_mcp_identity(
+    provider_id: &str,
+    args: &[String],
+    app_control_command: &str,
+    app_control_args: &[String],
+) -> Result<Vec<String>, String> {
+    let provider_id = provider_id.to_ascii_lowercase();
+    let is_codex = provider_id.contains("codex");
+    let is_claude = provider_id.contains("claude");
+    if !is_codex && !is_claude {
+        return Ok(args.to_vec());
+    }
+
+    let mut next = args.to_vec();
+    if is_codex {
+        append_codex_mcp_server_config_args(
+            &mut next,
+            APP_CONTROL_MCP_SERVER_NAME,
+            app_control_command,
+            app_control_args,
+        );
+        for tool in APP_CONTROL_MCP_TOOL_NAMES {
+            append_codex_mcp_tool_approval_arg(&mut next, APP_CONTROL_MCP_SERVER_NAME, tool);
+        }
+        next.push("-c".to_string());
+        next.push("shell_environment_policy.inherit=all".to_string());
+    }
+
+    if is_claude {
+        strip_terminal_arg_option(&mut next, "--mcp-config", "", true);
+        next.push("--mcp-config".to_string());
+        next.push(claude_app_control_mcp_config_arg(
+            app_control_command,
+            app_control_args,
+        )?);
+
+        strip_terminal_arg_option(&mut next, "--allowedTools", "", true);
+        strip_terminal_arg_option(&mut next, "--allowed-tools", "", true);
+        next.push("--allowedTools".to_string());
+        next.push(
+            APP_CONTROL_MCP_TOOL_NAMES
+                .iter()
+                .map(|tool| format!("mcp__{APP_CONTROL_MCP_SERVER_NAME}__{tool}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        apply_claude_managed_mcp_isolation_args(&mut next);
+    }
+
+    Ok(next)
+}
+
+fn terminal_env_vars_with_app_control_mcp_identity(
+    provider_id: &str,
+    env_vars: &[(String, String)],
+    app_control_command: &str,
+    app_control_args: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let mut next = env_vars.to_vec();
+    let provider_id = provider_id.to_ascii_lowercase();
+    if !provider_id.contains("opencode") {
+        return Ok(next);
+    }
+
+    let existing_config = next
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == OPENCODE_CONFIG_CONTENT_ENV).then(|| value.trim()))
+        .filter(|value| !value.is_empty());
+    let mut config = if let Some(existing_config) = existing_config {
+        serde_json::from_str::<Value>(existing_config)
+            .map_err(|error| format!("Invalid OpenCode inline config JSON: {error}"))?
+    } else {
+        json!({})
+    };
+    let Some(config_object) = config.as_object_mut() else {
+        return Err("OpenCode inline config must be a JSON object.".to_string());
+    };
+    config_object
+        .entry("$schema".to_string())
+        .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
+
+    if !config_object
+        .get("mcp")
+        .map_or(true, |value| value.is_object())
+    {
+        return Err("OpenCode inline config field `mcp` must be a JSON object.".to_string());
+    }
+    let mcp_servers = config_object
+        .entry("mcp".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "Unable to prepare OpenCode MCP config.".to_string())?;
+
+    let mut command = vec![Value::String(app_control_command.to_string())];
+    command.extend(app_control_args.iter().cloned().map(Value::String));
+    mcp_servers.insert(
+        APP_CONTROL_MCP_SERVER_NAME.to_string(),
+        json!({
+            "type": "local",
+            "command": command,
+            "enabled": true,
+            "timeout": APP_CONTROL_MCP_TIMEOUT_MS,
+            "environment": {
+                "DIFFFORGE_APP_CONTROL_MCP": "1"
+            }
+        }),
+    );
+
+    set_terminal_env_var(&mut next, OPENCODE_CONFIG_CONTENT_ENV, &config.to_string());
+    Ok(next)
+}
+
+fn claude_app_control_mcp_config_arg(
+    app_control_command: &str,
+    app_control_args: &[String],
+) -> Result<String, String> {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        APP_CONTROL_MCP_SERVER_NAME.to_string(),
+        json!({
+            "command": app_control_command,
+            "args": app_control_args,
+            "env": {
+                "DIFFFORGE_APP_CONTROL_MCP": "1"
+            },
+            "diffforge": {
+                "scope": "app-control",
+                "alwaysOn": true,
+                "toggleable": false,
+                "authority": "local_app_control"
+            }
+        }),
+    );
+    let config = json!({ "mcpServers": servers });
+
+    #[cfg(windows)]
+    {
+        let config_dir = env::temp_dir().join("diffforge-app-control-mcp");
+        fs::create_dir_all(&config_dir).map_err(|error| {
+            format!(
+                "Unable to create app-control MCP config directory {}: {error}",
+                config_dir.display()
+            )
+        })?;
+        let config_path = config_dir.join(format!("claude-app-control-{}.json", uuid::Uuid::new_v4()));
+        fs::write(&config_path, config.to_string()).map_err(|error| {
+            format!(
+                "Unable to write app-control MCP config {}: {error}",
+                config_path.display()
+            )
+        })?;
+        return Ok(config_path.to_string_lossy().to_string());
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(config.to_string())
+    }
+}
 
 fn append_codex_mcp_server_config_args(
     args: &mut Vec<String>,

@@ -1845,6 +1845,7 @@ struct TerminalOpenRequest {
     workspace_name: Option<String>,
     terminal_name: Option<String>,
     terminal_nickname: Option<String>,
+    app_control_mcp: Option<bool>,
     cols: Option<u16>,
     rows: Option<u16>,
     output_transport: Option<bool>,
@@ -1865,6 +1866,8 @@ struct TerminalStartAgentRequest {
 struct TerminalStartAgentPaneResult {
     pane_id: String,
     instance_id: Option<u64>,
+    model: Option<String>,
+    model_source: Option<String>,
     started: bool,
     skipped: bool,
     message: String,
@@ -1898,6 +1901,8 @@ struct TerminalOpenResult {
     provider_session_id: Option<String>,
     native_session_id: Option<String>,
     requested_provider_session_id: Option<String>,
+    model: Option<String>,
+    model_source: Option<String>,
     activity_status: String,
     command_phase: String,
     input_ready: bool,
@@ -2459,6 +2464,7 @@ include!("workspace_threads_store.rs");
 include!("architectures.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
+include!("app_control_mcp.rs");
 include!("terminal_cli.rs");
 include!("tokenomics.rs");
 include!("native_notifications.rs");
@@ -4630,6 +4636,7 @@ pub fn run() {
         .manage(TerminalDiagnosticState::new())
         .manage(WindowsTerminalDiagnosticState::new())
         .manage(CloudMcpState::new())
+        .manage(AppControlMcpState::new())
         .manage(DeveloperProcessMonitorState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
@@ -4939,6 +4946,11 @@ pub fn run() {
             cloud_mcp_architecture_hub_catalog,
             cloud_mcp_sync_architecture,
             cloud_mcp_hydrate_architecture,
+            cloud_mcp_get_loopspaces,
+            cloud_mcp_sync_loopspaces,
+            cloud_mcp_create_loopspace,
+            cloud_mcp_rename_loopspace,
+            cloud_mcp_delete_loopspace,
             cloud_mcp_list_account_assets,
             cloud_mcp_list_asset_clouds,
             cloud_mcp_save_asset_cloud,
@@ -5025,6 +5037,7 @@ pub fn run() {
             terminal_write,
             terminal_input_transport_endpoint,
             terminal_output_transport_endpoint,
+            app_control_mcp_reply,
             terminal_capture_direct_prompt_todo,
             terminal_write_realtime,
             terminal_refresh_theme,

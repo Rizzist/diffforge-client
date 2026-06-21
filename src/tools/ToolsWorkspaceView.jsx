@@ -1431,7 +1431,7 @@ const ToolsHydrationPanel = styled.div`
   gap: 7px;
   min-width: 0;
   padding: 9px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.22);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
   border-radius: 8px;
   background: linear-gradient(180deg, rgba(20, 29, 44, 0.92), rgba(10, 15, 24, 0.92));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
@@ -1494,7 +1494,7 @@ const ToolsHydrationFill = styled.div`
   height: 100%;
   min-width: 4px;
   border-radius: inherit;
-  background: linear-gradient(90deg, #7db0ff, #8fe0aa);
+  background: linear-gradient(90deg, var(--forge-accent-soft, #7db0ff), #8fe0aa);
   transition: width 180ms ease;
 `;
 
@@ -1557,7 +1557,7 @@ const ToolsSectionButton = styled.button`
 
   &[data-active="true"] {
     color: var(--forge-text, #f4f7fa);
-    background: rgba(125, 176, 255, 0.14);
+    background: rgba(var(--forge-accent-soft-rgb), 0.14);
   }
 
   &:hover:not([data-active="true"]) {
@@ -1703,7 +1703,7 @@ const SkillDocumentThemeButton = styled.button`
 
   &[data-active="true"] {
     color: var(--forge-text, #f4f7fa);
-    background: rgba(125, 176, 255, 0.16);
+    background: rgba(var(--forge-accent-soft-rgb), 0.16);
   }
 
   &:hover:not([data-active="true"]) {
@@ -1772,7 +1772,7 @@ const ToolsSkillsEditor = styled.textarea`
   resize: none;
 
   &:focus-visible {
-    box-shadow: inset 3px 0 0 rgba(125, 176, 255, 0.36);
+    box-shadow: inset 3px 0 0 rgba(var(--forge-accent-soft-rgb), 0.36);
   }
 
   &::placeholder {
@@ -1791,16 +1791,16 @@ const SkillDocumentActions = styled.div`
 
 const ToolsPrimaryButton = styled.button`
   padding: 8px 16px;
-  border: 1px solid rgba(125, 176, 255, 0.35);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.35);
   border-radius: 8px;
-  color: rgba(200, 222, 255, 0.98);
-  background: rgba(59, 130, 246, 0.18);
+  color: var(--forge-accent-soft, rgba(200, 222, 255, 0.98));
+  background: rgba(var(--forge-accent-rgb), 0.18);
   font-size: 12px;
   font-weight: 750;
   cursor: pointer;
 
   &:hover:not(:disabled) {
-    background: rgba(59, 130, 246, 0.3);
+    background: rgba(var(--forge-accent-rgb), 0.3);
   }
 
   &:disabled {
@@ -1881,7 +1881,7 @@ const ToolsSearchInput = styled.input`
   font-size: 12px;
 
   &:focus-visible {
-    outline: 2px solid rgba(125, 176, 255, 0.35);
+    outline: 2px solid rgba(var(--forge-accent-soft-rgb), 0.35);
     outline-offset: -1px;
   }
 `;
@@ -2019,16 +2019,16 @@ const CliStateText = styled.span`
 
 const CliRowButton = styled.button`
   padding: 3px 9px;
-  border: 1px solid rgba(125, 176, 255, 0.3);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.3);
   border-radius: 6px;
-  color: rgba(200, 222, 255, 0.95);
-  background: rgba(59, 130, 246, 0.12);
+  color: var(--forge-accent-soft, rgba(200, 222, 255, 0.95));
+  background: rgba(var(--forge-accent-rgb), 0.12);
   font-size: 10.5px;
   font-weight: 750;
   cursor: pointer;
 
   &:hover {
-    background: rgba(59, 130, 246, 0.24);
+    background: rgba(var(--forge-accent-rgb), 0.24);
   }
 
   &[data-danger="true"] {
@@ -2150,8 +2150,8 @@ const SkillSourceBadge = styled.span`
   white-space: nowrap;
 
   &[data-source="catalog"] {
-    border-color: rgba(125, 176, 255, 0.3);
-    color: rgba(180, 210, 255, 0.92);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.3);
+    color: var(--forge-accent-soft, rgba(180, 210, 255, 0.92));
   }
 
   &[data-source="cli"] {

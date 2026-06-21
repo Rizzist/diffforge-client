@@ -40,6 +40,14 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--app-control-mcp") {
+        let mcp_args = args.drain(2..).collect::<Vec<_>>();
+        if let Err(error) = rust_diffforge_lib::run_app_control_mcp_stdio_server(mcp_args) {
+            eprintln!("app-control mcp error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--claude-worktree-guard") {
         let guard_args = args.drain(2..).collect::<Vec<_>>();
         std::process::exit(rust_diffforge_lib::run_claude_worktree_guard(&guard_args));

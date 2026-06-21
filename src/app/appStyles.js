@@ -92,6 +92,22 @@ const FILES_VSCODE_THEME_VARS = `
     --files-vscode-blue: #0066cc;
     --files-vscode-focus: #0071e3;
   }
+
+  html[data-forge-space="loopspaces"] & {
+    --files-vscode-hover: rgba(var(--forge-accent-rgb), 0.12);
+    --files-vscode-selection: rgba(var(--forge-accent-rgb), 0.28);
+    --files-vscode-selection-inactive: rgba(var(--forge-accent-rgb), 0.08);
+    --files-vscode-blue: var(--forge-accent-soft);
+    --files-vscode-focus: var(--forge-accent);
+  }
+
+  html[data-forge-theme="light"][data-forge-space="loopspaces"] & {
+    --files-vscode-hover: rgba(var(--forge-accent-rgb), 0.075);
+    --files-vscode-selection: rgba(var(--forge-accent-rgb), 0.16);
+    --files-vscode-selection-inactive: rgba(var(--forge-accent-rgb), 0.055);
+    --files-vscode-blue: var(--forge-accent);
+    --files-vscode-focus: var(--forge-accent);
+  }
 `;
 
 export const GlobalStyle = createGlobalStyle`
@@ -132,6 +148,26 @@ export const GlobalStyle = createGlobalStyle`
     --forge-green: #3ccb7f;
     --forge-red: #ef6b6b;
     --forge-color-scheme: dark;
+    /* Architecture diagram (default/dark fallback) */
+    --arch-canvas-bg: #070a0f;
+    --arch-canvas-glow: rgba(30, 41, 59, 0.4);
+    --arch-dots: rgba(148, 163, 184, 0.16);
+    --arch-node-bg: #161c28;
+    --arch-node-border: rgba(148, 163, 184, 0.22);
+    --arch-node-shadow: 0 10px 28px rgba(2, 6, 23, 0.55);
+    --arch-node-text: #e8edf2;
+    --arch-node-text-muted: #93a0b2;
+    --arch-group-bg: rgba(255, 255, 255, 0.025);
+    --arch-group-border: rgba(148, 163, 184, 0.26);
+    --arch-edge: rgba(148, 163, 184, 0.5);
+    --arch-edge-selected: rgba(251, 191, 36, 0.95);
+    --arch-edge-label-bg: rgba(9, 13, 24, 0.92);
+    --arch-edge-label-border: rgba(148, 163, 184, 0.22);
+    --arch-edge-label-text: #cbd5e1;
+    --arch-icon-tile-bg: rgba(248, 250, 252, 0.08);
+    --arch-icon-tile-border: rgba(226, 232, 240, 0.18);
+    --arch-icon-mono: #f8fafc;
+    --arch-focus-ring: #7dd3fc;
     color: var(--forge-text);
     background: var(--forge-bg);
     color-scheme: var(--forge-color-scheme, dark);
@@ -185,6 +221,26 @@ export const GlobalStyle = createGlobalStyle`
     --forge-green: #3ccb7f;
     --forge-red: #ef6b6b;
     --forge-color-scheme: dark;
+    /* Architecture diagram (dark) */
+    --arch-canvas-bg: #070a0f;
+    --arch-canvas-glow: rgba(30, 41, 59, 0.4);
+    --arch-dots: rgba(148, 163, 184, 0.16);
+    --arch-node-bg: #161c28;
+    --arch-node-border: rgba(148, 163, 184, 0.22);
+    --arch-node-shadow: 0 10px 28px rgba(2, 6, 23, 0.55);
+    --arch-node-text: #e8edf2;
+    --arch-node-text-muted: #93a0b2;
+    --arch-group-bg: rgba(255, 255, 255, 0.025);
+    --arch-group-border: rgba(148, 163, 184, 0.26);
+    --arch-edge: rgba(148, 163, 184, 0.5);
+    --arch-edge-selected: rgba(251, 191, 36, 0.95);
+    --arch-edge-label-bg: rgba(9, 13, 24, 0.92);
+    --arch-edge-label-border: rgba(148, 163, 184, 0.22);
+    --arch-edge-label-text: #cbd5e1;
+    --arch-icon-tile-bg: rgba(248, 250, 252, 0.08);
+    --arch-icon-tile-border: rgba(226, 232, 240, 0.18);
+    --arch-icon-mono: #f8fafc;
+    --arch-focus-ring: #7dd3fc;
   }
 
   html[data-forge-theme="light"] {
@@ -231,6 +287,26 @@ export const GlobalStyle = createGlobalStyle`
     --forge-light-ink: #1d1d1f;
     --forge-light-muted: #7a7a7a;
     --forge-light-dark-tile: #272729;
+    /* Architecture diagram (light) */
+    --arch-canvas-bg: #f4f5f7;
+    --arch-canvas-glow: rgba(0, 102, 204, 0.06);
+    --arch-dots: rgba(0, 0, 0, 0.1);
+    --arch-node-bg: #ffffff;
+    --arch-node-border: #e2e5ea;
+    --arch-node-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+    --arch-node-text: #1b1e24;
+    --arch-node-text-muted: #5a6472;
+    --arch-group-bg: rgba(15, 23, 42, 0.04);
+    --arch-group-border: #e2e5ea;
+    --arch-edge: #6b7280;
+    --arch-edge-selected: #b45309;
+    --arch-edge-label-bg: #ffffff;
+    --arch-edge-label-border: rgba(0, 0, 0, 0.14);
+    --arch-edge-label-text: #404a57;
+    --arch-icon-tile-bg: #f0f1f4;
+    --arch-icon-tile-border: rgba(0, 0, 0, 0.12);
+    --arch-icon-mono: #272729;
+    --arch-focus-ring: #0066cc;
   }
 
   html[data-forge-theme="light"] * {
@@ -3936,6 +4012,120 @@ export const WorkspaceIdleDetail = styled.p`
   }
 `;
 
+export const LoopspaceRuntimeSurface = styled.section`
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  color: #f6f7f9;
+  background: #000;
+`;
+
+export const LoopspaceRuntimeToolbar = styled.form`
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 32px minmax(140px, 420px) 32px 32px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 48px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.92);
+
+  @media (max-width: 640px) {
+    grid-template-columns: 32px minmax(0, 1fr) 32px 32px;
+  }
+`;
+
+export const LoopspaceRuntimeNameInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  outline: none;
+  color: #f6f7f9;
+  background: rgba(255, 255, 255, 0.055);
+  font-size: 13px;
+  font-weight: 780;
+  letter-spacing: 0;
+
+  &:focus {
+    border-color: rgba(255, 255, 255, 0.34);
+    background: rgba(255, 255, 255, 0.085);
+  }
+
+  &:disabled {
+    opacity: 0.58;
+  }
+`;
+
+export const LoopspaceRuntimeIconButton = styled.button`
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 7px;
+  color: #f6f7f9;
+  background: rgba(255, 255, 255, 0.055);
+  cursor: pointer;
+  line-height: 0;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(255, 255, 255, 0.28);
+    background: rgba(255, 255, 255, 0.105);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.42;
+  }
+`;
+
+export const LoopspaceRuntimeDangerButton = styled(LoopspaceRuntimeIconButton)`
+  color: #ff8f8f;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(255, 121, 121, 0.34);
+    background: rgba(255, 78, 78, 0.12);
+  }
+`;
+
+export const LoopspaceRuntimeStage = styled.div`
+  min-width: 0;
+  min-height: 0;
+  background: #000;
+`;
+
+export const LoopspaceRuntimeError = styled.div`
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 110, 110, 0.32);
+  border-radius: 7px;
+  color: #ffd4d4;
+  background: rgba(64, 0, 0, 0.82);
+  font-size: 12px;
+  font-weight: 760;
+`;
+
 export const ForgeWorkspace = styled.section`
   position: relative;
   display: grid;
@@ -5560,10 +5750,10 @@ export const FileTreeButton = styled.button`
 
   &[data-drop-target="true"] {
     color: #ffffff;
-    background: rgba(47, 128, 255, 0.36);
+    background: rgba(var(--forge-accent-rgb), 0.36);
     box-shadow:
-      inset 0 0 0 1px rgba(117, 190, 255, 0.78),
-      inset 3px 0 0 rgba(117, 190, 255, 0.96);
+      inset 0 0 0 1px rgba(var(--forge-accent-soft-rgb), 0.78),
+      inset 3px 0 0 rgba(var(--forge-accent-soft-rgb), 0.96);
   }
 
   &:focus-visible {
@@ -9847,6 +10037,22 @@ export const AudioWidgetShell = styled.main`
       0 2px 10px rgba(29, 29, 31, 0.08);
   }
 
+  &[data-hover="true"]:not([data-dragging="true"]) {
+    box-shadow:
+      0 0 0 2px rgba(125, 176, 255, 0.42),
+      0 0 24px rgba(125, 176, 255, 0.24),
+      0 18px 44px rgba(0, 0, 0, 0.34);
+  }
+
+  &[data-theme="light"][data-hover="true"]:not([data-dragging="true"]),
+  html[data-forge-theme="light"] &[data-hover="true"]:not([data-dragging="true"]) {
+    box-shadow:
+      0 0 0 2px rgba(0, 102, 204, 0.34),
+      0 0 22px rgba(0, 102, 204, 0.16),
+      0 16px 36px rgba(29, 29, 31, 0.14),
+      0 2px 10px rgba(29, 29, 31, 0.08);
+  }
+
   &[data-opening="true"] {
     --audio-widget-shell-clip-right: var(--audio-widget-compact-clip-right);
     --audio-widget-surface-scale-x: var(--audio-widget-compact-scale);
@@ -10015,7 +10221,8 @@ export const AudioWidgetCancelButton = styled.button`
   transition: opacity 130ms ease, background 130ms ease, color 130ms ease;
   -webkit-app-region: no-drag;
 
-  ${AudioWidgetShell}:hover & {
+  ${AudioWidgetShell}:hover &,
+  ${AudioWidgetShell}[data-hover="true"] & {
     opacity: 1;
     pointer-events: auto;
   }
@@ -10956,6 +11163,32 @@ export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
       0 1px 0 rgba(255, 255, 255, 0.98) inset,
       0 -8px 15px rgba(0, 0, 0, 0.03) inset,
       0 6px 14px rgba(29, 29, 31, 0.1);
+  }
+
+  ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) & {
+    border-color: rgba(125, 176, 255, 0.48);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.12) inset,
+      0 -8px 16px rgba(0, 0, 0, 0.24) inset,
+      0 8px 22px rgba(0, 0, 0, 0.24),
+      0 0 0 4px rgba(125, 176, 255, 0.13),
+      0 0 22px rgba(125, 176, 255, 0.24);
+    transform: scale(1.035);
+  }
+
+  ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) &[data-size="focus"] {
+    transform: scale(0.84);
+  }
+
+  html[data-forge-theme="light"] ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) &,
+  html[data-audio-widget-theme="light"] ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) & {
+    border-color: rgba(0, 102, 204, 0.24);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.98) inset,
+      0 -8px 16px rgba(0, 0, 0, 0.035) inset,
+      0 8px 18px rgba(29, 29, 31, 0.12),
+      0 0 0 4px rgba(0, 102, 204, 0.09),
+      0 0 20px rgba(0, 102, 204, 0.14);
   }
 
   &[data-hidden="true"] {

@@ -288,6 +288,7 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   phase: "idle",
 };
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
+const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
 const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
@@ -2540,10 +2541,58 @@ const WORKSPACE_TOOL_TABS = [
   { id: "tokenomics", label: "Tokenomics", compactLabel: "Tokens" },
 ];
 const WORKSPACE_SCOPED_TOOL_TAB_IDS = new Set(["plans", "git"]);
+const APP_CONTROL_AGENT_WORKSPACE = Object.freeze({
+  id: "__diffforge_app_control__",
+  name: "App Control",
+});
+const APP_CONTROL_AGENT_PANE_ID = "forge-app-control-agent-terminal";
+const APP_CONTROL_AGENT_DEFAULT_ROLE = "claude";
+const APP_CONTROL_AGENT_LABELS = {
+  claude: "Claude Code",
+  codex: "Codex",
+  generic: "Terminal",
+  opencode: "OpenCode",
+};
 const noopWorkspaceToolHandler = () => {};
 export const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
 export const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
 export const TODO_QUEUE_PANE_MODE_FULLSCREEN = "fullscreen";
+
+function normalizeAppControlAgentRole(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (normalized === "terminal" || normalized === "shell" || normalized === "plain-shell") {
+    return "generic";
+  }
+  if (normalized === "claude-code" || normalized === "claudecode") {
+    return "claude";
+  }
+  if (normalized === "open-code" || normalized === "open-code-ai" || normalized === "opencode-ai") {
+    return "opencode";
+  }
+  return ["claude", "codex", "generic", "opencode"].includes(normalized)
+    ? normalized
+    : APP_CONTROL_AGENT_DEFAULT_ROLE;
+}
+
+function getAppControlAgent(agentStatuses, role) {
+  const roleId = normalizeAppControlAgentRole(role);
+  if (roleId === "generic") {
+    return {
+      id: "generic",
+      label: "Terminal",
+      installed: true,
+      authenticated: true,
+    };
+  }
+  const status = (Array.isArray(agentStatuses) ? agentStatuses : [])
+    .find((agent) => agent?.id === roleId);
+  return status || {
+    id: roleId,
+    label: APP_CONTROL_AGENT_LABELS[roleId] || roleId,
+    installed: true,
+    authenticated: true,
+  };
+}
 
 const TodoQueueSurface = styled.aside`
   display: grid;
@@ -3150,7 +3199,8 @@ const OrchestratorVoiceLogo = styled.img.attrs({
 
 const OrchestratorSectionTabs = styled.div`
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   min-height: 38px;
   border-bottom: 1px solid rgba(var(--forge-tint-soft-rgb), 0.12);
   transition: border-color 260ms ease;
@@ -3761,9 +3811,36 @@ const TodoQueueReadOnlyState = styled.div`
 
 const OrchestratorContent = styled.div`
   display: grid;
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+`;
+
+const OrchestratorAgentTerminalSurface = styled.div`
+  display: grid;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #030405;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+
+  &[data-active="true"] {
+    opacity: 1;
+    pointer-events: auto;
+    visibility: visible;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
 `;
 
 const OrchestratorHistoryView = styled.div`
@@ -3898,8 +3975,8 @@ const OrchestratorHistoryEngineChip = styled.span`
   }
 
   &[data-engine="pipeline"] {
-    color: rgba(191, 219, 254, 0.92);
-    background: rgba(59, 130, 246, 0.14);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-accent-rgb), 0.14);
   }
 `;
 
@@ -4237,14 +4314,14 @@ const OrchestratorHistoryTurnLabel = styled.div`
 
 const OrchestratorHistoryTurnStatus = styled.div`
   flex: 0 0 auto;
-  color: #8fb8ff;
+  color: var(--forge-accent-soft);
   font-size: 10px;
   font-weight: 820;
   line-height: 1.2;
   text-transform: uppercase;
 
   html[data-forge-theme="light"] & {
-    color: #0066cc;
+    color: var(--forge-accent);
   }
 
   &[data-status="cancelled"] {
@@ -4413,14 +4490,18 @@ const OrchestratorHistoryPlan = styled.div`
   gap: 10px;
   justify-self: center;
   padding: 12px clamp(10px, 2vw, 14px);
-  border: 1px solid rgba(45, 212, 191, 0.2);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
   border-radius: 8px;
-  background: rgba(5, 12, 20, 0.62);
+  background:
+    linear-gradient(180deg, rgba(var(--forge-accent-rgb), 0.055), transparent),
+    rgba(5, 12, 20, 0.62);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(13, 148, 136, 0.18);
-    background: rgba(255, 255, 255, 0.78);
+    border-color: rgba(var(--forge-accent-rgb), 0.18);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-accent-rgb), 0.045), transparent),
+      rgba(255, 255, 255, 0.78);
   }
 `;
 
@@ -4496,7 +4577,7 @@ const OrchestratorHistoryPlanProgressBar = styled.span`
   width: var(--voice-plan-progress, 0%);
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #2dd4bf, var(--forge-tint-soft));
+  background: linear-gradient(90deg, var(--forge-accent-soft), var(--forge-accent));
 `;
 
 const OrchestratorHistoryPlanSteps = styled.div`
@@ -4520,7 +4601,7 @@ const OrchestratorHistoryPlanStep = styled.div`
   background: transparent;
 
   &[data-active="true"] {
-    border-top-color: rgba(45, 212, 191, 0.26);
+    border-top-color: rgba(var(--forge-accent-soft-rgb), 0.3);
   }
 
   html[data-forge-theme="light"] & {
@@ -4529,7 +4610,7 @@ const OrchestratorHistoryPlanStep = styled.div`
   }
 
   html[data-forge-theme="light"] &[data-active="true"] {
-    border-top-color: rgba(13, 148, 136, 0.22);
+    border-top-color: rgba(var(--forge-accent-rgb), 0.24);
   }
 `;
 
@@ -4737,8 +4818,8 @@ const OrchestratorHistoryPlanActionButton = styled.button`
 
   &:hover {
     border-color: rgba(var(--forge-tint-soft-rgb), 0.32);
-    background: rgba(30, 41, 59, 0.72);
-    color: #eff6ff;
+    background: rgba(var(--forge-accent-rgb), 0.14);
+    color: var(--forge-accent-soft);
     transform: translateY(-1px);
   }
 
@@ -4880,7 +4961,7 @@ const OrchestratorHistoryInput = styled.textarea`
   }
 
   &:focus {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.45);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.45);
   }
 
   &:disabled {
@@ -4899,7 +4980,7 @@ const OrchestratorHistoryInput = styled.textarea`
   }
 
   html[data-forge-theme="light"] &:focus {
-    border-color: rgba(var(--forge-tint-rgb), 0.38);
+    border-color: rgba(var(--forge-accent-rgb), 0.38);
   }
 `;
 
@@ -4927,16 +5008,16 @@ const OrchestratorHistorySendButton = styled.button`
     opacity 140ms ease;
 
   &:not(:disabled):hover {
-    border-color: rgba(255, 255, 255, 0.42);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.5);
     color: #05070a;
-    background: #ffffff;
+    background: var(--forge-accent-soft);
   }
 
   &[data-ready="true"],
   &[data-animated="true"] {
-    border-color: rgba(255, 255, 255, 0.5);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.58);
     color: #05070a;
-    background: #ffffff;
+    background: var(--forge-accent-soft);
   }
 
   &[data-animated="true"] {
@@ -4959,16 +5040,16 @@ const OrchestratorHistorySendButton = styled.button`
   }
 
   html[data-forge-theme="light"] &:not(:disabled):hover {
-    border-color: rgba(0, 0, 0, 0.14);
-    color: #05070a;
-    background: #ffffff;
+    border-color: rgba(var(--forge-accent-rgb), 0.32);
+    color: #ffffff;
+    background: var(--forge-accent);
   }
 
   html[data-forge-theme="light"] &[data-ready="true"],
   html[data-forge-theme="light"] &[data-animated="true"] {
-    border-color: rgba(0, 0, 0, 0.14);
-    color: #05070a;
-    background: #ffffff;
+    border-color: rgba(var(--forge-accent-rgb), 0.34);
+    color: #ffffff;
+    background: var(--forge-accent);
   }
 `;
 
@@ -14313,6 +14394,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   accountKey = "",
   activeDragItemId = "",
   onAddToolTodo,
+  agentStatusError = "",
+  agentStatusState = "idle",
   billingStatus = null,
   connectedDevices = [],
   defaultWorkingDirectory = "",
@@ -14330,6 +14413,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   localDesktopProfile = null,
   onRefreshGitRepositories = null,
   onRefreshGitSnapshot = null,
+  onRecheckAgents = null,
   onBeginWorkspaceFileDrag,
   onBeginTodoDrag,
   onCancelQueuedItem,
@@ -14371,6 +14455,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   workspaceId,
   workspaceScopedTabsEnabled = true,
   workspaceTodos = null,
+  workspaces = [],
 }) {
   const orchestratorPanelWorkspaceId = workspaceId || workspace?.id || "";
   const orchestratorVoiceHistoryStoreKey = useMemo(
@@ -14400,6 +14485,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   }, []);
 
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
+  const [appControlAgentRole, setAppControlAgentRole] = useState(APP_CONTROL_AGENT_DEFAULT_ROLE);
   const [editingItemId, setEditingItemId] = useState("");
   const [editingDraft, setEditingDraft] = useState("");
   const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
@@ -14510,6 +14596,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     workspace?.workspaceName,
     workspaceTodos,
   ]);
+  const appControlAgent = useMemo(
+    () => getAppControlAgent(agentStatuses, appControlAgentRole),
+    [agentStatuses, appControlAgentRole],
+  );
+  const handleAppControlAgentRoleChange = useCallback(({ role }) => {
+    setAppControlAgentRole(normalizeAppControlAgentRole(role));
+  }, []);
   const orchestratorDeviceRows = useMemo(
     () => buildAccountLiveDeviceRows({
       connectedDevices,
@@ -17090,6 +17183,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorVoiceArea>
           <OrchestratorSectionTabs aria-label="Orchestrator section">
             <OrchestratorSectionButton
+              data-active={activeOrchestratorSection === "agent" ? "true" : "false"}
+              onClick={() => setActiveOrchestratorSection("agent")}
+              type="button"
+            >
+              Agent
+            </OrchestratorSectionButton>
+            <OrchestratorSectionButton
               data-active={activeOrchestratorSection === "todo" ? "true" : "false"}
               onClick={() => setActiveOrchestratorSection("todo")}
               type="button"
@@ -17106,6 +17206,42 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorSectionTabs>
           {renderOrchestratorDeviceRows()}
           <OrchestratorContent>
+            <OrchestratorAgentTerminalSurface
+              aria-hidden={activeOrchestratorSection === "agent" ? undefined : "true"}
+              data-active={activeOrchestratorSection === "agent" ? "true" : "false"}
+            >
+              <WorkspaceTerminal
+                agent={appControlAgent}
+                agentLaunchReady
+                agentStatuses={agentStatuses}
+                agentStatusError={agentStatusError}
+                agentStatusState={agentStatusState}
+                appControlMcp={appControlAgentRole !== "generic"}
+                defaultSessionMode="free"
+                dockedChrome
+                fullscreenState="idle"
+                isActive={activeOrchestratorSection === "agent"}
+                isFullscreen={false}
+                onChangeTerminalRole={handleAppControlAgentRoleChange}
+                onOpenSettings={noopWorkspaceToolHandler}
+                onRecheckAgents={onRecheckAgents || noopWorkspaceToolHandler}
+                paneIdOverride={APP_CONTROL_AGENT_PANE_ID}
+                prewarmShell={false}
+                startupReady
+                terminalBreakoutActive={false}
+                terminalCount={1}
+                terminalIndex={0}
+                terminalRole={appControlAgentRole}
+                terminalSelectionMode="pointerdown"
+                thread={null}
+                threadsViewActive={false}
+                workingDirectory={defaultWorkingDirectory || rootDirectory}
+                workspace={APP_CONTROL_AGENT_WORKSPACE}
+                workspaceError=""
+                workspaceThreads={{}}
+                workspaces={workspaces}
+              />
+            </OrchestratorAgentTerminalSurface>
             {activeOrchestratorSection === "todo" ? (
               workspaceScopedTabsEnabled ? (
                 <TodoQueueBoard
@@ -17514,7 +17650,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                 {todoSelectionEditable && dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
               </TodoQueueBoard>
               ) : null
-            ) : (
+            ) : activeOrchestratorSection === "history" ? (
               <OrchestratorHistoryView aria-label="Voice history">
                 <OrchestratorHistoryToolbar>
                   <strong>Voice history</strong>
@@ -17949,7 +18085,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                   </OrchestratorHistoryInputFrame>
                 </OrchestratorHistoryComposer>
               </OrchestratorHistoryView>
-            )}
+            ) : null}
           </OrchestratorContent>
         </OrchestratorView>
       ) : null}
@@ -31662,6 +31798,44 @@ function TerminalView({
     handleActivateTerminalPane({ paneId: getTerminalPaneId(terminalIndex) });
   }, [activateTerminalTabInRows, activeDisplayRows, getTerminalPaneId, handleActivateTerminalPane]);
 
+  useEffect(() => {
+    const handleAppControlTerminalFocus = (event) => {
+      const detail = event?.detail || {};
+      const workspaceId = String(detail.workspaceId || detail.workspace_id || "").trim();
+      if (workspaceId && workspaceId !== terminalWorkspace?.id) {
+        return;
+      }
+      const requestedPaneId = String(detail.paneId || detail.pane_id || "").trim();
+      let terminalIndex = Number.parseInt(detail.terminalIndex ?? detail.terminal_index, 10);
+      if (!Number.isInteger(terminalIndex) && requestedPaneId) {
+        terminalIndex = logicalTerminalIndexes.find((index) => getTerminalPaneId(index) === requestedPaneId);
+      }
+      if (!Number.isInteger(terminalIndex) || !logicalTerminalIndexes.includes(terminalIndex)) {
+        return;
+      }
+      const paneId = requestedPaneId || getTerminalPaneId(terminalIndex);
+      selectTerminalTab(terminalIndex);
+      window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
+        detail: {
+          paneId,
+          reason: "app_control_mcp_focus",
+          terminalIndex,
+        },
+      }));
+    };
+
+    window.addEventListener(APP_CONTROL_TERMINAL_FOCUS_EVENT, handleAppControlTerminalFocus);
+    return () => {
+      window.removeEventListener(APP_CONTROL_TERMINAL_FOCUS_EVENT, handleAppControlTerminalFocus);
+    };
+  }, [
+    getTerminalPaneId,
+    logicalTerminalIndexSignature,
+    logicalTerminalIndexes,
+    selectTerminalTab,
+    terminalWorkspace?.id,
+  ]);
+
   // Tabs select on click and start the grid drag (with live preview) once the
   // pointer moves past a small threshold, mirroring cmux tab dragging.
   const handleTerminalTabPointerDown = useCallback((event, terminalIndex) => {
@@ -33223,6 +33397,8 @@ function TerminalView({
         accountKey={accountKey}
         activeDragItemId={todoDragState?.itemId || ""}
         agentStatuses={agentStatuses}
+        agentStatusError={agentStatusError}
+        agentStatusState={agentStatusState}
         billingStatus={billingStatus}
         connectedDevices={connectedDevices}
         coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
@@ -33239,6 +33415,7 @@ function TerminalView({
         localDesktopProfile={cloudDesktopDeviceProfile}
         onRefreshGitRepositories={onRefreshGitRepositories}
         onRefreshGitSnapshot={onRefreshGitSnapshot}
+        onRecheckAgents={refreshAgentStatuses}
         onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
         onBeginTodoDrag={handleBeginTodoDrag}
         onCancelQueuedItem={cancelQueuedTodoQueueItem}
@@ -33281,6 +33458,7 @@ function TerminalView({
         workspaceId={terminalWorkspace?.id || ""}
         workspaceScopedTabsEnabled={workspaceScopedToolTabsEnabled}
         workspaceTodos={workspaceTodos}
+        workspaces={workspaces}
       />
     )
   ) : null;
