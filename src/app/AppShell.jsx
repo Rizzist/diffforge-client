@@ -5735,8 +5735,8 @@ function networkList(value) {
 
 const NETWORK_CATEGORY_LABELS = {
   todos: "Todos",
-  architectures: "Architectures",
   assets: "Assets",
+  documents: "Documents",
   tasks: "Tasks",
   tokenomics: "Tokenomics",
   catalog: "Catalog",
@@ -5750,8 +5750,8 @@ const NETWORK_CATEGORY_LABELS = {
 
 const NETWORK_CATEGORY_ORDER = [
   "todos",
-  "architectures",
   "assets",
+  "documents",
   "tasks",
   "tokenomics",
   "catalog",
@@ -5780,7 +5780,7 @@ function networkDomainFromText(value) {
   if (networkTextIsTransport(raw)) return "transport";
   if (networkTextIsLiveState(raw)) return "live_state";
   if (raw.includes("todo")) return "todos";
-  if (raw.includes("architect") || raw.includes("graph")) return "architectures";
+  if (raw.includes("document") || raw.includes("doc.sync") || raw.includes("doc.content")) return "documents";
   if (raw.includes("asset")) return "assets";
   if (raw.includes("tokenomic") || raw.includes("billing") || raw.includes("usage")) return "tokenomics";
   if (raw.includes("catalog") || raw.includes("workspace_deleted")) return "catalog";
@@ -5819,11 +5819,11 @@ function networkTextIsLiveState(raw) {
 function networkDomainFromItem(item) {
   const explicit = networkString(item?.domain || item?.category);
   if (explicit) {
-    return explicit;
+    return networkDomainFromText(explicit);
   }
   const summary = item?.payloadSummary || item?.payload_summary || {};
   const arrayCounts = summary?.arrayCounts || summary?.array_counts || {};
-  for (const key of ["todos", "architectures", "graphs", "assets", "tools", "skills", "terminals"]) {
+  for (const key of ["todos", "documents", "docs", "assets", "tools", "terminals"]) {
     if (networkNumber(arrayCounts?.[key]) > 0) {
       return networkDomainFromText(key);
     }
@@ -10507,13 +10507,7 @@ export default function App() {
 
     const workspaceName = graphText(options.workspaceName || options.workspace_name);
     const localListPromise = invoke("architecture_graphs_list", { repoPath: safeRepoPath });
-    const cloudListPromise = options.localOnly
-      ? Promise.resolve(null)
-      : invoke("cloud_mcp_get_architectures", {
-        repoPath: safeRepoPath,
-        workspaceId: safeWorkspaceId,
-        workspaceName,
-      }).catch(() => null);
+    const cloudListPromise = Promise.resolve(null);
 
     return Promise.all([localListPromise, cloudListPromise])
       .then(([result, cloudResult]) => {
@@ -10716,9 +10710,13 @@ export default function App() {
       refreshing: true,
       state: current.catalog ? current.state : "loading",
     }));
-    const request = invoke("cloud_mcp_architecture_hub_catalog", {
-      localOnly: options.localOnly === true,
-      workspaces: [],
+    const request = Promise.resolve({
+      builtAtMs: Date.now(),
+      cloudError: "",
+      entries: [],
+      global: null,
+      globalWorkspaceId: "account-global",
+      localOnly: true,
     })
       .then((catalog) => {
         setArchitectureHub({
@@ -10808,16 +10806,7 @@ export default function App() {
         });
       }
       try {
-        const result = await invoke("cloud_mcp_hydrate_architecture", {
-          refs: [ref],
-          repoPath: safeRepoPath,
-          workspaceId: context.workspaceId || "account-global",
-          workspaceName: context.workspaceName || "Global",
-          ...(context.scopeRepoId ? {
-            scopeRepoId: context.scopeRepoId,
-            scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
-          } : {}),
-        });
+        const result = { items: [], skipped: [ref], failed: [] };
         const resultItems = jsonArray(result?.items);
         const resultSkipped = jsonArray(result?.skipped);
         const resultFailures = jsonArray(result?.failed).concat(jsonArray(result?.missing));
@@ -10963,17 +10952,7 @@ export default function App() {
       scopeGitRepoIdentityId: "",
     };
     const localListPromise = invoke("architecture_graphs_list", { repoPath: safeRepoPath });
-    const cloudListPromise = options.localOnly
-      ? Promise.resolve(null)
-      : invoke("cloud_mcp_get_architectures", {
-        repoPath: safeRepoPath,
-        workspaceId: context.workspaceId,
-        workspaceName: context.workspaceName,
-        ...(context.scopeRepoId ? {
-          scopeRepoId: context.scopeRepoId,
-          scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
-        } : {}),
-      }).catch(() => null);
+    const cloudListPromise = Promise.resolve(null);
     return Promise.all([localListPromise, cloudListPromise])
       .then(([result, cloudResult]) => {
         const localGraphs = jsonArray(result?.graphs);
@@ -11126,20 +11105,6 @@ export default function App() {
       sourceRepoPath: safeSource,
       targetRepoPath: safeTarget,
     }).then((result) => {
-      const context = resolveArchitectureHubSyncContext(safeTarget);
-      if (context?.workspaceId && result?.graph) {
-        void invoke("cloud_mcp_sync_architecture", {
-          graph: result.graph,
-          reason: "architecture_graph_copy",
-          repoPath: safeTarget,
-          workspaceId: context.workspaceId,
-          workspaceName: context.workspaceName || "",
-          ...(context.scopeRepoId ? {
-            scopeRepoId: context.scopeRepoId,
-            scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
-          } : {}),
-        }).catch(() => {});
-      }
       void refreshArchitectureHubGraphList(safeTarget, { localOnly: true, refresh: true, silent: true });
       return result;
     });

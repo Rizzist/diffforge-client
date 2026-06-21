@@ -6241,15 +6241,10 @@ function ArchitecturesPanel({
         selectedGraphId,
         architectureGraphCloudId(ref),
       ]);
-      return invoke("cloud_mcp_hydrate_architecture", {
-        refs: [ref],
-        repoPath: selectedRepoPath,
-        workspaceId: syncWorkspaceId,
-        workspaceName: syncWorkspaceName,
-        ...(syncScopeRepoId ? {
-          scopeRepoId: syncScopeRepoId,
-          scopeGitRepoIdentityId: syncScopeGitRepoIdentityId,
-        } : {}),
+      return Promise.resolve({
+        failed: [],
+        items: [],
+        skipped: [ref],
       }).then((result) => {
         suppressExternalGraphWrites([
           selectedGraphId,
@@ -6602,19 +6597,6 @@ function ArchitecturesPanel({
         setDraftLocationMode("root");
         setDraftFolderPath("");
         setSaveState("idle");
-        if (syncWorkspaceId) {
-          void invoke("cloud_mcp_sync_architecture", {
-            graph: nextGraph,
-            reason: "architecture_graph_create",
-            repoPath: selectedRepoPath,
-            workspaceId: syncWorkspaceId,
-            workspaceName: syncWorkspaceName,
-            ...(selectedRepoSyncContext.scopeRepoId ? {
-              scopeRepoId: selectedRepoSyncContext.scopeRepoId,
-              scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
-            } : {}),
-          }).catch(() => {});
-        }
         void loadGraphList(selectedRepoPath, { refresh: true });
       })
       .catch((nextError) => {
@@ -6648,19 +6630,6 @@ function ArchitecturesPanel({
         });
         setSaveState("idle");
         void loadGraphList(selectedRepoPath, { refresh: true });
-        if (syncWorkspaceId) {
-          void invoke("cloud_mcp_sync_architecture", {
-            graph: nextGraph,
-            reason: "architecture_graph_save",
-            repoPath: selectedRepoPath,
-            workspaceId: syncWorkspaceId,
-            workspaceName: syncWorkspaceName,
-            ...(selectedRepoSyncContext.scopeRepoId ? {
-              scopeRepoId: selectedRepoSyncContext.scopeRepoId,
-              scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
-            } : {}),
-          }).catch(() => {});
-        }
         return nextGraph;
       })
       .catch((nextError) => {
@@ -6729,19 +6698,6 @@ function ArchitecturesPanel({
         nextIds.delete(nextGraphId);
         return nextIds;
       });
-    }
-    if (syncWorkspaceId && nextGraph) {
-      void invoke("cloud_mcp_sync_architecture", {
-        graph: nextGraph,
-        reason: "architecture_revision_restore",
-        repoPath: selectedRepoPath,
-        workspaceId: syncWorkspaceId,
-        workspaceName: syncWorkspaceName,
-        ...(selectedRepoSyncContext.scopeRepoId ? {
-          scopeRepoId: selectedRepoSyncContext.scopeRepoId,
-          scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
-        } : {}),
-      }).catch(() => {});
     }
     void loadGraphList(selectedRepoPath, { refresh: true });
   }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, suppressExternalGraphWrites, syncWorkspaceId, syncWorkspaceName]);

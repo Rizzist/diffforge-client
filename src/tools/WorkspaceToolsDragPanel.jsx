@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 
 import styled from "styled-components";
 import {
   ensureWorkspaceToolsFresh,
-  getWorkspaceToolsArchitectures,
   getWorkspaceToolsSkills,
   getWorkspaceToolsVersion,
   hasWorkspaceToolsLoaded,
@@ -12,8 +11,7 @@ import {
 
 const FILTERS = [
   { id: "all", label: "All" },
-  { id: "architectures", label: "Architectures" },
-  { id: "skills", label: "Skills" },
+  { id: "docs", label: "Docs" },
 ];
 
 const FILTER_STORAGE_PREFIX = "diffforge.workspaceTools.filter";
@@ -46,24 +44,17 @@ function writeStorage(prefix, workspaceId, value) {
   }
 }
 
-function architectureTodoText(item) {
-  return `Use the architecture graph "${item.title}" at .agents/architectures/graphs/${item.graphId}.arch in ${item.repoLabel} as the working context for this task.`;
-}
-
-function skillTodoText(entry) {
+function docTodoText(entry) {
   const body = text(entry.body).slice(0, 4000);
   return body
-    ? `Apply the "${entry.title}" account skill:\n\n${body}`
-    : `Apply the "${entry.title}" account skill.`;
+    ? `Apply the "${entry.title}" account doc:\n\n${body}`
+    : `Apply the "${entry.title}" account doc.`;
 }
 
 /**
- * Drag-and-drop sources for the workspace tools tab: architecture graphs and
- * account skills. Items can be dragged into the todo composer (plain text) or
- * clicked; the send-on-drop toggle decides whether a dropped/clicked item is
- * queued immediately or just listed. Data comes from the app-level workspace
- * tools store, so the tab renders instantly from cache and updates live as
- * background sync and change events land — no manual refresh.
+ * Drag-and-drop sources for account docs. Items can be dragged into the todo
+ * composer or clicked; the send-on-drop toggle decides whether a click queues
+ * immediately or just lists the todo.
  */
 export default function WorkspaceToolsDragPanel({
   coordinationTargets = [],
@@ -90,11 +81,6 @@ export default function WorkspaceToolsDragPanel({
     ensureWorkspaceToolsFresh(repoDescriptors);
   }, [repoDescriptors]);
 
-  const architectures = useMemo(
-    () => getWorkspaceToolsArchitectures(repoDescriptors),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [repoDescriptors, storeVersion],
-  );
   const skills = useMemo(
     () => getWorkspaceToolsSkills(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -136,8 +122,7 @@ export default function WorkspaceToolsDragPanel({
     event.dataTransfer.effectAllowed = "copy";
   }, []);
 
-  const visibleArchitectures = filter === "skills" ? [] : architectures;
-  const visibleSkills = filter === "architectures" ? [] : skills;
+  const visibleDocs = filter === "docs" || filter === "all" ? skills : [];
 
   return (
     <Panel aria-label="Draggable workspace tools">
@@ -174,54 +159,25 @@ export default function WorkspaceToolsDragPanel({
       {notice && <Notice aria-live="polite">{notice}</Notice>}
 
       <ItemsScroll>
-        {visibleArchitectures.length > 0 && (
+        {visibleDocs.length > 0 && (
           <>
-            <GroupLabel>Architectures</GroupLabel>
-            {visibleArchitectures.map((item) => {
-              const todoText = architectureTodoText(item);
+            <GroupLabel>Docs</GroupLabel>
+            {visibleDocs.map((entry) => {
+              const todoText = docTodoText(entry);
               return (
                 <ToolRow
                   draggable
-                  key={`${item.repoPath}:${item.graphId}`}
+                  key={`doc:${entry.title}`}
                   onDragStart={(event) => handleDragStart(event, todoText)}
                   title="Drag onto a terminal, or click + to add"
                 >
-                  <ToolGlyph aria-hidden="true" data-kind="architecture">⌬</ToolGlyph>
-                  <ToolCopy>
-                    <strong>{item.title}</strong>
-                    <span>{item.repoLabel}</span>
-                  </ToolCopy>
-                  <AddButton
-                    aria-label={`Add architecture ${item.title} as todo`}
-                    onClick={() => handleAdd(todoText)}
-                    type="button"
-                  >
-                    {sendOnDrop ? "Queue" : "Add"}
-                  </AddButton>
-                </ToolRow>
-              );
-            })}
-          </>
-        )}
-        {visibleSkills.length > 0 && (
-          <>
-            <GroupLabel>Skills</GroupLabel>
-            {visibleSkills.map((entry) => {
-              const todoText = skillTodoText(entry);
-              return (
-                <ToolRow
-                  draggable
-                  key={`skill:${entry.title}`}
-                  onDragStart={(event) => handleDragStart(event, todoText)}
-                  title="Drag onto a terminal, or click + to add"
-                >
-                  <ToolGlyph aria-hidden="true" data-kind="skill">✦</ToolGlyph>
+                  <ToolGlyph aria-hidden="true" data-kind="doc">✦</ToolGlyph>
                   <ToolCopy>
                     <strong>{entry.title}</strong>
-                    <span>{text(entry.body).split("\n").find(Boolean) || "Account skill"}</span>
+                    <span>{text(entry.body).split("\n").find(Boolean) || "Account doc"}</span>
                   </ToolCopy>
                   <AddButton
-                    aria-label={`Add skill ${entry.title} as todo`}
+                    aria-label={`Add doc ${entry.title} as todo`}
                     onClick={() => handleAdd(todoText)}
                     type="button"
                   >
@@ -232,16 +188,14 @@ export default function WorkspaceToolsDragPanel({
             })}
           </>
         )}
-        {toolsLoaded && !visibleArchitectures.length && !visibleSkills.length && (
+        {toolsLoaded && !visibleDocs.length && (
           <Empty>
-            {filter === "skills"
-              ? "No skills yet — create one in the Tools tab."
-              : filter === "architectures"
-                ? "No architecture graphs in this workspace yet."
-                : "No architectures or skills yet."}
+            {filter === "docs"
+              ? "No docs yet — create one in the Tools tab."
+              : "No docs yet."}
           </Empty>
         )}
-        {!toolsLoaded && !visibleArchitectures.length && !visibleSkills.length && (
+        {!toolsLoaded && !visibleDocs.length && (
           <Empty>Loading tools…</Empty>
         )}
       </ItemsScroll>
@@ -401,12 +355,7 @@ const ToolGlyph = styled.span`
   border-radius: 6px;
   font-size: 13px;
 
-  &[data-kind="architecture"] {
-    color: var(--forge-tint-soft);
-    background: rgba(var(--forge-tint-rgb), 0.12);
-  }
-
-  &[data-kind="skill"] {
+  &[data-kind="doc"] {
     color: rgba(223, 165, 90, 0.95);
     background: rgba(223, 165, 90, 0.12);
   }

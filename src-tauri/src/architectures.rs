@@ -2287,31 +2287,14 @@ async fn architecture_graph_revision_restore(
 
 #[tauri::command]
 async fn architecture_graph_delete(
-    state: State<'_, CloudMcpState>,
     repo_path: String,
     graph_id: String,
 ) -> Result<ArchitectureGraphRevisionList, String> {
-    let cloud_graph_id = graph_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         architecture_graph_delete_blocking(repo_path, graph_id)
     })
     .await
     .map_err(|error| format!("Architecture graph delete worker failed: {error}"))??;
-    if let Err(error) = cloud_mcp_delete_account_architecture_graph(
-        state.inner(),
-        cloud_graph_id.clone(),
-        Some("architecture_graph_delete".to_string()),
-    )
-    .await
-    {
-        log_cloud_sync_event(
-            "architecture.delete_sync_error",
-            json!({
-                "graph_id": cloud_graph_id,
-                "error": clean_terminal_telemetry_text(&error),
-            }),
-        );
-    }
     Ok(result)
 }
 

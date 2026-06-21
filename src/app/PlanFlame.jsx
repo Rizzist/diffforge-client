@@ -10,6 +10,7 @@ export const PLAN_FLAME_OPTIONS = [
 
 const PLAN_FLAME_KEYS = new Set(PLAN_FLAME_OPTIONS.map((option) => option.key));
 const PLAN_FLAME_REVEAL_DELAY_MS = 180;
+const PLAN_FLAME_ANIMATION_STORAGE_KEY = "diffforge.planFlame.animationEnabled";
 
 // quality.ratio caps the render pixel ratio, quality.octaves the noise depth,
 // and quality.detail gates the ridged-lick pass and second ember layer, so
@@ -331,6 +332,30 @@ function normalizedColor(color) {
   return new Float32Array(color);
 }
 
+function readPlanFlameAnimationEnabled() {
+  if (typeof window === "undefined") {
+    return true;
+  }
+
+  try {
+    return window.localStorage.getItem(PLAN_FLAME_ANIMATION_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function rememberPlanFlameAnimationEnabled(enabled) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(PLAN_FLAME_ANIMATION_STORAGE_KEY, enabled ? "true" : "false");
+  } catch {
+    // Best-effort UI preference; animation state still updates for this session.
+  }
+}
+
 export function normalizePlanFlameKey(plan, fallback = "") {
   const key = String(plan || "").trim().toLowerCase();
   return PLAN_FLAME_KEYS.has(key) ? key : fallback;
@@ -614,6 +639,7 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
   const [shaderReady, setShaderReady] = useState(false);
   const [flameMounted, setFlameMounted] = useState(false);
   const [flameVisible, setFlameVisible] = useState(false);
+  const [animationEnabled, setAnimationEnabled] = useState(readPlanFlameAnimationEnabled);
   const [pageVisible, setPageVisible] = useState(() => (
     typeof document === "undefined" || document.visibilityState !== "hidden"
   ));
@@ -642,6 +668,29 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
   const activePlan = normalizePlanFlameKey(previewPlan, planKey);
   const preset = PLAN_FLAME_PRESETS[activePlan];
   const flameActive = Boolean(active && pageVisible && preset);
+  const fireVisible = Boolean(flameVisible && animationEnabled);
+  const animationToggleLabel = animationEnabled
+    ? "Hide fire animation"
+    : "Show fire animation";
+  const flameVars = preset ? {
+    "--flame-glow": preset.glow,
+    "--flame-h": `${preset.height}px`,
+    "--flame-heat": preset.heat,
+  } : {};
+
+  function toggleAnimationEnabled() {
+    setAnimationEnabled((current) => {
+      const next = !current;
+      rememberPlanFlameAnimationEnabled(next);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    if (!animationEnabled) {
+      setShaderReady(false);
+    }
+  }, [animationEnabled]);
 
   useEffect(() => {
     let revealTimer = 0;
@@ -676,43 +725,58 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
   if (!flameMounted) return null;
 
   return (
-    <FlameStage
-      aria-hidden={showControls ? undefined : true}
-      data-plan={activePlan}
-      data-ready={shaderReady ? "true" : "false"}
-      data-visible={flameVisible ? "true" : "false"}
-      style={{
-        "--flame-glow": preset.glow,
-        "--flame-h": `${preset.height}px`,
-        "--flame-heat": preset.heat,
-      }}
-    >
-      <FlameBackdrop />
-      <FlameShaderCanvas
-        active={flameVisible}
-        key={activePlan}
-        onReady={setShaderReady}
-        planKey={activePlan}
-        preset={preset}
-      />
-      <FlameFallback data-ready={shaderReady ? "true" : "false"} />
+    <>
+      <FlameStage
+        aria-hidden="true"
+        data-plan={activePlan}
+        data-ready={shaderReady ? "true" : "false"}
+        data-visible={fireVisible ? "true" : "false"}
+        style={flameVars}
+      >
+        <FlameBackdrop />
+        {animationEnabled && (
+          <FlameShaderCanvas
+            active={fireVisible}
+            key={activePlan}
+            onReady={setShaderReady}
+            planKey={activePlan}
+            preset={preset}
+          />
+        )}
+        <FlameFallback
+          data-animated={animationEnabled ? "true" : "false"}
+          data-ready={shaderReady ? "true" : "false"}
+        />
+      </FlameStage>
       {showControls && (
-        <FlameSwitch aria-label="Switch fire plan preview">
-          {PLAN_FLAME_OPTIONS.map((option) => (
-            <FlameSwitchButton
-              aria-label={`Preview ${option.label} fire`}
-              data-active={activePlan === option.key}
-              key={option.key}
-              onClick={() => setPreviewPlan(option.key)}
-              title={`${option.label} fire`}
-              type="button"
-            >
-              {option.label}
-            </FlameSwitchButton>
-          ))}
-        </FlameSwitch>
+        <FlameControls data-visible={flameVisible ? "true" : "false"} style={flameVars}>
+          <FlameAnimationToggle
+            aria-checked={animationEnabled}
+            aria-label={animationToggleLabel}
+            onClick={toggleAnimationEnabled}
+            role="switch"
+            title={animationToggleLabel}
+            type="button"
+          />
+          {animationEnabled && (
+            <FlameSwitch aria-label="Switch fire plan preview">
+              {PLAN_FLAME_OPTIONS.map((option) => (
+                <FlameSwitchButton
+                  aria-label={`Preview ${option.label} fire`}
+                  data-active={activePlan === option.key}
+                  key={option.key}
+                  onClick={() => setPreviewPlan(option.key)}
+                  title={`${option.label} fire`}
+                  type="button"
+                >
+                  {option.label}
+                </FlameSwitchButton>
+              ))}
+            </FlameSwitch>
+          )}
+        </FlameControls>
       )}
-    </FlameStage>
+    </>
   );
 }
 
@@ -819,6 +883,118 @@ const FlameFallback = styled.div`
     /* The WebGL flame is up; stop compositing the fallback flicker forever. */
     animation: none;
   }
+
+  &[data-animated="false"] {
+    animation: none;
+  }
+`;
+
+const FlameControls = styled.div`
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 4;
+  height: 82px;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition:
+    opacity 0.2s ease,
+    visibility 0.2s step-end;
+
+  &[data-visible="true"] {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity 0.2s ease,
+      visibility 0ms step-start;
+  }
+`;
+
+const FlameAnimationToggle = styled.button`
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  z-index: 1;
+  display: inline-flex;
+  width: 48px;
+  height: 26px;
+  align-items: center;
+  padding: 3px;
+  border: 1px solid color-mix(in srgb, var(--flame-heat) 58%, rgba(255, 255, 255, 0.16));
+  border-radius: 999px;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--flame-heat) 34%, transparent), transparent 76%),
+    rgba(8, 5, 2, 0.58);
+  box-shadow:
+    0 0 18px color-mix(in srgb, var(--flame-heat) 34%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  cursor: pointer;
+  opacity: 0.74;
+  pointer-events: auto;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    opacity 0.16s ease;
+
+  &::before {
+    content: "";
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--flame-heat) 76%, #ffffff);
+    box-shadow:
+      0 0 16px color-mix(in srgb, var(--flame-heat) 72%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.44);
+    transform: translateX(20px);
+    transition:
+      background 0.16s ease,
+      box-shadow 0.16s ease,
+      transform 0.16s ease;
+  }
+
+  &[aria-checked="false"] {
+    border-color: color-mix(in srgb, var(--flame-heat) 48%, rgba(0, 0, 0, 0.34));
+    background:
+      linear-gradient(90deg, color-mix(in srgb, var(--flame-heat) 24%, transparent), transparent 82%),
+      rgba(8, 5, 2, 0.68);
+    opacity: 0.68;
+  }
+
+  &[aria-checked="false"]::before {
+    background: color-mix(in srgb, var(--flame-heat) 46%, rgba(10, 7, 3, 0.9));
+    box-shadow:
+      0 0 10px color-mix(in srgb, var(--flame-heat) 38%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.16);
+    transform: translateX(0);
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: color-mix(in srgb, var(--flame-heat) 78%, rgba(255, 255, 255, 0.2));
+    box-shadow:
+      0 0 24px color-mix(in srgb, var(--flame-heat) 48%, transparent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    opacity: 0.96;
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--flame-heat);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      linear-gradient(90deg, color-mix(in srgb, var(--flame-heat) 28%, transparent), transparent 76%),
+      rgba(255, 255, 255, 0.72);
+  }
+
+  @media (max-width: 620px) {
+    left: 12px;
+    bottom: 12px;
+  }
 `;
 
 const FlameSwitch = styled.div`
@@ -850,7 +1026,7 @@ const FlameSwitch = styled.div`
   @media (max-width: 620px) {
     right: 12px;
     bottom: 12px;
-    left: 12px;
+    left: 74px;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     grid-auto-flow: row;
   }

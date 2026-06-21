@@ -2546,6 +2546,10 @@ const APP_CONTROL_AGENT_WORKSPACE = Object.freeze({
   name: "App Control",
 });
 const APP_CONTROL_AGENT_PANE_ID = "forge-app-control-agent-terminal";
+const APP_CONTROL_AGENT_WORKSPACE_IDS = new Set([
+  APP_CONTROL_AGENT_WORKSPACE.id,
+  "diffforge_app_control",
+]);
 const APP_CONTROL_AGENT_DEFAULT_ROLE = "claude";
 const APP_CONTROL_AGENT_LABELS = {
   claude: "Claude Code",
@@ -2557,6 +2561,10 @@ const noopWorkspaceToolHandler = () => {};
 export const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
 export const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
 export const TODO_QUEUE_PANE_MODE_FULLSCREEN = "fullscreen";
+
+function isAppControlAgentWorkspaceId(value) {
+  return APP_CONTROL_AGENT_WORKSPACE_IDS.has(String(value || "").trim().toLowerCase());
+}
 
 function normalizeAppControlAgentRole(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
@@ -24334,6 +24342,17 @@ function TerminalView({
     }
 
     const eventPaneId = normalizeTodoTerminalIdentity(event.paneId || event.pane_id || "");
+    const eventWorkspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
+    if (eventPaneId === APP_CONTROL_AGENT_PANE_ID || isAppControlAgentWorkspaceId(eventWorkspaceId)) {
+      logTerminalStatus("frontend.todo_queue.terminal_direct_skip", {
+        paneId: eventPaneId,
+        reason: "app_control_terminal",
+        source: event.source || event.messageSource || "",
+        terminalIndex: event.terminalIndex ?? event.terminal_index ?? "",
+        workspaceId: eventWorkspaceId,
+      });
+      return;
+    }
     let targetTerminalIndex = normalizeTodoTerminalIndex(event.terminalIndex ?? event.terminal_index);
     if (targetTerminalIndex == null && eventPaneId) {
       targetTerminalIndex = logicalTerminalIndexes.find((candidateIndex) => (
@@ -24390,7 +24409,7 @@ function TerminalView({
     const targetThread = getTerminalThread(targetTerminalIndex) || null;
     const targetThreadId = String(targetThread?.id || targetThread?.threadId || "").trim();
     const threadId = normalizeTodoTerminalIdentity(event.threadId || event.thread_id || targetThreadId || "");
-    const workspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
+    const workspaceId = eventWorkspaceId;
     const targetColorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
     const targetTerminalColor = terminalColorForSlot(targetColorSlot ?? targetTerminalIndex);
     const terminalAssignmentFields = {

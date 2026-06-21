@@ -14,6 +14,9 @@ const TODO_DISPATCH_RECEIPT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const TODO_DISPATCH_RECEIPT_MAX_ITEMS: usize = 400;
 const TODO_DISPATCH_DRAIN_NOTIFY_DEDUPE_MS: u64 = 5_000;
 const TODO_DISPATCH_ATTENTION_DEDUPE_MS: u64 = 120_000;
+const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID: &str = "__diffforge_app_control__";
+const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID_NORMALIZED: &str = "diffforge_app_control";
+const TODO_DISPATCH_APP_CONTROL_PANE_ID: &str = "forge-app-control-agent-terminal";
 
 static TODO_DISPATCH_RECEIPTS_CACHE: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 static TODO_DISPATCH_DRAIN_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
@@ -42,6 +45,22 @@ fn todo_dispatch_text(value: &Value, keys: &[&str]) -> String {
         }
     }
     String::new()
+}
+
+fn todo_dispatch_is_app_control_workspace_id(workspace_id: &str) -> bool {
+    let workspace_id = workspace_id.trim();
+    workspace_id.eq_ignore_ascii_case(TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID)
+        || workspace_id.eq_ignore_ascii_case(TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID_NORMALIZED)
+}
+
+pub(crate) fn todo_dispatch_is_app_control_terminal_surface(
+    workspace_id: &str,
+    pane_id: &str,
+) -> bool {
+    todo_dispatch_is_app_control_workspace_id(workspace_id)
+        || pane_id
+            .trim()
+            .eq_ignore_ascii_case(TODO_DISPATCH_APP_CONTROL_PANE_ID)
 }
 
 /// Mirrors the frontend localStorage key sanitization so the ledger and the
@@ -1949,8 +1968,44 @@ fn todo_dispatch_todo_sync_commit_payload(
     reason: &str,
     source: &str,
 ) -> Option<Value> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return None;
+    }
     let todo_id = todo_store_item_sync_id(item);
     if todo_id.is_empty() {
+        return None;
+    }
+    let item_workspace_id = todo_dispatch_text(
+        item,
+        &[
+            "workspaceId",
+            "workspace_id",
+            "targetWorkspaceId",
+            "target_workspace_id",
+        ],
+    );
+    let item_pane_id = todo_dispatch_text(
+        item,
+        &[
+            "targetTerminalId",
+            "target_terminal_id",
+            "paneId",
+            "pane_id",
+        ],
+    );
+    if todo_dispatch_is_app_control_workspace_id(&item_workspace_id)
+        || todo_dispatch_is_app_control_terminal_surface(workspace_id, &item_pane_id)
+    {
+        log_terminal_status_event(
+            "backend.todo_store.todo_sync_app_control_skip",
+            json!({
+                "item_id": todo_id,
+                "pane_id": item_pane_id,
+                "reason": reason,
+                "workspace_id": workspace_id,
+            }),
+        );
         return None;
     }
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -2084,6 +2139,17 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
     }
     let workspace_id = workspace_id.trim();
     if workspace_id.is_empty() {
+        return None;
+    }
+    if todo_dispatch_is_app_control_workspace_id(workspace_id) {
+        log_terminal_status_event(
+            "backend.todo_store.delete_todo_sync_app_control_skip",
+            json!({
+                "reason": reason,
+                "removedCount": safe_todo_ids.len(),
+                "workspace_id": workspace_id,
+            }),
+        );
         return None;
     }
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -2308,6 +2374,18 @@ fn todo_store_changed_items_for_sync(previous: &[Value], next: &[Value]) -> Vec<
 }
 
 fn todo_store_push_items(app: &AppHandle, workspace_id: &str, items: Vec<Value>, reason: &str) {
+    let workspace_id = workspace_id.trim();
+    if todo_dispatch_is_app_control_workspace_id(workspace_id) {
+        log_terminal_status_event(
+            "backend.todo_store.cloud_push_app_control_skip",
+            json!({
+                "itemCount": items.len(),
+                "reason": reason,
+                "workspaceId": workspace_id,
+            }),
+        );
+        return;
+    }
     let items = items
         .into_iter()
         .filter(|item| item.is_object() && !todo_store_item_sync_id(item).is_empty())
@@ -5038,8 +5116,21 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
     item_id_override: Option<&str>,
 ) -> Option<String> {
     let workspace_id = workspace_id.trim();
+    let pane_id = pane_id.trim();
     let prompt = prompt.trim();
     if workspace_id.is_empty() || prompt.is_empty() {
+        return None;
+    }
+    if todo_dispatch_is_app_control_terminal_surface(workspace_id, pane_id) {
+        log_terminal_status_event(
+            "backend.todo_dispatch.direct_capture_app_control_skip",
+            json!({
+                "agent_kind": agent_kind.chars().take(80).collect::<String>(),
+                "pane_id": pane_id,
+                "prompt_len": prompt.len(),
+                "workspace_id": workspace_id,
+            }),
+        );
         return None;
     }
     // Only managed coding agents: shell terminals would turn every command

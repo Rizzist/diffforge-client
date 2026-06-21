@@ -1061,9 +1061,9 @@ function transferUpdatedAt(transfer) {
 }
 
 const SYNC_ACTIVITY_DOMAIN_LABELS = {
-  architectures: "Architectures",
   assets: "Assets",
   catalog: "Catalog",
+  documents: "Documents",
   live_state: "Live state",
   remote_commands: "Remote commands",
   system: "Sync",

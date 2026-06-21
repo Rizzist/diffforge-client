@@ -118,6 +118,19 @@ const CLOUD_UNAVAILABLE_STATUSES = new Set([
   "unavailable",
 ]);
 
+const DOC_BACKED_ASSET_SOURCE_TOKENS = new Set([
+  "account-document",
+]);
+
+const DOC_BACKED_ASSET_DOMAIN_TOKENS = new Set([
+  "documents",
+  "docs",
+]);
+
+const DOC_BACKED_ASSET_FOLDER_TOKENS = new Set([
+  "account-documents",
+]);
+
 function assetIdText(asset) {
   if (typeof asset === "string") return text(asset);
   return text(asset?.assetId || asset?.asset_id || asset?.id);
@@ -323,25 +336,37 @@ function dedupeAssetRows(items) {
 
 function assetHiddenFromGenericLibrary(asset) {
   const metadata = jsonObject(asset?.metadata) || {};
-  const sourceKind = text(
+  const sourceToken = text(
     asset?.sourceKind,
     asset?.source_kind,
     asset?.source,
     metadata.sourceKind,
     metadata.source_kind,
     metadata.source,
-  ).toLowerCase();
-  const sourceToken = sourceKind.replace(/[-\s.]+/gu, "_");
-  if (sourceToken === "account_skill" || sourceToken === "account_architecture") {
-    return true;
-  }
-  const docDomain = text(
+  ).toLowerCase().replace(/[._\s]+/gu, "-");
+  const domainToken = text(
     asset?.docDomain,
     asset?.doc_domain,
     metadata.docDomain,
     metadata.doc_domain,
-  ).toLowerCase();
-  return docDomain === "skills" || docDomain === "architectures";
+  ).toLowerCase().replace(/[._\s]+/gu, "-");
+  const folderToken = text(
+    asset?.assetFolder,
+    asset?.asset_folder,
+    asset?.folder,
+    asset?.group,
+    asset?.assetGroup,
+    asset?.asset_group,
+    metadata.assetFolder,
+    metadata.asset_folder,
+    metadata.folder,
+    metadata.group,
+    metadata.assetGroup,
+    metadata.asset_group,
+  ).toLowerCase().replace(/[._\s]+/gu, "-");
+  return DOC_BACKED_ASSET_SOURCE_TOKENS.has(sourceToken)
+    || DOC_BACKED_ASSET_DOMAIN_TOKENS.has(domainToken)
+    || DOC_BACKED_ASSET_FOLDER_TOKENS.has(folderToken);
 }
 
 function dedupeTransferRows(transfers) {

@@ -3,32 +3,60 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
-import { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
+import {
+  ButtonRefreshIcon,
+  FileDisclosure,
+  FileExplorerActions,
+  FileExplorerHeader,
+  FileExplorerPane,
+  FileIconButton,
+  FileKindIcon,
+  FileRootPath,
+  FilesWorkspaceSurface,
+  FileTree,
+  FileTreeButton,
+  FileTreeEmpty,
+  FileTreeItem,
+  FileTreeName,
+  PanelKicker,
+} from "../app/appStyles.js";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
 import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
 import {
+  ACCOUNT_DOCUMENTS_CONTRACT,
+  accountDocumentRequestFromSkill,
+  accountDocumentStorageKey,
+  accountDocumentUnitsFromPayload,
+  documentExtensionForKind,
   mergeSkillUnits,
+  normalizedDocumentCollection,
+  normalizedDocumentKind,
   skillsFromUnits,
-  skillsToSkillUnits,
   skillSlug,
   skillToneColor,
 } from "./skillsLibrary.js";
 import { noteAccountSkillUnits } from "./workspaceToolsStore.js";
 
 const SECTIONS = [
-  { id: "architectures", label: "Architectures" },
+  { id: "docs", label: "Docs" },
   { id: "mcps", label: "MCPs" },
-  { id: "skills", label: "Skills" },
   { id: "clis", label: "CLIs" },
 ];
 
 export const GLOBAL_MCP_DEFAULTS_SCOPE = "global-defaults";
 const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID = "account-global-mcp-defaults";
 const SKILL_EDITOR_THEME_STORAGE_KEY = "diffforge.tools.skillEditorTheme";
+const DOCUMENT_TYPE_OPTIONS = [
+  { id: "skill", label: "Skill", collection: "documents", extension: "md" },
+  { id: "architecture", label: "Architecture", collection: "documents", extension: "arch" },
+  { id: "instruction", label: "Instruction", collection: "documents", extension: "md" },
+  { id: "document", label: "Document", collection: "documents", extension: "md" },
+];
 
-function normalizedSectionId(value, fallback = "architectures") {
+function normalizedSectionId(value, fallback = "docs") {
   const normalized = text(value);
+  if (["architectures", "architecture", "skills", "skill"].includes(normalized)) return "docs";
   return SECTIONS.some((entry) => entry.id === normalized) ? normalized : fallback;
 }
 
@@ -39,6 +67,88 @@ function normalizedSkillEditorTheme(value, fallback = "dark") {
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
   return normalized || fallback;
+}
+
+function documentTypeOption(value, collection = "documents") {
+  const kind = normalizedDocumentKind(value, collection);
+  return DOCUMENT_TYPE_OPTIONS.find((entry) => entry.id === kind) || DOCUMENT_TYPE_OPTIONS[0];
+}
+
+function documentTypeLabel(value, collection = "documents") {
+  return documentTypeOption(value, collection).label;
+}
+
+function documentFileName(document) {
+  const collection = normalizedDocumentCollection();
+  const kind = normalizedDocumentKind(document?.documentKind || document?.source, collection);
+  const extension = text(document?.extension, documentExtensionForKind(kind, collection));
+  const id = text(document?.id || document?.documentId || document?.document_id, skillSlug(document?.title || "document"));
+  const suffix = `.${extension}`;
+  return id.toLowerCase().endsWith(suffix.toLowerCase()) ? id : `${id}${suffix}`;
+}
+
+function documentPreviewLine(document) {
+  const contentLine = String(document?.content || "").split("\n").map((line) => line.trim()).find(Boolean);
+  return text(contentLine, text(document?.localPath, `${documentTypeLabel(document?.documentKind, document?.collection)} doc`));
+}
+
+function documentEditorDraft(document) {
+  const option = documentTypeOption(document?.documentKind || document?.source, document?.collection);
+  const content = String(document?.content || "");
+  return {
+    assetId: text(document?.assetId || document?.asset_id),
+    baseContent: content,
+    collection: option.collection,
+    content,
+    contentHash: text(document?.contentHash || document?.content_hash || document?.sha256),
+    documentKey: accountDocumentStorageKey(document),
+    documentKind: option.id,
+    extension: text(document?.extension, option.extension),
+    id: text(document?.id || document?.documentId || document?.document_id),
+    localPath: text(document?.localPath || document?.local_path),
+    source: option.id,
+    title: text(document?.title || document?.name || document?.id),
+  };
+}
+
+function documentHasMaterializedContent(document) {
+  const hasContentFlag = document?.hasContent !== undefined
+    || document?.hasContentPayload !== undefined
+    || document?.hydrated !== undefined;
+  return document?.hydrated === true
+    || document?.hasContent === true
+    || document?.hasContentPayload === true
+    || (!hasContentFlag && String(document?.content || "").length > 0);
+}
+
+function editorWithRemoteDocumentContent(current, document) {
+  if (!current || !documentHasMaterializedContent(document)) return current;
+  const currentKey = current.documentKey || accountDocumentStorageKey(current);
+  const documentKey = accountDocumentStorageKey(document);
+  if (!currentKey || currentKey !== documentKey) return current;
+  const baseContent = String(current.baseContent ?? current.content ?? "");
+  if (String(current.content || "") !== baseContent) return current;
+  const content = String(document.content || "");
+  if (
+    current.content === content
+    && current.contentHash === text(document.contentHash || document.content_hash || document.sha256)
+    && current.localPath === text(document.localPath || document.local_path, current.localPath)
+  ) {
+    return current;
+  }
+  return {
+    ...current,
+    assetId: text(document.assetId || document.asset_id, current.assetId),
+    baseContent: content,
+    collection: normalizedDocumentCollection(),
+    content,
+    contentHash: text(document.contentHash || document.content_hash || document.sha256),
+    documentKind: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
+    extension: text(document.extension || document.ext, current.extension),
+    localPath: text(document.localPath || document.local_path, current.localPath),
+    source: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
+    title: text(document.title || document.name, current.title),
+  };
 }
 
 function getErrorMessage(error, fallback) {
@@ -69,18 +179,17 @@ function accountToolsEventHasKnownPayload(payload) {
       && typeof candidate === "object"
       && !Array.isArray(candidate)
       && (
-        candidate.contract === "diffforge.skills_doc.v1"
+        candidate.contract === ACCOUNT_DOCUMENTS_CONTRACT
         || candidate.contract === "diffforge.account_clis.v1"
         || candidate.contract === "diffforge.account_mcps.v1"
+        || candidate.document
+        || candidate.documents
+        || candidate.docs
+        || candidate.items
         || candidate.kind === "account_cli_changed"
         || candidate.kind === "account_mcp_changed"
-        || candidate.skill
-        || candidate.skill_units
-        || candidate.skillUnits
         || candidate.ops
         || candidate.delta === true
-        || candidate.skills?.skill_units
-        || candidate.skills?.skillUnits
         || candidate.clis
         || candidate.mcps
         || candidate.servers
@@ -97,49 +206,10 @@ function accountToolsSkillPayloadIsFull(payload) {
         candidate.authoritative === true
         || candidate.snapshot_full === true
         || candidate.snapshotFull === true
+        || candidate.kind === "account_documents"
+        || candidate.source === "local_account_document_cache"
       )
   ));
-}
-
-function accountToolsSkillUnitsFromEventPayload(payload) {
-  const candidates = accountToolsEventCandidates(payload);
-  const units = [];
-  const pushUnit = (unit, removed = false) => {
-    if (!unit || typeof unit !== "object" || Array.isArray(unit)) return;
-    units.push(removed ? { ...unit, current: false, deleted: true } : unit);
-  };
-  const pushOps = (ops) => {
-    (Array.isArray(ops) ? ops : []).forEach((op) => {
-      if (!op || typeof op !== "object" || Array.isArray(op)) return;
-      const kind = text(op.op || op.operation || op.action).toLowerCase();
-      const removed = ["d", "delete", "remove", "removed", "tombstone"].includes(kind);
-      pushUnit(op.skill || op.unit || op.skill_unit || op.skillUnit || op, removed);
-    });
-  };
-  for (const candidate of candidates) {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
-    const contract = candidate.contract;
-    pushUnit(candidate.skill);
-    (candidate.skill_units || candidate.skillUnits || []).forEach((unit) => pushUnit(unit));
-    (candidate.removed_skill_units || candidate.removedSkillUnits || []).forEach((unit) => pushUnit(unit, true));
-    pushOps(candidate.ops);
-    const skills = candidate.skills;
-    if (skills && typeof skills === "object" && !Array.isArray(skills)) {
-      (skills.skill_units || skills.skillUnits || []).forEach((unit) => pushUnit(unit));
-      (skills.removed_skill_units || skills.removedSkillUnits || []).forEach((unit) => pushUnit(unit, true));
-      pushOps(skills.ops);
-    }
-    if (contract === "diffforge.skills_doc.v1") {
-      const nested = candidate.payload?.skill || candidate.data?.skill;
-      pushUnit(nested);
-    }
-  }
-  const byId = new Map();
-  units.forEach((unit) => {
-    const id = text(unit?.skill_id || unit?.skillId || unit?.id);
-    if (id) byId.set(id, unit);
-  });
-  return Array.from(byId.values());
 }
 
 function accountToolsSkillMetaFromEventPayload(payload) {
@@ -233,6 +303,7 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
   const percent = clampProgressPercent(progress.percent);
   const title = text(progress.title, "Hydrating account tools");
   const meta = text(progress.error || progress.meta, `${Math.round(percent)}%`);
+
   return (
     <ToolsHydrationPanel data-placement={placement} data-state={text(progress.state, "hydrating")}>
       <ToolsHydrationCopy>
@@ -254,7 +325,6 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
 }
 
 export default function ToolsWorkspaceView({
-  architectures = null,
   defaultWorkingDirectory = "",
   initialSection = "",
   workspaces = [],
@@ -327,7 +397,7 @@ export default function ToolsWorkspaceView({
   const mcpScopeReady = activeMcpScope !== GLOBAL_MCP_DEFAULTS_SCOPE
     || (globalMcpDefaults.state === "ready" && Boolean(globalMcpDefaults.rootDirectory));
 
-  // ---- Skills (account-level structured library backed by per-skill units) ----
+  // ---- Docs (account-level markdown documents backed by per-document assets) ----
   const [skillsLibrary, setSkillsLibrary] = useState({ skills: [] });
   const [skillsRevision, setSkillsRevision] = useState(null);
   const [skillsMeta, setSkillsMeta] = useState({ updatedAt: "", updatedBy: "", offline: false });
@@ -342,10 +412,13 @@ export default function ToolsWorkspaceView({
     visible: false,
   });
   const skillsHydrationRunRef = useRef(0);
+  const hydratingDocKeyRef = useRef("");
   const [skillsQuery, setSkillsQuery] = useState("");
-  // "library:<id>" or "catalog:<id>" — selecting a skill shows its contents.
+  const [templateQuery, setTemplateQuery] = useState("");
+  const [newDocDraft, setNewDocDraft] = useState({ name: "", type: "skill" });
+  // "library:<collection>:<id>" or "catalog:<id>" — selecting a document shows its contents.
   const [selectedSkillKey, setSelectedSkillKey] = useState("");
-  // { id: ""|skillId, title, content } while creating/editing.
+  // { id: ""|documentId, title, content } while creating/editing.
   const [skillEditor, setSkillEditor] = useState(null);
   const [skillEditorTheme, setSkillEditorTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
@@ -382,11 +455,11 @@ export default function ToolsWorkspaceView({
     let progressTimer = null;
     setSkillsHydration({
       error: "",
-      meta: "Checking account skill assets",
+      meta: "Checking account document assets",
       percent: 6,
       runId: hydrationRunId,
       state: "hydrating",
-      title: "Hydrating skills",
+      title: "Hydrating docs",
       visible: true,
     });
     if (typeof window !== "undefined") {
@@ -396,7 +469,7 @@ export default function ToolsWorkspaceView({
           const nextPercent = Math.min(92, Math.max(8, Number(current.percent || 0) + 7));
           return {
             ...current,
-            meta: nextPercent < 62 ? "Downloading missing skill assets" : "Finalizing skill library",
+            meta: nextPercent < 62 ? "Downloading missing document assets" : "Finalizing document library",
             percent: nextPercent,
           };
         });
@@ -405,21 +478,16 @@ export default function ToolsWorkspaceView({
     setSkillsState((current) => (current === "ready" ? "refreshing" : "loading"));
     setSkillsError("");
     try {
-      const data = await invoke("cloud_mcp_get_account_skills");
-      const skills = data?.skills || {};
-      const units = Array.isArray(data?.skill_units)
-        ? data.skill_units
-        : Array.isArray(data?.skillUnits)
-          ? data.skillUnits
-          : accountToolsSkillUnitsFromEventPayload(skills);
+      const data = await invoke("cloud_mcp_get_account_documents", {
+        request: { limit: 2000 },
+      });
+      const skills = data || {};
+      const units = accountDocumentUnitsFromPayload(data);
       const parsedSkillsLibrary = { skills: skillsFromUnits(units) };
       setSkillsLibrary(parsedSkillsLibrary);
       noteAccountSkillUnits(parsedSkillsLibrary.skills);
-      setSkillsRevision(
-        Number.isFinite(Number(skills.revision)) && skills.revision !== null
-          ? Number(skills.revision)
-          : null,
-      );
+      const nextRevision = Number(skills.revision ?? skills.seq ?? skills.sequence);
+      setSkillsRevision(Number.isFinite(nextRevision) ? nextRevision : null);
       setSkillsMeta({
         updatedAt: text(skills.updated_at || skills.updatedAt),
         updatedBy: text(skills.updated_by_device_name || skills.updatedByDeviceName),
@@ -432,19 +500,19 @@ export default function ToolsWorkspaceView({
         ));
         const readyCount = parsedSkillsLibrary.skills.length || units.length;
         const readyLabel = readyCount
-          ? `${readyCount} skill${readyCount === 1 ? "" : "s"} ready`
-          : "Skill library ready";
+          ? `${readyCount} doc${readyCount === 1 ? "" : "s"} ready`
+          : "Document library ready";
         const hydratedLabel = units.length
           ? ` · ${hydratedUnits.length || units.length}/${units.length} downloaded`
           : "";
         const offline = Boolean(data?.offline);
         setSkillsHydration({
           error: "",
-          meta: offline ? "Showing cached skills" : `${readyLabel}${hydratedLabel}`,
+          meta: offline ? "Showing cached docs" : `${readyLabel}${hydratedLabel}`,
           percent: 100,
           runId: hydrationRunId,
           state: "ready",
-          title: offline ? "Skills loaded from cache" : "Skills hydrated",
+          title: offline ? "Docs loaded from cache" : "Docs hydrated",
           visible: true,
         });
         if (typeof window !== "undefined") {
@@ -464,11 +532,11 @@ export default function ToolsWorkspaceView({
       if (skillsHydrationRunRef.current === hydrationRunId) {
         setSkillsHydration({
           error: message,
-          meta: "Skill hydration failed",
+          meta: "Document hydration failed",
           percent: 100,
           runId: hydrationRunId,
           state: "error",
-          title: "Skill hydration needs attention",
+          title: "Document hydration needs attention",
           visible: true,
         });
       }
@@ -527,13 +595,14 @@ export default function ToolsWorkspaceView({
   useEffect(() => {
     let disposed = false;
     let unlisten = null;
-    void listen("cloud-mcp-account-skills-updated", (event) => {
+    void listen("cloud-mcp-account-documents-updated", (event) => {
       if (disposed) {
         return;
       }
-      const skillUnits = accountToolsSkillUnitsFromEventPayload(event?.payload);
+      const skillUnits = accountDocumentUnitsFromPayload(event?.payload);
       const replaceSkills = accountToolsSkillPayloadIsFull(event?.payload);
       if (skillUnits.length || replaceSkills) {
+        const materializedSkills = skillsFromUnits(skillUnits.filter(documentHasMaterializedContent));
         const skillMeta = accountToolsSkillMetaFromEventPayload(event?.payload);
         setSkillsLibrary((current) => {
           const nextLibrary = replaceSkills
@@ -542,6 +611,14 @@ export default function ToolsWorkspaceView({
           noteAccountSkillUnits(nextLibrary.skills);
           return nextLibrary;
         });
+        if (materializedSkills.length) {
+          setSkillEditor((current) => {
+            const incoming = materializedSkills.find((entry) => (
+              accountDocumentStorageKey(entry) === (current?.documentKey || accountDocumentStorageKey(current))
+            ));
+            return editorWithRemoteDocumentContent(current, incoming);
+          });
+        }
         const revisionUnit = skillUnits.find((unit) => unit?.revision != null);
         const revision = Number.isFinite(Number(skillMeta.revision))
           ? Number(skillMeta.revision)
@@ -607,19 +684,43 @@ export default function ToolsWorkspaceView({
     };
   }, []);
 
-  // Applies the next skill list locally right away, then syncs per-skill units
-  // through Rust in the background.
+  // Applies the next docs list locally right away, then asks Rust to save/delete
+  // the underlying account document files and Cloud metadata.
   const persistSkillsLibrary = useCallback(async (nextSkills) => {
     const nextLibrary = { skills: nextSkills };
-    const skillUnits = skillsToSkillUnits(nextLibrary.skills);
+    const nextByKey = new Map(nextLibrary.skills.map((skill) => [accountDocumentStorageKey(skill), skill]));
+    const currentByKey = new Map(skillsLibrary.skills.map((skill) => [accountDocumentStorageKey(skill), skill]));
+    const removed = Array.from(currentByKey.entries())
+      .filter(([key]) => key && !nextByKey.has(key))
+      .map(([, skill]) => skill);
+    const upserts = nextLibrary.skills.filter((skill) => {
+      const key = accountDocumentStorageKey(skill);
+      const current = key ? currentByKey.get(key) : null;
+      return !current
+        || String(current.content || "") !== String(skill.content || "")
+        || text(current.title) !== text(skill.title)
+        || text(current.documentKind) !== text(skill.documentKind)
+        || text(current.collection) !== text(skill.collection)
+        || skill.pendingPush === true;
+    });
     setSkillsLibrary(nextLibrary);
     setSkillsState("saving");
     setSkillsError("");
     noteAccountSkillUnits(nextLibrary.skills);
     try {
-      const result = await invoke("cloud_mcp_save_account_skills", {
-        skillUnits,
-      });
+      const results = [];
+      for (const skill of removed) {
+        results.push(await invoke("cloud_mcp_delete_account_document", {
+          request: accountDocumentRequestFromSkill(skill),
+        }));
+      }
+      for (const skill of upserts) {
+        results.push(await invoke("cloud_mcp_save_account_document", {
+          request: accountDocumentRequestFromSkill(skill),
+        }));
+      }
+      const result = [...results].reverse().find((entry) => entry) || {};
+      const failed = results.find((entry) => text(entry?.cloud_error || entry?.cloudError));
       setSkillsRevision(
         Number.isFinite(Number(result?.revision)) ? Number(result.revision) : skillsRevision,
       );
@@ -628,6 +729,9 @@ export default function ToolsWorkspaceView({
         updatedAt: text(result?.updated_at || result?.updatedAt, current.updatedAt),
         offline: false,
       }));
+      if (failed) {
+        throw new Error(text(failed.cloud_error || failed.cloudError, "Cloud did not accept the document sync."));
+      }
       const syncedLibrary = { skills: nextLibrary.skills.map(clearLocalPendingSkill) };
       setSkillsLibrary(syncedLibrary);
       noteAccountSkillUnits(syncedLibrary.skills);
@@ -636,11 +740,11 @@ export default function ToolsWorkspaceView({
     } catch (error) {
       // Stale revision or offline: the local list keeps the change so nothing
       // is lost; the next successful save syncs the full unit set.
-      setSkillsError(getErrorMessage(error, "Unable to sync skills."));
+      setSkillsError(getErrorMessage(error, "Unable to sync docs."));
       setSkillsState("ready");
       return false;
     }
-  }, [skillsRevision]);
+  }, [skillsLibrary.skills, skillsRevision]);
 
   const saveSkillsLibraryLocal = useCallback(async (nextSkills, pendingSkillIds = []) => {
     const pendingIds = new Set((Array.isArray(pendingSkillIds) ? pendingSkillIds : []).map(text).filter(Boolean));
@@ -650,17 +754,18 @@ export default function ToolsWorkspaceView({
         pendingIds.has(skill.id) ? withLocalPendingSkill(skill, localSavedAt) : skill
       )),
     };
-    const skillUnits = skillsToSkillUnits(nextLibrary.skills);
     setSkillsLibrary(nextLibrary);
     setSkillsState("savingLocal");
     setSkillsError("");
     noteAccountSkillUnits(nextLibrary.skills);
     try {
-      const result = await invoke("cloud_mcp_save_account_skills_local", {
-        baseRevision: skillsRevision,
-        pendingSkillIds: Array.from(pendingIds),
-        skillUnits,
-      });
+      const results = [];
+      for (const skill of nextLibrary.skills.filter((entry) => pendingIds.has(entry.id))) {
+        results.push(await invoke("cloud_mcp_save_account_document", {
+          request: accountDocumentRequestFromSkill(skill, { localOnly: true }),
+        }));
+      }
+      const result = [...results].reverse().find((entry) => entry) || {};
       setSkillsRevision(
         Number.isFinite(Number(result?.revision)) ? Number(result.revision) : skillsRevision,
       );
@@ -672,7 +777,7 @@ export default function ToolsWorkspaceView({
       setSkillsState("ready");
       return true;
     } catch (error) {
-      setSkillsError(getErrorMessage(error, "Unable to save skill locally."));
+      setSkillsError(getErrorMessage(error, "Unable to save doc locally."));
       setSkillsState("ready");
       return false;
     }
@@ -683,51 +788,77 @@ export default function ToolsWorkspaceView({
     const preferredId = skillSlug(entry.title || entry.id);
     if (existingIds.has(preferredId)) {
       setSelectedSkillKey(`library:${preferredId}`);
+      const existing = skillsLibrary.skills.find((skill) => skill.id === preferredId);
+      if (existing) setSkillEditor(documentEditorDraft(existing));
       return;
     }
     if (existingIds.has(entry.id)) {
       setSelectedSkillKey(`library:${entry.id}`);
+      const existing = skillsLibrary.skills.find((skill) => skill.id === entry.id);
+      if (existing) setSkillEditor(documentEditorDraft(existing));
       return;
     }
     const skillId = skillSlug(entry.title || entry.id, existingIds);
     const skill = {
-      content: String(entry.content || "").trim(),
+      collection: "documents",
+      content: String(entry.content || ""),
+      documentKind: "skill",
+      extension: "md",
       icon: text(entry.icon),
       id: skillId,
-      source: text(entry.source, "catalog"),
+      source: "skill",
       title: skillId,
       tone: text(entry.tone),
       updatedAt: new Date().toISOString(),
     };
     void persistSkillsLibrary([...skillsLibrary.skills, skill]);
-    setSelectedSkillKey(`library:${skill.id}`);
+    setSelectedSkillKey(`library:${accountDocumentStorageKey(skill)}`);
+    setSkillEditor(documentEditorDraft(skill));
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
-  const removeSkill = useCallback((skillId) => {
-    const skill = skillsLibrary.skills.find((entry) => entry.id === skillId);
+  const removeSkill = useCallback((skillKeyOrId) => {
+    const skill = skillsLibrary.skills.find((entry) => (
+      accountDocumentStorageKey(entry) === skillKeyOrId || entry.id === skillKeyOrId
+    ));
     if (!skill) return;
-    if (typeof window !== "undefined" && !window.confirm(`Remove the skill "${skill.title}"?`)) {
+    const skillKey = accountDocumentStorageKey(skill) || skill.id;
+    if (typeof window !== "undefined" && !window.confirm(`Remove the doc "${skill.title}"?`)) {
       return;
     }
-    void persistSkillsLibrary(skillsLibrary.skills.filter((entry) => entry.id !== skillId));
+    void persistSkillsLibrary(skillsLibrary.skills.filter((entry) => (
+      (accountDocumentStorageKey(entry) || entry.id) !== skillKey
+    )));
     setSelectedSkillKey("");
+    setSkillEditor(null);
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
   const saveSkillEditor = useCallback((mode = "push") => {
     if (!skillEditor || !text(skillEditor.title)) return;
+    const typeOption = documentTypeOption(skillEditor.documentKind || skillEditor.source, skillEditor.collection);
+    const editorCollection = typeOption.collection;
+    const editorKind = text(skillEditor.documentKind, typeOption.id);
+    const editorExtension = text(skillEditor.extension, typeOption.extension);
     const normalizedTitle = skillSlug(skillEditor.title);
     const existing = skillEditor.id
-      ? skillsLibrary.skills.find((entry) => entry.id === skillEditor.id)
+      ? skillsLibrary.skills.find((entry) => (
+        (skillEditor.documentKey && accountDocumentStorageKey(entry) === skillEditor.documentKey)
+        || entry.id === skillEditor.id
+      ))
       : null;
     const updatedAt = new Date().toISOString();
     let nextSkills;
     let savedId;
     if (existing) {
       savedId = existing.id;
-      nextSkills = skillsLibrary.skills.map((entry) => (entry.id === existing.id
+      const existingKey = accountDocumentStorageKey(existing) || existing.id;
+      nextSkills = skillsLibrary.skills.map((entry) => ((accountDocumentStorageKey(entry) || entry.id) === existingKey
         ? {
           ...entry,
-          content: String(skillEditor.content || "").trim(),
+          content: String(skillEditor.content || ""),
+          documentKind: editorKind,
+          extension: editorExtension,
+          collection: editorCollection,
+          source: editorKind,
           title: normalizedTitle,
           updatedAt,
         }
@@ -735,10 +866,14 @@ export default function ToolsWorkspaceView({
     } else {
       savedId = skillSlug(skillEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id)));
       nextSkills = [...skillsLibrary.skills, {
-        content: String(skillEditor.content || "").trim(),
+        collection: editorCollection,
+        content: String(skillEditor.content || ""),
+        documentKind: editorKind,
+        extension: editorExtension,
         icon: "",
         id: savedId,
-        source: "custom",
+        localPath: text(skillEditor.localPath),
+        source: editorKind,
         title: savedId,
         tone: "",
         updatedAt,
@@ -749,8 +884,13 @@ export default function ToolsWorkspaceView({
     } else {
       void persistSkillsLibrary(nextSkills);
     }
-    setSkillEditor(null);
-    setSelectedSkillKey(`library:${savedId}`);
+    const savedSkill = nextSkills.find((entry) => entry.id === savedId);
+    const savedKey = accountDocumentStorageKey(savedSkill) || savedId;
+    setSelectedSkillKey(`library:${savedKey}`);
+    setSkillEditor({
+      ...documentEditorDraft(savedSkill),
+      documentKey: savedKey,
+    });
   }, [persistSkillsLibrary, saveSkillsLibraryLocal, skillEditor, skillsLibrary.skills]);
 
   const runCliAction = useCallback(async (provider, action) => {
@@ -885,58 +1025,140 @@ export default function ToolsWorkspaceView({
     return parts.join(" · ") || "Synced to your account";
   }, [pendingSkillCount, skillsMeta, skillsRevision, skillsState]);
 
-  // One merged list (like the CLIs section): personal skills lead, catalog
-  // entries the user hasn't added follow, with skills for installed CLIs
-  // surfaced first among them. The search also matches ownership labels, so
-  // "personal", "curated", "downloadable", or "cli" filter by kind.
-  const skillRows = useMemo(() => {
+  const docFileRows = useMemo(() => {
     const query = text(skillsQuery).toLowerCase();
+    return skillsLibrary.skills
+      .map((skill) => {
+        const key = accountDocumentStorageKey(skill) || skill.id;
+        const fileName = documentFileName(skill);
+        return {
+          ...skill,
+          fileName,
+          key: `library:${key}`,
+          preview: documentPreviewLine(skill),
+          typeLabel: documentTypeLabel(skill.documentKind, skill.collection),
+        };
+      })
+      .filter((row) => (
+        !query
+        || row.fileName.toLowerCase().includes(query)
+        || row.title.toLowerCase().includes(query)
+        || row.preview.toLowerCase().includes(query)
+        || row.typeLabel.toLowerCase().includes(query)
+        || text(row.localPath).toLowerCase().includes(query)
+      ))
+      .sort((left, right) => left.fileName.localeCompare(right.fileName));
+  }, [skillsLibrary.skills, skillsQuery]);
+
+  const defaultSkillRows = useMemo(() => {
+    const query = text(templateQuery).toLowerCase();
     const ownedIds = new Set(skillsLibrary.skills.map((skill) => skill.id));
-    const ownedRows = skillsLibrary.skills.map((skill) => ({
-      ...skill,
-      key: `library:${skill.id}`,
-      owned: true,
-      searchLabel: `personal yours ${skill.source === "cli" ? "cli" : skill.source === "catalog" ? "curated" : "custom"}`,
-    }));
-    const catalogRows = SKILLS_CATALOG
-      .filter((entry) => !ownedIds.has(entry.id) && !ownedIds.has(skillSlug(entry.title || entry.id)))
+    return SKILLS_CATALOG
       .map((entry) => {
+        const defaultId = skillSlug(entry.title || entry.id);
+        const added = ownedIds.has(defaultId) || ownedIds.has(entry.id);
         const cliInstalled = Boolean(catalogChecks?.[skillCliBinary(entry)]?.installed);
         return {
           ...entry,
+          added,
           cliInstalled,
-          key: `catalog:${entry.id}`,
-          owned: false,
-          searchLabel: `downloadable catalog curated${cliInstalled ? " cli installed" : ""}`,
+          defaultFileName: `${defaultId}.md`,
+          defaultId,
+          searchLabel: `${entry.title} ${entry.description || ""} ${defaultId} ${cliInstalled ? "cli installed" : ""}`.toLowerCase(),
         };
       })
+      .filter((row) => !query || row.searchLabel.includes(query))
       .sort((a, b) => {
+        if (a.added !== b.added) return a.added ? 1 : -1;
         if (a.cliInstalled !== b.cliInstalled) return a.cliInstalled ? -1 : 1;
-        if (a.source !== b.source) return a.source === "catalog" ? -1 : 1;
         return a.title.localeCompare(b.title);
       });
-    return [...ownedRows, ...catalogRows].filter((row) => (
-      !query
-        || row.title.toLowerCase().includes(query)
-        || String(row.content || "").toLowerCase().includes(query)
-        || row.searchLabel.includes(query)
-    ));
-  }, [catalogChecks, skillsLibrary.skills, skillsQuery]);
+  }, [catalogChecks, skillsLibrary.skills, templateQuery]);
+
+  const startNewDocument = useCallback(() => {
+    const requestedName = text(newDocDraft.name);
+    if (!requestedName) return;
+    const option = documentTypeOption(newDocDraft.type);
+    const existingIds = new Set(skillsLibrary.skills.map((entry) => entry.id));
+    const docId = skillSlug(requestedName, existingIds);
+    setSelectedSkillKey("");
+    setSkillEditor({
+      baseContent: "",
+      collection: option.collection,
+      content: "",
+      contentHash: "",
+      documentKind: option.id,
+      extension: option.extension,
+      id: "",
+      localPath: "",
+      source: option.id,
+      title: docId,
+    });
+    setNewDocDraft((current) => ({ ...current, name: "" }));
+  }, [newDocDraft, skillsLibrary.skills]);
 
   const selectedSkill = useMemo(() => {
     const [scope, ...rest] = selectedSkillKey.split(":");
-    const id = rest.join(":");
-    if (!id) return null;
+    const key = rest.join(":");
+    if (!key) return null;
     if (scope === "library") {
-      const skill = skillsLibrary.skills.find((entry) => entry.id === id);
+      const skill = skillsLibrary.skills.find((entry) => (
+        accountDocumentStorageKey(entry) === key || entry.id === key
+      ));
       return skill ? { ...skill, owned: true } : null;
     }
     if (scope === "catalog") {
-      const entry = SKILLS_CATALOG.find((candidate) => candidate.id === id);
+      const entry = SKILLS_CATALOG.find((candidate) => candidate.id === key);
       return entry ? { ...entry, owned: false } : null;
     }
     return null;
   }, [selectedSkillKey, skillsLibrary.skills]);
+
+  useEffect(() => {
+    if (!selectedSkill?.owned || !documentHasMaterializedContent(selectedSkill)) return;
+    setSkillEditor((current) => editorWithRemoteDocumentContent(current, selectedSkill));
+  }, [selectedSkill]);
+
+  useEffect(() => {
+    const selectedKey = selectedSkill?.owned ? accountDocumentStorageKey(selectedSkill) : "";
+    if (!selectedKey || String(selectedSkill?.content || "").length > 0) return;
+    if (hydratingDocKeyRef.current === selectedKey) return;
+    hydratingDocKeyRef.current = selectedKey;
+    let cancelled = false;
+    invoke("cloud_mcp_hydrate_account_document", {
+      request: accountDocumentRequestFromSkill(selectedSkill),
+    }).then((result) => {
+      if (cancelled) return;
+      const units = accountDocumentUnitsFromPayload(result);
+      if (units.length) {
+        const hydratedSkills = skillsFromUnits(units);
+        const hydratedSkill = hydratedSkills.find((entry) => accountDocumentStorageKey(entry) === selectedKey);
+        setSkillsLibrary((current) => {
+          const nextLibrary = applySkillUnitsToLibrary(current, units);
+          noteAccountSkillUnits(nextLibrary.skills);
+          return nextLibrary;
+        });
+        if (documentHasMaterializedContent(hydratedSkill)) {
+          setSkillEditor((current) => {
+            return editorWithRemoteDocumentContent(current, hydratedSkill);
+          });
+        }
+      }
+    }).catch((error) => {
+      if (!cancelled) {
+        setSkillsError(getErrorMessage(error, "Unable to hydrate doc content."));
+      }
+    }).finally(() => {
+      if (hydratingDocKeyRef.current === selectedKey) {
+        hydratingDocKeyRef.current = "";
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSkillKey, selectedSkill]);
+
+  const docsCreateMode = !skillEditor;
 
   return (
     <ToolsHubShell aria-label="Global toolkit" data-section={section}>
@@ -956,32 +1178,6 @@ export default function ToolsWorkspaceView({
           ))}
         </ToolsSectionNav>
       </ToolsHubHeader>
-
-      {section === "architectures" && (
-        <ToolsHubFill aria-label="Account architectures">
-          {architectures ? (
-            <ToolsHubStack data-has-progress={architectures.hydration?.visible ? "true" : undefined}>
-              <ToolsHydrationProgress placement="hub" progress={architectures.hydration} />
-              <ArchitectureHubView
-                catalog={architectures.catalog}
-                catalogError={architectures.catalogError}
-                catalogState={architectures.catalogState}
-                graphLists={architectures.graphLists}
-                onCopyGraph={architectures.onCopyGraph}
-                onGraphListRefresh={architectures.onGraphListRefresh}
-                onRefreshCatalog={architectures.onRefreshCatalog}
-                onSelectionChange={architectures.onSelectionChange}
-                resolveRepoSyncContext={architectures.resolveRepoSyncContext}
-                selectedGraphId={architectures.selectedGraphId}
-                selectedRepoPath={architectures.selectedRepoPath}
-                workspaceDispatchTargets={architectures.workspaceDispatchTargets}
-              />
-            </ToolsHubStack>
-          ) : (
-            <ToolsEmpty>Architectures are unavailable right now.</ToolsEmpty>
-          )}
-        </ToolsHubFill>
-      )}
 
       {section === "mcps" && (
         <ToolsMcpPane aria-label="MCP settings">
@@ -1016,238 +1212,298 @@ export default function ToolsWorkspaceView({
         </ToolsMcpPane>
       )}
 
-      {(section === "skills" || section === "clis") && (
-        <ToolsScroll>
-          <ToolsLayout>
-            {section === "skills" && (
-              <ToolsPanel aria-label="Skills" data-mode={skillEditor ? "editor" : undefined}>
-                <ToolsHydrationProgress
-                  placement={skillEditor ? "editor" : "panel"}
-                  progress={skillsHydration}
-                />
-                {skillEditor ? (
-                  <>
-                    <SkillDocumentEditor data-page-theme={skillEditorTheme}>
-                      <SkillDocumentToolbar>
-                        <SkillDocumentToolbarCopy>
-                          <ToolsPanelTitle>{skillEditor.id ? "Edit skill" : "New skill"}</ToolsPanelTitle>
-                          <ToolsPanelHint>
-                            Skills sync to your account and feed every coding agent.
-                          </ToolsPanelHint>
-                        </SkillDocumentToolbarCopy>
-                        <SkillDocumentToolbarControls>
-                          <ToolsStatusPill data-tone={skillsStatusTone}>
-                            {skillsStatusLabel}
-                          </ToolsStatusPill>
-                          <SkillDocumentThemeSwitch aria-label="Skill editor page theme">
-                            {["dark", "light"].map((theme) => (
-                              <SkillDocumentThemeButton
-                                aria-pressed={skillEditorTheme === theme}
-                                data-active={skillEditorTheme === theme ? "true" : "false"}
-                                key={theme}
-                                onClick={() => setSkillEditorTheme(theme)}
-                                type="button"
-                              >
-                                {theme === "dark" ? "Dark" : "Light"}
-                              </SkillDocumentThemeButton>
-                            ))}
-                          </SkillDocumentThemeSwitch>
-                        </SkillDocumentToolbarControls>
-                      </SkillDocumentToolbar>
-                      <SkillDocumentCanvas>
-                        <SkillDocumentPage>
-                          <SkillDocumentTitleInput
-                            aria-label="Skill title"
-                            onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
-                            placeholder="skill_title"
-                            value={skillEditor.title}
-                          />
-                          <ToolsSkillsEditor
-                            aria-label="Skill content"
-                            onChange={(event) => setSkillEditor((current) => ({ ...current, content: event.target.value }))}
-                            placeholder={"Document the workflow, commands, and conventions this skill covers..."}
-                            spellCheck={false}
-                            value={skillEditor.content}
-                          />
-                        </SkillDocumentPage>
-                      </SkillDocumentCanvas>
-                    </SkillDocumentEditor>
-                    {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
-                    <SkillDocumentActions>
-                      <ToolsGhostButton onClick={() => setSkillEditor(null)} type="button">
-                        Cancel
-                      </ToolsGhostButton>
-                      <ToolsGhostButton
-                        disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
-                        onClick={() => saveSkillEditor("local")}
-                        type="button"
+      {(section === "docs" || section === "clis") && (
+        <ToolsScroll data-section={section}>
+          <ToolsLayout data-section={section}>
+            {section === "docs" && (
+              <DocsWorkspaceSurface aria-label="Docs workspace">
+              <DocsWorkspaceGrid data-show-templates={docsCreateMode ? "true" : "false"}>
+                <DocsFilesPane aria-label="Document files">
+                  <FileExplorerHeader>
+                    <div>
+                      <PanelKicker>Explorer</PanelKicker>
+                    </div>
+                    <FileExplorerActions>
+                    <FileIconButton
+                      aria-label="Refresh docs"
+                      disabled={skillsState === "loading" || skillsState === "refreshing"}
+                      onClick={() => void loadAccountTools()}
+                      title="Refresh docs"
+                      type="button"
+                    >
+                      <ButtonRefreshIcon aria-hidden="true" />
+                    </FileIconButton>
+                    </FileExplorerActions>
+                  </FileExplorerHeader>
+                  <DocsRootPath title="Account documents">account-documents / personal</DocsRootPath>
+                  <DocsExplorerSearchInput
+                    aria-label="Search document files"
+                    onChange={(event) => setSkillsQuery(event.target.value)}
+                    placeholder="Search .md, .arch…"
+                    type="search"
+                    value={skillsQuery}
+                  />
+                  <FileTree aria-label="Account document explorer">
+                    <FileTreeItem>
+                      <DocsExplorerFolderButton
+                        $depth={0}
+                        as="div"
+                        data-selected="false"
                       >
-                        {skillsState === "savingLocal" ? "Saving locally…" : "Save Local"}
-                      </ToolsGhostButton>
-                      <ToolsPrimaryButton
-                        disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
-                        onClick={() => saveSkillEditor("push")}
-                        type="button"
-                      >
-                        {skillsState === "saving" ? "Syncing…" : "Push Save"}
-                      </ToolsPrimaryButton>
-                    </SkillDocumentActions>
-                  </>
-                ) : selectedSkill ? (
-                  <>
-                    <SkillDetailHeader>
-                      <ToolsGhostButton onClick={() => setSelectedSkillKey("")} type="button">
-                        ‹ Skills
-                      </ToolsGhostButton>
-                      <SkillDetailActions>
-                        {selectedSkill.owned ? (
-                          <>
-                            <ToolsGhostButton
-                              onClick={() => setSkillEditor({
-                                content: selectedSkill.content,
-                                id: selectedSkill.id,
-                                title: selectedSkill.title,
-                              })}
+                        <FileDisclosure>
+                          <span className="codicon codicon-chevron-down" aria-hidden="true" />
+                        </FileDisclosure>
+                        <FileKindIcon data-file-tone="folder">
+                          <span className="codicon codicon-folder-opened" aria-hidden="true" />
+                        </FileKindIcon>
+                        <FileTreeName title="documents">documents</FileTreeName>
+                        <DocsExplorerCount>{docFileRows.length || ""}</DocsExplorerCount>
+                      </DocsExplorerFolderButton>
+                      {skillsState === "loading" ? (
+                        <FileTreeEmpty>Loading docs…</FileTreeEmpty>
+                      ) : docFileRows.length ? (
+                        docFileRows.map((row) => {
+                          const active = selectedSkillKey === row.key;
+                          const iconClass = row.extension === "arch" ? "codicon-file-code" : "codicon-markdown";
+                          const fileTone = row.extension === "arch" ? "data" : "markdown";
+                          return (
+                            <DocsExplorerFileButton
+                              $depth={1}
+                              data-selected={active ? "true" : "false"}
+                              key={row.key}
+                              onClick={() => {
+                                setSelectedSkillKey(row.key);
+                                setSkillEditor(documentEditorDraft(row));
+                              }}
+                              title={text(row.localPath, row.preview)}
                               type="button"
                             >
-                              Edit
-                            </ToolsGhostButton>
-                            <ToolsGhostButton
-                              data-danger="true"
-                              onClick={() => removeSkill(selectedSkill.id)}
-                              type="button"
+                              <FileDisclosure />
+                              <FileKindIcon data-file-tone={fileTone}>
+                                <span className={`codicon ${iconClass}`} aria-hidden="true" />
+                              </FileKindIcon>
+                              <FileTreeName>{row.fileName}</FileTreeName>
+                              <DocsExplorerStatus title={row.pendingPush ? "Pending push" : row.typeLabel}>
+                                {row.pendingPush ? "●" : ""}
+                              </DocsExplorerStatus>
+                            </DocsExplorerFileButton>
+                          );
+                        })
+                      ) : (
+                        <FileTreeEmpty>{text(skillsQuery) ? "No matching docs." : "No docs saved yet."}</FileTreeEmpty>
+                      )}
+                    </FileTreeItem>
+                  </FileTree>
+                </DocsFilesPane>
+
+                <DocsCenterPane aria-label="Document editor">
+                  <ToolsHydrationProgress placement="editor" progress={skillsHydration} />
+                  {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
+                  {skillEditor ? (
+                    <>
+                      <SkillDocumentEditor data-page-theme={skillEditorTheme}>
+                        <SkillDocumentToolbar>
+                          <SkillDocumentToolbarCopy>
+                            <ToolsPanelTitle>{documentFileName(skillEditor)}</ToolsPanelTitle>
+                            <ToolsPanelHint>
+                              {text(skillEditor.localPath, documentTypeLabel(skillEditor.documentKind, skillEditor.collection))}
+                            </ToolsPanelHint>
+                          </SkillDocumentToolbarCopy>
+                          <SkillDocumentToolbarControls>
+                            <DocTypeSelect
+                              aria-label="Document type"
+                              onChange={(event) => {
+                                const option = documentTypeOption(event.target.value);
+                                setSkillEditor((current) => ({
+                                  ...current,
+                                  collection: option.collection,
+                                  documentKind: option.id,
+                                  extension: option.extension,
+                                  source: option.id,
+                                }));
+                              }}
+                              value={documentTypeOption(skillEditor.documentKind, skillEditor.collection).id}
                             >
-                              Remove
-                            </ToolsGhostButton>
-                          </>
-                        ) : (
-                          <ToolsPrimaryButton
-                            disabled={skillsState === "saving"}
-                            onClick={() => addCatalogSkill(selectedSkill)}
+                              {DOCUMENT_TYPE_OPTIONS.map((option) => (
+                                <option key={option.id} value={option.id}>{option.label}</option>
+                              ))}
+                            </DocTypeSelect>
+                            <ToolsStatusPill data-tone={skillsStatusTone}>
+                              {skillsStatusLabel}
+                            </ToolsStatusPill>
+                            <SkillDocumentThemeSwitch aria-label="Document editor page theme">
+                              {["dark", "light"].map((theme) => (
+                                <SkillDocumentThemeButton
+                                  aria-pressed={skillEditorTheme === theme}
+                                  data-active={skillEditorTheme === theme ? "true" : "false"}
+                                  key={theme}
+                                  onClick={() => setSkillEditorTheme(theme)}
+                                  type="button"
+                                >
+                                  {theme === "dark" ? "Dark" : "Light"}
+                                </SkillDocumentThemeButton>
+                              ))}
+                            </SkillDocumentThemeSwitch>
+                          </SkillDocumentToolbarControls>
+                        </SkillDocumentToolbar>
+                        <SkillDocumentCanvas>
+                          <SkillDocumentPage>
+                            <SkillDocumentTitleInput
+                              aria-label="Document name"
+                              onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
+                              placeholder="doc_name"
+                              value={skillEditor.title}
+                            />
+                            <ToolsSkillsEditor
+                              aria-label="Document content"
+                              onChange={(event) => setSkillEditor((current) => ({ ...current, content: event.target.value }))}
+                              placeholder={skillEditor.extension === "arch" ? "title System_Map" : "# Notes"}
+                              spellCheck={false}
+                              value={skillEditor.content}
+                            />
+                          </SkillDocumentPage>
+                        </SkillDocumentCanvas>
+                      </SkillDocumentEditor>
+                      <SkillDocumentActions>
+                        <ToolsGhostButton
+                          onClick={() => {
+                            setSkillEditor(null);
+                            setSelectedSkillKey("");
+                          }}
+                          type="button"
+                        >
+                          Close
+                        </ToolsGhostButton>
+                        {skillEditor.id && (
+                          <ToolsGhostButton
+                            data-danger="true"
+                            onClick={() => removeSkill(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
                             type="button"
                           >
-                            {skillsState === "saving" ? "Adding…" : "Add to my skills"}
-                          </ToolsPrimaryButton>
+                            Delete
+                          </ToolsGhostButton>
                         )}
-                      </SkillDetailActions>
-                    </SkillDetailHeader>
-                    <SkillDetailTitle>
-                      <SkillRowIcon
-                        aria-hidden="true"
-                        style={{ "--skill-color": skillToneColor(selectedSkill.tone, selectedSkill.title) }}
-                      >
-                        <SkillIconGlyph icon={selectedSkill.icon} title={selectedSkill.title} />
-                      </SkillRowIcon>
-                      <div>
-                        <strong>{selectedSkill.title}</strong>
-                      </div>
-                    </SkillDetailTitle>
-                    <SkillDetailMeta>
-                      <SkillSourceBadge data-source={selectedSkill.source}>
-                        {selectedSkill.source === "cli"
-                          ? "CLI skill"
-                          : selectedSkill.source === "catalog"
-                            ? "Curated"
-                            : "Custom"}
-                      </SkillSourceBadge>
-                      {selectedSkill.owned && selectedSkill.updatedAt && (
-                        <span>updated {timeAgo(selectedSkill.updatedAt)}</span>
-                      )}
-                      {selectedSkill.owned && selectedSkill.pendingPush && (
-                        <SkillSourceBadge data-source="pending">Pending push</SkillSourceBadge>
-                      )}
-                      {!selectedSkill.owned && <span>preview — not in your library yet</span>}
-                    </SkillDetailMeta>
-                    {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
-                    <SkillContent>{selectedSkill.content || "This skill has no content yet."}</SkillContent>
-                  </>
-                ) : (
-                  <>
-                    <CliSearchRow>
-                      <CliSearchInput
-                        aria-label="Search skills"
-                        onChange={(event) => setSkillsQuery(event.target.value)}
-                        placeholder="Search skills…"
-                        type="search"
-                        value={skillsQuery}
-                      />
-                      <ToolsGhostButton
-                        onClick={() => setSkillEditor({ content: "", id: "", title: "" })}
+                        <ToolsGhostButton
+                          disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
+                          onClick={() => saveSkillEditor("local")}
+                          type="button"
+                        >
+                          {skillsState === "savingLocal" ? "Saving locally…" : "Save Local"}
+                        </ToolsGhostButton>
+                        <ToolsPrimaryButton
+                          disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
+                          onClick={() => saveSkillEditor("push")}
+                          type="button"
+                        >
+                          {skillsState === "saving" ? "Syncing…" : "Push Save"}
+                        </ToolsPrimaryButton>
+                      </SkillDocumentActions>
+                    </>
+                  ) : (
+                    <DocsCreateModal>
+                      <DocsCreateHeader>
+                        <div>
+                          <ToolsPanelTitle>New doc</ToolsPanelTitle>
+                          <DocsCreateFileName>
+                            {text(newDocDraft.name)
+                              ? `${skillSlug(newDocDraft.name)}.${documentTypeOption(newDocDraft.type).extension}`
+                              : `untitled.${documentTypeOption(newDocDraft.type).extension}`}
+                          </DocsCreateFileName>
+                        </div>
+                        <ToolsStatusPill data-tone={skillsStatusTone}>
+                          {skillsStatusLabel}
+                        </ToolsStatusPill>
+                      </DocsCreateHeader>
+                      <DocsCreateFields>
+                        <DocsField>
+                          <label htmlFor="tools-doc-name">Name</label>
+                          <input
+                            autoComplete="off"
+                            id="tools-doc-name"
+                            onChange={(event) => setNewDocDraft((current) => ({ ...current, name: event.target.value }))}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                startNewDocument();
+                              }
+                            }}
+                            placeholder="My_New_Doc"
+                            value={newDocDraft.name}
+                          />
+                        </DocsField>
+                        <DocsField>
+                          <label htmlFor="tools-doc-type">Type</label>
+                          <select
+                            id="tools-doc-type"
+                            onChange={(event) => setNewDocDraft((current) => ({ ...current, type: event.target.value }))}
+                            value={newDocDraft.type}
+                          >
+                            {DOCUMENT_TYPE_OPTIONS.map((option) => (
+                              <option key={option.id} value={option.id}>{option.label}</option>
+                            ))}
+                          </select>
+                        </DocsField>
+                      </DocsCreateFields>
+                      <ToolsPrimaryButton
+                        disabled={!text(newDocDraft.name)}
+                        onClick={startNewDocument}
                         type="button"
                       >
-                        New skill
-                      </ToolsGhostButton>
-                      <ToolsStatusPill data-tone={skillsStatusTone}>
-                        {skillsStatusLabel}
-                      </ToolsStatusPill>
-                    </CliSearchRow>
-                    {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
-                    {skillsState === "loading" ? (
-                      <ToolsEmpty>Loading skills…</ToolsEmpty>
-                    ) : (
-                      <>
-                        <SkillsList role="list">
-                          {skillRows.map((row) => (
-                            <SkillRow
-                              key={row.key}
-                              onClick={() => setSelectedSkillKey(row.key)}
-                              role="listitem"
-                              type="button"
-                            >
-                              <SkillRowIcon
-                                aria-hidden="true"
-                                style={{ "--skill-color": skillToneColor(row.tone, row.title) }}
-                              >
-                                <SkillIconGlyph icon={row.icon} title={row.title} />
-                              </SkillRowIcon>
-                              <SkillRowCopy>
-                                <strong>{row.title}</strong>
-                                <span>{String(row.content || "").split("\n").find(Boolean) || "No content yet"}</span>
-                              </SkillRowCopy>
-                              <SkillRowSide>
-                                {row.owned ? (
-                                  <>
-                                    <SkillSourceBadge data-source={row.source}>
-                                      Personal
-                                    </SkillSourceBadge>
-                                    {row.pendingPush && (
-                                      <SkillSourceBadge data-source="pending">Pending</SkillSourceBadge>
-                                    )}
-                                    <SkillRowChevron aria-hidden="true">›</SkillRowChevron>
-                                  </>
-                                ) : (
-                                  <>
-                                    {row.cliInstalled && (
-                                      <SkillSourceBadge data-source="cli">CLI installed</SkillSourceBadge>
-                                    )}
-                                    <CliRowButton
-                                      disabled={skillsState === "saving"}
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        addCatalogSkill(row);
-                                      }}
-                                      type="button"
-                                    >
-                                      Add
-                                    </CliRowButton>
-                                  </>
-                                )}
-                              </SkillRowSide>
-                            </SkillRow>
-                          ))}
-                          {!skillRows.length && (
-                            <ToolsEmpty>
-                              {text(skillsQuery)
-                                ? "No skills match your search."
-                                : "No skills yet — create one or add a downloadable skill."}
-                            </ToolsEmpty>
-                          )}
-                        </SkillsList>
-                      </>
+                        Create
+                      </ToolsPrimaryButton>
+                    </DocsCreateModal>
+                  )}
+                </DocsCenterPane>
+
+                {docsCreateMode && (
+                <DocsTemplatesPane aria-label="Default skills">
+                  <DocsPaneHeader>
+                    <div>
+                      <DocsPaneKicker>Defaults</DocsPaneKicker>
+                      <DocsPaneTitle>Skills</DocsPaneTitle>
+                    </div>
+                  </DocsPaneHeader>
+                  <DocsSearchInput
+                    aria-label="Search default skills"
+                    onChange={(event) => setTemplateQuery(event.target.value)}
+                    placeholder="Search defaults…"
+                    type="search"
+                    value={templateQuery}
+                  />
+                  <DocsTemplateList role="list">
+                    {defaultSkillRows.map((row) => (
+                      <DocsTemplateRow
+                        data-added={row.added ? "true" : "false"}
+                        key={row.id}
+                        role="listitem"
+                      >
+                        <SkillRowIcon
+                          aria-hidden="true"
+                          style={{ "--skill-color": skillToneColor(row.tone, row.title) }}
+                        >
+                          <SkillIconGlyph icon={row.icon} title={row.title} />
+                        </SkillRowIcon>
+                        <DocsTemplateCopy>
+                          <strong>{row.defaultFileName}</strong>
+                          <span>{row.description}</span>
+                        </DocsTemplateCopy>
+                        <CliRowButton
+                          disabled={row.added || skillsState === "saving"}
+                          onClick={() => addCatalogSkill(row)}
+                          type="button"
+                        >
+                          {row.added ? "Added" : "Add"}
+                        </CliRowButton>
+                      </DocsTemplateRow>
+                    ))}
+                    {!defaultSkillRows.length && (
+                      <ToolsEmpty>No default skills match.</ToolsEmpty>
                     )}
-                  </>
+                  </DocsTemplateList>
+                </DocsTemplatesPane>
                 )}
-              </ToolsPanel>
+              </DocsWorkspaceGrid>
+              </DocsWorkspaceSurface>
             )}
 
             {section === "clis" && (
@@ -1424,6 +1680,12 @@ const ToolsScroll = styled.div`
   overflow-anchor: none;
   scrollbar-gutter: stable;
   padding: 14px 16px 24px;
+
+  &[data-section="docs"] {
+    display: grid;
+    overflow: hidden;
+    padding: 12px;
+  }
 `;
 
 const ToolsHydrationPanel = styled.div`
@@ -1519,6 +1781,13 @@ const ToolsLayout = styled.section`
   margin: 0 auto;
   gap: 12px;
   min-width: 0;
+
+  &[data-section="docs"] {
+    align-content: stretch;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+  }
 `;
 
 const ToolsSectionNav = styled.nav`
@@ -1582,6 +1851,315 @@ const ToolsPanel = styled.section`
   }
 `;
 
+const DocsWorkspaceSurface = styled(FilesWorkspaceSurface)`
+  border: 1px solid var(--files-vscode-border);
+  border-radius: 8px;
+`;
+
+const DocsWorkspaceGrid = styled.section`
+  display: grid;
+  grid-template-columns: minmax(218px, 280px) minmax(360px, 1fr);
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+
+  &[data-show-templates="true"] {
+    grid-template-columns: minmax(218px, 280px) minmax(360px, 1fr) minmax(238px, 310px);
+  }
+
+  @media (max-width: 1060px) {
+    grid-template-columns: minmax(200px, 240px) minmax(320px, 1fr);
+
+    > :last-child {
+      display: none;
+    }
+  }
+`;
+
+const DocsPaneBase = styled.aside`
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 9px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
+  border-radius: 8px;
+  background: rgba(8, 12, 18, 0.72);
+`;
+
+const DocsFilesPane = styled(FileExplorerPane)`
+  border-right: 1px solid var(--files-vscode-border);
+`;
+
+const DocsTemplatesPane = styled(DocsPaneBase)``;
+
+const DocsRootPath = styled(FileRootPath)`
+  padding-right: 10px;
+`;
+
+const DocsExplorerSearchInput = styled.input`
+  width: calc(100% - 16px);
+  min-width: 0;
+  height: 26px;
+  margin: 6px 8px;
+  padding: 0 8px;
+  border: 1px solid var(--files-vscode-border);
+  border-radius: 4px;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-editor);
+  font-size: 11px;
+  outline: none;
+
+  &::placeholder {
+    color: var(--files-vscode-text-muted);
+  }
+
+  &:focus-visible {
+    border-color: var(--files-vscode-focus);
+    box-shadow: 0 0 0 1px var(--files-vscode-focus);
+  }
+`;
+
+const DocsExplorerFolderButton = styled(FileTreeButton)`
+  cursor: default;
+`;
+
+const DocsExplorerFileButton = styled(FileTreeButton)`
+  cursor: pointer;
+`;
+
+const DocsExplorerCount = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--files-vscode-text-muted);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 22px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const DocsExplorerStatus = styled.span`
+  color: #e2c08d;
+  font-size: 10px;
+  line-height: 22px;
+  text-align: center;
+`;
+
+const DocsCenterPane = styled.section`
+  display: grid;
+  align-content: stretch;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 0;
+  border-right: 1px solid var(--files-vscode-border);
+  border-radius: 0;
+  background: rgba(7, 10, 16, 0.72);
+
+  ${DocsWorkspaceGrid}[data-show-templates="false"] & {
+    border-right: 0;
+  }
+`;
+
+const DocsPaneHeader = styled.header`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const DocsPaneKicker = styled.div`
+  margin-bottom: 2px;
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+`;
+
+const DocsPaneTitle = styled.div`
+  overflow: hidden;
+  color: var(--forge-text, #f4f7fa);
+  font-size: 13px;
+  font-weight: 820;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const ToolsSearchInput = styled.input`
+  width: min(220px, 100%);
+  padding: 7px 11px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  color: var(--forge-text, #f4f7fa);
+  background: rgba(7, 9, 13, 0.55);
+  font-size: 12px;
+
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-accent-soft-rgb), 0.35);
+    outline-offset: -1px;
+  }
+`;
+
+const DocsSearchInput = styled(ToolsSearchInput)`
+  width: 100%;
+`;
+
+const DocsCreateModal = styled.div`
+  align-self: center;
+  justify-self: center;
+  display: grid;
+  gap: 14px;
+  width: min(420px, calc(100% - 28px));
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  background: rgba(12, 17, 26, 0.94);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+`;
+
+const DocsCreateHeader = styled.header`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+`;
+
+const DocsCreateFileName = styled.div`
+  overflow: hidden;
+  color: var(--forge-text-muted, #7a8493);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const DocsCreateFields = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px;
+  gap: 10px;
+  min-width: 0;
+`;
+
+const DocsField = styled.div`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+
+  label {
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  input,
+  select {
+    width: 100%;
+    min-width: 0;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.13));
+    border-radius: 7px;
+    color: var(--forge-text, #f4f7fa);
+    background: rgba(5, 8, 13, 0.76);
+    font-size: 12px;
+    font-weight: 650;
+    outline: none;
+  }
+
+  input {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  }
+
+  input:focus-visible,
+  select:focus-visible {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.44);
+    box-shadow: 0 0 0 2px rgba(var(--forge-accent-rgb), 0.14);
+  }
+`;
+
+const DocTypeSelect = styled.select`
+  height: 28px;
+  max-width: 138px;
+  min-width: 112px;
+  padding: 0 9px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border-radius: 7px;
+  color: var(--forge-text-soft, #b6c0cc);
+  background: rgba(4, 7, 12, 0.78);
+  font-size: 10.5px;
+  font-weight: 760;
+  outline: none;
+`;
+
+const DocsTemplateList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.07));
+  border-radius: 7px;
+  background: rgba(3, 6, 10, 0.34);
+`;
+
+const DocsTemplateRow = styled.div`
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 50px;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  &[data-added="true"] {
+    opacity: 0.64;
+  }
+`;
+
+const DocsTemplateCopy = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text, #f4f7fa);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 11px;
+    font-weight: 780;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    display: -webkit-box;
+    overflow: hidden;
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 10px;
+    line-height: 1.25;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+`;
+
 const ToolsPanelTitle = styled.h3`
   margin: 0 0 3px;
   font-size: 14px;
@@ -1635,7 +2213,9 @@ const SkillDocumentEditor = styled.div`
   --skill-editor-page-rule: rgba(230, 236, 245, 0.08);
 
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background: rgba(5, 8, 13, 0.8);
 
@@ -1715,11 +2295,10 @@ const SkillDocumentCanvas = styled.div`
   display: grid;
   justify-items: center;
   min-width: 0;
-  min-height: 540px;
-  max-height: min(72vh, 780px);
+  min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: clamp(18px, 3.5vw, 34px);
+  padding: 24px;
   background: var(--skill-editor-desk);
 `;
 
@@ -1728,7 +2307,7 @@ const SkillDocumentPage = styled.div`
   align-content: start;
   width: min(780px, 100%);
   min-height: 900px;
-  padding: clamp(34px, 5vw, 58px) clamp(28px, 6vw, 70px) 64px;
+  padding: 48px 56px 64px;
   border: 1px solid var(--skill-editor-page-border);
   border-radius: 4px;
   color: var(--skill-editor-page-text);
@@ -1745,7 +2324,7 @@ const SkillDocumentTitleInput = styled.input`
   color: var(--skill-editor-page-text);
   background: transparent;
   font-family: ui-serif, Georgia, "Times New Roman", serif;
-  font-size: clamp(24px, 3.2vw, 34px);
+  font-size: 30px;
   font-weight: 760;
   line-height: 1.18;
   outline: none;
@@ -1870,26 +2449,6 @@ const ToolsEmpty = styled.p`
   color: var(--forge-text-muted, #7a8493);
   font-size: 12px;
 `;
-
-const ToolsSearchInput = styled.input`
-  width: min(220px, 100%);
-  padding: 7px 11px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
-  border-radius: 8px;
-  color: var(--forge-text, #f4f7fa);
-  background: rgba(7, 9, 13, 0.55);
-  font-size: 12px;
-
-  &:focus-visible {
-    outline: 2px solid rgba(var(--forge-accent-soft-rgb), 0.35);
-    outline-offset: -1px;
-  }
-`;
-
-
-
-
-
 
 // --- Minimalist CLI list (installed-programs style) ------------------------
 

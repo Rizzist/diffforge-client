@@ -16,6 +16,42 @@ function text(value, fallback = "") {
   return normalized || fallback;
 }
 
+export const ACCOUNT_DOCUMENTS_CONTRACT = "diffforge.account_documents.v1";
+
+export function normalizedDocumentCollection() {
+  return "documents";
+}
+
+export function normalizedDocumentKind(value, collection = "documents") {
+  const normalized = text(value).toLowerCase();
+  if (["arch", "architecture", "architectures", "graph", "graphs"].includes(normalized)) return "architecture";
+  if (["skill", "skills"].includes(normalized)) return "skill";
+  if (["instruction", "instructions"].includes(normalized)) return "instruction";
+  if (["generic", "document", "documents", "doc", "docs"].includes(normalized)) return "document";
+  const rawCollection = text(collection).toLowerCase();
+  if (["arch", "architecture", "architectures", "graph", "graphs"].includes(rawCollection)) return "architecture";
+  if (["skill", "skills"].includes(rawCollection)) return "skill";
+  if (["instruction", "instructions"].includes(rawCollection)) return "instruction";
+  return "document";
+}
+
+export function documentExtensionForKind(kind, collection = "documents") {
+  return normalizedDocumentKind(kind, collection) === "architecture" ? "arch" : "md";
+}
+
+export function normalizedDocumentId(value) {
+  const cleaned = text(value)
+    .split(/[\\/]/u)
+    .filter(Boolean)
+    .pop() || "";
+  return cleaned.replace(/\.(?:md|markdown|arch)$/iu, "").trim();
+}
+
+export function accountDocumentStorageKey(document) {
+  const id = normalizedDocumentId(document?.document_id || document?.documentId || document?.id || document?.skill_id || document?.skillId);
+  return id || "";
+}
+
 export function skillToneColor(tone, seed = "") {
   if (SKILL_TONES[tone]) return SKILL_TONES[tone];
   const source = text(seed, "skill");
@@ -27,7 +63,7 @@ export function skillToneColor(tone, seed = "") {
 }
 
 export function skillSlug(title, existingIds = new Set()) {
-  const base = text(title)
+  const base = text(normalizedDocumentId(title), text(title))
     .replace(/[^A-Za-z0-9]+/gu, "_")
     .replace(/^_+|_+$/gu, "")
     .slice(0, 64) || "skill";
@@ -41,15 +77,36 @@ export function skillSlug(title, existingIds = new Set()) {
 }
 
 export function skillFromUnit(unit) {
-  const id = text(unit?.skill_id || unit?.skillId || unit?.id);
+  const id = normalizedDocumentId(unit?.skill_id || unit?.skillId || unit?.document_id || unit?.documentId || unit?.id);
   if (!id) return null;
+  const collection = normalizedDocumentCollection();
+  const documentKind = normalizedDocumentKind(
+    unit?.document_kind || unit?.documentKind || unit?.kind || unit?.type,
+    unit?.collection || unit?.document_collection || unit?.documentCollection || unit?.source || collection,
+  );
+  const extension = text(unit?.extension || unit?.ext, documentExtensionForKind(documentKind, collection));
+  const hasContentFlag = unit?.hasContent !== undefined || unit?.hasContentPayload !== undefined;
+  const hasContent = unit?.hydrated === true
+    || unit?.hasContent === true
+    || unit?.hasContentPayload === true
+    || (!hasContentFlag && (
+      unit?.content_md !== undefined
+      || unit?.contentMd !== undefined
+      || unit?.content !== undefined
+      || unit?.body !== undefined
+    ));
   return {
     assetId: text(unit?.asset_id || unit?.assetId),
     blobId: text(unit?.blob_id || unit?.blobId),
     content: String(unit?.content_md ?? unit?.contentMd ?? unit?.content ?? unit?.body ?? ""),
     contentHash: text(unit?.content_hash || unit?.contentHash || unit?.hash || unit?.sha256),
+    collection,
+    documentKind,
+    extension,
+    hasContent,
     icon: text(unit?.icon),
     id,
+    localPath: text(unit?.local_path || unit?.localPath),
     mimeType: text(unit?.mime_type || unit?.mimeType),
     localSavedAt: text(unit?.local_saved_at || unit?.localSavedAt),
     pendingPush: unit?.pending_push === true || unit?.pendingPush === true,
@@ -57,7 +114,7 @@ export function skillFromUnit(unit) {
     sizeBytes: Number.isFinite(Number(unit?.size_bytes ?? unit?.sizeBytes))
       ? Number(unit?.size_bytes ?? unit?.sizeBytes)
       : 0,
-    source: text(unit?.source, "custom"),
+    source: text(unit?.source, documentKind),
     syncStatus: text(unit?.sync_status || unit?.syncStatus),
     title: text(unit?.title || unit?.name || unit?.label, id),
     tone: text(unit?.tone),
@@ -70,30 +127,34 @@ export function skillsFromUnits(units) {
   (Array.isArray(units) ? units : []).forEach((unit) => {
     const skill = skillFromUnit(unit);
     if (!skill) return;
+    const key = accountDocumentStorageKey(skill) || skill.id;
     const removed = unit?.deleted === true || unit?.current === false || unit?.tombstoned === true;
     if (removed) {
-      byId.delete(skill.id);
+      byId.delete(key);
     } else {
-      byId.set(skill.id, skill);
+      byId.set(key, skill);
     }
   });
   return Array.from(byId.values()).sort((left, right) => left.title.localeCompare(right.title));
 }
 
 export function mergeSkillUnits(currentSkills, units) {
-  const byId = new Map((Array.isArray(currentSkills) ? currentSkills : []).map((skill) => [skill.id, skill]));
+  const byId = new Map((Array.isArray(currentSkills) ? currentSkills : [])
+    .map((skill) => [accountDocumentStorageKey(skill) || skill.id, skill]));
   (Array.isArray(units) ? units : []).forEach((unit) => {
     const skill = skillFromUnit(unit);
     if (!skill) return;
+    const key = accountDocumentStorageKey(skill) || skill.id;
     const removed = unit?.deleted === true || unit?.current === false || unit?.tombstoned === true;
     if (removed) {
-      byId.delete(skill.id);
+      byId.delete(key);
     } else {
-      const existing = byId.get(skill.id) || {};
-      byId.set(skill.id, {
+      const existing = byId.get(key) || {};
+      const hasContent = skill.hasContent === true || unit?.hydrated === true;
+      byId.set(key, {
         ...existing,
         ...skill,
-        content: skill.content || existing.content || "",
+        content: hasContent ? skill.content : existing.content || "",
       });
     }
   });
@@ -105,20 +166,190 @@ export function skillsToSkillUnits(skills) {
     .map((skill) => ({
       assetId: text(skill?.assetId),
       blobId: text(skill?.blobId),
+      collection: normalizedDocumentCollection(),
       content: String(skill?.content || "").trim(),
       contentMd: String(skill?.content || "").trim(),
+      documentKind: normalizedDocumentKind(skill?.documentKind || skill?.source, skill?.collection || skill?.source),
       icon: text(skill?.icon),
-      id: text(skill?.id),
+      id: normalizedDocumentId(skill?.id),
+      localPath: text(skill?.localPath),
       mimeType: text(skill?.mimeType),
       sha256: text(skill?.sha256),
       sizeBytes: Number.isFinite(Number(skill?.sizeBytes)) ? Number(skill.sizeBytes) : 0,
-      skillId: text(skill?.id),
+      skillId: normalizedDocumentId(skill?.id),
       source: text(skill?.source, "custom"),
       title: text(skill?.title, "Untitled skill"),
       tone: text(skill?.tone),
       updatedAt: text(skill?.updatedAt),
     }))
     .filter((skill) => skill.id && skill.title);
+}
+
+export function accountDocumentUnitFromRow(row, removed = false) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const id = normalizedDocumentId(row.document_id || row.documentId || row.id || row.skill_id || row.skillId);
+  if (!id) return null;
+  const collection = normalizedDocumentCollection();
+  const hasContent = row.content_md !== undefined
+    || row.contentMd !== undefined
+    || row.content !== undefined
+    || row.body !== undefined
+    || row.hydrated === true;
+  const documentKind = normalizedDocumentKind(
+    row.document_kind || row.documentKind || row.kind || row.type,
+    row.collection || row.document_collection || row.documentCollection || row.source || collection,
+  );
+  const extension = text(row.extension || row.ext, documentExtensionForKind(documentKind, collection));
+  return {
+    ...row,
+    collection,
+    content: String(row.content_md ?? row.contentMd ?? row.content ?? row.body ?? ""),
+    contentMd: String(row.content_md ?? row.contentMd ?? row.content ?? row.body ?? ""),
+    current: removed ? false : row.current,
+    deleted: removed || row.deleted === true || row.tombstoned === true,
+    documentId: id,
+    documentKind,
+    extension,
+    hasContent,
+    hasContentPayload: hasContent,
+    id,
+    skillId: id,
+    skill_id: id,
+    source: text(row.source, documentKind),
+    title: text(row.title || row.name || row.label, id),
+  };
+}
+
+function documentPayloadCandidates(payload) {
+  return [
+    payload,
+    payload?.payload,
+    payload?.data,
+    payload?.event,
+    payload?.projection,
+    payload?.cloud_response,
+    payload?.cloudResponse,
+    payload?.source_response,
+    payload?.sourceResponse,
+    payload?.payload?.payload,
+    payload?.payload?.data,
+    payload?.payload?.projection,
+    payload?.data?.payload,
+    payload?.data?.projection,
+  ];
+}
+
+export function accountDocumentUnitsFromPayload(payload) {
+  const units = [];
+  const pushDocument = (row, removed = false) => {
+    const unit = accountDocumentUnitFromRow(row, removed);
+    if (unit) units.push(unit);
+  };
+  const pushOps = (ops) => {
+    (Array.isArray(ops) ? ops : []).forEach((op) => {
+      if (Array.isArray(op)) {
+        const kind = text(op[0]).toLowerCase();
+        const id = normalizedDocumentId(op[1]);
+        if (!id) return;
+        if (["d", "delete", "remove", "removed", "tombstone", "tombstoned"].includes(kind)) {
+          pushDocument({ document_id: id, documentId: id, id }, true);
+          return;
+        }
+        if (!["u", "upsert", "save", "edit", "put"].includes(kind)) return;
+        pushDocument({
+          asset_id: text(op[6]),
+          assetId: text(op[6]),
+          blob_id: text(op[7]),
+          blobId: text(op[7]),
+          collection: "documents",
+          content_hash: text(op[3]),
+          contentHash: text(op[3]),
+          document_id: id,
+          documentId: id,
+          document_kind: text(op[10], "document"),
+          documentKind: text(op[10], "document"),
+          file_path: text(op[11]),
+          filePath: text(op[11]),
+          id,
+          mime_type: text(op[9]),
+          mimeType: text(op[9]),
+          sha256: text(op[8]),
+          size_bytes: Number.isFinite(Number(op[4])) ? Number(op[4]) : 0,
+          sizeBytes: Number.isFinite(Number(op[4])) ? Number(op[4]) : 0,
+          title: text(op[5], id),
+        });
+        return;
+      }
+      if (!op || typeof op !== "object") return;
+      const kind = text(op.op || op.operation || op.action || op.kind).toLowerCase();
+      const removed = ["d", "delete", "remove", "removed", "tombstone", "tombstoned"].includes(kind);
+      pushDocument(op.document || op.doc || op.item || op, removed);
+    });
+  };
+  documentPayloadCandidates(payload).forEach((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return;
+    const candidateKind = text(candidate.op || candidate.operation || candidate.action || candidate.kind).toLowerCase();
+    const candidateRemoved = [
+      "account_document_deleted",
+      "d",
+      "delete",
+      "remove",
+      "removed",
+      "tombstone",
+      "tombstoned",
+    ].includes(candidateKind);
+    if (candidate.document_id || candidate.documentId || candidate.id) {
+      pushDocument(candidate, candidateRemoved);
+    }
+    pushDocument(candidate.document || candidate.doc || candidate.item);
+    (candidate.documents || candidate.docs || candidate.items || []).forEach((row) => pushDocument(row));
+    (candidate.removed_documents || candidate.removedDocuments || candidate.removed_docs || candidate.removedDocs || [])
+      .forEach((row) => pushDocument(row, true));
+    pushOps(candidate.ops);
+    pushOps(candidate.removed);
+  });
+  const byKey = new Map();
+  units.forEach((unit) => {
+    const key = accountDocumentStorageKey(unit);
+    if (key) byKey.set(key, unit);
+  });
+  return Array.from(byKey.values());
+}
+
+export function accountDocumentRequestFromSkill(skill, { localOnly = false } = {}) {
+  const collection = normalizedDocumentCollection();
+  const documentKind = normalizedDocumentKind(skill?.documentKind || skill?.source, collection);
+  const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
+  const id = normalizedDocumentId(skill?.id || skill?.documentId || skill?.document_id) || skillSlug(skill?.title || "document");
+  const mimeType = text(
+    skill?.mimeType,
+    extension === "arch" ? "text/vnd.diffforge.arch" : "text/markdown",
+  );
+  return {
+    document: {
+      asset_id: text(skill?.assetId),
+      assetId: text(skill?.assetId),
+      collection,
+      content: String(skill?.content || ""),
+      content_md: String(skill?.content || ""),
+      contentMd: String(skill?.content || ""),
+      document_id: id,
+      documentId: id,
+      document_kind: documentKind,
+      documentKind,
+      extension,
+      id,
+      local_path: text(skill?.localPath),
+      localPath: text(skill?.localPath),
+      mime_type: mimeType,
+      mimeType,
+      name: text(skill?.title, id),
+      source: documentKind,
+      title: text(skill?.title, id),
+    },
+    local_only: Boolean(localOnly),
+    localOnly: Boolean(localOnly),
+  };
 }
 
 export function skillsToToolEntries(skills) {

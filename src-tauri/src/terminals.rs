@@ -9395,13 +9395,33 @@ fn emit_terminal_prompt_submitted(
     // showed nothing while the agent worked. Capture synthetic-ref
     // submissions here too, converging on the exact item id the webview
     // minted so both writers land on one row.
-    let synthetic_direct_todo_id = if !direct_capture_candidate && !todo_resume_requested {
+    let app_control_terminal_prompt =
+        todo_dispatch_is_app_control_terminal_surface(&metadata.workspace_id, &metadata.pane_id);
+    let synthetic_direct_todo_id = if !app_control_terminal_prompt
+        && !direct_capture_candidate
+        && !todo_resume_requested
+    {
         terminal_prompt_synthetic_direct_todo_id(todo_id, todo_dispatch_id, todo_command_id)
     } else {
         None
     };
     let mut direct_todo_item_id: Option<String> = None;
-    if direct_capture_candidate || synthetic_direct_todo_id.is_some() {
+    if app_control_terminal_prompt {
+        terminal_direct_prompt_mark_seen(&metadata.pane_id, prompt);
+        log_terminal_status_event(
+            "backend.terminal.direct_capture_app_control_skip",
+            json!({
+                "agent_id": metadata.agent_id.clone(),
+                "agent_kind": metadata.agent_kind.clone(),
+                "instance_id": instance.id,
+                "pane_id": metadata.pane_id.clone(),
+                "prompt_event_id": prompt_event_id.unwrap_or_default(),
+                "prompt_len": prompt.len(),
+                "terminal_index": metadata.terminal_index,
+                "workspace_id": metadata.workspace_id.clone(),
+            }),
+        );
+    } else if direct_capture_candidate || synthetic_direct_todo_id.is_some() {
         if terminal_direct_prompt_should_capture(&metadata.pane_id, prompt) {
             direct_todo_item_id = todo_dispatch_capture_direct_prompt_todo(
                 app,
@@ -12543,15 +12563,28 @@ async fn terminal_capture_direct_prompt_todo(
 ) -> Result<Option<String>, String> {
     validate_terminal_pane_id(&request.pane_id)?;
     let workspace_id = request.workspace_id.trim();
+    let pane_id = request.pane_id.trim();
     let prompt = request.prompt.trim();
     if workspace_id.is_empty() || prompt.is_empty() {
+        return Ok(None);
+    }
+    if todo_dispatch_is_app_control_terminal_surface(workspace_id, pane_id) {
+        log_terminal_status_event(
+            "backend.terminal.capture_direct_prompt_app_control_skip",
+            json!({
+                "agent_kind": request.agent_kind.trim(),
+                "pane_id": pane_id,
+                "prompt_len": prompt.len(),
+                "workspace_id": workspace_id,
+            }),
+        );
         return Ok(None);
     }
     Ok(todo_dispatch_capture_direct_prompt_todo(
         &app,
         workspace_id,
         request.workspace_name.as_deref().unwrap_or_default(),
-        request.pane_id.trim(),
+        pane_id,
         request.terminal_index.unwrap_or(0),
         request.thread_id.trim(),
         request.agent_kind.trim(),

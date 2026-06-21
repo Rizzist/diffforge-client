@@ -19,6 +19,19 @@ const LOCAL_AVAILABLE_STATUS_TOKENS = new Set([
   "synced",
 ]);
 
+const DOC_BACKED_ASSET_SOURCE_TOKENS = new Set([
+  "account-document",
+]);
+
+const DOC_BACKED_ASSET_DOMAIN_TOKENS = new Set([
+  "documents",
+  "docs",
+]);
+
+const DOC_BACKED_ASSET_FOLDER_TOKENS = new Set([
+  "account-documents",
+]);
+
 function text(...values) {
   for (const value of values) {
     const normalized = String(value ?? "").trim();
@@ -49,6 +62,55 @@ function booleanValue(value, fallback = false) {
 
 function normalizedToken(value) {
   return text(value).toLowerCase().replace(/[._\s]+/gu, "-");
+}
+
+function assetDocBacked(row = {}) {
+  const object = jsonObject(row);
+  if (!object) return false;
+  const metadata = jsonObject(object.metadata) || {};
+  const sourceKind = normalizedToken(
+    text(
+      object.src,
+      object.source_kind,
+      object.sourceKind,
+      object.source,
+      metadata.src,
+      metadata.source_kind,
+      metadata.sourceKind,
+      metadata.source,
+    ),
+  );
+  const docDomain = normalizedToken(
+    text(
+      object.dom,
+      object.doc_domain,
+      object.docDomain,
+      metadata.dom,
+      metadata.doc_domain,
+      metadata.docDomain,
+    ),
+  );
+  const folder = normalizedToken(
+    text(
+      object.fold,
+      object.asset_folder,
+      object.assetFolder,
+      object.folder,
+      object.group,
+      object.asset_group,
+      object.assetGroup,
+      metadata.fold,
+      metadata.asset_folder,
+      metadata.assetFolder,
+      metadata.folder,
+      metadata.group,
+      metadata.asset_group,
+      metadata.assetGroup,
+    ),
+  );
+  return DOC_BACKED_ASSET_SOURCE_TOKENS.has(sourceKind)
+    || DOC_BACKED_ASSET_DOMAIN_TOKENS.has(docDomain)
+    || DOC_BACKED_ASSET_FOLDER_TOKENS.has(folder);
 }
 
 function compactUpdatedAt(value) {
@@ -193,6 +255,9 @@ export function accountAssetFanoutFromValue(value = {}) {
       const sourceKind = text(object.src, object.source_kind, object.sourceKind, object.source);
       const folder = text(object.fold, object.asset_folder, object.assetFolder, object.folder, object.group, object.asset_group, object.assetGroup);
       const docDomain = text(object.dom, object.doc_domain, object.docDomain);
+      if (assetDocBacked({ source_kind: sourceKind, folder, doc_domain: docDomain })) {
+        return;
+      }
       itemsById.set(assetId, {
         asset_id: assetId,
         assetId: assetId,

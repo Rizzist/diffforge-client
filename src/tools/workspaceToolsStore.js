@@ -1,22 +1,25 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-import { mergeSkillUnits, skillsFromUnits, skillsToToolEntries } from "./skillsLibrary.js";
+import {
+  ACCOUNT_DOCUMENTS_CONTRACT,
+  accountDocumentUnitsFromPayload,
+  mergeSkillUnits,
+  skillsFromUnits,
+  skillsToToolEntries,
+} from "./skillsLibrary.js";
 
-// App-level cache for the orchestrator Tools tab. Architectures and account
-// skills are globally synced data, so they live at module scope and survive
-// the tab's mount/unmount cycle: the panel renders instantly from this cache
-// while the store silently revalidates and listens for change events, so no
-// manual Refresh button is needed.
+// App-level cache for account docs exposed to the workspace tools panel. Docs
+// are globally synced data, so they live at module scope and survive mount
+// cycles while the store silently revalidates and listens for change events.
 
 const SKILLS_REVALIDATE_MIN_MS = 20_000;
-const ARCHITECTURE_EVENT_DEBOUNCE_MS = 500;
+const ACCOUNT_TOOLS_EVENT_DEBOUNCE_MS = 500;
 const ARCHITECTURE_CHANGE_EVENTS = [
   "architecture-store-changed",
-  "cloud-mcp-workspace-architectures-updated",
 ];
 const ACCOUNT_TOOLS_CHANGE_EVENTS = [
-  "cloud-mcp-account-skills-updated",
+  "cloud-mcp-account-documents-updated",
 ];
 
 const workspaceToolsStore = {
@@ -150,18 +153,17 @@ function accountToolsEventHasKnownPayload(payload) {
       && typeof candidate === "object"
       && !Array.isArray(candidate)
       && (
-        candidate.contract === "diffforge.skills_doc.v1"
+        candidate.contract === ACCOUNT_DOCUMENTS_CONTRACT
         || candidate.contract === "diffforge.account_clis.v1"
         || candidate.contract === "diffforge.account_mcps.v1"
+        || candidate.document
+        || candidate.documents
+        || candidate.docs
+        || candidate.items
         || candidate.kind === "account_cli_changed"
         || candidate.kind === "account_mcp_changed"
-        || candidate.skill
-        || candidate.skill_units
-        || candidate.skillUnits
         || candidate.ops
         || candidate.delta === true
-        || candidate.skills?.skill_units
-        || candidate.skills?.skillUnits
         || candidate.clis
         || candidate.mcps
         || candidate.servers
@@ -178,46 +180,17 @@ function accountToolsSkillPayloadIsFull(payload) {
         candidate.authoritative === true
         || candidate.snapshot_full === true
         || candidate.snapshotFull === true
+        || candidate.kind === "account_documents"
+        || candidate.source === "local_account_document_cache"
       )
   ));
 }
 
 function accountToolsSkillUnitsFromEventPayload(payload) {
-  const candidates = accountToolsEventCandidates(payload);
-  const units = [];
-  const pushUnit = (unit, removed = false) => {
-    if (!unit || typeof unit !== "object" || Array.isArray(unit)) return;
-    units.push(removed ? { ...unit, current: false, deleted: true } : unit);
-  };
-  const pushOps = (ops) => {
-    (Array.isArray(ops) ? ops : []).forEach((op) => {
-      if (!op || typeof op !== "object" || Array.isArray(op)) return;
-      const kind = text(op.op || op.operation || op.action).toLowerCase();
-      const removed = ["d", "delete", "remove", "removed", "tombstone"].includes(kind);
-      pushUnit(op.skill || op.unit || op.skill_unit || op.skillUnit || op, removed);
-    });
-  };
-  for (const candidate of candidates) {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
-    const contract = candidate.contract;
-    pushUnit(candidate.skill);
-    (candidate.skill_units || candidate.skillUnits || []).forEach((unit) => pushUnit(unit));
-    (candidate.removed_skill_units || candidate.removedSkillUnits || []).forEach((unit) => pushUnit(unit, true));
-    pushOps(candidate.ops);
-    const skills = candidate.skills;
-    if (skills && typeof skills === "object" && !Array.isArray(skills)) {
-      (skills.skill_units || skills.skillUnits || []).forEach((unit) => pushUnit(unit));
-      (skills.removed_skill_units || skills.removedSkillUnits || []).forEach((unit) => pushUnit(unit, true));
-      pushOps(skills.ops);
-    }
-    if (contract === "diffforge.skills_doc.v1") {
-      const nested = candidate.payload?.skill || candidate.data?.skill;
-      pushUnit(nested);
-    }
-  }
+  const units = accountDocumentUnitsFromPayload(payload).filter(Boolean);
   const byId = new Map();
   units.forEach((unit) => {
-    const id = text(unit?.skill_id || unit?.skillId || unit?.id);
+    const id = text(unit?.skill_id || unit?.skillId || unit?.document_id || unit?.documentId || unit?.id);
     if (id) byId.set(id, unit);
   });
   return Array.from(byId.values());
@@ -240,9 +213,11 @@ async function loadAccountSkills({ force = false } = {}) {
   }
   const load = (async () => {
     try {
-      const tools = await invoke("cloud_mcp_get_account_skills");
+      const tools = await invoke("cloud_mcp_get_account_documents", {
+        request: { limit: 2000 },
+      });
       workspaceToolsStore.skillsFetchedAtMs = Date.now();
-      const units = accountToolsSkillUnitsFromEventPayload(tools);
+      const units = accountDocumentUnitsFromPayload(tools);
       applyAccountSkills(skillsFromUnits(units));
     } catch {
       // Offline or transient failure: keep cached entries, leave "loading".
@@ -272,7 +247,7 @@ function wireArchitectureChangeEvents() {
       architectureEventTimer = window.setTimeout(() => {
         architectureEventTimer = 0;
         refreshKnownArchitectureRepos();
-      }, ARCHITECTURE_EVENT_DEBOUNCE_MS);
+      }, ACCOUNT_TOOLS_EVENT_DEBOUNCE_MS);
     }).catch(() => {
       // Event wiring is best-effort; mount revalidation still keeps data fresh.
     });
@@ -296,7 +271,7 @@ function wireAccountToolsChangeEvents() {
       accountToolsEventTimer = window.setTimeout(() => {
         accountToolsEventTimer = 0;
         void loadAccountSkills({ force: true });
-      }, ARCHITECTURE_EVENT_DEBOUNCE_MS);
+      }, ACCOUNT_TOOLS_EVENT_DEBOUNCE_MS);
     }).catch(() => {
       // Event wiring is best-effort; mount revalidation still keeps data fresh.
     });
@@ -305,7 +280,6 @@ function wireAccountToolsChangeEvents() {
 
 /** Serve-from-cache plus silent revalidate for the given workspace repos. */
 export function ensureWorkspaceToolsFresh(repoDescriptors) {
-  wireArchitectureChangeEvents();
   wireAccountToolsChangeEvents();
   const descriptors = Array.isArray(repoDescriptors) ? repoDescriptors : [];
   const activeRepos = new Set();
@@ -314,7 +288,6 @@ export function ensureWorkspaceToolsFresh(repoDescriptors) {
     if (!cleaned) return;
     activeRepos.add(cleaned);
     workspaceToolsStore.knownRepos.set(cleaned, text(label, cleaned.split(/[\\/]/u).pop()));
-    void loadArchitecturesForRepo(cleaned, workspaceToolsStore.knownRepos.get(cleaned));
   });
   workspaceToolsStore.knownRepos.forEach((_label, repoPath) => {
     if (activeRepos.has(repoPath)) return;
@@ -338,7 +311,6 @@ export function noteAccountSkillUnits(skills) {
 
 export function subscribeWorkspaceTools(listener) {
   workspaceToolsListeners.add(listener);
-  wireArchitectureChangeEvents();
   wireAccountToolsChangeEvents();
   return () => {
     workspaceToolsListeners.delete(listener);
@@ -363,7 +335,6 @@ export function getWorkspaceToolsSkills() {
 }
 
 export function hasWorkspaceToolsLoaded(repoDescriptors) {
-  if (!workspaceToolsStore.skillsLoaded) return false;
-  return (Array.isArray(repoDescriptors) ? repoDescriptors : [])
-    .every(({ repoPath }) => workspaceToolsStore.archAttemptedRepos.has(text(repoPath)));
+  void repoDescriptors;
+  return workspaceToolsStore.skillsLoaded;
 }

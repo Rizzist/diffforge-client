@@ -661,6 +661,25 @@ function getTerminalDirectTodoRefs(promptEventId) {
   };
 }
 
+const APP_CONTROL_TERMINAL_WORKSPACE_IDS = new Set([
+  "__diffforge_app_control__",
+  "diffforge_app_control",
+]);
+const APP_CONTROL_TERMINAL_PANE_ID = "forge-app-control-agent-terminal";
+
+function normalizeAppControlTerminalWorkspaceId(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isAppControlTerminalSurface({ paneId, workspaceId } = {}) {
+  const normalizedWorkspaceId = normalizeAppControlTerminalWorkspaceId(workspaceId);
+  const normalizedPaneId = String(paneId || "").trim();
+  return (
+    APP_CONTROL_TERMINAL_WORKSPACE_IDS.has(normalizedWorkspaceId)
+    || normalizedPaneId === APP_CONTROL_TERMINAL_PANE_ID
+  );
+}
+
 function getTerminalInputTransportLogFields(payload = {}, extra = {}) {
   const data = String(payload?.data || "");
   return {
@@ -2201,6 +2220,10 @@ function WorkspaceTerminal({
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = String(paneIdOverride || "").trim()
     || getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const appControlTerminalSurface = isAppControlTerminalSurface({
+    paneId,
+    workspaceId: workspace?.id,
+  });
   const terminalSelectsOnPointerDown = terminalSelectionMode !== "pointerup";
   const terminalThreadId = thread?.id || "";
   const terminalThreadSlotKey = thread?.slotKey
@@ -12356,7 +12379,9 @@ function WorkspaceTerminal({
                 ? `tui-manual-input:${submitPromptResolution.source}`
                 : "tui-manual-input";
               const promptEventSource = TODO_QUEUE_SOURCE_TERMINAL_DIRECT;
-              const terminalDirectTodoRefs = getTerminalDirectTodoRefs(promptId);
+              const terminalDirectTodoRefs = appControlTerminalSurface
+                ? null
+                : getTerminalDirectTodoRefs(promptId);
               const promptSnapshot = getTerminalComposerSnapshot(terminalSubmittedComposerState, {
                 promptEventId: promptId,
                 source: promptEventSource,
@@ -13612,7 +13637,16 @@ function WorkspaceTerminal({
   // PTY lifetime must be tied to pane identity and explicit lifecycle actions only.
   // Volatile thread/global-state callbacks are intentionally excluded so ordinary
   // workspace-thread updates do not tear down live terminal processes.
-  }, [paneId, restartKey, terminalClosed, terminalIndex, terminalRoleId, terminalStartupUnblocked, workspace?.id]);
+  }, [
+    appControlTerminalSurface,
+    paneId,
+    restartKey,
+    terminalClosed,
+    terminalIndex,
+    terminalRoleId,
+    terminalStartupUnblocked,
+    workspace?.id,
+  ]);
 
   useEffect(() => {
     const pendingPrompt = thread?.pendingPrompt;
@@ -13989,60 +14023,82 @@ function WorkspaceTerminal({
               threadId: currentThreadId,
               workspaceId: workspace?.id || thread?.workspaceId || "",
             });
-            try {
-              const capturedTodoItemId = await invoke("terminal_capture_direct_prompt_todo", {
-                request: {
-                  agentKind: terminalAgentKind,
-                  itemId: "",
+            if (appControlTerminalSurface) {
+              logTerminalStatus("frontend.pending_prompt.direct_todo_capture_skip", {
+                ...pendingPromptLogFields,
+                instanceId: currentInstanceId,
+                paneId,
+                reason: "app_control_terminal",
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_capture_skip", {
+                agentId: terminalAgentKind,
+                deliveryMode: effectiveDeliveryMode,
+                instanceId: currentInstanceId,
+                paneId,
+                promptId,
+                reason: "app_control_terminal",
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+            } else {
+              try {
+                const capturedTodoItemId = await invoke("terminal_capture_direct_prompt_todo", {
+                  request: {
+                    agentKind: terminalAgentKind,
+                    itemId: "",
+                    paneId,
+                    prompt: promptText,
+                    promptEventId: promptId,
+                    terminalIndex,
+                    threadId: currentThreadId,
+                    workspaceId: workspace?.id || thread?.workspaceId || "",
+                    workspaceName: workspace?.name || "",
+                  },
+                });
+                logTerminalStatus("frontend.pending_prompt.direct_todo_captured", {
+                  ...pendingPromptLogFields,
+                  capturedTodoItemId: capturedTodoItemId || "",
+                  instanceId: currentInstanceId,
+                  promptEventSubmittedAt: pendingPromptSubmittedAt,
+                  threadId: currentThreadId,
+                });
+                logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_captured", {
+                  agentId: terminalAgentKind,
+                  capturedTodoItemId: capturedTodoItemId || "",
+                  deliveryMode: effectiveDeliveryMode,
+                  instanceId: currentInstanceId,
                   paneId,
-                  prompt: promptText,
-                  promptEventId: promptId,
+                  promptId,
+                  promptText: pendingPromptTextDiagnostic,
+                  sendPolicy: "pending-prompt-terminal-direct-todo",
                   terminalIndex,
                   threadId: currentThreadId,
                   workspaceId: workspace?.id || thread?.workspaceId || "",
-                  workspaceName: workspace?.name || "",
-                },
-              });
-              logTerminalStatus("frontend.pending_prompt.direct_todo_captured", {
-                ...pendingPromptLogFields,
-                capturedTodoItemId: capturedTodoItemId || "",
-                instanceId: currentInstanceId,
-                promptEventSubmittedAt: pendingPromptSubmittedAt,
-                threadId: currentThreadId,
-              });
-              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_captured", {
-                agentId: terminalAgentKind,
-                capturedTodoItemId: capturedTodoItemId || "",
-                deliveryMode: effectiveDeliveryMode,
-                instanceId: currentInstanceId,
-                paneId,
-                promptId,
-                promptText: pendingPromptTextDiagnostic,
-                sendPolicy: "pending-prompt-terminal-direct-todo",
-                terminalIndex,
-                threadId: currentThreadId,
-                workspaceId: workspace?.id || thread?.workspaceId || "",
-              });
-            } catch (captureError) {
-              const captureMessage = getErrorMessage(captureError, "Unable to capture pending prompt todo.");
-              logTerminalStatus("frontend.pending_prompt.direct_todo_capture_error", {
-                ...pendingPromptLogFields,
-                error: captureMessage,
-                instanceId: currentInstanceId,
-                promptEventSubmittedAt: pendingPromptSubmittedAt,
-                threadId: currentThreadId,
-              });
-              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_capture_error", {
-                agentId: terminalAgentKind,
-                deliveryMode: effectiveDeliveryMode,
-                error: captureMessage,
-                instanceId: currentInstanceId,
-                paneId,
-                promptId,
-                terminalIndex,
-                threadId: currentThreadId,
-                workspaceId: workspace?.id || thread?.workspaceId || "",
-              });
+                });
+              } catch (captureError) {
+                const captureMessage = getErrorMessage(captureError, "Unable to capture pending prompt todo.");
+                logTerminalStatus("frontend.pending_prompt.direct_todo_capture_error", {
+                  ...pendingPromptLogFields,
+                  error: captureMessage,
+                  instanceId: currentInstanceId,
+                  promptEventSubmittedAt: pendingPromptSubmittedAt,
+                  threadId: currentThreadId,
+                });
+                logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_capture_error", {
+                  agentId: terminalAgentKind,
+                  deliveryMode: effectiveDeliveryMode,
+                  error: captureMessage,
+                  instanceId: currentInstanceId,
+                  paneId,
+                  promptId,
+                  terminalIndex,
+                  threadId: currentThreadId,
+                  workspaceId: workspace?.id || thread?.workspaceId || "",
+                });
+              }
             }
             await waiter.promise;
             logTerminalStatus("frontend.pending_prompt.submit_observed", {
@@ -14344,6 +14400,7 @@ function WorkspaceTerminal({
       }
     };
   }, [
+    appControlTerminalSurface,
     isGenericTerminal,
     onThreadTerminalLifecycle,
     paneId,
