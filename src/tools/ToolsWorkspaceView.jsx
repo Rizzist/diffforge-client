@@ -19,6 +19,9 @@ import {
   FileTreeItem,
   FileTreeName,
   PanelKicker,
+  ResizeHandle,
+  ResizePanel,
+  ResizePanelGroup,
 } from "../app/appStyles.js";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
@@ -36,7 +39,12 @@ import {
   skillSlug,
   skillToneColor,
 } from "./skillsLibrary.js";
-import { noteAccountSkillUnits } from "./workspaceToolsStore.js";
+import {
+  getWorkspaceToolsAccountSkills,
+  hasWorkspaceToolsLoaded,
+  noteAccountSkillUnits,
+  subscribeWorkspaceTools,
+} from "./workspaceToolsStore.js";
 
 const SECTIONS = [
   { id: "docs", label: "Docs" },
@@ -47,6 +55,13 @@ const SECTIONS = [
 export const GLOBAL_MCP_DEFAULTS_SCOPE = "global-defaults";
 const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID = "account-global-mcp-defaults";
 const SKILL_EDITOR_THEME_STORAGE_KEY = "diffforge.tools.skillEditorTheme";
+const ACCOUNT_DOCS_BACKGROUND_REFRESH_TIMEOUT_MS = 4_500;
+const ACCOUNT_DOCS_FOREGROUND_REFRESH_TIMEOUT_MS = 12_000;
+const SKILL_DOCUMENT_A4_WIDTH_PX = 794;
+const SKILL_DOCUMENT_A4_HEIGHT_PX = 1123;
+const SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX = 48;
+const SKILL_DOCUMENT_MIN_SCALE = 0.38;
+const SKILL_DOCUMENT_MAX_SCALE = 1.35;
 const DOCUMENT_TYPE_OPTIONS = [
   { id: "skill", label: "Skill", collection: "documents", extension: "md" },
   { id: "architecture", label: "Architecture", collection: "documents", extension: "arch" },
@@ -69,6 +84,62 @@ function text(value, fallback = "") {
   return normalized || fallback;
 }
 
+function compactDocumentText(value, maxLength = 1200) {
+  const raw = String(value ?? "");
+  if (raw.length <= maxLength) {
+    return { text: raw, truncated: false };
+  }
+  return { text: raw.slice(0, maxLength), truncated: true };
+}
+
+function documentDraftFingerprint(value) {
+  const source = String(value ?? "");
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}:${source.length}`;
+}
+
+function documentOffsetPosition(content, offset) {
+  const safeContent = String(content ?? "");
+  const safeOffset = Math.max(0, Math.min(safeContent.length, Number(offset) || 0));
+  const before = safeContent.slice(0, safeOffset);
+  const lines = before.split("\n");
+  return {
+    column: lines[lines.length - 1].length + 1,
+    line: lines.length,
+    offset: safeOffset,
+  };
+}
+
+function documentSelectionContext(content, selection) {
+  const source = String(content ?? "");
+  const start = Math.max(0, Math.min(source.length, Number(selection?.start) || 0));
+  const end = Math.max(start, Math.min(source.length, Number(selection?.end) || start));
+  const selected = source.slice(start, end);
+  const selectedText = compactDocumentText(selected, 8000);
+  const prefix = compactDocumentText(source.slice(Math.max(0, start - 1400), start), 1400);
+  const suffix = compactDocumentText(source.slice(end, Math.min(source.length, end + 1400)), 1400);
+  return {
+    active: end > start,
+    direction: text(selection?.direction),
+    end,
+    endPosition: documentOffsetPosition(source, end),
+    prefixText: prefix.text,
+    prefixTruncated: start > 1400 || prefix.truncated,
+    selectedText: selectedText.text,
+    selectedTextLength: selected.length,
+    selectedTextTruncated: selectedText.truncated,
+    start,
+    startPosition: documentOffsetPosition(source, start),
+    suffixText: suffix.text,
+    suffixTruncated: source.length - end > 1400 || suffix.truncated,
+    updatedAtMs: Number(selection?.updatedAtMs) || 0,
+  };
+}
+
 function documentTypeOption(value, collection = "documents") {
   const kind = normalizedDocumentKind(value, collection);
   return DOCUMENT_TYPE_OPTIONS.find((entry) => entry.id === kind) || DOCUMENT_TYPE_OPTIONS[0];
@@ -76,6 +147,40 @@ function documentTypeOption(value, collection = "documents") {
 
 function documentTypeLabel(value, collection = "documents") {
   return documentTypeOption(value, collection).label;
+}
+
+function clampSkillDocumentScale(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.min(SKILL_DOCUMENT_MAX_SCALE, Math.max(SKILL_DOCUMENT_MIN_SCALE, numeric));
+}
+
+function roundedDocumentPx(value, min = 0) {
+  const numeric = Number(value);
+  const safeValue = Number.isFinite(numeric) ? Math.max(min, numeric) : min;
+  return `${Math.round(safeValue)}px`;
+}
+
+function skillDocumentPageStyle(scale) {
+  const safeScale = clampSkillDocumentScale(scale);
+  return {
+    "--skill-document-page-scale": String(safeScale),
+    "--skill-document-page-width": roundedDocumentPx(SKILL_DOCUMENT_A4_WIDTH_PX * safeScale),
+    "--skill-document-page-height": roundedDocumentPx(SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale),
+    "--skill-document-page-padding-top": roundedDocumentPx(52 * safeScale, 20),
+    "--skill-document-page-padding-inline": roundedDocumentPx(58 * safeScale, 22),
+    "--skill-document-page-padding-bottom": roundedDocumentPx(76 * safeScale, 26),
+    "--skill-document-title-font-size": roundedDocumentPx(30 * safeScale, 16),
+    "--skill-document-title-padding-bottom": roundedDocumentPx(7 * safeScale, 4),
+    "--skill-document-body-margin-top": roundedDocumentPx(24 * safeScale, 10),
+    "--skill-document-body-margin-left": roundedDocumentPx(-10 * safeScale, -20),
+    "--skill-document-body-bleed": roundedDocumentPx(20 * safeScale),
+    "--skill-document-body-padding-inline": roundedDocumentPx(10 * safeScale, 4),
+    "--skill-document-body-padding-top": roundedDocumentPx(8 * safeScale, 4),
+    "--skill-document-body-padding-bottom": roundedDocumentPx(24 * safeScale, 10),
+    "--skill-document-body-font-size": roundedDocumentPx(15 * safeScale, 10),
+    "--skill-document-body-min-height": roundedDocumentPx(900 * safeScale, 320),
+  };
 }
 
 function documentFileName(document) {
@@ -112,13 +217,26 @@ function documentEditorDraft(document) {
 }
 
 function documentHasMaterializedContent(document) {
-  const hasContentFlag = document?.hasContent !== undefined
-    || document?.hasContentPayload !== undefined
-    || document?.hydrated !== undefined;
-  return document?.hydrated === true
+  return document?.hasContentPayload === true || documentHasInlineContent(document);
+}
+
+function documentHasInlineContent(document) {
+  return String(document?.content ?? document?.content_md ?? document?.contentMd ?? document?.body ?? "").length > 0;
+}
+
+function documentCanHydrate(document) {
+  const key = accountDocumentStorageKey(document) || text(document?.id);
+  if (!key) return false;
+  if (document?.contentStale === true) return true;
+  if (documentHasInlineContent(document)) return false;
+  return Boolean(
+    text(document?.assetId || document?.asset_id)
+    || text(document?.blobId || document?.blob_id)
+    || text(document?.contentHash || document?.content_hash || document?.sha256)
     || document?.hasContent === true
     || document?.hasContentPayload === true
-    || (!hasContentFlag && String(document?.content || "").length > 0);
+    || Number(document?.sizeBytes ?? document?.size_bytes) > 0,
+  );
 }
 
 function editorWithRemoteDocumentContent(current, document) {
@@ -237,9 +355,15 @@ function applySkillUnitsToLibrary(library, units) {
   };
 }
 
-function replaceSkillUnitsInLibrary(units) {
+function replaceSkillUnitsInLibrary(units, currentSkills = []) {
+  const incomingSkills = skillsFromUnits(units);
+  const incomingKeys = new Set(incomingSkills.map((skill) => accountDocumentStorageKey(skill) || skill.id).filter(Boolean));
   return {
-    skills: skillsFromUnits(units),
+    skills: mergeSkillUnits(
+      (Array.isArray(currentSkills) ? currentSkills : [])
+        .filter((skill) => incomingKeys.has(accountDocumentStorageKey(skill) || skill.id)),
+      units,
+    ),
   };
 }
 
@@ -325,8 +449,11 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
 }
 
 export default function ToolsWorkspaceView({
+  onAppControlContextChange = null,
+  onAppControlDocumentActions = null,
   defaultWorkingDirectory = "",
   initialSection = "",
+  rightToolsOrchestratorOpen = false,
   workspaces = [],
 }) {
   const [section, setSection] = useState(() => normalizedSectionId(initialSection));
@@ -398,10 +525,12 @@ export default function ToolsWorkspaceView({
     || (globalMcpDefaults.state === "ready" && Boolean(globalMcpDefaults.rootDirectory));
 
   // ---- Docs (account-level markdown documents backed by per-document assets) ----
-  const [skillsLibrary, setSkillsLibrary] = useState({ skills: [] });
+  const [skillsLibrary, setSkillsLibrary] = useState(() => ({
+    skills: getWorkspaceToolsAccountSkills(),
+  }));
   const [skillsRevision, setSkillsRevision] = useState(null);
   const [skillsMeta, setSkillsMeta] = useState({ updatedAt: "", updatedBy: "", offline: false });
-  const [skillsState, setSkillsState] = useState("loading");
+  const [skillsState, setSkillsState] = useState(() => (hasWorkspaceToolsLoaded() ? "ready" : "loading"));
   const [skillsError, setSkillsError] = useState("");
   const [skillsHydration, setSkillsHydration] = useState({
     error: "",
@@ -413,6 +542,7 @@ export default function ToolsWorkspaceView({
   });
   const skillsHydrationRunRef = useRef(0);
   const hydratingDocKeyRef = useRef("");
+  const [hydratingDocKeys, setHydratingDocKeys] = useState(() => new Set());
   const [skillsQuery, setSkillsQuery] = useState("");
   const [templateQuery, setTemplateQuery] = useState("");
   const [newDocDraft, setNewDocDraft] = useState({ name: "", type: "skill" });
@@ -420,6 +550,12 @@ export default function ToolsWorkspaceView({
   const [selectedSkillKey, setSelectedSkillKey] = useState("");
   // { id: ""|documentId, title, content } while creating/editing.
   const [skillEditor, setSkillEditor] = useState(null);
+  const [skillEditorSelection, setSkillEditorSelection] = useState({
+    direction: "",
+    end: 0,
+    start: 0,
+    updatedAtMs: 0,
+  });
   const [skillEditorTheme, setSkillEditorTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     try {
@@ -428,6 +564,38 @@ export default function ToolsWorkspaceView({
       return "dark";
     }
   });
+  const skillDocumentCanvasRef = useRef(null);
+  const [skillDocumentScale, setSkillDocumentScale] = useState(1);
+  const docsExplorerPanelRef = useRef(null);
+  const [docsExplorerCollapsed, setDocsExplorerCollapsed] = useState(false);
+  const [docsExplorerSize, setDocsExplorerSize] = useState("238px");
+
+  const collapseDocsExplorer = useCallback(() => {
+    setDocsExplorerCollapsed(true);
+  }, []);
+
+  const expandDocsExplorer = useCallback(() => {
+    setDocsExplorerCollapsed(false);
+  }, []);
+
+  const syncDocsExplorerCollapsedState = useCallback((panelSize) => {
+    const pixels = Number(panelSize?.pixels);
+    const percentage = Number(panelSize?.percentage);
+    const collapsed = Number.isFinite(pixels) ? pixels <= 58 : Number.isFinite(percentage) && percentage <= 6;
+    setDocsExplorerCollapsed(collapsed);
+    if (!collapsed && Number.isFinite(pixels)) {
+      setDocsExplorerSize(`${Math.round(pixels)}px`);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (docsExplorerCollapsed) return undefined;
+    if (typeof window === "undefined") return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      docsExplorerPanelRef.current?.resize?.(docsExplorerSize);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [docsExplorerCollapsed, docsExplorerSize]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -449,27 +617,31 @@ export default function ToolsWorkspaceView({
   const [catalogBusy, setCatalogBusy] = useState({});
   const [catalogQuery, setCatalogQuery] = useState("");
 
-  const loadAccountTools = useCallback(async () => {
+  const loadAccountTools = useCallback(async ({ showProgress = false } = {}) => {
     const hydrationRunId = skillsHydrationRunRef.current + 1;
     skillsHydrationRunRef.current = hydrationRunId;
     let progressTimer = null;
-    setSkillsHydration({
-      error: "",
-      meta: "Checking account document assets",
-      percent: 6,
-      runId: hydrationRunId,
-      state: "hydrating",
-      title: "Hydrating docs",
-      visible: true,
-    });
-    if (typeof window !== "undefined") {
+    if (showProgress) {
+      setSkillsHydration({
+        error: "",
+        meta: "Checking account document assets",
+        percent: 6,
+        runId: hydrationRunId,
+        state: "hydrating",
+        title: "Refreshing docs",
+        visible: true,
+      });
+    } else {
+      setSkillsHydration((current) => ({ ...current, visible: false, state: "idle" }));
+    }
+    if (showProgress && typeof window !== "undefined") {
       progressTimer = window.setInterval(() => {
         setSkillsHydration((current) => {
           if (current.runId !== hydrationRunId || current.state !== "hydrating") return current;
           const nextPercent = Math.min(92, Math.max(8, Number(current.percent || 0) + 7));
           return {
             ...current,
-            meta: nextPercent < 62 ? "Downloading missing document assets" : "Finalizing document library",
+            meta: nextPercent < 62 ? "Checking document metadata" : "Refreshing document library",
             percent: nextPercent,
           };
         });
@@ -477,13 +649,40 @@ export default function ToolsWorkspaceView({
     }
     setSkillsState((current) => (current === "ready" ? "refreshing" : "loading"));
     setSkillsError("");
+    let lastLocalLibrary = null;
     try {
+      try {
+        const localData = await invoke("cloud_mcp_get_account_documents", {
+          request: { limit: 2000, local_only: true },
+        });
+        if (skillsHydrationRunRef.current === hydrationRunId) {
+          const localUnits = accountDocumentUnitsFromPayload(localData);
+          const localSkillsLibrary = { skills: skillsFromUnits(localUnits) };
+          lastLocalLibrary = localSkillsLibrary;
+          setSkillsLibrary(localSkillsLibrary);
+          noteAccountSkillUnits(localSkillsLibrary.skills);
+          setSkillsState("ready");
+        }
+      } catch {
+        // Local cache is best-effort; the full Cloud revalidation below can still succeed.
+      }
       const data = await invoke("cloud_mcp_get_account_documents", {
-        request: { limit: 2000 },
+        request: {
+          cloud_timeout_ms: showProgress
+            ? ACCOUNT_DOCS_FOREGROUND_REFRESH_TIMEOUT_MS
+            : ACCOUNT_DOCS_BACKGROUND_REFRESH_TIMEOUT_MS,
+          limit: 2000,
+        },
       });
       const skills = data || {};
       const units = accountDocumentUnitsFromPayload(data);
-      const parsedSkillsLibrary = { skills: skillsFromUnits(units) };
+      let parsedSkillsLibrary = replaceSkillUnitsInLibrary(
+        units,
+        lastLocalLibrary?.skills || getWorkspaceToolsAccountSkills(),
+      );
+      if (!parsedSkillsLibrary.skills.length && lastLocalLibrary?.skills?.length && data?.offline) {
+        parsedSkillsLibrary = lastLocalLibrary;
+      }
       setSkillsLibrary(parsedSkillsLibrary);
       noteAccountSkillUnits(parsedSkillsLibrary.skills);
       const nextRevision = Number(skills.revision ?? skills.seq ?? skills.sequence);
@@ -494,7 +693,7 @@ export default function ToolsWorkspaceView({
         offline: Boolean(data?.offline),
       });
       setSkillsState("ready");
-      if (skillsHydrationRunRef.current === hydrationRunId) {
+      if (showProgress && skillsHydrationRunRef.current === hydrationRunId) {
         const hydratedUnits = units.filter((unit) => (
           text(unit?.content_md ?? unit?.contentMd ?? unit?.content).length
         ));
@@ -528,8 +727,8 @@ export default function ToolsWorkspaceView({
     } catch (error) {
       const message = getErrorMessage(error, "Unable to load account tools.");
       setSkillsError(message);
-      setSkillsState("error");
-      if (skillsHydrationRunRef.current === hydrationRunId) {
+      setSkillsState(lastLocalLibrary?.skills?.length ? "ready" : "error");
+      if (showProgress && skillsHydrationRunRef.current === hydrationRunId) {
         setSkillsHydration({
           error: message,
           meta: "Document hydration failed",
@@ -539,6 +738,8 @@ export default function ToolsWorkspaceView({
           title: "Document hydration needs attention",
           visible: true,
         });
+      } else {
+        setSkillsHydration((current) => ({ ...current, visible: false, state: "idle" }));
       }
     } finally {
       if (progressTimer) {
@@ -584,8 +785,23 @@ export default function ToolsWorkspaceView({
   }, []);
 
   useEffect(() => {
-    void loadAccountTools();
+    const cachedSkills = getWorkspaceToolsAccountSkills();
+    if (hasWorkspaceToolsLoaded()) {
+      setSkillsLibrary({ skills: cachedSkills });
+      setSkillsState("ready");
+    } else {
+      void loadAccountTools({ showProgress: false });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    return subscribeWorkspaceTools(() => {
+      setSkillsLibrary({ skills: getWorkspaceToolsAccountSkills() });
+      if (hasWorkspaceToolsLoaded()) {
+        setSkillsState((current) => (current === "loading" ? "ready" : current));
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -603,15 +819,34 @@ export default function ToolsWorkspaceView({
       const replaceSkills = accountToolsSkillPayloadIsFull(event?.payload);
       if (skillUnits.length || replaceSkills) {
         const materializedSkills = skillsFromUnits(skillUnits.filter(documentHasMaterializedContent));
+        const pendingHydrationSkills = skillsFromUnits(skillUnits)
+          .filter((entry) => !documentHasMaterializedContent(entry) && documentCanHydrate(entry));
         const skillMeta = accountToolsSkillMetaFromEventPayload(event?.payload);
         setSkillsLibrary((current) => {
           const nextLibrary = replaceSkills
-            ? replaceSkillUnitsInLibrary(skillUnits)
+            ? replaceSkillUnitsInLibrary(skillUnits, current.skills)
             : applySkillUnitsToLibrary(current, skillUnits);
           noteAccountSkillUnits(nextLibrary.skills);
           return nextLibrary;
         });
+        if (pendingHydrationSkills.length) {
+          setHydratingDocKeys((current) => {
+            const next = new Set(current);
+            pendingHydrationSkills.forEach((entry) => {
+              const key = accountDocumentStorageKey(entry) || entry.id;
+              if (key) next.add(key);
+            });
+            return next;
+          });
+        }
         if (materializedSkills.length) {
+          setHydratingDocKeys((current) => {
+            const next = new Set(current);
+            materializedSkills.forEach((entry) => {
+              next.delete(accountDocumentStorageKey(entry) || entry.id);
+            });
+            return next;
+          });
           setSkillEditor((current) => {
             const incoming = materializedSkills.find((entry) => (
               accountDocumentStorageKey(entry) === (current?.documentKey || accountDocumentStorageKey(current))
@@ -637,7 +872,7 @@ export default function ToolsWorkspaceView({
         return;
       }
       if (!accountToolsEventHasKnownPayload(event?.payload)) {
-        void loadAccountTools();
+        void loadAccountTools({ showProgress: false });
       }
     }).then((dispose) => {
       if (disposed) {
@@ -762,7 +997,7 @@ export default function ToolsWorkspaceView({
       const results = [];
       for (const skill of nextLibrary.skills.filter((entry) => pendingIds.has(entry.id))) {
         results.push(await invoke("cloud_mcp_save_account_document", {
-          request: accountDocumentRequestFromSkill(skill, { localOnly: true }),
+          request: accountDocumentRequestFromSkill(skill, { local_only: true }),
         }));
       }
       const result = [...results].reverse().find((entry) => entry) || {};
@@ -832,8 +1067,8 @@ export default function ToolsWorkspaceView({
     setSkillEditor(null);
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
-  const saveSkillEditor = useCallback((mode = "push") => {
-    if (!skillEditor || !text(skillEditor.title)) return;
+  const saveSkillEditor = useCallback(async (mode = "push") => {
+    if (!skillEditor || !text(skillEditor.title)) return false;
     const typeOption = documentTypeOption(skillEditor.documentKind || skillEditor.source, skillEditor.collection);
     const editorCollection = typeOption.collection;
     const editorKind = text(skillEditor.documentKind, typeOption.id);
@@ -879,11 +1114,9 @@ export default function ToolsWorkspaceView({
         updatedAt,
       }];
     }
-    if (mode === "local") {
-      void saveSkillsLibraryLocal(nextSkills, [savedId]);
-    } else {
-      void persistSkillsLibrary(nextSkills);
-    }
+    const savePromise = mode === "local"
+      ? saveSkillsLibraryLocal(nextSkills, [savedId])
+      : persistSkillsLibrary(nextSkills);
     const savedSkill = nextSkills.find((entry) => entry.id === savedId);
     const savedKey = accountDocumentStorageKey(savedSkill) || savedId;
     setSelectedSkillKey(`library:${savedKey}`);
@@ -891,6 +1124,7 @@ export default function ToolsWorkspaceView({
       ...documentEditorDraft(savedSkill),
       documentKey: savedKey,
     });
+    return savePromise;
   }, [persistSkillsLibrary, saveSkillsLibraryLocal, skillEditor, skillsLibrary.skills]);
 
   const runCliAction = useCallback(async (provider, action) => {
@@ -1027,6 +1261,7 @@ export default function ToolsWorkspaceView({
 
   const docFileRows = useMemo(() => {
     const query = text(skillsQuery).toLowerCase();
+    const hydrationPassActive = skillsHydration.visible === true && skillsHydration.state === "hydrating";
     return skillsLibrary.skills
       .map((skill) => {
         const key = accountDocumentStorageKey(skill) || skill.id;
@@ -1034,8 +1269,10 @@ export default function ToolsWorkspaceView({
         return {
           ...skill,
           fileName,
+          hydrating: hydratingDocKeys.has(key) || (hydrationPassActive && documentCanHydrate(skill)),
           key: `library:${key}`,
           preview: documentPreviewLine(skill),
+          storageKey: key,
           typeLabel: documentTypeLabel(skill.documentKind, skill.collection),
         };
       })
@@ -1048,7 +1285,7 @@ export default function ToolsWorkspaceView({
         || text(row.localPath).toLowerCase().includes(query)
       ))
       .sort((left, right) => left.fileName.localeCompare(right.fileName));
-  }, [skillsLibrary.skills, skillsQuery]);
+  }, [hydratingDocKeys, skillsHydration.state, skillsHydration.visible, skillsLibrary.skills, skillsQuery]);
 
   const defaultSkillRows = useMemo(() => {
     const query = text(templateQuery).toLowerCase();
@@ -1121,9 +1358,15 @@ export default function ToolsWorkspaceView({
 
   useEffect(() => {
     const selectedKey = selectedSkill?.owned ? accountDocumentStorageKey(selectedSkill) : "";
-    if (!selectedKey || String(selectedSkill?.content || "").length > 0) return;
+    if (!selectedKey) return;
+    if (String(selectedSkill?.content || "").length > 0 && selectedSkill?.contentStale !== true) return;
     if (hydratingDocKeyRef.current === selectedKey) return;
     hydratingDocKeyRef.current = selectedKey;
+    setHydratingDocKeys((current) => {
+      const next = new Set(current);
+      next.add(selectedKey);
+      return next;
+    });
     let cancelled = false;
     invoke("cloud_mcp_hydrate_account_document", {
       request: accountDocumentRequestFromSkill(selectedSkill),
@@ -1152,13 +1395,241 @@ export default function ToolsWorkspaceView({
       if (hydratingDocKeyRef.current === selectedKey) {
         hydratingDocKeyRef.current = "";
       }
+      setHydratingDocKeys((current) => {
+        const next = new Set(current);
+        next.delete(selectedKey);
+        return next;
+      });
     });
     return () => {
       cancelled = true;
     };
   }, [selectedSkillKey, selectedSkill]);
 
+  const skillEditorDocumentKey = skillEditor
+    ? skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id
+    : "";
+  useEffect(() => {
+    setSkillEditorSelection({
+      direction: "",
+      end: 0,
+      start: 0,
+      updatedAtMs: Date.now(),
+    });
+  }, [skillEditorDocumentKey]);
+
+  const selectedDocumentRefreshing = Boolean(
+    skillEditor
+    && skillEditorDocumentKey
+    && (
+      hydratingDocKeys.has(skillEditorDocumentKey)
+      || (
+        selectedSkill?.owned
+        && (accountDocumentStorageKey(selectedSkill) || selectedSkill.id) === skillEditorDocumentKey
+        && (selectedSkill.contentStale === true || (!documentHasMaterializedContent(selectedSkill) && documentCanHydrate(selectedSkill)))
+      )
+    ),
+  );
+  const skillEditorBusy = skillsState === "saving" || skillsState === "savingLocal";
+  const skillEditorReadOnly = selectedDocumentRefreshing || skillEditorBusy;
+  const skillEditorOpen = Boolean(skillEditor);
+  const skillDocumentMetricsStyle = useMemo(
+    () => skillDocumentPageStyle(skillDocumentScale),
+    [skillDocumentScale],
+  );
+  const appControlDocumentContext = useMemo(() => {
+    const content = String(skillEditor?.content || "");
+    const preview = compactDocumentText(content, 1400);
+    const localPath = text(skillEditor?.localPath || selectedSkill?.localPath || selectedSkill?.local_path);
+    const documentKind = normalizedDocumentKind(
+      skillEditor?.documentKind || skillEditor?.source || selectedSkill?.documentKind || selectedSkill?.source,
+      skillEditor?.collection || selectedSkill?.collection,
+    );
+    return {
+      active: section === "docs",
+      canDirectEditFile: Boolean(localPath),
+      contentLength: content.length,
+      contentPreview: preview.text,
+      contentPreviewTruncated: preview.truncated,
+      dirty: Boolean(skillEditor && (
+        String(skillEditor.content || "") !== String(skillEditor.baseContent ?? "")
+        || text(skillEditor.title) !== text(selectedSkill?.title, text(skillEditor.title))
+      )),
+      document: skillEditor ? {
+        collection: normalizedDocumentCollection(),
+        contentHash: text(skillEditor.contentHash || selectedSkill?.contentHash || selectedSkill?.sha256),
+        documentKey: skillEditorDocumentKey,
+        draftFingerprint: documentDraftFingerprint(content),
+        extension: text(skillEditor.extension || selectedSkill?.extension, documentExtensionForKind(documentKind)),
+        id: text(skillEditor.id || selectedSkill?.id || selectedSkill?.documentId),
+        kind: documentKind,
+        localPath,
+        pendingPush: Boolean(selectedSkill?.pendingPush),
+        source: documentKind,
+        syncStatus: text(selectedSkill?.syncStatus),
+        title: text(skillEditor.title || selectedSkill?.title),
+      } : null,
+      editorReadOnly: Boolean(skillEditorReadOnly),
+      editorState: skillsState,
+      highlightedRange: skillEditor ? documentSelectionContext(content, skillEditorSelection) : null,
+      saveModes: ["local", "publish"],
+      section,
+      selectedKey: selectedSkillKey,
+      surface: "tools",
+      type: "tools_document_context",
+      updatedAtMs: Date.now(),
+    };
+  }, [
+    section,
+    selectedSkill,
+    selectedSkillKey,
+    skillEditor,
+    skillEditorDocumentKey,
+    skillEditorReadOnly,
+    skillEditorSelection,
+    skillsState,
+  ]);
+
+  useEffect(() => {
+    if (typeof onAppControlContextChange !== "function") return;
+    onAppControlContextChange(appControlDocumentContext);
+  }, [appControlDocumentContext, onAppControlContextChange]);
+
+  useEffect(() => {
+    if (typeof onAppControlContextChange !== "function") return undefined;
+    return () => {
+      onAppControlContextChange({
+        active: false,
+        section: "",
+        surface: "tools",
+        type: "tools_document_context",
+        updatedAtMs: Date.now(),
+      });
+    };
+  }, [onAppControlContextChange]);
+
+  const appControlDocumentActions = useMemo(() => ({
+    getSelectedDocumentContext: async () => appControlDocumentContext,
+    saveSelectedDocument: async (input = {}) => {
+      if (!skillEditor) {
+        return {
+          ok: false,
+          error: {
+            code: "no_selected_document",
+            message: "No Tools document is selected.",
+          },
+          context: appControlDocumentContext,
+        };
+      }
+      const requestedMode = text(input.mode || input.saveMode || input.save_mode || input.action, "publish")
+        .toLowerCase();
+      const localOnly = ["local", "local_only", "local-only", "draft"].includes(requestedMode);
+      const document = appControlDocumentContext.document || {};
+      if (document.localPath && document.id) {
+        const result = await invoke("cloud_mcp_save_account_document", {
+          request: {
+            document: {
+              collection: normalizedDocumentCollection(),
+              doc_id: document.id,
+              document_id: document.id,
+              document_kind: document.kind,
+              extension: document.extension,
+              id: document.id,
+              local_path: document.localPath,
+              name: document.title || document.id,
+              source: document.kind,
+              title: document.title || document.id,
+            },
+            local_only: localOnly,
+          },
+        });
+        return {
+          ok: result?.ok !== false,
+          mode: localOnly ? "local" : "publish",
+          result,
+          source: "local_path",
+          context: appControlDocumentContext,
+        };
+      }
+      const ok = await saveSkillEditor(localOnly ? "local" : "push");
+      return {
+        ok: Boolean(ok),
+        mode: localOnly ? "local" : "publish",
+        source: "editor_state",
+        context: appControlDocumentContext,
+      };
+    },
+  }), [appControlDocumentContext, saveSkillEditor, skillEditor]);
+
+  useEffect(() => {
+    if (typeof onAppControlDocumentActions !== "function") return undefined;
+    return onAppControlDocumentActions(appControlDocumentActions);
+  }, [appControlDocumentActions, onAppControlDocumentActions]);
+
   const docsCreateMode = !skillEditor;
+  const showDocsTemplatesPane = docsCreateMode && !rightToolsOrchestratorOpen;
+  const skillEditorRows = useMemo(() => {
+    const content = String(skillEditor?.content || "");
+    const estimatedLines = content.split("\n").reduce((total, line) => {
+      return total + Math.max(1, Math.ceil(line.length / 82));
+    }, 0);
+    return Math.max(28, Math.min(260, estimatedLines + 8));
+  }, [skillEditor?.content]);
+  const scrollSkillDocumentCanvas = useCallback((event) => {
+    const canvas = skillDocumentCanvasRef.current;
+    if (!canvas) return;
+    event.preventDefault();
+    event.stopPropagation();
+    canvas.scrollTop += event.deltaY;
+    canvas.scrollLeft += event.deltaX;
+  }, []);
+  const updateSkillEditorSelection = useCallback((event) => {
+    const target = event?.target;
+    const start = Number(target?.selectionStart);
+    const end = Number(target?.selectionEnd);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      return;
+    }
+    setSkillEditorSelection({
+      direction: text(target?.selectionDirection),
+      end,
+      start,
+      updatedAtMs: Date.now(),
+    });
+  }, []);
+  useEffect(() => {
+    if (!skillEditorOpen || typeof window === "undefined") return undefined;
+    const canvas = skillDocumentCanvasRef.current;
+    if (!canvas) return undefined;
+
+    let animationFrame = 0;
+    const updateScale = () => {
+      const bounds = canvas.getBoundingClientRect();
+      if (!bounds.width) return;
+      const availableWidth = Math.max(1, bounds.width - SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX);
+      const nextScale = clampSkillDocumentScale(availableWidth / SKILL_DOCUMENT_A4_WIDTH_PX);
+      setSkillDocumentScale((current) => (
+        Math.abs(current - nextScale) < 0.005 ? current : nextScale
+      ));
+    };
+    const scheduleUpdate = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(updateScale);
+    };
+
+    updateScale();
+    const ResizeObserverConstructor = window.ResizeObserver;
+    const observer = typeof ResizeObserverConstructor === "function"
+      ? new ResizeObserverConstructor(scheduleUpdate)
+      : null;
+    observer?.observe(canvas);
+    window.addEventListener("resize", scheduleUpdate);
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      observer?.disconnect();
+      window.removeEventListener("resize", scheduleUpdate);
+    };
+  }, [skillEditorOpen]);
 
   return (
     <ToolsHubShell aria-label="Global toolkit" data-section={section}>
@@ -1216,121 +1687,155 @@ export default function ToolsWorkspaceView({
         <ToolsScroll data-section={section}>
           <ToolsLayout data-section={section}>
             {section === "docs" && (
-              <DocsWorkspaceSurface aria-label="Docs workspace">
-              <DocsWorkspaceGrid data-show-templates={docsCreateMode ? "true" : "false"}>
-                <DocsFilesPane aria-label="Document files">
-                  <FileExplorerHeader>
-                    <div>
-                      <PanelKicker>Explorer</PanelKicker>
-                    </div>
-                    <FileExplorerActions>
-                    <FileIconButton
-                      aria-label="Refresh docs"
-                      disabled={skillsState === "loading" || skillsState === "refreshing"}
-                      onClick={() => void loadAccountTools()}
-                      title="Refresh docs"
-                      type="button"
-                    >
-                      <ButtonRefreshIcon aria-hidden="true" />
-                    </FileIconButton>
-                    </FileExplorerActions>
-                  </FileExplorerHeader>
-                  <DocsRootPath title="Account documents">account-documents / personal</DocsRootPath>
-                  <DocsExplorerSearchInput
-                    aria-label="Search document files"
-                    onChange={(event) => setSkillsQuery(event.target.value)}
-                    placeholder="Search .md, .arch…"
-                    type="search"
-                    value={skillsQuery}
-                  />
-                  <FileTree aria-label="Account document explorer">
-                    <FileTreeItem>
-                      <DocsExplorerFolderButton
-                        $depth={0}
-                        as="div"
-                        data-selected="false"
+              <DocsWorkspaceSurface
+                aria-label="Docs workspace"
+                style={{ "--docs-explorer-offset": docsExplorerCollapsed ? "0px" : docsExplorerSize }}
+              >
+                {docsExplorerCollapsed && (
+                  <DocsExplorerRestoreButton
+                    aria-label="Show document explorer"
+                    onClick={expandDocsExplorer}
+                    title="Show document explorer"
+                    type="button"
+                  >
+                    <span className="codicon codicon-layout-sidebar-left" aria-hidden="true" />
+                    <span>Explorer</span>
+                  </DocsExplorerRestoreButton>
+                )}
+                <DocsWorkspaceGrid
+                  data-surface="files"
+                  data-show-explorer={docsExplorerCollapsed ? "false" : "true"}
+                  data-show-templates={showDocsTemplatesPane ? "true" : "false"}
+                  key={`${docsCreateMode ? "docs-create" : "docs-edit"}-${docsExplorerCollapsed ? "explorer-hidden" : "explorer-visible"}-${showDocsTemplatesPane ? "templates-visible" : "templates-hidden"}`}
+                  orientation="horizontal"
+                >
+                  {!docsExplorerCollapsed && (
+                    <>
+                      <ResizePanel
+                        data-surface="files"
+                        defaultSize={docsExplorerSize}
+                        groupResizeBehavior="preserve-pixel-size"
+                        id="docs-explorer"
+                        maxSize="360px"
+                        minSize="184px"
+                        onResize={syncDocsExplorerCollapsedState}
+                        panelRef={docsExplorerPanelRef}
                       >
-                        <FileDisclosure>
-                          <span className="codicon codicon-chevron-down" aria-hidden="true" />
-                        </FileDisclosure>
-                        <FileKindIcon data-file-tone="folder">
-                          <span className="codicon codicon-folder-opened" aria-hidden="true" />
-                        </FileKindIcon>
-                        <FileTreeName title="documents">documents</FileTreeName>
-                        <DocsExplorerCount>{docFileRows.length || ""}</DocsExplorerCount>
-                      </DocsExplorerFolderButton>
-                      {skillsState === "loading" ? (
-                        <FileTreeEmpty>Loading docs…</FileTreeEmpty>
-                      ) : docFileRows.length ? (
-                        docFileRows.map((row) => {
-                          const active = selectedSkillKey === row.key;
-                          const iconClass = row.extension === "arch" ? "codicon-file-code" : "codicon-markdown";
-                          const fileTone = row.extension === "arch" ? "data" : "markdown";
-                          return (
-                            <DocsExplorerFileButton
-                              $depth={1}
-                              data-selected={active ? "true" : "false"}
-                              key={row.key}
-                              onClick={() => {
-                                setSelectedSkillKey(row.key);
-                                setSkillEditor(documentEditorDraft(row));
-                              }}
-                              title={text(row.localPath, row.preview)}
-                              type="button"
-                            >
-                              <FileDisclosure />
-                              <FileKindIcon data-file-tone={fileTone}>
-                                <span className={`codicon ${iconClass}`} aria-hidden="true" />
-                              </FileKindIcon>
-                              <FileTreeName>{row.fileName}</FileTreeName>
-                              <DocsExplorerStatus title={row.pendingPush ? "Pending push" : row.typeLabel}>
-                                {row.pendingPush ? "●" : ""}
-                              </DocsExplorerStatus>
-                            </DocsExplorerFileButton>
-                          );
-                        })
-                      ) : (
-                        <FileTreeEmpty>{text(skillsQuery) ? "No matching docs." : "No docs saved yet."}</FileTreeEmpty>
-                      )}
-                    </FileTreeItem>
-                  </FileTree>
-                </DocsFilesPane>
+                        <DocsFilesPane
+                          aria-label="Document files"
+                          data-collapsed="false"
+                    >
+                      <FileExplorerHeader>
+                        <div>
+                          <PanelKicker>Explorer</PanelKicker>
+                        </div>
+                        <FileExplorerActions>
+                          <FileIconButton
+                            aria-label="Refresh docs"
+                            disabled={skillsState === "loading" || skillsState === "refreshing"}
+                            onClick={() => void loadAccountTools({ showProgress: true })}
+                            title="Refresh docs"
+                            type="button"
+                          >
+                            <ButtonRefreshIcon aria-hidden="true" />
+                          </FileIconButton>
+                          <FileIconButton
+                            aria-label="Collapse docs explorer"
+                            onClick={collapseDocsExplorer}
+                            title="Collapse docs explorer"
+                            type="button"
+                          >
+                            <span
+                              className="codicon codicon-chevron-left"
+                              aria-hidden="true"
+                            />
+                          </FileIconButton>
+                        </FileExplorerActions>
+                      </FileExplorerHeader>
+                      <>
+                          <DocsRootPath title="Account documents">account-documents / personal</DocsRootPath>
+                          <DocsExplorerSearchInput
+                            aria-label="Search document files"
+                            onChange={(event) => setSkillsQuery(event.target.value)}
+                            placeholder="Search .md, .arch…"
+                            type="search"
+                            value={skillsQuery}
+                          />
+                          <FileTree aria-label="Account document explorer">
+                            <FileTreeItem>
+                              <DocsExplorerFolderButton
+                                $depth={0}
+                                as="div"
+                                data-selected="false"
+                              >
+                                <FileDisclosure>
+                                  <span className="codicon codicon-chevron-down" aria-hidden="true" />
+                                </FileDisclosure>
+                                <FileKindIcon data-file-tone="folder">
+                                  <span className="codicon codicon-folder-opened" aria-hidden="true" />
+                                </FileKindIcon>
+                                <FileTreeName title="documents">documents</FileTreeName>
+                                <DocsExplorerCount>{docFileRows.length || ""}</DocsExplorerCount>
+                              </DocsExplorerFolderButton>
+                              {docFileRows.length ? (
+                                docFileRows.map((row) => {
+                                  const active = selectedSkillKey === row.key;
+                                  const iconClass = row.extension === "arch" ? "codicon-file-code" : "codicon-markdown";
+                                  const fileTone = row.extension === "arch" ? "data" : "markdown";
+                                  return (
+                                    <DocsExplorerFileButton
+                                      $depth={1}
+                                      data-selected={active ? "true" : "false"}
+                                      key={row.key}
+                                      onClick={() => {
+                                        setSelectedSkillKey(row.key);
+                                        setSkillEditor(documentEditorDraft(row));
+                                      }}
+                                      title={text(row.localPath, row.preview)}
+                                      type="button"
+                                    >
+                                      <FileDisclosure />
+                                      <FileKindIcon data-file-tone={fileTone}>
+                                        <span className={`codicon ${iconClass}`} aria-hidden="true" />
+                                      </FileKindIcon>
+                                      <FileTreeName>{row.fileName}</FileTreeName>
+                                      <DocsExplorerStatus title={row.hydrating ? "Hydrating document" : row.pendingPush ? "Pending push" : row.typeLabel}>
+                                        {row.hydrating ? (
+                                          <DocsExplorerSpinner aria-label="Hydrating document" role="status" />
+                                        ) : row.pendingPush ? "●" : ""}
+                                      </DocsExplorerStatus>
+                                    </DocsExplorerFileButton>
+                                  );
+                                })
+                              ) : (
+                                <FileTreeEmpty>{text(skillsQuery) ? "No matching docs." : "No docs saved yet."}</FileTreeEmpty>
+                              )}
+                            </FileTreeItem>
+                          </FileTree>
+                      </>
+                        </DocsFilesPane>
+                      </ResizePanel>
 
-                <DocsCenterPane aria-label="Document editor">
-                  <ToolsHydrationProgress placement="editor" progress={skillsHydration} />
+                      <ResizeHandle data-direction="horizontal" data-surface="files" />
+                    </>
+                  )}
+
+                  <ResizePanel
+                    data-surface="files"
+                    id="docs-editor"
+                    minSize="360px"
+                  >
+                    <DocsCenterPane aria-label="Document editor">
                   {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
                   {skillEditor ? (
                     <>
-                      <SkillDocumentEditor data-page-theme={skillEditorTheme}>
+                      <SkillDocumentEditor
+                        aria-busy={selectedDocumentRefreshing ? "true" : "false"}
+                        data-page-theme={skillEditorTheme}
+                        data-refreshing={selectedDocumentRefreshing ? "true" : "false"}
+                      >
                         <SkillDocumentToolbar>
-                          <SkillDocumentToolbarCopy>
-                            <ToolsPanelTitle>{documentFileName(skillEditor)}</ToolsPanelTitle>
-                            <ToolsPanelHint>
-                              {text(skillEditor.localPath, documentTypeLabel(skillEditor.documentKind, skillEditor.collection))}
-                            </ToolsPanelHint>
-                          </SkillDocumentToolbarCopy>
-                          <SkillDocumentToolbarControls>
-                            <DocTypeSelect
-                              aria-label="Document type"
-                              onChange={(event) => {
-                                const option = documentTypeOption(event.target.value);
-                                setSkillEditor((current) => ({
-                                  ...current,
-                                  collection: option.collection,
-                                  documentKind: option.id,
-                                  extension: option.extension,
-                                  source: option.id,
-                                }));
-                              }}
-                              value={documentTypeOption(skillEditor.documentKind, skillEditor.collection).id}
-                            >
-                              {DOCUMENT_TYPE_OPTIONS.map((option) => (
-                                <option key={option.id} value={option.id}>{option.label}</option>
-                              ))}
-                            </DocTypeSelect>
-                            <ToolsStatusPill data-tone={skillsStatusTone}>
-                              {skillsStatusLabel}
-                            </ToolsStatusPill>
+                          <SkillDocumentToolbarControls data-side="left">
                             <SkillDocumentThemeSwitch aria-label="Document editor page theme">
                               {["dark", "light"].map((theme) => (
                                 <SkillDocumentThemeButton
@@ -1345,59 +1850,78 @@ export default function ToolsWorkspaceView({
                               ))}
                             </SkillDocumentThemeSwitch>
                           </SkillDocumentToolbarControls>
+                          <SkillDocumentToolbarControls data-side="right">
+                            <SkillDocumentActions data-placement="toolbar">
+                              <ToolsGhostButton
+                                onClick={() => {
+                                  setSkillEditor(null);
+                                  setSelectedSkillKey("");
+                                }}
+                                type="button"
+                              >
+                                Close
+                              </ToolsGhostButton>
+                              {skillEditor.id && (
+                                <ToolsGhostButton
+                                  data-danger="true"
+                                  disabled={skillEditorReadOnly}
+                                  onClick={() => removeSkill(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
+                                  type="button"
+                                >
+                                  Delete
+                                </ToolsGhostButton>
+                              )}
+                              <ToolsGhostButton
+                                disabled={!text(skillEditor.title) || skillEditorReadOnly}
+                                onClick={() => void saveSkillEditor("local")}
+                                type="button"
+                              >
+                                {skillsState === "savingLocal" ? "Saving locally…" : "Save Local"}
+                              </ToolsGhostButton>
+                              <ToolsPrimaryButton
+                                disabled={!text(skillEditor.title) || skillEditorReadOnly}
+                                onClick={() => void saveSkillEditor("push")}
+                                type="button"
+                              >
+                                {skillsState === "saving" ? "Saving…" : "Save"}
+                              </ToolsPrimaryButton>
+                            </SkillDocumentActions>
+                          </SkillDocumentToolbarControls>
                         </SkillDocumentToolbar>
-                        <SkillDocumentCanvas>
+                        <SkillDocumentCanvas ref={skillDocumentCanvasRef} style={skillDocumentMetricsStyle}>
+                          {selectedDocumentRefreshing && (
+                            <SkillDocumentRefreshOverlay role="status">
+                              <DocsExplorerSpinner aria-hidden="true" />
+                              <span>Refreshing document</span>
+                            </SkillDocumentRefreshOverlay>
+                          )}
                           <SkillDocumentPage>
                             <SkillDocumentTitleInput
                               aria-label="Document name"
+                              readOnly={skillEditorReadOnly}
                               onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
                               placeholder="doc_name"
                               value={skillEditor.title}
                             />
                             <ToolsSkillsEditor
                               aria-label="Document content"
-                              onChange={(event) => setSkillEditor((current) => ({ ...current, content: event.target.value }))}
+                              readOnly={skillEditorReadOnly}
+                              onChange={(event) => {
+                                updateSkillEditorSelection(event);
+                                setSkillEditor((current) => ({ ...current, content: event.target.value }));
+                              }}
+                              onKeyUp={updateSkillEditorSelection}
+                              onMouseUp={updateSkillEditorSelection}
+                              onSelect={updateSkillEditorSelection}
+                              onWheelCapture={scrollSkillDocumentCanvas}
                               placeholder={skillEditor.extension === "arch" ? "title System_Map" : "# Notes"}
+                              rows={skillEditorRows}
                               spellCheck={false}
                               value={skillEditor.content}
                             />
                           </SkillDocumentPage>
                         </SkillDocumentCanvas>
                       </SkillDocumentEditor>
-                      <SkillDocumentActions>
-                        <ToolsGhostButton
-                          onClick={() => {
-                            setSkillEditor(null);
-                            setSelectedSkillKey("");
-                          }}
-                          type="button"
-                        >
-                          Close
-                        </ToolsGhostButton>
-                        {skillEditor.id && (
-                          <ToolsGhostButton
-                            data-danger="true"
-                            onClick={() => removeSkill(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
-                            type="button"
-                          >
-                            Delete
-                          </ToolsGhostButton>
-                        )}
-                        <ToolsGhostButton
-                          disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
-                          onClick={() => saveSkillEditor("local")}
-                          type="button"
-                        >
-                          {skillsState === "savingLocal" ? "Saving locally…" : "Save Local"}
-                        </ToolsGhostButton>
-                        <ToolsPrimaryButton
-                          disabled={!text(skillEditor.title) || skillsState === "saving" || skillsState === "savingLocal"}
-                          onClick={() => saveSkillEditor("push")}
-                          type="button"
-                        >
-                          {skillsState === "saving" ? "Syncing…" : "Push Save"}
-                        </ToolsPrimaryButton>
-                      </SkillDocumentActions>
                     </>
                   ) : (
                     <DocsCreateModal>
@@ -1453,10 +1977,21 @@ export default function ToolsWorkspaceView({
                       </ToolsPrimaryButton>
                     </DocsCreateModal>
                   )}
-                </DocsCenterPane>
+                    </DocsCenterPane>
+                  </ResizePanel>
 
-                {docsCreateMode && (
-                <DocsTemplatesPane aria-label="Default skills">
+                  {showDocsTemplatesPane && (
+                    <>
+                      <ResizeHandle data-direction="horizontal" data-surface="files" />
+                      <ResizePanel
+                        data-surface="files"
+                        defaultSize="282px"
+                        groupResizeBehavior="preserve-pixel-size"
+                        id="docs-defaults"
+                        maxSize="340px"
+                        minSize="238px"
+                      >
+                        <DocsTemplatesPane aria-label="Default skills">
                   <DocsPaneHeader>
                     <div>
                       <DocsPaneKicker>Defaults</DocsPaneKicker>
@@ -1500,9 +2035,12 @@ export default function ToolsWorkspaceView({
                       <ToolsEmpty>No default skills match.</ToolsEmpty>
                     )}
                   </DocsTemplateList>
-                </DocsTemplatesPane>
-                )}
-              </DocsWorkspaceGrid>
+                        </DocsTemplatesPane>
+                      </ResizePanel>
+                    </>
+                  )}
+                </DocsWorkspaceGrid>
+                <ToolsHydrationProgress placement="docs-floating" progress={skillsHydration} />
               </DocsWorkspaceSurface>
             )}
 
@@ -1615,6 +2153,27 @@ export default function ToolsWorkspaceView({
 }
 
 const ToolsHubShell = styled.section`
+  --tools-border: rgba(230, 236, 245, 0.1);
+  --tools-border-subtle: rgba(230, 236, 245, 0.06);
+  --tools-bg:
+    radial-gradient(circle at 78% 8%, rgba(var(--forge-accent-rgb), 0.095), transparent 18rem),
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(4, 7, 12, 0.94);
+  --tools-header-bg: rgba(5, 8, 13, 0.96);
+  --tools-panel-bg: rgba(9, 13, 20, 0.72);
+  --tools-panel-bg-strong: rgba(8, 11, 16, 0.84);
+  --tools-editor-bg: rgba(6, 9, 14, 0.88);
+  --tools-control-bg: rgba(7, 9, 13, 0.66);
+  --tools-control-bg-soft: rgba(230, 236, 245, 0.05);
+  --tools-input-bg: rgba(5, 8, 13, 0.78);
+  --tools-template-bg: rgba(3, 6, 10, 0.34);
+  --tools-progress-bg: linear-gradient(180deg, rgba(20, 29, 44, 0.92), rgba(10, 15, 24, 0.92));
+  --tools-progress-error-bg: linear-gradient(180deg, rgba(49, 24, 24, 0.94), rgba(20, 12, 14, 0.94));
+  --tools-doc-desk: linear-gradient(180deg, rgba(12, 16, 24, 0.96), rgba(5, 8, 13, 0.98));
+  --tools-doc-page: #0d1118;
+  --tools-doc-page-border: rgba(230, 236, 245, 0.1);
+
   position: relative;
   isolation: isolate;
   display: grid;
@@ -1624,6 +2183,53 @@ const ToolsHubShell = styled.section`
   height: 100%;
   overflow: hidden;
   color: var(--forge-text);
+  background: var(--tools-bg);
+  background-size: auto, 68px 68px, 68px 68px, auto;
+
+  html[data-forge-space="loopspaces"] & {
+    --tools-border: rgba(255, 209, 102, 0.14);
+    --tools-border-subtle: rgba(255, 209, 102, 0.075);
+    --tools-bg:
+      radial-gradient(circle at 76% 8%, rgba(var(--forge-accent-rgb), 0.15), transparent 18rem),
+      radial-gradient(circle at 28% 96%, rgba(var(--forge-accent-soft-rgb), 0.055), transparent 20rem),
+      linear-gradient(90deg, rgba(var(--forge-accent-soft-rgb), 0.03) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(var(--forge-accent-soft-rgb), 0.022) 1px, transparent 1px),
+      rgba(5, 4, 2, 0.96);
+    --tools-header-bg: rgba(8, 5, 2, 0.96);
+    --tools-panel-bg: rgba(14, 10, 5, 0.74);
+    --tools-panel-bg-strong: rgba(12, 8, 4, 0.86);
+    --tools-editor-bg: rgba(8, 6, 3, 0.9);
+    --tools-control-bg: rgba(12, 8, 4, 0.72);
+    --tools-control-bg-soft: rgba(var(--forge-accent-soft-rgb), 0.055);
+    --tools-input-bg: rgba(8, 6, 3, 0.8);
+    --tools-template-bg: rgba(9, 6, 3, 0.42);
+    --tools-progress-bg: linear-gradient(180deg, rgba(37, 26, 10, 0.94), rgba(13, 9, 4, 0.94));
+    --tools-progress-error-bg: linear-gradient(180deg, rgba(49, 24, 24, 0.94), rgba(20, 12, 14, 0.94));
+    --tools-doc-desk: linear-gradient(180deg, rgba(18, 12, 5, 0.96), rgba(5, 4, 2, 0.98));
+    --tools-doc-page: #100d08;
+    --tools-doc-page-border: rgba(255, 209, 102, 0.14);
+  }
+
+  html[data-forge-theme="light"] & {
+    --tools-border: rgba(0, 0, 0, 0.1);
+    --tools-border-subtle: rgba(0, 0, 0, 0.065);
+    --tools-bg:
+      linear-gradient(180deg, rgba(var(--forge-accent-rgb), 0.045), transparent 22rem),
+      var(--forge-bg, #f5f5f7);
+    --tools-header-bg: rgba(255, 255, 255, 0.88);
+    --tools-panel-bg: rgba(255, 255, 255, 0.86);
+    --tools-panel-bg-strong: #ffffff;
+    --tools-editor-bg: #f5f5f7;
+    --tools-control-bg: rgba(255, 255, 255, 0.78);
+    --tools-control-bg-soft: rgba(var(--forge-accent-rgb), 0.075);
+    --tools-input-bg: #ffffff;
+    --tools-template-bg: rgba(255, 255, 255, 0.72);
+    --tools-progress-bg: linear-gradient(180deg, #ffffff, #f5f7fb);
+    --tools-progress-error-bg: linear-gradient(180deg, #fff5f5, #fffafa);
+    --tools-doc-desk: linear-gradient(180deg, #eef2f7, #dbe3ed);
+    --tools-doc-page: #fffdf8;
+    --tools-doc-page-border: rgba(29, 29, 31, 0.14);
+  }
 `;
 
 const ToolsHubHeader = styled.header`
@@ -1634,8 +2240,8 @@ const ToolsHubHeader = styled.header`
   height: 48px;
   overflow: hidden;
   padding: 6px 10px;
-  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
-  background: rgba(5, 8, 13, 0.96);
+  border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
+  background: var(--tools-header-bg);
   backdrop-filter: blur(12px);
 `;
 
@@ -1683,8 +2289,11 @@ const ToolsScroll = styled.div`
 
   &[data-section="docs"] {
     display: grid;
+    grid-template-rows: minmax(0, 1fr);
+    height: 100%;
+    max-height: 100%;
     overflow: hidden;
-    padding: 12px;
+    padding: 0;
   }
 `;
 
@@ -1695,7 +2304,7 @@ const ToolsHydrationPanel = styled.div`
   padding: 9px 10px;
   border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
   border-radius: 8px;
-  background: linear-gradient(180deg, rgba(20, 29, 44, 0.92), rgba(10, 15, 24, 0.92));
+  background: var(--tools-progress-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 
   &[data-placement="hub"],
@@ -1703,9 +2312,32 @@ const ToolsHydrationPanel = styled.div`
     margin: 10px 10px 0;
   }
 
+  &[data-placement="docs-floating"] {
+    position: absolute;
+    left: calc(var(--docs-explorer-offset, 0px) + 14px);
+    bottom: 12px;
+    z-index: 60;
+    width: min(320px, calc(100% - var(--docs-explorer-offset, 0px) - 28px));
+    gap: 5px;
+    padding: 7px 8px;
+    border-radius: 7px;
+    pointer-events: none;
+    box-shadow:
+      0 16px 34px rgba(0, 0, 0, 0.36),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  &[data-placement="docs-floating"] strong {
+    font-size: 10px;
+  }
+
+  &[data-placement="docs-floating"] span {
+    font-size: 9px;
+  }
+
   &[data-state="error"] {
     border-color: rgba(255, 132, 119, 0.34);
-    background: linear-gradient(180deg, rgba(49, 24, 24, 0.94), rgba(20, 12, 14, 0.94));
+    background: var(--tools-progress-error-bg);
   }
 
   &[data-state="ready"] {
@@ -1750,6 +2382,10 @@ const ToolsHydrationTrack = styled.div`
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.07);
+
+  ${ToolsHydrationPanel}[data-placement="docs-floating"] & {
+    height: 3px;
+  }
 `;
 
 const ToolsHydrationFill = styled.div`
@@ -1783,10 +2419,15 @@ const ToolsLayout = styled.section`
   min-width: 0;
 
   &[data-section="docs"] {
+    grid-template-rows: minmax(0, 1fr);
     align-content: stretch;
     width: 100%;
     height: 100%;
+    max-height: 100%;
+    min-height: 0;
     margin: 0;
+    gap: 0;
+    overflow: hidden;
   }
 `;
 
@@ -1801,9 +2442,9 @@ const ToolsSectionNav = styled.nav`
   overflow-y: hidden;
   scrollbar-width: none;
   padding: 3px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.1));
   border-radius: 9px;
-  background: rgba(7, 9, 13, 0.56);
+  background: var(--tools-control-bg);
 
   &::-webkit-scrollbar {
     display: none;
@@ -1839,63 +2480,144 @@ const ToolsPanel = styled.section`
   gap: 10px;
   min-width: 0;
   padding: 14px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.1));
   border-radius: 10px;
-  background: rgba(13, 17, 23, 0.6);
+  background: var(--tools-panel-bg);
 
   &[data-mode="editor"] {
     gap: 0;
     padding: 0;
     overflow: hidden;
-    background: rgba(8, 11, 16, 0.72);
+    background: var(--tools-panel-bg-strong);
   }
 `;
 
 const DocsWorkspaceSurface = styled(FilesWorkspaceSurface)`
-  border: 1px solid var(--files-vscode-border);
-  border-radius: 8px;
+  --files-vscode-sidebar: var(--tools-panel-bg-strong);
+  --files-vscode-editor: var(--tools-editor-bg);
+  --files-vscode-editor-gutter: var(--tools-panel-bg);
+  --files-vscode-tab: var(--tools-control-bg);
+  --files-vscode-tab-active: var(--tools-editor-bg);
+  --files-vscode-border: var(--tools-border);
+  --files-vscode-border-subtle: var(--tools-border-subtle);
+  --files-vscode-hover: rgba(var(--forge-accent-rgb), 0.1);
+  --files-vscode-selection: rgba(var(--forge-accent-rgb), 0.25);
+  --files-vscode-selection-inactive: rgba(var(--forge-accent-rgb), 0.08);
+  --files-vscode-blue: var(--forge-accent-soft);
+  --files-vscode-focus: var(--forge-accent);
+
+  position: relative;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: var(--tools-bg);
 `;
 
-const DocsWorkspaceGrid = styled.section`
-  display: grid;
-  grid-template-columns: minmax(218px, 280px) minmax(360px, 1fr);
-  gap: 0;
+const DocsWorkspaceGrid = styled(ResizePanelGroup)`
   min-width: 0;
   min-height: 0;
   height: 100%;
+  max-height: 100%;
   overflow: hidden;
+`;
 
-  &[data-show-templates="true"] {
-    grid-template-columns: minmax(218px, 280px) minmax(360px, 1fr) minmax(238px, 310px);
+const DocsExplorerRestoreButton = styled.button`
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 70;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  max-width: 156px;
+  padding: 0 10px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 7px;
+  color: var(--forge-text-soft, #b6c0cc);
+  background: var(--tools-control-bg);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease, transform 140ms ease;
+
+  span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  @media (max-width: 1060px) {
-    grid-template-columns: minmax(200px, 240px) minmax(320px, 1fr);
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.36);
+    color: var(--forge-accent-soft, #7db0ff);
+    background: rgba(var(--forge-accent-rgb), 0.14);
+    transform: translateY(-1px);
+  }
 
-    > :last-child {
-      display: none;
-    }
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-accent-soft-rgb), 0.32);
+    outline-offset: 2px;
   }
 `;
 
 const DocsPaneBase = styled.aside`
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 9px;
+  gap: 0;
   min-width: 0;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   overflow: hidden;
-  padding: 10px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
-  border-radius: 8px;
-  background: rgba(8, 12, 18, 0.72);
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--files-vscode-border);
+  border-radius: 0;
+  background: var(--tools-panel-bg);
 `;
 
 const DocsFilesPane = styled(FileExplorerPane)`
-  border-right: 1px solid var(--files-vscode-border);
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
+  border-right: 0;
+
+  &[data-collapsed="true"] {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  &[data-collapsed="true"] ${FileExplorerHeader} {
+    min-height: 36px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  &[data-collapsed="true"] ${FileExplorerActions} {
+    justify-content: center;
+    width: 100%;
+  }
 `;
 
-const DocsTemplatesPane = styled(DocsPaneBase)``;
+const DocsTemplatesPane = styled(DocsPaneBase)`
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
+`;
 
 const DocsRootPath = styled(FileRootPath)`
   padding-right: 10px;
@@ -1944,24 +2666,45 @@ const DocsExplorerCount = styled.span`
   white-space: nowrap;
 `;
 
+const docsExplorerSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
 const DocsExplorerStatus = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: #e2c08d;
   font-size: 10px;
   line-height: 22px;
   text-align: center;
 `;
 
+const DocsExplorerSpinner = styled.span`
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(var(--forge-accent-soft-rgb), 0.18);
+  border-top-color: var(--forge-accent-soft, #7db0ff);
+  border-radius: 999px;
+  animation: ${docsExplorerSpin} 740ms linear infinite;
+`;
+
 const DocsCenterPane = styled.section`
+  position: relative;
   display: grid;
   align-content: stretch;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   overflow: hidden;
   border: 0;
   border-right: 1px solid var(--files-vscode-border);
   border-radius: 0;
-  background: rgba(7, 10, 16, 0.72);
+  background: var(--tools-editor-bg);
 
   ${DocsWorkspaceGrid}[data-show-templates="false"] & {
     border-right: 0;
@@ -1970,10 +2713,12 @@ const DocsCenterPane = styled.section`
 
 const DocsPaneHeader = styled.header`
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  padding: 14px 14px 8px;
 `;
 
 const DocsPaneKicker = styled.div`
@@ -1997,10 +2742,10 @@ const DocsPaneTitle = styled.div`
 const ToolsSearchInput = styled.input`
   width: min(220px, 100%);
   padding: 7px 11px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 8px;
   color: var(--forge-text, #f4f7fa);
-  background: rgba(7, 9, 13, 0.55);
+  background: var(--tools-input-bg);
   font-size: 12px;
 
   &:focus-visible {
@@ -2010,20 +2755,26 @@ const ToolsSearchInput = styled.input`
 `;
 
 const DocsSearchInput = styled(ToolsSearchInput)`
-  width: 100%;
+  flex: 0 0 auto;
+  width: calc(100% - 28px);
+  margin: 8px 14px 14px;
 `;
 
 const DocsCreateModal = styled.div`
-  align-self: center;
+  grid-row: 2;
+  align-self: start;
   justify-self: center;
   display: grid;
   gap: 14px;
   width: min(420px, calc(100% - 28px));
   min-width: 0;
+  max-height: calc(100% - 56px);
+  margin-top: 28px;
+  overflow: auto;
   padding: 18px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 8px;
-  background: rgba(12, 17, 26, 0.94);
+  background: var(--tools-panel-bg-strong);
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
 `;
 
@@ -2071,10 +2822,11 @@ const DocsField = styled.div`
     min-width: 0;
     height: 32px;
     padding: 0 10px;
-    border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.13));
+    border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.13));
     border-radius: 7px;
     color: var(--forge-text, #f4f7fa);
-    background: rgba(5, 8, 13, 0.76);
+    background: var(--tools-input-bg);
+    color-scheme: var(--forge-color-scheme, dark);
     font-size: 12px;
     font-weight: 650;
     outline: none;
@@ -2096,10 +2848,11 @@ const DocTypeSelect = styled.select`
   max-width: 138px;
   min-width: 112px;
   padding: 0 9px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 7px;
   color: var(--forge-text-soft, #b6c0cc);
-  background: rgba(4, 7, 12, 0.78);
+  background: var(--tools-control-bg);
+  color-scheme: var(--forge-color-scheme, dark);
   font-size: 10.5px;
   font-weight: 760;
   outline: none;
@@ -2108,12 +2861,20 @@ const DocTypeSelect = styled.select`
 const DocsTemplateList = styled.div`
   display: grid;
   align-content: start;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.07));
-  border-radius: 7px;
-  background: rgba(3, 6, 10, 0.34);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 12px;
+  scrollbar-gutter: stable;
+  border-top: 1px solid var(--tools-border-subtle, rgba(230, 236, 245, 0.07));
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  border-radius: 0;
+  background: var(--tools-template-bg);
 `;
 
 const DocsTemplateRow = styled.div`
@@ -2123,7 +2884,7 @@ const DocsTemplateRow = styled.div`
   gap: 9px;
   min-height: 50px;
   padding: 7px 8px;
-  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+  border-bottom: 1px solid var(--tools-border-subtle, rgba(230, 236, 245, 0.05));
 
   &:last-child {
     border-bottom: 0;
@@ -2179,7 +2940,7 @@ const ToolsStatusPill = styled.span`
   max-width: 100%;
   overflow: hidden;
   padding: 4px 10px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 999px;
   color: var(--forge-text-soft, #b6c0cc);
   font-size: 10px;
@@ -2200,12 +2961,24 @@ const ToolsStatusPill = styled.span`
   &[data-tone="muted"] {
     color: var(--forge-text-muted, #7a8493);
   }
+
+  html[data-forge-theme="light"] &[data-tone="good"] {
+    border-color: rgba(10, 127, 69, 0.28);
+    color: #0a7f45;
+    background: rgba(10, 127, 69, 0.06);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="warn"] {
+    border-color: rgba(139, 90, 0, 0.28);
+    color: #8b5a00;
+    background: rgba(139, 90, 0, 0.06);
+  }
 `;
 
 const SkillDocumentEditor = styled.div`
-  --skill-editor-desk: linear-gradient(180deg, rgba(12, 16, 24, 0.96), rgba(5, 8, 13, 0.98));
-  --skill-editor-page: #0d1118;
-  --skill-editor-page-border: rgba(230, 236, 245, 0.1);
+  --skill-editor-desk: var(--tools-doc-desk);
+  --skill-editor-page: var(--tools-doc-page);
+  --skill-editor-page-border: var(--tools-doc-page-border);
   --skill-editor-page-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
   --skill-editor-page-text: #e8edf5;
   --skill-editor-page-muted: #778396;
@@ -2213,11 +2986,14 @@ const SkillDocumentEditor = styled.div`
   --skill-editor-page-rule: rgba(230, 236, 245, 0.08);
 
   display: grid;
+  grid-row: 2;
   grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  max-height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: rgba(5, 8, 13, 0.8);
+  background: var(--tools-editor-bg);
 
   &[data-page-theme="light"] {
     --skill-editor-desk: linear-gradient(180deg, #dfe6ef, #cbd5e1);
@@ -2233,14 +3009,16 @@ const SkillDocumentEditor = styled.div`
 
 const SkillDocumentToolbar = styled.div`
   display: flex;
+  position: relative;
+  z-index: 5;
   min-width: 0;
-  align-items: flex-start;
+  min-height: 44px;
+  align-items: center;
   justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-  padding: 14px;
-  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
-  background: rgba(7, 10, 16, 0.76);
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
+  background: var(--tools-control-bg);
 `;
 
 const SkillDocumentToolbarCopy = styled.div`
@@ -2253,11 +3031,21 @@ const SkillDocumentToolbarCopy = styled.div`
 const SkillDocumentToolbarControls = styled.div`
   display: flex;
   flex: 0 1 auto;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 8px;
   min-width: 0;
+
+  &[data-side="right"] {
+    justify-content: flex-end;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  &[data-side="right"]::-webkit-scrollbar {
+    display: none;
+  }
 `;
 
 const SkillDocumentThemeSwitch = styled.div`
@@ -2265,9 +3053,9 @@ const SkillDocumentThemeSwitch = styled.div`
   align-items: center;
   gap: 2px;
   padding: 3px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 8px;
-  background: rgba(4, 7, 12, 0.78);
+  background: var(--tools-control-bg);
 `;
 
 const SkillDocumentThemeButton = styled.button`
@@ -2293,38 +3081,80 @@ const SkillDocumentThemeButton = styled.button`
 
 const SkillDocumentCanvas = styled.div`
   display: grid;
+  position: relative;
+  align-content: start;
   justify-items: center;
+  box-sizing: border-box;
+  height: 100%;
+  max-height: 100%;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 24px;
+  padding: 24px 24px max(72px, var(--skill-document-page-padding-bottom, 76px));
+  scroll-padding-bottom: 112px;
+  scrollbar-gutter: stable;
   background: var(--skill-editor-desk);
+`;
+
+const SkillDocumentRefreshOverlay = styled.div`
+  display: inline-flex;
+  position: sticky;
+  top: 10px;
+  z-index: 4;
+  align-items: center;
+  gap: 8px;
+  justify-self: center;
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
+  border-radius: 999px;
+  color: var(--forge-text-soft, #b6c0cc);
+  background: color-mix(in srgb, var(--tools-control-bg) 88%, transparent);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.28);
+  font-size: 10px;
+  font-weight: 780;
+  letter-spacing: 0;
+  pointer-events: none;
 `;
 
 const SkillDocumentPage = styled.div`
   display: grid;
   align-content: start;
-  width: min(780px, 100%);
-  min-height: 900px;
-  padding: 48px 56px 64px;
+  box-sizing: border-box;
+  width: var(--skill-document-page-width, 794px);
+  min-height: var(--skill-document-page-height, 1123px);
+  aspect-ratio: 210 / 297;
+  padding:
+    var(--skill-document-page-padding-top, 52px)
+    var(--skill-document-page-padding-inline, 58px)
+    var(--skill-document-page-padding-bottom, 76px);
   border: 1px solid var(--skill-editor-page-border);
   border-radius: 4px;
   color: var(--skill-editor-page-text);
   background: var(--skill-editor-page);
   box-shadow: var(--skill-editor-page-shadow);
+  transition:
+    filter 140ms ease,
+    opacity 140ms ease;
+
+  ${SkillDocumentEditor}[data-refreshing="true"] & {
+    filter: grayscale(0.28);
+    opacity: 0.58;
+  }
 `;
 
 const SkillDocumentTitleInput = styled.input`
   width: 100%;
   min-width: 0;
-  padding: 0 0 7px;
+  padding: 0 0 var(--skill-document-title-padding-bottom, 7px);
   border: 0;
   border-bottom: 1px solid var(--skill-editor-page-rule);
   color: var(--skill-editor-page-text);
   background: transparent;
   font-family: ui-serif, Georgia, "Times New Roman", serif;
-  font-size: 30px;
+  font-size: var(--skill-document-title-font-size, 30px);
   font-weight: 760;
   line-height: 1.18;
   outline: none;
@@ -2332,40 +3162,80 @@ const SkillDocumentTitleInput = styled.input`
   &::placeholder {
     color: var(--skill-editor-page-placeholder);
   }
+
+  &:read-only {
+    cursor: default;
+  }
 `;
 
 const ToolsSkillsEditor = styled.textarea`
-  width: 100%;
+  width: calc(100% + var(--skill-document-body-bleed, 20px));
   min-width: 0;
-  min-height: 650px;
-  margin-top: 24px;
-  padding: 0;
+  min-height: var(--skill-document-body-min-height, 900px);
+  margin-top: var(--skill-document-body-margin-top, 24px);
+  margin-left: var(--skill-document-body-margin-left, -10px);
+  padding:
+    var(--skill-document-body-padding-top, 8px)
+    var(--skill-document-body-padding-inline, 10px)
+    var(--skill-document-body-padding-bottom, 24px);
   border: 0;
+  border-radius: 8px;
   color: var(--skill-editor-page-text);
   background: transparent;
+  caret-color: var(--forge-accent-soft, #7db0ff);
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 15px;
+  font-size: var(--skill-document-body-font-size, 15px);
   font-weight: 520;
   line-height: 1.72;
   outline: none;
+  overflow: hidden;
   resize: none;
+  transition:
+    background 140ms ease,
+    box-shadow 140ms ease;
 
   &:focus-visible {
-    box-shadow: inset 3px 0 0 rgba(var(--forge-accent-soft-rgb), 0.36);
+    background: rgba(var(--forge-accent-soft-rgb), 0.035);
+    box-shadow: inset 0 0 0 1px rgba(var(--forge-accent-soft-rgb), 0.1);
+  }
+
+  &::selection {
+    background: rgba(var(--forge-accent-soft-rgb), 0.28);
   }
 
   &::placeholder {
     color: var(--skill-editor-page-placeholder);
   }
+
+  &:read-only {
+    caret-color: transparent;
+    cursor: default;
+  }
 `;
 
 const SkillDocumentActions = styled.div`
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
   padding: 12px 14px 14px;
-  border-top: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
-  background: rgba(7, 10, 16, 0.72);
+  border-top: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
+  background: var(--tools-control-bg);
+
+  &[data-placement="toolbar"] {
+    flex-wrap: nowrap;
+    align-items: center;
+    overflow: visible;
+    padding: 0;
+    border-top: 0;
+    background: transparent;
+  }
+
+  &[data-placement="toolbar"] button {
+    height: 31px;
+    padding: 0 12px;
+    white-space: nowrap;
+  }
 `;
 
 const ToolsPrimaryButton = styled.button`
@@ -2390,7 +3260,7 @@ const ToolsPrimaryButton = styled.button`
 
 const ToolsGhostButton = styled.button`
   padding: 8px 14px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 8px;
   color: var(--forge-text-soft, #b6c0cc);
   background: transparent;
@@ -2468,9 +3338,9 @@ const CliList = styled.div`
   align-content: start;
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   border-radius: 9px;
-  background: rgba(7, 9, 13, 0.4);
+  background: var(--tools-panel-bg);
 `;
 
 const CliRow = styled.div`
@@ -2480,14 +3350,14 @@ const CliRow = styled.div`
   gap: 10px;
   min-height: 38px;
   padding: 0 10px;
-  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+  border-bottom: 1px solid var(--tools-border-subtle, rgba(230, 236, 245, 0.05));
 
   &:last-child {
     border-bottom: 0;
   }
 
   &:hover {
-    background: rgba(230, 236, 245, 0.035);
+    background: var(--tools-control-bg-soft);
   }
 
   /* Install/Uninstall affordances stay hidden until the row is hovered, so
@@ -2609,9 +3479,9 @@ const SkillsList = styled.div`
   align-content: start;
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   border-radius: 9px;
-  background: rgba(7, 9, 13, 0.4);
+  background: var(--tools-panel-bg);
 `;
 
 const SkillRow = styled.button`
@@ -2623,7 +3493,7 @@ const SkillRow = styled.button`
   min-height: 46px;
   padding: 6px 10px;
   border: 0;
-  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+  border-bottom: 1px solid var(--tools-border-subtle, rgba(230, 236, 245, 0.05));
   color: var(--forge-text, #f4f7fa);
   background: transparent;
   cursor: pointer;
@@ -2634,7 +3504,7 @@ const SkillRow = styled.button`
   }
 
   &:hover {
-    background: rgba(230, 236, 245, 0.035);
+    background: var(--tools-control-bg-soft);
   }
 `;
 
@@ -2699,7 +3569,7 @@ const SkillRowChevron = styled.span`
 
 const SkillSourceBadge = styled.span`
   padding: 2px 7px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.14));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.14));
   border-radius: 999px;
   color: var(--forge-text-muted, #7a8493);
   font-size: 9.5px;
@@ -2774,10 +3644,10 @@ const SkillContent = styled.pre`
   min-width: 0;
   overflow-x: auto;
   padding: 14px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   border-radius: 9px;
   color: var(--forge-text, #e8eef8);
-  background: rgba(7, 9, 13, 0.55);
+  background: var(--tools-panel-bg-strong);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   font-size: 12.5px;
   line-height: 1.6;

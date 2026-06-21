@@ -125,9 +125,9 @@ export default function WorkspaceToolsDragPanel({
   const visibleDocs = filter === "docs" || filter === "all" ? skills : [];
 
   return (
-    <Panel aria-label="Draggable workspace tools">
+    <Panel aria-label="Draggable workspace docs">
       <Toolbar>
-        <FilterNav role="tablist" aria-label="Tool filter">
+        <FilterNav role="tablist" aria-label="Doc filter">
           {FILTERS.map((entry) => (
             <FilterButton
               aria-selected={filter === entry.id}
@@ -191,12 +191,12 @@ export default function WorkspaceToolsDragPanel({
         {toolsLoaded && !visibleDocs.length && (
           <Empty>
             {filter === "docs"
-              ? "No docs yet — create one in the Tools tab."
+              ? "No docs yet — create one in Tools > Docs."
               : "No docs yet."}
           </Empty>
         )}
         {!toolsLoaded && !visibleDocs.length && (
-          <Empty>Loading tools…</Empty>
+          <Empty>Loading docs…</Empty>
         )}
       </ItemsScroll>
     </Panel>
@@ -228,6 +228,10 @@ const FilterNav = styled.nav`
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
   border-radius: 8px;
   background: rgba(7, 9, 13, 0.5);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.045);
+  }
 `;
 
 const FilterButton = styled.button`
@@ -344,6 +348,10 @@ const ToolRow = styled.div`
 
   &:active {
     cursor: grabbing;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
   }
 `;
 

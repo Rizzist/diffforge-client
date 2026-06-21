@@ -795,6 +795,10 @@ const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
 ];
 const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "get_state",
+    "get_visible_context",
+    "get_selected_document_context",
+    "get_selection_context",
+    "save_selected_document",
     "select_workspace",
     "select_tab",
     "list_terminals",

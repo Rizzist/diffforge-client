@@ -2535,7 +2535,7 @@ const VOICE_PLAN_WAITING_STATUSES = new Set([
 ]);
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator", compactLabel: "Orch" },
-  { id: "tools", label: "Tools" },
+  { id: "tools", label: "Docs" },
   { id: "plans", label: "Plans" },
   { id: "git", label: "Git" },
   { id: "tokenomics", label: "Tokenomics", compactLabel: "Tokens" },
@@ -2880,9 +2880,25 @@ const OrchestratorTopButton = styled.button`
 
 const OrchestratorView = styled.div`
   display: grid;
+  grid-row: 2;
+  grid-column: 1;
+  position: relative;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto auto auto minmax(0, 1fr);
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+
+  &[data-active="true"] {
+    z-index: 2;
+    opacity: 1;
+    pointer-events: auto;
+    visibility: visible;
+  }
 `;
 
 const OrchestratorVoiceArea = styled.div`
@@ -5070,6 +5086,10 @@ const OrchestratorHistorySendIcon = styled(North)`
 
 const WorkspaceToolSurface = styled.div`
   display: grid;
+  grid-row: 2;
+  grid-column: 1;
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
   grid-template-rows: minmax(0, 1fr);
@@ -14482,8 +14502,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }
   }, [activeWorkspaceTool, workspaceToolTabs]);
 
-  // Prefetch the app-level tools cache (architectures + skills) as soon as the
-  // orchestrator panel mounts so the Tools tab opens instantly, never "loading".
+  // Prefetch account docs as soon as the orchestrator panel mounts so the Docs
+  // tab opens instantly, never "loading".
   useEffect(() => {
     warmWorkspaceTools(coordinationTargets, rootDirectory);
   }, [coordinationTargets, rootDirectory]);
@@ -16846,6 +16866,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const showTodoDispatchTargets = todoSelectionEditable
     && workspaceTodoDispatchTargets.length > 0
     && typeof onDispatchTodoToTarget === "function";
+  const appControlAgentVisible = activeWorkspaceTool === "orchestrator"
+    && activeOrchestratorSection === "agent";
   const handleDispatchTargetChange = useCallback((event, item, source) => {
     if (!todoSelectionEditable) {
       event.target.value = "";
@@ -17036,12 +17058,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
   return (
     <TodoQueueSurface
-      aria-label="Workspace tools"
+      aria-label="Workspace docs"
       data-active-tool={activeWorkspaceTool}
       data-pane-mode={paneMode}
       data-tool-fullscreen={paneFullscreen ? "true" : undefined}
     >
-      <OrchestratorTopNav aria-label="Workspace tool">
+      <OrchestratorTopNav aria-label="Workspace docs">
         <OrchestratorTopTabs>
           {workspaceToolTabs.map((tool) => (
             <OrchestratorTopButton
@@ -17097,12 +17119,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             workspaceError={workspaceError}
           />
         </WorkspaceToolSurface>
-      ) : activeWorkspaceTool === "orchestrator" ? (
-        <OrchestratorView>
+      ) : null}
+      <OrchestratorView
+        aria-hidden={activeWorkspaceTool === "orchestrator" ? undefined : "true"}
+        data-active={activeWorkspaceTool === "orchestrator" ? "true" : "false"}
+      >
           <OrchestratorVoiceArea>
             <OrchestratorVoicePaneControls aria-label="Orchestrator pane controls">
               <WorkspaceToolControlButton
-                aria-label="Minimize workspace tools"
+                aria-label="Minimize workspace docs"
                 data-control="minimize"
                 onClick={onMinimizePane}
                 title="Minimize"
@@ -17139,7 +17164,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                 </>
               )}
               <WorkspaceToolControlButton
-                aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
+                aria-label={paneFullscreen ? "Exit workspace docs big view" : "Open workspace docs big view"}
                 data-control="fullscreen"
                 onClick={onToggleFullscreenPane}
                 title={paneFullscreen ? "Exit big view" : "Big view"}
@@ -17215,8 +17240,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           {renderOrchestratorDeviceRows()}
           <OrchestratorContent>
             <OrchestratorAgentTerminalSurface
-              aria-hidden={activeOrchestratorSection === "agent" ? undefined : "true"}
-              data-active={activeOrchestratorSection === "agent" ? "true" : "false"}
+              aria-hidden={appControlAgentVisible ? undefined : "true"}
+              data-active={appControlAgentVisible ? "true" : "false"}
             >
               <WorkspaceTerminal
                 agent={appControlAgent}
@@ -17228,7 +17253,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                 defaultSessionMode="free"
                 dockedChrome
                 fullscreenState="idle"
-                isActive={activeOrchestratorSection === "agent"}
+                isActive={appControlAgentVisible}
                 isFullscreen={false}
                 onChangeTerminalRole={handleAppControlAgentRoleChange}
                 onOpenSettings={noopWorkspaceToolHandler}
@@ -18096,7 +18121,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             ) : null}
           </OrchestratorContent>
         </OrchestratorView>
-      ) : null}
       {activeWorkspaceTool === "tokenomics" ? (
         <WorkspaceToolSurface data-tool="tokenomics">
           <AccountTokenomicsView
@@ -33398,10 +33422,10 @@ function TerminalView({
 
   const workspaceToolPaneContent = effectiveTodoQueueVisible ? (
     todoQueuePaneMinimized ? (
-      <WorkspaceToolMinimizedRail aria-label="Workspace tools minimized">
+      <WorkspaceToolMinimizedRail aria-label="Workspace docs minimized">
         <WorkspaceToolRailControls>
           <WorkspaceToolControlButton
-            aria-label="Unminimize workspace tools"
+            aria-label="Unminimize workspace docs"
             onClick={restoreTodoQueuePane}
             title="Unminimize"
             type="button"
@@ -33409,7 +33433,7 @@ function TerminalView({
             <TitleRestoreIcon aria-hidden="true" />
           </WorkspaceToolControlButton>
         </WorkspaceToolRailControls>
-        <WorkspaceToolRailLabel>Tools</WorkspaceToolRailLabel>
+        <WorkspaceToolRailLabel>Docs</WorkspaceToolRailLabel>
       </WorkspaceToolMinimizedRail>
     ) : (
       <TodoQueuePanel

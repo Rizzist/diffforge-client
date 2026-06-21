@@ -75,6 +75,9 @@ const SNIPPING_STRIP_INITIAL_PLACEHOLDER_COUNT = 8;
 const SNIPPING_STRIP_LOADING_MORE_PLACEHOLDER_COUNT = 3;
 const STRIP_THUMBNAIL_CACHE_LIMIT = 48;
 const STRIP_THUMBNAIL_MAX_CONCURRENT_READS = 3;
+const FORGE_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
+const FORGE_SPACE_MODE_LOOPSPACES = "loopspaces";
+const FORGE_SPACE_MODE_WORKSPACES = "workspaces";
 
 const stripThumbnailCache = new Map();
 const stripThumbnailInflight = new Map();
@@ -151,12 +154,69 @@ const NUMBER_RADIUS_BY_STROKE = { 3: 14, 5: 18, 9: 26 };
 
 const COLOR_OPTIONS = ["#f8fafc", "#ef4444", "#f59e0b", "#22c55e", "#38bdf8", "#a855f7"];
 
+function normalizeForgeSpaceMode(value) {
+  return String(value || "").trim().toLowerCase() === FORGE_SPACE_MODE_LOOPSPACES
+    ? FORGE_SPACE_MODE_LOOPSPACES
+    : FORGE_SPACE_MODE_WORKSPACES;
+}
+
+function readForgeSpaceMode() {
+  if (typeof window !== "undefined") {
+    try {
+      return normalizeForgeSpaceMode(window.localStorage.getItem(FORGE_SPACE_MODE_STORAGE_KEY));
+    } catch {
+      // Floating snip windows can still render with the default workspace tint.
+    }
+  }
+  return FORGE_SPACE_MODE_WORKSPACES;
+}
+
+function applyForgeSpaceDataset(spaceMode = readForgeSpaceMode()) {
+  if (typeof document === "undefined") {
+    return normalizeForgeSpaceMode(spaceMode);
+  }
+  const normalized = normalizeForgeSpaceMode(spaceMode);
+  document.documentElement.dataset.forgeSpace = normalized;
+  if (document.body) {
+    document.body.dataset.forgeSpace = normalized;
+  }
+  return normalized;
+}
+
+function snipAccentAlpha(alpha) {
+  return `rgba(var(--snip-ui-accent-rgb, 59, 130, 246), ${alpha})`;
+}
+
+function snipAccentSoftAlpha(alpha) {
+  return `rgba(var(--snip-ui-accent-soft-rgb, 147, 197, 253), ${alpha})`;
+}
+
+function readSnipCssVariable(name, fallback) {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return fallback;
+  }
+  try {
+    const value = window.getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return value || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function snipCanvasAccentSoftAlpha(alpha) {
+  return `rgba(${readSnipCssVariable("--snip-ui-accent-soft-rgb", "147, 197, 253")}, ${alpha})`;
+}
+
+function snipCanvasAccentSoftColor() {
+  return readSnipCssVariable("--snip-ui-accent-soft", "#60a5fa");
+}
+
 // react-select theme for the composer's workspace/terminal pickers: compact
 // dark pills with an upward menu (the composer sits on the bottom edge).
 function targetColorAlpha(hex, alpha) {
   const value = String(hex || "").trim();
   if (!/^#[0-9a-fA-F]{6}$/.test(value)) {
-    return `rgba(147, 197, 253, ${alpha})`;
+    return snipAccentSoftAlpha(alpha);
   }
   const r = Number.parseInt(value.slice(1, 3), 16);
   const g = Number.parseInt(value.slice(3, 5), 16);
@@ -180,12 +240,12 @@ const TARGET_SELECT_STYLES = {
       borderColor: accent
         ? targetColorAlpha(accent, state.isFocused ? 0.66 : 0.38)
         : state.isFocused
-          ? "rgba(147, 197, 253, 0.45)"
+          ? snipAccentSoftAlpha(0.45)
           : "rgba(230, 236, 245, 0.12)",
       boxShadow: state.isFocused && accent ? `0 0 0 3px ${targetColorAlpha(accent, 0.13)}` : "none",
       cursor: "pointer",
       transition: "border-color 120ms ease, background-color 120ms ease, box-shadow 140ms ease",
-      ":hover": { borderColor: accent ? targetColorAlpha(accent, 0.6) : "rgba(147, 197, 253, 0.4)" },
+      ":hover": { borderColor: accent ? targetColorAlpha(accent, 0.6) : snipAccentSoftAlpha(0.4) },
     };
   },
   valueContainer: (base) => ({ ...base, padding: "0 2px 0 11px", flexWrap: "nowrap" }),
@@ -237,12 +297,12 @@ const TARGET_SELECT_STYLES = {
       fontWeight: 650,
       color: state.isSelected ? "#ffffff" : "rgba(248, 250, 252, 0.85)",
       backgroundColor: state.isSelected
-        ? (accent ? targetColorAlpha(accent, 0.26) : "rgba(59, 130, 246, 0.45)")
+        ? (accent ? targetColorAlpha(accent, 0.26) : snipAccentAlpha(0.45))
         : state.isFocused
           ? "rgba(230, 236, 245, 0.09)"
           : "transparent",
       cursor: "pointer",
-      ":active": { backgroundColor: accent ? targetColorAlpha(accent, 0.2) : "rgba(59, 130, 246, 0.32)" },
+      ":active": { backgroundColor: accent ? targetColorAlpha(accent, 0.2) : snipAccentAlpha(0.32) },
     };
   },
   noOptionsMessage: (base) => ({
@@ -1176,11 +1236,25 @@ function snipUploadButtonTitle(uploadState, name) {
 
 function useFloatingWindowBody(kind) {
   useEffect(() => {
+    applyForgeSpaceDataset();
     document.documentElement.dataset.snippingFloating = kind;
-    document.body.dataset.snippingFloating = kind;
+    if (document.body) {
+      document.body.dataset.snippingFloating = kind;
+    }
+    const handleStorage = (event) => {
+      if (event.key === FORGE_SPACE_MODE_STORAGE_KEY) {
+        applyForgeSpaceDataset(event.newValue);
+      }
+    };
+    window.addEventListener("storage", handleStorage);
     return () => {
+      window.removeEventListener("storage", handleStorage);
+      delete document.documentElement.dataset.forgeSpace;
       delete document.documentElement.dataset.snippingFloating;
-      delete document.body.dataset.snippingFloating;
+      if (document.body) {
+        delete document.body.dataset.forgeSpace;
+        delete document.body.dataset.snippingFloating;
+      }
     };
   }, [kind]);
 }
@@ -1974,9 +2048,9 @@ const FloatUploadButton = styled.button`
   align-items: center;
   gap: 4px;
   padding: 0 9px;
-  border: 1px solid rgba(125, 176, 255, 0.34);
+  border: 1px solid rgba(var(--snip-ui-accent-soft-rgb), 0.34);
   border-radius: 999px;
-  color: #cfe3ff;
+  color: var(--snip-ui-send-text);
   background: rgba(7, 10, 16, 0.85);
   font-size: 10px;
   font-weight: 760;
@@ -1989,8 +2063,8 @@ const FloatUploadButton = styled.button`
 
   &:hover:not(:disabled),
   &[data-synthetic-hover="true"]:not(:disabled) {
-    color: #06121f;
-    background: #7db0ff;
+    color: var(--snip-ui-on-accent);
+    background: var(--snip-ui-accent-soft);
     border-color: transparent;
   }
 
@@ -2058,9 +2132,9 @@ const FloatUploadSideButton = styled.button`
 
   &:hover:not(:disabled),
   &[data-synthetic-hover="true"]:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.58);
-    color: #06121f;
-    background: #7db0ff;
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.58);
+    color: var(--snip-ui-on-accent);
+    background: var(--snip-ui-accent-soft);
   }
 
   &[data-primary="true"] {
@@ -2117,7 +2191,7 @@ const FloatUploadProgress = styled.span`
   left: 0;
   height: 3px;
   overflow: hidden;
-  background: rgba(125, 176, 255, 0.18);
+  background: rgba(var(--snip-ui-accent-soft-rgb), 0.18);
   pointer-events: none;
   z-index: 3;
 
@@ -2129,7 +2203,7 @@ const FloatUploadProgress = styled.span`
     left: 0;
     width: 40%;
     border-radius: 999px;
-    background: #7db0ff;
+    background: var(--snip-ui-accent-soft);
     animation: ${floatUploadSlide} 1.1s ease-in-out infinite;
   }
 
@@ -2175,7 +2249,7 @@ const FloatActionButton = styled.button`
   &:hover:not(:disabled),
   &[data-synthetic-hover="true"]:not(:disabled) {
     color: #fff;
-    background: rgba(125, 176, 255, 0.22);
+    background: rgba(var(--snip-ui-accent-soft-rgb), 0.22);
   }
 
   &[data-danger="true"]:hover:not(:disabled),
@@ -2201,9 +2275,9 @@ const FloatStatusPill = styled.span`
   gap: 6px;
   overflow: hidden;
   padding: 5px 10px 5px 8px;
-  border: 1px solid rgba(125, 176, 255, 0.32);
+  border: 1px solid rgba(var(--snip-ui-accent-soft-rgb), 0.32);
   border-radius: 999px;
-  color: #dceaff;
+  color: var(--snip-ui-send-text);
   background: linear-gradient(180deg, rgba(10, 14, 22, 0.95), rgba(5, 8, 13, 0.9));
   box-shadow:
     0 12px 28px rgba(0, 0, 0, 0.34),
@@ -3589,10 +3663,10 @@ const StripTile = styled.div`
   touch-action: none;
 
   &:hover {
-    border-color: rgba(125, 176, 255, 0.48);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.48);
     box-shadow:
       0 16px 32px rgba(0, 0, 0, 0.28),
-      0 0 0 1px rgba(125, 176, 255, 0.16),
+      0 0 0 1px rgba(var(--snip-ui-accent-soft-rgb), 0.16),
       inset 0 1px 0 rgba(255, 255, 255, 0.1);
   }
 
@@ -3648,7 +3722,7 @@ const StripTileThumbnailPlaceholder = styled.div`
   inset: 0;
   overflow: hidden;
   background:
-    radial-gradient(circle at 24% 28%, rgba(125, 176, 255, 0.2), transparent 26%),
+    radial-gradient(circle at 24% 28%, rgba(var(--snip-ui-accent-soft-rgb), 0.2), transparent 26%),
     linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 41, 59, 0.72));
   pointer-events: none;
 
@@ -3686,7 +3760,7 @@ const StripDropSlot = styled.div`
   flex: 0 0 120px;
   width: 120px;
   height: 74px;
-  border: 1px dashed rgba(125, 176, 255, 0.62);
+  border: 1px dashed rgba(var(--snip-ui-accent-soft-rgb), 0.62);
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(28, 48, 78, 0.42), rgba(8, 14, 24, 0.28)),
@@ -3735,7 +3809,7 @@ const StripTilePinButton = styled.button`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.58);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.58);
     background: rgba(24, 39, 65, 0.94);
     transform: scale(1.05);
   }
@@ -3762,7 +3836,7 @@ const StripTileUploadButton = styled.button`
   height: 22px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(125, 176, 255, 0.28);
+  border: 1px solid rgba(var(--snip-ui-accent-soft-rgb), 0.28);
   border-radius: 999px;
   color: #d8e9ff;
   background: rgba(6, 10, 16, 0.74);
@@ -3790,9 +3864,9 @@ const StripTileUploadButton = styled.button`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.64);
-    color: #06121f;
-    background: #7db0ff;
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.64);
+    color: var(--snip-ui-on-accent);
+    background: var(--snip-ui-accent-soft);
     transform: scale(1.05);
   }
 
@@ -3804,7 +3878,7 @@ const StripTileUploadButton = styled.button`
   &[data-state="uploading"],
   &[data-state="publishing"],
   &[data-state="deleting"] {
-    border-color: rgba(125, 176, 255, 0.58);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.58);
     color: #e6f1ff;
     background: rgba(18, 35, 60, 0.92);
   }
@@ -3860,9 +3934,9 @@ const StripUploadSideButton = styled.button`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(125, 176, 255, 0.58);
-    color: #06121f;
-    background: #7db0ff;
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.58);
+    color: var(--snip-ui-on-accent);
+    background: var(--snip-ui-accent-soft);
   }
 
   &[data-primary="true"] {
@@ -3934,7 +4008,7 @@ const StripTileActionButton = styled.button`
 
   &:hover:not(:disabled) {
     color: #fff;
-    background: rgba(125, 176, 255, 0.24);
+    background: rgba(var(--snip-ui-accent-soft-rgb), 0.24);
   }
 
   &[data-danger="true"]:hover:not(:disabled) {
@@ -5721,7 +5795,7 @@ function drawHoverOutline(context, annotation) {
   context.save();
   context.setLineDash([5, 4]);
   context.lineWidth = Math.max(1.25, context.canvas.width / 1200);
-  context.strokeStyle = "rgba(147, 197, 253, 0.85)";
+  context.strokeStyle = snipCanvasAccentSoftAlpha(0.85);
   context.strokeRect(bounds.x - pad, bounds.y - pad, bounds.width + pad * 2, bounds.height + pad * 2);
   context.restore();
 }
@@ -5810,14 +5884,14 @@ function drawSelectionOverlay(context, annotation, scale) {
   context.save();
   context.setLineDash([px(5), px(4)]);
   context.lineWidth = px(1.25);
-  context.strokeStyle = "rgba(96, 165, 250, 0.95)";
+  context.strokeStyle = snipCanvasAccentSoftAlpha(0.95);
   context.strokeRect(bounds.x - pad, bounds.y - pad, bounds.width + pad * 2, bounds.height + pad * 2);
   context.setLineDash([]);
   const radius = px(SELECT_HANDLE_SCREEN_PX);
   const isLine = annotation.type === "line" || annotation.type === "arrow";
   annotationSelectHandles(annotation).forEach((handle) => {
     context.beginPath();
-    context.fillStyle = "#60a5fa";
+    context.fillStyle = snipCanvasAccentSoftColor();
     context.strokeStyle = "#ffffff";
     context.lineWidth = px(1.5);
     if (isLine) {
@@ -6133,6 +6207,50 @@ function drawArrow(context, startX, startY, endX, endY, size) {
 }
 
 const SnipFloatingGlobalStyle = createGlobalStyle`
+  html {
+    --snip-ui-bg: #05070b;
+    --snip-ui-bg-deep: #02040a;
+    --snip-ui-panel: rgba(10, 13, 19, 0.86);
+    --snip-ui-panel-soft: rgba(230, 236, 245, 0.06);
+    --snip-ui-panel-strong: rgba(8, 11, 17, 0.82);
+    --snip-ui-border: rgba(230, 236, 245, 0.12);
+    --snip-ui-border-soft: rgba(230, 236, 245, 0.07);
+    --snip-ui-border-strong: rgba(230, 236, 245, 0.16);
+    --snip-ui-accent: #3b82f6;
+    --snip-ui-accent-soft: #93c5fd;
+    --snip-ui-accent-rgb: 59, 130, 246;
+    --snip-ui-accent-soft-rgb: 147, 197, 253;
+    --snip-ui-on-accent: #06121f;
+    --snip-ui-stage-glow: rgba(59, 130, 246, 0.08);
+    --snip-ui-active-bg: rgba(59, 130, 246, 0.42);
+    --snip-ui-active-ring: rgba(147, 197, 253, 0.38);
+    --snip-ui-send-bg: rgba(37, 99, 235, 0.32);
+    --snip-ui-send-bg-hover: rgba(37, 99, 235, 0.5);
+    --snip-ui-send-text: #e0f2fe;
+  }
+
+  html[data-forge-space="loopspaces"] {
+    --snip-ui-bg: #050402;
+    --snip-ui-bg-deep: #020201;
+    --snip-ui-panel: rgba(14, 10, 5, 0.88);
+    --snip-ui-panel-soft: rgba(255, 209, 102, 0.055);
+    --snip-ui-panel-strong: rgba(13, 9, 4, 0.86);
+    --snip-ui-border: rgba(255, 209, 102, 0.14);
+    --snip-ui-border-soft: rgba(255, 209, 102, 0.075);
+    --snip-ui-border-strong: rgba(255, 209, 102, 0.2);
+    --snip-ui-accent: #f59e0b;
+    --snip-ui-accent-soft: #ffd166;
+    --snip-ui-accent-rgb: 245, 158, 11;
+    --snip-ui-accent-soft-rgb: 255, 209, 102;
+    --snip-ui-on-accent: #1d1302;
+    --snip-ui-stage-glow: rgba(245, 158, 11, 0.11);
+    --snip-ui-active-bg: rgba(180, 116, 20, 0.46);
+    --snip-ui-active-ring: rgba(255, 209, 102, 0.38);
+    --snip-ui-send-bg: rgba(180, 116, 20, 0.34);
+    --snip-ui-send-bg-hover: rgba(180, 116, 20, 0.52);
+    --snip-ui-send-text: #fff3c4;
+  }
+
   *,
   *::before,
   *::after {
@@ -6157,10 +6275,10 @@ const FloatingButton = styled.button`
   width: 28px;
   height: 28px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--snip-ui-border-strong);
   border-radius: 999px;
   color: #f8fafc;
-  background: rgba(7, 10, 16, 0.72);
+  background: var(--snip-ui-panel);
   cursor: pointer;
 
   svg {
@@ -6169,8 +6287,8 @@ const FloatingButton = styled.button`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(255, 255, 255, 0.36);
-    background: rgba(15, 23, 36, 0.94);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.42);
+    background: var(--snip-ui-panel-strong);
   }
 
   &[data-danger="true"] {
@@ -6202,9 +6320,9 @@ const EditorWindowRoot = styled.main`
   width: 100%;
   height: 100%;
   overflow: hidden;
-  border: 1px solid rgba(230, 236, 245, 0.14);
+  border: 1px solid var(--snip-ui-border-strong);
   border-radius: 14px;
-  background: #05070b;
+  background: var(--snip-ui-bg);
   color: #f8fafc;
   font-family:
     Inter,
@@ -6302,7 +6420,7 @@ const EditorStatus = styled.span`
   }
 
   &[data-state="saving"] i {
-    background: #60a5fa;
+    background: var(--snip-ui-accent-soft);
   }
 `;
 
@@ -6379,8 +6497,8 @@ const EditorThumbButton = styled.button`
   &[data-active="true"],
   &:hover,
   &:focus-visible {
-    border-color: rgba(147, 197, 253, 0.56);
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.56);
+    box-shadow: 0 0 0 2px rgba(var(--snip-ui-accent-rgb), 0.18);
   }
 `;
 
@@ -6419,8 +6537,8 @@ const EditorStage = styled.section`
      clears the options pill, left clears the tool rail. */
   padding: 52px 12px 56px 52px;
   background:
-    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
-    #05070b;
+    radial-gradient(circle at 50% 0%, var(--snip-ui-stage-glow), transparent 42%),
+    var(--snip-ui-bg);
 
   &[data-media="video"] {
     padding: 52px 14px 18px;
@@ -6451,7 +6569,7 @@ const EditorVideoPlayer = styled.video`
   max-width: 100%;
   max-height: 100%;
   border-radius: 8px;
-  background: #02040a;
+  background: var(--snip-ui-bg-deep);
   box-shadow:
     0 0 0 1px rgba(230, 236, 245, 0.25),
     0 0 0 2px rgba(2, 4, 8, 0.95),
@@ -6483,10 +6601,10 @@ const EditorImageLoadingOverlay = styled.div`
   justify-items: center;
   gap: 8px;
   padding: 16px 18px;
-  border: 1px solid rgba(230, 236, 245, 0.14);
+  border: 1px solid var(--snip-ui-border-strong);
   border-radius: 10px;
   color: rgba(248, 250, 252, 0.84);
-  background: rgba(8, 11, 17, 0.82);
+  background: var(--snip-ui-panel-strong);
   box-shadow: 0 18px 54px rgba(0, 0, 0, 0.38);
   transform: translate(-50%, -50%);
   pointer-events: none;
@@ -6522,8 +6640,8 @@ const EditorImageLoadingOverlay = styled.div`
 const EditorImageLoadingSpinner = styled.span`
   width: 18px;
   height: 18px;
-  border: 2px solid rgba(147, 197, 253, 0.28);
-  border-top-color: rgba(147, 197, 253, 0.95);
+  border: 2px solid rgba(var(--snip-ui-accent-soft-rgb), 0.28);
+  border-top-color: rgba(var(--snip-ui-accent-soft-rgb), 0.95);
   border-radius: 999px;
   animation: ${floatUploadSpin} 0.72s linear infinite;
 `;
@@ -6580,11 +6698,8 @@ const EditorZoomReadout = styled.button`
   }
 `;
 
-/* The rail spans the editor body's full height — stage plus composer band
-   (the centered composer leaves the bottom-left corner free) — with the
-   tool groups centered via auto margins instead of justify-content:
-   overflow-safe, so a short window can still scroll to the first and last
-   tool. */
+/* The rail spans the editor body's full height — stage plus composer band —
+   and keeps the tools top-aligned so the first controls are always visible. */
 const EditorFloatingRail = styled.nav`
   position: absolute;
   left: 8px;
@@ -6594,27 +6709,20 @@ const EditorFloatingRail = styled.nav`
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: flex-start;
   gap: 6px;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 10px 5px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
+  border: 1px solid var(--snip-ui-border);
   border-radius: 999px;
-  background: rgba(10, 13, 19, 0.86);
+  background: var(--snip-ui-panel);
   backdrop-filter: blur(14px);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
   scrollbar-width: none;
 
   &::-webkit-scrollbar {
     display: none;
-  }
-
-  > :first-child {
-    margin-top: auto;
-  }
-
-  > :last-child {
-    margin-bottom: auto;
   }
 `;
 
@@ -6629,9 +6737,9 @@ const EditorActionCluster = styled.nav`
   align-items: center;
   gap: 2px;
   padding: 3px 4px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
+  border: 1px solid var(--snip-ui-border);
   border-radius: 999px;
-  background: rgba(10, 13, 19, 0.86);
+  background: var(--snip-ui-panel);
   backdrop-filter: blur(14px);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
 `;
@@ -6640,7 +6748,7 @@ const EditorRailDivider = styled.span`
   width: 18px;
   height: 1px;
   flex: none;
-  background: rgba(230, 236, 245, 0.12);
+  background: var(--snip-ui-border);
 `;
 
 // Bottom pill twin of the rail: always-available style controls plus the
@@ -6658,9 +6766,9 @@ const EditorOptionsBar = styled.nav`
   overflow-x: auto;
   overflow-y: hidden;
   padding: 6px 12px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
+  border: 1px solid var(--snip-ui-border);
   border-radius: 999px;
-  background: rgba(10, 13, 19, 0.86);
+  background: var(--snip-ui-panel);
   backdrop-filter: blur(14px);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
   transform: translateX(-50%);
@@ -6675,7 +6783,7 @@ const EditorBarDivider = styled.span`
   width: 1px;
   height: 18px;
   flex: none;
-  background: rgba(230, 236, 245, 0.12);
+  background: var(--snip-ui-border);
 `;
 
 const EditorBarTextButton = styled.button`
@@ -6736,8 +6844,8 @@ const EditorToolButton = styled.button`
 
   &[data-active="true"] {
     color: #ffffff;
-    background: rgba(59, 130, 246, 0.42);
-    box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.38);
+    background: var(--snip-ui-active-bg);
+    box-shadow: 0 0 0 1px var(--snip-ui-active-ring);
   }
 
   &:disabled {
@@ -6796,7 +6904,7 @@ const CustomColorButton = styled.label`
   &[data-active="true"] {
     box-shadow:
       0 0 0 2px rgba(8, 10, 15, 0.95),
-      0 0 0 4px rgba(147, 197, 253, 0.8);
+      0 0 0 4px rgba(var(--snip-ui-accent-soft-rgb), 0.8);
     transform: scale(1.05);
   }
 `;
@@ -6847,7 +6955,7 @@ const TextBgButton = styled.button`
   &[data-active="true"] {
     box-shadow:
       0 0 0 2px rgba(8, 10, 15, 0.95),
-      0 0 0 4px rgba(147, 197, 253, 0.8);
+      0 0 0 4px rgba(var(--snip-ui-accent-soft-rgb), 0.8);
     transform: scale(1.05);
   }
 `;
@@ -6860,7 +6968,7 @@ const EditorTextOverlayInput = styled.textarea`
   min-width: 60px;
   max-width: calc(100% - 24px);
   padding: 2px 6px;
-  border: 1.5px dashed rgba(147, 197, 253, 0.75);
+  border: 1.5px dashed rgba(var(--snip-ui-accent-soft-rgb), 0.75);
   border-radius: 6px;
   outline: none;
   resize: none;
@@ -6868,7 +6976,7 @@ const EditorTextOverlayInput = styled.textarea`
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   font-weight: 700;
   line-height: 1.25;
-  caret-color: #93c5fd;
+  caret-color: var(--snip-ui-accent-soft);
 
   &::placeholder {
     color: rgba(148, 163, 184, 0.65);
@@ -6898,7 +7006,7 @@ const SizeDotButton = styled.button`
   }
 
   &[data-active="true"] {
-    background: rgba(59, 130, 246, 0.32);
+    background: rgba(var(--snip-ui-accent-rgb), 0.32);
   }
 
   &[data-active="true"] i {
@@ -6909,8 +7017,12 @@ const SizeDotButton = styled.button`
 const EditorComposer = styled.form`
   flex: none;
   padding: 8px 16px 12px;
-  border-top: 1px solid rgba(230, 236, 245, 0.07);
+  border-top: 1px solid var(--snip-ui-border-soft);
   background: rgba(10, 13, 19, 0.6);
+
+  html[data-forge-space="loopspaces"] & {
+    background: rgba(12, 8, 4, 0.64);
+  }
 
   /* The prompt line lives inside the composer card; the card carries the
      border and focus ring, so the input itself stays bare. */
@@ -6952,14 +7064,14 @@ const EditorComposerInner = styled.div`
   min-width: min(100%, 360px);
   margin: 0 auto;
   padding: 8px 9px 9px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
+  border: 1px solid var(--snip-ui-border);
   border-radius: 18px;
-  background: rgba(230, 236, 245, 0.06);
+  background: var(--snip-ui-panel-soft);
   transition: border-color 120ms ease, box-shadow 140ms ease;
 
   &:focus-within {
-    border-color: rgba(147, 197, 253, 0.45);
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.45);
+    box-shadow: 0 0 0 3px rgba(var(--snip-ui-accent-rgb), 0.12);
   }
 
   &[data-disabled="true"] {
@@ -6989,10 +7101,10 @@ const EditorSendButton = styled.button`
   height: 32px;
   flex: none;
   place-items: center;
-  border: 1px solid rgba(147, 197, 253, 0.34);
+  border: 1px solid rgba(var(--snip-ui-accent-soft-rgb), 0.34);
   border-radius: 999px;
-  color: #e0f2fe;
-  background: rgba(37, 99, 235, 0.32);
+  color: var(--snip-ui-send-text);
+  background: var(--snip-ui-send-bg);
   cursor: pointer;
   transition: background 120ms ease;
 
@@ -7002,8 +7114,8 @@ const EditorSendButton = styled.button`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(147, 197, 253, 0.56);
-    background: rgba(37, 99, 235, 0.5);
+    border-color: rgba(var(--snip-ui-accent-soft-rgb), 0.56);
+    background: var(--snip-ui-send-bg-hover);
   }
 
   &:disabled {

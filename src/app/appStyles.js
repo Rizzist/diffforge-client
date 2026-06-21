@@ -10004,7 +10004,7 @@ export const AudioWidgetShell = styled.main`
     z-index: 1;
     border: 1px solid rgba(230, 236, 245, 0.13);
     background:
-      radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.13), transparent 34%),
+      radial-gradient(circle at 16% 0%, rgba(var(--forge-accent-soft-rgb), 0.13), transparent 34%),
       linear-gradient(180deg, rgba(37, 42, 49, 0.94), rgba(12, 15, 19, 0.96));
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.07) inset,
@@ -10016,7 +10016,7 @@ export const AudioWidgetShell = styled.main`
   &[data-theme="light"]::after {
     border-color: rgba(0, 0, 0, 0.08);
     background:
-      radial-gradient(circle at 16% 0%, rgba(0, 102, 204, 0.1), transparent 36%),
+      radial-gradient(circle at 16% 0%, rgba(var(--forge-accent-rgb), 0.1), transparent 36%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 247, 250, 0.97));
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.96) inset,
@@ -10039,16 +10039,16 @@ export const AudioWidgetShell = styled.main`
 
   &[data-hover="true"]:not([data-dragging="true"]) {
     box-shadow:
-      0 0 0 2px rgba(125, 176, 255, 0.42),
-      0 0 24px rgba(125, 176, 255, 0.24),
+      0 0 0 2px rgba(var(--forge-accent-soft-rgb), 0.42),
+      0 0 24px rgba(var(--forge-accent-soft-rgb), 0.24),
       0 18px 44px rgba(0, 0, 0, 0.34);
   }
 
   &[data-theme="light"][data-hover="true"]:not([data-dragging="true"]),
   html[data-forge-theme="light"] &[data-hover="true"]:not([data-dragging="true"]) {
     box-shadow:
-      0 0 0 2px rgba(0, 102, 204, 0.34),
-      0 0 22px rgba(0, 102, 204, 0.16),
+      0 0 0 2px rgba(var(--forge-accent-rgb), 0.34),
+      0 0 22px rgba(var(--forge-accent-rgb), 0.16),
       0 16px 36px rgba(29, 29, 31, 0.14),
       0 2px 10px rgba(29, 29, 31, 0.08);
   }
@@ -10315,7 +10315,7 @@ export const AudioBarSurface = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.14);
   border-radius: 999px;
   background:
-    radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.12), transparent 36%),
+    radial-gradient(circle at 16% 0%, rgba(var(--forge-accent-soft-rgb), 0.12), transparent 36%),
     linear-gradient(180deg, rgba(37, 42, 49, 0.96), rgba(12, 15, 19, 0.97));
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.07) inset,
@@ -10362,7 +10362,7 @@ export const AudioBarSurface = styled.div`
   ${AudioBarShell}[data-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.1);
     background:
-      radial-gradient(circle at 16% 0%, rgba(0, 102, 204, 0.08), transparent 36%),
+      radial-gradient(circle at 16% 0%, rgba(var(--forge-accent-rgb), 0.08), transparent 36%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 247, 250, 0.97));
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.96) inset,
@@ -10646,7 +10646,7 @@ export const AudioBarRecordButton = styled.button`
   border: 1px solid rgba(230, 236, 245, 0.18);
   border-radius: 50%;
   background:
-    radial-gradient(circle at 30% 18%, rgba(125, 176, 255, 0.14), transparent 55%),
+    radial-gradient(circle at 30% 18%, rgba(var(--forge-accent-soft-rgb), 0.14), transparent 55%),
     linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.98));
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
   cursor: pointer;
@@ -10673,7 +10673,7 @@ export const AudioBarRecordButton = styled.button`
   ${AudioBarIdleShell}[data-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.14);
     background:
-      radial-gradient(circle at 30% 18%, rgba(0, 102, 204, 0.08), transparent 55%),
+      radial-gradient(circle at 30% 18%, rgba(var(--forge-accent-rgb), 0.08), transparent 55%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
     box-shadow: 0 10px 22px rgba(29, 29, 31, 0.2);
   }
@@ -10692,7 +10692,7 @@ export const AudioHistoryQuickButton = styled.button`
   border-radius: 999px;
   color: rgba(230, 236, 245, 0.78);
   background:
-    radial-gradient(circle at 32% 18%, rgba(125, 176, 255, 0.12), transparent 54%),
+    radial-gradient(circle at 32% 18%, rgba(var(--forge-accent-soft-rgb), 0.12), transparent 54%),
     rgba(19, 23, 30, 0.88);
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.08) inset,
@@ -10765,9 +10765,9 @@ export const AudioHistoryQuickButton = styled.button`
 
   &:hover:not(:disabled) {
     color: #ffffff;
-    border-color: rgba(125, 176, 255, 0.38);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.38);
     background:
-      radial-gradient(circle at 32% 18%, rgba(125, 176, 255, 0.2), transparent 58%),
+      radial-gradient(circle at 32% 18%, rgba(var(--forge-accent-soft-rgb), 0.2), transparent 58%),
       rgba(44, 55, 70, 0.94);
     transform: translateY(-1px) scale(1.04);
   }
@@ -10792,7 +10792,7 @@ export const AudioHistoryQuickButton = styled.button`
     border-color: rgba(29, 29, 31, 0.11);
     color: rgba(29, 29, 31, 0.68);
     background:
-      radial-gradient(circle at 32% 18%, rgba(0, 102, 204, 0.08), transparent 55%),
+      radial-gradient(circle at 32% 18%, rgba(var(--forge-accent-rgb), 0.08), transparent 55%),
       rgba(255, 255, 255, 0.96);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.9) inset,
@@ -10841,10 +10841,10 @@ export const AudioHistoryQuickButton = styled.button`
   html[data-audio-widget-theme="light"] &:hover:not(:disabled),
   ${AudioBarIdleShell}[data-theme="light"] &:hover:not(:disabled),
   ${AudioBarShell}[data-theme="light"] &:hover:not(:disabled) {
-    color: rgba(0, 73, 150, 0.98);
-    border-color: rgba(0, 102, 204, 0.22);
+    color: var(--forge-accent);
+    border-color: rgba(var(--forge-accent-rgb), 0.22);
     background:
-      radial-gradient(circle at 32% 18%, rgba(0, 102, 204, 0.14), transparent 58%),
+      radial-gradient(circle at 32% 18%, rgba(var(--forge-accent-rgb), 0.14), transparent 58%),
       rgba(255, 255, 255, 0.99);
   }
 `;
@@ -11028,7 +11028,7 @@ export const AudioWidgetHistoryTray = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.12);
   border-radius: 999px;
   background:
-    radial-gradient(circle at 28% 0%, rgba(125, 176, 255, 0.12), transparent 46%),
+    radial-gradient(circle at 28% 0%, rgba(var(--forge-accent-soft-rgb), 0.12), transparent 46%),
     rgba(7, 10, 14, 0.88);
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.08) inset,
@@ -11068,7 +11068,7 @@ export const AudioWidgetHistoryTray = styled.div`
   html[data-audio-widget-theme="light"] & {
     border-color: rgba(29, 29, 31, 0.08);
     background:
-      radial-gradient(circle at 28% 0%, rgba(0, 102, 204, 0.08), transparent 48%),
+      radial-gradient(circle at 28% 0%, rgba(var(--forge-accent-rgb), 0.08), transparent 48%),
       rgba(247, 248, 251, 0.94);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.92) inset,
@@ -11147,14 +11147,14 @@ export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
 
   html[data-forge-theme="light"] &,
   html[data-audio-widget-theme="light"] & {
-    border-color: rgba(0, 102, 204, 0.14);
+    border-color: rgba(var(--forge-accent-rgb), 0.14);
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 247, 250, 0.96));
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.98) inset,
       0 -8px 16px rgba(0, 0, 0, 0.035) inset,
       0 8px 18px rgba(29, 29, 31, 0.12),
-      0 0 0 4px rgba(0, 102, 204, 0.035);
+      0 0 0 4px rgba(var(--forge-accent-rgb), 0.035);
   }
 
   html[data-forge-theme="light"] &[data-size="focus"],
@@ -11166,13 +11166,13 @@ export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
   }
 
   ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) & {
-    border-color: rgba(125, 176, 255, 0.48);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.48);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.12) inset,
       0 -8px 16px rgba(0, 0, 0, 0.24) inset,
       0 8px 22px rgba(0, 0, 0, 0.24),
-      0 0 0 4px rgba(125, 176, 255, 0.13),
-      0 0 22px rgba(125, 176, 255, 0.24);
+      0 0 0 4px rgba(var(--forge-accent-soft-rgb), 0.13),
+      0 0 22px rgba(var(--forge-accent-soft-rgb), 0.24);
     transform: scale(1.035);
   }
 
@@ -11182,13 +11182,13 @@ export const AudioWidgetLogo = styled.img.attrs({ draggable: false })`
 
   html[data-forge-theme="light"] ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) &,
   html[data-audio-widget-theme="light"] ${AudioWidgetShell}[data-hover="true"]:not([data-dragging="true"]) & {
-    border-color: rgba(0, 102, 204, 0.24);
+    border-color: rgba(var(--forge-accent-rgb), 0.24);
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.98) inset,
       0 -8px 16px rgba(0, 0, 0, 0.035) inset,
       0 8px 18px rgba(29, 29, 31, 0.12),
-      0 0 0 4px rgba(0, 102, 204, 0.09),
-      0 0 20px rgba(0, 102, 204, 0.14);
+      0 0 0 4px rgba(var(--forge-accent-rgb), 0.09),
+      0 0 20px rgba(var(--forge-accent-rgb), 0.14);
   }
 
   &[data-hidden="true"] {
@@ -11207,7 +11207,7 @@ export const AudioWidgetMeter = styled.div`
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 999px;
   background:
-    linear-gradient(90deg, rgba(125, 176, 255, 0.05) 0 1px, transparent 1px 9px),
+    linear-gradient(90deg, rgba(var(--forge-accent-soft-rgb), 0.05) 0 1px, transparent 1px 9px),
     linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012)),
     rgba(9, 11, 14, 0.74);
 
@@ -11252,7 +11252,7 @@ export const AudioWidgetMeter = styled.div`
     opacity: 0.62;
     filter: saturate(0.58) brightness(0.88);
     box-shadow:
-      0 0 8px rgba(125, 176, 255, 0.08),
+      0 0 8px rgba(var(--forge-accent-soft-rgb), 0.08),
       0 1px 0 rgba(255, 255, 255, 0.1) inset;
   }
 
@@ -11270,8 +11270,8 @@ export const AudioWidgetMeter = styled.div`
     padding: 7px 11px;
     border-color: rgba(230, 236, 245, 0.11);
     background:
-      linear-gradient(90deg, rgba(125, 176, 255, 0.055) 0 1px, transparent 1px 9px),
-      radial-gradient(circle at 18% 0%, rgba(125, 176, 255, 0.11), transparent 42%),
+      linear-gradient(90deg, rgba(var(--forge-accent-soft-rgb), 0.055) 0 1px, transparent 1px 9px),
+      radial-gradient(circle at 18% 0%, rgba(var(--forge-accent-soft-rgb), 0.11), transparent 42%),
       linear-gradient(180deg, rgba(33, 38, 45, 0.78), rgba(9, 11, 14, 0.76));
     opacity: 0;
     transform: translateX(-10px) scaleX(0.82);
@@ -11286,7 +11286,7 @@ export const AudioWidgetMeter = styled.div`
   &[data-prominent="true"] span {
     min-height: 6px;
     box-shadow:
-      0 0 12px rgba(125, 176, 255, 0.16),
+      0 0 12px rgba(var(--forge-accent-soft-rgb), 0.16),
       0 0 18px rgba(217, 121, 53, 0.05),
       0 1px 0 rgba(255, 255, 255, 0.14) inset;
   }
@@ -11297,7 +11297,7 @@ export const AudioWidgetMeter = styled.div`
   }
 
   &[data-processing="true"] {
-    border-color: rgba(125, 176, 255, 0.18);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.18);
     background:
       linear-gradient(90deg, rgba(217, 121, 53, 0.055) 0 1px, transparent 1px 9px),
       radial-gradient(circle at 12% 0%, rgba(217, 121, 53, 0.12), transparent 40%),
@@ -11319,7 +11319,7 @@ export const AudioWidgetMeter = styled.div`
   html[data-audio-widget-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.075);
     background:
-      linear-gradient(90deg, rgba(0, 102, 204, 0.055) 0 1px, transparent 1px 9px),
+      linear-gradient(90deg, rgba(var(--forge-accent-rgb), 0.055) 0 1px, transparent 1px 9px),
       linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(250, 250, 252, 0.9));
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.9) inset,
@@ -11361,8 +11361,8 @@ export const AudioWidgetMeter = styled.div`
   html[data-audio-widget-theme="light"] &[data-prominent="true"] {
     border-color: rgba(0, 0, 0, 0.075);
     background:
-      linear-gradient(90deg, rgba(0, 102, 204, 0.05) 0 1px, transparent 1px 9px),
-      radial-gradient(circle at 18% 0%, rgba(0, 102, 204, 0.08), transparent 42%),
+      linear-gradient(90deg, rgba(var(--forge-accent-rgb), 0.05) 0 1px, transparent 1px 9px),
+      radial-gradient(circle at 18% 0%, rgba(var(--forge-accent-rgb), 0.08), transparent 42%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(246, 247, 250, 0.88));
   }
 
@@ -11376,7 +11376,7 @@ export const AudioWidgetMeter = styled.div`
 
   html[data-forge-theme="light"] &[data-processing="true"],
   html[data-audio-widget-theme="light"] &[data-processing="true"] {
-    border-color: rgba(0, 102, 204, 0.13);
+    border-color: rgba(var(--forge-accent-rgb), 0.13);
     background:
       linear-gradient(90deg, rgba(221, 112, 31, 0.045) 0 1px, transparent 1px 9px),
       radial-gradient(circle at 12% 0%, rgba(221, 112, 31, 0.08), transparent 40%),
@@ -11431,7 +11431,7 @@ export const AudioWidgetLoader = styled.div`
     position: absolute;
     inset: 5px;
     border: 2px solid rgba(230, 236, 245, 0.1);
-    border-top-color: var(--forge-blue-soft);
+    border-top-color: var(--forge-accent-soft);
     border-right-color: var(--forge-ember);
     border-radius: inherit;
     animation: ${audioWidgetSpin} 860ms linear infinite;
@@ -11444,7 +11444,7 @@ export const AudioWidgetLoader = styled.div`
     border-radius: inherit;
     background: rgba(244, 247, 250, 0.92);
     box-shadow:
-      0 0 14px rgba(125, 176, 255, 0.28),
+      0 0 14px rgba(var(--forge-accent-soft-rgb), 0.28),
       0 0 18px rgba(217, 121, 53, 0.14);
   }
 
@@ -11461,15 +11461,15 @@ export const AudioWidgetLoader = styled.div`
   html[data-forge-theme="light"] &::before,
   html[data-audio-widget-theme="light"] &::before {
     border-color: rgba(0, 0, 0, 0.08);
-    border-top-color: var(--forge-blue);
+    border-top-color: var(--forge-accent);
     border-right-color: rgba(221, 112, 31, 0.88);
   }
 
   html[data-forge-theme="light"] &::after,
   html[data-audio-widget-theme="light"] &::after {
-    background: var(--forge-blue);
+    background: var(--forge-accent);
     box-shadow:
-      0 0 12px rgba(0, 102, 204, 0.26),
+      0 0 12px rgba(var(--forge-accent-rgb), 0.26),
       0 0 16px rgba(221, 112, 31, 0.1);
   }
 `;
@@ -11568,6 +11568,22 @@ export const AudioWidgetActions = styled.div`
 `;
 
 export const McpWorkspaceSurface = styled.section`
+  --mcp-border: rgba(230, 236, 245, 0.1);
+  --mcp-border-strong: rgba(230, 236, 245, 0.14);
+  --mcp-bg:
+    radial-gradient(circle at 78% 8%, rgba(var(--forge-accent-rgb), 0.095), transparent 18rem),
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.18);
+  --mcp-panel-bg: rgba(17, 22, 29, 0.78);
+  --mcp-panel-bg-soft: rgba(21, 27, 35, 0.42);
+  --mcp-panel-bg-raised: rgba(17, 22, 29, 0.86);
+  --mcp-control-bg: rgba(13, 17, 23, 0.92);
+  --mcp-control-bg-soft: rgba(230, 236, 245, 0.05);
+  --mcp-hover-bg: rgba(230, 236, 245, 0.035);
+  --mcp-active-bg: rgba(var(--forge-accent-rgb), 0.12);
+  --mcp-icon-bg: rgba(21, 27, 35, 0.72);
+
   container-type: inline-size;
   display: grid;
   width: 100%;
@@ -11579,11 +11595,27 @@ export const McpWorkspaceSurface = styled.section`
   overflow: hidden;
   padding: 12px 16px 16px;
 
-  background:
-    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
-    rgba(13, 17, 23, 0.18);
-  background-size: 68px 68px, 68px 68px, auto;
+  background: var(--mcp-bg);
+  background-size: auto, 68px 68px, 68px 68px, auto;
+
+  html[data-forge-space="loopspaces"] & {
+    --mcp-border: rgba(255, 209, 102, 0.14);
+    --mcp-border-strong: rgba(255, 209, 102, 0.18);
+    --mcp-bg:
+      radial-gradient(circle at 78% 8%, rgba(var(--forge-accent-rgb), 0.15), transparent 18rem),
+      radial-gradient(circle at 28% 96%, rgba(var(--forge-accent-soft-rgb), 0.055), transparent 20rem),
+      linear-gradient(90deg, rgba(var(--forge-accent-soft-rgb), 0.03) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(var(--forge-accent-soft-rgb), 0.022) 1px, transparent 1px),
+      rgba(5, 4, 2, 0.96);
+    --mcp-panel-bg: rgba(14, 10, 5, 0.76);
+    --mcp-panel-bg-soft: rgba(13, 9, 4, 0.5);
+    --mcp-panel-bg-raised: rgba(16, 11, 5, 0.86);
+    --mcp-control-bg: rgba(8, 6, 3, 0.9);
+    --mcp-control-bg-soft: rgba(var(--forge-accent-soft-rgb), 0.055);
+    --mcp-hover-bg: rgba(var(--forge-accent-soft-rgb), 0.045);
+    --mcp-active-bg: rgba(var(--forge-accent-rgb), 0.13);
+    --mcp-icon-bg: rgba(16, 11, 5, 0.74);
+  }
 
   html[data-forge-theme="light"] & {
     background: var(--forge-bg);
@@ -11595,11 +11627,11 @@ export const McpHeaderPanel = styled.section`
   gap: 10px;
   min-width: 0;
   padding: 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.86);
+    var(--mcp-panel-bg-raised, rgba(17, 22, 29, 0.86));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -11635,9 +11667,9 @@ export const McpTitleRow = styled.div`
   ${VaultPlaceholderIcon} {
     width: 44px;
     height: 44px;
-    border-color: rgba(125, 160, 205, 0.24);
-    color: var(--forge-blue-soft);
-    background: rgba(125, 160, 205, 0.08);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.24);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-accent-rgb), 0.08);
 
     svg {
       width: 18px;
@@ -11684,8 +11716,8 @@ export const McpButtonSpinner = styled.i`
   width: 12px;
   height: 12px;
   flex: 0 0 auto;
-  border: 2px solid rgba(125, 160, 205, 0.24);
-  border-top-color: var(--forge-blue-soft);
+  border: 2px solid rgba(var(--forge-accent-soft-rgb), 0.24);
+  border-top-color: var(--forge-accent-soft);
   border-right-color: var(--forge-amber);
   border-radius: 50%;
   animation: ${workspaceCloseSpin} 760ms linear infinite;
@@ -11706,16 +11738,16 @@ export const McpActionStatus = styled.div`
   gap: 9px;
   overflow: hidden;
   padding: 9px 10px;
-  border: 1px solid rgba(59, 130, 246, 0.28);
+  border: 1px solid rgba(var(--forge-accent-rgb), 0.28);
   border-radius: 8px;
-  color: var(--forge-blue-soft);
-  background: rgba(59, 130, 246, 0.08);
+  color: var(--forge-accent-soft);
+  background: rgba(var(--forge-accent-rgb), 0.08);
 
   &::before {
     position: absolute;
     inset: 0 auto 0 -38%;
     width: 38%;
-    background: linear-gradient(90deg, transparent, rgba(125, 176, 255, 0.16), transparent);
+    background: linear-gradient(90deg, transparent, rgba(var(--forge-accent-soft-rgb), 0.16), transparent);
     animation: ${loadingOrangeSweep} 1.35s cubic-bezier(0.45, 0, 0.25, 1) infinite;
     content: "";
   }
@@ -11776,10 +11808,10 @@ export const McpMetricPill = styled.span`
   align-items: center;
   gap: 5px;
   padding: 0 9px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 999px;
   color: var(--forge-text-muted);
-  background: rgba(21, 27, 35, 0.62);
+  background: var(--mcp-panel-bg-soft, rgba(21, 27, 35, 0.62));
   font-size: 10px;
   font-weight: 780;
   white-space: nowrap;
@@ -11798,9 +11830,9 @@ export const McpMetricPill = styled.span`
   }
 
   &[data-state="enabled"] {
-    border-color: rgba(59, 130, 246, 0.3);
-    color: var(--forge-blue-soft);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-accent-rgb), 0.3);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-accent-rgb), 0.1);
   }
 
   &[data-state="blocked"] {
@@ -11900,9 +11932,9 @@ export const McpRegistryPanel = styled.aside`
   gap: 8px;
   overflow: hidden;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.72);
+  background: var(--mcp-panel-bg, rgba(13, 17, 23, 0.72));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -11979,8 +12011,8 @@ export const McpServerButton = styled.button`
 
   &[data-active="true"],
   &:hover {
-    border-color: rgba(125, 160, 205, 0.22);
-    background: var(--forge-surface-selected);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.24);
+    background: var(--mcp-active-bg, var(--forge-surface-selected));
   }
 
   html[data-forge-theme="light"] &[data-active="true"],
@@ -11990,7 +12022,7 @@ export const McpServerButton = styled.button`
   }
 
   &[data-active="true"]::before {
-    background: var(--forge-blue-soft);
+    background: var(--forge-accent-soft);
   }
 
   html[data-forge-theme="light"] &[data-active="true"]::before {
@@ -12012,10 +12044,10 @@ export const McpServerIcon = styled.span`
   width: 28px;
   height: 28px;
   place-items: center;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: rgba(21, 27, 35, 0.72);
+  background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
 
   svg {
     width: 15px;
@@ -12023,15 +12055,15 @@ export const McpServerIcon = styled.span`
   }
 
   &[data-state="enabled"] {
-    border-color: rgba(59, 130, 246, 0.32);
-    color: var(--forge-blue-soft);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-accent-rgb), 0.32);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-accent-rgb), 0.1);
   }
 
   &[data-state="planned"] {
-    border-color: var(--forge-border);
+    border-color: var(--mcp-border, var(--forge-border));
     color: var(--forge-text-muted);
-    background: rgba(21, 27, 35, 0.72);
+    background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
   }
 
   &[data-state="blocked"] {
@@ -12091,24 +12123,24 @@ export const McpStatusBadge = styled.span`
   align-items: center;
   gap: 5px;
   padding: 3px 6px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 999px;
   color: var(--forge-text-muted);
-  background: rgba(21, 27, 35, 0.72);
+  background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
   font-size: 9px;
   font-weight: 760;
   text-transform: uppercase;
 
   &[data-state="enabled"] {
-    border-color: rgba(59, 130, 246, 0.3);
-    color: var(--forge-blue-soft);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-accent-rgb), 0.3);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-accent-rgb), 0.1);
   }
 
   &[data-state="planned"] {
-    border-color: var(--forge-border);
+    border-color: var(--mcp-border, var(--forge-border));
     color: var(--forge-text-muted);
-    background: rgba(21, 27, 35, 0.72);
+    background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
   }
 
   &[data-state="blocked"] {
@@ -12123,8 +12155,8 @@ export const McpStatusBadge = styled.span`
     width: 9px;
     height: 9px;
     flex: 0 0 auto;
-    border: 1.5px solid rgba(125, 160, 205, 0.24);
-    border-top-color: var(--forge-blue-soft);
+    border: 1.5px solid rgba(var(--forge-accent-soft-rgb), 0.24);
+    border-top-color: var(--forge-accent-soft);
     border-right-color: var(--forge-amber);
     border-radius: 50%;
     animation: ${workspaceCloseSpin} 760ms linear infinite;
@@ -12165,11 +12197,11 @@ export const McpEditorPanel = styled.section`
   gap: 12px;
   overflow: auto;
   padding: 14px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.78);
+    var(--mcp-panel-bg, rgba(17, 22, 29, 0.78));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -12196,10 +12228,10 @@ export const McpSwitchButton = styled.button`
   align-items: center;
   gap: 9px;
   padding: 0 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
-  background: rgba(21, 27, 35, 0.72);
+  background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
   font-size: 12px;
   font-weight: 760;
 
@@ -12224,13 +12256,13 @@ export const McpSwitchButton = styled.button`
   }
 
   &[aria-pressed="true"] {
-    border-color: rgba(59, 130, 246, 0.34);
-    color: var(--forge-blue-soft);
-    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(var(--forge-accent-rgb), 0.34);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-accent-rgb), 0.1);
   }
 
   &[aria-pressed="true"] > span::after {
-    background: var(--forge-blue-soft);
+    background: var(--forge-accent-soft);
     transform: translateX(12px);
   }
 
@@ -12337,10 +12369,10 @@ export const McpInput = styled.input`
   width: 100%;
   min-height: 40px;
   padding: 0 12px;
-  border: 1px solid var(--forge-border-strong);
+  border: 1px solid var(--mcp-border-strong, var(--forge-border-strong));
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(13, 17, 23, 0.92);
+  background: var(--mcp-control-bg, rgba(13, 17, 23, 0.92));
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -12349,9 +12381,9 @@ export const McpInput = styled.input`
   font-size: 12px;
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.44);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.44);
     outline: none;
-    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+    box-shadow: 0 0 0 3px rgba(var(--forge-accent-rgb), 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -12370,10 +12402,10 @@ export const McpTextarea = styled.textarea`
   min-height: 86px;
   resize: vertical;
   padding: 11px 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(13, 17, 23, 0.76);
+  background: var(--mcp-control-bg, rgba(13, 17, 23, 0.76));
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -12384,8 +12416,8 @@ export const McpTextarea = styled.textarea`
   outline: none;
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.44);
-    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.44);
+    box-shadow: 0 0 0 3px rgba(var(--forge-accent-rgb), 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -12409,9 +12441,9 @@ export const McpTransportTabs = styled.div`
   grid-template-columns: repeat(var(--mcp-tab-count), minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.46);
+  background: var(--mcp-control-bg, rgba(13, 17, 23, 0.46));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
@@ -12445,9 +12477,9 @@ export const McpTransportButton = styled.button`
 
   &[data-active="true"],
   &:hover {
-    border-color: rgba(125, 160, 205, 0.28);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
     color: var(--forge-text);
-    background: var(--forge-surface-selected);
+    background: var(--mcp-active-bg, var(--forge-surface-selected));
   }
 
   html[data-forge-theme="light"] &[data-active="true"],
@@ -12479,9 +12511,9 @@ export const McpAccessPanel = styled.section`
   align-content: start;
   gap: 10px;
   padding: 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
-  background: rgba(21, 27, 35, 0.42);
+  background: var(--mcp-panel-bg-soft, rgba(21, 27, 35, 0.42));
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -12510,7 +12542,7 @@ export const McpAccessTopline = styled.div`
   svg {
     width: 16px;
     height: 16px;
-    color: var(--forge-blue-soft);
+    color: var(--forge-accent-soft);
   }
 
   html[data-forge-theme="light"] & svg {
@@ -12530,10 +12562,10 @@ export const McpToolChip = styled.span`
   min-height: 26px;
   align-items: center;
   padding: 0 8px;
-  border: 1px solid rgba(125, 160, 205, 0.18);
+  border: 1px solid var(--mcp-border, rgba(125, 160, 205, 0.18));
   border-radius: 999px;
   color: var(--forge-text-soft);
-  background: rgba(13, 17, 23, 0.48);
+  background: var(--mcp-control-bg, rgba(13, 17, 23, 0.48));
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -12576,10 +12608,10 @@ export const McpInlineActions = styled.span`
     justify-content: center;
     gap: 5px;
     padding: 0 10px;
-    border: 1px solid var(--forge-border);
+    border: 1px solid var(--mcp-border, var(--forge-border));
     border-radius: 6px;
     color: var(--forge-text-soft);
-    background: rgba(21, 27, 35, 0.72);
+    background: var(--mcp-icon-bg, rgba(21, 27, 35, 0.72));
     font-size: 10px;
     font-weight: 900;
     white-space: nowrap;
@@ -12590,7 +12622,7 @@ export const McpInlineActions = styled.span`
   }
 
   button:hover {
-    border-color: rgba(125, 160, 205, 0.34);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
     color: var(--forge-text);
   }
 
@@ -12628,9 +12660,9 @@ export const McpCheckRow = styled.label`
   align-items: center;
   gap: 9px;
   padding: 8px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.58);
+  background: var(--mcp-control-bg, rgba(13, 17, 23, 0.58));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -12639,7 +12671,7 @@ export const McpCheckRow = styled.label`
   input {
     width: 16px;
     height: 16px;
-    accent-color: var(--forge-blue);
+    accent-color: var(--forge-accent);
   }
 
   > span {
@@ -12672,10 +12704,10 @@ export const McpCheckRow = styled.label`
 export const McpEmptyAccess = styled.p`
   margin: 0;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--mcp-border, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: rgba(21, 27, 35, 0.48);
+  background: var(--mcp-panel-bg-soft, rgba(21, 27, 35, 0.48));
   font-size: 12px;
   font-weight: 650;
 
@@ -12710,9 +12742,9 @@ export const McpMountRow = styled.div`
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border: 1px solid rgba(125, 160, 205, 0.14);
+  border: 1px solid var(--mcp-border, rgba(125, 160, 205, 0.14));
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.36);
+  background: var(--mcp-control-bg, rgba(13, 17, 23, 0.36));
 
   ${TerminalAgentDot} {
     justify-self: center;

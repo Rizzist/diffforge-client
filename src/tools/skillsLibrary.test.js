@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  accountDocumentUnitsFromPayload,
   mergeSkillUnits,
   skillSlug,
   skillsFromUnits,
@@ -13,10 +14,10 @@ test("skills normalize from unit metadata", () => {
   const skills = skillsFromUnits([{
     asset_id: "asset-review",
     content_md: "Check the diff and tests.",
+    doc_id: "review",
     local_saved_at: "2026-06-20T12:00:00.000Z",
     pending_push: true,
     sha256: "abc",
-    skill_id: "review",
     sync_status: "local_pending",
     title: "Review",
   }]);
@@ -32,12 +33,63 @@ test("skills normalize from unit metadata", () => {
 
 test("skill unit merge removes tombstoned rows", () => {
   const current = skillsFromUnits([
-    { skillId: "review", title: "Review" },
-    { skillId: "ship", title: "Ship" },
+    { doc_id: "review", title: "Review" },
+    { doc_id: "ship", title: "Ship" },
   ]);
-  const merged = mergeSkillUnits(current, [{ skill_id: "review", deleted: true }]);
+  const merged = mergeSkillUnits(current, [{ doc_id: "review", deleted: true }]);
 
   assert.deepEqual(merged.map((skill) => skill.id), ["ship"]);
+});
+
+test("metadata-only document updates preserve cached content until hydration lands", () => {
+  const current = skillsFromUnits([{
+    content_hash: "old-hash",
+    content_md: "Previous content stays visible.",
+    doc_id: "review",
+    title: "Review",
+  }]);
+
+  const metadataOnly = mergeSkillUnits(current, [{
+    asset_id: "asset-review",
+    content_hash: "new-hash",
+    doc_id: "review",
+    has_content: true,
+    title: "Review",
+  }]);
+
+  assert.equal(metadataOnly[0].content, "Previous content stays visible.");
+  assert.equal(metadataOnly[0].contentHash, "new-hash");
+  assert.equal(metadataOnly[0].contentStale, true);
+  assert.equal(metadataOnly[0].hasContent, true);
+  assert.equal(metadataOnly[0].hasContentPayload, false);
+
+  const hydrated = mergeSkillUnits(metadataOnly, [{
+    content_hash: "new-hash",
+    content_md: "Fresh hydrated content.",
+    doc_id: "review",
+    title: "Review",
+  }]);
+
+  assert.equal(hydrated[0].content, "Fresh hydrated content.");
+  assert.equal(hydrated[0].contentStale, false);
+  assert.equal(hydrated[0].hasContentPayload, true);
+});
+
+test("hydrated metadata without inline bytes is not treated as materialized content", () => {
+  const units = accountDocumentUnitsFromPayload({
+    documents: [{
+      asset_id: "asset-review",
+      content_hash: "new-hash",
+      doc_id: "review",
+      hydrated: true,
+      title: "Review",
+    }],
+  });
+  const skills = skillsFromUnits(units);
+
+  assert.equal(skills[0].content, "");
+  assert.equal(skills[0].hasContent, true);
+  assert.equal(skills[0].hasContentPayload, false);
 });
 
 test("skills serialize to unit sync payloads", () => {
@@ -50,8 +102,8 @@ test("skills serialize to unit sync payloads", () => {
   }]);
 
   assert.equal(units.length, 1);
-  assert.equal(units[0].skillId, "conventional-commits");
-  assert.equal(units[0].contentMd, "Use `type(scope): summary`.");
+  assert.equal(units[0].doc_id, "conventional-commits");
+  assert.equal(units[0].content_md, "Use `type(scope): summary`.");
   assert.equal(Object.prototype.hasOwnProperty.call(units[0], "description"), false);
 });
 

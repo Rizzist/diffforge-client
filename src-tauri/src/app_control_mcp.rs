@@ -428,8 +428,46 @@ fn app_control_mcp_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "get_state",
-            "description": "Return the current Diff Forge app view, selected workspace, active workspace, and available navigation targets.",
+            "description": "Return the current Diff Forge app view, selected workspace, active workspace, available navigation targets, and a compact visible-context summary.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        json!({
+            "name": "get_visible_context",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document metadata and highlighted range when available. Use localPath from this response for direct file edits.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContent": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "get_selected_document_context",
+            "description": "Return the selected Tools document context, including local backing file path, document type, sync state, and current highlighted range.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContent": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "get_selection_context",
+            "description": "Return only the current highlighted selection/range context for the visible document surface.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": true}
+        }),
+        json!({
+            "name": "save_selected_document",
+            "description": "Save the currently selected Tools document from Diff Forge's live editor state. Use mode=local for local-only pending save or mode=publish to fan out to account sync.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "description": "local, publish, push, sync, or save."}
+                },
+                "additionalProperties": true
+            }
         }),
         json!({
             "name": "select_workspace",
@@ -531,6 +569,10 @@ fn app_control_mcp_tools() -> Vec<Value> {
 fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: Value) -> Value {
     if ![
         "get_state",
+        "get_visible_context",
+        "get_selected_document_context",
+        "get_selection_context",
+        "save_selected_document",
         "select_workspace",
         "select_tab",
         "list_terminals",

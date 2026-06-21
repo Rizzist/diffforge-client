@@ -14,7 +14,7 @@ const CLOUD_MCP_ROUTE_INITIALIZING_TIMEOUT_SECS: u64 = 150;
 const CLOUD_MCP_ROUTE_INITIALIZING_MIN_POLL_MS: u64 = 1_500;
 const CLOUD_MCP_ROUTE_INITIALIZING_MAX_POLL_MS: u64 = 8_000;
 const CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS: u64 = 2_500;
-const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
+const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 30;
 const CLOUD_MCP_WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const CLOUD_MCP_WS_SILENCE_WATCHDOG_SECS: u64 = 45;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
@@ -35,8 +35,7 @@ const CLOUD_MCP_NATIVE_SESSIONS_UPDATED_EVENT: &str = "cloud-mcp-native-sessions
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT: &str = "cloud-mcp-loopspaces-updated";
 const CLOUD_MCP_LOOPSPACES_CONTRACT: &str = "diffforge.loopspaces.v1";
-const CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT: &str =
-    "cloud-mcp-loopspace-triggers-updated";
+const CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT: &str = "cloud-mcp-loopspace-triggers-updated";
 const CLOUD_MCP_LOOPSPACE_TRIGGERS_CONTRACT: &str = "diffforge.loopspace_triggers.v1";
 const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-account-assets-updated";
 const CLOUD_MCP_ACCOUNT_ASSETS_V2_CONTRACT: &str = "diffforge.account_assets.v2";
@@ -90,8 +89,7 @@ const CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE: &str = "device_live_state_sync_sta
 const CLOUD_MCP_LOOPSPACE_MIRROR_TABLE: &str = "loopspace_mirror_rows";
 const CLOUD_MCP_LOOPSPACE_SYNC_STATE_TABLE: &str = "loopspace_sync_state";
 const CLOUD_MCP_LOOPSPACE_TRIGGER_MIRROR_TABLE: &str = "loopspace_trigger_mirror_rows";
-const CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE: &str =
-    "loopspace_trigger_run_mirror_rows";
+const CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE: &str = "loopspace_trigger_run_mirror_rows";
 const CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE: &str = "loopspace_trigger_sync_state";
 const CLOUD_MCP_ASSET_LIBRARY_DB_FILE: &str = "account-asset-library.sqlite";
 const CLOUD_MCP_LEGACY_ASSET_LIBRARY_DB_FILE: &str = "workspace-asset-library.sqlite";
@@ -130,7 +128,7 @@ const CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS: u64 = 20;
 // Backstop sweep only — the notify_one() path handles real work immediately,
 // so this timed wake can be infrequent. 15s was 4 idle CPU wakes/min forever.
 const CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS: u64 = 60_000;
-const CLOUD_MCP_OUTBOX_STALE_IN_FLIGHT_MS: u64 = 120_000;
+const CLOUD_MCP_OUTBOX_STALE_IN_FLIGHT_MS: u64 = (CLOUD_MCP_SYNC_TIMEOUT_SECS + 15) * 1000;
 const CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS: u64 = 10_000;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM: u8 = 1;
@@ -207,7 +205,6 @@ static CLOUD_MCP_NETWORK_RECENT_FRAMES: OnceLock<StdMutex<VecDeque<Value>>> = On
 static CLOUD_MCP_TOKENOMICS_SYNC_LOGS: OnceLock<StdMutex<VecDeque<Value>>> = OnceLock::new();
 
 static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
-static CLOUD_MCP_OUTBOX_RECOVERY_DONE: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
     std::sync::mpsc::Sender<(String, CloudMcpOutboxRow)>,
 > = OnceLock::new();
@@ -2267,10 +2264,7 @@ fn cloud_mcp_open_outbox_conn() -> Result<rusqlite::Connection, String> {
     Ok(conn)
 }
 
-fn cloud_mcp_outbox_recover_stale_in_flight_once() {
-    if CLOUD_MCP_OUTBOX_RECOVERY_DONE.swap(true, Ordering::SeqCst) {
-        return;
-    }
+fn cloud_mcp_outbox_recover_stale_in_flight() {
     let Ok(conn) = cloud_mcp_open_outbox_conn() else {
         return;
     };
@@ -4080,10 +4074,7 @@ fn cloud_mcp_sync_activity_domain(raw: &str) -> &'static str {
         "todos"
     } else if raw.contains("loopspace") || raw.contains("loopspaces") {
         "loopspaces"
-    } else if raw.contains("document")
-        || raw.contains("doc.sync")
-        || raw.contains("doc.content")
-    {
+    } else if raw.contains("document") || raw.contains("doc.sync") || raw.contains("doc.content") {
         "documents"
     } else if raw.contains("asset") {
         "assets"
@@ -4593,6 +4584,21 @@ fn cloud_mcp_tokenomics_bucket_status_active(acked_at_ms: i64, outbox_status: &s
     )
 }
 
+fn cloud_mcp_effective_live_unit_outbox_status(
+    outbox_status: &str,
+    updated_at_ms: i64,
+    now: u64,
+) -> String {
+    let normalized_status = outbox_status.trim().to_ascii_lowercase();
+    if normalized_status == "in_flight"
+        && updated_at_ms > 0
+        && now.saturating_sub(updated_at_ms as u64) >= CLOUD_MCP_OUTBOX_STALE_IN_FLIGHT_MS
+    {
+        return "retrying".to_string();
+    }
+    normalized_status
+}
+
 fn cloud_mcp_tokenomics_bucket_sync_activity(
     now: u64,
 ) -> Option<CloudMcpTokenomicsBucketSyncActivity> {
@@ -4822,7 +4828,10 @@ fn cloud_mcp_device_live_unit_sync_activities(now: u64) -> Vec<CloudMcpDeviceLiv
         let mut latest_updated_ms = 0i64;
 
         for row in &group.rows {
-            let active = cloud_mcp_tokenomics_bucket_status_active(row.acked_at_ms, &row.status);
+            let effective_status =
+                cloud_mcp_effective_live_unit_outbox_status(&row.status, row.updated_at_ms, now);
+            let active =
+                cloud_mcp_tokenomics_bucket_status_active(row.acked_at_ms, &effective_status);
             if active {
                 activity.remaining_count = activity.remaining_count.saturating_add(1);
                 activity.bytes = activity.bytes.saturating_add(row.bytes);
@@ -4836,7 +4845,7 @@ fn cloud_mcp_device_live_unit_sync_activities(now: u64) -> Vec<CloudMcpDeviceLiv
                         .map(|current| current.min(active_at_ms))
                         .unwrap_or(active_at_ms),
                 );
-                match row.status.trim().to_ascii_lowercase().as_str() {
+                match effective_status.as_str() {
                     "dead_letter" => saw_dead_letter = true,
                     "retrying" => saw_retrying = true,
                     "in_flight" => saw_in_flight = true,
@@ -4852,7 +4861,10 @@ fn cloud_mcp_device_live_unit_sync_activities(now: u64) -> Vec<CloudMcpDeviceLiv
             .unwrap_or_default()
             .saturating_sub(CLOUD_MCP_TOKENOMICS_BUCKET_ACK_WINDOW_GRACE_MS);
         for row in &group.rows {
-            let active = cloud_mcp_tokenomics_bucket_status_active(row.acked_at_ms, &row.status);
+            let effective_status =
+                cloud_mcp_effective_live_unit_outbox_status(&row.status, row.updated_at_ms, now);
+            let active =
+                cloud_mcp_tokenomics_bucket_status_active(row.acked_at_ms, &effective_status);
             if !active && row.acked_at_ms > 0 && row.acked_at_ms >= recent_ack_floor {
                 activity.progress_done = activity.progress_done.saturating_add(1);
                 latest_updated_ms = latest_updated_ms.max(row.acked_at_ms);
@@ -6014,21 +6026,11 @@ async fn cloud_mcp_send_event_over_app_ws_once(
         Ok(Err(_)) => {
             state.global_ws_pending.lock().await.remove(&request_id);
             cloud_mcp_fail_sync_activity_key(&sync_activity_key);
-            cloud_mcp_mark_global_ws_disconnected(
-                state,
-                "Cloud MCP app websocket event response was cancelled.",
-            )
-            .await;
             return Err("Cloud MCP app websocket event response was cancelled.".to_string());
         }
         Err(_) => {
             state.global_ws_pending.lock().await.remove(&request_id);
             cloud_mcp_fail_sync_activity_key(&sync_activity_key);
-            cloud_mcp_mark_global_ws_disconnected(
-                state,
-                "Cloud MCP app websocket event request timed out.",
-            )
-            .await;
             return Err("Cloud MCP app websocket event request timed out.".to_string());
         }
     };
@@ -6158,7 +6160,7 @@ async fn cloud_mcp_auth_material_present(state: &CloudMcpState) -> bool {
 const CLOUD_MCP_OUTBOX_AUTH_WAIT_RETRY_MS: u64 = 3_000;
 
 async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
-    cloud_mcp_outbox_recover_stale_in_flight_once();
+    cloud_mcp_outbox_recover_stale_in_flight();
     loop {
         tokio::select! {
             _ = state.background_sync.notify.notified() => {}
@@ -6167,6 +6169,7 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
         sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS)).await;
 
         loop {
+            cloud_mcp_outbox_recover_stale_in_flight();
             if !cloud_mcp_auth_material_present(&state).await {
                 // Hold the backlog instead of failing every row; re-check
                 // shortly (sign-in also notifies through the ready path).
@@ -11220,8 +11223,9 @@ fn cloud_mcp_loopspaces_payload(value: &Value) -> Value {
 fn cloud_mcp_loopspace_scope_key(value: Option<&Value>) -> String {
     value
         .and_then(|payload| {
-            cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"])
-                .or_else(|| cloud_mcp_payload_text(payload, &["billing_scope_key", "billingScopeKey"]))
+            cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"]).or_else(|| {
+                cloud_mcp_payload_text(payload, &["billing_scope_key", "billingScopeKey"])
+            })
         })
         .unwrap_or_else(cloud_mcp_process_account_scope_key)
 }
@@ -11251,10 +11255,7 @@ fn cloud_mcp_loopspace_sync_state_from_conn(
     })
 }
 
-fn cloud_mcp_loopspace_local_count_from_conn(
-    conn: &rusqlite::Connection,
-    scope_key: &str,
-) -> i64 {
+fn cloud_mcp_loopspace_local_count_from_conn(conn: &rusqlite::Connection, scope_key: &str) -> i64 {
     conn.query_row(
         &format!(
             "SELECT COUNT(1)
@@ -11292,8 +11293,9 @@ fn cloud_mcp_loopspace_sync_resume_domain(reason: &str) -> Value {
                 0,
             )
         });
-    let store_empty =
-        sync_state.server_cursor <= 0 && sync_state.manifest_hash.trim().is_empty() && local_count == 0;
+    let store_empty = sync_state.server_cursor <= 0
+        && sync_state.manifest_hash.trim().is_empty()
+        && local_count == 0;
     json!({
         "c": "loopspaces.sync",
         "contract": CLOUD_MCP_LOOPSPACES_CONTRACT,
@@ -11319,7 +11321,9 @@ fn cloud_mcp_loopspace_sync_resume_domain(reason: &str) -> Value {
     })
 }
 
-fn cloud_mcp_loopspace_normalized_row(row: &Value) -> Option<(String, String, i64, i64, i64, Value)> {
+fn cloud_mcp_loopspace_normalized_row(
+    row: &Value,
+) -> Option<(String, String, i64, i64, i64, Value)> {
     let loopspace_id = cloud_mcp_payload_text(row, &["id", "loopspace_id", "loopspaceId"])?;
     let loopspace_id = loopspace_id.trim().to_string();
     if loopspace_id.is_empty() {
@@ -11329,7 +11333,9 @@ fn cloud_mcp_loopspace_normalized_row(row: &Value) -> Option<(String, String, i6
         .unwrap_or_else(|| loopspace_id.clone())
         .trim()
         .to_string();
-    let revision = cloud_mcp_payload_i64(row, &["revision"]).unwrap_or(0).max(0);
+    let revision = cloud_mcp_payload_i64(row, &["revision"])
+        .unwrap_or(0)
+        .max(0);
     let server_seq = cloud_mcp_payload_i64(row, &["server_seq", "serverSeq"])
         .unwrap_or(revision)
         .max(revision)
@@ -11349,7 +11355,14 @@ fn cloud_mcp_loopspace_normalized_row(row: &Value) -> Option<(String, String, i6
         object.insert("sort_order".to_string(), json!(sort_order));
         object.insert("sortOrder".to_string(), json!(sort_order));
     }
-    Some((loopspace_id, name, revision, server_seq, sort_order, normalized))
+    Some((
+        loopspace_id,
+        name,
+        revision,
+        server_seq,
+        sort_order,
+        normalized,
+    ))
 }
 
 fn cloud_mcp_loopspace_upsert_row(
@@ -11532,7 +11545,10 @@ async fn cloud_mcp_apply_loopspaces_sync_data(
         let mode = cloud_mcp_payload_text(&payload, &["m", "mode"]).unwrap_or_default();
         let snapshot_full =
             cloud_mcp_payload_bool(&payload, &["snapshot_full", "snapshotFull"], false)
-                || matches!(mode.trim().to_ascii_lowercase().as_str(), "snapshot" | "full");
+                || matches!(
+                    mode.trim().to_ascii_lowercase().as_str(),
+                    "snapshot" | "full"
+                );
         let mut changed = false;
         if snapshot_full {
             conn.execute(
@@ -11561,7 +11577,9 @@ async fn cloud_mcp_apply_loopspaces_sync_data(
         for removed_key in ["removed_loopspaces", "removedLoopspaces"] {
             if let Some(removed) = payload.get(removed_key).and_then(Value::as_array) {
                 for row in removed {
-                    if let Some(id) = cloud_mcp_payload_text(row, &["id", "loopspace_id", "loopspaceId"]) {
+                    if let Some(id) =
+                        cloud_mcp_payload_text(row, &["id", "loopspace_id", "loopspaceId"])
+                    {
                         changed |= cloud_mcp_loopspace_delete_row(&conn, &scope_key, &id)?;
                     }
                 }
@@ -11584,8 +11602,9 @@ async fn cloud_mcp_apply_loopspaces_sync_data(
         .unwrap_or(current_state.server_cursor)
         .max(current_state.server_cursor)
         .max(0);
-        let manifest_hash = cloud_mcp_payload_text(&payload, &["manifest_hash", "manifestHash", "mh"])
-            .unwrap_or(current_state.manifest_hash);
+        let manifest_hash =
+            cloud_mcp_payload_text(&payload, &["manifest_hash", "manifestHash", "mh"])
+                .unwrap_or(current_state.manifest_hash);
         conn.execute(
             &format!(
                 "INSERT INTO {CLOUD_MCP_LOOPSPACE_SYNC_STATE_TABLE}(
@@ -11663,19 +11682,27 @@ fn cloud_mcp_loopspace_sync_payload(reason: &str) -> Value {
                 0,
             )
         });
-    let store_empty =
-        sync_state.server_cursor <= 0 && sync_state.manifest_hash.trim().is_empty() && local_count == 0;
+    let store_empty = sync_state.server_cursor <= 0
+        && sync_state.manifest_hash.trim().is_empty()
+        && local_count == 0;
     if let Some(object) = payload.as_object_mut() {
         object.insert(
             "m".to_string(),
-            json!(if sync_state.server_cursor > 0 { "delta" } else { "hello" }),
+            json!(if sync_state.server_cursor > 0 {
+                "delta"
+            } else {
+                "hello"
+            }),
         );
         object.insert("cursor".to_string(), json!(sync_state.server_cursor));
         object.insert("server_seq".to_string(), json!(sync_state.server_cursor));
         object.insert("serverSeq".to_string(), json!(sync_state.server_cursor));
         object.insert("server_cursor".to_string(), json!(sync_state.server_cursor));
         object.insert("serverCursor".to_string(), json!(sync_state.server_cursor));
-        object.insert("manifest_hash".to_string(), json!(sync_state.manifest_hash.clone()));
+        object.insert(
+            "manifest_hash".to_string(),
+            json!(sync_state.manifest_hash.clone()),
+        );
         object.insert("manifestHash".to_string(), json!(sync_state.manifest_hash));
         object.insert("store_empty".to_string(), json!(store_empty));
         object.insert("storeEmpty".to_string(), json!(store_empty));
@@ -11714,8 +11741,9 @@ async fn cloud_mcp_send_loopspace_mutation(
     match cloud_mcp_send_loopspace_sync_request(state, &payload, reason).await {
         Ok(value) => Ok(value),
         Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {
-            let key = cloud_mcp_payload_text(&payload, &["pid", "client_request_id", "clientRequestId"])
-                .unwrap_or_else(|| format!("loopspaces.sync:{}", uuid::Uuid::new_v4()));
+            let key =
+                cloud_mcp_payload_text(&payload, &["pid", "client_request_id", "clientRequestId"])
+                    .unwrap_or_else(|| format!("loopspaces.sync:{}", uuid::Uuid::new_v4()));
             cloud_mcp_enqueue_background_sync(
                 state,
                 key,
@@ -11729,8 +11757,14 @@ async fn cloud_mcp_send_loopspace_mutation(
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("queued".to_string(), json!(true));
                 object.insert("durable".to_string(), json!(true));
-                object.insert("sync_error".to_string(), json!(clean_terminal_telemetry_text(&error)));
-                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                object.insert(
+                    "sync_error".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
+                object.insert(
+                    "syncError".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
             }
             Ok(snapshot)
         }
@@ -11739,25 +11773,29 @@ async fn cloud_mcp_send_loopspace_mutation(
 }
 
 #[tauri::command]
-async fn cloud_mcp_get_loopspaces(
-    _state: State<'_, CloudMcpState>,
-) -> Result<Value, String> {
+async fn cloud_mcp_get_loopspaces(_state: State<'_, CloudMcpState>) -> Result<Value, String> {
     cloud_mcp_get_loopspaces_snapshot()
 }
 
 #[tauri::command]
-async fn cloud_mcp_sync_loopspaces(
-    state: State<'_, CloudMcpState>,
-) -> Result<Value, String> {
+async fn cloud_mcp_sync_loopspaces(state: State<'_, CloudMcpState>) -> Result<Value, String> {
     let payload = cloud_mcp_loopspace_sync_payload("manual_loopspaces_sync");
-    match cloud_mcp_send_loopspace_sync_request(state.inner(), &payload, "manual_loopspaces_sync").await {
+    match cloud_mcp_send_loopspace_sync_request(state.inner(), &payload, "manual_loopspaces_sync")
+        .await
+    {
         Ok(value) => Ok(value),
         Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {
             let mut snapshot = cloud_mcp_get_loopspaces_snapshot()?;
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("remote".to_string(), json!(false));
-                object.insert("sync_error".to_string(), json!(clean_terminal_telemetry_text(&error)));
-                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                object.insert(
+                    "sync_error".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
+                object.insert(
+                    "syncError".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
             }
             Ok(snapshot)
         }
@@ -11774,12 +11812,22 @@ async fn cloud_mcp_create_loopspace(
     if name.is_empty() {
         return Err("Loop name is required.".to_string());
     }
-    let client_request_id = format!("loopspace-create-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    let client_request_id = format!(
+        "loopspace-create-{}-{}",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    );
     let mut payload = cloud_mcp_loopspace_request_base("commit", "loopspace_create");
     if let Some(object) = payload.as_object_mut() {
         object.insert("pid".to_string(), json!(client_request_id.clone()));
-        object.insert("client_request_id".to_string(), json!(client_request_id.clone()));
-        object.insert("clientRequestId".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "clientRequestId".to_string(),
+            json!(client_request_id.clone()),
+        );
         object.insert(
             "ops".to_string(),
             json!([{
@@ -11806,12 +11854,22 @@ async fn cloud_mcp_rename_loopspace(
     if name.is_empty() {
         return Err("Loop name is required.".to_string());
     }
-    let client_request_id = format!("loopspace-rename-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    let client_request_id = format!(
+        "loopspace-rename-{}-{}",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    );
     let mut payload = cloud_mcp_loopspace_request_base("commit", "loopspace_rename");
     if let Some(object) = payload.as_object_mut() {
         object.insert("pid".to_string(), json!(client_request_id.clone()));
-        object.insert("client_request_id".to_string(), json!(client_request_id.clone()));
-        object.insert("clientRequestId".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "clientRequestId".to_string(),
+            json!(client_request_id.clone()),
+        );
         object.insert(
             "ops".to_string(),
             json!([{
@@ -11834,12 +11892,22 @@ async fn cloud_mcp_delete_loopspace(
     if loopspace_id.is_empty() {
         return Err("Loop id is required.".to_string());
     }
-    let client_request_id = format!("loopspace-delete-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    let client_request_id = format!(
+        "loopspace-delete-{}-{}",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    );
     let mut payload = cloud_mcp_loopspace_request_base("commit", "loopspace_delete");
     if let Some(object) = payload.as_object_mut() {
         object.insert("pid".to_string(), json!(client_request_id.clone()));
-        object.insert("client_request_id".to_string(), json!(client_request_id.clone()));
-        object.insert("clientRequestId".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "clientRequestId".to_string(),
+            json!(client_request_id.clone()),
+        );
         object.insert(
             "ops".to_string(),
             json!([{
@@ -11969,8 +12037,9 @@ fn cloud_mcp_loopspace_trigger_sync_resume_domain(reason: &str) -> Value {
                 0,
             )
         });
-    let store_empty =
-        sync_state.server_cursor <= 0 && sync_state.manifest_hash.trim().is_empty() && local_count == 0;
+    let store_empty = sync_state.server_cursor <= 0
+        && sync_state.manifest_hash.trim().is_empty()
+        && local_count == 0;
     json!({
         "c": "loopspace_triggers.sync",
         "contract": CLOUD_MCP_LOOPSPACE_TRIGGERS_CONTRACT,
@@ -12015,7 +12084,18 @@ fn cloud_mcp_loopspace_trigger_ids_from_row(row: &Value) -> Vec<String> {
 
 fn cloud_mcp_loopspace_trigger_normalized_row(
     row: &Value,
-) -> Option<(String, String, String, bool, i64, i64, i64, i64, String, Value)> {
+) -> Option<(
+    String,
+    String,
+    String,
+    bool,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    Value,
+)> {
     let trigger_id = cloud_mcp_payload_text(row, &["id", "trigger_id", "triggerId"])?;
     let trigger_id = trigger_id.trim().to_string();
     if trigger_id.is_empty() {
@@ -12030,15 +12110,19 @@ fn cloud_mcp_loopspace_trigger_normalized_row(
         .trim()
         .to_string();
     let enabled = cloud_mcp_payload_bool(row, &["enabled"], true);
-    let revision = cloud_mcp_payload_i64(row, &["revision"]).unwrap_or(0).max(0);
+    let revision = cloud_mcp_payload_i64(row, &["revision"])
+        .unwrap_or(0)
+        .max(0);
     let server_seq = cloud_mcp_payload_i64(row, &["server_seq", "serverSeq"])
         .unwrap_or(revision)
         .max(revision)
         .max(0);
-    let next_due_at_ms =
-        cloud_mcp_payload_i64(row, &["next_due_at_ms", "nextDueAtMs"]).unwrap_or(0).max(0);
-    let last_run_at_ms =
-        cloud_mcp_payload_i64(row, &["last_run_at_ms", "lastRunAtMs"]).unwrap_or(0).max(0);
+    let next_due_at_ms = cloud_mcp_payload_i64(row, &["next_due_at_ms", "nextDueAtMs"])
+        .unwrap_or(0)
+        .max(0);
+    let last_run_at_ms = cloud_mcp_payload_i64(row, &["last_run_at_ms", "lastRunAtMs"])
+        .unwrap_or(0)
+        .max(0);
     let last_status = cloud_mcp_payload_text(row, &["last_status", "lastStatus"])
         .unwrap_or_default()
         .trim()
@@ -12053,8 +12137,14 @@ fn cloud_mcp_loopspace_trigger_normalized_row(
         object.insert("triggerType".to_string(), json!(trigger_type.clone()));
         object.insert("name".to_string(), json!(name.clone()));
         object.insert("enabled".to_string(), json!(enabled));
-        object.insert("loopspace_ids".to_string(), json!(cloud_mcp_loopspace_trigger_ids_from_row(row)));
-        object.insert("loopspaceIds".to_string(), json!(cloud_mcp_loopspace_trigger_ids_from_row(row)));
+        object.insert(
+            "loopspace_ids".to_string(),
+            json!(cloud_mcp_loopspace_trigger_ids_from_row(row)),
+        );
+        object.insert(
+            "loopspaceIds".to_string(),
+            json!(cloud_mcp_loopspace_trigger_ids_from_row(row)),
+        );
         object.insert("revision".to_string(), json!(revision));
         object.insert("server_seq".to_string(), json!(server_seq));
         object.insert("serverSeq".to_string(), json!(server_seq));
@@ -12191,10 +12281,12 @@ fn cloud_mcp_loopspace_trigger_run_normalized_row(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let created_at_ms =
-        cloud_mcp_payload_i64(row, &["created_at_ms", "createdAtMs"]).unwrap_or(0).max(0);
-    let completed_at_ms =
-        cloud_mcp_payload_i64(row, &["completed_at_ms", "completedAtMs"]).unwrap_or(0).max(0);
+    let created_at_ms = cloud_mcp_payload_i64(row, &["created_at_ms", "createdAtMs"])
+        .unwrap_or(0)
+        .max(0);
+    let completed_at_ms = cloud_mcp_payload_i64(row, &["completed_at_ms", "completedAtMs"])
+        .unwrap_or(0)
+        .max(0);
     let mut normalized = row.clone();
     if let Some(object) = normalized.as_object_mut() {
         object.insert("id".to_string(), json!(run_id.clone()));
@@ -12227,8 +12319,15 @@ fn cloud_mcp_loopspace_trigger_run_upsert_row(
     scope_key: &str,
     row: &Value,
 ) -> Result<bool, String> {
-    let Some((run_id, trigger_id, trigger_type, status, created_at_ms, completed_at_ms, normalized)) =
-        cloud_mcp_loopspace_trigger_run_normalized_row(row)
+    let Some((
+        run_id,
+        trigger_id,
+        trigger_type,
+        status,
+        created_at_ms,
+        completed_at_ms,
+        normalized,
+    )) = cloud_mcp_loopspace_trigger_run_normalized_row(row)
     else {
         return Ok(false);
     };
@@ -12413,13 +12512,17 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
     let payload = cloud_mcp_loopspace_triggers_payload(value);
     let scope_key = cloud_mcp_loopspace_scope_key(Some(&payload));
     let conn = cloud_mcp_open_outbox_conn()?;
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|error| format!("Unable to start loopspace trigger mirror transaction: {error}"))?;
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|error| {
+        format!("Unable to start loopspace trigger mirror transaction: {error}")
+    })?;
     let result = (|| -> Result<Value, String> {
         let mode = cloud_mcp_payload_text(&payload, &["m", "mode"]).unwrap_or_default();
         let snapshot_full =
             cloud_mcp_payload_bool(&payload, &["snapshot_full", "snapshotFull"], false)
-                || matches!(mode.trim().to_ascii_lowercase().as_str(), "snapshot" | "full");
+                || matches!(
+                    mode.trim().to_ascii_lowercase().as_str(),
+                    "snapshot" | "full"
+                );
         let mut changed = false;
         if snapshot_full {
             conn.execute(
@@ -12429,7 +12532,9 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
                 ),
                 rusqlite::params![scope_key],
             )
-            .map_err(|error| format!("Unable to replace loopspace trigger mirror snapshot: {error}"))?;
+            .map_err(|error| {
+                format!("Unable to replace loopspace trigger mirror snapshot: {error}")
+            })?;
             conn.execute(
                 &format!(
                     "DELETE FROM {CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE}
@@ -12437,7 +12542,9 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
                 ),
                 rusqlite::params![scope_key],
             )
-            .map_err(|error| format!("Unable to replace loopspace trigger run mirror snapshot: {error}"))?;
+            .map_err(|error| {
+                format!("Unable to replace loopspace trigger run mirror snapshot: {error}")
+            })?;
             changed = true;
         }
 
@@ -12466,10 +12573,9 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
         for removed_key in ["removed_triggers", "removedTriggers"] {
             if let Some(removed) = payload.get(removed_key).and_then(Value::as_array) {
                 for row in removed {
-                    let id = row
-                        .as_str()
-                        .map(str::to_string)
-                        .or_else(|| cloud_mcp_payload_text(row, &["id", "trigger_id", "triggerId"]));
+                    let id = row.as_str().map(str::to_string).or_else(|| {
+                        cloud_mcp_payload_text(row, &["id", "trigger_id", "triggerId"])
+                    });
                     if let Some(id) = id {
                         changed |= cloud_mcp_loopspace_trigger_delete_row(&conn, &scope_key, &id)?;
                     }
@@ -12493,8 +12599,9 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
         .unwrap_or(current_state.server_cursor)
         .max(current_state.server_cursor)
         .max(0);
-        let manifest_hash = cloud_mcp_payload_text(&payload, &["manifest_hash", "manifestHash", "mh"])
-            .unwrap_or(current_state.manifest_hash);
+        let manifest_hash =
+            cloud_mcp_payload_text(&payload, &["manifest_hash", "manifestHash", "mh"])
+                .unwrap_or(current_state.manifest_hash);
         conn.execute(
             &format!(
                 "INSERT INTO {CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE}(
@@ -12524,8 +12631,9 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
         Ok(snapshot)
     })();
     if result.is_ok() {
-        conn.execute_batch("COMMIT")
-            .map_err(|error| format!("Unable to commit loopspace trigger mirror transaction: {error}"))?;
+        conn.execute_batch("COMMIT").map_err(|error| {
+            format!("Unable to commit loopspace trigger mirror transaction: {error}")
+        })?;
     } else {
         let _ = conn.execute_batch("ROLLBACK");
     }
@@ -12571,19 +12679,27 @@ fn cloud_mcp_loopspace_trigger_sync_payload(reason: &str) -> Value {
                 0,
             )
         });
-    let store_empty =
-        sync_state.server_cursor <= 0 && sync_state.manifest_hash.trim().is_empty() && local_count == 0;
+    let store_empty = sync_state.server_cursor <= 0
+        && sync_state.manifest_hash.trim().is_empty()
+        && local_count == 0;
     if let Some(object) = payload.as_object_mut() {
         object.insert(
             "m".to_string(),
-            json!(if sync_state.server_cursor > 0 { "delta" } else { "hello" }),
+            json!(if sync_state.server_cursor > 0 {
+                "delta"
+            } else {
+                "hello"
+            }),
         );
         object.insert("cursor".to_string(), json!(sync_state.server_cursor));
         object.insert("server_seq".to_string(), json!(sync_state.server_cursor));
         object.insert("serverSeq".to_string(), json!(sync_state.server_cursor));
         object.insert("server_cursor".to_string(), json!(sync_state.server_cursor));
         object.insert("serverCursor".to_string(), json!(sync_state.server_cursor));
-        object.insert("manifest_hash".to_string(), json!(sync_state.manifest_hash.clone()));
+        object.insert(
+            "manifest_hash".to_string(),
+            json!(sync_state.manifest_hash.clone()),
+        );
         object.insert("manifestHash".to_string(), json!(sync_state.manifest_hash));
         object.insert("store_empty".to_string(), json!(store_empty));
         object.insert("storeEmpty".to_string(), json!(store_empty));
@@ -12627,8 +12743,9 @@ async fn cloud_mcp_send_loopspace_trigger_mutation(
     match cloud_mcp_send_loopspace_trigger_sync_request(state, &payload, reason).await {
         Ok(value) => Ok(value),
         Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {
-            let key = cloud_mcp_payload_text(&payload, &["pid", "client_request_id", "clientRequestId"])
-                .unwrap_or_else(|| format!("loopspace_triggers.sync:{}", uuid::Uuid::new_v4()));
+            let key =
+                cloud_mcp_payload_text(&payload, &["pid", "client_request_id", "clientRequestId"])
+                    .unwrap_or_else(|| format!("loopspace_triggers.sync:{}", uuid::Uuid::new_v4()));
             cloud_mcp_enqueue_background_sync(
                 state,
                 key,
@@ -12642,8 +12759,14 @@ async fn cloud_mcp_send_loopspace_trigger_mutation(
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("queued".to_string(), json!(true));
                 object.insert("durable".to_string(), json!(true));
-                object.insert("sync_error".to_string(), json!(clean_terminal_telemetry_text(&error)));
-                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                object.insert(
+                    "sync_error".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
+                object.insert(
+                    "syncError".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
             }
             Ok(snapshot)
         }
@@ -12652,9 +12775,7 @@ async fn cloud_mcp_send_loopspace_trigger_mutation(
 }
 
 fn cloud_mcp_loopspace_trigger_config_for_command(config: Option<Value>) -> Value {
-    config
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}))
+    config.filter(Value::is_object).unwrap_or_else(|| json!({}))
 }
 
 fn cloud_mcp_loopspace_trigger_ids_for_command(loopspace_ids: Option<Vec<String>>) -> Vec<String> {
@@ -12692,8 +12813,14 @@ async fn cloud_mcp_sync_loopspace_triggers(
             let mut snapshot = cloud_mcp_get_loopspace_triggers_snapshot()?;
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("remote".to_string(), json!(false));
-                object.insert("sync_error".to_string(), json!(clean_terminal_telemetry_text(&error)));
-                object.insert("syncError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                object.insert(
+                    "sync_error".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
+                object.insert(
+                    "syncError".to_string(),
+                    json!(clean_terminal_telemetry_text(&error)),
+                );
             }
             Ok(snapshot)
         }
@@ -12736,8 +12863,14 @@ async fn cloud_mcp_create_loopspace_trigger(
         cloud_mcp_loopspace_trigger_request_base("commit", "loopspace_trigger_create");
     if let Some(object) = payload.as_object_mut() {
         object.insert("pid".to_string(), json!(client_request_id.clone()));
-        object.insert("client_request_id".to_string(), json!(client_request_id.clone()));
-        object.insert("clientRequestId".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "clientRequestId".to_string(),
+            json!(client_request_id.clone()),
+        );
         object.insert(
             "ops".to_string(),
             json!([{
@@ -12754,12 +12887,8 @@ async fn cloud_mcp_create_loopspace_trigger(
             }]),
         );
     }
-    cloud_mcp_send_loopspace_trigger_mutation(
-        state.inner(),
-        payload,
-        "loopspace_trigger_create",
-    )
-    .await
+    cloud_mcp_send_loopspace_trigger_mutation(state.inner(), payload, "loopspace_trigger_create")
+        .await
 }
 
 #[tauri::command]
@@ -12823,16 +12952,15 @@ async fn cloud_mcp_update_loopspace_trigger(
         cloud_mcp_loopspace_trigger_request_base("commit", "loopspace_trigger_update");
     if let Some(object) = payload.as_object_mut() {
         object.insert("pid".to_string(), json!(client_request_id.clone()));
-        object.insert("client_request_id".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
         object.insert("clientRequestId".to_string(), json!(client_request_id));
         object.insert("ops".to_string(), json!([op]));
     }
-    cloud_mcp_send_loopspace_trigger_mutation(
-        state.inner(),
-        payload,
-        "loopspace_trigger_update",
-    )
-    .await
+    cloud_mcp_send_loopspace_trigger_mutation(state.inner(), payload, "loopspace_trigger_update")
+        .await
 }
 
 #[tauri::command]
@@ -12853,8 +12981,14 @@ async fn cloud_mcp_delete_loopspace_trigger(
         cloud_mcp_loopspace_trigger_request_base("commit", "loopspace_trigger_delete");
     if let Some(object) = payload.as_object_mut() {
         object.insert("pid".to_string(), json!(client_request_id.clone()));
-        object.insert("client_request_id".to_string(), json!(client_request_id.clone()));
-        object.insert("clientRequestId".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "clientRequestId".to_string(),
+            json!(client_request_id.clone()),
+        );
         object.insert(
             "ops".to_string(),
             json!([{
@@ -12866,12 +13000,8 @@ async fn cloud_mcp_delete_loopspace_trigger(
             }]),
         );
     }
-    cloud_mcp_send_loopspace_trigger_mutation(
-        state.inner(),
-        payload,
-        "loopspace_trigger_delete",
-    )
-    .await
+    cloud_mcp_send_loopspace_trigger_mutation(state.inner(), payload, "loopspace_trigger_delete")
+        .await
 }
 
 fn cloud_mcp_account_sync_resume_todo_domain(reason: &str) -> Value {
@@ -13004,7 +13134,6 @@ async fn cloud_mcp_account_sync_resume_payload(reason: &str) -> Value {
                 "v": 2,
                 "h": documents_have,
                 "store_empty": documents_store_empty,
-                "storeEmpty": documents_store_empty,
                 "reason": reason,
                 "source": "rust-diffforge-account-sync-resume",
             },
@@ -13070,7 +13199,8 @@ async fn cloud_mcp_apply_account_sync_resume_response(
         response,
         &["loopspaces", "loops", "loop_spaces", "loopSpaces"],
     ) {
-        match cloud_mcp_apply_loopspaces_sync_data(state, &loopspaces, "account_sync_resume").await {
+        match cloud_mcp_apply_loopspaces_sync_data(state, &loopspaces, "account_sync_resume").await
+        {
             Ok(snapshot) => {
                 let _ = state.global_ws_events.send(json!({
                     "kind": "loopspaces.sync",
@@ -13130,10 +13260,9 @@ async fn cloud_mcp_apply_account_sync_resume_response(
             }
         }
     }
-    if let Some(documents) = cloud_mcp_account_sync_resume_domain(
-        response,
-        &["documents", "docs", "account_documents", "accountDocuments"],
-    ) {
+    if let Some(documents) =
+        cloud_mcp_account_sync_resume_domain(response, &["documents", "docs", "account_documents"])
+    {
         match cloud_mcp_apply_account_documents_sync_data_with_hydration(
             state,
             &documents,
@@ -13145,7 +13274,6 @@ async fn cloud_mcp_apply_account_sync_resume_response(
                 let _ = state.global_ws_events.send(json!({
                     "kind": "doc.sync",
                     "event_kind": "doc.sync",
-                    "eventKind": "doc.sync",
                     "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
                     "c": "doc.sync",
                     "d": "documents",
@@ -13306,7 +13434,13 @@ fn cloud_mcp_initial_account_snapshot(
 ) -> Option<Value> {
     message
         .get(snake_key)
-        .or_else(|| message.get(camel_key))
+        .or_else(|| {
+            if camel_key.is_empty() {
+                None
+            } else {
+                message.get(camel_key)
+            }
+        })
         .cloned()
         .filter(|value| !value.is_null())
 }
@@ -13508,18 +13642,11 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 });
             }
         }
-        if let Some(initial_account_documents) = cloud_mcp_initial_account_snapshot(
-            &message,
-            "initial_account_documents",
-            "initialAccountDocuments",
-        )
-        .or_else(|| {
-            cloud_mcp_initial_account_snapshot(
-                &message,
-                "initial_account_docs",
-                "initialAccountDocs",
+        if let Some(initial_account_documents) =
+            cloud_mcp_initial_account_snapshot(&message, "initial_account_documents", "").or_else(
+                || cloud_mcp_initial_account_snapshot(&message, "initial_account_docs", ""),
             )
-        }) {
+        {
             match cloud_mcp_apply_account_documents_sync_data_with_hydration(
                 state,
                 &initial_account_documents,
@@ -13531,7 +13658,6 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                     let _ = state.global_ws_events.send(json!({
                         "kind": "doc.sync",
                         "event_kind": "doc.sync",
-                        "eventKind": "doc.sync",
                         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
                         "c": "doc.sync",
                         "d": "documents",
@@ -13814,7 +13940,6 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 let _ = state.global_ws_events.send(json!({
                     "kind": "doc.sync",
                     "event_kind": "doc.sync",
-                    "eventKind": "doc.sync",
                     "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
                     "c": "doc.sync",
                     "d": "documents",
@@ -14000,7 +14125,6 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                     let _ = state.global_ws_events.send(json!({
                         "kind": "doc.sync",
                         "event_kind": "doc.sync",
-                        "eventKind": "doc.sync",
                         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
                         "c": "doc.sync",
                         "d": "documents",
@@ -14036,7 +14160,8 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 .global_ws_events
                 .send(cloud_mcp_account_asset_local_projection_event(&event_kind));
         } else if is_loopspaces_sync_event {
-            match cloud_mcp_apply_loopspaces_sync_data(state, &event, "loopspaces_cloud_event").await
+            match cloud_mcp_apply_loopspaces_sync_data(state, &event, "loopspaces_cloud_event")
+                .await
             {
                 Ok(snapshot) => {
                     let _ = state.global_ws_events.send(json!({
@@ -14885,23 +15010,28 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if cloud_mcp_is_account_documents_sync_wake_event(&event_kind, &event) {
-                let event_to_emit = match cloud_mcp_apply_account_documents_sync_data_with_hydration(
-                    &state_clone,
-                    &event,
-                    "remote_command_listener_documents",
-                )
-                .await
-                {
-                    Ok(applied) => applied,
-                    Err(error) => {
-                        log_cloud_sync_event(
-                            "account_documents.listener_apply_error",
-                            json!({
-                                "event_kind": event_kind,
-                                "error": clean_terminal_telemetry_text(&error),
-                            }),
-                        );
-                        event.clone()
+                let event_to_emit = match cloud_mcp_account_documents_preapplied_payload(&event) {
+                    Some(applied) => applied,
+                    None => {
+                        match cloud_mcp_apply_account_documents_sync_data_with_hydration(
+                            &state_clone,
+                            &event,
+                            "remote_command_listener_documents",
+                        )
+                        .await
+                        {
+                            Ok(applied) => applied,
+                            Err(error) => {
+                                log_cloud_sync_event(
+                                    "account_documents.listener_apply_error",
+                                    json!({
+                                        "event_kind": event_kind,
+                                        "error": clean_terminal_telemetry_text(&error),
+                                    }),
+                                );
+                                event.clone()
+                            }
+                        }
                     }
                 };
                 let _ = app.emit(CLOUD_MCP_ACCOUNT_DOCUMENTS_UPDATED_EVENT, event_to_emit);
@@ -16442,7 +16572,6 @@ fn cloud_mcp_doc_wire_text(event: &Value, key: &str) -> Option<String> {
 fn cloud_mcp_doc_domain(event: &Value) -> Option<String> {
     cloud_mcp_doc_wire_text(event, "d")
         .or_else(|| cloud_mcp_doc_wire_text(event, "doc_domain"))
-        .or_else(|| cloud_mcp_doc_wire_text(event, "docDomain"))
         .map(|value| value.to_ascii_lowercase())
 }
 
@@ -16451,11 +16580,15 @@ fn cloud_mcp_is_account_documents_sync_wake_event(event_kind: &str, event: &Valu
     if contract.as_deref() == Some(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT) {
         return cloud_mcp_doc_domain(event).as_deref() == Some("documents");
     }
-    let wire_kind = if event_kind.trim().is_empty() {
-        cloud_mcp_doc_wire_text(event, "c").unwrap_or_default()
-    } else {
-        event_kind.trim().to_string()
-    };
+    let legacy_event_kind = cloud_mcp_doc_wire_text(event, "eventKind").is_some();
+    let wire_kind = cloud_mcp_doc_wire_text(event, "c")
+        .or_else(|| cloud_mcp_doc_wire_text(event, "event_kind"))
+        .or_else(|| {
+            (!legacy_event_kind)
+                .then(|| event_kind.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
     if matches!(wire_kind.as_str(), "doc.sync" | "doc.content") {
         return cloud_mcp_doc_domain(event).as_deref() == Some("documents");
     }
@@ -19476,17 +19609,17 @@ async fn cloud_mcp_ws_request_with_timeout(
             .await
         {
             Ok(response) => {
-                let _ = cloud_mcp_ws_note_request_outcome(false);
+                cloud_mcp_ws_note_request_outcome(false);
                 return Ok(response);
             }
             Err(error) => {
                 let timed_out = error.contains("request timed out");
-                let strike_out = cloud_mcp_ws_note_request_outcome(timed_out);
+                cloud_mcp_ws_note_request_outcome(timed_out);
                 if !retry_transient_errors
                     || !cloud_mcp_ws_request_error_is_transient(&error)
                     || attempt > 0
                 {
-                    if strike_out {
+                    if cloud_mcp_ws_request_error_indicates_dead_connection(&error) {
                         cloud_mcp_mark_global_ws_disconnected(state, &error).await;
                         state.global_ws_reconnect.notify_waiters();
                     }
@@ -19494,13 +19627,11 @@ async fn cloud_mcp_ws_request_with_timeout(
                 }
                 last_error = error.clone();
                 // Tear the shared websocket down only when the error proves
-                // the connection itself is gone, or when consecutive request
-                // timeouts strike out. A single request timeout on an
-                // otherwise healthy socket must not kill the connection:
-                // doing so caused a reconnect storm (teardown → ready →
-                // snapshot replay + backlog release → next timeout → repeat)
-                // that flapped the sync pill between Connecting and Syncing.
-                if strike_out || cloud_mcp_ws_request_error_indicates_dead_connection(&error) {
+                // the connection itself is gone. Request timeouts are scoped
+                // to the individual sync unit: the server may still process
+                // that request, and killing the app socket here creates a
+                // reconnect storm under backlog pressure.
+                if cloud_mcp_ws_request_error_indicates_dead_connection(&error) {
                     cloud_mcp_mark_global_ws_disconnected(state, &error).await;
                     state.global_ws_reconnect.notify_waiters();
                 }
@@ -19679,23 +19810,16 @@ fn cloud_mcp_ws_request_error_is_transient(error: &str) -> bool {
 }
 
 static CLOUD_MCP_WS_TIMEOUT_STRIKES: AtomicUsize = AtomicUsize::new(0);
-const CLOUD_MCP_WS_TIMEOUT_STRIKE_LIMIT: usize = 2;
 
-/// Two-strike request-timeout policy: one timeout on a healthy socket is
-/// tolerated (the silence watchdog covers genuinely dead connections), but
-/// consecutive timeouts with no successful response in between indicate a
-/// connection that looks alive yet serves nothing — tear it down.
-fn cloud_mcp_ws_note_request_outcome(timed_out: bool) -> bool {
+/// Request timeouts are telemetry for sync-unit retry/backoff only. The socket
+/// health decision belongs to explicit close/read/write failures and the silence
+/// watchdog, because a slow server response can coexist with a healthy app ws.
+fn cloud_mcp_ws_note_request_outcome(timed_out: bool) {
     if !timed_out {
         CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
-        return false;
+        return;
     }
-    let strikes = CLOUD_MCP_WS_TIMEOUT_STRIKES.fetch_add(1, Ordering::AcqRel) + 1;
-    if strikes >= CLOUD_MCP_WS_TIMEOUT_STRIKE_LIMIT {
-        CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
-        return true;
-    }
-    false
+    CLOUD_MCP_WS_TIMEOUT_STRIKES.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Subset of transient errors that prove the shared websocket itself is dead
@@ -20418,18 +20542,16 @@ async fn cloud_mcp_send_event_now(
                 .get("data")
                 .cloned()
                 .unwrap_or_else(|| response.clone());
-            if let Ok(applied) =
-                cloud_mcp_apply_account_documents_sync_data_with_hydration(
-                    state,
-                    &data,
-                    "documents_outbox_response",
-                )
-                .await
+            if let Ok(applied) = cloud_mcp_apply_account_documents_sync_data_with_hydration(
+                state,
+                &data,
+                "documents_outbox_response",
+            )
+            .await
             {
                 let _ = state.global_ws_events.send(json!({
                     "kind": "doc.sync",
                     "event_kind": "doc.sync",
-                    "eventKind": "doc.sync",
                     "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
                     "c": "doc.sync",
                     "d": "documents",
@@ -23595,12 +23717,12 @@ async fn cloud_mcp_apply_desktop_auth_session(
     let previous_auth = {
         let auth = state.auth.lock().await;
         (
-            auth.desktop_session_token.clone(),
+            auth.desktop_session_token.is_some(),
             auth.billing_scope_type.clone(),
             auth.team_id.clone(),
         )
     };
-    let account_context_changed = previous_auth.0 != desktop_session_token
+    let account_context_changed = previous_auth.0 != desktop_session_token.is_some()
         || previous_auth.1 != billing_scope_type
         || previous_auth.2 != team_id;
     cloud_mcp_remove_legacy_desktop_session(&app);
@@ -26179,29 +26301,13 @@ fn cloud_mcp_normalize_account_document_id(raw: &str) -> String {
 fn cloud_mcp_account_document_explicit_scope_key(input: &Value) -> Option<String> {
     cloud_mcp_payload_text(
         input,
-        &[
-            "scope_key",
-            "scopeKey",
-            "billing_scope_key",
-            "billingScopeKey",
-            "scope",
-            "account_scope",
-            "accountScope",
-        ],
+        &["scope_key", "billing_scope_key", "scope", "account_scope"],
     )
     .or_else(|| {
         input.get("metadata").and_then(|metadata| {
             cloud_mcp_payload_text(
                 metadata,
-                &[
-                    "scope_key",
-                    "scopeKey",
-                    "billing_scope_key",
-                    "billingScopeKey",
-                    "scope",
-                    "account_scope",
-                    "accountScope",
-                ],
+                &["scope_key", "billing_scope_key", "scope", "account_scope"],
             )
         })
     })
@@ -26209,7 +26315,11 @@ fn cloud_mcp_account_document_explicit_scope_key(input: &Value) -> Option<String
 
 fn cloud_mcp_account_document_scope_key(input: &Value) -> String {
     cloud_mcp_account_document_explicit_scope_key(input)
-        .or_else(|| cloud_mcp_payload_scope_key(input))
+        .or_else(|| {
+            let mut canonical = input.clone();
+            cloud_mcp_strip_account_document_wire_aliases(&mut canonical);
+            cloud_mcp_payload_scope_key(&canonical)
+        })
         .unwrap_or_else(cloud_mcp_process_account_scope_key)
 }
 
@@ -26218,30 +26328,21 @@ fn cloud_mcp_account_document_collection(_input: &Value) -> String {
 }
 
 fn cloud_mcp_account_document_id(input: &Value) -> String {
-    cloud_mcp_payload_text(
-        input,
-        &[
-            "document_id",
-            "documentId",
-            "doc_id",
-            "docId",
-            "id",
-        ],
-    )
-    .or_else(|| {
-        input.get("metadata").and_then(|metadata| {
-            cloud_mcp_payload_text(metadata, &["document_id", "documentId", "doc_id", "docId", "id"])
+    cloud_mcp_payload_text(input, &["doc_id", "document_id", "id"])
+        .or_else(|| {
+            input.get("metadata").and_then(|metadata| {
+                cloud_mcp_payload_text(metadata, &["doc_id", "document_id", "id"])
+            })
         })
-    })
-    .map(|value| cloud_mcp_normalize_account_document_id(&value))
-    .filter(|value| !value.trim().is_empty())
-    .unwrap_or_default()
+        .map(|value| cloud_mcp_normalize_account_document_id(&value))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
 }
 
 fn cloud_mcp_account_document_extension(input: &Value, _collection: &str) -> String {
     let explicit = cloud_mcp_payload_text(input, &["extension", "ext", "file_extension"])
         .or_else(|| {
-            cloud_mcp_payload_text(input, &["file_path", "filePath"]).and_then(|path| {
+            cloud_mcp_payload_text(input, &["file_path"]).and_then(|path| {
                 Path::new(&path)
                     .extension()
                     .and_then(|value| value.to_str())
@@ -26249,7 +26350,7 @@ fn cloud_mcp_account_document_extension(input: &Value, _collection: &str) -> Str
             })
         })
         .or_else(|| {
-            cloud_mcp_payload_text(input, &["mime_type", "mimeType"]).and_then(|mime| {
+            cloud_mcp_payload_text(input, &["mime_type"]).and_then(|mime| {
                 let mime = mime.trim().to_ascii_lowercase();
                 if mime == "text/markdown" || mime == "text/x-markdown" {
                     Some("md".to_string())
@@ -26263,13 +26364,16 @@ fn cloud_mcp_account_document_extension(input: &Value, _collection: &str) -> Str
         .trim_start_matches('.')
         .to_ascii_lowercase();
     match explicit.as_str() {
+        "arch" => "arch".to_string(),
         "md" | "markdown" => "md".to_string(),
         _ => "md".to_string(),
     }
 }
 
 fn cloud_mcp_account_document_mime_for_extension(extension: &str) -> &'static str {
-    if extension.eq_ignore_ascii_case("md") {
+    if extension.eq_ignore_ascii_case("arch") {
+        "text/vnd.diffforge.arch"
+    } else if extension.eq_ignore_ascii_case("md") {
         "text/markdown"
     } else {
         "text/plain"
@@ -26303,24 +26407,24 @@ fn cloud_mcp_account_document_local_path_for_parts(
         )))
 }
 
-fn cloud_mcp_account_document_content(input: &Value) -> Option<String> {
+fn cloud_mcp_account_document_inline_content(input: &Value) -> Option<String> {
     cloud_mcp_payload_text(
         input,
         &[
             "content_md",
-            "contentMd",
             "content",
             "body",
             "text",
             "source_text",
-            "sourceText",
             "dsl",
         ],
     )
-    .or_else(|| {
-        cloud_mcp_payload_text(input, &["local_path", "localPath", "path"]).and_then(|path| {
-            fs::read_to_string(&path).ok()
-        })
+}
+
+fn cloud_mcp_account_document_content(input: &Value) -> Option<String> {
+    cloud_mcp_account_document_inline_content(input).or_else(|| {
+        cloud_mcp_payload_text(input, &["local_path", "path"])
+            .and_then(|path| fs::read_to_string(&path).ok())
     })
 }
 
@@ -26328,14 +26432,12 @@ fn cloud_mcp_strip_account_document_content(value: &mut Value) {
     match value {
         Value::Object(object) => {
             for key in [
-            "content",
-            "content_md",
-            "contentMd",
-            "body",
-            "text",
-            "source_text",
-            "sourceText",
-            "dsl",
+                "content",
+                "content_md",
+                "body",
+                "text",
+                "source_text",
+                "dsl",
             ] {
                 object.remove(key);
             }
@@ -26346,6 +26448,88 @@ fn cloud_mcp_strip_account_document_content(value: &mut Value) {
         Value::Array(items) => {
             for item in items {
                 cloud_mcp_strip_account_document_content(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+const CLOUD_MCP_ACCOUNT_DOCUMENT_LEGACY_CAMEL_KEYS: &[&str] = &[
+    "accountDocuments",
+    "accountDocumentsRoot",
+    "accountScope",
+    "assetFolder",
+    "assetId",
+    "billingScopeKey",
+    "blobId",
+    "cloudError",
+    "cloudResponse",
+    "cloudSynced",
+    "cloudTimeoutMs",
+    "collectionId",
+    "contentHash",
+    "contentLength",
+    "contentMd",
+    "contentRevision",
+    "deletedAtMs",
+    "deletedCount",
+    "deletedDocuments",
+    "deletedDocs",
+    "docDomain",
+    "docId",
+    "documentDomain",
+    "documentId",
+    "documentKind",
+    "eventKind",
+    "failedCount",
+    "filePath",
+    "hydratedCount",
+    "hydratedDocuments",
+    "hydrationFailed",
+    "idempotencyKey",
+    "initialAccountDocs",
+    "initialAccountDocuments",
+    "lastSyncError",
+    "lastSyncedAt",
+    "localDeleted",
+    "localOnly",
+    "localPath",
+    "localPathHint",
+    "localSaved",
+    "metaHash",
+    "mimeType",
+    "payloadHash",
+    "removedDocuments",
+    "removedDocs",
+    "requestedCount",
+    "scopeKey",
+    "sizeBytes",
+    "sourceFormat",
+    "sourceKind",
+    "sourceResponse",
+    "sourceText",
+    "storeEmpty",
+    "syncContract",
+    "syncStatus",
+    "syncUnit",
+    "timeoutMs",
+    "updatedAt",
+    "upsertedCount",
+];
+
+fn cloud_mcp_strip_account_document_wire_aliases(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in CLOUD_MCP_ACCOUNT_DOCUMENT_LEGACY_CAMEL_KEYS {
+                object.remove(*key);
+            }
+            for child in object.values_mut() {
+                cloud_mcp_strip_account_document_wire_aliases(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                cloud_mcp_strip_account_document_wire_aliases(item);
             }
         }
         _ => {}
@@ -26423,33 +26607,22 @@ fn cloud_mcp_account_document_metadata_row(
     };
     let content_hash = content_hash
         .map(str::to_string)
-        .or_else(|| {
-            cloud_mcp_payload_text(
-                input,
-                &[
-                    "content_hash",
-                    "contentHash",
-                    "hash",
-                    "sha256",
-                    "content_revision",
-                    "contentRevision",
-                ],
-            )
-        })
+        .or_else(|| cloud_mcp_payload_text(input, &["content_hash", "hash", "sha256"]))
         .unwrap_or_default();
     let size_bytes = size_bytes
-        .or_else(|| cloud_mcp_payload_u64(input, &["size_bytes", "sizeBytes", "content_length", "contentLength"]))
+        .or_else(|| cloud_mcp_payload_u64(input, &["size_bytes", "content_length"]))
         .unwrap_or_default();
     let title = cloud_mcp_account_document_title(input, &document_id);
-    let mime_type = cloud_mcp_payload_text(input, &["mime_type", "mimeType"])
+    let mime_type = cloud_mcp_payload_text(input, &["mime_type"])
         .unwrap_or_else(|| cloud_mcp_account_document_mime_for_extension(&extension).to_string());
-    let updated_at = cloud_mcp_payload_text(input, &["updated_at", "updatedAt"])
-        .unwrap_or_else(cloud_mcp_rfc3339_now);
+    let updated_at =
+        cloud_mcp_payload_text(input, &["updated_at"]).unwrap_or_else(cloud_mcp_rfc3339_now);
     let mut row = input.clone();
     if !row.is_object() {
         row = json!({});
     }
     cloud_mcp_strip_account_document_content(&mut row);
+    cloud_mcp_strip_account_document_wire_aliases(&mut row);
     if let Some(object) = row.as_object_mut() {
         object.insert("kind".to_string(), json!("account_document"));
         object.insert(
@@ -26459,58 +26632,35 @@ fn cloud_mcp_account_document_metadata_row(
         object.insert("c".to_string(), json!("doc.sync"));
         object.insert("d".to_string(), json!("documents"));
         object.insert("scope_key".to_string(), json!(scope_key.clone()));
-        object.insert("scopeKey".to_string(), json!(scope_key.clone()));
         object.insert("collection".to_string(), json!(collection.clone()));
-        object.insert("document_id".to_string(), json!(document_id.clone()));
-        object.insert("documentId".to_string(), json!(document_id.clone()));
         object.insert("doc_id".to_string(), json!(document_id.clone()));
-        object.insert("docId".to_string(), json!(document_id.clone()));
+        object.insert("document_id".to_string(), json!(document_id.clone()));
         object.insert("id".to_string(), json!(document_id.clone()));
         object.insert("title".to_string(), json!(title));
         object.insert("extension".to_string(), json!(extension.clone()));
         object.insert("mime_type".to_string(), json!(mime_type.clone()));
-        object.insert("mimeType".to_string(), json!(mime_type));
         object.insert("content_hash".to_string(), json!(content_hash.clone()));
-        object.insert("contentHash".to_string(), json!(content_hash.clone()));
         object.insert("sha256".to_string(), json!(content_hash.clone()));
         object.insert(
             "size_bytes".to_string(),
             json!(size_bytes.min(i64::MAX as u64) as i64),
         );
         object.insert(
-            "sizeBytes".to_string(),
-            json!(size_bytes.min(i64::MAX as u64) as i64),
-        );
-        object.insert(
             "local_path".to_string(),
             json!(local_path.display().to_string()),
         );
-        object.insert(
-            "localPath".to_string(),
-            json!(local_path.display().to_string()),
-        );
         object.insert("updated_at".to_string(), json!(updated_at.clone()));
-        object.insert("updatedAt".to_string(), json!(updated_at));
         object.insert(
             "sync_status".to_string(),
             json!(sync_status.unwrap_or("local_available")),
         );
-        object.insert(
-            "syncStatus".to_string(),
-            json!(sync_status.unwrap_or("local_available")),
-        );
         if let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) {
             metadata.insert("doc_domain".to_string(), json!("documents"));
-            metadata.insert("docDomain".to_string(), json!("documents"));
             metadata.insert("collection".to_string(), json!(collection));
             metadata.insert("doc_id".to_string(), json!(document_id.clone()));
-            metadata.insert("docId".to_string(), json!(document_id));
+            metadata.insert("document_id".to_string(), json!(document_id));
             metadata.insert(
                 "sync_contract".to_string(),
-                json!(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT),
-            );
-            metadata.insert(
-                "syncContract".to_string(),
                 json!(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT),
             );
         }
@@ -26525,10 +26675,10 @@ fn cloud_mcp_account_document_row_text(row: &Value, keys: &[&str]) -> String {
 fn cloud_mcp_store_account_document_metadata(row: &Value) -> Result<(), String> {
     let mut row = row.clone();
     cloud_mcp_strip_account_document_content(&mut row);
-    let scope_key = cloud_mcp_account_document_row_text(&row, &["scope_key", "scopeKey"]);
+    cloud_mcp_strip_account_document_wire_aliases(&mut row);
+    let scope_key = cloud_mcp_account_document_row_text(&row, &["scope_key"]);
     let collection = cloud_mcp_account_document_row_text(&row, &["collection"]);
-    let document_id =
-        cloud_mcp_account_document_row_text(&row, &["document_id", "documentId", "id"]);
+    let document_id = cloud_mcp_account_document_row_text(&row, &["doc_id", "document_id", "id"]);
     if scope_key.trim().is_empty() || collection.trim().is_empty() || document_id.trim().is_empty()
     {
         return Err("Account document metadata requires scope, collection, and id.".to_string());
@@ -26547,18 +26697,17 @@ fn cloud_mcp_store_account_document_metadata(row: &Value) -> Result<(), String> 
     } else {
         "md".to_string()
     };
-    let mime_type = cloud_mcp_account_document_row_text(&row, &["mime_type", "mimeType"]);
-    let content_hash =
-        cloud_mcp_account_document_row_text(&row, &["content_hash", "contentHash", "sha256"]);
-    let asset_id = cloud_mcp_account_document_row_text(&row, &["asset_id", "assetId"]);
-    let blob_id = cloud_mcp_account_document_row_text(&row, &["blob_id", "blobId"]);
+    let mime_type = cloud_mcp_account_document_row_text(&row, &["mime_type"]);
+    let content_hash = cloud_mcp_account_document_row_text(&row, &["content_hash", "sha256"]);
+    let asset_id = cloud_mcp_account_document_row_text(&row, &["asset_id"]);
+    let blob_id = cloud_mcp_account_document_row_text(&row, &["blob_id"]);
     let sha256 = cloud_mcp_account_document_row_text(&row, &["sha256"]);
-    let size_bytes = cloud_mcp_payload_u64(&row, &["size_bytes", "sizeBytes"])
+    let size_bytes = cloud_mcp_payload_u64(&row, &["size_bytes"])
         .unwrap_or_default()
         .min(i64::MAX as u64) as i64;
-    let local_path = cloud_mcp_account_document_row_text(&row, &["local_path", "localPath"]);
-    let sync_status = cloud_mcp_account_document_row_text(&row, &["sync_status", "syncStatus"]);
-    let updated_at = cloud_mcp_account_document_row_text(&row, &["updated_at", "updatedAt"]);
+    let local_path = cloud_mcp_account_document_row_text(&row, &["local_path"]);
+    let sync_status = cloud_mcp_account_document_row_text(&row, &["sync_status"]);
+    let updated_at = cloud_mcp_account_document_row_text(&row, &["updated_at"]);
     let now_ms = cloud_mcp_now_ms() as i64;
     let _ = conn.execute(
         "DELETE FROM account_document_items
@@ -26627,23 +26776,22 @@ fn cloud_mcp_delete_account_document_cache_row(
             rusqlite::params![scope_key, collection, document_id],
         )
     };
-    result
-    .map_err(|error| format!("Unable to remove account document metadata: {error}"))?;
+    result.map_err(|error| format!("Unable to remove account document metadata: {error}"))?;
     Ok(())
 }
 
-fn cloud_mcp_account_document_cache_rows(input: &Value, limit: usize) -> Result<Vec<Value>, String> {
+fn cloud_mcp_account_document_cache_rows(
+    input: &Value,
+    limit: usize,
+) -> Result<Vec<Value>, String> {
     let conn = cloud_mcp_open_account_documents_cache_conn()?;
     let scope_key = cloud_mcp_account_document_explicit_scope_key(input).unwrap_or_default();
-    let collection = cloud_mcp_payload_text(input, &["collection", "collection_id", "collectionId"])
+    let collection = cloud_mcp_payload_text(input, &["collection", "collection_id"])
         .map(|_| "documents".to_string())
         .unwrap_or_else(|| "documents".to_string());
-    let document_id = cloud_mcp_payload_text(
-        input,
-        &["document_id", "documentId", "doc_id", "docId", "id"],
-    )
-    .map(|value| cloud_mcp_normalize_account_document_id(&value))
-    .unwrap_or_default();
+    let document_id = cloud_mcp_payload_text(input, &["doc_id", "document_id", "id"])
+        .map(|value| cloud_mcp_normalize_account_document_id(&value))
+        .unwrap_or_default();
     let mut sql = "SELECT row_json FROM account_document_items WHERE deleted=0".to_string();
     let mut params = Vec::<String>::new();
     if !scope_key.trim().is_empty() {
@@ -26677,6 +26825,7 @@ fn cloud_mcp_account_document_cache_rows(input: &Value, limit: usize) -> Result<
     for text in mapped.filter_map(Result::ok) {
         if let Ok(mut row) = serde_json::from_str::<Value>(&text) {
             cloud_mcp_strip_account_document_content(&mut row);
+            cloud_mcp_strip_account_document_wire_aliases(&mut row);
             rows.push(row);
         }
     }
@@ -26698,6 +26847,139 @@ fn cloud_mcp_account_document_row_from_cache(
     )
     .ok()
     .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    .map(|mut row| {
+        cloud_mcp_strip_account_document_content(&mut row);
+        cloud_mcp_strip_account_document_wire_aliases(&mut row);
+        row
+    })
+}
+
+fn cloud_mcp_account_document_row_from_cache_by_local_path(
+    scope_key: &str,
+    collection: &str,
+    path: &Path,
+) -> Option<Value> {
+    let conn = cloud_mcp_open_account_documents_cache_conn().ok()?;
+    let local_path = path.display().to_string();
+    conn.query_row(
+        "SELECT row_json FROM account_document_items
+         WHERE scope_key=?1 AND collection=?2 AND local_path=?3 AND deleted=0
+         LIMIT 1",
+        rusqlite::params![scope_key, collection, local_path],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    .map(|mut row| {
+        cloud_mcp_strip_account_document_content(&mut row);
+        cloud_mcp_strip_account_document_wire_aliases(&mut row);
+        row
+    })
+}
+
+fn cloud_mcp_account_document_numbered_sibling_base(stem: &str) -> Option<String> {
+    let stem = stem.trim();
+    let prefix = stem.strip_suffix(')')?;
+    let open = prefix.rfind(" (")?;
+    let digits = &prefix[open + 2..];
+    if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let base = prefix[..open].trim();
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+fn cloud_mcp_account_document_numbered_base_matches(
+    base: &str,
+    document_id: &str,
+    canonical_stem: &str,
+) -> bool {
+    let base = base.trim();
+    if base.is_empty() {
+        return false;
+    }
+    let document_id = document_id.trim();
+    let path_component = cloud_mcp_account_document_path_component(document_id, "document");
+    base.eq_ignore_ascii_case(document_id)
+        || base.eq_ignore_ascii_case(canonical_stem)
+        || base.eq_ignore_ascii_case(&path_component)
+}
+
+fn cloud_mcp_cleanup_account_document_numbered_siblings(
+    scope_key: &str,
+    collection: &str,
+    document_id: &str,
+    extension: &str,
+    canonical_path: &Path,
+    _expected_hash: &str,
+) {
+    let Some(parent) = canonical_path.parent() else {
+        return;
+    };
+    let canonical_stem = canonical_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == canonical_path || !path.is_file() {
+            continue;
+        }
+        let entry_extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !entry_extension.eq_ignore_ascii_case(extension) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(base) = cloud_mcp_account_document_numbered_sibling_base(stem) else {
+            continue;
+        };
+        if !cloud_mcp_account_document_numbered_base_matches(&base, document_id, &canonical_stem) {
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+        let _ = cloud_mcp_delete_account_document_cache_row(scope_key, collection, stem);
+    }
+}
+
+fn cloud_mcp_cleanup_stale_account_document_numbered_cache_rows(scope_key: &str, collection: &str) {
+    let rows = cloud_mcp_account_document_cache_rows(
+        &json!({
+            "scope_key": scope_key,
+            "collection": collection,
+        }),
+        2_000,
+    )
+    .unwrap_or_default();
+    for row in &rows {
+        let document_id =
+            cloud_mcp_account_document_row_text(row, &["doc_id", "document_id", "id"]);
+        let Some(base) = cloud_mcp_account_document_numbered_sibling_base(&document_id) else {
+            continue;
+        };
+        let local_path = cloud_mcp_account_document_row_text(row, &["local_path", "path"]);
+        let local_missing = local_path.trim().is_empty() || !Path::new(&local_path).is_file();
+        let base_exists = rows.iter().any(|candidate| {
+            let candidate_id =
+                cloud_mcp_account_document_row_text(candidate, &["doc_id", "document_id", "id"]);
+            candidate_id.eq_ignore_ascii_case(&base)
+        });
+        if local_missing || base_exists {
+            if !local_path.trim().is_empty() {
+                let _ = fs::remove_file(&local_path);
+            }
+            let _ =
+                cloud_mcp_delete_account_document_cache_row(scope_key, collection, &document_id);
+        }
+    }
 }
 
 fn cloud_mcp_recover_account_document_files(input: &Value) -> Vec<Value> {
@@ -26706,8 +26988,9 @@ fn cloud_mcp_recover_account_document_files(input: &Value) -> Vec<Value> {
         Err(_) => return Vec::new(),
     };
     let scope_key = cloud_mcp_account_document_scope_key(input);
-    let scope_dir =
-        root.join(cloud_mcp_account_document_path_component(&scope_key, "personal"));
+    let scope_dir = root.join(cloud_mcp_account_document_path_component(
+        &scope_key, "personal",
+    ));
     let collections_dir = scope_dir.join("collections");
     let collection_dirs = vec![collections_dir.join("documents")];
     let mut rows = Vec::new();
@@ -26739,6 +27022,15 @@ fn cloud_mcp_recover_account_document_files(input: &Value) -> Vec<Value> {
             let Ok((hash, size_bytes)) = cloud_mcp_file_sha256_and_size(&path) else {
                 continue;
             };
+            if let Some(base) = cloud_mcp_account_document_numbered_sibling_base(stem) {
+                let base_path = collection_dir.join(format!("{base}.{extension}"));
+                if base_path.is_file() {
+                    let _ = fs::remove_file(&path);
+                    let _ =
+                        cloud_mcp_delete_account_document_cache_row(&scope_key, &collection, stem);
+                    continue;
+                }
+            }
             let title = fs::read_to_string(&path)
                 .ok()
                 .and_then(|content| {
@@ -26750,36 +27042,47 @@ fn cloud_mcp_recover_account_document_files(input: &Value) -> Vec<Value> {
                     })
                 })
                 .unwrap_or_else(|| stem.to_string());
+            let existing = cloud_mcp_account_document_row_from_cache_by_local_path(
+                &scope_key,
+                &collection,
+                &path,
+            );
+            let document_id = existing
+                .as_ref()
+                .map(|row| {
+                    cloud_mcp_account_document_row_text(row, &["doc_id", "document_id", "id"])
+                })
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| stem.to_string());
+            let title = existing
+                .as_ref()
+                .map(|row| cloud_mcp_account_document_row_text(row, &["title", "name"]))
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(title);
             let row = json!({
                 "kind": "account_document",
                 "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
                 "c": "doc.sync",
                 "d": "documents",
                 "scope_key": scope_key,
-                "scopeKey": scope_key,
                 "collection": collection,
-                "document_id": stem,
-                "documentId": stem,
-                "id": stem,
+                "doc_id": document_id,
+                "document_id": document_id,
+                "id": document_id,
                 "title": title,
                 "extension": extension,
                 "mime_type": cloud_mcp_account_document_mime_for_extension(&extension),
-                "mimeType": cloud_mcp_account_document_mime_for_extension(&extension),
                 "content_hash": hash,
-                "contentHash": hash,
                 "sha256": hash,
                 "size_bytes": size_bytes.min(i64::MAX as u64) as i64,
-                "sizeBytes": size_bytes.min(i64::MAX as u64) as i64,
                 "local_path": path.display().to_string(),
-                "localPath": path.display().to_string(),
                 "updated_at": cloud_mcp_rfc3339_now(),
-                "updatedAt": cloud_mcp_rfc3339_now(),
                 "sync_status": "local_available",
-                "syncStatus": "local_available",
             });
             let _ = cloud_mcp_store_account_document_metadata(&row);
             rows.push(row);
         }
+        cloud_mcp_cleanup_stale_account_document_numbered_cache_rows(&scope_key, &collection);
     }
     rows
 }
@@ -26795,19 +27098,197 @@ fn cloud_mcp_account_documents_projection(mut rows: Vec<Value>, error: Option<St
     json!({
         "kind": "account_documents",
         "event_kind": "doc.sync",
-        "eventKind": "doc.sync",
         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
         "c": "doc.sync",
         "d": "documents",
         "source": "local_account_document_cache",
         "root": root,
         "account_documents_root": root,
-        "accountDocumentsRoot": root,
         "items": rows.clone(),
         "documents": rows,
         "count": count,
         "error": error.unwrap_or_default(),
     })
+}
+
+fn cloud_mcp_account_document_watched_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    if !path.starts_with(root) {
+        return None;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "md" | "arch") {
+        return None;
+    }
+    let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    if file_name.starts_with('.') || file_name.ends_with(".tmp") {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn cloud_mcp_account_document_mark_local_pending(row: &mut Value) {
+    if let Some(object) = row.as_object_mut() {
+        let now = cloud_mcp_rfc3339_now();
+        object.insert("pending_push".to_string(), json!(true));
+        object.insert("sync_status".to_string(), json!("local_pending"));
+        object.insert("local_saved_at".to_string(), json!(now.clone()));
+        object.insert("updated_at".to_string(), json!(now));
+    }
+}
+
+fn cloud_mcp_account_document_watcher_emit(app: &AppHandle, changed_paths: Vec<PathBuf>) {
+    if changed_paths.is_empty() {
+        return;
+    }
+
+    let request = json!({});
+    let scope_key = cloud_mcp_account_document_scope_key(&request);
+    let collection = "documents".to_string();
+    let mut existing_hash_by_path = HashMap::<String, String>::new();
+    let mut deleted = Vec::<Value>::new();
+
+    for path in &changed_paths {
+        let path_text = path.display().to_string();
+        let existing =
+            cloud_mcp_account_document_row_from_cache_by_local_path(&scope_key, &collection, path);
+        if let Some(row) = existing.as_ref() {
+            existing_hash_by_path.insert(
+                path_text.clone(),
+                cloud_mcp_account_document_row_text(row, &["content_hash", "sha256"]),
+            );
+        }
+        if path.exists() {
+            continue;
+        }
+        if let Some(row) = existing {
+            let document_id =
+                cloud_mcp_account_document_row_text(&row, &["doc_id", "document_id", "id"]);
+            if !document_id.trim().is_empty() {
+                let _ =
+                    cloud_mcp_delete_account_document_cache_row(&scope_key, &collection, &document_id);
+                let mut removed =
+                    cloud_mcp_account_document_deleted_payload(&scope_key, &collection, &document_id);
+                if let Some(object) = removed.as_object_mut() {
+                    object.insert("deleted".to_string(), json!(true));
+                    object.insert("current".to_string(), json!(false));
+                    object.insert("local_path".to_string(), json!(path_text));
+                }
+                deleted.push(removed);
+            }
+        }
+    }
+
+    let changed_path_keys = changed_paths
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect::<HashSet<_>>();
+    let recovered = cloud_mcp_recover_account_document_files(&request);
+    let mut upserted = Vec::<Value>::new();
+    for mut row in recovered {
+        let path_text = cloud_mcp_account_document_row_text(&row, &["local_path", "path"]);
+        if path_text.trim().is_empty() || !changed_path_keys.contains(&path_text) {
+            continue;
+        }
+        let new_hash = cloud_mcp_account_document_row_text(&row, &["content_hash", "sha256"]);
+        let previous_hash = existing_hash_by_path
+            .get(&path_text)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        if previous_hash.is_empty()
+            || (!new_hash.trim().is_empty()
+                && !new_hash.trim().eq_ignore_ascii_case(previous_hash.trim()))
+        {
+            cloud_mcp_account_document_mark_local_pending(&mut row);
+            let _ = cloud_mcp_store_account_document_metadata(&row);
+        }
+        let content = fs::read_to_string(&path_text).unwrap_or_default();
+        upserted.push(cloud_mcp_account_document_with_content(row, content));
+    }
+
+    if upserted.is_empty() && deleted.is_empty() {
+        return;
+    }
+
+    let payload = json!({
+        "kind": "account_documents_apply_result",
+        "event_kind": "doc.sync",
+        "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
+        "c": "doc.sync",
+        "d": "documents",
+        "reason": "file_watch",
+        "source": "account_document_file_watcher",
+        "upserted": upserted.clone(),
+        "documents": upserted.clone(),
+        "items": upserted.clone(),
+        "deleted": deleted.clone(),
+        "removed_documents": deleted,
+        "upserted_count": upserted.len(),
+    });
+    cloud_mcp_emit_account_documents_updated(app, "file_watch", payload);
+}
+
+pub(crate) fn cloud_mcp_start_account_documents_watcher(app: AppHandle) {
+    let _ = thread::Builder::new()
+        .name("diffforge-account-documents-watcher".to_string())
+        .spawn(move || {
+            use notify::Watcher as _;
+
+            let Ok(root) = cloud_mcp_account_documents_root() else {
+                return;
+            };
+            if fs::create_dir_all(&root).is_err() {
+                return;
+            }
+            let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+            let Ok(mut watcher) = notify::recommended_watcher(tx) else {
+                return;
+            };
+            if watcher.watch(&root, notify::RecursiveMode::Recursive).is_err() {
+                return;
+            }
+
+            let collect = |event: notify::Result<notify::Event>, paths: &mut HashSet<PathBuf>| {
+                let Ok(event) = event else {
+                    return;
+                };
+                match event.kind {
+                    notify::event::EventKind::Any
+                    | notify::event::EventKind::Create(_)
+                    | notify::event::EventKind::Modify(_)
+                    | notify::event::EventKind::Remove(_) => {}
+                    _ => return,
+                }
+                for path in &event.paths {
+                    if let Some(path) = cloud_mcp_account_document_watched_path(&root, path) {
+                        paths.insert(path);
+                    }
+                }
+            };
+
+            loop {
+                let Ok(first) = rx.recv() else {
+                    return;
+                };
+                let mut pending_paths = HashSet::<PathBuf>::new();
+                collect(first, &mut pending_paths);
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(550)) {
+                        Ok(event) => collect(event, &mut pending_paths),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                cloud_mcp_account_document_watcher_emit(
+                    &app,
+                    pending_paths.into_iter().collect::<Vec<_>>(),
+                );
+            }
+        });
 }
 
 fn cloud_mcp_account_document_have_refs() -> Vec<Value> {
@@ -26820,16 +27301,36 @@ fn cloud_mcp_account_document_have_refs() -> Vec<Value> {
         .filter_map(|row| {
             let collection = cloud_mcp_account_document_row_text(&row, &["collection"]);
             let document_id =
-                cloud_mcp_account_document_row_text(&row, &["document_id", "documentId", "id"]);
+                cloud_mcp_account_document_row_text(&row, &["doc_id", "document_id", "id"]);
             if collection.is_empty() || document_id.is_empty() {
                 return None;
             }
+            let expected_hash =
+                cloud_mcp_account_document_row_text(&row, &["content_hash", "sha256"]);
+            let local_hash = cloud_mcp_account_document_row_text(&row, &["local_path", "path"])
+                .trim()
+                .is_empty()
+                .then(String::new)
+                .unwrap_or_else(|| {
+                    let path = cloud_mcp_account_document_row_text(&row, &["local_path", "path"]);
+                    cloud_mcp_file_sha256_and_size(Path::new(&path))
+                        .map(|(hash, _)| hash)
+                        .unwrap_or_default()
+                });
+            let have_hash = if !local_hash.trim().is_empty()
+                && (expected_hash.trim().is_empty()
+                    || !local_hash.eq_ignore_ascii_case(expected_hash.trim()))
+            {
+                local_hash
+            } else {
+                expected_hash
+            };
             Some(json!([
                 document_id,
                 "",
-                cloud_mcp_account_document_row_text(&row, &["content_hash", "contentHash", "sha256"]),
-                cloud_mcp_account_document_row_text(&row, &["asset_id", "assetId"]),
-                cloud_mcp_account_document_row_text(&row, &["updated_at", "updatedAt"]),
+                have_hash,
+                cloud_mcp_account_document_row_text(&row, &["asset_id"]),
+                cloud_mcp_account_document_row_text(&row, &["updated_at"]),
             ]))
         })
         .collect()
@@ -26839,10 +27340,12 @@ fn cloud_mcp_account_documents_payload_base(source: &str, reason: &str) -> Value
     let mut payload = cloud_mcp_tools_base_payload(source);
     if let Some(object) = payload.as_object_mut() {
         object.insert("event_kind".to_string(), json!("doc.sync"));
-        object.insert("eventKind".to_string(), json!("doc.sync"));
         object.insert("c".to_string(), json!("doc.sync"));
         object.insert("d".to_string(), json!("documents"));
-        object.insert("contract".to_string(), json!(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT));
+        object.insert(
+            "contract".to_string(),
+            json!(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT),
+        );
         object.insert("scope".to_string(), json!("account"));
         object.insert("v".to_string(), json!(2));
         object.insert("reason".to_string(), json!(reason));
@@ -26862,7 +27365,6 @@ fn cloud_mcp_emit_account_documents_updated(app: &AppHandle, reason: &str, paylo
         json!({
             "kind": "account_documents_snapshot",
             "event_kind": "doc.sync",
-            "eventKind": "doc.sync",
             "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
             "c": "doc.sync",
             "d": "documents",
@@ -26870,6 +27372,28 @@ fn cloud_mcp_emit_account_documents_updated(app: &AppHandle, reason: &str, paylo
             "payload": payload,
         }),
     );
+}
+
+fn cloud_mcp_account_documents_preapplied_payload(event: &Value) -> Option<Value> {
+    let is_apply_result = |value: &Value| {
+        cloud_mcp_payload_text(value, &["kind"])
+            .map(|kind| kind == "account_documents_apply_result")
+            .unwrap_or(false)
+    };
+    if is_apply_result(event) {
+        let mut payload = event.clone();
+        cloud_mcp_strip_account_document_wire_aliases(&mut payload);
+        return Some(payload);
+    }
+    event
+        .get("payload")
+        .or_else(|| event.get("data"))
+        .filter(|value| is_apply_result(value))
+        .cloned()
+        .map(|mut payload| {
+            cloud_mcp_strip_account_document_wire_aliases(&mut payload);
+            payload
+        })
 }
 
 fn cloud_mcp_account_document_items_from_value(value: &Value) -> Vec<Value> {
@@ -26930,30 +27454,20 @@ fn cloud_mcp_account_document_from_op(op: &Value) -> Option<Value> {
     }
     Some(json!({
         "collection": collection,
-        "document_id": document_id,
-        "documentId": document_id,
         "doc_id": document_id,
-        "docId": document_id,
+        "document_id": document_id,
         "id": document_id,
         "meta_hash": array.get(2).and_then(Value::as_str).unwrap_or_default(),
-        "metaHash": array.get(2).and_then(Value::as_str).unwrap_or_default(),
         "content_hash": array.get(3).and_then(Value::as_str).unwrap_or_default(),
-        "contentHash": array.get(3).and_then(Value::as_str).unwrap_or_default(),
         "size_bytes": array.get(4).and_then(Value::as_i64).unwrap_or_default(),
-        "sizeBytes": array.get(4).and_then(Value::as_i64).unwrap_or_default(),
         "title": array.get(5).and_then(Value::as_str).unwrap_or(document_id.as_str()),
         "asset_id": array.get(6).and_then(Value::as_str).unwrap_or_default(),
-        "assetId": array.get(6).and_then(Value::as_str).unwrap_or_default(),
         "blob_id": array.get(7).and_then(Value::as_str).unwrap_or_default(),
-        "blobId": array.get(7).and_then(Value::as_str).unwrap_or_default(),
         "sha256": array.get(8).and_then(Value::as_str).unwrap_or_default(),
         "mime_type": array.get(9).and_then(Value::as_str).unwrap_or_default(),
-        "mimeType": array.get(9).and_then(Value::as_str).unwrap_or_default(),
         "document_kind": array.get(10).and_then(Value::as_str).unwrap_or("document"),
-        "documentKind": array.get(10).and_then(Value::as_str).unwrap_or("document"),
         "source": array.get(10).and_then(Value::as_str).unwrap_or("document"),
         "file_path": array.get(11).and_then(Value::as_str).unwrap_or_default(),
-        "filePath": array.get(11).and_then(Value::as_str).unwrap_or_default(),
     }))
 }
 
@@ -26965,36 +27479,39 @@ fn cloud_mcp_account_document_delete_identity(op: &Value) -> Option<(String, Str
         .unwrap_or(op);
     let scope_key = cloud_mcp_account_document_explicit_scope_key(source)
         .or_else(|| cloud_mcp_account_document_explicit_scope_key(op))
-        .or_else(|| cloud_mcp_payload_scope_key(source))
-        .or_else(|| cloud_mcp_payload_scope_key(op))
+        .or_else(|| {
+            let mut canonical = source.clone();
+            cloud_mcp_strip_account_document_wire_aliases(&mut canonical);
+            cloud_mcp_payload_scope_key(&canonical)
+        })
+        .or_else(|| {
+            let mut canonical = op.clone();
+            cloud_mcp_strip_account_document_wire_aliases(&mut canonical);
+            cloud_mcp_payload_scope_key(&canonical)
+        })
         .unwrap_or_else(cloud_mcp_process_account_scope_key);
     let collection = "documents".to_string();
-    let document_id = cloud_mcp_payload_text(
-        source,
-        &["document_id", "documentId", "doc_id", "docId", "id"],
-    )
-    .or_else(|| {
-        cloud_mcp_payload_text(
-            op,
-            &["document_id", "documentId", "doc_id", "docId", "id"],
-        )
-    })
-    .or_else(|| op.as_array().and_then(|items| items.get(1)).and_then(Value::as_str).map(str::to_string))
-    .map(|value| cloud_mcp_normalize_account_document_id(&value))
-    .filter(|value| !value.trim().is_empty())?;
+    let document_id = cloud_mcp_payload_text(source, &["doc_id", "document_id", "id"])
+        .or_else(|| cloud_mcp_payload_text(op, &["doc_id", "document_id", "id"]))
+        .or_else(|| {
+            op.as_array()
+                .and_then(|items| items.get(1))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .map(|value| cloud_mcp_normalize_account_document_id(&value))
+        .filter(|value| !value.trim().is_empty())?;
     Some((scope_key, collection, document_id))
 }
 
-fn cloud_mcp_delete_account_document_local(
-    scope_key: &str,
-    collection: &str,
-    document_id: &str,
-) {
+fn cloud_mcp_delete_account_document_local(scope_key: &str, collection: &str, document_id: &str) {
     let mut collections = vec![collection.to_string(), "documents".to_string()];
     if collection == "documents" {
         if let Ok(root) = cloud_mcp_account_documents_root() {
             let scope_dir = root
-                .join(cloud_mcp_account_document_path_component(scope_key, "personal"))
+                .join(cloud_mcp_account_document_path_component(
+                    scope_key, "personal",
+                ))
                 .join("collections");
             if let Ok(entries) = fs::read_dir(scope_dir) {
                 for entry in entries.flatten() {
@@ -27031,16 +27548,15 @@ fn cloud_mcp_account_document_deleted_payload(
 ) -> Value {
     json!({
         "scope_key": scope_key,
-        "scopeKey": scope_key,
         "collection": collection,
+        "doc_id": document_id,
         "document_id": document_id,
-        "documentId": document_id,
         "id": document_id,
     })
 }
 
 fn cloud_mcp_account_document_write_inline_content(row: &Value) -> Result<Option<Value>, String> {
-    let Some(content) = cloud_mcp_account_document_content(row) else {
+    let Some(content) = cloud_mcp_account_document_inline_content(row) else {
         return Ok(None);
     };
     let scope_key = cloud_mcp_account_document_scope_key(row);
@@ -27066,7 +27582,10 @@ fn cloud_mcp_account_document_write_inline_content(row: &Value) -> Result<Option
     Ok(Some(metadata))
 }
 
-fn cloud_mcp_apply_account_documents_sync_data(event: &Value, reason: &str) -> Result<Value, String> {
+fn cloud_mcp_apply_account_documents_sync_data(
+    event: &Value,
+    reason: &str,
+) -> Result<Value, String> {
     let payload = event
         .get("payload")
         .filter(|value| value.is_object())
@@ -27076,14 +27595,7 @@ fn cloud_mcp_apply_account_documents_sync_data(event: &Value, reason: &str) -> R
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
 
-    for key in [
-        "removed_documents",
-        "removedDocuments",
-        "deleted_documents",
-        "deletedDocuments",
-        "removed_docs",
-        "removedDocs",
-    ] {
+    for key in ["removed_documents", "deleted_documents", "removed_docs"] {
         for item in payload
             .get(key)
             .and_then(Value::as_array)
@@ -27120,24 +27632,29 @@ fn cloud_mcp_apply_account_documents_sync_data(event: &Value, reason: &str) -> R
     }
 
     for item in cloud_mcp_account_document_items_from_value(payload) {
-        match cloud_mcp_account_document_write_inline_content(&item)
-            .and_then(|maybe_row| {
-                let row = if let Some(row) = maybe_row {
-                    row
-                } else {
-                    cloud_mcp_account_document_metadata_row(
-                        &item,
-                        None,
-                        None,
-                        None,
-                        Some("remote_metadata"),
-                    )?
-                };
-                cloud_mcp_store_account_document_metadata(&row)?;
-                Ok(row)
-            }) {
+        match cloud_mcp_account_document_write_inline_content(&item).and_then(|maybe_row| {
+            let row = if let Some(row) = maybe_row {
+                row
+            } else {
+                cloud_mcp_account_document_metadata_row(
+                    &item,
+                    None,
+                    None,
+                    None,
+                    Some("remote_metadata"),
+                )?
+            };
+            cloud_mcp_store_account_document_metadata(&row)?;
+            Ok(row)
+        }) {
             Ok(row) => upserted.push(row),
-            Err(error) => failed.push(json!({"item": item, "error": clean_terminal_telemetry_text(&error)})),
+            Err(error) => {
+                let mut failed_item = item;
+                cloud_mcp_strip_account_document_wire_aliases(&mut failed_item);
+                failed.push(
+                    json!({"item": failed_item, "error": clean_terminal_telemetry_text(&error)}),
+                );
+            }
         }
     }
 
@@ -27162,24 +27679,29 @@ fn cloud_mcp_apply_account_documents_sync_data(event: &Value, reason: &str) -> R
             continue;
         }
         if let Some(document) = cloud_mcp_account_document_from_op(&op) {
-            match cloud_mcp_account_document_write_inline_content(&document)
-                .and_then(|maybe_row| {
-                    let row = if let Some(row) = maybe_row {
-                        row
-                    } else {
-                        cloud_mcp_account_document_metadata_row(
-                            &document,
-                            None,
-                            None,
-                            None,
-                            Some("remote_metadata"),
-                        )?
-                    };
-                    cloud_mcp_store_account_document_metadata(&row)?;
-                    Ok(row)
-                }) {
+            match cloud_mcp_account_document_write_inline_content(&document).and_then(|maybe_row| {
+                let row = if let Some(row) = maybe_row {
+                    row
+                } else {
+                    cloud_mcp_account_document_metadata_row(
+                        &document,
+                        None,
+                        None,
+                        None,
+                        Some("remote_metadata"),
+                    )?
+                };
+                cloud_mcp_store_account_document_metadata(&row)?;
+                Ok(row)
+            }) {
                 Ok(row) => upserted.push(row),
-                Err(error) => failed.push(json!({"op": op, "error": clean_terminal_telemetry_text(&error)})),
+                Err(error) => {
+                    let mut failed_op = op;
+                    cloud_mcp_strip_account_document_wire_aliases(&mut failed_op);
+                    failed.push(
+                        json!({"op": failed_op, "error": clean_terminal_telemetry_text(&error)}),
+                    );
+                }
             }
         }
     }
@@ -27190,7 +27712,6 @@ fn cloud_mcp_apply_account_documents_sync_data(event: &Value, reason: &str) -> R
     Ok(json!({
         "kind": "account_documents_apply_result",
         "event_kind": "doc.sync",
-        "eventKind": "doc.sync",
         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
         "c": "doc.sync",
         "d": "documents",
@@ -27200,11 +27721,8 @@ fn cloud_mcp_apply_account_documents_sync_data(event: &Value, reason: &str) -> R
         "deleted": deleted,
         "failed": failed.clone(),
         "upserted_count": upserted_count,
-        "upsertedCount": upserted_count,
         "deleted_count": deleted_count,
-        "deletedCount": deleted_count,
         "failed_count": failed_count,
-        "failedCount": failed_count,
     }))
 }
 
@@ -27216,17 +27734,12 @@ fn cloud_mcp_account_document_with_content(mut row: Value, content: String) -> V
         if extension.eq_ignore_ascii_case("arch") {
             object.insert("source".to_string(), json!(content.clone()));
             object
-                .entry("sourceFormat".to_string())
-                .or_insert_with(|| json!("eraserDsl"));
-            object
                 .entry("source_format".to_string())
                 .or_insert_with(|| json!("eraserDsl"));
         } else {
             object.insert("content_md".to_string(), json!(content.clone()));
-            object.insert("contentMd".to_string(), json!(content.clone()));
         }
         object.insert("content_hash".to_string(), json!(hash.clone()));
-        object.insert("contentHash".to_string(), json!(hash.clone()));
         object.insert("sha256".to_string(), json!(hash));
         object.insert("hydrated".to_string(), json!(true));
     }
@@ -27234,16 +27747,7 @@ fn cloud_mcp_account_document_with_content(mut row: Value, content: String) -> V
 }
 
 fn cloud_mcp_account_document_expected_content_hash(row: &Value) -> String {
-    cloud_mcp_account_document_row_text(
-        row,
-        &[
-            "content_hash",
-            "contentHash",
-            "sha256",
-            "content_revision",
-            "contentRevision",
-        ],
-    )
+    cloud_mcp_account_document_row_text(row, &["content_hash", "sha256"])
 }
 
 fn cloud_mcp_account_document_local_file_is_current(row: &Value, path: &str) -> bool {
@@ -27256,21 +27760,40 @@ fn cloud_mcp_account_document_local_file_is_current(row: &Value, path: &str) -> 
         .unwrap_or(false)
 }
 
+fn cloud_mcp_account_document_read_current_file(row: &Value, path: &str) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let expected_hash = cloud_mcp_account_document_expected_content_hash(row);
+    if expected_hash.trim().is_empty() {
+        return Some(content);
+    }
+    let actual_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    if actual_hash.eq_ignore_ascii_case(expected_hash.trim()) {
+        return Some(content);
+    }
+    log_cloud_sync_event(
+        "account_documents.hydrate_rejected_stale_file",
+        json!({
+            "path": path,
+            "expected_hash": expected_hash,
+            "actual_hash": actual_hash,
+        }),
+    );
+    None
+}
+
 fn cloud_mcp_account_document_hydration_key(row: &Value) -> String {
-    let scope_key = cloud_mcp_account_document_row_text(row, &["scope_key", "scopeKey"]);
+    let scope_key = cloud_mcp_account_document_row_text(row, &["scope_key"]);
     let collection = cloud_mcp_account_document_row_text(row, &["collection"]);
-    let document_id =
-        cloud_mcp_account_document_row_text(row, &["document_id", "documentId", "id"]);
+    let document_id = cloud_mcp_account_document_row_text(row, &["doc_id", "document_id", "id"]);
     cloud_mcp_account_document_key(&scope_key, &collection, &document_id)
 }
 
 fn cloud_mcp_account_document_row_needs_asset_hydration(row: &Value) -> bool {
-    let asset_id = cloud_mcp_payload_text(row, &["asset_id", "assetId"])
-        .unwrap_or_default();
+    let asset_id = cloud_mcp_payload_text(row, &["asset_id"]).unwrap_or_default();
     if asset_id.trim().is_empty() {
         return false;
     }
-    let Some(path) = cloud_mcp_payload_text(row, &["local_path", "localPath", "path"]) else {
+    let Some(path) = cloud_mcp_payload_text(row, &["local_path", "path"]) else {
         return true;
     };
     if !Path::new(&path).exists() {
@@ -27325,38 +27848,71 @@ async fn cloud_mcp_apply_account_documents_sync_data_with_hydration(
         return Ok(applied);
     }
 
-    let mut hydrated = Vec::new();
-    let mut hydration_failed = Vec::new();
-    for row in &upserted {
-        if !cloud_mcp_account_document_row_needs_asset_hydration(row) {
-            continue;
-        }
-        match cloud_mcp_hydrate_account_document_one(state, row.clone(), true).await {
-            Ok(hydrated_row) => hydrated.push(hydrated_row),
-            Err(error) => hydration_failed.push(json!({
-                "document": row,
-                "error": clean_terminal_telemetry_text(&error),
-            })),
-        }
+    let rows_to_hydrate = upserted
+        .iter()
+        .filter(|row| cloud_mcp_account_document_row_needs_asset_hydration(row))
+        .cloned()
+        .collect::<Vec<_>>();
+    if rows_to_hydrate.is_empty() {
+        return Ok(applied);
     }
 
     if let Some(object) = applied.as_object_mut() {
-        if !hydrated.is_empty() {
-            let merged = cloud_mcp_account_document_rows_with_hydrated_content(&upserted, &hydrated);
-            object.insert("upserted".to_string(), json!(merged.clone()));
-            object.insert("documents".to_string(), json!(merged.clone()));
-            object.insert("items".to_string(), json!(merged));
-            object.insert("hydrated".to_string(), json!(hydrated.clone()));
-            object.insert("hydrated_documents".to_string(), json!(hydrated.clone()));
-            object.insert("hydratedDocuments".to_string(), json!(hydrated.clone()));
-            object.insert("hydrated_count".to_string(), json!(hydrated.len()));
-            object.insert("hydratedCount".to_string(), json!(hydrated.len()));
-        }
-        if !hydration_failed.is_empty() {
-            object.insert("hydration_failed".to_string(), json!(hydration_failed.clone()));
-            object.insert("hydrationFailed".to_string(), json!(hydration_failed));
-        }
+        object.insert("hydration_pending".to_string(), json!(true));
+        object.insert(
+            "hydration_pending_count".to_string(),
+            json!(rows_to_hydrate.len()),
+        );
+        object.insert(
+            "hydration_pending_documents".to_string(),
+            json!(rows_to_hydrate.clone()),
+        );
     }
+
+    let state_clone = state.clone();
+    let hydrate_reason = reason.to_string();
+    tauri::async_runtime::spawn(async move {
+        let mut hydrated = Vec::new();
+        let mut hydration_failed = Vec::new();
+        for row in &rows_to_hydrate {
+            match cloud_mcp_hydrate_account_document_one(&state_clone, row.clone(), true).await {
+                Ok(hydrated_row) => hydrated.push(hydrated_row),
+                Err(error) => hydration_failed.push(json!({
+                    "document": row,
+                    "error": clean_terminal_telemetry_text(&error),
+                })),
+            }
+        }
+        if hydrated.is_empty() && hydration_failed.is_empty() {
+            return;
+        }
+        let result = json!({
+            "kind": "account_documents_apply_result",
+            "event_kind": "doc.sync",
+            "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
+            "c": "doc.sync",
+            "d": "documents",
+            "reason": format!("{hydrate_reason}_hydration"),
+            "upserted": hydrated.clone(),
+            "documents": hydrated.clone(),
+            "items": hydrated.clone(),
+            "hydrated": hydrated.clone(),
+            "hydrated_documents": hydrated.clone(),
+            "hydrated_count": hydrated.len(),
+            "hydration_failed": hydration_failed.clone(),
+            "failed": hydration_failed.clone(),
+            "failed_count": hydration_failed.len(),
+        });
+        let _ = state_clone.global_ws_events.send(json!({
+            "kind": "doc.sync",
+            "event_kind": "doc.sync",
+            "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
+            "c": "doc.sync",
+            "d": "documents",
+            "reason": format!("{hydrate_reason}_hydration"),
+            "payload": result,
+        }));
+    });
 
     Ok(applied)
 }
@@ -27375,16 +27931,11 @@ fn cloud_mcp_account_document_request_document(request: &Value) -> Value {
     if let (Some(target), Some(source)) = (document.as_object_mut(), request.as_object()) {
         for key in [
             "scope_key",
-            "scopeKey",
             "billing_scope_key",
-            "billingScopeKey",
             "collection",
             "collection_id",
-            "collectionId",
-            "document_id",
-            "documentId",
             "doc_id",
-            "docId",
+            "document_id",
             "id",
             "extension",
             "ext",
@@ -27412,14 +27963,15 @@ fn cloud_mcp_account_document_refs_from_request(request: &Value) -> Vec<Value> {
             .iter()
             .map(|item| {
                 if item.is_object() {
-                    item.clone()
+                    let mut item = item.clone();
+                    cloud_mcp_strip_account_document_wire_aliases(&mut item);
+                    item
                 } else if let Some(id) = item.as_str() {
                     let mut object = serde_json::Map::new();
                     object.insert("document_id".to_string(), json!(id));
-                    object.insert("documentId".to_string(), json!(id));
                     object.insert("id".to_string(), json!(id));
                     if let Some(collection) =
-                        cloud_mcp_payload_text(request, &["collection", "collection_id", "collectionId"])
+                        cloud_mcp_payload_text(request, &["collection", "collection_id"])
                     {
                         object.insert("collection".to_string(), json!(collection));
                     }
@@ -27433,13 +27985,76 @@ fn cloud_mcp_account_document_refs_from_request(request: &Value) -> Vec<Value> {
     vec![cloud_mcp_account_document_request_document(request)]
 }
 
+fn cloud_mcp_account_document_hydration_stage_dir(
+    scope_key: &str,
+    collection: &str,
+    document_id: &str,
+    asset_id: &str,
+) -> Result<PathBuf, String> {
+    Ok(cloud_mcp_account_documents_root()?
+        .join(".hydration-downloads")
+        .join(cloud_mcp_account_document_path_component(
+            scope_key, "personal",
+        ))
+        .join(cloud_mcp_account_document_path_component(
+            collection,
+            "documents",
+        ))
+        .join(cloud_mcp_account_document_path_component(
+            document_id,
+            "document",
+        ))
+        .join(cloud_mcp_account_document_path_component(asset_id, "asset")))
+}
+
+async fn cloud_mcp_download_account_document_asset_content(
+    state: &CloudMcpState,
+    row: &Value,
+    scope_key: &str,
+    collection: &str,
+    document_id: &str,
+    asset_id: &str,
+) -> Result<String, String> {
+    let stage_dir = cloud_mcp_account_document_hydration_stage_dir(
+        scope_key,
+        collection,
+        document_id,
+        asset_id,
+    )?;
+    let _ = fs::remove_dir_all(&stage_dir);
+    let result: Result<String, String> = async {
+        let downloaded = cloud_mcp_download_account_asset_once(
+            state,
+            asset_id.to_string(),
+            Some(stage_dir.display().to_string()),
+            None,
+        )
+        .await?;
+        let local_path = cloud_mcp_payload_text(&downloaded, &["local_path", "path"])
+            .or_else(|| {
+                downloaded
+                    .get("asset")
+                    .and_then(|asset| cloud_mcp_payload_text(asset, &["local_path", "path"]))
+            })
+            .ok_or_else(|| {
+                "Downloaded account document asset did not include a local path.".to_string()
+            })?;
+        cloud_mcp_account_document_read_current_file(row, &local_path).ok_or_else(|| {
+            format!("Downloaded account document asset {local_path} did not match metadata.")
+        })
+    }
+    .await;
+    let _ = fs::remove_dir_all(&stage_dir);
+    result
+}
+
 async fn cloud_mcp_hydrate_account_document_one(
     state: &CloudMcpState,
     request: Value,
     allow_cloud_content_request: bool,
 ) -> Result<Value, String> {
     if let Some(row) = cloud_mcp_account_document_write_inline_content(&request)? {
-        let content = cloud_mcp_account_document_content(&request).unwrap_or_default();
+        let content = cloud_mcp_account_document_inline_content(&request).unwrap_or_default();
         return Ok(cloud_mcp_account_document_with_content(row, content));
     }
 
@@ -27457,12 +28072,13 @@ async fn cloud_mcp_hydrate_account_document_one(
     if let Some(object) = row.as_object_mut() {
         if let Some(request_object) = request.as_object() {
             for (key, value) in request_object {
-                object.entry(key.clone()).or_insert_with(|| value.clone());
+                object.insert(key.clone(), value.clone());
             }
         }
     }
+    cloud_mcp_strip_account_document_wire_aliases(&mut row);
 
-    if let Some(path) = cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"]) {
+    if let Some(path) = cloud_mcp_payload_text(&row, &["local_path", "path"]) {
         if !cloud_mcp_account_document_local_file_is_current(&row, &path) {
             log_cloud_sync_event(
                 "account_documents.hydrate_stale_local_file",
@@ -27478,8 +28094,8 @@ async fn cloud_mcp_hydrate_account_document_one(
         }
     }
 
-    let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"])
-        .or_else(|| cloud_mcp_payload_text(&request, &["asset_id", "assetId"]));
+    let asset_id = cloud_mcp_payload_text(&row, &["asset_id"])
+        .or_else(|| cloud_mcp_payload_text(&request, &["asset_id"]));
     if let Some(asset_id) = asset_id.filter(|value| !value.trim().is_empty()) {
         let extension = cloud_mcp_account_document_extension(&row, &collection);
         let canonical_path = cloud_mcp_account_document_local_path_for_parts(
@@ -27490,44 +28106,41 @@ async fn cloud_mcp_hydrate_account_document_one(
         )?;
         let content = if let Ok(asset_row) = cloud_mcp_asset_row_from_file(&asset_id) {
             cloud_mcp_payload_text(&asset_row, &["local_path", "localPath", "path"])
-                .and_then(|path| fs::read_to_string(path).ok())
+                .and_then(|path| cloud_mcp_account_document_read_current_file(&row, &path))
         } else {
             None
         };
         let content = match content {
             Some(content) => content,
             None => {
-                let target_dir = canonical_path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| "Account document path has no parent directory.".to_string())?;
-                let downloaded = cloud_mcp_download_account_asset_once(
+                cloud_mcp_download_account_document_asset_content(
                     state,
-                    asset_id.clone(),
-                    Some(target_dir.display().to_string()),
-                    None,
+                    &row,
+                    &scope_key,
+                    &collection,
+                    &document_id,
+                    &asset_id,
                 )
-                .await?;
-                let local_path =
-                    cloud_mcp_payload_text(&downloaded, &["local_path", "localPath", "path"])
-                        .or_else(|| {
-                            downloaded.get("asset").and_then(|asset| {
-                                cloud_mcp_payload_text(asset, &["local_path", "localPath", "path"])
-                            })
-                        })
-                        .ok_or_else(|| {
-                            "Downloaded account document asset did not include a local path."
-                                .to_string()
-                        })?;
-                fs::read_to_string(&local_path).map_err(|error| {
-                    format!(
-                        "Unable to read downloaded account document asset {local_path}: {error}"
-                    )
-                })?
+                .await?
             }
         };
-        cloud_mcp_write_account_document_file(&canonical_path, &content)?;
         let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let expected_hash = cloud_mcp_account_document_expected_content_hash(&row);
+        if !expected_hash.trim().is_empty() && !hash.eq_ignore_ascii_case(expected_hash.trim()) {
+            return Err(format!(
+                "Downloaded account document asset {asset_id} hash mismatch for {collection}/{document_id}: expected {}, got {hash}",
+                expected_hash.trim()
+            ));
+        }
+        cloud_mcp_write_account_document_file(&canonical_path, &content)?;
+        cloud_mcp_cleanup_account_document_numbered_siblings(
+            &scope_key,
+            &collection,
+            &document_id,
+            &extension,
+            &canonical_path,
+            &hash,
+        );
         let mut updated = cloud_mcp_account_document_metadata_row(
             &row,
             Some(&canonical_path),
@@ -27536,8 +28149,7 @@ async fn cloud_mcp_hydrate_account_document_one(
             Some("hydrated"),
         )?;
         if let Some(object) = updated.as_object_mut() {
-            object.insert("asset_id".to_string(), json!(asset_id.clone()));
-            object.insert("assetId".to_string(), json!(asset_id));
+            object.insert("asset_id".to_string(), json!(asset_id));
         }
         cloud_mcp_store_account_document_metadata(&updated)?;
         return Ok(cloud_mcp_account_document_with_content(updated, content));
@@ -27550,22 +28162,15 @@ async fn cloud_mcp_hydrate_account_document_one(
             object.insert("m".to_string(), json!("hydrate"));
             object.insert("c".to_string(), json!("doc.content"));
             object.insert("d".to_string(), json!("documents"));
-            object.insert(
-                "h".to_string(),
-                json!([[document_id.clone()]]),
-            );
+            object.insert("h".to_string(), json!([[document_id.clone()]]));
             object.insert("collection".to_string(), json!(collection.clone()));
             object.insert("document_id".to_string(), json!(document_id.clone()));
-            object.insert("documentId".to_string(), json!(document_id.clone()));
         }
         let response = cloud_mcp_ws_request(state, "doc.content", &payload).await?;
         let data = response.get("data").cloned().unwrap_or(response);
         let items = cloud_mcp_account_document_items_from_value(&data);
         if let Some(item) = items.into_iter().next() {
-            return Box::pin(cloud_mcp_hydrate_account_document_one(
-                state, item, false,
-            ))
-            .await;
+            return Box::pin(cloud_mcp_hydrate_account_document_one(state, item, false)).await;
         }
     }
 
@@ -27586,7 +28191,7 @@ async fn cloud_mcp_get_account_documents(
     let _ = cloud_mcp_recover_account_document_files(&request);
     let local_rows = cloud_mcp_account_document_cache_rows(&request, limit).unwrap_or_default();
     let local_projection = cloud_mcp_account_documents_projection(local_rows.clone(), None);
-    if cloud_mcp_payload_bool(&request, &["local_only", "localOnly"], false) {
+    if cloud_mcp_payload_bool(&request, &["local_only"], false) {
         return Ok(local_projection);
     }
 
@@ -27597,25 +28202,35 @@ async fn cloud_mcp_get_account_documents(
         object.insert("m".to_string(), json!("delta"));
         object.insert("h".to_string(), json!(have.clone()));
         object.insert("store_empty".to_string(), json!(have.is_empty()));
-        object.insert("storeEmpty".to_string(), json!(have.is_empty()));
-        if let Some(collection) =
-            cloud_mcp_payload_text(&request, &["collection", "collection_id", "collectionId"])
+        if let Some(collection) = cloud_mcp_payload_text(&request, &["collection", "collection_id"])
         {
             object.insert("collection".to_string(), json!(collection));
         }
     }
-    match cloud_mcp_ws_request(state.inner(), "doc.sync", &payload).await {
+    let cloud_timeout_ms = cloud_mcp_payload_i64(&request, &["cloud_timeout_ms", "timeout_ms"])
+        .unwrap_or((CLOUD_MCP_SYNC_TIMEOUT_SECS * 1000) as i64)
+        .clamp(500, (CLOUD_MCP_SYNC_TIMEOUT_SECS * 1000) as i64) as u64;
+    match cloud_mcp_ws_request_with_timeout(
+        state.inner(),
+        "doc.sync",
+        &payload,
+        Duration::from_millis(cloud_timeout_ms),
+    )
+    .await
+    {
         Ok(response) => {
             let data = response.get("data").cloned().unwrap_or(response);
-            let _ =
-                cloud_mcp_apply_account_documents_sync_data_with_hydration(state.inner(), &data, "get")
-                    .await;
+            let _ = cloud_mcp_apply_account_documents_sync_data_with_hydration(
+                state.inner(),
+                &data,
+                "get",
+            )
+            .await;
             let rows = cloud_mcp_account_document_cache_rows(&request, limit).unwrap_or_default();
             let mut projection = cloud_mcp_account_documents_projection(rows, None);
             if let Some(object) = projection.as_object_mut() {
                 object.insert("offline".to_string(), json!(false));
                 object.insert("source_response".to_string(), data.clone());
-                object.insert("sourceResponse".to_string(), data);
             }
             Ok(projection)
         }
@@ -27625,7 +28240,6 @@ async fn cloud_mcp_get_account_documents(
             if let Some(object) = projection.as_object_mut() {
                 object.insert("offline".to_string(), json!(true));
                 object.insert("cloud_error".to_string(), json!(error.clone()));
-                object.insert("cloudError".to_string(), json!(error));
             }
             Ok(projection)
         }
@@ -27654,7 +28268,6 @@ async fn cloud_mcp_hydrate_account_document(
     let result = json!({
         "kind": "account_document_hydrate",
         "event_kind": "doc.content",
-        "eventKind": "doc.content",
         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
         "c": "doc.content",
         "d": "documents",
@@ -27662,50 +28275,34 @@ async fn cloud_mcp_hydrate_account_document(
         "documents": items.clone(),
         "failed": failed.clone(),
         "requested_count": requested_count,
-        "requestedCount": requested_count,
         "hydrated_count": items.len(),
-        "hydratedCount": items.len(),
         "failed_count": failed.len(),
-        "failedCount": failed.len(),
         "complete": failed.is_empty(),
     });
     cloud_mcp_emit_account_documents_updated(&app, "hydrate", result.clone());
     Ok(result)
 }
 
-fn cloud_mcp_account_document_asset_input(
-    row: &Value,
-    asset_id: &str,
-    filename: &str,
-) -> Value {
+fn cloud_mcp_account_document_asset_input(row: &Value, asset_id: &str, filename: &str) -> Value {
     let collection = cloud_mcp_account_document_row_text(row, &["collection"]);
-    let document_id = cloud_mcp_account_document_row_text(row, &["document_id", "documentId", "id"]);
+    let document_id = cloud_mcp_account_document_row_text(row, &["document_id", "id"]);
     let extension = cloud_mcp_account_document_row_text(row, &["extension", "ext"]);
     let mime_type = cloud_mcp_account_document_mime_for_extension(&extension);
     json!({
         "asset_id": asset_id,
-        "assetId": asset_id,
         "name": filename,
         "filename": filename,
         "mime_type": mime_type,
-        "mimeType": mime_type,
         "kind": "file",
         "folder": CLOUD_MCP_ASSET_FOLDER_DOCUMENTS,
         "group": CLOUD_MCP_ASSET_FOLDER_DOCUMENTS,
         "asset_folder": CLOUD_MCP_ASSET_FOLDER_DOCUMENTS,
-        "assetFolder": CLOUD_MCP_ASSET_FOLDER_DOCUMENTS,
         "source_kind": "account_document",
-        "sourceKind": "account_document",
         "metadata": {
             "doc_domain": "documents",
-            "docDomain": "documents",
             "collection": collection,
-            "doc_id": document_id,
-            "docId": document_id,
             "document_id": document_id,
-            "documentId": document_id,
             "sync_contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
-            "syncContract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
             "extension": extension,
             "title": cloud_mcp_account_document_row_text(row, &["title", "name"]),
         },
@@ -27719,8 +28316,9 @@ async fn cloud_mcp_save_account_document(
     request: Value,
 ) -> Result<Value, String> {
     let document = cloud_mcp_account_document_request_document(&request);
-    let content = cloud_mcp_account_document_content(&document)
-        .ok_or_else(|| "Saving an account document requires content or a readable local path.".to_string())?;
+    let content = cloud_mcp_account_document_content(&document).ok_or_else(|| {
+        "Saving an account document requires content or a readable local path.".to_string()
+    })?;
     let scope_key = cloud_mcp_account_document_scope_key(&document);
     let collection = cloud_mcp_account_document_collection(&document);
     let document_id = cloud_mcp_account_document_id(&document);
@@ -27748,12 +28346,18 @@ async fn cloud_mcp_save_account_document(
     let mut cloud_error = String::new();
     let mut cloud_response = Value::Null;
     let mut upload_response = Value::Null;
-    let local_only = cloud_mcp_payload_bool(&request, &["local_only", "localOnly"], false);
+    let local_only = cloud_mcp_payload_bool(&request, &["local_only"], false);
     if !local_only {
         let filename = path
             .file_name()
             .and_then(|value| value.to_str())
-            .unwrap_or_else(|| if extension == "arch" { "document.arch" } else { "document.md" });
+            .unwrap_or_else(|| {
+                if extension == "arch" {
+                    "document.arch"
+                } else {
+                    "document.md"
+                }
+            });
         let asset_id = format!(
             "asset-account-document-{}-{}-{}-{}",
             cloud_mcp_short_hash(&scope_key),
@@ -27775,33 +28379,21 @@ async fn cloud_mcp_save_account_document(
             Ok(asset_row)
         }) {
             Ok(asset_row) => {
-                match cloud_mcp_upload_account_asset_once(
-                    state.inner(),
-                    asset_id.clone(),
-                    None,
-                )
-                .await
+                match cloud_mcp_upload_account_asset_once(state.inner(), asset_id.clone(), None)
+                    .await
                 {
                     Ok(uploaded) => {
                         upload_response = uploaded.clone();
                         if let Some(object) = row.as_object_mut() {
-                            for key in [
-                                "asset_id",
-                                "assetId",
-                                "blob_id",
-                                "blobId",
-                                "sha256",
-                                "size_bytes",
-                                "sizeBytes",
-                                "mime_type",
-                                "mimeType",
-                            ] {
-                                if let Some(value) = uploaded.get(key).or_else(|| asset_row.get(key)) {
+                            for key in ["asset_id", "blob_id", "sha256", "size_bytes", "mime_type"]
+                            {
+                                if let Some(value) =
+                                    uploaded.get(key).or_else(|| asset_row.get(key))
+                                {
                                     object.insert(key.to_string(), value.clone());
                                 }
                             }
                             object.insert("sync_status".to_string(), json!("syncing"));
-                            object.insert("syncStatus".to_string(), json!("syncing"));
                         }
                         let _ = cloud_mcp_store_account_document_metadata(&row);
 
@@ -27821,49 +28413,50 @@ async fn cloud_mcp_save_account_document(
                             object.insert("m".to_string(), json!("commit"));
                             object.insert("collection".to_string(), json!(collection.clone()));
                             object.insert("document_id".to_string(), json!(document_id.clone()));
-                            object.insert("documentId".to_string(), json!(document_id.clone()));
                             object.insert("content_hash".to_string(), json!(content_hash.clone()));
-                            object.insert("contentHash".to_string(), json!(content_hash.clone()));
                             object.insert("payload_hash".to_string(), json!(payload_hash.clone()));
-                            object.insert("payloadHash".to_string(), json!(payload_hash));
-                            object.insert("idempotency_key".to_string(), json!(idempotency_key.clone()));
-                            object.insert("idempotencyKey".to_string(), json!(idempotency_key));
+                            object.insert(
+                                "idempotency_key".to_string(),
+                                json!(idempotency_key.clone()),
+                            );
                             object.insert("sync_unit".to_string(), json!("account_document"));
-                            object.insert("syncUnit".to_string(), json!("account_document"));
                             object.insert("document".to_string(), row.clone());
-                            object.insert("ops".to_string(), json!([{
-                                "op": "u",
-                                "collection": collection.clone(),
-                                "document_id": document_id.clone(),
-                                "documentId": document_id.clone(),
-                                "document": row.clone(),
-                            }]));
+                            object.insert(
+                                "ops".to_string(),
+                                json!([{
+                                    "op": "u",
+                                    "collection": collection.clone(),
+                                    "document_id": document_id.clone(),
+                                    "document": row.clone(),
+                                }]),
+                            );
                         }
                         match cloud_mcp_ws_request(state.inner(), "doc.sync", &payload).await {
                             Ok(response) => {
                                 cloud_response = response.get("data").cloned().unwrap_or(response);
                                 if let Some(object) = row.as_object_mut() {
                                     object.insert("sync_status".to_string(), json!("synced"));
-                                    object.insert("syncStatus".to_string(), json!("synced"));
-                                    object.insert("last_synced_at".to_string(), json!(cloud_mcp_rfc3339_now()));
-                                    object.insert("lastSyncedAt".to_string(), json!(cloud_mcp_rfc3339_now()));
+                                    object.insert(
+                                        "last_synced_at".to_string(),
+                                        json!(cloud_mcp_rfc3339_now()),
+                                    );
                                 }
                                 let _ = cloud_mcp_store_account_document_metadata(&row);
-                                let _ =
-                                    cloud_mcp_apply_account_documents_sync_data_with_hydration(
-                                        state.inner(),
-                                        &cloud_response,
-                                        "save_response",
-                                    )
-                                    .await;
+                                let _ = cloud_mcp_apply_account_documents_sync_data_with_hydration(
+                                    state.inner(),
+                                    &cloud_response,
+                                    "save_response",
+                                )
+                                .await;
                             }
                             Err(error) => {
                                 cloud_error = error;
                                 if let Some(object) = row.as_object_mut() {
                                     object.insert("sync_status".to_string(), json!("sync_failed"));
-                                    object.insert("syncStatus".to_string(), json!("sync_failed"));
-                                    object.insert("last_sync_error".to_string(), json!(cloud_error.clone()));
-                                    object.insert("lastSyncError".to_string(), json!(cloud_error.clone()));
+                                    object.insert(
+                                        "last_sync_error".to_string(),
+                                        json!(cloud_error.clone()),
+                                    );
                                 }
                                 let _ = cloud_mcp_store_account_document_metadata(&row);
                             }
@@ -27873,9 +28466,8 @@ async fn cloud_mcp_save_account_document(
                         cloud_error = error;
                         if let Some(object) = row.as_object_mut() {
                             object.insert("sync_status".to_string(), json!("upload_failed"));
-                            object.insert("syncStatus".to_string(), json!("upload_failed"));
-                            object.insert("last_sync_error".to_string(), json!(cloud_error.clone()));
-                            object.insert("lastSyncError".to_string(), json!(cloud_error.clone()));
+                            object
+                                .insert("last_sync_error".to_string(), json!(cloud_error.clone()));
                         }
                         let _ = cloud_mcp_store_account_document_metadata(&row);
                     }
@@ -27893,21 +28485,16 @@ async fn cloud_mcp_save_account_document(
         "ok": true,
         "kind": "account_document_saved",
         "event_kind": "doc.sync",
-        "eventKind": "doc.sync",
         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
         "c": "doc.sync",
         "d": "documents",
         "local_saved": true,
-        "localSaved": true,
         "cloud_synced": cloud_synced,
-        "cloudSynced": cloud_synced,
         "cloud_error": cloud_error,
-        "cloudError": cloud_error,
         "document": row,
         "projection": projection,
         "upload": upload_response,
         "cloud_response": cloud_response,
-        "cloudResponse": cloud_response,
     });
     cloud_mcp_emit_account_documents_updated(&app, "save", result.clone());
     Ok(result)
@@ -27929,27 +28516,21 @@ async fn cloud_mcp_delete_account_document(
     cloud_mcp_delete_account_document_local(&scope_key, &collection, &document_id);
     let mut cloud_error = String::new();
     let mut cloud_response = Value::Null;
-    if !cloud_mcp_payload_bool(&request, &["local_only", "localOnly"], false) {
-        let mut payload = cloud_mcp_account_documents_payload_base(
-            "rust-diffforge-account-documents",
-            "delete",
-        );
+    if !cloud_mcp_payload_bool(&request, &["local_only"], false) {
+        let mut payload =
+            cloud_mcp_account_documents_payload_base("rust-diffforge-account-documents", "delete");
         if let Some(object) = payload.as_object_mut() {
             object.insert("m".to_string(), json!("commit"));
             object.insert("collection".to_string(), json!(collection.clone()));
             object.insert("document_id".to_string(), json!(document_id.clone()));
-            object.insert("documentId".to_string(), json!(document_id.clone()));
             object.insert("sync_unit".to_string(), json!("account_document"));
-            object.insert("syncUnit".to_string(), json!("account_document"));
             object.insert(
                 "ops".to_string(),
                 json!([{
                     "op": "d",
                     "collection": collection.clone(),
                     "document_id": document_id.clone(),
-                    "documentId": document_id.clone(),
                     "deleted_at_ms": cloud_mcp_now_ms(),
-                    "deletedAtMs": cloud_mcp_now_ms(),
                 }]),
             );
         }
@@ -27966,22 +28547,16 @@ async fn cloud_mcp_delete_account_document(
         "ok": true,
         "kind": "account_document_deleted",
         "event_kind": "doc.sync",
-        "eventKind": "doc.sync",
         "contract": CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT,
         "c": "doc.sync",
         "d": "documents",
         "scope_key": scope_key,
-        "scopeKey": scope_key,
         "collection": collection,
         "document_id": document_id,
-        "documentId": document_id,
         "id": document_id,
         "local_deleted": true,
-        "localDeleted": true,
         "cloud_error": cloud_error,
-        "cloudError": cloud_error,
         "cloud_response": cloud_response,
-        "cloudResponse": cloud_response,
     });
     cloud_mcp_emit_account_documents_updated(&app, "delete", result.clone());
     Ok(result)
@@ -30250,11 +30825,8 @@ async fn cloud_mcp_register_account_asset(
     let req = cloud_mcp_asset_scope_request();
     let row = cloud_mcp_asset_local_row(&req, "", None, Path::new(&path), metadata)?;
     cloud_mcp_asset_store_local_row(&row)?;
-    let cloud = cloud_mcp_enqueue_account_asset_register_row(
-        state.inner(),
-        &row,
-        "asset_register",
-    )?;
+    let cloud =
+        cloud_mcp_enqueue_account_asset_register_row(state.inner(), &row, "asset_register")?;
     if upload.unwrap_or(false) {
         let asset_id = cloud_mcp_payload_text(&row, &["asset_id", "assetId"]).unwrap_or_default();
         return cloud_mcp_upload_account_asset(state, asset_id, None).await;
@@ -40751,6 +41323,35 @@ mod cloud_mcp_tests {
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
+    fn assert_account_document_snake_only(value: &Value) {
+        fn visit(value: &Value, path: &str) {
+            match value {
+                Value::Object(object) => {
+                    for (key, child) in object {
+                        assert!(
+                            !CLOUD_MCP_ACCOUNT_DOCUMENT_LEGACY_CAMEL_KEYS.contains(&key.as_str()),
+                            "legacy account document key {key} at {path}"
+                        );
+                        let child_path = if path.is_empty() {
+                            key.to_string()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        visit(child, &child_path);
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        visit(child, &format!("{path}[{index}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        visit(value, "$");
+    }
+
     #[test]
     fn account_document_cache_writes_canonical_file_and_keeps_metadata_only() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
@@ -40795,6 +41396,7 @@ mod cloud_mcp_tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), content);
         assert!(row.get("content").is_none());
+        assert_account_document_snake_only(&row);
 
         let rows = cloud_mcp_account_document_cache_rows(
             &json!({
@@ -40812,6 +41414,360 @@ mod cloud_mcp_tests {
         assert!(cached.get("content_md").is_none());
         assert!(cached.get("contentMd").is_none());
         assert!(cached["metadata"].get("content").is_none());
+        assert_account_document_snake_only(cached);
+
+        let projection = cloud_mcp_account_documents_projection(rows.clone(), None);
+        assert_account_document_snake_only(&projection);
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn account_document_remote_metadata_does_not_read_local_path_as_content() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-account-document-remote-meta-data");
+        let cache_root = test_cloud_root("diffforge-account-document-remote-meta-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let stale_path = data_root.join("stale.md");
+        fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        fs::write(&stale_path, "old local content").unwrap();
+        let remote_hash = "f7381cee8a0478d958b5";
+        let input = json!({
+            "scope_key": "Personal Account",
+            "collection": "documents",
+            "document_id": "starter",
+            "title": "starter",
+            "local_path": stale_path.display().to_string(),
+            "content_hash": remote_hash,
+            "asset_id": "asset-account-document-starter-f7381cee8a04",
+            "size_bytes": 34,
+        });
+
+        assert!(cloud_mcp_account_document_write_inline_content(&input)
+            .unwrap()
+            .is_none());
+        let row = cloud_mcp_account_document_metadata_row(
+            &input,
+            None,
+            None,
+            None,
+            Some("remote_metadata"),
+        )
+        .unwrap();
+        cloud_mcp_store_account_document_metadata(&row).unwrap();
+        let rows = cloud_mcp_account_document_cache_rows(
+            &json!({
+                "scope_key": "Personal Account",
+                "collection": "documents",
+                "document_id": "starter",
+            }),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["content_hash"], json!(remote_hash));
+        assert_account_document_snake_only(&row);
+        assert_account_document_snake_only(&rows[0]);
+        assert_ne!(
+            rows[0]["content_hash"],
+            json!(format!(
+                "{:x}",
+                Sha256::digest("old local content".as_bytes())
+            ))
+        );
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn account_document_preapplied_payload_preserves_hydrated_content() {
+        let applied = json!({
+            "kind": "account_documents_apply_result",
+            "event_kind": "doc.sync",
+            "documents": [{
+                "document_id": "starter",
+                "content_md": "fresh web content",
+                "content_hash": "fresh-hash",
+                "hydrated": true,
+            }],
+            "hydrated_documents": [{
+                "document_id": "starter",
+                "content_md": "fresh web content",
+                "content_hash": "fresh-hash",
+                "hydrated": true,
+            }],
+        });
+        let envelope = json!({
+            "kind": "doc.sync",
+            "event_kind": "doc.sync",
+            "payload": applied,
+        });
+
+        let payload = cloud_mcp_account_documents_preapplied_payload(&envelope).unwrap();
+
+        assert_eq!(payload["kind"], json!("account_documents_apply_result"));
+        assert_eq!(
+            payload["documents"][0]["content_md"],
+            json!("fresh web content")
+        );
+        assert_eq!(
+            payload["hydrated_documents"][0]["content_md"],
+            json!("fresh web content")
+        );
+        assert_account_document_snake_only(&payload);
+    }
+
+    #[test]
+    fn account_document_camel_only_input_is_rejected_and_not_replayed() {
+        let row = cloud_mcp_account_document_metadata_row(
+            &json!({
+                "scopeKey": "Personal Account",
+                "documentId": "Legacy Plan",
+                "contentHash": "legacy-hash",
+                "assetId": "asset-legacy-plan",
+                "sizeBytes": 42,
+            }),
+            None,
+            None,
+            None,
+            Some("remote_metadata"),
+        );
+        assert!(row.is_err());
+
+        let applied = cloud_mcp_apply_account_documents_sync_data(
+            &json!({
+                "c": "doc.sync",
+                "d": "documents",
+                "documents": [{
+                    "scopeKey": "Personal Account",
+                    "documentId": "Legacy Plan",
+                    "contentHash": "legacy-hash",
+                    "assetId": "asset-legacy-plan",
+                    "sizeBytes": 42,
+                    "contentMd": "# Legacy\n",
+                }]
+            }),
+            "test_camel_only_documents",
+        )
+        .unwrap();
+
+        assert_eq!(applied["upserted_count"], json!(0));
+        assert_eq!(applied["failed_count"], json!(1));
+        assert_account_document_snake_only(&applied);
+    }
+
+    #[test]
+    fn account_document_cached_asset_file_must_match_expected_hash() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-account-document-file-hash-data");
+        let path = data_root.join("candidate.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old local content").unwrap();
+        let actual_hash = format!("{:x}", Sha256::digest("old local content".as_bytes()));
+        let row = json!({
+            "document_id": "starter",
+            "content_hash": "fresh-web-hash",
+        });
+
+        assert!(
+            cloud_mcp_account_document_read_current_file(&row, &path.display().to_string())
+                .is_none()
+        );
+        let matching_row = json!({
+            "document_id": "starter",
+            "content_hash": actual_hash,
+        });
+        assert_eq!(
+            cloud_mcp_account_document_read_current_file(
+                &matching_row,
+                &path.display().to_string()
+            )
+            .as_deref(),
+            Some("old local content")
+        );
+
+        let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn account_document_hydration_stage_dir_is_hidden_from_collection_recovery() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-account-document-stage-data");
+        let cache_root = test_cloud_root("diffforge-account-document-stage-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        let canonical = cloud_mcp_account_document_local_path_for_parts(
+            "Personal Account",
+            "documents",
+            "starterskill",
+            "md",
+        )
+        .unwrap();
+        let stage_dir = cloud_mcp_account_document_hydration_stage_dir(
+            "Personal Account",
+            "documents",
+            "starterskill",
+            "asset-account-document-starterskill",
+        )
+        .unwrap();
+        let collection_dir = canonical.parent().unwrap();
+
+        assert!(!stage_dir.starts_with(collection_dir));
+        assert!(stage_dir
+            .display()
+            .to_string()
+            .contains(".hydration-downloads"));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn account_document_recovery_reuses_cached_identity_for_sanitized_path() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-account-document-reuse-id-data");
+        let cache_root = test_cloud_root("diffforge-account-document-reuse-id-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let content = "# Quarterly Plan\n\nKeep the original id.\n";
+        let path = cloud_mcp_account_document_local_path_for_parts(
+            "Personal Account",
+            "documents",
+            "Quarterly Plan",
+            "md",
+        )
+        .unwrap();
+        cloud_mcp_write_account_document_file(&path, content).unwrap();
+        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let row = cloud_mcp_account_document_metadata_row(
+            &json!({
+                "scope_key": "Personal Account",
+                "collection": "documents",
+                "document_id": "Quarterly Plan",
+                "title": "Quarterly Plan",
+                "extension": "md",
+            }),
+            Some(&path),
+            Some(&hash),
+            Some(content.as_bytes().len() as u64),
+            Some("local_available"),
+        )
+        .unwrap();
+        cloud_mcp_store_account_document_metadata(&row).unwrap();
+
+        let recovered = cloud_mcp_recover_account_document_files(&json!({
+            "scope_key": "Personal Account",
+        }));
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0]["document_id"], json!("Quarterly Plan"));
+        let original_rows = cloud_mcp_account_document_cache_rows(
+            &json!({
+                "scope_key": "Personal Account",
+                "document_id": "Quarterly Plan",
+            }),
+            10,
+        )
+        .unwrap();
+        assert_eq!(original_rows.len(), 1);
+        let sanitized_rows = cloud_mcp_account_document_cache_rows(
+            &json!({
+                "scope_key": "Personal Account",
+                "document_id": "Quarterly-Plan",
+            }),
+            10,
+        )
+        .unwrap();
+        assert!(sanitized_rows.is_empty());
+        assert_account_document_snake_only(&recovered[0]);
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn account_document_recovery_consolidates_numbered_hydration_siblings() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-account-document-numbered-data");
+        let cache_root = test_cloud_root("diffforge-account-document-numbered-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let content = "# Starter Skill\n\nUse one canonical file.\n";
+        let canonical = cloud_mcp_account_document_local_path_for_parts(
+            "Personal Account",
+            "documents",
+            "starterskill",
+            "md",
+        )
+        .unwrap();
+        cloud_mcp_write_account_document_file(&canonical, content).unwrap();
+        let stale_content = "# Starter Skill\n\nOld downloaded copy.\n";
+        let sibling = canonical.with_file_name("starterskill (1).md");
+        cloud_mcp_write_account_document_file(&sibling, stale_content).unwrap();
+        let stale_hash = format!("{:x}", Sha256::digest(stale_content.as_bytes()));
+        let sibling_row = cloud_mcp_account_document_metadata_row(
+            &json!({
+                "scope_key": "Personal Account",
+                "collection": "documents",
+                "document_id": "starterskill (1)",
+                "title": "Starter Skill Copy",
+                "extension": "md",
+            }),
+            Some(&sibling),
+            Some(&stale_hash),
+            Some(stale_content.as_bytes().len() as u64),
+            Some("local_available"),
+        )
+        .unwrap();
+        cloud_mcp_store_account_document_metadata(&sibling_row).unwrap();
+
+        let recovered = cloud_mcp_recover_account_document_files(&json!({
+            "scope_key": "Personal Account",
+        }));
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0]["document_id"], json!("starterskill"));
+        assert!(canonical.is_file());
+        assert!(!sibling.exists());
+        let suffix_rows = cloud_mcp_account_document_cache_rows(
+            &json!({
+                "scope_key": "Personal Account",
+                "document_id": "starterskill (1)",
+            }),
+            10,
+        )
+        .unwrap();
+        assert!(suffix_rows.is_empty());
+        let rows = cloud_mcp_account_document_cache_rows(
+            &json!({
+                "scope_key": "Personal Account",
+            }),
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["document_id"], json!("starterskill"));
+        assert_account_document_snake_only(&rows[0]);
 
         let _ = fs::remove_dir_all(data_root);
         let _ = fs::remove_dir_all(cache_root);
@@ -40872,6 +41828,7 @@ mod cloud_mcp_tests {
         .unwrap();
 
         assert_eq!(applied["deleted_count"], json!(1));
+        assert_account_document_snake_only(&applied);
         assert!(!md_path.exists());
         assert!(!arch_path.exists());
         let rows = cloud_mcp_account_document_cache_rows(
@@ -40938,6 +41895,8 @@ mod cloud_mcp_tests {
         assert_eq!(rows[0]["content_hash"], json!("content-hash-9000"));
         assert_eq!(rows[0]["asset_id"], json!("asset-account-document-mydoc2"));
         assert_eq!(rows[0]["document_kind"], json!("skill"));
+        assert_account_document_snake_only(&applied);
+        assert_account_document_snake_only(&rows[0]);
 
         let bad_rows = cloud_mcp_account_document_cache_rows(
             &json!({
@@ -43834,7 +44793,10 @@ mod cloud_mcp_tests {
 
         let response = cloud_mcp_asset_library_response_from_rows(rows, Vec::new(), None);
         assert_eq!(response["count"].as_u64(), Some(1));
-        assert_eq!(response["items"][0]["asset_id"].as_str(), Some("asset-generic-visible"));
+        assert_eq!(
+            response["items"][0]["asset_id"].as_str(),
+            Some("asset-generic-visible")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

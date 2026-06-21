@@ -2719,13 +2719,92 @@ function UntrackedAssetsPanel({
 }
 
 const AssetsSurface = styled.section`
+  --asset-surface-bg:
+    radial-gradient(circle at 78% 8%, rgba(var(--forge-accent-rgb), 0.09), transparent 18rem),
+    linear-gradient(90deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.011) 1px, transparent 1px),
+    #030508;
+  --asset-border: rgba(148, 163, 184, 0.14);
+  --asset-border-soft: rgba(148, 163, 184, 0.1);
+  --asset-border-strong: rgba(148, 163, 184, 0.18);
+  --asset-panel-bg: rgba(8, 12, 18, 0.72);
+  --asset-panel-bg-soft: rgba(15, 23, 42, 0.34);
+  --asset-panel-bg-strong: rgba(2, 6, 23, 0.72);
+  --asset-control-bg: rgba(15, 23, 42, 0.42);
+  --asset-control-bg-strong: rgba(15, 23, 42, 0.5);
+  --asset-overlay-bg: rgba(7, 10, 16, 0.88);
+  --asset-card-bg: rgba(2, 6, 23, 0.42);
+  --asset-card-preview-bg: rgba(15, 23, 42, 0.44);
+  --asset-caption-bg: rgba(2, 6, 23, 0.55);
+  --asset-modal-bg: rgba(7, 10, 16, 0.96);
+
   position: relative;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
   color: var(--forge-text);
-  background: var(--forge-bg);
+  background: var(--asset-surface-bg);
+  background-size: auto, auto, 72px 72px, 72px 72px, auto;
+
+  html[data-forge-space="loopspaces"] & {
+    --asset-surface-bg:
+      radial-gradient(circle at 76% 8%, rgba(var(--forge-accent-rgb), 0.14), transparent 18rem),
+      radial-gradient(circle at 24% 96%, rgba(var(--forge-accent-soft-rgb), 0.05), transparent 20rem),
+      linear-gradient(90deg, rgba(var(--forge-accent-soft-rgb), 0.026) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(var(--forge-accent-soft-rgb), 0.019) 1px, transparent 1px),
+      #050402;
+    --asset-border: rgba(255, 209, 102, 0.14);
+    --asset-border-soft: rgba(255, 209, 102, 0.1);
+    --asset-border-strong: rgba(255, 209, 102, 0.2);
+    --asset-panel-bg: rgba(13, 9, 4, 0.7);
+    --asset-panel-bg-soft: rgba(13, 9, 4, 0.48);
+    --asset-panel-bg-strong: rgba(8, 6, 3, 0.78);
+    --asset-control-bg: rgba(15, 10, 4, 0.58);
+    --asset-control-bg-strong: rgba(15, 10, 4, 0.66);
+    --asset-overlay-bg: rgba(10, 7, 3, 0.88);
+    --asset-card-bg: rgba(11, 8, 4, 0.58);
+    --asset-card-preview-bg: rgba(12, 8, 4, 0.5);
+    --asset-caption-bg: rgba(8, 6, 3, 0.64);
+    --asset-modal-bg: rgba(10, 7, 3, 0.97);
+  }
+
+  html[data-forge-theme="light"] & {
+    --asset-surface-bg: #f5f5f7;
+    --asset-border: rgba(29, 29, 31, 0.12);
+    --asset-border-soft: rgba(29, 29, 31, 0.08);
+    --asset-border-strong: rgba(29, 29, 31, 0.16);
+    --asset-panel-bg: rgba(255, 255, 255, 0.84);
+    --asset-panel-bg-soft: rgba(255, 255, 255, 0.72);
+    --asset-panel-bg-strong: rgba(255, 255, 255, 0.92);
+    --asset-control-bg: rgba(255, 255, 255, 0.86);
+    --asset-control-bg-strong: rgba(255, 255, 255, 0.94);
+    --asset-overlay-bg: rgba(255, 255, 255, 0.92);
+    --asset-card-bg: rgba(255, 255, 255, 0.88);
+    --asset-card-preview-bg: rgba(245, 247, 250, 0.88);
+    --asset-caption-bg: rgba(255, 255, 255, 0.9);
+    --asset-modal-bg: rgba(255, 255, 255, 0.98);
+  }
+
+  html[data-forge-theme="light"][data-forge-space="loopspaces"] & {
+    --asset-surface-bg:
+      radial-gradient(circle at 78% 8%, rgba(var(--forge-accent-rgb), 0.1), transparent 18rem),
+      radial-gradient(circle at 20% 96%, rgba(var(--forge-accent-soft-rgb), 0.08), transparent 20rem),
+      #fff8ea;
+    --asset-border: rgba(181, 106, 0, 0.14);
+    --asset-border-soft: rgba(181, 106, 0, 0.1);
+    --asset-border-strong: rgba(181, 106, 0, 0.2);
+    --asset-panel-bg: rgba(255, 250, 240, 0.82);
+    --asset-panel-bg-soft: rgba(255, 247, 225, 0.74);
+    --asset-panel-bg-strong: rgba(255, 250, 240, 0.92);
+    --asset-control-bg: rgba(255, 247, 225, 0.86);
+    --asset-control-bg-strong: rgba(255, 250, 240, 0.94);
+    --asset-overlay-bg: rgba(255, 250, 240, 0.92);
+    --asset-card-bg: rgba(255, 250, 240, 0.88);
+    --asset-card-preview-bg: rgba(255, 247, 225, 0.82);
+    --asset-caption-bg: rgba(255, 250, 240, 0.9);
+    --asset-modal-bg: rgba(255, 250, 240, 0.98);
+  }
 `;
 
 const AssetsPane = styled.div`
@@ -2789,9 +2868,9 @@ const AssetModeTabList = styled.div`
   min-width: 0;
   margin-top: 6px;
   padding: 3px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
+  border: 1px solid var(--asset-border-soft);
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.28);
+  background: var(--asset-panel-bg-soft);
 `;
 
 const AssetModeTab = styled.button`
@@ -2925,7 +3004,7 @@ const AssetCloudControls = styled.div`
   gap: 6px;
   min-width: 0;
   padding-bottom: 8px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  border-bottom: 1px solid var(--asset-border-soft);
 `;
 
 const AssetCloudButton = styled.button`
@@ -2936,10 +3015,10 @@ const AssetCloudButton = styled.button`
   max-width: 190px;
   padding: 0 9px;
   overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.15);
+  border: 1px solid var(--asset-border);
   border-radius: 7px;
   color: rgba(203, 213, 225, 0.78);
-  background: rgba(15, 23, 42, 0.36);
+  background: var(--asset-control-bg);
   font: inherit;
   font-size: 10px;
   font-weight: 850;
@@ -2979,9 +3058,9 @@ const AssetCloudSettings = styled.div`
   gap: 10px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.15);
+  border: 1px solid var(--asset-border);
   border-radius: 8px;
-  background: rgba(2, 6, 23, 0.36);
+  background: var(--asset-panel-bg);
 
   @media (max-width: 820px) {
     grid-template-columns: 1fr;
@@ -2996,7 +3075,7 @@ const AssetCloudSettingsHeader = styled.div`
   gap: 10px;
   min-width: 0;
   padding-bottom: 8px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  border-bottom: 1px solid var(--asset-border-soft);
 
   > div {
     display: grid;
@@ -3055,9 +3134,9 @@ const AssetCloudRow = styled.div`
   gap: 7px;
   min-width: 0;
   padding: 7px;
-  border: 1px solid rgba(148, 163, 184, 0.13);
+  border: 1px solid var(--asset-border);
   border-radius: 7px;
-  background: rgba(15, 23, 42, 0.34);
+  background: var(--asset-panel-bg-soft);
 
   > svg {
     width: 16px;
@@ -3116,9 +3195,9 @@ const AssetProviderTabs = styled.div`
   gap: 4px;
   width: max-content;
   padding: 3px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
+  border: 1px solid var(--asset-border-soft);
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.34);
+  background: var(--asset-panel-bg-soft);
 `;
 
 const AssetProviderButton = styled.button`
@@ -3157,10 +3236,10 @@ const AssetCloudInput = styled.input`
   min-width: 0;
   min-height: 30px;
   padding: 0 9px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 7px;
   color: rgba(226, 232, 240, 0.92);
-  background: rgba(15, 23, 42, 0.5);
+  background: var(--asset-control-bg-strong);
   font: inherit;
   font-size: 10px;
   font-weight: 760;
@@ -3194,10 +3273,10 @@ const AssetCloudFormFooter = styled.div`
 const AssetMiniButton = styled.button`
   min-height: 26px;
   padding: 0 8px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 6px;
   color: rgba(226, 232, 240, 0.84);
-  background: rgba(15, 23, 42, 0.48);
+  background: var(--asset-control-bg);
   font: inherit;
   font-size: 9px;
   font-weight: 850;
@@ -3256,9 +3335,9 @@ const AssetSelectionDockBar = styled.div`
   gap: 7px;
   max-width: calc(100% - 32px);
   padding: 8px 12px;
-  border: 1px solid rgba(45, 212, 191, 0.22);
+  border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.24);
   border-radius: 999px;
-  background: rgba(9, 16, 22, 0.9);
+  background: var(--asset-overlay-bg);
   backdrop-filter: blur(12px);
   box-shadow: 0 14px 38px rgba(0, 0, 0, 0.45);
   transform: translate(-50%, 0);
@@ -3353,10 +3432,10 @@ const AssetBatchButton = styled.button`
   gap: 5px;
   min-height: 28px;
   padding: 0 9px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 999px;
   color: rgba(226, 232, 240, 0.86);
-  background: rgba(15, 23, 42, 0.42);
+  background: var(--asset-control-bg);
   font: inherit;
   font-size: 10px;
   font-weight: 850;
@@ -3437,7 +3516,7 @@ const AssetGridScroller = styled.div`
   min-height: 120px;
   overflow: auto;
   padding: 0 ${ASSET_GRID_PAD_X}px;
-  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  border-top: 1px solid var(--asset-border-soft);
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   scrollbar-width: thin;
@@ -3569,10 +3648,10 @@ const AssetCard = styled.article`
   flex-direction: column;
   min-width: 0;
   overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(2, 6, 23, 0.42);
+  background: var(--asset-card-bg);
   box-shadow: 0 8px 20px rgba(2, 6, 23, 0.14);
   transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
 
@@ -3663,7 +3742,7 @@ const AssetCardPreview = styled.button`
   padding: 0;
   border: 0;
   color: inherit;
-  background: rgba(15, 23, 42, 0.44);
+  background: var(--asset-card-preview-bg);
   font: inherit;
   text-align: inherit;
   cursor: pointer;
@@ -3724,7 +3803,7 @@ const AssetPreviewImage = styled.img`
   padding: 6px;
   object-fit: contain;
   object-position: center;
-  background: rgba(2, 6, 23, 0.7);
+  background: var(--asset-panel-bg-strong);
   opacity: 0;
   transition: opacity 160ms ease;
 
@@ -3749,7 +3828,7 @@ const AssetPreviewPlaceholder = styled.div`
   pointer-events: none;
   background:
     radial-gradient(circle at 24% 28%, rgba(var(--forge-accent-soft-rgb), 0.16), transparent 30%),
-    linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 41, 59, 0.7));
+    linear-gradient(135deg, var(--asset-card-preview-bg), var(--asset-panel-bg-soft));
 
   &::after {
     content: "";
@@ -3812,10 +3891,10 @@ const AssetCardStatus = styled.span`
   max-width: calc(100% - 84px);
   overflow: hidden;
   padding: 3px 6px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 6px;
   color: rgba(203, 213, 225, 0.74);
-  background: rgba(2, 6, 23, 0.84);
+  background: var(--asset-panel-bg-strong);
   font-size: 8px;
   font-weight: 850;
   line-height: 1;
@@ -3874,7 +3953,7 @@ const AssetAvailabilityBadge = styled.span`
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
   color: rgba(226, 232, 240, 0.84);
-  background: rgba(7, 10, 16, 0.85);
+  background: var(--asset-overlay-bg);
   box-shadow: 0 8px 18px rgba(2, 6, 23, 0.2);
   font-size: 8.5px;
   font-weight: 900;
@@ -3945,7 +4024,7 @@ const AssetShareButton = styled.button`
   border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.28);
   border-radius: 999px;
   color: var(--forge-accent-soft, rgba(219, 234, 254, 0.94));
-  background: rgba(7, 10, 16, 0.88);
+  background: var(--asset-overlay-bg);
   font: inherit;
   font-size: 9px;
   font-weight: 850;
@@ -4024,7 +4103,7 @@ const AssetUtilityButton = styled.button`
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
   color: #f8fafc;
-  background: rgba(7, 10, 16, 0.85);
+  background: var(--asset-overlay-bg);
   font: inherit;
   cursor: pointer;
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
@@ -4133,10 +4212,10 @@ const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
   height: 28px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 999px;
   color: rgba(226, 232, 240, 0.84);
-  background: rgba(2, 6, 23, 0.82);
+  background: var(--asset-panel-bg-strong);
   opacity: 0;
   pointer-events: none;
   transform: translateY(-3px);
@@ -4189,9 +4268,9 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   justify-content: center;
   gap: 5px;
   padding: 4px 6px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--asset-border-strong);
   border-radius: 999px;
-  background: rgba(7, 10, 16, 0.88);
+  background: var(--asset-overlay-bg);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
   opacity: 0;
   pointer-events: none;
@@ -4250,8 +4329,8 @@ const AssetCardCaption = styled.div`
   min-width: 0;
   min-height: 36px;
   padding: 6px 9px 7px;
-  border-top: 1px solid rgba(148, 163, 184, 0.1);
-  background: rgba(2, 6, 23, 0.55);
+  border-top: 1px solid var(--asset-border-soft);
+  background: var(--asset-caption-bg);
 `;
 
 const AssetCardName = styled.strong`
@@ -4295,10 +4374,10 @@ const AssetInfoPanel = styled.section`
   max-height: min(720px, calc(100vh - 36px));
   overflow: auto;
   padding: 14px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  border: 1px solid var(--asset-border-strong);
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(7, 10, 16, 0.96);
+  background: var(--asset-modal-bg);
   box-shadow: 0 22px 70px rgba(0, 0, 0, 0.48);
 `;
 
@@ -4338,10 +4417,10 @@ const AssetInfoCloseButton = styled.button`
   height: 30px;
   flex: 0 0 auto;
   padding: 0;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 7px;
   color: rgba(226, 232, 240, 0.84);
-  background: rgba(15, 23, 42, 0.5);
+  background: var(--asset-control-bg-strong);
   font: inherit;
   cursor: pointer;
 
@@ -4374,9 +4453,9 @@ const AssetInfoStatusCard = styled.div`
   gap: 5px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
+  border: 1px solid var(--asset-border);
   border-radius: 7px;
-  background: rgba(15, 23, 42, 0.42);
+  background: var(--asset-panel-bg-soft);
 
   svg {
     width: 16px;
@@ -4437,7 +4516,7 @@ const AssetInfoSection = styled.section`
   display: grid;
   gap: 7px;
   padding: 11px 0;
-  border-top: 1px solid rgba(148, 163, 184, 0.1);
+  border-top: 1px solid var(--asset-border-soft);
 `;
 
 const AssetInfoSectionTitle = styled.strong`
@@ -4492,7 +4571,7 @@ const AssetInfoDeviceRow = styled.div`
   padding: 8px;
   border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.16);
   border-radius: 7px;
-  background: rgba(30, 41, 59, 0.32);
+  background: var(--asset-panel-bg-soft);
 
   svg {
     width: 16px;
@@ -4547,7 +4626,7 @@ const AssetTransferOverlay = styled.div`
   padding: 5px 6px;
   border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
   border-radius: 7px;
-  background: rgba(2, 6, 23, 0.88);
+  background: var(--asset-panel-bg-strong);
   backdrop-filter: blur(8px);
 `;
 
@@ -4594,7 +4673,7 @@ const AssetTransferCancel = styled.button`
   border: 1px solid rgba(251, 113, 133, 0.28);
   border-radius: 999px;
   color: rgba(254, 205, 211, 0.92);
-  background: rgba(2, 6, 23, 0.85);
+  background: var(--asset-panel-bg-strong);
   cursor: pointer;
 
   svg {
@@ -4651,7 +4730,7 @@ const AssetToast = styled.div`
   border: 1px solid rgba(74, 222, 128, 0.3);
   border-radius: 8px;
   color: rgba(226, 232, 240, 0.94);
-  background: rgba(8, 14, 22, 0.94);
+  background: var(--asset-modal-bg);
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.46);
   backdrop-filter: blur(14px);
   pointer-events: auto;
@@ -4659,15 +4738,15 @@ const AssetToast = styled.div`
   &[data-kind="error"] {
     border-color: rgba(248, 113, 113, 0.34);
     background:
-      linear-gradient(135deg, rgba(127, 29, 29, 0.2), rgba(8, 14, 22, 0.94) 52%),
-      rgba(8, 14, 22, 0.94);
+      linear-gradient(135deg, rgba(127, 29, 29, 0.2), transparent 52%),
+      var(--asset-modal-bg);
   }
 
   &[data-kind="success"] {
     border-color: rgba(74, 222, 128, 0.32);
     background:
-      linear-gradient(135deg, rgba(20, 83, 45, 0.2), rgba(8, 14, 22, 0.94) 52%),
-      rgba(8, 14, 22, 0.94);
+      linear-gradient(135deg, rgba(20, 83, 45, 0.2), transparent 52%),
+      var(--asset-modal-bg);
   }
 `;
 
@@ -4705,10 +4784,10 @@ const AssetToastMeta = styled.div`
     max-width: 100%;
     padding: 3px 5px;
     overflow: hidden;
-    border: 1px solid rgba(148, 163, 184, 0.13);
+    border: 1px solid var(--asset-border);
     border-radius: 5px;
     color: rgba(203, 213, 225, 0.76);
-    background: rgba(15, 23, 42, 0.42);
+    background: var(--asset-panel-bg-soft);
     font-size: 8px;
     font-weight: 820;
     line-height: 1.2;
@@ -4729,10 +4808,10 @@ const AssetToastIconButton = styled.button`
   height: 26px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 6px;
   color: rgba(226, 232, 240, 0.78);
-  background: rgba(15, 23, 42, 0.44);
+  background: var(--asset-control-bg);
   cursor: pointer;
 
   svg {
@@ -4760,10 +4839,10 @@ const AssetIconButton = styled.button`
   width: 30px;
   height: 30px;
   padding: 0;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--asset-border);
   border-radius: 7px;
   color: rgba(226, 232, 240, 0.84);
-  background: rgba(15, 23, 42, 0.5);
+  background: var(--asset-control-bg-strong);
   font: inherit;
   cursor: pointer;
 
@@ -4828,7 +4907,7 @@ const AssetEmptyState = styled.div`
   min-height: 120px;
   overflow: auto;
   padding: 20px;
-  border: 1px dashed rgba(148, 163, 184, 0.22);
+  border: 1px dashed var(--asset-border-strong);
   border-radius: 8px;
   color: var(--forge-text-muted);
   font-size: 13px;

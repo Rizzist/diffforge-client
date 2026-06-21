@@ -626,6 +626,13 @@ const AUDIO_WIDGET_THEME_META_COLORS = {
   [AUDIO_WIDGET_THEME_DARK]: "#030508",
   [AUDIO_WIDGET_THEME_LIGHT]: "#f5f5f7",
 };
+const AUDIO_WIDGET_LOOPSPACE_THEME_META_COLORS = {
+  [AUDIO_WIDGET_THEME_DARK]: "#120b02",
+  [AUDIO_WIDGET_THEME_LIGHT]: "#fff8ea",
+};
+const FORGE_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
+const FORGE_SPACE_MODE_LOOPSPACES = "loopspaces";
+const FORGE_SPACE_MODE_WORKSPACES = "workspaces";
 const AUDIO_WIDGET_THEME_OPTIONS = [
   {
     detail: "Dark floating recorder",
@@ -1338,6 +1345,13 @@ function buildInputMeterBarStyle(index, level, active) {
 }
 
 function buildWidgetMeterBarStyle(index, level, processing, barCount = AUDIO_WIDGET_METER_BARS) {
+  const loopspaceActive = readAudioWidgetSpaceMode() === FORGE_SPACE_MODE_LOOPSPACES;
+  let barHueBase = processing ? 192 : 198;
+  let barHueRange = processing ? 46 : 66;
+  if (loopspaceActive) {
+    barHueBase = processing ? 34 : 38;
+    barHueRange = processing ? 22 : 28;
+  }
   const normalizedLevel = clampAudioLevel(level) / 100;
   const signalEnergy = processing ? 0.75 : Math.min(1, normalizedLevel * 8);
   const midpoint = (barCount - 1) / 2;
@@ -1354,7 +1368,7 @@ function buildWidgetMeterBarStyle(index, level, processing, barCount = AUDIO_WID
   const scaleHigh = Math.min(0.98, scale + (processing ? 0.17 : 0.08 + (signalEnergy * 0.16)) + (centerLift * 0.07));
 
   return {
-    "--bar-hue": `${processing ? 192 + ((index * 9) % 46) : 198 + ((index * 13) % 66)}`,
+    "--bar-hue": `${barHueBase + ((index * (processing ? 9 : 13)) % barHueRange)}`,
     "--delay": `${-1 * ((index * (processing ? 41 : 57)) % (processing ? 1100 : signalEnergy > 0.2 ? 1100 : 1700))}ms`,
     "--duration": `${(processing ? 760 : signalEnergy > 0.2 ? 620 : 1320) + ((index * (processing ? 29 : 47)) % (processing ? 260 : signalEnergy > 0.2 ? 430 : 560))}ms`,
     "--scale": scale.toFixed(2),
@@ -1421,18 +1435,58 @@ function applyAudioWidgetThemePreference(theme) {
   }
 
   const normalizedTheme = normalizeAudioWidgetTheme(theme);
+  const normalizedSpaceMode = readAudioWidgetSpaceMode();
   document.documentElement.dataset.forgeTheme = normalizedTheme;
+  document.documentElement.dataset.forgeSpace = normalizedSpaceMode;
   document.documentElement.dataset.audioWidgetTheme = normalizedTheme;
   if (document.body) {
     document.body.dataset.forgeTheme = normalizedTheme;
+    document.body.dataset.forgeSpace = normalizedSpaceMode;
     document.body.dataset.audioWidgetTheme = normalizedTheme;
   }
 
-  const themeColor = AUDIO_WIDGET_THEME_META_COLORS[normalizedTheme]
-    || AUDIO_WIDGET_THEME_META_COLORS[AUDIO_WIDGET_THEME_DARK];
+  const themeColors = normalizedSpaceMode === FORGE_SPACE_MODE_LOOPSPACES
+    ? AUDIO_WIDGET_LOOPSPACE_THEME_META_COLORS
+    : AUDIO_WIDGET_THEME_META_COLORS;
+  const themeColor = themeColors[normalizedTheme] || themeColors[AUDIO_WIDGET_THEME_DARK];
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", themeColor);
 
   return normalizedTheme;
+}
+
+function normalizeAudioWidgetSpaceMode(value) {
+  return String(value || "").trim().toLowerCase() === FORGE_SPACE_MODE_LOOPSPACES
+    ? FORGE_SPACE_MODE_LOOPSPACES
+    : FORGE_SPACE_MODE_WORKSPACES;
+}
+
+function readAudioWidgetSpaceMode() {
+  if (typeof window !== "undefined") {
+    try {
+      const stored = window.localStorage.getItem(FORGE_SPACE_MODE_STORAGE_KEY);
+      if (stored) {
+        return normalizeAudioWidgetSpaceMode(stored);
+      }
+    } catch {
+      // The widget can still inherit from the document dataset.
+    }
+  }
+  if (typeof document !== "undefined") {
+    return normalizeAudioWidgetSpaceMode(document.documentElement.dataset.forgeSpace);
+  }
+  return FORGE_SPACE_MODE_WORKSPACES;
+}
+
+function applyAudioWidgetSpacePreference(spaceMode = readAudioWidgetSpaceMode()) {
+  if (typeof document === "undefined") {
+    return normalizeAudioWidgetSpaceMode(spaceMode);
+  }
+  const normalizedSpaceMode = normalizeAudioWidgetSpaceMode(spaceMode);
+  document.documentElement.dataset.forgeSpace = normalizedSpaceMode;
+  if (document.body) {
+    document.body.dataset.forgeSpace = normalizedSpaceMode;
+  }
+  return normalizedSpaceMode;
 }
 
 function defaultPushToTalkShortcut() {
@@ -9436,15 +9490,27 @@ export function AudioWidgetWindow() {
 
   useEffect(() => {
     document.documentElement.dataset.audioWidget = "true";
+    applyAudioWidgetSpacePreference();
     document.documentElement.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(audioWidgetTheme);
     document.body.dataset.audioWidget = "true";
+    document.body.dataset.forgeSpace = readAudioWidgetSpaceMode();
     document.body.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(audioWidgetTheme);
 
+    const handleSpaceStorage = (event) => {
+      if (event.key === FORGE_SPACE_MODE_STORAGE_KEY) {
+        applyAudioWidgetSpacePreference(event.newValue);
+      }
+    };
+    window.addEventListener("storage", handleSpaceStorage);
+
     return () => {
+      window.removeEventListener("storage", handleSpaceStorage);
       delete document.documentElement.dataset.audioWidget;
       delete document.documentElement.dataset.audioWidgetTheme;
+      delete document.documentElement.dataset.forgeSpace;
       delete document.body.dataset.audioWidget;
       delete document.body.dataset.audioWidgetTheme;
+      delete document.body.dataset.forgeSpace;
     };
   }, [audioWidgetTheme]);
 
@@ -10045,18 +10111,37 @@ export function AudioWidgetErrorOverlayWindow() {
     }
     document.documentElement.dataset.audioWidgetError = "true";
     document.body.dataset.audioWidgetError = "true";
+    applyAudioWidgetSpacePreference();
     document.documentElement.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(
+      payload?.theme || AUDIO_WIDGET_THEME_DARK,
+    );
+    document.documentElement.dataset.forgeTheme = normalizeAudioWidgetTheme(
       payload?.theme || AUDIO_WIDGET_THEME_DARK,
     );
     document.body.dataset.audioWidgetTheme = normalizeAudioWidgetTheme(
       payload?.theme || AUDIO_WIDGET_THEME_DARK,
     );
+    document.body.dataset.forgeTheme = normalizeAudioWidgetTheme(
+      payload?.theme || AUDIO_WIDGET_THEME_DARK,
+    );
+
+    const handleSpaceStorage = (event) => {
+      if (event.key === FORGE_SPACE_MODE_STORAGE_KEY) {
+        applyAudioWidgetSpacePreference(event.newValue);
+      }
+    };
+    window.addEventListener("storage", handleSpaceStorage);
 
     return () => {
+      window.removeEventListener("storage", handleSpaceStorage);
       delete document.documentElement.dataset.audioWidgetError;
       delete document.body.dataset.audioWidgetError;
       delete document.documentElement.dataset.audioWidgetTheme;
+      delete document.documentElement.dataset.forgeTheme;
+      delete document.documentElement.dataset.forgeSpace;
       delete document.body.dataset.audioWidgetTheme;
+      delete document.body.dataset.forgeTheme;
+      delete document.body.dataset.forgeSpace;
     };
   }, [payload?.theme]);
 

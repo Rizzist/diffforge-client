@@ -14,6 +14,7 @@ import {
 // cycles while the store silently revalidates and listens for change events.
 
 const SKILLS_REVALIDATE_MIN_MS = 20_000;
+const ACCOUNT_DOCS_REVALIDATE_TIMEOUT_MS = 4_500;
 const ACCOUNT_TOOLS_EVENT_DEBOUNCE_MS = 500;
 const ARCHITECTURE_CHANGE_EVENTS = [
   "architecture-store-changed",
@@ -190,7 +191,7 @@ function accountToolsSkillUnitsFromEventPayload(payload) {
   const units = accountDocumentUnitsFromPayload(payload).filter(Boolean);
   const byId = new Map();
   units.forEach((unit) => {
-    const id = text(unit?.skill_id || unit?.skillId || unit?.document_id || unit?.documentId || unit?.id);
+    const id = text(unit?.doc_id || unit?.document_id || unit?.id);
     if (id) byId.set(id, unit);
   });
   return Array.from(byId.values());
@@ -213,14 +214,30 @@ async function loadAccountSkills({ force = false } = {}) {
   }
   const load = (async () => {
     try {
+      const localTools = await invoke("cloud_mcp_get_account_documents", {
+        request: { limit: 2000, local_only: true },
+      });
+      const localUnits = accountDocumentUnitsFromPayload(localTools);
+      applyAccountSkills(skillsFromUnits(localUnits));
+    } catch {
+      if (!workspaceToolsStore.skillsLoaded) {
+        applyAccountSkills([]);
+      }
+    }
+
+    try {
       const tools = await invoke("cloud_mcp_get_account_documents", {
-        request: { limit: 2000 },
+        request: {
+          limit: 2000,
+          cloud_timeout_ms: ACCOUNT_DOCS_REVALIDATE_TIMEOUT_MS,
+        },
       });
       workspaceToolsStore.skillsFetchedAtMs = Date.now();
       const units = accountDocumentUnitsFromPayload(tools);
       applyAccountSkills(skillsFromUnits(units));
     } catch {
-      // Offline or transient failure: keep cached entries, leave "loading".
+      // Offline or transient failure: keep the local cache. Docs are account
+      // data, not a tab-scoped loading surface.
       if (!workspaceToolsStore.skillsLoaded) {
         applyAccountSkills([]);
       }
@@ -332,6 +349,10 @@ export function getWorkspaceToolsArchitectures(repoDescriptors) {
 
 export function getWorkspaceToolsSkills() {
   return workspaceToolsStore.skillsEntries;
+}
+
+export function getWorkspaceToolsAccountSkills() {
+  return workspaceToolsStore.skills;
 }
 
 export function hasWorkspaceToolsLoaded(repoDescriptors) {

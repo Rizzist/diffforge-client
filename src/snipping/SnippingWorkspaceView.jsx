@@ -48,8 +48,59 @@ const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
 const SNIPPING_ACTION_RECORDING = "area-recording";
 const SNIPPING_PERMISSION_HIGHLIGHT_MS = 4200;
+const FORGE_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
+const FORGE_SPACE_MODE_LOOPSPACES = "loopspaces";
+const FORGE_SPACE_MODE_WORKSPACES = "workspaces";
 const RECORDING_MIN_SELECTION_SIZE = 36;
 const RECORDING_RESIZE_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
+
+function normalizeForgeSpaceMode(value) {
+  return String(value || "").trim().toLowerCase() === FORGE_SPACE_MODE_LOOPSPACES
+    ? FORGE_SPACE_MODE_LOOPSPACES
+    : FORGE_SPACE_MODE_WORKSPACES;
+}
+
+function readForgeSpaceMode() {
+  if (typeof window !== "undefined") {
+    try {
+      return normalizeForgeSpaceMode(window.localStorage.getItem(FORGE_SPACE_MODE_STORAGE_KEY));
+    } catch {
+      // The overlay still has a usable default when localStorage is unavailable.
+    }
+  }
+  return FORGE_SPACE_MODE_WORKSPACES;
+}
+
+function applyForgeSpaceDataset(spaceMode = readForgeSpaceMode()) {
+  if (typeof document === "undefined") {
+    return normalizeForgeSpaceMode(spaceMode);
+  }
+  const normalized = normalizeForgeSpaceMode(spaceMode);
+  document.documentElement.dataset.forgeSpace = normalized;
+  if (document.body) {
+    document.body.dataset.forgeSpace = normalized;
+  }
+  return normalized;
+}
+
+function useForgeSpaceDataset() {
+  useEffect(() => {
+    applyForgeSpaceDataset();
+    const handleStorage = (event) => {
+      if (event.key === FORGE_SPACE_MODE_STORAGE_KEY) {
+        applyForgeSpaceDataset(event.newValue);
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      delete document.documentElement.dataset.forgeSpace;
+      if (document.body) {
+        delete document.body.dataset.forgeSpace;
+      }
+    };
+  }, []);
+}
 
 function clearOverlaySnapshotPath(monitor) {
   if (!monitor || typeof monitor !== "object") return monitor || null;
@@ -923,6 +974,7 @@ export default function SnippingWorkspaceView({
 }
 
 export function SnippingOverlayWindow() {
+  useForgeSpaceDataset();
   const [drag, setDrag] = useState(null);
   const [error, setError] = useState("");
   const [capturing, setCapturing] = useState(false);
@@ -1076,6 +1128,19 @@ export function SnippingOverlayWindow() {
   const loadOverlayStatus = useCallback(async () => {
     try {
       const status = await invoke("snipping_area_overlay_status");
+      if (status?.active === false) {
+        applyOverlayMonitor(null, status?.mode);
+        logCursorDebug("status_inactive", cursorDebugSnapshot(null, {
+          overlayMonitor: null,
+          mode: status?.mode,
+        }));
+        try {
+          await getCurrentWindow().hide();
+        } catch {
+          // A hidden/prewarmed overlay can ignore stale status quietly.
+        }
+        return;
+      }
       applyOverlayMonitor(status?.monitor || null, status?.mode);
       logCursorDebug("status_loaded", cursorDebugSnapshot(null, {
         overlayMonitor: status?.monitor || null,
@@ -1244,6 +1309,12 @@ export function SnippingOverlayWindow() {
     if (event.target?.closest?.("button")) {
       return;
     }
+    if (!overlayMonitor) {
+      logCursorDebug("pointer_down_ignored", cursorDebugSnapshot(event, {
+        reason: "inactive_overlay",
+      }));
+      return;
+    }
     if ((event.pointerType === "mouse" && event.button !== 0) || capturingRef.current) {
       logCursorDebug("pointer_down_ignored", cursorDebugSnapshot(event, {
         reason: capturingRef.current ? "capturing" : "non_primary_mouse_button",
@@ -1296,7 +1367,7 @@ export function SnippingOverlayWindow() {
       captureAcquired,
       drag: nextDrag,
     }));
-  }, [cursorDebugSnapshot, logCursorDebug, overlayMode, overlayPoint, recordingSelection]);
+  }, [cursorDebugSnapshot, logCursorDebug, overlayMode, overlayMonitor, overlayPoint, recordingSelection]);
 
   const updateDrag = useCallback((event) => {
     if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
@@ -1556,6 +1627,7 @@ export function SnippingOverlayWindow() {
 }
 
 export function SnippingRecordingControlsWindow() {
+  useForgeSpaceDataset();
   const [status, setStatus] = useState(null);
   const [nowMs, setNowMs] = useState(Date.now());
   const [stopping, setStopping] = useState(false);
@@ -1911,6 +1983,30 @@ const SnippingEmptyState = styled.div`
 `;
 
 const SnippingOverlayGlobalStyle = createGlobalStyle`
+  html {
+    --snipping-overlay-panel: rgba(10, 12, 16, 0.78);
+    --snipping-overlay-panel-strong: rgba(10, 12, 16, 0.88);
+    --snipping-overlay-border: rgba(255, 255, 255, 0.14);
+    --snipping-overlay-accent-rgb: 59, 130, 246;
+    --snipping-overlay-accent-soft-rgb: 125, 176, 255;
+    --snipping-overlay-accent-soft: #7db0ff;
+    --snipping-selection-border: rgba(125, 176, 255, 0.95);
+    --snipping-selection-shadow: rgba(8, 10, 14, 0.14);
+    --snipping-selection-dash: #0f172a;
+  }
+
+  html[data-forge-space="loopspaces"] {
+    --snipping-overlay-panel: rgba(15, 10, 4, 0.82);
+    --snipping-overlay-panel-strong: rgba(13, 9, 4, 0.9);
+    --snipping-overlay-border: rgba(255, 209, 102, 0.18);
+    --snipping-overlay-accent-rgb: 245, 158, 11;
+    --snipping-overlay-accent-soft-rgb: 255, 209, 102;
+    --snipping-overlay-accent-soft: #ffd166;
+    --snipping-selection-border: rgba(255, 209, 102, 0.96);
+    --snipping-selection-shadow: rgba(22, 14, 3, 0.16);
+    --snipping-selection-dash: #3a2505;
+  }
+
   html,
   body,
   #app {
@@ -1975,10 +2071,10 @@ const SnippingOverlayHint = styled.div`
   top: 28px;
   left: 50%;
   padding: 7px 14px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--snipping-overlay-border);
   border-radius: 999px;
   color: rgba(244, 247, 250, 0.92);
-  background: rgba(10, 12, 16, 0.78);
+  background: var(--snipping-overlay-panel);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
   font-size: 12px;
   font-weight: 600;
@@ -1992,18 +2088,20 @@ const SnippingOverlayHint = styled.div`
 
 const SnippingSelectionBox = styled.div`
   position: absolute;
-  border: 1.5px solid rgba(125, 176, 255, 0.95);
+  border: 1.5px solid var(--snipping-selection-border);
   border-radius: 2px;
   /* Subtle spotlight: hint the selection without darkening the screen. */
   box-shadow:
     0 0 0 1px rgba(8, 10, 14, 0.35),
-    0 0 0 100000px rgba(8, 10, 14, 0.14);
+    0 0 0 100000px var(--snipping-selection-shadow),
+    0 0 28px rgba(var(--snipping-overlay-accent-rgb), 0.2);
   pointer-events: none;
 
   &[data-mode="recording"] {
     border: 0;
     box-shadow:
-      0 0 0 100000px rgba(8, 10, 14, 0.14);
+      0 0 0 100000px var(--snipping-selection-shadow),
+      0 0 28px rgba(var(--snipping-overlay-accent-rgb), 0.18);
     pointer-events: auto;
   }
 
@@ -2011,13 +2109,13 @@ const SnippingSelectionBox = styled.div`
     content: "";
     position: absolute;
     inset: -1px;
-    border: 1px dashed rgba(248, 250, 252, 0.92);
+    border: 1px dashed rgba(var(--snipping-overlay-accent-soft-rgb), 0.92);
     border-radius: 4px;
     background:
-      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 0 / 12px 1px repeat-x,
-      linear-gradient(90deg, #0f172a 50%, transparent 0) 0 100% / 12px 1px repeat-x,
-      linear-gradient(0deg, #0f172a 50%, transparent 0) 0 0 / 1px 12px repeat-y,
-      linear-gradient(0deg, #0f172a 50%, transparent 0) 100% 0 / 1px 12px repeat-y;
+      linear-gradient(90deg, var(--snipping-selection-dash) 50%, transparent 0) 0 0 / 12px 1px repeat-x,
+      linear-gradient(90deg, var(--snipping-selection-dash) 50%, transparent 0) 0 100% / 12px 1px repeat-x,
+      linear-gradient(0deg, var(--snipping-selection-dash) 50%, transparent 0) 0 0 / 1px 12px repeat-y,
+      linear-gradient(0deg, var(--snipping-selection-dash) 50%, transparent 0) 100% 0 / 1px 12px repeat-y;
     animation: recordingSelectionMarch 720ms linear infinite;
     pointer-events: none;
   }
@@ -2027,9 +2125,9 @@ const SnippingSelectionBox = styled.div`
     left: 50%;
     top: calc(100% + 8px);
     padding: 4px 9px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid var(--snipping-overlay-border);
     border-radius: 6px;
-    background: rgba(10, 12, 16, 0.88);
+    background: var(--snipping-overlay-panel-strong);
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
     color: rgba(244, 247, 250, 0.92);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -2127,9 +2225,9 @@ const SnippingRecordingControlDock = styled.div`
   gap: 8px;
   min-height: 42px;
   padding: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.13);
+  border: 1px solid var(--snipping-overlay-border);
   border-radius: 12px;
-  background: rgba(9, 12, 18, 0.86);
+  background: var(--snipping-overlay-panel-strong);
   box-shadow:
     0 18px 46px rgba(0, 0, 0, 0.4),
     inset 0 1px 0 rgba(255, 255, 255, 0.08);
@@ -2160,7 +2258,7 @@ const SnippingRecordingControlDock = styled.div`
     border: 1px solid rgba(255, 255, 255, 0.14);
     border-radius: 7px;
     color: rgba(248, 250, 252, 0.9);
-    background: rgba(10, 12, 16, 0.88);
+    background: var(--snipping-overlay-panel-strong);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
     font-size: 12px;
     font-weight: 760;

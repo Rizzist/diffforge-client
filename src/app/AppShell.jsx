@@ -1228,6 +1228,7 @@ const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
 const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
+const APP_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
 const APP_THEME_DARK = "dark";
 const APP_THEME_LIGHT = "light";
 const APP_THEME_DEFAULT = APP_THEME_DARK;
@@ -8075,6 +8076,11 @@ function applyForgeThemePreference(theme, spaceMode = APP_SPACE_MODE_DEFAULT) {
     document.body.dataset.forgeTheme = normalizedTheme;
     document.body.dataset.forgeSpace = normalizedSpaceMode;
   }
+  try {
+    window.localStorage.setItem(APP_SPACE_MODE_STORAGE_KEY, normalizedSpaceMode);
+  } catch {
+    // Space mode still applies to the current window even when persistence is unavailable.
+  }
 
   const themeColor = normalizedSpaceMode === APP_SPACE_MODE_LOOPSPACES
     ? APP_LOOPSPACE_THEME_META_COLORS[normalizedTheme] || APP_LOOPSPACE_THEME_META_COLORS[APP_THEME_DEFAULT]
@@ -9562,6 +9568,8 @@ export default function App() {
   const workspaceArchitectureGraphListInFlightRef = useRef(new Set());
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
+  const appControlVisibleContextRef = useRef(null);
+  const appControlDocumentActionsRef = useRef({});
   const mainWindowFocusedRef = useRef(mainWindowFocused);
   const workspacesRef = useRef(workspaces);
   const workspaceCatalogRef = useRef(workspaceCatalog);
@@ -9617,6 +9625,24 @@ export default function App() {
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
+
+  const handleAppControlContextChange = useCallback((context) => {
+    appControlVisibleContextRef.current = context && typeof context === "object" && !Array.isArray(context)
+      ? context
+      : null;
+  }, []);
+
+  const registerAppControlDocumentActions = useCallback((actions) => {
+    const safeActions = actions && typeof actions === "object" && !Array.isArray(actions)
+      ? actions
+      : {};
+    appControlDocumentActionsRef.current = safeActions;
+    return () => {
+      if (appControlDocumentActionsRef.current === safeActions) {
+        appControlDocumentActionsRef.current = {};
+      }
+    };
+  }, []);
   const sharedMcpActiveRuntimeTargetsRef = useRef(new Map());
   const sharedMcpBackgroundJobsRef = useRef(new Map());
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
@@ -24643,8 +24669,41 @@ export default function App() {
         });
       });
     };
+    const buildAppControlVisibleContext = (input = {}) => {
+      const context = appControlVisibleContextRef.current;
+      const toolsSurfaceVisible = GLOBAL_TOOLS_VIEWS.has(visibleView);
+      const activeContext = context
+        && typeof context === "object"
+        && !Array.isArray(context)
+        && context.surface === "tools"
+        && context.active !== false
+        && toolsSurfaceVisible;
+      const includeContent = appControlBooleanValue(input.includeContent ?? input.include_content, false);
+      const contextPayload = activeContext ? { ...context } : null;
+      if (contextPayload && !includeContent) {
+        delete contextPayload.content;
+        delete contextPayload.fullContent;
+        delete contextPayload.draftContent;
+      }
+      return {
+        active: Boolean(activeContext),
+        activeView,
+        context: contextPayload,
+        visibleView,
+      };
+    };
+    const buildAppControlSelectionContext = () => {
+      const visibleContext = buildAppControlVisibleContext();
+      const context = visibleContext.context || {};
+      return {
+        ...visibleContext,
+        document: context.document || null,
+        selection: context.highlightedRange || null,
+      };
+    };
     const buildAppControlState = () => ({
       activeView,
+      visibleContext: buildAppControlVisibleContext(),
       visibleView,
       selectedWorkspace: selectedWorkspace ? workspaceSummary(selectedWorkspace) : null,
       activatedWorkspace: activatedWorkspace ? workspaceSummary(activatedWorkspace) : null,
@@ -24673,6 +24732,73 @@ export default function App() {
           sendAppControlReply(requestId, {
             ok: true,
             data: buildAppControlState(),
+          });
+          return;
+        }
+
+        if (tool === "get_visible_context") {
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...buildAppControlVisibleContext(input),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "get_selected_document_context") {
+          const visibleContext = buildAppControlVisibleContext(input);
+          const documentContext = visibleContext.context?.document ? visibleContext.context : null;
+          sendAppControlReply(requestId, {
+            ok: Boolean(documentContext),
+            ...(documentContext ? {} : {
+              error: {
+                code: "no_selected_document",
+                message: "No Tools document is selected in the visible app context.",
+              },
+            }),
+            data: {
+              ...visibleContext,
+              documentContext,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "get_selection_context") {
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...buildAppControlSelectionContext(),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "save_selected_document") {
+          const actions = appControlDocumentActionsRef.current || {};
+          if (typeof actions.saveSelectedDocument !== "function") {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "document_actions_unavailable",
+                message: "The Tools document editor is not available.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await actions.saveSelectedDocument(input);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+            data: {
+              result,
+              state: buildAppControlState(),
+            },
           });
           return;
         }
@@ -31344,6 +31470,9 @@ export default function App() {
                     }}
                     defaultWorkingDirectory={defaultWorkingDirectory}
                     initialSection={visibleView === "mcps" ? "mcps" : "architectures"}
+                    onAppControlContextChange={handleAppControlContextChange}
+                    onAppControlDocumentActions={registerAppControlDocumentActions}
+                    rightToolsOrchestratorOpen={workspaceToolPaneVisible && !workspaceToolPaneMinimized}
                     workspaces={assetWorkspaceOptions}
                   />
                 </ForgeWorkspace>
@@ -31533,10 +31662,10 @@ export default function App() {
                           {shouldRenderAccountToolPanel ? (
                             <>
                               {workspaceToolPaneMinimized ? (
-                                <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
+                                <WorkspaceAppToolMinimizedRail aria-label="App docs minimized">
                                   <WorkspaceAppToolRailControls>
                                     <WorkspaceAppToolRailButton
-                                      aria-label="Unminimize app tools"
+                                      aria-label="Unminimize app docs"
                                       onClick={restoreWorkspaceToolPane}
                                       title="Unminimize"
                                       type="button"
@@ -31544,7 +31673,7 @@ export default function App() {
                                       <TitleRestoreIcon aria-hidden="true" />
                                     </WorkspaceAppToolRailButton>
                                   </WorkspaceAppToolRailControls>
-                                  <WorkspaceAppToolRailLabel>Tools</WorkspaceAppToolRailLabel>
+                                  <WorkspaceAppToolRailLabel>Docs</WorkspaceAppToolRailLabel>
                                 </WorkspaceAppToolMinimizedRail>
                               ) : null}
                               <div

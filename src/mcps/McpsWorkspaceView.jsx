@@ -120,8 +120,8 @@ const MCP_SELECT_STYLES = {
     borderRadius: 8,
     borderColor: state.isFocused
       ? "rgba(var(--forge-accent-soft-rgb), 0.44)"
-      : "var(--forge-border-strong)",
-    backgroundColor: "rgba(13, 17, 23, 0.92)",
+      : "var(--mcp-border-strong, var(--forge-border-strong))",
+    backgroundColor: "var(--mcp-control-bg, rgba(13, 17, 23, 0.92))",
     boxShadow: state.isFocused ? "0 0 0 3px rgba(var(--forge-accent-rgb), 0.12)" : "none",
     cursor: "default",
   }),
@@ -152,9 +152,9 @@ const MCP_SELECT_STYLES = {
   menu: (base) => ({
     ...base,
     overflow: "hidden",
-    border: "1px solid var(--forge-border-strong)",
+    border: "1px solid var(--mcp-border-strong, var(--forge-border-strong))",
     borderRadius: 8,
-    backgroundColor: "var(--forge-surface-raised)",
+    backgroundColor: "var(--mcp-panel-bg-raised, var(--forge-surface-raised))",
     boxShadow: "0 16px 36px rgba(0, 0, 0, 0.32)",
   }),
   menuList: (base) => ({
@@ -168,7 +168,7 @@ const MCP_SELECT_STYLES = {
     backgroundColor: state.isSelected
       ? "rgba(var(--forge-accent-rgb), 0.18)"
       : state.isFocused
-        ? "var(--forge-surface-selected)"
+        ? "var(--mcp-active-bg, var(--forge-surface-selected))"
         : "transparent",
     fontSize: 12,
     fontWeight: 760,
@@ -192,10 +192,10 @@ const MCP_BAR_SELECT_STYLES = {
     ...MCP_SELECT_STYLES.control(base, state),
     minHeight: 34,
     height: 34,
-    backgroundColor: "rgba(230, 236, 245, 0.05)",
+    backgroundColor: "var(--mcp-control-bg-soft, rgba(230, 236, 245, 0.05))",
     borderColor: state.isFocused
       ? "rgba(var(--forge-accent-soft-rgb), 0.44)"
-      : "var(--forge-border, rgba(230, 236, 245, 0.12))",
+      : "var(--mcp-border, var(--forge-border, rgba(230, 236, 245, 0.12)))",
     cursor: "pointer",
   }),
   valueContainer: (base) => ({ ...base, padding: "0 2px 0 10px", flexWrap: "nowrap" }),
@@ -2607,7 +2607,7 @@ const McpHubDetailCrumb = styled.span`
 const McpHubGhostButton = styled.button`
   flex: 0 0 auto;
   padding: 8px 13px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border: 1px solid var(--mcp-border, var(--forge-border, rgba(230, 236, 245, 0.12)));
   border-radius: 8px;
   color: var(--forge-text-soft, #b6c0cc);
   background: transparent;
@@ -2617,7 +2617,7 @@ const McpHubGhostButton = styled.button`
   white-space: nowrap;
 
   &:hover:not(:disabled) {
-    border-color: rgba(230, 236, 245, 0.24);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
     color: var(--forge-text, #f4f7fa);
   }
 
@@ -2641,9 +2641,9 @@ const McpHubList = styled.div`
   align-content: start;
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border: 1px solid var(--mcp-border, var(--forge-border, rgba(230, 236, 245, 0.08)));
   border-radius: 10px;
-  background: rgba(7, 9, 13, 0.4);
+  background: var(--mcp-panel-bg, rgba(7, 9, 13, 0.4));
 `;
 
 const McpHubRow = styled.div`
@@ -2653,14 +2653,14 @@ const McpHubRow = styled.div`
   gap: 10px;
   min-height: 52px;
   padding: 0 12px 0 0;
-  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+  border-bottom: 1px solid var(--mcp-border, var(--forge-border, rgba(230, 236, 245, 0.05)));
 
   &:last-child {
     border-bottom: 0;
   }
 
   &:hover {
-    background: rgba(230, 236, 245, 0.03);
+    background: var(--mcp-hover-bg, rgba(230, 236, 245, 0.03));
   }
 `;
 
@@ -2693,7 +2693,7 @@ const McpHubRowIcon = styled.span`
   place-items: center;
   border-radius: 8px;
   color: var(--forge-text-soft, #b6c0cc);
-  background: rgba(230, 236, 245, 0.06);
+  background: var(--mcp-icon-bg, rgba(230, 236, 245, 0.06));
 
   svg {
     width: 15px;
@@ -2765,7 +2765,7 @@ const McpHubRowButtonAction = styled.button`
   border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.3);
   border-radius: 7px;
   color: var(--forge-accent-soft, rgba(200, 222, 255, 0.95));
-  background: rgba(var(--forge-accent-rgb), 0.12);
+  background: var(--mcp-active-bg, rgba(var(--forge-accent-rgb), 0.12));
   font-size: 11px;
   font-weight: 750;
   cursor: pointer;

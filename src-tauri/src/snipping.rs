@@ -31,12 +31,17 @@ static SNIPPING_DESKTOP_ICONS_HIDDEN_BY_APP: AtomicBool = AtomicBool::new(false)
 static SNIPPING_AREA_BEGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static SNIPPING_AREA_BEGIN_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_BEGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SNIPPING_SCAP_CAPTURE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static SNIPPING_SCAP_CAPTURE_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static SNIPPING_SCAP_CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_CURSOR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS: AtomicU64 = AtomicU64::new(0);
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_SCAP_CAPTURE_FPS: u32 = 60;
 const SNIPPING_SCAP_WARM_CAPTURE_FPS: u32 = 30;
 const SNIPPING_SCAP_CAPTURE_TIMEOUT_MS: u64 = 4_500;
+const SNIPPING_SCAP_CAPTURE_BUSY_POLL_MS: u64 = 20;
+const SNIPPING_SCAP_CAPTURE_STALE_MS: u64 = SNIPPING_SCAP_CAPTURE_TIMEOUT_MS + 1_500;
 const SNIPPING_SCAP_TARGET_SIZE_TIMEOUT_MS: u64 = 1_200;
 const SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS: u64 = 5_500;
 const SNIPPING_AREA_BEGIN_STALE_MS: u64 = SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS + 3_000;
@@ -1453,6 +1458,11 @@ fn macos_screen_capture_permission_granted() -> bool {
     let granted = unsafe { CGPreflightScreenCaptureAccess() };
     if granted {
         SNIPPING_SCREEN_CAPTURE_CONFIRMED.store(true, Ordering::Release);
+        return true;
+    }
+    let granted = std::panic::catch_unwind(scap::has_permission).unwrap_or(false);
+    if granted {
+        SNIPPING_SCREEN_CAPTURE_CONFIRMED.store(true, Ordering::Release);
     }
     granted
 }
@@ -1578,8 +1588,8 @@ fn snipping_reason_is_hotkey(reason: &str) -> bool {
 
 fn snipping_error_is_screen_capture_permission(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    lower.contains("screen capture permission")
-        || lower.contains("screen recording")
+    lower.contains("screen capture permission was not granted")
+        || lower.contains("screen recording permission was not granted")
         || lower.contains("permission was not granted")
 }
 
@@ -1603,6 +1613,12 @@ fn emit_snipping_permission_attention(
     error: &str,
 ) {
     if !snipping_reason_is_hotkey(reason) || !snipping_error_is_screen_capture_permission(error) {
+        return;
+    }
+
+    let permissions = snipping_permission_status();
+    if !permissions.screen_capture_required || permissions.screen_capture_granted {
+        emit_snipping_capture_attention(app, reason, shortcut, error);
         return;
     }
 
@@ -2360,6 +2376,29 @@ fn snipping_area_overlay_is_ready(app: &AppHandle, label: &str) -> bool {
         .lock()
         .map(|labels| labels.contains(label))
         .unwrap_or(false)
+}
+
+fn snipping_handle_area_overlay_destroyed(app: &AppHandle, label: &str) {
+    snipping_forget_area_overlay_ready(app, label);
+    let session_was_active = app
+        .state::<SnippingState>()
+        .active_area_sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(label))
+        .unwrap_or(false);
+    if !session_was_active {
+        return;
+    }
+
+    log_snipping_area_cursor_debug_event(
+        "native.overlay_destroyed_active_session",
+        json!({
+            "overlay_label": label,
+            "cursor_position": snipping_app_cursor_position_debug_value(app),
+        }),
+    );
+    let _ = snipping_clear_area_sessions(app);
+    snipping_hide_area_overlay(app);
 }
 
 fn snipping_wait_for_area_overlay_ready(app: &AppHandle, label: &str) {
@@ -3138,6 +3177,67 @@ where
     Ok((data, width, height))
 }
 
+struct SnippingScapCaptureGuard {
+    generation: u64,
+}
+
+impl Drop for SnippingScapCaptureGuard {
+    fn drop(&mut self) {
+        if SNIPPING_SCAP_CAPTURE_GENERATION.load(Ordering::Acquire) == self.generation {
+            SNIPPING_SCAP_CAPTURE_STARTED_AT_MS.store(0, Ordering::Release);
+            SNIPPING_SCAP_CAPTURE_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn snipping_scap_capture_age_ms(now_ms: u64) -> Option<u64> {
+    if !SNIPPING_SCAP_CAPTURE_IN_FLIGHT.load(Ordering::Acquire) {
+        return None;
+    }
+    let started_at = SNIPPING_SCAP_CAPTURE_STARTED_AT_MS.load(Ordering::Acquire);
+    if started_at == 0 {
+        return None;
+    }
+    Some(now_ms.saturating_sub(started_at))
+}
+
+fn snipping_begin_scap_capture(context: &str) -> Result<SnippingScapCaptureGuard, String> {
+    let started = Instant::now();
+    loop {
+        let now = current_time_ms();
+        if SNIPPING_SCAP_CAPTURE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let generation = SNIPPING_SCAP_CAPTURE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+            SNIPPING_SCAP_CAPTURE_STARTED_AT_MS.store(now, Ordering::Release);
+            return Ok(SnippingScapCaptureGuard { generation });
+        }
+
+        if snipping_scap_capture_age_ms(now).is_some_and(|age| age >= SNIPPING_SCAP_CAPTURE_STALE_MS)
+        {
+            let generation = SNIPPING_SCAP_CAPTURE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+            SNIPPING_SCAP_CAPTURE_STARTED_AT_MS.store(now, Ordering::Release);
+            log_terminal_status_event(
+                "backend.snipping.scap_capture.stale_superseded",
+                json!({
+                    "context": context,
+                    "stale_after_ms": SNIPPING_SCAP_CAPTURE_STALE_MS,
+                }),
+            );
+            return Ok(SnippingScapCaptureGuard { generation });
+        }
+
+        if started.elapsed() >= Duration::from_millis(SNIPPING_SCAP_CAPTURE_TIMEOUT_MS) {
+            return Err(format!(
+                "Screen capture is still busy while {context}. Try the snip again."
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(SNIPPING_SCAP_CAPTURE_BUSY_POLL_MS));
+    }
+}
+
 fn snipping_scap_capture_image_inner(
     target: Option<scap::Target>,
     crop_area: Option<scap::capturer::Area>,
@@ -3181,9 +3281,11 @@ fn snipping_scap_capture_image(
     crop_area: Option<scap::capturer::Area>,
     context: &str,
 ) -> Result<image::RgbaImage, String> {
+    let capture_guard = snipping_begin_scap_capture(context)?;
     let (sender, receiver) = std::sync::mpsc::channel();
     let context_for_worker = context.to_string();
     thread::spawn(move || {
+        let _capture_guard = capture_guard;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             snipping_scap_capture_image_inner(target, crop_area)
         }))
@@ -3195,7 +3297,7 @@ fn snipping_scap_capture_image(
     match receiver.recv_timeout(Duration::from_millis(SNIPPING_SCAP_CAPTURE_TIMEOUT_MS)) {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "Timed out while {context}. Try the snip again; if it keeps happening, reopen Screen Recording permission for Diff Forge AI."
+            "Timed out while {context}. Try the snip again."
         )),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(format!("Screen capture backend stopped while {context}."))
@@ -5427,6 +5529,9 @@ fn snipping_capture_full_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
+    if snipping_area_session_active(app) {
+        snipping_reset_active_area_for_fresh_capture(app, reason, &shortcut)?;
+    }
     let exclude_desktop_icons = snipping_should_hide_desktop_icons(app);
     snipping_hide_desktop_icons_for_capture(app);
     let image_result = snipping_monitor_for_full(app).and_then(|monitor| {
@@ -5503,7 +5608,7 @@ fn ensure_snipping_overlay_window(
         let label_for_destroy = label.to_string();
         window.on_window_event(move |event| {
             if matches!(event, WindowEvent::Destroyed) {
-                snipping_forget_area_overlay_ready(&app_for_destroy, &label_for_destroy);
+                snipping_handle_area_overlay_destroyed(&app_for_destroy, &label_for_destroy);
             }
         });
     }
@@ -6513,6 +6618,24 @@ fn snipping_area_already_active_payload(reason: &str, shortcut: String) -> Value
     })
 }
 
+fn snipping_reset_active_area_for_fresh_capture(
+    app: &AppHandle,
+    reason: &str,
+    shortcut: &str,
+) -> Result<(), String> {
+    log_snipping_area_cursor_debug_event(
+        "native.reset_active_area_session",
+        json!({
+            "reason": reason,
+            "shortcut": shortcut,
+            "cursor_position": snipping_app_cursor_position_debug_value(app),
+        }),
+    );
+    snipping_clear_area_sessions(app)?;
+    snipping_hide_area_overlay(app);
+    Ok(())
+}
+
 fn snipping_area_session_monitor(
     app: &AppHandle,
     label: &str,
@@ -6617,15 +6740,7 @@ fn snipping_begin_area_for(
     );
     ensure_snipping_enabled(app)?;
     if snipping_area_session_active(app) {
-        log_snipping_area_cursor_debug_event(
-            "native.begin_already_active",
-            json!({
-                "reason": reason,
-                "shortcut": &shortcut,
-                "cursor_position": snipping_app_cursor_position_debug_value(app),
-            }),
-        );
-        return Ok(snipping_area_already_active_payload(reason, shortcut));
+        snipping_reset_active_area_for_fresh_capture(app, reason, &shortcut)?;
     }
     snipping_clear_stale_area_begin_if_needed(app, reason, &shortcut);
     let Some(begin_guard) = snipping_try_begin_area_snip() else {
@@ -6641,15 +6756,7 @@ fn snipping_begin_area_for(
         return Ok(snipping_area_already_active_payload(reason, shortcut));
     };
     if snipping_area_session_active(app) {
-        log_snipping_area_cursor_debug_event(
-            "native.begin_active_after_guard",
-            json!({
-                "reason": reason,
-                "shortcut": &shortcut,
-                "cursor_position": snipping_app_cursor_position_debug_value(app),
-            }),
-        );
-        return Ok(snipping_area_already_active_payload(reason, shortcut));
+        snipping_reset_active_area_for_fresh_capture(app, reason, &shortcut)?;
     }
 
     // Boot the preview window for this capture while the user is still
@@ -7476,12 +7583,19 @@ fn snipping_area_overlay_status(
     window: tauri::WebviewWindow,
 ) -> Result<Value, String> {
     let label = window.label().to_string();
-    let monitor = snipping_area_session_monitor(&app, &label)
-        .or_else(|_| snipping_current_area_monitor(&app))?;
-    let mode = snipping_area_session_mode(&app, &label)
-        .unwrap_or(SnippingAreaMode::Image);
+    let Ok(monitor) = snipping_area_session_monitor(&app, &label) else {
+        return Ok(json!({
+            "kind": "snipping_area_overlay_status",
+            "active": false,
+            "overlayLabel": label,
+            "monitor": Value::Null,
+            "mode": SnippingAreaMode::Image.as_str(),
+        }));
+    };
+    let mode = snipping_area_session_mode(&app, &label).unwrap_or(SnippingAreaMode::Image);
     Ok(json!({
         "kind": "snipping_area_overlay_status",
+        "active": true,
         "mode": mode.as_str(),
         "overlayLabel": label,
         "monitor": monitor,
