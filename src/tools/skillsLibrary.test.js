@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  accountDocumentHydrateRequestFromSkill,
+  accountDocumentRequestFromSkill,
   accountDocumentUnitsFromPayload,
   mergeSkillUnits,
   skillSlug,
@@ -29,6 +31,35 @@ test("skills normalize from unit metadata", () => {
   assert.equal(skills[0].pendingPush, true);
   assert.equal(skills[0].localSavedAt, "2026-06-20T12:00:00.000Z");
   assert.equal(skills[0].syncStatus, "local_pending");
+});
+
+test("document save requests mark inline content as intentional", () => {
+  const request = accountDocumentRequestFromSkill({
+    content: "",
+    id: "blank",
+    title: "Blank",
+  });
+
+  assert.equal(request.document.has_content_payload, true);
+  assert.equal(request.document.content_md, "");
+});
+
+test("document hydrate requests never include editor content", () => {
+  const request = accountDocumentHydrateRequestFromSkill({
+    assetId: "asset-blank",
+    content: "",
+    contentHash: "abc",
+    id: "blank",
+    localPath: "/tmp/blank.md",
+    title: "Blank",
+  });
+
+  assert.equal(request.document.asset_id, "asset-blank");
+  assert.equal(request.document.content_hash, "abc");
+  assert.equal(request.document.local_path, "/tmp/blank.md");
+  assert.equal(Object.prototype.hasOwnProperty.call(request.document, "content"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(request.document, "content_md"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(request.document, "body"), false);
 });
 
 test("skill unit merge removes tombstoned rows", () => {
@@ -73,6 +104,43 @@ test("metadata-only document updates preserve cached content until hydration lan
   assert.equal(hydrated[0].content, "Fresh hydrated content.");
   assert.equal(hydrated[0].contentStale, false);
   assert.equal(hydrated[0].hasContentPayload, true);
+});
+
+test("metadata-only document updates preserve pending local saves", () => {
+  const current = skillsFromUnits([{
+    content_hash: "old-hash",
+    content_md: "Unsynced local body.",
+    doc_id: "review",
+    local_saved_at: "2026-06-20T12:00:00.000Z",
+    pending_push: true,
+    sync_status: "local_pending",
+    title: "Review",
+  }]);
+
+  const metadataOnly = mergeSkillUnits(current, [{
+    content_hash: "new-hash",
+    doc_id: "review",
+    has_content: true,
+    title: "Review",
+  }]);
+
+  assert.equal(metadataOnly[0].content, "Unsynced local body.");
+  assert.equal(metadataOnly[0].pendingPush, true);
+  assert.equal(metadataOnly[0].syncStatus, "local_pending");
+  assert.equal(metadataOnly[0].localSavedAt, "2026-06-20T12:00:00.000Z");
+
+  const synced = mergeSkillUnits(metadataOnly, [{
+    content_hash: "new-hash",
+    content_md: "Cloud accepted body.",
+    doc_id: "review",
+    pending_push: false,
+    sync_status: "synced",
+    title: "Review",
+  }]);
+
+  assert.equal(synced[0].content, "Cloud accepted body.");
+  assert.equal(synced[0].pendingPush, false);
+  assert.equal(synced[0].syncStatus, "synced");
 });
 
 test("hydrated metadata without inline bytes is not treated as materialized content", () => {

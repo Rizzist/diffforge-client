@@ -157,6 +157,11 @@ export function mergeSkillUnits(currentSkills, units) {
       const hasContentPayload = skill.hasContentPayload === true;
       const incomingHash = text(skill.contentHash || skill.sha256);
       const existingHash = text(existing.contentHash || existing.sha256);
+      const incomingStatus = text(skill.syncStatus);
+      const incomingPending = skill.pendingPush === true
+        || ["local_pending", "sync_failed", "upload_failed"].includes(incomingStatus);
+      const incomingSynced = incomingStatus === "synced";
+      const pendingPush = incomingPending || (existing.pendingPush === true && !incomingSynced);
       const contentStale = !hasContentPayload
         && Boolean(String(existing.content || ""))
         && Boolean(incomingHash)
@@ -167,6 +172,11 @@ export function mergeSkillUnits(currentSkills, units) {
         ...skill,
         content: hasContentPayload ? skill.content : existing.content || "",
         contentStale: hasContentPayload ? false : Boolean(existing.contentStale || contentStale),
+        localSavedAt: pendingPush ? text(skill.localSavedAt, existing.localSavedAt) : text(skill.localSavedAt),
+        pendingPush,
+        syncStatus: pendingPush && !incomingStatus
+          ? text(existing.syncStatus, "local_pending")
+          : incomingStatus,
       });
     }
   });
@@ -340,6 +350,7 @@ export function accountDocumentRequestFromSkill(skill, { local_only = false } = 
       document_id: id,
       document_kind: documentKind,
       extension,
+      has_content_payload: true,
       id,
       local_path: text(skill?.localPath),
       mime_type: mimeType,
@@ -349,6 +360,36 @@ export function accountDocumentRequestFromSkill(skill, { local_only = false } = 
     },
     local_only: Boolean(local_only),
   };
+}
+
+export function accountDocumentHydrateRequestFromSkill(skill) {
+  const collection = normalizedDocumentCollection();
+  const documentKind = normalizedDocumentKind(skill?.documentKind || skill?.source, collection);
+  const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
+  const id = normalizedDocumentId(skill?.id || skill?.doc_id || skill?.document_id) || skillSlug(skill?.title || "document");
+  const contentHash = text(skill?.contentHash || skill?.content_hash || skill?.sha256);
+  const document = {
+    asset_id: text(skill?.assetId || skill?.asset_id),
+    blob_id: text(skill?.blobId || skill?.blob_id),
+    collection,
+    content_hash: contentHash,
+    doc_id: id,
+    document_id: id,
+    document_kind: documentKind,
+    extension,
+    id,
+    local_path: text(skill?.localPath || skill?.local_path),
+    mime_type: text(skill?.mimeType || skill?.mime_type),
+    name: text(skill?.title || skill?.name, id),
+    sha256: contentHash,
+    source: documentKind,
+    title: text(skill?.title || skill?.name, id),
+  };
+  const sizeBytes = Number(skill?.sizeBytes ?? skill?.size_bytes);
+  if (Number.isFinite(sizeBytes) && sizeBytes > 0) {
+    document.size_bytes = sizeBytes;
+  }
+  return { document };
 }
 
 export function skillsToToolEntries(skills) {

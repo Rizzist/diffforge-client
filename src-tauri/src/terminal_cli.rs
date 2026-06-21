@@ -799,6 +799,7 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "get_selected_document_context",
     "get_selection_context",
     "save_selected_document",
+    "update_selected_document",
     "select_workspace",
     "select_tab",
     "list_terminals",

@@ -181,8 +181,6 @@ function accountToolsSkillPayloadIsFull(payload) {
         candidate.authoritative === true
         || candidate.snapshot_full === true
         || candidate.snapshotFull === true
-        || candidate.kind === "account_documents"
-        || candidate.source === "local_account_document_cache"
       )
   ));
 }

@@ -433,7 +433,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_visible_context",
-            "description": "Return the currently visible Diff Forge context, including selected Tools document metadata and highlighted range when available. Use localPath from this response for direct file edits.",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document metadata and highlighted range when available. Use localPath from this response for direct file edits. For unsaved Tools drafts, use update_selected_document instead of searching local storage or writing legacy account-skills.md.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -465,6 +465,23 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string", "description": "local, publish, push, sync, or save."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "update_selected_document",
+            "description": "Patch the currently selected Tools document or unsaved draft inside Diff Forge. Accepts snake_case document fields and can optionally save locally or publish. Use this for unsaved drafts; never write legacy account-skills.md.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "New document title/name."},
+                    "content": {"type": "string", "description": "Full markdown or architecture content to place in the editor."},
+                    "content_md": {"type": "string", "description": "Full markdown content to place in the editor."},
+                    "document_kind": {"type": "string", "description": "skill, architecture, instruction, or document."},
+                    "extension": {"type": "string", "description": "md or arch."},
+                    "mode": {"type": "string", "description": "draft, local, publish, push, sync, or save. draft updates the editor without persisting."},
+                    "save": {"type": "boolean", "description": "When true, save after applying the patch. mode controls local vs publish."}
                 },
                 "additionalProperties": true
             }
@@ -573,6 +590,7 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "get_selected_document_context",
         "get_selection_context",
         "save_selected_document",
+        "update_selected_document",
         "select_workspace",
         "select_tab",
         "list_terminals",

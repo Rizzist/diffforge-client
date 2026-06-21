@@ -28,6 +28,7 @@ import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
 import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
 import {
   ACCOUNT_DOCUMENTS_CONTRACT,
+  accountDocumentHydrateRequestFromSkill,
   accountDocumentRequestFromSkill,
   accountDocumentStorageKey,
   accountDocumentUnitsFromPayload,
@@ -140,6 +141,21 @@ function documentSelectionContext(content, selection) {
   };
 }
 
+function documentSelectionSegments(content, selection) {
+  const source = String(content ?? "");
+  const start = Math.max(0, Math.min(source.length, Number(selection?.start) || 0));
+  const end = Math.max(start, Math.min(source.length, Number(selection?.end) || start));
+  if (end <= start) return null;
+  return {
+    active: true,
+    after: source.slice(end),
+    before: source.slice(0, start),
+    selected: source.slice(start, end),
+    start,
+    end,
+  };
+}
+
 function documentTypeOption(value, collection = "documents") {
   const kind = normalizedDocumentKind(value, collection);
   return DOCUMENT_TYPE_OPTIONS.find((entry) => entry.id === kind) || DOCUMENT_TYPE_OPTIONS[0];
@@ -200,9 +216,11 @@ function documentPreviewLine(document) {
 function documentEditorDraft(document) {
   const option = documentTypeOption(document?.documentKind || document?.source, document?.collection);
   const content = String(document?.content || "");
+  const title = text(document?.title || document?.name || document?.id);
   return {
     assetId: text(document?.assetId || document?.asset_id),
     baseContent: content,
+    baseTitle: title,
     collection: option.collection,
     content,
     contentHash: text(document?.contentHash || document?.content_hash || document?.sha256),
@@ -212,7 +230,7 @@ function documentEditorDraft(document) {
     id: text(document?.id || document?.documentId || document?.document_id),
     localPath: text(document?.localPath || document?.local_path),
     source: option.id,
-    title: text(document?.title || document?.name || document?.id),
+    title,
   };
 }
 
@@ -240,32 +258,76 @@ function documentCanHydrate(document) {
 }
 
 function editorWithRemoteDocumentContent(current, document) {
-  if (!current || !documentHasMaterializedContent(document)) return current;
+  if (!current || !document) return current;
   const currentKey = current.documentKey || accountDocumentStorageKey(current);
   const documentKey = accountDocumentStorageKey(document);
   if (!currentKey || currentKey !== documentKey) return current;
   const baseContent = String(current.baseContent ?? current.content ?? "");
-  if (String(current.content || "") !== baseContent) return current;
+  const bodyDirty = String(current.content || "") !== baseContent;
+  const currentTitle = text(current.title);
+  const baseTitle = text(current.baseTitle, currentTitle);
+  const remoteTitle = text(document.title || document.name, currentTitle);
+  const titleDirty = currentTitle !== baseTitle;
+  const nextMetadata = {
+    assetId: text(document.assetId || document.asset_id, current.assetId),
+    baseTitle: remoteTitle,
+    collection: normalizedDocumentCollection(),
+    documentKind: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
+    extension: text(document.extension || document.ext, current.extension),
+    localPath: text(document.localPath || document.local_path, current.localPath),
+    source: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
+    title: titleDirty ? currentTitle : remoteTitle,
+  };
+  if (bodyDirty) {
+    if (
+      current.assetId === nextMetadata.assetId
+      && current.baseTitle === nextMetadata.baseTitle
+      && current.documentKind === nextMetadata.documentKind
+      && current.extension === nextMetadata.extension
+      && current.localPath === nextMetadata.localPath
+      && current.source === nextMetadata.source
+      && current.title === nextMetadata.title
+    ) {
+      return current;
+    }
+    return {
+      ...current,
+      ...nextMetadata,
+    };
+  }
+  if (!documentHasMaterializedContent(document)) {
+    if (
+      current.assetId === nextMetadata.assetId
+      && current.baseTitle === nextMetadata.baseTitle
+      && current.documentKind === nextMetadata.documentKind
+      && current.extension === nextMetadata.extension
+      && current.localPath === nextMetadata.localPath
+      && current.source === nextMetadata.source
+      && current.title === nextMetadata.title
+    ) {
+      return current;
+    }
+    return {
+      ...current,
+      ...nextMetadata,
+    };
+  }
   const content = String(document.content || "");
   if (
     current.content === content
     && current.contentHash === text(document.contentHash || document.content_hash || document.sha256)
+    && current.baseTitle === nextMetadata.baseTitle
     && current.localPath === text(document.localPath || document.local_path, current.localPath)
+    && current.title === nextMetadata.title
   ) {
     return current;
   }
   return {
     ...current,
-    assetId: text(document.assetId || document.asset_id, current.assetId),
+    ...nextMetadata,
     baseContent: content,
-    collection: normalizedDocumentCollection(),
     content,
     contentHash: text(document.contentHash || document.content_hash || document.sha256),
-    documentKind: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
-    extension: text(document.extension || document.ext, current.extension),
-    localPath: text(document.localPath || document.local_path, current.localPath),
-    source: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
-    title: text(document.title || document.name, current.title),
   };
 }
 
@@ -324,8 +386,6 @@ function accountToolsSkillPayloadIsFull(payload) {
         candidate.authoritative === true
         || candidate.snapshot_full === true
         || candidate.snapshotFull === true
-        || candidate.kind === "account_documents"
-        || candidate.source === "local_account_document_cache"
       )
   ));
 }
@@ -556,6 +616,8 @@ export default function ToolsWorkspaceView({
     start: 0,
     updatedAtMs: 0,
   });
+  const [lastDocumentSelection, setLastDocumentSelection] = useState(null);
+  const documentSelectionClearAtRef = useRef(0);
   const [skillEditorTheme, setSkillEditorTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     try {
@@ -1067,17 +1129,18 @@ export default function ToolsWorkspaceView({
     setSkillEditor(null);
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
-  const saveSkillEditor = useCallback(async (mode = "push") => {
-    if (!skillEditor || !text(skillEditor.title)) return false;
-    const typeOption = documentTypeOption(skillEditor.documentKind || skillEditor.source, skillEditor.collection);
+  const saveSkillEditor = useCallback(async (mode = "push", editorOverride = null) => {
+    const activeEditor = editorOverride || skillEditor;
+    if (!activeEditor || !text(activeEditor.title)) return false;
+    const typeOption = documentTypeOption(activeEditor.documentKind || activeEditor.source, activeEditor.collection);
     const editorCollection = typeOption.collection;
-    const editorKind = text(skillEditor.documentKind, typeOption.id);
-    const editorExtension = text(skillEditor.extension, typeOption.extension);
-    const normalizedTitle = skillSlug(skillEditor.title);
-    const existing = skillEditor.id
+    const editorKind = text(activeEditor.documentKind, typeOption.id);
+    const editorExtension = text(activeEditor.extension, typeOption.extension);
+    const displayTitle = text(activeEditor.title);
+    const existing = activeEditor.id
       ? skillsLibrary.skills.find((entry) => (
-        (skillEditor.documentKey && accountDocumentStorageKey(entry) === skillEditor.documentKey)
-        || entry.id === skillEditor.id
+        (activeEditor.documentKey && accountDocumentStorageKey(entry) === activeEditor.documentKey)
+        || entry.id === activeEditor.id
       ))
       : null;
     const updatedAt = new Date().toISOString();
@@ -1089,27 +1152,27 @@ export default function ToolsWorkspaceView({
       nextSkills = skillsLibrary.skills.map((entry) => ((accountDocumentStorageKey(entry) || entry.id) === existingKey
         ? {
           ...entry,
-          content: String(skillEditor.content || ""),
+          content: String(activeEditor.content || ""),
           documentKind: editorKind,
           extension: editorExtension,
           collection: editorCollection,
           source: editorKind,
-          title: normalizedTitle,
+          title: displayTitle,
           updatedAt,
         }
         : entry));
     } else {
-      savedId = skillSlug(skillEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id)));
+      savedId = skillSlug(activeEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id)));
       nextSkills = [...skillsLibrary.skills, {
         collection: editorCollection,
-        content: String(skillEditor.content || ""),
+        content: String(activeEditor.content || ""),
         documentKind: editorKind,
         extension: editorExtension,
         icon: "",
         id: savedId,
-        localPath: text(skillEditor.localPath),
+        localPath: text(activeEditor.localPath),
         source: editorKind,
-        title: savedId,
+        title: displayTitle,
         tone: "",
         updatedAt,
       }];
@@ -1266,8 +1329,10 @@ export default function ToolsWorkspaceView({
       .map((skill) => {
         const key = accountDocumentStorageKey(skill) || skill.id;
         const fileName = documentFileName(skill);
+        const displayName = text(skill.title, fileName);
         return {
           ...skill,
+          displayName,
           fileName,
           hydrating: hydratingDocKeys.has(key) || (hydrationPassActive && documentCanHydrate(skill)),
           key: `library:${key}`,
@@ -1278,13 +1343,14 @@ export default function ToolsWorkspaceView({
       })
       .filter((row) => (
         !query
+        || row.displayName.toLowerCase().includes(query)
         || row.fileName.toLowerCase().includes(query)
         || row.title.toLowerCase().includes(query)
         || row.preview.toLowerCase().includes(query)
         || row.typeLabel.toLowerCase().includes(query)
         || text(row.localPath).toLowerCase().includes(query)
       ))
-      .sort((left, right) => left.fileName.localeCompare(right.fileName));
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
   }, [hydratingDocKeys, skillsHydration.state, skillsHydration.visible, skillsLibrary.skills, skillsQuery]);
 
   const defaultSkillRows = useMemo(() => {
@@ -1324,9 +1390,10 @@ export default function ToolsWorkspaceView({
       collection: option.collection,
       content: "",
       contentHash: "",
+      documentKey: docId,
       documentKind: option.id,
       extension: option.extension,
-      id: "",
+      id: docId,
       localPath: "",
       source: option.id,
       title: docId,
@@ -1359,7 +1426,15 @@ export default function ToolsWorkspaceView({
   useEffect(() => {
     const selectedKey = selectedSkill?.owned ? accountDocumentStorageKey(selectedSkill) : "";
     if (!selectedKey) return;
-    if (String(selectedSkill?.content || "").length > 0 && selectedSkill?.contentStale !== true) return;
+    const editorKey = skillEditor?.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor?.id || "";
+    const editorMatchesSelected = editorKey === selectedKey;
+    const editorContent = String(skillEditor?.content || "");
+    const editorBaseContent = String(skillEditor?.baseContent ?? skillEditor?.content ?? "");
+    if (editorMatchesSelected && editorContent !== editorBaseContent) return;
+    if (
+      (String(selectedSkill?.content || "").length > 0 || (editorMatchesSelected && editorContent.length > 0))
+      && selectedSkill?.contentStale !== true
+    ) return;
     if (hydratingDocKeyRef.current === selectedKey) return;
     hydratingDocKeyRef.current = selectedKey;
     setHydratingDocKeys((current) => {
@@ -1369,7 +1444,7 @@ export default function ToolsWorkspaceView({
     });
     let cancelled = false;
     invoke("cloud_mcp_hydrate_account_document", {
-      request: accountDocumentRequestFromSkill(selectedSkill),
+      request: accountDocumentHydrateRequestFromSkill(selectedSkill),
     }).then((result) => {
       if (cancelled) return;
       const units = accountDocumentUnitsFromPayload(result);
@@ -1404,7 +1479,7 @@ export default function ToolsWorkspaceView({
     return () => {
       cancelled = true;
     };
-  }, [selectedSkillKey, selectedSkill]);
+  }, [selectedSkillKey, selectedSkill, skillEditor]);
 
   const skillEditorDocumentKey = skillEditor
     ? skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id
@@ -1416,6 +1491,7 @@ export default function ToolsWorkspaceView({
       start: 0,
       updatedAtMs: Date.now(),
     });
+    setLastDocumentSelection(null);
   }, [skillEditorDocumentKey]);
 
   const selectedDocumentRefreshing = Boolean(
@@ -1426,6 +1502,8 @@ export default function ToolsWorkspaceView({
       || (
         selectedSkill?.owned
         && (accountDocumentStorageKey(selectedSkill) || selectedSkill.id) === skillEditorDocumentKey
+        && String(skillEditor.content || "").length === 0
+        && String(skillEditor.content || "") === String(skillEditor.baseContent ?? skillEditor.content ?? "")
         && (selectedSkill.contentStale === true || (!documentHasMaterializedContent(selectedSkill) && documentCanHydrate(selectedSkill)))
       )
     ),
@@ -1440,17 +1518,35 @@ export default function ToolsWorkspaceView({
   const appControlDocumentContext = useMemo(() => {
     const content = String(skillEditor?.content || "");
     const preview = compactDocumentText(content, 1400);
+    const draftFingerprint = documentDraftFingerprint(content);
     const localPath = text(skillEditor?.localPath || selectedSkill?.localPath || selectedSkill?.local_path);
     const documentKind = normalizedDocumentKind(
       skillEditor?.documentKind || skillEditor?.source || selectedSkill?.documentKind || selectedSkill?.source,
       skillEditor?.collection || selectedSkill?.collection,
     );
+    const liveSelectionContext = skillEditor ? documentSelectionContext(content, skillEditorSelection) : null;
+    const preservedSelectionContext = skillEditor
+      && lastDocumentSelection
+      && lastDocumentSelection.documentKey === skillEditorDocumentKey
+      && lastDocumentSelection.draftFingerprint === draftFingerprint
+        ? documentSelectionContext(content, lastDocumentSelection)
+        : null;
+    const highlightedRange = liveSelectionContext?.active
+      ? liveSelectionContext
+      : preservedSelectionContext?.active
+        ? {
+          ...preservedSelectionContext,
+          preserved: true,
+        }
+        : liveSelectionContext;
     return {
       active: section === "docs",
       canDirectEditFile: Boolean(localPath),
+      content,
       contentLength: content.length,
       contentPreview: preview.text,
       contentPreviewTruncated: preview.truncated,
+      draftContent: content,
       dirty: Boolean(skillEditor && (
         String(skillEditor.content || "") !== String(skillEditor.baseContent ?? "")
         || text(skillEditor.title) !== text(selectedSkill?.title, text(skillEditor.title))
@@ -1459,7 +1555,7 @@ export default function ToolsWorkspaceView({
         collection: normalizedDocumentCollection(),
         contentHash: text(skillEditor.contentHash || selectedSkill?.contentHash || selectedSkill?.sha256),
         documentKey: skillEditorDocumentKey,
-        draftFingerprint: documentDraftFingerprint(content),
+        draftFingerprint,
         extension: text(skillEditor.extension || selectedSkill?.extension, documentExtensionForKind(documentKind)),
         id: text(skillEditor.id || selectedSkill?.id || selectedSkill?.documentId),
         kind: documentKind,
@@ -1471,7 +1567,8 @@ export default function ToolsWorkspaceView({
       } : null,
       editorReadOnly: Boolean(skillEditorReadOnly),
       editorState: skillsState,
-      highlightedRange: skillEditor ? documentSelectionContext(content, skillEditorSelection) : null,
+      fullContent: content,
+      highlightedRange,
       saveModes: ["local", "publish"],
       section,
       selectedKey: selectedSkillKey,
@@ -1487,6 +1584,7 @@ export default function ToolsWorkspaceView({
     skillEditorDocumentKey,
     skillEditorReadOnly,
     skillEditorSelection,
+    lastDocumentSelection,
     skillsState,
   ]);
 
@@ -1508,6 +1606,169 @@ export default function ToolsWorkspaceView({
     };
   }, [onAppControlContextChange]);
 
+  const clearDocumentSelection = useCallback(() => {
+    const updatedAtMs = Date.now();
+    documentSelectionClearAtRef.current = updatedAtMs;
+    setSkillEditorSelection({
+      direction: "",
+      end: 0,
+      start: 0,
+      updatedAtMs,
+    });
+    setLastDocumentSelection(null);
+  }, []);
+
+  const updateSelectedDocumentFromAppControl = useCallback(async (input = {}) => {
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(input, key);
+    const requestedTitle = hasOwn("title")
+      ? text(input.title)
+      : hasOwn("name")
+        ? text(input.name)
+        : "";
+    const requestedKind = hasOwn("document_kind")
+      ? text(input.document_kind)
+      : hasOwn("kind")
+        ? text(input.kind)
+        : "";
+    const requestedExtension = hasOwn("extension") || hasOwn("ext")
+      ? text(input.extension || input.ext)
+      : "";
+    const hasContentPatch = hasOwn("content_md") || hasOwn("content");
+    const requestedContent = hasOwn("content_md")
+      ? String(input.content_md ?? "")
+      : hasOwn("content")
+        ? String(input.content ?? "")
+        : "";
+    const baseTitle = requestedTitle || text(skillEditor?.title || newDocDraft.name, "Untitled document");
+    if (!skillEditor && !baseTitle) {
+      return {
+        ok: false,
+        error: {
+          code: "no_selected_document",
+          message: "No Tools document is selected.",
+        },
+        context: appControlDocumentContext,
+      };
+    }
+    const existingIds = new Set(skillsLibrary.skills.map((entry) => entry.id).filter(Boolean));
+    const isExistingDocument = Boolean(selectedSkill?.owned);
+    const option = documentTypeOption(requestedKind || skillEditor?.documentKind || skillEditor?.source || newDocDraft.type);
+    const draftId = isExistingDocument
+      ? text(skillEditor?.id || selectedSkill?.id || selectedSkill?.documentId)
+      : skillSlug(baseTitle, existingIds);
+    const nextEditor = {
+      ...(skillEditor || {
+        assetId: "",
+        baseContent: "",
+        collection: option.collection,
+        content: "",
+        contentHash: "",
+        documentKey: draftId,
+        documentKind: option.id,
+        extension: option.extension,
+        id: draftId,
+        localPath: "",
+        source: option.id,
+        title: draftId,
+      }),
+    };
+    if (requestedTitle) {
+      nextEditor.title = requestedTitle;
+      if (!isExistingDocument) {
+        nextEditor.id = skillSlug(requestedTitle, existingIds);
+        nextEditor.documentKey = nextEditor.id;
+      }
+    }
+    if (requestedKind) {
+      const nextOption = documentTypeOption(requestedKind);
+      nextEditor.collection = nextOption.collection;
+      nextEditor.documentKind = nextOption.id;
+      nextEditor.source = nextOption.id;
+      nextEditor.extension = requestedExtension || nextOption.extension;
+    } else if (requestedExtension) {
+      nextEditor.extension = requestedExtension.replace(/^\./u, "").toLowerCase() || nextEditor.extension;
+    }
+    if (hasContentPatch) {
+      nextEditor.content = requestedContent;
+    }
+    const contextForNextEditor = () => {
+      const content = String(nextEditor.content || "");
+      const preview = compactDocumentText(content, 1400);
+      const documentKind = normalizedDocumentKind(nextEditor.documentKind || nextEditor.source, nextEditor.collection);
+      const documentKey = nextEditor.documentKey || accountDocumentStorageKey(nextEditor) || nextEditor.id;
+      return {
+        ...appControlDocumentContext,
+        active: section === "docs",
+        canDirectEditFile: Boolean(nextEditor.localPath),
+        content,
+        contentLength: content.length,
+        contentPreview: preview.text,
+        contentPreviewTruncated: preview.truncated,
+        dirty: true,
+        document: {
+          ...(appControlDocumentContext.document || {}),
+          collection: normalizedDocumentCollection(),
+          contentHash: text(nextEditor.contentHash),
+          documentKey,
+          draftFingerprint: documentDraftFingerprint(content),
+          extension: text(nextEditor.extension, documentExtensionForKind(documentKind)),
+          id: text(nextEditor.id || documentKey),
+          kind: documentKind,
+          localPath: text(nextEditor.localPath),
+          pendingPush: Boolean(nextEditor.pendingPush),
+          source: documentKind,
+          syncStatus: text(nextEditor.syncStatus),
+          title: text(nextEditor.title || nextEditor.id || documentKey),
+        },
+        draftContent: content,
+        fullContent: content,
+        highlightedRange: documentSelectionContext(content, skillEditorSelection),
+        section,
+        selectedKey: isExistingDocument ? selectedSkillKey : "",
+        updatedAtMs: Date.now(),
+      };
+    };
+    const nextContext = contextForNextEditor();
+    setSelectedSkillKey(isExistingDocument
+      ? selectedSkillKey
+      : "");
+    setSkillEditor(nextEditor);
+    if (hasContentPatch) {
+      clearDocumentSelection();
+    }
+
+    const requestedMode = text(input.mode || input.save_mode, input.save === true ? "local" : "draft").toLowerCase();
+    const shouldSave = input.save === true || !["", "draft", "edit", "update", "none"].includes(requestedMode);
+    if (!shouldSave) {
+      return {
+        ok: true,
+        mode: "draft",
+        source: "editor_state",
+        context: nextContext,
+      };
+    }
+    const localOnly = ["local", "local_only", "local-only", "draft"].includes(requestedMode);
+    const ok = await saveSkillEditor(localOnly ? "local" : "push", nextEditor);
+    return {
+      ok: Boolean(ok),
+      mode: localOnly ? "local" : "publish",
+      source: "editor_state",
+      context: nextContext,
+    };
+  }, [
+    appControlDocumentContext,
+    clearDocumentSelection,
+    newDocDraft.name,
+    newDocDraft.type,
+    saveSkillEditor,
+    section,
+    selectedSkill,
+    selectedSkillKey,
+    skillEditor,
+    skillEditorSelection,
+    skillsLibrary.skills,
+  ]);
+
   const appControlDocumentActions = useMemo(() => ({
     getSelectedDocumentContext: async () => appControlDocumentContext,
     saveSelectedDocument: async (input = {}) => {
@@ -1525,7 +1786,8 @@ export default function ToolsWorkspaceView({
         .toLowerCase();
       const localOnly = ["local", "local_only", "local-only", "draft"].includes(requestedMode);
       const document = appControlDocumentContext.document || {};
-      if (document.localPath && document.id) {
+      const editorDirty = String(skillEditor.content || "") !== String(skillEditor.baseContent ?? skillEditor.content ?? "");
+      if (document.localPath && document.id && !editorDirty) {
         const result = await invoke("cloud_mcp_save_account_document", {
           request: {
             document: {
@@ -1543,6 +1805,21 @@ export default function ToolsWorkspaceView({
             local_only: localOnly,
           },
         });
+        const units = accountDocumentUnitsFromPayload(result);
+        if (units.length) {
+          const hydratedSkills = skillsFromUnits(units);
+          setSkillsLibrary((current) => {
+            const nextLibrary = applySkillUnitsToLibrary(current, units);
+            noteAccountSkillUnits(nextLibrary.skills);
+            return nextLibrary;
+          });
+          const hydratedSkill = hydratedSkills.find((entry) => (
+            (accountDocumentStorageKey(entry) || entry.id) === (skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)
+          ));
+          if (documentHasMaterializedContent(hydratedSkill)) {
+            setSkillEditor((current) => editorWithRemoteDocumentContent(current, hydratedSkill));
+          }
+        }
         return {
           ok: result?.ok !== false,
           mode: localOnly ? "local" : "publish",
@@ -1559,7 +1836,8 @@ export default function ToolsWorkspaceView({
         context: appControlDocumentContext,
       };
     },
-  }), [appControlDocumentContext, saveSkillEditor, skillEditor]);
+    updateSelectedDocument: updateSelectedDocumentFromAppControl,
+  }), [appControlDocumentContext, saveSkillEditor, skillEditor, updateSelectedDocumentFromAppControl]);
 
   useEffect(() => {
     if (typeof onAppControlDocumentActions !== "function") return undefined;
@@ -1575,6 +1853,19 @@ export default function ToolsWorkspaceView({
     }, 0);
     return Math.max(28, Math.min(260, estimatedLines + 8));
   }, [skillEditor?.content]);
+  const preservedSkillEditorSelection = useMemo(() => {
+    if (!skillEditor || !lastDocumentSelection) return null;
+    const content = String(skillEditor.content || "");
+    const documentKey = skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id || "";
+    if (
+      !documentKey
+      || lastDocumentSelection.documentKey !== documentKey
+      || lastDocumentSelection.draftFingerprint !== documentDraftFingerprint(content)
+    ) {
+      return null;
+    }
+    return documentSelectionSegments(content, lastDocumentSelection);
+  }, [skillEditor, lastDocumentSelection]);
   const scrollSkillDocumentCanvas = useCallback((event) => {
     const canvas = skillDocumentCanvasRef.current;
     if (!canvas) return;
@@ -1590,13 +1881,41 @@ export default function ToolsWorkspaceView({
     if (!Number.isFinite(start) || !Number.isFinite(end)) {
       return;
     }
-    setSkillEditorSelection({
+    const updatedAtMs = Date.now();
+    const eventType = text(event?.type);
+    const suppressPreserve = eventType === "blur"
+      && updatedAtMs - documentSelectionClearAtRef.current < 400;
+    const nextSelection = {
       direction: text(target?.selectionDirection),
       end,
       start,
-      updatedAtMs: Date.now(),
+      updatedAtMs,
+    };
+    setSkillEditorSelection({
+      ...nextSelection,
     });
-  }, []);
+    if (!skillEditor) {
+      return;
+    }
+    const documentKey = skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id || "";
+    const content = String(skillEditor.content || "");
+    if (documentKey && end > start) {
+      if (suppressPreserve) {
+        setLastDocumentSelection(null);
+        return;
+      }
+      setLastDocumentSelection({
+        ...nextSelection,
+        contentLength: content.length,
+        documentKey,
+        draftFingerprint: documentDraftFingerprint(content),
+      });
+      return;
+    }
+    if (suppressPreserve || (target && typeof document !== "undefined" && document.activeElement === target)) {
+      setLastDocumentSelection(null);
+    }
+  }, [skillEditor]);
   useEffect(() => {
     if (!skillEditorOpen || typeof window === "undefined") return undefined;
     const canvas = skillDocumentCanvasRef.current;
@@ -1791,14 +2110,14 @@ export default function ToolsWorkspaceView({
                                         setSelectedSkillKey(row.key);
                                         setSkillEditor(documentEditorDraft(row));
                                       }}
-                                      title={text(row.localPath, row.preview)}
+                                      title={[row.displayName, row.fileName, text(row.localPath)].filter(Boolean).join(" · ")}
                                       type="button"
                                     >
                                       <FileDisclosure />
                                       <FileKindIcon data-file-tone={fileTone}>
                                         <span className={`codicon ${iconClass}`} aria-hidden="true" />
                                       </FileKindIcon>
-                                      <FileTreeName>{row.fileName}</FileTreeName>
+                                      <FileTreeName>{row.displayName}</FileTreeName>
                                       <DocsExplorerStatus title={row.hydrating ? "Hydrating document" : row.pendingPush ? "Pending push" : row.typeLabel}>
                                         {row.hydrating ? (
                                           <DocsExplorerSpinner aria-label="Hydrating document" role="status" />
@@ -1895,7 +2214,7 @@ export default function ToolsWorkspaceView({
                               <span>Refreshing document</span>
                             </SkillDocumentRefreshOverlay>
                           )}
-                          <SkillDocumentPage>
+                          <SkillDocumentPage onPointerDownCapture={clearDocumentSelection}>
                             <SkillDocumentTitleInput
                               aria-label="Document name"
                               readOnly={skillEditorReadOnly}
@@ -1903,22 +2222,32 @@ export default function ToolsWorkspaceView({
                               placeholder="doc_name"
                               value={skillEditor.title}
                             />
-                            <ToolsSkillsEditor
-                              aria-label="Document content"
-                              readOnly={skillEditorReadOnly}
-                              onChange={(event) => {
-                                updateSkillEditorSelection(event);
-                                setSkillEditor((current) => ({ ...current, content: event.target.value }));
-                              }}
-                              onKeyUp={updateSkillEditorSelection}
-                              onMouseUp={updateSkillEditorSelection}
-                              onSelect={updateSkillEditorSelection}
-                              onWheelCapture={scrollSkillDocumentCanvas}
-                              placeholder={skillEditor.extension === "arch" ? "title System_Map" : "# Notes"}
-                              rows={skillEditorRows}
-                              spellCheck={false}
-                              value={skillEditor.content}
-                            />
+                            <SkillDocumentBodyStack>
+                              {preservedSkillEditorSelection?.active && (
+                                <SkillDocumentSelectionOverlay aria-hidden="true">
+                                  <span>{preservedSkillEditorSelection.before}</span>
+                                  <SkillDocumentSelectionMark>{preservedSkillEditorSelection.selected}</SkillDocumentSelectionMark>
+                                  <span>{preservedSkillEditorSelection.after}</span>
+                                </SkillDocumentSelectionOverlay>
+                              )}
+                              <ToolsSkillsEditor
+                                aria-label="Document content"
+                                readOnly={skillEditorReadOnly}
+                                onChange={(event) => {
+                                  updateSkillEditorSelection(event);
+                                  setSkillEditor((current) => ({ ...current, content: event.target.value }));
+                                }}
+                                onBlur={updateSkillEditorSelection}
+                                onKeyUp={updateSkillEditorSelection}
+                                onMouseUp={updateSkillEditorSelection}
+                                onSelect={updateSkillEditorSelection}
+                                onWheelCapture={scrollSkillDocumentCanvas}
+                                placeholder={skillEditor.extension === "arch" ? "title System_Map" : "# Notes"}
+                                rows={skillEditorRows}
+                                spellCheck={false}
+                                value={skillEditor.content}
+                              />
+                            </SkillDocumentBodyStack>
                           </SkillDocumentPage>
                         </SkillDocumentCanvas>
                       </SkillDocumentEditor>
@@ -3168,12 +3497,58 @@ const SkillDocumentTitleInput = styled.input`
   }
 `;
 
-const ToolsSkillsEditor = styled.textarea`
+const SkillDocumentBodyStack = styled.div`
+  position: relative;
+  display: grid;
   width: calc(100% + var(--skill-document-body-bleed, 20px));
   min-width: 0;
   min-height: var(--skill-document-body-min-height, 900px);
   margin-top: var(--skill-document-body-margin-top, 24px);
   margin-left: var(--skill-document-body-margin-left, -10px);
+
+  > * {
+    grid-area: 1 / 1;
+  }
+`;
+
+const SkillDocumentSelectionOverlay = styled.div`
+  position: relative;
+  z-index: 0;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--skill-document-body-min-height, 900px);
+  padding:
+    var(--skill-document-body-padding-top, 8px)
+    var(--skill-document-body-padding-inline, 10px)
+    var(--skill-document-body-padding-bottom, 24px);
+  border-radius: 8px;
+  color: transparent;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: var(--skill-document-body-font-size, 15px);
+  font-weight: 520;
+  line-height: 1.72;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  white-space: pre-wrap;
+`;
+
+const SkillDocumentSelectionMark = styled.span`
+  border-radius: 4px;
+  background: rgba(var(--forge-accent-soft-rgb), 0.24);
+  box-shadow:
+    0 0 0 1px rgba(var(--forge-accent-soft-rgb), 0.16),
+    0 0 0 3px rgba(var(--forge-accent-soft-rgb), 0.055);
+`;
+
+const ToolsSkillsEditor = styled.textarea`
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--skill-document-body-min-height, 900px);
   padding:
     var(--skill-document-body-padding-top, 8px)
     var(--skill-document-body-padding-inline, 10px)

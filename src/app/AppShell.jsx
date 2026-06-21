@@ -670,6 +670,7 @@ const MAIN_WINDOW_CURSOR_EVENT = "forge-main-window-cursor";
 const SETTINGS_TAB_GENERAL = "general";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
 const SETTINGS_PERMISSION_HIGHLIGHT_MS = 4200;
+const APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
 const MACOS_AUTOMATION_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
 const MACOS_FULL_DISK_ACCESS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
@@ -9569,6 +9570,7 @@ export default function App() {
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const appControlVisibleContextRef = useRef(null);
+  const appControlDocumentSelectionSnapshotRef = useRef(null);
   const appControlDocumentActionsRef = useRef({});
   const mainWindowFocusedRef = useRef(mainWindowFocused);
   const workspacesRef = useRef(workspaces);
@@ -9627,9 +9629,34 @@ export default function App() {
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
 
   const handleAppControlContextChange = useCallback((context) => {
-    appControlVisibleContextRef.current = context && typeof context === "object" && !Array.isArray(context)
+    const safeContext = context && typeof context === "object" && !Array.isArray(context)
       ? context
       : null;
+    appControlVisibleContextRef.current = safeContext;
+    if (
+      safeContext?.surface === "tools"
+      && safeContext?.document
+      && safeContext?.highlightedRange?.active === true
+    ) {
+      const capturedAtMs = Date.now();
+      let snapshot = null;
+      try {
+        snapshot = JSON.parse(JSON.stringify(safeContext));
+      } catch {
+        snapshot = {
+          ...safeContext,
+          document: { ...(safeContext.document || {}) },
+          highlightedRange: { ...(safeContext.highlightedRange || {}) },
+        };
+      }
+      snapshot.selectionCapturedAtMs = capturedAtMs;
+      snapshot.highlightedRange = {
+        ...(snapshot.highlightedRange || {}),
+        capturedAtMs,
+        preserved: true,
+      };
+      appControlDocumentSelectionSnapshotRef.current = snapshot;
+    }
   }, []);
 
   const registerAppControlDocumentActions = useCallback((actions) => {
@@ -11562,18 +11589,34 @@ export default function App() {
   useEffect(() => {
     // Report whether dictation may route into the selected terminal pane.
     // Pane selection is sticky (grey outline), so the backend needs to know
-    // what the user is actually looking at: the terminal route is only
-    // allowed while the Terminals view is visible and focus is not held by a
-    // non-terminal editable element (todo list, composers, and similar).
-    // When blocked, transcripts fall through to the focused input instead.
+    // what the user is actually looking at: the terminal route is allowed
+    // while the Terminals view is visible and focus is not held by a
+    // non-terminal editable element (todo list, composers, and similar), or
+    // while the user has just interacted with a visible terminal pane. The
+    // pointer path matters for canvas/terminal surfaces that do not always
+    // produce a fresh focusin event before dictation starts. When blocked,
+    // transcripts fall through to the focused input instead.
     let lastReported = null;
     let flushTimer = 0;
+
+    let lastInteractedTerminalPane = null;
+
+    const visibleTerminalPaneForElement = (element) => {
+      const pane = element?.closest?.("[data-pane-id]") || null;
+      if (!pane) {
+        return null;
+      }
+      if (pane.closest?.("[aria-hidden='true'], [hidden]")) {
+        return null;
+      }
+      return pane;
+    };
 
     const elementAcceptsDictation = (element) => {
       if (!element || element === document.body || element === document.documentElement) {
         return false;
       }
-      if (element.closest?.("[data-pane-id]")) {
+      if (visibleTerminalPaneForElement(element)) {
         // Focus inside a terminal surface keeps the terminal route.
         return false;
       }
@@ -11596,8 +11639,15 @@ export default function App() {
 
     const reportGate = () => {
       const terminalsVisible = visibleViewRef.current === DEFAULT_WORKSPACE_VIEW;
-      const allowTerminal = terminalsVisible
-        && !elementAcceptsDictation(document.activeElement);
+      const terminalInteractionActive = Boolean(
+        visibleTerminalPaneForElement(document.activeElement)
+          || visibleTerminalPaneForElement(lastInteractedTerminalPane),
+      );
+      const allowTerminal = terminalInteractionActive
+        || (
+          terminalsVisible
+          && !elementAcceptsDictation(document.activeElement)
+        );
       if (lastReported === allowTerminal) {
         return;
       }
@@ -11613,13 +11663,28 @@ export default function App() {
       flushTimer = window.setTimeout(reportGate, 0);
     };
 
+    const handleFocusIn = (event) => {
+      const terminalPane = visibleTerminalPaneForElement(event.target);
+      if (terminalPane || elementAcceptsDictation(event.target)) {
+        lastInteractedTerminalPane = terminalPane;
+      }
+      scheduleReport();
+    };
+
+    const handlePointerDown = (event) => {
+      lastInteractedTerminalPane = visibleTerminalPaneForElement(event.target);
+      scheduleReport();
+    };
+
     reportGate();
-    window.addEventListener("focusin", scheduleReport, true);
+    window.addEventListener("focusin", handleFocusIn, true);
     window.addEventListener("focusout", scheduleReport, true);
+    window.addEventListener("pointerdown", handlePointerDown, true);
     return () => {
       window.clearTimeout(flushTimer);
-      window.removeEventListener("focusin", scheduleReport, true);
+      window.removeEventListener("focusin", handleFocusIn, true);
       window.removeEventListener("focusout", scheduleReport, true);
+      window.removeEventListener("pointerdown", handlePointerDown, true);
     };
   }, [visibleView]);
 
@@ -24669,7 +24734,49 @@ export default function App() {
         });
       });
     };
-    const buildAppControlVisibleContext = (input = {}) => {
+    const appControlDocumentContextKey = (context) => {
+      const document = context?.document || {};
+      return String(document.documentKey || context?.selectedKey || document.id || "").trim();
+    };
+    const getFreshAppControlDocumentSelectionSnapshot = (currentContext = null) => {
+      const snapshot = appControlDocumentSelectionSnapshotRef.current;
+      if (!snapshot?.document || snapshot?.highlightedRange?.active !== true) {
+        return null;
+      }
+      const capturedAtMs = Number(
+        snapshot.selectionCapturedAtMs
+          || snapshot.highlightedRange?.capturedAtMs
+          || snapshot.highlightedRange?.updatedAtMs
+          || 0,
+      );
+      if (!Number.isFinite(capturedAtMs) || Date.now() - capturedAtMs > APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS) {
+        return null;
+      }
+      if (currentContext?.document) {
+        const currentKey = appControlDocumentContextKey(currentContext);
+        const snapshotKey = appControlDocumentContextKey(snapshot);
+        if (currentKey && snapshotKey && currentKey !== snapshotKey) {
+          return null;
+        }
+        const currentFingerprint = String(currentContext.document?.draftFingerprint || "").trim();
+        const snapshotFingerprint = String(snapshot.document?.draftFingerprint || "").trim();
+        if (currentFingerprint && snapshotFingerprint && currentFingerprint !== snapshotFingerprint) {
+          return null;
+        }
+      }
+      return {
+        ...snapshot,
+        active: currentContext?.active ?? false,
+        restoredFromSelectionSnapshot: true,
+        selectionCapturedAtMs: capturedAtMs,
+        highlightedRange: {
+          ...(snapshot.highlightedRange || {}),
+          capturedAtMs,
+          preserved: true,
+        },
+      };
+    };
+    const buildAppControlVisibleContext = (input = {}, options = {}) => {
       const context = appControlVisibleContextRef.current;
       const toolsSurfaceVisible = GLOBAL_TOOLS_VIEWS.has(visibleView);
       const activeContext = context
@@ -24679,7 +24786,27 @@ export default function App() {
         && context.active !== false
         && toolsSurfaceVisible;
       const includeContent = appControlBooleanValue(input.includeContent ?? input.include_content, false);
-      const contextPayload = activeContext ? { ...context } : null;
+      const allowSelectionSnapshot = Boolean(options.allowSelectionSnapshot)
+        && appControlBooleanValue(input.allowSelectionSnapshot ?? input.allow_selection_snapshot, true);
+      const snapshot = allowSelectionSnapshot
+        ? getFreshAppControlDocumentSelectionSnapshot(context)
+        : null;
+      let contextPayload = activeContext ? { ...context } : null;
+      if (
+        contextPayload
+        && !contextPayload.highlightedRange?.active
+        && snapshot
+      ) {
+        contextPayload = {
+          ...contextPayload,
+          highlightedRange: snapshot.highlightedRange,
+          restoredFromSelectionSnapshot: true,
+          selectionCapturedAtMs: snapshot.selectionCapturedAtMs,
+        };
+      }
+      if (!contextPayload && snapshot) {
+        contextPayload = snapshot;
+      }
       if (contextPayload && !includeContent) {
         delete contextPayload.content;
         delete contextPayload.fullContent;
@@ -24688,12 +24815,13 @@ export default function App() {
       return {
         active: Boolean(activeContext),
         activeView,
+        restoredFromSelectionSnapshot: Boolean(contextPayload?.restoredFromSelectionSnapshot),
         context: contextPayload,
         visibleView,
       };
     };
     const buildAppControlSelectionContext = () => {
-      const visibleContext = buildAppControlVisibleContext();
+      const visibleContext = buildAppControlVisibleContext({}, { allowSelectionSnapshot: true });
       const context = visibleContext.context || {};
       return {
         ...visibleContext,
@@ -24748,7 +24876,7 @@ export default function App() {
         }
 
         if (tool === "get_selected_document_context") {
-          const visibleContext = buildAppControlVisibleContext(input);
+          const visibleContext = buildAppControlVisibleContext(input, { allowSelectionSnapshot: true });
           const documentContext = visibleContext.context?.document ? visibleContext.context : null;
           sendAppControlReply(requestId, {
             ok: Boolean(documentContext),
@@ -24792,6 +24920,31 @@ export default function App() {
             return;
           }
           const result = await actions.saveSelectedDocument(input);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+            data: {
+              result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "update_selected_document") {
+          const actions = appControlDocumentActionsRef.current || {};
+          if (typeof actions.updateSelectedDocument !== "function") {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "document_actions_unavailable",
+                message: "The Tools document editor is not available.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await actions.updateSelectedDocument(input);
           sendAppControlReply(requestId, {
             ok: result?.ok !== false,
             ...(result?.ok === false && result?.error ? { error: result.error } : {}),
