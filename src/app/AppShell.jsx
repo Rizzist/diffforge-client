@@ -11,6 +11,11 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import "@vscode/codicons/dist/codicon.css";
+import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { AdsClick } from "@styled-icons/material-rounded/AdsClick";
+import { History } from "@styled-icons/material-rounded/History";
+import { Schedule } from "@styled-icons/material-rounded/Schedule";
+import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
@@ -275,10 +280,27 @@ import {
   WorkspaceIdleDetail,
   LoopspaceRuntimeSurface,
   LoopspaceRuntimeToolbar,
-  LoopspaceRuntimeNameInput,
   LoopspaceRuntimeIconButton,
-  LoopspaceRuntimeDangerButton,
   LoopspaceRuntimeStage,
+  LoopspaceRuntimeTitle,
+  LoopspaceRuntimeTabs,
+  LoopspaceRuntimeTabButton,
+  LoopspaceGraphCanvas,
+  LoopspaceGraphContent,
+  LoopspaceGraphNode,
+  LoopspaceGraphNodeIcon,
+  LoopspaceGraphNodeText,
+  LoopspaceGraphNodeAction,
+  LoopspaceGraphTriggerGrid,
+  LoopspaceGraphConnector,
+  LoopspaceGraphEmpty,
+  LoopspaceLogsList,
+  LoopspaceLogRow,
+  LoopspaceLogIcon,
+  LoopspaceLogMain,
+  LoopspaceLogMeta,
+  LoopspaceRailSettingsMenu,
+  LoopspaceRailSettingsItem,
   LoopspaceRuntimeError,
   ForgeWorkspace,
   TerminalWorkspaceSurface,
@@ -758,6 +780,10 @@ function appControlLoopspaceTriggerPayload(value) {
       Array.isArray(candidate?.triggers)
       || Array.isArray(candidate?.loopspace_triggers)
       || Array.isArray(candidate?.loopspaceTriggers)
+      || Array.isArray(candidate?.runs)
+      || Array.isArray(candidate?.logs)
+      || Array.isArray(candidate?.trigger_runs)
+      || Array.isArray(candidate?.triggerRuns)
     ) {
       return candidate;
     }
@@ -769,13 +795,80 @@ function appControlLoopspaceTriggerRows(value) {
   const payload = appControlLoopspaceTriggerPayload(value);
   const rows = payload?.triggers || payload?.loopspace_triggers || payload?.loopspaceTriggers || [];
   return Array.isArray(rows)
-    ? rows.map((row) => ({
-      ...row,
-      id: appControlText(row, ["id", "trigger_id", "triggerId"]),
-      name: appControlText(row, ["name", "trigger_name", "triggerName"]),
-      type: appControlText(row, ["type", "trigger_type", "triggerType"]).toLowerCase(),
-    })).filter((row) => row.id)
+    ? rows.map((row) => {
+      const loopspaceIds = Array.isArray(row?.loopspaceIds)
+        ? row.loopspaceIds
+        : Array.isArray(row?.loopspace_ids)
+          ? row.loopspace_ids
+          : [];
+      const config = row?.config && typeof row.config === "object" ? row.config : {};
+      const id = appControlText(row, ["id", "trigger_id", "triggerId"]);
+      return {
+        ...row,
+        config,
+        enabled: row?.enabled !== false,
+        id,
+        lastRunAtMs: Number(row?.lastRunAtMs || row?.last_run_at_ms || 0) || 0,
+        lastStatus: appControlText(row, ["lastStatus", "last_status"]),
+        loopspaceIds: loopspaceIds.map((item) => String(item || "").trim()).filter(Boolean),
+        name: appControlText(row, ["name", "trigger_name", "triggerName"]) || id,
+        nextDueAtMs: Number(row?.nextDueAtMs || row?.next_due_at_ms || 0) || 0,
+        type: appControlText(row, ["type", "trigger_type", "triggerType"]).toLowerCase() || "cron",
+      };
+    }).filter((row) => row.id)
     : [];
+}
+
+function appControlLoopspaceTriggerRunRows(value) {
+  const payload = appControlLoopspaceTriggerPayload(value);
+  const rows = payload?.logs || payload?.runs || payload?.trigger_runs || payload?.triggerRuns || [];
+  return Array.isArray(rows)
+    ? rows.map((row) => {
+      const loopspaceIds = Array.isArray(row?.loopspaceIds)
+        ? row.loopspaceIds
+        : Array.isArray(row?.loopspace_ids)
+          ? row.loopspace_ids
+          : [];
+      return {
+        ...row,
+        completedAtMs: Number(row?.completedAtMs || row?.completed_at_ms || 0) || 0,
+        createdAtMs: Number(row?.createdAtMs || row?.created_at_ms || 0) || 0,
+        error: appControlText(row, ["error"]),
+        id: appControlText(row, ["id", "run_id", "runId"]),
+        loopspaceIds: loopspaceIds.map((item) => String(item || "").trim()).filter(Boolean),
+        status: appControlText(row, ["status"]) || "run",
+        triggerId: appControlText(row, ["triggerId", "trigger_id"]),
+        type: appControlText(row, ["type", "trigger_type", "triggerType"]).toLowerCase(),
+      };
+    }).filter((row) => row.id)
+    : [];
+}
+
+function loopspaceTriggerTypeLabel(type) {
+  if (type === "webhook") return "Webhook";
+  if (type === "manual") return "Manual";
+  return "Cron";
+}
+
+function loopspaceTriggerTypeIcon(type) {
+  if (type === "webhook") return Webhook;
+  if (type === "manual") return AdsClick;
+  return Schedule;
+}
+
+function formatLoopspaceRuntimeTime(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  try {
+    return new Date(ms).toLocaleString([], {
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      month: "short",
+    });
+  } catch {
+    return "";
+  }
 }
 
 function appShellIsMacPlatform() {
@@ -1358,6 +1451,8 @@ const CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT = "cloud-mcp-account-device-live
 const CLOUD_MCP_ACCOUNT_USAGE_EVENT = "cloud-mcp-account-usage";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT = "cloud-mcp-loopspaces-updated";
+const CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT = "cloud-mcp-loopspace-triggers-updated";
+const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 const TODO_QUEUE_WORKSPACE_STORAGE_PREFIX = "diffforge.todoQueue.";
@@ -4240,20 +4335,198 @@ function LoopspaceRuntimeView({
   actionState,
   error,
   loopspace,
-  nameDraft,
   onBack,
-  onDelete,
-  onRename,
-  setNameDraft,
 }) {
-  const renaming = actionState === "renaming";
-  const deleting = actionState === "deleting";
-  const busy = renaming || deleting;
-  const canRename = Boolean(loopspace?.id && nameDraft.trim() && nameDraft.trim() !== loopspace.name && !busy);
+  const [activeTab, setActiveTab] = useState("graph");
+  const [triggers, setTriggers] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [loadingState, setLoadingState] = useState("idle");
+  const [runtimeError, setRuntimeError] = useState("");
+  const [dropActive, setDropActive] = useState(false);
+  const loopspaceId = loopspace?.id || "";
+  const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
+
+  const applyTriggerSnapshot = useCallback((value) => {
+    const nextTriggers = appControlLoopspaceTriggerRows(value);
+    const nextRuns = appControlLoopspaceTriggerRunRows(value);
+    setTriggers(nextTriggers);
+    if (loopspaceId) {
+      const triggerLoopspaceIds = new Map(nextTriggers.map((trigger) => [trigger.id, trigger.loopspaceIds]));
+      setLogs(nextRuns.filter((run) => (
+        run.loopspaceIds.includes(loopspaceId)
+        || (triggerLoopspaceIds.get(run.triggerId) || []).includes(loopspaceId)
+      )));
+    } else {
+      setLogs([]);
+    }
+    return { runs: nextRuns, triggers: nextTriggers };
+  }, [loopspaceId]);
+
+  const refreshLoopspaceLogs = useCallback(async () => {
+    if (!loopspaceId) {
+      setLogs([]);
+      return;
+    }
+    try {
+      const value = await invoke("cloud_mcp_sync_loopspace_logs", {
+        limit: 100,
+        loopspaceId,
+      });
+      setLogs(appControlLoopspaceTriggerRunRows(value));
+    } catch {
+      try {
+        const value = await invoke("cloud_mcp_get_loopspace_logs", {
+          limit: 100,
+          loopspaceId,
+        });
+        setLogs(appControlLoopspaceTriggerRunRows(value));
+      } catch {
+        // The trigger snapshot below still gives us a useful recent-log fallback.
+      }
+    }
+  }, [loopspaceId]);
+
+  const refreshLoopspaceTriggers = useCallback(async (remote = true) => {
+    if (!loopspaceId) {
+      setTriggers([]);
+      setLogs([]);
+      return;
+    }
+    setLoadingState("loading");
+    setRuntimeError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_get_loopspace_triggers"));
+    } catch {
+      applyTriggerSnapshot({});
+    }
+    if (remote) {
+      try {
+        applyTriggerSnapshot(await invoke("cloud_mcp_sync_loopspace_triggers"));
+      } catch (syncError) {
+        setRuntimeError(String(syncError || "Unable to sync loop graph."));
+      }
+    }
+    await refreshLoopspaceLogs();
+    setLoadingState("idle");
+  }, [applyTriggerSnapshot, loopspaceId, refreshLoopspaceLogs]);
+
+  useEffect(() => {
+    setActiveTab("graph");
+    setRuntimeError("");
+    setDropActive(false);
+    refreshLoopspaceTriggers(true);
+  }, [loopspaceId, refreshLoopspaceTriggers]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenTriggers = null;
+    void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
+      if (disposed) return;
+      applyTriggerSnapshot(event?.payload || event);
+      void refreshLoopspaceLogs();
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenTriggers = unlisten;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlistenTriggers === "function") unlistenTriggers();
+    };
+  }, [applyTriggerSnapshot, refreshLoopspaceLogs]);
+
+  const attachedTriggers = useMemo(() => (
+    triggers.filter((trigger) => trigger.loopspaceIds.includes(loopspaceId))
+  ), [loopspaceId, triggers]);
+
+  const triggerById = useMemo(() => {
+    const map = new Map();
+    for (const trigger of triggers) {
+      map.set(trigger.id, trigger);
+    }
+    return map;
+  }, [triggers]);
+
+  const attachTriggerToLoop = useCallback(async (triggerLike) => {
+    if (!loopspaceId || busy) return;
+    const triggerId = String(triggerLike?.id || triggerLike?.triggerId || "").trim();
+    if (!triggerId) return;
+    const trigger = triggerById.get(triggerId) || triggerLike;
+    const loopspaceIds = Array.isArray(trigger?.loopspaceIds) ? trigger.loopspaceIds : [];
+    if (loopspaceIds.includes(loopspaceId)) {
+      setRuntimeError("");
+      return;
+    }
+    const nextLoopspaceIds = [...loopspaceIds, loopspaceId]
+      .map((id) => String(id || "").trim())
+      .filter((id, index, list) => id && list.indexOf(id) === index);
+    setLoadingState("saving");
+    setRuntimeError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
+        loopspaceIds: nextLoopspaceIds,
+        triggerId,
+      }));
+      await refreshLoopspaceLogs();
+      setLoadingState("idle");
+    } catch (attachError) {
+      setLoadingState("idle");
+      setRuntimeError(String(attachError || "Unable to attach trigger to loop."));
+    }
+  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceLogs, triggerById]);
+
+  const detachTriggerFromLoop = useCallback(async (trigger) => {
+    if (!loopspaceId || !trigger?.id || busy) return;
+    const nextLoopspaceIds = (trigger.loopspaceIds || []).filter((id) => id !== loopspaceId);
+    setLoadingState("saving");
+    setRuntimeError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
+        loopspaceIds: nextLoopspaceIds,
+        triggerId: trigger.id,
+      }));
+      await refreshLoopspaceLogs();
+      setLoadingState("idle");
+    } catch (detachError) {
+      setLoadingState("idle");
+      setRuntimeError(String(detachError || "Unable to remove trigger from loop graph."));
+    }
+  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceLogs]);
+
+  const readDroppedTrigger = useCallback((event) => {
+    const raw = event.dataTransfer.getData(LOOPSPACE_TRIGGER_DRAG_MIME)
+      || event.dataTransfer.getData("text/plain");
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return { id: raw };
+    }
+  }, []);
+
+  const hasDroppedTriggerType = useCallback((event) => (
+    Array.from(event.dataTransfer?.types || []).includes(LOOPSPACE_TRIGGER_DRAG_MIME)
+  ), []);
+
+  const onGraphDrop = useCallback((event) => {
+    event.preventDefault();
+    setDropActive(false);
+    if (!hasDroppedTriggerType(event)) {
+      return;
+    }
+    const trigger = readDroppedTrigger(event);
+    if (trigger) {
+      void attachTriggerToLoop(trigger);
+    }
+  }, [attachTriggerToLoop, hasDroppedTriggerType, readDroppedTrigger]);
+
+  const runtimeStatus = runtimeError || error;
 
   return (
     <LoopspaceRuntimeSurface aria-label={loopspace?.name || "Loop"}>
-      <LoopspaceRuntimeToolbar onSubmit={onRename}>
+      <LoopspaceRuntimeToolbar>
         <LoopspaceRuntimeIconButton
           aria-label="Unselect loop"
           disabled={busy}
@@ -4263,36 +4536,134 @@ function LoopspaceRuntimeView({
         >
           <ButtonBackIcon aria-hidden="true" />
         </LoopspaceRuntimeIconButton>
-        <LoopspaceRuntimeNameInput
-          aria-label="Loop name"
-          autoComplete="off"
-          autoCorrect="off"
-          disabled={deleting}
-          maxLength={80}
-          onChange={(event) => setNameDraft(event.target.value)}
-          spellCheck={false}
-          value={nameDraft}
-        />
-        <LoopspaceRuntimeIconButton
-          aria-label="Rename loop"
-          disabled={!canRename}
-          title="Rename"
-          type="submit"
-        >
-          {renaming ? <PendingIcon aria-hidden="true" /> : <ButtonCheckIcon aria-hidden="true" />}
-        </LoopspaceRuntimeIconButton>
-        <LoopspaceRuntimeDangerButton
-          aria-label="Delete loop"
-          disabled={busy}
-          onClick={onDelete}
-          title="Delete"
-          type="button"
-        >
-          <ButtonDeleteIcon aria-hidden="true" />
-        </LoopspaceRuntimeDangerButton>
+        <LoopspaceRuntimeTitle>
+          <strong>{loopspace?.name || "Loop"}</strong>
+          <span>{attachedTriggers.length} trigger reference{attachedTriggers.length === 1 ? "" : "s"}</span>
+        </LoopspaceRuntimeTitle>
+        <LoopspaceRuntimeTabs aria-label="Loop views" role="tablist">
+          <LoopspaceRuntimeTabButton
+            data-active={activeTab === "graph" ? "true" : undefined}
+            onClick={() => setActiveTab("graph")}
+            role="tab"
+            type="button"
+          >
+            <AccountTree aria-hidden="true" />
+            <span>Graph</span>
+          </LoopspaceRuntimeTabButton>
+          <LoopspaceRuntimeTabButton
+            data-active={activeTab === "logs" ? "true" : undefined}
+            onClick={() => setActiveTab("logs")}
+            role="tab"
+            type="button"
+          >
+            <History aria-hidden="true" />
+            <span>Logs</span>
+          </LoopspaceRuntimeTabButton>
+        </LoopspaceRuntimeTabs>
       </LoopspaceRuntimeToolbar>
-      <LoopspaceRuntimeStage aria-hidden="true" />
-      {error && <LoopspaceRuntimeError>{error}</LoopspaceRuntimeError>}
+      <LoopspaceRuntimeStage>
+        {activeTab === "graph" ? (
+          <LoopspaceGraphCanvas
+            data-drop-active={dropActive ? "true" : undefined}
+            onDragEnter={(event) => {
+              if (hasDroppedTriggerType(event)) {
+                event.preventDefault();
+                setDropActive(true);
+              }
+            }}
+            onDragLeave={(event) => {
+              if (event.currentTarget === event.target) setDropActive(false);
+            }}
+            onDragOver={(event) => {
+              if (hasDroppedTriggerType(event)) {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "copy";
+              }
+            }}
+            onDrop={onGraphDrop}
+          >
+            <LoopspaceGraphContent>
+              <LoopspaceGraphNode data-kind="loop">
+                <LoopspaceGraphNodeIcon>
+                  <AccountTree aria-hidden="true" />
+                </LoopspaceGraphNodeIcon>
+                <LoopspaceGraphNodeText>
+                  <strong>{loopspace?.name || "Loop"}</strong>
+                  <span>Loop graph</span>
+                </LoopspaceGraphNodeText>
+                <span />
+              </LoopspaceGraphNode>
+              <LoopspaceGraphConnector aria-hidden="true" />
+              {attachedTriggers.length ? (
+                <LoopspaceGraphTriggerGrid>
+                  {attachedTriggers.map((trigger) => {
+                    const Icon = loopspaceTriggerTypeIcon(trigger.type);
+                    return (
+                      <LoopspaceGraphNode data-kind={trigger.type} key={trigger.id}>
+                        <LoopspaceGraphNodeIcon>
+                          <Icon aria-hidden="true" />
+                        </LoopspaceGraphNodeIcon>
+                        <LoopspaceGraphNodeText>
+                          <strong>{trigger.name}</strong>
+                          <span>{loopspaceTriggerTypeLabel(trigger.type)}</span>
+                        </LoopspaceGraphNodeText>
+                        <LoopspaceGraphNodeAction
+                          aria-label={`Remove ${trigger.name} from loop graph`}
+                          disabled={busy}
+                          onClick={() => detachTriggerFromLoop(trigger)}
+                          title="Remove from graph"
+                          type="button"
+                        >
+                          <ButtonCloseIcon aria-hidden="true" />
+                        </LoopspaceGraphNodeAction>
+                      </LoopspaceGraphNode>
+                    );
+                  })}
+                </LoopspaceGraphTriggerGrid>
+              ) : (
+                <LoopspaceGraphEmpty>
+                  <strong>Drop triggers here</strong>
+                  <span>Drag a reusable trigger from the Triggers tab into this graph.</span>
+                </LoopspaceGraphEmpty>
+              )}
+            </LoopspaceGraphContent>
+          </LoopspaceGraphCanvas>
+        ) : (
+          <LoopspaceLogsList aria-label={`${loopspace?.name || "Loop"} logs`}>
+            {logs.length ? logs.map((run) => {
+              const trigger = triggerById.get(run.triggerId);
+              const type = run.type || trigger?.type || "manual";
+              const Icon = loopspaceTriggerTypeIcon(type);
+              const status = run.status || "run";
+              const tone = status === "success" || status === "webhook" ? "good" : "error";
+              return (
+                <LoopspaceLogRow key={run.id}>
+                  <LoopspaceLogIcon>
+                    <Icon aria-hidden="true" />
+                  </LoopspaceLogIcon>
+                  <LoopspaceLogMain>
+                    <strong>{trigger?.name || run.triggerId || "Trigger run"}</strong>
+                    <span>
+                      {[loopspaceTriggerTypeLabel(type), formatLoopspaceRuntimeTime(run.createdAtMs), run.error]
+                        .filter(Boolean)
+                        .join(" - ")}
+                    </span>
+                  </LoopspaceLogMain>
+                  <LoopspaceLogMeta data-tone={tone === "error" ? "error" : undefined}>
+                    {status}
+                  </LoopspaceLogMeta>
+                </LoopspaceLogRow>
+              );
+            }) : (
+              <LoopspaceGraphEmpty>
+                <strong>No logs yet</strong>
+                <span>Cron, webhook, and manual runs for this loop will appear here.</span>
+              </LoopspaceGraphEmpty>
+            )}
+          </LoopspaceLogsList>
+        )}
+      </LoopspaceRuntimeStage>
+      {runtimeStatus && <LoopspaceRuntimeError>{runtimeStatus}</LoopspaceRuntimeError>}
     </LoopspaceRuntimeSurface>
   );
 }
@@ -9721,6 +10092,7 @@ export default function App() {
   const [loopspaceError, setLoopspaceError] = useState("");
   const [loopspaceRenameDraft, setLoopspaceRenameDraft] = useState("");
   const [loopspaceActionState, setLoopspaceActionState] = useState("idle");
+  const [loopspaceSettingsMenuId, setLoopspaceSettingsMenuId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
   const [workspaceHydrationReady, setWorkspaceHydrationReady] = useState(false);
@@ -12736,6 +13108,9 @@ export default function App() {
       }
       return nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : "";
     });
+    setLoopspaceSettingsMenuId((currentId) => (
+      currentId && nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : ""
+    ));
     return nextLoopspaces;
   }, []);
 
@@ -15735,6 +16110,88 @@ export default function App() {
       setLoopspaceError(String(error || "Unable to delete loop."));
     }
   }, [applyLoopspaceSnapshot, loopspaceActionState, selectedLoopspace]);
+
+  const renameLoopspaceFromRail = useCallback(async (loopspace) => {
+    if (!loopspace?.id || loopspaceActionState === "deleting") {
+      return;
+    }
+    const currentName = loopspace.name || "";
+    const nextName = typeof window === "undefined"
+      ? currentName
+      : window.prompt("Rename loop", currentName);
+    if (nextName == null) {
+      return;
+    }
+    const name = String(nextName || "").trim();
+    if (!name || name === currentName) {
+      return;
+    }
+    setLoopspaceSettingsMenuId("");
+    setLoopspaceActionState("renaming");
+    setLoopspaceError("");
+    try {
+      const result = await invoke("cloud_mcp_rename_loopspace", {
+        loopspaceId: loopspace.id,
+        name,
+      });
+      applyLoopspaceSnapshot(result);
+      setLoopspaceActionState("idle");
+    } catch (error) {
+      setLoopspaceActionState("idle");
+      setLoopspaceError(String(error || "Unable to rename loop."));
+    }
+  }, [applyLoopspaceSnapshot, loopspaceActionState]);
+
+  const deleteLoopspaceFromRail = useCallback(async (loopspace) => {
+    if (!loopspace?.id || loopspaceActionState === "renaming") {
+      return;
+    }
+    const confirmed = typeof window === "undefined"
+      ? true
+      : window.confirm(`Delete "${loopspace.name}"?`);
+    if (!confirmed) {
+      return;
+    }
+    setLoopspaceSettingsMenuId("");
+    setLoopspaceActionState("deleting");
+    setLoopspaceError("");
+    try {
+      const result = await invoke("cloud_mcp_delete_loopspace", {
+        loopspaceId: loopspace.id,
+      });
+      applyLoopspaceSnapshot(result);
+      if (selectedLoopspaceId === loopspace.id) {
+        setSelectedLoopspaceId("");
+      }
+      setLoopspaceActionState("idle");
+    } catch (error) {
+      setLoopspaceActionState("idle");
+      setLoopspaceError(String(error || "Unable to delete loop."));
+    }
+  }, [applyLoopspaceSnapshot, loopspaceActionState, selectedLoopspaceId]);
+
+  useEffect(() => {
+    if (!loopspaceSettingsMenuId) {
+      return undefined;
+    }
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setLoopspaceSettingsMenuId("");
+      }
+    };
+    const onPointerDown = (event) => {
+      if (event.target?.closest?.("[data-loopspace-settings-menu]")) {
+        return;
+      }
+      setLoopspaceSettingsMenuId("");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [loopspaceSettingsMenuId]);
 
   const closeCreateWorkspaceModal = useCallback(() => {
     if (workspaceSyncState === "creating") {
@@ -30552,6 +31009,44 @@ export default function App() {
                                     <span>loop</span>
                                   </WorkspaceLabel>
                                 </WorkspaceButton>
+                                <WorkspaceSettingsButton
+                                  aria-label={`Open settings for ${loopspace.name}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setLoopspaceSettingsMenuId((current) => (
+                                      current === loopspace.id ? "" : loopspace.id
+                                    ));
+                                  }}
+                                  title="Loop settings"
+                                  type="button"
+                                >
+                                  <ButtonSettingsIcon aria-hidden="true" />
+                                </WorkspaceSettingsButton>
+                                {loopspaceSettingsMenuId === loopspace.id ? (
+                                  <LoopspaceRailSettingsMenu
+                                    data-loopspace-settings-menu="true"
+                                    onClick={(event) => event.stopPropagation()}
+                                    role="menu"
+                                  >
+                                    <LoopspaceRailSettingsItem
+                                      onClick={() => renameLoopspaceFromRail(loopspace)}
+                                      role="menuitem"
+                                      type="button"
+                                    >
+                                      <ButtonSettingsIcon aria-hidden="true" />
+                                      <span>Rename</span>
+                                    </LoopspaceRailSettingsItem>
+                                    <LoopspaceRailSettingsItem
+                                      data-tone="danger"
+                                      onClick={() => deleteLoopspaceFromRail(loopspace)}
+                                      role="menuitem"
+                                      type="button"
+                                    >
+                                      <ButtonDeleteIcon aria-hidden="true" />
+                                      <span>Delete</span>
+                                    </LoopspaceRailSettingsItem>
+                                  </LoopspaceRailSettingsMenu>
+                                ) : null}
                               </WorkspaceRow>
                             );
                           })}
@@ -30971,11 +31466,7 @@ export default function App() {
                           actionState={loopspaceActionState}
                           error={loopspaceError}
                           loopspace={selectedLoopspace}
-                          nameDraft={loopspaceRenameDraft}
                           onBack={unselectLoopspace}
-                          onDelete={deleteSelectedLoopspace}
-                          onRename={renameSelectedLoopspace}
-                          setNameDraft={setLoopspaceRenameDraft}
                         />
                       ) : (
                         <WorkspaceIdleState

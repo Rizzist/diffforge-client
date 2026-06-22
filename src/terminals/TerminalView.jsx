@@ -6,6 +6,7 @@ import { Apple as DeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
 import { Linux as DeviceLinuxIcon } from "@styled-icons/fa-brands/Linux";
 import { Windows as DeviceWindowsIcon } from "@styled-icons/fa-brands/Windows";
 import { AddToQueue } from "@styled-icons/material-rounded/AddToQueue";
+import { AdsClick } from "@styled-icons/material-rounded/AdsClick";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Computer as DeviceComputerIcon } from "@styled-icons/material-rounded/Computer";
@@ -15,8 +16,10 @@ import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Language as DeviceWebIcon } from "@styled-icons/material-rounded/Language";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
+import { Schedule } from "@styled-icons/material-rounded/Schedule";
 import { ToggleOff } from "@styled-icons/material-rounded/ToggleOff";
 import { ToggleOn } from "@styled-icons/material-rounded/ToggleOn";
+import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
@@ -775,9 +778,9 @@ function getLoopspaceWebhookCopyUrl(path, baseUrl) {
 }
 
 const LOOPSPACE_TRIGGER_TYPE_OPTIONS = [
-  { label: "Cron", value: "cron" },
-  { label: "Webhook", value: "webhook" },
-  { label: "Manual", value: "manual" },
+  { icon: Schedule, label: "Cron", value: "cron" },
+  { icon: Webhook, label: "Webhook", value: "webhook" },
+  { icon: AdsClick, label: "Manual", value: "manual" },
 ];
 
 const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
@@ -787,6 +790,20 @@ const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
   { id: "daily", label: "Daily", value: "@daily" },
   { id: "custom", label: "Custom", value: "" },
 ];
+
+const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
+
+function getLoopspaceTriggerTypeLabel(type) {
+  if (type === "webhook") return "Webhook";
+  if (type === "manual") return "Manual";
+  return "Cron";
+}
+
+function getLoopspaceTriggerTypeIcon(type) {
+  if (type === "webhook") return Webhook;
+  if (type === "manual") return AdsClick;
+  return Schedule;
+}
 
 function getForgeCanvasTintPalette(themeMode, spaceMode = getForgeSpaceMode()) {
   if (spaceMode === "loopspaces") {
@@ -5348,9 +5365,9 @@ const LoopspaceTriggersScroll = styled.div`
 
 const LoopspaceTriggerForm = styled.form`
   display: grid;
-  gap: 9px;
+  gap: 8px;
   min-width: 0;
-  padding: 10px;
+  padding: 9px;
   border: 1px solid rgba(230, 236, 245, 0.08);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.028);
@@ -5434,18 +5451,27 @@ const LoopspaceTriggerTypePicker = styled.div`
 
 const LoopspaceTriggerTypeButton = styled.button`
   display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 5px;
+  align-items: center;
+  justify-content: center;
   min-width: 0;
   height: 27px;
-  place-items: center;
   border: 0;
   border-radius: 6px;
-  padding: 0 8px;
+  padding: 0 7px;
   color: rgba(232, 238, 248, 0.62);
   background: transparent;
   font-size: 10.5px;
   font-weight: 850;
   cursor: pointer;
   outline: none;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
 
   &[data-active="true"] {
     color: #ffffff;
@@ -5463,52 +5489,6 @@ const LoopspaceTriggerTypeButton = styled.button`
       color: #14171f;
       background: rgba(var(--forge-accent-rgb), 0.18);
     }
-  }
-`;
-
-const LoopspaceTriggerLoopList = styled.div`
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-  max-height: 116px;
-  overflow: auto;
-  padding: 7px;
-  border: 1px solid rgba(230, 236, 245, 0.08);
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.1);
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.08);
-    background: rgba(0, 0, 0, 0.025);
-  }
-`;
-
-const LoopspaceTriggerLoopOption = styled.label`
-  display: grid;
-  grid-template-columns: 15px minmax(0, 1fr);
-  gap: 7px;
-  align-items: center;
-  min-width: 0;
-  color: rgba(232, 238, 248, 0.72);
-  font-size: 10.5px;
-  font-weight: 720;
-  line-height: 1.2;
-
-  input {
-    width: 13px;
-    height: 13px;
-    margin: 0;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: rgba(25, 28, 34, 0.72);
   }
 `;
 
@@ -5572,7 +5552,7 @@ const LoopspaceTriggerIconButton = styled.button`
 
 const LoopspaceTriggerPrimaryButton = styled(LoopspaceTriggerIconButton)`
   width: auto;
-  min-width: 84px;
+  min-width: 76px;
   grid-auto-flow: column;
   grid-auto-columns: max-content;
   gap: 6px;
@@ -5597,6 +5577,11 @@ const LoopspaceTriggerRow = styled.div`
   border-left-width: 2px;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.026);
+  cursor: grab;
+
+  &:active {
+    cursor: grabbing;
+  }
 
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.08);
@@ -5607,10 +5592,40 @@ const LoopspaceTriggerRow = styled.div`
 
 const LoopspaceTriggerRowHeader = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
   min-width: 0;
+`;
+
+const LoopspaceTriggerTypeIconTile = styled.span`
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid rgba(230, 236, 245, 0.09);
+  border-radius: 7px;
+  color: rgba(255, 209, 102, 0.95);
+  background: rgba(255, 209, 102, 0.1);
+
+  &[data-kind="webhook"] {
+    color: #93c5fd;
+    background: rgba(59, 130, 246, 0.12);
+  }
+
+  &[data-kind="manual"] {
+    color: #c4b5fd;
+    background: rgba(139, 92, 246, 0.12);
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+  }
 `;
 
 const LoopspaceTriggerNameInput = styled(LoopspaceTriggerInput)`
@@ -5721,7 +5736,6 @@ const LoopspaceTriggerEmpty = styled.div`
 
 const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   const [triggers, setTriggers] = useState([]);
-  const [runs, setRuns] = useState([]);
   const [loopspaces, setLoopspaces] = useState([]);
   const [state, setState] = useState("idle");
   const [error, setError] = useState("");
@@ -5729,7 +5743,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   const [draftType, setDraftType] = useState("cron");
   const [draftSchedulePreset, setDraftSchedulePreset] = useState("5m");
   const [draftCustomSchedule, setDraftCustomSchedule] = useState("");
-  const [draftLoopspaceIds, setDraftLoopspaceIds] = useState([]);
   const [nameDrafts, setNameDrafts] = useState({});
   const [editingTriggerId, setEditingTriggerId] = useState("");
   const [copiedTriggerId, setCopiedTriggerId] = useState("");
@@ -5746,7 +5759,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
       editingTriggerIdRef.current = "";
       setEditingTriggerId("");
     }
-    setRuns(snapshot.runs);
     setNameDrafts((current) => {
       const next = {};
       for (const trigger of snapshot.triggers) {
@@ -5762,9 +5774,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   const applyLoopspaceSnapshot = useCallback((value) => {
     const rows = normalizeLoopspaceRows(value);
     setLoopspaces(rows);
-    setDraftLoopspaceIds((current) => (
-      current.filter((id) => rows.some((row) => row.id === id))
-    ));
     return rows;
   }, []);
 
@@ -5878,14 +5887,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     return draftCustomSchedule.trim() || "@every 5m";
   }, [draftCustomSchedule, draftSchedulePreset]);
 
-  const toggleDraftLoopspace = useCallback((loopspaceId) => {
-    setDraftLoopspaceIds((current) => (
-      current.includes(loopspaceId)
-        ? current.filter((id) => id !== loopspaceId)
-        : [...current, loopspaceId]
-    ));
-  }, []);
-
   const createTrigger = useCallback(async (event) => {
     event.preventDefault();
     const name = draftName.trim();
@@ -5904,7 +5905,7 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
       const result = await invoke("cloud_mcp_create_loopspace_trigger", {
         config,
         enabled: true,
-        loopspaceIds: draftLoopspaceIds,
+        loopspaceIds: [],
         name,
         triggerType: draftType,
       });
@@ -5917,7 +5918,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     }
   }, [
     applyTriggerSnapshot,
-    draftLoopspaceIds,
     draftName,
     draftSchedule,
     draftType,
@@ -6066,6 +6066,35 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     }
   }, [applyTriggerSnapshot, state]);
 
+  const startTriggerDrag = useCallback((event, trigger) => {
+    if (!trigger?.id) {
+      event.preventDefault();
+      return;
+    }
+    const target = event.target;
+    if (
+      typeof HTMLElement !== "undefined"
+      && target instanceof HTMLElement
+      && (
+        target.closest("button,textarea,select")
+        || (target.closest("input") && !target.closest("input")?.readOnly)
+      )
+    ) {
+      event.preventDefault();
+      return;
+    }
+    const payload = JSON.stringify({
+      id: trigger.id,
+      loopspaceIds: trigger.loopspaceIds || [],
+      name: trigger.name,
+      triggerId: trigger.id,
+      type: trigger.type,
+    });
+    event.dataTransfer.effectAllowed = "copy";
+    event.dataTransfer.setData(LOOPSPACE_TRIGGER_DRAG_MIME, payload);
+    event.dataTransfer.setData("text/plain", trigger.id);
+  }, []);
+
   return (
     <LoopspaceTriggersView>
       <LoopspaceTriggersHeader>
@@ -6099,16 +6128,20 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
             />
           </LoopspaceTriggerFieldGrid>
           <LoopspaceTriggerTypePicker aria-label="Trigger type" role="group">
-            {LOOPSPACE_TRIGGER_TYPE_OPTIONS.map((option) => (
-              <LoopspaceTriggerTypeButton
-                data-active={draftType === option.value}
-                key={option.value}
-                onClick={() => setDraftType(option.value)}
-                type="button"
-              >
-                {option.label}
-              </LoopspaceTriggerTypeButton>
-            ))}
+            {LOOPSPACE_TRIGGER_TYPE_OPTIONS.map((option) => {
+              const Icon = option.icon;
+              return (
+                <LoopspaceTriggerTypeButton
+                  data-active={draftType === option.value}
+                  key={option.value}
+                  onClick={() => setDraftType(option.value)}
+                  type="button"
+                >
+                  <Icon aria-hidden="true" />
+                  <span>{option.label}</span>
+                </LoopspaceTriggerTypeButton>
+              );
+            })}
           </LoopspaceTriggerTypePicker>
           {draftType === "cron" ? (
             <>
@@ -6133,23 +6166,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                   value={draftCustomSchedule}
                 />
               ) : null}
-            </>
-          ) : null}
-          {loopspaces.length > 0 ? (
-            <>
-              <LoopspaceTriggerSectionLabel>Loops</LoopspaceTriggerSectionLabel>
-              <LoopspaceTriggerLoopList aria-label="Loop attachments">
-                {loopspaces.map((loopspace) => (
-                  <LoopspaceTriggerLoopOption key={loopspace.id}>
-                    <input
-                      checked={draftLoopspaceIds.includes(loopspace.id)}
-                      onChange={() => toggleDraftLoopspace(loopspace.id)}
-                      type="checkbox"
-                    />
-                    <span title={loopspace.name}>{loopspace.name}</span>
-                  </LoopspaceTriggerLoopOption>
-                ))}
-              </LoopspaceTriggerLoopList>
             </>
           ) : null}
           <LoopspaceTriggerActionRow>
@@ -6177,9 +6193,18 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                 ? getLoopspaceWebhookCopyUrl(trigger.webhookPath, webhookBaseUrl)
                 : "";
               const isWebhookCopied = copiedTriggerId === trigger.id;
+              const TypeIcon = getLoopspaceTriggerTypeIcon(trigger.type);
               return (
-                <LoopspaceTriggerRow key={trigger.id}>
+                <LoopspaceTriggerRow
+                  draggable={!isRenaming && state !== "saving"}
+                  key={trigger.id}
+                  onDragStart={(event) => startTriggerDrag(event, trigger)}
+                  title="Drag into a loop graph"
+                >
                   <LoopspaceTriggerRowHeader>
+                    <LoopspaceTriggerTypeIconTile data-kind={trigger.type}>
+                      <TypeIcon aria-hidden="true" />
+                    </LoopspaceTriggerTypeIconTile>
                     <LoopspaceTriggerNameControl>
                       <LoopspaceTriggerNameInput
                         aria-label="Trigger name"
@@ -6265,7 +6290,7 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                   </LoopspaceTriggerRowHeader>
                   <LoopspaceTriggerBadgeRow>
                     <LoopspaceTriggerBadge>
-                      {trigger.type === "webhook" ? "Webhook" : trigger.type === "manual" ? "Manual" : "Cron"}
+                      {getLoopspaceTriggerTypeLabel(trigger.type)}
                     </LoopspaceTriggerBadge>
                     <LoopspaceTriggerBadge data-tone={trigger.enabled ? "good" : "muted"}>
                       {trigger.enabled ? "Enabled" : "Disabled"}
@@ -6292,18 +6317,6 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
         ) : (
           <LoopspaceTriggerEmpty>No triggers</LoopspaceTriggerEmpty>
         )}
-        {runs.length > 0 ? (
-          <LoopspaceTriggerList aria-label="Recent trigger runs">
-            {runs.slice(0, 6).map((run) => (
-              <LoopspaceTriggerBadgeRow key={run.id}>
-                <LoopspaceTriggerBadge>{run.status || "run"}</LoopspaceTriggerBadge>
-                <LoopspaceTriggerBadge data-tone="muted">
-                  {formatLoopspaceTriggerTime(run.createdAtMs) || run.id}
-                </LoopspaceTriggerBadge>
-              </LoopspaceTriggerBadgeRow>
-            ))}
-          </LoopspaceTriggerList>
-        ) : null}
       </LoopspaceTriggersScroll>
     </LoopspaceTriggersView>
   );

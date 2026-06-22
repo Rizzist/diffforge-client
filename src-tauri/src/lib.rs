@@ -4949,6 +4949,8 @@ pub fn run() {
             cloud_mcp_rename_loopspace,
             cloud_mcp_delete_loopspace,
             cloud_mcp_get_loopspace_triggers,
+            cloud_mcp_get_loopspace_logs,
+            cloud_mcp_sync_loopspace_logs,
             cloud_mcp_sync_loopspace_triggers,
             cloud_mcp_create_loopspace_trigger,
             cloud_mcp_update_loopspace_trigger,
