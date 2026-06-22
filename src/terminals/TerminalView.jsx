@@ -11,9 +11,12 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { Computer as DeviceComputerIcon } from "@styled-icons/material-rounded/Computer";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Devices as DeviceGenericIcon } from "@styled-icons/material-rounded/Devices";
+import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Language as DeviceWebIcon } from "@styled-icons/material-rounded/Language";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
+import { ToggleOff } from "@styled-icons/material-rounded/ToggleOff";
+import { ToggleOn } from "@styled-icons/material-rounded/ToggleOn";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
@@ -749,6 +752,26 @@ function formatLoopspaceTriggerTime(value) {
   } catch {
     return "";
   }
+}
+
+function normalizeLoopspaceWebhookBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const withoutSlash = raw.replace(/\/+$/, "");
+  const lower = withoutSlash.toLowerCase();
+  if (lower.startsWith("wss://")) return `https://${withoutSlash.slice(6)}`;
+  if (lower.startsWith("ws://")) return `http://${withoutSlash.slice(5)}`;
+  return withoutSlash;
+}
+
+function getLoopspaceWebhookCopyUrl(path, baseUrl) {
+  const rawPath = String(path || "").trim();
+  if (!rawPath) return "";
+  if (/^https?:\/\//i.test(rawPath)) return rawPath;
+  const normalizedBase = normalizeLoopspaceWebhookBaseUrl(baseUrl);
+  if (!normalizedBase) return rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  return `${normalizedBase}${normalizedPath}`;
 }
 
 const LOOPSPACE_TRIGGER_TYPE_OPTIONS = [
@@ -5523,6 +5546,18 @@ const LoopspaceTriggerIconButton = styled.button`
     background: rgba(var(--forge-accent-rgb), 0.14);
   }
 
+  &[data-active="true"] {
+    color: #bbf7d0;
+    border-color: rgba(34, 197, 94, 0.26);
+    background: rgba(34, 197, 94, 0.12);
+  }
+
+  &[data-copied="true"] {
+    color: #ffffff;
+    border-color: rgba(var(--forge-accent-rgb), 0.46);
+    background: rgba(var(--forge-accent-rgb), 0.18);
+  }
+
   &:disabled {
     cursor: default;
     opacity: 0.45;
@@ -5580,7 +5615,32 @@ const LoopspaceTriggerRowHeader = styled.div`
 
 const LoopspaceTriggerNameInput = styled(LoopspaceTriggerInput)`
   height: 28px;
-  padding: 0 7px;
+  padding: 0 34px 0 7px;
+
+  &:read-only {
+    cursor: default;
+  }
+`;
+
+const LoopspaceTriggerNameControl = styled.div`
+  position: relative;
+  min-width: 0;
+`;
+
+const LoopspaceTriggerNameEditButton = styled(LoopspaceTriggerIconButton)`
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  width: 22px;
+  height: 22px;
+  transform: translateY(-50%);
+  border-color: transparent;
+  background: transparent;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
 `;
 
 const LoopspaceTriggerBadgeRow = styled.div`
@@ -5671,15 +5731,26 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   const [draftCustomSchedule, setDraftCustomSchedule] = useState("");
   const [draftLoopspaceIds, setDraftLoopspaceIds] = useState([]);
   const [nameDrafts, setNameDrafts] = useState({});
+  const [editingTriggerId, setEditingTriggerId] = useState("");
+  const [copiedTriggerId, setCopiedTriggerId] = useState("");
+  const [webhookBaseUrl, setWebhookBaseUrl] = useState("");
+  const editingTriggerIdRef = useRef("");
+  const editingNameInputRef = useRef(null);
+  const copyFeedbackTimeoutRef = useRef(null);
 
   const applyTriggerSnapshot = useCallback((value) => {
     const snapshot = normalizeLoopspaceTriggerSnapshot(value);
+    const editingId = editingTriggerIdRef.current;
     setTriggers(snapshot.triggers);
+    if (editingId && !snapshot.triggers.some((trigger) => trigger.id === editingId)) {
+      editingTriggerIdRef.current = "";
+      setEditingTriggerId("");
+    }
     setRuns(snapshot.runs);
     setNameDrafts((current) => {
       const next = {};
       for (const trigger of snapshot.triggers) {
-        next[trigger.id] = Object.prototype.hasOwnProperty.call(current, trigger.id)
+        next[trigger.id] = trigger.id === editingId && Object.prototype.hasOwnProperty.call(current, trigger.id)
           ? current[trigger.id]
           : trigger.name;
       }
@@ -5735,6 +5806,41 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     syncTriggers(true);
     syncLoopspaces();
   }, [syncLoopspaces, syncTriggers]);
+
+  useEffect(() => {
+    let disposed = false;
+    void invoke("cloud_mcp_get_status").then((status) => {
+      if (disposed) return;
+      setWebhookBaseUrl(String(status?.baseUrl || status?.base_url || "").trim());
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => () => {
+    if (copyFeedbackTimeoutRef.current) {
+      window.clearTimeout(copyFeedbackTimeoutRef.current);
+      copyFeedbackTimeoutRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!editingTriggerId || !editingNameInputRef.current) {
+      return undefined;
+    }
+    const node = editingNameInputRef.current;
+    const focusNameInput = () => {
+      node.focus();
+      node.select();
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      const frameId = window.requestAnimationFrame(focusNameInput);
+      return () => window.cancelAnimationFrame(frameId);
+    }
+    focusNameInput();
+    return undefined;
+  }, [editingTriggerId]);
 
   useEffect(() => {
     let disposed = false;
@@ -5817,9 +5923,47 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     draftType,
   ]);
 
+  const beginRenameTrigger = useCallback((trigger) => {
+    if (!trigger?.id || state === "saving") {
+      return;
+    }
+    setNameDrafts((current) => ({
+      ...current,
+      [trigger.id]: String(current[trigger.id] ?? trigger.name),
+    }));
+    editingTriggerIdRef.current = trigger.id;
+    setEditingTriggerId(trigger.id);
+  }, [state]);
+
+  const cancelRenameTrigger = useCallback((trigger) => {
+    if (!trigger?.id) {
+      return;
+    }
+    setNameDrafts((current) => ({
+      ...current,
+      [trigger.id]: trigger.name,
+    }));
+    editingTriggerIdRef.current = "";
+    setEditingTriggerId("");
+    setError("");
+  }, []);
+
   const renameTrigger = useCallback(async (trigger) => {
+    if (!trigger?.id || state === "saving") {
+      return;
+    }
     const name = String(nameDrafts[trigger.id] ?? trigger.name).trim();
-    if (!name || name === trigger.name || state === "saving") {
+    if (!name) {
+      setError("Trigger name is required.");
+      return;
+    }
+    if (name === trigger.name) {
+      setNameDrafts((current) => ({
+        ...current,
+        [trigger.id]: trigger.name,
+      }));
+      editingTriggerIdRef.current = "";
+      setEditingTriggerId("");
       return;
     }
     setState("saving");
@@ -5829,6 +5973,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
         name,
         triggerId: trigger.id,
       }));
+      editingTriggerIdRef.current = "";
+      setEditingTriggerId("");
       setState("idle");
     } catch (renameError) {
       setState("idle");
@@ -5853,6 +5999,30 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
       setError(String(toggleError || "Unable to update trigger."));
     }
   }, [applyTriggerSnapshot, state]);
+
+  const copyWebhookTrigger = useCallback(async (trigger, webhookUrl) => {
+    const copyValue = String(webhookUrl || "").trim();
+    if (!trigger?.id || !copyValue) {
+      return;
+    }
+    setError("");
+    try {
+      const copied = await copyTextToClipboard(copyValue);
+      if (!copied) {
+        throw new Error("Clipboard unavailable.");
+      }
+      setCopiedTriggerId(trigger.id);
+      if (copyFeedbackTimeoutRef.current) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current);
+      }
+      copyFeedbackTimeoutRef.current = window.setTimeout(() => {
+        setCopiedTriggerId((current) => (current === trigger.id ? "" : current));
+        copyFeedbackTimeoutRef.current = null;
+      }, 1300);
+    } catch (copyError) {
+      setError(String(copyError || "Unable to copy webhook URL."));
+    }
+  }, []);
 
   const runTrigger = useCallback(async (trigger) => {
     if (!trigger?.id || trigger.type !== "manual" || !trigger.enabled || state === "saving") {
@@ -6002,26 +6172,53 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                 .filter(Boolean);
               const nextDue = formatLoopspaceTriggerTime(trigger.nextDueAtMs);
               const lastRun = formatLoopspaceTriggerTime(trigger.lastRunAtMs);
+              const isRenaming = editingTriggerId === trigger.id;
+              const webhookUrl = trigger.webhookPath
+                ? getLoopspaceWebhookCopyUrl(trigger.webhookPath, webhookBaseUrl)
+                : "";
+              const isWebhookCopied = copiedTriggerId === trigger.id;
               return (
                 <LoopspaceTriggerRow key={trigger.id}>
                   <LoopspaceTriggerRowHeader>
-                    <LoopspaceTriggerNameInput
-                      aria-label="Trigger name"
-                      maxLength={120}
-                      onChange={(event) => {
-                        setNameDrafts((current) => ({
-                          ...current,
-                          [trigger.id]: event.target.value,
-                        }));
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          renameTrigger(trigger);
-                        }
-                      }}
-                      value={nameDrafts[trigger.id] ?? trigger.name}
-                    />
+                    <LoopspaceTriggerNameControl>
+                      <LoopspaceTriggerNameInput
+                        aria-label="Trigger name"
+                        maxLength={120}
+                        onChange={(event) => {
+                          setNameDrafts((current) => ({
+                            ...current,
+                            [trigger.id]: event.target.value,
+                          }));
+                        }}
+                        onDoubleClick={() => beginRenameTrigger(trigger)}
+                        onKeyDown={(event) => {
+                          if (!isRenaming) {
+                            return;
+                          }
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            renameTrigger(trigger);
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelRenameTrigger(trigger);
+                          }
+                        }}
+                        readOnly={!isRenaming}
+                        ref={isRenaming ? editingNameInputRef : null}
+                        title={isRenaming ? "Editing trigger name" : "Click the pencil to rename"}
+                        value={nameDrafts[trigger.id] ?? trigger.name}
+                      />
+                      <LoopspaceTriggerNameEditButton
+                        aria-label={isRenaming ? "Save trigger name" : "Rename trigger"}
+                        data-active={isRenaming ? "true" : undefined}
+                        disabled={state === "saving"}
+                        onClick={() => (isRenaming ? renameTrigger(trigger) : beginRenameTrigger(trigger))}
+                        title={isRenaming ? "Save name" : "Rename"}
+                        type="button"
+                      >
+                        {isRenaming ? <Check aria-hidden="true" /> : <Edit aria-hidden="true" />}
+                      </LoopspaceTriggerNameEditButton>
+                    </LoopspaceTriggerNameControl>
                     <LoopspaceTriggerActionRow>
                       {trigger.type === "manual" ? (
                         <LoopspaceTriggerIconButton
@@ -6034,23 +6231,26 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                           <PlayArrow aria-hidden="true" />
                         </LoopspaceTriggerIconButton>
                       ) : null}
+                      {trigger.type === "webhook" && webhookUrl ? (
+                        <LoopspaceTriggerIconButton
+                          aria-label="Copy webhook URL"
+                          data-copied={isWebhookCopied ? "true" : undefined}
+                          onClick={() => copyWebhookTrigger(trigger, webhookUrl)}
+                          title={isWebhookCopied ? "Copied" : "Copy webhook URL"}
+                          type="button"
+                        >
+                          <ContentCopy aria-hidden="true" />
+                        </LoopspaceTriggerIconButton>
+                      ) : null}
                       <LoopspaceTriggerIconButton
                         aria-label={trigger.enabled ? "Disable trigger" : "Enable trigger"}
+                        data-active={trigger.enabled ? "true" : undefined}
                         disabled={state === "saving"}
                         onClick={() => toggleTriggerEnabled(trigger)}
                         title={trigger.enabled ? "Disable" : "Enable"}
                         type="button"
                       >
-                        <Check aria-hidden="true" />
-                      </LoopspaceTriggerIconButton>
-                      <LoopspaceTriggerIconButton
-                        aria-label="Rename trigger"
-                        disabled={state === "saving"}
-                        onClick={() => renameTrigger(trigger)}
-                        title="Rename"
-                        type="button"
-                      >
-                        <ButtonRefreshIcon aria-hidden="true" />
+                        {trigger.enabled ? <ToggleOn aria-hidden="true" /> : <ToggleOff aria-hidden="true" />}
                       </LoopspaceTriggerIconButton>
                       <LoopspaceTriggerIconButton
                         aria-label="Delete trigger"
@@ -6081,8 +6281,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                     {trigger.lastStatus ? <LoopspaceTriggerBadge>{trigger.lastStatus}</LoopspaceTriggerBadge> : null}
                   </LoopspaceTriggerBadgeRow>
                   {trigger.webhookPath ? (
-                    <LoopspaceTriggerWebhookPath title={trigger.webhookPath}>
-                      {trigger.webhookPath}
+                    <LoopspaceTriggerWebhookPath title={webhookUrl || trigger.webhookPath}>
+                      {webhookUrl || trigger.webhookPath}
                     </LoopspaceTriggerWebhookPath>
                   ) : null}
                 </LoopspaceTriggerRow>
