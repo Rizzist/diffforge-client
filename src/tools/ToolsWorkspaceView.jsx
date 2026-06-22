@@ -6,6 +6,8 @@ import styled, { keyframes } from "styled-components";
 import {
   ButtonRefreshIcon,
   FileDisclosure,
+  FileContextMenu,
+  FileContextMenuItem,
   FileExplorerActions,
   FileExplorerHeader,
   FileExplorerPane,
@@ -65,6 +67,7 @@ const ACCOUNT_DOCS_FOREGROUND_REFRESH_TIMEOUT_MS = 12_000;
 const SKILL_DOCUMENT_A4_WIDTH_PX = 794;
 const SKILL_DOCUMENT_A4_HEIGHT_PX = 1123;
 const SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX = 48;
+const SKILL_DOCUMENT_CANVAS_VERTICAL_GUTTER_PX = 112;
 const SKILL_DOCUMENT_MIN_SCALE = 0.38;
 const SKILL_DOCUMENT_MAX_SCALE = 1.35;
 const DOCUMENT_TYPE_OPTIONS = [
@@ -302,6 +305,10 @@ function documentHasInlineContent(document) {
   return String(document?.content ?? document?.content_md ?? document?.contentMd ?? document?.body ?? "").length > 0;
 }
 
+function documentContentHash(document) {
+  return text(document?.contentHash || document?.content_hash || document?.sha256);
+}
+
 function documentCanHydrate(document) {
   if (documentIsFolderRow(document)) return false;
   const key = accountDocumentStorageKey(document) || text(document?.id);
@@ -319,6 +326,20 @@ function documentCanHydrate(document) {
     || document?.hasContentPayload === true
     || Number(document?.sizeBytes ?? document?.size_bytes) > 0,
   );
+}
+
+function documentNeedsHydration(document) {
+  if (!documentCanHydrate(document)) return false;
+  if (documentHasMaterializedContent(document) && document?.contentStale !== true) return false;
+  return true;
+}
+
+function documentHasCurrentMaterializedContent(current, incoming) {
+  if (!documentHasMaterializedContent(current) || current?.contentStale === true) return false;
+  const incomingHash = documentContentHash(incoming);
+  if (!incomingHash) return true;
+  const currentHash = documentContentHash(current);
+  return Boolean(currentHash) && currentHash === incomingHash;
 }
 
 function documentDraftKey(document) {
@@ -469,6 +490,52 @@ function clampProgressPercent(value, fallback = 0) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.max(0, Math.min(100, number));
+}
+
+function clampNumber(value, min, max) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return min;
+  return Math.min(Math.max(numericValue, min), max);
+}
+
+function documentFolderRow(folderPath, source = {}) {
+  const pathKey = normalizedDocumentPath(folderPath);
+  if (!pathKey) return null;
+  const parts = pathKey.split("/").filter(Boolean);
+  const fileName = parts[parts.length - 1] || "folder";
+  const parentPathKey = parts.slice(0, -1).join("/");
+  return {
+    collection: normalizedDocumentCollection(),
+    entryKind: "folder",
+    fileName,
+    folderId: pathKey,
+    folderPath: pathKey,
+    id: pathKey,
+    kind: "folder",
+    parentPathKey,
+    pathKey,
+    rowType: "folder",
+    title: text(source.title || source.fileName || source.file_name, fileName),
+    type: "folder",
+    updatedAt: text(source.updatedAt || source.updated_at, new Date().toISOString()),
+  };
+}
+
+function documentPathIsSameOrChild(path, parentPath) {
+  const safePath = normalizedDocumentPath(path);
+  const safeParent = normalizedDocumentPath(parentPath);
+  return safePath === safeParent || Boolean(safeParent && safePath.startsWith(`${safeParent}/`));
+}
+
+function docsCreateTargetFolder(target = {}) {
+  const targetKind = text(target.kind, "root");
+  if (targetKind === "folder") {
+    return normalizedDocumentPath(target.pathKey || target.folderPath || target.folder_path || target.id);
+  }
+  if (targetKind === "document") {
+    return normalizedDocumentPath(target.parentPathKey || target.parent_path_key || target.folderPath || target.folder_path);
+  }
+  return "";
 }
 
 function accountToolsEventCandidates(payload) {
@@ -718,6 +785,7 @@ export default function ToolsWorkspaceView({
   const [skillsLibrary, setSkillsLibrary] = useState(() => ({
     skills: getWorkspaceToolsAccountSkills(),
   }));
+  const skillsLibraryRef = useRef(skillsLibrary);
   const [skillsRevision, setSkillsRevision] = useState(null);
   const [skillsMeta, setSkillsMeta] = useState({ updatedAt: "", updatedBy: "", offline: false });
   const [skillsState, setSkillsState] = useState(() => (hasWorkspaceToolsLoaded() ? "ready" : "loading"));
@@ -735,7 +803,7 @@ export default function ToolsWorkspaceView({
   const [hydratingDocKeys, setHydratingDocKeys] = useState(() => new Set());
   const [skillsQuery, setSkillsQuery] = useState("");
   const [templateQuery, setTemplateQuery] = useState("");
-  const [newDocDraft, setNewDocDraft] = useState({ name: "", type: "skill" });
+  const [newDocDraft, setNewDocDraft] = useState({ createKind: "document", folderPath: "", name: "", type: "skill" });
   const [documentDraft, setDocumentDraft] = useState(() => getWorkspaceToolsDocumentDraft());
   // "library:<collection>:<id>" or "catalog:<id>" — selecting a document shows its contents.
   const [selectedSkillKey, setSelectedSkillKey] = useState(() => text(getWorkspaceToolsDocumentDraft()?.selectedKey));
@@ -761,10 +829,12 @@ export default function ToolsWorkspaceView({
     }
   });
   const skillDocumentCanvasRef = useRef(null);
+  const docsWorkspaceSurfaceRef = useRef(null);
   const [skillDocumentScale, setSkillDocumentScale] = useState(1);
   const docsExplorerPanelRef = useRef(null);
   const [docsExplorerCollapsed, setDocsExplorerCollapsed] = useState(false);
   const [docsExplorerSize, setDocsExplorerSize] = useState("238px");
+  const [docsContextMenu, setDocsContextMenu] = useState(null);
 
   const collapseDocsExplorer = useCallback(() => {
     setDocsExplorerCollapsed(true);
@@ -1006,6 +1076,30 @@ export default function ToolsWorkspaceView({
   }, [refreshCliStatuses]);
 
   useEffect(() => {
+    skillsLibraryRef.current = skillsLibrary;
+  }, [skillsLibrary]);
+
+  useEffect(() => {
+    if (!hydratingDocKeys.size) return;
+    const skillsByKey = new Map((skillsLibrary.skills || [])
+      .map((skill) => [accountDocumentStorageKey(skill) || text(skill?.id), skill])
+      .filter(([key]) => key));
+    setHydratingDocKeys((current) => {
+      let changed = false;
+      const next = new Set();
+      current.forEach((key) => {
+        const skill = skillsByKey.get(key);
+        if (skill && documentNeedsHydration(skill)) {
+          next.add(key);
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : current;
+    });
+  }, [hydratingDocKeys.size, skillsLibrary.skills]);
+
+  useEffect(() => {
     let disposed = false;
     let unlisten = null;
     void listen("cloud-mcp-account-documents-updated", (event) => {
@@ -1017,7 +1111,17 @@ export default function ToolsWorkspaceView({
       if (skillUnits.length || replaceSkills) {
         const materializedSkills = skillsFromUnits(skillUnits.filter(documentHasMaterializedContent));
         const pendingHydrationSkills = skillsFromUnits(skillUnits)
-          .filter((entry) => !documentHasMaterializedContent(entry) && documentCanHydrate(entry));
+          .filter((entry) => {
+            const key = accountDocumentStorageKey(entry) || text(entry?.id);
+            const existing = key
+              ? (skillsLibraryRef.current.skills || [])
+                .find((candidate) => (accountDocumentStorageKey(candidate) || text(candidate?.id)) === key)
+              : null;
+            if (existing && documentHasCurrentMaterializedContent(existing, entry)) {
+              return false;
+            }
+            return documentNeedsHydration(entry);
+          });
         const skillMeta = accountToolsSkillMetaFromEventPayload(event?.payload);
         setSkillsLibrary((current) => {
           const nextLibrary = replaceSkills
@@ -1302,6 +1406,170 @@ export default function ToolsWorkspaceView({
     setSkillEditor(null);
   }, [persistSkillsLibrary, skillEditor, skillsLibrary.skills]);
 
+  const closeDocsContextMenu = useCallback(() => {
+    setDocsContextMenu(null);
+  }, []);
+
+  const openDocsContextMenu = useCallback((event, target = {}) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const menuWidth = 190;
+    const menuHeight = target.kind === "root" ? 72 : 112;
+    const viewportWidth = typeof window !== "undefined" ? window.innerWidth : menuWidth + 16;
+    const viewportHeight = typeof window !== "undefined" ? window.innerHeight : menuHeight + 16;
+    setDocsContextMenu({
+      target,
+      x: clampNumber(event.clientX, 8, Math.max(8, viewportWidth - menuWidth - 8)),
+      y: clampNumber(event.clientY, 8, Math.max(8, viewportHeight - menuHeight - 8)),
+    });
+  }, []);
+
+  const beginContextCreateDocument = useCallback((target = docsContextMenu?.target || {}) => {
+    closeDocsContextMenu();
+    const folderPath = docsCreateTargetFolder(target);
+    setSelectedSkillKey("");
+    setSkillEditor(null);
+    setNewDocDraft((current) => ({
+      ...current,
+      createKind: "document",
+      folderPath,
+    }));
+  }, [closeDocsContextMenu, docsContextMenu]);
+
+  const beginContextCreateFolder = useCallback((target = docsContextMenu?.target || {}) => {
+    closeDocsContextMenu();
+    const folderPath = docsCreateTargetFolder(target);
+    setSelectedSkillKey("");
+    setSkillEditor(null);
+    setNewDocDraft((current) => ({
+      ...current,
+      createKind: "folder",
+      folderPath,
+    }));
+  }, [closeDocsContextMenu, docsContextMenu]);
+
+  const createDocumentFolder = useCallback((parentPathInput = "", folderNameInput = "") => {
+    const parentPath = normalizedDocumentPath(parentPathInput);
+    const folderName = text(folderNameInput);
+    if (!folderName) return false;
+    const normalizedName = skillSlug(folderName || "");
+    if (!normalizedName) return false;
+    const basePath = parentPath ? `${parentPath}/${normalizedName}` : normalizedName;
+    const existingPaths = new Set(skillsLibrary.skills
+      .filter(documentIsFolderRow)
+      .map((entry) => normalizedDocumentPath(entry.pathKey || entry.path_key || entry.folderPath || entry.folder_path || entry.id))
+      .filter(Boolean));
+    let folderPath = basePath;
+    let suffix = 2;
+    while (existingPaths.has(folderPath)) {
+      folderPath = `${basePath}_${suffix}`;
+      suffix += 1;
+    }
+    const folder = documentFolderRow(folderPath);
+    if (!folder) return false;
+    const nextSkills = [
+      ...skillsLibrary.skills.filter((entry) => (accountDocumentStorageKey(entry) || entry.id) !== accountDocumentStorageKey(folder)),
+      folder,
+    ];
+    setSkillsLibrary({ skills: nextSkills });
+    noteAccountSkillUnits(nextSkills);
+    setSelectedSkillKey("");
+    setSkillEditor(null);
+    setNewDocDraft((current) => ({
+      ...current,
+      createKind: "document",
+      name: "",
+      folderPath,
+    }));
+    return true;
+  }, [skillsLibrary.skills]);
+
+  const deleteContextTarget = useCallback((target = docsContextMenu?.target || {}) => {
+    closeDocsContextMenu();
+    const targetKind = text(target.kind);
+    if (targetKind === "document") {
+      if (target.isDraft || target.draft || text(target.syncStatus || target.sync_status) === "draft") {
+        clearWorkspaceToolsDocumentDraft(target.storageKey || target.documentKey || target.document_key);
+        setDocumentDraft(null);
+        if ((skillEditor?.documentKey || documentDraftKey(skillEditor)) === target.storageKey) {
+          setSkillEditor(null);
+          setSelectedSkillKey("");
+        }
+        return;
+      }
+      removeSkill(target.storageKey);
+      return;
+    }
+    if (targetKind !== "folder") return;
+    const folderPath = normalizedDocumentPath(target.pathKey);
+    if (!folderPath) return;
+    const affectedDocs = skillsLibrary.skills.filter((entry) => (
+      !documentIsFolderRow(entry)
+      && documentPathIsSameOrChild(
+        entry.pathKey || entry.path_key || entry.filePath || entry.file_path || accountDocumentStorageKey(entry),
+        folderPath,
+      )
+    ));
+    const affectedFolders = skillsLibrary.skills.filter((entry) => (
+      documentIsFolderRow(entry)
+      && documentPathIsSameOrChild(entry.pathKey || entry.path_key || entry.folderPath || entry.folder_path || entry.id, folderPath)
+    ));
+    const label = text(target.displayName || target.title, folderPath);
+    const confirmed = typeof window === "undefined" || window.confirm(
+      `Delete folder "${label}"${affectedDocs.length ? ` and ${affectedDocs.length} doc${affectedDocs.length === 1 ? "" : "s"}` : ""}?`,
+    );
+    if (!confirmed) return;
+    const removedKeys = new Set([...affectedDocs, ...affectedFolders]
+      .map((entry) => accountDocumentStorageKey(entry) || entry.id)
+      .filter(Boolean));
+    const nextSkills = skillsLibrary.skills.filter((entry) => !removedKeys.has(accountDocumentStorageKey(entry) || entry.id));
+    const selectedKey = selectedSkillKey.startsWith("library:") ? selectedSkillKey.slice("library:".length) : "";
+    if (
+      selectedKey && affectedDocs.some((entry) => (accountDocumentStorageKey(entry) || entry.id) === selectedKey)
+    ) {
+      setSelectedSkillKey("");
+      setSkillEditor(null);
+    }
+    const draftPath = normalizedDocumentPath(documentDraft?.pathKey || documentDraft?.path_key || documentDraft?.filePath || documentDraft?.file_path);
+    if (draftPath && documentPathIsSameOrChild(draftPath, folderPath)) {
+      clearWorkspaceToolsDocumentDraft(documentDraft.documentKey || documentDraftKey(documentDraft));
+      setDocumentDraft(null);
+    }
+    setNewDocDraft((current) => ({
+      ...current,
+      folderPath: documentPathIsSameOrChild(current.folderPath, folderPath) ? "" : current.folderPath,
+    }));
+    void persistSkillsLibrary(nextSkills);
+  }, [
+    closeDocsContextMenu,
+    docsContextMenu,
+    documentDraft,
+    persistSkillsLibrary,
+    removeSkill,
+    selectedSkillKey,
+    skillEditor,
+    skillsLibrary.skills,
+  ]);
+
+  useEffect(() => {
+    if (!docsContextMenu) return undefined;
+    const closeMenu = (event) => {
+      if (event?.target?.closest?.("[data-docs-context-menu='true']")) return;
+      closeDocsContextMenu();
+    };
+    const closeOnKey = (event) => {
+      if (event.key === "Escape") closeDocsContextMenu();
+    };
+    window.addEventListener("pointerdown", closeMenu, true);
+    window.addEventListener("keydown", closeOnKey, true);
+    window.addEventListener("resize", closeDocsContextMenu);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu, true);
+      window.removeEventListener("keydown", closeOnKey, true);
+      window.removeEventListener("resize", closeDocsContextMenu);
+    };
+  }, [closeDocsContextMenu, docsContextMenu]);
+
   const saveSkillEditor = useCallback(async (mode = "push", editorOverride = null) => {
     const activeEditor = editorOverride || skillEditor;
     if (!activeEditor || !text(activeEditor.title)) return false;
@@ -1347,7 +1615,7 @@ export default function ToolsWorkspaceView({
         }
         : entry));
     } else {
-      savedId = skillSlug(activeEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id)));
+      savedId = text(activeEditor.id, skillSlug(activeEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id))));
       savedPathMeta = documentPathMetadata({
         ...activeEditor,
         extension: editorExtension,
@@ -1564,6 +1832,15 @@ export default function ToolsWorkspaceView({
       return node;
     };
     const docs = [];
+    const draftKey = documentDraft ? text(documentDraft.documentKey || documentDraft.document_key || documentDraftKey(documentDraft)) : "";
+    const draftSelectedKey = text(documentDraft?.selectedKey || documentDraft?.selected_key);
+    const draftStorageKey = documentDraft ? accountDocumentStorageKey(documentDraft) : "";
+    const draftTargetKey = draftSelectedKey.startsWith("library:")
+      ? draftSelectedKey.slice("library:".length)
+      : draftStorageKey && !draftStorageKey.startsWith("draft:")
+        ? draftStorageKey
+        : "";
+    let draftMergedIntoSavedRow = false;
     (skillsLibrary.skills || []).forEach((skill) => {
       if (documentIsFolderRow(skill)) {
         const pathKey = normalizedDocumentPath(skill.pathKey || skill.path_key || skill.folderPath || skill.folder_path || skill.id);
@@ -1575,30 +1852,44 @@ export default function ToolsWorkspaceView({
         }
         return;
       }
-        const key = accountDocumentStorageKey(skill) || skill.id;
-        if (!key) return;
-        const fileName = documentFileName(skill);
-        const displayName = text(skill.title, fileName);
-        const pathKey = normalizedDocumentPath(skill.pathKey || skill.path_key || skill.filePath || skill.file_path || key);
-        const parentPathKey = normalizedDocumentPath(skill.parentPathKey || skill.parent_path_key || skill.folderPath || skill.folder_path || pathKey.split("/").slice(0, -1).join("/"));
-        ensureFolder(parentPathKey);
-        const row = {
-          ...skill,
-          depth: parentPathKey ? parentPathKey.split("/").filter(Boolean).length + 1 : 1,
-          displayName,
-          fileName,
-          filePath: normalizedDocumentPath(skill.filePath || skill.file_path || pathKey),
-          folderPath: parentPathKey,
-          hydrating: hydratingDocKeys.has(key) || (hydrationPassActive && documentCanHydrate(skill)),
-          key: `library:${key}`,
-          parentPathKey,
-          pathKey,
-          preview: documentPreviewLine(skill),
-          rowType: "document",
-          storageKey: key,
-          typeLabel: documentTypeLabel(skill.documentKind, skill.collection),
-        };
-        const matches = (
+      const key = accountDocumentStorageKey(skill) || skill.id;
+      if (!key) return;
+      const draftForSavedRow = draftTargetKey && draftTargetKey === key ? documentDraft : null;
+      if (draftForSavedRow) {
+        draftMergedIntoSavedRow = true;
+      }
+      const fileName = documentFileName(skill);
+      const displayName = text(skill.title, fileName);
+      const pathKey = normalizedDocumentPath(skill.pathKey || skill.path_key || skill.filePath || skill.file_path || key);
+      const parentPathKey = normalizedDocumentPath(skill.parentPathKey || skill.parent_path_key || skill.folderPath || skill.folder_path || pathKey.split("/").slice(0, -1).join("/"));
+      ensureFolder(parentPathKey);
+      const row = {
+        ...skill,
+        depth: parentPathKey ? parentPathKey.split("/").filter(Boolean).length + 1 : 1,
+        displayName,
+        fileName,
+        filePath: normalizedDocumentPath(skill.filePath || skill.file_path || pathKey),
+        folderPath: parentPathKey,
+        draft: Boolean(draftForSavedRow),
+        draftDocument: draftForSavedRow || null,
+        draftKey: draftForSavedRow ? draftKey : "",
+        draftSelectedKey: draftForSavedRow ? `library:${key}` : "",
+        hydrating: documentNeedsHydration(skill)
+          && (hydratingDocKeys.has(key) || hydrationPassActive),
+        isDraft: Boolean(draftForSavedRow),
+        key: `library:${key}`,
+        parentPathKey,
+        pathKey,
+        preview: documentPreviewLine(draftForSavedRow || skill),
+        rowType: "document",
+        savedStorageKey: key,
+        storageKey: draftForSavedRow ? draftKey : key,
+        syncStatus: draftForSavedRow ? "draft" : text(skill.syncStatus || skill.sync_status),
+        typeLabel: draftForSavedRow
+          ? `${documentTypeLabel(skill.documentKind, skill.collection)} draft`
+          : documentTypeLabel(skill.documentKind, skill.collection),
+      };
+      const matches = (
         !query
         || row.displayName.toLowerCase().includes(query)
         || row.fileName.toLowerCase().includes(query)
@@ -1606,12 +1897,14 @@ export default function ToolsWorkspaceView({
         || row.pathKey.toLowerCase().includes(query)
         || row.preview.toLowerCase().includes(query)
         || row.typeLabel.toLowerCase().includes(query)
+        || text(draftForSavedRow?.title).toLowerCase().includes(query)
+        || documentFileName(draftForSavedRow || {}).toLowerCase().includes(query)
+        || normalizedDocumentPath(draftForSavedRow?.pathKey || draftForSavedRow?.path_key || draftForSavedRow?.filePath || draftForSavedRow?.file_path).toLowerCase().includes(query)
         || text(row.localPath).toLowerCase().includes(query)
-        );
-        if (matches) docs.push(row);
+      );
+      if (matches) docs.push(row);
     });
-    if (documentDraft) {
-      const draftKey = documentDraft.documentKey || documentDraftKey(documentDraft);
+    if (documentDraft && !draftMergedIntoSavedRow) {
       const fileName = documentFileName(documentDraft);
       const displayName = text(documentDraft.title, fileName);
       const pathKey = normalizedDocumentPath(documentDraft.pathKey || documentDraft.path_key || documentDraft.filePath || documentDraft.file_path || fileName);
@@ -1709,14 +2002,27 @@ export default function ToolsWorkspaceView({
   const startNewDocument = useCallback(() => {
     const requestedName = text(newDocDraft.name);
     if (!requestedName) return;
+    const folderPath = normalizedDocumentPath(newDocDraft.folderPath);
+    if (text(newDocDraft.createKind, "document") === "folder") {
+      createDocumentFolder(folderPath, requestedName);
+      return;
+    }
     const option = documentTypeOption(newDocDraft.type);
-    const existingIds = new Set(skillsLibrary.skills.map((entry) => entry.id));
-    const docId = skillSlug(requestedName, existingIds);
+    const existingIds = new Set(skillsLibrary.skills
+      .filter((entry) => !documentIsFolderRow(entry))
+      .flatMap((entry) => [
+        normalizedDocumentPath(entry.id),
+        normalizedDocumentPath(entry.pathKey || entry.path_key || entry.filePath || entry.file_path).replace(/\.(?:md|markdown|arch)$/iu, ""),
+      ])
+      .filter(Boolean));
+    const docId = skillSlug(folderPath ? `${folderPath}/${requestedName}` : requestedName, existingIds);
+    const title = docId.split("/").filter(Boolean).pop() || docId;
     const pathMeta = documentPathMetadata({
       documentKind: option.id,
       extension: option.extension,
+      folderPath,
       id: docId,
-      title: docId,
+      title,
     });
     setSelectedSkillKey("");
     const draftEditor = {
@@ -1735,12 +2041,12 @@ export default function ToolsWorkspaceView({
       rowType: "document",
       source: option.id,
       syncStatus: "draft",
-      title: docId,
+      title,
     };
     setSkillEditor(draftEditor);
     setWorkspaceToolsDocumentDraft(editorDraftSnapshot(draftEditor, "", null));
-    setNewDocDraft((current) => ({ ...current, name: "" }));
-  }, [newDocDraft, skillsLibrary.skills]);
+    setNewDocDraft((current) => ({ ...current, createKind: "document", name: "" }));
+  }, [createDocumentFolder, newDocDraft, skillsLibrary.skills]);
 
   const selectedSkill = useMemo(() => {
     const [scope, ...rest] = selectedSkillKey.split(":");
@@ -1779,6 +2085,7 @@ export default function ToolsWorkspaceView({
     const editorContent = String(skillEditor?.content || "");
     const editorBaseContent = String(skillEditor?.baseContent ?? skillEditor?.content ?? "");
     if (editorMatchesSelected && editorContent !== editorBaseContent) return;
+    if (!documentNeedsHydration(selectedSkill)) return;
     if (
       (String(selectedSkill?.content || "").length > 0 || (editorMatchesSelected && editorContent.length > 0))
       && selectedSkill?.contentStale !== true
@@ -1846,16 +2153,68 @@ export default function ToolsWorkspaceView({
     skillEditor
     && skillEditorDocumentKey
     && (
-      hydratingDocKeys.has(skillEditorDocumentKey)
+      (hydratingDocKeys.has(skillEditorDocumentKey) && documentNeedsHydration(selectedSkill))
       || (
         selectedSkill?.owned
         && (accountDocumentStorageKey(selectedSkill) || selectedSkill.id) === skillEditorDocumentKey
         && String(skillEditor.content || "").length === 0
         && String(skillEditor.content || "") === String(skillEditor.baseContent ?? skillEditor.content ?? "")
-        && (selectedSkill.contentStale === true || (!documentHasMaterializedContent(selectedSkill) && documentCanHydrate(selectedSkill)))
+        && documentNeedsHydration(selectedSkill)
       )
     ),
   );
+  const savedDocumentForEditor = useMemo(() => {
+    const selectedLibraryKey = selectedSkillKey.startsWith("library:")
+      ? selectedSkillKey.slice("library:".length)
+      : "";
+    const candidateKeys = new Set([
+      skillEditorDocumentKey,
+      selectedLibraryKey,
+      text(skillEditor?.selectedKey || skillEditor?.selected_key).startsWith("library:")
+        ? text(skillEditor?.selectedKey || skillEditor?.selected_key).slice("library:".length)
+        : "",
+      text(documentDraft?.selectedKey || documentDraft?.selected_key).startsWith("library:")
+        ? text(documentDraft?.selectedKey || documentDraft?.selected_key).slice("library:".length)
+        : "",
+    ].filter(Boolean));
+    if (!candidateKeys.size) return null;
+    return skillsLibrary.skills.find((entry) => (
+      !documentIsFolderRow(entry)
+      && candidateKeys.has(accountDocumentStorageKey(entry) || entry.id)
+    )) || null;
+  }, [documentDraft, selectedSkillKey, skillEditor, skillEditorDocumentKey, skillsLibrary.skills]);
+  const skillEditorHasDraftChanges = Boolean(
+    skillEditor
+    && (
+      editorHasUnsavedDraft(skillEditor, selectedSkill || savedDocumentForEditor)
+      || (
+        documentDraft
+        && (
+          text(documentDraft.documentKey || documentDraft.document_key) === skillEditorDocumentKey
+          || text(documentDraft.selectedKey || documentDraft.selected_key) === selectedSkillKey
+        )
+      )
+    ),
+  );
+  const discardSkillEditorDraft = useCallback(() => {
+    if (!skillEditor) return;
+    clearWorkspaceToolsDocumentDraft();
+    setDocumentDraft(null);
+    setSkillsError("");
+
+    if (savedDocumentForEditor) {
+      const savedKey = accountDocumentStorageKey(savedDocumentForEditor) || savedDocumentForEditor.id;
+      setSelectedSkillKey(`library:${savedKey}`);
+      setSkillEditor({
+        ...documentEditorDraft(savedDocumentForEditor),
+        documentKey: savedKey,
+      });
+      return;
+    }
+
+    setSelectedSkillKey("");
+    setSkillEditor(null);
+  }, [savedDocumentForEditor, skillEditor]);
   const skillEditorBusy = skillsState === "saving" || skillsState === "savingLocal";
   const skillEditorReadOnly = selectedDocumentRefreshing || skillEditorBusy;
   const skillEditorOpen = Boolean(skillEditor);
@@ -2333,9 +2692,12 @@ export default function ToolsWorkspaceView({
     let animationFrame = 0;
     const updateScale = () => {
       const bounds = canvas.getBoundingClientRect();
-      if (!bounds.width) return;
+      if (!bounds.width || !bounds.height) return;
       const availableWidth = Math.max(1, bounds.width - SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX);
-      const nextScale = clampSkillDocumentScale(availableWidth / SKILL_DOCUMENT_A4_WIDTH_PX);
+      const availableHeight = Math.max(1, bounds.height - SKILL_DOCUMENT_CANVAS_VERTICAL_GUTTER_PX);
+      const widthScale = availableWidth / SKILL_DOCUMENT_A4_WIDTH_PX;
+      const heightScale = availableHeight / SKILL_DOCUMENT_A4_HEIGHT_PX;
+      const nextScale = clampSkillDocumentScale(Math.min(widthScale, heightScale));
       setSkillDocumentScale((current) => (
         Math.abs(current - nextScale) < 0.005 ? current : nextScale
       ));
@@ -2417,6 +2779,8 @@ export default function ToolsWorkspaceView({
             {section === "docs" && (
               <DocsWorkspaceSurface
                 aria-label="Docs workspace"
+                data-docs-explorer-collapsed={docsExplorerCollapsed ? "true" : "false"}
+                ref={docsWorkspaceSurfaceRef}
                 style={{ "--docs-explorer-offset": docsExplorerCollapsed ? "0px" : docsExplorerSize }}
               >
                 {docsExplorerCollapsed && (
@@ -2452,6 +2816,14 @@ export default function ToolsWorkspaceView({
                         <DocsFilesPane
                           aria-label="Document files"
                           data-collapsed="false"
+                          onContextMenu={(event) => {
+                            if (event.defaultPrevented) return;
+                            openDocsContextMenu(event, {
+                              displayName: "documents",
+                              kind: "root",
+                              pathKey: "",
+                            });
+                          }}
                     >
                       <FileExplorerHeader>
                         <div>
@@ -2489,12 +2861,24 @@ export default function ToolsWorkspaceView({
                             type="search"
                             value={skillsQuery}
                           />
-                          <FileTree aria-label="Account document explorer">
+                          <FileTree
+                            aria-label="Account document explorer"
+                            onContextMenu={(event) => openDocsContextMenu(event, {
+                              displayName: "documents",
+                              kind: "root",
+                              pathKey: "",
+                            })}
+                          >
                             <FileTreeItem>
                               <DocsExplorerFolderButton
                                 $depth={0}
                                 as="div"
                                 data-selected="false"
+                                onContextMenu={(event) => openDocsContextMenu(event, {
+                                  displayName: "documents",
+                                  kind: "root",
+                                  pathKey: "",
+                                })}
                               >
                                 <FileDisclosure>
                                   <span className="codicon codicon-chevron-down" aria-hidden="true" />
@@ -2514,6 +2898,10 @@ export default function ToolsWorkspaceView({
                                         as="div"
                                         data-selected="false"
                                         key={row.key}
+                                        onContextMenu={(event) => openDocsContextMenu(event, {
+                                          ...row,
+                                          kind: "folder",
+                                        })}
                                         title={[row.pathKey, text(row.localPath)].filter(Boolean).join(" · ")}
                                       >
                                         <FileDisclosure>
@@ -2528,7 +2916,8 @@ export default function ToolsWorkspaceView({
                                     );
                                   }
                                   const active = selectedSkillKey === row.key
-                                    || (row.isDraft && skillEditor?.documentKey && skillEditor.documentKey === row.storageKey);
+                                    || (row.isDraft && skillEditor?.documentKey && skillEditor.documentKey === row.storageKey)
+                                    || (row.draftKey && skillEditor?.documentKey === row.draftKey);
                                   const iconClass = row.extension === "arch" ? "codicon-file-code" : "codicon-markdown";
                                   const fileTone = row.extension === "arch" ? "data" : "markdown";
                                   return (
@@ -2536,10 +2925,17 @@ export default function ToolsWorkspaceView({
                                       $depth={row.depth}
                                       data-selected={active ? "true" : "false"}
                                       key={row.key}
+                                      onContextMenu={(event) => openDocsContextMenu(event, {
+                                        ...row,
+                                        kind: "document",
+                                      })}
                                       onClick={() => {
                                         if (row.isDraft) {
-                                          setSelectedSkillKey(text(row.selectedKey));
-                                          setSkillEditor(documentEditorDraft(row));
+                                            const draftDocument = row.draftDocument
+                                              ? { ...row.draftDocument, selectedKey: row.draftSelectedKey || row.key }
+                                              : row;
+                                          setSelectedSkillKey(text(row.draftSelectedKey || row.selectedKey));
+                                          setSkillEditor(documentEditorDraft(draftDocument));
                                         } else {
                                           setSelectedSkillKey(row.key);
                                           setSkillEditor(documentEditorDraft(row));
@@ -2553,7 +2949,7 @@ export default function ToolsWorkspaceView({
                                         <span className={`codicon ${iconClass}`} aria-hidden="true" />
                                       </FileKindIcon>
                                       <FileTreeName title={row.pathKey}>{row.displayName}</FileTreeName>
-                                      <DocsExplorerStatus title={row.isDraft ? "Draft" : row.hydrating ? "Hydrating document" : row.pendingPush ? "Pending push" : row.typeLabel}>
+                                      <DocsExplorerStatus title={row.isDraft ? (row.savedStorageKey ? "Saved document with draft changes" : "Draft") : row.hydrating ? "Hydrating document" : row.pendingPush ? "Pending push" : row.typeLabel}>
                                         {row.hydrating ? (
                                           <DocsExplorerSpinner aria-label="Hydrating document" role="status" />
                                         ) : row.isDraft ? "DRAFT" : row.pendingPush ? "●" : ""}
@@ -2615,6 +3011,16 @@ export default function ToolsWorkspaceView({
                               >
                                 Close
                               </ToolsGhostButton>
+                              {skillEditorHasDraftChanges && (
+                                <ToolsGhostButton
+                                  disabled={skillEditorBusy}
+                                  onClick={discardSkillEditorDraft}
+                                  title={savedDocumentForEditor ? "Discard draft changes and return to the saved document" : "Clear this unsaved draft"}
+                                  type="button"
+                                >
+                                  {savedDocumentForEditor ? "Discard changes" : "Clear draft"}
+                                </ToolsGhostButton>
+                              )}
                               {skillEditor.id && (
                                 <ToolsGhostButton
                                   data-danger="true"
@@ -2691,12 +3097,29 @@ export default function ToolsWorkspaceView({
                     <DocsCreateModal>
                       <DocsCreateHeader>
                         <div>
-                          <ToolsPanelTitle>New doc</ToolsPanelTitle>
+                          <ToolsPanelTitle>
+                            {text(newDocDraft.createKind, "document") === "folder" ? "New folder" : "New doc"}
+                          </ToolsPanelTitle>
                           <DocsCreateFileName>
-                            {text(newDocDraft.name)
-                              ? `${skillSlug(newDocDraft.name)}.${documentTypeOption(newDocDraft.type).extension}`
-                              : `untitled.${documentTypeOption(newDocDraft.type).extension}`}
+                            {text(newDocDraft.createKind, "document") === "folder"
+                              ? `${normalizedDocumentPath(newDocDraft.folderPath) ? `${normalizedDocumentPath(newDocDraft.folderPath)}/` : ""}${text(newDocDraft.name) ? skillSlug(newDocDraft.name) : "untitled_folder"}`
+                              : text(newDocDraft.name)
+                                ? `${normalizedDocumentPath(newDocDraft.folderPath) ? `${normalizedDocumentPath(newDocDraft.folderPath)}/` : ""}${skillSlug(newDocDraft.name)}.${documentTypeOption(newDocDraft.type).extension}`
+                                : `${normalizedDocumentPath(newDocDraft.folderPath) ? `${normalizedDocumentPath(newDocDraft.folderPath)}/` : ""}untitled.${documentTypeOption(newDocDraft.type).extension}`}
                           </DocsCreateFileName>
+                          <DocsCreateLocation>
+                            <span className="codicon codicon-folder" aria-hidden="true" />
+                            <span>{normalizedDocumentPath(newDocDraft.folderPath) || "documents"}</span>
+                            {normalizedDocumentPath(newDocDraft.folderPath) && (
+                              <button
+                                aria-label="Create in root documents folder"
+                                onClick={() => setNewDocDraft((current) => ({ ...current, folderPath: "" }))}
+                                type="button"
+                              >
+                                Root
+                              </button>
+                            )}
+                          </DocsCreateLocation>
                         </div>
                         <ToolsStatusPill data-tone={skillsStatusTone}>
                           {skillsStatusLabel}
@@ -2719,25 +3142,39 @@ export default function ToolsWorkspaceView({
                             value={newDocDraft.name}
                           />
                         </DocsField>
-                        <DocsField>
-                          <label htmlFor="tools-doc-type">Type</label>
-                          <select
-                            id="tools-doc-type"
-                            onChange={(event) => setNewDocDraft((current) => ({ ...current, type: event.target.value }))}
-                            value={newDocDraft.type}
-                          >
-                            {DOCUMENT_TYPE_OPTIONS.map((option) => (
-                              <option key={option.id} value={option.id}>{option.label}</option>
-                            ))}
-                          </select>
-                        </DocsField>
+                        {text(newDocDraft.createKind, "document") === "folder" ? (
+                          <DocsField>
+                            <label htmlFor="tools-doc-create-kind">Create</label>
+                            <select
+                              id="tools-doc-create-kind"
+                              onChange={(event) => setNewDocDraft((current) => ({ ...current, createKind: event.target.value }))}
+                              value={text(newDocDraft.createKind, "document")}
+                            >
+                              <option value="folder">Folder</option>
+                              <option value="document">Document</option>
+                            </select>
+                          </DocsField>
+                        ) : (
+                          <DocsField>
+                            <label htmlFor="tools-doc-type">Type</label>
+                            <select
+                              id="tools-doc-type"
+                              onChange={(event) => setNewDocDraft((current) => ({ ...current, type: event.target.value }))}
+                              value={newDocDraft.type}
+                            >
+                              {DOCUMENT_TYPE_OPTIONS.map((option) => (
+                                <option key={option.id} value={option.id}>{option.label}</option>
+                              ))}
+                            </select>
+                          </DocsField>
+                        )}
                       </DocsCreateFields>
                       <ToolsPrimaryButton
                         disabled={!text(newDocDraft.name)}
                         onClick={startNewDocument}
                         type="button"
                       >
-                        Create
+                        {text(newDocDraft.createKind, "document") === "folder" ? "Create folder" : "Create doc"}
                       </ToolsPrimaryButton>
                     </DocsCreateModal>
                   )}
@@ -2802,8 +3239,53 @@ export default function ToolsWorkspaceView({
                         </DocsTemplatesPane>
                       </ResizePanel>
                     </>
-                  )}
-                </DocsWorkspaceGrid>
+	                  )}
+	                </DocsWorkspaceGrid>
+                {docsContextMenu && (
+                  <FileContextMenu
+                    data-docs-context-menu="true"
+                    role="menu"
+                    style={{
+                      left: docsContextMenu.x,
+                      position: "fixed",
+                      top: docsContextMenu.y,
+                    }}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                    }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                  >
+                    <FileContextMenuItem
+                      onClick={() => beginContextCreateDocument(docsContextMenu.target)}
+                      role="menuitem"
+                      type="button"
+                    >
+                      New document here
+                    </FileContextMenuItem>
+                    <FileContextMenuItem
+                      onClick={() => beginContextCreateFolder(docsContextMenu.target)}
+                      role="menuitem"
+                      type="button"
+                    >
+                      New folder here
+                    </FileContextMenuItem>
+                    {docsContextMenu.target?.kind !== "root" && (
+                      <FileContextMenuItem
+                        data-danger="true"
+                        onClick={() => deleteContextTarget(docsContextMenu.target)}
+                        role="menuitem"
+                        type="button"
+                      >
+	                        {docsContextMenu.target?.kind === "folder"
+                            ? "Delete folder"
+                            : docsContextMenu.target?.isDraft
+                              ? "Clear draft"
+                              : "Delete document"}
+                      </FileContextMenuItem>
+                    )}
+                  </FileContextMenu>
+                )}
                 <ToolsHydrationProgress placement="docs-floating" progress={skillsHydration} />
               </DocsWorkspaceSurface>
             )}
@@ -3560,6 +4042,46 @@ const DocsCreateFileName = styled.div`
   white-space: nowrap;
 `;
 
+const DocsCreateLocation = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 8px;
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1.2;
+
+  > span:nth-child(2) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    flex: 0 0 auto;
+    min-height: 20px;
+    padding: 0 7px;
+    border: 1px solid rgba(var(--forge-accent-soft-rgb), 0.22);
+    border-radius: 6px;
+    color: var(--forge-accent-soft, #7db0ff);
+    background: rgba(var(--forge-accent-rgb), 0.08);
+    font: inherit;
+    font-size: 10px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+
+  button:hover,
+  button:focus-visible {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.42);
+    background: rgba(var(--forge-accent-rgb), 0.15);
+    outline: none;
+  }
+`;
+
 const DocsCreateFields = styled.div`
   display: grid;
   grid-template-columns: minmax(0, 1fr) 150px;
@@ -3783,6 +4305,17 @@ const SkillDocumentToolbar = styled.div`
   padding: 7px 10px;
   border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   background: var(--tools-control-bg);
+
+  [data-docs-explorer-collapsed="true"] & {
+    padding-left: 132px;
+  }
+
+  @media (max-width: 760px) {
+    [data-docs-explorer-collapsed="true"] & {
+      padding-left: 10px;
+      padding-top: 48px;
+    }
+  }
 `;
 
 const SkillDocumentToolbarCopy = styled.div`

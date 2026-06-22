@@ -12919,6 +12919,9 @@ fn cloud_mcp_loopspace_trigger_config_for_command(
         Some("webhook") => {
             object.clear();
         }
+        Some("manual") => {
+            object.clear();
+        }
         _ => {}
     }
     config
@@ -12988,8 +12991,8 @@ async fn cloud_mcp_create_loopspace_trigger(
         return Err("Trigger name is required.".to_string());
     }
     let trigger_type = trigger_type.trim().to_ascii_lowercase();
-    if !matches!(trigger_type.as_str(), "cron" | "webhook") {
-        return Err("Trigger type must be cron or webhook.".to_string());
+    if !matches!(trigger_type.as_str(), "cron" | "webhook" | "manual") {
+        return Err("Trigger type must be cron, webhook, or manual.".to_string());
     }
     let mut config = cloud_mcp_loopspace_trigger_config_for_command(config, Some(&trigger_type));
     if trigger_type == "cron" {
@@ -13107,6 +13110,56 @@ async fn cloud_mcp_update_loopspace_trigger(
     }
     cloud_mcp_send_loopspace_trigger_mutation(state.inner(), payload, "loopspace_trigger_update")
         .await
+}
+
+#[tauri::command]
+async fn cloud_mcp_run_loopspace_trigger(
+    state: State<'_, CloudMcpState>,
+    trigger_id: String,
+    payload: Option<Value>,
+    source: Option<String>,
+) -> Result<Value, String> {
+    let trigger_id = trigger_id.trim().to_string();
+    if trigger_id.is_empty() {
+        return Err("Trigger id is required.".to_string());
+    }
+    let source = source
+        .unwrap_or_else(|| "rust-diffforge".to_string())
+        .trim()
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let input = payload.unwrap_or_else(|| json!({}));
+    let client_request_id = format!(
+        "loopspace-trigger-run-{}-{}",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    );
+    let mut request = cloud_mcp_loopspace_trigger_request_base("commit", "loopspace_trigger_run");
+    if let Some(object) = request.as_object_mut() {
+        object.insert("pid".to_string(), json!(client_request_id.clone()));
+        object.insert(
+            "client_request_id".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "clientRequestId".to_string(),
+            json!(client_request_id.clone()),
+        );
+        object.insert(
+            "ops".to_string(),
+            json!([{
+                "op": "run",
+                "id": trigger_id,
+                "trigger_id": trigger_id,
+                "triggerId": trigger_id,
+                "source": if source.is_empty() { "rust-diffforge" } else { source.as_str() },
+                "payload": input,
+                "idempotency_key": client_request_id,
+            }]),
+        );
+    }
+    cloud_mcp_send_loopspace_trigger_mutation(state.inner(), request, "loopspace_trigger_run").await
 }
 
 #[tauri::command]
@@ -24452,7 +24505,12 @@ fn cloud_mcp_is_app_control_pane_id(pane_id: &str) -> bool {
 fn cloud_mcp_terminal_value_is_device_orchestrator(value: &Value) -> bool {
     let terminal_scope = cloud_mcp_payload_text(
         value,
-        &["terminal_scope", "terminalScope", "scope", "terminal_scope_kind"],
+        &[
+            "terminal_scope",
+            "terminalScope",
+            "scope",
+            "terminal_scope_kind",
+        ],
     )
     .unwrap_or_default()
     .trim()
@@ -24481,8 +24539,8 @@ fn cloud_mcp_terminal_value_is_device_orchestrator(value: &Value) -> bool {
         return true;
     }
 
-    let workspace_id = cloud_mcp_payload_text(value, &["workspace_id", "workspaceId"])
-        .unwrap_or_default();
+    let workspace_id =
+        cloud_mcp_payload_text(value, &["workspace_id", "workspaceId"]).unwrap_or_default();
     if cloud_mcp_is_app_control_workspace_id(&workspace_id) {
         return true;
     }
@@ -24588,9 +24646,14 @@ fn cloud_mcp_normalize_device_terminal_orchestrator(
     object.insert("agent_kind".to_string(), json!(agent_kind.clone()));
     object.insert("agentKind".to_string(), json!(agent_kind));
     object.insert("status".to_string(), json!(status));
-    object.insert("activity_status".to_string(), json!(activity_status.clone()));
+    object.insert(
+        "activity_status".to_string(),
+        json!(activity_status.clone()),
+    );
     object.insert("activityStatus".to_string(), json!(activity_status));
-    object.entry("commandable".to_string()).or_insert(json!(true));
+    object
+        .entry("commandable".to_string())
+        .or_insert(json!(true));
     object.entry("connected".to_string()).or_insert(json!(true));
     object
         .entry("native_connected".to_string())
@@ -24647,7 +24710,12 @@ fn cloud_mcp_upsert_device_terminal_orchestrator(
     };
     let terminal_id = cloud_mcp_payload_text(
         &normalized,
-        &["terminal_id", "terminalId", "target_terminal_id", "targetTerminalId"],
+        &[
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+        ],
     )
     .unwrap_or_default();
     let terminal_instance_id = cloud_mcp_payload_u64(
@@ -24683,11 +24751,7 @@ fn cloud_mcp_upsert_device_terminal_orchestrator(
     };
 
     let existing_index = orchestrators.iter().position(|candidate| {
-        cloud_mcp_presence_terminal_matches_instance(
-            candidate,
-            &terminal_id,
-            terminal_instance_id,
-        )
+        cloud_mcp_presence_terminal_matches_instance(candidate, &terminal_id, terminal_instance_id)
     });
     if removes_from_snapshot {
         orchestrators.retain(|candidate| {
@@ -24737,7 +24801,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     let device_profile = cloud_mcp_desktop_device_profile();
 
     if let Some(orchestrators) = terminal_orchestrators.as_ref() {
-        for terminal in cloud_mcp_json_collection_items(orchestrators).into_iter().take(32) {
+        for terminal in cloud_mcp_json_collection_items(orchestrators)
+            .into_iter()
+            .take(32)
+        {
             if let Some(normalized) = cloud_mcp_normalize_device_terminal_orchestrator(
                 &terminal,
                 normalized_terminal_orchestrators.len(),
@@ -25591,7 +25658,10 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         cloud_mcp_upsert_device_terminal_orchestrator(snapshot, payload, observed_at_ms);
         if let Some(object) = snapshot.as_object_mut() {
             object.insert("reason".to_string(), json!(reason));
-            object.insert("summary".to_string(), json!("Desktop terminal orchestrator state synced."));
+            object.insert(
+                "summary".to_string(),
+                json!("Desktop terminal orchestrator state synced."),
+            );
         }
         return;
     }
@@ -25811,9 +25881,8 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     );
     let reason = payload.source.as_str();
     let provider_session_id = payload.provider_session_id.clone();
-    let device_terminal_orchestrator =
-        cloud_mcp_is_app_control_workspace_id(&payload.workspace_id)
-            || cloud_mcp_is_app_control_pane_id(terminal_id);
+    let device_terminal_orchestrator = cloud_mcp_is_app_control_workspace_id(&payload.workspace_id)
+        || cloud_mcp_is_app_control_pane_id(terminal_id);
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(payload.observed_at_ms));
     let workspace_runtime_seq = if device_terminal_orchestrator {
         None
@@ -28937,6 +29006,24 @@ fn cloud_mcp_account_document_write_inline_content(row: &Value) -> Result<Option
     Ok(Some(metadata))
 }
 
+fn cloud_mcp_account_document_apply_row(row: &Value, sync_status: &str) -> Result<Value, String> {
+    if let Some(metadata) = cloud_mcp_account_document_write_inline_content(row)? {
+        return Ok(metadata);
+    }
+
+    let metadata =
+        cloud_mcp_account_document_metadata_row(row, None, None, None, Some(sync_status))?;
+    cloud_mcp_store_account_document_metadata_with_folders(&metadata)?;
+    let local_path = cloud_mcp_account_document_row_text(&metadata, &["local_path", "path"]);
+    if let Some(content) = (!local_path.trim().is_empty())
+        .then(|| cloud_mcp_account_document_read_current_file(&metadata, &local_path))
+        .flatten()
+    {
+        return Ok(cloud_mcp_account_document_with_content(metadata, content));
+    }
+    Ok(metadata)
+}
+
 fn cloud_mcp_apply_account_documents_sync_data(
     event: &Value,
     reason: &str,
@@ -28999,21 +29086,7 @@ fn cloud_mcp_apply_account_documents_sync_data(
     }
 
     for item in cloud_mcp_account_document_items_from_value(payload) {
-        match cloud_mcp_account_document_write_inline_content(&item).and_then(|maybe_row| {
-            let row = if let Some(row) = maybe_row {
-                row
-            } else {
-                cloud_mcp_account_document_metadata_row(
-                    &item,
-                    None,
-                    None,
-                    None,
-                    Some("remote_metadata"),
-                )?
-            };
-            cloud_mcp_store_account_document_metadata_with_folders(&row)?;
-            Ok(row)
-        }) {
+        match cloud_mcp_account_document_apply_row(&item, "remote_metadata") {
             Ok(row) => upserted.push(row),
             Err(error) => {
                 let mut failed_item = item;
@@ -29052,21 +29125,7 @@ fn cloud_mcp_apply_account_documents_sync_data(
             continue;
         }
         if let Some(document) = cloud_mcp_account_document_from_op(&op) {
-            match cloud_mcp_account_document_write_inline_content(&document).and_then(|maybe_row| {
-                let row = if let Some(row) = maybe_row {
-                    row
-                } else {
-                    cloud_mcp_account_document_metadata_row(
-                        &document,
-                        None,
-                        None,
-                        None,
-                        Some("remote_metadata"),
-                    )?
-                };
-                cloud_mcp_store_account_document_metadata_with_folders(&row)?;
-                Ok(row)
-            }) {
+            match cloud_mcp_account_document_apply_row(&document, "remote_metadata") {
                 Ok(row) => upserted.push(row),
                 Err(error) => {
                     let mut failed_op = op;
@@ -29858,9 +29917,8 @@ async fn cloud_mcp_save_account_document(
                         {
                             Ok(response) => {
                                 cloud_response = response.get("data").cloned().unwrap_or(response);
-                                if cloud_mcp_account_document_sync_response_queued(
-                                    &cloud_response,
-                                ) {
+                                if cloud_mcp_account_document_sync_response_queued(&cloud_response)
+                                {
                                     let queued_error = cloud_mcp_payload_text(
                                         &cloud_response,
                                         &["last_error", "sync_error", "error", "message"],
@@ -29880,14 +29938,16 @@ async fn cloud_mcp_save_account_document(
                                         );
                                         object.remove("last_sync_error");
                                     }
+                                    let _ = cloud_mcp_store_account_document_metadata_with_folders(
+                                        &row,
+                                    );
                                     let _ =
-                                        cloud_mcp_store_account_document_metadata_with_folders(&row);
-                                    let _ = cloud_mcp_apply_account_documents_sync_data_with_hydration(
-                                        state.inner(),
-                                        &cloud_response,
-                                        "save_response",
-                                    )
-                                    .await;
+                                        cloud_mcp_apply_account_documents_sync_data_with_hydration(
+                                            state.inner(),
+                                            &cloud_response,
+                                            "save_response",
+                                        )
+                                        .await;
                                 }
                                 let _ =
                                     cloud_mcp_store_account_document_metadata_with_folders(&row);
@@ -42993,6 +43053,68 @@ mod cloud_mcp_tests {
                 Sha256::digest("old local content".as_bytes())
             ))
         );
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn account_document_metadata_apply_materializes_current_local_file() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-account-document-local-current-data");
+        let cache_root = test_cloud_root("diffforge-account-document-local-current-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let content = "Already here locally.";
+        let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let path = cloud_mcp_account_document_local_path_for_file_path(
+            "Personal Account",
+            "documents",
+            "starter.md",
+        )
+        .unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+
+        let applied = cloud_mcp_apply_account_documents_sync_data(
+            &json!({
+                "c": "doc.sync",
+                "d": "documents",
+                "documents": [{
+                    "scope_key": "Personal Account",
+                    "collection": "documents",
+                    "document_id": "starter",
+                    "file_path": "starter.md",
+                    "path_key": "starter.md",
+                    "title": "starter",
+                    "content_hash": content_hash,
+                    "asset_id": "asset-account-document-starter",
+                    "size_bytes": content.as_bytes().len(),
+                }]
+            }),
+            "test_local_current_metadata",
+        )
+        .unwrap();
+
+        assert_eq!(applied["upserted_count"], json!(1));
+        assert_eq!(applied["documents"][0]["content_md"], json!(content));
+        assert_eq!(applied["documents"][0]["has_content_payload"], json!(true));
+        let rows = cloud_mcp_account_document_cache_rows(
+            &json!({
+                "scope_key": "Personal Account",
+                "collection": "documents",
+                "document_id": "starter",
+            }),
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("content_md").is_none());
+        assert_account_document_snake_only(&applied);
+        assert_account_document_snake_only(&rows[0]);
 
         let _ = fs::remove_dir_all(data_root);
         let _ = fs::remove_dir_all(cache_root);

@@ -4952,6 +4952,7 @@ pub fn run() {
             cloud_mcp_sync_loopspace_triggers,
             cloud_mcp_create_loopspace_trigger,
             cloud_mcp_update_loopspace_trigger,
+            cloud_mcp_run_loopspace_trigger,
             cloud_mcp_delete_loopspace_trigger,
             cloud_mcp_list_account_assets,
             cloud_mcp_list_asset_clouds,

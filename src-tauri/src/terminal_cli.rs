@@ -801,6 +801,7 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "save_selected_document",
     "update_selected_document",
     "select_workspace",
+    "run_loopspace_trigger",
     "select_tab",
     "list_terminals",
     "open_terminals",
@@ -816,6 +817,7 @@ Default routing:
 - For creating a skill/instruction/architecture/document draft, call update_selected_document with title, document_kind, content or content_md, and mode=\"draft\" unless the user asks to save or publish.
 - For modifying or deleting highlighted text, get the selection context, preserve the surrounding document, send the full updated document content through update_selected_document, and keep mode=\"draft\" unless the user asks for local save or publish.
 - For save locally, use mode=\"local\". For publish, push, sync, fan out, or share with other clients, use mode=\"publish\".
+- For Loopspace manual trigger requests, call run_loopspace_trigger with a triggerId or triggerName and optional payload.
 - For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
 
 Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";
@@ -979,7 +981,9 @@ fn terminal_env_vars_with_app_control_mcp_identity(
         .entry("instructions".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     let Some(instructions_array) = instructions.as_array_mut() else {
-        return Err("OpenCode inline config field `instructions` must be a JSON array.".to_string());
+        return Err(
+            "OpenCode inline config field `instructions` must be a JSON array.".to_string(),
+        );
     };
     if !instructions_array
         .iter()
@@ -1024,7 +1028,8 @@ fn claude_app_control_mcp_config_arg(
                 config_dir.display()
             )
         })?;
-        let config_path = config_dir.join(format!("claude-app-control-{}.json", uuid::Uuid::new_v4()));
+        let config_path =
+            config_dir.join(format!("claude-app-control-{}.json", uuid::Uuid::new_v4()));
         fs::write(&config_path, config.to_string()).map_err(|error| {
             format!(
                 "Unable to write app-control MCP config {}: {error}",
@@ -2277,7 +2282,9 @@ fn send_diff_forge_activity_hook_transport(
         Duration::from_millis(TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS),
     )
     .map_err(|error| format!("Unable to connect to activity transport: {error}"))?;
-    let timeout = Some(Duration::from_millis(TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS));
+    let timeout = Some(Duration::from_millis(
+        TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS,
+    ));
     let _ = stream.set_write_timeout(timeout);
     let _ = stream.set_read_timeout(timeout);
 
@@ -2940,11 +2947,12 @@ mod terminal_cli_tests {
         assert!(prompt.contains("make a skill"));
         assert!(prompt.contains("update_selected_document"));
         assert!(args.iter().any(|arg| {
-            arg.contains("mcp_servers.diffforge-app-control.command")
-                && arg.contains("diff-forge")
+            arg.contains("mcp_servers.diffforge-app-control.command") && arg.contains("diff-forge")
         }));
         assert!(args.iter().any(|arg| {
-            arg.contains("mcp_servers.diffforge-app-control.tools.get_visible_context.approval_mode")
+            arg.contains(
+                "mcp_servers.diffforge-app-control.tools.get_visible_context.approval_mode",
+            )
         }));
     }
 
@@ -5451,19 +5459,21 @@ fn run_agent_thread_turn_for_context(
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
     let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut launch_env_vars = env_vars.to_vec();
-    let launch_provider_session_id =
-        if matches!(provider, AgentProvider::Codex) && !requested_provider_session_id.is_empty() {
-            match resolve_codex_resume_session(&requested_provider_session_id, &working_directory_text) {
-                Ok((session_id, home)) => {
-                    let _ = prepare_codex_rollout_for_resume(&session_id, &working_directory_text);
-                    apply_codex_resume_home_env(&mut launch_env_vars, &home.to_string_lossy());
-                    session_id
-                }
-                Err(_) => String::new(),
+    let launch_provider_session_id = if matches!(provider, AgentProvider::Codex)
+        && !requested_provider_session_id.is_empty()
+    {
+        match resolve_codex_resume_session(&requested_provider_session_id, &working_directory_text)
+        {
+            Ok((session_id, home)) => {
+                let _ = prepare_codex_rollout_for_resume(&session_id, &working_directory_text);
+                apply_codex_resume_home_env(&mut launch_env_vars, &home.to_string_lossy());
+                session_id
             }
-        } else {
-            requested_provider_session_id.clone()
-        };
+            Err(_) => String::new(),
+        }
+    } else {
+        requested_provider_session_id.clone()
+    };
     let mut output_path = None;
     let (args, stdin_text) = match provider {
         AgentProvider::Codex => {

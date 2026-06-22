@@ -605,6 +605,7 @@ import {
 } from "../tools/skillsLibrary.js";
 import {
   setWorkspaceToolsDocumentDraft,
+  warmWorkspaceTools,
 } from "../tools/workspaceToolsStore.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
@@ -731,6 +732,50 @@ const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
 
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function appControlText(value, keys) {
+  for (const key of keys) {
+    const text = value?.[key];
+    if (typeof text === "string" && text.trim()) {
+      return text.trim();
+    }
+  }
+  return "";
+}
+
+function appControlLoopspaceTriggerPayload(value) {
+  const candidates = [
+    value?.payload,
+    value?.sync,
+    value?.response,
+    value?.data,
+    value?.event,
+    value,
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (
+      Array.isArray(candidate?.triggers)
+      || Array.isArray(candidate?.loopspace_triggers)
+      || Array.isArray(candidate?.loopspaceTriggers)
+    ) {
+      return candidate;
+    }
+  }
+  return value || {};
+}
+
+function appControlLoopspaceTriggerRows(value) {
+  const payload = appControlLoopspaceTriggerPayload(value);
+  const rows = payload?.triggers || payload?.loopspace_triggers || payload?.loopspaceTriggers || [];
+  return Array.isArray(rows)
+    ? rows.map((row) => ({
+      ...row,
+      id: appControlText(row, ["id", "trigger_id", "triggerId"]),
+      name: appControlText(row, ["name", "trigger_name", "triggerName"]),
+      type: appControlText(row, ["type", "trigger_type", "triggerType"]).toLowerCase(),
+    })).filter((row) => row.id)
+    : [];
 }
 
 function appShellIsMacPlatform() {
@@ -20610,6 +20655,18 @@ export default function App() {
     invoke("snipping_set_dispatch_targets", { targets: workspaceTerminalDispatchTargets }).catch(() => {});
   }, [workspaceTerminalDispatchTargets]);
   useEffect(() => {
+    if (authState !== "authenticated") return;
+    warmWorkspaceTools(
+      workspaceTerminalDispatchTargets,
+      selectedWorkspaceFileRoot || defaultWorkingDirectory,
+    );
+  }, [
+    authState,
+    defaultWorkingDirectory,
+    selectedWorkspaceFileRoot,
+    workspaceTerminalDispatchTargets,
+  ]);
+  useEffect(() => {
     let disposed = false;
     let unlistenAnnotationTodo = null;
 
@@ -25463,6 +25520,70 @@ export default function App() {
             ...(result?.ok === false && result?.error ? { error: result.error } : {}),
             data: {
               result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "run_loopspace_trigger") {
+          let triggerId = appControlText(input, ["triggerId", "trigger_id", "id"]);
+          const triggerName = appControlText(input, ["triggerName", "trigger_name", "name"]);
+          let trigger = null;
+          if (!triggerId || triggerName) {
+            const snapshot = await invoke("cloud_mcp_get_loopspace_triggers").catch(() => null);
+            let rows = appControlLoopspaceTriggerRows(snapshot);
+            if (!rows.length) {
+              const synced = await invoke("cloud_mcp_sync_loopspace_triggers").catch(() => null);
+              rows = appControlLoopspaceTriggerRows(synced);
+            }
+            if (triggerId) {
+              trigger = rows.find((row) => row.id === triggerId) || null;
+            } else if (triggerName) {
+              const normalizedName = triggerName.toLowerCase();
+              trigger = rows.find((row) => row.name.toLowerCase() === normalizedName)
+                || rows.find((row) => row.id === triggerName)
+                || null;
+              triggerId = trigger?.id || "";
+            }
+          }
+          if (!triggerId) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "trigger_not_found",
+                message: "No matching Loopspace trigger was found.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          if (trigger && trigger.type && trigger.type !== "manual") {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "manual_trigger_required",
+                message: "Only manual Loopspace triggers can be run directly.",
+              },
+              data: {
+                trigger,
+                state: buildAppControlState(),
+              },
+            });
+            return;
+          }
+          const result = await invoke("cloud_mcp_run_loopspace_trigger", {
+            triggerId,
+            payload: input?.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
+              ? input.payload
+              : {},
+            source: "app_control_mcp",
+          });
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            data: {
+              result,
+              triggerId,
               state: buildAppControlState(),
             },
           });

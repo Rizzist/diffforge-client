@@ -143,6 +143,30 @@ test("metadata-only document updates preserve cached content until hydration lan
   assert.equal(hydrated[0].hasContentPayload, true);
 });
 
+test("metadata-only same-hash document updates keep local content materialized", () => {
+  const current = skillsFromUnits([{
+    content_hash: "same-hash",
+    content_md: "",
+    doc_id: "blank",
+    has_content_payload: true,
+    title: "Blank",
+  }]);
+
+  const merged = mergeSkillUnits(current, [{
+    asset_id: "asset-blank",
+    content_hash: "same-hash",
+    doc_id: "blank",
+    has_content: true,
+    title: "Blank",
+  }]);
+
+  assert.equal(merged[0].content, "");
+  assert.equal(merged[0].contentHash, "same-hash");
+  assert.equal(merged[0].contentStale, false);
+  assert.equal(merged[0].hasContent, true);
+  assert.equal(merged[0].hasContentPayload, true);
+});
+
 test("metadata-only document updates preserve pending local saves", () => {
   const current = skillsFromUnits([{
     content_hash: "old-hash",

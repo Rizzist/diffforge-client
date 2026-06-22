@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import styled from "styled-components";
 import {
+  accountDocumentStorageKey,
+  normalizedDocumentKind,
+} from "./skillsLibrary.js";
+import {
   ensureWorkspaceToolsFresh,
-  getWorkspaceToolsSkills,
+  getWorkspaceToolsAccountSkills,
   getWorkspaceToolsVersion,
   hasWorkspaceToolsLoaded,
   subscribeWorkspaceTools,
@@ -11,12 +15,23 @@ import {
 
 const FILTERS = [
   { id: "all", label: "All" },
-  { id: "docs", label: "Docs" },
+  { id: "skill", label: "Skills" },
+  { id: "architecture", label: "Arch" },
+  { id: "instruction", label: "Instructions" },
+  { id: "document", label: "Generic" },
 ];
 
 const FILTER_STORAGE_PREFIX = "diffforge.workspaceTools.filter";
 const SEND_STORAGE_PREFIX = "diffforge.workspaceTools.sendOnDrop";
 export const WORKSPACE_TOOL_TODO_DRAG_MIME = "application/x-diffforge-workspace-tool-todo";
+export const WORKSPACE_TOOL_DOC_DRAG_MIME = "application/x-diffforge-workspace-doc";
+
+const DOC_KIND_LABELS = {
+  architecture: "Arch",
+  document: "Generic",
+  instruction: "Instruction",
+  skill: "Skill",
+};
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -44,6 +59,53 @@ function writeStorage(prefix, workspaceId, value) {
   }
 }
 
+function normalizedFilterId(value) {
+  const normalized = text(value, "all").toLowerCase();
+  if (normalized === "arch" || normalized === "architectures") return "architecture";
+  if (normalized === "skills") return "skill";
+  if (normalized === "instructions") return "instruction";
+  if (normalized === "docs" || normalized === "documents") return "all";
+  if (normalized === "generic" || normalized === "doc" || normalized === "document") return "document";
+  return FILTERS.some((entry) => entry.id === normalized) ? normalized : "all";
+}
+
+function documentTitle(entry) {
+  return text(entry?.title || entry?.name || entry?.id || entry?.documentId || entry?.document_id, "Untitled doc");
+}
+
+function documentBody(entry) {
+  return String(entry?.content ?? entry?.contentMd ?? entry?.content_md ?? entry?.body ?? "");
+}
+
+function documentKind(entry) {
+  return normalizedDocumentKind(
+    entry?.documentKind || entry?.document_kind || entry?.source || entry?.kind,
+    entry?.collection,
+  );
+}
+
+function documentIsFolder(entry) {
+  const rowType = text(entry?.rowType || entry?.row_type || entry?.type).toLowerCase();
+  const entryKind = text(entry?.entryKind || entry?.entry_kind).toLowerCase();
+  return rowType === "folder" || entryKind === "folder";
+}
+
+function docCardEntry(entry) {
+  const kind = documentKind(entry);
+  const title = documentTitle(entry);
+  return {
+    body: documentBody(entry),
+    contentHash: text(entry?.contentHash || entry?.content_hash || entry?.sha256),
+    id: text(entry?.id || entry?.documentId || entry?.document_id || accountDocumentStorageKey(entry)),
+    kind,
+    key: accountDocumentStorageKey(entry) || text(entry?.id || title),
+    localPath: text(entry?.localPath || entry?.local_path),
+    pathKey: text(entry?.pathKey || entry?.path_key),
+    title,
+    typeLabel: DOC_KIND_LABELS[kind] || "Generic",
+  };
+}
+
 function docTodoText(entry) {
   const body = text(entry.body).slice(0, 4000);
   return body
@@ -51,26 +113,37 @@ function docTodoText(entry) {
     : `Apply the "${entry.title}" account doc.`;
 }
 
+function docDragPayload(entry, sendOnDrop) {
+  return {
+    document: {
+      content_hash: entry.contentHash,
+      doc_id: entry.id,
+      document_kind: entry.kind,
+      local_path: entry.localPath,
+      path_key: entry.pathKey || entry.key,
+      title: entry.title,
+    },
+    send_on_drop: Boolean(sendOnDrop),
+    text: docTodoText(entry),
+    type: "account_document",
+  };
+}
+
 /**
- * Drag-and-drop sources for account docs. Items can be dragged into the todo
- * composer or clicked; the send-on-drop toggle decides whether a click queues
- * immediately or just lists the todo.
+ * Drag-and-drop sources for account docs. Cards can be dragged into terminals
+ * or other tool-aware drop zones; send-on-drop controls terminal dispatch.
  */
 export default function WorkspaceToolsDragPanel({
   coordinationTargets = [],
-  onAddToolTodo,
   rootDirectory = "",
   workspaceId = "",
 }) {
   const [filter, setFilter] = useState(() => {
-    const stored = readStorage(FILTER_STORAGE_PREFIX, workspaceId, "all");
-    return FILTERS.some((entry) => entry.id === stored) ? stored : "all";
+    return normalizedFilterId(readStorage(FILTER_STORAGE_PREFIX, workspaceId, "all"));
   });
   const [sendOnDrop, setSendOnDrop] = useState(
     () => readStorage(SEND_STORAGE_PREFIX, workspaceId, "false") === "true",
   );
-  const [notice, setNotice] = useState("");
-
   const repoDescriptors = useMemo(
     () => workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory),
     [coordinationTargets, rootDirectory],
@@ -81,16 +154,19 @@ export default function WorkspaceToolsDragPanel({
     ensureWorkspaceToolsFresh(repoDescriptors);
   }, [repoDescriptors]);
 
-  const skills = useMemo(
-    () => getWorkspaceToolsSkills(),
+  const docs = useMemo(
+    () => getWorkspaceToolsAccountSkills()
+      .filter((entry) => !documentIsFolder(entry))
+      .map(docCardEntry)
+      .filter((entry) => entry.key || entry.title || text(entry.body))
+      .sort((left, right) => left.title.localeCompare(right.title)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [storeVersion],
   );
   const toolsLoaded = hasWorkspaceToolsLoaded(repoDescriptors);
 
   useEffect(() => {
-    const stored = readStorage(FILTER_STORAGE_PREFIX, workspaceId, "all");
-    setFilter(FILTERS.some((entry) => entry.id === stored) ? stored : "all");
+    setFilter(normalizedFilterId(readStorage(FILTER_STORAGE_PREFIX, workspaceId, "all")));
     setSendOnDrop(readStorage(SEND_STORAGE_PREFIX, workspaceId, "false") === "true");
   }, [workspaceId]);
 
@@ -106,23 +182,15 @@ export default function WorkspaceToolsDragPanel({
     });
   }, [workspaceId]);
 
-  const handleAdd = useCallback((todoText, { forceSend = null } = {}) => {
-    if (typeof onAddToolTodo !== "function") return;
-    const send = forceSend === null ? sendOnDrop : forceSend;
-    const item = onAddToolTodo(todoText, { send });
-    if (item) {
-      setNotice(send ? "Queued todo" : "Added to todo list");
-      window.setTimeout(() => setNotice(""), 2200);
-    }
-  }, [onAddToolTodo, sendOnDrop]);
-
-  const handleDragStart = useCallback((event, todoText) => {
-    event.dataTransfer.setData(WORKSPACE_TOOL_TODO_DRAG_MIME, JSON.stringify({ text: todoText }));
-    event.dataTransfer.setData("text/plain", todoText);
+  const handleDragStart = useCallback((event, entry) => {
+    const payload = docDragPayload(entry, sendOnDrop);
+    event.dataTransfer.setData(WORKSPACE_TOOL_TODO_DRAG_MIME, JSON.stringify(payload));
+    event.dataTransfer.setData(WORKSPACE_TOOL_DOC_DRAG_MIME, JSON.stringify(payload.document));
+    event.dataTransfer.setData("text/plain", payload.text);
     event.dataTransfer.effectAllowed = "copy";
-  }, []);
+  }, [sendOnDrop]);
 
-  const visibleDocs = filter === "docs" || filter === "all" ? skills : [];
+  const visibleDocs = filter === "all" ? docs : docs.filter((entry) => entry.kind === filter);
 
   return (
     <Panel aria-label="Draggable workspace docs">
@@ -147,8 +215,8 @@ export default function WorkspaceToolsDragPanel({
             data-active={sendOnDrop ? "true" : "false"}
             onClick={toggleSendOnDrop}
             title={sendOnDrop
-              ? "Clicking queues immediately; dropping sends only over a terminal"
-              : "Clicking adds without sending; dropping sends only over a terminal"}
+              ? "Dropping a doc onto a terminal sends immediately"
+              : "Dropping a doc onto a terminal adds it without sending"}
             type="button"
           >
             <SendToggleKnob aria-hidden="true" data-active={sendOnDrop ? "true" : "false"} />
@@ -156,43 +224,34 @@ export default function WorkspaceToolsDragPanel({
           </SendToggle>
         </ToolbarActions>
       </Toolbar>
-      {notice && <Notice aria-live="polite">{notice}</Notice>}
 
       <ItemsScroll>
         {visibleDocs.length > 0 && (
-          <>
-            <GroupLabel>Docs</GroupLabel>
+          <DocCardGrid aria-label="Account docs" role="list">
             {visibleDocs.map((entry) => {
-              const todoText = docTodoText(entry);
               return (
-                <ToolRow
+                <DocCard
+                  aria-label={`${entry.typeLabel} document ${entry.title}`}
                   draggable
-                  key={`doc:${entry.title}`}
-                  onDragStart={(event) => handleDragStart(event, todoText)}
-                  title="Drag onto a terminal, or click + to add"
+                  key={`doc:${entry.key || entry.title}`}
+                  onDragStart={(event) => handleDragStart(event, entry)}
+                  role="listitem"
+                  title={sendOnDrop
+                    ? "Drag onto a terminal to send"
+                    : "Drag onto a terminal to add without sending"}
                 >
-                  <ToolGlyph aria-hidden="true" data-kind="doc">✦</ToolGlyph>
-                  <ToolCopy>
-                    <strong>{entry.title}</strong>
-                    <span>{text(entry.body).split("\n").find(Boolean) || "Account doc"}</span>
-                  </ToolCopy>
-                  <AddButton
-                    aria-label={`Add doc ${entry.title} as todo`}
-                    onClick={() => handleAdd(todoText)}
-                    type="button"
-                  >
-                    {sendOnDrop ? "Queue" : "Add"}
-                  </AddButton>
-                </ToolRow>
+                  <DocCardTitle>{entry.title}</DocCardTitle>
+                  <DocCardType>{entry.typeLabel}</DocCardType>
+                </DocCard>
               );
             })}
-          </>
+          </DocCardGrid>
         )}
         {toolsLoaded && !visibleDocs.length && (
           <Empty>
-            {filter === "docs"
-              ? "No docs yet — create one in Tools > Docs."
-              : "No docs yet."}
+            {filter === "all"
+              ? "No docs yet."
+              : `No ${FILTERS.find((entry) => entry.id === filter)?.label.toLowerCase() || "docs"} yet.`}
           </Empty>
         )}
         {!toolsLoaded && !visibleDocs.length && (
@@ -205,8 +264,8 @@ export default function WorkspaceToolsDragPanel({
 
 const Panel = styled.div`
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 8px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -214,15 +273,16 @@ const Panel = styled.div`
 `;
 
 const Toolbar = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 8px;
-  flex-wrap: wrap;
 `;
 
 const FilterNav = styled.nav`
-  display: inline-flex;
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
   gap: 2px;
   padding: 2px;
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
@@ -235,13 +295,14 @@ const FilterNav = styled.nav`
 `;
 
 const FilterButton = styled.button`
-  padding: 5px 10px;
+  padding: 5px 8px;
   border: 0;
   border-radius: 6px;
   color: var(--forge-text-muted, #7a8493);
   background: transparent;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 700;
+  line-height: 1;
   cursor: pointer;
 
   &[data-active="true"] {
@@ -254,6 +315,7 @@ const ToolbarActions = styled.div`
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  justify-self: end;
 `;
 
 const SendToggle = styled.button`
@@ -303,107 +365,97 @@ const SendToggleKnob = styled.span`
   }
 `;
 
-const Notice = styled.div`
-  padding: 5px 9px;
-  border: 1px solid rgba(60, 203, 127, 0.25);
-  border-radius: 7px;
-  color: rgba(170, 235, 200, 0.95);
-  background: rgba(10, 40, 25, 0.3);
-  font-size: 11px;
-  font-weight: 650;
-`;
-
 const ItemsScroll = styled.div`
   display: grid;
   align-content: start;
-  gap: 4px;
   min-height: 0;
   overflow-y: auto;
   scrollbar-width: thin;
 `;
 
-const GroupLabel = styled.span`
-  margin-top: 4px;
-  color: var(--forge-text-muted, #7a8493);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+const DocCardGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
 `;
 
-const ToolRow = styled.div`
+const DocCard = styled.div`
+  position: relative;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 8px;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: stretch;
+  min-width: 0;
+  aspect-ratio: 1.618 / 1;
+  padding: 11px 10px 9px;
   border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.5);
+  background:
+    linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.08), transparent 46%),
+    rgba(13, 17, 23, 0.58);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
   cursor: grab;
+  user-select: none;
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    transform 140ms ease;
 
   &:hover {
     border-color: rgba(var(--forge-tint-soft-rgb), 0.25);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 10px 24px rgba(0, 0, 0, 0.16);
+    transform: translateY(-1px);
   }
 
   &:active {
     cursor: grabbing;
+    transform: translateY(0);
   }
 
   html[data-forge-theme="light"] & {
-    background: #ffffff;
+    background:
+      linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.08), transparent 46%),
+      #ffffff;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
   }
 `;
 
-const ToolGlyph = styled.span`
+const DocCardTitle = styled.strong`
   display: grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  font-size: 13px;
-
-  &[data-kind="doc"] {
-    color: rgba(223, 165, 90, 0.95);
-    background: rgba(223, 165, 90, 0.12);
-  }
-`;
-
-const ToolCopy = styled.div`
-  display: grid;
   min-width: 0;
-  gap: 1px;
+  align-self: center;
+  overflow: hidden;
+  color: var(--forge-text, #f4f7fa);
+  font-size: 12.5px;
+  font-weight: 750;
+  line-height: 1.22;
+  text-align: center;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 
-  strong {
-    overflow: hidden;
-    font-size: 12px;
-    font-weight: 750;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  span {
-    overflow: hidden;
-    color: var(--forge-text-muted, #7a8493);
-    font-size: 10.5px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  html[data-forge-theme="light"] & {
+    color: #171b22;
   }
 `;
 
-const AddButton = styled.button`
-  padding: 5px 10px;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.3);
-  border-radius: 7px;
-  color: var(--forge-tint-soft);
-  background: rgba(var(--forge-tint-rgb), 0.14);
-  font-size: 11px;
-  font-weight: 750;
-  cursor: pointer;
-
-  &:hover {
-    background: rgba(var(--forge-tint-rgb), 0.26);
-  }
+const DocCardType = styled.span`
+  justify-self: center;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 `;
 
 const Empty = styled.p`

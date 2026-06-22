@@ -181,7 +181,10 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
-    let request_id = format!("app-control-mcp-{}", counter.fetch_add(1, Ordering::Relaxed));
+    let request_id = format!(
+        "app-control-mcp-{}",
+        counter.fetch_add(1, Ordering::Relaxed)
+    );
     let (sender, receiver) = oneshot::channel();
     pending
         .lock()
@@ -212,7 +215,8 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
-    let response = match timeout(Duration::from_millis(APP_CONTROL_MCP_TIMEOUT_MS), receiver).await {
+    let response = match timeout(Duration::from_millis(APP_CONTROL_MCP_TIMEOUT_MS), receiver).await
+    {
         Ok(Ok(value)) => value,
         Ok(Err(_)) => json!({
             "ok": false,
@@ -403,7 +407,10 @@ fn handle_app_control_mcp_json_rpc(context: &AppControlMcpContext, request: Valu
         "tools/call" => {
             let params = &request["params"];
             let name = params["name"].as_str().unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let result = app_control_mcp_call_tool(context, name, args);
             json!({
                 "jsonrpc": "2.0",
@@ -495,6 +502,23 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "workspaceId": {"type": "string"},
                     "workspaceName": {"type": "string"},
                     "active": {"type": "boolean", "description": "true activates/selects; false deactivates."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "run_loopspace_trigger",
+            "description": "Run a manual Loopspace trigger by trigger id or trigger name. Use this when the user asks the terminal orchestrator to kick, fire, invoke, or manually run a Loopspace trigger.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "triggerId": {"type": "string"},
+                    "trigger_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "triggerName": {"type": "string"},
+                    "trigger_name": {"type": "string"},
+                    "name": {"type": "string"},
+                    "payload": {"type": "object", "description": "Optional structured payload to record with the manual run."}
                 },
                 "additionalProperties": true
             }
@@ -592,6 +616,7 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "save_selected_document",
         "update_selected_document",
         "select_workspace",
+        "run_loopspace_trigger",
         "select_tab",
         "list_terminals",
         "open_terminals",

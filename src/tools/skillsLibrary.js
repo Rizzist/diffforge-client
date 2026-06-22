@@ -244,7 +244,11 @@ export function mergeSkillUnits(currentSkills, units) {
         || ["local_pending", "sync_failed", "upload_failed"].includes(incomingStatus);
       const incomingSynced = incomingStatus === "synced";
       const pendingPush = incomingPending || (existing.pendingPush === true && !incomingSynced);
+      const preserveExistingPayload = !hasContentPayload
+        && existing.hasContentPayload === true
+        && (!incomingHash || !existingHash || incomingHash === existingHash);
       const contentStale = !hasContentPayload
+        && !preserveExistingPayload
         && Boolean(String(existing.content || ""))
         && Boolean(incomingHash)
         && Boolean(existingHash)
@@ -253,7 +257,13 @@ export function mergeSkillUnits(currentSkills, units) {
         ...existing,
         ...skill,
         content: hasContentPayload ? skill.content : existing.content || "",
-        contentStale: hasContentPayload ? false : Boolean(existing.contentStale || contentStale),
+        contentStale: hasContentPayload || preserveExistingPayload
+          ? false
+          : Boolean(existing.contentStale || contentStale),
+        hasContent: hasContentPayload || preserveExistingPayload
+          ? true
+          : skill.hasContent,
+        hasContentPayload: hasContentPayload || preserveExistingPayload,
         localSavedAt: pendingPush ? text(skill.localSavedAt, existing.localSavedAt) : text(skill.localSavedAt),
         pendingPush,
         syncStatus: pendingPush && !incomingStatus

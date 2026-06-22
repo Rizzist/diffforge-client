@@ -13,6 +13,7 @@ import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Devices as DeviceGenericIcon } from "@styled-icons/material-rounded/Devices";
 import { Language as DeviceWebIcon } from "@styled-icons/material-rounded/Language";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
+import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
@@ -749,6 +750,20 @@ function formatLoopspaceTriggerTime(value) {
     return "";
   }
 }
+
+const LOOPSPACE_TRIGGER_TYPE_OPTIONS = [
+  { label: "Cron", value: "cron" },
+  { label: "Webhook", value: "webhook" },
+  { label: "Manual", value: "manual" },
+];
+
+const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
+  { id: "5m", label: "5 min", value: "@every 5m" },
+  { id: "15m", label: "15 min", value: "@every 15m" },
+  { id: "hourly", label: "Hourly", value: "@hourly" },
+  { id: "daily", label: "Daily", value: "@daily" },
+  { id: "custom", label: "Custom", value: "" },
+];
 
 function getForgeCanvasTintPalette(themeMode, spaceMode = getForgeSpaceMode()) {
   if (spaceMode === "loopspaces") {
@@ -5376,7 +5391,7 @@ const LoopspaceTriggerSectionLabel = styled.div`
 
 const LoopspaceTriggerTypePicker = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 4px;
   min-width: 0;
   padding: 3px;
@@ -5387,6 +5402,10 @@ const LoopspaceTriggerTypePicker = styled.div`
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.08);
     background: rgba(0, 0, 0, 0.035);
+  }
+
+  &[data-variant="schedule"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 `;
 
@@ -5648,7 +5667,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   const [error, setError] = useState("");
   const [draftName, setDraftName] = useState("");
   const [draftType, setDraftType] = useState("cron");
-  const [draftSchedule, setDraftSchedule] = useState("@every 5m");
+  const [draftSchedulePreset, setDraftSchedulePreset] = useState("5m");
+  const [draftCustomSchedule, setDraftCustomSchedule] = useState("");
   const [draftLoopspaceIds, setDraftLoopspaceIds] = useState([]);
   const [nameDrafts, setNameDrafts] = useState({});
 
@@ -5744,6 +5764,14 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     return map;
   }, [loopspaces]);
 
+  const draftSchedule = useMemo(() => {
+    const preset = LOOPSPACE_TRIGGER_SCHEDULE_PRESETS.find((option) => option.id === draftSchedulePreset);
+    if (preset?.value) {
+      return preset.value;
+    }
+    return draftCustomSchedule.trim() || "@every 5m";
+  }, [draftCustomSchedule, draftSchedulePreset]);
+
   const toggleDraftLoopspace = useCallback((loopspaceId) => {
     setDraftLoopspaceIds((current) => (
       current.includes(loopspaceId)
@@ -5826,6 +5854,25 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     }
   }, [applyTriggerSnapshot, state]);
 
+  const runTrigger = useCallback(async (trigger) => {
+    if (!trigger?.id || trigger.type !== "manual" || !trigger.enabled || state === "saving") {
+      return;
+    }
+    setState("saving");
+    setError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_run_loopspace_trigger", {
+        payload: {},
+        source: "rust-diffforge-ui",
+        triggerId: trigger.id,
+      }));
+      setState("idle");
+    } catch (runError) {
+      setState("idle");
+      setError(String(runError || "Unable to run trigger."));
+    }
+  }, [applyTriggerSnapshot, state]);
+
   const deleteTrigger = useCallback(async (trigger) => {
     if (!trigger?.id || state === "saving") {
       return;
@@ -5882,26 +5929,40 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
             />
           </LoopspaceTriggerFieldGrid>
           <LoopspaceTriggerTypePicker aria-label="Trigger type" role="group">
-            {["cron", "webhook"].map((type) => (
+            {LOOPSPACE_TRIGGER_TYPE_OPTIONS.map((option) => (
               <LoopspaceTriggerTypeButton
-                data-active={draftType === type}
-                key={type}
-                onClick={() => setDraftType(type)}
+                data-active={draftType === option.value}
+                key={option.value}
+                onClick={() => setDraftType(option.value)}
                 type="button"
               >
-                {type === "cron" ? "Cron" : "Webhook"}
+                {option.label}
               </LoopspaceTriggerTypeButton>
             ))}
           </LoopspaceTriggerTypePicker>
           {draftType === "cron" ? (
             <>
               <LoopspaceTriggerSectionLabel>Schedule</LoopspaceTriggerSectionLabel>
-              <LoopspaceTriggerInput
-                aria-label="Cron schedule"
-                onChange={(event) => setDraftSchedule(event.target.value)}
-                placeholder="@every 5m"
-                value={draftSchedule}
-              />
+              <LoopspaceTriggerTypePicker aria-label="Cron schedule" data-variant="schedule" role="group">
+                {LOOPSPACE_TRIGGER_SCHEDULE_PRESETS.map((option) => (
+                  <LoopspaceTriggerTypeButton
+                    data-active={draftSchedulePreset === option.id}
+                    key={option.id}
+                    onClick={() => setDraftSchedulePreset(option.id)}
+                    type="button"
+                  >
+                    {option.label}
+                  </LoopspaceTriggerTypeButton>
+                ))}
+              </LoopspaceTriggerTypePicker>
+              {draftSchedulePreset === "custom" ? (
+                <LoopspaceTriggerInput
+                  aria-label="Custom cron schedule"
+                  onChange={(event) => setDraftCustomSchedule(event.target.value)}
+                  placeholder="@every 5m"
+                  value={draftCustomSchedule}
+                />
+              ) : null}
             </>
           ) : null}
           {loopspaces.length > 0 ? (
@@ -5962,6 +6023,17 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                       value={nameDrafts[trigger.id] ?? trigger.name}
                     />
                     <LoopspaceTriggerActionRow>
+                      {trigger.type === "manual" ? (
+                        <LoopspaceTriggerIconButton
+                          aria-label="Run trigger"
+                          disabled={state === "saving" || !trigger.enabled}
+                          onClick={() => runTrigger(trigger)}
+                          title="Run"
+                          type="button"
+                        >
+                          <PlayArrow aria-hidden="true" />
+                        </LoopspaceTriggerIconButton>
+                      ) : null}
                       <LoopspaceTriggerIconButton
                         aria-label={trigger.enabled ? "Disable trigger" : "Enable trigger"}
                         disabled={state === "saving"}
@@ -5992,7 +6064,9 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                     </LoopspaceTriggerActionRow>
                   </LoopspaceTriggerRowHeader>
                   <LoopspaceTriggerBadgeRow>
-                    <LoopspaceTriggerBadge>{trigger.type === "webhook" ? "Webhook" : "Cron"}</LoopspaceTriggerBadge>
+                    <LoopspaceTriggerBadge>
+                      {trigger.type === "webhook" ? "Webhook" : trigger.type === "manual" ? "Manual" : "Cron"}
+                    </LoopspaceTriggerBadge>
                     <LoopspaceTriggerBadge data-tone={trigger.enabled ? "good" : "muted"}>
                       {trigger.enabled ? "Enabled" : "Disabled"}
                     </LoopspaceTriggerBadge>
@@ -7393,9 +7467,17 @@ function getJsonDragPayload(dataTransfer, type) {
   }
 }
 
-function getDraggedWorkspaceToolTodoText(dataTransfer) {
+function getDraggedWorkspaceToolTodoDrop(dataTransfer) {
   const payload = getJsonDragPayload(dataTransfer, WORKSPACE_TOOL_TODO_DRAG_MIME);
-  return normalizeTodoQueueText(payload?.text);
+  const text = normalizeTodoQueueText(payload?.text);
+  if (!text) {
+    return null;
+  }
+  const sendFlag = payload?.send_on_drop ?? payload?.sendOnDrop ?? payload?.send;
+  return {
+    send: sendFlag === undefined ? true : Boolean(sendFlag),
+    text,
+  };
 }
 
 function getDraggedArchitectureGraphTodoText(dataTransfer) {
@@ -7414,9 +7496,13 @@ function getDraggedArchitectureGraphTodoText(dataTransfer) {
   );
 }
 
-function getTerminalNativeTodoDropText(dataTransfer) {
-  return getDraggedWorkspaceToolTodoText(dataTransfer)
-    || getDraggedArchitectureGraphTodoText(dataTransfer);
+function getTerminalNativeTodoDrop(dataTransfer) {
+  const workspaceToolDrop = getDraggedWorkspaceToolTodoDrop(dataTransfer);
+  if (workspaceToolDrop?.text) {
+    return workspaceToolDrop;
+  }
+  const architectureText = getDraggedArchitectureGraphTodoText(dataTransfer);
+  return architectureText ? { send: true, text: architectureText } : null;
 }
 
 function isTerminalNativeTodoDropTransfer(dataTransfer) {
@@ -33464,15 +33550,16 @@ function TerminalView({
       event.stopPropagation();
 
       if (hasNativeTodoTransfer) {
-        const todoText = getTerminalNativeTodoDropText(event.dataTransfer);
-        const item = addWorkspaceToolTodo(todoText, {
-          send: true,
+        const todoDrop = getTerminalNativeTodoDrop(event.dataTransfer);
+        const item = addWorkspaceToolTodo(todoDrop?.text || "", {
+          send: Boolean(todoDrop?.send),
           targetTerminalIndex,
         });
         logTerminalStatus("frontend.terminal_native_todo_drop", {
           accepted: Boolean(item),
+          send: Boolean(todoDrop?.send),
           targetTerminalIndex,
-          textLength: todoText.length,
+          textLength: String(todoDrop?.text || "").length,
           types: Array.from(event.dataTransfer?.types || []),
           workspaceId: terminalWorkspace?.id || "",
         });
