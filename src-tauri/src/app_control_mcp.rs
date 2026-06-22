@@ -523,8 +523,10 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "content": {"type": "string", "description": "Full script content to place in the editor."},
                     "content_md": {"type": "string", "description": "Full script content to place in the editor."},
                     "shell": {"type": "string", "description": "zsh, bash, python3, or node."},
-                    "button_color": {"type": "string", "description": "Hex color for the bottom run button."},
-                    "text_color": {"type": "string", "description": "Hex text color for the bottom run button."},
+                    "workspace_button_color": {"type": "string", "description": "Hex background color for the Workspaces-mode bottom run button."},
+                    "workspace_text_color": {"type": "string", "description": "Hex text color for the Workspaces-mode bottom run button."},
+                    "loopspace_button_color": {"type": "string", "description": "Hex background color for the Loopspaces-mode bottom run button."},
+                    "loopspace_text_color": {"type": "string", "description": "Hex text color for the Loopspaces-mode bottom run button."},
                     "mode": {"type": "string", "description": "draft, local, save, run, or execute."},
                     "save": {"type": "boolean", "description": "When true, save after applying the patch."}
                 },

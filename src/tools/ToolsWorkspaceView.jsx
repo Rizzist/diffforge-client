@@ -86,8 +86,10 @@ const SCRIPT_SHELL_OPTIONS = [
   { id: "cmd", label: "Cmd", extension: "cmd" },
   { id: "bat", label: "Batch", extension: "bat" },
 ];
-const SCRIPT_DEFAULT_BUTTON_COLOR = "#1f3f7a";
-const SCRIPT_DEFAULT_TEXT_COLOR = "#f6d38a";
+const SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
+const SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR = "#4b3512";
+const SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR = "#ffffff";
+const SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR = "#ffffff";
 
 function normalizedSectionId(value, fallback = "docs") {
   const normalized = text(value);
@@ -301,30 +303,48 @@ function scriptEditorDraft(script = {}) {
   const fileName = scriptFileName({ ...script, extension });
   const pathKey = scriptPathKey(script) || fileName;
   const content = String(script.content ?? "");
-  const buttonColor = text(script.buttonColor || script.button_color, SCRIPT_DEFAULT_BUTTON_COLOR);
-  const textColor = text(script.textColor || script.text_color, SCRIPT_DEFAULT_TEXT_COLOR);
+  const workspaceButtonColor = text(
+    script.workspaceButtonColor || script.workspace_button_color,
+    SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+  );
+  const loopspaceButtonColor = text(
+    script.loopspaceButtonColor || script.loopspace_button_color,
+    SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+  );
+  const workspaceTextColor = text(
+    script.workspaceTextColor || script.workspace_text_color,
+    SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
+  );
+  const loopspaceTextColor = text(
+    script.loopspaceTextColor || script.loopspace_text_color,
+    SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR,
+  );
   const workingDirectory = text(script.workingDirectory || script.working_directory);
   return {
     baseContent: content,
-    baseButtonColor: buttonColor,
     baseExtension: extension,
+    baseLoopspaceButtonColor: loopspaceButtonColor,
+    baseLoopspaceTextColor: loopspaceTextColor,
     basePathKey: pathKey,
     baseShell: shell,
-    baseTextColor: textColor,
     baseTitle: scriptTitle({ ...script, fileName }),
+    baseWorkspaceButtonColor: workspaceButtonColor,
+    baseWorkspaceTextColor: workspaceTextColor,
     baseWorkingDirectory: workingDirectory,
-    buttonColor,
     content,
     contentHash: text(script.contentHash || script.content_hash),
     extension,
     fileName,
     id: text(script.id, pathKey),
     localPath: text(script.localPath || script.local_path),
+    loopspaceButtonColor,
+    loopspaceTextColor,
     pathKey,
     shell,
-    textColor,
     title: scriptTitle({ ...script, fileName }),
     updatedAt: text(script.updatedAt || script.updated_at),
+    workspaceButtonColor,
+    workspaceTextColor,
     workingDirectory,
   };
 }
@@ -334,14 +354,19 @@ function scriptSaveRequest(script = {}) {
   const extension = text(script.extension, scriptExtensionForShell(shell)).replace(/^\./u, "").toLowerCase();
   const fileName = scriptFileName({ ...script, extension });
   return {
-    button_color: text(script.buttonColor || script.button_color, SCRIPT_DEFAULT_BUTTON_COLOR),
     content: String(script.content ?? ""),
     extension,
     file_name: fileName,
+    loopspace_button_color: text(script.loopspaceButtonColor || script.loopspace_button_color, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR),
+    loopspace_text_color: text(script.loopspaceTextColor || script.loopspace_text_color, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR),
     path_key: scriptPathKey(script) || fileName,
     shell,
-    text_color: text(script.textColor || script.text_color, SCRIPT_DEFAULT_TEXT_COLOR),
     title: scriptTitle({ ...script, fileName }),
+    workspace_button_color: text(
+      script.workspaceButtonColor || script.workspace_button_color,
+      SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+    ),
+    workspace_text_color: text(script.workspaceTextColor || script.workspace_text_color, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR),
     working_directory: text(script.workingDirectory || script.working_directory),
   };
 }
@@ -350,8 +375,10 @@ function scriptHasUnsavedChanges(editor) {
   if (!editor) return false;
   return String(editor.content || "") !== String(editor.baseContent ?? "")
     || text(editor.title) !== text(editor.baseTitle || editor.title)
-    || text(editor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR) !== text(editor.baseButtonColor, SCRIPT_DEFAULT_BUTTON_COLOR)
-    || text(editor.textColor, SCRIPT_DEFAULT_TEXT_COLOR) !== text(editor.baseTextColor, SCRIPT_DEFAULT_TEXT_COLOR)
+    || text(editor.workspaceButtonColor, SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR) !== text(editor.baseWorkspaceButtonColor, SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR)
+    || text(editor.loopspaceButtonColor, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR) !== text(editor.baseLoopspaceButtonColor, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR)
+    || text(editor.workspaceTextColor, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR) !== text(editor.baseWorkspaceTextColor, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR)
+    || text(editor.loopspaceTextColor, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR) !== text(editor.baseLoopspaceTextColor, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR)
     || text(editor.shell, "zsh") !== text(editor.baseShell, "zsh")
     || text(editor.extension, scriptExtensionForShell(editor.shell)) !== text(editor.baseExtension, scriptExtensionForShell(editor.baseShell))
     || text(editor.workingDirectory) !== text(editor.baseWorkingDirectory)
@@ -884,7 +911,7 @@ export default function ToolsWorkspaceView({
         setGlobalMcpDefaults({
           error: "",
           rootDirectory: text(data.rootDirectory || data.root_directory),
-          state: result?.ok === false ? "error" : "ready",
+          state: response?.ok === false ? "error" : "ready",
           workspaceId: text(data.workspaceId || data.workspace_id, GLOBAL_MCP_DEFAULTS_WORKSPACE_ID),
         });
       })
@@ -1041,10 +1068,12 @@ export default function ToolsWorkspaceView({
   const [scriptsExplorerCollapsed, setScriptsExplorerCollapsed] = useState(false);
   const [scriptsExplorerSize, setScriptsExplorerSize] = useState("238px");
   const [newScriptDraft, setNewScriptDraft] = useState({
-    buttonColor: SCRIPT_DEFAULT_BUTTON_COLOR,
+    loopspaceButtonColor: SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+    loopspaceTextColor: SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR,
     name: "",
     shell: "zsh",
-    textColor: SCRIPT_DEFAULT_TEXT_COLOR,
+    workspaceButtonColor: SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+    workspaceTextColor: SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
   });
   const [scriptRunResults, setScriptRunResults] = useState({});
   const scriptRunInFlightRef = useRef(false);
@@ -1302,17 +1331,19 @@ export default function ToolsWorkspaceView({
     setSelectedScriptLogKey(pathKey);
     setScriptPaneTab("editor");
     setScriptEditor(scriptEditorDraft({
-      button_color: newScriptDraft.buttonColor,
       content: shell === "python3"
         ? "#!/usr/bin/env python3\n\nprint(\"hello from Diff Forge\")\n"
         : shell === "node"
           ? "#!/usr/bin/env node\n\nconsole.log(\"hello from Diff Forge\");\n"
           : "#!/usr/bin/env zsh\n\nprintf 'hello from Diff Forge\\n'\n",
       extension,
+      loopspace_button_color: newScriptDraft.loopspaceButtonColor,
+      loopspace_text_color: newScriptDraft.loopspaceTextColor,
       path_key: pathKey,
       shell,
-      text_color: newScriptDraft.textColor,
       title: name,
+      workspace_button_color: newScriptDraft.workspaceButtonColor,
+      workspace_text_color: newScriptDraft.workspaceTextColor,
     }));
   }, [newScriptDraft, scriptsLibrary.scripts]);
 
@@ -2885,20 +2916,24 @@ export default function ToolsWorkspaceView({
       highlightedRange,
       saveModes: ["draft", "local"],
       script: scriptEditor ? {
-        buttonColor: text(scriptEditor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR),
-        button_color: text(scriptEditor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR),
         draftFingerprint,
         extension: text(scriptEditor.extension, scriptExtensionForShell(scriptEditor.shell)),
         id: text(scriptEditor.id || scriptEditorKey),
         isDraft: editorDirty || !scriptEditor.localPath,
         localPath: text(scriptEditor.localPath),
         local_path: text(scriptEditor.localPath),
+        loopspaceButtonColor: text(scriptEditor.loopspaceButtonColor, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR),
+        loopspace_button_color: text(scriptEditor.loopspaceButtonColor, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR),
+        loopspaceTextColor: text(scriptEditor.loopspaceTextColor, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR),
+        loopspace_text_color: text(scriptEditor.loopspaceTextColor, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR),
         pathKey: scriptEditorKey,
         path_key: scriptEditorKey,
         shell: scriptShellOption(scriptEditor.shell).id,
-        textColor: text(scriptEditor.textColor, SCRIPT_DEFAULT_TEXT_COLOR),
-        text_color: text(scriptEditor.textColor, SCRIPT_DEFAULT_TEXT_COLOR),
         title: text(scriptEditor.title || scriptEditorKey),
+        workspaceButtonColor: text(scriptEditor.workspaceButtonColor, SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR),
+        workspace_button_color: text(scriptEditor.workspaceButtonColor, SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR),
+        workspaceTextColor: text(scriptEditor.workspaceTextColor, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR),
+        workspace_text_color: text(scriptEditor.workspaceTextColor, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR),
         workingDirectory: text(scriptEditor.workingDirectory),
         working_directory: text(scriptEditor.workingDirectory),
       } : null,
@@ -2949,6 +2984,18 @@ export default function ToolsWorkspaceView({
       updatedAtMs,
     });
     setLastDocumentSelection(null);
+  }, []);
+
+  const clearScriptSelection = useCallback(() => {
+    const updatedAtMs = Date.now();
+    scriptSelectionClearAtRef.current = updatedAtMs;
+    setScriptEditorSelection({
+      direction: "",
+      end: 0,
+      start: 0,
+      updatedAtMs,
+    });
+    setLastScriptSelection(null);
   }, []);
 
   const updateSelectedDocumentFromAppControl = useCallback(async (input = {}) => {
@@ -3242,11 +3289,13 @@ export default function ToolsWorkspaceView({
         ? String(input.content_md ?? "")
         : "";
     const current = scriptEditor || scriptEditorDraft({
-      button_color: SCRIPT_DEFAULT_BUTTON_COLOR,
       content: "",
+      loopspace_button_color: SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+      loopspace_text_color: SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR,
       shell: requestedShell || newScriptDraft.shell,
-      text_color: SCRIPT_DEFAULT_TEXT_COLOR,
       title: requestedTitle || newScriptDraft.name || "New Script",
+      workspace_button_color: SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+      workspace_text_color: SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
     });
     const nextShell = requestedShell ? scriptShellOption(requestedShell).id : current.shell;
     const nextExtension = text(
@@ -3255,12 +3304,26 @@ export default function ToolsWorkspaceView({
     ).replace(/^\./u, "").toLowerCase();
     const nextEditor = {
       ...current,
-      buttonColor: text(input.button_color || input.buttonColor, current.buttonColor || SCRIPT_DEFAULT_BUTTON_COLOR),
       content: hasContentPatch ? requestedContent : String(current.content || ""),
       extension: nextExtension,
+      loopspaceButtonColor: text(
+        input.loopspace_button_color || input.loopspaceButtonColor,
+        current.loopspaceButtonColor || SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+      ),
+      loopspaceTextColor: text(
+        input.loopspace_text_color || input.loopspaceTextColor,
+        current.loopspaceTextColor || SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR,
+      ),
       shell: nextShell,
-      textColor: text(input.text_color || input.textColor, current.textColor || SCRIPT_DEFAULT_TEXT_COLOR),
       title: requestedTitle || current.title || "New Script",
+      workspaceButtonColor: text(
+        input.workspace_button_color || input.workspaceButtonColor,
+        current.workspaceButtonColor || SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+      ),
+      workspaceTextColor: text(
+        input.workspace_text_color || input.workspaceTextColor,
+        current.workspaceTextColor || SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
+      ),
       workingDirectory: text(input.working_directory || input.workingDirectory, current.workingDirectory),
     };
     const requestedPath = normalizedDocumentPath(input.path_key || input.path || input.file_path);
@@ -3455,17 +3518,6 @@ export default function ToolsWorkspaceView({
       setLastDocumentSelection(null);
     }
   }, [skillEditor]);
-  const clearScriptSelection = useCallback(() => {
-    const updatedAtMs = Date.now();
-    scriptSelectionClearAtRef.current = updatedAtMs;
-    setScriptEditorSelection({
-      direction: "",
-      end: 0,
-      start: 0,
-      updatedAtMs,
-    });
-    setLastScriptSelection(null);
-  }, []);
   const updateScriptEditorSelection = useCallback((event) => {
     const target = event?.target;
     const start = Number(target?.selectionStart);
@@ -4248,7 +4300,7 @@ export default function ToolsWorkspaceView({
                   )}
 
                   <ResizePanel data-surface="files" id="scripts-editor" minSize="360px">
-                    <DocsCenterPane aria-label="Local script editor">
+                    <DocsCenterPane aria-label="Local script editor" data-pane-kind="scripts">
                       {scriptsError && <ToolsError role="alert">{scriptsError}</ToolsError>}
                       {scriptsMessage && <ToolsNotice>{scriptsMessage}</ToolsNotice>}
                       <ScriptPaneTabs aria-label="Script view" role="tablist">
@@ -4321,7 +4373,7 @@ export default function ToolsWorkspaceView({
                           )}
                         </ScriptLogsPanel>
                       ) : scriptEditor ? (
-                        <SkillDocumentEditor data-page-theme={skillEditorTheme}>
+                        <SkillDocumentEditor data-page-theme={skillEditorTheme} data-script-editor="true">
                           <SkillDocumentToolbar>
                             <SkillDocumentToolbarControls data-side="left">
                               <SkillDocumentThemeSwitch aria-label="Script editor page theme">
@@ -4337,22 +4389,40 @@ export default function ToolsWorkspaceView({
                                   </SkillDocumentThemeButton>
                                 ))}
                               </SkillDocumentThemeSwitch>
-                              <ScriptColorField title="Button color">
-                                <span>Button</span>
+                              <ScriptColorField title="Workspace button background">
+                                <span>Work BG</span>
                                 <input
-                                  aria-label="Script button color"
-                                  onChange={(event) => setScriptEditor((current) => ({ ...current, buttonColor: event.target.value }))}
+                                  aria-label="Workspace script button background color"
+                                  onChange={(event) => setScriptEditor((current) => ({ ...current, workspaceButtonColor: event.target.value }))}
                                   type="color"
-                                  value={text(scriptEditor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR)}
+                                  value={text(scriptEditor.workspaceButtonColor, SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR)}
                                 />
                               </ScriptColorField>
-                              <ScriptColorField title="Text color">
-                                <span>Text</span>
+                              <ScriptColorField title="Workspace button text">
+                                <span>Work Text</span>
                                 <input
-                                  aria-label="Script button text color"
-                                  onChange={(event) => setScriptEditor((current) => ({ ...current, textColor: event.target.value }))}
+                                  aria-label="Workspace script button text color"
+                                  onChange={(event) => setScriptEditor((current) => ({ ...current, workspaceTextColor: event.target.value }))}
                                   type="color"
-                                  value={text(scriptEditor.textColor, SCRIPT_DEFAULT_TEXT_COLOR)}
+                                  value={text(scriptEditor.workspaceTextColor, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR)}
+                                />
+                              </ScriptColorField>
+                              <ScriptColorField title="Loopspace button background">
+                                <span>Loop BG</span>
+                                <input
+                                  aria-label="Loopspace script button background color"
+                                  onChange={(event) => setScriptEditor((current) => ({ ...current, loopspaceButtonColor: event.target.value }))}
+                                  type="color"
+                                  value={text(scriptEditor.loopspaceButtonColor, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR)}
+                                />
+                              </ScriptColorField>
+                              <ScriptColorField title="Loopspace button text">
+                                <span>Loop Text</span>
+                                <input
+                                  aria-label="Loopspace script button text color"
+                                  onChange={(event) => setScriptEditor((current) => ({ ...current, loopspaceTextColor: event.target.value }))}
+                                  type="color"
+                                  value={text(scriptEditor.loopspaceTextColor, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR)}
                                 />
                               </ScriptColorField>
                             </SkillDocumentToolbarControls>
@@ -4504,21 +4574,39 @@ export default function ToolsWorkspaceView({
                               </select>
                             </DocsField>
                             <ScriptColorCreateField>
-                              <label htmlFor="tools-script-button-color">Button</label>
+                              <label htmlFor="tools-script-workspace-button-color">Work BG</label>
                               <input
-                                id="tools-script-button-color"
-                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, buttonColor: event.target.value }))}
+                                id="tools-script-workspace-button-color"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, workspaceButtonColor: event.target.value }))}
                                 type="color"
-                                value={newScriptDraft.buttonColor}
+                                value={newScriptDraft.workspaceButtonColor}
                               />
                             </ScriptColorCreateField>
                             <ScriptColorCreateField>
-                              <label htmlFor="tools-script-text-color">Text</label>
+                              <label htmlFor="tools-script-workspace-text-color">Work Text</label>
                               <input
-                                id="tools-script-text-color"
-                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, textColor: event.target.value }))}
+                                id="tools-script-workspace-text-color"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, workspaceTextColor: event.target.value }))}
                                 type="color"
-                                value={newScriptDraft.textColor}
+                                value={newScriptDraft.workspaceTextColor}
+                              />
+                            </ScriptColorCreateField>
+                            <ScriptColorCreateField>
+                              <label htmlFor="tools-script-loopspace-button-color">Loop BG</label>
+                              <input
+                                id="tools-script-loopspace-button-color"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, loopspaceButtonColor: event.target.value }))}
+                                type="color"
+                                value={newScriptDraft.loopspaceButtonColor}
+                              />
+                            </ScriptColorCreateField>
+                            <ScriptColorCreateField>
+                              <label htmlFor="tools-script-loopspace-text-color">Loop Text</label>
+                              <input
+                                id="tools-script-loopspace-text-color"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, loopspaceTextColor: event.target.value }))}
+                                type="color"
+                                value={newScriptDraft.loopspaceTextColor}
                               />
                             </ScriptColorCreateField>
                           </ScriptCreateFields>
@@ -5204,6 +5292,12 @@ const DocsCenterPane = styled.section`
   ${DocsWorkspaceGrid}[data-show-templates="false"] & {
     border-right: 0;
   }
+
+  &[data-pane-kind="scripts"] {
+    display: flex;
+    flex-direction: column;
+    align-content: stretch;
+  }
 `;
 
 const DocsPaneHeader = styled.header`
@@ -5540,6 +5634,13 @@ const SkillDocumentEditor = styled.div`
     --skill-editor-page-placeholder: rgba(100, 112, 132, 0.68);
     --skill-editor-page-rule: rgba(30, 41, 59, 0.14);
   }
+
+  &[data-script-editor="true"] {
+    grid-row: auto;
+    flex: 1 1 auto;
+    height: auto;
+    max-height: none;
+  }
 `;
 
 const SkillDocumentToolbar = styled.div`
@@ -5817,21 +5918,22 @@ const ScriptPaneTabs = styled.div`
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  flex: 0 0 auto;
   width: fit-content;
   max-width: 100%;
-  margin: 12px 16px 0;
-  padding: 4px;
+  margin: 8px 10px;
+  padding: 3px;
   border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--tools-control-bg, rgba(7, 10, 15, 0.58));
 `;
 
 const ScriptPaneTabButton = styled.button`
-  min-width: 74px;
-  height: 30px;
-  padding: 0 12px;
+  min-width: 62px;
+  height: 26px;
+  padding: 0 10px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 6px;
   color: var(--forge-text-muted, #8d96a6);
   background: transparent;
   font-size: 11px;
@@ -5850,22 +5952,24 @@ const ScriptPaneTabButton = styled.button`
 `;
 
 const ScriptLogsPanel = styled.section`
+  flex: 1 1 auto;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
   min-height: 0;
-  height: 100%;
-  padding: 14px 16px 18px;
+  height: auto;
+  overflow: hidden;
+  padding: 0 10px 10px;
 `;
 
 const ScriptLogsHeader = styled.header`
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
-  padding: 12px 14px;
+  padding: 9px 11px;
   border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 10px;
   background:
@@ -5887,7 +5991,7 @@ const ScriptLogsHeader = styled.header`
 
   strong {
     color: var(--forge-text-strong, #f6f8fb);
-    font-size: 15px;
+    font-size: 13px;
     font-weight: 900;
   }
 
@@ -5904,13 +6008,13 @@ const ScriptLogsStatus = styled.div`
   align-items: center;
   gap: 7px;
   flex: 0 0 auto;
-  min-height: 28px;
-  padding: 0 10px;
+  min-height: 24px;
+  padding: 0 8px;
   border: 1px solid rgba(125, 211, 252, 0.24);
   border-radius: 999px;
   color: #93c5fd;
   background: rgba(37, 99, 235, 0.16);
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 900;
   text-transform: uppercase;
 
@@ -5924,17 +6028,17 @@ const ScriptLogsStatus = styled.div`
 const ScriptLogsMeta = styled.div`
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 
   span {
-    min-height: 24px;
-    padding: 5px 9px;
+    min-height: 21px;
+    padding: 4px 8px;
     border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
     border-radius: 999px;
     color: var(--forge-text-muted, #8d96a6);
     background: rgba(8, 11, 16, 0.58);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 760;
   }
 `;
@@ -5943,14 +6047,15 @@ const ScriptLogsTerminal = styled.pre`
   min-width: 0;
   min-height: 0;
   margin: 0;
-  padding: 14px;
+  padding: 11px 12px;
   border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
-  border-radius: 10px;
+  border-radius: 8px;
   overflow: auto;
+  max-height: 100%;
   background: #05070a;
   color: #d8dee9;
   font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 560;
   line-height: 1.55;
   white-space: pre-wrap;
@@ -6046,9 +6151,13 @@ const ScriptColorField = styled.label`
 
 const ScriptCreateFields = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px 72px 72px;
+  grid-template-columns: minmax(0, 1fr) 120px repeat(4, 82px);
   gap: 10px;
   min-width: 0;
+
+  @media (max-width: 1040px) {
+    grid-template-columns: minmax(0, 1fr) 120px repeat(2, 82px);
+  }
 
   @media (max-width: 760px) {
     grid-template-columns: minmax(0, 1fr) 120px;

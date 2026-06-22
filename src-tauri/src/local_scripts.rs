@@ -4,6 +4,9 @@ const LOCAL_SCRIPTS_META_SUFFIX: &str = ".diffforge.json";
 const LOCAL_SCRIPTS_RUN_TIMEOUT_MS: u128 = 120_000;
 const LOCAL_SCRIPTS_RUN_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const LOCAL_SCRIPT_RUN_EVENT: &str = "diffforge://local-script-run";
+const LOCAL_SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR: &str = "#1f3f7a";
+const LOCAL_SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR: &str = "#4b3512";
+const LOCAL_SCRIPT_DEFAULT_TEXT_COLOR: &str = "#ffffff";
 
 fn local_scripts_root() -> Result<PathBuf, String> {
     cloud_mcp_local_data_file_path(LOCAL_SCRIPTS_ROOT_DIR)
@@ -329,7 +332,6 @@ fn local_scripts_value_for_path(root: &Path, path: &Path, include_content: bool)
         String::new()
     };
     Some(json!({
-        "button_color": local_scripts_text(meta.get("button_color")).if_empty("#1e3a8a"),
         "content": if include_content { content } else { String::new() },
         "content_hash": content_hash,
         "created_at": local_scripts_text(meta.get("created_at")),
@@ -337,13 +339,16 @@ fn local_scripts_value_for_path(root: &Path, path: &Path, include_content: bool)
         "file_name": path.file_name().and_then(|value| value.to_str()).unwrap_or("script.sh"),
         "id": rel_path,
         "local_path": path.to_string_lossy(),
+        "loopspace_button_color": local_scripts_text(meta.get("loopspace_button_color")).if_empty(LOCAL_SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR),
+        "loopspace_text_color": local_scripts_text(meta.get("loopspace_text_color")).if_empty(LOCAL_SCRIPT_DEFAULT_TEXT_COLOR),
         "modified_at": modified_at,
         "path_key": rel_path,
         "shell": shell,
         "size_bytes": metadata.len(),
-        "text_color": local_scripts_text(meta.get("text_color")).if_empty("#f8fafc"),
         "title": if title.is_empty() { local_scripts_title_from_path(path) } else { title },
         "updated_at": local_scripts_text(meta.get("updated_at")),
+        "workspace_button_color": local_scripts_text(meta.get("workspace_button_color")).if_empty(LOCAL_SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR),
+        "workspace_text_color": local_scripts_text(meta.get("workspace_text_color")).if_empty(LOCAL_SCRIPT_DEFAULT_TEXT_COLOR),
         "working_directory": local_scripts_text(meta.get("working_directory")),
     }))
 }
@@ -485,12 +490,14 @@ async fn local_scripts_save(request: Value) -> Result<Value, String> {
         .if_empty(&local_scripts_text(existing_meta.get("title")).if_empty(&local_scripts_title_from_path(&path)));
     let created_at = local_scripts_text(existing_meta.get("created_at")).if_empty(&now);
     let meta = json!({
-        "button_color": local_scripts_text(request.get("button_color")).if_empty(&local_scripts_text(existing_meta.get("button_color")).if_empty("#1e3a8a")),
         "created_at": created_at,
+        "loopspace_button_color": local_scripts_text(request.get("loopspace_button_color")).if_empty(&local_scripts_text(existing_meta.get("loopspace_button_color")).if_empty(LOCAL_SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR)),
+        "loopspace_text_color": local_scripts_text(request.get("loopspace_text_color")).if_empty(&local_scripts_text(existing_meta.get("loopspace_text_color")).if_empty(LOCAL_SCRIPT_DEFAULT_TEXT_COLOR)),
         "shell": shell,
-        "text_color": local_scripts_text(request.get("text_color")).if_empty(&local_scripts_text(existing_meta.get("text_color")).if_empty("#f8fafc")),
         "title": title,
         "updated_at": now,
+        "workspace_button_color": local_scripts_text(request.get("workspace_button_color")).if_empty(&local_scripts_text(existing_meta.get("workspace_button_color")).if_empty(LOCAL_SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR)),
+        "workspace_text_color": local_scripts_text(request.get("workspace_text_color")).if_empty(&local_scripts_text(existing_meta.get("workspace_text_color")).if_empty(LOCAL_SCRIPT_DEFAULT_TEXT_COLOR)),
         "working_directory": local_scripts_text(request.get("working_directory")).if_empty(&local_scripts_text(existing_meta.get("working_directory"))),
     });
     local_scripts_write_meta(&path, &meta)?;

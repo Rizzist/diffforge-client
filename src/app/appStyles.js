@@ -3729,9 +3729,20 @@ export const WorkspaceViewStack = styled.div`
   transition: background 260ms ease;
 `;
 
+export const WorkspaceMainColumn = styled.div`
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
 export const WorkspaceAppToolLayout = styled.div`
   position: relative;
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   width: 100%;
   height: 100%;
   min-width: 0;
@@ -3913,35 +3924,53 @@ export const WorkspaceViewPane = styled.div`
 `;
 
 export const AppGlobalScriptsShelf = styled.div`
-  position: absolute;
-  left: 14px;
-  right: 14px;
-  bottom: 12px;
-  z-index: 280;
+  position: relative;
+  z-index: 8;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  max-height: 54px;
+  min-height: 36px;
+  max-height: 40px;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 8px;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.22);
-  border-radius: 10px;
+  overscroll-behavior-x: contain;
+  padding: 4px 10px;
+  border-top: 1px solid rgba(var(--forge-tint-soft-rgb), 0.16);
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  border-radius: 0;
   background:
-    linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.14), rgba(214, 164, 70, 0.1)),
-    color-mix(in srgb, var(--forge-shell-panel, #10151f) 90%, transparent);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
-  backdrop-filter: blur(16px) saturate(130%);
-  scrollbar-width: thin;
+    linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.13), rgba(var(--forge-tint-soft-rgb), 0.045)),
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), rgba(0, 0, 0, 0.06)),
+    var(--forge-shell-panel, #10151f);
+  box-shadow: none;
+  backdrop-filter: none;
   pointer-events: auto;
 
+  scrollbar-width: thin;
+  scrollbar-color: rgba(var(--forge-tint-soft-rgb), 0.22) transparent;
+
+  &::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(var(--forge-tint-soft-rgb), 0.18);
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
   html[data-forge-theme="light"] & {
-    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    border-top-color: rgba(var(--forge-tint-rgb), 0.16);
     background:
-      linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.1), rgba(214, 164, 70, 0.08)),
-      rgba(255, 255, 255, 0.82);
-    box-shadow: 0 16px 32px rgba(15, 23, 42, 0.14);
+      linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.1), rgba(var(--forge-tint-soft-rgb), 0.04)),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.78)),
+      var(--forge-shell-panel, #ffffff);
   }
 `;
 
@@ -3950,22 +3979,24 @@ export const AppGlobalScriptButton = styled.button`
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  gap: 7px;
-  min-width: 96px;
-  max-width: 220px;
-  min-height: 34px;
-  padding: 0 12px;
-  border: 1px solid color-mix(in srgb, var(--script-button-color, #f6d38a) 38%, transparent);
-  border-radius: 8px;
-  color: var(--script-button-color, #f6d38a);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--script-button-bg, #1f3f7a) 86%, white 8%), var(--script-button-bg, #1f3f7a));
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.12),
-    0 8px 18px rgba(0, 0, 0, 0.24);
+  gap: 6px;
+  min-width: 0;
+  max-width: 168px;
+  min-height: 26px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--script-button-color, #ffffff) 24%, transparent);
+  border-radius: 7px;
+  color: var(--script-button-color, #ffffff);
+  background: color-mix(in srgb, var(--script-button-bg, #1f3f7a) 30%, transparent);
+  box-shadow: none;
   font-size: 11px;
-  font-weight: 850;
+  font-weight: 600;
+  letter-spacing: 0.1px;
   cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
 
   span {
     min-width: 0;
@@ -3975,25 +4006,19 @@ export const AppGlobalScriptButton = styled.button`
   }
 
   &[data-running="true"] {
-    opacity: 0.76;
+    opacity: 0.7;
   }
 
   &:hover,
   &:focus-visible {
-    transform: translateY(-1px);
+    border-color: color-mix(in srgb, var(--script-button-color, #ffffff) 42%, transparent);
+    background: color-mix(in srgb, var(--script-button-bg, #232c3c) 46%, transparent);
     outline: none;
   }
 
   &:disabled {
-    opacity: 0.58;
+    opacity: 0.5;
     cursor: progress;
-    transform: none;
-  }
-
-  html[data-forge-theme="light"] & {
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.28),
-      0 8px 18px rgba(15, 23, 42, 0.14);
   }
 `;
 
@@ -4223,6 +4248,18 @@ export const LoopspaceRuntimeTitle = styled.div`
     letter-spacing: 0;
     text-transform: uppercase;
   }
+
+  span[data-loading="true"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  span[data-loading="true"] svg {
+    width: 11px;
+    height: 11px;
+    flex: 0 0 auto;
+  }
 `;
 
 export const LoopspaceRuntimeTabs = styled.div`
@@ -4281,7 +4318,7 @@ export const LoopspaceRuntimeTabButton = styled.button`
 
 export const LoopspaceGraphCanvas = styled.div`
   position: relative;
-  display: grid;
+  display: block;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -4289,38 +4326,88 @@ export const LoopspaceGraphCanvas = styled.div`
   background:
     linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(rgba(255, 209, 102, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 209, 102, 0.055) 1px, transparent 1px),
+    linear-gradient(rgba(255, 209, 102, 0.16), rgba(255, 209, 102, 0.16)),
+    linear-gradient(90deg, rgba(255, 209, 102, 0.16), rgba(255, 209, 102, 0.16)),
+    radial-gradient(circle at var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%), rgba(255, 209, 102, 0.12), transparent 90px),
     #000;
-  background-size: 32px 32px;
+  background-size:
+    var(--loopspace-grid-size, 32px) var(--loopspace-grid-size, 32px),
+    var(--loopspace-grid-size, 32px) var(--loopspace-grid-size, 32px),
+    var(--loopspace-grid-major-size, 160px) var(--loopspace-grid-major-size, 160px),
+    var(--loopspace-grid-major-size, 160px) var(--loopspace-grid-major-size, 160px),
+    100% 1px,
+    1px 100%,
+    100% 100%,
+    100% 100%;
+  background-position:
+    var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+    var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+    var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+    var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+    0 var(--loopspace-origin-y, 50%),
+    var(--loopspace-origin-x, 50%) 0,
+    0 0,
+    0 0;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 
   &[data-drop-active="true"] {
     border-color: rgba(255, 209, 102, 0.44);
     background:
       linear-gradient(rgba(255, 209, 102, 0.055) 1px, transparent 1px),
       linear-gradient(90deg, rgba(255, 209, 102, 0.055) 1px, transparent 1px),
+      linear-gradient(rgba(255, 209, 102, 0.11) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 209, 102, 0.11) 1px, transparent 1px),
+      linear-gradient(rgba(255, 209, 102, 0.22), rgba(255, 209, 102, 0.22)),
+      linear-gradient(90deg, rgba(255, 209, 102, 0.22), rgba(255, 209, 102, 0.22)),
+      radial-gradient(circle at var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%), rgba(255, 209, 102, 0.18), transparent 96px),
       rgba(25, 16, 0, 0.88);
-    background-size: 32px 32px;
+    background-size:
+      var(--loopspace-grid-size, 32px) var(--loopspace-grid-size, 32px),
+      var(--loopspace-grid-size, 32px) var(--loopspace-grid-size, 32px),
+      var(--loopspace-grid-major-size, 160px) var(--loopspace-grid-major-size, 160px),
+      var(--loopspace-grid-major-size, 160px) var(--loopspace-grid-major-size, 160px),
+      100% 1px,
+      1px 100%,
+      100% 100%,
+      100% 100%;
+    background-position:
+      var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+      var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+      var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+      var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%),
+      0 var(--loopspace-origin-y, 50%),
+      var(--loopspace-origin-x, 50%) 0,
+      0 0,
+      0 0;
+  }
+
+  &[data-panning="true"] {
+    cursor: grabbing;
   }
 `;
 
 export const LoopspaceGraphContent = styled.div`
-  align-self: center;
-  justify-self: center;
-  display: grid;
-  min-width: min(720px, calc(100vw - 420px));
-  max-width: min(860px, 92%);
-  gap: 24px;
-  justify-items: center;
-  padding: 28px;
-
-  @media (max-width: 900px) {
-    min-width: 0;
-    width: 92%;
-  }
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  transform: translate3d(
+    calc(50% + var(--loopspace-pan-x, 0px)),
+    calc(50% + var(--loopspace-pan-y, 0px)),
+    0
+  ) scale(var(--loopspace-zoom, 1));
+  transform-origin: 0 0;
+  pointer-events: none;
 `;
 
 export const LoopspaceGraphNode = styled.div`
   --loop-node-accent: 255, 209, 102;
-  position: relative;
+  position: absolute;
+  top: 0;
+  left: 0;
   display: grid;
   min-width: 184px;
   max-width: 280px;
@@ -4335,6 +4422,8 @@ export const LoopspaceGraphNode = styled.div`
     linear-gradient(135deg, rgba(var(--loop-node-accent), 0.13), rgba(255, 255, 255, 0.035)),
     rgba(6, 6, 6, 0.94);
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  pointer-events: auto;
+  transform: translate3d(var(--loopspace-node-x, 0px), var(--loopspace-node-y, 0px), 0);
 
   &[data-kind="cron"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
@@ -4418,19 +4507,147 @@ export const LoopspaceGraphNodeAction = styled.button`
   }
 `;
 
-export const LoopspaceGraphTriggerGrid = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 12px;
-  min-width: 0;
+export const LoopspaceGraphControls = styled.div`
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px;
+  border: 1px solid rgba(255, 209, 102, 0.16);
+  border-radius: 9px;
+  background: rgba(6, 6, 6, 0.76);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(14px) saturate(120%);
+  cursor: default;
+  user-select: none;
 `;
 
-export const LoopspaceGraphConnector = styled.div`
-  width: 2px;
-  height: 32px;
+export const LoopspaceGraphControlButton = styled.button`
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: rgba(255, 246, 223, 0.9);
+  background: rgba(255, 255, 255, 0.055);
+  font-size: 16px;
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover,
+  &:focus-visible {
+    color: #fff6df;
+    outline: none;
+    border-color: rgba(255, 209, 102, 0.34);
+    background: rgba(255, 209, 102, 0.14);
+  }
+
+  &:disabled {
+    opacity: 0.38;
+    cursor: not-allowed;
+  }
+`;
+
+export const LoopspaceGraphZoomReadout = styled.span`
+  min-width: 44px;
+  padding: 0 6px;
+  color: rgba(248, 250, 252, 0.68);
+  font-size: 11px;
+  font-weight: 850;
+  text-align: center;
+  letter-spacing: 0;
+`;
+
+export const LoopspaceGraphNavHud = styled.div`
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px;
+  border: 1px solid rgba(255, 209, 102, 0.16);
+  border-radius: 10px;
+  color: rgba(248, 250, 252, 0.64);
+  background: rgba(6, 6, 6, 0.72);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(14px) saturate(120%);
+  cursor: default;
+  user-select: none;
+`;
+
+export const LoopspaceGraphNavMap = styled.div`
+  position: relative;
+  width: 76px;
+  height: 52px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 209, 102, 0.16);
+  border-radius: 7px;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+    rgba(255, 255, 255, 0.035);
+  background-size: 12px 12px;
+`;
+
+export const LoopspaceGraphNavViewport = styled.span`
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 26px;
+  height: 18px;
+  border: 1px solid rgba(96, 165, 250, 0.86);
+  border-radius: 4px;
+  background: rgba(96, 165, 250, 0.16);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.18);
+  transform: translate3d(
+    calc(-50% + var(--loopspace-nav-x, 0px)),
+    calc(-50% + var(--loopspace-nav-y, 0px)),
+    0
+  ) scale(var(--loopspace-nav-scale, 1));
+`;
+
+export const LoopspaceGraphNavOrigin = styled.span`
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 5px;
   border-radius: 999px;
-  background: linear-gradient(180deg, rgba(255, 209, 102, 0.0), rgba(255, 209, 102, 0.58));
+  background: rgba(255, 209, 102, 0.86);
+  box-shadow: 0 0 18px rgba(255, 209, 102, 0.48);
+  transform: translate(-50%, -50%);
+`;
+
+export const LoopspaceGraphNavStats = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 64px;
+
+  strong {
+    color: rgba(255, 246, 223, 0.94);
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  span {
+    color: rgba(248, 250, 252, 0.46);
+    font-size: 10px;
+    font-weight: 760;
+    letter-spacing: 0;
+    white-space: nowrap;
+  }
 `;
 
 export const LoopspaceGraphEmpty = styled.div`

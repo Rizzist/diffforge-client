@@ -272,6 +272,7 @@ import {
   WorkspaceAppToolRailButton,
   WorkspaceAppToolRailLabel,
   WorkspaceViewPane,
+  WorkspaceMainColumn,
   AppGlobalScriptsShelf,
   AppGlobalScriptButton,
   WorkspaceRuntimeLayer,
@@ -293,8 +294,14 @@ import {
   LoopspaceGraphNodeIcon,
   LoopspaceGraphNodeText,
   LoopspaceGraphNodeAction,
-  LoopspaceGraphTriggerGrid,
-  LoopspaceGraphConnector,
+  LoopspaceGraphControls,
+  LoopspaceGraphControlButton,
+  LoopspaceGraphZoomReadout,
+  LoopspaceGraphNavHud,
+  LoopspaceGraphNavMap,
+  LoopspaceGraphNavViewport,
+  LoopspaceGraphNavOrigin,
+  LoopspaceGraphNavStats,
   LoopspaceGraphEmpty,
   LoopspaceLogsList,
   LoopspaceLogRow,
@@ -718,8 +725,10 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
 const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
-const APP_SCRIPT_DEFAULT_BUTTON_COLOR = "#1f3f7a";
-const APP_SCRIPT_DEFAULT_TEXT_COLOR = "#f6d38a";
+const APP_SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
+const APP_SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR = "#4b3512";
+const APP_SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR = "#ffffff";
+const APP_SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR = "#ffffff";
 const LOCAL_SCRIPT_RUN_EVENT = "diffforge://local-script-run";
 const REMOTE_NAVIGATION_COMMANDS = new Set([
   "workspace_select",
@@ -4366,6 +4375,32 @@ function parseLoopspaceGraphProps(rawProps = "") {
   return props;
 }
 
+function loopspaceGraphFiniteNumber(value, fallback = 0) {
+  const number = Number.parseFloat(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+const LOOPSPACE_GRAPH_MIN_ZOOM = 0.35;
+const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
+const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
+
+function clampLoopspaceGraphZoom(value) {
+  return Math.min(LOOPSPACE_GRAPH_MAX_ZOOM, Math.max(LOOPSPACE_GRAPH_MIN_ZOOM, Number(value) || 1));
+}
+
+function loopspaceGraphPropValue(props, keys = []) {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(props, key) && props[key] !== "") {
+      return props[key];
+    }
+  }
+  return undefined;
+}
+
+function loopspaceGraphSnapCoordinate(value) {
+  return Math.round(loopspaceGraphFiniteNumber(value, 0) / 16) * 16;
+}
+
 function parseLoopspaceArchGraphSource(source = "") {
   const nodes = [];
   const edges = [];
@@ -4395,12 +4430,17 @@ function parseLoopspaceArchGraphSource(source = "") {
     const id = String(props.id || props.nodeId || props.node_id || loopspaceGraphNodeIdFromLabel(label)).trim();
     if (!id || nodeByLabel.has(id)) return;
     const triggerId = String(props.triggerId || props.triggerid || props.trigger_id || props.trigger || "").trim();
+    const xValue = loopspaceGraphPropValue(props, ["x", "left", "posx", "pos_x"]);
+    const yValue = loopspaceGraphPropValue(props, ["y", "top", "posy", "pos_y"]);
     const node = {
       id,
       icon: String(props.icon || "").trim(),
       label,
       role: String(props.role || "").trim(),
       triggerId,
+      hasPosition: xValue !== undefined || yValue !== undefined,
+      x: loopspaceGraphFiniteNumber(xValue, 0),
+      y: loopspaceGraphFiniteNumber(yValue, 0),
     };
     nodes.push(node);
     nodeByLabel.set(id, node);
@@ -4409,13 +4449,16 @@ function parseLoopspaceArchGraphSource(source = "") {
   return { edges, nodes };
 }
 
-function loopspaceTriggerGraphNodeLine(trigger) {
+function loopspaceTriggerGraphNodeLine(trigger, position = null) {
   const triggerId = String(trigger?.id || trigger?.triggerId || "").trim();
   const name = String(trigger?.name || triggerId || "Trigger").trim().replace(/"/g, "'");
   const type = String(trigger?.type || "manual").trim().toLowerCase();
   const nodeId = `trigger-${triggerId}`.replace(/[^a-zA-Z0-9_-]/g, "-");
   const icon = type === "cron" ? "clock" : type === "webhook" ? "webhook" : "play";
-  return `"${name}" [icon: ${icon}, role: trigger, id: ${nodeId}, triggerId: ${triggerId}, triggerType: ${type}]`;
+  const positionProps = position
+    ? `, x: ${loopspaceGraphSnapCoordinate(position.x)}, y: ${loopspaceGraphSnapCoordinate(position.y)}`
+    : "";
+  return `"${name}" [icon: ${icon}, role: trigger, id: ${nodeId}, triggerId: ${triggerId}, triggerType: ${type}${positionProps}]`;
 }
 
 function loopspaceGraphTriggerIdFromLine(line) {
@@ -4433,14 +4476,14 @@ function loopspaceGraphSourceHasTrigger(source, triggerId) {
     .some((line) => loopspaceGraphTriggerIdFromLine(line) === id);
 }
 
-function loopspaceGraphSourceWithTrigger(source, trigger) {
+function loopspaceGraphSourceWithTrigger(source, trigger, position = null) {
   const triggerId = String(trigger?.id || trigger?.triggerId || "").trim();
   if (!triggerId) return source || "";
   const current = String(source || "").trimEnd();
   if (loopspaceGraphSourceHasTrigger(current, triggerId)) {
     return source || "";
   }
-  return `${current}${current ? "\n" : ""}${loopspaceTriggerGraphNodeLine(trigger)}\n`;
+  return `${current}${current ? "\n" : ""}${loopspaceTriggerGraphNodeLine(trigger, position)}\n`;
 }
 
 function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
@@ -4468,10 +4511,22 @@ function LoopspaceRuntimeView({
   const [loadingState, setLoadingState] = useState("idle");
   const [runtimeError, setRuntimeError] = useState("");
   const [dropActive, setDropActive] = useState(false);
+  const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
+  const [canvasZoom, setCanvasZoom] = useState(1);
+  const [isCanvasPanning, setCanvasPanning] = useState(false);
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
+  const loopspaceRef = useRef(loopspace);
+  const graphSourceRef = useRef("");
+  const triggerRefsRef = useRef([]);
+  const refreshGenerationRef = useRef(0);
+  const graphCanvasRef = useRef(null);
+  const canvasPanRef = useRef(canvasPan);
+  const canvasZoomRef = useRef(canvasZoom);
+  const canvasPanGestureRef = useRef(null);
 
   const applyGraphSnapshot = useCallback((value) => {
+    const fallbackLoopspace = loopspaceRef.current;
     const candidates = [
       value,
       value?.sync,
@@ -4494,12 +4549,13 @@ function LoopspaceRuntimeView({
         break;
       }
     }
-    if (!graph && loopspace?.graph) {
-      graph = loopspace.graph;
-      row = loopspace;
+    if (!graph && fallbackLoopspace?.graph) {
+      graph = fallbackLoopspace.graph;
+      row = fallbackLoopspace;
     }
     if (!graph) return null;
     const source = String(graph.source || graph.sourceText || graph.source_text || "");
+    graphSourceRef.current = source;
     setGraphSource(source);
     setGraphMeta(graph);
     const refs = Array.isArray(value?.triggerRefs)
@@ -4509,10 +4565,11 @@ function LoopspaceRuntimeView({
         : Array.isArray(row?.trigger_refs)
           ? row.trigger_refs
           : [];
+    triggerRefsRef.current = refs;
     setTriggerRefs(refs);
     setRuntimeHead(value?.runtimeHead || row?.runtimeHead || row?.runtime_head || null);
     return { graph, refs, row, source };
-  }, [loopspace, loopspaceId]);
+  }, [loopspaceId]);
 
   const applyTriggerSnapshot = useCallback((value) => {
     const nextTriggers = appControlLoopspaceTriggerRows(value);
@@ -4522,8 +4579,8 @@ function LoopspaceRuntimeView({
       const triggerLoopspaceIds = new Map(nextTriggers.map((trigger) => [trigger.id, trigger.loopspaceIds]));
       const graphTriggerIds = new Set(
         [
-          ...triggerRefs.map((ref) => String(ref?.triggerId || ref?.trigger_id || "").trim()),
-          ...parseLoopspaceArchGraphSource(graphSource).nodes.map((node) => node.triggerId),
+          ...triggerRefsRef.current.map((ref) => String(ref?.triggerId || ref?.trigger_id || "").trim()),
+          ...parseLoopspaceArchGraphSource(graphSourceRef.current).nodes.map((node) => node.triggerId),
         ].filter(Boolean),
       );
       setLogs(nextRuns.filter((run) => (
@@ -4535,33 +4592,48 @@ function LoopspaceRuntimeView({
       setLogs([]);
     }
     return { runs: nextRuns, triggers: nextTriggers };
-  }, [graphSource, loopspaceId, triggerRefs]);
+  }, [loopspaceId]);
 
-  const refreshLoopspaceLogs = useCallback(async () => {
-    if (!loopspaceId) {
+  const refreshLoopspaceLogs = useCallback(async (
+    activeLoopspaceId = loopspaceId,
+    generation = refreshGenerationRef.current,
+    remote = true,
+  ) => {
+    if (!activeLoopspaceId) {
       setLogs([]);
       return;
     }
-    try {
-      const value = await invoke("cloud_mcp_sync_loopspace_logs", {
-        limit: 100,
-        loopspaceId,
-      });
+    const applyLogs = (value) => {
+      if (generation !== refreshGenerationRef.current) return;
       setLogs(appControlLoopspaceTriggerRunRows(value));
-    } catch {
+    };
+    if (remote) {
       try {
-        const value = await invoke("cloud_mcp_get_loopspace_logs", {
+        const value = await invoke("cloud_mcp_sync_loopspace_logs", {
           limit: 100,
-          loopspaceId,
+          loopspaceId: activeLoopspaceId,
         });
-        setLogs(appControlLoopspaceTriggerRunRows(value));
+        applyLogs(value);
+        return;
       } catch {
-        // The trigger snapshot below still gives us a useful recent-log fallback.
+        // Fall back to the local mirror below.
       }
+    }
+    try {
+      const value = await invoke("cloud_mcp_get_loopspace_logs", {
+        limit: 100,
+        loopspaceId: activeLoopspaceId,
+      });
+      applyLogs(value);
+    } catch {
+      // The trigger snapshot still gives us a useful recent-log fallback.
     }
   }, [loopspaceId]);
 
-  const refreshLoopspaceGraph = useCallback(async (remote = true) => {
+  const refreshLoopspaceGraph = useCallback(async (
+    remote = true,
+    generation = refreshGenerationRef.current,
+  ) => {
     if (!loopspaceId) {
       setGraphSource("");
       setGraphMeta(null);
@@ -4569,22 +4641,32 @@ function LoopspaceRuntimeView({
       setRuntimeHead(null);
       return;
     }
-    applyGraphSnapshot(loopspace);
     try {
-      applyGraphSnapshot(await invoke("cloud_mcp_get_loopspace_graph", { loopspaceId }));
+      const local = await invoke("cloud_mcp_get_loopspace_graph", { loopspaceId });
+      if (generation === refreshGenerationRef.current) {
+        applyGraphSnapshot(local);
+      }
     } catch {
       // A remote sync below can hydrate a freshly-created loop graph.
     }
     if (remote) {
       try {
-        applyGraphSnapshot(await invoke("cloud_mcp_sync_loopspace_graph", { loopspaceId }));
+        const synced = await invoke("cloud_mcp_sync_loopspace_graph", { loopspaceId });
+        if (generation === refreshGenerationRef.current) {
+          applyGraphSnapshot(synced);
+        }
       } catch (graphError) {
-        setRuntimeError(String(graphError || "Unable to sync loop graph."));
+        if (generation === refreshGenerationRef.current) {
+          setRuntimeError(String(graphError || "Unable to sync loop graph."));
+        }
       }
     }
-  }, [applyGraphSnapshot, loopspace, loopspaceId]);
+  }, [applyGraphSnapshot, loopspaceId]);
 
-  const refreshLoopspaceTriggers = useCallback(async (remote = true) => {
+  const refreshLoopspaceTriggers = useCallback(async (
+    remote = true,
+    generation = refreshGenerationRef.current,
+  ) => {
     if (!loopspaceId) {
       setTriggers([]);
       setLogs([]);
@@ -4593,29 +4675,67 @@ function LoopspaceRuntimeView({
     setLoadingState("loading");
     setRuntimeError("");
     try {
-      applyTriggerSnapshot(await invoke("cloud_mcp_get_loopspace_triggers"));
+      const local = await invoke("cloud_mcp_get_loopspace_triggers");
+      if (generation === refreshGenerationRef.current) {
+        applyTriggerSnapshot(local);
+      }
     } catch {
-      applyTriggerSnapshot({});
+      if (generation === refreshGenerationRef.current) {
+        applyTriggerSnapshot({});
+      }
     }
     if (remote) {
       try {
-        applyTriggerSnapshot(await invoke("cloud_mcp_sync_loopspace_triggers"));
+        const synced = await invoke("cloud_mcp_sync_loopspace_triggers");
+        if (generation === refreshGenerationRef.current) {
+          applyTriggerSnapshot(synced);
+        }
       } catch (syncError) {
-        setRuntimeError(String(syncError || "Unable to sync loop graph."));
+        if (generation === refreshGenerationRef.current) {
+          setRuntimeError(String(syncError || "Unable to sync loop graph."));
+        }
       }
     }
-    await refreshLoopspaceLogs();
-    setLoadingState("idle");
+    await refreshLoopspaceLogs(loopspaceId, generation, false);
+    if (generation === refreshGenerationRef.current) {
+      setLoadingState("idle");
+    }
   }, [applyTriggerSnapshot, loopspaceId, refreshLoopspaceLogs]);
 
   useEffect(() => {
+    loopspaceRef.current = loopspace;
+    applyGraphSnapshot(loopspace);
+  }, [applyGraphSnapshot, loopspace]);
+
+  useEffect(() => {
+    canvasPanRef.current = canvasPan;
+  }, [canvasPan]);
+
+  useEffect(() => {
+    canvasZoomRef.current = canvasZoom;
+  }, [canvasZoom]);
+
+  useEffect(() => {
+    const generation = refreshGenerationRef.current + 1;
+    refreshGenerationRef.current = generation;
     setActiveTab("graph");
     setRuntimeError("");
     setDropActive(false);
-    applyGraphSnapshot(loopspace);
-    refreshLoopspaceGraph(true);
-    refreshLoopspaceTriggers(true);
-  }, [applyGraphSnapshot, loopspace, loopspaceId, refreshLoopspaceGraph, refreshLoopspaceTriggers]);
+    const resetPan = { x: 0, y: 0 };
+    canvasPanRef.current = resetPan;
+    canvasZoomRef.current = 1;
+    canvasPanGestureRef.current = null;
+    setCanvasPan(resetPan);
+    setCanvasZoom(1);
+    setCanvasPanning(false);
+    void refreshLoopspaceGraph(true, generation);
+    void refreshLoopspaceTriggers(true, generation);
+    return () => {
+      if (refreshGenerationRef.current === generation) {
+        refreshGenerationRef.current += 1;
+      }
+    };
+  }, [loopspaceId, refreshLoopspaceGraph, refreshLoopspaceTriggers]);
 
   useEffect(() => {
     let disposed = false;
@@ -4624,8 +4744,7 @@ function LoopspaceRuntimeView({
     void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
       if (disposed) return;
       applyTriggerSnapshot(event?.payload || event);
-      void refreshLoopspaceLogs();
-      void refreshLoopspaceGraph(true);
+      void refreshLoopspaceLogs(loopspaceId, refreshGenerationRef.current, false);
     }).then((unlisten) => {
       if (disposed) {
         unlisten();
@@ -4648,7 +4767,7 @@ function LoopspaceRuntimeView({
       if (typeof unlistenTriggers === "function") unlistenTriggers();
       if (typeof unlistenLoopspaces === "function") unlistenLoopspaces();
     };
-  }, [applyGraphSnapshot, applyTriggerSnapshot, refreshLoopspaceGraph, refreshLoopspaceLogs]);
+  }, [applyGraphSnapshot, applyTriggerSnapshot, loopspaceId, refreshLoopspaceLogs]);
 
   const parsedGraph = useMemo(() => parseLoopspaceArchGraphSource(graphSource), [graphSource]);
 
@@ -4676,7 +4795,7 @@ function LoopspaceRuntimeView({
     return map;
   }, [triggers]);
 
-  const attachTriggerToLoop = useCallback(async (triggerLike) => {
+  const attachTriggerToLoop = useCallback(async (triggerLike, position = null) => {
     if (!loopspaceId || busy) return;
     const triggerId = String(triggerLike?.id || triggerLike?.triggerId || "").trim();
     if (!triggerId) return;
@@ -4685,7 +4804,7 @@ function LoopspaceRuntimeView({
       setRuntimeError("");
       return;
     }
-    const nextSource = loopspaceGraphSourceWithTrigger(graphSource, trigger);
+    const nextSource = loopspaceGraphSourceWithTrigger(graphSource, trigger, position);
     setLoadingState("saving");
     setRuntimeError("");
     try {
@@ -4748,6 +4867,112 @@ function LoopspaceRuntimeView({
     Array.from(event.dataTransfer?.types || []).includes(LOOPSPACE_TRIGGER_DRAG_MIME)
   ), []);
 
+  const graphPointFromClient = useCallback((clientX, clientY) => {
+    const rect = graphCanvasRef.current?.getBoundingClientRect?.();
+    if (!rect) return { x: 0, y: 0 };
+    const pan = canvasPanRef.current || { x: 0, y: 0 };
+    const zoom = canvasZoomRef.current || 1;
+    return {
+      x: loopspaceGraphSnapCoordinate((clientX - rect.left - (rect.width / 2) - pan.x) / zoom),
+      y: loopspaceGraphSnapCoordinate((clientY - rect.top - (rect.height / 2) - pan.y) / zoom),
+    };
+  }, []);
+
+  const applyGraphViewport = useCallback((nextPan, nextZoom = canvasZoomRef.current) => {
+    const safePan = {
+      x: Number.isFinite(nextPan?.x) ? nextPan.x : 0,
+      y: Number.isFinite(nextPan?.y) ? nextPan.y : 0,
+    };
+    const safeZoom = clampLoopspaceGraphZoom(nextZoom);
+    canvasPanRef.current = safePan;
+    canvasZoomRef.current = safeZoom;
+    setCanvasPan(safePan);
+    setCanvasZoom(safeZoom);
+  }, []);
+
+  const zoomGraphTo = useCallback((nextZoom, clientPoint = null) => {
+    const rect = graphCanvasRef.current?.getBoundingClientRect?.();
+    const currentPan = canvasPanRef.current || { x: 0, y: 0 };
+    const currentZoom = canvasZoomRef.current || 1;
+    const safeZoom = clampLoopspaceGraphZoom(nextZoom);
+    if (!rect) {
+      applyGraphViewport(currentPan, safeZoom);
+      return;
+    }
+    const anchorX = clientPoint?.clientX ?? (rect.left + (rect.width / 2));
+    const anchorY = clientPoint?.clientY ?? (rect.top + (rect.height / 2));
+    const canvasX = anchorX - rect.left - (rect.width / 2);
+    const canvasY = anchorY - rect.top - (rect.height / 2);
+    const worldX = (canvasX - currentPan.x) / currentZoom;
+    const worldY = (canvasY - currentPan.y) / currentZoom;
+    applyGraphViewport({
+      x: canvasX - (worldX * safeZoom),
+      y: canvasY - (worldY * safeZoom),
+    }, safeZoom);
+  }, [applyGraphViewport]);
+
+  const zoomGraphBy = useCallback((factor, clientPoint = null) => {
+    zoomGraphTo((canvasZoomRef.current || 1) * factor, clientPoint);
+  }, [zoomGraphTo]);
+
+  const resetGraphViewport = useCallback(() => {
+    applyGraphViewport({ x: 0, y: 0 }, 1);
+  }, [applyGraphViewport]);
+
+  const onGraphPointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    const target = event.target;
+    if (target?.closest?.("[data-loopspace-graph-node='true'], button, a, input, textarea, select, [role='button']")) {
+      return;
+    }
+    event.preventDefault();
+    const startPan = canvasPanRef.current || { x: 0, y: 0 };
+    canvasPanGestureRef.current = {
+      pan: startPan,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
+    setCanvasPanning(true);
+    event.currentTarget?.setPointerCapture?.(event.pointerId);
+  }, []);
+
+  const onGraphPointerMove = useCallback((event) => {
+    const gesture = canvasPanGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const nextPan = {
+      x: gesture.pan.x + event.clientX - gesture.startX,
+      y: gesture.pan.y + event.clientY - gesture.startY,
+    };
+    applyGraphViewport(nextPan);
+  }, [applyGraphViewport]);
+
+  const finishGraphPan = useCallback((event) => {
+    const gesture = canvasPanGestureRef.current;
+    if (!gesture || (event?.pointerId !== undefined && gesture.pointerId !== event.pointerId)) return;
+    canvasPanGestureRef.current = null;
+    setCanvasPanning(false);
+    event?.currentTarget?.releasePointerCapture?.(gesture.pointerId);
+  }, []);
+
+  const onGraphWheel = useCallback((event) => {
+    event.preventDefault();
+    if (event.ctrlKey || event.metaKey) {
+      const zoomFactor = Math.exp(-event.deltaY * 0.0024);
+      zoomGraphBy(zoomFactor, { clientX: event.clientX, clientY: event.clientY });
+      return;
+    }
+    const current = canvasPanRef.current || { x: 0, y: 0 };
+    const horizontalDelta = event.shiftKey && Math.abs(event.deltaY) > Math.abs(event.deltaX)
+      ? event.deltaY
+      : event.deltaX;
+    applyGraphViewport({
+      x: current.x - horizontalDelta,
+      y: current.y - event.deltaY,
+    });
+  }, [applyGraphViewport, zoomGraphBy]);
+
   const onGraphDrop = useCallback((event) => {
     event.preventDefault();
     setDropActive(false);
@@ -4756,10 +4981,15 @@ function LoopspaceRuntimeView({
     }
     const trigger = readDroppedTrigger(event);
     if (trigger) {
-      void attachTriggerToLoop(trigger);
+      void attachTriggerToLoop(trigger, graphPointFromClient(event.clientX, event.clientY));
     }
-  }, [attachTriggerToLoop, hasDroppedTriggerType, readDroppedTrigger]);
+  }, [attachTriggerToLoop, graphPointFromClient, hasDroppedTriggerType, readDroppedTrigger]);
 
+  const graphZoomPercent = Math.round(canvasZoom * 100);
+  const graphGridSize = Math.max(8, 32 * canvasZoom);
+  const graphMajorGridSize = Math.max(40, 160 * canvasZoom);
+  const graphNavX = Math.max(-30, Math.min(30, -canvasPan.x * 0.045));
+  const graphNavY = Math.max(-30, Math.min(30, -canvasPan.y * 0.045));
   const runtimeStatus = runtimeError || error;
 
   return (
@@ -4776,7 +5006,14 @@ function LoopspaceRuntimeView({
         </LoopspaceRuntimeIconButton>
         <LoopspaceRuntimeTitle>
           <strong>{loopspace?.name || "Loop"}</strong>
-          <span>{attachedTriggers.length} trigger reference{attachedTriggers.length === 1 ? "" : "s"}</span>
+          {loadingState === "loading" ? (
+            <span data-loading="true">
+              <PendingIcon aria-hidden="true" />
+              <span>Loading triggers</span>
+            </span>
+          ) : (
+            <span>{attachedTriggers.length} trigger reference{attachedTriggers.length === 1 ? "" : "s"}</span>
+          )}
         </LoopspaceRuntimeTitle>
         <LoopspaceRuntimeTabs aria-label="Loop views" role="tablist">
           <LoopspaceRuntimeTabButton
@@ -4803,6 +5040,7 @@ function LoopspaceRuntimeView({
         {activeTab === "graph" ? (
           <LoopspaceGraphCanvas
             data-drop-active={dropActive ? "true" : undefined}
+            data-panning={isCanvasPanning ? "true" : undefined}
             onDragEnter={(event) => {
               if (hasDroppedTriggerType(event)) {
                 event.preventDefault();
@@ -4810,7 +5048,8 @@ function LoopspaceRuntimeView({
               }
             }}
             onDragLeave={(event) => {
-              if (event.currentTarget === event.target) setDropActive(false);
+              const nextTarget = event.relatedTarget;
+              if (!nextTarget || !event.currentTarget.contains(nextTarget)) setDropActive(false);
             }}
             onDragOver={(event) => {
               if (hasDroppedTriggerType(event)) {
@@ -4819,57 +5058,123 @@ function LoopspaceRuntimeView({
               }
             }}
             onDrop={onGraphDrop}
+            onPointerCancel={finishGraphPan}
+            onPointerDown={onGraphPointerDown}
+            onPointerMove={onGraphPointerMove}
+            onPointerUp={finishGraphPan}
+            onWheel={onGraphWheel}
+            ref={graphCanvasRef}
+            style={{
+              "--loopspace-grid-major-size": `${graphMajorGridSize}px`,
+              "--loopspace-grid-size": `${graphGridSize}px`,
+              "--loopspace-origin-x": `calc(50% + ${canvasPan.x}px)`,
+              "--loopspace-origin-y": `calc(50% + ${canvasPan.y}px)`,
+              "--loopspace-pan-x": `${canvasPan.x}px`,
+              "--loopspace-pan-y": `${canvasPan.y}px`,
+              "--loopspace-zoom": canvasZoom,
+            }}
           >
             <LoopspaceGraphContent>
-              {parsedGraph.nodes.length ? (
-                <LoopspaceGraphTriggerGrid>
-                  {parsedGraph.nodes.map((node) => {
-                    const trigger = node.triggerId ? triggerById.get(node.triggerId) : null;
-                    const type = trigger?.type || node.role || "loop";
-                    const Icon = node.triggerId
-                      ? loopspaceTriggerTypeIcon(trigger?.type || "manual")
-                      : AccountTree;
-                    const isRuntimeNode = String(runtimeHead?.currentNodeId || runtimeHead?.current_node_id || runtimeHead?.cursorNodeId || runtimeHead?.cursor_node_id || "") === node.id;
-                    return (
-                      <LoopspaceGraphNode
-                        data-kind={node.triggerId ? (trigger?.type || "manual") : "loop"}
-                        data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
-                        key={node.id}
+              {parsedGraph.nodes.map((node, index) => {
+                const trigger = node.triggerId ? triggerById.get(node.triggerId) : null;
+                const type = trigger?.type || node.role || "loop";
+                const Icon = node.triggerId
+                  ? loopspaceTriggerTypeIcon(trigger?.type || "manual")
+                  : AccountTree;
+                const isRuntimeNode = String(runtimeHead?.currentNodeId || runtimeHead?.current_node_id || runtimeHead?.cursorNodeId || runtimeHead?.cursor_node_id || "") === node.id;
+                const nodeX = node.hasPosition ? node.x : ((index % 4) * 240) - 120;
+                const nodeY = node.hasPosition ? node.y : Math.floor(index / 4) * 96;
+                return (
+                  <LoopspaceGraphNode
+                    data-kind={node.triggerId ? (trigger?.type || "manual") : "loop"}
+                    data-loopspace-graph-node="true"
+                    data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
+                    key={node.id}
+                    style={{
+                      "--loopspace-node-x": `${nodeX}px`,
+                      "--loopspace-node-y": `${nodeY}px`,
+                    }}
+                  >
+                    <LoopspaceGraphNodeIcon>
+                      <Icon aria-hidden="true" />
+                    </LoopspaceGraphNodeIcon>
+                    <LoopspaceGraphNodeText>
+                      <strong>{trigger?.name || node.label}</strong>
+                      <span>
+                        {[
+                          node.triggerId ? loopspaceTriggerTypeLabel(trigger?.type || "manual") : (type || "Graph node"),
+                          isRuntimeNode ? (runtimeHead?.status || "active") : "",
+                        ].filter(Boolean).join(" - ")}
+                      </span>
+                    </LoopspaceGraphNodeText>
+                    {node.triggerId ? (
+                      <LoopspaceGraphNodeAction
+                        aria-label={`Remove ${trigger?.name || node.label} from loop graph`}
+                        disabled={busy}
+                        onClick={() => detachTriggerFromLoop({ id: node.triggerId, name: trigger?.name || node.label })}
+                        title="Remove from graph"
+                        type="button"
                       >
-                        <LoopspaceGraphNodeIcon>
-                          <Icon aria-hidden="true" />
-                        </LoopspaceGraphNodeIcon>
-                        <LoopspaceGraphNodeText>
-                          <strong>{trigger?.name || node.label}</strong>
-                          <span>
-                            {[
-                              node.triggerId ? loopspaceTriggerTypeLabel(trigger?.type || "manual") : (type || "Graph node"),
-                              isRuntimeNode ? (runtimeHead?.status || "active") : "",
-                            ].filter(Boolean).join(" - ")}
-                          </span>
-                        </LoopspaceGraphNodeText>
-                        {node.triggerId ? (
-                          <LoopspaceGraphNodeAction
-                            aria-label={`Remove ${trigger?.name || node.label} from loop graph`}
-                            disabled={busy}
-                            onClick={() => detachTriggerFromLoop({ id: node.triggerId, name: trigger?.name || node.label })}
-                            title="Remove from graph"
-                            type="button"
-                          >
-                            <ButtonCloseIcon aria-hidden="true" />
-                          </LoopspaceGraphNodeAction>
-                        ) : <span />}
-                      </LoopspaceGraphNode>
-                    );
-                  })}
-                </LoopspaceGraphTriggerGrid>
-              ) : (
-                <LoopspaceGraphEmpty>
-                  <strong>Drop triggers here</strong>
-                  <span>Drag a reusable trigger from the Triggers tab into this graph.</span>
-                </LoopspaceGraphEmpty>
-              )}
+                        <ButtonCloseIcon aria-hidden="true" />
+                      </LoopspaceGraphNodeAction>
+                    ) : <span />}
+                  </LoopspaceGraphNode>
+                );
+              })}
             </LoopspaceGraphContent>
+            <LoopspaceGraphControls
+              aria-label="Graph zoom controls"
+              onPointerDown={(event) => event.stopPropagation()}
+              onWheel={(event) => event.stopPropagation()}
+            >
+              <LoopspaceGraphControlButton
+                aria-label="Zoom out"
+                disabled={canvasZoom <= LOOPSPACE_GRAPH_MIN_ZOOM}
+                onClick={() => zoomGraphBy(1 / LOOPSPACE_GRAPH_ZOOM_STEP)}
+                title="Zoom out"
+                type="button"
+              >
+                <span aria-hidden="true">-</span>
+              </LoopspaceGraphControlButton>
+              <LoopspaceGraphZoomReadout>{graphZoomPercent}%</LoopspaceGraphZoomReadout>
+              <LoopspaceGraphControlButton
+                aria-label="Zoom in"
+                disabled={canvasZoom >= LOOPSPACE_GRAPH_MAX_ZOOM}
+                onClick={() => zoomGraphBy(LOOPSPACE_GRAPH_ZOOM_STEP)}
+                title="Zoom in"
+                type="button"
+              >
+                <span aria-hidden="true">+</span>
+              </LoopspaceGraphControlButton>
+              <LoopspaceGraphControlButton
+                aria-label="Reset graph view"
+                onClick={resetGraphViewport}
+                title="Reset view"
+                type="button"
+              >
+                <ButtonRefreshIcon aria-hidden="true" />
+              </LoopspaceGraphControlButton>
+            </LoopspaceGraphControls>
+            <LoopspaceGraphNavHud
+              aria-label="Graph viewport"
+              onPointerDown={(event) => event.stopPropagation()}
+              onWheel={(event) => event.stopPropagation()}
+            >
+              <LoopspaceGraphNavMap>
+                <LoopspaceGraphNavOrigin />
+                <LoopspaceGraphNavViewport
+                  style={{
+                    "--loopspace-nav-x": `${graphNavX}px`,
+                    "--loopspace-nav-y": `${graphNavY}px`,
+                    "--loopspace-nav-scale": Math.max(0.46, Math.min(1.1, 1 / canvasZoom)),
+                  }}
+                />
+              </LoopspaceGraphNavMap>
+              <LoopspaceGraphNavStats>
+                <strong>{graphZoomPercent}%</strong>
+                <span>{Math.round(canvasPan.x)} / {Math.round(canvasPan.y)}</span>
+              </LoopspaceGraphNavStats>
+            </LoopspaceGraphNavHud>
           </LoopspaceGraphCanvas>
         ) : (
           <LoopspaceLogsList aria-label={`${loopspace?.name || "Loop"} logs`}>
@@ -5659,13 +5964,45 @@ function appScriptTitle(script) {
 function appScriptButtonRow(script = {}) {
   const pathKey = appScriptPathKey(script);
   const fileName = appScriptFileName({ ...script, pathKey });
+  const workspaceButtonColor = appScriptText(
+    script.workspaceButtonColor || script.workspace_button_color,
+    APP_SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+  );
+  const loopspaceButtonColor = appScriptText(
+    script.loopspaceButtonColor || script.loopspace_button_color,
+    APP_SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+  );
+  const workspaceTextColor = appScriptText(
+    script.workspaceTextColor || script.workspace_text_color,
+    APP_SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
+  );
+  const loopspaceTextColor = appScriptText(
+    script.loopspaceTextColor || script.loopspace_text_color,
+    APP_SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR,
+  );
   return {
-    buttonColor: appScriptText(script.buttonColor || script.button_color, APP_SCRIPT_DEFAULT_BUTTON_COLOR),
     fileName,
     id: appScriptText(script.id, pathKey || fileName),
+    loopspaceButtonColor,
+    loopspaceTextColor,
     pathKey: pathKey || fileName,
-    textColor: appScriptText(script.textColor || script.text_color, APP_SCRIPT_DEFAULT_TEXT_COLOR),
     title: appScriptTitle({ ...script, fileName }),
+    workspaceButtonColor,
+    workspaceTextColor,
+  };
+}
+
+function appScriptColorsForSpace(script = {}, spaceMode = APP_SPACE_MODE_WORKSPACES) {
+  const useLoopspaceColors = spaceMode === APP_SPACE_MODE_LOOPSPACES;
+  return {
+    buttonColor: appScriptText(
+      useLoopspaceColors ? script.loopspaceButtonColor || script.loopspace_button_color : script.workspaceButtonColor || script.workspace_button_color,
+      useLoopspaceColors ? APP_SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR : APP_SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+    ),
+    textColor: appScriptText(
+      useLoopspaceColors ? script.loopspaceTextColor || script.loopspace_text_color : script.workspaceTextColor || script.workspace_text_color,
+      useLoopspaceColors ? APP_SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR : APP_SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
+    ),
   };
 }
 
@@ -10592,6 +10929,7 @@ export default function App() {
   const workspaceToolLayoutRef = useRef(null);
   const workspaceToolPanelRef = useRef(null);
   const workspaceToolMainPanelRef = useRef(null);
+  const appScriptsShelfRef = useRef(null);
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
@@ -10643,9 +10981,12 @@ export default function App() {
   const startupAgentFlowIdRef = useRef(0);
   const startupAgentSettingsPendingRef = useRef(false);
   const audioAutoOpenStartupKeyRef = useRef("");
+  const spaceModeRef = useRef(spaceMode);
   const selectedWorkspaceIdRef = useRef("");
+  const selectedLoopspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
   const workspacePendingActivationIdRef = useRef("");
+  const loopspacesRef = useRef(loopspaces);
   const workspaceGraphStateRef = useRef(workspaceGraphState);
   const workspaceArchitectureScanInFlightRef = useRef(new Set());
   const workspaceArchitectureGraphListInFlightRef = useRef(new Set());
@@ -10911,6 +11252,24 @@ export default function App() {
       appScriptRunInFlightRef.current = false;
     }
   }, [appScriptRunResults, defaultWorkingDirectory, focusAppScriptLogs]);
+
+  // Let a two-finger trackpad gesture (or mouse wheel) scroll the script
+  // shelf horizontally even when the gesture is mostly vertical. The listener
+  // must be non-passive so we can preventDefault and keep the page still.
+  useEffect(() => {
+    const shelf = appScriptsShelfRef.current;
+    if (!shelf) return undefined;
+    const onWheel = (event) => {
+      if (shelf.scrollWidth <= shelf.clientWidth) return;
+      const horizontalIntent = Math.abs(event.deltaX) >= Math.abs(event.deltaY);
+      const delta = horizontalIntent ? event.deltaX : event.deltaY;
+      if (delta === 0) return;
+      shelf.scrollLeft += delta;
+      event.preventDefault();
+    };
+    shelf.addEventListener("wheel", onWheel, { passive: false });
+    return () => shelf.removeEventListener("wheel", onWheel);
+  }, [appScriptsLibrary.scripts.length]);
 
   useEffect(() => {
     let disposed = false;
@@ -12850,6 +13209,18 @@ export default function App() {
   }, [selectedWorkspaceId]);
 
   useEffect(() => {
+    spaceModeRef.current = spaceMode;
+  }, [spaceMode]);
+
+  useEffect(() => {
+    loopspacesRef.current = loopspaces;
+  }, [loopspaces]);
+
+  useEffect(() => {
+    selectedLoopspaceIdRef.current = selectedLoopspaceId;
+  }, [selectedLoopspaceId]);
+
+  useEffect(() => {
     workspaceGraphStateRef.current = workspaceGraphState;
   }, [workspaceGraphState]);
 
@@ -13688,12 +14059,16 @@ export default function App() {
   const selectedLoopspace = findLoopspaceById(loopspaces, selectedLoopspaceId);
   const applyLoopspaceSnapshot = useCallback((value) => {
     const nextLoopspaces = normalizeLoopspaces(value);
+    loopspacesRef.current = nextLoopspaces;
     setLoopspaces(nextLoopspaces);
     setSelectedLoopspaceId((currentId) => {
       if (!currentId) {
+        selectedLoopspaceIdRef.current = "";
         return "";
       }
-      return nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : "";
+      const nextId = nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : "";
+      selectedLoopspaceIdRef.current = nextId;
+      return nextId;
     });
     setLoopspaceSettingsMenuId((currentId) => (
       currentId && nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : ""
@@ -14372,6 +14747,7 @@ export default function App() {
     setSelectedWorkspaceId("");
     setWorkspaceSettingsModalId("");
     if (spaceMode === APP_SPACE_MODE_LOOPSPACES) {
+      selectedLoopspaceIdRef.current = "";
       setSelectedLoopspaceId("");
     }
     if (DEVICE_LEVEL_APP_VIEW_IDS.has(activeViewRef.current) || DEVICE_LEVEL_APP_VIEW_IDS.has(visibleViewRef.current)) {
@@ -14856,6 +15232,8 @@ export default function App() {
 
     setSelectedWorkspaceId(workspace.id);
     selectedWorkspaceIdRef.current = workspace.id;
+    selectedLoopspaceIdRef.current = "";
+    spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
@@ -14954,6 +15332,8 @@ export default function App() {
     setWorkspacePendingActivationId("");
     workspacePendingActivationIdRef.current = "";
     selectedWorkspaceIdRef.current = workspace.id;
+    selectedLoopspaceIdRef.current = "";
+    spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
     setSelectedWorkspaceId(workspace.id);
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
@@ -14983,6 +15363,7 @@ export default function App() {
     cancelDeferredWorkspaceActivation();
     selectedWorkspaceIdRef.current = "";
     workspacePendingActivationIdRef.current = "";
+    spaceModeRef.current = APP_SPACE_MODE_LOOPSPACES;
     setSelectedWorkspaceId("");
     setWorkspacePendingActivationId("");
     setWorkspaceSettingsModalId("");
@@ -14999,6 +15380,8 @@ export default function App() {
   }, [cancelDeferredWorkspaceActivation, showView]);
 
   const exitLoopspacesMode = useCallback((source = "workspace_rail_title") => {
+    spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
+    selectedLoopspaceIdRef.current = "";
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
@@ -15027,6 +15410,8 @@ export default function App() {
     cancelDeferredWorkspaceActivation();
     selectedWorkspaceIdRef.current = "";
     workspacePendingActivationIdRef.current = "";
+    selectedLoopspaceIdRef.current = loopspace.id;
+    spaceModeRef.current = APP_SPACE_MODE_LOOPSPACES;
     setSelectedWorkspaceId("");
     setWorkspacePendingActivationId("");
     setWorkspaceSettingsModalId("");
@@ -15648,6 +16033,8 @@ export default function App() {
         workspaces: nextCatalog,
       });
 
+      selectedLoopspaceIdRef.current = "";
+      spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
       setSpaceMode(APP_SPACE_MODE_WORKSPACES);
       setSelectedLoopspaceId("");
       setLoopspaceCreatePanelOpen(false);
@@ -16556,6 +16943,8 @@ export default function App() {
   }, [activeAccountScopeKey, authState, loadWorkspaces]);
 
   const openCreateWorkspaceModal = useCallback(() => {
+    spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
+    selectedLoopspaceIdRef.current = "";
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
@@ -16573,6 +16962,7 @@ export default function App() {
 
   const openCreateLoopspacePanel = useCallback(() => {
     enterLoopspacesMode("loopspace_create_panel");
+    selectedLoopspaceIdRef.current = "";
     setLoopspaceName("");
     setLoopspaceError("");
     setLoopspaceState("idle");
@@ -16609,6 +16999,7 @@ export default function App() {
         setLoopspaceError(syncError
           ? `Loop create was queued for retry. ${syncError}`
           : "Loop create was queued for retry and will appear after Cloud confirms it.");
+        spaceModeRef.current = APP_SPACE_MODE_LOOPSPACES;
         setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
         return;
       }
@@ -16618,15 +17009,18 @@ export default function App() {
       if (!changedLoopspace?.id) {
         setLoopspaceState("idle");
         setLoopspaceError("Cloud did not confirm the created loop. Please try again.");
+        spaceModeRef.current = APP_SPACE_MODE_LOOPSPACES;
         setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
         return;
       }
       if (changedLoopspace?.id) {
+        selectedLoopspaceIdRef.current = changedLoopspace.id;
         setSelectedLoopspaceId(changedLoopspace.id);
       }
       setLoopspaceName("");
       setLoopspaceCreatePanelOpen(false);
       setLoopspaceState("idle");
+      spaceModeRef.current = APP_SPACE_MODE_LOOPSPACES;
       setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
       showView(DEFAULT_WORKSPACE_VIEW, {
         immediate: true,
@@ -16639,6 +17033,7 @@ export default function App() {
   }, [applyLoopspaceSnapshot, loopspaceName, showView]);
 
   const unselectLoopspace = useCallback(() => {
+    selectedLoopspaceIdRef.current = "";
     setSelectedLoopspaceId("");
     setLoopspaceError("");
     setLoopspaceActionState("idle");
@@ -16690,6 +17085,7 @@ export default function App() {
         loopspaceId: selectedLoopspace.id,
       });
       applyLoopspaceSnapshot(result);
+      selectedLoopspaceIdRef.current = "";
       setSelectedLoopspaceId("");
       setLoopspaceActionState("idle");
     } catch (error) {
@@ -16748,6 +17144,7 @@ export default function App() {
       });
       applyLoopspaceSnapshot(result);
       if (selectedLoopspaceId === loopspace.id) {
+        selectedLoopspaceIdRef.current = "";
         setSelectedLoopspaceId("");
       }
       setLoopspaceActionState("idle");
@@ -16887,6 +17284,8 @@ export default function App() {
       setWorkspaceCatalog(nextCatalog);
       workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
+      selectedLoopspaceIdRef.current = "";
+      spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
       setSpaceMode(APP_SPACE_MODE_WORKSPACES);
       setSelectedLoopspaceId("");
       setLoopspaceCreatePanelOpen(false);
@@ -16930,6 +17329,8 @@ export default function App() {
   ]);
 
   const openWorkspaceSettings = useCallback((workspaceId) => {
+    selectedLoopspaceIdRef.current = "";
+    spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
@@ -26504,51 +26905,63 @@ export default function App() {
         source: "draft_snapshot",
       };
     };
-    const buildAppControlState = () => ({
-      activeView,
-      visibleContext: buildAppControlVisibleContext(),
-      visibleView,
-      spaceMode,
-      selectedLoopspace: selectedLoopspace ? {
-        id: selectedLoopspace.id,
-        name: selectedLoopspace.name,
-      } : null,
-      loopspaces: loopspaces.map((loopspace) => ({
-        id: loopspace.id,
-        name: loopspace.name,
-      })),
-      selectedWorkspace: selectedWorkspace ? workspaceSummary(selectedWorkspace) : null,
-      activatedWorkspace: activatedWorkspace ? workspaceSummary(activatedWorkspace) : null,
-      workspaces: workspaces.map(workspaceSummary),
-      availableTabs: [
-        "terminals",
-        "files",
-        "history",
-        "tools",
-        "architectures",
-        "mcps",
-        "clis",
-        "scripts",
-        "assets",
-        "audio",
-        "tokenomics",
-        "snipping",
-        "settings",
-      ],
-    });
+    const currentLoopspaceStateForAppControl = () => {
+      const currentLoopspaces = Array.isArray(loopspacesRef.current) ? loopspacesRef.current : [];
+      const currentSelectedLoopspace = findLoopspaceById(
+        currentLoopspaces,
+        selectedLoopspaceIdRef.current,
+      );
+      return { currentLoopspaces, currentSelectedLoopspace };
+    };
+    const buildAppControlState = () => {
+      const { currentLoopspaces, currentSelectedLoopspace } = currentLoopspaceStateForAppControl();
+      return {
+        activeView: activeViewRef.current || activeView,
+        visibleContext: buildAppControlVisibleContext(),
+        visibleView: visibleViewRef.current || visibleView,
+        spaceMode: spaceModeRef.current || spaceMode,
+        selectedLoopspace: currentSelectedLoopspace ? {
+          id: currentSelectedLoopspace.id,
+          name: currentSelectedLoopspace.name,
+        } : null,
+        loopspaces: currentLoopspaces.map((loopspace) => ({
+          id: loopspace.id,
+          name: loopspace.name,
+        })),
+        selectedWorkspace: selectedWorkspace ? workspaceSummary(selectedWorkspace) : null,
+        activatedWorkspace: activatedWorkspace ? workspaceSummary(activatedWorkspace) : null,
+        workspaces: workspaces.map(workspaceSummary),
+        availableTabs: [
+          "terminals",
+          "files",
+          "history",
+          "tools",
+          "architectures",
+          "mcps",
+          "clis",
+          "scripts",
+          "assets",
+          "audio",
+          "tokenomics",
+          "snipping",
+          "settings",
+        ],
+      };
+    };
     const resolveLoopspaceForAppControl = (inputValue = {}) => {
       const loopspaceId = appControlText(inputValue, ["loopspaceId", "loopspace_id", "id"]);
       const loopspaceName = appControlText(inputValue, ["loopspaceName", "loopspace_name", "name"]);
+      const { currentLoopspaces, currentSelectedLoopspace } = currentLoopspaceStateForAppControl();
       if (loopspaceId) {
-        return loopspaces.find((loopspace) => loopspace.id === loopspaceId) || null;
+        return currentLoopspaces.find((loopspace) => loopspace.id === loopspaceId) || null;
       }
       if (loopspaceName) {
         const normalizedName = loopspaceName.toLowerCase();
-        return loopspaces.find((loopspace) => loopspace.name.toLowerCase() === normalizedName)
-          || loopspaces.find((loopspace) => loopspace.id === loopspaceName)
+        return currentLoopspaces.find((loopspace) => loopspace.name.toLowerCase() === normalizedName)
+          || currentLoopspaces.find((loopspace) => loopspace.id === loopspaceName)
           || null;
       }
-      return selectedLoopspace || null;
+      return currentSelectedLoopspace || null;
     };
     const handleAppControlRequest = async (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
@@ -32164,6 +32577,7 @@ export default function App() {
                     minSize={`${workspaceMainPanelMinSize}%`}
                     ref={workspaceToolMainPanelRef}
                   >
+              <WorkspaceMainColumn>
               <WorkspaceViewStack>
                 <WorkspaceViewPane
                   aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
@@ -33777,6 +34191,38 @@ export default function App() {
                   </WorkspaceGitPullOverlay>
                 )}
               </WorkspaceViewStack>
+                {appScriptsLibrary.scripts.length > 0 && (
+                  <AppGlobalScriptsShelf
+                    aria-label="Local script run buttons"
+                    ref={appScriptsShelfRef}
+                  >
+                    {appScriptsLibrary.scripts.map((script) => {
+                      const pathKey = appScriptPathKey(script);
+                      const runState = appScriptRunResults[pathKey]?.state || "";
+                      const running = runState === "running";
+                      const scriptColors = appScriptColorsForSpace(script, spaceMode);
+                      return (
+                        <AppGlobalScriptButton
+                          aria-busy={running ? "true" : "false"}
+                          data-running={running ? "true" : "false"}
+                          disabled={appScriptsState === "running" && !running}
+                          key={pathKey}
+                          onClick={() => void runAppScript(script)}
+                          style={{
+                            "--script-button-bg": scriptColors.buttonColor,
+                            "--script-button-color": scriptColors.textColor,
+                          }}
+                          title={running ? `Open ${appScriptTitle(script)} logs` : `Run ${appScriptTitle(script)}`}
+                          type="button"
+                        >
+                          {running && <PendingIcon aria-hidden="true" />}
+                          <span>{appScriptTitle(script)}</span>
+                        </AppGlobalScriptButton>
+                      );
+                    })}
+                  </AppGlobalScriptsShelf>
+                )}
+              </WorkspaceMainColumn>
                   </ResizePanel>
                   <>
                     {workspaceToolPaneVisible && (
@@ -33869,33 +34315,6 @@ export default function App() {
                       </ResizePanel>
                   </>
                 </ResizePanelGroup>
-                {appScriptsLibrary.scripts.length > 0 && (
-                  <AppGlobalScriptsShelf aria-label="Local script run buttons">
-                    {appScriptsLibrary.scripts.map((script) => {
-                      const pathKey = appScriptPathKey(script);
-                      const runState = appScriptRunResults[pathKey]?.state || "";
-                      const running = runState === "running";
-                      return (
-                        <AppGlobalScriptButton
-                          aria-busy={running ? "true" : "false"}
-                          data-running={running ? "true" : "false"}
-                          disabled={appScriptsState === "running" && !running}
-                          key={pathKey}
-                          onClick={() => void runAppScript(script)}
-                          style={{
-                            "--script-button-bg": appScriptText(script.buttonColor, APP_SCRIPT_DEFAULT_BUTTON_COLOR),
-                            "--script-button-color": appScriptText(script.textColor, APP_SCRIPT_DEFAULT_TEXT_COLOR),
-                          }}
-                          title={running ? `Open ${appScriptTitle(script)} logs` : `Run ${appScriptTitle(script)}`}
-                          type="button"
-                        >
-                          {running && <PendingIcon aria-hidden="true" />}
-                          <span>{appScriptTitle(script)}</span>
-                        </AppGlobalScriptButton>
-                      );
-                    })}
-                  </AppGlobalScriptsShelf>
-                )}
               </WorkspaceAppToolLayout>
               </DashboardShell>
               {networkingOverlayOpen && (

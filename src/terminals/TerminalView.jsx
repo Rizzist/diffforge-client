@@ -5550,6 +5550,21 @@ const LoopspaceTriggerIconButton = styled.button`
   }
 `;
 
+const LoopspaceTriggerSpinner = styled.span`
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(232, 238, 248, 0.24);
+  border-top-color: rgba(var(--forge-accent-rgb), 0.92);
+  border-radius: 999px;
+  animation: ${orchestratorHistorySpinner} 760ms linear infinite;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(26, 28, 33, 0.16);
+    border-top-color: rgba(var(--forge-accent-rgb), 0.9);
+  }
+`;
+
 const LoopspaceTriggerPrimaryButton = styled(LoopspaceTriggerIconButton)`
   width: auto;
   min-width: 76px;
@@ -6095,6 +6110,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     event.dataTransfer.setData("text/plain", trigger.id);
   }, []);
 
+  const triggersBusy = state === "loading" || state === "saving";
+
   return (
     <LoopspaceTriggersView>
       <LoopspaceTriggersHeader>
@@ -6108,12 +6125,16 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
         </div>
         <LoopspaceTriggerIconButton
           aria-label="Sync triggers"
-          disabled={state === "loading" || state === "saving"}
+          disabled={triggersBusy}
           onClick={() => syncTriggers(true)}
           title="Sync"
           type="button"
         >
-          <ButtonRefreshIcon aria-hidden="true" />
+          {triggersBusy ? (
+            <LoopspaceTriggerSpinner aria-label="Syncing triggers" role="status" />
+          ) : (
+            <ButtonRefreshIcon aria-hidden="true" />
+          )}
         </LoopspaceTriggerIconButton>
       </LoopspaceTriggersHeader>
       <LoopspaceTriggersScroll>
