@@ -597,6 +597,15 @@ import {
 } from "./appStyles";
 import { PlanFlame } from "./PlanFlame.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
+import {
+  documentExtensionForKind,
+  normalizedDocumentCollection,
+  normalizedDocumentKind,
+  normalizedDocumentPath,
+} from "../tools/skillsLibrary.js";
+import {
+  setWorkspaceToolsDocumentDraft,
+} from "../tools/workspaceToolsStore.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
@@ -700,6 +709,11 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 ]);
 const APP_CONTROL_MCP_REQUEST_EVENT = "forge-app-control-mcp-request";
 const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
+const DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_IDS = new Set([
+  "__diffforge_app_control__",
+  "diffforge_app_control",
+]);
+const DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID = "forge-app-control-agent-terminal";
 const WORKSPACE_TOOL_VISIBLE_MIN_WIDTH = 760;
 const WORKSPACE_TOOL_MINIMIZED_WIDTH_PX = 34;
 const WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX = 300;
@@ -1792,6 +1806,27 @@ function workspaceThreadProjectionHash(value) {
   }
 
   return (hash >>> 0).toString(36);
+}
+
+function documentDraftFingerprint(value) {
+  const text = String(value ?? "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}:${text.length}`;
+}
+
+function documentDraftFallbackFileName(title, extension) {
+  const stem = String(title || "untitled")
+    .trim()
+    .replace(/\.(?:md|markdown|arch)$/iu, "")
+    .replace(/[^A-Za-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "")
+    .slice(0, 80)
+    || "untitled";
+  return `${stem}.${String(extension || "md").replace(/^\./u, "") || "md"}`;
 }
 
 function workspaceThreadProjectionIdPart(value, fallback = "event") {
@@ -6612,8 +6647,26 @@ function normalizeTerminalLiveSessionsPayload(payload) {
         if (!session || typeof session !== "object") {
           return null;
         }
-        const paneId = cleanAppCloseText(session.paneId || session.pane_id);
-        const instanceId = normalizeCloseCount(session.instanceId || session.instance_id);
+        const rawPaneId = cleanAppCloseText(session.paneId || session.pane_id);
+        const rawTerminalId = cleanAppCloseText(
+          session.terminalId
+            || session.terminal_id
+            || session.targetTerminalId
+            || session.target_terminal_id,
+        );
+        const paneId = rawPaneId || rawTerminalId;
+        const terminalId = rawTerminalId || paneId;
+        const targetTerminalId = cleanAppCloseText(
+          session.targetTerminalId
+            || session.target_terminal_id
+            || terminalId,
+        );
+        const instanceId = normalizeCloseCount(
+          session.instanceId
+            || session.instance_id
+            || session.terminalInstanceId
+            || session.terminal_instance_id,
+        );
         if (!paneId || !instanceId) {
           return null;
         }
@@ -6661,6 +6714,14 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           session.terminalLifecycle || session.terminal_lifecycle,
           terminalStatus === "closed" ? "closed" : "open",
         );
+        const providerSessionId = cleanAppCloseText(
+          session.providerSessionId
+            || session.provider_session_id
+            || session.nativeSessionId
+            || session.native_session_id
+            || session.sessionId
+            || session.session_id,
+        );
         const sessionAgentId = cleanAppCloseText(
           session.agentId || session.agent_id || session.agentKind || session.agent_kind,
         );
@@ -6697,17 +6758,34 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           paneId,
           parked: session.parked === true || Boolean(parkedPrompt),
           parkedPrompt,
+          providerSessionId,
+          provider_session_id: providerSessionId,
           readiness,
           runtimeUpdatedAtMs: normalizeCloseCount(session.runtimeUpdatedAtMs || session.runtime_updated_at_ms),
+          sessionId: providerSessionId,
+          session_id: providerSessionId,
           sessionMode: cleanAppCloseText(session.sessionMode || session.session_mode),
           sessionState: cleanAppCloseText(session.sessionState || session.session_state),
           status: terminalStatus,
+          surfaceKind: cleanAppCloseText(session.surfaceKind || session.surface_kind),
+          targetTerminalId,
+          target_terminal_id: targetTerminalId,
+          terminalId,
+          terminal_id: terminalId,
           terminalIndex: normalizeAppCloseTerminalIndex(session.terminalIndex ?? session.terminal_index),
+          terminalInstanceId: instanceId,
+          terminal_instance_id: instanceId,
+          terminalKind: cleanAppCloseText(session.terminalKind || session.terminal_kind),
+          terminal_kind: cleanAppCloseText(session.terminalKind || session.terminal_kind),
           terminalLifecycle,
           terminalName,
           terminalNickname,
+          terminalScope: cleanAppCloseText(session.terminalScope || session.terminal_scope),
+          terminal_scope: cleanAppCloseText(session.terminalScope || session.terminal_scope),
           terminalStatus,
           terminalWorkState: cleanAppCloseText(session.terminalWorkState || session.terminal_work_state),
+          workspaceScoped: session.workspaceScoped === false || session.workspace_scoped === false ? false : undefined,
+          workspace_scoped: session.workspaceScoped === false || session.workspace_scoped === false ? false : undefined,
           threadId: cleanAppCloseText(session.threadId || session.thread_id),
           turnId: cleanAppCloseText(session.turnId || session.turn_id || session.providerTurnId || session.provider_turn_id),
           turnStatus,
@@ -6742,6 +6820,9 @@ function buildRustTerminalAuthorityWorkspaces({
   const grouped = new Map();
 
   liveSnapshot.sessions.forEach((session) => {
+    if (isDeviceTerminalOrchestratorSession(session)) {
+      return;
+    }
     const workspaceId = session.workspaceId;
     if (!workspaceId) {
       return;
@@ -6925,6 +7006,170 @@ function buildRustTerminalAuthorityWorkspaces({
       Number(left.terminalIndex ?? 9999) - Number(right.terminalIndex ?? 9999)
     )),
   }));
+}
+
+function isDeviceTerminalOrchestratorWorkspaceId(value) {
+  return DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_IDS.has(String(value || "").trim().toLowerCase());
+}
+
+function isDeviceTerminalOrchestratorSession(session = {}) {
+  const terminalScope = String(session.terminalScope || session.terminal_scope || "").trim().toLowerCase();
+  if (terminalScope === "device") {
+    return true;
+  }
+  if (session.workspaceScoped === false || session.workspace_scoped === false) {
+    return true;
+  }
+  const terminalKind = String(
+    session.terminalKind
+      || session.terminal_kind
+      || session.surfaceKind
+      || session.surface_kind
+      || "",
+  ).trim().toLowerCase();
+  if (["terminal_orchestrator", "device_terminal_orchestrator", "app_control_orchestrator"].includes(terminalKind)) {
+    return true;
+  }
+  const workspaceId = String(session.workspaceId || session.workspace_id || "").trim();
+  if (isDeviceTerminalOrchestratorWorkspaceId(workspaceId)) {
+    return true;
+  }
+  const paneId = String(
+    session.paneId
+      || session.pane_id
+      || session.terminalId
+      || session.terminal_id
+      || session.targetTerminalId
+      || session.target_terminal_id
+      || "",
+  ).trim();
+  return paneId.toLowerCase() === DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID.toLowerCase();
+}
+
+function buildRustTerminalAuthorityTerminalOrchestrators(payload) {
+  const liveSnapshot = normalizeTerminalLiveSessionsPayload(payload);
+  return liveSnapshot.sessions
+    .filter(isDeviceTerminalOrchestratorSession)
+    .sort((left, right) => (
+      Number(left.terminalIndex ?? left.terminal_index ?? 0)
+        - Number(right.terminalIndex ?? right.terminal_index ?? 0)
+    ))
+    .map((session, index) => {
+      const terminalIndex = Number(session.terminalIndex ?? session.terminal_index ?? index);
+      const safeIndex = Number.isInteger(terminalIndex) && terminalIndex >= 0 ? terminalIndex : index;
+      const paneId = String(
+        session.paneId
+          || session.pane_id
+          || session.terminalId
+          || session.terminal_id
+          || session.targetTerminalId
+          || session.target_terminal_id
+          || `device-terminal-orchestrator-${safeIndex + 1}`,
+      ).trim();
+      const terminalId = String(
+        session.terminalId
+          || session.terminal_id
+          || session.targetTerminalId
+          || session.target_terminal_id
+          || paneId,
+      ).trim();
+      const targetTerminalId = String(
+        session.targetTerminalId
+          || session.target_terminal_id
+          || terminalId,
+      ).trim();
+      const terminalInstanceId = session.terminalInstanceId
+        || session.terminal_instance_id
+        || session.instanceId
+        || session.instance_id
+        || "";
+      const agentId = normalizeWorkspaceLiveTerminalAgentId(session.agentId || session.agentKind) || WORKSPACE_TERMINAL_ROLE_GENERIC;
+      const terminalStatus = normalizeTerminalNativeRailState(session.terminalStatus || session.status, "idle");
+      const nativeRailState = normalizeTerminalNativeRailState(
+        session.nativeRailState,
+        terminalRailStateFromActivityStatus(session.activityStatus || terminalStatus, terminalStatus),
+      );
+      const nativeRailFields = getTerminalNativeRailStateFields(
+        nativeRailState,
+        session.nativeRailLabel || "",
+      );
+      const readiness = normalizeTerminalNativeRailState(
+        session.readiness,
+        terminalReadinessFromPresenceStatus(terminalStatus || nativeRailState),
+      );
+      const displayName = String(index + 1);
+      const providerSessionId = String(
+        session.providerSessionId
+          || session.provider_session_id
+          || session.nativeSessionId
+          || session.native_session_id
+          || session.sessionId
+          || session.session_id
+          || "",
+      ).trim();
+      return {
+        agentId,
+        agentKind: agentId,
+        agentLabel: agentId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(agentId),
+        activityStatus: nativeRailState,
+        activity_status: nativeRailState,
+        commandPhase: session.commandPhase || "",
+        command_phase: session.commandPhase || "",
+        commandable: true,
+        connected: true,
+        displayName,
+        display_name: displayName,
+        displayStatus: nativeRailFields.nativeRailLabel,
+        display_status: nativeRailFields.nativeRailLabel,
+        executionPhase: session.executionPhase || "",
+        execution_phase: session.executionPhase || "",
+        index: safeIndex,
+        inputReady: session.inputReady === true || readiness === "ready",
+        input_ready: session.inputReady === true || readiness === "ready",
+        nativeConnected: true,
+        native_connected: true,
+        ...nativeRailFields,
+        paneId,
+        pane_id: paneId,
+        providerSessionId,
+        provider_session_id: providerSessionId,
+        readiness,
+        sessionId: providerSessionId,
+        session_id: providerSessionId,
+        sessionState: session.sessionState || "session_attached",
+        session_state: session.sessionState || "session_attached",
+        status: terminalStatus,
+        targetTerminalId,
+        target_terminal_id: targetTerminalId,
+        terminalId,
+        terminal_id: terminalId,
+        terminalIndex: safeIndex,
+        terminal_index: safeIndex,
+        terminalInstanceId,
+        terminal_instance_id: terminalInstanceId,
+        terminalKind: "terminal_orchestrator",
+        terminal_kind: "terminal_orchestrator",
+        terminalLifecycle: session.terminalLifecycle || "open",
+        terminal_lifecycle: session.terminalLifecycle || "open",
+        terminalName: displayName,
+        terminal_name: displayName,
+        terminalNickname: displayName,
+        terminal_nickname: displayName,
+        terminalScope: "device",
+        terminal_scope: "device",
+        terminalStatus,
+        terminal_status: terminalStatus,
+        terminalWorkState: session.terminalWorkState || "",
+        terminal_work_state: session.terminalWorkState || "",
+        turnId: session.turnId || "",
+        turnStatus: session.turnStatus || "",
+        turn_status: session.turnStatus || "",
+        updatedAtMs: session.runtimeUpdatedAtMs || liveSnapshot.generatedAtMs || Date.now(),
+        updated_at_ms: session.runtimeUpdatedAtMs || liveSnapshot.generatedAtMs || Date.now(),
+        workspaceScoped: false,
+        workspace_scoped: false,
+      };
+    });
 }
 
 function appCloseTerminalRiskLabel(risk) {
@@ -8286,6 +8531,19 @@ function normalizeLoopspaces(value) {
     });
 }
 
+function loopspaceSnapshotQueued(value) {
+  return [value, value?.sync, value?.response, value?.payload, value?.data]
+    .filter(Boolean)
+    .some((candidate) => Boolean(candidate?.queued || candidate?.durable));
+}
+
+function loopspaceSnapshotSyncError(value) {
+  const candidate = [value, value?.sync, value?.response, value?.payload, value?.data]
+    .filter(Boolean)
+    .find((item) => item?.syncError || item?.sync_error);
+  return String(candidate?.syncError || candidate?.sync_error || "").trim();
+}
+
 function readLoopspaces() {
   return [];
 }
@@ -9570,6 +9828,7 @@ export default function App() {
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const appControlVisibleContextRef = useRef(null);
+  const appControlDocumentContextSnapshotRef = useRef(null);
   const appControlDocumentSelectionSnapshotRef = useRef(null);
   const appControlDocumentActionsRef = useRef({});
   const mainWindowFocusedRef = useRef(mainWindowFocused);
@@ -9633,6 +9892,26 @@ export default function App() {
       ? context
       : null;
     appControlVisibleContextRef.current = safeContext;
+    if (safeContext?.surface === "tools" && safeContext.active !== false) {
+      if (safeContext.document) {
+        const capturedAtMs = Date.now();
+        let snapshot = null;
+        try {
+          snapshot = JSON.parse(JSON.stringify(safeContext));
+        } catch {
+          snapshot = {
+            ...safeContext,
+            document: { ...(safeContext.document || {}) },
+            highlightedRange: safeContext.highlightedRange ? { ...safeContext.highlightedRange } : null,
+          };
+        }
+        snapshot.documentContextCapturedAtMs = capturedAtMs;
+        appControlDocumentContextSnapshotRef.current = snapshot;
+      } else {
+        appControlDocumentContextSnapshotRef.current = null;
+        appControlDocumentSelectionSnapshotRef.current = null;
+      }
+    }
     if (
       safeContext?.surface === "tools"
       && safeContext?.document
@@ -15317,9 +15596,24 @@ export default function App() {
     try {
       const result = await invoke("cloud_mcp_create_loopspace", { name });
       const nextLoopspaces = applyLoopspaceSnapshot(result);
+      if (loopspaceSnapshotQueued(result)) {
+        const syncError = loopspaceSnapshotSyncError(result);
+        setLoopspaceState("idle");
+        setLoopspaceError(syncError
+          ? `Loop create was queued for retry. ${syncError}`
+          : "Loop create was queued for retry and will appear after Cloud confirms it.");
+        setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+        return;
+      }
       const changedLoopspace = normalizeLoopspaces(result?.response || result?.sync || result)[0]
         || nextLoopspaces.find((loopspace) => loopspace.name === name)
         || null;
+      if (!changedLoopspace?.id) {
+        setLoopspaceState("idle");
+        setLoopspaceError("Cloud did not confirm the created loop. Please try again.");
+        setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+        return;
+      }
       if (changedLoopspace?.id) {
         setSelectedLoopspaceId(changedLoopspace.id);
       }
@@ -18959,6 +19253,10 @@ export default function App() {
     workspaceThreads,
     workspaces,
   ]);
+  const rustTerminalAuthorityOrchestrators = useMemo(
+    () => buildRustTerminalAuthorityTerminalOrchestrators(rustTerminalAuthoritySnapshot),
+    [rustTerminalAuthoritySnapshot],
+  );
   const workspaceTerminalsWorkspaces = useMemo(() => {
     const rustAuthorityByWorkspaceId = new Map(
       rustTerminalAuthorityWorkspaces.map((workspace) => [
@@ -19540,8 +19838,11 @@ export default function App() {
     workspaces,
   ]);
   const workspaceCatalogSyncKey = useMemo(
-    () => JSON.stringify(workspaceCatalogSyncTargets),
-    [workspaceCatalogSyncTargets],
+    () => JSON.stringify({
+      terminalOrchestrators: rustTerminalAuthorityOrchestrators,
+      workspaces: workspaceCatalogSyncTargets,
+    }),
+    [rustTerminalAuthorityOrchestrators, workspaceCatalogSyncTargets],
   );
   const workspaceMcpSyncTargets = useMemo(
     () => workspaceCatalogSyncTargets
@@ -19598,6 +19899,8 @@ export default function App() {
       0,
     );
     workspaceTerminalsSyncPendingRef.current = {
+      terminalOrchestratorCount: rustTerminalAuthorityOrchestrators.length,
+      terminalOrchestrators: rustTerminalAuthorityOrchestrators,
       reason,
       syncKey,
       terminalCount,
@@ -19637,6 +19940,7 @@ export default function App() {
         }
       };
       invoke("cloud_mcp_sync_device_workspaces_snapshot", {
+        terminalOrchestrators: pending.terminalOrchestrators,
         workspaces: pending.workspaces,
         reason: pending.reason,
       })
@@ -19663,6 +19967,7 @@ export default function App() {
             storedWorkspaceCount,
             storedCount,
             terminalCount: pending.terminalCount,
+            terminalOrchestratorCount: pending.terminalOrchestratorCount,
             workspaceCount: pending.workspaceCount,
           });
         })
@@ -19682,6 +19987,7 @@ export default function App() {
             details: {
               reason: pending.reason,
               terminalCount: pending.terminalCount,
+              terminalOrchestratorCount: pending.terminalOrchestratorCount,
               workspaceCount: pending.workspaceCount,
             },
           });
@@ -19713,6 +20019,7 @@ export default function App() {
     workspaceListHydrated,
     workspaceState,
     cloudLiveSyncEpoch,
+    rustTerminalAuthorityOrchestrators,
     workspaceTerminalsLiveSyncRevision,
     workspaceSyncState,
   ]);
@@ -24738,6 +25045,29 @@ export default function App() {
       const document = context?.document || {};
       return String(document.documentKey || context?.selectedKey || document.id || "").trim();
     };
+    const getFreshAppControlDocumentContextSnapshot = (currentContext = null) => {
+      const snapshot = appControlDocumentContextSnapshotRef.current;
+      if (!snapshot?.document) {
+        return null;
+      }
+      if (currentContext?.document) {
+        const currentKey = appControlDocumentContextKey(currentContext);
+        const snapshotKey = appControlDocumentContextKey(snapshot);
+        if (currentKey && snapshotKey && currentKey !== snapshotKey) {
+          return null;
+        }
+        const currentFingerprint = String(currentContext.document?.draftFingerprint || "").trim();
+        const snapshotFingerprint = String(snapshot.document?.draftFingerprint || "").trim();
+        if (currentFingerprint && snapshotFingerprint && currentFingerprint !== snapshotFingerprint) {
+          return null;
+        }
+      }
+      return {
+        ...snapshot,
+        active: currentContext?.active ?? false,
+        restoredFromDocumentSnapshot: true,
+      };
+    };
     const getFreshAppControlDocumentSelectionSnapshot = (currentContext = null) => {
       const snapshot = appControlDocumentSelectionSnapshotRef.current;
       if (!snapshot?.document || snapshot?.highlightedRange?.active !== true) {
@@ -24791,6 +25121,9 @@ export default function App() {
       const snapshot = allowSelectionSnapshot
         ? getFreshAppControlDocumentSelectionSnapshot(context)
         : null;
+      const documentSnapshot = allowSelectionSnapshot
+        ? getFreshAppControlDocumentContextSnapshot(context)
+        : null;
       let contextPayload = activeContext ? { ...context } : null;
       if (
         contextPayload
@@ -24804,8 +25137,23 @@ export default function App() {
           selectionCapturedAtMs: snapshot.selectionCapturedAtMs,
         };
       }
+      if (!contextPayload && documentSnapshot) {
+        contextPayload = documentSnapshot;
+      }
       if (!contextPayload && snapshot) {
         contextPayload = snapshot;
+      }
+      if (
+        contextPayload
+        && !contextPayload.highlightedRange?.active
+        && snapshot
+      ) {
+        contextPayload = {
+          ...contextPayload,
+          highlightedRange: snapshot.highlightedRange,
+          restoredFromSelectionSnapshot: true,
+          selectionCapturedAtMs: snapshot.selectionCapturedAtMs,
+        };
       }
       if (contextPayload && !includeContent) {
         delete contextPayload.content;
@@ -24815,6 +25163,7 @@ export default function App() {
       return {
         active: Boolean(activeContext),
         activeView,
+        restoredFromDocumentSnapshot: Boolean(contextPayload?.restoredFromDocumentSnapshot),
         restoredFromSelectionSnapshot: Boolean(contextPayload?.restoredFromSelectionSnapshot),
         context: contextPayload,
         visibleView,
@@ -24827,6 +25176,158 @@ export default function App() {
         ...visibleContext,
         document: context.document || null,
         selection: context.highlightedRange || null,
+      };
+    };
+    const updateHiddenAppControlDocumentDraft = (input = {}) => {
+      const visibleContext = buildAppControlVisibleContext(
+        { includeContent: true, include_content: true },
+        { allowSelectionSnapshot: true },
+      );
+      const context = visibleContext.context || {};
+      const document = context.document || {};
+      const documentKey = String(document.documentKey || context.selectedKey || document.id || "").trim();
+      const syncStatus = String(document.syncStatus || document.sync_status || "").trim().toLowerCase();
+      const isDraft = Boolean(
+        document.isDraft === true
+        || document.draft === true
+        || syncStatus === "draft"
+        || documentKey.startsWith("draft:"),
+      );
+      if (!isDraft) {
+        return null;
+      }
+
+      const hasOwn = (key) => Object.prototype.hasOwnProperty.call(input, key);
+      const requestedMode = String(input.mode || input.saveMode || input.save_mode || input.action || "").trim().toLowerCase();
+      const wantsSave = input.save === true
+        || !["", "draft", "edit", "update", "none"].includes(requestedMode);
+      if (wantsSave) {
+        return {
+          ok: false,
+          error: {
+            code: "document_editor_required",
+            message: "Open the Tools document editor before saving this draft.",
+          },
+          context,
+          mode: "draft",
+          source: "draft_snapshot",
+        };
+      }
+
+      const existingContent = String(context.fullContent ?? context.draftContent ?? context.content ?? "");
+      const hasContentPatch = hasOwn("content_md") || hasOwn("content");
+      const content = hasOwn("content_md")
+        ? String(input.content_md ?? "")
+        : hasOwn("content")
+          ? String(input.content ?? "")
+          : existingContent;
+      const title = String(
+        input.title
+          || input.name
+          || document.title
+          || document.name
+          || document.id
+          || "Untitled document",
+      ).trim() || "Untitled document";
+      const documentKind = normalizedDocumentKind(
+        input.document_kind
+          || input.documentKind
+          || input.kind
+          || input.source
+          || document.kind
+          || document.source
+          || document.documentKind
+          || "document",
+        document.collection,
+      );
+      const extension = String(
+        input.extension
+          || input.ext
+          || document.extension
+          || document.ext
+          || documentExtensionForKind(documentKind),
+      ).trim().replace(/^\./u, "").toLowerCase() || documentExtensionForKind(documentKind);
+      const keyPath = documentKey.startsWith("draft:")
+        ? documentKey.slice("draft:".length)
+        : "";
+      const requestedFileName = normalizedDocumentPath(input.file_name || input.fileName).split("/").filter(Boolean).pop() || "";
+      const requestedFolderPath = normalizedDocumentPath(input.folder_path || input.folderPath);
+      const requestedFilePath = normalizedDocumentPath(input.file_path || input.filePath || input.path_key || input.pathKey);
+      let filePath = requestedFilePath
+        || normalizedDocumentPath(document.pathKey || document.path_key || document.filePath || document.file_path || keyPath);
+      const leafFromPath = filePath.split("/").filter(Boolean).pop() || "";
+      const fileName = requestedFileName
+        || normalizedDocumentPath(document.fileName || document.file_name).split("/").filter(Boolean).pop()
+        || leafFromPath
+        || documentDraftFallbackFileName(title, extension);
+      const folderPath = requestedFolderPath
+        || normalizedDocumentPath(document.folderPath || document.folder_path || document.folderId || document.folder_id)
+        || normalizedDocumentPath(filePath.split("/").slice(0, -1).join("/"));
+      if (!filePath) {
+        filePath = folderPath ? `${folderPath}/${fileName}` : fileName;
+      }
+      const parentPathKey = normalizedDocumentPath(folderPath || filePath.split("/").slice(0, -1).join("/"));
+      const nextDocumentKey = documentKey || `draft:${filePath}`;
+      const fingerprint = documentDraftFingerprint(content);
+      const previewMaxLength = 1400;
+      const contentPreview = content.length > previewMaxLength
+        ? content.slice(0, previewMaxLength)
+        : content;
+      const nextDocument = {
+        ...document,
+        collection: normalizedDocumentCollection(),
+        documentKey: nextDocumentKey,
+        draft: true,
+        draftFingerprint: fingerprint,
+        extension,
+        fileName,
+        filePath,
+        folderId: parentPathKey,
+        folderPath: parentPathKey,
+        id: String(document.id || nextDocumentKey).trim(),
+        isDraft: true,
+        kind: documentKind,
+        localPath: "",
+        parentPathKey,
+        pathKey: filePath,
+        pendingPush: false,
+        rowType: "document",
+        source: documentKind,
+        syncStatus: "draft",
+        title,
+      };
+      const nextContext = {
+        ...context,
+        active: false,
+        contentPreview,
+        contentPreviewTruncated: content.length > previewMaxLength,
+        dirty: true,
+        document: nextDocument,
+        draftContent: content,
+        fullContent: content,
+        highlightedRange: hasContentPatch ? null : context.highlightedRange,
+        restoredFromDocumentSnapshot: true,
+        selectedKey: String(context.selectedKey || "").trim(),
+      };
+      setWorkspaceToolsDocumentDraft({
+        ...nextDocument,
+        baseContent: String(context.document?.baseContent ?? ""),
+        baseTitle: String(context.document?.baseTitle || document.title || ""),
+        content,
+        selectedKey: nextContext.selectedKey,
+      });
+      appControlDocumentContextSnapshotRef.current = {
+        ...nextContext,
+        documentContextCapturedAtMs: Date.now(),
+      };
+      if (hasContentPatch) {
+        appControlDocumentSelectionSnapshotRef.current = null;
+      }
+      return {
+        ok: true,
+        context: nextContext,
+        mode: "draft",
+        source: "draft_snapshot",
       };
     };
     const buildAppControlState = () => ({
@@ -24934,6 +25435,18 @@ export default function App() {
         if (tool === "update_selected_document") {
           const actions = appControlDocumentActionsRef.current || {};
           if (typeof actions.updateSelectedDocument !== "function") {
+            const hiddenDraftResult = updateHiddenAppControlDocumentDraft(input);
+            if (hiddenDraftResult) {
+              sendAppControlReply(requestId, {
+                ok: hiddenDraftResult?.ok !== false,
+                ...(hiddenDraftResult?.ok === false && hiddenDraftResult?.error ? { error: hiddenDraftResult.error } : {}),
+                data: {
+                  result: hiddenDraftResult,
+                  state: buildAppControlState(),
+                },
+              });
+              return;
+            }
             sendAppControlReply(requestId, {
               ok: false,
               error: {

@@ -295,6 +295,7 @@ const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
 const TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT = "todo-store-cancel-requested";
 const TODO_DISPATCH_STARTUP_RECONCILE_TAURI_EVENT = "todo-dispatch-startup-reconcile";
+const CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT = "cloud-mcp-loopspace-triggers-updated";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const REMOTE_TODO_REQUEUE_EVENT = "diffforge:remote-todo-requeue";
 const REMOTE_TODO_UNQUEUE_EVENT = "diffforge:remote-todo-unqueue";
@@ -621,6 +622,132 @@ function getForgeSpaceMode() {
   }
 
   return document.documentElement?.dataset?.forgeSpace === "loopspaces" ? "loopspaces" : "workspaces";
+}
+
+function getLoopspaceTriggerPayload(value) {
+  const candidates = [
+    value?.payload,
+    value?.sync,
+    value?.response,
+    value?.data,
+    value?.event,
+    value,
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (
+      Array.isArray(candidate?.triggers)
+      || Array.isArray(candidate?.loopspace_triggers)
+      || Array.isArray(candidate?.loopspaceTriggers)
+      || Array.isArray(candidate?.runs)
+      || Array.isArray(candidate?.trigger_runs)
+      || Array.isArray(candidate?.triggerRuns)
+    ) {
+      return candidate;
+    }
+    if (candidate?.payload && candidate.payload !== candidate) {
+      const nested = getLoopspaceTriggerPayload(candidate.payload);
+      if (
+        Array.isArray(nested?.triggers)
+        || Array.isArray(nested?.loopspace_triggers)
+        || Array.isArray(nested?.loopspaceTriggers)
+        || Array.isArray(nested?.runs)
+        || Array.isArray(nested?.trigger_runs)
+        || Array.isArray(nested?.triggerRuns)
+      ) {
+        return nested;
+      }
+    }
+  }
+  return value || {};
+}
+
+function normalizeLoopspaceTriggerRows(value) {
+  const payload = getLoopspaceTriggerPayload(value);
+  const rows = payload?.triggers || payload?.loopspace_triggers || payload?.loopspaceTriggers || [];
+  return Array.isArray(rows)
+    ? rows.map((row) => {
+      const id = String(row?.id || row?.trigger_id || row?.triggerId || "").trim();
+      const config = row?.config && typeof row.config === "object" ? row.config : {};
+      const loopspaceIds = Array.isArray(row?.loopspaceIds)
+        ? row.loopspaceIds
+        : Array.isArray(row?.loopspace_ids)
+          ? row.loopspace_ids
+          : [];
+      return {
+        ...row,
+        id,
+        config,
+        enabled: row?.enabled !== false,
+        loopspaceIds: loopspaceIds.map((item) => String(item || "").trim()).filter(Boolean),
+        name: String(row?.name || id || "Trigger").trim(),
+        type: String(row?.type || row?.trigger_type || row?.triggerType || "cron").trim().toLowerCase(),
+        nextDueAtMs: Number(row?.nextDueAtMs || row?.next_due_at_ms || 0) || 0,
+        lastRunAtMs: Number(row?.lastRunAtMs || row?.last_run_at_ms || 0) || 0,
+        lastStatus: String(row?.lastStatus || row?.last_status || "").trim(),
+        webhookPath: String(row?.webhookPath || row?.webhook_path || config.webhookPath || config.webhook_path || "").trim(),
+      };
+    }).filter((row) => row.id)
+    : [];
+}
+
+function normalizeLoopspaceTriggerRuns(value) {
+  const payload = getLoopspaceTriggerPayload(value);
+  const rows = payload?.runs || payload?.trigger_runs || payload?.triggerRuns || [];
+  return Array.isArray(rows)
+    ? rows.map((row) => ({
+      ...row,
+      id: String(row?.id || row?.run_id || row?.runId || "").trim(),
+      status: String(row?.status || "").trim(),
+      triggerId: String(row?.triggerId || row?.trigger_id || "").trim(),
+      createdAtMs: Number(row?.createdAtMs || row?.created_at_ms || 0) || 0,
+    })).filter((row) => row.id)
+    : [];
+}
+
+function normalizeLoopspaceTriggerSnapshot(value) {
+  return {
+    runs: normalizeLoopspaceTriggerRuns(value),
+    triggers: normalizeLoopspaceTriggerRows(value),
+  };
+}
+
+function getLoopspaceListPayload(value) {
+  const candidates = [value?.payload, value?.sync, value?.response, value?.data, value].filter(Boolean);
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate?.loopspaces)) {
+      return candidate;
+    }
+    if (candidate?.payload && candidate.payload !== candidate) {
+      const nested = getLoopspaceListPayload(candidate.payload);
+      if (Array.isArray(nested?.loopspaces)) return nested;
+    }
+  }
+  return value || {};
+}
+
+function normalizeLoopspaceRows(value) {
+  const payload = getLoopspaceListPayload(value);
+  const rows = Array.isArray(payload?.loopspaces) ? payload.loopspaces : [];
+  return rows.map((row) => ({
+    ...row,
+    id: String(row?.id || row?.loopspace_id || row?.loopspaceId || "").trim(),
+    name: String(row?.name || row?.loopspace_name || row?.loopspaceName || "Loop").trim(),
+  })).filter((row) => row.id);
+}
+
+function formatLoopspaceTriggerTime(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  try {
+    return new Date(ms).toLocaleString([], {
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      month: "short",
+    });
+  } catch {
+    return "";
+  }
 }
 
 function getForgeCanvasTintPalette(themeMode, spaceMode = getForgeSpaceMode()) {
@@ -2536,11 +2663,13 @@ const VOICE_PLAN_WAITING_STATUSES = new Set([
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator", compactLabel: "Orch" },
   { id: "tools", label: "Docs" },
+  { id: "triggers", label: "Triggers", compactLabel: "Trig" },
   { id: "plans", label: "Plans" },
   { id: "git", label: "Git" },
   { id: "tokenomics", label: "Tokenomics", compactLabel: "Tokens" },
 ];
 const WORKSPACE_SCOPED_TOOL_TAB_IDS = new Set(["plans", "git"]);
+const LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS = new Set(["triggers"]);
 const APP_CONTROL_AGENT_WORKSPACE = Object.freeze({
   id: "__diffforge_app_control__",
   name: "App Control",
@@ -5122,6 +5251,789 @@ const WorkspaceToolSurface = styled.div`
     display: none;
   }
 `;
+
+const LoopspaceTriggersView = styled.div`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  color: inherit;
+  overflow: hidden;
+`;
+
+const LoopspaceTriggersHeader = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+  }
+`;
+
+const LoopspaceTriggersTitle = styled.div`
+  min-width: 0;
+  color: #f7fafc;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1.15;
+
+  html[data-forge-theme="light"] & {
+    color: #17191d;
+  }
+`;
+
+const LoopspaceTriggersMeta = styled.div`
+  margin-top: 3px;
+  color: rgba(232, 238, 248, 0.56);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1.25;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(26, 28, 33, 0.58);
+  }
+`;
+
+const LoopspaceTriggersScroll = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  padding: 10px;
+  overflow: auto;
+`;
+
+const LoopspaceTriggerForm = styled.form`
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.028);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: rgba(255, 255, 255, 0.68);
+  }
+`;
+
+const LoopspaceTriggerFieldGrid = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  min-width: 0;
+`;
+
+const LoopspaceTriggerInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  box-sizing: border-box;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 7px;
+  padding: 0 9px;
+  color: #eef4ff;
+  background: rgba(255, 255, 255, 0.045);
+  font-size: 11px;
+  font-weight: 700;
+  outline: none;
+
+  &::placeholder {
+    color: rgba(232, 238, 248, 0.38);
+  }
+
+  &:focus {
+    border-color: rgba(var(--forge-accent-rgb), 0.44);
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: #1d1f25;
+    background: rgba(255, 255, 255, 0.8);
+  }
+`;
+
+const LoopspaceTriggerSectionLabel = styled.div`
+  min-width: 0;
+  color: rgba(232, 238, 248, 0.52);
+  font-size: 9.5px;
+  font-weight: 850;
+  letter-spacing: 0;
+  line-height: 1;
+  text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(25, 28, 34, 0.52);
+  }
+`;
+
+const LoopspaceTriggerTypePicker = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 4px;
+  min-width: 0;
+  padding: 3px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.12);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: rgba(0, 0, 0, 0.035);
+  }
+`;
+
+const LoopspaceTriggerTypeButton = styled.button`
+  display: inline-grid;
+  min-width: 0;
+  height: 27px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 8px;
+  color: rgba(232, 238, 248, 0.62);
+  background: transparent;
+  font-size: 10.5px;
+  font-weight: 850;
+  cursor: pointer;
+  outline: none;
+
+  &[data-active="true"] {
+    color: #ffffff;
+    background: rgba(var(--forge-accent-rgb), 0.22);
+  }
+
+  &:focus-visible {
+    box-shadow: inset 0 0 0 1px rgba(var(--forge-accent-rgb), 0.58);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(25, 28, 34, 0.6);
+
+    &[data-active="true"] {
+      color: #14171f;
+      background: rgba(var(--forge-accent-rgb), 0.18);
+    }
+  }
+`;
+
+const LoopspaceTriggerLoopList = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  max-height: 116px;
+  overflow: auto;
+  padding: 7px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.1);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: rgba(0, 0, 0, 0.025);
+  }
+`;
+
+const LoopspaceTriggerLoopOption = styled.label`
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr);
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  color: rgba(232, 238, 248, 0.72);
+  font-size: 10.5px;
+  font-weight: 720;
+  line-height: 1.2;
+
+  input {
+    width: 13px;
+    height: 13px;
+    margin: 0;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(25, 28, 34, 0.72);
+  }
+`;
+
+const LoopspaceTriggerActionRow = styled.div`
+  display: flex;
+  min-width: 0;
+  gap: 7px;
+  align-items: center;
+  justify-content: flex-end;
+`;
+
+const LoopspaceTriggerIconButton = styled.button`
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 7px;
+  padding: 0;
+  color: rgba(232, 238, 248, 0.82);
+  background: rgba(255, 255, 255, 0.045);
+  cursor: pointer;
+  outline: none;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover,
+  &:focus-visible {
+    color: #ffffff;
+    border-color: rgba(var(--forge-accent-rgb), 0.36);
+    background: rgba(var(--forge-accent-rgb), 0.14);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: #252932;
+    background: rgba(255, 255, 255, 0.8);
+  }
+`;
+
+const LoopspaceTriggerPrimaryButton = styled(LoopspaceTriggerIconButton)`
+  width: auto;
+  min-width: 84px;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 6px;
+  padding: 0 10px;
+  color: #ffffff;
+  background: rgba(var(--forge-accent-rgb), 0.18);
+`;
+
+const LoopspaceTriggerList = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const LoopspaceTriggerRow = styled.div`
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-left-color: rgba(var(--forge-accent-rgb), 0.34);
+  border-left-width: 2px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.026);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    border-left-color: rgba(var(--forge-accent-rgb), 0.34);
+    background: rgba(255, 255, 255, 0.72);
+  }
+`;
+
+const LoopspaceTriggerRowHeader = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+`;
+
+const LoopspaceTriggerNameInput = styled(LoopspaceTriggerInput)`
+  height: 28px;
+  padding: 0 7px;
+`;
+
+const LoopspaceTriggerBadgeRow = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+`;
+
+const LoopspaceTriggerBadge = styled.span`
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  border-radius: 6px;
+  padding: 3px 7px;
+  color: rgba(232, 238, 248, 0.78);
+  background: rgba(255, 255, 255, 0.055);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &[data-tone="good"] {
+    color: #bbf7d0;
+    background: rgba(34, 197, 94, 0.14);
+  }
+
+  &[data-tone="muted"] {
+    color: rgba(232, 238, 248, 0.52);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(25, 28, 34, 0.72);
+    background: rgba(0, 0, 0, 0.055);
+  }
+`;
+
+const LoopspaceTriggerWebhookPath = styled.code`
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(230, 236, 245, 0.07);
+  border-radius: 6px;
+  padding: 5px 7px;
+  color: rgba(232, 238, 248, 0.62);
+  background: rgba(0, 0, 0, 0.11);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    color: rgba(25, 28, 34, 0.62);
+    background: rgba(0, 0, 0, 0.03);
+  }
+`;
+
+const LoopspaceTriggerEmpty = styled.div`
+  display: grid;
+  place-items: center;
+  min-height: 96px;
+  border: 1px dashed rgba(230, 236, 245, 0.11);
+  border-radius: 8px;
+  color: rgba(232, 238, 248, 0.5);
+  font-size: 11px;
+  font-weight: 760;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(25, 28, 34, 0.55);
+  }
+`;
+
+const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
+  const [triggers, setTriggers] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [loopspaces, setLoopspaces] = useState([]);
+  const [state, setState] = useState("idle");
+  const [error, setError] = useState("");
+  const [draftName, setDraftName] = useState("");
+  const [draftType, setDraftType] = useState("cron");
+  const [draftSchedule, setDraftSchedule] = useState("@every 5m");
+  const [draftLoopspaceIds, setDraftLoopspaceIds] = useState([]);
+  const [nameDrafts, setNameDrafts] = useState({});
+
+  const applyTriggerSnapshot = useCallback((value) => {
+    const snapshot = normalizeLoopspaceTriggerSnapshot(value);
+    setTriggers(snapshot.triggers);
+    setRuns(snapshot.runs);
+    setNameDrafts((current) => {
+      const next = {};
+      for (const trigger of snapshot.triggers) {
+        next[trigger.id] = Object.prototype.hasOwnProperty.call(current, trigger.id)
+          ? current[trigger.id]
+          : trigger.name;
+      }
+      return next;
+    });
+    return snapshot;
+  }, []);
+
+  const applyLoopspaceSnapshot = useCallback((value) => {
+    const rows = normalizeLoopspaceRows(value);
+    setLoopspaces(rows);
+    setDraftLoopspaceIds((current) => (
+      current.filter((id) => rows.some((row) => row.id === id))
+    ));
+    return rows;
+  }, []);
+
+  const syncLoopspaces = useCallback(async () => {
+    try {
+      applyLoopspaceSnapshot(await invoke("cloud_mcp_get_loopspaces"));
+    } catch {
+      applyLoopspaceSnapshot([]);
+    }
+    try {
+      applyLoopspaceSnapshot(await invoke("cloud_mcp_sync_loopspaces"));
+    } catch {
+      // A trigger can still be created without loop attachments.
+    }
+  }, [applyLoopspaceSnapshot]);
+
+  const syncTriggers = useCallback(async (remote = true) => {
+    setState("loading");
+    setError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_get_loopspace_triggers"));
+    } catch {
+      applyTriggerSnapshot({});
+    }
+    if (!remote) {
+      setState("idle");
+      return;
+    }
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_sync_loopspace_triggers"));
+      setState("idle");
+    } catch (syncError) {
+      setState("idle");
+      setError(String(syncError || "Unable to sync triggers."));
+    }
+  }, [applyTriggerSnapshot]);
+
+  useEffect(() => {
+    syncTriggers(true);
+    syncLoopspaces();
+  }, [syncLoopspaces, syncTriggers]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenTriggers = null;
+    void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
+      if (!disposed) {
+        applyTriggerSnapshot(event?.payload || event);
+      }
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlistenTriggers = dispose;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlistenTriggers === "function") unlistenTriggers();
+    };
+  }, [applyTriggerSnapshot]);
+
+  const loopspaceById = useMemo(() => {
+    const map = new Map();
+    for (const loopspace of loopspaces) {
+      map.set(loopspace.id, loopspace);
+    }
+    return map;
+  }, [loopspaces]);
+
+  const toggleDraftLoopspace = useCallback((loopspaceId) => {
+    setDraftLoopspaceIds((current) => (
+      current.includes(loopspaceId)
+        ? current.filter((id) => id !== loopspaceId)
+        : [...current, loopspaceId]
+    ));
+  }, []);
+
+  const createTrigger = useCallback(async (event) => {
+    event.preventDefault();
+    const name = draftName.trim();
+    if (!name) {
+      setError("Trigger name is required.");
+      return;
+    }
+    const config = draftType === "cron"
+      ? {
+        schedule: draftSchedule.trim() || "@every 5m",
+      }
+      : {};
+    setState("saving");
+    setError("");
+    try {
+      const result = await invoke("cloud_mcp_create_loopspace_trigger", {
+        config,
+        enabled: true,
+        loopspaceIds: draftLoopspaceIds,
+        name,
+        triggerType: draftType,
+      });
+      applyTriggerSnapshot(result);
+      setDraftName("");
+      setState("idle");
+    } catch (createError) {
+      setState("idle");
+      setError(String(createError || "Unable to create trigger."));
+    }
+  }, [
+    applyTriggerSnapshot,
+    draftLoopspaceIds,
+    draftName,
+    draftSchedule,
+    draftType,
+  ]);
+
+  const renameTrigger = useCallback(async (trigger) => {
+    const name = String(nameDrafts[trigger.id] ?? trigger.name).trim();
+    if (!name || name === trigger.name || state === "saving") {
+      return;
+    }
+    setState("saving");
+    setError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
+        name,
+        triggerId: trigger.id,
+      }));
+      setState("idle");
+    } catch (renameError) {
+      setState("idle");
+      setError(String(renameError || "Unable to rename trigger."));
+    }
+  }, [applyTriggerSnapshot, nameDrafts, state]);
+
+  const toggleTriggerEnabled = useCallback(async (trigger) => {
+    if (!trigger?.id || state === "saving") {
+      return;
+    }
+    setState("saving");
+    setError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
+        enabled: !trigger.enabled,
+        triggerId: trigger.id,
+      }));
+      setState("idle");
+    } catch (toggleError) {
+      setState("idle");
+      setError(String(toggleError || "Unable to update trigger."));
+    }
+  }, [applyTriggerSnapshot, state]);
+
+  const deleteTrigger = useCallback(async (trigger) => {
+    if (!trigger?.id || state === "saving") {
+      return;
+    }
+    const confirmed = typeof window === "undefined"
+      ? true
+      : window.confirm(`Delete "${trigger.name}"?`);
+    if (!confirmed) {
+      return;
+    }
+    setState("saving");
+    setError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_delete_loopspace_trigger", {
+        triggerId: trigger.id,
+      }));
+      setState("idle");
+    } catch (deleteError) {
+      setState("idle");
+      setError(String(deleteError || "Unable to delete trigger."));
+    }
+  }, [applyTriggerSnapshot, state]);
+
+  return (
+    <LoopspaceTriggersView>
+      <LoopspaceTriggersHeader>
+        <div>
+          <LoopspaceTriggersTitle>Triggers</LoopspaceTriggersTitle>
+          <LoopspaceTriggersMeta>
+            {triggers.length} trigger{triggers.length === 1 ? "" : "s"}
+            {state === "loading" ? " - Syncing" : ""}
+            {state === "saving" ? " - Saving" : ""}
+          </LoopspaceTriggersMeta>
+        </div>
+        <LoopspaceTriggerIconButton
+          aria-label="Sync triggers"
+          disabled={state === "loading" || state === "saving"}
+          onClick={() => syncTriggers(true)}
+          title="Sync"
+          type="button"
+        >
+          <ButtonRefreshIcon aria-hidden="true" />
+        </LoopspaceTriggerIconButton>
+      </LoopspaceTriggersHeader>
+      <LoopspaceTriggersScroll>
+        <LoopspaceTriggerForm onSubmit={createTrigger}>
+          <LoopspaceTriggerFieldGrid>
+            <LoopspaceTriggerInput
+              aria-label="Trigger name"
+              maxLength={120}
+              onChange={(event) => setDraftName(event.target.value)}
+              placeholder="Trigger name"
+              value={draftName}
+            />
+          </LoopspaceTriggerFieldGrid>
+          <LoopspaceTriggerTypePicker aria-label="Trigger type" role="group">
+            {["cron", "webhook"].map((type) => (
+              <LoopspaceTriggerTypeButton
+                data-active={draftType === type}
+                key={type}
+                onClick={() => setDraftType(type)}
+                type="button"
+              >
+                {type === "cron" ? "Cron" : "Webhook"}
+              </LoopspaceTriggerTypeButton>
+            ))}
+          </LoopspaceTriggerTypePicker>
+          {draftType === "cron" ? (
+            <>
+              <LoopspaceTriggerSectionLabel>Schedule</LoopspaceTriggerSectionLabel>
+              <LoopspaceTriggerInput
+                aria-label="Cron schedule"
+                onChange={(event) => setDraftSchedule(event.target.value)}
+                placeholder="@every 5m"
+                value={draftSchedule}
+              />
+            </>
+          ) : null}
+          {loopspaces.length > 0 ? (
+            <>
+              <LoopspaceTriggerSectionLabel>Loops</LoopspaceTriggerSectionLabel>
+              <LoopspaceTriggerLoopList aria-label="Loop attachments">
+                {loopspaces.map((loopspace) => (
+                  <LoopspaceTriggerLoopOption key={loopspace.id}>
+                    <input
+                      checked={draftLoopspaceIds.includes(loopspace.id)}
+                      onChange={() => toggleDraftLoopspace(loopspace.id)}
+                      type="checkbox"
+                    />
+                    <span title={loopspace.name}>{loopspace.name}</span>
+                  </LoopspaceTriggerLoopOption>
+                ))}
+              </LoopspaceTriggerLoopList>
+            </>
+          ) : null}
+          <LoopspaceTriggerActionRow>
+            <LoopspaceTriggerPrimaryButton
+              disabled={state === "saving" || !draftName.trim()}
+              title="Create trigger"
+              type="submit"
+            >
+              <ButtonAddIcon aria-hidden="true" />
+              <span>Create</span>
+            </LoopspaceTriggerPrimaryButton>
+          </LoopspaceTriggerActionRow>
+          {error ? <LoopspaceTriggersMeta role="status">{error}</LoopspaceTriggersMeta> : null}
+        </LoopspaceTriggerForm>
+        {triggers.length > 0 ? (
+          <LoopspaceTriggerList>
+            {triggers.map((trigger) => {
+              const attachedLoops = trigger.loopspaceIds
+                .map((id) => loopspaceById.get(id)?.name || id)
+                .filter(Boolean);
+              const nextDue = formatLoopspaceTriggerTime(trigger.nextDueAtMs);
+              const lastRun = formatLoopspaceTriggerTime(trigger.lastRunAtMs);
+              return (
+                <LoopspaceTriggerRow key={trigger.id}>
+                  <LoopspaceTriggerRowHeader>
+                    <LoopspaceTriggerNameInput
+                      aria-label="Trigger name"
+                      maxLength={120}
+                      onChange={(event) => {
+                        setNameDrafts((current) => ({
+                          ...current,
+                          [trigger.id]: event.target.value,
+                        }));
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          renameTrigger(trigger);
+                        }
+                      }}
+                      value={nameDrafts[trigger.id] ?? trigger.name}
+                    />
+                    <LoopspaceTriggerActionRow>
+                      <LoopspaceTriggerIconButton
+                        aria-label={trigger.enabled ? "Disable trigger" : "Enable trigger"}
+                        disabled={state === "saving"}
+                        onClick={() => toggleTriggerEnabled(trigger)}
+                        title={trigger.enabled ? "Disable" : "Enable"}
+                        type="button"
+                      >
+                        <Check aria-hidden="true" />
+                      </LoopspaceTriggerIconButton>
+                      <LoopspaceTriggerIconButton
+                        aria-label="Rename trigger"
+                        disabled={state === "saving"}
+                        onClick={() => renameTrigger(trigger)}
+                        title="Rename"
+                        type="button"
+                      >
+                        <ButtonRefreshIcon aria-hidden="true" />
+                      </LoopspaceTriggerIconButton>
+                      <LoopspaceTriggerIconButton
+                        aria-label="Delete trigger"
+                        disabled={state === "saving"}
+                        onClick={() => deleteTrigger(trigger)}
+                        title="Delete"
+                        type="button"
+                      >
+                        <Close aria-hidden="true" />
+                      </LoopspaceTriggerIconButton>
+                    </LoopspaceTriggerActionRow>
+                  </LoopspaceTriggerRowHeader>
+                  <LoopspaceTriggerBadgeRow>
+                    <LoopspaceTriggerBadge>{trigger.type === "webhook" ? "Webhook" : "Cron"}</LoopspaceTriggerBadge>
+                    <LoopspaceTriggerBadge data-tone={trigger.enabled ? "good" : "muted"}>
+                      {trigger.enabled ? "Enabled" : "Disabled"}
+                    </LoopspaceTriggerBadge>
+                    {trigger.type === "cron" && trigger.config?.schedule ? (
+                      <LoopspaceTriggerBadge>{trigger.config.schedule}</LoopspaceTriggerBadge>
+                    ) : null}
+                    {attachedLoops.length ? (
+                      <LoopspaceTriggerBadge>{attachedLoops.join(", ")}</LoopspaceTriggerBadge>
+                    ) : null}
+                    {nextDue ? <LoopspaceTriggerBadge>{`Next ${nextDue}`}</LoopspaceTriggerBadge> : null}
+                    {lastRun ? <LoopspaceTriggerBadge>{`Last ${lastRun}`}</LoopspaceTriggerBadge> : null}
+                    {trigger.lastStatus ? <LoopspaceTriggerBadge>{trigger.lastStatus}</LoopspaceTriggerBadge> : null}
+                  </LoopspaceTriggerBadgeRow>
+                  {trigger.webhookPath ? (
+                    <LoopspaceTriggerWebhookPath title={trigger.webhookPath}>
+                      {trigger.webhookPath}
+                    </LoopspaceTriggerWebhookPath>
+                  ) : null}
+                </LoopspaceTriggerRow>
+              );
+            })}
+          </LoopspaceTriggerList>
+        ) : (
+          <LoopspaceTriggerEmpty>No triggers</LoopspaceTriggerEmpty>
+        )}
+        {runs.length > 0 ? (
+          <LoopspaceTriggerList aria-label="Recent trigger runs">
+            {runs.slice(0, 6).map((run) => (
+              <LoopspaceTriggerBadgeRow key={run.id}>
+                <LoopspaceTriggerBadge>{run.status || "run"}</LoopspaceTriggerBadge>
+                <LoopspaceTriggerBadge data-tone="muted">
+                  {formatLoopspaceTriggerTime(run.createdAtMs) || run.id}
+                </LoopspaceTriggerBadge>
+              </LoopspaceTriggerBadgeRow>
+            ))}
+          </LoopspaceTriggerList>
+        ) : null}
+      </LoopspaceTriggersScroll>
+    </LoopspaceTriggersView>
+  );
+});
 
 const TodoQueueComposer = styled.form`
   position: relative;
@@ -14491,11 +15403,27 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     [orchestratorPanelWorkspaceId, rootDirectory],
   );
   const [activeWorkspaceTool, setActiveWorkspaceTool] = useState("orchestrator");
+  const [spaceMode, setSpaceMode] = useState(getForgeSpaceMode);
+  const loopspacesModeActive = spaceMode === "loopspaces";
+  useEffect(() => {
+    const updateSpaceMode = () => setSpaceMode(getForgeSpaceMode());
+    updateSpaceMode();
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") {
+      return undefined;
+    }
+    const observer = new MutationObserver(updateSpaceMode);
+    observer.observe(document.documentElement, {
+      attributeFilter: ["data-forge-space"],
+      attributes: true,
+    });
+    return () => observer.disconnect();
+  }, []);
   const workspaceToolTabs = useMemo(() => (
     WORKSPACE_TOOL_TABS.filter((tool) => (
-      workspaceScopedTabsEnabled || !WORKSPACE_SCOPED_TOOL_TAB_IDS.has(tool.id)
+      (workspaceScopedTabsEnabled || !WORKSPACE_SCOPED_TOOL_TAB_IDS.has(tool.id))
+      && (loopspacesModeActive || !LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS.has(tool.id))
     ))
-  ), [workspaceScopedTabsEnabled]);
+  ), [loopspacesModeActive, workspaceScopedTabsEnabled]);
   useEffect(() => {
     if (!workspaceToolTabs.some((tool) => tool.id === activeWorkspaceTool)) {
       setActiveWorkspaceTool("orchestrator");
@@ -17106,6 +18034,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             rootDirectory={rootDirectory}
             workspaceId={workspace?.id || ""}
           />
+        </WorkspaceToolSurface>
+      ) : activeWorkspaceTool === "triggers" && loopspacesModeActive ? (
+        <WorkspaceToolSurface data-tool="triggers">
+          <LoopspaceTriggersPanel />
         </WorkspaceToolSurface>
       ) : activeWorkspaceTool === "git" && workspaceScopedTabsEnabled ? (
         <WorkspaceToolSurface data-tool="git">

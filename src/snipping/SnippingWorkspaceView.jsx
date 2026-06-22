@@ -1769,11 +1769,11 @@ const SnippingPanel = styled.section`
   justify-self: center;
   gap: 12px;
   padding: 14px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.86);
+    var(--audio-panel-bg, rgba(17, 22, 29, 0.86));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -1867,9 +1867,9 @@ const SnippingInfoTile = styled.div`
   gap: 4px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.42);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.42));
 
   span {
     color: var(--forge-text-muted);
@@ -1921,10 +1921,10 @@ const SnipPreviewCard = styled.button`
   min-width: 0;
   gap: 8px;
   padding: 8px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(7, 9, 13, 0.45);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.45));
   text-align: left;
 
   img,
@@ -1960,8 +1960,8 @@ const SnipPreviewCard = styled.button`
   }
 
   &:hover {
-    border-color: rgba(125, 160, 205, 0.34);
-    background: rgba(21, 27, 35, 0.72);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.34));
+    background: var(--audio-control-bg-hover, rgba(21, 27, 35, 0.72));
   }
 
   html[data-forge-theme="light"] & {
@@ -1974,7 +1974,7 @@ const SnippingEmptyState = styled.div`
   min-height: 96px;
   place-items: center;
   padding: 18px;
-  border: 1px dashed var(--forge-border);
+  border: 1px dashed var(--audio-border, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-muted);
   font-size: 12px;

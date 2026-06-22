@@ -428,12 +428,12 @@ fn app_control_mcp_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "get_state",
-            "description": "Return the current Diff Forge app view, selected workspace, active workspace, available navigation targets, and a compact visible-context summary.",
+            "description": "Return the current Diff Forge app view, selected workspace, active workspace, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, or selection is unclear.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
             "name": "get_visible_context",
-            "description": "Return the currently visible Diff Forge context, including selected Tools document metadata and highlighted range when available. Use localPath from this response for direct file edits. For unsaved Tools drafts, use update_selected_document instead of searching local storage or writing legacy account-skills.md.",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document metadata and highlighted range when available. Use this first for prompts like explain this skill, create a draft here, modify/delete this selection, or what is selected. Use localPath only for direct file edits when appropriate. For unsaved Tools drafts, use update_selected_document instead of searching local storage or writing legacy account-skills.md.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -444,7 +444,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_selected_document_context",
-            "description": "Return the selected Tools document context, including local backing file path, document type, sync state, and current highlighted range.",
+            "description": "Return the selected Tools document context, including local backing file path, document type, sync state, and current highlighted range. Use this for questions about the currently selected skill, instruction, architecture, or document.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -455,12 +455,12 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_selection_context",
-            "description": "Return only the current highlighted selection/range context for the visible document surface.",
+            "description": "Return only the current highlighted selection/range context for the visible document surface. Use this before modify/delete/rewrite/replace-this-selection requests, then preserve surrounding content when applying an edit.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": true}
         }),
         json!({
             "name": "save_selected_document",
-            "description": "Save the currently selected Tools document from Diff Forge's live editor state. Use mode=local for local-only pending save or mode=publish to fan out to account sync.",
+            "description": "Save the currently selected Tools document from Diff Forge's live editor state. Use mode=local for local-only pending save. Use mode=publish when the user says publish, push, sync, fan out, or save for other clients.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -471,7 +471,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_selected_document",
-            "description": "Patch the currently selected Tools document or unsaved draft inside Diff Forge. Accepts snake_case document fields and can optionally save locally or publish. Use this for unsaved drafts; never write legacy account-skills.md.",
+            "description": "Create or patch the currently selected Tools document or unsaved draft inside Diff Forge. Use this for make/create skill, create a draft, modify/delete highlighted selection, rewrite selected text, edit instruction, or update architecture requests. Send the full updated content/content_md when changing text. Default to mode=draft unless the user asks for local save or publish. Never write legacy account-skills.md.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

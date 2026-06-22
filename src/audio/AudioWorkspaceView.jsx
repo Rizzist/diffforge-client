@@ -805,10 +805,10 @@ const AudioDictionaryBottomJumpButton = styled.button`
   height: 28px;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(125, 160, 205, 0.28);
+  border: 1px solid var(--audio-border-strong, rgba(125, 160, 205, 0.28));
   border-radius: 999px;
-  color: #d9e7ff;
-  background: rgba(11, 15, 21, 0.88);
+  color: var(--audio-accent-text, #d9e7ff);
+  background: var(--audio-control-bg, rgba(11, 15, 21, 0.88));
   box-shadow:
     0 8px 22px rgba(0, 0, 0, 0.28),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
@@ -821,14 +821,14 @@ const AudioDictionaryBottomJumpButton = styled.button`
     transform 140ms ease;
 
   &:hover {
-    border-color: rgba(125, 160, 205, 0.46);
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.46);
     color: #ffffff;
-    background: rgba(47, 128, 255, 0.22);
+    background: rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.22);
     transform: translateX(50%) translateY(-1px);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(139, 184, 255, 0.58);
+    outline: 2px solid rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.58);
     outline-offset: 2px;
   }
 

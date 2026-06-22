@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   ACCOUNT_DOCUMENTS_CONTRACT,
+  accountDocumentStorageKey,
   accountDocumentUnitsFromPayload,
   mergeSkillUnits,
   skillsFromUnits,
@@ -16,6 +17,7 @@ import {
 const SKILLS_REVALIDATE_MIN_MS = 20_000;
 const ACCOUNT_DOCS_REVALIDATE_TIMEOUT_MS = 4_500;
 const ACCOUNT_TOOLS_EVENT_DEBOUNCE_MS = 500;
+const ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY = "diffforge.tools.activeDocumentDraft.v1";
 const ARCHITECTURE_CHANGE_EVENTS = [
   "architecture-store-changed",
 ];
@@ -26,6 +28,8 @@ const ACCOUNT_TOOLS_CHANGE_EVENTS = [
 const workspaceToolsStore = {
   architecturesByRepo: new Map(), // repoPath -> [{ graphId, repoLabel, repoPath, title }]
   archAttemptedRepos: new Set(),
+  documentDraft: null,
+  documentDraftLoaded: false,
   knownRepos: new Map(), // repoPath -> label; event refreshes re-fetch all of these
   skillsEntries: [],
   skills: [],
@@ -45,6 +49,66 @@ let accountToolsEventTimer = 0;
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
   return normalized || fallback;
+}
+
+function clonePlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return { ...value };
+  }
+}
+
+function readWorkspaceToolsDocumentDraftFromStorage() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage?.getItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeWorkspaceToolsDocumentDraftToStorage(draft) {
+  if (typeof window === "undefined") return;
+  try {
+    if (!draft) {
+      window.localStorage?.removeItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY);
+      return;
+    }
+    window.localStorage?.setItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  } catch {
+    // Draft persistence is best-effort; the in-memory copy still survives tab switches.
+  }
+}
+
+function ensureWorkspaceToolsDocumentDraftLoaded() {
+  if (workspaceToolsStore.documentDraftLoaded) return;
+  workspaceToolsStore.documentDraftLoaded = true;
+  workspaceToolsStore.documentDraft = readWorkspaceToolsDocumentDraftFromStorage();
+}
+
+function normalizeWorkspaceToolsDocumentDraft(draft) {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) return null;
+  const title = text(draft.title || draft.name || draft.id);
+  const content = String(draft.content ?? draft.content_md ?? draft.contentMd ?? "");
+  const documentKey = text(draft.documentKey || draft.document_key || accountDocumentStorageKey(draft) || draft.id);
+  if (!documentKey && !title && !content) return null;
+  return {
+    ...clonePlainObject(draft),
+    content,
+    documentKey,
+    draft: true,
+    isDraft: true,
+    rowType: "document",
+    syncStatus: "draft",
+    title: title || "Untitled document",
+    updatedAtMs: Date.now(),
+  };
 }
 
 export function workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory) {
@@ -116,6 +180,8 @@ async function loadArchitecturesForRepo(repoPath, label) {
 function skillsSignature(skills) {
   return JSON.stringify((Array.isArray(skills) ? skills : []).map((skill) => [
     skill.id,
+    skill.pathKey,
+    skill.rowType,
     skill.title,
     skill.content,
     skill.assetId,
@@ -159,8 +225,6 @@ function accountToolsEventHasKnownPayload(payload) {
         || candidate.contract === "diffforge.account_mcps.v1"
         || candidate.document
         || candidate.documents
-        || candidate.docs
-        || candidate.items
         || candidate.kind === "account_cli_changed"
         || candidate.kind === "account_mcp_changed"
         || candidate.ops
@@ -189,7 +253,7 @@ function accountToolsSkillUnitsFromEventPayload(payload) {
   const units = accountDocumentUnitsFromPayload(payload).filter(Boolean);
   const byId = new Map();
   units.forEach((unit) => {
-    const id = text(unit?.doc_id || unit?.document_id || unit?.id);
+    const id = accountDocumentStorageKey(unit) || text(unit?.path_key || unit?.doc_id || unit?.document_id || unit?.id);
     if (id) byId.set(id, unit);
   });
   return Array.from(byId.values());
@@ -322,6 +386,33 @@ export function warmWorkspaceTools(coordinationTargets, rootDirectory) {
 export function noteAccountSkillUnits(skills) {
   workspaceToolsStore.skillsFetchedAtMs = Date.now();
   applyAccountSkills(Array.isArray(skills) ? skills : []);
+}
+
+export function getWorkspaceToolsDocumentDraft() {
+  ensureWorkspaceToolsDocumentDraftLoaded();
+  return clonePlainObject(workspaceToolsStore.documentDraft);
+}
+
+export function setWorkspaceToolsDocumentDraft(draft) {
+  ensureWorkspaceToolsDocumentDraftLoaded();
+  const nextDraft = normalizeWorkspaceToolsDocumentDraft(draft);
+  const previousKey = JSON.stringify(workspaceToolsStore.documentDraft || null);
+  const nextKey = JSON.stringify(nextDraft || null);
+  workspaceToolsStore.documentDraft = nextDraft;
+  writeWorkspaceToolsDocumentDraftToStorage(nextDraft);
+  if (previousKey !== nextKey) notifyWorkspaceToolsListeners();
+}
+
+export function clearWorkspaceToolsDocumentDraft(documentKey = "") {
+  ensureWorkspaceToolsDocumentDraftLoaded();
+  const current = workspaceToolsStore.documentDraft;
+  if (!current) return;
+  const requestedKey = text(documentKey);
+  const currentKey = text(current.documentKey || current.document_key || accountDocumentStorageKey(current) || current.id);
+  if (requestedKey && currentKey && requestedKey !== currentKey) return;
+  workspaceToolsStore.documentDraft = null;
+  writeWorkspaceToolsDocumentDraftToStorage(null);
+  notifyWorkspaceToolsListeners();
 }
 
 export function subscribeWorkspaceTools(listener) {

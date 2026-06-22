@@ -44,6 +44,43 @@ test("document save requests mark inline content as intentional", () => {
   assert.equal(request.document.content_md, "");
 });
 
+test("document payload parsing preserves empty local content when projection follows", () => {
+  const units = accountDocumentUnitsFromPayload({
+    document: {
+      content: "",
+      content_hash: "empty-hash",
+      content_md: "",
+      doc_id: "blank",
+      has_content_payload: true,
+      title: "Blank",
+    },
+    documents: [{
+      content: "",
+      content_hash: "empty-hash",
+      content_md: "",
+      doc_id: "blank",
+      has_content_payload: true,
+      title: "Blank",
+    }],
+    projection: {
+      documents: [{
+        content_hash: "empty-hash",
+        doc_id: "blank",
+        has_content: true,
+        title: "Blank",
+      }],
+    },
+  });
+  const skills = skillsFromUnits(units);
+
+  assert.equal(skills.length, 1);
+  assert.equal(skills[0].id, "blank");
+  assert.equal(skills[0].content, "");
+  assert.equal(skills[0].hasContent, true);
+  assert.equal(skills[0].hasContentPayload, true);
+  assert.equal(skills[0].contentHash, "empty-hash");
+});
+
 test("document hydrate requests never include editor content", () => {
   const request = accountDocumentHydrateRequestFromSkill({
     assetId: "asset-blank",
@@ -141,6 +178,59 @@ test("metadata-only document updates preserve pending local saves", () => {
   assert.equal(synced[0].content, "Cloud accepted body.");
   assert.equal(synced[0].pendingPush, false);
   assert.equal(synced[0].syncStatus, "synced");
+});
+
+test("local save payload projection does not erase materialized document content", () => {
+  const units = accountDocumentUnitsFromPayload({
+    kind: "account_documents_snapshot",
+    payload: {
+      kind: "account_document_saved",
+      document: {
+        content_hash: "empty-hash",
+        content_md: "",
+        doc_id: "local-draft",
+        document_id: "local-draft",
+        has_content_payload: true,
+        local_saved_at: "2026-06-20T12:00:00.000Z",
+        path_key: "local-draft.md",
+        pending_push: true,
+        sync_status: "local_pending",
+        title: "Local Draft",
+      },
+      documents: [{
+        content_hash: "empty-hash",
+        content_md: "",
+        doc_id: "local-draft",
+        document_id: "local-draft",
+        has_content_payload: true,
+        local_saved_at: "2026-06-20T12:00:00.000Z",
+        path_key: "local-draft.md",
+        pending_push: true,
+        sync_status: "local_pending",
+        title: "Local Draft",
+      }],
+      projection: {
+        documents: [{
+          content_hash: "empty-hash",
+          doc_id: "local-draft",
+          document_id: "local-draft",
+          local_path: "/tmp/local-draft.md",
+          path_key: "local-draft.md",
+          pending_push: true,
+          sync_status: "local_pending",
+          title: "Local Draft",
+        }],
+      },
+    },
+  });
+  const skills = skillsFromUnits(units);
+
+  assert.equal(skills.length, 1);
+  assert.equal(skills[0].content, "");
+  assert.equal(skills[0].hasContentPayload, true);
+  assert.equal(skills[0].pendingPush, true);
+  assert.equal(skills[0].syncStatus, "local_pending");
+  assert.equal(skills[0].localPath, "/tmp/local-draft.md");
 });
 
 test("hydrated metadata without inline bytes is not treated as materialized content", () => {

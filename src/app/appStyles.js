@@ -6952,11 +6952,84 @@ export const VaultStatusGrid = styled.div`
 `;
 
 export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
+  --audio-surface-bg:
+    radial-gradient(circle at 78% 8%, rgba(var(--forge-tint-rgb), 0.09), transparent 18rem),
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.18);
+  --audio-surface-bg-size: auto, 68px 68px, 68px 68px, auto;
+  --audio-border: rgba(125, 160, 205, 0.2);
+  --audio-border-soft: rgba(125, 160, 205, 0.16);
+  --audio-border-strong: rgba(125, 160, 205, 0.36);
+  --audio-panel-bg: rgba(17, 22, 29, 0.86);
+  --audio-panel-bg-soft: rgba(13, 17, 23, 0.58);
+  --audio-panel-bg-muted: rgba(7, 9, 13, 0.42);
+  --audio-control-bg: rgba(21, 27, 35, 0.78);
+  --audio-control-bg-hover: rgba(24, 31, 42, 0.84);
+  --audio-control-selected-bg: rgba(var(--forge-tint-rgb), 0.12);
+  --audio-accent: var(--forge-tint);
+  --audio-accent-soft: var(--forge-tint-soft);
+  --audio-accent-rgb: var(--forge-tint-rgb);
+  --audio-accent-soft-rgb: var(--forge-tint-soft-rgb);
+  --audio-accent-text: #dceaff;
+  --audio-focus-ring: rgba(var(--forge-tint-soft-rgb), 0.42);
+
   place-items: stretch;
   align-content: start;
   justify-items: stretch;
   gap: 10px;
   padding: 16px;
+  background: var(--audio-surface-bg);
+  background-size: var(--audio-surface-bg-size);
+
+  html[data-forge-space="loopspaces"] & {
+    --audio-surface-bg:
+      radial-gradient(circle at 78% 8%, rgba(var(--forge-tint-rgb), 0.15), transparent 18rem),
+      radial-gradient(circle at 28% 96%, rgba(var(--forge-tint-soft-rgb), 0.055), transparent 20rem),
+      linear-gradient(90deg, rgba(var(--forge-tint-soft-rgb), 0.03) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(var(--forge-tint-soft-rgb), 0.022) 1px, transparent 1px),
+      rgba(5, 4, 2, 0.96);
+    --audio-surface-bg-size: auto, auto, 68px 68px, 68px 68px, auto;
+    --audio-border: rgba(var(--forge-tint-soft-rgb), 0.16);
+    --audio-border-soft: rgba(var(--forge-tint-soft-rgb), 0.11);
+    --audio-border-strong: rgba(var(--forge-tint-soft-rgb), 0.32);
+    --audio-panel-bg: rgba(14, 10, 5, 0.8);
+    --audio-panel-bg-soft: rgba(13, 9, 4, 0.58);
+    --audio-panel-bg-muted: rgba(8, 6, 3, 0.52);
+    --audio-control-bg: rgba(15, 10, 4, 0.74);
+    --audio-control-bg-hover: rgba(22, 15, 6, 0.86);
+    --audio-control-selected-bg: rgba(var(--forge-tint-rgb), 0.14);
+    --audio-accent-text: #ffe8a3;
+    --audio-focus-ring: rgba(var(--forge-tint-soft-rgb), 0.42);
+  }
+
+  html[data-forge-theme="light"] & {
+    --audio-surface-bg: var(--forge-bg);
+    --audio-surface-bg-size: auto;
+    --audio-border: var(--forge-border);
+    --audio-border-soft: var(--forge-border);
+    --audio-border-strong: rgba(var(--forge-tint-rgb), 0.22);
+    --audio-panel-bg: var(--forge-surface);
+    --audio-panel-bg-soft: var(--forge-surface-control);
+    --audio-panel-bg-muted: var(--forge-surface);
+    --audio-control-bg: var(--forge-surface);
+    --audio-control-bg-hover: var(--forge-surface-control);
+    --audio-control-selected-bg: rgba(var(--forge-tint-rgb), 0.09);
+    --audio-accent-text: var(--forge-text);
+    --audio-focus-ring: rgba(var(--forge-tint-rgb), 0.18);
+  }
+
+  html[data-forge-theme="light"][data-forge-space="loopspaces"] & {
+    --audio-surface-bg:
+      radial-gradient(circle at 78% 8%, rgba(var(--forge-tint-rgb), 0.08), transparent 18rem),
+      #f5f5f7;
+    --audio-surface-bg-size: auto, auto;
+    --audio-border: rgba(var(--forge-tint-rgb), 0.16);
+    --audio-border-soft: rgba(var(--forge-tint-rgb), 0.1);
+    --audio-border-strong: rgba(var(--forge-tint-rgb), 0.26);
+    --audio-panel-bg-soft: rgba(var(--forge-tint-rgb), 0.045);
+    --audio-control-selected-bg: rgba(var(--forge-tint-rgb), 0.1);
+  }
 `;
 
 export const AudioSetupPanel = styled.section`
@@ -6966,11 +7039,11 @@ export const AudioSetupPanel = styled.section`
   justify-self: center;
   gap: 12px;
   padding: 14px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.86);
+    var(--audio-panel-bg, rgba(17, 22, 29, 0.86));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -6984,7 +7057,7 @@ export const AudioHeroRow = styled.div`
   gap: 10px;
   min-width: 0;
   padding-bottom: 10px;
-  border-bottom: 1px solid var(--forge-border);
+  border-bottom: 1px solid var(--audio-border-soft, var(--forge-border));
 
   > div {
     min-width: 0;
@@ -7007,9 +7080,9 @@ export const AudioHeroRow = styled.div`
   ${VaultPlaceholderIcon} {
     width: 36px;
     height: 36px;
-    border-color: rgba(125, 160, 205, 0.24);
-    color: var(--forge-blue-soft);
-    background: rgba(125, 160, 205, 0.08);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.24));
+    color: var(--audio-accent-soft, var(--forge-blue-soft));
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
 
     svg {
       width: 18px;
@@ -7108,13 +7181,13 @@ export const AudioLocalModelRow = styled.div`
   gap: 10px;
   min-width: 0;
   padding: 9px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.42);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.42));
 
   &[data-selected="true"] {
-    border-color: rgba(125, 160, 205, 0.42);
-    background: rgba(125, 160, 205, 0.1);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.42));
+    background: var(--audio-control-selected-bg, rgba(125, 160, 205, 0.1));
   }
 
   html[data-forge-theme="light"] & {
@@ -7171,10 +7244,10 @@ export const AudioLocalModelPill = styled.span`
   min-height: 20px;
   align-items: center;
   padding: 0 7px;
-  border: 1px solid rgba(125, 160, 205, 0.2);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.2));
   border-radius: 999px;
   color: var(--forge-text-muted);
-  background: rgba(125, 160, 205, 0.06);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.06);
   font-size: 10px;
   font-weight: 760;
   white-space: nowrap;
@@ -7222,11 +7295,11 @@ export const AudioProviderPanel = styled.section`
   min-width: 0;
   gap: 10px;
   padding: 12px;
-  border: 1px solid rgba(125, 160, 205, 0.2);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.2));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.024), rgba(244, 247, 250, 0.006)),
-    rgba(13, 17, 23, 0.55);
+    var(--audio-panel-bg-soft, rgba(13, 17, 23, 0.55));
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -7276,10 +7349,10 @@ export const AudioModeButton = styled.button`
   align-items: center;
   gap: 8px;
   padding: 7px 9px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
-  background: rgba(7, 9, 13, 0.38);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.38));
   text-align: left;
   transition:
     background 160ms ease,
@@ -7290,11 +7363,11 @@ export const AudioModeButton = styled.button`
     width: 30px;
     height: 30px;
     padding: 6px;
-    border: 1px solid rgba(125, 160, 205, 0.16);
+    border: 1px solid var(--audio-border-soft, rgba(125, 160, 205, 0.16));
     border-radius: 8px;
     justify-self: center;
     color: var(--forge-text-muted);
-    background: rgba(21, 27, 35, 0.7);
+    background: var(--audio-control-bg, rgba(21, 27, 35, 0.7));
   }
 
   > span {
@@ -7342,20 +7415,20 @@ export const AudioModeButton = styled.button`
   }
 
   &[aria-pressed="true"] {
-    border-color: rgba(95, 156, 255, 0.62);
-    color: #dceaff;
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.62);
+    color: var(--audio-accent-text, #dceaff);
     background:
-      linear-gradient(180deg, rgba(59, 130, 246, 0.2), rgba(59, 130, 246, 0.08)),
-      rgba(21, 27, 35, 0.74);
+      linear-gradient(180deg, rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.2), rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.08)),
+      var(--audio-control-bg, rgba(21, 27, 35, 0.74));
     box-shadow:
-      0 0 0 1px rgba(95, 156, 255, 0.18) inset,
-      0 8px 22px rgba(59, 130, 246, 0.08);
+      0 0 0 1px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.18) inset,
+      0 8px 22px rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.08);
   }
 
   &[aria-pressed="true"] > svg {
-    border-color: rgba(95, 156, 255, 0.42);
-    color: #8bb9ff;
-    background: rgba(59, 130, 246, 0.14);
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.42);
+    color: var(--audio-accent-soft, #8bb9ff);
+    background: rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.14);
   }
 
   html[data-forge-theme="light"] &[aria-pressed="true"] {
@@ -7430,11 +7503,11 @@ export const AudioDevicePanel = styled.section`
   gap: 10px;
   min-width: 0;
   padding: 12px;
-  border: 1px solid rgba(125, 160, 205, 0.2);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.2));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.01)),
-    rgba(13, 17, 23, 0.58);
+    var(--audio-panel-bg-soft, rgba(13, 17, 23, 0.58));
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -7471,10 +7544,10 @@ export const AudioDeviceSelect = styled.select`
   min-width: 0;
   min-height: 36px;
   padding: 0 34px 0 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text);
-  background-color: rgba(21, 27, 35, 0.78);
+  background-color: var(--audio-control-bg, rgba(21, 27, 35, 0.78));
   background-image:
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"),
     linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.012));
@@ -7494,14 +7567,14 @@ export const AudioDeviceSelect = styled.select`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(125, 160, 205, 0.32);
-    background-color: rgba(24, 31, 42, 0.84);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.32));
+    background-color: var(--audio-control-bg-hover, rgba(24, 31, 42, 0.84));
   }
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.44);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.44));
     outline: none;
-    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+    box-shadow: 0 0 0 3px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -7554,8 +7627,8 @@ export const AudioInputPillSelect = styled(AudioDeviceSelect)`
   background-size: 16px 16px;
 
   &:hover:not(:disabled) {
-    border-color: rgba(125, 160, 205, 0.24);
-    background-color: rgba(24, 31, 42, 0.6);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.24));
+    background-color: var(--audio-control-bg-hover, rgba(24, 31, 42, 0.6));
   }
 
   html[data-forge-theme="light"] & {
@@ -7599,11 +7672,11 @@ export const AudioInputPill = styled.div`
   align-items: center;
   gap: 10px;
   padding: 7px 10px 7px 7px;
-  border: 1px solid rgba(125, 160, 205, 0.22);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.22));
   border-radius: 999px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.045), rgba(244, 247, 250, 0.008)),
-    rgba(7, 9, 13, 0.62);
+    var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.62));
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.18);
   transition: border-color 180ms ease, box-shadow 180ms ease;
 
@@ -7645,12 +7718,12 @@ export const AudioInputMicButton = styled.button`
   flex: 0 0 auto;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(95, 156, 255, 0.4);
+  border: 1px solid rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.4);
   border-radius: 50%;
-  color: #8bb9ff;
+  color: var(--audio-accent-soft, #8bb9ff);
   background:
-    linear-gradient(180deg, rgba(59, 130, 246, 0.24), rgba(59, 130, 246, 0.1)),
-    rgba(21, 27, 35, 0.8);
+    linear-gradient(180deg, rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.24), rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.1)),
+    var(--audio-control-bg, rgba(21, 27, 35, 0.8));
   cursor: pointer;
   transition:
     background 160ms ease,
@@ -7675,11 +7748,11 @@ export const AudioInputMicButton = styled.button`
   /* Live keeps the same mic logo, just a brighter blue — the red X swap
      read as alarming rather than active. */
   &[data-live="true"] {
-    border-color: rgba(95, 156, 255, 0.66);
-    color: #dceaff;
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.66);
+    color: var(--audio-accent-text, #dceaff);
     background:
-      linear-gradient(180deg, rgba(59, 130, 246, 0.36), rgba(59, 130, 246, 0.16)),
-      rgba(21, 27, 35, 0.8);
+      linear-gradient(180deg, rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.36), rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.16)),
+      var(--audio-control-bg, rgba(21, 27, 35, 0.8));
   }
 
   html[data-forge-theme="light"] & {
@@ -7711,10 +7784,10 @@ export const AudioInputMuteButton = styled.button`
   flex: 0 0 auto;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(95, 156, 255, 0.36);
+  border: 1px solid rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.36);
   border-radius: 8px;
-  color: #8bb9ff;
-  background: rgba(59, 130, 246, 0.12);
+  color: var(--audio-accent-soft, #8bb9ff);
+  background: rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.12);
   cursor: pointer;
   transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 
@@ -7724,14 +7797,14 @@ export const AudioInputMuteButton = styled.button`
   }
 
   &:hover:not(:disabled) {
-    border-color: rgba(95, 156, 255, 0.55);
-    background: rgba(59, 130, 246, 0.2);
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.55);
+    background: rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.2);
   }
 
   &[data-active="true"] {
-    border-color: rgba(95, 156, 255, 0.62);
-    color: #dceaff;
-    background: rgba(59, 130, 246, 0.28);
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.62);
+    color: var(--audio-accent-text, #dceaff);
+    background: rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.28);
   }
 
   &:disabled {
@@ -7772,7 +7845,7 @@ export const AudioInputPillIconButton = styled.button`
 
   &:hover:not(:disabled) {
     color: var(--forge-text);
-    background: rgba(244, 247, 250, 0.08);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
   }
 
   &:disabled {
@@ -7795,7 +7868,7 @@ export const AudioInputMeter = styled.div`
   gap: 3px;
   padding: 5px 8px;
   border-radius: 999px;
-  background: rgba(125, 176, 255, 0.05);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.05);
 
   span {
     display: block;
@@ -7832,7 +7905,7 @@ export const AudioInputMeter = styled.div`
     opacity: 0.58;
     filter: saturate(0.52) brightness(0.84);
     box-shadow:
-      0 0 7px rgba(125, 176, 255, 0.06),
+      0 0 7px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.06),
       0 1px 0 rgba(255, 255, 255, 0.08) inset;
   }
 
@@ -7908,9 +7981,9 @@ export const AudioShortcutCard = styled.div`
   min-width: 0;
   gap: 8px;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.5);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.5));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -7934,10 +8007,10 @@ export const AudioShortcutKey = styled.kbd`
   min-width: 0;
   overflow: hidden;
   padding: 7px 9px;
-  border: 1px solid rgba(125, 160, 205, 0.24);
+  border: 1px solid var(--audio-border-strong, rgba(125, 160, 205, 0.24));
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(21, 27, 35, 0.74);
+  background: var(--audio-control-bg, rgba(21, 27, 35, 0.74));
   font-family:
     "Cascadia Mono",
     "SFMono-Regular",
@@ -7988,11 +8061,11 @@ export const AudioTabBar = styled.div`
   gap: 8px;
   min-width: 0;
   padding: 10px 10px 8px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.03), rgba(244, 247, 250, 0.008)),
-    rgba(7, 9, 13, 0.72);
+    var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.72));
 
   ${AudioHeroRow} {
     padding-bottom: 0;
@@ -8014,7 +8087,7 @@ export const AudioTabList = styled.div`
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.006)),
-    rgba(17, 22, 29, 0.58);
+    var(--audio-panel-bg-soft, rgba(17, 22, 29, 0.58));
 
   html[data-forge-theme="light"] & {
     background: rgba(0, 102, 204, 0.035);
@@ -8043,11 +8116,11 @@ export const AudioTabButton = styled.button`
 
   &:hover {
     color: var(--forge-text-soft);
-    background: rgba(244, 247, 250, 0.04);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.04);
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline: 2px solid var(--audio-focus-ring, rgba(125, 160, 205, 0.42));
     outline-offset: 2px;
   }
 
@@ -8061,14 +8134,14 @@ export const AudioTabButton = styled.button`
   }
 
   &[aria-selected="true"] {
-    border-color: rgba(95, 156, 255, 0.48);
-    color: #dceaff;
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.48);
+    color: var(--audio-accent-text, #dceaff);
     background:
-      linear-gradient(180deg, rgba(59, 130, 246, 0.2), rgba(59, 130, 246, 0.08)),
-      rgba(21, 27, 35, 0.78);
+      linear-gradient(180deg, rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.2), rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.08)),
+      var(--audio-control-bg, rgba(21, 27, 35, 0.78));
     box-shadow:
-      0 0 0 1px rgba(95, 156, 255, 0.12) inset,
-      0 8px 20px rgba(59, 130, 246, 0.08);
+      0 0 0 1px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12) inset,
+      0 8px 20px rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.08);
   }
 
   html[data-forge-theme="light"] &[aria-selected="true"] {
@@ -8134,9 +8207,9 @@ export const AudioRuleListItem = styled.div`
   min-width: 0;
   min-height: 58px;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.34);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.34));
   cursor: pointer;
   transition:
     border-color 140ms ease,
@@ -8144,12 +8217,12 @@ export const AudioRuleListItem = styled.div`
     opacity 140ms ease;
 
   &:hover {
-    border-color: rgba(125, 160, 205, 0.28);
-    background: rgba(21, 27, 35, 0.52);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.28));
+    background: var(--audio-control-bg-hover, rgba(21, 27, 35, 0.52));
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline: 2px solid var(--audio-focus-ring, rgba(125, 160, 205, 0.42));
     outline-offset: 2px;
   }
 
@@ -8322,9 +8395,9 @@ export const AudioDictionaryStat = styled.div`
   min-width: 0;
   gap: 2px;
   padding: 10px 12px;
-  border: 1px solid rgba(125, 160, 205, 0.16);
+  border: 1px solid var(--audio-border-soft, rgba(125, 160, 205, 0.16));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.32);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.32));
 
   strong {
     overflow: hidden;
@@ -8358,11 +8431,11 @@ export const AudioDictionaryComposer = styled.form`
   gap: 10px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(125, 160, 205, 0.18);
+  border: 1px solid var(--audio-border-soft, rgba(125, 160, 205, 0.18));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.024), rgba(244, 247, 250, 0.008)),
-    rgba(13, 17, 23, 0.5);
+    var(--audio-panel-bg-soft, rgba(13, 17, 23, 0.5));
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -8426,10 +8499,10 @@ export const AudioDictionaryTextarea = styled.textarea`
   min-width: 0;
   min-height: 56px;
   padding: 9px 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(21, 27, 35, 0.72);
+  background: var(--audio-control-bg, rgba(21, 27, 35, 0.72));
   font-size: 12px;
   font-weight: 650;
   font-family: inherit;
@@ -8438,9 +8511,9 @@ export const AudioDictionaryTextarea = styled.textarea`
   resize: vertical;
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.44);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.44));
     outline: none;
-    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+    box-shadow: 0 0 0 3px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -8480,7 +8553,7 @@ export const AudioDictionaryWordList = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding: 4px 0 52px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   background: rgba(2, 4, 8, 0.48);
   scroll-padding-bottom: 52px;
@@ -8497,7 +8570,7 @@ export const AudioDictionaryWordRow = styled.div`
   --audio-word-dot-center-y: calc(var(--audio-word-row-padding-top) + (var(--audio-word-text-line-height) / 2));
   --audio-word-dot-radius: 3px;
   --audio-word-dot-size: 6px;
-  --audio-word-dot-color: #7db0ff;
+  --audio-word-dot-color: var(--audio-accent-soft, #7db0ff);
 
   position: relative;
   display: grid;
@@ -8527,7 +8600,7 @@ export const AudioDictionaryWordRow = styled.div`
 
   &:hover,
   &:focus-within {
-    background: rgba(125, 160, 205, 0.07);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.07);
   }
 
   &:hover::before,
@@ -8699,9 +8772,9 @@ export const AudioDictionaryTitleInput = styled.input`
   letter-spacing: 0;
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.28);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.28));
     outline: none;
-    background: rgba(21, 27, 35, 0.42);
+    background: var(--audio-control-bg, rgba(21, 27, 35, 0.42));
   }
 
   html[data-forge-theme="light"] &:focus {
@@ -8716,10 +8789,10 @@ export const AudioDictionaryMetaPill = styled.span`
   align-items: center;
   justify-content: center;
   padding: 0 8px;
-  border: 1px solid rgba(125, 160, 205, 0.16);
+  border: 1px solid var(--audio-border-soft, rgba(125, 160, 205, 0.16));
   border-radius: 999px;
   color: var(--forge-text-muted);
-  background: rgba(125, 160, 205, 0.08);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
   font-size: 11px;
   font-weight: 720;
   line-height: 1;
@@ -8754,10 +8827,10 @@ export const AudioDictionaryEmpty = styled.div`
   place-items: center;
   gap: 4px;
   padding: 18px;
-  border: 1px dashed rgba(125, 160, 205, 0.22);
+  border: 1px dashed var(--audio-border, rgba(125, 160, 205, 0.22));
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: rgba(7, 9, 13, 0.22);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.22));
   text-align: center;
 
   strong {
@@ -8790,9 +8863,9 @@ export const AudioRulesTabs = styled.div`
   gap: 4px;
   min-width: 0;
   padding: 3px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 999px;
-  background: rgba(7, 9, 13, 0.5);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.5));
   justify-self: start;
 
   html[data-forge-theme="light"] & {
@@ -8818,7 +8891,7 @@ export const AudioRulesTab = styled.button`
 
   &[aria-pressed="true"] {
     color: var(--forge-text);
-    background: rgba(125, 160, 205, 0.18);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.18);
   }
 
   html[data-forge-theme="light"] &[aria-pressed="true"] {
@@ -8847,9 +8920,9 @@ export const AudioRuleRow = styled.div`
   gap: 8px;
   min-width: 0;
   padding: 8px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.5);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.5));
 
   &[data-disabled="true"] {
     opacity: 0.55;
@@ -8884,10 +8957,10 @@ export const AudioRuleTextarea = styled.textarea`
   min-width: 0;
   min-height: 56px;
   padding: 8px 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text);
-  background: rgba(21, 27, 35, 0.78);
+  background: var(--audio-control-bg, rgba(21, 27, 35, 0.78));
   font-size: 12px;
   font-weight: 600;
   font-family: inherit;
@@ -8895,9 +8968,9 @@ export const AudioRuleTextarea = styled.textarea`
   resize: vertical;
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.44);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.44));
     outline: none;
-    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+    box-shadow: 0 0 0 3px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12);
   }
 
   html[data-forge-theme="light"] & {
@@ -8918,9 +8991,9 @@ export const AudioRuleToggle = styled.button`
   align-self: center;
   align-items: center;
   padding: 2px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 999px;
-  background: rgba(125, 160, 205, 0.12);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12);
   cursor: pointer;
   transition: background 140ms ease;
 
@@ -8943,7 +9016,7 @@ export const AudioRuleToggle = styled.button`
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline: 2px solid var(--audio-focus-ring, rgba(125, 160, 205, 0.42));
     outline-offset: 2px;
   }
 `;
@@ -8973,7 +9046,7 @@ export const AudioRuleIconButton = styled.button`
   }
 
   &:focus-visible {
-    outline: 2px solid rgba(125, 160, 205, 0.42);
+    outline: 2px solid var(--audio-focus-ring, rgba(125, 160, 205, 0.42));
     outline-offset: 2px;
   }
 `;
@@ -9054,11 +9127,11 @@ export const AudioInsightCard = styled.div`
   align-content: start;
   gap: 4px;
   padding: 9px 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 10px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(13, 17, 23, 0.66);
+    var(--audio-panel-bg-soft, rgba(13, 17, 23, 0.66));
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -9131,11 +9204,11 @@ export const AudioWpmGauge = styled.svg`
   }
 
   .track {
-    stroke: rgba(125, 160, 205, 0.18);
+    stroke: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.18);
   }
 
   .fill {
-    stroke: #5f9cff;
+    stroke: var(--audio-accent-soft, #5f9cff);
     transition: stroke-dashoffset 420ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
@@ -9176,26 +9249,26 @@ export const AudioHeatmapCell = styled.span`
   width: 9px;
   height: 9px;
   border-radius: 2.5px;
-  background: rgba(125, 160, 205, 0.1);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.1);
 
   &[data-empty="true"] {
     background: transparent;
   }
 
   &[data-level="1"] {
-    background: rgba(95, 156, 255, 0.28);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.28);
   }
 
   &[data-level="2"] {
-    background: rgba(95, 156, 255, 0.48);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.48);
   }
 
   &[data-level="3"] {
-    background: rgba(95, 156, 255, 0.7);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.7);
   }
 
   &[data-level="4"] {
-    background: #5f9cff;
+    background: var(--audio-accent-soft, #5f9cff);
   }
 
   html[data-forge-theme="light"] & {
@@ -9228,11 +9301,11 @@ export const AudioHistoryStatChip = styled.div`
   min-width: 0;
   gap: 3px;
   padding: 8px 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(13, 17, 23, 0.66);
+    var(--audio-panel-bg-soft, rgba(13, 17, 23, 0.66));
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -9317,9 +9390,9 @@ export const AudioHistoryRow = styled.div`
   align-content: start;
   gap: 4px;
   padding: 8px 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 9, 13, 0.5);
+  background: var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.5));
 
   /* The row's translateY is its absolute position in the virtual list. It only
      changes when an item is inserted/removed above it or a measured height
@@ -9409,9 +9482,9 @@ export const AudioHistorySnippetChangeRow = styled.div`
   align-items: start;
   gap: 7px;
   padding: 5px 7px;
-  border-left: 2px solid rgba(95, 156, 255, 0.54);
+  border-left: 2px solid rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.54);
   border-radius: 6px;
-  background: rgba(95, 156, 255, 0.055);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.055);
 
   html[data-forge-theme="light"] & {
     border-left-color: rgba(0, 102, 204, 0.46);
@@ -9425,10 +9498,10 @@ export const AudioHistorySnippetChangeBadge = styled.span`
   align-items: center;
   justify-content: center;
   padding: 0 6px;
-  border: 1px solid rgba(95, 156, 255, 0.26);
+  border: 1px solid rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.26);
   border-radius: 999px;
-  color: var(--forge-blue-soft);
-  background: rgba(95, 156, 255, 0.08);
+  color: var(--audio-accent-soft, var(--forge-blue-soft));
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
   font-size: 9.5px;
   font-weight: 800;
   letter-spacing: 0;
@@ -9507,9 +9580,9 @@ export const AudioHistoryExpandButton = styled.button`
   cursor: pointer;
 
   &:hover {
-    border-color: rgba(95, 156, 255, 0.4);
+    border-color: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.4);
     color: var(--forge-text-soft);
-    background: rgba(95, 156, 255, 0.08);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
   }
 `;
 
@@ -9549,10 +9622,10 @@ export const AudioHistoryProvider = styled.span`
   min-height: 22px;
   align-items: center;
   padding: 0 7px;
-  border: 1px solid rgba(125, 160, 205, 0.28);
+  border: 1px solid var(--audio-border-strong, rgba(125, 160, 205, 0.28));
   border-radius: 999px;
-  color: var(--forge-blue-soft);
-  background: rgba(125, 160, 205, 0.08);
+  color: var(--audio-accent-soft, var(--forge-blue-soft));
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
   font-size: 10px;
   font-weight: 780;
   text-transform: uppercase;
@@ -9610,9 +9683,9 @@ export const AudioHistoryVariantControl = styled.div`
   align-items: center;
   gap: 2px;
   padding: 1px 3px;
-  border: 1px solid rgba(125, 160, 205, 0.22);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.22));
   border-radius: 999px;
-  background: rgba(21, 27, 35, 0.58);
+  background: var(--audio-control-bg, rgba(21, 27, 35, 0.58));
 
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 102, 204, 0.14);
@@ -9641,7 +9714,7 @@ export const AudioHistoryVariantButton = styled.button`
 
   &:hover {
     color: var(--forge-text);
-    background: rgba(125, 160, 205, 0.14);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.14);
   }
 
   html[data-forge-theme="light"] &:hover {
@@ -9675,10 +9748,10 @@ export const AudioHistoryCopyButton = styled.button`
   justify-content: center;
   gap: 5px;
   padding: 0 7px;
-  border: 1px solid rgba(125, 160, 205, 0.22);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.22));
   border-radius: 999px;
   color: var(--forge-text-soft);
-  background: rgba(21, 27, 35, 0.64);
+  background: var(--audio-control-bg, rgba(21, 27, 35, 0.64));
   font-size: 10px;
   font-weight: 780;
   line-height: 1;
@@ -9695,9 +9768,9 @@ export const AudioHistoryCopyButton = styled.button`
   }
 
   &:hover {
-    border-color: rgba(125, 160, 205, 0.36);
+    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.36));
     color: var(--forge-text);
-    background: rgba(125, 160, 205, 0.12);
+    background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12);
   }
 
   &[data-copied="true"] {
@@ -9743,9 +9816,9 @@ export const AudioPathBlock = styled.div`
   gap: 7px 12px;
   min-width: 0;
   padding: 10px 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(13, 17, 23, 0.58);
+  background: var(--audio-panel-bg-soft, rgba(13, 17, 23, 0.58));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
@@ -9801,9 +9874,9 @@ export const AudioProgressPanel = styled.div`
   display: grid;
   gap: 7px;
   padding: 10px;
-  border: 1px solid rgba(125, 160, 205, 0.22);
+  border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.22));
   border-radius: 8px;
-  background: rgba(125, 160, 205, 0.07);
+  background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.07);
 
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 102, 204, 0.16);
@@ -14751,8 +14824,8 @@ export const TerminalRoleButton = styled.button`
 
   &[data-selected="true"] {
     color: #fff;
-    border-color: rgba(98, 160, 255, 0.38);
-    background: rgba(98, 160, 255, 0.14);
+    border-color: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.38);
+    background: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.14);
   }
 
   &[data-role="claude"][data-selected="true"] {
@@ -14762,9 +14835,9 @@ export const TerminalRoleButton = styled.button`
 
   html[data-forge-theme="light"] &[data-selected="true"],
   html[data-forge-theme="light"] &[data-role="claude"][data-selected="true"] {
-    color: var(--forge-blue);
-    border-color: rgba(0, 102, 204, 0.24);
-    background: rgba(0, 102, 204, 0.08);
+    color: var(--settings-accent, var(--forge-tint));
+    border-color: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.24);
+    background: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.08);
   }
 
   &[data-role="generic"][data-selected="true"] {
@@ -14820,11 +14893,11 @@ export const AgentSettingsPanel = styled.section`
   min-height: 0;
   overflow: hidden;
   padding: 14px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.8);
+    var(--settings-panel-bg, rgba(17, 22, 29, 0.8));
   box-shadow: inset 0 1px 0 rgba(244, 247, 250, 0.04);
 
   html[data-forge-theme="light"] & {
@@ -14856,10 +14929,10 @@ export const AgentReadyPill = styled.div`
   align-items: center;
   gap: 8px;
   padding: 0 11px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
-  background: rgba(21, 27, 35, 0.72);
+  background: var(--settings-control-bg, rgba(21, 27, 35, 0.72));
   font-size: 12px;
   font-weight: 760;
 
@@ -14905,11 +14978,11 @@ export const AgentCard = styled.section`
   min-height: 0;
   overflow: hidden;
   padding: 12px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(13, 17, 23, 0.78);
+    var(--settings-panel-bg-soft, rgba(13, 17, 23, 0.78));
   transition:
     border-color 160ms ease,
     background 160ms ease,
@@ -14924,10 +14997,10 @@ export const AgentCard = styled.section`
   }
 
   &:hover {
-    border-color: var(--forge-border-strong);
+    border-color: var(--settings-border-strong, var(--forge-border-strong));
     background:
       linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
-      rgba(17, 22, 29, 0.88);
+      var(--settings-control-bg-hover, rgba(17, 22, 29, 0.88));
   }
 
   html[data-forge-theme="light"] & {
@@ -14967,10 +15040,10 @@ export const AgentIcon = styled.span`
   width: 32px;
   height: 32px;
   place-items: center;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: rgba(230, 236, 245, 0.04);
+  background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.04);
 
   svg {
     width: 17px;
@@ -15022,9 +15095,9 @@ export const AgentInstallPanel = styled.div`
   display: grid;
   gap: 8px;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(21, 27, 35, 0.42);
+  background: var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.42));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
@@ -15052,10 +15125,10 @@ export const AgentInstallTopline = styled.div`
 export const AgentInstallBadge = styled.span`
   flex: 0 0 auto;
   padding: 4px 7px;
-  border: 1px solid rgba(125, 160, 205, 0.28);
+  border: 1px solid var(--settings-border-strong, rgba(125, 160, 205, 0.28));
   border-radius: 999px;
   color: var(--forge-text-soft);
-  background: rgba(125, 160, 205, 0.08);
+  background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
   font-size: 10px;
   font-weight: 760;
   text-transform: uppercase;
@@ -15084,10 +15157,10 @@ export const AgentInstallCommand = styled.code`
   min-width: 0;
   overflow: hidden;
   padding: 8px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
-  background: rgba(7, 9, 13, 0.54);
+  background: var(--settings-panel-bg-muted, rgba(7, 9, 13, 0.54));
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 11px;
   text-overflow: ellipsis;
@@ -15113,10 +15186,10 @@ export const AgentPermissionHint = styled.p`
 export const AgentInstallMessage = styled.p`
   margin: 0;
   padding: 8px 9px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
-  background: rgba(21, 27, 35, 0.5);
+  background: var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.5));
   font-size: 12px;
   font-weight: 650;
   line-height: 1.45;
@@ -15212,6 +15285,25 @@ export const PanelHeading = styled.h2`
 `;
 
 export const SettingsPage = styled.section`
+  --settings-surface-bg:
+    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
+    rgba(13, 17, 23, 0.18);
+  --settings-surface-bg-size: 72px 72px, 72px 72px, auto;
+  --settings-border: rgba(230, 236, 245, 0.1);
+  --settings-border-soft: rgba(230, 236, 245, 0.1);
+  --settings-border-strong: rgba(230, 236, 245, 0.16);
+  --settings-panel-bg: rgba(17, 22, 29, 0.8);
+  --settings-panel-bg-soft: rgba(13, 17, 23, 0.78);
+  --settings-panel-bg-muted: rgba(21, 27, 35, 0.5);
+  --settings-control-bg: rgba(21, 27, 35, 0.72);
+  --settings-control-bg-hover: rgba(17, 22, 29, 0.88);
+  --settings-tab-bg: rgba(7, 10, 16, 0.64);
+  --settings-accent: var(--forge-tint);
+  --settings-accent-soft: var(--forge-tint-soft);
+  --settings-accent-rgb: var(--forge-tint-rgb);
+  --settings-accent-soft-rgb: var(--forge-tint-soft-rgb);
+
   display: grid;
   grid-column: 1 / -1;
   width: 100%;
@@ -15223,15 +15315,53 @@ export const SettingsPage = styled.section`
   min-height: 0;
   overflow: auto;
   padding: 16px;
-  background:
-    linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(230, 236, 245, 0.014) 1px, transparent 1px),
-    rgba(13, 17, 23, 0.18);
-  background-size: 72px 72px, 72px 72px, auto;
+  background: var(--settings-surface-bg);
+  background-size: var(--settings-surface-bg-size);
   animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
+  html[data-forge-space="loopspaces"] & {
+    --settings-surface-bg:
+      radial-gradient(circle at 76% 8%, rgba(var(--forge-tint-rgb), 0.13), transparent 18rem),
+      radial-gradient(circle at 22% 98%, rgba(var(--forge-tint-soft-rgb), 0.045), transparent 20rem),
+      linear-gradient(90deg, rgba(var(--forge-tint-soft-rgb), 0.03) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(var(--forge-tint-soft-rgb), 0.022) 1px, transparent 1px),
+      rgba(5, 4, 2, 0.96);
+    --settings-surface-bg-size: auto, auto, 72px 72px, 72px 72px, auto;
+    --settings-border: rgba(var(--forge-tint-soft-rgb), 0.16);
+    --settings-border-soft: rgba(var(--forge-tint-soft-rgb), 0.1);
+    --settings-border-strong: rgba(var(--forge-tint-soft-rgb), 0.3);
+    --settings-panel-bg: rgba(14, 10, 5, 0.8);
+    --settings-panel-bg-soft: rgba(13, 9, 4, 0.72);
+    --settings-panel-bg-muted: rgba(8, 6, 3, 0.52);
+    --settings-control-bg: rgba(15, 10, 4, 0.74);
+    --settings-control-bg-hover: rgba(22, 15, 6, 0.86);
+    --settings-tab-bg: rgba(8, 6, 3, 0.72);
+  }
+
   html[data-forge-theme="light"] & {
-    background: var(--forge-bg);
+    --settings-surface-bg: var(--forge-bg);
+    --settings-surface-bg-size: auto;
+    --settings-border: var(--forge-border);
+    --settings-border-soft: var(--forge-border);
+    --settings-border-strong: rgba(var(--forge-tint-rgb), 0.22);
+    --settings-panel-bg: var(--forge-surface);
+    --settings-panel-bg-soft: var(--forge-surface);
+    --settings-panel-bg-muted: var(--forge-surface-control);
+    --settings-control-bg: var(--forge-surface-control);
+    --settings-control-bg-hover: var(--forge-surface-control);
+    --settings-tab-bg: var(--forge-surface-control);
+  }
+
+  html[data-forge-theme="light"][data-forge-space="loopspaces"] & {
+    --settings-surface-bg:
+      radial-gradient(circle at 76% 8%, rgba(var(--forge-tint-rgb), 0.07), transparent 18rem),
+      #f5f5f7;
+    --settings-surface-bg-size: auto, auto;
+    --settings-border: rgba(var(--forge-tint-rgb), 0.16);
+    --settings-border-soft: rgba(var(--forge-tint-rgb), 0.1);
+    --settings-border-strong: rgba(var(--forge-tint-rgb), 0.26);
+    --settings-panel-bg-muted: rgba(var(--forge-tint-rgb), 0.045);
+    --settings-tab-bg: rgba(var(--forge-tint-rgb), 0.04);
   }
 
   ${DashboardTitle} {
@@ -15270,9 +15400,9 @@ export const SettingsTabNav = styled.nav`
   gap: 6px;
   width: min(100%, 620px);
   padding: 4px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border, var(--forge-border));
   border-radius: 8px;
-  background: rgba(7, 10, 16, 0.64);
+  background: var(--settings-tab-bg, rgba(7, 10, 16, 0.64));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
@@ -15303,7 +15433,7 @@ export const SettingsTabButton = styled.button`
 
   &:hover {
     color: var(--forge-text);
-    background: rgba(125, 160, 205, 0.1);
+    background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.1);
   }
 
   &[data-active="true"] {
@@ -15341,11 +15471,11 @@ export const SettingsPermissionRow = styled.section`
   gap: 12px;
   min-width: 0;
   padding: 13px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.03), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.72);
+    var(--settings-panel-bg-soft, rgba(17, 22, 29, 0.72));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -15360,7 +15490,7 @@ export const SettingsPermissionRow = styled.section`
   }
 
   &[data-tone="neutral"] {
-    border-color: rgba(125, 160, 205, 0.18);
+    border-color: var(--settings-border, rgba(125, 160, 205, 0.18));
   }
 `;
 
@@ -15370,10 +15500,10 @@ export const SettingsPermissionIcon = styled.span`
   height: 38px;
   align-items: center;
   justify-content: center;
-  border: 1px solid rgba(125, 160, 205, 0.22);
+  border: 1px solid var(--settings-border, rgba(125, 160, 205, 0.22));
   border-radius: 8px;
-  color: rgba(153, 190, 255, 0.96);
-  background: rgba(44, 72, 121, 0.22);
+  color: var(--settings-accent-soft, rgba(153, 190, 255, 0.96));
+  background: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.14);
 
   svg {
     width: 19px;
@@ -15420,10 +15550,10 @@ export const SettingsPermissionStatus = styled.span`
   justify-content: center;
   min-height: 26px;
   padding: 0 9px;
-  border: 1px solid rgba(125, 160, 205, 0.2);
+  border: 1px solid var(--settings-border, rgba(125, 160, 205, 0.2));
   border-radius: 999px;
   color: var(--forge-text-soft);
-  background: rgba(12, 17, 25, 0.56);
+  background: var(--settings-control-bg, rgba(12, 17, 25, 0.56));
   font-size: 11px;
   font-weight: 820;
   letter-spacing: 0.04em;
@@ -15480,18 +15610,18 @@ export const AccountCard = styled.section`
   display: grid;
   gap: 12px;
   padding: 14px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(17, 22, 29, 0.78);
+    var(--settings-panel-bg-soft, rgba(17, 22, 29, 0.78));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
   }
 
   &[data-tone="blue"] {
-    border-color: rgba(125, 160, 205, 0.18);
+    border-color: var(--settings-border, rgba(125, 160, 205, 0.18));
   }
 
   &[data-tone="orange"] {
@@ -15575,9 +15705,9 @@ export const SettingsIdentityItem = styled.div`
   min-width: 0;
   gap: 4px;
   padding: 9px 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(21, 27, 35, 0.5);
+  background: var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.5));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
@@ -15615,9 +15745,9 @@ export const SettingsRepoCard = styled.button`
   align-items: center;
   min-width: 0;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
-  background: rgba(10, 14, 20, 0.58);
+  background: var(--settings-panel-bg-muted, rgba(10, 14, 20, 0.58));
   color: var(--forge-text);
   cursor: pointer;
   text-align: left;
@@ -15679,9 +15809,9 @@ export const CreditUsageTrack = styled.div`
   width: 100%;
   height: 8px;
   overflow: hidden;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 999px;
-  background: rgba(10, 14, 20, 0.62);
+  background: var(--settings-panel-bg-muted, rgba(10, 14, 20, 0.62));
 
   html[data-forge-theme="light"] & {
     background: rgba(15, 23, 42, 0.08);
@@ -15778,12 +15908,12 @@ export const AppearanceThemeButton = styled.button`
   align-items: center;
   gap: 10px;
   padding: 10px;
-  border: 1px solid var(--forge-border);
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    rgba(21, 27, 35, 0.56);
+    var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.56));
   text-align: left;
   transition:
     border-color 160ms ease,
@@ -15792,22 +15922,22 @@ export const AppearanceThemeButton = styled.button`
     color 160ms ease;
 
   &:hover {
-    border-color: var(--forge-border-strong);
+    border-color: var(--settings-border-strong, var(--forge-border-strong));
     color: var(--forge-text);
     background:
       linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
-      rgba(21, 27, 35, 0.72);
+      var(--settings-control-bg-hover, rgba(21, 27, 35, 0.72));
   }
 
   &[data-selected="true"] {
-    border-color: rgba(var(--forge-tint-rgb), 0.38);
+    border-color: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.38);
     color: var(--forge-text);
     background:
-      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.12), rgba(var(--forge-tint-rgb), 0.045)),
-      rgba(21, 27, 35, 0.82);
+      linear-gradient(180deg, rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.12), rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.045)),
+      var(--settings-control-bg, rgba(21, 27, 35, 0.82));
     box-shadow:
-      inset 0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.12),
-      0 0 18px rgba(var(--forge-tint-rgb), 0.08);
+      inset 0 0 0 1px rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12),
+      0 0 18px rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.08);
   }
 
   html[data-forge-theme="light"] & {
@@ -15829,16 +15959,16 @@ export const AppearanceThemeButton = styled.button`
     width: 36px;
     height: 36px;
     place-items: center;
-    border: 1px solid var(--forge-border);
+    border: 1px solid var(--settings-border-soft, var(--forge-border));
     border-radius: 8px;
     color: var(--forge-text-muted);
-    background: rgba(230, 236, 245, 0.04);
+    background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.04);
   }
 
   &[data-selected="true"] > span {
-    border-color: rgba(var(--forge-tint-rgb), 0.34);
-    color: var(--forge-tint-soft);
-    background: rgba(var(--forge-tint-rgb), 0.1);
+    border-color: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.34);
+    color: var(--settings-accent-soft, var(--forge-tint-soft));
+    background: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.1);
   }
 
   svg {

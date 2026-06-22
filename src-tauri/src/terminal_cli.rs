@@ -807,7 +807,56 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "close_terminals",
     "focus_terminal",
 ];
+const APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT: &str = "\
+You are Diff Forge's app-control terminal orchestrator. Treat the visible Diff Forge UI as first-class context, not as an ordinary repo task. When the user asks things like \"make a skill\", \"create a draft\", \"modify this selection\", \"delete this selection\", \"save this locally\", or \"publish this\", use the diffforge-app-control MCP tools before guessing.
+
+Default routing:
+- Start with get_visible_context when the request could refer to the current tab, selected Tools document, draft, or highlighted text.
+- For Tools document questions, use get_selected_document_context or get_visible_context(includeContent=true) and explain the selected skill, instruction, architecture, or document from that context.
+- For creating a skill/instruction/architecture/document draft, call update_selected_document with title, document_kind, content or content_md, and mode=\"draft\" unless the user asks to save or publish.
+- For modifying or deleting highlighted text, get the selection context, preserve the surrounding document, send the full updated document content through update_selected_document, and keep mode=\"draft\" unless the user asks for local save or publish.
+- For save locally, use mode=\"local\". For publish, push, sync, fan out, or share with other clients, use mode=\"publish\".
+- For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
+
+Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";
 const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+fn app_control_orchestrator_instructions_body() -> String {
+    format!(
+        "# Diff Forge App-Control Orchestrator\n\n{}\n",
+        APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT
+    )
+}
+
+fn diffforge_app_control_orchestrator_instructions_path() -> PathBuf {
+    env::temp_dir()
+        .join("diffforge-app-control")
+        .join("orchestrator-instructions.md")
+}
+
+fn ensure_diffforge_app_control_orchestrator_instructions_file() -> Result<PathBuf, String> {
+    let path = diffforge_app_control_orchestrator_instructions_path();
+    let Some(parent) = path.parent() else {
+        return Err("Unable to prepare app-control orchestrator instruction path.".to_string());
+    };
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Unable to prepare app-control orchestrator instruction directory {}: {error}",
+            parent.display()
+        )
+    })?;
+
+    let body = app_control_orchestrator_instructions_body();
+    if fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
+        fs::write(&path, body).map_err(|error| {
+            format!(
+                "Unable to write app-control orchestrator instructions {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(path)
+}
 
 fn terminal_args_with_app_control_mcp_identity(
     provider_id: &str,
@@ -824,6 +873,7 @@ fn terminal_args_with_app_control_mcp_identity(
 
     let mut next = args.to_vec();
     if is_codex {
+        append_codex_app_control_developer_instructions_arg(&mut next);
         append_codex_mcp_server_config_args(
             &mut next,
             APP_CONTROL_MCP_SERVER_NAME,
@@ -838,6 +888,9 @@ fn terminal_args_with_app_control_mcp_identity(
     }
 
     if is_claude {
+        next.push("--append-system-prompt".to_string());
+        next.push(APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT.to_string());
+
         strip_terminal_arg_option(&mut next, "--mcp-config", "", true);
         next.push("--mcp-config".to_string());
         next.push(claude_app_control_mcp_config_arg(
@@ -918,6 +971,22 @@ fn terminal_env_vars_with_app_control_mcp_identity(
             }
         }),
     );
+
+    let instruction_path = ensure_diffforge_app_control_orchestrator_instructions_file()?
+        .to_string_lossy()
+        .to_string();
+    let instructions = config_object
+        .entry("instructions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(instructions_array) = instructions.as_array_mut() else {
+        return Err("OpenCode inline config field `instructions` must be a JSON array.".to_string());
+    };
+    if !instructions_array
+        .iter()
+        .any(|value| value.as_str() == Some(instruction_path.as_str()))
+    {
+        instructions_array.push(Value::String(instruction_path));
+    }
 
     set_terminal_env_var(&mut next, OPENCODE_CONFIG_CONTENT_ENV, &config.to_string());
     Ok(next)
@@ -1006,6 +1075,64 @@ fn append_codex_mcp_tool_approval_arg(args: &mut Vec<String>, server_key: &str, 
         "mcp_servers.{server_key}.tools.{tool}.approval_mode={}",
         terminal_toml_string("approve")
     ));
+}
+
+fn append_codex_app_control_developer_instructions_arg(args: &mut Vec<String>) {
+    let existing = take_codex_config_string_override(args, "developer_instructions");
+    let instructions = match existing {
+        Some(existing) if existing.trim().is_empty() => {
+            APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT.to_string()
+        }
+        Some(existing) if existing.contains(APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT) => existing,
+        Some(existing) => format!("{existing}\n\n{APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT}"),
+        None => APP_CONTROL_ORCHESTRATOR_SYSTEM_PROMPT.to_string(),
+    };
+    args.push("-c".to_string());
+    args.push(format!(
+        "developer_instructions={}",
+        terminal_toml_string(&instructions)
+    ));
+}
+
+fn take_codex_config_string_override(args: &mut Vec<String>, key: &str) -> Option<String> {
+    let mut next = Vec::with_capacity(args.len());
+    let mut value = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if (arg == "-c" || arg == "--config") && index + 1 < args.len() {
+            if let Some(candidate) = codex_config_string_override_value(&args[index + 1], key) {
+                if let Some(candidate) = candidate {
+                    value = Some(candidate);
+                }
+                index += 2;
+                continue;
+            }
+        }
+
+        if let Some(config) = arg.strip_prefix("--config=") {
+            if let Some(candidate) = codex_config_string_override_value(config, key) {
+                if let Some(candidate) = candidate {
+                    value = Some(candidate);
+                }
+                index += 1;
+                continue;
+            }
+        }
+
+        next.push(arg.clone());
+        index += 1;
+    }
+    *args = next;
+    value
+}
+
+fn codex_config_string_override_value(config: &str, key: &str) -> Option<Option<String>> {
+    let (candidate_key, raw_value) = config.split_once('=')?;
+    if candidate_key.trim() != key {
+        return None;
+    }
+    Some(terminal_toml_string_literal_value(raw_value))
 }
 
 fn terminal_toml_key_segment(value: &str) -> String {
@@ -1694,6 +1821,9 @@ fn codex_hooks_path_from_profile(profile_path: &Path) -> Result<Option<PathBuf>,
 
 fn terminal_toml_string_literal_value(value: &str) -> Option<String> {
     let value = value.trim();
+    if value.starts_with("'''") && value.ends_with("'''") && value.len() >= 6 {
+        return Some(value[3..value.len().saturating_sub(3)].to_string());
+    }
     if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
         return None;
     }
@@ -2748,6 +2878,111 @@ mod terminal_cli_tests {
         assert!(settings.contains("\"Stop\""));
         assert!(settings.contains("\"PostToolUse\""));
         assert!(settings.contains("\"SubagentStop\""));
+    }
+
+    #[test]
+    fn app_control_claude_launch_appends_orchestrator_instructions() {
+        let args = terminal_args_with_app_control_mcp_identity(
+            "claude",
+            &["--model".to_string(), "sonnet".to_string()],
+            "diff-forge",
+            &["--app-control-mcp".to_string()],
+        )
+        .unwrap();
+
+        let prompt = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--append-system-prompt").then(|| pair[1].as_str()))
+            .unwrap();
+        assert!(prompt.contains("app-control terminal orchestrator"));
+        assert!(prompt.contains("make a skill"));
+        assert!(prompt.contains("modify this selection"));
+        assert!(prompt.contains("update_selected_document"));
+
+        let allowed_tools = args
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--allowedTools" || pair[0] == "--allowed-tools")
+                    .then(|| pair[1].as_str())
+            })
+            .unwrap();
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__get_visible_context"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__update_selected_document"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--mcp-config"));
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn app_control_codex_launch_adds_orchestrator_developer_instructions() {
+        let args = terminal_args_with_app_control_mcp_identity(
+            "codex",
+            &[
+                "-c".to_string(),
+                "developer_instructions=\"Keep existing app instruction\"".to_string(),
+            ],
+            "diff-forge",
+            &["--app-control-mcp".to_string()],
+        )
+        .unwrap();
+
+        let developer_instruction_configs = args
+            .windows(2)
+            .filter_map(|pair| {
+                (pair[0] == "-c" || pair[0] == "--config")
+                    .then(|| pair[1].strip_prefix("developer_instructions="))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(developer_instruction_configs.len(), 1);
+        let prompt = terminal_toml_string_literal_value(developer_instruction_configs[0]).unwrap();
+        assert!(prompt.contains("Keep existing app instruction"));
+        assert!(prompt.contains("app-control terminal orchestrator"));
+        assert!(prompt.contains("make a skill"));
+        assert!(prompt.contains("update_selected_document"));
+        assert!(args.iter().any(|arg| {
+            arg.contains("mcp_servers.diffforge-app-control.command")
+                && arg.contains("diff-forge")
+        }));
+        assert!(args.iter().any(|arg| {
+            arg.contains("mcp_servers.diffforge-app-control.tools.get_visible_context.approval_mode")
+        }));
+    }
+
+    #[test]
+    fn app_control_opencode_launch_adds_orchestrator_instruction_file() {
+        let env_vars = terminal_env_vars_with_app_control_mcp_identity(
+            "opencode",
+            &[(
+                OPENCODE_CONFIG_CONTENT_ENV.to_string(),
+                r#"{"instructions":["existing.md"]}"#.to_string(),
+            )],
+            "diff-forge",
+            &["--app-control-mcp".to_string()],
+        )
+        .unwrap();
+
+        let config = env_vars
+            .iter()
+            .find_map(|(key, value)| (key == OPENCODE_CONFIG_CONTENT_ENV).then_some(value))
+            .unwrap();
+        let config = serde_json::from_str::<Value>(config).unwrap();
+        let instructions = config["instructions"].as_array().unwrap();
+        assert!(instructions
+            .iter()
+            .any(|value| value.as_str() == Some("existing.md")));
+        let instruction_path = instructions
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|value| value.contains("diffforge-app-control"))
+            .unwrap();
+        let body = fs::read_to_string(instruction_path).unwrap();
+        assert!(body.contains("Diff Forge App-Control Orchestrator"));
+        assert!(body.contains("modify this selection"));
+        assert!(body.contains("update_selected_document"));
+        assert_eq!(
+            config["mcp"][APP_CONTROL_MCP_SERVER_NAME]["command"][0].as_str(),
+            Some("diff-forge")
+        );
     }
 
     #[test]
