@@ -784,10 +784,10 @@ const LOOPSPACE_TRIGGER_TYPE_OPTIONS = [
 ];
 
 const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
-  { id: "5m", label: "5 min", value: "@every 5m" },
-  { id: "15m", label: "15 min", value: "@every 15m" },
-  { id: "hourly", label: "Hourly", value: "@hourly" },
-  { id: "daily", label: "Daily", value: "@daily" },
+  { id: "5m", label: "5m", value: "@every 5m" },
+  { id: "15m", label: "15m", value: "@every 15m" },
+  { id: "hourly", label: "1h", value: "@hourly" },
+  { id: "daily", label: "24h", value: "@daily" },
   { id: "custom", label: "Custom", value: "" },
 ];
 
@@ -5309,36 +5309,11 @@ const WorkspaceToolSurface = styled.div`
 
 const LoopspaceTriggersView = styled.div`
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   color: inherit;
   overflow: hidden;
-`;
-
-const LoopspaceTriggersHeader = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  padding: 12px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
-
-  html[data-forge-theme="light"] & {
-    border-bottom-color: rgba(0, 0, 0, 0.08);
-  }
-`;
-
-const LoopspaceTriggersTitle = styled.div`
-  min-width: 0;
-  color: #f7fafc;
-  font-size: 12px;
-  font-weight: 850;
-  line-height: 1.15;
-
-  html[data-forge-theme="light"] & {
-    color: #17191d;
-  }
 `;
 
 const LoopspaceTriggersMeta = styled.div`
@@ -5445,7 +5420,11 @@ const LoopspaceTriggerTypePicker = styled.div`
   }
 
   &[data-variant="schedule"] {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    padding: 5px;
   }
 `;
 
@@ -5489,6 +5468,27 @@ const LoopspaceTriggerTypeButton = styled.button`
       color: #14171f;
       background: rgba(var(--forge-accent-rgb), 0.18);
     }
+  }
+
+  &[data-variant="schedule"] {
+    width: 36px;
+    height: 36px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    padding: 0;
+    font-size: 10.5px;
+    line-height: 1;
+  }
+
+  &[data-variant="schedule"][data-schedule-id="custom"] {
+    width: auto;
+    min-width: 62px;
+    height: 32px;
+    padding: 0 12px;
+  }
+
+  &[data-variant="schedule"][data-active="true"] {
+    border-color: rgba(var(--forge-accent-rgb), 0.22);
   }
 `;
 
@@ -6110,33 +6110,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     event.dataTransfer.setData("text/plain", trigger.id);
   }, []);
 
-  const triggersBusy = state === "loading" || state === "saving";
-
   return (
     <LoopspaceTriggersView>
-      <LoopspaceTriggersHeader>
-        <div>
-          <LoopspaceTriggersTitle>Triggers</LoopspaceTriggersTitle>
-          <LoopspaceTriggersMeta>
-            {triggers.length} trigger{triggers.length === 1 ? "" : "s"}
-            {state === "loading" ? " - Syncing" : ""}
-            {state === "saving" ? " - Saving" : ""}
-          </LoopspaceTriggersMeta>
-        </div>
-        <LoopspaceTriggerIconButton
-          aria-label="Sync triggers"
-          disabled={triggersBusy}
-          onClick={() => syncTriggers(true)}
-          title="Sync"
-          type="button"
-        >
-          {triggersBusy ? (
-            <LoopspaceTriggerSpinner aria-label="Syncing triggers" role="status" />
-          ) : (
-            <ButtonRefreshIcon aria-hidden="true" />
-          )}
-        </LoopspaceTriggerIconButton>
-      </LoopspaceTriggersHeader>
       <LoopspaceTriggersScroll>
         <LoopspaceTriggerForm onSubmit={createTrigger}>
           <LoopspaceTriggerFieldGrid>
@@ -6171,6 +6146,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                 {LOOPSPACE_TRIGGER_SCHEDULE_PRESETS.map((option) => (
                   <LoopspaceTriggerTypeButton
                     data-active={draftSchedulePreset === option.id}
+                    data-schedule-id={option.id}
+                    data-variant="schedule"
                     key={option.id}
                     onClick={() => setDraftSchedulePreset(option.id)}
                     type="button"

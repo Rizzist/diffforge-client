@@ -4941,6 +4941,8 @@ pub fn run() {
             local_scripts_save,
             local_scripts_delete,
             local_scripts_run,
+            local_scripts_cancel_run,
+            local_scripts_run_history,
             cloud_mcp_get_account_tools,
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,

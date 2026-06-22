@@ -564,6 +564,7 @@ const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 const AUDIO_WIDGET_HISTORY_TRAY_SIZE = { width: 64, height: 98 };
+const AUDIO_WIDGET_HISTORY_TRAY_EXIT_ANIMATION_MS = 210;
 const AUDIO_WIDGET_BUBBLE_DRAG_DEBUG_SAMPLE_MS = 160;
 const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_SAMPLE_MS = 90;
 const AUDIO_WIDGET_BUBBLE_DRAG_SETTLE_STABLE_SAMPLES = 3;
@@ -870,7 +871,7 @@ function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover)
 
 // Transcripts longer than this get the 3-line clamp + "Show more" toggle.
 const AUDIO_HISTORY_CLAMP_THRESHOLD_CHARS = 220;
-const AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT = 124;
+const AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT = 140;
 const AUDIO_HISTORY_ROW_GAP = 8;
 const AUDIO_HISTORY_VIRTUAL_OVERSCAN_ROWS = 4;
 const AUDIO_HISTORY_VIEWPORT_FALLBACK_HEIGHT = 420;
@@ -2466,10 +2467,12 @@ function estimateAudioHistoryRowHeight(row) {
     : Math.max(1, Math.min(6, hardBreaks, wrappedLines));
   const snippetRows = Array.isArray(row?.snippetChanges) ? row.snippetChanges.length : 0;
   const variantControlAllowance = Array.isArray(row?.variants) && row.variants.length > 1 ? 8 : 0;
+  const meta = String(row?.meta || "");
+  const metaLines = Math.max(1, Math.min(3, Math.ceil(meta.length / 74)));
 
   return Math.max(
     AUDIO_HISTORY_ESTIMATED_ROW_HEIGHT,
-    62 + (visibleTextLines * 19) + (snippetRows * 28) + variantControlAllowance,
+    62 + (visibleTextLines * 19) + (metaLines * 15) + (snippetRows * 28) + variantControlAllowance,
   );
 }
 
@@ -6031,6 +6034,7 @@ export function AudioWidgetWindow() {
   const [cancelNoticePaused, setCancelNoticePaused] = useState(false);
   const [widgetHistory, setWidgetHistory] = useState(readAudioTranscriptionHistory);
   const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
+  const [historyTrayClosing, setHistoryTrayClosing] = useState(false);
   const [widgetDragging, setWidgetDragging] = useState(false);
   const [copiedWidgetHistorySlot, setCopiedWidgetHistorySlot] = useState("");
   const [polishStatus, setPolishStatus] = useState({ state: "idle", error: "" });
@@ -6068,6 +6072,9 @@ export function AudioWidgetWindow() {
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
   const historyTrayCloseTimerRef = useRef(0);
+  const historyTrayExitTimerRef = useRef(0);
+  const historyTrayOpenRef = useRef(false);
+  const historyTrayClosingRef = useRef(false);
   const bubbleHistoryTrayActiveRef = useRef(false);
   const bubbleHistoryTrayHoverRef = useRef(false);
   const bubbleHistoryTrayPolishPinnedRef = useRef(false);
@@ -6997,6 +7004,13 @@ export function AudioWidgetWindow() {
         if (closeHistoryTray) {
           bubbleHistoryTrayHoverRef.current = false;
           bubbleHistoryTrayActiveRef.current = false;
+          historyTrayOpenRef.current = false;
+          historyTrayClosingRef.current = false;
+          if (historyTrayExitTimerRef.current) {
+            window.clearTimeout(historyTrayExitTimerRef.current);
+            historyTrayExitTimerRef.current = 0;
+          }
+          setHistoryTrayClosing(false);
           setHistoryTrayOpen(false);
           await windowHandle.setSize(new LogicalSize(
             AUDIO_WIDGET_COMPACT_SIZE.width,
@@ -7060,11 +7074,15 @@ export function AudioWidgetWindow() {
     && !widgetActive
     && !cancelNoticeActive;
   const bubbleHistoryTrayActive = canUseBubbleHistoryTray && historyTrayOpen;
+  const bubbleHistoryTrayClosing = canUseBubbleHistoryTray && historyTrayClosing;
+  const bubbleHistoryTrayFrameActive = bubbleHistoryTrayActive || bubbleHistoryTrayClosing;
   const bubbleHistoryTrayVisible = bubbleHistoryTrayActive && !widgetDragging;
   const bubbleCancelNoticeActiveRef = useRef(bubbleCancelNoticeActive);
   bubbleCancelNoticeActiveRef.current = bubbleCancelNoticeActive;
+  historyTrayOpenRef.current = historyTrayOpen;
+  historyTrayClosingRef.current = historyTrayClosing;
   canUseBubbleHistoryTrayRef.current = canUseBubbleHistoryTray;
-  bubbleHistoryTrayActiveRef.current = bubbleHistoryTrayActive;
+  bubbleHistoryTrayActiveRef.current = bubbleHistoryTrayFrameActive;
 
   const refreshWidgetHistory = useCallback(() => {
     setWidgetHistory(readAudioTranscriptionHistory());
@@ -7107,16 +7125,36 @@ export function AudioWidgetWindow() {
     }
   }, []);
 
+  const clearBubbleHistoryTrayExitTimer = useCallback(() => {
+    if (historyTrayExitTimerRef.current) {
+      window.clearTimeout(historyTrayExitTimerRef.current);
+      historyTrayExitTimerRef.current = 0;
+    }
+  }, []);
+
   const scheduleBubbleHistoryTrayClose = useCallback((delayMs = 140) => {
-    if (historyTrayCloseTimerRef.current) {
+    if (
+      historyTrayCloseTimerRef.current
+      || historyTrayClosingRef.current
+      || !historyTrayOpenRef.current
+    ) {
       return;
     }
 
     historyTrayCloseTimerRef.current = window.setTimeout(() => {
       historyTrayCloseTimerRef.current = 0;
+      clearBubbleHistoryTrayExitTimer();
+      historyTrayOpenRef.current = false;
+      historyTrayClosingRef.current = true;
+      setHistoryTrayClosing(true);
       setHistoryTrayOpen(false);
+      historyTrayExitTimerRef.current = window.setTimeout(() => {
+        historyTrayExitTimerRef.current = 0;
+        historyTrayClosingRef.current = false;
+        setHistoryTrayClosing(false);
+      }, AUDIO_WIDGET_HISTORY_TRAY_EXIT_ANIMATION_MS);
     }, delayMs);
-  }, []);
+  }, [clearBubbleHistoryTrayExitTimer]);
 
   const releaseBubbleHistoryTrayPolishPin = useCallback(() => {
     bubbleHistoryTrayPolishPinnedRef.current = false;
@@ -7138,8 +7176,12 @@ export function AudioWidgetWindow() {
     bubbleHistoryTrayPolishPinnedRef.current = true;
     bubbleHistoryTrayCloseDeferredRef.current = false;
     clearBubbleHistoryTrayCloseTimer();
+    clearBubbleHistoryTrayExitTimer();
+    historyTrayOpenRef.current = true;
+    historyTrayClosingRef.current = false;
+    setHistoryTrayClosing(false);
     setHistoryTrayOpen(true);
-  }, [clearBubbleHistoryTrayCloseTimer]);
+  }, [clearBubbleHistoryTrayCloseTimer, clearBubbleHistoryTrayExitTimer]);
 
   const resetPolishStatusSoon = useCallback((delayMs = 1500) => {
     if (polishStatusTimerRef.current) {
@@ -7253,9 +7295,13 @@ export function AudioWidgetWindow() {
     bubbleHistoryTrayHoverRef.current = true;
     bubbleHistoryTrayCloseDeferredRef.current = false;
     clearBubbleHistoryTrayCloseTimer();
+    clearBubbleHistoryTrayExitTimer();
 
+    historyTrayOpenRef.current = true;
+    historyTrayClosingRef.current = false;
+    setHistoryTrayClosing(false);
     setHistoryTrayOpen(true);
-  }, [canUseBubbleHistoryTray, clearBubbleHistoryTrayCloseTimer]);
+  }, [canUseBubbleHistoryTray, clearBubbleHistoryTrayCloseTimer, clearBubbleHistoryTrayExitTimer]);
 
   const closeBubbleHistoryTray = useCallback(() => {
     bubbleHistoryTrayHoverRef.current = false;
@@ -7322,13 +7368,17 @@ export function AudioWidgetWindow() {
     bubbleHistoryTrayPolishPinnedRef.current = false;
     bubbleHistoryTrayCloseDeferredRef.current = false;
     setBubbleHoverState(false);
+    clearBubbleHistoryTrayExitTimer();
 
+    historyTrayOpenRef.current = false;
+    historyTrayClosingRef.current = false;
+    setHistoryTrayClosing(false);
     setHistoryTrayOpen(false);
     return undefined;
-  }, [canUseBubbleHistoryTray, setBubbleHoverState]);
+  }, [canUseBubbleHistoryTray, clearBubbleHistoryTrayExitTimer, setBubbleHoverState]);
 
   useEffect(() => {
-    if (bubbleHistoryTrayActive) {
+    if (bubbleHistoryTrayFrameActive) {
       document.documentElement.dataset.audioWidgetHistoryTray = "true";
       document.body.dataset.audioWidgetHistoryTray = "true";
     } else {
@@ -7340,7 +7390,7 @@ export function AudioWidgetWindow() {
       delete document.documentElement.dataset.audioWidgetHistoryTray;
       delete document.body.dataset.audioWidgetHistoryTray;
     };
-  }, [bubbleHistoryTrayActive]);
+  }, [bubbleHistoryTrayFrameActive]);
 
   useEffect(() => {
     let disposed = false;
@@ -7381,6 +7431,10 @@ export function AudioWidgetWindow() {
     if (historyTrayCloseTimerRef.current) {
       window.clearTimeout(historyTrayCloseTimerRef.current);
       historyTrayCloseTimerRef.current = 0;
+    }
+    if (historyTrayExitTimerRef.current) {
+      window.clearTimeout(historyTrayExitTimerRef.current);
+      historyTrayExitTimerRef.current = 0;
     }
     bubbleHistoryTrayHoverRef.current = false;
     bubbleHistoryTrayPolishPinnedRef.current = false;
@@ -7922,7 +7976,7 @@ export function AudioWidgetWindow() {
   // bubble's screen position alone. No tray open/close path should setPosition,
   // otherwise hover close can undo a native drag that happened while expanded.
   useEffect(() => {
-    if (!bubbleHistoryTrayActive || widgetDragging) {
+    if (!bubbleHistoryTrayFrameActive || widgetDragging) {
       return undefined;
     }
 
@@ -7946,7 +8000,7 @@ export function AudioWidgetWindow() {
 
     return () => {
       disposed = true;
-      if (widgetDraggingRef.current && bubbleHistoryTrayActiveRef.current) {
+      if (widgetDraggingRef.current) {
         return;
       }
 
@@ -7963,7 +8017,7 @@ export function AudioWidgetWindow() {
         });
       });
     };
-  }, [bubbleHistoryTrayActive, runWidgetWindowAction, widgetDragging]);
+  }, [bubbleHistoryTrayFrameActive, runWidgetWindowAction, widgetDragging]);
 
   // Bubble-style errors get a small card above the widget: the window grows
   // upward by the card height while the error shows, and the pill stays at
@@ -8205,6 +8259,10 @@ export function AudioWidgetWindow() {
       window.clearTimeout(historyTrayCloseTimerRef.current);
       historyTrayCloseTimerRef.current = 0;
     }
+    if (historyTrayExitTimerRef.current) {
+      window.clearTimeout(historyTrayExitTimerRef.current);
+      historyTrayExitTimerRef.current = 0;
+    }
 
     historyTrayCloseAfterDragRef.current = trayWasActive;
     widgetDragReleaseSeenRef.current = false;
@@ -8214,6 +8272,9 @@ export function AudioWidgetWindow() {
     bubbleHistoryTrayHoverRef.current = false;
     bubbleHistoryTrayCloseDeferredRef.current = false;
     bubbleHistoryTrayActiveRef.current = false;
+    historyTrayOpenRef.current = false;
+    historyTrayClosingRef.current = false;
+    setHistoryTrayClosing(false);
     setHistoryTrayOpen(false);
     scheduleWidgetDragFinish(5000);
 
@@ -10024,6 +10085,7 @@ export function AudioWidgetWindow() {
         data-state={widgetState}
         data-theme={audioWidgetTheme}
         data-history-tray={bubbleHistoryTrayActive ? "true" : undefined}
+        data-history-tray-frame={bubbleHistoryTrayFrameActive ? "true" : undefined}
         onMouseEnter={handleBubbleHoverEnter}
         onMouseLeave={handleBubbleHoverLeave}
         onPointerCancel={handleBubbleHoverLeave}

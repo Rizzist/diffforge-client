@@ -1,6 +1,7 @@
 const APP_CONTROL_MCP_REQUEST_EVENT: &str = "forge-app-control-mcp-request";
 const APP_CONTROL_MCP_SERVER_NAME: &str = "diffforge-app-control";
 const APP_CONTROL_MCP_TIMEOUT_MS: u64 = 20_000;
+const APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,6 +178,55 @@ async fn handle_app_control_mcp_bridge_connection(
                 "message": "Invalid app-control MCP bridge token."
             }
         });
+        write_app_control_mcp_bridge_response(&mut stream, response).await?;
+        return Ok(());
+    }
+
+    if request.tool == "run_local_script" {
+        let mut input = request.input;
+        if let Some(object) = input.as_object_mut() {
+            object.insert("cause".to_string(), json!("orchestrator_terminal"));
+            object.insert("source_kind".to_string(), json!("app_control_mcp"));
+        }
+        let response = match local_scripts_enqueue_run(app.clone(), input).await {
+            Ok(result) => {
+                json!({
+                "ok": true,
+                "data": {
+                    "accepted": true,
+                    "message": "Local script queued in Diff Forge. Check Scripts logs or history for output.",
+                    "result": result,
+                },
+                })
+            }
+            Err(error) => json!({
+                "ok": false,
+                "error": {
+                    "code": "local_script_run_failed",
+                    "message": error,
+                },
+            }),
+        };
+        write_app_control_mcp_bridge_response(&mut stream, response).await?;
+        return Ok(());
+    }
+
+    if request.tool == "list_local_scripts" {
+        let response = match local_scripts_list(Some(json!({ "include_content": false }))).await {
+            Ok(result) => json!({
+                "ok": true,
+                "data": {
+                    "inventory": result,
+                },
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "error": {
+                    "code": "local_scripts_list_failed",
+                    "message": error,
+                },
+            }),
+        };
         write_app_control_mcp_bridge_response(&mut stream, response).await?;
         return Ok(());
     }
@@ -435,12 +485,12 @@ fn app_control_mcp_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "get_state",
-            "description": "Return the current Diff Forge app view, selected workspace, active workspace, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, or selection is unclear.",
+            "description": "Return the current Diff Forge app view, selected workspace, active workspace, localScripts inventory, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, script, or selection is unclear.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
             "name": "get_visible_context",
-            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata and highlighted range when available. Use this first for prompts like explain this skill, create a draft here, modify/delete this selection, or what is selected. Use localPath only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata, highlighted range, and state.localScripts inventory when available. Use this first for prompts like explain this skill, create a draft here, modify/delete this selection, run a local script, or what is selected. Use localPath only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -470,6 +520,11 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 },
                 "additionalProperties": true
             }
+        }),
+        json!({
+            "name": "list_local_scripts",
+            "description": "Return every saved local Tools script available on this device, including stable script_id, exact script name, path_key, file_name, and shell. Use this before run_local_script when the user names a script that is not selected or when more than one script exists.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
             "name": "get_selection_context",
@@ -506,7 +561,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "save_selected_script",
-            "description": "Save the currently selected local Tools script from Diff Forge's live editor state. Scripts are local only and do not sync to Cloud.",
+            "description": "Save the currently selected local Tools script from Diff Forge's live editor state. Script content stays local; script id/name metadata syncs to Cloud for device routing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -535,10 +590,26 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "run_selected_script",
-            "description": "Save if needed, then run the currently selected local Tools script on this device.",
+            "description": "Save if needed, then start the currently selected local Tools script on this device. This returns after the run is accepted; do not wait or poll unless the user explicitly asks for logs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "run_local_script",
+            "description": "Start a saved local Tools script on this device by exact script_id, script_name/name, or path_key. This returns immediately after the run is accepted; do not wait or poll unless the user explicitly asks for logs. Use this when the user asks to run a known script that is not necessarily selected in the editor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "script_id": {"type": "string", "description": "Stable script_id from the local scripts inventory."},
+                    "script_name": {"type": "string", "description": "Exact visible script name if script_id is unavailable."},
+                    "name": {"type": "string", "description": "Alias for script_name."},
+                    "path_key": {"type": "string", "description": "Local path key such as scripts/deploy.sh or deploy.sh."},
+                    "working_directory": {"type": "string", "description": "Optional cwd override."},
+                    "shell": {"type": "string", "description": "Optional shell override: zsh, bash, python3, node, powershell, cmd."}
+                },
                 "additionalProperties": true
             }
         }),
@@ -574,7 +645,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_loopspace_graph",
-            "description": "Return the selected Loopspace graph document, or a graph selected by loopspaceId/loopspaceName. Use this before editing a Loopspace graph.",
+            "description": "Return the selected Loopspace .dfblueprint graph document, parsed blueprint AST, source format, runtime head, and graph metadata. Use this before editing a Loopspace graph.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -590,7 +661,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_loopspace_graph",
-            "description": "Replace a Loopspace graph document with updated architecture DSL source. Returns only after the client hydrates the Cloud-accepted graph, unless the edit is queued/offline.",
+            "description": "Replace a Loopspace graph document with full .dfblueprint source. The source/sourceText/graphSource field is required; prefer patch_loopspace_graph for small edits. Returns after the client hydrates the Cloud-accepted graph, unless queued/offline.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -601,6 +672,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "loopspace_name": {"type": "string"},
                     "name": {"type": "string"},
                     "source": {"type": "string"},
+                    "source_format": {"type": "string", "description": "Use dfblueprint.v1."},
                     "sourceText": {"type": "string"},
                     "graphSource": {"type": "string"}
                 },
@@ -609,7 +681,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "edit_loopspace_graph",
-            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with updated architecture DSL source after reading the current graph.",
+            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with full .dfblueprint source after reading the current graph. The source/sourceText/graphSource field is required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -620,8 +692,34 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "loopspace_name": {"type": "string"},
                     "name": {"type": "string"},
                     "source": {"type": "string"},
+                    "source_format": {"type": "string", "description": "Use dfblueprint.v1."},
                     "sourceText": {"type": "string"},
                     "graphSource": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "patch_loopspace_graph",
+            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph first, then send operations such as add_trigger, add_node, move_node, remove_node, connect, disconnect, or update_node_props. Edges are explicit nodeId.port -> nodeId.port connections.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "loopspaceId": {"type": "string"},
+                    "loopspace_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "loopspaceName": {"type": "string"},
+                    "loopspace_name": {"type": "string"},
+                    "name": {"type": "string"},
+                    "operations": {
+                        "type": "array",
+                        "items": {"type": "object", "additionalProperties": true},
+                        "description": "Examples: {op:'add_trigger', triggerId:'...', name:'BasicCron', triggerType:'cron', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'send_message', label:'Read document'}; {op:'connect', from:'trigger-basic', to:'read_doc'}."
+                    },
+                    "ops": {
+                        "type": "array",
+                        "items": {"type": "object", "additionalProperties": true}
+                    }
                 },
                 "additionalProperties": true
             }
@@ -722,11 +820,14 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "save_selected_script",
         "update_selected_script",
         "run_selected_script",
+        "run_local_script",
+        "list_local_scripts",
         "select_workspace",
         "run_loopspace_trigger",
         "get_loopspace_graph",
         "update_loopspace_graph",
         "edit_loopspace_graph",
+        "patch_loopspace_graph",
         "select_tab",
         "list_terminals",
         "open_terminals",
@@ -761,7 +862,12 @@ fn app_control_mcp_forward_to_app(
 ) -> Result<Value, String> {
     let mut stream = std::net::TcpStream::connect(context.endpoint.trim())
         .map_err(|error| format!("Unable to connect to app-control bridge: {error}"))?;
-    let timeout_duration = Duration::from_millis(APP_CONTROL_MCP_TIMEOUT_MS + 1000);
+    let bridge_timeout_ms = if tool == "run_local_script" {
+        APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS
+    } else {
+        APP_CONTROL_MCP_TIMEOUT_MS + 1000
+    };
+    let timeout_duration = Duration::from_millis(bridge_timeout_ms);
     let _ = stream.set_read_timeout(Some(timeout_duration));
     let _ = stream.set_write_timeout(Some(timeout_duration));
     let mut request = json!({

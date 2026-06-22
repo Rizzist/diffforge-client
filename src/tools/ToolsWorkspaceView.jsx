@@ -86,10 +86,13 @@ const SCRIPT_SHELL_OPTIONS = [
   { id: "cmd", label: "Cmd", extension: "cmd" },
   { id: "bat", label: "Batch", extension: "bat" },
 ];
-const SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
-const SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR = "#4b3512";
+const SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
+const SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR = "#4b3512";
+const SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR = "#07101d";
+const SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR = "#120c04";
 const SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR = "#ffffff";
 const SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR = "#ffffff";
+const SCRIPT_EXPLORER_FINISH_BADGE_MS = 5000;
 
 function normalizedSectionId(value, fallback = "docs") {
   const normalized = text(value);
@@ -279,6 +282,12 @@ function scriptExtensionForShell(value) {
   return scriptShellOption(value).extension;
 }
 
+function scriptButtonColor(value, fallback, legacyFallback) {
+  const normalized = text(value, fallback).toLowerCase();
+  if (legacyFallback && normalized === legacyFallback.toLowerCase()) return fallback;
+  return normalized || fallback;
+}
+
 function scriptPathKey(script) {
   return normalizedDocumentPath(script?.pathKey || script?.path_key || script?.filePath || script?.file_path || script?.id);
 }
@@ -304,11 +313,19 @@ function scriptEditorDraft(script = {}) {
   const pathKey = scriptPathKey(script) || fileName;
   const content = String(script.content ?? "");
   const workspaceButtonColor = text(
-    script.workspaceButtonColor || script.workspace_button_color,
+    scriptButtonColor(
+      script.workspaceButtonColor || script.workspace_button_color,
+      SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+      SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR,
+    ),
     SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
   );
   const loopspaceButtonColor = text(
-    script.loopspaceButtonColor || script.loopspace_button_color,
+    scriptButtonColor(
+      script.loopspaceButtonColor || script.loopspace_button_color,
+      SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+      SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR,
+    ),
     SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
   );
   const workspaceTextColor = text(
@@ -357,13 +374,21 @@ function scriptSaveRequest(script = {}) {
     content: String(script.content ?? ""),
     extension,
     file_name: fileName,
-    loopspace_button_color: text(script.loopspaceButtonColor || script.loopspace_button_color, SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR),
+    loopspace_button_color: scriptButtonColor(
+      script.loopspaceButtonColor || script.loopspace_button_color,
+      SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
+      SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR,
+    ),
     loopspace_text_color: text(script.loopspaceTextColor || script.loopspace_text_color, SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR),
     path_key: scriptPathKey(script) || fileName,
     shell,
     title: scriptTitle({ ...script, fileName }),
     workspace_button_color: text(
-      script.workspaceButtonColor || script.workspace_button_color,
+      scriptButtonColor(
+        script.workspaceButtonColor || script.workspace_button_color,
+        SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
+        SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR,
+      ),
       SCRIPT_DEFAULT_WORKSPACE_BUTTON_COLOR,
     ),
     workspace_text_color: text(script.workspaceTextColor || script.workspace_text_color, SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR),
@@ -1064,6 +1089,7 @@ export default function ToolsWorkspaceView({
   const [lastScriptSelection, setLastScriptSelection] = useState(null);
   const scriptSelectionClearAtRef = useRef(0);
   const scriptDocumentCanvasRef = useRef(null);
+  const scriptLogsTerminalRef = useRef(null);
   const scriptsExplorerPanelRef = useRef(null);
   const [scriptsExplorerCollapsed, setScriptsExplorerCollapsed] = useState(false);
   const [scriptsExplorerSize, setScriptsExplorerSize] = useState("238px");
@@ -1076,7 +1102,10 @@ export default function ToolsWorkspaceView({
     workspaceTextColor: SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR,
   });
   const [scriptRunResults, setScriptRunResults] = useState({});
-  const scriptRunInFlightRef = useRef(false);
+  const [scriptRunHistory, setScriptRunHistory] = useState([]);
+  const [scriptCompletionMarkers, setScriptCompletionMarkers] = useState({});
+  const scriptRunStateRef = useRef({});
+  const scriptCompletionTimersRef = useRef(new Map());
 
   const loadLocalScripts = useCallback(async ({ selectKey = "" } = {}) => {
     setScriptsState((current) => (current === "ready" ? "refreshing" : "loading"));
@@ -1178,20 +1207,6 @@ export default function ToolsWorkspaceView({
     const source = script || scriptEditor;
     const pathKey = scriptPathKey(source);
     if (!pathKey) return null;
-    if (scriptRunInFlightRef.current) {
-      if (
-        scriptRunResults[pathKey]?.state === "running"
-        || sharedScriptRunResults[pathKey]?.state === "running"
-      ) {
-        setSelectedScriptKey(pathKey);
-        setSelectedScriptLogKey(pathKey);
-        setScriptPaneTab("logs");
-        return null;
-      }
-      setScriptsError("A local script is already running.");
-      return null;
-    }
-    scriptRunInFlightRef.current = true;
     setScriptsState("running");
     setScriptsError("");
     setScriptsMessage("");
@@ -1218,31 +1233,52 @@ export default function ToolsWorkspaceView({
         timedOut: false,
         updatedAt: Date.now(),
       },
+      [runId]: {
+        chunks: [],
+        durationMs: 0,
+        endedAt: "",
+        error: "",
+        exitCode: null,
+        ok: null,
+        pathKey,
+        runId,
+        script: source,
+        state: "running",
+        stderr: "",
+        stdout: "",
+        startedAt,
+        timedOut: false,
+        updatedAt: Date.now(),
+      },
     }));
     try {
       const result = await invoke("local_scripts_run", {
         request: {
           default_working_directory: defaultWorkingDirectory,
+          cause: "manual",
           path_key: pathKey,
           run_id: runId,
+          source_kind: "tools_editor",
         },
       });
-      setScriptRunResults((current) => ({
-        ...current,
-        [pathKey]: {
+      const resultState = text(result?.state || result?.run_status || result?.runStatus).toLowerCase();
+      const queued = result?.queued === true || resultState === "queued";
+      const running = resultState === "running";
+      setScriptRunResults((current) => {
+        const nextLog = {
           chunks: [
             String(result?.stdout ?? "").length ? { stream: "stdout", text: String(result?.stdout ?? "") } : null,
             String(result?.stderr ?? "").length ? { stream: "stderr", text: String(result?.stderr ?? "") } : null,
           ].filter(Boolean),
-          durationMs: Number(result?.duration_ms ?? result?.durationMs) || 0,
-          endedAt: text(result?.ended_at || result?.endedAt, new Date().toISOString()),
+          durationMs: queued || running ? 0 : Number(result?.duration_ms ?? result?.durationMs) || 0,
+          endedAt: queued || running ? "" : text(result?.ended_at || result?.endedAt, new Date().toISOString()),
           exitCode: result?.exit_code,
           error: text(result?.error),
-          ok: result?.ok !== false,
+          ok: queued || running ? null : result?.ok !== false,
           pathKey,
           runId: text(result?.run_id || result?.runId, runId),
           script: source,
-          state: "ready",
+          state: queued ? "queued" : running ? "running" : result?.ok === false || resultState === "failed" ? "error" : "ready",
           stderr: String(result?.stderr ?? ""),
           stderrTruncated: Boolean(result?.stderr_truncated || result?.stderrTruncated),
           stdout: String(result?.stdout ?? ""),
@@ -1250,10 +1286,14 @@ export default function ToolsWorkspaceView({
           timedOut: Boolean(result?.timed_out || result?.timedOut),
           startedAt: text(result?.started_at || result?.startedAt, startedAt),
           updatedAt: Date.now(),
-        },
-      }));
+        };
+        return {
+          ...current,
+          [pathKey]: nextLog,
+          [nextLog.runId || runId]: nextLog,
+        };
+      });
       setScriptsState("ready");
-      setScriptsMessage(result?.ok === false ? "Script finished with errors." : "Script finished.");
       return result;
     } catch (error) {
       const message = getErrorMessage(error, "Unable to run local script.");
@@ -1271,12 +1311,70 @@ export default function ToolsWorkspaceView({
           state: "error",
           updatedAt: Date.now(),
         },
+        [runId]: {
+          ...(current[runId] || current[pathKey] || {}),
+          endedAt: new Date().toISOString(),
+          error: message,
+          pathKey,
+          runId,
+          script: source,
+          state: "error",
+          updatedAt: Date.now(),
+        },
       }));
       return null;
-    } finally {
-      scriptRunInFlightRef.current = false;
     }
   }, [defaultWorkingDirectory, scriptEditor, scriptRunResults, sharedScriptRunResults]);
+
+  const markScriptCompletion = useCallback((pathKey, ok = true) => {
+    const safePathKey = normalizedDocumentPath(pathKey);
+    if (!safePathKey) return;
+    if (typeof window === "undefined") return;
+    const timers = scriptCompletionTimersRef.current;
+    const existingTimer = timers.get(safePathKey);
+    if (existingTimer) {
+      window.clearTimeout(existingTimer);
+      timers.delete(safePathKey);
+    }
+    setScriptCompletionMarkers((current) => ({
+      ...current,
+      [safePathKey]: {
+        ok: ok !== false,
+        updatedAt: Date.now(),
+      },
+    }));
+    const timer = window.setTimeout(() => {
+      timers.delete(safePathKey);
+      setScriptCompletionMarkers((current) => {
+        if (!Object.prototype.hasOwnProperty.call(current, safePathKey)) return current;
+        const next = { ...current };
+        delete next[safePathKey];
+        return next;
+      });
+    }, SCRIPT_EXPLORER_FINISH_BADGE_MS);
+    timers.set(safePathKey, timer);
+  }, []);
+
+  const loadScriptRunHistory = useCallback(async (pathKey = "") => {
+    try {
+      const result = await invoke("local_scripts_run_history", {
+        request: {
+          limit: 100,
+          path_key: pathKey,
+        },
+      });
+      setScriptRunHistory(Array.isArray(result?.runs) ? result.runs : []);
+    } catch {
+      setScriptRunHistory([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      scriptCompletionTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      scriptCompletionTimersRef.current.clear();
+    };
+  }, []);
 
   const deleteLocalScript = useCallback(async (script = scriptEditor) => {
     const pathKey = scriptPathKey(script);
@@ -2818,8 +2916,6 @@ export default function ToolsWorkspaceView({
     ]);
 
   const scriptEditorKey = scriptEditor ? scriptPathKey(scriptEditor) || scriptEditor.id : "";
-  const scriptEditorBusy = ["saving", "running", "deleting"].includes(scriptsState);
-  const scriptEditorReadOnly = scriptEditorBusy;
   const scriptsEditorOpen = Boolean(scriptEditor);
   useEffect(() => {
     const updatedAtMs = Date.now();
@@ -2851,6 +2947,26 @@ export default function ToolsWorkspaceView({
     ...(sharedScriptRunResults && typeof sharedScriptRunResults === "object" ? sharedScriptRunResults : {}),
   }), [scriptRunResults, sharedScriptRunResults]);
   useEffect(() => {
+    const previous = scriptRunStateRef.current || {};
+    const next = {};
+    Object.entries(mergedScriptRunResults).forEach(([key, result]) => {
+      const pathKey = normalizedDocumentPath(result?.pathKey || result?.path_key || key);
+      if (!pathKey) return;
+      const state = text(result?.state);
+      const runId = text(result?.runId || result?.run_id);
+      const ok = result?.ok !== false && state !== "error";
+      next[pathKey] = { ok, runId, state };
+      const prior = previous[pathKey];
+      if (prior?.state === "running" && state && !["queued", "running"].includes(state)) {
+        markScriptCompletion(pathKey, ok);
+      }
+    });
+    scriptRunStateRef.current = next;
+  }, [markScriptCompletion, mergedScriptRunResults]);
+  const scriptEditorRunning = Boolean(scriptEditorKey && ["queued", "running"].includes(mergedScriptRunResults[scriptEditorKey]?.state));
+  const scriptEditorBusy = ["saving", "deleting"].includes(scriptsState);
+  const scriptEditorReadOnly = scriptEditorBusy;
+  useEffect(() => {
     const pathKey = normalizedDocumentPath(scriptLogFocusRequest?.pathKey || scriptLogFocusRequest?.path_key);
     if (!pathKey) return;
     setSection("scripts");
@@ -2862,6 +2978,21 @@ export default function ToolsWorkspaceView({
   const activeScriptLog = useMemo(() => (
     scriptRunDisplayLog(mergedScriptRunResults[activeScriptLogKey])
   ), [activeScriptLogKey, mergedScriptRunResults]);
+  const activeScriptHistory = useMemo(() => (
+    scriptRunHistory.map(scriptRunDisplayLog).filter(Boolean)
+  ), [scriptRunHistory]);
+  useEffect(() => {
+    if (section !== "scripts" || scriptPaneTab !== "history") return;
+    void loadScriptRunHistory(activeScriptLogKey);
+  }, [activeScriptLogKey, loadScriptRunHistory, scriptPaneTab, section]);
+  const scrollActiveScriptLogToBottom = useCallback(() => {
+    const terminal = scriptLogsTerminalRef.current;
+    if (!terminal) return;
+    terminal.scrollTo({
+      behavior: "smooth",
+      top: terminal.scrollHeight,
+    });
+  }, []);
   const scriptEditorRows = useMemo(() => {
     const content = String(scriptEditor?.content || "");
     const estimatedLines = content.split("\n").reduce((total, line) => {
@@ -3347,12 +3478,17 @@ export default function ToolsWorkspaceView({
     if (shouldSave) {
       const ok = await saveLocalScript(nextEditor);
       if (shouldRun && ok) {
-        const runResult = await runLocalScript(nextEditor);
+        void runLocalScript(nextEditor);
         return {
-          ok: Boolean(runResult?.ok !== false),
+          accepted: true,
+          ok: true,
           context: appControlScriptContext,
           mode: "run",
-          result: runResult,
+          result: {
+            accepted: true,
+            path_key: scriptPathKey(nextEditor) || nextEditor.id || "",
+            state: "running",
+          },
           source: "script_editor",
         };
       }
@@ -3405,11 +3541,16 @@ export default function ToolsWorkspaceView({
           };
         }
       }
-      const result = await runLocalScript(scriptEditor);
+      void runLocalScript(scriptEditor);
       return {
-        ok: result?.ok !== false,
+        accepted: true,
         context: appControlScriptContext,
-        result,
+        ok: true,
+        result: {
+          accepted: true,
+          path_key: scriptPathKey(scriptEditor) || scriptEditor.id || "",
+          state: "running",
+        },
       };
     },
     saveSelectedScript: async () => {
@@ -4256,6 +4397,8 @@ export default function ToolsWorkspaceView({
                                 scriptRows.map((row) => {
                                   const pathKey = scriptPathKey(row) || row.id;
                                   const active = selectedScriptKey === pathKey || scriptEditorKey === pathKey;
+                                  const runState = text(mergedScriptRunResults[pathKey]?.state);
+                                  const completionMarker = scriptCompletionMarkers[pathKey];
                                   const extension = text(row.extension, "sh");
                                   const fileTone = extension === "py"
                                     ? "python"
@@ -4280,9 +4423,17 @@ export default function ToolsWorkspaceView({
                                         <span className="codicon codicon-file-code" aria-hidden="true" />
                                       </FileKindIcon>
                                       <FileTreeName title={pathKey}>{scriptFileName(row)}</FileTreeName>
-                                      <DocsExplorerStatus title={mergedScriptRunResults[pathKey]?.state === "running" ? "Running" : row.shell}>
-                                        {mergedScriptRunResults[pathKey]?.state === "running" ? (
-                                          <DocsExplorerSpinner aria-label="Running script" role="status" />
+                                      <DocsExplorerStatus title={["queued", "running"].includes(runState) ? (runState === "queued" ? "Queued" : "Running") : completionMarker ? (completionMarker.ok ? "Finished" : "Finished with errors") : row.shell}>
+                                        {["queued", "running"].includes(runState) ? (
+                                          <DocsExplorerSpinner aria-label={runState === "queued" ? "Queued script" : "Running script"} role="status" />
+                                        ) : completionMarker ? (
+                                          <ScriptExplorerFinishIcon
+                                            aria-label={completionMarker.ok ? "Script finished" : "Script finished with errors"}
+                                            data-state={completionMarker.ok ? "ok" : "error"}
+                                            role="status"
+                                          >
+                                            <span className={`codicon codicon-${completionMarker.ok ? "check" : "error"}`} aria-hidden="true" />
+                                          </ScriptExplorerFinishIcon>
                                         ) : ""}
                                       </DocsExplorerStatus>
                                     </DocsExplorerFileButton>
@@ -4304,7 +4455,7 @@ export default function ToolsWorkspaceView({
                       {scriptsError && <ToolsError role="alert">{scriptsError}</ToolsError>}
                       {scriptsMessage && <ToolsNotice>{scriptsMessage}</ToolsNotice>}
                       <ScriptPaneTabs aria-label="Script view" role="tablist">
-                        {["editor", "logs"].map((tab) => (
+                        {["editor", "logs", "history"].map((tab) => (
                           <ScriptPaneTabButton
                             aria-selected={scriptPaneTab === tab}
                             data-active={scriptPaneTab === tab ? "true" : "false"}
@@ -4313,12 +4464,66 @@ export default function ToolsWorkspaceView({
                             role="tab"
                             type="button"
                           >
-                            {tab === "editor" ? "Editor" : "Logs"}
+                            {tab === "editor" ? "Editor" : tab === "logs" ? "Logs" : "History"}
                           </ScriptPaneTabButton>
                         ))}
                       </ScriptPaneTabs>
-                      {scriptPaneTab === "logs" ? (
-                        <ScriptLogsPanel aria-live={activeScriptLog?.state === "running" ? "polite" : "off"}>
+                      {scriptPaneTab === "history" ? (
+                        <ScriptLogsPanel>
+                          {activeScriptHistory.length ? (
+                            <ScriptHistoryList>
+                              {activeScriptHistory.map((run) => (
+                                <ScriptHistoryRow key={run.runId || `${run.pathKey}-${run.startedAt}-${run.updatedAt}`}>
+                                  <ScriptLogsHeader>
+                                    <div>
+                                      <strong>{run.title}</strong>
+                                      <span>{run.pathKey || "local script"}</span>
+                                    </div>
+                                    <ScriptLogsStatus data-state={run.state === "failed" || run.state === "error" ? "error" : run.state}>
+                                      {["queued", "running"].includes(run.state) && <DocsExplorerSpinner aria-hidden="true" />}
+                                      <span>
+                                        {run.state === "queued"
+                                          ? "Queued"
+                                          : run.state === "running"
+                                            ? "Running"
+                                            : run.ok === false || run.state === "failed" || run.state === "error"
+                                              ? "Failed"
+                                              : "Completed"}
+                                      </span>
+                                    </ScriptLogsStatus>
+                                  </ScriptLogsHeader>
+                                  <ScriptLogsMeta>
+                                    <span>Cause {text(run.cause, "manual")}</span>
+                                    <span>Source {text(run.source_kind || run.sourceKind, "manual")}</span>
+                                    <span>Start {run.startedAtLabel}</span>
+                                    <span>End {["queued", "running"].includes(run.state) ? "pending" : run.endedAtLabel}</span>
+                                    <span>Duration {run.state === "queued" ? "queued" : run.state === "running" ? "running" : run.durationLabel}</span>
+                                    {run.exitCode !== null && run.exitCode !== undefined && (
+                                      <span>Exit {String(run.exitCode)}</span>
+                                    )}
+                                  </ScriptLogsMeta>
+                                  {(run.chunks.length || run.error) && (
+                                    <ScriptHistoryOutput>
+                                      {run.chunks.slice(0, 2).map((chunk, index) => (
+                                        <ScriptLogChunk data-stream={chunk.stream === "stderr" ? "stderr" : "stdout"} key={`${run.runId}-${index}-${chunk.stream}`}>
+                                          {String(chunk.text || "")}
+                                        </ScriptLogChunk>
+                                      ))}
+                                      {run.error && <ScriptLogChunk data-stream="stderr">{`${run.error}\n`}</ScriptLogChunk>}
+                                    </ScriptHistoryOutput>
+                                  )}
+                                </ScriptHistoryRow>
+                              ))}
+                            </ScriptHistoryList>
+                          ) : (
+                            <ScriptLogsEmpty>
+                              <strong>No run history</strong>
+                              <span>Queued, completed, and failed runs will appear here.</span>
+                            </ScriptLogsEmpty>
+                          )}
+                        </ScriptLogsPanel>
+                      ) : scriptPaneTab === "logs" ? (
+                        <ScriptLogsPanel aria-live={["queued", "running"].includes(activeScriptLog?.state) ? "polite" : "off"}>
                           {activeScriptLog ? (
                             <>
                               <ScriptLogsHeader>
@@ -4327,10 +4532,12 @@ export default function ToolsWorkspaceView({
                                   <span>{activeScriptLog.pathKey || activeScriptLog.script?.pathKey || "local script"}</span>
                                 </div>
                                 <ScriptLogsStatus data-state={activeScriptLog.state}>
-                                  {activeScriptLog.state === "running" && <DocsExplorerSpinner aria-hidden="true" />}
+                                  {["queued", "running"].includes(activeScriptLog.state) && <DocsExplorerSpinner aria-hidden="true" />}
                                   <span>
-                                    {activeScriptLog.state === "running"
-                                      ? "Running"
+                                    {activeScriptLog.state === "queued"
+                                      ? "Queued"
+                                      : activeScriptLog.state === "running"
+                                        ? "Running"
                                       : activeScriptLog.ok === false || activeScriptLog.state === "error"
                                         ? "Finished with errors"
                                         : "Finished"}
@@ -4338,14 +4545,17 @@ export default function ToolsWorkspaceView({
                                 </ScriptLogsStatus>
                               </ScriptLogsHeader>
                               <ScriptLogsMeta>
+                                <ScriptLogsMetaButton onClick={scrollActiveScriptLogToBottom} type="button">
+                                  Scroll to bottom
+                                </ScriptLogsMetaButton>
                                 <span>Start {activeScriptLog.startedAtLabel}</span>
-                                <span>End {activeScriptLog.state === "running" ? "pending" : activeScriptLog.endedAtLabel}</span>
-                                <span>Duration {activeScriptLog.state === "running" ? "running" : activeScriptLog.durationLabel}</span>
+                                <span>End {["queued", "running"].includes(activeScriptLog.state) ? "pending" : activeScriptLog.endedAtLabel}</span>
+                                <span>Duration {activeScriptLog.state === "queued" ? "queued" : activeScriptLog.state === "running" ? "running" : activeScriptLog.durationLabel}</span>
                                 {activeScriptLog.exitCode !== null && activeScriptLog.exitCode !== undefined && (
                                   <span>Exit {String(activeScriptLog.exitCode)}</span>
                                 )}
                               </ScriptLogsMeta>
-                              <ScriptLogsTerminal role="log">
+                              <ScriptLogsTerminal ref={scriptLogsTerminalRef} role="log">
                                 {activeScriptLog.chunks.length ? (
                                   activeScriptLog.chunks.map((chunk, index) => (
                                     <ScriptLogChunk data-stream={chunk.stream === "stderr" ? "stderr" : "stdout"} key={`${index}-${chunk.stream}`}>
@@ -4354,7 +4564,7 @@ export default function ToolsWorkspaceView({
                                   ))
                                 ) : (
                                   <ScriptLogsPlaceholder>
-                                    {activeScriptLog.state === "running" ? "Waiting for output…" : "No output."}
+                                    {activeScriptLog.state === "queued" ? "Waiting in queue…" : activeScriptLog.state === "running" ? "Waiting for output…" : "No output."}
                                   </ScriptLogsPlaceholder>
                                 )}
                                 {activeScriptLog.error && (
@@ -4455,7 +4665,7 @@ export default function ToolsWorkspaceView({
                                   {scriptsState === "saving" ? "Saving…" : "Save Local"}
                                 </ToolsGhostButton>
                                 <ToolsPrimaryButton
-                                  disabled={!text(scriptEditor.title) || scriptsState === "running"}
+                                  disabled={!text(scriptEditor.title) || scriptEditorBusy}
                                   onClick={async () => {
                                     const saved = scriptHasUnsavedChanges(scriptEditor) || !scriptEditor.localPath
                                       ? await saveLocalScript(scriptEditor)
@@ -4466,7 +4676,7 @@ export default function ToolsWorkspaceView({
                                   }}
                                   type="button"
                                 >
-                                  {scriptsState === "running" ? "Running…" : "Run"}
+                                  {scriptEditorRunning ? "Queue run" : "Run"}
                                 </ToolsPrimaryButton>
                               </SkillDocumentActions>
                             </SkillDocumentToolbarControls>
@@ -5259,6 +5469,8 @@ const DocsExplorerStatus = styled.span`
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 18px;
+  min-width: 18px;
   color: #e2c08d;
   font-size: 10px;
   line-height: 22px;
@@ -5266,12 +5478,33 @@ const DocsExplorerStatus = styled.span`
 `;
 
 const DocsExplorerSpinner = styled.span`
+  flex: 0 0 auto;
   width: 11px;
   height: 11px;
   border: 2px solid rgba(var(--forge-accent-soft-rgb), 0.18);
   border-top-color: var(--forge-accent-soft, #7db0ff);
   border-radius: 999px;
   animation: ${docsExplorerSpin} 740ms linear infinite;
+`;
+
+const ScriptExplorerFinishIcon = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border: 1px solid rgba(134, 239, 172, 0.3);
+  border-radius: 999px;
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.14);
+  font-size: 10px;
+  line-height: 1;
+
+  &[data-state="error"] {
+    border-color: rgba(248, 113, 113, 0.3);
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.14);
+  }
 `;
 
 const DocsCenterPane = styled.section`
@@ -5355,7 +5588,7 @@ const DocsCreateModal = styled.div`
   justify-self: center;
   display: grid;
   gap: 14px;
-  width: min(420px, calc(100% - 28px));
+  width: min(620px, calc(100% - 28px));
   min-width: 0;
   max-height: calc(100% - 56px);
   margin-top: 28px;
@@ -5427,7 +5660,7 @@ const DocsCreateLocation = styled.div`
 
 const DocsCreateFields = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 150px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr));
   gap: 10px;
   min-width: 0;
 `;
@@ -5436,13 +5669,19 @@ const DocsField = styled.div`
   display: grid;
   gap: 5px;
   min-width: 0;
+  overflow: hidden;
 
   label {
+    min-width: 0;
+    overflow: hidden;
     color: var(--forge-text-muted, #7a8493);
     font-size: 10px;
     font-weight: 800;
     letter-spacing: 0.08em;
+    line-height: 1.15;
+    text-overflow: ellipsis;
     text-transform: uppercase;
+    white-space: nowrap;
   }
 
   input,
@@ -6005,9 +6244,12 @@ const ScriptLogsHeader = styled.header`
 
 const ScriptLogsStatus = styled.div`
   display: inline-flex;
+  flex-direction: row;
   align-items: center;
+  justify-content: center;
   gap: 7px;
   flex: 0 0 auto;
+  width: max-content;
   min-height: 24px;
   padding: 0 8px;
   border: 1px solid rgba(125, 211, 252, 0.24);
@@ -6016,7 +6258,24 @@ const ScriptLogsStatus = styled.div`
   background: rgba(37, 99, 235, 0.16);
   font-size: 9px;
   font-weight: 900;
+  line-height: 1;
   text-transform: uppercase;
+  white-space: nowrap;
+
+  ${DocsExplorerSpinner} {
+    flex: 0 0 auto;
+    width: 11px;
+    height: 11px;
+  }
+
+  span {
+    display: inline-block;
+    flex: 0 0 auto;
+    min-width: max-content;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: nowrap;
+  }
 
   &[data-state="error"] {
     border-color: rgba(248, 113, 113, 0.28);
@@ -6028,6 +6287,7 @@ const ScriptLogsStatus = styled.div`
 const ScriptLogsMeta = styled.div`
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
 
   span {
@@ -6040,6 +6300,27 @@ const ScriptLogsMeta = styled.div`
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     font-size: 9px;
     font-weight: 760;
+  }
+`;
+
+const ScriptLogsMetaButton = styled.button`
+  min-height: 21px;
+  padding: 4px 9px;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
+  border-radius: 999px;
+  color: var(--forge-tint-soft, #7db0ff);
+  background: rgba(var(--forge-tint-rgb), 0.12);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 9px;
+  font-weight: 820;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.48);
+    background: rgba(var(--forge-tint-rgb), 0.2);
+    outline: none;
   }
 `;
 
@@ -6058,6 +6339,43 @@ const ScriptLogsTerminal = styled.pre`
   font-size: 11px;
   font-weight: 560;
   line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+`;
+
+const ScriptHistoryList = styled.div`
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 2px 4px;
+`;
+
+const ScriptHistoryRow = styled.article`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 10px;
+  background: rgba(8, 11, 16, 0.46);
+`;
+
+const ScriptHistoryOutput = styled.pre`
+  min-width: 0;
+  max-height: 160px;
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  overflow: auto;
+  background: #05070a;
+  color: #d8dee9;
+  font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 560;
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 `;
@@ -6151,21 +6469,14 @@ const ScriptColorField = styled.label`
 
 const ScriptCreateFields = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px repeat(4, 82px);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
   gap: 10px;
   min-width: 0;
-
-  @media (max-width: 1040px) {
-    grid-template-columns: minmax(0, 1fr) 120px repeat(2, 82px);
-  }
-
-  @media (max-width: 760px) {
-    grid-template-columns: minmax(0, 1fr) 120px;
-  }
 `;
 
 const ScriptColorCreateField = styled(DocsField)`
   input[type="color"] {
+    width: 100%;
     padding: 3px;
     cursor: pointer;
   }

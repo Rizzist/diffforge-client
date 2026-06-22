@@ -804,11 +804,14 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "save_selected_script",
     "update_selected_script",
     "run_selected_script",
+    "run_local_script",
+    "list_local_scripts",
     "select_workspace",
     "run_loopspace_trigger",
     "get_loopspace_graph",
     "update_loopspace_graph",
     "edit_loopspace_graph",
+    "patch_loopspace_graph",
     "select_tab",
     "list_terminals",
     "open_terminals",
@@ -824,9 +827,9 @@ Default routing:
 - For creating a skill/instruction/architecture/document draft, call update_selected_document with title, document_kind, content or content_md, and mode=\"draft\" unless the user asks to save or publish.
 - For modifying or deleting highlighted text, get the selection context, preserve the surrounding document, send the full updated document content through update_selected_document, and keep mode=\"draft\" unless the user asks for local save or publish.
 - For save locally, use mode=\"local\". For publish, push, sync, fan out, or share with other clients, use mode=\"publish\".
-- For local Scripts tab questions, use get_selected_script_context or get_visible_context(includeContent=true). For creating or editing a local script, call update_selected_script with title, shell, content/content_md, and mode=\"draft\" unless the user asks to save or run. For save locally use save_selected_script or update_selected_script(mode=\"local\"). For run requests use run_selected_script.
+- For local Scripts tab questions, use get_selected_script_context or get_visible_context(includeContent=true). The state includes localScripts; use list_local_scripts when you need the complete current script inventory. For creating or editing a local script, call update_selected_script with title, shell, content/content_md, and mode=\"draft\" unless the user asks to save or run. For save locally use save_selected_script or update_selected_script(mode=\"local\"). For saved selected or named scripts, prefer run_local_script with script_id when available or an exact script_name; use run_selected_script when a selected draft may need saving first. Script run tools are fire-and-forget: once accepted, tell the user it started and stop; do not monitor logs unless the user explicitly asks.
 - For Loopspace manual trigger requests, call run_loopspace_trigger with a triggerId or triggerName and optional payload.
-- For Loopspace graph edits, call get_loopspace_graph first, then update_loopspace_graph with the full updated architecture DSL source and wait for the hydrated result.
+- For Loopspace graph edits, call get_loopspace_graph first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Prefer patch_loopspace_graph for add_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
 - For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
 
 Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";

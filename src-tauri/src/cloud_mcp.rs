@@ -3710,6 +3710,27 @@ fn cloud_mcp_outbox_idempotency_key(
     {
         return key;
     }
+    let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    if normalized_kind == "account_script_run_state" {
+        let device_id = cloud_mcp_payload_text(
+            payload,
+            &["owner_device_id", "device_id", "ownerDeviceId", "deviceId"],
+        )
+        .unwrap_or_default();
+        let script_id =
+            cloud_mcp_payload_text(payload, &["script_id", "scriptId"]).unwrap_or_default();
+        let run_id =
+            cloud_mcp_payload_text(payload, &["run_id", "runId", "command_id", "commandId"])
+                .unwrap_or_default();
+        let state = cloud_mcp_payload_text(payload, &["state"]).unwrap_or_default();
+        let run_status = cloud_mcp_payload_text(payload, &["run_status", "runStatus", "status"])
+            .unwrap_or_default();
+        if !device_id.is_empty() && !script_id.is_empty() && !run_id.is_empty() {
+            return format!(
+                "account_script_run_state:{device_id}:{script_id}:{run_id}:{state}:{run_status}"
+            );
+        }
+    }
     if let Some(key) = cloud_mcp_payload_text(payload, &["client_request_id", "clientRequestId"]) {
         return format!("client-request:{event_kind}:{key}");
     }
@@ -3742,7 +3763,6 @@ fn cloud_mcp_outbox_idempotency_key(
             parts.push(value);
         }
     }
-    let normalized_kind = event_kind.trim().to_ascii_lowercase();
     if matches!(
         normalized_kind.as_str(),
         "workspace_todo_dispatch_status"
@@ -12092,9 +12112,10 @@ fn cloud_mcp_loopspace_graph_from_snapshot(snapshot: &Value, loopspace_id: &str)
                 .filter(Value::is_object)
                 .unwrap_or_else(|| {
                     json!({
-                        "docId": cloud_mcp_payload_text(row, &["graph_doc_id", "graphDocId"]).unwrap_or_default(),
+                        "docId": cloud_mcp_payload_text(row, &["graph_doc_id", "graphDocId"]).unwrap_or_else(|| format!("{loopspace_id}:graph.dfblueprint")),
                         "loopspaceId": loopspace_id,
-                        "format": "arch",
+                        "format": "dfblueprint.v1",
+                        "source_format": "dfblueprint.v1",
                         "source": cloud_mcp_payload_text(row, &["graph_source", "graphSource", "source"]).unwrap_or_default(),
                         "contentHash": cloud_mcp_payload_text(row, &["graph_content_hash", "graphContentHash"]).unwrap_or_default(),
                         "epoch": cloud_mcp_payload_i64(row, &["graph_epoch", "graphEpoch"]).unwrap_or(0),
@@ -12129,7 +12150,10 @@ async fn cloud_mcp_sync_loopspace_graph(
     loopspace_id: String,
 ) -> Result<Value, String> {
     let synced = cloud_mcp_sync_loopspaces(state).await?;
-    let snapshot = synced.get("sync").cloned().unwrap_or_else(|| synced.clone());
+    let snapshot = synced
+        .get("sync")
+        .cloned()
+        .unwrap_or_else(|| synced.clone());
     cloud_mcp_loopspace_graph_from_snapshot(&snapshot, &loopspace_id)
         .ok_or_else(|| "Loop graph was not returned by Cloud.".to_string())
 }
@@ -12139,6 +12163,7 @@ async fn cloud_mcp_update_loopspace_graph(
     state: State<'_, CloudMcpState>,
     loopspace_id: String,
     source: String,
+    source_format: Option<String>,
 ) -> Result<Value, String> {
     let loopspace_id = loopspace_id.trim().to_string();
     if loopspace_id.is_empty() {
@@ -12166,6 +12191,9 @@ async fn cloud_mcp_update_loopspace_graph(
                 "op": "graph",
                 "id": loopspace_id.clone(),
                 "source": source,
+                "source_format": source_format
+                    .as_deref()
+                    .unwrap_or("dfblueprint.v1"),
                 "idempotency_key": client_request_id,
             }]),
         );
@@ -12179,10 +12207,14 @@ async fn cloud_mcp_update_loopspace_graph(
         }
         return Ok(queued);
     }
-    let mut snapshot = result.get("sync").cloned().unwrap_or_else(|| result.clone());
+    let mut snapshot = result
+        .get("sync")
+        .cloned()
+        .unwrap_or_else(|| result.clone());
     let mut graph = cloud_mcp_loopspace_graph_from_snapshot(&snapshot, &loopspace_id);
     if graph.is_none() {
-        let retry_payload = cloud_mcp_loopspace_sync_payload("loopspace_graph_update_hydrate_retry");
+        let retry_payload =
+            cloud_mcp_loopspace_sync_payload("loopspace_graph_update_hydrate_retry");
         if let Ok(retry) = cloud_mcp_send_loopspace_sync_request(
             state.inner(),
             &retry_payload,
@@ -12208,7 +12240,10 @@ async fn cloud_mcp_update_loopspace_graph(
     if let Some(object) = graph.as_object_mut() {
         object.insert("hydrated".to_string(), json!(true));
         object.insert("sync".to_string(), snapshot);
-        object.insert("response".to_string(), result.get("response").cloned().unwrap_or(result));
+        object.insert(
+            "response".to_string(),
+            result.get("response").cloned().unwrap_or(result),
+        );
     }
     Ok(graph)
 }
@@ -12680,7 +12715,9 @@ fn cloud_mcp_loopspace_trigger_run_upsert_row(
         ),
         rusqlite::params![scope_key, run_id],
     )
-    .map_err(|error| format!("Unable to replace loopspace trigger run loop mirror rows: {error}"))?;
+    .map_err(|error| {
+        format!("Unable to replace loopspace trigger run loop mirror rows: {error}")
+    })?;
     for loopspace_id in loopspace_ids {
         conn.execute(
             &format!(
@@ -12691,7 +12728,9 @@ fn cloud_mcp_loopspace_trigger_run_upsert_row(
             ),
             rusqlite::params![scope_key, loopspace_id, run_id, trigger_id, created_at_ms],
         )
-        .map_err(|error| format!("Unable to upsert loopspace trigger run loop mirror row: {error}"))?;
+        .map_err(|error| {
+            format!("Unable to upsert loopspace trigger run loop mirror row: {error}")
+        })?;
     }
     Ok(changed)
 }
@@ -12878,9 +12917,10 @@ fn cloud_mcp_get_loopspace_logs_snapshot(
     let mut logs = Vec::new();
     let mut seen_run_ids = std::collections::HashSet::new();
     for row_json in mapped_run_statement
-        .query_map(rusqlite::params![scope_key, loopspace_id, max_rows], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(
+            rusqlite::params![scope_key, loopspace_id, max_rows],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(|error| format!("Unable to query loopspace trigger run mirror rows: {error}"))?
         .filter_map(|row| row.ok())
     {
@@ -12903,7 +12943,10 @@ fn cloud_mcp_get_loopspace_logs_snapshot(
             continue;
         }
         if let Some(object) = run.as_object_mut() {
-            object.insert("loopspace_ids".to_string(), json!(run_loopspace_ids.clone()));
+            object.insert(
+                "loopspace_ids".to_string(),
+                json!(run_loopspace_ids.clone()),
+            );
             object.insert("loopspaceIds".to_string(), json!(run_loopspace_ids));
         }
         logs.push(run);
@@ -12940,7 +12983,8 @@ fn cloud_mcp_get_loopspace_logs_snapshot(
             }
             let mut run_loopspace_ids = cloud_mcp_loopspace_trigger_ids_from_row(&run);
             if run_loopspace_ids.is_empty() {
-                if let Some(trigger_id) = cloud_mcp_payload_text(&run, &["trigger_id", "triggerId"]) {
+                if let Some(trigger_id) = cloud_mcp_payload_text(&run, &["trigger_id", "triggerId"])
+                {
                     run_loopspace_ids = trigger_loopspace_ids
                         .get(&trigger_id)
                         .cloned()
@@ -12951,7 +12995,10 @@ fn cloud_mcp_get_loopspace_logs_snapshot(
                 continue;
             }
             if let Some(object) = run.as_object_mut() {
-                object.insert("loopspace_ids".to_string(), json!(run_loopspace_ids.clone()));
+                object.insert(
+                    "loopspace_ids".to_string(),
+                    json!(run_loopspace_ids.clone()),
+                );
                 object.insert("loopspaceIds".to_string(), json!(run_loopspace_ids));
             }
             logs.push(run);
@@ -14021,6 +14068,12 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
         let _ = app.emit(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, event.clone());
         todo_dispatch_record_remote_intake(&app, &event);
         todo_dispatch_apply_remote_delete(&app, &event);
+        cloud_mcp_apply_remote_workspace_lever(&app, state, &event);
+        cloud_mcp_apply_remote_terminal_lever(&app, state, &event);
+        cloud_mcp_apply_remote_agent_lever(&app, state, &event);
+        cloud_mcp_apply_remote_asset_lever(&app, state, &event);
+        cloud_mcp_apply_remote_local_script_lever(&app, state, &event);
+        cloud_mcp_apply_remote_device_lever(&app, state, &event);
         if !cloud_mcp_remote_command_is_rust_owned(&event) {
             let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
         }
@@ -14439,6 +14492,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_spawn_account_live_state_reconcile(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_sync_resume(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_asset_inventory_sync(state, "websocket_hello_ack");
+        cloud_mcp_spawn_local_scripts_inventory_sync(state, "websocket_hello_ack");
         return;
     }
     if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -15844,6 +15898,7 @@ async fn cloud_mcp_start_remote_command_listener(
             cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_asset_lever(&app, &state_clone, &event);
+            cloud_mcp_apply_remote_local_script_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
             if cloud_mcp_remote_command_is_rust_owned(&event) {
                 continue;
@@ -16769,6 +16824,161 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
     });
 }
 
+/// Local script execution is device-owned. Cloud and voice route only script
+/// identity/name; the target Rust client resolves its own local scripts folder,
+/// emits the normal script-run UI events, and reports completion to Cloud.
+fn cloud_mcp_apply_remote_local_script_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) {
+    let command_kind =
+        cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .replace(['.', ' ', '-'], "_");
+    if !matches!(
+        command_kind.as_str(),
+        "local_script_run" | "run_local_script" | "script_run" | "run_script"
+    ) {
+        return;
+    }
+    let script_id = cloud_mcp_payload_text(event, &["script_id", "scriptId", "id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "script_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "scriptId"]))
+        .unwrap_or_default();
+    let script_name =
+        cloud_mcp_payload_text(event, &["script_name", "scriptName", "name", "title"])
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "script_name"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "scriptName"]))
+            .unwrap_or_default();
+    let path_key = cloud_mcp_payload_text(event, &["path_key", "pathKey"])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "path_key"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "pathKey"]))
+        .unwrap_or_default();
+    let working_directory =
+        cloud_mcp_payload_text(event, &["working_directory", "workingDirectory", "cwd"])
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "working_directory"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "workingDirectory"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "cwd"]))
+            .unwrap_or_default();
+    let shell = cloud_mcp_payload_text(event, &["shell"])
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "shell"]))
+        .unwrap_or_default();
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    tauri::async_runtime::spawn(async move {
+        if script_id.trim().is_empty()
+            && script_name.trim().is_empty()
+            && path_key.trim().is_empty()
+        {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "Local script run did not include script_id, script_name, or path_key.",
+                None,
+            )
+            .await;
+            return;
+        }
+        let run_id = cloud_mcp_payload_text(&event, &["run_id", "runId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["command_id", "commandId"]))
+            .unwrap_or_else(|| format!("remote-script-run-{}", uuid::Uuid::new_v4()));
+        let command_id = cloud_mcp_payload_text(&event, &["command_id", "commandId"])
+            .unwrap_or_else(|| run_id.clone());
+        let trigger_id = cloud_mcp_payload_text(&event, &["trigger_id", "triggerId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "trigger_id"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "triggerId"]))
+            .unwrap_or_default();
+        let voice_session_id =
+            cloud_mcp_payload_text(&event, &["voice_session_id", "voiceSessionId"])
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "voice_session_id"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "voiceSessionId"]))
+                .unwrap_or_default();
+        let workspace_id = cloud_mcp_payload_text(&event, &["workspace_id", "workspaceId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "workspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "workspaceId"]))
+            .unwrap_or_default();
+        let terminal_id = cloud_mcp_payload_text(&event, &["terminal_id", "terminalId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "terminal_id"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "terminalId"]))
+            .unwrap_or_default();
+        let loopspace_id = cloud_mcp_payload_text(&event, &["loopspace_id", "loopspaceId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopspaceId"]))
+            .unwrap_or_default();
+        let request_id = cloud_mcp_payload_text(&event, &["request_id", "requestId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "request_id"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "requestId"]))
+            .unwrap_or_else(|| command_id.clone());
+        let cause = cloud_mcp_payload_text(&event, &["cause", "run_cause", "trigger_cause"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "cause"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "run_cause"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "trigger_cause"]))
+            .unwrap_or_else(|| {
+                if !trigger_id.is_empty() || !loopspace_id.is_empty() {
+                    "loop".to_string()
+                } else if !voice_session_id.is_empty() {
+                    "orchestrator_voice".to_string()
+                } else {
+                    "orchestrator".to_string()
+                }
+            });
+        let source_kind =
+            cloud_mcp_payload_text(&event, &["source_kind", "source", "trigger_source"])
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "source_kind"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "source"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "trigger_source"]))
+                .unwrap_or_else(|| "cloud_remote_command".to_string());
+        let request = json!({
+            "cause": cause,
+            "command_id": command_id,
+            "loopspace_id": loopspace_id,
+            "path_key": path_key,
+            "request_id": request_id,
+            "run_id": run_id,
+            "script_id": script_id,
+            "script_name": script_name,
+            "shell": shell,
+            "source_kind": source_kind,
+            "terminal_id": terminal_id,
+            "trigger_id": trigger_id,
+            "voice_session_id": voice_session_id,
+            "working_directory": working_directory,
+            "workspace_id": workspace_id,
+        });
+        match local_scripts_enqueue_run(app.clone(), request).await {
+            Ok(details) => {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "queued",
+                    "Local script queued on this desktop.",
+                    Some(&details),
+                )
+                .await;
+            }
+            Err(error) => {
+                let details = json!({
+                    "error": error,
+                    "script_id": cloud_mcp_payload_text(&event, &["script_id", "scriptId", "id"]),
+                    "script_name": cloud_mcp_payload_text(&event, &["script_name", "scriptName", "name", "title"]),
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Local script could not be run on this desktop.",
+                    Some(&details),
+                )
+                .await;
+            }
+        }
+    });
+}
+
 /// Device-level levers Rust always owns, with or without the webview: window
 /// visibility, native notifications, agent account switching, and terminal
 /// output status (served from the native PTY tail buffer). The webview
@@ -16973,6 +17183,10 @@ fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
             | "asset_upload"
             | "download_asset"
             | "asset_download"
+            | "local_script_run"
+            | "run_local_script"
+            | "script_run"
+            | "run_script"
             | "plan_release_stage"
             | "release_plan_stage"
             | "plan_release"
@@ -21126,6 +21340,13 @@ async fn cloud_mcp_send_event_now(
         )
         .await;
         return Ok(response);
+    }
+    if event_kind.trim().eq_ignore_ascii_case("script.inventory")
+        || event_kind
+            .trim()
+            .eq_ignore_ascii_case("account_script_run_state")
+    {
+        return cloud_mcp_ws_request(state, event_kind.trim(), payload).await;
     }
     if event_kind.trim().eq_ignore_ascii_case("loopspaces.sync") {
         let response = cloud_mcp_ws_request(state, "loopspaces.sync", payload).await?;
@@ -28342,7 +28563,8 @@ fn cloud_mcp_tombstone_account_document_cache_row(
     };
     let folder_path = folder_id.clone();
     let key = cloud_mcp_account_document_key(scope_key, collection, &path_key);
-    let row = cloud_mcp_account_document_deleted_payload(scope_key, collection, &document_id, &path_key);
+    let row =
+        cloud_mcp_account_document_deleted_payload(scope_key, collection, &document_id, &path_key);
     conn.execute(
         "INSERT INTO account_document_items(
             key, scope_key, collection, row_type, document_id, folder_id, folder_path,
@@ -28396,7 +28618,9 @@ fn cloud_mcp_account_document_deleted_prefixes(scope_key: &str, collection: &str
     ) else {
         return Vec::new();
     };
-    let Ok(mapped) = stmt.query_map(rusqlite::params![scope_key, collection], |row| row.get::<_, String>(0)) else {
+    let Ok(mapped) = stmt.query_map(rusqlite::params![scope_key, collection], |row| {
+        row.get::<_, String>(0)
+    }) else {
         return Vec::new();
     };
     mapped
@@ -28452,9 +28676,10 @@ fn cloud_mcp_account_document_cache_rows_under_path(
     ) else {
         return Vec::new();
     };
-    let Ok(mapped) = stmt.query_map(rusqlite::params![scope_key, collection, path_key, like], |row| {
-        row.get::<_, String>(0)
-    }) else {
+    let Ok(mapped) = stmt.query_map(
+        rusqlite::params![scope_key, collection, path_key, like],
+        |row| row.get::<_, String>(0),
+    ) else {
         return Vec::new();
     };
     mapped
@@ -29663,7 +29888,11 @@ fn cloud_mcp_delete_account_document_local(
             &collection_name,
             document_id,
             path_key,
-            if is_folder_delete { "folder" } else { "document" },
+            if is_folder_delete {
+                "folder"
+            } else {
+                "document"
+            },
         );
     }
 }
@@ -30512,8 +30741,13 @@ async fn cloud_mcp_save_account_document_folder(
     document: Value,
     local_only: bool,
 ) -> Result<Value, String> {
-    let mut row =
-        cloud_mcp_account_document_metadata_row(&document, None, None, None, Some("local_available"))?;
+    let mut row = cloud_mcp_account_document_metadata_row(
+        &document,
+        None,
+        None,
+        None,
+        Some("local_available"),
+    )?;
     let scope_key = cloud_mcp_account_document_row_text(&row, &["scope_key"]);
     let collection = cloud_mcp_account_document_row_text(&row, &["collection"]);
     let folder_id = cloud_mcp_account_document_row_text(&row, &["folder_id", "path_key", "id"]);
@@ -30530,8 +30764,10 @@ async fn cloud_mcp_save_account_document_folder(
     }
     cloud_mcp_store_account_document_metadata(&row)?;
     if !local_only {
-        let mut payload =
-            cloud_mcp_account_documents_payload_base("rust-diffforge-account-documents", "folder_save");
+        let mut payload = cloud_mcp_account_documents_payload_base(
+            "rust-diffforge-account-documents",
+            "folder_save",
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("m".to_string(), json!("commit"));
             object.insert("collection".to_string(), json!(collection.clone()));
@@ -30584,7 +30820,11 @@ async fn cloud_mcp_save_account_document_folder(
             }
             Err(error) => {
                 cloud_error = error;
-                cloud_mcp_account_document_mark_pending(&mut row, "sync_failed", Some(&cloud_error));
+                cloud_mcp_account_document_mark_pending(
+                    &mut row,
+                    "sync_failed",
+                    Some(&cloud_error),
+                );
                 let _ = cloud_mcp_store_account_document_metadata(&row);
             }
         }
@@ -30622,8 +30862,9 @@ async fn cloud_mcp_delete_account_document_folder(
     local_only: bool,
 ) -> Result<Value, String> {
     let (scope_key, collection, document_id, path_key) =
-        cloud_mcp_account_document_delete_identity(&document)
-            .ok_or_else(|| "Deleting an account document folder requires a folder id.".to_string())?;
+        cloud_mcp_account_document_delete_identity(&document).ok_or_else(|| {
+            "Deleting an account document folder requires a folder id.".to_string()
+        })?;
     cloud_mcp_delete_account_document_local(&scope_key, &collection, &document_id, &path_key);
     let mut removed = cloud_mcp_account_document_deleted_payload(
         &scope_key,
@@ -30642,8 +30883,10 @@ async fn cloud_mcp_delete_account_document_folder(
     let mut cloud_error = String::new();
     let mut cloud_response = Value::Null;
     if !local_only {
-        let mut payload =
-            cloud_mcp_account_documents_payload_base("rust-diffforge-account-documents", "folder_delete");
+        let mut payload = cloud_mcp_account_documents_payload_base(
+            "rust-diffforge-account-documents",
+            "folder_delete",
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("m".to_string(), json!("commit"));
             object.insert("collection".to_string(), json!(collection.clone()));
@@ -30841,10 +31084,7 @@ async fn cloud_mcp_save_account_document(
                             );
                             object.insert("sync_unit".to_string(), json!("account_document"));
                             object.insert("documents".to_string(), json!(commit_rows.clone()));
-                            object.insert(
-                                "ops".to_string(),
-                                json!(commit_ops),
-                            );
+                            object.insert("ops".to_string(), json!(commit_ops));
                         }
                         match cloud_mcp_post_event_endpoint(state.inner(), "doc.sync", &payload)
                             .await
@@ -44124,7 +44364,8 @@ mod cloud_mcp_tests {
             "collection": "documents",
         }));
         assert!(recovered.iter().any(|row| {
-            cloud_mcp_account_document_row_text(row, &["path_key", "file_path"]) == "Starter/Basic2.md"
+            cloud_mcp_account_document_row_text(row, &["path_key", "file_path"])
+                == "Starter/Basic2.md"
         }));
 
         let applied = cloud_mcp_apply_account_documents_sync_data(
@@ -44160,14 +44401,21 @@ mod cloud_mcp_tests {
         )
         .is_empty());
 
-        cloud_mcp_write_account_document_file(&stale_path, "stale file should stay local-only invisible").unwrap();
+        cloud_mcp_write_account_document_file(
+            &stale_path,
+            "stale file should stay local-only invisible",
+        )
+        .unwrap();
         let recovered_again = cloud_mcp_recover_account_document_files(&json!({
             "scope_key": "Personal Account",
             "collection": "documents",
         }));
         assert!(!recovered_again.iter().any(|row| {
             cloud_mcp_account_document_path_is_same_or_child(
-                &cloud_mcp_account_document_row_text(row, &["path_key", "file_path", "folder_path"]),
+                &cloud_mcp_account_document_row_text(
+                    row,
+                    &["path_key", "file_path", "folder_path"],
+                ),
                 "Starter",
             )
         }));
@@ -48102,6 +48350,19 @@ mod cloud_mcp_tests {
         })));
         assert!(cloud_mcp_remote_command_is_rust_owned(&json!({
             "command_kind": "download_asset"
+        })));
+    }
+
+    #[test]
+    fn local_script_remote_commands_are_rust_owned() {
+        assert!(cloud_mcp_remote_command_is_rust_owned(&json!({
+            "command_kind": "local_script_run"
+        })));
+        assert!(cloud_mcp_remote_command_is_rust_owned(&json!({
+            "command_kind": "run_local_script"
+        })));
+        assert!(!cloud_mcp_remote_command_is_rust_owned(&json!({
+            "command_kind": "select_tab"
         })));
     }
 

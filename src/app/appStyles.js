@@ -385,31 +385,31 @@ export const GlobalStyle = createGlobalStyle`
   }
 
   *::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 9px;
+    height: 5px;
   }
 
   *::-webkit-scrollbar-track {
     background:
-      linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.012)),
-      rgba(10, 14, 20, 0.86);
+      linear-gradient(180deg, rgba(244, 247, 250, 0.018), rgba(244, 247, 250, 0.006)),
+      rgba(4, 8, 15, 0.9);
   }
 
   *::-webkit-scrollbar-thumb {
     min-height: 42px;
-    border: 2px solid rgba(10, 14, 20, 0.92);
+    border: 1px solid rgba(4, 8, 15, 0.9);
     border-radius: 999px;
-    background: #2a3442;
+    background: rgba(100, 121, 153, 0.42);
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background: #3a4657;
+    background: rgba(125, 150, 184, 0.56);
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-corner {
-    background: rgba(10, 14, 20, 0.86);
+    background: rgba(4, 8, 15, 0.9);
   }
 
   html,
@@ -3930,8 +3930,8 @@ export const AppGlobalScriptsShelf = styled.div`
   align-items: center;
   gap: 6px;
   min-width: 0;
-  min-height: 36px;
-  max-height: 40px;
+  min-height: 34px;
+  max-height: 38px;
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
@@ -3942,23 +3942,22 @@ export const AppGlobalScriptsShelf = styled.div`
   border-left: 0;
   border-radius: 0;
   background:
-    linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.13), rgba(var(--forge-tint-soft-rgb), 0.045)),
-    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.055), rgba(0, 0, 0, 0.06)),
-    var(--forge-shell-panel, #10151f);
+    linear-gradient(90deg, rgba(var(--forge-tint-rgb), 0.085), rgba(var(--forge-tint-soft-rgb), 0.022)),
+    var(--forge-shell-right-bg, #05080d);
   box-shadow: none;
   backdrop-filter: none;
   pointer-events: auto;
 
   scrollbar-width: thin;
-  scrollbar-color: rgba(var(--forge-tint-soft-rgb), 0.22) transparent;
+  scrollbar-color: rgba(var(--forge-tint-soft-rgb), 0.26) transparent;
 
   &::-webkit-scrollbar {
-    height: 6px;
+    height: 4px;
   }
 
   &::-webkit-scrollbar-thumb {
     border-radius: 999px;
-    background: rgba(var(--forge-tint-soft-rgb), 0.18);
+    background: rgba(var(--forge-tint-soft-rgb), 0.24);
   }
 
   &::-webkit-scrollbar-track {
@@ -3974,20 +3973,56 @@ export const AppGlobalScriptsShelf = styled.div`
   }
 `;
 
+export const AppGlobalScriptRunStatus = styled.span`
+  position: relative;
+  display: inline-grid;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 999px;
+  color: currentColor;
+  cursor: pointer;
+
+  svg {
+    grid-area: 1 / 1;
+    width: 14px;
+    height: 14px;
+    transition:
+      opacity 120ms ease,
+      transform 120ms ease;
+  }
+
+  [data-cancel-icon="true"] {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+
+  &:hover,
+  &:focus-visible {
+    outline: none;
+  }
+`;
+
 export const AppGlobalScriptButton = styled.button`
   display: inline-flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
   gap: 6px;
-  min-width: 0;
-  max-width: 168px;
-  min-height: 26px;
-  padding: 0 11px;
-  border: 1px solid color-mix(in srgb, var(--script-button-color, #ffffff) 24%, transparent);
+  width: max-content;
+  min-width: max-content;
+  max-width: none;
+  min-height: 25px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--script-button-color, #ffffff) 18%, transparent);
   border-radius: 7px;
   color: var(--script-button-color, #ffffff);
-  background: color-mix(in srgb, var(--script-button-bg, #1f3f7a) 30%, transparent);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(0, 0, 0, 0.08)),
+    var(--script-button-bg, #07101d);
   box-shadow: none;
   font-size: 11px;
   font-weight: 600;
@@ -3998,10 +4033,16 @@ export const AppGlobalScriptButton = styled.button`
     border-color 140ms ease,
     color 140ms ease;
 
+  svg {
+    flex: 0 0 auto;
+  }
+
   span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    display: inline-block;
+    flex: 0 0 auto;
+    min-width: max-content;
+    overflow: visible;
+    text-overflow: clip;
     white-space: nowrap;
   }
 
@@ -4009,10 +4050,26 @@ export const AppGlobalScriptButton = styled.button`
     opacity: 0.7;
   }
 
+  &[data-running="true"]:hover ${AppGlobalScriptRunStatus} [data-spinner-icon="true"],
+  &[data-running="true"] ${AppGlobalScriptRunStatus}:hover [data-spinner-icon="true"],
+  &[data-running="true"] ${AppGlobalScriptRunStatus}:focus-visible [data-spinner-icon="true"] {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+
+  &[data-running="true"]:hover ${AppGlobalScriptRunStatus} [data-cancel-icon="true"],
+  &[data-running="true"] ${AppGlobalScriptRunStatus}:hover [data-cancel-icon="true"],
+  &[data-running="true"] ${AppGlobalScriptRunStatus}:focus-visible [data-cancel-icon="true"] {
+    opacity: 1;
+    transform: scale(1);
+  }
+
   &:hover,
   &:focus-visible {
     border-color: color-mix(in srgb, var(--script-button-color, #ffffff) 42%, transparent);
-    background: color-mix(in srgb, var(--script-button-bg, #232c3c) 46%, transparent);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(0, 0, 0, 0.04)),
+      color-mix(in srgb, var(--script-button-bg, #07101d) 88%, var(--script-button-color, #ffffff));
     outline: none;
   }
 
@@ -4403,14 +4460,48 @@ export const LoopspaceGraphContent = styled.div`
   pointer-events: none;
 `;
 
+export const LoopspaceGraphEdges = styled.svg`
+  position: absolute;
+  inset: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+`;
+
+export const LoopspaceGraphEdgePath = styled.path`
+  fill: none;
+  stroke: rgba(255, 209, 102, 0.46);
+  stroke-width: 2;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 8px rgba(255, 209, 102, 0.18));
+`;
+
+export const LoopspaceGraphConnectionPreview = styled(LoopspaceGraphEdgePath)`
+  stroke: rgba(96, 165, 250, 0.74);
+  stroke-dasharray: 7 6;
+  filter: drop-shadow(0 0 10px rgba(96, 165, 250, 0.24));
+`;
+
+export const LoopspaceGraphEdgeLabel = styled.text`
+  fill: rgba(248, 250, 252, 0.62);
+  font-size: 10px;
+  font-weight: 850;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.72);
+  stroke-width: 4px;
+  text-anchor: middle;
+  text-transform: uppercase;
+`;
+
 export const LoopspaceGraphNode = styled.div`
   --loop-node-accent: 255, 209, 102;
   position: absolute;
   top: 0;
   left: 0;
   display: grid;
-  min-width: 184px;
-  max-width: 280px;
+  width: 220px;
+  min-height: 66px;
   grid-template-columns: 34px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
@@ -4428,8 +4519,8 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="cron"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
+  &[data-kind="send_message"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="loop"] {
-    min-width: 230px;
     --loop-node-accent: 255, 209, 102;
   }
 
@@ -4438,6 +4529,51 @@ export const LoopspaceGraphNode = styled.div`
     box-shadow:
       0 0 0 1px rgba(134, 239, 172, 0.18),
       0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+`;
+
+export const LoopspaceGraphNodePort = styled.button`
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(var(--loop-node-accent), 0.72);
+  border-radius: 999px;
+  background: #050505;
+  box-shadow:
+    0 0 0 3px rgba(var(--loop-node-accent), 0.1),
+    0 0 16px rgba(var(--loop-node-accent), 0.18);
+  cursor: crosshair;
+  transform: translateY(-50%);
+
+  &::after {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: inherit;
+    background: rgba(var(--loop-node-accent), 0.9);
+  }
+
+  &[data-side="input"] {
+    left: -10px;
+  }
+
+  &[data-side="output"] {
+    right: -10px;
+  }
+
+  &[data-active="true"],
+  &:hover,
+  &:focus-visible {
+    outline: none;
+    border-color: #ffffff;
+    box-shadow:
+      0 0 0 4px rgba(var(--loop-node-accent), 0.2),
+      0 0 20px rgba(var(--loop-node-accent), 0.34);
   }
 `;
 
@@ -4571,7 +4707,7 @@ export const LoopspaceGraphZoomReadout = styled.span`
 export const LoopspaceGraphNavHud = styled.div`
   position: absolute;
   right: 14px;
-  bottom: 14px;
+  bottom: 50px;
   z-index: 6;
   display: flex;
   align-items: center;
@@ -4647,6 +4783,164 @@ export const LoopspaceGraphNavStats = styled.div`
     font-weight: 760;
     letter-spacing: 0;
     white-space: nowrap;
+  }
+`;
+
+export const LoopspaceGraphPalette = styled.div`
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 5;
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+  height: 42px;
+  box-sizing: border-box;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  padding: 4px 7px;
+  border-top: 1px solid rgba(255, 209, 102, 0.16);
+  background: rgba(6, 6, 6, 0.82);
+  box-shadow: 0 -12px 28px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px) saturate(120%);
+  cursor: default;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 209, 102, 0.24) transparent;
+
+  &::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(255, 209, 102, 0.24);
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+`;
+
+export const LoopspaceGraphPaletteSearch = styled.input`
+  flex: 0 0 126px;
+  width: 126px;
+  min-width: 0;
+  height: 30px;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 209, 102, 0.18);
+  border-radius: 7px;
+  padding: 0 9px;
+  color: rgba(248, 250, 252, 0.92);
+  background: rgba(7, 9, 12, 0.9);
+  font-size: 10.5px;
+  font-weight: 760;
+  outline: none;
+
+  &:focus {
+    border-color: rgba(255, 209, 102, 0.42);
+    box-shadow: 0 0 0 2px rgba(255, 209, 102, 0.12);
+  }
+
+  &::placeholder {
+    color: rgba(248, 250, 252, 0.45);
+  }
+`;
+
+export const LoopspaceGraphPaletteTrack = styled.div`
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  min-width: max-content;
+`;
+
+export const LoopspaceGraphPaletteCard = styled.div`
+  --loop-palette-accent: 129, 140, 248;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  width: 142px;
+  height: 30px;
+  padding: 5px 7px;
+  border: 1px solid rgba(var(--loop-palette-accent), 0.28);
+  border-radius: 7px;
+  color: #f8fafc;
+  background:
+    linear-gradient(135deg, rgba(var(--loop-palette-accent), 0.14), rgba(255, 255, 255, 0.035)),
+    rgba(7, 9, 12, 0.9);
+  cursor: grab;
+  user-select: none;
+
+  &[data-kind="send_message"] {
+    --loop-palette-accent: 45, 212, 191;
+  }
+
+  &[data-kind="device"] {
+    --loop-palette-accent: 96, 165, 250;
+  }
+
+  &[data-kind="run_script"] {
+    --loop-palette-accent: 251, 191, 36;
+  }
+
+  &:active {
+    cursor: grabbing;
+  }
+
+  &:hover {
+    border-color: rgba(var(--loop-palette-accent), 0.46);
+    background:
+      linear-gradient(135deg, rgba(var(--loop-palette-accent), 0.2), rgba(255, 255, 255, 0.05)),
+      rgba(9, 12, 16, 0.94);
+  }
+`;
+
+export const LoopspaceGraphPaletteIcon = styled.span`
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid rgba(var(--loop-palette-accent), 0.38);
+  border-radius: 6px;
+  color: #ffffff;
+  background: rgba(var(--loop-palette-accent), 0.16);
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+`;
+
+export const LoopspaceGraphPaletteText = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  strong {
+    white-space: nowrap;
+    font-size: 10.5px;
+    font-weight: 900;
+  }
+
+  span {
+    display: none;
+    color: rgba(248, 250, 252, 0.56);
+    font-size: 8.5px;
+    font-weight: 680;
+    line-height: 1.1;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
   }
 `;
 
@@ -10253,13 +10547,15 @@ export const AudioHistorySnippetChangeText = styled.div`
 export const AudioHistoryRowFootline = styled.div`
   display: flex;
   min-width: 0;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
 `;
 
 export const AudioHistoryExpandButton = styled.button`
   flex: none;
+  margin-left: auto;
   padding: 2px 8px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
@@ -10489,14 +10785,17 @@ export const AudioHistoryCopyButton = styled.button`
 `;
 
 export const AudioHistoryMeta = styled.p`
+  flex: 1 1 240px;
   margin: 0;
   min-width: 0;
-  overflow: hidden;
+  max-width: 100%;
+  overflow: visible;
   color: var(--forge-text-muted);
   font-size: 11px;
   font-weight: 650;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
 `;
 
 export const AudioPathBlock = styled.div`
@@ -10713,7 +11012,7 @@ export const AudioWidgetShell = styled.main`
     cursor: grabbing;
   }
 
-  &[data-history-tray="true"] {
+  &[data-history-tray-frame="true"] {
     place-items: start center;
   }
 
@@ -10849,7 +11148,7 @@ export const AudioWidgetShell = styled.main`
     transition: none;
   }
 
-  &[data-history-tray="true"] {
+  &[data-history-tray-frame="true"] {
     place-items: start center;
     overflow: visible;
     border-radius: 18px;
@@ -11769,7 +12068,7 @@ export const AudioWidgetFocusStage = styled.div`
     transform: translateX(0) scaleX(1);
   }
 
-  ${AudioWidgetShell}[data-history-tray="true"] & {
+  ${AudioWidgetShell}[data-history-tray-frame="true"] & {
     width: 64px;
     height: 64px;
     border-radius: 999px;
