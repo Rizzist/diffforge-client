@@ -4520,6 +4520,7 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
   &[data-kind="send_message"] { --loop-node-accent: 45, 212, 191; }
+  &[data-kind="run_script"] { --loop-node-accent: 251, 191, 36; }
   &[data-kind="loop"] {
     --loop-node-accent: 255, 209, 102;
   }
@@ -4529,6 +4530,25 @@ export const LoopspaceGraphNode = styled.div`
     box-shadow:
       0 0 0 1px rgba(134, 239, 172, 0.18),
       0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+
+  &[data-pending="true"] {
+    border-style: dashed;
+    border-color: rgba(var(--loop-node-accent), 0.62);
+    opacity: 0.68;
+    box-shadow:
+      0 0 0 1px rgba(var(--loop-node-accent), 0.12),
+      0 16px 42px rgba(0, 0, 0, 0.36);
+  }
+
+  &[data-ghost="true"] {
+    border-style: dashed;
+    border-color: rgba(var(--loop-node-accent), 0.78);
+    opacity: 0.5;
+    pointer-events: none;
+    box-shadow:
+      0 0 0 1px rgba(var(--loop-node-accent), 0.18),
+      0 14px 38px rgba(0, 0, 0, 0.32);
   }
 `;
 
@@ -4617,6 +4637,35 @@ export const LoopspaceGraphNodeText = styled.div`
     font-weight: 740;
     letter-spacing: 0;
     text-transform: uppercase;
+  }
+`;
+
+export const LoopspaceGraphNodeSelect = styled.select`
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  margin-top: 3px;
+  padding: 0 22px 0 8px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.28);
+  border-radius: 6px;
+  color: #f8fafc;
+  background:
+    linear-gradient(135deg, rgba(var(--loop-node-accent), 0.12), rgba(255, 255, 255, 0.035)),
+    #050505;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0;
+  outline: none;
+  pointer-events: auto;
+
+  &:focus {
+    border-color: rgba(var(--loop-node-accent), 0.58);
+    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.14);
+  }
+
+  &:disabled {
+    color: rgba(248, 250, 252, 0.42);
+    cursor: not-allowed;
   }
 `;
 

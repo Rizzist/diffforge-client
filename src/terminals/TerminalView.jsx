@@ -792,6 +792,7 @@ const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
 ];
 
 const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
+const LOOPSPACE_TRIGGER_DRAG_KIND = "loopspace_trigger_ref";
 
 function getLoopspaceTriggerTypeLabel(type) {
   if (type === "webhook") return "Webhook";
@@ -6099,15 +6100,29 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
       return;
     }
     const payload = JSON.stringify({
+      kind: LOOPSPACE_TRIGGER_DRAG_KIND,
       id: trigger.id,
-      loopspaceIds: trigger.loopspaceIds || [],
+      loopspace_ids: trigger.loopspaceIds || [],
       name: trigger.name,
-      triggerId: trigger.id,
+      trigger_id: trigger.id,
       type: trigger.type,
+      trigger_type: trigger.type,
     });
     event.dataTransfer.effectAllowed = "copy";
-    event.dataTransfer.setData(LOOPSPACE_TRIGGER_DRAG_MIME, payload);
-    event.dataTransfer.setData("text/plain", trigger.id);
+    try {
+      event.dataTransfer.setData("text/plain", payload);
+    } catch {
+      try {
+        event.dataTransfer.setData("text/plain", trigger.id);
+      } catch {
+        // Some embedded targets reject data writes; custom MIME remains best-effort.
+      }
+    }
+    try {
+      event.dataTransfer.setData(LOOPSPACE_TRIGGER_DRAG_MIME, payload);
+    } catch {
+      // text/plain is the cross-webview path.
+    }
   }, []);
 
   return (

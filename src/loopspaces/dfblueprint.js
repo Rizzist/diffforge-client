@@ -129,11 +129,11 @@ function parseNodeLine(line, lineIndex) {
   const lineKind = match[1].toLowerCase();
   const label = unquoteDfBlueprint(match[2].trim());
   const props = parseDfBlueprintProps(match[3]);
-  const id = safeText(props.id || props.nodeId || props.node_id, sanitizeDfBlueprintId(label, `${lineKind}-${lineIndex}`));
-  const triggerId = safeText(props.triggerId || props.trigger_id || props.trigger);
+  const id = safeText(props.id || props.node_id, sanitizeDfBlueprintId(label, `${lineKind}-${lineIndex}`));
+  const triggerId = safeText(props.trigger_id);
   const kind = lineKind === "trigger"
     ? "trigger"
-    : safeText(props.kind || props.nodeKind || props.node_kind || props.type, "action");
+    : safeText(props.kind || props.node_kind || props.type, "action");
   const x = numberOrNull(props.x ?? props.pos_x ?? props.left);
   const y = numberOrNull(props.y ?? props.pos_y ?? props.top);
   return {
@@ -143,9 +143,9 @@ function parseNodeLine(line, lineIndex) {
     nodeKind: kind === "trigger" ? "" : kind,
     role: safeText(props.role, kind === "trigger" ? "trigger" : "action"),
     icon: safeText(props.icon),
-    mode: safeText(props.mode || props.splitterMode || props.splitter_mode),
+    mode: safeText(props.mode || props.splitter_mode),
     triggerId,
-    triggerType: safeText(props.triggerType || props.trigger_type || props.type),
+    triggerType: safeText(props.trigger_type),
     hasPosition: x !== null || y !== null,
     x: x ?? 0,
     y: y ?? 0,
@@ -170,71 +170,17 @@ function parseEdgeLine(line, lineIndex) {
   const from = parseEdgeEndpoint(match[1]);
   const to = parseEdgeEndpoint(match[2]);
   const props = parseDfBlueprintProps(match[3] || "");
-  const id = safeText(props.id || props.edgeId || props.edge_id, `edge-${from.nodeId}-${from.portId || "out"}-${to.nodeId}-${to.portId || "in"}-${lineIndex}`);
+  const id = safeText(props.id || props.edge_id, `edge-${from.nodeId}-${from.portId || "out"}-${to.nodeId}-${to.portId || "in"}-${lineIndex}`);
   return {
     id,
     from: from.nodeId,
-    fromPort: from.portId || safeText(props.fromPort || props.from_port, "out"),
+    fromPort: from.portId || safeText(props.from_port, "out"),
     to: to.nodeId,
-    toPort: to.portId || safeText(props.toPort || props.to_port, "in"),
+    toPort: to.portId || safeText(props.to_port, "in"),
     label: safeText(props.label || props.name),
     role: safeText(props.role, "flow"),
     props,
   };
-}
-
-function normalizeLegacyArchGraph(source) {
-  const lines = String(source || "").split(/\r?\n/);
-  const ast = emptyDfBlueprintAst();
-  const seen = new Set();
-  lines.forEach((line, lineIndex) => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#")) return;
-    const edgeMatch = trimmed.match(/^(.+?)\s*(>|--)\s*(.+?)(?::\s*(.*?))?(?:\s*\[(.*)\])?$/);
-    if (edgeMatch && !trimmed.startsWith("[")) {
-      const props = parseDfBlueprintProps(edgeMatch[5] || "");
-      const from = safeText(props.fromId || props.fromid || props.from_id, sanitizeDfBlueprintId(edgeMatch[1]));
-      const to = safeText(props.toId || props.toid || props.to_id, sanitizeDfBlueprintId(edgeMatch[3]));
-      ast.edges.push({
-        id: safeText(props.id || props.edgeId || props.edge_id, `edge-${from}-${to}-${lineIndex}`),
-        from,
-        fromPort: "out",
-        to,
-        toPort: "in",
-        label: safeText(edgeMatch[4]),
-        role: safeText(props.role, "flow"),
-        props,
-      });
-      return;
-    }
-    const nodeMatch = trimmed.match(/^(.+?)\s*\[(.*)\]\s*$/);
-    if (!nodeMatch) return;
-    const props = parseDfBlueprintProps(nodeMatch[2]);
-    const label = unquoteDfBlueprint(nodeMatch[1].trim());
-    const id = safeText(props.id || props.nodeId || props.node_id, sanitizeDfBlueprintId(label, `node-${lineIndex}`));
-    if (seen.has(id)) return;
-    seen.add(id);
-    const triggerId = safeText(props.triggerId || props.triggerid || props.trigger_id || props.trigger);
-    const nodeKind = safeText(props.nodeKind || props.nodekind || props.node_kind || props.kind, triggerId ? "trigger" : "action");
-    const x = numberOrNull(props.x ?? props.left ?? props.posx ?? props.pos_x);
-    const y = numberOrNull(props.y ?? props.top ?? props.posy ?? props.pos_y);
-    ast.nodes.push({
-      id,
-      icon: safeText(props.icon),
-      label,
-      mode: safeText(props.mode || props.splitterMode || props.splitter_mode),
-      nodeKind: triggerId ? "" : nodeKind,
-      kind: triggerId ? "trigger" : nodeKind,
-      role: safeText(props.role, triggerId ? "trigger" : "action"),
-      triggerId,
-      triggerType: safeText(props.triggerType || props.trigger_type || props.type),
-      hasPosition: x !== null || y !== null,
-      x: x ?? 0,
-      y: y ?? 0,
-      props,
-    });
-  });
-  return ast;
 }
 
 export function emptyDfBlueprintAst(name = "Loopspace") {
@@ -252,9 +198,7 @@ export function parseDfBlueprintSource(source = "") {
   const ast = emptyDfBlueprintAst();
   if (!text.trim()) return ast;
   const hasBlueprintHeader = text.split(/\r?\n/).some((line) => /^\s*(dfblueprint|blueprint|format)\b/i.test(line));
-  if (!hasBlueprintHeader && /\[[^\]]*(nodeKind|triggerId|fromId|toId|role)\s*:/i.test(text)) {
-    return normalizeLegacyArchGraph(text);
-  }
+  if (!hasBlueprintHeader) return ast;
   const seenNodes = new Set();
   text.split(/\r?\n/).forEach((line, lineIndex) => {
     const trimmed = line.trim();
@@ -302,8 +246,8 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
     const props = {
       id: node.id,
       ...(isTrigger ? {
-        triggerId: node.triggerId,
-        triggerType: node.triggerType || node.type || "manual",
+        trigger_id: node.triggerId,
+        trigger_type: node.triggerType || node.type || "manual",
       } : {
         kind: node.nodeKind || node.kind || "action",
         role: node.role || "action",
@@ -320,7 +264,7 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
       ) : {}),
     };
     lines.push(`${isTrigger ? "trigger" : "node"} ${quoteDfBlueprint(node.label || node.id)} [${serializeDfBlueprintProps(props, isTrigger
-      ? ["id", "triggerId", "triggerType", "icon", "x", "y"]
+      ? ["id", "trigger_id", "trigger_type", "icon", "x", "y"]
       : ["id", "kind", "role", "icon", "mode", "x", "y"])}]`);
   }
   if (next.nodes.length && next.edges.length) lines.push("");
@@ -351,11 +295,11 @@ export function normalizeDfBlueprintSource(source = "", options = {}) {
 }
 
 export function createDfBlueprintNodeFromTemplate(template, position = null) {
-  const templateId = sanitizeDfBlueprintId(template?.id || template?.nodeKind || "node", "node").replace(/-/g, "_");
-  const deviceId = safeText(template?.device_id || template?.deviceId);
+  const templateId = sanitizeDfBlueprintId(template?.id || template?.node_kind || "node", "node").replace(/-/g, "_");
+  const deviceId = safeText(template?.device_id);
   if (templateId === "device" && deviceId) {
     const safeDeviceId = sanitizeDfBlueprintId(deviceId, "device");
-    const label = safeText(template?.label || template?.device_label || template?.deviceLabel, deviceId);
+    const label = safeText(template?.label || template?.device_label, deviceId);
     return {
       id: `device-${safeDeviceId}`,
       icon: safeText(template?.icon, "device"),
@@ -378,10 +322,10 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
   }
   const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
   if (templateId === "run_script") {
-    const scriptId = safeText(template?.script_id || template?.scriptId || template?.script);
-    const pathKey = safeText(template?.path_key || template?.pathKey);
-    const scriptName = safeText(template?.script_name || template?.scriptName || template?.label, scriptId || pathKey || "Script");
-    const deviceLabel = safeText(template?.device_label || template?.deviceLabel);
+    const scriptId = safeText(template?.script_id || template?.script);
+    const pathKey = safeText(template?.path_key);
+    const scriptName = safeText(template?.script_name || template?.label, scriptId || pathKey || "Script");
+    const deviceLabel = safeText(template?.device_label);
     return {
       id: `${templateId}-${sanitizeDfBlueprintId(scriptId || pathKey || "script", "script")}-${suffix}`,
       icon: safeText(template?.icon, "terminal"),
@@ -421,8 +365,8 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
 }
 
 export function createDfBlueprintTriggerNode(trigger, position = null) {
-  const triggerId = safeText(trigger?.id || trigger?.triggerId);
-  const type = safeText(trigger?.type || trigger?.triggerType, "manual").toLowerCase();
+  const triggerId = safeText(trigger?.trigger_id || trigger?.id);
+  const type = safeText(trigger?.type || trigger?.trigger_type, "manual").toLowerCase();
   return {
     id: `trigger-${triggerId}`.replace(/[^a-zA-Z0-9_-]/g, "-"),
     icon: type === "cron" ? "clock" : type === "webhook" ? "webhook" : "play",
@@ -512,7 +456,7 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
     const action = safeText(op?.op || op?.type || op?.action).toLowerCase();
     if (action === "addnode" || action === "add_node") {
       const node = createDfBlueprintNodeFromTemplate({
-        id: op.kind || op.nodeKind || op.node_kind || "action",
+        id: op.kind || op.node_kind || "action",
         label: op.label || op.name || "Graph node",
         role: op.role || "action",
         icon: op.icon || "",
@@ -538,19 +482,19 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
       } else {
         ast.nodes.push(node);
       }
-    } else if (action === "addtrigger" || action === "add_trigger") {
+    } else if (action === "addtrigger" || action === "add_trigger" || action === "attach_trigger") {
       const node = createDfBlueprintTriggerNode({
-        id: op.triggerId || op.trigger_id || op.id,
+        trigger_id: op.trigger_id,
         name: op.label || op.name,
-        type: op.triggerType || op.trigger_type || op.type,
+        trigger_type: op.trigger_type || op.type,
       }, op.position || { x: op.x, y: op.y });
       if (node.triggerId && !ast.nodes.some((item) => item.id === node.id)) ast.nodes.push(node);
     } else if (action === "removenode" || action === "remove_node") {
-      const id = safeText(op.nodeId || op.node_id || op.id);
+      const id = safeText(op.node_id || op.id);
       ast.nodes = ast.nodes.filter((node) => node.id !== id);
       ast.edges = ast.edges.filter((edge) => edge.from !== id && edge.to !== id);
     } else if (action === "movenode" || action === "move_node") {
-      const id = safeText(op.nodeId || op.node_id || op.id);
+      const id = safeText(op.node_id || op.id);
       ast.nodes = ast.nodes.map((node) => node.id === id ? {
         ...node,
         hasPosition: true,
@@ -558,30 +502,30 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         y: Math.round(Number(op.y ?? op.position?.y ?? node.y) || 0),
       } : node);
     } else if (action === "connect") {
-      const from = safeText(op.from || op.fromId || op.from_id);
-      const to = safeText(op.to || op.toId || op.to_id);
+      const from = safeText(op.from || op.from_id);
+      const to = safeText(op.to || op.to_id);
       if (from && to && from !== to && !ast.edges.some((edge) => edge.from === from && edge.to === to)) {
         ast.edges.push({
-          id: safeText(op.id || op.edgeId || op.edge_id, `edge-${from}-${to}-${Date.now().toString(36)}`),
+          id: safeText(op.edge_id || op.id, `edge-${from}-${to}-${Date.now().toString(36)}`),
           from,
-          fromPort: safeText(op.fromPort || op.from_port, "out"),
+          fromPort: safeText(op.from_port, "out"),
           to,
-          toPort: safeText(op.toPort || op.to_port, "in"),
+          toPort: safeText(op.to_port, "in"),
           label: safeText(op.label, "next"),
           role: safeText(op.role, "flow"),
           props: {},
         });
       }
     } else if (action === "disconnect") {
-      const edgeId = safeText(op.edgeId || op.edge_id || op.id);
-      const from = safeText(op.from || op.fromId || op.from_id);
-      const to = safeText(op.to || op.toId || op.to_id);
+      const edgeId = safeText(op.edge_id || op.id);
+      const from = safeText(op.from || op.from_id);
+      const to = safeText(op.to || op.to_id);
       ast.edges = ast.edges.filter((edge) => {
         if (edgeId) return edge.id !== edgeId;
         return !(edge.from === from && edge.to === to);
       });
     } else if (action === "updatenodeprops" || action === "update_node_props" || action === "updateprops") {
-      const id = safeText(op.nodeId || op.node_id || op.id);
+      const id = safeText(op.node_id || op.id);
       ast.nodes = ast.nodes.map((node) => {
         if (node.id !== id) return node;
         const props = op.props && typeof op.props === "object" ? op.props : {};

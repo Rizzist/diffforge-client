@@ -91,6 +91,8 @@ const SNIPPING_AREA_REASSERT_DELAYS_MS: [u64; 6] = [0, 120, 280, 700, 1_600, 3_0
 const SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS: u64 = 50;
 #[cfg(target_os = "macos")]
 const SNIPPING_AREA_CURSOR_GUARD_DURATION_MS: u64 = 5_000;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_PROCESS_TRANSFORM_TO_BACKGROUND: u32 = 2;
 
 // CGPreflightScreenCaptureAccess caches its result per process and is known to
 // keep reporting false after the user grants Screen Recording while the app is
@@ -135,6 +137,21 @@ extern "C" {
     fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
     fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: u32) -> i64;
     fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SnippingMacosProcessSerialNumber {
+    high_long_of_psn: u32,
+    low_long_of_psn: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn GetCurrentProcess(psn: *mut SnippingMacosProcessSerialNumber) -> i32;
+    fn TransformProcessType(psn: *const SnippingMacosProcessSerialNumber, transform_state: u32)
+        -> i32;
 }
 
 /// kCGEventSourceStateCombinedSessionState / kCGMouseButtonLeft: true while
@@ -452,6 +469,33 @@ impl SnippingWarmCaptureState {
             frames: StdMutex::new(HashMap::new()),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnippingCaptureHelperTarget {
+    display_id: Option<u32>,
+    title: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnippingCaptureHelperArea {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnippingCaptureHelperRequest {
+    target: Option<SnippingCaptureHelperTarget>,
+    crop_area: Option<SnippingCaptureHelperArea>,
+    frame_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnippingCaptureHelperResponse {
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone)]
@@ -1579,7 +1623,8 @@ fn snipping_reason_is_hotkey(reason: &str) -> bool {
 fn snipping_error_is_screen_capture_permission(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("screen capture permission")
-        || lower.contains("screen recording")
+        || lower.contains("permission to capture the screen")
+        || lower.contains("screen capture access")
         || lower.contains("permission was not granted")
 }
 
@@ -3176,11 +3221,251 @@ fn snipping_scap_capture_image_inner(
     capture_result
 }
 
+fn snipping_capture_helper_target_from_scap(
+    target: Option<&scap::Target>,
+) -> Option<SnippingCaptureHelperTarget> {
+    match target {
+        Some(scap::Target::Display(display)) => Some(SnippingCaptureHelperTarget {
+            display_id: Some(display.id),
+            title: (!display.title.trim().is_empty()).then(|| display.title.clone()),
+        }),
+        _ => None,
+    }
+}
+
+fn snipping_capture_helper_area_from_scap(
+    crop_area: Option<&scap::capturer::Area>,
+) -> Option<SnippingCaptureHelperArea> {
+    crop_area.map(|area| SnippingCaptureHelperArea {
+        x: area.origin.x,
+        y: area.origin.y,
+        width: area.size.width,
+        height: area.size.height,
+    })
+}
+
+fn snipping_capture_helper_area_to_scap(
+    area: Option<SnippingCaptureHelperArea>,
+) -> Option<scap::capturer::Area> {
+    area.map(|area| {
+        snipping_scap_capture_area(
+            area.x.max(0.0).round() as u32,
+            area.y.max(0.0).round() as u32,
+            area.width.max(1.0).round() as u32,
+            area.height.max(1.0).round() as u32,
+        )
+    })
+}
+
+fn snipping_capture_helper_target_to_scap(
+    target: Option<SnippingCaptureHelperTarget>,
+) -> Option<scap::Target> {
+    let target = target?;
+    let title = target
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let displays = snipping_scap_display_targets();
+    if let Some(display_id) = target.display_id {
+        if let Some(display) = displays.iter().find(|candidate| match candidate {
+            scap::Target::Display(display) => display.id == display_id,
+            scap::Target::Window(_) => false,
+        }) {
+            return Some(display.clone());
+        }
+    }
+    if let Some(title) = title {
+        if let Some(display) = displays.iter().find(|candidate| match candidate {
+            scap::Target::Display(display) => display.title.trim().eq_ignore_ascii_case(&title),
+            scap::Target::Window(_) => false,
+        }) {
+            return Some(display.clone());
+        }
+    }
+    None
+}
+
+fn snipping_capture_helper_frame_path() -> Result<PathBuf, String> {
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let tmp_dir = root.join(".tmp");
+    fs::create_dir_all(&tmp_dir).map_err(|error| {
+        format!(
+            "Unable to create snipping temp directory {}: {error}",
+            tmp_dir.display()
+        )
+    })?;
+    Ok(tmp_dir.join(format!(
+        ".snipping-capture-helper-{}-{}.rgba",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    )))
+}
+
+fn snipping_read_capture_helper_frame(
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<image::RgbaImage, String> {
+    if width == 0 || height == 0 {
+        return Err("Screen capture helper returned an empty frame.".to_string());
+    }
+    let expected_len = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| "Screen capture helper returned a frame that is too large.".to_string())?;
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "Unable to read screen capture helper frame {}: {error}",
+            path.display()
+        )
+    })?;
+    if bytes.len() != expected_len {
+        return Err("Screen capture helper returned incomplete frame data.".to_string());
+    }
+    image::RgbaImage::from_raw(width, height, bytes)
+        .ok_or_else(|| "Unable to decode screen capture helper frame.".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_capture_helper_make_background_process() {
+    unsafe {
+        let mut psn = SnippingMacosProcessSerialNumber {
+            high_long_of_psn: 0,
+            low_long_of_psn: 0,
+        };
+        if GetCurrentProcess(&mut psn) == 0 {
+            let _ = TransformProcessType(&psn, SNIPPING_MACOS_PROCESS_TRANSFORM_TO_BACKGROUND);
+        }
+    }
+
+    if let Some(main_thread_marker) = objc2::MainThreadMarker::new() {
+        let application = objc2_app_kit::NSApplication::sharedApplication(main_thread_marker);
+        let _ = application
+            .setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Prohibited);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_capture_helper_make_background_process() {}
+
+pub fn run_snipping_capture_helper(_args: &[String]) -> i32 {
+    snipping_capture_helper_make_background_process();
+
+    let result = (|| -> Result<(), String> {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("Unable to read screen capture helper request: {error}"))?;
+        let request: SnippingCaptureHelperRequest = serde_json::from_str(&input)
+            .map_err(|error| format!("Invalid screen capture helper request: {error}"))?;
+        let target = snipping_capture_helper_target_to_scap(request.target);
+        let crop_area = snipping_capture_helper_area_to_scap(request.crop_area);
+        let frame_path = request.frame_path.trim();
+        if frame_path.is_empty() {
+            return Err("Screen capture helper request is missing a frame path.".to_string());
+        }
+        let image = snipping_scap_capture_image_inner(target, crop_area)?;
+        fs::write(frame_path, image.as_raw()).map_err(|error| {
+            format!("Unable to write screen capture helper frame {frame_path}: {error}")
+        })?;
+        let response = SnippingCaptureHelperResponse {
+            width: image.width(),
+            height: image.height(),
+        };
+        let body = serde_json::to_string(&response)
+            .map_err(|error| format!("Unable to encode screen capture helper response: {error}"))?;
+        std::io::stdout()
+            .write_all(body.as_bytes())
+            .map_err(|error| format!("Unable to write screen capture helper response: {error}"))?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_scap_capture_image_via_helper(
+    target: Option<scap::Target>,
+    crop_area: Option<scap::capturer::Area>,
+    context: &str,
+) -> Result<image::RgbaImage, String> {
+    let executable = env::current_exe()
+        .map_err(|error| format!("Unable to locate screen capture helper: {error}"))?;
+    let executable = executable.display().to_string();
+    let frame_path = snipping_capture_helper_frame_path()?;
+    let request = SnippingCaptureHelperRequest {
+        target: snipping_capture_helper_target_from_scap(target.as_ref()),
+        crop_area: snipping_capture_helper_area_from_scap(crop_area.as_ref()),
+        frame_path: frame_path.display().to_string(),
+    };
+    let request = serde_json::to_string(&request)
+        .map_err(|error| format!("Unable to encode screen capture helper request: {error}"))?;
+    let capture = match run_command_capture(
+        &executable,
+        &["--snipping-capture-helper"],
+        Some(&request),
+        Duration::from_millis(SNIPPING_SCAP_CAPTURE_TIMEOUT_MS),
+        None,
+    ) {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = fs::remove_file(&frame_path);
+            return Err(if error.contains(" timed out.") {
+                format!("Timed out while {context}; restarted the screen capture helper. Try the snip again.")
+            } else {
+                format!("Screen capture helper failed while {context}: {error}")
+            });
+        }
+    };
+    if capture.exit_code != Some(0) {
+        let _ = fs::remove_file(&frame_path);
+        let details = command_output_text(&capture.stdout, &capture.stderr);
+        let details = details.trim();
+        return Err(if details.is_empty() {
+            format!("Screen capture helper failed while {context}.")
+        } else {
+            format!("Screen capture helper failed while {context}: {details}")
+        });
+    }
+    let response: SnippingCaptureHelperResponse = match serde_json::from_str(&capture.stdout) {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = fs::remove_file(&frame_path);
+            return Err(format!(
+                "Screen capture helper returned invalid output: {error}"
+            ));
+        }
+    };
+    let image = snipping_read_capture_helper_frame(&frame_path, response.width, response.height);
+    let _ = fs::remove_file(&frame_path);
+    let image = image?;
+    if image.width() != response.width || image.height() != response.height {
+        return Err("Screen capture helper returned mismatched image dimensions.".to_string());
+    }
+    Ok(image)
+}
+
 fn snipping_scap_capture_image(
     target: Option<scap::Target>,
     crop_area: Option<scap::capturer::Area>,
     context: &str,
 ) -> Result<image::RgbaImage, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return snipping_scap_capture_image_via_helper(target, crop_area, context);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
     let (sender, receiver) = std::sync::mpsc::channel();
     let context_for_worker = context.to_string();
     thread::spawn(move || {
@@ -3200,6 +3485,7 @@ fn snipping_scap_capture_image(
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(format!("Screen capture backend stopped while {context}."))
         }
+    }
     }
 }
 

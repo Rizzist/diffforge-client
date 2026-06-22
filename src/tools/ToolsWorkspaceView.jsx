@@ -201,25 +201,43 @@ function roundedDocumentPx(value, min = 0) {
   return `${Math.round(safeValue)}px`;
 }
 
-function skillDocumentPageStyle(scale) {
+function skillDocumentPageStyle(scale, options = {}) {
   const safeScale = clampSkillDocumentScale(scale);
+  const bodyOffsetPx = Math.max(0, Number(options.bodyOffsetPx) || 0);
+  const pageHeight = SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale;
+  const paddingTop = Math.max(20, 52 * safeScale);
+  const paddingBottom = Math.max(26, 76 * safeScale);
+  const titleFontSize = Math.max(16, 30 * safeScale);
+  const titlePaddingBottom = Math.max(4, 7 * safeScale);
+  const bodyMarginTop = Math.max(10, 24 * safeScale);
+  const bodyMinHeight = Math.max(
+    180,
+    pageHeight
+      - paddingTop
+      - paddingBottom
+      - titleFontSize * 1.18
+      - titlePaddingBottom
+      - bodyMarginTop
+      - bodyOffsetPx
+      - 10,
+  );
   return {
     "--skill-document-page-scale": String(safeScale),
     "--skill-document-page-width": roundedDocumentPx(SKILL_DOCUMENT_A4_WIDTH_PX * safeScale),
     "--skill-document-page-height": roundedDocumentPx(SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale),
-    "--skill-document-page-padding-top": roundedDocumentPx(52 * safeScale, 20),
+    "--skill-document-page-padding-top": roundedDocumentPx(paddingTop),
     "--skill-document-page-padding-inline": roundedDocumentPx(58 * safeScale, 22),
-    "--skill-document-page-padding-bottom": roundedDocumentPx(76 * safeScale, 26),
-    "--skill-document-title-font-size": roundedDocumentPx(30 * safeScale, 16),
-    "--skill-document-title-padding-bottom": roundedDocumentPx(7 * safeScale, 4),
-    "--skill-document-body-margin-top": roundedDocumentPx(24 * safeScale, 10),
+    "--skill-document-page-padding-bottom": roundedDocumentPx(paddingBottom),
+    "--skill-document-title-font-size": roundedDocumentPx(titleFontSize),
+    "--skill-document-title-padding-bottom": roundedDocumentPx(titlePaddingBottom),
+    "--skill-document-body-margin-top": roundedDocumentPx(bodyMarginTop),
     "--skill-document-body-margin-left": roundedDocumentPx(-10 * safeScale, -20),
     "--skill-document-body-bleed": roundedDocumentPx(20 * safeScale),
     "--skill-document-body-padding-inline": roundedDocumentPx(10 * safeScale, 4),
     "--skill-document-body-padding-top": roundedDocumentPx(8 * safeScale, 4),
     "--skill-document-body-padding-bottom": roundedDocumentPx(24 * safeScale, 10),
     "--skill-document-body-font-size": roundedDocumentPx(15 * safeScale, 10),
-    "--skill-document-body-min-height": roundedDocumentPx(900 * safeScale, 320),
+    "--skill-document-body-min-height": roundedDocumentPx(bodyMinHeight, 180),
   };
 }
 
@@ -2831,6 +2849,10 @@ export default function ToolsWorkspaceView({
     () => skillDocumentPageStyle(skillDocumentScale),
     [skillDocumentScale],
   );
+  const scriptDocumentMetricsStyle = useMemo(
+    () => skillDocumentPageStyle(skillDocumentScale, { bodyOffsetPx: 40 }),
+    [skillDocumentScale],
+  );
   const appControlDocumentContext = useMemo(() => {
     const content = String(skillEditor?.content || "");
     const preview = compactDocumentText(content, 1400);
@@ -2998,7 +3020,7 @@ export default function ToolsWorkspaceView({
     const estimatedLines = content.split("\n").reduce((total, line) => {
       return total + Math.max(1, Math.ceil(line.length / 86));
     }, 0);
-    return Math.max(28, Math.min(280, estimatedLines + 8));
+    return Math.max(1, Math.min(280, estimatedLines + 4));
   }, [scriptEditor?.content]);
   const preservedScriptEditorSelection = useMemo(() => {
     if (!scriptEditor || !lastScriptSelection) return null;
@@ -3586,7 +3608,7 @@ export default function ToolsWorkspaceView({
     const estimatedLines = content.split("\n").reduce((total, line) => {
       return total + Math.max(1, Math.ceil(line.length / 82));
     }, 0);
-    return Math.max(28, Math.min(260, estimatedLines + 8));
+    return Math.max(1, Math.min(260, estimatedLines + 4));
   }, [skillEditor?.content]);
   const preservedSkillEditorSelection = useMemo(() => {
     if (!skillEditor || !lastDocumentSelection) return null;
@@ -4681,7 +4703,7 @@ export default function ToolsWorkspaceView({
                               </SkillDocumentActions>
                             </SkillDocumentToolbarControls>
                           </SkillDocumentToolbar>
-                          <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={skillDocumentMetricsStyle}>
+                          <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={scriptDocumentMetricsStyle}>
                             <SkillDocumentPage onPointerDownCapture={clearScriptSelection}>
                               <SkillDocumentTitleInput
                                 aria-label="Script name"
@@ -5385,6 +5407,7 @@ const DocsFilesPane = styled(FileExplorerPane)`
   max-height: 100%;
   overflow: hidden;
   border-right: 0;
+  contain: layout paint;
 
   &[data-collapsed="true"] {
     grid-template-rows: auto minmax(0, 1fr);
@@ -5875,8 +5898,8 @@ const SkillDocumentEditor = styled.div`
   }
 
   &[data-script-editor="true"] {
-    grid-row: auto;
-    flex: 1 1 auto;
+    flex: 1 1 0;
+    min-height: 0;
     height: auto;
     max-height: none;
   }
@@ -5884,13 +5907,16 @@ const SkillDocumentEditor = styled.div`
 
 const SkillDocumentToolbar = styled.div`
   display: flex;
+  flex-wrap: wrap;
   position: relative;
   z-index: 5;
+  box-sizing: border-box;
+  flex: 0 0 auto;
   min-width: 0;
   min-height: 44px;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   padding: 7px 10px;
   border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   background: var(--tools-control-bg);
@@ -5916,26 +5942,24 @@ const SkillDocumentToolbarCopy = styled.div`
 
 const SkillDocumentToolbarControls = styled.div`
   display: flex;
-  flex: 0 1 auto;
-  flex-wrap: nowrap;
+  flex: 1 1 260px;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-start;
   gap: 8px;
   min-width: 0;
+  max-width: 100%;
 
   &[data-side="right"] {
+    flex: 1 1 240px;
     justify-content: flex-end;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  &[data-side="right"]::-webkit-scrollbar {
-    display: none;
+    overflow: visible;
   }
 `;
 
 const SkillDocumentThemeSwitch = styled.div`
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 2px;
   padding: 3px;
@@ -5945,6 +5969,7 @@ const SkillDocumentThemeSwitch = styled.div`
 `;
 
 const SkillDocumentThemeButton = styled.button`
+  flex: 0 0 auto;
   height: 24px;
   padding: 0 9px;
   border: 0;
@@ -5968,6 +5993,7 @@ const SkillDocumentThemeButton = styled.button`
 const SkillDocumentCanvas = styled.div`
   display: grid;
   position: relative;
+  align-self: stretch;
   align-content: start;
   justify-items: center;
   box-sizing: border-box;
@@ -5975,6 +6001,7 @@ const SkillDocumentCanvas = styled.div`
   max-height: 100%;
   min-width: 0;
   min-height: 0;
+  contain: layout paint;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -6445,9 +6472,13 @@ const ScriptMetaRow = styled.div`
 
 const ScriptColorField = styled.label`
   display: inline-flex;
+  flex: 1 1 98px;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
   height: 31px;
+  min-width: 82px;
+  max-width: 138px;
   padding: 0 8px;
   border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 8px;
@@ -6455,8 +6486,16 @@ const ScriptColorField = styled.label`
   background: var(--tools-control-bg);
   font-size: 10px;
   font-weight: 780;
+  line-height: 1.05;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   input {
+    flex: 0 0 20px;
     width: 20px;
     height: 20px;
     padding: 0;
@@ -6492,16 +6531,22 @@ const SkillDocumentActions = styled.div`
   background: var(--tools-control-bg);
 
   &[data-placement="toolbar"] {
-    flex-wrap: nowrap;
+    flex: 1 1 auto;
+    flex-wrap: wrap;
     align-items: center;
+    justify-content: flex-end;
     overflow: visible;
     padding: 0;
     border-top: 0;
     background: transparent;
+    min-width: 0;
+    max-width: 100%;
   }
 
   &[data-placement="toolbar"] button {
+    flex: 0 1 auto;
     height: 31px;
+    min-width: max-content;
     padding: 0 12px;
     white-space: nowrap;
   }

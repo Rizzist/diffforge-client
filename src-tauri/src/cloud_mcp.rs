@@ -3429,6 +3429,18 @@ fn cloud_mcp_outbox_stable_snapshot_hash_value(event_kind: &str, value: &Value) 
 
 fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> Option<String> {
     let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    if normalized_kind == "script.inventory" || normalized_kind == "script_inventory" {
+        let device_id = cloud_mcp_payload_text(
+            payload,
+            &["owner_device_id", "device_id", "ownerDeviceId", "deviceId"],
+        )
+        .unwrap_or_default();
+        if !device_id.is_empty() {
+            let scope_key =
+                cloud_mcp_payload_scope_key(payload).unwrap_or_else(cloud_mcp_process_account_scope_key);
+            return Some(format!("script-inventory:{scope_key}:{device_id}"));
+        }
+    }
     if cloud_mcp_device_live_unit_event_kind(&normalized_kind) {
         let scope_key = cloud_mcp_payload_scope_key(payload)
             .unwrap_or_else(cloud_mcp_process_account_scope_key);
@@ -3711,6 +3723,19 @@ fn cloud_mcp_outbox_idempotency_key(
         return key;
     }
     let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    if normalized_kind == "script.inventory" || normalized_kind == "script_inventory" {
+        let device_id = cloud_mcp_payload_text(
+            payload,
+            &["owner_device_id", "device_id", "ownerDeviceId", "deviceId"],
+        )
+        .unwrap_or_default();
+        let inventory_hash =
+            cloud_mcp_payload_text(payload, &["inventory_hash", "inventoryHash"])
+                .unwrap_or_else(|| payload_hash.to_string());
+        if !device_id.is_empty() {
+            return format!("script_inventory:{device_id}:{inventory_hash}");
+        }
+    }
     if normalized_kind == "account_script_run_state" {
         let device_id = cloud_mcp_payload_text(
             payload,
@@ -12134,6 +12159,21 @@ fn cloud_mcp_loopspace_graph_from_snapshot(snapshot: &Value, loopspace_id: &str)
         })
 }
 
+fn cloud_mcp_loopspace_graph_result_source(value: &Value) -> String {
+    value
+        .get("graph")
+        .and_then(|graph| {
+            cloud_mcp_payload_text(graph, &["source", "source_text", "sourceText", "graph_source"])
+        })
+        .or_else(|| {
+            cloud_mcp_payload_text(
+                value,
+                &["source", "source_text", "sourceText", "graph_source", "graphSource"],
+            )
+        })
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 async fn cloud_mcp_get_loopspace_graph(
     _state: State<'_, CloudMcpState>,
@@ -12212,6 +12252,14 @@ async fn cloud_mcp_update_loopspace_graph(
         .cloned()
         .unwrap_or_else(|| result.clone());
     let mut graph = cloud_mcp_loopspace_graph_from_snapshot(&snapshot, &loopspace_id);
+    if graph
+        .as_ref()
+        .map(cloud_mcp_loopspace_graph_result_source)
+        .unwrap_or_default()
+        != source
+    {
+        graph = None;
+    }
     if graph.is_none() {
         let retry_payload =
             cloud_mcp_loopspace_sync_payload("loopspace_graph_update_hydrate_retry");
@@ -12224,6 +12272,14 @@ async fn cloud_mcp_update_loopspace_graph(
         {
             snapshot = retry.get("sync").cloned().unwrap_or(retry);
             graph = cloud_mcp_loopspace_graph_from_snapshot(&snapshot, &loopspace_id);
+            if graph
+                .as_ref()
+                .map(cloud_mcp_loopspace_graph_result_source)
+                .unwrap_or_default()
+                != source
+            {
+                graph = None;
+            }
         }
     }
     let Some(mut graph) = graph else {
@@ -12234,6 +12290,10 @@ async fn cloud_mcp_update_loopspace_graph(
             "loopspaceId": loopspace_id,
             "sync": snapshot,
             "response": result.get("response").cloned().unwrap_or(result),
+            "stale_hydration": true,
+            "staleHydration": true,
+            "expected_source": source,
+            "expectedSource": source,
             "error": "Cloud accepted the graph edit, but the updated loop graph did not hydrate locally.",
         }));
     };

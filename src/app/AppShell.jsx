@@ -314,6 +314,7 @@ import {
   LoopspaceGraphNode,
   LoopspaceGraphNodeIcon,
   LoopspaceGraphNodeText,
+  LoopspaceGraphNodeSelect,
   LoopspaceGraphNodeAction,
   LoopspaceGraphNodePort,
   LoopspaceGraphControls,
@@ -325,7 +326,6 @@ import {
   LoopspaceGraphNavOrigin,
   LoopspaceGraphNavStats,
   LoopspaceGraphPalette,
-  LoopspaceGraphPaletteSearch,
   LoopspaceGraphPaletteTrack,
   LoopspaceGraphPaletteCard,
   LoopspaceGraphPaletteIcon,
@@ -1503,8 +1503,17 @@ const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updat
 const CLOUD_MCP_LOOPSPACES_UPDATED_EVENT = "cloud-mcp-loopspaces-updated";
 const CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT = "cloud-mcp-loopspace-triggers-updated";
 const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
+const LOOPSPACE_TRIGGER_DRAG_KIND = "loopspace_trigger_ref";
 const LOOPSPACE_GRAPH_NODE_DRAG_MIME = "application/x-diffforge-loopspace-node-template";
+const LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND = "loopspace_graph_node_template";
 const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
+  {
+    description: "Run a selected local script on its device.",
+    icon: "terminal",
+    id: "run_script",
+    label: "Run script",
+    role: "action",
+  },
   {
     description: "Send a prompt into a device terminal agent.",
     icon: "message",
@@ -4415,6 +4424,42 @@ function clampLoopspaceGraphZoom(value) {
   return Math.min(LOOPSPACE_GRAPH_MAX_ZOOM, Math.max(LOOPSPACE_GRAPH_MIN_ZOOM, Number(value) || 1));
 }
 
+function loopspaceParseJsonDragPayload(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function loopspaceDragPayloadFromPlainText(dataTransfer) {
+  return loopspaceParseJsonDragPayload(dataTransfer?.getData?.("text/plain"));
+}
+
+function loopspaceSetDragPayload(event, customMime, payload, fallbackText = "") {
+  const json = JSON.stringify(payload || {});
+  try {
+    event.dataTransfer?.setData?.("text/plain", json);
+  } catch {
+    if (fallbackText) {
+      try {
+        event.dataTransfer?.setData?.("text/plain", fallbackText);
+      } catch {
+        // Some embedded webviews reject drag data writes for protected targets.
+      }
+    }
+  }
+  if (customMime) {
+    try {
+      event.dataTransfer?.setData?.(customMime, json);
+    } catch {
+      // text/plain is the portable path; custom MIME is only a richer hint.
+    }
+  }
+}
+
 function loopspaceGraphPropValue(props, keys = []) {
   for (const key of keys) {
     if (Object.prototype.hasOwnProperty.call(props, key) && props[key] !== "") {
@@ -4432,7 +4477,7 @@ function parseLoopspaceGraphEdgeLine(line) {
   return parseDfBlueprintSource(`dfblueprint "edge"\n${line}\n`).edges[0] || null;
 }
 
-function parseLoopspaceArchGraphSource(source = "") {
+function parseLoopspaceBlueprintGraphSource(source = "") {
   return parseDfBlueprintSource(source);
 }
 
@@ -4500,7 +4545,15 @@ function loopspaceGraphDeviceTemplatesFromRows(rows = []) {
   ));
 }
 
-function loopspaceGraphScriptTemplatesFromRows(rows = [], ownerDevice = null) {
+function loopspaceGraphPaletteTemplateKey(template = {}) {
+  const templateId = String(template?.id || "").trim();
+  if (templateId === "device") {
+    return `${templateId}:${template.device_id || template.deviceId || ""}`;
+  }
+  return templateId || "node";
+}
+
+function loopspaceGraphScriptOptionsFromRows(rows = [], ownerDevice = null) {
   const ownerDeviceId = cloudDeviceAliasList(ownerDevice)[0]
     || safeCloudMcpText(ownerDevice?.device_id || ownerDevice?.id, "");
   if (!ownerDeviceId) return [];
@@ -4522,14 +4575,10 @@ function loopspaceGraphScriptTemplatesFromRows(rows = [], ownerDevice = null) {
       if (!scriptId && !pathKey) return null;
       const label = appScriptTitle(script);
       return {
-        description: [ownerDeviceLabel || "this device", appScriptFileName(script)].filter(Boolean).join(" - "),
         device_id: ownerDeviceId,
         device_label: ownerDeviceLabel,
-        icon: "terminal",
-        id: "run_script",
         label,
         path_key: pathKey,
-        role: "action",
         script_id: scriptId || pathKey,
         script_name: label,
         shell: appScriptText(script.shell),
@@ -4537,6 +4586,10 @@ function loopspaceGraphScriptTemplatesFromRows(rows = [], ownerDevice = null) {
     })
     .filter(Boolean)
     .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+}
+
+function loopspaceGraphScriptOptionKey(option = {}) {
+  return String(option.script_id || option.path_key || "").trim();
 }
 
 function loopspaceGraphNodeTemplateLine(template, position = null) {
@@ -4683,16 +4736,19 @@ function LoopspaceRuntimeView({
   const [loadingState, setLoadingState] = useState("idle");
   const [runtimeError, setRuntimeError] = useState("");
   const [dropActive, setDropActive] = useState(false);
+  const [graphDragGhost, setGraphDragGhost] = useState(null);
   const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [isCanvasPanning, setCanvasPanning] = useState(false);
   const [pendingConnection, setPendingConnection] = useState(null);
-  const [graphScriptSearch, setGraphScriptSearch] = useState("");
   const [nodeDragPositions, setNodeDragPositions] = useState({});
+  const [pendingGraphNodeIds, setPendingGraphNodeIds] = useState(() => new Set());
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
   const loopspaceRef = useRef(loopspace);
   const graphSourceRef = useRef("");
+  const pendingGraphCommitRef = useRef(null);
+  const activeGraphDragRef = useRef(null);
   const triggerRefsRef = useRef([]);
   const refreshGenerationRef = useRef(0);
   const graphCanvasRef = useRef(null);
@@ -4732,6 +4788,21 @@ function LoopspaceRuntimeView({
     }
     if (!graph) return null;
     const source = String(graph.source || graph.sourceText || graph.source_text || "");
+    const pendingGraph = pendingGraphCommitRef.current;
+    if (pendingGraph?.source && source && source !== pendingGraph.source) {
+      return {
+        graph,
+        pending: true,
+        refs: triggerRefsRef.current,
+        row,
+        source,
+        stale: true,
+      };
+    }
+    if (pendingGraph?.source && source === pendingGraph.source) {
+      pendingGraphCommitRef.current = null;
+      setPendingGraphNodeIds(new Set());
+    }
     graphSourceRef.current = source;
     setGraphSource(source);
     setGraphMeta(graph);
@@ -4762,7 +4833,7 @@ function LoopspaceRuntimeView({
       const graphTriggerIds = new Set(
         [
           ...triggerRefsRef.current.map((ref) => String(ref?.triggerId || ref?.trigger_id || "").trim()),
-          ...parseLoopspaceArchGraphSource(graphSourceRef.current).nodes.map((node) => node.triggerId),
+          ...parseLoopspaceBlueprintGraphSource(graphSourceRef.current).nodes.map((node) => node.triggerId),
         ].filter(Boolean),
       );
       setLogs(nextRuns.filter((run) => (
@@ -4903,7 +4974,10 @@ function LoopspaceRuntimeView({
     setActiveTab("graph");
     setRuntimeError("");
     setDropActive(false);
+    setGraphDragGhost(null);
     setPendingConnection(null);
+    pendingGraphCommitRef.current = null;
+    activeGraphDragRef.current = null;
     const resetPan = { x: 0, y: 0 };
     canvasPanRef.current = resetPan;
     canvasZoomRef.current = 1;
@@ -4914,6 +4988,7 @@ function LoopspaceRuntimeView({
     setCanvasZoom(1);
     setCanvasPanning(false);
     setNodeDragPositions({});
+    setPendingGraphNodeIds(new Set());
     void refreshLoopspaceGraph(true, generation);
     void refreshLoopspaceTriggers(true, generation);
     return () => {
@@ -4955,7 +5030,7 @@ function LoopspaceRuntimeView({
     };
   }, [applyGraphSnapshot, applyTriggerSnapshot, loopspaceId, refreshLoopspaceLogs]);
 
-  const parsedGraph = useMemo(() => parseLoopspaceArchGraphSource(graphSource), [graphSource]);
+  const parsedGraph = useMemo(() => parseLoopspaceBlueprintGraphSource(graphSource), [graphSource]);
 
   const attachedTriggerIds = useMemo(() => {
     const ids = new Set(
@@ -4973,38 +5048,36 @@ function LoopspaceRuntimeView({
     triggers.filter((trigger) => attachedTriggerIds.has(trigger.id))
   ), [attachedTriggerIds, triggers]);
 
+  const loopspaceGraphScriptOptions = useMemo(() => (
+    loopspaceGraphScriptOptionsFromRows(localScripts, localDesktopProfile)
+  ), [localDesktopProfile, localScripts]);
+
   const loopspaceGraphPaletteTemplates = useMemo(() => {
     const deviceTemplates = loopspaceGraphDeviceTemplatesFromRows([
       ...safeCloudMcpArray(registeredDevices),
       ...safeCloudMcpArray(loopspace?.registered_devices),
       ...safeCloudMcpArray(knownDevices),
     ]);
-    const scriptTemplates = loopspaceGraphScriptTemplatesFromRows(localScripts, localDesktopProfile);
-    const search = graphScriptSearch.trim().toLowerCase();
-    const filteredScriptTemplates = search
-      ? scriptTemplates.filter((template) => (
-        [
-          template.label,
-          template.description,
-          template.script_id,
-          template.path_key,
-          template.device_label,
-        ].some((value) => String(value || "").toLowerCase().includes(search))
-      ))
-      : scriptTemplates;
     return [
       ...deviceTemplates,
-      ...filteredScriptTemplates,
       ...LOOPSPACE_GRAPH_NODE_TEMPLATES,
     ];
   }, [
-    graphScriptSearch,
     knownDevices,
-    localDesktopProfile,
-    localScripts,
     loopspace?.registered_devices,
     registeredDevices,
   ]);
+
+  const graphPaletteTemplateByKey = useMemo(() => {
+    const map = new Map();
+    for (const template of loopspaceGraphPaletteTemplates) {
+      map.set(loopspaceGraphPaletteTemplateKey(template), template);
+      if (template?.id && !map.has(template.id)) {
+        map.set(template.id, template);
+      }
+    }
+    return map;
+  }, [loopspaceGraphPaletteTemplates]);
 
   const triggerById = useMemo(() => {
     const map = new Map();
@@ -5040,14 +5113,24 @@ function LoopspaceRuntimeView({
     return map;
   }, [nodeDragPositions, parsedGraph.nodes]);
 
-  const commitLoopspaceGraphSource = useCallback(async (nextSource, fallbackError) => {
+  const commitLoopspaceGraphSource = useCallback(async (nextSource, fallbackError, options = {}) => {
     if (!loopspaceId || busy) return;
     const previousSource = graphSourceRef.current;
     const normalizedSource = normalizeDfBlueprintSource(nextSource, {
       name: loopspaceRef.current?.name || loopspace?.name || "Loopspace",
     });
+    const pendingNodeIds = safeCloudMcpArray(options.pendingNodeIds)
+      .map((id) => String(id || "").trim())
+      .filter(Boolean);
+    pendingGraphCommitRef.current = {
+      nodeIds: pendingNodeIds,
+      previousSource,
+      source: normalizedSource,
+      startedAtMs: Date.now(),
+    };
     graphSourceRef.current = normalizedSource;
     setGraphSource(normalizedSource);
+    setPendingGraphNodeIds(new Set(pendingNodeIds));
     setLoadingState("saving");
     setRuntimeError("");
     try {
@@ -5061,13 +5144,18 @@ function LoopspaceRuntimeView({
           ? "Graph edit was queued for retry and will appear after Cloud confirms it."
           : "Cloud accepted the graph edit, but the updated graph did not hydrate locally yet.");
       } else {
-        applyGraphSnapshot(result);
+        const applied = applyGraphSnapshot(result);
+        if (applied?.stale) {
+          setRuntimeError("Waiting for Cloud to confirm the latest graph edit.");
+        }
       }
       await refreshLoopspaceLogs();
       setLoadingState("idle");
     } catch (graphError) {
+      pendingGraphCommitRef.current = null;
       graphSourceRef.current = previousSource;
       setGraphSource(previousSource);
+      setPendingGraphNodeIds(new Set());
       setLoadingState("idle");
       setRuntimeError(String(graphError || fallbackError || "Unable to update loop graph."));
     }
@@ -5075,21 +5163,46 @@ function LoopspaceRuntimeView({
 
   const attachTriggerToLoop = useCallback(async (triggerLike, position = null) => {
     if (!loopspaceId || busy) return;
-    const triggerId = String(triggerLike?.id || triggerLike?.triggerId || "").trim();
+    const triggerId = String(triggerLike?.id || triggerLike?.trigger_id || "").trim();
     if (!triggerId) return;
-    const trigger = triggerById.get(triggerId) || triggerLike;
-    if (attachedTriggerIds.has(triggerId)) {
-      setRuntimeError("");
+    const trigger = triggerById.get(triggerId);
+    if (!trigger) {
+      setRuntimeError("Trigger is not in local trigger inventory yet; refresh triggers and try again.");
       return;
     }
-    const nextSource = loopspaceGraphSourceWithTrigger(graphSource, trigger, position);
-    await commitLoopspaceGraphSource(nextSource, "Unable to attach trigger to loop.");
+    if (attachedTriggerIds.has(triggerId)) {
+      setRuntimeError("Trigger is already on this loop graph.");
+      return;
+    }
+    const baseSource = graphSourceRef.current || graphSource;
+    const node = createDfBlueprintTriggerNode({
+      ...trigger,
+      trigger_id: trigger.id,
+    }, position);
+    const nextSource = addDfBlueprintNode(baseSource, node);
+    if (nextSource === baseSource) {
+      setRuntimeError("Trigger is already on this loop graph.");
+      return;
+    }
+    await commitLoopspaceGraphSource(nextSource, "Unable to attach trigger to loop.", {
+      pendingNodeIds: [node.id],
+    });
   }, [attachedTriggerIds, busy, commitLoopspaceGraphSource, graphSource, loopspaceId, triggerById]);
 
   const attachGraphNodeTemplateToLoop = useCallback(async (template, position = null) => {
     if (!loopspaceId || busy || !template?.id) return;
-    const nextSource = loopspaceGraphSourceWithNodeTemplate(graphSource, template, position);
-    await commitLoopspaceGraphSource(nextSource, "Unable to add graph node.");
+    const baseSource = graphSourceRef.current || graphSource;
+    const node = createDfBlueprintNodeFromTemplate(template, position);
+    const nextSource = addDfBlueprintNode(baseSource, node);
+    if (nextSource === baseSource) {
+      setRuntimeError(template.id === "device"
+        ? "Device is already on this loop graph."
+        : "Graph node is already on this loop graph.");
+      return;
+    }
+    await commitLoopspaceGraphSource(nextSource, "Unable to add graph node.", {
+      pendingNodeIds: [node.id],
+    });
   }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
 
   const detachTriggerFromLoop = useCallback(async (trigger) => {
@@ -5103,6 +5216,39 @@ function LoopspaceRuntimeView({
     const nextSource = loopspaceGraphSourceWithoutNode(graphSource, node.id);
     await commitLoopspaceGraphSource(nextSource, "Unable to remove graph node.");
   }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateRunScriptNodeSelection = useCallback(async (node, selectedKey) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const key = String(selectedKey || "").trim();
+    const selectedScript = loopspaceGraphScriptOptions.find((option) => (
+      loopspaceGraphScriptOptionKey(option) === key
+      || option.path_key === key
+      || option.script_id === key
+    ));
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, selectedScript ? {
+      label: selectedScript.label || "Run script",
+      props: {
+        device_id: selectedScript.device_id || "",
+        device_label: selectedScript.device_label || "",
+        path_key: selectedScript.path_key || "",
+        script_id: selectedScript.script_id || selectedScript.path_key || "",
+        script_name: selectedScript.script_name || selectedScript.label || "",
+        shell: selectedScript.shell || "",
+      },
+    } : {
+      label: "Run script",
+      props: {
+        device_id: "",
+        device_label: "",
+        path_key: "",
+        script_id: "",
+        script_name: "",
+        shell: "",
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update script node.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceGraphScriptOptions, loopspaceId]);
 
   const connectGraphNodes = useCallback(async (fromId, toId) => {
     const fromNode = graphNodeLookup.get(String(fromId || "").trim());
@@ -5243,14 +5389,30 @@ function LoopspaceRuntimeView({
   }, [connectGraphNodes, pendingConnection]);
 
   const readDroppedTrigger = useCallback((event) => {
-    const raw = event.dataTransfer.getData(LOOPSPACE_TRIGGER_DRAG_MIME)
-      || event.dataTransfer.getData("text/plain");
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return { id: raw };
+    const plainPayload = loopspaceDragPayloadFromPlainText(event.dataTransfer);
+    if (plainPayload?.kind === LOOPSPACE_TRIGGER_DRAG_KIND) {
+      return {
+        id: plainPayload.trigger_id || plainPayload.id || "",
+        loopspace_ids: plainPayload.loopspace_ids || [],
+        name: plainPayload.name || "",
+        trigger_id: plainPayload.trigger_id || plainPayload.id || "",
+        type: plainPayload.type || plainPayload.trigger_type || "manual",
+      };
     }
+    const customPayload = loopspaceParseJsonDragPayload(
+      event.dataTransfer?.getData?.(LOOPSPACE_TRIGGER_DRAG_MIME),
+    );
+    if (customPayload?.kind === LOOPSPACE_TRIGGER_DRAG_KIND || customPayload?.trigger_id || customPayload?.id) {
+      return {
+        id: customPayload.trigger_id || customPayload.id || "",
+        loopspace_ids: customPayload.loopspace_ids || [],
+        name: customPayload.name || "",
+        trigger_id: customPayload.trigger_id || customPayload.id || "",
+        type: customPayload.type || customPayload.trigger_type || "manual",
+      };
+    }
+    const plain = String(event.dataTransfer?.getData?.("text/plain") || "").trim();
+    return plain ? { id: plain, trigger_id: plain } : null;
   }, []);
 
   const hasDroppedTriggerType = useCallback((event) => (
@@ -5258,15 +5420,39 @@ function LoopspaceRuntimeView({
   ), []);
 
   const readDroppedGraphNodeTemplate = useCallback((event) => {
-    const raw = event.dataTransfer.getData(LOOPSPACE_GRAPH_NODE_DRAG_MIME);
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      return parsed?.id && parsed?.label ? parsed : null;
-    } catch {
-      return null;
+    const activeDrag = activeGraphDragRef.current;
+    if (activeDrag?.kind === "template" && activeDrag.template?.id) {
+      return activeDrag.template;
     }
-  }, []);
+    const plainPayload = loopspaceDragPayloadFromPlainText(event.dataTransfer);
+    if (plainPayload?.kind === LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND) {
+      if (plainPayload.template?.id) return plainPayload.template;
+      const templateKey = String(plainPayload.template_key || "").trim();
+      if (templateKey) {
+        return graphPaletteTemplateByKey.get(templateKey)
+          || graphPaletteTemplateByKey.get(templateKey.split(":")[0])
+          || null;
+      }
+    }
+    const customPayload = loopspaceParseJsonDragPayload(
+      event.dataTransfer?.getData?.(LOOPSPACE_GRAPH_NODE_DRAG_MIME),
+    );
+    if (customPayload?.kind === LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND) {
+      if (customPayload.template?.id) return customPayload.template;
+      const templateKey = String(customPayload.template_key || "").trim();
+      if (templateKey) {
+        return graphPaletteTemplateByKey.get(templateKey)
+          || graphPaletteTemplateByKey.get(templateKey.split(":")[0])
+          || null;
+      }
+    }
+    if (customPayload?.id) {
+      return customPayload;
+    }
+    const plain = event.dataTransfer?.getData?.("text/plain");
+    if (!plain) return null;
+    return graphPaletteTemplateByKey.get(plain) || graphPaletteTemplateByKey.get(String(plain).split(":")[0]) || null;
+  }, [graphPaletteTemplateByKey]);
 
   const hasDroppedGraphNodeTemplateType = useCallback((event) => (
     Array.from(event.dataTransfer?.types || []).includes(LOOPSPACE_GRAPH_NODE_DRAG_MIME)
@@ -5278,9 +5464,18 @@ function LoopspaceRuntimeView({
   }, []);
 
   const hasDroppedLoopspaceGraphItemType = useCallback((event) => (
-    hasDroppedTriggerType(event)
-    || hasDroppedGraphNodeTemplateType(event)
-    || hasDroppedTriggerPlainTextFallbackType(event)
+    (() => {
+      const types = Array.from(event.dataTransfer?.types || []);
+      if (types.includes("Files")) return false;
+      const plainPayload = loopspaceDragPayloadFromPlainText(event.dataTransfer);
+      return activeGraphDragRef.current?.kind === "template"
+        || hasDroppedTriggerType(event)
+        || hasDroppedGraphNodeTemplateType(event)
+        || plainPayload?.kind === LOOPSPACE_TRIGGER_DRAG_KIND
+        || plainPayload?.kind === LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND
+        || hasDroppedTriggerPlainTextFallbackType(event)
+        || types.length === 0;
+    })()
   ), [hasDroppedGraphNodeTemplateType, hasDroppedTriggerPlainTextFallbackType, hasDroppedTriggerType]);
 
   const applyGraphViewport = useCallback((nextPan, nextZoom = canvasZoomRef.current) => {
@@ -5388,10 +5583,81 @@ function LoopspaceRuntimeView({
     event.stopPropagation();
   }, []);
 
+  const graphPreviewNodeFromDropEvent = useCallback((event, position) => {
+    const graphNodeTemplate = readDroppedGraphNodeTemplate(event);
+    if (graphNodeTemplate) {
+      return createDfBlueprintNodeFromTemplate(graphNodeTemplate, position);
+    }
+    const trigger = readDroppedTrigger(event);
+    if (trigger) {
+      const triggerId = String(trigger?.trigger_id || trigger?.id || "").trim();
+      if (triggerId) {
+        const inventoryTrigger = triggerById.get(triggerId);
+        return inventoryTrigger
+          ? createDfBlueprintTriggerNode({
+              ...inventoryTrigger,
+              trigger_id: inventoryTrigger.id,
+            }, position)
+          : createDfBlueprintNodeFromTemplate({
+              icon: "clock",
+              id: "trigger",
+              label: "Unknown trigger",
+              role: "trigger",
+            }, position);
+      }
+    }
+    if (hasDroppedTriggerType(event)) {
+      return createDfBlueprintNodeFromTemplate({
+        icon: "clock",
+        id: "manual",
+        label: "Drop trigger",
+        role: "trigger",
+      }, position);
+    }
+    if (hasDroppedLoopspaceGraphItemType(event)) {
+      return createDfBlueprintNodeFromTemplate({
+        icon: "node",
+        id: "node",
+        label: "Drop node",
+        role: "action",
+      }, position);
+    }
+    return null;
+  }, [
+    hasDroppedLoopspaceGraphItemType,
+    hasDroppedTriggerType,
+    readDroppedGraphNodeTemplate,
+    readDroppedTrigger,
+    triggerById,
+  ]);
+
+  const updateGraphDragGhostFromEvent = useCallback((event) => {
+    if (!hasDroppedLoopspaceGraphItemType(event)) {
+      setGraphDragGhost(null);
+      return false;
+    }
+    const position = graphPointFromClient(event.clientX, event.clientY);
+    const node = graphPreviewNodeFromDropEvent(event, position);
+    if (!node) {
+      setGraphDragGhost(null);
+      return false;
+    }
+    setGraphDragGhost({
+      node,
+      position,
+    });
+    return true;
+  }, [graphPointFromClient, graphPreviewNodeFromDropEvent, hasDroppedLoopspaceGraphItemType]);
+
   const onGraphDrop = useCallback((event) => {
     event.preventDefault();
     setDropActive(false);
+    setGraphDragGhost(null);
     if (!hasDroppedLoopspaceGraphItemType(event)) {
+      return;
+    }
+    if (busy) {
+      setRuntimeError("Graph is still saving. Try the drop again after Cloud confirms the current edit.");
       return;
     }
     const position = graphPointFromClient(event.clientX, event.clientY);
@@ -5402,15 +5668,19 @@ function LoopspaceRuntimeView({
     }
     const trigger = readDroppedTrigger(event);
     if (trigger) {
-      const triggerId = String(trigger?.id || trigger?.triggerId || "").trim();
-      const hasCustomTriggerPayload = hasDroppedTriggerType(event);
-      if (hasCustomTriggerPayload || triggerById.has(triggerId)) {
-        void attachTriggerToLoop(triggerById.get(triggerId) || trigger, position);
+      const triggerId = String(trigger?.trigger_id || trigger?.id || "").trim();
+      if (triggerById.has(triggerId)) {
+        void attachTriggerToLoop(triggerById.get(triggerId), position);
+      } else {
+        setRuntimeError("Trigger is not in local trigger inventory yet; refresh triggers and try again.");
       }
+    } else {
+      setRuntimeError("Unable to read the dropped graph item.");
     }
   }, [
     attachGraphNodeTemplateToLoop,
     attachTriggerToLoop,
+    busy,
     graphPointFromClient,
     hasDroppedLoopspaceGraphItemType,
     hasDroppedTriggerType,
@@ -5479,16 +5749,21 @@ function LoopspaceRuntimeView({
               if (hasDroppedLoopspaceGraphItemType(event)) {
                 event.preventDefault();
                 setDropActive(true);
+                updateGraphDragGhostFromEvent(event);
               }
             }}
             onDragLeave={(event) => {
               const nextTarget = event.relatedTarget;
-              if (!nextTarget || !event.currentTarget.contains(nextTarget)) setDropActive(false);
+              if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
+                setDropActive(false);
+                setGraphDragGhost(null);
+              }
             }}
             onDragOver={(event) => {
               if (hasDroppedLoopspaceGraphItemType(event)) {
                 event.preventDefault();
                 event.dataTransfer.dropEffect = "copy";
+                updateGraphDragGhostFromEvent(event);
               }
             }}
             onDrop={onGraphDrop}
@@ -5552,12 +5827,20 @@ function LoopspaceRuntimeView({
                 const isRuntimeNode = String(runtimeHead?.currentNodeId || runtimeHead?.current_node_id || runtimeHead?.cursorNodeId || runtimeHead?.cursor_node_id || "") === node.id;
                 const nodeLayout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, index);
                 const canRemoveNode = Boolean(node.triggerId || node.nodeKind);
+                const nodeScriptKey = node.nodeKind === "run_script"
+                  ? String(
+                    loopspaceGraphPropValue(node.props, ["script_id", "scriptId"])
+                      || loopspaceGraphPropValue(node.props, ["path_key", "pathKey"])
+                      || "",
+                  ).trim()
+                  : "";
                 return (
                   <LoopspaceGraphNode
                     data-kind={node.triggerId ? (trigger?.type || "manual") : (node.nodeKind || "loop")}
                     data-loopspace-graph-node-id={node.id}
                     data-loopspace-graph-node="true"
                     data-dragging={nodeDragPositions[node.id] ? "true" : undefined}
+                    data-pending={pendingGraphNodeIds.has(node.id) ? "true" : undefined}
                     data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
                     key={node.id}
                     onPointerCancel={finishGraphNodeDrag}
@@ -5603,6 +5886,30 @@ function LoopspaceRuntimeView({
                           isRuntimeNode ? (runtimeHead?.status || "active") : "",
                         ].filter(Boolean).join(" - ")}
                       </span>
+                      {node.nodeKind === "run_script" ? (
+                        <LoopspaceGraphNodeSelect
+                          aria-label={`Script for ${node.label || "Run script"}`}
+                          disabled={busy || loopspaceGraphScriptOptions.length === 0}
+                          onChange={(event) => void updateRunScriptNodeSelection(node, event.target.value)}
+                          onClick={(event) => event.stopPropagation()}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          title={loopspaceGraphScriptOptions.length ? "Select local script" : "No local scripts available on this device"}
+                          value={nodeScriptKey}
+                        >
+                          <option value="">Select script...</option>
+                          {nodeScriptKey && !loopspaceGraphScriptOptions.some((option) => loopspaceGraphScriptOptionKey(option) === nodeScriptKey) ? (
+                            <option value={nodeScriptKey}>{nodeScriptKey}</option>
+                          ) : null}
+                          {loopspaceGraphScriptOptions.map((option) => {
+                            const optionKey = loopspaceGraphScriptOptionKey(option);
+                            return (
+                              <option key={optionKey || option.label} value={optionKey}>
+                                {option.label}
+                              </option>
+                            );
+                          })}
+                        </LoopspaceGraphNodeSelect>
+                      ) : null}
                     </LoopspaceGraphNodeText>
                     {canRemoveNode ? (
                       <LoopspaceGraphNodeAction
@@ -5634,6 +5941,39 @@ function LoopspaceRuntimeView({
                   </LoopspaceGraphNode>
                 );
               })}
+              {graphDragGhost?.node ? (() => {
+                const node = graphDragGhost.node;
+                const nodeLayout = loopspaceGraphNodeLayout(node, 0);
+                const type = node.nodeKind || node.role || "node";
+                const Icon = node.nodeKind === "device"
+                  ? Devices
+                  : node.nodeKind === "run_script"
+                    ? Terminal
+                    : node.nodeKind === "send_message"
+                      ? AdsClick
+                      : AccountTree;
+                return (
+                  <LoopspaceGraphNode
+                    aria-hidden="true"
+                    data-ghost="true"
+                    data-kind={node.nodeKind || type || "loop"}
+                    key="loopspace-graph-drag-ghost"
+                    style={{
+                      "--loopspace-node-x": `${nodeLayout.x}px`,
+                      "--loopspace-node-y": `${nodeLayout.y}px`,
+                    }}
+                  >
+                    <LoopspaceGraphNodeIcon>
+                      <Icon aria-hidden="true" />
+                    </LoopspaceGraphNodeIcon>
+                    <LoopspaceGraphNodeText>
+                      <strong>{node.label || "Drop node"}</strong>
+                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : "Pending drop"}</span>
+                    </LoopspaceGraphNodeText>
+                    <span />
+                  </LoopspaceGraphNode>
+                );
+              })() : null}
             </LoopspaceGraphContent>
             <LoopspaceGraphControls
               aria-label="Graph zoom controls"
@@ -5673,14 +6013,6 @@ function LoopspaceRuntimeView({
               onPointerDown={(event) => event.stopPropagation()}
               onWheel={onGraphPaletteWheel}
             >
-              {localScripts.length > 0 && (
-                <LoopspaceGraphPaletteSearch
-                  aria-label="Search scripts"
-                  onChange={(event) => setGraphScriptSearch(event.target.value)}
-                  placeholder="Search scripts..."
-                  value={graphScriptSearch}
-                />
-              )}
               <LoopspaceGraphPaletteTrack>
                 {loopspaceGraphPaletteTemplates.map((template) => {
                   const PaletteIcon = template.id === "device"
@@ -5692,18 +6024,28 @@ function LoopspaceRuntimeView({
                         : AccountTree;
                   const templateKey = template.id === "device"
                     ? `${template.id}:${template.device_id}`
-                    : template.id === "run_script"
-                      ? `${template.id}:${template.device_id || "local"}:${template.script_id || template.path_key}`
                     : template.id;
                   return (
-                    <LoopspaceGraphPaletteCard
-                      draggable
-                      data-kind={template.id}
-                      key={templateKey}
-                      onDragStart={(event) => {
-                        event.dataTransfer.effectAllowed = "copy";
-                        event.dataTransfer.setData(LOOPSPACE_GRAPH_NODE_DRAG_MIME, JSON.stringify(template));
-                        event.dataTransfer.setData("text/plain", templateKey);
+                      <LoopspaceGraphPaletteCard
+                        draggable
+                        data-kind={template.id}
+                        key={templateKey}
+                        onDragEnd={() => {
+                          activeGraphDragRef.current = null;
+                          setDropActive(false);
+                          setGraphDragGhost(null);
+                        }}
+                        onDragStart={(event) => {
+                          activeGraphDragRef.current = {
+                            kind: "template",
+                            template,
+                          };
+                          event.dataTransfer.effectAllowed = "copy";
+                          loopspaceSetDragPayload(event, LOOPSPACE_GRAPH_NODE_DRAG_MIME, {
+                            kind: LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND,
+                            template,
+                            template_key: templateKey,
+                          }, templateKey);
                       }}
                       title={`Drag ${template.label} into the graph`}
                     >
@@ -27636,6 +27978,67 @@ export default function App() {
       }
       return currentSelectedLoopspace || null;
     };
+    const getLoopspaceTriggerRowsForAppControl = async (remote = true) => {
+      const snapshot = await invoke("cloud_mcp_get_loopspace_triggers").catch(() => null);
+      let rows = appControlLoopspaceTriggerRows(snapshot);
+      if (remote) {
+        const synced = await invoke("cloud_mcp_sync_loopspace_triggers").catch(() => null);
+        const syncedRows = appControlLoopspaceTriggerRows(synced);
+        if (syncedRows.length || !rows.length) rows = syncedRows;
+      }
+      return rows;
+    };
+    const resolveLoopspaceTriggerForAppControl = (inputValue = {}, rows = []) => {
+      const triggerId = appControlText(inputValue, ["trigger_id", "id"]);
+      const triggerName = appControlText(inputValue, ["trigger_name", "name"]);
+      if (triggerId) {
+        return rows.find((row) => row.id === triggerId) || null;
+      }
+      if (triggerName) {
+        const normalizedName = triggerName.toLowerCase();
+        return rows.find((row) => row.name.toLowerCase() === normalizedName)
+          || rows.find((row) => row.id === triggerName)
+          || null;
+      }
+      return null;
+    };
+    const validateLoopspaceGraphSourceTriggerRefsForAppControl = (source, rows = []) => {
+      const knownTriggerIds = new Set(rows.map((row) => row.id).filter(Boolean));
+      const missing = parseDfBlueprintSource(source)
+        .nodes
+        .filter((node) => node.triggerId && !knownTriggerIds.has(node.triggerId));
+      if (missing.length) {
+        const labels = missing.map((node) => node.label || node.triggerId).join(", ");
+        const error = new Error(`Graph references trigger inventory ids that do not exist: ${labels}. Create or list triggers first, then attach by trigger_id.`);
+        error.code = "trigger_inventory_required";
+        throw error;
+      }
+    };
+    const normalizeLoopspaceGraphPatchOperationsForAppControl = (operations = [], rows = []) => (
+      operations.map((operation) => {
+        const op = operation && typeof operation === "object" ? operation : {};
+        const action = appControlText(op, ["op", "action"]).toLowerCase();
+        if (action !== "add_trigger" && action !== "attach_trigger" && action !== "addtrigger") {
+          return op;
+        }
+        const trigger = resolveLoopspaceTriggerForAppControl(op, rows);
+        if (!trigger) {
+          const requested = appControlText(op, ["trigger_id", "id", "trigger_name", "name"]) || "unknown";
+          const error = new Error(`No matching Loopspace trigger exists for "${requested}". Use create_loopspace_trigger first, then attach_trigger with the returned trigger_id.`);
+          error.code = "trigger_inventory_required";
+          throw error;
+        }
+        return {
+          ...op,
+          label: trigger.name,
+          name: trigger.name,
+          op: "attach_trigger",
+          trigger_id: trigger.id,
+          trigger_type: trigger.type,
+          type: trigger.type,
+        };
+      })
+    );
     const handleAppControlRequest = async (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const requestId = String(payload.requestId || payload.request_id || "").trim();
@@ -27849,6 +28252,68 @@ export default function App() {
           return;
         }
 
+        if (tool === "list_loopspace_triggers") {
+          const rows = await getLoopspaceTriggerRowsForAppControl(input.remote !== false);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              triggers: rows,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "create_loopspace_trigger") {
+          const name = appControlText(input, ["trigger_name", "name"]);
+          const triggerType = appControlText(input, ["trigger_type", "type"]).toLowerCase() || "manual";
+          if (!name) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "trigger_name_required",
+                message: "create_loopspace_trigger requires trigger_name or name.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          if (!["cron", "webhook", "manual"].includes(triggerType)) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "unsupported_trigger_type",
+                message: "trigger_type must be cron, webhook, or manual.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const loopspaceIds = safeCloudMcpArray(input.loopspace_ids)
+            .map((id) => String(id || "").trim())
+            .filter(Boolean);
+          const result = await invoke("cloud_mcp_create_loopspace_trigger", {
+            config: input.config && typeof input.config === "object" && !Array.isArray(input.config)
+              ? input.config
+              : triggerType === "cron"
+                ? { schedule: "@every 5m" }
+                : {},
+            enabled: input.enabled !== false,
+            loopspaceIds,
+            name,
+            triggerType,
+          });
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            data: {
+              result,
+              triggers: appControlLoopspaceTriggerRows(result),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
         if (tool === "run_loopspace_trigger") {
           let triggerId = appControlText(input, ["triggerId", "trigger_id", "id"]);
           const triggerName = appControlText(input, ["triggerName", "trigger_name", "name"]);
@@ -27940,7 +28405,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Use stable node ids, explicit trigger nodes, and edge from.out -> to.in connections.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -27980,6 +28445,25 @@ export default function App() {
             });
             return;
           }
+          const triggerRows = await getLoopspaceTriggerRowsForAppControl(true);
+          let normalizedOperations;
+          try {
+            normalizedOperations = normalizeLoopspaceGraphPatchOperationsForAppControl(operations, triggerRows);
+          } catch (patchError) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: patchError?.code || "loopspace_graph_patch_invalid",
+                message: String(patchError?.message || patchError || "Invalid Loopspace graph patch."),
+              },
+              data: {
+                loopspace: { id: loopspace.id, name: loopspace.name },
+                state: buildAppControlState(),
+                triggers: triggerRows,
+              },
+            });
+            return;
+          }
           let current = await invoke("cloud_mcp_get_loopspace_graph", {
             loopspaceId: loopspace.id,
           }).catch(() => null);
@@ -27989,7 +28473,24 @@ export default function App() {
             });
           }
           const currentSource = String(current?.graph?.source || current?.graph?.sourceText || current?.graph?.source_text || "");
-          const source = applyDfBlueprintPatchOperations(currentSource, operations, { name: loopspace.name });
+          const source = applyDfBlueprintPatchOperations(currentSource, normalizedOperations, { name: loopspace.name });
+          try {
+            validateLoopspaceGraphSourceTriggerRefsForAppControl(source, triggerRows);
+          } catch (patchError) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: patchError?.code || "loopspace_graph_patch_invalid",
+                message: String(patchError?.message || patchError || "Invalid Loopspace graph patch."),
+              },
+              data: {
+                loopspace: { id: loopspace.id, name: loopspace.name },
+                state: buildAppControlState(),
+                triggers: triggerRows,
+              },
+            });
+            return;
+          }
           const result = await invoke("cloud_mcp_update_loopspace_graph", {
             loopspaceId: loopspace.id,
             source,
@@ -28018,16 +28519,8 @@ export default function App() {
 
         if (tool === "update_loopspace_graph" || tool === "edit_loopspace_graph") {
           const loopspace = resolveLoopspaceForAppControl(input);
-          const hasSourceInput = typeof input.source === "string"
-            || typeof input.graphSource === "string"
-            || typeof input.sourceText === "string";
-          const source = typeof input.source === "string"
-            ? input.source
-            : typeof input.graphSource === "string"
-              ? input.graphSource
-              : typeof input.sourceText === "string"
-                ? input.sourceText
-                : "";
+          const hasSourceInput = typeof input.source === "string";
+          const source = typeof input.source === "string" ? input.source : "";
           if (!loopspace) {
             sendAppControlReply(requestId, {
               ok: false,
@@ -28054,6 +28547,24 @@ export default function App() {
             return;
           }
           const normalizedSource = normalizeDfBlueprintSource(source, { name: loopspace.name });
+          const triggerRows = await getLoopspaceTriggerRowsForAppControl(true);
+          try {
+            validateLoopspaceGraphSourceTriggerRefsForAppControl(normalizedSource, triggerRows);
+          } catch (graphError) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: graphError?.code || "loopspace_graph_source_invalid",
+                message: String(graphError?.message || graphError || "Invalid Loopspace graph source."),
+              },
+              data: {
+                loopspace: { id: loopspace.id, name: loopspace.name },
+                state: buildAppControlState(),
+                triggers: triggerRows,
+              },
+            });
+            return;
+          }
           const result = await invoke("cloud_mcp_update_loopspace_graph", {
             loopspaceId: loopspace.id,
             source: normalizedSource,

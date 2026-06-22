@@ -627,15 +627,41 @@ fn app_control_mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "list_loopspace_triggers",
+            "description": "List reusable Loopspace trigger inventory. Use this before editing a Loopspace graph that references cron, webhook, or manual triggers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "remote": {"type": "boolean", "description": "When true or omitted, refresh from Cloud before returning the local trigger inventory."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "create_loopspace_trigger",
+            "description": "Create a reusable Loopspace trigger inventory item. To put it in a graph, call patch_loopspace_graph with {op:'attach_trigger', trigger_id:'...'} after this succeeds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "trigger_name": {"type": "string", "description": "Visible trigger name, for example BasicCron."},
+                    "name": {"type": "string", "description": "Alias for trigger_name."},
+                    "trigger_type": {"type": "string", "description": "cron, webhook, or manual."},
+                    "type": {"type": "string", "description": "Alias for trigger_type."},
+                    "loopspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional loopspace ids this trigger belongs to."},
+                    "config": {"type": "object", "description": "Trigger config. Cron supports {schedule:'@every 5m'}."},
+                    "enabled": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
             "name": "run_loopspace_trigger",
             "description": "Run a manual Loopspace trigger by trigger id or trigger name. Use this when the user asks the terminal orchestrator to kick, fire, invoke, or manually run a Loopspace trigger.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "triggerId": {"type": "string"},
                     "trigger_id": {"type": "string"},
                     "id": {"type": "string"},
-                    "triggerName": {"type": "string"},
                     "trigger_name": {"type": "string"},
                     "name": {"type": "string"},
                     "payload": {"type": "object", "description": "Optional structured payload to record with the manual run."}
@@ -649,10 +675,8 @@ fn app_control_mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "loopspaceId": {"type": "string"},
                     "loopspace_id": {"type": "string"},
                     "id": {"type": "string"},
-                    "loopspaceName": {"type": "string"},
                     "loopspace_name": {"type": "string"},
                     "name": {"type": "string"}
                 },
@@ -661,60 +685,50 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_loopspace_graph",
-            "description": "Replace a Loopspace graph document with full .dfblueprint source. The source/sourceText/graphSource field is required; prefer patch_loopspace_graph for small edits. Returns after the client hydrates the Cloud-accepted graph, unless queued/offline.",
+            "description": "Replace a Loopspace graph document with full .dfblueprint source. The source field is required; prefer patch_loopspace_graph for small edits. Returns after the client hydrates the Cloud-accepted graph, unless queued/offline.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "loopspaceId": {"type": "string"},
                     "loopspace_id": {"type": "string"},
                     "id": {"type": "string"},
-                    "loopspaceName": {"type": "string"},
                     "loopspace_name": {"type": "string"},
                     "name": {"type": "string"},
                     "source": {"type": "string"},
-                    "source_format": {"type": "string", "description": "Use dfblueprint.v1."},
-                    "sourceText": {"type": "string"},
-                    "graphSource": {"type": "string"}
+                    "source_format": {"type": "string", "description": "Use dfblueprint.v1."}
                 },
                 "additionalProperties": true
             }
         }),
         json!({
             "name": "edit_loopspace_graph",
-            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with full .dfblueprint source after reading the current graph. The source/sourceText/graphSource field is required.",
+            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with full .dfblueprint source after reading the current graph. The source field is required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "loopspaceId": {"type": "string"},
                     "loopspace_id": {"type": "string"},
                     "id": {"type": "string"},
-                    "loopspaceName": {"type": "string"},
                     "loopspace_name": {"type": "string"},
                     "name": {"type": "string"},
                     "source": {"type": "string"},
-                    "source_format": {"type": "string", "description": "Use dfblueprint.v1."},
-                    "sourceText": {"type": "string"},
-                    "graphSource": {"type": "string"}
+                    "source_format": {"type": "string", "description": "Use dfblueprint.v1."}
                 },
                 "additionalProperties": true
             }
         }),
         json!({
             "name": "patch_loopspace_graph",
-            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph first, then send operations such as add_trigger, add_node, move_node, remove_node, connect, disconnect, or update_node_props. Edges are explicit nodeId.port -> nodeId.port connections.",
+            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first. Do not invent standalone cron/manual/webhook nodes. Edges are explicit node_id.port -> node_id.port connections.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "loopspaceId": {"type": "string"},
                     "loopspace_id": {"type": "string"},
                     "id": {"type": "string"},
-                    "loopspaceName": {"type": "string"},
                     "loopspace_name": {"type": "string"},
                     "name": {"type": "string"},
                     "operations": {
                         "type": "array",
                         "items": {"type": "object", "additionalProperties": true},
-                        "description": "Examples: {op:'add_trigger', triggerId:'...', name:'BasicCron', triggerType:'cron', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'send_message', label:'Read document'}; {op:'connect', from:'trigger-basic', to:'read_doc'}."
+                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'send_message', label:'Read document'}; {op:'connect', from:'trigger-basic', to:'read_doc'}."
                     },
                     "ops": {
                         "type": "array",
@@ -823,6 +837,8 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "run_local_script",
         "list_local_scripts",
         "select_workspace",
+        "list_loopspace_triggers",
+        "create_loopspace_trigger",
         "run_loopspace_trigger",
         "get_loopspace_graph",
         "update_loopspace_graph",
