@@ -272,6 +272,8 @@ import {
   WorkspaceAppToolRailButton,
   WorkspaceAppToolRailLabel,
   WorkspaceViewPane,
+  AppGlobalScriptsShelf,
+  AppGlobalScriptButton,
   WorkspaceRuntimeLayer,
   WorkspaceIdleSurface,
   WorkspaceIdlePanel,
@@ -707,7 +709,7 @@ const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.pr
 const MACOS_AUTOMATION_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
 const MACOS_FULL_DISK_ACCESS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture"]);
-const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps"]);
+const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps", "clis", "scripts"]);
 const WORKSPACE_TAB_VIEW_BY_ID = {
   terminals: DEFAULT_WORKSPACE_VIEW,
   files: "files",
@@ -715,7 +717,10 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
 const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
-const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps"]);
+const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
+const APP_SCRIPT_DEFAULT_BUTTON_COLOR = "#1f3f7a";
+const APP_SCRIPT_DEFAULT_TEXT_COLOR = "#f6d38a";
+const LOCAL_SCRIPT_RUN_EVENT = "diffforge://local-script-run";
 const REMOTE_NAVIGATION_COMMANDS = new Set([
   "workspace_select",
   "select_workspace",
@@ -960,6 +965,12 @@ function normalizeAppControlTabId(value) {
   }
   if (normalized === "mcp" || normalized === "mcps" || normalized === "mcp_servers") {
     return { id: "mcps", scope: "global", view: "mcps" };
+  }
+  if (normalized === "cli" || normalized === "clis") {
+    return { id: "clis", scope: "global", view: "clis" };
+  }
+  if (normalized === "script" || normalized === "scripts" || normalized === "local_scripts") {
+    return { id: "scripts", scope: "global", view: "scripts" };
   }
   if (normalized === "tool" || normalized === "tools") {
     return { id: "tools", scope: "global", view: "tools" };
@@ -4331,6 +4342,116 @@ function LoopspaceCreatePanel({
   );
 }
 
+function loopspaceGraphNodeIdFromLabel(label) {
+  return String(label || "")
+    .trim()
+    .replace(/^"|"$/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function parseLoopspaceGraphProps(rawProps = "") {
+  const props = {};
+  String(rawProps || "").split(",").forEach((part) => {
+    const index = part.indexOf(":");
+    if (index <= 0) return;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim().replace(/^"|"$/g, "").replace(/^'|'$/g, "");
+    if (key && value) {
+      props[key] = value;
+      props[key.toLowerCase()] = value;
+    }
+  });
+  return props;
+}
+
+function parseLoopspaceArchGraphSource(source = "") {
+  const nodes = [];
+  const edges = [];
+  const nodeByLabel = new Map();
+  String(source || "").split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#")) return;
+    if (/^(title|folder|direction|run)\s/i.test(trimmed)) return;
+    const edgeMatch = trimmed.match(/^(.+?)\s*(>|--)\s*(.+?)(?::\s*(.*?))?(?:\s*\[(.*)\])?$/);
+    if (edgeMatch && !trimmed.startsWith("[")) {
+      const from = edgeMatch[1].trim().replace(/^"|"$/g, "");
+      const to = edgeMatch[3].trim().replace(/^"|"$/g, "");
+      if (from && to) {
+        edges.push({
+          from: loopspaceGraphNodeIdFromLabel(from),
+          label: String(edgeMatch[4] || "").trim(),
+          role: edgeMatch[2] === "--" ? "depends_on" : "flows_to",
+          to: loopspaceGraphNodeIdFromLabel(to),
+        });
+      }
+      return;
+    }
+    const nodeMatch = trimmed.match(/^(.+?)\s*\[(.*)\]\s*$/);
+    if (!nodeMatch) return;
+    const label = nodeMatch[1].trim().replace(/^"|"$/g, "");
+    const props = parseLoopspaceGraphProps(nodeMatch[2]);
+    const id = String(props.id || props.nodeId || props.node_id || loopspaceGraphNodeIdFromLabel(label)).trim();
+    if (!id || nodeByLabel.has(id)) return;
+    const triggerId = String(props.triggerId || props.triggerid || props.trigger_id || props.trigger || "").trim();
+    const node = {
+      id,
+      icon: String(props.icon || "").trim(),
+      label,
+      role: String(props.role || "").trim(),
+      triggerId,
+    };
+    nodes.push(node);
+    nodeByLabel.set(id, node);
+    nodeByLabel.set(loopspaceGraphNodeIdFromLabel(label), node);
+  });
+  return { edges, nodes };
+}
+
+function loopspaceTriggerGraphNodeLine(trigger) {
+  const triggerId = String(trigger?.id || trigger?.triggerId || "").trim();
+  const name = String(trigger?.name || triggerId || "Trigger").trim().replace(/"/g, "'");
+  const type = String(trigger?.type || "manual").trim().toLowerCase();
+  const nodeId = `trigger-${triggerId}`.replace(/[^a-zA-Z0-9_-]/g, "-");
+  const icon = type === "cron" ? "clock" : type === "webhook" ? "webhook" : "play";
+  return `"${name}" [icon: ${icon}, role: trigger, id: ${nodeId}, triggerId: ${triggerId}, triggerType: ${type}]`;
+}
+
+function loopspaceGraphTriggerIdFromLine(line) {
+  const nodeMatch = String(line || "").trim().match(/^(.+?)\s*\[(.*)\]\s*$/);
+  if (!nodeMatch) return "";
+  const props = parseLoopspaceGraphProps(nodeMatch[2]);
+  return String(props.triggerId || props.triggerid || props.trigger_id || props.trigger || "").trim();
+}
+
+function loopspaceGraphSourceHasTrigger(source, triggerId) {
+  const id = String(triggerId || "").trim();
+  if (!id) return false;
+  return String(source || "")
+    .split(/\r?\n/)
+    .some((line) => loopspaceGraphTriggerIdFromLine(line) === id);
+}
+
+function loopspaceGraphSourceWithTrigger(source, trigger) {
+  const triggerId = String(trigger?.id || trigger?.triggerId || "").trim();
+  if (!triggerId) return source || "";
+  const current = String(source || "").trimEnd();
+  if (loopspaceGraphSourceHasTrigger(current, triggerId)) {
+    return source || "";
+  }
+  return `${current}${current ? "\n" : ""}${loopspaceTriggerGraphNodeLine(trigger)}\n`;
+}
+
+function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
+  const id = String(triggerId || "").trim();
+  if (!id) return source || "";
+  return String(source || "")
+    .split(/\r?\n/)
+    .filter((line) => loopspaceGraphTriggerIdFromLine(line) !== id)
+    .join("\n");
+}
+
 function LoopspaceRuntimeView({
   actionState,
   error,
@@ -4340,11 +4461,58 @@ function LoopspaceRuntimeView({
   const [activeTab, setActiveTab] = useState("graph");
   const [triggers, setTriggers] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [graphSource, setGraphSource] = useState("");
+  const [graphMeta, setGraphMeta] = useState(null);
+  const [triggerRefs, setTriggerRefs] = useState([]);
+  const [runtimeHead, setRuntimeHead] = useState(null);
   const [loadingState, setLoadingState] = useState("idle");
   const [runtimeError, setRuntimeError] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
+
+  const applyGraphSnapshot = useCallback((value) => {
+    const candidates = [
+      value,
+      value?.sync,
+      value?.response,
+      value?.payload,
+      value?.data,
+    ].filter(Boolean);
+    let graph = null;
+    let row = null;
+    for (const candidate of candidates) {
+      if (candidate?.graph && typeof candidate.graph === "object") {
+        graph = candidate.graph;
+        row = candidate.loopspace && typeof candidate.loopspace === "object" ? candidate.loopspace : row;
+        break;
+      }
+      const rows = Array.isArray(candidate?.loopspaces) ? candidate.loopspaces : [];
+      row = rows.find((item) => String(item?.id || item?.loopspaceId || item?.loopspace_id || "") === loopspaceId) || row;
+      if (row?.graph && typeof row.graph === "object") {
+        graph = row.graph;
+        break;
+      }
+    }
+    if (!graph && loopspace?.graph) {
+      graph = loopspace.graph;
+      row = loopspace;
+    }
+    if (!graph) return null;
+    const source = String(graph.source || graph.sourceText || graph.source_text || "");
+    setGraphSource(source);
+    setGraphMeta(graph);
+    const refs = Array.isArray(value?.triggerRefs)
+      ? value.triggerRefs
+      : Array.isArray(row?.triggerRefs)
+        ? row.triggerRefs
+        : Array.isArray(row?.trigger_refs)
+          ? row.trigger_refs
+          : [];
+    setTriggerRefs(refs);
+    setRuntimeHead(value?.runtimeHead || row?.runtimeHead || row?.runtime_head || null);
+    return { graph, refs, row, source };
+  }, [loopspace, loopspaceId]);
 
   const applyTriggerSnapshot = useCallback((value) => {
     const nextTriggers = appControlLoopspaceTriggerRows(value);
@@ -4352,15 +4520,22 @@ function LoopspaceRuntimeView({
     setTriggers(nextTriggers);
     if (loopspaceId) {
       const triggerLoopspaceIds = new Map(nextTriggers.map((trigger) => [trigger.id, trigger.loopspaceIds]));
+      const graphTriggerIds = new Set(
+        [
+          ...triggerRefs.map((ref) => String(ref?.triggerId || ref?.trigger_id || "").trim()),
+          ...parseLoopspaceArchGraphSource(graphSource).nodes.map((node) => node.triggerId),
+        ].filter(Boolean),
+      );
       setLogs(nextRuns.filter((run) => (
         run.loopspaceIds.includes(loopspaceId)
         || (triggerLoopspaceIds.get(run.triggerId) || []).includes(loopspaceId)
+        || graphTriggerIds.has(run.triggerId)
       )));
     } else {
       setLogs([]);
     }
     return { runs: nextRuns, triggers: nextTriggers };
-  }, [loopspaceId]);
+  }, [graphSource, loopspaceId, triggerRefs]);
 
   const refreshLoopspaceLogs = useCallback(async () => {
     if (!loopspaceId) {
@@ -4385,6 +4560,29 @@ function LoopspaceRuntimeView({
       }
     }
   }, [loopspaceId]);
+
+  const refreshLoopspaceGraph = useCallback(async (remote = true) => {
+    if (!loopspaceId) {
+      setGraphSource("");
+      setGraphMeta(null);
+      setTriggerRefs([]);
+      setRuntimeHead(null);
+      return;
+    }
+    applyGraphSnapshot(loopspace);
+    try {
+      applyGraphSnapshot(await invoke("cloud_mcp_get_loopspace_graph", { loopspaceId }));
+    } catch {
+      // A remote sync below can hydrate a freshly-created loop graph.
+    }
+    if (remote) {
+      try {
+        applyGraphSnapshot(await invoke("cloud_mcp_sync_loopspace_graph", { loopspaceId }));
+      } catch (graphError) {
+        setRuntimeError(String(graphError || "Unable to sync loop graph."));
+      }
+    }
+  }, [applyGraphSnapshot, loopspace, loopspaceId]);
 
   const refreshLoopspaceTriggers = useCallback(async (remote = true) => {
     if (!loopspaceId) {
@@ -4414,16 +4612,20 @@ function LoopspaceRuntimeView({
     setActiveTab("graph");
     setRuntimeError("");
     setDropActive(false);
+    applyGraphSnapshot(loopspace);
+    refreshLoopspaceGraph(true);
     refreshLoopspaceTriggers(true);
-  }, [loopspaceId, refreshLoopspaceTriggers]);
+  }, [applyGraphSnapshot, loopspace, loopspaceId, refreshLoopspaceGraph, refreshLoopspaceTriggers]);
 
   useEffect(() => {
     let disposed = false;
     let unlistenTriggers = null;
+    let unlistenLoopspaces = null;
     void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
       if (disposed) return;
       applyTriggerSnapshot(event?.payload || event);
       void refreshLoopspaceLogs();
+      void refreshLoopspaceGraph(true);
     }).then((unlisten) => {
       if (disposed) {
         unlisten();
@@ -4431,15 +4633,40 @@ function LoopspaceRuntimeView({
         unlistenTriggers = unlisten;
       }
     }).catch(() => {});
+    void listen(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
+      if (disposed) return;
+      applyGraphSnapshot(event?.payload || event);
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenLoopspaces = unlisten;
+      }
+    }).catch(() => {});
     return () => {
       disposed = true;
       if (typeof unlistenTriggers === "function") unlistenTriggers();
+      if (typeof unlistenLoopspaces === "function") unlistenLoopspaces();
     };
-  }, [applyTriggerSnapshot, refreshLoopspaceLogs]);
+  }, [applyGraphSnapshot, applyTriggerSnapshot, refreshLoopspaceGraph, refreshLoopspaceLogs]);
+
+  const parsedGraph = useMemo(() => parseLoopspaceArchGraphSource(graphSource), [graphSource]);
+
+  const attachedTriggerIds = useMemo(() => {
+    const ids = new Set(
+      triggerRefs
+        .map((ref) => String(ref?.triggerId || ref?.trigger_id || "").trim())
+        .filter(Boolean),
+    );
+    for (const node of parsedGraph.nodes) {
+      if (node.triggerId) ids.add(node.triggerId);
+    }
+    return ids;
+  }, [parsedGraph.nodes, triggerRefs]);
 
   const attachedTriggers = useMemo(() => (
-    triggers.filter((trigger) => trigger.loopspaceIds.includes(loopspaceId))
-  ), [loopspaceId, triggers]);
+    triggers.filter((trigger) => attachedTriggerIds.has(trigger.id))
+  ), [attachedTriggerIds, triggers]);
 
   const triggerById = useMemo(() => {
     const map = new Map();
@@ -4454,46 +4681,57 @@ function LoopspaceRuntimeView({
     const triggerId = String(triggerLike?.id || triggerLike?.triggerId || "").trim();
     if (!triggerId) return;
     const trigger = triggerById.get(triggerId) || triggerLike;
-    const loopspaceIds = Array.isArray(trigger?.loopspaceIds) ? trigger.loopspaceIds : [];
-    if (loopspaceIds.includes(loopspaceId)) {
+    if (attachedTriggerIds.has(triggerId)) {
       setRuntimeError("");
       return;
     }
-    const nextLoopspaceIds = [...loopspaceIds, loopspaceId]
-      .map((id) => String(id || "").trim())
-      .filter((id, index, list) => id && list.indexOf(id) === index);
+    const nextSource = loopspaceGraphSourceWithTrigger(graphSource, trigger);
     setLoadingState("saving");
     setRuntimeError("");
     try {
-      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
-        loopspaceIds: nextLoopspaceIds,
-        triggerId,
-      }));
+      const result = await invoke("cloud_mcp_update_loopspace_graph", {
+        loopspaceId,
+        source: nextSource,
+      });
+      if (result?.hydrated === false || loopspaceSnapshotQueued(result)) {
+        setRuntimeError(loopspaceSnapshotQueued(result)
+          ? "Graph edit was queued for retry and will appear after Cloud confirms it."
+          : "Cloud accepted the graph edit, but the updated graph did not hydrate locally yet.");
+      } else {
+        applyGraphSnapshot(result);
+      }
       await refreshLoopspaceLogs();
       setLoadingState("idle");
     } catch (attachError) {
       setLoadingState("idle");
       setRuntimeError(String(attachError || "Unable to attach trigger to loop."));
     }
-  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceLogs, triggerById]);
+  }, [applyGraphSnapshot, attachedTriggerIds, busy, graphSource, loopspaceId, refreshLoopspaceLogs, triggerById]);
 
   const detachTriggerFromLoop = useCallback(async (trigger) => {
     if (!loopspaceId || !trigger?.id || busy) return;
-    const nextLoopspaceIds = (trigger.loopspaceIds || []).filter((id) => id !== loopspaceId);
+    const nextSource = loopspaceGraphSourceWithoutTrigger(graphSource, trigger.id);
     setLoadingState("saving");
     setRuntimeError("");
     try {
-      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
-        loopspaceIds: nextLoopspaceIds,
-        triggerId: trigger.id,
-      }));
+      const result = await invoke("cloud_mcp_update_loopspace_graph", {
+        loopspaceId,
+        source: nextSource,
+      });
+      if (result?.hydrated === false || loopspaceSnapshotQueued(result)) {
+        setRuntimeError(loopspaceSnapshotQueued(result)
+          ? "Graph edit was queued for retry and will appear after Cloud confirms it."
+          : "Cloud accepted the graph edit, but the updated graph did not hydrate locally yet.");
+      } else {
+        applyGraphSnapshot(result);
+      }
       await refreshLoopspaceLogs();
       setLoadingState("idle");
     } catch (detachError) {
       setLoadingState("idle");
       setRuntimeError(String(detachError || "Unable to remove trigger from loop graph."));
     }
-  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceLogs]);
+  }, [applyGraphSnapshot, busy, graphSource, loopspaceId, refreshLoopspaceLogs]);
 
   const readDroppedTrigger = useCallback((event) => {
     const raw = event.dataTransfer.getData(LOOPSPACE_TRIGGER_DRAG_MIME)
@@ -4583,39 +4821,44 @@ function LoopspaceRuntimeView({
             onDrop={onGraphDrop}
           >
             <LoopspaceGraphContent>
-              <LoopspaceGraphNode data-kind="loop">
-                <LoopspaceGraphNodeIcon>
-                  <AccountTree aria-hidden="true" />
-                </LoopspaceGraphNodeIcon>
-                <LoopspaceGraphNodeText>
-                  <strong>{loopspace?.name || "Loop"}</strong>
-                  <span>Loop graph</span>
-                </LoopspaceGraphNodeText>
-                <span />
-              </LoopspaceGraphNode>
-              <LoopspaceGraphConnector aria-hidden="true" />
-              {attachedTriggers.length ? (
+              {parsedGraph.nodes.length ? (
                 <LoopspaceGraphTriggerGrid>
-                  {attachedTriggers.map((trigger) => {
-                    const Icon = loopspaceTriggerTypeIcon(trigger.type);
+                  {parsedGraph.nodes.map((node) => {
+                    const trigger = node.triggerId ? triggerById.get(node.triggerId) : null;
+                    const type = trigger?.type || node.role || "loop";
+                    const Icon = node.triggerId
+                      ? loopspaceTriggerTypeIcon(trigger?.type || "manual")
+                      : AccountTree;
+                    const isRuntimeNode = String(runtimeHead?.currentNodeId || runtimeHead?.current_node_id || runtimeHead?.cursorNodeId || runtimeHead?.cursor_node_id || "") === node.id;
                     return (
-                      <LoopspaceGraphNode data-kind={trigger.type} key={trigger.id}>
+                      <LoopspaceGraphNode
+                        data-kind={node.triggerId ? (trigger?.type || "manual") : "loop"}
+                        data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
+                        key={node.id}
+                      >
                         <LoopspaceGraphNodeIcon>
                           <Icon aria-hidden="true" />
                         </LoopspaceGraphNodeIcon>
                         <LoopspaceGraphNodeText>
-                          <strong>{trigger.name}</strong>
-                          <span>{loopspaceTriggerTypeLabel(trigger.type)}</span>
+                          <strong>{trigger?.name || node.label}</strong>
+                          <span>
+                            {[
+                              node.triggerId ? loopspaceTriggerTypeLabel(trigger?.type || "manual") : (type || "Graph node"),
+                              isRuntimeNode ? (runtimeHead?.status || "active") : "",
+                            ].filter(Boolean).join(" - ")}
+                          </span>
                         </LoopspaceGraphNodeText>
-                        <LoopspaceGraphNodeAction
-                          aria-label={`Remove ${trigger.name} from loop graph`}
-                          disabled={busy}
-                          onClick={() => detachTriggerFromLoop(trigger)}
-                          title="Remove from graph"
-                          type="button"
-                        >
-                          <ButtonCloseIcon aria-hidden="true" />
-                        </LoopspaceGraphNodeAction>
+                        {node.triggerId ? (
+                          <LoopspaceGraphNodeAction
+                            aria-label={`Remove ${trigger?.name || node.label} from loop graph`}
+                            disabled={busy}
+                            onClick={() => detachTriggerFromLoop({ id: node.triggerId, name: trigger?.name || node.label })}
+                            title="Remove from graph"
+                            type="button"
+                          >
+                            <ButtonCloseIcon aria-hidden="true" />
+                          </LoopspaceGraphNodeAction>
+                        ) : <span />}
                       </LoopspaceGraphNode>
                     );
                   })}
@@ -5386,6 +5629,147 @@ function getErrorMessage(error, fallback) {
     return error.message;
   }
 
+  return fallback;
+}
+
+function appScriptText(value, fallback = "") {
+  const normalized = String(value ?? "").trim();
+  return normalized || fallback;
+}
+
+function appScriptPathKey(script) {
+  return normalizedDocumentPath(script?.pathKey || script?.path_key || script?.filePath || script?.file_path || script?.id);
+}
+
+function appScriptFileName(script) {
+  const explicit = appScriptText(script?.fileName || script?.file_name);
+  if (explicit) return explicit;
+  const pathKey = appScriptPathKey(script);
+  const leaf = pathKey.split("/").filter(Boolean).pop();
+  return leaf || "script.sh";
+}
+
+function appScriptTitle(script) {
+  return appScriptText(
+    script?.title || script?.name,
+    appScriptFileName(script).replace(/\.[^.]+$/u, "").replace(/[_-]+/gu, " "),
+  );
+}
+
+function appScriptButtonRow(script = {}) {
+  const pathKey = appScriptPathKey(script);
+  const fileName = appScriptFileName({ ...script, pathKey });
+  return {
+    buttonColor: appScriptText(script.buttonColor || script.button_color, APP_SCRIPT_DEFAULT_BUTTON_COLOR),
+    fileName,
+    id: appScriptText(script.id, pathKey || fileName),
+    pathKey: pathKey || fileName,
+    textColor: appScriptText(script.textColor || script.text_color, APP_SCRIPT_DEFAULT_TEXT_COLOR),
+    title: appScriptTitle({ ...script, fileName }),
+  };
+}
+
+function appScriptNowIso() {
+  return new Date().toISOString();
+}
+
+function appScriptRunId(pathKey) {
+  return `script:${pathKey}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+}
+
+function appScriptMs(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+}
+
+function appScriptRunLogStarted(script, runId = appScriptRunId(appScriptPathKey(script))) {
+  const pathKey = appScriptPathKey(script);
+  const startedAtMs = Date.now();
+  const startedAt = appScriptNowIso();
+  return {
+    chunks: [],
+    durationMs: 0,
+    endedAt: "",
+    endedAtMs: 0,
+    error: "",
+    exitCode: null,
+    ok: null,
+    pathKey,
+    runId,
+    script: appScriptButtonRow(script),
+    state: "running",
+    stderr: "",
+    stdout: "",
+    startedAt,
+    startedAtMs,
+    timedOut: false,
+    updatedAt: startedAtMs,
+  };
+}
+
+function appScriptRunLogFromResult(result = {}, fallback = {}) {
+  const pathKey = appScriptText(result.path_key || result.pathKey, fallback.pathKey);
+  const endedAtMs = Date.now();
+  const durationMs = appScriptMs(result.duration_ms ?? result.durationMs, fallback.startedAtMs ? endedAtMs - fallback.startedAtMs : 0);
+  const startedAt = appScriptText(result.started_at || result.startedAt, fallback.startedAt || "");
+  const endedAt = appScriptText(result.ended_at || result.endedAt, appScriptNowIso());
+  const stdout = String(result.stdout ?? "");
+  const stderr = String(result.stderr ?? "");
+  const chunks = fallback.chunks?.length
+    ? fallback.chunks
+    : [
+      stdout ? { stream: "stdout", text: stdout } : null,
+      stderr ? { stream: "stderr", text: stderr } : null,
+    ].filter(Boolean);
+  return {
+    ...fallback,
+    chunks,
+    durationMs,
+    endedAt,
+    endedAtMs,
+    error: appScriptText(result.error, fallback.error || ""),
+    exitCode: result.exit_code ?? result.exitCode ?? fallback.exitCode ?? null,
+    ok: result.ok !== false,
+    pathKey,
+    runId: appScriptText(result.run_id || result.runId, fallback.runId || appScriptRunId(pathKey)),
+    script: appScriptButtonRow(result.script || fallback.script || { pathKey }),
+    state: result.ok === false ? "error" : "ready",
+    stderr,
+    stderrTruncated: Boolean(result.stderr_truncated || result.stderrTruncated),
+    stdout,
+    stdoutTruncated: Boolean(result.stdout_truncated || result.stdoutTruncated),
+    timedOut: Boolean(result.timed_out || result.timedOut),
+    updatedAt: endedAtMs,
+  };
+}
+
+function appScriptRunLogFromEvent(payload = {}, fallback = {}) {
+  const stage = appScriptText(payload.stage);
+  const pathKey = appScriptText(payload.path_key || payload.pathKey, fallback.pathKey);
+  if (!pathKey) return null;
+  if (stage === "start") {
+    return {
+      ...appScriptRunLogStarted(payload.script || fallback.script || { pathKey }, appScriptText(payload.run_id || payload.runId) || appScriptRunId(pathKey)),
+      pathKey,
+      startedAt: appScriptText(payload.started_at || payload.startedAt, fallback.startedAt || appScriptNowIso()),
+    };
+  }
+  if (stage === "output") {
+    const stream = appScriptText(payload.stream, "stdout") === "stderr" ? "stderr" : "stdout";
+    const text = String(payload.chunk ?? "");
+    return {
+      ...fallback,
+      chunks: [...(fallback.chunks || []), { stream, text }],
+      pathKey,
+      runId: appScriptText(payload.run_id || payload.runId, fallback.runId || appScriptRunId(pathKey)),
+      state: "running",
+      [stream]: `${fallback[stream] || ""}${text}`,
+      updatedAt: Date.now(),
+    };
+  }
+  if (stage === "finish") {
+    return appScriptRunLogFromResult(payload, fallback);
+  }
   return fallback;
 }
 
@@ -8920,9 +9304,28 @@ function normalizeLoopspaceEntry(entry) {
   }
   const name = String(entry?.name || entry?.loopspace_name || entry?.loopspaceName || id).trim() || id;
   return {
+    ...entry,
     id,
     name,
     createdAt: String(entry?.createdAt || entry?.created_at || ""),
+    graph: entry?.graph && typeof entry.graph === "object" ? entry.graph : null,
+    graphContentHash: String(entry?.graphContentHash || entry?.graph_content_hash || entry?.graph?.contentHash || entry?.graph?.content_hash || ""),
+    graphEpoch: Number(entry?.graphEpoch || entry?.graph_epoch || entry?.graph?.epoch || entry?.graph?.graphEpoch || 0) || 0,
+    logSegments: Array.isArray(entry?.logSegments)
+      ? entry.logSegments
+      : Array.isArray(entry?.log_segments)
+        ? entry.log_segments
+        : [],
+    runtimeHead: entry?.runtimeHead && typeof entry.runtimeHead === "object"
+      ? entry.runtimeHead
+      : entry?.runtime_head && typeof entry.runtime_head === "object"
+        ? entry.runtime_head
+        : null,
+    triggerRefs: Array.isArray(entry?.triggerRefs)
+      ? entry.triggerRefs
+      : Array.isArray(entry?.trigger_refs)
+        ? entry.trigger_refs
+        : [],
     updatedAt: String(entry?.updatedAt || entry?.updated_at || ""),
     revision: Number(entry?.revision || entry?.server_seq || entry?.serverSeq || 0) || 0,
   };
@@ -10153,6 +10556,10 @@ export default function App() {
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const [accountToolDraft, setAccountToolDraft] = useState("");
   const [accountToolItems, setAccountToolItems] = useState([]);
+  const [appScriptsLibrary, setAppScriptsLibrary] = useState({ root: "", scripts: [] });
+  const [appScriptsState, setAppScriptsState] = useState("idle");
+  const [appScriptRunResults, setAppScriptRunResults] = useState({});
+  const [appScriptLogFocusRequest, setAppScriptLogFocusRequest] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [workspacePendingActivationId, setWorkspacePendingActivationId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -10248,6 +10655,9 @@ export default function App() {
   const appControlDocumentContextSnapshotRef = useRef(null);
   const appControlDocumentSelectionSnapshotRef = useRef(null);
   const appControlDocumentActionsRef = useRef({});
+  const appControlScriptContextSnapshotRef = useRef(null);
+  const appControlScriptSelectionSnapshotRef = useRef(null);
+  const appControlScriptActionsRef = useRef({});
   const mainWindowFocusedRef = useRef(mainWindowFocused);
   const workspacesRef = useRef(workspaces);
   const workspaceCatalogRef = useRef(workspaceCatalog);
@@ -10303,6 +10713,7 @@ export default function App() {
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
+  const appScriptRunInFlightRef = useRef(false);
 
   const handleAppControlContextChange = useCallback((context) => {
     const safeContext = context && typeof context === "object" && !Array.isArray(context)
@@ -10328,6 +10739,28 @@ export default function App() {
         appControlDocumentContextSnapshotRef.current = null;
         appControlDocumentSelectionSnapshotRef.current = null;
       }
+      if (safeContext.script) {
+        const capturedAtMs = Date.now();
+        let snapshot = null;
+        try {
+          snapshot = JSON.parse(JSON.stringify(safeContext));
+        } catch {
+          snapshot = {
+            ...safeContext,
+            highlightedRange: safeContext.highlightedRange ? { ...safeContext.highlightedRange } : null,
+            script: { ...(safeContext.script || {}) },
+          };
+        }
+        snapshot.scriptContextCapturedAtMs = capturedAtMs;
+        appControlScriptContextSnapshotRef.current = snapshot;
+      } else {
+        appControlScriptContextSnapshotRef.current = null;
+        appControlScriptSelectionSnapshotRef.current = null;
+      }
+    }
+    if (!(safeContext?.surface === "tools" && safeContext.active !== false && safeContext.script)) {
+      appControlScriptContextSnapshotRef.current = null;
+      appControlScriptSelectionSnapshotRef.current = null;
     }
     if (
       safeContext?.surface === "tools"
@@ -10353,6 +10786,30 @@ export default function App() {
       };
       appControlDocumentSelectionSnapshotRef.current = snapshot;
     }
+    if (
+      safeContext?.surface === "tools"
+      && safeContext?.script
+      && safeContext?.highlightedRange?.active === true
+    ) {
+      const capturedAtMs = Date.now();
+      let snapshot = null;
+      try {
+        snapshot = JSON.parse(JSON.stringify(safeContext));
+      } catch {
+        snapshot = {
+          ...safeContext,
+          highlightedRange: { ...(safeContext.highlightedRange || {}) },
+          script: { ...(safeContext.script || {}) },
+        };
+      }
+      snapshot.selectionCapturedAtMs = capturedAtMs;
+      snapshot.highlightedRange = {
+        ...(snapshot.highlightedRange || {}),
+        capturedAtMs,
+        preserved: true,
+      };
+      appControlScriptSelectionSnapshotRef.current = snapshot;
+    }
   }, []);
 
   const registerAppControlDocumentActions = useCallback((actions) => {
@@ -10366,6 +10823,136 @@ export default function App() {
       }
     };
   }, []);
+  const registerAppControlScriptActions = useCallback((actions) => {
+    const safeActions = actions && typeof actions === "object" && !Array.isArray(actions)
+      ? actions
+      : {};
+    appControlScriptActionsRef.current = safeActions;
+    return () => {
+      if (appControlScriptActionsRef.current === safeActions) {
+        appControlScriptActionsRef.current = {};
+      }
+    };
+  }, []);
+  const refreshAppScripts = useCallback(async () => {
+    setAppScriptsState((current) => (current === "ready" ? "refreshing" : "loading"));
+    try {
+      const result = await invoke("local_scripts_list", {
+        request: { include_content: false },
+      });
+      const rows = Array.isArray(result?.scripts)
+        ? result.scripts.map(appScriptButtonRow).filter((script) => appScriptPathKey(script))
+        : [];
+      rows.sort((a, b) => appScriptPathKey(a).localeCompare(appScriptPathKey(b)));
+      setAppScriptsLibrary({
+        root: appScriptText(result?.root),
+        scripts: rows,
+      });
+      setAppScriptsState("ready");
+    } catch {
+      setAppScriptsLibrary((current) => ({ ...current, scripts: [] }));
+      setAppScriptsState("error");
+    }
+  }, []);
+  const focusAppScriptLogs = useCallback((script) => {
+    const pathKey = typeof script === "string" ? normalizedDocumentPath(script) : appScriptPathKey(script);
+    if (!pathKey) return;
+    window.clearTimeout(viewTransitionTimeoutRef.current);
+    setActiveView("scripts");
+    activeViewRef.current = "scripts";
+    setVisibleView("scripts");
+    visibleViewRef.current = "scripts";
+    setViewMotion("entered");
+    setAppScriptLogFocusRequest({ pathKey, requestedAt: Date.now() });
+  }, []);
+  const runAppScript = useCallback(async (script) => {
+    const pathKey = appScriptPathKey(script);
+    if (!pathKey) return;
+    if (appScriptRunResults[pathKey]?.state === "running") {
+      focusAppScriptLogs(pathKey);
+      return;
+    }
+    if (appScriptRunInFlightRef.current) return;
+    const runId = appScriptRunId(pathKey);
+    appScriptRunInFlightRef.current = true;
+    setAppScriptsState("running");
+    const startedLog = appScriptRunLogStarted(script, runId);
+    setAppScriptRunResults((current) => ({
+      ...current,
+      [pathKey]: startedLog,
+    }));
+    try {
+      const result = await invoke("local_scripts_run", {
+        request: {
+          default_working_directory: defaultWorkingDirectory,
+          path_key: pathKey,
+          run_id: runId,
+        },
+      });
+      setAppScriptRunResults((current) => ({
+        ...current,
+        [pathKey]: appScriptRunLogFromResult(result, current[pathKey] || startedLog),
+      }));
+      setAppScriptsState("ready");
+    } catch (error) {
+      setAppScriptRunResults((current) => ({
+        ...current,
+        [pathKey]: {
+          ...(current[pathKey] || startedLog),
+          endedAt: appScriptNowIso(),
+          endedAtMs: Date.now(),
+          error: getErrorMessage(error, "Unable to run local script."),
+          state: "error",
+          updatedAt: Date.now(),
+        },
+      }));
+      setAppScriptsState("ready");
+    } finally {
+      appScriptRunInFlightRef.current = false;
+    }
+  }, [appScriptRunResults, defaultWorkingDirectory, focusAppScriptLogs]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen(LOCAL_SCRIPT_RUN_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const pathKey = appScriptText(payload.path_key || payload.pathKey);
+      if (!pathKey) return;
+      setAppScriptRunResults((current) => {
+        const next = appScriptRunLogFromEvent(payload, current[pathKey] || { pathKey });
+        return next ? { ...current, [pathKey]: next } : current;
+      });
+      if (payload.stage === "start") {
+        setAppScriptsState("running");
+      } else if (payload.stage === "finish") {
+        setAppScriptsState("ready");
+      }
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+      } else {
+        unlisten = nextUnlisten;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      setAppScriptsLibrary({ root: "", scripts: [] });
+      setAppScriptsState("idle");
+      setAppScriptLogFocusRequest(null);
+      setAppScriptRunResults({});
+      return;
+    }
+    void refreshAppScripts();
+  }, [authState, refreshAppScripts]);
+
   const sharedMcpActiveRuntimeTargetsRef = useRef(new Map());
   const sharedMcpBackgroundJobsRef = useRef(new Map());
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
@@ -25559,6 +26146,10 @@ export default function App() {
       const document = context?.document || {};
       return String(document.documentKey || context?.selectedKey || document.id || "").trim();
     };
+    const appControlScriptContextKey = (context) => {
+      const script = context?.script || {};
+      return String(script.pathKey || script.path_key || context?.selectedKey || script.id || "").trim();
+    };
     const getFreshAppControlDocumentContextSnapshot = (currentContext = null) => {
       const snapshot = appControlDocumentContextSnapshotRef.current;
       if (!snapshot?.document) {
@@ -25580,6 +26171,33 @@ export default function App() {
         ...snapshot,
         active: currentContext?.active ?? false,
         restoredFromDocumentSnapshot: true,
+      };
+    };
+    const getFreshAppControlScriptContextSnapshot = (currentContext = null) => {
+      const snapshot = appControlScriptContextSnapshotRef.current;
+      if (!snapshot?.script) {
+        return null;
+      }
+      const capturedAtMs = Number(snapshot.scriptContextCapturedAtMs || snapshot.updatedAtMs || 0);
+      if (!Number.isFinite(capturedAtMs) || Date.now() - capturedAtMs > APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS) {
+        return null;
+      }
+      if (currentContext?.script) {
+        const currentKey = appControlScriptContextKey(currentContext);
+        const snapshotKey = appControlScriptContextKey(snapshot);
+        if (currentKey && snapshotKey && currentKey !== snapshotKey) {
+          return null;
+        }
+        const currentFingerprint = String(currentContext.script?.draftFingerprint || "").trim();
+        const snapshotFingerprint = String(snapshot.script?.draftFingerprint || "").trim();
+        if (currentFingerprint && snapshotFingerprint && currentFingerprint !== snapshotFingerprint) {
+          return null;
+        }
+      }
+      return {
+        ...snapshot,
+        active: currentContext?.active ?? false,
+        restoredFromScriptSnapshot: true,
       };
     };
     const getFreshAppControlDocumentSelectionSnapshot = (currentContext = null) => {
@@ -25620,6 +26238,44 @@ export default function App() {
         },
       };
     };
+    const getFreshAppControlScriptSelectionSnapshot = (currentContext = null) => {
+      const snapshot = appControlScriptSelectionSnapshotRef.current;
+      if (!snapshot?.script || snapshot?.highlightedRange?.active !== true) {
+        return null;
+      }
+      const capturedAtMs = Number(
+        snapshot.selectionCapturedAtMs
+          || snapshot.highlightedRange?.capturedAtMs
+          || snapshot.highlightedRange?.updatedAtMs
+          || 0,
+      );
+      if (!Number.isFinite(capturedAtMs) || Date.now() - capturedAtMs > APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS) {
+        return null;
+      }
+      if (currentContext?.script) {
+        const currentKey = appControlScriptContextKey(currentContext);
+        const snapshotKey = appControlScriptContextKey(snapshot);
+        if (currentKey && snapshotKey && currentKey !== snapshotKey) {
+          return null;
+        }
+        const currentFingerprint = String(currentContext.script?.draftFingerprint || "").trim();
+        const snapshotFingerprint = String(snapshot.script?.draftFingerprint || "").trim();
+        if (currentFingerprint && snapshotFingerprint && currentFingerprint !== snapshotFingerprint) {
+          return null;
+        }
+      }
+      return {
+        ...snapshot,
+        active: currentContext?.active ?? false,
+        restoredFromSelectionSnapshot: true,
+        selectionCapturedAtMs: capturedAtMs,
+        highlightedRange: {
+          ...(snapshot.highlightedRange || {}),
+          capturedAtMs,
+          preserved: true,
+        },
+      };
+    };
     const buildAppControlVisibleContext = (input = {}, options = {}) => {
       const context = appControlVisibleContextRef.current;
       const toolsSurfaceVisible = GLOBAL_TOOLS_VIEWS.has(visibleView);
@@ -25634,9 +26290,11 @@ export default function App() {
         && appControlBooleanValue(input.allowSelectionSnapshot ?? input.allow_selection_snapshot, true);
       const snapshot = allowSelectionSnapshot
         ? getFreshAppControlDocumentSelectionSnapshot(context)
+          || getFreshAppControlScriptSelectionSnapshot(context)
         : null;
       const documentSnapshot = allowSelectionSnapshot
         ? getFreshAppControlDocumentContextSnapshot(context)
+          || getFreshAppControlScriptContextSnapshot(context)
         : null;
       let contextPayload = activeContext ? { ...context } : null;
       if (
@@ -25678,6 +26336,7 @@ export default function App() {
         active: Boolean(activeContext),
         activeView,
         restoredFromDocumentSnapshot: Boolean(contextPayload?.restoredFromDocumentSnapshot),
+        restoredFromScriptSnapshot: Boolean(contextPayload?.restoredFromScriptSnapshot),
         restoredFromSelectionSnapshot: Boolean(contextPayload?.restoredFromSelectionSnapshot),
         context: contextPayload,
         visibleView,
@@ -25689,6 +26348,7 @@ export default function App() {
       return {
         ...visibleContext,
         document: context.document || null,
+        script: context.script || null,
         selection: context.highlightedRange || null,
       };
     };
@@ -25848,6 +26508,15 @@ export default function App() {
       activeView,
       visibleContext: buildAppControlVisibleContext(),
       visibleView,
+      spaceMode,
+      selectedLoopspace: selectedLoopspace ? {
+        id: selectedLoopspace.id,
+        name: selectedLoopspace.name,
+      } : null,
+      loopspaces: loopspaces.map((loopspace) => ({
+        id: loopspace.id,
+        name: loopspace.name,
+      })),
       selectedWorkspace: selectedWorkspace ? workspaceSummary(selectedWorkspace) : null,
       activatedWorkspace: activatedWorkspace ? workspaceSummary(activatedWorkspace) : null,
       workspaces: workspaces.map(workspaceSummary),
@@ -25858,6 +26527,8 @@ export default function App() {
         "tools",
         "architectures",
         "mcps",
+        "clis",
+        "scripts",
         "assets",
         "audio",
         "tokenomics",
@@ -25865,6 +26536,20 @@ export default function App() {
         "settings",
       ],
     });
+    const resolveLoopspaceForAppControl = (inputValue = {}) => {
+      const loopspaceId = appControlText(inputValue, ["loopspaceId", "loopspace_id", "id"]);
+      const loopspaceName = appControlText(inputValue, ["loopspaceName", "loopspace_name", "name"]);
+      if (loopspaceId) {
+        return loopspaces.find((loopspace) => loopspace.id === loopspaceId) || null;
+      }
+      if (loopspaceName) {
+        const normalizedName = loopspaceName.toLowerCase();
+        return loopspaces.find((loopspace) => loopspace.name.toLowerCase() === normalizedName)
+          || loopspaces.find((loopspace) => loopspace.id === loopspaceName)
+          || null;
+      }
+      return selectedLoopspace || null;
+    };
     const handleAppControlRequest = async (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       const requestId = String(payload.requestId || payload.request_id || "").trim();
@@ -25904,6 +26589,26 @@ export default function App() {
             data: {
               ...visibleContext,
               documentContext,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "get_selected_script_context") {
+          const visibleContext = buildAppControlVisibleContext(input, { allowSelectionSnapshot: true });
+          const scriptContext = visibleContext.context?.script ? visibleContext.context : null;
+          sendAppControlReply(requestId, {
+            ok: Boolean(scriptContext),
+            ...(scriptContext ? {} : {
+              error: {
+                code: "no_selected_script",
+                message: "No local script is selected in the visible app context.",
+              },
+            }),
+            data: {
+              ...visibleContext,
+              scriptContext,
               state: buildAppControlState(),
             },
           });
@@ -25983,6 +26688,81 @@ export default function App() {
           return;
         }
 
+        if (tool === "save_selected_script") {
+          const actions = appControlScriptActionsRef.current || {};
+          if (typeof actions.saveSelectedScript !== "function") {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "script_actions_unavailable",
+                message: "The local script editor is not available.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await actions.saveSelectedScript(input);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+            data: {
+              result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "update_selected_script") {
+          const actions = appControlScriptActionsRef.current || {};
+          if (typeof actions.updateSelectedScript !== "function") {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "script_actions_unavailable",
+                message: "The local script editor is not available.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await actions.updateSelectedScript(input);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+            data: {
+              result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "run_selected_script") {
+          const actions = appControlScriptActionsRef.current || {};
+          if (typeof actions.runSelectedScript !== "function") {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "script_actions_unavailable",
+                message: "The local script editor is not available.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await actions.runSelectedScript(input);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+            data: {
+              result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
         if (tool === "run_loopspace_trigger") {
           let triggerId = appControlText(input, ["triggerId", "trigger_id", "id"]);
           const triggerName = appControlText(input, ["triggerName", "trigger_name", "name"]);
@@ -26041,6 +26821,81 @@ export default function App() {
             data: {
               result,
               triggerId,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "get_loopspace_graph") {
+          const loopspace = resolveLoopspaceForAppControl(input);
+          if (!loopspace) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "loopspace_not_found",
+                message: "No matching Loopspace was found.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          let result = await invoke("cloud_mcp_get_loopspace_graph", {
+            loopspaceId: loopspace.id,
+          }).catch(() => null);
+          if (!result) {
+            result = await invoke("cloud_mcp_sync_loopspace_graph", {
+              loopspaceId: loopspace.id,
+            });
+          }
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            data: {
+              result,
+              loopspace: { id: loopspace.id, name: loopspace.name },
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "update_loopspace_graph" || tool === "edit_loopspace_graph") {
+          const loopspace = resolveLoopspaceForAppControl(input);
+          const source = typeof input.source === "string"
+            ? input.source
+            : typeof input.graphSource === "string"
+              ? input.graphSource
+              : typeof input.sourceText === "string"
+                ? input.sourceText
+                : "";
+          if (!loopspace) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "loopspace_not_found",
+                message: "No matching Loopspace was found.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await invoke("cloud_mcp_update_loopspace_graph", {
+            loopspaceId: loopspace.id,
+            source,
+          });
+          const hydrated = result?.hydrated !== false && !loopspaceSnapshotQueued(result);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false && hydrated,
+            ...(hydrated ? {} : {
+              error: {
+                code: "loopspace_graph_edit_queued",
+                message: "The graph edit was queued and has not hydrated from Cloud yet.",
+              },
+            }),
+            data: {
+              result,
+              hydrated,
+              loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
           });
@@ -31216,7 +32071,7 @@ export default function App() {
                         data-active={GLOBAL_TOOLS_VIEWS.has(activeView)}
                         data-scope="global"
                         onClick={() => showView("tools")}
-                        title="Architectures, MCPs, Skills & CLIs"
+                        title="Docs, MCPs, CLIs & Scripts"
                         type="button"
                       >
                         <ButtonHubIcon aria-hidden="true" />
@@ -32747,10 +33602,14 @@ export default function App() {
                       workspaceDispatchTargets: workspaceTerminalDispatchTargets,
                     }}
                     defaultWorkingDirectory={defaultWorkingDirectory}
-                    initialSection={visibleView === "mcps" ? "mcps" : "architectures"}
+                    initialSection={GLOBAL_TOOLS_VIEWS.has(visibleView) ? visibleView : "tools"}
                     onAppControlContextChange={handleAppControlContextChange}
                     onAppControlDocumentActions={registerAppControlDocumentActions}
+                    onAppControlScriptActions={registerAppControlScriptActions}
+                    onLocalScriptsChanged={refreshAppScripts}
                     rightToolsOrchestratorOpen={workspaceToolPaneVisible && !workspaceToolPaneMinimized}
+                    scriptLogFocusRequest={appScriptLogFocusRequest}
+                    sharedScriptRunResults={appScriptRunResults}
                     workspaces={assetWorkspaceOptions}
                   />
                 </ForgeWorkspace>
@@ -33010,6 +33869,33 @@ export default function App() {
                       </ResizePanel>
                   </>
                 </ResizePanelGroup>
+                {appScriptsLibrary.scripts.length > 0 && (
+                  <AppGlobalScriptsShelf aria-label="Local script run buttons">
+                    {appScriptsLibrary.scripts.map((script) => {
+                      const pathKey = appScriptPathKey(script);
+                      const runState = appScriptRunResults[pathKey]?.state || "";
+                      const running = runState === "running";
+                      return (
+                        <AppGlobalScriptButton
+                          aria-busy={running ? "true" : "false"}
+                          data-running={running ? "true" : "false"}
+                          disabled={appScriptsState === "running" && !running}
+                          key={pathKey}
+                          onClick={() => void runAppScript(script)}
+                          style={{
+                            "--script-button-bg": appScriptText(script.buttonColor, APP_SCRIPT_DEFAULT_BUTTON_COLOR),
+                            "--script-button-color": appScriptText(script.textColor, APP_SCRIPT_DEFAULT_TEXT_COLOR),
+                          }}
+                          title={running ? `Open ${appScriptTitle(script)} logs` : `Run ${appScriptTitle(script)}`}
+                          type="button"
+                        >
+                          {running && <PendingIcon aria-hidden="true" />}
+                          <span>{appScriptTitle(script)}</span>
+                        </AppGlobalScriptButton>
+                      );
+                    })}
+                  </AppGlobalScriptsShelf>
+                )}
               </WorkspaceAppToolLayout>
               </DashboardShell>
               {networkingOverlayOpen && (

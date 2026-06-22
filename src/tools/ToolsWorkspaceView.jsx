@@ -57,6 +57,7 @@ const SECTIONS = [
   { id: "docs", label: "Docs" },
   { id: "mcps", label: "MCPs" },
   { id: "clis", label: "CLIs" },
+  { id: "scripts", label: "Scripts" },
 ];
 
 export const GLOBAL_MCP_DEFAULTS_SCOPE = "global-defaults";
@@ -76,6 +77,17 @@ const DOCUMENT_TYPE_OPTIONS = [
   { id: "instruction", label: "Instruction", collection: "documents", extension: "md" },
   { id: "document", label: "Document", collection: "documents", extension: "md" },
 ];
+const SCRIPT_SHELL_OPTIONS = [
+  { id: "zsh", label: "Zsh", extension: "sh" },
+  { id: "bash", label: "Bash", extension: "sh" },
+  { id: "python3", label: "Python", extension: "py" },
+  { id: "node", label: "Node", extension: "js" },
+  { id: "powershell", label: "PowerShell", extension: "ps1" },
+  { id: "cmd", label: "Cmd", extension: "cmd" },
+  { id: "bat", label: "Batch", extension: "bat" },
+];
+const SCRIPT_DEFAULT_BUTTON_COLOR = "#1f3f7a";
+const SCRIPT_DEFAULT_TEXT_COLOR = "#f6d38a";
 
 function normalizedSectionId(value, fallback = "docs") {
   const normalized = text(value);
@@ -253,6 +265,136 @@ function documentPathMetadata(document) {
     folderPath,
     parentPathKey: folderPath,
     pathKey: filePath,
+  };
+}
+
+function scriptShellOption(value) {
+  const shell = text(value, "zsh").toLowerCase();
+  return SCRIPT_SHELL_OPTIONS.find((entry) => entry.id === shell) || SCRIPT_SHELL_OPTIONS[0];
+}
+
+function scriptExtensionForShell(value) {
+  return scriptShellOption(value).extension;
+}
+
+function scriptPathKey(script) {
+  return normalizedDocumentPath(script?.pathKey || script?.path_key || script?.filePath || script?.file_path || script?.id);
+}
+
+function scriptFileName(script) {
+  const explicit = text(script?.fileName || script?.file_name);
+  if (explicit) return explicit;
+  const pathKey = scriptPathKey(script);
+  const leaf = pathKey.split("/").filter(Boolean).pop();
+  if (leaf) return leaf;
+  const extension = text(script?.extension, scriptExtensionForShell(script?.shell));
+  return `${skillSlug(script?.title || "script")}.${extension}`;
+}
+
+function scriptTitle(script) {
+  return text(script?.title || script?.name, scriptFileName(script).replace(/\.[^.]+$/u, "").replace(/[_-]+/gu, " "));
+}
+
+function scriptEditorDraft(script = {}) {
+  const shell = scriptShellOption(script.shell).id;
+  const extension = text(script.extension, scriptExtensionForShell(shell)).replace(/^\./u, "").toLowerCase();
+  const fileName = scriptFileName({ ...script, extension });
+  const pathKey = scriptPathKey(script) || fileName;
+  const content = String(script.content ?? "");
+  const buttonColor = text(script.buttonColor || script.button_color, SCRIPT_DEFAULT_BUTTON_COLOR);
+  const textColor = text(script.textColor || script.text_color, SCRIPT_DEFAULT_TEXT_COLOR);
+  const workingDirectory = text(script.workingDirectory || script.working_directory);
+  return {
+    baseContent: content,
+    baseButtonColor: buttonColor,
+    baseExtension: extension,
+    basePathKey: pathKey,
+    baseShell: shell,
+    baseTextColor: textColor,
+    baseTitle: scriptTitle({ ...script, fileName }),
+    baseWorkingDirectory: workingDirectory,
+    buttonColor,
+    content,
+    contentHash: text(script.contentHash || script.content_hash),
+    extension,
+    fileName,
+    id: text(script.id, pathKey),
+    localPath: text(script.localPath || script.local_path),
+    pathKey,
+    shell,
+    textColor,
+    title: scriptTitle({ ...script, fileName }),
+    updatedAt: text(script.updatedAt || script.updated_at),
+    workingDirectory,
+  };
+}
+
+function scriptSaveRequest(script = {}) {
+  const shell = scriptShellOption(script.shell).id;
+  const extension = text(script.extension, scriptExtensionForShell(shell)).replace(/^\./u, "").toLowerCase();
+  const fileName = scriptFileName({ ...script, extension });
+  return {
+    button_color: text(script.buttonColor || script.button_color, SCRIPT_DEFAULT_BUTTON_COLOR),
+    content: String(script.content ?? ""),
+    extension,
+    file_name: fileName,
+    path_key: scriptPathKey(script) || fileName,
+    shell,
+    text_color: text(script.textColor || script.text_color, SCRIPT_DEFAULT_TEXT_COLOR),
+    title: scriptTitle({ ...script, fileName }),
+    working_directory: text(script.workingDirectory || script.working_directory),
+  };
+}
+
+function scriptHasUnsavedChanges(editor) {
+  if (!editor) return false;
+  return String(editor.content || "") !== String(editor.baseContent ?? "")
+    || text(editor.title) !== text(editor.baseTitle || editor.title)
+    || text(editor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR) !== text(editor.baseButtonColor, SCRIPT_DEFAULT_BUTTON_COLOR)
+    || text(editor.textColor, SCRIPT_DEFAULT_TEXT_COLOR) !== text(editor.baseTextColor, SCRIPT_DEFAULT_TEXT_COLOR)
+    || text(editor.shell, "zsh") !== text(editor.baseShell, "zsh")
+    || text(editor.extension, scriptExtensionForShell(editor.shell)) !== text(editor.baseExtension, scriptExtensionForShell(editor.baseShell))
+    || text(editor.workingDirectory) !== text(editor.baseWorkingDirectory)
+    || text(scriptPathKey(editor)) !== text(editor.basePathKey || scriptPathKey(editor));
+}
+
+function scriptRunLabel(script) {
+  return text(script?.title || script?.name, scriptFileName(script));
+}
+
+function formatScriptLogTime(value) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return "pending";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatScriptLogDuration(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return "pending";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
+
+function scriptRunDisplayLog(result = null) {
+  if (!result) return null;
+  const chunks = Array.isArray(result.chunks) && result.chunks.length
+    ? result.chunks
+    : [
+      String(result.stdout ?? "").length ? { stream: "stdout", text: String(result.stdout) } : null,
+      String(result.stderr ?? "").length ? { stream: "stderr", text: String(result.stderr) } : null,
+      text(result.error) ? { stream: "stderr", text: `${String(result.error)}\n` } : null,
+    ].filter(Boolean);
+  return {
+    ...result,
+    chunks,
+    durationLabel: formatScriptLogDuration(result.durationMs ?? result.duration_ms),
+    endedAtLabel: formatScriptLogTime(result.endedAt || result.ended_at),
+    pathKey: normalizedDocumentPath(result.pathKey || result.path_key),
+    startedAtLabel: formatScriptLogTime(result.startedAt || result.started_at),
+    title: text(result.script?.title || result.title, scriptFileName(result.script || { pathKey: result.pathKey || result.path_key })),
   };
 }
 
@@ -708,9 +850,13 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
 export default function ToolsWorkspaceView({
   onAppControlContextChange = null,
   onAppControlDocumentActions = null,
+  onAppControlScriptActions = null,
+  onLocalScriptsChanged = null,
   defaultWorkingDirectory = "",
   initialSection = "",
   rightToolsOrchestratorOpen = false,
+  scriptLogFocusRequest = null,
+  sharedScriptRunResults = {},
   workspaces = [],
 }) {
   const [section, setSection] = useState(() => normalizedSectionId(initialSection));
@@ -738,7 +884,7 @@ export default function ToolsWorkspaceView({
         setGlobalMcpDefaults({
           error: "",
           rootDirectory: text(data.rootDirectory || data.root_directory),
-          state: "ready",
+          state: result?.ok === false ? "error" : "ready",
           workspaceId: text(data.workspaceId || data.workspace_id, GLOBAL_MCP_DEFAULTS_WORKSPACE_ID),
         });
       })
@@ -871,6 +1017,335 @@ export default function ToolsWorkspaceView({
       // The editor theme is cosmetic; storage failures should not block editing.
     }
   }, [skillEditorTheme]);
+
+  // ---- Scripts (local-only runnable files) ----
+  const [scriptsLibrary, setScriptsLibrary] = useState({ root: "", scripts: [] });
+  const [scriptsState, setScriptsState] = useState("loading");
+  const [scriptsError, setScriptsError] = useState("");
+  const [scriptsMessage, setScriptsMessage] = useState("");
+  const [scriptsQuery, setScriptsQuery] = useState("");
+  const [selectedScriptKey, setSelectedScriptKey] = useState("");
+  const [selectedScriptLogKey, setSelectedScriptLogKey] = useState("");
+  const [scriptPaneTab, setScriptPaneTab] = useState("editor");
+  const [scriptEditor, setScriptEditor] = useState(null);
+  const [scriptEditorSelection, setScriptEditorSelection] = useState({
+    direction: "",
+    end: 0,
+    start: 0,
+    updatedAtMs: 0,
+  });
+  const [lastScriptSelection, setLastScriptSelection] = useState(null);
+  const scriptSelectionClearAtRef = useRef(0);
+  const scriptDocumentCanvasRef = useRef(null);
+  const scriptsExplorerPanelRef = useRef(null);
+  const [scriptsExplorerCollapsed, setScriptsExplorerCollapsed] = useState(false);
+  const [scriptsExplorerSize, setScriptsExplorerSize] = useState("238px");
+  const [newScriptDraft, setNewScriptDraft] = useState({
+    buttonColor: SCRIPT_DEFAULT_BUTTON_COLOR,
+    name: "",
+    shell: "zsh",
+    textColor: SCRIPT_DEFAULT_TEXT_COLOR,
+  });
+  const [scriptRunResults, setScriptRunResults] = useState({});
+  const scriptRunInFlightRef = useRef(false);
+
+  const loadLocalScripts = useCallback(async ({ selectKey = "" } = {}) => {
+    setScriptsState((current) => (current === "ready" ? "refreshing" : "loading"));
+    setScriptsError("");
+    try {
+      const result = await invoke("local_scripts_list", {
+        request: { include_content: false },
+      });
+      const rows = Array.isArray(result?.scripts) ? result.scripts.map(scriptEditorDraft) : [];
+      const rowKeys = new Set(rows.map((row) => scriptPathKey(row) || row.id).filter(Boolean));
+      setScriptsLibrary({
+        root: text(result?.root),
+        scripts: rows,
+      });
+      setScriptEditor((current) => {
+        const currentKey = scriptPathKey(current) || current?.id || "";
+        if (currentKey && current?.localPath && !rowKeys.has(currentKey)) {
+          return null;
+        }
+        return current;
+      });
+      setSelectedScriptKey((current) => (current && !rowKeys.has(current) ? "" : current));
+      setScriptsState("ready");
+      if (selectKey) {
+        const target = rows.find((row) => (scriptPathKey(row) || row.id) === selectKey);
+        if (target) {
+          setSelectedScriptKey(selectKey);
+        }
+      }
+    } catch (error) {
+      setScriptsError(getErrorMessage(error, "Unable to load local scripts."));
+      setScriptsState("error");
+    }
+  }, []);
+
+  const readLocalScript = useCallback(async (script) => {
+    const pathKey = scriptPathKey(script);
+    if (!pathKey) return;
+    setScriptsState((current) => (current === "ready" ? "refreshing" : current));
+    setScriptsError("");
+    try {
+      const result = await invoke("local_scripts_read", {
+        request: { path_key: pathKey },
+      });
+      const editor = scriptEditorDraft(result?.script || script);
+      setSelectedScriptKey(scriptPathKey(editor) || editor.id || pathKey);
+      setScriptEditor(editor);
+      setScriptsLibrary((current) => ({
+        ...current,
+        scripts: current.scripts.map((row) => (
+          (scriptPathKey(row) || row.id) === pathKey ? { ...row, ...editor, content: "" } : row
+        )),
+      }));
+      setScriptsState("ready");
+    } catch (error) {
+      setScriptsError(getErrorMessage(error, "Unable to read local script."));
+      setScriptsState("ready");
+    }
+  }, []);
+
+  const saveLocalScript = useCallback(async (editor = scriptEditor) => {
+    if (!editor) return false;
+    setScriptsState("saving");
+    setScriptsError("");
+    setScriptsMessage("");
+    try {
+      const result = await invoke("local_scripts_save", {
+        request: scriptSaveRequest(editor),
+      });
+      const saved = scriptEditorDraft(result?.script || editor);
+      const key = scriptPathKey(saved) || saved.id;
+      setScriptEditor(saved);
+      setSelectedScriptKey(key);
+      setSelectedScriptLogKey(key);
+      setScriptsLibrary((current) => {
+        const nextRows = [...current.scripts];
+        const index = nextRows.findIndex((row) => (scriptPathKey(row) || row.id) === key);
+        const savedRow = { ...saved, content: "" };
+        if (index >= 0) {
+          nextRows[index] = savedRow;
+        } else {
+          nextRows.push(savedRow);
+        }
+        nextRows.sort((a, b) => scriptPathKey(a).localeCompare(scriptPathKey(b)));
+        return { ...current, scripts: nextRows };
+      });
+      setScriptsState("ready");
+      setScriptsMessage("Saved locally.");
+      onLocalScriptsChanged?.();
+      return true;
+    } catch (error) {
+      setScriptsError(getErrorMessage(error, "Unable to save local script."));
+      setScriptsState("ready");
+      return false;
+    }
+  }, [onLocalScriptsChanged, scriptEditor]);
+
+  const runLocalScript = useCallback(async (script = scriptEditor) => {
+    const source = script || scriptEditor;
+    const pathKey = scriptPathKey(source);
+    if (!pathKey) return null;
+    if (scriptRunInFlightRef.current) {
+      if (
+        scriptRunResults[pathKey]?.state === "running"
+        || sharedScriptRunResults[pathKey]?.state === "running"
+      ) {
+        setSelectedScriptKey(pathKey);
+        setSelectedScriptLogKey(pathKey);
+        setScriptPaneTab("logs");
+        return null;
+      }
+      setScriptsError("A local script is already running.");
+      return null;
+    }
+    scriptRunInFlightRef.current = true;
+    setScriptsState("running");
+    setScriptsError("");
+    setScriptsMessage("");
+    const runId = `script:${pathKey}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+    const startedAt = new Date().toISOString();
+    setSelectedScriptLogKey(pathKey);
+    setScriptPaneTab("logs");
+    setScriptRunResults((current) => ({
+      ...current,
+      [pathKey]: {
+        chunks: [],
+        durationMs: 0,
+        endedAt: "",
+        error: "",
+        exitCode: null,
+        ok: null,
+        pathKey,
+        runId,
+        script: source,
+        state: "running",
+        stderr: "",
+        stdout: "",
+        startedAt,
+        timedOut: false,
+        updatedAt: Date.now(),
+      },
+    }));
+    try {
+      const result = await invoke("local_scripts_run", {
+        request: {
+          default_working_directory: defaultWorkingDirectory,
+          path_key: pathKey,
+          run_id: runId,
+        },
+      });
+      setScriptRunResults((current) => ({
+        ...current,
+        [pathKey]: {
+          chunks: [
+            String(result?.stdout ?? "").length ? { stream: "stdout", text: String(result?.stdout ?? "") } : null,
+            String(result?.stderr ?? "").length ? { stream: "stderr", text: String(result?.stderr ?? "") } : null,
+          ].filter(Boolean),
+          durationMs: Number(result?.duration_ms ?? result?.durationMs) || 0,
+          endedAt: text(result?.ended_at || result?.endedAt, new Date().toISOString()),
+          exitCode: result?.exit_code,
+          error: text(result?.error),
+          ok: result?.ok !== false,
+          pathKey,
+          runId: text(result?.run_id || result?.runId, runId),
+          script: source,
+          state: "ready",
+          stderr: String(result?.stderr ?? ""),
+          stderrTruncated: Boolean(result?.stderr_truncated || result?.stderrTruncated),
+          stdout: String(result?.stdout ?? ""),
+          stdoutTruncated: Boolean(result?.stdout_truncated || result?.stdoutTruncated),
+          timedOut: Boolean(result?.timed_out || result?.timedOut),
+          startedAt: text(result?.started_at || result?.startedAt, startedAt),
+          updatedAt: Date.now(),
+        },
+      }));
+      setScriptsState("ready");
+      setScriptsMessage(result?.ok === false ? "Script finished with errors." : "Script finished.");
+      return result;
+    } catch (error) {
+      const message = getErrorMessage(error, "Unable to run local script.");
+      setScriptsError(message);
+      setScriptsState("ready");
+      setScriptRunResults((current) => ({
+        ...current,
+        [pathKey]: {
+          ...(current[pathKey] || {}),
+          endedAt: new Date().toISOString(),
+          error: message,
+          pathKey,
+          runId,
+          script: source,
+          state: "error",
+          updatedAt: Date.now(),
+        },
+      }));
+      return null;
+    } finally {
+      scriptRunInFlightRef.current = false;
+    }
+  }, [defaultWorkingDirectory, scriptEditor, scriptRunResults, sharedScriptRunResults]);
+
+  const deleteLocalScript = useCallback(async (script = scriptEditor) => {
+    const pathKey = scriptPathKey(script);
+    if (!pathKey) return false;
+    setScriptsState("deleting");
+    setScriptsError("");
+    try {
+      await invoke("local_scripts_delete", {
+        request: { path_key: pathKey },
+      });
+      setScriptsLibrary((current) => ({
+        ...current,
+        scripts: current.scripts.filter((row) => (scriptPathKey(row) || row.id) !== pathKey),
+      }));
+      setScriptEditor((current) => (
+        (scriptPathKey(current) || current?.id) === pathKey ? null : current
+      ));
+      setSelectedScriptKey((current) => (current === pathKey ? "" : current));
+      setSelectedScriptLogKey((current) => (current === pathKey ? "" : current));
+      setScriptRunResults((current) => {
+        if (!Object.prototype.hasOwnProperty.call(current, pathKey)) return current;
+        const next = { ...current };
+        delete next[pathKey];
+        return next;
+      });
+      setScriptsState("ready");
+      setScriptsMessage("Deleted local script.");
+      onLocalScriptsChanged?.();
+      return true;
+    } catch (error) {
+      setScriptsError(getErrorMessage(error, "Unable to delete local script."));
+      setScriptsState("ready");
+      return false;
+    }
+  }, [onLocalScriptsChanged, scriptEditor]);
+
+  const createLocalScriptDraft = useCallback(() => {
+    const name = text(newScriptDraft.name, "New Script");
+    const shell = scriptShellOption(newScriptDraft.shell).id;
+    const extension = scriptExtensionForShell(shell);
+    const existingScriptNames = new Set(
+      scriptsLibrary.scripts
+        .flatMap((row) => {
+          const key = scriptPathKey(row);
+          const fileName = scriptFileName(row);
+          const stem = fileName.replace(/\.[^.]+$/u, "");
+          return [key, fileName, stem].filter(Boolean);
+        }),
+    );
+    const pathKey = `${skillSlug(name, existingScriptNames)}.${extension}`;
+    setSelectedScriptKey("");
+    setSelectedScriptLogKey(pathKey);
+    setScriptPaneTab("editor");
+    setScriptEditor(scriptEditorDraft({
+      button_color: newScriptDraft.buttonColor,
+      content: shell === "python3"
+        ? "#!/usr/bin/env python3\n\nprint(\"hello from Diff Forge\")\n"
+        : shell === "node"
+          ? "#!/usr/bin/env node\n\nconsole.log(\"hello from Diff Forge\");\n"
+          : "#!/usr/bin/env zsh\n\nprintf 'hello from Diff Forge\\n'\n",
+      extension,
+      path_key: pathKey,
+      shell,
+      text_color: newScriptDraft.textColor,
+      title: name,
+    }));
+  }, [newScriptDraft, scriptsLibrary.scripts]);
+
+  const collapseScriptsExplorer = useCallback(() => {
+    setScriptsExplorerCollapsed(true);
+  }, []);
+
+  const expandScriptsExplorer = useCallback(() => {
+    setScriptsExplorerCollapsed(false);
+  }, []);
+
+  const syncScriptsExplorerCollapsedState = useCallback((panelSize) => {
+    const pixels = Number(panelSize?.pixels);
+    const percentage = Number(panelSize?.percentage);
+    const collapsed = Number.isFinite(pixels) ? pixels <= 58 : Number.isFinite(percentage) && percentage <= 6;
+    setScriptsExplorerCollapsed(collapsed);
+    if (!collapsed && Number.isFinite(pixels)) {
+      setScriptsExplorerSize(`${Math.round(pixels)}px`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadLocalScripts();
+  }, [loadLocalScripts]);
+
+  useEffect(() => {
+    if (scriptsExplorerCollapsed) return undefined;
+    if (typeof window === "undefined") return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      scriptsExplorerPanelRef.current?.resize?.(scriptsExplorerSize);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [scriptsExplorerCollapsed, scriptsExplorerSize]);
 
   // ---- CLIs ----
   const [cliStatuses, setCliStatuses] = useState([]);
@@ -1228,13 +1703,19 @@ export default function ToolsWorkspaceView({
     const nextByKey = new Map(nextLibrary.skills.map((skill) => [accountDocumentStorageKey(skill), skill]));
     const currentByKey = new Map(skillsLibrary.skills.map((skill) => [accountDocumentStorageKey(skill), skill]));
     const removed = Array.from(currentByKey.entries())
-      .filter(([key, skill]) => key && !nextByKey.has(key) && !documentIsFolderRow(skill))
+      .filter(([key]) => key && !nextByKey.has(key))
       .map(([, skill]) => skill);
     const upserts = nextLibrary.skills.filter((skill) => {
-      if (documentIsFolderRow(skill)) return false;
       const key = accountDocumentStorageKey(skill);
       const keyOrId = key || text(skill?.id);
       const current = key ? currentByKey.get(key) : null;
+      if (documentIsFolderRow(skill)) {
+        return forcedIds.has(keyOrId)
+          || !current
+          || text(current.title) !== text(skill.title)
+          || normalizedDocumentPath(current.pathKey || current.path_key || current.folderPath || current.folder_path || current.id) !== normalizedDocumentPath(skill.pathKey || skill.path_key || skill.folderPath || skill.folder_path || skill.id)
+          || normalizedDocumentPath(current.parentPathKey || current.parent_path_key || current.parentFolderId || current.parent_folder_id) !== normalizedDocumentPath(skill.parentPathKey || skill.parent_path_key || skill.parentFolderId || skill.parent_folder_id);
+      }
       return forcedIds.has(keyOrId)
         || !current
         || String(current.content || "") !== String(skill.content || "")
@@ -1471,8 +1952,7 @@ export default function ToolsWorkspaceView({
       ...skillsLibrary.skills.filter((entry) => (accountDocumentStorageKey(entry) || entry.id) !== accountDocumentStorageKey(folder)),
       folder,
     ];
-    setSkillsLibrary({ skills: nextSkills });
-    noteAccountSkillUnits(nextSkills);
+    void persistSkillsLibrary(nextSkills, [accountDocumentStorageKey(folder)]);
     setSelectedSkillKey("");
     setSkillEditor(null);
     setNewDocDraft((current) => ({
@@ -1482,7 +1962,7 @@ export default function ToolsWorkspaceView({
       folderPath,
     }));
     return true;
-  }, [skillsLibrary.skills]);
+  }, [persistSkillsLibrary, skillsLibrary.skills]);
 
   const deleteContextTarget = useCallback((target = docsContextMenu?.target || {}) => {
     closeDocsContextMenu();
@@ -2303,13 +2783,148 @@ export default function ToolsWorkspaceView({
     skillEditorReadOnly,
     skillEditorSelection,
     lastDocumentSelection,
-    skillsState,
+      skillsState,
+    ]);
+
+  const scriptEditorKey = scriptEditor ? scriptPathKey(scriptEditor) || scriptEditor.id : "";
+  const scriptEditorBusy = ["saving", "running", "deleting"].includes(scriptsState);
+  const scriptEditorReadOnly = scriptEditorBusy;
+  const scriptsEditorOpen = Boolean(scriptEditor);
+  useEffect(() => {
+    const updatedAtMs = Date.now();
+    scriptSelectionClearAtRef.current = updatedAtMs;
+    setScriptEditorSelection({
+      direction: "",
+      end: 0,
+      start: 0,
+      updatedAtMs,
+    });
+    setLastScriptSelection(null);
+  }, [scriptEditorKey]);
+  const scriptRows = useMemo(() => {
+    const query = text(scriptsQuery).toLowerCase();
+    return (scriptsLibrary.scripts || [])
+      .filter((script) => {
+        if (!query) return true;
+        return [
+          scriptRunLabel(script),
+          scriptPathKey(script),
+          script.shell,
+          script.localPath,
+        ].join(" ").toLowerCase().includes(query);
+      })
+      .sort((a, b) => scriptPathKey(a).localeCompare(scriptPathKey(b)));
+  }, [scriptsLibrary.scripts, scriptsQuery]);
+  const mergedScriptRunResults = useMemo(() => ({
+    ...(scriptRunResults && typeof scriptRunResults === "object" ? scriptRunResults : {}),
+    ...(sharedScriptRunResults && typeof sharedScriptRunResults === "object" ? sharedScriptRunResults : {}),
+  }), [scriptRunResults, sharedScriptRunResults]);
+  useEffect(() => {
+    const pathKey = normalizedDocumentPath(scriptLogFocusRequest?.pathKey || scriptLogFocusRequest?.path_key);
+    if (!pathKey) return;
+    setSection("scripts");
+    setSelectedScriptKey(pathKey);
+    setSelectedScriptLogKey(pathKey);
+    setScriptPaneTab("logs");
+  }, [scriptLogFocusRequest?.pathKey, scriptLogFocusRequest?.path_key, scriptLogFocusRequest?.requestedAt]);
+  const activeScriptLogKey = selectedScriptLogKey || scriptEditorKey || selectedScriptKey;
+  const activeScriptLog = useMemo(() => (
+    scriptRunDisplayLog(mergedScriptRunResults[activeScriptLogKey])
+  ), [activeScriptLogKey, mergedScriptRunResults]);
+  const scriptEditorRows = useMemo(() => {
+    const content = String(scriptEditor?.content || "");
+    const estimatedLines = content.split("\n").reduce((total, line) => {
+      return total + Math.max(1, Math.ceil(line.length / 86));
+    }, 0);
+    return Math.max(28, Math.min(280, estimatedLines + 8));
+  }, [scriptEditor?.content]);
+  const preservedScriptEditorSelection = useMemo(() => {
+    if (!scriptEditor || !lastScriptSelection) return null;
+    const content = String(scriptEditor.content || "");
+    const key = scriptPathKey(scriptEditor) || scriptEditor.id || "";
+    if (
+      !key
+      || lastScriptSelection.scriptKey !== key
+      || lastScriptSelection.draftFingerprint !== documentDraftFingerprint(content)
+    ) {
+      return null;
+    }
+    return documentSelectionSegments(content, lastScriptSelection);
+  }, [scriptEditor, lastScriptSelection]);
+  const appControlScriptContext = useMemo(() => {
+    const content = String(scriptEditor?.content || "");
+    const preview = compactDocumentText(content, 1400);
+    const draftFingerprint = documentDraftFingerprint(content);
+    const editorDirty = scriptHasUnsavedChanges(scriptEditor);
+    const liveSelectionContext = scriptEditor ? documentSelectionContext(content, scriptEditorSelection) : null;
+    const preservedSelectionContext = scriptEditor
+      && lastScriptSelection
+      && lastScriptSelection.scriptKey === scriptEditorKey
+      && lastScriptSelection.draftFingerprint === draftFingerprint
+        ? documentSelectionContext(content, lastScriptSelection)
+        : null;
+    const highlightedRange = liveSelectionContext?.active
+      ? liveSelectionContext
+      : preservedSelectionContext?.active
+        ? {
+          ...preservedSelectionContext,
+          preserved: true,
+        }
+        : liveSelectionContext;
+    return {
+      active: section === "scripts",
+      canDirectEditFile: Boolean(scriptEditor?.localPath),
+      content,
+      contentLength: content.length,
+      contentPreview: preview.text,
+      contentPreviewTruncated: preview.truncated,
+      dirty: Boolean(scriptEditor && editorDirty),
+      editorReadOnly: Boolean(scriptEditorReadOnly),
+      editorState: scriptsState,
+      fullContent: content,
+      highlightedRange,
+      saveModes: ["draft", "local"],
+      script: scriptEditor ? {
+        buttonColor: text(scriptEditor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR),
+        button_color: text(scriptEditor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR),
+        draftFingerprint,
+        extension: text(scriptEditor.extension, scriptExtensionForShell(scriptEditor.shell)),
+        id: text(scriptEditor.id || scriptEditorKey),
+        isDraft: editorDirty || !scriptEditor.localPath,
+        localPath: text(scriptEditor.localPath),
+        local_path: text(scriptEditor.localPath),
+        pathKey: scriptEditorKey,
+        path_key: scriptEditorKey,
+        shell: scriptShellOption(scriptEditor.shell).id,
+        textColor: text(scriptEditor.textColor, SCRIPT_DEFAULT_TEXT_COLOR),
+        text_color: text(scriptEditor.textColor, SCRIPT_DEFAULT_TEXT_COLOR),
+        title: text(scriptEditor.title || scriptEditorKey),
+        workingDirectory: text(scriptEditor.workingDirectory),
+        working_directory: text(scriptEditor.workingDirectory),
+      } : null,
+      section,
+      selectedKey: selectedScriptKey,
+      surface: "tools",
+      type: "tools_script_context",
+      updatedAtMs: Date.now(),
+    };
+  }, [
+    lastScriptSelection,
+    scriptEditor,
+    scriptEditorKey,
+    scriptEditorReadOnly,
+    scriptEditorSelection,
+    scriptsState,
+    section,
+    selectedScriptKey,
   ]);
+
+  const activeAppControlContext = section === "scripts" ? appControlScriptContext : appControlDocumentContext;
 
   useEffect(() => {
     if (typeof onAppControlContextChange !== "function") return;
-    onAppControlContextChange(appControlDocumentContext);
-  }, [appControlDocumentContext, onAppControlContextChange]);
+    onAppControlContextChange(activeAppControlContext);
+  }, [activeAppControlContext, onAppControlContextChange]);
 
   useEffect(() => {
     if (typeof onAppControlContextChange !== "function") return undefined;
@@ -2318,7 +2933,7 @@ export default function ToolsWorkspaceView({
         active: false,
         section: "",
         surface: "tools",
-        type: "tools_document_context",
+        type: "tools_context",
         updatedAtMs: Date.now(),
       });
     };
@@ -2612,6 +3227,154 @@ export default function ToolsWorkspaceView({
     return onAppControlDocumentActions(appControlDocumentActions);
   }, [appControlDocumentActions, onAppControlDocumentActions]);
 
+  const updateSelectedScriptFromAppControl = useCallback(async (input = {}) => {
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(input, key);
+    const requestedTitle = hasOwn("title")
+      ? text(input.title)
+      : hasOwn("name")
+        ? text(input.name)
+        : "";
+    const requestedShell = hasOwn("shell") ? text(input.shell) : "";
+    const hasContentPatch = hasOwn("content") || hasOwn("content_md");
+    const requestedContent = hasOwn("content")
+      ? String(input.content ?? "")
+      : hasOwn("content_md")
+        ? String(input.content_md ?? "")
+        : "";
+    const current = scriptEditor || scriptEditorDraft({
+      button_color: SCRIPT_DEFAULT_BUTTON_COLOR,
+      content: "",
+      shell: requestedShell || newScriptDraft.shell,
+      text_color: SCRIPT_DEFAULT_TEXT_COLOR,
+      title: requestedTitle || newScriptDraft.name || "New Script",
+    });
+    const nextShell = requestedShell ? scriptShellOption(requestedShell).id : current.shell;
+    const nextExtension = text(
+      input.extension || input.ext || current.extension,
+      scriptExtensionForShell(nextShell),
+    ).replace(/^\./u, "").toLowerCase();
+    const nextEditor = {
+      ...current,
+      buttonColor: text(input.button_color || input.buttonColor, current.buttonColor || SCRIPT_DEFAULT_BUTTON_COLOR),
+      content: hasContentPatch ? requestedContent : String(current.content || ""),
+      extension: nextExtension,
+      shell: nextShell,
+      textColor: text(input.text_color || input.textColor, current.textColor || SCRIPT_DEFAULT_TEXT_COLOR),
+      title: requestedTitle || current.title || "New Script",
+      workingDirectory: text(input.working_directory || input.workingDirectory, current.workingDirectory),
+    };
+    const requestedPath = normalizedDocumentPath(input.path_key || input.path || input.file_path);
+    if (requestedPath) {
+      nextEditor.pathKey = requestedPath;
+      nextEditor.fileName = requestedPath.split("/").filter(Boolean).pop() || nextEditor.fileName;
+    } else if (!scriptPathKey(nextEditor)) {
+      nextEditor.pathKey = `${skillSlug(nextEditor.title)}.${nextExtension}`;
+      nextEditor.fileName = nextEditor.pathKey;
+    }
+    setScriptEditor(nextEditor);
+    setSelectedScriptKey(scriptPathKey(nextEditor) || nextEditor.id || "");
+    if (hasContentPatch) {
+      clearScriptSelection();
+    }
+    const requestedMode = text(input.mode || input.save_mode, input.save === true ? "local" : "draft").toLowerCase();
+    const shouldRun = ["run", "execute"].includes(requestedMode) || input.run === true;
+    const shouldSave = input.save === true
+      || shouldRun
+      || !["", "draft", "edit", "update", "none"].includes(requestedMode);
+    if (shouldSave) {
+      const ok = await saveLocalScript(nextEditor);
+      if (shouldRun && ok) {
+        const runResult = await runLocalScript(nextEditor);
+        return {
+          ok: Boolean(runResult?.ok !== false),
+          context: appControlScriptContext,
+          mode: "run",
+          result: runResult,
+          source: "script_editor",
+        };
+      }
+      return {
+        ok: Boolean(ok),
+        context: appControlScriptContext,
+        mode: "local",
+        source: "script_editor",
+      };
+    }
+    return {
+      ok: true,
+      context: appControlScriptContext,
+      mode: "draft",
+      source: "script_editor",
+    };
+  }, [
+    appControlScriptContext,
+    clearScriptSelection,
+    newScriptDraft.name,
+    newScriptDraft.shell,
+    runLocalScript,
+    saveLocalScript,
+    scriptEditor,
+  ]);
+
+  const appControlScriptActions = useMemo(() => ({
+    getSelectedScriptContext: async () => appControlScriptContext,
+    runSelectedScript: async () => {
+      if (!scriptEditor) {
+        return {
+          ok: false,
+          error: {
+            code: "no_selected_script",
+            message: "No local script is selected.",
+          },
+          context: appControlScriptContext,
+        };
+      }
+      if (scriptHasUnsavedChanges(scriptEditor) || !scriptEditor.localPath) {
+        const saved = await saveLocalScript(scriptEditor);
+        if (!saved) {
+          return {
+            ok: false,
+            error: {
+              code: "script_save_failed",
+              message: "The local script could not be saved before running.",
+            },
+            context: appControlScriptContext,
+          };
+        }
+      }
+      const result = await runLocalScript(scriptEditor);
+      return {
+        ok: result?.ok !== false,
+        context: appControlScriptContext,
+        result,
+      };
+    },
+    saveSelectedScript: async () => {
+      if (!scriptEditor) {
+        return {
+          ok: false,
+          error: {
+            code: "no_selected_script",
+            message: "No local script is selected.",
+          },
+          context: appControlScriptContext,
+        };
+      }
+      const ok = await saveLocalScript(scriptEditor);
+      return {
+        ok: Boolean(ok),
+        context: appControlScriptContext,
+        mode: "local",
+      };
+    },
+    updateSelectedScript: updateSelectedScriptFromAppControl,
+  }), [appControlScriptContext, runLocalScript, saveLocalScript, scriptEditor, updateSelectedScriptFromAppControl]);
+
+  useEffect(() => {
+    if (typeof onAppControlScriptActions !== "function") return undefined;
+    return onAppControlScriptActions(appControlScriptActions);
+  }, [appControlScriptActions, onAppControlScriptActions]);
+
   const docsCreateMode = !skillEditor;
   const showDocsTemplatesPane = docsCreateMode && !rightToolsOrchestratorOpen;
   const skillEditorRows = useMemo(() => {
@@ -2636,6 +3399,14 @@ export default function ToolsWorkspaceView({
   }, [skillEditor, lastDocumentSelection]);
   const scrollSkillDocumentCanvas = useCallback((event) => {
     const canvas = skillDocumentCanvasRef.current;
+    if (!canvas) return;
+    event.preventDefault();
+    event.stopPropagation();
+    canvas.scrollTop += event.deltaY;
+    canvas.scrollLeft += event.deltaX;
+  }, []);
+  const scrollScriptDocumentCanvas = useCallback((event) => {
+    const canvas = scriptDocumentCanvasRef.current;
     if (!canvas) return;
     event.preventDefault();
     event.stopPropagation();
@@ -2684,9 +3455,62 @@ export default function ToolsWorkspaceView({
       setLastDocumentSelection(null);
     }
   }, [skillEditor]);
+  const clearScriptSelection = useCallback(() => {
+    const updatedAtMs = Date.now();
+    scriptSelectionClearAtRef.current = updatedAtMs;
+    setScriptEditorSelection({
+      direction: "",
+      end: 0,
+      start: 0,
+      updatedAtMs,
+    });
+    setLastScriptSelection(null);
+  }, []);
+  const updateScriptEditorSelection = useCallback((event) => {
+    const target = event?.target;
+    const start = Number(target?.selectionStart);
+    const end = Number(target?.selectionEnd);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      return;
+    }
+    const updatedAtMs = Date.now();
+    const eventType = text(event?.type);
+    const suppressPreserve = eventType === "blur"
+      && updatedAtMs - scriptSelectionClearAtRef.current < 400;
+    const nextSelection = {
+      direction: text(target?.selectionDirection),
+      end,
+      start,
+      updatedAtMs,
+    };
+    setScriptEditorSelection({ ...nextSelection });
+    if (!scriptEditor) {
+      return;
+    }
+    const scriptKey = scriptPathKey(scriptEditor) || scriptEditor.id || "";
+    const content = String(scriptEditor.content || "");
+    if (scriptKey && end > start) {
+      if (suppressPreserve) {
+        setLastScriptSelection(null);
+        return;
+      }
+      setLastScriptSelection({
+        ...nextSelection,
+        contentLength: content.length,
+        draftFingerprint: documentDraftFingerprint(content),
+        scriptKey,
+      });
+      return;
+    }
+    if (suppressPreserve || (target && typeof document !== "undefined" && document.activeElement === target)) {
+      setLastScriptSelection(null);
+    }
+  }, [scriptEditor]);
   useEffect(() => {
-    if (!skillEditorOpen || typeof window === "undefined") return undefined;
-    const canvas = skillDocumentCanvasRef.current;
+    if ((!skillEditorOpen && !scriptsEditorOpen) || typeof window === "undefined") return undefined;
+    const canvas = section === "scripts"
+      ? scriptDocumentCanvasRef.current
+      : skillDocumentCanvasRef.current;
     if (!canvas) return undefined;
 
     let animationFrame = 0;
@@ -2719,7 +3543,7 @@ export default function ToolsWorkspaceView({
       observer?.disconnect();
       window.removeEventListener("resize", scheduleUpdate);
     };
-  }, [skillEditorOpen]);
+  }, [scriptDocumentCanvasRef, scriptsEditorOpen, section, skillEditorOpen]);
 
   return (
     <ToolsHubShell aria-label="Global toolkit" data-section={section}>
@@ -2773,7 +3597,7 @@ export default function ToolsWorkspaceView({
         </ToolsMcpPane>
       )}
 
-      {(section === "docs" || section === "clis") && (
+      {(section === "docs" || section === "clis" || section === "scripts") && (
         <ToolsScroll data-section={section}>
           <ToolsLayout data-section={section}>
             {section === "docs" && (
@@ -3290,6 +4114,429 @@ export default function ToolsWorkspaceView({
               </DocsWorkspaceSurface>
             )}
 
+            {section === "scripts" && (
+              <DocsWorkspaceSurface
+                aria-label="Scripts workspace"
+                data-docs-explorer-collapsed={scriptsExplorerCollapsed ? "true" : "false"}
+                data-scripts-surface="true"
+                style={{ "--docs-explorer-offset": scriptsExplorerCollapsed ? "0px" : scriptsExplorerSize }}
+              >
+                {scriptsExplorerCollapsed && (
+                  <DocsExplorerRestoreButton
+                    aria-label="Show script explorer"
+                    onClick={expandScriptsExplorer}
+                    title="Show script explorer"
+                    type="button"
+                  >
+                    <span className="codicon codicon-layout-sidebar-left" aria-hidden="true" />
+                    <span>Explorer</span>
+                  </DocsExplorerRestoreButton>
+                )}
+                <DocsWorkspaceGrid
+                  data-surface="files"
+                  data-show-explorer={scriptsExplorerCollapsed ? "false" : "true"}
+                  data-show-templates="false"
+                  key={`scripts-${scriptsExplorerCollapsed ? "explorer-hidden" : "explorer-visible"}`}
+                  orientation="horizontal"
+                >
+                  {!scriptsExplorerCollapsed && (
+                    <>
+                      <ResizePanel
+                        data-surface="files"
+                        defaultSize={scriptsExplorerSize}
+                        groupResizeBehavior="preserve-pixel-size"
+                        id="scripts-explorer"
+                        maxSize="360px"
+                        minSize="184px"
+                        onResize={syncScriptsExplorerCollapsedState}
+                        panelRef={scriptsExplorerPanelRef}
+                      >
+                        <DocsFilesPane aria-label="Local scripts" data-collapsed="false">
+                          <FileExplorerHeader>
+                            <div>
+                              <PanelKicker>Explorer</PanelKicker>
+                            </div>
+                            <FileExplorerActions>
+                              <FileIconButton
+                                aria-label="Refresh scripts"
+                                disabled={scriptsState === "loading" || scriptsState === "refreshing"}
+                                onClick={() => void loadLocalScripts()}
+                                title="Refresh scripts"
+                                type="button"
+                              >
+                                <ButtonRefreshIcon aria-hidden="true" />
+                              </FileIconButton>
+                              <FileIconButton
+                                aria-label="Collapse scripts explorer"
+                                onClick={collapseScriptsExplorer}
+                                title="Collapse scripts explorer"
+                                type="button"
+                              >
+                                <span className="codicon codicon-chevron-left" aria-hidden="true" />
+                              </FileIconButton>
+                            </FileExplorerActions>
+                          </FileExplorerHeader>
+                          <DocsRootPath title={scriptsLibrary.root || "Local scripts"}>local-scripts / scripts</DocsRootPath>
+                          <DocsExplorerSearchInput
+                            aria-label="Search local scripts"
+                            onChange={(event) => setScriptsQuery(event.target.value)}
+                            placeholder="Search .sh, .py, .js…"
+                            type="search"
+                            value={scriptsQuery}
+                          />
+                          <FileTree aria-label="Local script explorer">
+                            <FileTreeItem>
+                              <DocsExplorerFolderButton
+                                $depth={0}
+                                as="div"
+                                data-selected="false"
+                              >
+                                <FileDisclosure>
+                                  <span className="codicon codicon-chevron-down" aria-hidden="true" />
+                                </FileDisclosure>
+                                <FileKindIcon data-file-tone="folder">
+                                  <span className="codicon codicon-folder-opened" aria-hidden="true" />
+                                </FileKindIcon>
+                                <FileTreeName title="scripts">scripts</FileTreeName>
+                                <DocsExplorerCount>{scriptRows.length || ""}</DocsExplorerCount>
+                              </DocsExplorerFolderButton>
+                              {scriptRows.length ? (
+                                scriptRows.map((row) => {
+                                  const pathKey = scriptPathKey(row) || row.id;
+                                  const active = selectedScriptKey === pathKey || scriptEditorKey === pathKey;
+                                  const extension = text(row.extension, "sh");
+                                  const fileTone = extension === "py"
+                                    ? "python"
+                                    : ["js", "mjs", "cjs"].includes(extension)
+                                      ? "javascript"
+                                      : "terminal";
+                                  return (
+                                    <DocsExplorerFileButton
+                                      $depth={1}
+                                      data-selected={active ? "true" : "false"}
+                                      key={pathKey}
+                                      onClick={() => {
+                                        setScriptPaneTab("editor");
+                                        setSelectedScriptLogKey(pathKey);
+                                        void readLocalScript(row);
+                                      }}
+                                      title={[scriptRunLabel(row), pathKey, row.localPath].filter(Boolean).join(" · ")}
+                                      type="button"
+                                    >
+                                      <FileDisclosure />
+                                      <FileKindIcon data-file-tone={fileTone}>
+                                        <span className="codicon codicon-file-code" aria-hidden="true" />
+                                      </FileKindIcon>
+                                      <FileTreeName title={pathKey}>{scriptFileName(row)}</FileTreeName>
+                                      <DocsExplorerStatus title={mergedScriptRunResults[pathKey]?.state === "running" ? "Running" : row.shell}>
+                                        {mergedScriptRunResults[pathKey]?.state === "running" ? (
+                                          <DocsExplorerSpinner aria-label="Running script" role="status" />
+                                        ) : ""}
+                                      </DocsExplorerStatus>
+                                    </DocsExplorerFileButton>
+                                  );
+                                })
+                              ) : (
+                                <FileTreeEmpty>{text(scriptsQuery) ? "No matching scripts." : "No scripts saved yet."}</FileTreeEmpty>
+                              )}
+                            </FileTreeItem>
+                          </FileTree>
+                        </DocsFilesPane>
+                      </ResizePanel>
+                      <ResizeHandle data-direction="horizontal" data-surface="files" />
+                    </>
+                  )}
+
+                  <ResizePanel data-surface="files" id="scripts-editor" minSize="360px">
+                    <DocsCenterPane aria-label="Local script editor">
+                      {scriptsError && <ToolsError role="alert">{scriptsError}</ToolsError>}
+                      {scriptsMessage && <ToolsNotice>{scriptsMessage}</ToolsNotice>}
+                      <ScriptPaneTabs aria-label="Script view" role="tablist">
+                        {["editor", "logs"].map((tab) => (
+                          <ScriptPaneTabButton
+                            aria-selected={scriptPaneTab === tab}
+                            data-active={scriptPaneTab === tab ? "true" : "false"}
+                            key={tab}
+                            onClick={() => setScriptPaneTab(tab)}
+                            role="tab"
+                            type="button"
+                          >
+                            {tab === "editor" ? "Editor" : "Logs"}
+                          </ScriptPaneTabButton>
+                        ))}
+                      </ScriptPaneTabs>
+                      {scriptPaneTab === "logs" ? (
+                        <ScriptLogsPanel aria-live={activeScriptLog?.state === "running" ? "polite" : "off"}>
+                          {activeScriptLog ? (
+                            <>
+                              <ScriptLogsHeader>
+                                <div>
+                                  <strong>{activeScriptLog.title}</strong>
+                                  <span>{activeScriptLog.pathKey || activeScriptLog.script?.pathKey || "local script"}</span>
+                                </div>
+                                <ScriptLogsStatus data-state={activeScriptLog.state}>
+                                  {activeScriptLog.state === "running" && <DocsExplorerSpinner aria-hidden="true" />}
+                                  <span>
+                                    {activeScriptLog.state === "running"
+                                      ? "Running"
+                                      : activeScriptLog.ok === false || activeScriptLog.state === "error"
+                                        ? "Finished with errors"
+                                        : "Finished"}
+                                  </span>
+                                </ScriptLogsStatus>
+                              </ScriptLogsHeader>
+                              <ScriptLogsMeta>
+                                <span>Start {activeScriptLog.startedAtLabel}</span>
+                                <span>End {activeScriptLog.state === "running" ? "pending" : activeScriptLog.endedAtLabel}</span>
+                                <span>Duration {activeScriptLog.state === "running" ? "running" : activeScriptLog.durationLabel}</span>
+                                {activeScriptLog.exitCode !== null && activeScriptLog.exitCode !== undefined && (
+                                  <span>Exit {String(activeScriptLog.exitCode)}</span>
+                                )}
+                              </ScriptLogsMeta>
+                              <ScriptLogsTerminal role="log">
+                                {activeScriptLog.chunks.length ? (
+                                  activeScriptLog.chunks.map((chunk, index) => (
+                                    <ScriptLogChunk data-stream={chunk.stream === "stderr" ? "stderr" : "stdout"} key={`${index}-${chunk.stream}`}>
+                                      {String(chunk.text || "")}
+                                    </ScriptLogChunk>
+                                  ))
+                                ) : (
+                                  <ScriptLogsPlaceholder>
+                                    {activeScriptLog.state === "running" ? "Waiting for output…" : "No output."}
+                                  </ScriptLogsPlaceholder>
+                                )}
+                                {activeScriptLog.error && (
+                                  <ScriptLogChunk data-stream="stderr">{`${activeScriptLog.error}\n`}</ScriptLogChunk>
+                                )}
+                                {(activeScriptLog.stdoutTruncated || activeScriptLog.stderrTruncated) && (
+                                  <ScriptLogsPlaceholder>Output was truncated by Diff Forge.</ScriptLogsPlaceholder>
+                                )}
+                              </ScriptLogsTerminal>
+                            </>
+                          ) : (
+                            <ScriptLogsEmpty>
+                              <strong>No script run selected</strong>
+                              <span>Run a script from the bottom bar or the editor to see ephemeral logs here.</span>
+                            </ScriptLogsEmpty>
+                          )}
+                        </ScriptLogsPanel>
+                      ) : scriptEditor ? (
+                        <SkillDocumentEditor data-page-theme={skillEditorTheme}>
+                          <SkillDocumentToolbar>
+                            <SkillDocumentToolbarControls data-side="left">
+                              <SkillDocumentThemeSwitch aria-label="Script editor page theme">
+                                {["dark", "light"].map((theme) => (
+                                  <SkillDocumentThemeButton
+                                    aria-pressed={skillEditorTheme === theme}
+                                    data-active={skillEditorTheme === theme ? "true" : "false"}
+                                    key={theme}
+                                    onClick={() => setSkillEditorTheme(theme)}
+                                    type="button"
+                                  >
+                                    {theme === "dark" ? "Dark" : "Light"}
+                                  </SkillDocumentThemeButton>
+                                ))}
+                              </SkillDocumentThemeSwitch>
+                              <ScriptColorField title="Button color">
+                                <span>Button</span>
+                                <input
+                                  aria-label="Script button color"
+                                  onChange={(event) => setScriptEditor((current) => ({ ...current, buttonColor: event.target.value }))}
+                                  type="color"
+                                  value={text(scriptEditor.buttonColor, SCRIPT_DEFAULT_BUTTON_COLOR)}
+                                />
+                              </ScriptColorField>
+                              <ScriptColorField title="Text color">
+                                <span>Text</span>
+                                <input
+                                  aria-label="Script button text color"
+                                  onChange={(event) => setScriptEditor((current) => ({ ...current, textColor: event.target.value }))}
+                                  type="color"
+                                  value={text(scriptEditor.textColor, SCRIPT_DEFAULT_TEXT_COLOR)}
+                                />
+                              </ScriptColorField>
+                            </SkillDocumentToolbarControls>
+                            <SkillDocumentToolbarControls data-side="right">
+                              <SkillDocumentActions data-placement="toolbar">
+                                <ToolsGhostButton
+                                  onClick={() => {
+                                    setScriptEditor(null);
+                                    setSelectedScriptKey("");
+                                  }}
+                                  type="button"
+                                >
+                                  Close
+                                </ToolsGhostButton>
+                                {scriptEditor.localPath && (
+                                  <ToolsGhostButton
+                                    data-danger="true"
+                                    disabled={scriptEditorReadOnly}
+                                    onClick={() => void deleteLocalScript(scriptEditor)}
+                                    type="button"
+                                  >
+                                    Delete
+                                  </ToolsGhostButton>
+                                )}
+                                <ToolsGhostButton
+                                  disabled={!text(scriptEditor.title) || scriptEditorReadOnly}
+                                  onClick={() => void saveLocalScript(scriptEditor)}
+                                  type="button"
+                                >
+                                  {scriptsState === "saving" ? "Saving…" : "Save Local"}
+                                </ToolsGhostButton>
+                                <ToolsPrimaryButton
+                                  disabled={!text(scriptEditor.title) || scriptsState === "running"}
+                                  onClick={async () => {
+                                    const saved = scriptHasUnsavedChanges(scriptEditor) || !scriptEditor.localPath
+                                      ? await saveLocalScript(scriptEditor)
+                                      : true;
+                                    if (saved) {
+                                      await runLocalScript(scriptEditor);
+                                    }
+                                  }}
+                                  type="button"
+                                >
+                                  {scriptsState === "running" ? "Running…" : "Run"}
+                                </ToolsPrimaryButton>
+                              </SkillDocumentActions>
+                            </SkillDocumentToolbarControls>
+                          </SkillDocumentToolbar>
+                          <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={skillDocumentMetricsStyle}>
+                            <SkillDocumentPage onPointerDownCapture={clearScriptSelection}>
+                              <SkillDocumentTitleInput
+                                aria-label="Script name"
+                                onChange={(event) => setScriptEditor((current) => ({ ...current, title: event.target.value }))}
+                                placeholder="script_name"
+                                readOnly={scriptEditorReadOnly}
+                                value={scriptEditor.title}
+                              />
+                              <ScriptMetaRow>
+                                <DocTypeSelect
+                                  aria-label="Script shell"
+                                  disabled={scriptEditorReadOnly}
+                                  onChange={(event) => {
+                                    const shell = event.target.value;
+                                    setScriptEditor((current) => ({
+                                      ...current,
+                                      extension: scriptExtensionForShell(shell),
+                                      shell,
+                                    }));
+                                  }}
+                                  value={scriptShellOption(scriptEditor.shell).id}
+                                >
+                                  {SCRIPT_SHELL_OPTIONS.map((option) => (
+                                    <option key={option.id} value={option.id}>{option.label}</option>
+                                  ))}
+                                </DocTypeSelect>
+                                <span>{scriptPathKey(scriptEditor) || scriptFileName(scriptEditor)}</span>
+                              </ScriptMetaRow>
+                              <SkillDocumentBodyStack>
+                                {preservedScriptEditorSelection?.active && (
+                                  <ScriptSelectionOverlay aria-hidden="true">
+                                    <span>{preservedScriptEditorSelection.before}</span>
+                                    <SkillDocumentSelectionMark>{preservedScriptEditorSelection.selected}</SkillDocumentSelectionMark>
+                                    <span>{preservedScriptEditorSelection.after}</span>
+                                  </ScriptSelectionOverlay>
+                                )}
+                                <ToolsScriptEditor
+                                  aria-label="Script content"
+                                  onBlur={updateScriptEditorSelection}
+                                  onChange={(event) => {
+                                    updateScriptEditorSelection(event);
+                                    setScriptEditor((current) => ({ ...current, content: event.target.value }));
+                                  }}
+                                  onKeyUp={updateScriptEditorSelection}
+                                  onMouseUp={updateScriptEditorSelection}
+                                  onSelect={updateScriptEditorSelection}
+                                  onWheelCapture={scrollScriptDocumentCanvas}
+                                  placeholder="#!/usr/bin/env zsh"
+                                  readOnly={scriptEditorReadOnly}
+                                  rows={scriptEditorRows}
+                                  spellCheck={false}
+                                  value={scriptEditor.content}
+                                />
+                              </SkillDocumentBodyStack>
+                            </SkillDocumentPage>
+                          </SkillDocumentCanvas>
+                        </SkillDocumentEditor>
+                      ) : (
+                        <DocsCreateModal>
+                          <DocsCreateHeader>
+                            <div>
+                              <ToolsPanelTitle>New script</ToolsPanelTitle>
+                              <DocsCreateFileName>
+                                {text(newScriptDraft.name)
+                                  ? `${skillSlug(newScriptDraft.name)}.${scriptExtensionForShell(newScriptDraft.shell)}`
+                                  : `untitled.${scriptExtensionForShell(newScriptDraft.shell)}`}
+                              </DocsCreateFileName>
+                            </div>
+                            <ToolsStatusPill data-tone={scriptsState === "ready" ? "good" : "muted"}>
+                              Local only
+                            </ToolsStatusPill>
+                          </DocsCreateHeader>
+                          <ScriptCreateFields>
+                            <DocsField>
+                              <label htmlFor="tools-script-name">Name</label>
+                              <input
+                                autoComplete="off"
+                                id="tools-script-name"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, name: event.target.value }))}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    createLocalScriptDraft();
+                                  }
+                                }}
+                                placeholder="Run_Tests"
+                                value={newScriptDraft.name}
+                              />
+                            </DocsField>
+                            <DocsField>
+                              <label htmlFor="tools-script-shell">Shell</label>
+                              <select
+                                id="tools-script-shell"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, shell: event.target.value }))}
+                                value={newScriptDraft.shell}
+                              >
+                                {SCRIPT_SHELL_OPTIONS.map((option) => (
+                                  <option key={option.id} value={option.id}>{option.label}</option>
+                                ))}
+                              </select>
+                            </DocsField>
+                            <ScriptColorCreateField>
+                              <label htmlFor="tools-script-button-color">Button</label>
+                              <input
+                                id="tools-script-button-color"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, buttonColor: event.target.value }))}
+                                type="color"
+                                value={newScriptDraft.buttonColor}
+                              />
+                            </ScriptColorCreateField>
+                            <ScriptColorCreateField>
+                              <label htmlFor="tools-script-text-color">Text</label>
+                              <input
+                                id="tools-script-text-color"
+                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, textColor: event.target.value }))}
+                                type="color"
+                                value={newScriptDraft.textColor}
+                              />
+                            </ScriptColorCreateField>
+                          </ScriptCreateFields>
+                          <ToolsPrimaryButton
+                            disabled={!text(newScriptDraft.name)}
+                            onClick={createLocalScriptDraft}
+                            type="button"
+                          >
+                            Create script
+                          </ToolsPrimaryButton>
+                        </DocsCreateModal>
+                      )}
+                    </DocsCenterPane>
+                  </ResizePanel>
+                </DocsWorkspaceGrid>
+              </DocsWorkspaceSurface>
+            )}
+
             {section === "clis" && (
               <ToolsPanel aria-label="CLIs">
                 <CliSearchRow>
@@ -3533,7 +4780,8 @@ const ToolsScroll = styled.div`
   scrollbar-gutter: stable;
   padding: 14px 16px 24px;
 
-  &[data-section="docs"] {
+  &[data-section="docs"],
+  &[data-section="scripts"] {
     display: grid;
     grid-template-rows: minmax(0, 1fr);
     height: 100%;
@@ -3664,7 +4912,8 @@ const ToolsLayout = styled.section`
   gap: 12px;
   min-width: 0;
 
-  &[data-section="docs"] {
+  &[data-section="docs"],
+  &[data-section="scripts"] {
     grid-template-rows: minmax(0, 1fr);
     align-content: stretch;
     width: 100%;
@@ -4553,6 +5802,263 @@ const ToolsSkillsEditor = styled.textarea`
   &:read-only {
     caret-color: transparent;
     cursor: default;
+  }
+`;
+
+const ToolsScriptEditor = styled(ToolsSkillsEditor)`
+  font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: calc(var(--skill-document-body-font-size, 15px) * 0.9);
+  font-weight: 560;
+  line-height: 1.62;
+  tab-size: 2;
+`;
+
+const ScriptPaneTabs = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  max-width: 100%;
+  margin: 12px 16px 0;
+  padding: 4px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 10px;
+  background: var(--tools-control-bg, rgba(7, 10, 15, 0.58));
+`;
+
+const ScriptPaneTabButton = styled.button`
+  min-width: 74px;
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--forge-text-muted, #8d96a6);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 850;
+  cursor: pointer;
+
+  &[data-active="true"] {
+    color: var(--forge-text-strong, #f6f8fb);
+    background: rgba(var(--forge-tint-rgb), 0.2);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-tint-rgb), 0.5);
+    outline-offset: 2px;
+  }
+`;
+
+const ScriptLogsPanel = styled.section`
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 14px 16px 18px;
+`;
+
+const ScriptLogsHeader = styled.header`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 10px;
+  background:
+    linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.12), rgba(214, 164, 70, 0.08)),
+    rgba(12, 16, 23, 0.72);
+
+  div {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  strong,
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: var(--forge-text-strong, #f6f8fb);
+    font-size: 15px;
+    font-weight: 900;
+  }
+
+  span {
+    color: var(--forge-text-muted, #8d96a6);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 10px;
+    font-weight: 760;
+  }
+`;
+
+const ScriptLogsStatus = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  border-radius: 999px;
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.16);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+
+  &[data-state="error"] {
+    border-color: rgba(248, 113, 113, 0.28);
+    color: #fca5a5;
+    background: rgba(127, 29, 29, 0.18);
+  }
+`;
+
+const ScriptLogsMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+
+  span {
+    min-height: 24px;
+    padding: 5px 9px;
+    border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+    border-radius: 999px;
+    color: var(--forge-text-muted, #8d96a6);
+    background: rgba(8, 11, 16, 0.58);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 10px;
+    font-weight: 760;
+  }
+`;
+
+const ScriptLogsTerminal = styled.pre`
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 10px;
+  overflow: auto;
+  background: #05070a;
+  color: #d8dee9;
+  font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+`;
+
+const ScriptLogChunk = styled.span`
+  display: inline;
+  color: inherit;
+
+  &[data-stream="stderr"] {
+    color: #fca5a5;
+  }
+`;
+
+const ScriptLogsPlaceholder = styled.span`
+  display: block;
+  color: var(--forge-text-muted, #8d96a6);
+`;
+
+const ScriptLogsEmpty = styled.div`
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  min-height: 220px;
+  color: var(--forge-text-muted, #8d96a6);
+  text-align: center;
+
+  strong {
+    color: var(--forge-text-strong, #f6f8fb);
+    font-size: 15px;
+    font-weight: 900;
+  }
+
+  span {
+    max-width: 34rem;
+    font-size: 12px;
+    font-weight: 680;
+  }
+`;
+
+const ScriptSelectionOverlay = styled(SkillDocumentSelectionOverlay)`
+  font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: calc(var(--skill-document-body-font-size, 15px) * 0.9);
+  font-weight: 560;
+  line-height: 1.62;
+  tab-size: 2;
+`;
+
+const ScriptMetaRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 12px;
+  color: var(--skill-editor-page-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 10px;
+  font-weight: 700;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const ScriptColorField = styled.label`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 31px;
+  padding: 0 8px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  color: var(--forge-text-muted, #7a8493);
+  background: var(--tools-control-bg);
+  font-size: 10px;
+  font-weight: 780;
+
+  input {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    cursor: pointer;
+  }
+`;
+
+const ScriptCreateFields = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 72px 72px;
+  gap: 10px;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    grid-template-columns: minmax(0, 1fr) 120px;
+  }
+`;
+
+const ScriptColorCreateField = styled(DocsField)`
+  input[type="color"] {
+    padding: 3px;
+    cursor: pointer;
   }
 `;
 

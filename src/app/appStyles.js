@@ -3912,6 +3912,91 @@ export const WorkspaceViewPane = styled.div`
   }
 `;
 
+export const AppGlobalScriptsShelf = styled.div`
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 12px;
+  z-index: 280;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-height: 54px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 8px;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.22);
+  border-radius: 10px;
+  background:
+    linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.14), rgba(214, 164, 70, 0.1)),
+    color-mix(in srgb, var(--forge-shell-panel, #10151f) 90%, transparent);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(16px) saturate(130%);
+  scrollbar-width: thin;
+  pointer-events: auto;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(var(--forge-tint-rgb), 0.16);
+    background:
+      linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.1), rgba(214, 164, 70, 0.08)),
+      rgba(255, 255, 255, 0.82);
+    box-shadow: 0 16px 32px rgba(15, 23, 42, 0.14);
+  }
+`;
+
+export const AppGlobalScriptButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  gap: 7px;
+  min-width: 96px;
+  max-width: 220px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--script-button-color, #f6d38a) 38%, transparent);
+  border-radius: 8px;
+  color: var(--script-button-color, #f6d38a);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--script-button-bg, #1f3f7a) 86%, white 8%), var(--script-button-bg, #1f3f7a));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 8px 18px rgba(0, 0, 0, 0.24);
+  font-size: 11px;
+  font-weight: 850;
+  cursor: pointer;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-running="true"] {
+    opacity: 0.76;
+  }
+
+  &:hover,
+  &:focus-visible {
+    transform: translateY(-1px);
+    outline: none;
+  }
+
+  &:disabled {
+    opacity: 0.58;
+    cursor: progress;
+    transform: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      0 8px 18px rgba(15, 23, 42, 0.14);
+  }
+`;
+
 export const WorkspaceRuntimeLayer = styled.div`
   position: absolute;
   inset: 0;
@@ -4257,6 +4342,13 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="loop"] {
     min-width: 230px;
     --loop-node-accent: 255, 209, 102;
+  }
+
+  &[data-runtime] {
+    border-color: rgba(134, 239, 172, 0.72);
+    box-shadow:
+      0 0 0 1px rgba(134, 239, 172, 0.18),
+      0 18px 48px rgba(0, 0, 0, 0.42);
   }
 `;
 

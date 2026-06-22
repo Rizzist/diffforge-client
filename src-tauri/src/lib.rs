@@ -2469,6 +2469,7 @@ include!("terminal_cli.rs");
 include!("tokenomics.rs");
 include!("native_notifications.rs");
 include!("cloud_mcp.rs");
+include!("local_scripts.rs");
 include!("assets.rs");
 include!("agent_sessions.rs");
 include!("terminals.rs");
@@ -4935,6 +4936,11 @@ pub fn run() {
             cloud_mcp_hydrate_account_document,
             cloud_mcp_save_account_document,
             cloud_mcp_delete_account_document,
+            local_scripts_list,
+            local_scripts_read,
+            local_scripts_save,
+            local_scripts_delete,
+            local_scripts_run,
             cloud_mcp_get_account_tools,
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,
@@ -4948,6 +4954,9 @@ pub fn run() {
             cloud_mcp_create_loopspace,
             cloud_mcp_rename_loopspace,
             cloud_mcp_delete_loopspace,
+            cloud_mcp_get_loopspace_graph,
+            cloud_mcp_sync_loopspace_graph,
+            cloud_mcp_update_loopspace_graph,
             cloud_mcp_get_loopspace_triggers,
             cloud_mcp_get_loopspace_logs,
             cloud_mcp_sync_loopspace_logs,

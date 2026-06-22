@@ -60,7 +60,7 @@ function documentRowType(row) {
   const entryKind = text(row?.entry_kind || row?.entryKind).toLowerCase();
   if (entryKind === "folder" || entryKind === "document") return entryKind;
   const kind = text(row?.kind).toLowerCase();
-  const rowType = text(row?.row_type || row?.type).toLowerCase();
+  const rowType = text(row?.row_type || row?.rowType || row?.type).toLowerCase();
   return rowType === "folder" || kind === "account_document_folder" ? "folder" : "document";
 }
 
@@ -107,6 +107,30 @@ export function accountDocumentStorageKey(document) {
   if (pathKey) return rowType === "folder" ? `folder:${pathKey}` : pathKey;
   const id = normalizedDocumentId(document?.doc_id || document?.document_id || document?.id);
   return id ? (rowType === "folder" ? `folder:${id}` : id) : "";
+}
+
+function accountDocumentVisiblePath(document) {
+  return normalizedDocumentPath(
+    document?.pathKey
+      || document?.path_key
+      || document?.filePath
+      || document?.file_path
+      || document?.folderPath
+      || document?.folder_path
+      || document?.id
+      || document?.doc_id
+      || document?.document_id,
+  );
+}
+
+function documentPathIsSameOrChild(path, parentPath) {
+  const normalizedPath = normalizedDocumentPath(path);
+  const normalizedParent = normalizedDocumentPath(parentPath);
+  return Boolean(
+    normalizedPath
+      && normalizedParent
+      && (normalizedPath === normalizedParent || normalizedPath.startsWith(`${normalizedParent}/`)),
+  );
 }
 
 export function skillToneColor(tone, seed = "") {
@@ -234,6 +258,14 @@ export function mergeSkillUnits(currentSkills, units) {
     const removed = unit?.deleted === true || unit?.current === false || unit?.tombstoned === true;
     if (removed) {
       byId.delete(key);
+      if (documentRowType(skill) === "folder") {
+        const folderPath = accountDocumentVisiblePath(skill);
+        Array.from(byId.entries()).forEach(([candidateKey, candidate]) => {
+          if (documentPathIsSameOrChild(accountDocumentVisiblePath(candidate), folderPath)) {
+            byId.delete(candidateKey);
+          }
+        });
+      }
     } else {
       const existing = byId.get(key) || {};
       const hasContentPayload = skill.hasContentPayload === true;
@@ -515,6 +547,8 @@ export function accountDocumentUnitsFromPayload(payload) {
     (candidate.documents || []).forEach((row) => pushDocument(row));
     (candidate.removed_documents || [])
       .forEach((row) => pushDocument(row, true));
+    (Array.isArray(candidate.deleted) ? candidate.deleted : [])
+      .forEach((row) => pushDocument(row, true));
     pushOps(candidate.ops);
     pushOps(candidate.removed);
   });
@@ -555,6 +589,49 @@ export function accountDocumentUnitsFromPayload(payload) {
 
 export function accountDocumentRequestFromSkill(skill, { local_only = false } = {}) {
   const collection = normalizedDocumentCollection();
+  const rowKind = text(skill?.entryKind || skill?.entry_kind || skill?.rowType || skill?.row_type || skill?.type || skill?.kind).toLowerCase();
+  if (rowKind === "folder" || rowKind === "account_document_folder") {
+    const folderPath = normalizedDocumentPath(
+      skill?.pathKey
+        || skill?.path_key
+        || skill?.folderPath
+        || skill?.folder_path
+        || skill?.folderId
+        || skill?.folder_id
+        || skill?.id,
+    );
+    const parts = folderPath.split("/").filter(Boolean);
+    const fileName = text(skill?.fileName || skill?.file_name || skill?.title || skill?.name, parts[parts.length - 1] || "folder");
+    const parentPathKey = normalizedDocumentPath(
+      skill?.parentPathKey
+        || skill?.parent_path_key
+        || skill?.parentFolderId
+        || skill?.parent_folder_id
+        || parts.slice(0, -1).join("/"),
+    );
+    return {
+      document: {
+        collection,
+        doc_id: folderPath,
+        document_id: folderPath,
+        entry_kind: "folder",
+        file_name: fileName,
+        file_path: folderPath,
+        folder_id: folderPath,
+        folder_path: folderPath,
+        id: folderPath,
+        kind: "folder",
+        name: text(skill?.title, fileName),
+        parent_folder_id: parentPathKey,
+        parent_path_key: parentPathKey,
+        path_key: folderPath,
+        row_type: "folder",
+        title: text(skill?.title, fileName),
+        type: "folder",
+      },
+      local_only: Boolean(local_only),
+    };
+  }
   const documentKind = normalizedDocumentKind(skill?.documentKind || skill?.source, collection);
   const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
   const filePath = documentFilePathFromParts(skill, extension);

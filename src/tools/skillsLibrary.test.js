@@ -109,6 +109,49 @@ test("skill unit merge removes tombstoned rows", () => {
   assert.deepEqual(merged.map((skill) => skill.id), ["ship"]);
 });
 
+test("backend deleted payloads prune folder descendants from the live document list", () => {
+  const current = skillsFromUnits([
+    {
+      entry_kind: "folder",
+      folder_id: "Starter",
+      folder_path: "Starter",
+      path_key: "Starter",
+      title: "Starter",
+    },
+    {
+      content_hash: "hash-basic",
+      doc_id: "Basic2",
+      file_path: "Starter/Basic2.md",
+      parent_path_key: "Starter",
+      path_key: "Starter/Basic2.md",
+      title: "Basic2",
+    },
+    {
+      content_hash: "hash-sample",
+      doc_id: "Sampledraft",
+      file_path: "Sampledraft.md",
+      path_key: "Sampledraft.md",
+      title: "Sampledraft",
+    },
+  ]);
+  const units = accountDocumentUnitsFromPayload({
+    kind: "account_documents_apply_result",
+    deleted: [{
+      current: false,
+      deleted: true,
+      entry_kind: "folder",
+      folder_id: "Starter",
+      folder_path: "Starter",
+      path_key: "Starter",
+      row_type: "folder",
+      title: "Starter",
+    }],
+  });
+  const merged = mergeSkillUnits(current, units);
+
+  assert.deepEqual(merged.map((skill) => skill.id), ["Sampledraft"]);
+});
+
 test("metadata-only document updates preserve cached content until hydration lands", () => {
   const current = skillsFromUnits([{
     content_hash: "old-hash",

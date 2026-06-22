@@ -440,7 +440,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_visible_context",
-            "description": "Return the currently visible Diff Forge context, including selected Tools document metadata and highlighted range when available. Use this first for prompts like explain this skill, create a draft here, modify/delete this selection, or what is selected. Use localPath only for direct file edits when appropriate. For unsaved Tools drafts, use update_selected_document instead of searching local storage or writing legacy account-skills.md.",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata and highlighted range when available. Use this first for prompts like explain this skill, create a draft here, modify/delete this selection, or what is selected. Use localPath only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -461,8 +461,19 @@ fn app_control_mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_selected_script_context",
+            "description": "Return the selected local Tools script context, including local backing file path, shell, button colors, and current highlighted range. Use this for questions about the currently selected script.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContent": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
             "name": "get_selection_context",
-            "description": "Return only the current highlighted selection/range context for the visible document surface. Use this before modify/delete/rewrite/replace-this-selection requests, then preserve surrounding content when applying an edit.",
+            "description": "Return only the current highlighted selection/range context for the visible document or local script surface. Use this before modify/delete/rewrite/replace-this-selection requests, then preserve surrounding content when applying an edit.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": true}
         }),
         json!({
@@ -490,6 +501,42 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "mode": {"type": "string", "description": "draft, local, publish, push, sync, or save. draft updates the editor without persisting."},
                     "save": {"type": "boolean", "description": "When true, save after applying the patch. mode controls local vs publish."}
                 },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "save_selected_script",
+            "description": "Save the currently selected local Tools script from Diff Forge's live editor state. Scripts are local only and do not sync to Cloud.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "update_selected_script",
+            "description": "Create or patch the currently selected local Tools script or unsaved script draft inside Diff Forge. Send the full updated content/content_md when changing text. Default to mode=draft unless the user asks to save locally or run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "New script title/name."},
+                    "content": {"type": "string", "description": "Full script content to place in the editor."},
+                    "content_md": {"type": "string", "description": "Full script content to place in the editor."},
+                    "shell": {"type": "string", "description": "zsh, bash, python3, or node."},
+                    "button_color": {"type": "string", "description": "Hex color for the bottom run button."},
+                    "text_color": {"type": "string", "description": "Hex text color for the bottom run button."},
+                    "mode": {"type": "string", "description": "draft, local, save, run, or execute."},
+                    "save": {"type": "boolean", "description": "When true, save after applying the patch."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "run_selected_script",
+            "description": "Save if needed, then run the currently selected local Tools script on this device.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
                 "additionalProperties": true
             }
         }),
@@ -524,8 +571,62 @@ fn app_control_mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_loopspace_graph",
+            "description": "Return the selected Loopspace graph document, or a graph selected by loopspaceId/loopspaceName. Use this before editing a Loopspace graph.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "loopspaceId": {"type": "string"},
+                    "loopspace_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "loopspaceName": {"type": "string"},
+                    "loopspace_name": {"type": "string"},
+                    "name": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "update_loopspace_graph",
+            "description": "Replace a Loopspace graph document with updated architecture DSL source. Returns only after the client hydrates the Cloud-accepted graph, unless the edit is queued/offline.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "loopspaceId": {"type": "string"},
+                    "loopspace_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "loopspaceName": {"type": "string"},
+                    "loopspace_name": {"type": "string"},
+                    "name": {"type": "string"},
+                    "source": {"type": "string"},
+                    "sourceText": {"type": "string"},
+                    "graphSource": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "edit_loopspace_graph",
+            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with updated architecture DSL source after reading the current graph.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "loopspaceId": {"type": "string"},
+                    "loopspace_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "loopspaceName": {"type": "string"},
+                    "loopspace_name": {"type": "string"},
+                    "name": {"type": "string"},
+                    "source": {"type": "string"},
+                    "sourceText": {"type": "string"},
+                    "graphSource": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
             "name": "select_tab",
-            "description": "Switch the visible Diff Forge app tab. Supports terminals, files, history, tools, architectures, mcps, assets, audio, tokenomics, snipping, and settings.",
+            "description": "Switch the visible Diff Forge app tab. Supports terminals, files, history, tools, documents, mcps, clis, scripts, assets, audio, tokenomics, snipping, and settings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -612,11 +713,18 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "get_state",
         "get_visible_context",
         "get_selected_document_context",
+        "get_selected_script_context",
         "get_selection_context",
         "save_selected_document",
         "update_selected_document",
+        "save_selected_script",
+        "update_selected_script",
+        "run_selected_script",
         "select_workspace",
         "run_loopspace_trigger",
+        "get_loopspace_graph",
+        "update_loopspace_graph",
+        "edit_loopspace_graph",
         "select_tab",
         "list_terminals",
         "open_terminals",

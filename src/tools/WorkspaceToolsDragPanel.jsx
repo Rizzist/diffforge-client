@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { Architecture } from "@styled-icons/material-rounded/Architecture";
+import { Article } from "@styled-icons/material-rounded/Article";
+import { IntegrationInstructions } from "@styled-icons/material-rounded/IntegrationInstructions";
+import { Psychology } from "@styled-icons/material-rounded/Psychology";
 import styled from "styled-components";
 import {
   accountDocumentStorageKey,
@@ -31,6 +35,13 @@ const DOC_KIND_LABELS = {
   document: "Generic",
   instruction: "Instruction",
   skill: "Skill",
+};
+
+const DOC_KIND_ICONS = {
+  architecture: Architecture,
+  document: Article,
+  instruction: IntegrationInstructions,
+  skill: Psychology,
 };
 
 function text(value, fallback = "") {
@@ -229,6 +240,7 @@ export default function WorkspaceToolsDragPanel({
         {visibleDocs.length > 0 && (
           <DocCardGrid aria-label="Account docs" role="list">
             {visibleDocs.map((entry) => {
+              const KindIcon = DOC_KIND_ICONS[entry.kind] || Article;
               return (
                 <DocCard
                   aria-label={`${entry.typeLabel} document ${entry.title}`}
@@ -240,8 +252,15 @@ export default function WorkspaceToolsDragPanel({
                     ? "Drag onto a terminal to send"
                     : "Drag onto a terminal to add without sending"}
                 >
-                  <DocCardTitle>{entry.title}</DocCardTitle>
-                  <DocCardType>{entry.typeLabel}</DocCardType>
+                  <DocCardContent>
+                    <DocCardIcon aria-hidden="true" data-kind={entry.kind}>
+                      <KindIcon />
+                    </DocCardIcon>
+                    <DocCardCopy>
+                      <DocCardTitle>{entry.title}</DocCardTitle>
+                      <DocCardType>{entry.typeLabel}</DocCardType>
+                    </DocCardCopy>
+                  </DocCardContent>
                 </DocCard>
               );
             })}
@@ -274,14 +293,15 @@ const Panel = styled.div`
 
 const Toolbar = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 6px;
 `;
 
 const FilterNav = styled.nav`
   display: flex;
   min-width: 0;
+  width: 100%;
   flex-wrap: wrap;
   gap: 2px;
   padding: 2px;
@@ -315,7 +335,8 @@ const ToolbarActions = styled.div`
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  justify-self: end;
+  justify-self: start;
+  min-width: 0;
 `;
 
 const SendToggle = styled.button`
@@ -384,8 +405,7 @@ const DocCardGrid = styled.div`
 const DocCard = styled.div`
   position: relative;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
-  align-items: stretch;
+  place-items: center;
   min-width: 0;
   aspect-ratio: 1.618 / 1;
   padding: 11px 10px 9px;
@@ -423,17 +443,68 @@ const DocCard = styled.div`
   }
 `;
 
-const DocCardTitle = styled.strong`
+const DocCardContent = styled.div`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+`;
+
+const DocCardIcon = styled.span`
   display: grid;
   place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  color: rgba(125, 176, 255, 0.95);
+  background: rgba(125, 176, 255, 0.12);
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  &[data-kind="skill"] {
+    color: rgba(150, 230, 185, 0.95);
+    background: rgba(60, 203, 127, 0.13);
+  }
+
+  &[data-kind="architecture"] {
+    color: rgba(150, 190, 255, 0.96);
+    background: rgba(80, 135, 245, 0.14);
+  }
+
+  &[data-kind="instruction"] {
+    color: rgba(238, 187, 104, 0.96);
+    background: rgba(238, 187, 104, 0.13);
+  }
+
+  &[data-kind="document"] {
+    color: rgba(188, 158, 235, 0.96);
+    background: rgba(188, 158, 235, 0.13);
+  }
+`;
+
+const DocCardCopy = styled.div`
+  display: grid;
+  align-content: center;
+  justify-items: start;
   min-width: 0;
-  align-self: center;
+  gap: 7px;
+`;
+
+const DocCardTitle = styled.strong`
+  min-width: 0;
   overflow: hidden;
   color: var(--forge-text, #f4f7fa);
   font-size: 12.5px;
   font-weight: 750;
   line-height: 1.22;
-  text-align: center;
+  text-align: left;
   overflow-wrap: anywhere;
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -445,7 +516,7 @@ const DocCardTitle = styled.strong`
 `;
 
 const DocCardType = styled.span`
-  justify-self: center;
+  justify-self: start;
   max-width: 100%;
   overflow: hidden;
   color: var(--forge-text-muted, #7a8493);
