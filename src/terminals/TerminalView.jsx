@@ -691,7 +691,16 @@ function normalizeLoopspaceTriggerRows(value) {
         nextDueAtMs: Number(row?.nextDueAtMs || row?.next_due_at_ms || 0) || 0,
         lastRunAtMs: Number(row?.lastRunAtMs || row?.last_run_at_ms || 0) || 0,
         lastStatus: String(row?.lastStatus || row?.last_status || "").trim(),
+        webhookAuthMode: normalizeLoopspaceWebhookAuthMode(
+          row?.webhookAuthMode
+          || row?.webhook_auth_mode
+          || config.webhookAuthMode
+          || config.webhook_auth_mode,
+        ),
         webhookPath: String(row?.webhookPath || row?.webhook_path || config.webhookPath || config.webhook_path || "").trim(),
+        webhookSecret: String(row?.webhookSecret || row?.webhook_secret || "").trim(),
+        webhookSecretHint: String(row?.webhookSecretHint || row?.webhook_secret_hint || "").trim(),
+        webhookSignatureToleranceSec: Number(row?.webhookSignatureToleranceSec || row?.webhook_signature_tolerance_sec || 300) || 300,
       };
     }).filter((row) => row.id)
     : [];
@@ -772,7 +781,7 @@ function getLoopspaceWebhookCopyUrl(path, baseUrl) {
   if (!rawPath) return "";
   if (/^https?:\/\//i.test(rawPath)) return rawPath;
   const normalizedBase = normalizeLoopspaceWebhookBaseUrl(baseUrl);
-  if (!normalizedBase) return rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  if (!normalizedBase) return "";
   const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
   return `${normalizedBase}${normalizedPath}`;
 }
@@ -781,6 +790,11 @@ const LOOPSPACE_TRIGGER_TYPE_OPTIONS = [
   { icon: Schedule, label: "Cron", value: "cron" },
   { icon: Webhook, label: "Webhook", value: "webhook" },
   { icon: AdsClick, label: "Manual", value: "manual" },
+];
+
+const LOOPSPACE_WEBHOOK_AUTH_OPTIONS = [
+  { label: "Signed", value: "signed_hmac" },
+  { label: "Public URL", value: "public_token" },
 ];
 
 const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
@@ -793,6 +807,7 @@ const LOOPSPACE_TRIGGER_SCHEDULE_PRESETS = [
 
 const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
 const LOOPSPACE_TRIGGER_DRAG_KIND = "loopspace_trigger_ref";
+const LOOPSPACE_GRAPH_POINTER_DRAG_EVENT = "diffforge:loopspace-graph-pointer-drag-start";
 
 function getLoopspaceTriggerTypeLabel(type) {
   if (type === "webhook") return "Webhook";
@@ -804,6 +819,21 @@ function getLoopspaceTriggerTypeIcon(type) {
   if (type === "webhook") return Webhook;
   if (type === "manual") return AdsClick;
   return Schedule;
+}
+
+function normalizeLoopspaceWebhookAuthMode(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (["public", "public_token", "bearer", "bearer_path", "url_token"].includes(raw)) {
+    return "public_token";
+  }
+  if (["signed", "signed_hmac", "hmac", "stripe", "stripe_compatible"].includes(raw)) {
+    return "signed_hmac";
+  }
+  return "signed_hmac";
+}
+
+function getLoopspaceWebhookAuthLabel(mode) {
+  return normalizeLoopspaceWebhookAuthMode(mode) === "public_token" ? "Public URL" : "Signed";
 }
 
 function getForgeCanvasTintPalette(themeMode, spaceMode = getForgeSpaceMode()) {
@@ -5405,6 +5435,67 @@ const LoopspaceTriggerSectionLabel = styled.div`
   }
 `;
 
+const LoopspaceWebhookModeHelp = styled.div`
+  min-width: 0;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 7px;
+  padding: 7px 8px;
+  color: rgba(232, 238, 248, 0.62);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1.35;
+
+  &[data-tone="risk"] {
+    color: #fecaca;
+    border-color: rgba(248, 113, 113, 0.2);
+    background: rgba(127, 29, 29, 0.16);
+  }
+
+  &[data-tone="safe"] {
+    color: #bbf7d0;
+    border-color: rgba(34, 197, 94, 0.18);
+    background: rgba(20, 83, 45, 0.14);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(25, 28, 34, 0.66);
+    background: rgba(255, 255, 255, 0.72);
+
+    &[data-tone="risk"] {
+      color: #7f1d1d;
+      background: rgba(254, 226, 226, 0.78);
+    }
+
+    &[data-tone="safe"] {
+      color: #14532d;
+      background: rgba(220, 252, 231, 0.74);
+    }
+  }
+`;
+
+const LoopspaceWebhookConfirm = styled.label`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  color: rgba(232, 238, 248, 0.7);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1.25;
+
+  input {
+    width: 14px;
+    height: 14px;
+    accent-color: rgb(var(--forge-accent-rgb));
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(25, 28, 34, 0.72);
+  }
+`;
+
 const LoopspaceTriggerTypePicker = styled.div`
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -5426,6 +5517,10 @@ const LoopspaceTriggerTypePicker = styled.div`
     gap: 6px;
     align-items: center;
     padding: 5px;
+  }
+
+  &[data-variant="webhook-auth"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 `;
 
@@ -5706,9 +5801,19 @@ const LoopspaceTriggerBadge = styled.span`
     color: rgba(232, 238, 248, 0.52);
   }
 
+  &[data-tone="risk"] {
+    color: #fecaca;
+    background: rgba(127, 29, 29, 0.18);
+  }
+
   html[data-forge-theme="light"] & {
     color: rgba(25, 28, 34, 0.72);
     background: rgba(0, 0, 0, 0.055);
+
+    &[data-tone="risk"] {
+      color: #7f1d1d;
+      background: rgba(254, 226, 226, 0.78);
+    }
   }
 `;
 
@@ -5757,6 +5862,8 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   const [error, setError] = useState("");
   const [draftName, setDraftName] = useState("");
   const [draftType, setDraftType] = useState("cron");
+  const [draftWebhookAuthMode, setDraftWebhookAuthMode] = useState("signed_hmac");
+  const [draftPublicWebhookConfirmed, setDraftPublicWebhookConfirmed] = useState(false);
   const [draftSchedulePreset, setDraftSchedulePreset] = useState("5m");
   const [draftCustomSchedule, setDraftCustomSchedule] = useState("");
   const [nameDrafts, setNameDrafts] = useState({});
@@ -5910,6 +6017,10 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
       setError("Trigger name is required.");
       return;
     }
+    if (draftType === "webhook" && draftWebhookAuthMode === "public_token" && !draftPublicWebhookConfirmed) {
+      setError("Confirm the public URL risk before creating this webhook.");
+      return;
+    }
     const config = draftType === "cron"
       ? {
         schedule: draftSchedule.trim() || "@every 5m",
@@ -5923,10 +6034,16 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
         enabled: true,
         loopspaceIds: [],
         name,
+        publicWebhookConfirmed: draftType === "webhook" && draftWebhookAuthMode === "public_token"
+          ? draftPublicWebhookConfirmed
+          : undefined,
         triggerType: draftType,
+        webhookAuthMode: draftType === "webhook" ? draftWebhookAuthMode : undefined,
+        webhookSignatureToleranceSec: draftType === "webhook" ? 300 : undefined,
       });
       applyTriggerSnapshot(result);
       setDraftName("");
+      setDraftPublicWebhookConfirmed(false);
       setState("idle");
     } catch (createError) {
       setState("idle");
@@ -5935,7 +6052,9 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
   }, [
     applyTriggerSnapshot,
     draftName,
+    draftPublicWebhookConfirmed,
     draftSchedule,
+    draftWebhookAuthMode,
     draftType,
   ]);
 
@@ -6040,6 +6159,55 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     }
   }, []);
 
+  const copyWebhookSecret = useCallback(async (trigger) => {
+    const copyValue = String(trigger?.webhookSecret || "").trim();
+    if (!trigger?.id || !copyValue) {
+      return;
+    }
+    setError("");
+    try {
+      const copied = await copyTextToClipboard(copyValue);
+      if (!copied) {
+        throw new Error("Clipboard unavailable.");
+      }
+      setCopiedTriggerId(`${trigger.id}:secret`);
+      if (copyFeedbackTimeoutRef.current) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current);
+      }
+      copyFeedbackTimeoutRef.current = window.setTimeout(() => {
+        setCopiedTriggerId((current) => (current === `${trigger.id}:secret` ? "" : current));
+        copyFeedbackTimeoutRef.current = null;
+      }, 1300);
+    } catch (copyError) {
+      setError(String(copyError || "Unable to copy webhook signing secret."));
+    }
+  }, []);
+
+  const rotateWebhookSecret = useCallback(async (trigger) => {
+    if (!trigger?.id || trigger.type !== "webhook" || state === "saving") {
+      return;
+    }
+    const label = trigger.webhookAuthMode === "public_token" ? "public URL token" : "signing secret";
+    const confirmed = typeof window === "undefined"
+      ? true
+      : window.confirm(`Rotate the ${label} for "${trigger.name}"? Existing integrations will need to be updated.`);
+    if (!confirmed) {
+      return;
+    }
+    setState("saving");
+    setError("");
+    try {
+      applyTriggerSnapshot(await invoke("cloud_mcp_update_loopspace_trigger", {
+        rotateSecret: true,
+        triggerId: trigger.id,
+      }));
+      setState("idle");
+    } catch (rotateError) {
+      setState("idle");
+      setError(String(rotateError || "Unable to rotate webhook secret."));
+    }
+  }, [applyTriggerSnapshot, state]);
+
   const runTrigger = useCallback(async (trigger) => {
     if (!trigger?.id || trigger.type !== "manual" || !trigger.enabled || state === "saving") {
       return;
@@ -6125,6 +6293,38 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
     }
   }, []);
 
+  const startTriggerPointerDrag = useCallback((event, trigger) => {
+    if (event.button !== 0 || !trigger?.id) return;
+    const target = event.target;
+    if (
+      typeof HTMLElement !== "undefined"
+      && target instanceof HTMLElement
+      && (
+        target.closest("button,textarea,select")
+        || (target.closest("input") && !target.closest("input")?.readOnly)
+      )
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof window === "undefined" || typeof CustomEvent === "undefined") return;
+    window.dispatchEvent(new CustomEvent(LOOPSPACE_GRAPH_POINTER_DRAG_EVENT, {
+      detail: {
+        kind: "trigger",
+        pointer_id: event.pointerId,
+        trigger: {
+          id: trigger.id,
+          loopspace_ids: trigger.loopspaceIds || [],
+          name: trigger.name,
+          trigger_id: trigger.id,
+          trigger_type: trigger.type,
+          type: trigger.type,
+        },
+      },
+    }));
+  }, []);
+
   return (
     <LoopspaceTriggersView>
       <LoopspaceTriggersScroll>
@@ -6145,7 +6345,12 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                 <LoopspaceTriggerTypeButton
                   data-active={draftType === option.value}
                   key={option.value}
-                  onClick={() => setDraftType(option.value)}
+                  onClick={() => {
+                    setDraftType(option.value);
+                    if (option.value !== "webhook") {
+                      setDraftPublicWebhookConfirmed(false);
+                    }
+                  }}
                   type="button"
                 >
                   <Icon aria-hidden="true" />
@@ -6181,9 +6386,51 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
               ) : null}
             </>
           ) : null}
+          {draftType === "webhook" ? (
+            <>
+              <LoopspaceTriggerSectionLabel>Webhook security</LoopspaceTriggerSectionLabel>
+              <LoopspaceTriggerTypePicker aria-label="Webhook security mode" data-variant="webhook-auth" role="group">
+                {LOOPSPACE_WEBHOOK_AUTH_OPTIONS.map((option) => (
+                  <LoopspaceTriggerTypeButton
+                    data-active={draftWebhookAuthMode === option.value}
+                    data-variant="webhook-auth"
+                    key={option.value}
+                    onClick={() => {
+                      setDraftWebhookAuthMode(option.value);
+                      if (option.value !== "public_token") {
+                        setDraftPublicWebhookConfirmed(false);
+                      }
+                    }}
+                    type="button"
+                  >
+                    {option.label}
+                  </LoopspaceTriggerTypeButton>
+                ))}
+              </LoopspaceTriggerTypePicker>
+              <LoopspaceWebhookModeHelp data-tone={draftWebhookAuthMode === "public_token" ? "risk" : "safe"}>
+                {draftWebhookAuthMode === "public_token"
+                  ? "Anyone with this URL can fire the trigger."
+                  : "Signed requests must include a Stripe-style HMAC timestamp header."}
+              </LoopspaceWebhookModeHelp>
+              {draftWebhookAuthMode === "public_token" ? (
+                <LoopspaceWebhookConfirm>
+                  <input
+                    checked={draftPublicWebhookConfirmed}
+                    onChange={(event) => setDraftPublicWebhookConfirmed(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span>I understand this public URL is a bearer credential.</span>
+                </LoopspaceWebhookConfirm>
+              ) : null}
+            </>
+          ) : null}
           <LoopspaceTriggerActionRow>
             <LoopspaceTriggerPrimaryButton
-              disabled={state === "saving" || !draftName.trim()}
+              disabled={
+                state === "saving"
+                || !draftName.trim()
+                || (draftType === "webhook" && draftWebhookAuthMode === "public_token" && !draftPublicWebhookConfirmed)
+              }
               title="Create trigger"
               type="submit"
             >
@@ -6206,12 +6453,17 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                 ? getLoopspaceWebhookCopyUrl(trigger.webhookPath, webhookBaseUrl)
                 : "";
               const isWebhookCopied = copiedTriggerId === trigger.id;
+              const isWebhookSecretCopied = copiedTriggerId === `${trigger.id}:secret`;
               const TypeIcon = getLoopspaceTriggerTypeIcon(trigger.type);
               return (
                 <LoopspaceTriggerRow
-                  draggable={!isRenaming && state !== "saving"}
                   key={trigger.id}
                   onDragStart={(event) => startTriggerDrag(event, trigger)}
+                  onPointerDown={(event) => {
+                    if (!isRenaming && state !== "saving") {
+                      startTriggerPointerDrag(event, trigger);
+                    }
+                  }}
                   title="Drag into a loop graph"
                 >
                   <LoopspaceTriggerRowHeader>
@@ -6270,15 +6522,37 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                         </LoopspaceTriggerIconButton>
                       ) : null}
                       {trigger.type === "webhook" && webhookUrl ? (
-                        <LoopspaceTriggerIconButton
-                          aria-label="Copy webhook URL"
-                          data-copied={isWebhookCopied ? "true" : undefined}
-                          onClick={() => copyWebhookTrigger(trigger, webhookUrl)}
-                          title={isWebhookCopied ? "Copied" : "Copy webhook URL"}
-                          type="button"
-                        >
-                          <ContentCopy aria-hidden="true" />
-                        </LoopspaceTriggerIconButton>
+                        <>
+                          <LoopspaceTriggerIconButton
+                            aria-label="Copy webhook URL"
+                            data-copied={isWebhookCopied ? "true" : undefined}
+                            onClick={() => copyWebhookTrigger(trigger, webhookUrl)}
+                            title={isWebhookCopied ? "Copied" : "Copy webhook URL"}
+                            type="button"
+                          >
+                            <ContentCopy aria-hidden="true" />
+                          </LoopspaceTriggerIconButton>
+                          {trigger.webhookAuthMode !== "public_token" && trigger.webhookSecret ? (
+                            <LoopspaceTriggerIconButton
+                              aria-label="Copy webhook signing secret"
+                              data-copied={isWebhookSecretCopied ? "true" : undefined}
+                              onClick={() => copyWebhookSecret(trigger)}
+                              title={isWebhookSecretCopied ? "Copied" : "Copy signing secret"}
+                              type="button"
+                            >
+                              <ContentCopy aria-hidden="true" />
+                            </LoopspaceTriggerIconButton>
+                          ) : null}
+                          <LoopspaceTriggerIconButton
+                            aria-label="Rotate webhook secret"
+                            disabled={state === "saving"}
+                            onClick={() => rotateWebhookSecret(trigger)}
+                            title={trigger.webhookAuthMode === "public_token" ? "Rotate public URL token" : "Rotate signing secret"}
+                            type="button"
+                          >
+                            <ButtonRefreshIcon aria-hidden="true" />
+                          </LoopspaceTriggerIconButton>
+                        </>
                       ) : null}
                       <LoopspaceTriggerIconButton
                         aria-label={trigger.enabled ? "Disable trigger" : "Enable trigger"}
@@ -6308,6 +6582,11 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                     <LoopspaceTriggerBadge data-tone={trigger.enabled ? "good" : "muted"}>
                       {trigger.enabled ? "Enabled" : "Disabled"}
                     </LoopspaceTriggerBadge>
+                    {trigger.type === "webhook" ? (
+                      <LoopspaceTriggerBadge data-tone={trigger.webhookAuthMode === "public_token" ? "risk" : "good"}>
+                        {getLoopspaceWebhookAuthLabel(trigger.webhookAuthMode)}
+                      </LoopspaceTriggerBadge>
+                    ) : null}
                     {trigger.type === "cron" && trigger.config?.schedule ? (
                       <LoopspaceTriggerBadge>{trigger.config.schedule}</LoopspaceTriggerBadge>
                     ) : null}
@@ -6321,6 +6600,9 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
                   {trigger.webhookPath ? (
                     <LoopspaceTriggerWebhookPath title={webhookUrl || trigger.webhookPath}>
                       {webhookUrl || trigger.webhookPath}
+                      {trigger.webhookAuthMode !== "public_token" && trigger.webhookSecretHint
+                        ? ` · secret ${trigger.webhookSecretHint}`
+                        : ""}
                     </LoopspaceTriggerWebhookPath>
                   ) : null}
                 </LoopspaceTriggerRow>

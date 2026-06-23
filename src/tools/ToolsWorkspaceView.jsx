@@ -201,9 +201,25 @@ function roundedDocumentPx(value, min = 0) {
   return `${Math.round(safeValue)}px`;
 }
 
-function skillDocumentPageStyle(scale, options = {}) {
+function workspaceContextMenuPosition(event, container, menuWidth = 190, menuHeight = 96) {
+  const margin = 8;
+  const rect = container?.getBoundingClientRect?.();
+  if (rect && Number.isFinite(rect.width) && Number.isFinite(rect.height)) {
+    return {
+      x: clampNumber(event.clientX - rect.left, margin, Math.max(margin, rect.width - menuWidth - margin)),
+      y: clampNumber(event.clientY - rect.top, margin, Math.max(margin, rect.height - menuHeight - margin)),
+    };
+  }
+  const viewportWidth = typeof window !== "undefined" ? window.innerWidth : menuWidth + margin * 2;
+  const viewportHeight = typeof window !== "undefined" ? window.innerHeight : menuHeight + margin * 2;
+  return {
+    x: clampNumber(event.clientX, margin, Math.max(margin, viewportWidth - menuWidth - margin)),
+    y: clampNumber(event.clientY, margin, Math.max(margin, viewportHeight - menuHeight - margin)),
+  };
+}
+
+function skillDocumentPageStyle(scale) {
   const safeScale = clampSkillDocumentScale(scale);
-  const bodyOffsetPx = Math.max(0, Number(options.bodyOffsetPx) || 0);
   const pageHeight = SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale;
   const paddingTop = Math.max(20, 52 * safeScale);
   const paddingBottom = Math.max(26, 76 * safeScale);
@@ -218,7 +234,6 @@ function skillDocumentPageStyle(scale, options = {}) {
       - titleFontSize * 1.18
       - titlePaddingBottom
       - bodyMarginTop
-      - bodyOffsetPx
       - 10,
   );
   return {
@@ -448,6 +463,47 @@ function formatScriptLogDuration(value) {
   return `${minutes}m ${seconds}s`;
 }
 
+function scriptRunTimestampMs(...values) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+    const normalized = text(value);
+    if (!normalized) continue;
+    const numeric = Number(normalized);
+    if (Number.isFinite(numeric) && numeric > 1_000_000_000) return numeric;
+    const parsed = Date.parse(normalized);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function normalizedScriptRunState(result = {}) {
+  const raw = text(result.state || result.runStatus || result.run_status || result.status).toLowerCase();
+  if (raw === "queued" || raw === "running" || raw === "completed" || raw === "failed") return raw;
+  if (raw === "cancelled" || raw === "canceled") return "cancelled";
+  if (raw === "error") return "failed";
+  if (raw === "ready" || raw === "done" || raw === "finished" || raw === "success" || raw === "succeeded") {
+    return result.ok === false ? "failed" : "completed";
+  }
+  if (result.ok === false) return "failed";
+  if (result.endedAt || result.ended_at || result.endedAtMs || result.ended_at_ms) return "completed";
+  if (result.startedAt || result.started_at || result.startedAtMs || result.started_at_ms) return "running";
+  if (result.queuedAt || result.queued_at || result.queuedAtMs || result.queued_at_ms) return "queued";
+  return "";
+}
+
+function scriptRunStatusLabel(run = {}) {
+  if (run.state === "queued") return "Queued";
+  if (run.state === "running") return "Running";
+  if (run.state === "cancelled") return "Cancelled";
+  if (run.ok === false || run.state === "failed" || run.state === "error") return "Failed";
+  return "Completed";
+}
+
+function scriptRunStatusTone(run = {}) {
+  if (run.ok === false || run.state === "failed" || run.state === "error" || run.state === "cancelled") return "error";
+  return run.state;
+}
+
 function scriptRunDisplayLog(result = null) {
   if (!result) return null;
   const chunks = Array.isArray(result.chunks) && result.chunks.length
@@ -457,15 +513,90 @@ function scriptRunDisplayLog(result = null) {
       String(result.stderr ?? "").length ? { stream: "stderr", text: String(result.stderr) } : null,
       text(result.error) ? { stream: "stderr", text: `${String(result.error)}\n` } : null,
     ].filter(Boolean);
+  const pathKey = normalizedDocumentPath(
+    result.pathKey
+    || result.path_key
+    || result.script?.pathKey
+    || result.script?.path_key,
+  );
+  const runId = text(result.runId || result.run_id);
+  const state = normalizedScriptRunState(result);
+  const queuedAt = text(result.queuedAt || result.queued_at);
+  const startedAt = text(result.startedAt || result.started_at, queuedAt);
+  const endedAt = text(result.endedAt || result.ended_at);
+  const queuedAtMs = scriptRunTimestampMs(result.queuedAtMs, result.queued_at_ms, queuedAt);
+  const startedAtMs = scriptRunTimestampMs(result.startedAtMs, result.started_at_ms, startedAt, queuedAtMs);
+  const endedAtMs = scriptRunTimestampMs(result.endedAtMs, result.ended_at_ms, endedAt);
+  const updatedAtMs = scriptRunTimestampMs(
+    result.updatedAtMs,
+    result.updated_at_ms,
+    result.updatedAt,
+    result.updated_at,
+    endedAtMs,
+    startedAtMs,
+    queuedAtMs,
+  );
   return {
     ...result,
     chunks,
     durationLabel: formatScriptLogDuration(result.durationMs ?? result.duration_ms),
-    endedAtLabel: formatScriptLogTime(result.endedAt || result.ended_at),
-    pathKey: normalizedDocumentPath(result.pathKey || result.path_key),
-    startedAtLabel: formatScriptLogTime(result.startedAt || result.started_at),
-    title: text(result.script?.title || result.title, scriptFileName(result.script || { pathKey: result.pathKey || result.path_key })),
+    durationMs: Number(result.durationMs ?? result.duration_ms) || 0,
+    endedAt,
+    endedAtLabel: formatScriptLogTime(endedAt),
+    endedAtMs,
+    exitCode: result.exitCode ?? result.exit_code,
+    ok: result.ok,
+    pathKey,
+    queuedAt,
+    queuedAtMs,
+    runId,
+    runStatus: text(result.runStatus || result.run_status),
+    sourceKind: text(result.sourceKind || result.source_kind),
+    startedAt,
+    startedAtLabel: formatScriptLogTime(startedAt),
+    startedAtMs,
+    state,
+    title: text(
+      result.script?.title || result.script?.name || result.script_name || result.scriptName || result.name || result.title,
+      scriptFileName(result.script || { pathKey }),
+    ),
+    updatedAtMs,
   };
+}
+
+function scriptRunHistorySortValue(run = {}) {
+  return scriptRunTimestampMs(
+    run.updatedAtMs,
+    run.updated_at_ms,
+    run.endedAtMs,
+    run.ended_at_ms,
+    run.startedAtMs,
+    run.started_at_ms,
+    run.queuedAtMs,
+    run.queued_at_ms,
+    run.endedAt,
+    run.ended_at,
+    run.startedAt,
+    run.started_at,
+    run.queuedAt,
+    run.queued_at,
+  );
+}
+
+function scriptRunHistoryKey(run = {}) {
+  const runId = text(run.runId || run.run_id);
+  if (runId) return `run:${runId}`;
+  return [
+    "script",
+    normalizedDocumentPath(run.pathKey || run.path_key),
+    scriptRunHistorySortValue(run),
+  ].join(":");
+}
+
+function scriptRunMatchesPath(run = {}, activePathKey = "") {
+  const expected = normalizedDocumentPath(activePathKey);
+  if (!expected) return true;
+  return normalizedDocumentPath(run.pathKey || run.path_key || run.script?.pathKey || run.script?.path_key) === expected;
 }
 
 function documentIsFolderRow(document) {
@@ -1108,9 +1239,11 @@ export default function ToolsWorkspaceView({
   const scriptSelectionClearAtRef = useRef(0);
   const scriptDocumentCanvasRef = useRef(null);
   const scriptLogsTerminalRef = useRef(null);
+  const scriptsWorkspaceSurfaceRef = useRef(null);
   const scriptsExplorerPanelRef = useRef(null);
   const [scriptsExplorerCollapsed, setScriptsExplorerCollapsed] = useState(false);
   const [scriptsExplorerSize, setScriptsExplorerSize] = useState("238px");
+  const [scriptsContextMenu, setScriptsContextMenu] = useState(null);
   const [newScriptDraft, setNewScriptDraft] = useState({
     loopspaceButtonColor: SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR,
     loopspaceTextColor: SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR,
@@ -1429,6 +1562,34 @@ export default function ToolsWorkspaceView({
     }
   }, [onLocalScriptsChanged, scriptEditor]);
 
+  const closeScriptsContextMenu = useCallback(() => {
+    setScriptsContextMenu(null);
+  }, []);
+
+  const openScriptsContextMenu = useCallback((event, target = {}) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const menuWidth = 176;
+    const menuHeight = target.kind === "script" ? 80 : 44;
+    const position = workspaceContextMenuPosition(event, scriptsWorkspaceSurfaceRef.current, menuWidth, menuHeight);
+    setScriptsContextMenu({
+      target,
+      x: position.x,
+      y: position.y,
+    });
+  }, []);
+
+  const beginCreateLocalScript = useCallback(() => {
+    closeScriptsContextMenu();
+    setScriptsError("");
+    setScriptsMessage("");
+    setSelectedScriptKey("");
+    setSelectedScriptLogKey("");
+    setScriptPaneTab("editor");
+    setScriptEditor(null);
+    setNewScriptDraft((current) => ({ ...current, name: "" }));
+  }, [closeScriptsContextMenu]);
+
   const createLocalScriptDraft = useCallback(() => {
     const name = text(newScriptDraft.name, "New Script");
     const shell = scriptShellOption(newScriptDraft.shell).id;
@@ -1462,6 +1623,31 @@ export default function ToolsWorkspaceView({
       workspace_text_color: newScriptDraft.workspaceTextColor,
     }));
   }, [newScriptDraft, scriptsLibrary.scripts]);
+
+  const deleteContextScript = useCallback((target = scriptsContextMenu?.target || {}) => {
+    closeScriptsContextMenu();
+    const script = target.script || target;
+    void deleteLocalScript(script);
+  }, [closeScriptsContextMenu, deleteLocalScript, scriptsContextMenu]);
+
+  useEffect(() => {
+    if (!scriptsContextMenu) return undefined;
+    const closeMenu = (event) => {
+      if (event?.target?.closest?.("[data-scripts-context-menu='true']")) return;
+      closeScriptsContextMenu();
+    };
+    const closeOnKey = (event) => {
+      if (event.key === "Escape") closeScriptsContextMenu();
+    };
+    window.addEventListener("pointerdown", closeMenu, true);
+    window.addEventListener("keydown", closeOnKey, true);
+    window.addEventListener("resize", closeScriptsContextMenu);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu, true);
+      window.removeEventListener("keydown", closeOnKey, true);
+      window.removeEventListener("resize", closeScriptsContextMenu);
+    };
+  }, [closeScriptsContextMenu, scriptsContextMenu]);
 
   const collapseScriptsExplorer = useCallback(() => {
     setScriptsExplorerCollapsed(true);
@@ -2043,12 +2229,11 @@ export default function ToolsWorkspaceView({
     event.stopPropagation();
     const menuWidth = 190;
     const menuHeight = target.kind === "root" ? 72 : 112;
-    const viewportWidth = typeof window !== "undefined" ? window.innerWidth : menuWidth + 16;
-    const viewportHeight = typeof window !== "undefined" ? window.innerHeight : menuHeight + 16;
+    const position = workspaceContextMenuPosition(event, docsWorkspaceSurfaceRef.current, menuWidth, menuHeight);
     setDocsContextMenu({
       target,
-      x: clampNumber(event.clientX, 8, Math.max(8, viewportWidth - menuWidth - 8)),
-      y: clampNumber(event.clientY, 8, Math.max(8, viewportHeight - menuHeight - 8)),
+      x: position.x,
+      y: position.y,
     });
   }, []);
 
@@ -2849,10 +3034,6 @@ export default function ToolsWorkspaceView({
     () => skillDocumentPageStyle(skillDocumentScale),
     [skillDocumentScale],
   );
-  const scriptDocumentMetricsStyle = useMemo(
-    () => skillDocumentPageStyle(skillDocumentScale, { bodyOffsetPx: 40 }),
-    [skillDocumentScale],
-  );
   const appControlDocumentContext = useMemo(() => {
     const content = String(skillEditor?.content || "");
     const preview = compactDocumentText(content, 1400);
@@ -3000,9 +3181,26 @@ export default function ToolsWorkspaceView({
   const activeScriptLog = useMemo(() => (
     scriptRunDisplayLog(mergedScriptRunResults[activeScriptLogKey])
   ), [activeScriptLogKey, mergedScriptRunResults]);
-  const activeScriptHistory = useMemo(() => (
-    scriptRunHistory.map(scriptRunDisplayLog).filter(Boolean)
-  ), [scriptRunHistory]);
+  const activeScriptHistory = useMemo(() => {
+    const activePathKey = normalizedDocumentPath(activeScriptLogKey);
+    const rowsByRun = new Map();
+    [
+      ...scriptRunHistory,
+      ...Object.values(mergedScriptRunResults || {}),
+    ]
+      .map(scriptRunDisplayLog)
+      .filter(Boolean)
+      .filter((run) => scriptRunMatchesPath(run, activePathKey))
+      .forEach((run) => {
+        const key = scriptRunHistoryKey(run);
+        const existing = rowsByRun.get(key);
+        if (!existing || scriptRunHistorySortValue(run) >= scriptRunHistorySortValue(existing)) {
+          rowsByRun.set(key, run);
+        }
+      });
+    return Array.from(rowsByRun.values())
+      .sort((a, b) => scriptRunHistorySortValue(b) - scriptRunHistorySortValue(a));
+  }, [activeScriptLogKey, mergedScriptRunResults, scriptRunHistory]);
   useEffect(() => {
     if (section !== "scripts" || scriptPaneTab !== "history") return;
     void loadScriptRunHistory(activeScriptLogKey);
@@ -4001,6 +4199,30 @@ export default function ToolsWorkspaceView({
                               )}
                             </FileTreeItem>
                           </FileTree>
+                          <DocsExplorerFooter>
+                            <DocsExplorerFooterButton
+                              onClick={() => beginContextCreateDocument({
+                                displayName: "documents",
+                                kind: "root",
+                                pathKey: "",
+                              })}
+                              type="button"
+                            >
+                              <span className="codicon codicon-new-file" aria-hidden="true" />
+                              <span>New doc</span>
+                            </DocsExplorerFooterButton>
+                            <DocsExplorerFooterButton
+                              onClick={() => beginContextCreateFolder({
+                                displayName: "documents",
+                                kind: "root",
+                                pathKey: "",
+                              })}
+                              type="button"
+                            >
+                              <span className="codicon codicon-new-folder" aria-hidden="true" />
+                              <span>New folder</span>
+                            </DocsExplorerFooterButton>
+                          </DocsExplorerFooter>
                       </>
                         </DocsFilesPane>
                       </ResizePanel>
@@ -4286,7 +4508,6 @@ export default function ToolsWorkspaceView({
                     role="menu"
                     style={{
                       left: docsContextMenu.x,
-                      position: "fixed",
                       top: docsContextMenu.y,
                     }}
                     onContextMenu={(event) => {
@@ -4334,6 +4555,7 @@ export default function ToolsWorkspaceView({
                 aria-label="Scripts workspace"
                 data-docs-explorer-collapsed={scriptsExplorerCollapsed ? "true" : "false"}
                 data-scripts-surface="true"
+                ref={scriptsWorkspaceSurfaceRef}
                 style={{ "--docs-explorer-offset": scriptsExplorerCollapsed ? "0px" : scriptsExplorerSize }}
               >
                 {scriptsExplorerCollapsed && (
@@ -4366,7 +4588,18 @@ export default function ToolsWorkspaceView({
                         onResize={syncScriptsExplorerCollapsedState}
                         panelRef={scriptsExplorerPanelRef}
                       >
-                        <DocsFilesPane aria-label="Local scripts" data-collapsed="false">
+                        <DocsFilesPane
+                          aria-label="Local scripts"
+                          data-collapsed="false"
+                          onContextMenu={(event) => {
+                            if (event.defaultPrevented) return;
+                            openScriptsContextMenu(event, {
+                              displayName: "scripts",
+                              kind: "root",
+                              pathKey: "",
+                            });
+                          }}
+                        >
                           <FileExplorerHeader>
                             <div>
                               <PanelKicker>Explorer</PanelKicker>
@@ -4399,12 +4632,24 @@ export default function ToolsWorkspaceView({
                             type="search"
                             value={scriptsQuery}
                           />
-                          <FileTree aria-label="Local script explorer">
+                          <FileTree
+                            aria-label="Local script explorer"
+                            onContextMenu={(event) => openScriptsContextMenu(event, {
+                              displayName: "scripts",
+                              kind: "root",
+                              pathKey: "",
+                            })}
+                          >
                             <FileTreeItem>
                               <DocsExplorerFolderButton
                                 $depth={0}
                                 as="div"
                                 data-selected="false"
+                                onContextMenu={(event) => openScriptsContextMenu(event, {
+                                  displayName: "scripts",
+                                  kind: "root",
+                                  pathKey: "",
+                                })}
                               >
                                 <FileDisclosure>
                                   <span className="codicon codicon-chevron-down" aria-hidden="true" />
@@ -4432,6 +4677,12 @@ export default function ToolsWorkspaceView({
                                       $depth={1}
                                       data-selected={active ? "true" : "false"}
                                       key={pathKey}
+                                      onContextMenu={(event) => openScriptsContextMenu(event, {
+                                        displayName: scriptFileName(row),
+                                        kind: "script",
+                                        pathKey,
+                                        script: row,
+                                      })}
                                       onClick={() => {
                                         setScriptPaneTab("editor");
                                         setSelectedScriptLogKey(pathKey);
@@ -4466,6 +4717,12 @@ export default function ToolsWorkspaceView({
                               )}
                             </FileTreeItem>
                           </FileTree>
+                          <DocsExplorerFooter>
+                            <DocsExplorerFooterButton onClick={beginCreateLocalScript} type="button">
+                              <span className="codicon codicon-new-file" aria-hidden="true" />
+                              <span>New script</span>
+                            </DocsExplorerFooterButton>
+                          </DocsExplorerFooter>
                         </DocsFilesPane>
                       </ResizePanel>
                       <ResizeHandle data-direction="horizontal" data-surface="files" />
@@ -4494,48 +4751,26 @@ export default function ToolsWorkspaceView({
                         <ScriptLogsPanel>
                           {activeScriptHistory.length ? (
                             <ScriptHistoryList>
-                              {activeScriptHistory.map((run) => (
-                                <ScriptHistoryRow key={run.runId || `${run.pathKey}-${run.startedAt}-${run.updatedAt}`}>
-                                  <ScriptLogsHeader>
-                                    <div>
+                              {activeScriptHistory.map((run) => {
+                                const isActive = ["queued", "running"].includes(run.state);
+                                return (
+                                  <ScriptHistoryRow key={run.runId || `${run.pathKey}-${run.startedAtMs}-${run.updatedAtMs}`}>
+                                    <ScriptHistoryRowMain>
                                       <strong>{run.title}</strong>
-                                      <span>{run.pathKey || "local script"}</span>
-                                    </div>
-                                    <ScriptLogsStatus data-state={run.state === "failed" || run.state === "error" ? "error" : run.state}>
-                                      {["queued", "running"].includes(run.state) && <DocsExplorerSpinner aria-hidden="true" />}
-                                      <span>
-                                        {run.state === "queued"
-                                          ? "Queued"
-                                          : run.state === "running"
-                                            ? "Running"
-                                            : run.ok === false || run.state === "failed" || run.state === "error"
-                                              ? "Failed"
-                                              : "Completed"}
-                                      </span>
+                                      <ScriptHistoryRowMeta>
+                                        <span>Cause {text(run.cause, "manual")}</span>
+                                        <span>Start {run.startedAtLabel}</span>
+                                        <span>End {isActive ? "pending" : run.endedAtLabel}</span>
+                                        <span>Duration {run.state === "queued" ? "queued" : run.state === "running" ? "running" : run.durationLabel}</span>
+                                      </ScriptHistoryRowMeta>
+                                    </ScriptHistoryRowMain>
+                                    <ScriptLogsStatus data-state={scriptRunStatusTone(run)}>
+                                      {isActive && <DocsExplorerSpinner aria-hidden="true" />}
+                                      <span>{scriptRunStatusLabel(run)}</span>
                                     </ScriptLogsStatus>
-                                  </ScriptLogsHeader>
-                                  <ScriptLogsMeta>
-                                    <span>Cause {text(run.cause, "manual")}</span>
-                                    <span>Source {text(run.source_kind || run.sourceKind, "manual")}</span>
-                                    <span>Start {run.startedAtLabel}</span>
-                                    <span>End {["queued", "running"].includes(run.state) ? "pending" : run.endedAtLabel}</span>
-                                    <span>Duration {run.state === "queued" ? "queued" : run.state === "running" ? "running" : run.durationLabel}</span>
-                                    {run.exitCode !== null && run.exitCode !== undefined && (
-                                      <span>Exit {String(run.exitCode)}</span>
-                                    )}
-                                  </ScriptLogsMeta>
-                                  {(run.chunks.length || run.error) && (
-                                    <ScriptHistoryOutput>
-                                      {run.chunks.slice(0, 2).map((chunk, index) => (
-                                        <ScriptLogChunk data-stream={chunk.stream === "stderr" ? "stderr" : "stdout"} key={`${run.runId}-${index}-${chunk.stream}`}>
-                                          {String(chunk.text || "")}
-                                        </ScriptLogChunk>
-                                      ))}
-                                      {run.error && <ScriptLogChunk data-stream="stderr">{`${run.error}\n`}</ScriptLogChunk>}
-                                    </ScriptHistoryOutput>
-                                  )}
-                                </ScriptHistoryRow>
-                              ))}
+                                  </ScriptHistoryRow>
+                                );
+                              })}
                             </ScriptHistoryList>
                           ) : (
                             <ScriptLogsEmpty>
@@ -4703,7 +4938,7 @@ export default function ToolsWorkspaceView({
                               </SkillDocumentActions>
                             </SkillDocumentToolbarControls>
                           </SkillDocumentToolbar>
-                          <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={scriptDocumentMetricsStyle}>
+                          <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={skillDocumentMetricsStyle}>
                             <SkillDocumentPage onPointerDownCapture={clearScriptSelection}>
                               <SkillDocumentTitleInput
                                 aria-label="Script name"
@@ -4712,26 +4947,6 @@ export default function ToolsWorkspaceView({
                                 readOnly={scriptEditorReadOnly}
                                 value={scriptEditor.title}
                               />
-                              <ScriptMetaRow>
-                                <DocTypeSelect
-                                  aria-label="Script shell"
-                                  disabled={scriptEditorReadOnly}
-                                  onChange={(event) => {
-                                    const shell = event.target.value;
-                                    setScriptEditor((current) => ({
-                                      ...current,
-                                      extension: scriptExtensionForShell(shell),
-                                      shell,
-                                    }));
-                                  }}
-                                  value={scriptShellOption(scriptEditor.shell).id}
-                                >
-                                  {SCRIPT_SHELL_OPTIONS.map((option) => (
-                                    <option key={option.id} value={option.id}>{option.label}</option>
-                                  ))}
-                                </DocTypeSelect>
-                                <span>{scriptPathKey(scriptEditor) || scriptFileName(scriptEditor)}</span>
-                              </ScriptMetaRow>
                               <SkillDocumentBodyStack>
                                 {preservedScriptEditorSelection?.active && (
                                   <ScriptSelectionOverlay aria-hidden="true">
@@ -4854,6 +5069,39 @@ export default function ToolsWorkspaceView({
                     </DocsCenterPane>
                   </ResizePanel>
                 </DocsWorkspaceGrid>
+                {scriptsContextMenu && (
+                  <FileContextMenu
+                    data-scripts-context-menu="true"
+                    role="menu"
+                    style={{
+                      left: scriptsContextMenu.x,
+                      top: scriptsContextMenu.y,
+                    }}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                    }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                  >
+                    <FileContextMenuItem
+                      onClick={beginCreateLocalScript}
+                      role="menuitem"
+                      type="button"
+                    >
+                      New script
+                    </FileContextMenuItem>
+                    {scriptsContextMenu.target?.kind === "script" && (
+                      <FileContextMenuItem
+                        data-danger="true"
+                        onClick={() => deleteContextScript(scriptsContextMenu.target)}
+                        role="menuitem"
+                        type="button"
+                      >
+                        Delete script
+                      </FileContextMenuItem>
+                    )}
+                  </FileContextMenu>
+                )}
               </DocsWorkspaceSurface>
             )}
 
@@ -5403,6 +5651,7 @@ const DocsPaneBase = styled.aside`
 `;
 
 const DocsFilesPane = styled(FileExplorerPane)`
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   height: 100%;
   max-height: 100%;
   overflow: hidden;
@@ -5498,6 +5747,50 @@ const DocsExplorerStatus = styled.span`
   font-size: 10px;
   line-height: 22px;
   text-align: center;
+`;
+
+const DocsExplorerFooter = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 8px 8px;
+  border-top: 1px solid var(--files-vscode-border-subtle);
+  background: var(--files-vscode-sidebar);
+`;
+
+const DocsExplorerFooterButton = styled.button`
+  display: inline-flex;
+  flex: 1 1 96px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--files-vscode-border);
+  border-radius: 6px;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-editor);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 760;
+  cursor: pointer;
+
+  span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.38);
+    color: var(--forge-accent-soft, #7db0ff);
+    background: var(--files-vscode-hover);
+    outline: none;
+  }
 `;
 
 const DocsExplorerSpinner = styled.span`
@@ -5734,21 +6027,6 @@ const DocsField = styled.div`
   }
 `;
 
-const DocTypeSelect = styled.select`
-  height: 28px;
-  max-width: 138px;
-  min-width: 112px;
-  padding: 0 9px;
-  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
-  border-radius: 7px;
-  color: var(--forge-text-soft, #b6c0cc);
-  background: var(--tools-control-bg);
-  color-scheme: var(--forge-color-scheme, dark);
-  font-size: 10.5px;
-  font-weight: 760;
-  outline: none;
-`;
-
 const DocsTemplateList = styled.div`
   display: grid;
   align-content: start;
@@ -5906,16 +6184,15 @@ const SkillDocumentEditor = styled.div`
 `;
 
 const SkillDocumentToolbar = styled.div`
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(max-content, auto);
   position: relative;
   z-index: 5;
   box-sizing: border-box;
   flex: 0 0 auto;
   min-width: 0;
   min-height: 44px;
-  align-items: flex-start;
-  justify-content: space-between;
+  align-items: start;
   gap: 8px;
   padding: 7px 10px;
   border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
@@ -5931,6 +6208,10 @@ const SkillDocumentToolbar = styled.div`
       padding-top: 48px;
     }
   }
+
+  @media (max-width: 980px) {
+    grid-template-columns: minmax(0, 1fr);
+  }
 `;
 
 const SkillDocumentToolbarCopy = styled.div`
@@ -5942,7 +6223,6 @@ const SkillDocumentToolbarCopy = styled.div`
 
 const SkillDocumentToolbarControls = styled.div`
   display: flex;
-  flex: 1 1 260px;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-start;
@@ -5951,9 +6231,14 @@ const SkillDocumentToolbarControls = styled.div`
   max-width: 100%;
 
   &[data-side="right"] {
-    flex: 1 1 240px;
     justify-content: flex-end;
     overflow: visible;
+  }
+
+  @media (max-width: 980px) {
+    &[data-side="right"] {
+      justify-content: flex-start;
+    }
   }
 `;
 
@@ -6381,30 +6666,46 @@ const ScriptHistoryList = styled.div`
 
 const ScriptHistoryRow = styled.article`
   display: grid;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
-  padding: 9px;
+  min-height: 50px;
+  padding: 8px 10px;
   border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 10px;
   background: rgba(8, 11, 16, 0.46);
 `;
 
-const ScriptHistoryOutput = styled.pre`
+const ScriptHistoryRowMain = styled.div`
+  display: grid;
+  gap: 5px;
   min-width: 0;
-  max-height: 160px;
-  margin: 0;
-  padding: 9px 10px;
-  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
-  border-radius: 8px;
-  overflow: auto;
-  background: #05070a;
-  color: #d8dee9;
-  font-family: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 10px;
-  font-weight: 560;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-strong, #f6f8fb);
+    font-size: 12px;
+    font-weight: 900;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const ScriptHistoryRowMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+
+  span {
+    color: var(--forge-text-muted, #8d96a6);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    font-size: 9px;
+    font-weight: 760;
+    white-space: nowrap;
+  }
 `;
 
 const ScriptLogChunk = styled.span`
@@ -6449,25 +6750,6 @@ const ScriptSelectionOverlay = styled(SkillDocumentSelectionOverlay)`
   font-weight: 560;
   line-height: 1.62;
   tab-size: 2;
-`;
-
-const ScriptMetaRow = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  margin-top: 12px;
-  color: var(--skill-editor-page-muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
-  font-size: 10px;
-  font-weight: 700;
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 `;
 
 const ScriptColorField = styled.label`

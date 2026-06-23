@@ -3984,8 +3984,9 @@ export const AppGlobalScriptRunStatus = styled.span`
   color: currentColor;
   cursor: pointer;
 
-  svg {
+  > svg {
     grid-area: 1 / 1;
+    display: block;
     width: 14px;
     height: 14px;
     transition:
@@ -3993,7 +3994,12 @@ export const AppGlobalScriptRunStatus = styled.span`
       transform 120ms ease;
   }
 
+  [data-spinner-icon="true"] {
+    z-index: 1;
+  }
+
   [data-cancel-icon="true"] {
+    z-index: 2;
     opacity: 0;
     transform: scale(0.72);
   }
@@ -4037,7 +4043,7 @@ export const AppGlobalScriptButton = styled.button`
     flex: 0 0 auto;
   }
 
-  span {
+  > [data-script-label="true"] {
     display: inline-block;
     flex: 0 0 auto;
     min-width: max-content;
@@ -4053,8 +4059,7 @@ export const AppGlobalScriptButton = styled.button`
   &[data-running="true"]:hover ${AppGlobalScriptRunStatus} [data-spinner-icon="true"],
   &[data-running="true"] ${AppGlobalScriptRunStatus}:hover [data-spinner-icon="true"],
   &[data-running="true"] ${AppGlobalScriptRunStatus}:focus-visible [data-spinner-icon="true"] {
-    opacity: 0;
-    transform: scale(0.72);
+    opacity: 0.28;
   }
 
   &[data-running="true"]:hover ${AppGlobalScriptRunStatus} [data-cancel-icon="true"],
@@ -4500,9 +4505,9 @@ export const LoopspaceGraphNode = styled.div`
   top: 0;
   left: 0;
   display: grid;
-  width: 220px;
-  min-height: 66px;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  width: max-content;
+  max-width: 320px;
+  grid-template-columns: 34px minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
@@ -4618,20 +4623,20 @@ export const LoopspaceGraphNodeText = styled.div`
   min-width: 0;
   gap: 3px;
 
-  strong,
-  span {
+  & > strong,
+  & > span {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  strong {
+  & > strong {
     font-size: 12.5px;
     font-weight: 850;
   }
 
-  span {
+  & > span {
     color: rgba(248, 250, 252, 0.56);
     font-size: 10px;
     font-weight: 740;
@@ -4640,55 +4645,314 @@ export const LoopspaceGraphNodeText = styled.div`
   }
 `;
 
-export const LoopspaceGraphNodeSelect = styled.select`
+export const LoopspaceGraphNodeSelectButton = styled.button`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 8px;
   width: 100%;
-  min-width: 0;
-  height: 24px;
-  margin-top: 3px;
-  padding: 0 22px 0 8px;
-  border: 1px solid rgba(var(--loop-node-accent), 0.28);
-  border-radius: 6px;
+  min-width: 168px;
+  margin-top: 5px;
+  padding: 6px 9px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.32);
+  border-radius: 7px;
   color: #f8fafc;
   background:
-    linear-gradient(135deg, rgba(var(--loop-node-accent), 0.12), rgba(255, 255, 255, 0.035)),
-    #050505;
-  font-size: 10.5px;
-  font-weight: 800;
-  letter-spacing: 0;
-  outline: none;
+    linear-gradient(135deg, rgba(var(--loop-node-accent), 0.14), rgba(255, 255, 255, 0.03)),
+    rgba(5, 5, 5, 0.92);
+  text-align: left;
+  cursor: pointer;
   pointer-events: auto;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
 
-  &:focus {
-    border-color: rgba(var(--loop-node-accent), 0.58);
+  &:hover:not(:disabled),
+  &[data-open="true"] {
+    border-color: rgba(var(--loop-node-accent), 0.6);
     box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.14);
   }
 
   &:disabled {
-    color: rgba(248, 250, 252, 0.42);
     cursor: not-allowed;
+    opacity: 0.55;
   }
 `;
 
-export const LoopspaceGraphNodeAction = styled.button`
-  display: inline-grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 6px;
-  color: rgba(248, 250, 252, 0.62);
-  background: rgba(255, 255, 255, 0.045);
-  cursor: pointer;
+export const LoopspaceGraphNodeSelectValue = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+
+  strong {
+    overflow: hidden;
+    font-size: 11.5px;
+    font-weight: 850;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const LoopspaceGraphNodeSelectDevice = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: rgba(var(--loop-node-accent), 0.88);
+  font-size: 9.5px;
+  font-weight: 760;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 
   svg {
-    width: 13px;
-    height: 13px;
+    flex: none;
+    width: 11px;
+    height: 11px;
+    opacity: 0.9;
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-muted="true"] {
+    color: rgba(248, 250, 252, 0.4);
+  }
+`;
+
+export const LoopspaceGraphNodeDeviceBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 2px;
+  padding: 4px 7px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.25);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.9);
+  background: rgba(255, 255, 255, 0.045);
+  font-size: 10px;
+  font-weight: 780;
+  letter-spacing: 0.02em;
+
+  svg {
+    flex: none;
+    width: 12px;
+    height: 12px;
+    color: rgba(var(--loop-node-accent), 0.9);
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const LoopspaceGraphNodeDeviceDot = styled.i`
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.14);
+
+  &[data-status="online"],
+  &[data-status="connected"],
+  &[data-status="active"],
+  &[data-status="ready"] {
+    background: #4ade80;
+    box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.14);
+  }
+
+  &[data-status="queued"],
+  &[data-status="awaiting_device"] {
+    background: #facc15;
+    box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.14);
+  }
+`;
+
+export const LoopspaceGraphNodeSelectChevron = styled.span`
+  display: grid;
+  place-items: center;
+  color: rgba(248, 250, 252, 0.6);
+
+  svg {
+    width: 16px;
+    height: 16px;
+    transition: transform 0.14s ease;
+  }
+
+  ${LoopspaceGraphNodeSelectButton}[data-open="true"] & svg {
+    transform: rotate(180deg);
+  }
+`;
+
+export const LoopspaceGraphNodeSelectMenu = styled.div`
+  position: fixed;
+  z-index: 2147483600;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 200px;
+  padding: 6px;
+  border: 1px solid rgba(251, 191, 36, 0.28);
+  border-radius: 11px;
+  background: rgba(12, 10, 6, 0.97);
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(251, 191, 36, 0.08);
+  backdrop-filter: blur(18px) saturate(130%);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+
+  &::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 8px;
+    background: rgba(251, 191, 36, 0.22);
+  }
+`;
+
+export const LoopspaceGraphNodeSelectOption = styled.button`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #f8fafc;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease;
+
+  & > svg {
+    flex: none;
+    width: 15px;
+    height: 15px;
+    color: #fbbf24;
+  }
+
+  &:hover,
+  &:focus-visible {
+    outline: none;
+    border-color: rgba(251, 191, 36, 0.3);
+    background: rgba(251, 191, 36, 0.12);
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(251, 191, 36, 0.34);
+    background: rgba(251, 191, 36, 0.16);
+  }
+`;
+
+export const LoopspaceGraphNodeSelectOptionMain = styled.span`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+
+  strong {
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const LoopspaceGraphNodeSelectOptionDevice = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: rgba(248, 250, 252, 0.52);
+  font-size: 10px;
+  font-weight: 680;
+  letter-spacing: 0.01em;
+
+  svg {
+    flex: none;
+    width: 12px;
+    height: 12px;
+    color: rgba(251, 191, 36, 0.78);
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-transform: uppercase;
+  }
+
+  em {
+    flex: none;
+    padding: 1px 5px;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(248, 250, 252, 0.6);
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 760;
+    text-transform: lowercase;
+  }
+`;
+
+export const LoopspaceGraphNodeSelectEmpty = styled.div`
+  padding: 12px 10px;
+  color: rgba(248, 250, 252, 0.55);
+  font-size: 11px;
+  font-weight: 640;
+  text-align: center;
+`;
+
+export const LoopspaceGraphNodeAction = styled.button`
+  position: absolute;
+  top: -9px;
+  right: -9px;
+  z-index: 3;
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid rgba(255, 121, 121, 0.32);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.86);
+  background: rgba(28, 10, 10, 0.96);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transform: scale(0.82);
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease, color 0.12s ease, background 0.12s ease;
+
+  svg {
+    width: 12px;
+    height: 12px;
   }
 
   &:hover {
-    color: #ffb4b4;
-    border-color: rgba(255, 121, 121, 0.28);
-    background: rgba(255, 78, 78, 0.1);
+    color: #fff;
+    border-color: rgba(255, 121, 121, 0.6);
+    background: rgba(220, 60, 60, 0.92);
+  }
+
+  ${LoopspaceGraphNode}:hover &,
+  ${LoopspaceGraphNode}:focus-within & {
+    opacity: 1;
+    transform: scale(1);
+    pointer-events: auto;
+  }
+
+  &:focus-visible {
+    opacity: 1;
+    transform: scale(1);
+    pointer-events: auto;
+    outline: none;
   }
 `;
 

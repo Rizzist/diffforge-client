@@ -13433,6 +13433,18 @@ fn cloud_mcp_loopspace_trigger_ids_for_command(loopspace_ids: Option<Vec<String>
     ids
 }
 
+fn cloud_mcp_normalize_webhook_auth_mode(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = match raw.to_ascii_lowercase().as_str() {
+        "signed" | "signed_hmac" | "hmac" | "stripe" | "stripe_compatible" => "signed_hmac",
+        "public" | "public_token" | "bearer" | "bearer_path" | "url_token" => "public_token",
+        _ => return Err("Webhook auth mode must be signed_hmac or public_token.".to_string()),
+    };
+    Ok(Some(normalized.to_string()))
+}
+
 #[tauri::command]
 async fn cloud_mcp_get_loopspace_triggers(
     _state: State<'_, CloudMcpState>,
@@ -13545,6 +13557,9 @@ async fn cloud_mcp_create_loopspace_trigger(
     loopspace_ids: Option<Vec<String>>,
     config: Option<Value>,
     enabled: Option<bool>,
+    webhook_auth_mode: Option<String>,
+    webhook_signature_tolerance_sec: Option<i64>,
+    public_webhook_confirmed: Option<bool>,
 ) -> Result<Value, String> {
     let name = name.trim().chars().take(120).collect::<String>();
     if name.is_empty() {
@@ -13554,6 +13569,16 @@ async fn cloud_mcp_create_loopspace_trigger(
     if !matches!(trigger_type.as_str(), "cron" | "webhook" | "manual") {
         return Err("Trigger type must be cron, webhook, or manual.".to_string());
     }
+    let webhook_auth_mode = if trigger_type == "webhook" {
+        let mode = cloud_mcp_normalize_webhook_auth_mode(webhook_auth_mode.as_deref())?
+            .unwrap_or_else(|| "signed_hmac".to_string());
+        if mode == "public_token" && !public_webhook_confirmed.unwrap_or(false) {
+            return Err("Creating a public webhook requires explicit confirmation.".to_string());
+        }
+        Some(mode)
+    } else {
+        None
+    };
     let mut config = cloud_mcp_loopspace_trigger_config_for_command(config, Some(&trigger_type));
     if trigger_type == "cron" {
         if let Some(object) = config.as_object_mut() {
@@ -13595,6 +13620,26 @@ async fn cloud_mcp_create_loopspace_trigger(
                 "idempotency_key": client_request_id,
             }]),
         );
+        if trigger_type == "webhook" {
+            if let Some(ops) = object.get_mut("ops").and_then(Value::as_array_mut) {
+                if let Some(op) = ops.first_mut().and_then(Value::as_object_mut) {
+                    if let Some(mode) = webhook_auth_mode.as_deref() {
+                        op.insert("webhook_auth_mode".to_string(), json!(mode));
+                        op.insert("webhookAuthMode".to_string(), json!(mode));
+                    }
+                    if let Some(tolerance) = webhook_signature_tolerance_sec {
+                        op.insert(
+                            "webhook_signature_tolerance_sec".to_string(),
+                            json!(tolerance.clamp(30, 86_400)),
+                        );
+                        op.insert(
+                            "webhookSignatureToleranceSec".to_string(),
+                            json!(tolerance.clamp(30, 86_400)),
+                        );
+                    }
+                }
+            }
+        }
     }
     cloud_mcp_send_loopspace_trigger_mutation(state.inner(), payload, "loopspace_trigger_create")
         .await
@@ -13609,6 +13654,9 @@ async fn cloud_mcp_update_loopspace_trigger(
     loopspace_ids: Option<Vec<String>>,
     config: Option<Value>,
     rotate_secret: Option<bool>,
+    webhook_auth_mode: Option<String>,
+    webhook_signature_tolerance_sec: Option<i64>,
+    public_webhook_confirmed: Option<bool>,
 ) -> Result<Value, String> {
     let trigger_id = trigger_id.trim().to_string();
     if trigger_id.is_empty() {
@@ -13646,6 +13694,19 @@ async fn cloud_mcp_update_loopspace_trigger(
     if rotate_secret.unwrap_or(false) {
         op["rotate_secret"] = json!(true);
         op["rotateSecret"] = json!(true);
+        changed = true;
+    }
+    if let Some(mode) = cloud_mcp_normalize_webhook_auth_mode(webhook_auth_mode.as_deref())? {
+        if mode == "public_token" && !public_webhook_confirmed.unwrap_or(false) {
+            return Err("Switching to a public webhook requires explicit confirmation.".to_string());
+        }
+        op["webhook_auth_mode"] = json!(mode);
+        op["webhookAuthMode"] = json!(mode);
+        changed = true;
+    }
+    if let Some(tolerance) = webhook_signature_tolerance_sec {
+        op["webhook_signature_tolerance_sec"] = json!(tolerance.clamp(30, 86_400));
+        op["webhookSignatureToleranceSec"] = json!(tolerance.clamp(30, 86_400));
         changed = true;
     }
     if !changed {
@@ -16952,6 +17013,10 @@ fn cloud_mcp_apply_remote_local_script_lever(
             .or_else(|| cloud_mcp_payload_text(&event, &["payload", "trigger_id"]))
             .or_else(|| cloud_mcp_payload_text(&event, &["payload", "triggerId"]))
             .unwrap_or_default();
+        let trigger_run_id = cloud_mcp_payload_text(&event, &["trigger_run_id", "triggerRunId"])
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "trigger_run_id"]))
+            .or_else(|| cloud_mcp_payload_text(&event, &["payload", "triggerRunId"]))
+            .unwrap_or_default();
         let voice_session_id =
             cloud_mcp_payload_text(&event, &["voice_session_id", "voiceSessionId"])
                 .or_else(|| cloud_mcp_payload_text(&event, &["payload", "voice_session_id"]))
@@ -16969,6 +17034,21 @@ fn cloud_mcp_apply_remote_local_script_lever(
             .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopspace_id"]))
             .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopspaceId"]))
             .unwrap_or_default();
+        let loop_runtime_run_id =
+            cloud_mcp_payload_text(&event, &["loop_runtime_run_id", "loopRuntimeRunId"])
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loop_runtime_run_id"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopRuntimeRunId"]))
+                .unwrap_or_else(|| run_id.clone());
+        let loop_runtime_node_id =
+            cloud_mcp_payload_text(&event, &["loop_runtime_node_id", "loopRuntimeNodeId"])
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loop_runtime_node_id"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopRuntimeNodeId"]))
+                .unwrap_or_default();
+        let loop_runtime_edge_id =
+            cloud_mcp_payload_text(&event, &["loop_runtime_edge_id", "loopRuntimeEdgeId"])
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loop_runtime_edge_id"]))
+                .or_else(|| cloud_mcp_payload_text(&event, &["payload", "loopRuntimeEdgeId"]))
+                .unwrap_or_default();
         let request_id = cloud_mcp_payload_text(&event, &["request_id", "requestId"])
             .or_else(|| cloud_mcp_payload_text(&event, &["payload", "request_id"]))
             .or_else(|| cloud_mcp_payload_text(&event, &["payload", "requestId"]))
@@ -16995,6 +17075,9 @@ fn cloud_mcp_apply_remote_local_script_lever(
         let request = json!({
             "cause": cause,
             "command_id": command_id,
+            "loop_runtime_edge_id": loop_runtime_edge_id,
+            "loop_runtime_node_id": loop_runtime_node_id,
+            "loop_runtime_run_id": loop_runtime_run_id,
             "loopspace_id": loopspace_id,
             "path_key": path_key,
             "request_id": request_id,
@@ -17005,6 +17088,7 @@ fn cloud_mcp_apply_remote_local_script_lever(
             "source_kind": source_kind,
             "terminal_id": terminal_id,
             "trigger_id": trigger_id,
+            "trigger_run_id": trigger_run_id,
             "voice_session_id": voice_session_id,
             "working_directory": working_directory,
             "workspace_id": workspace_id,

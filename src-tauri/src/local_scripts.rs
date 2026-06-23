@@ -683,7 +683,11 @@ fn local_scripts_run_state_payload(
         "terminal_id": local_scripts_text(request.get("terminal_id").or_else(|| request.get("terminalId"))),
         "timed_out": timed_out,
         "loopspace_id": local_scripts_text(request.get("loopspace_id").or_else(|| request.get("loopspaceId"))),
+        "loop_runtime_edge_id": local_scripts_text(request.get("loop_runtime_edge_id").or_else(|| request.get("loopRuntimeEdgeId"))),
+        "loop_runtime_node_id": local_scripts_text(request.get("loop_runtime_node_id").or_else(|| request.get("loopRuntimeNodeId"))),
+        "loop_runtime_run_id": local_scripts_text(request.get("loop_runtime_run_id").or_else(|| request.get("loopRuntimeRunId"))).if_empty(run_id),
         "trigger_id": local_scripts_text(request.get("trigger_id").or_else(|| request.get("triggerId"))),
+        "trigger_run_id": local_scripts_text(request.get("trigger_run_id").or_else(|| request.get("triggerRunId"))),
         "updated_at": local_scripts_now_iso(),
         "voice_session_id": local_scripts_text(request.get("voice_session_id").or_else(|| request.get("voiceSessionId"))),
         "workspace_id": local_scripts_text(request.get("workspace_id").or_else(|| request.get("workspaceId"))),
@@ -1336,6 +1340,10 @@ async fn local_scripts_enqueue_run(app: AppHandle, request: Value) -> Result<Val
         json!({
             "cause": cause,
             "kind": "local_script_run",
+            "loop_runtime_edge_id": local_scripts_text(request.get("loop_runtime_edge_id").or_else(|| request.get("loopRuntimeEdgeId"))),
+            "loop_runtime_node_id": local_scripts_text(request.get("loop_runtime_node_id").or_else(|| request.get("loopRuntimeNodeId"))),
+            "loop_runtime_run_id": local_scripts_text(request.get("loop_runtime_run_id").or_else(|| request.get("loopRuntimeRunId"))).if_empty(&run_id),
+            "loopspace_id": local_scripts_text(request.get("loopspace_id").or_else(|| request.get("loopspaceId"))),
             "path_key": rel_path.clone(),
             "queued_at": queued_at,
             "queued_at_ms": queued_at_ms,
@@ -1345,6 +1353,8 @@ async fn local_scripts_enqueue_run(app: AppHandle, request: Value) -> Result<Val
             "source_kind": source_kind,
             "stage": "queued",
             "state": "queued",
+            "trigger_id": local_scripts_text(request.get("trigger_id").or_else(|| request.get("triggerId"))),
+            "trigger_run_id": local_scripts_text(request.get("trigger_run_id").or_else(|| request.get("triggerRunId"))),
         }),
     );
     local_scripts_spawn_run_state_sync(cloud_state, payload);
@@ -1458,6 +1468,10 @@ fn local_scripts_fail_queued_run(app: AppHandle, request: Value, error: String) 
             "error": error,
             "exit_code": Value::Null,
             "kind": "local_script_run",
+            "loop_runtime_edge_id": local_scripts_text(request.get("loop_runtime_edge_id").or_else(|| request.get("loopRuntimeEdgeId"))),
+            "loop_runtime_node_id": local_scripts_text(request.get("loop_runtime_node_id").or_else(|| request.get("loopRuntimeNodeId"))),
+            "loop_runtime_run_id": local_scripts_text(request.get("loop_runtime_run_id").or_else(|| request.get("loopRuntimeRunId"))).if_empty(&run_id),
+            "loopspace_id": local_scripts_text(request.get("loopspace_id").or_else(|| request.get("loopspaceId"))),
             "ok": false,
             "path_key": rel_path,
             "run_id": run_id,
@@ -1468,6 +1482,8 @@ fn local_scripts_fail_queued_run(app: AppHandle, request: Value, error: String) 
             "stderr": "",
             "stdout": "",
             "timed_out": false,
+            "trigger_id": local_scripts_text(request.get("trigger_id").or_else(|| request.get("triggerId"))),
+            "trigger_run_id": local_scripts_text(request.get("trigger_run_id").or_else(|| request.get("triggerRunId"))),
         }),
     );
     local_scripts_spawn_run_state_sync(cloud_state, failed_payload);
@@ -1523,6 +1539,10 @@ fn local_scripts_cancel_queued_run(app: AppHandle, request: Value) -> Value {
         "error": error_text,
         "exit_code": Value::Null,
         "kind": "local_script_run",
+        "loop_runtime_edge_id": local_scripts_text(request.get("loop_runtime_edge_id").or_else(|| request.get("loopRuntimeEdgeId"))),
+        "loop_runtime_node_id": local_scripts_text(request.get("loop_runtime_node_id").or_else(|| request.get("loopRuntimeNodeId"))),
+        "loop_runtime_run_id": local_scripts_text(request.get("loop_runtime_run_id").or_else(|| request.get("loopRuntimeRunId"))).if_empty(&run_id),
+        "loopspace_id": local_scripts_text(request.get("loopspace_id").or_else(|| request.get("loopspaceId"))),
         "ok": false,
         "path_key": rel_path.clone(),
         "queued_at": local_scripts_text(request.get("queued_at")),
@@ -1536,6 +1556,8 @@ fn local_scripts_cancel_queued_run(app: AppHandle, request: Value) -> Value {
         "stderr": "",
         "stdout": "",
         "timed_out": false,
+        "trigger_id": local_scripts_text(request.get("trigger_id").or_else(|| request.get("triggerId"))),
+        "trigger_run_id": local_scripts_text(request.get("trigger_run_id").or_else(|| request.get("triggerRunId"))),
     });
     local_scripts_store_run_row(&result);
     local_scripts_emit_run_event(&app, result.clone());
@@ -1713,6 +1735,10 @@ async fn local_scripts_run_request(app: AppHandle, request: Value) -> Result<Val
                 "cwd": cwd.clone(),
                 "cause": local_scripts_run_cause(&request),
                 "kind": "local_script_run",
+                "loop_runtime_edge_id": local_scripts_text(request.get("loop_runtime_edge_id").or_else(|| request.get("loopRuntimeEdgeId"))),
+                "loop_runtime_node_id": local_scripts_text(request.get("loop_runtime_node_id").or_else(|| request.get("loopRuntimeNodeId"))),
+                "loop_runtime_run_id": local_scripts_text(request.get("loop_runtime_run_id").or_else(|| request.get("loopRuntimeRunId"))).if_empty(&run_id),
+                "loopspace_id": local_scripts_text(request.get("loopspace_id").or_else(|| request.get("loopspaceId"))),
                 "path_key": rel_path.clone(),
                 "queued_at": local_scripts_text(request.get("queued_at")),
                 "queued_at_ms": local_scripts_request_i64(&request, &["queued_at_ms"]),
@@ -1723,6 +1749,8 @@ async fn local_scripts_run_request(app: AppHandle, request: Value) -> Result<Val
                 "started_at": started_at_iso,
                 "started_at_ms": started_at_ms,
                 "state": "running",
+                "trigger_id": local_scripts_text(request.get("trigger_id").or_else(|| request.get("triggerId"))),
+                "trigger_run_id": local_scripts_text(request.get("trigger_run_id").or_else(|| request.get("triggerRunId"))),
             }),
         );
         local_scripts_spawn_run_state_sync(cloud_state.clone(), running_payload);
@@ -1803,6 +1831,10 @@ async fn local_scripts_run_request(app: AppHandle, request: Value) -> Result<Val
             "error": error_text,
             "exit_code": status.code(),
             "kind": "local_script_run",
+            "loop_runtime_edge_id": local_scripts_text(request.get("loop_runtime_edge_id").or_else(|| request.get("loopRuntimeEdgeId"))),
+            "loop_runtime_node_id": local_scripts_text(request.get("loop_runtime_node_id").or_else(|| request.get("loopRuntimeNodeId"))),
+            "loop_runtime_run_id": local_scripts_text(request.get("loop_runtime_run_id").or_else(|| request.get("loopRuntimeRunId"))).if_empty(&run_id),
+            "loopspace_id": local_scripts_text(request.get("loopspace_id").or_else(|| request.get("loopspaceId"))),
             "ok": ok,
             "path_key": rel_path.clone(),
             "queued_at": local_scripts_text(request.get("queued_at")),
@@ -1819,6 +1851,8 @@ async fn local_scripts_run_request(app: AppHandle, request: Value) -> Result<Val
             "stdout": stdout,
             "stdout_truncated": stdout_truncated,
             "timed_out": timed_out,
+            "trigger_id": local_scripts_text(request.get("trigger_id").or_else(|| request.get("triggerId"))),
+            "trigger_run_id": local_scripts_text(request.get("trigger_run_id").or_else(|| request.get("triggerRunId"))),
         });
         local_scripts_store_run_row(&result);
         local_scripts_emit_run_event(&app, {

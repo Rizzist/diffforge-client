@@ -649,7 +649,31 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "type": {"type": "string", "description": "Alias for trigger_type."},
                     "loopspace_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional loopspace ids this trigger belongs to."},
                     "config": {"type": "object", "description": "Trigger config. Cron supports {schedule:'@every 5m'}."},
+                    "webhook_auth_mode": {"type": "string", "description": "For webhook triggers: signed_hmac by default, or public_token when the user explicitly wants a public URL."},
+                    "webhook_signature_tolerance_sec": {"type": "integer", "description": "Signed webhook timestamp tolerance in seconds. Default 300."},
+                    "public_webhook_confirmed": {"type": "boolean", "description": "Required true when webhook_auth_mode is public_token."},
                     "enabled": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "update_loopspace_trigger",
+            "description": "Update, enable/disable, or rotate a reusable Loopspace trigger. For webhook public_token mode, public_webhook_confirmed must be true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "trigger_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "trigger_name": {"type": "string", "description": "New visible trigger name."},
+                    "name": {"type": "string", "description": "Alias for trigger_name."},
+                    "enabled": {"type": "boolean"},
+                    "loopspace_ids": {"type": "array", "items": {"type": "string"}},
+                    "config": {"type": "object", "description": "Replacement trigger config. Cron supports {schedule:'@every 5m'}."},
+                    "rotate_secret": {"type": "boolean", "description": "Rotate webhook public URL token or signing secret."},
+                    "webhook_auth_mode": {"type": "string", "description": "signed_hmac or public_token."},
+                    "webhook_signature_tolerance_sec": {"type": "integer", "description": "Signed webhook timestamp tolerance in seconds."},
+                    "public_webhook_confirmed": {"type": "boolean", "description": "Required true when webhook_auth_mode is public_token."}
                 },
                 "additionalProperties": true
             }
@@ -839,6 +863,7 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "select_workspace",
         "list_loopspace_triggers",
         "create_loopspace_trigger",
+        "update_loopspace_trigger",
         "run_loopspace_trigger",
         "get_loopspace_graph",
         "update_loopspace_graph",
