@@ -1098,6 +1098,7 @@ const ACTIVITY_SYNC_CONNECTING_STATUSES = [
 ];
 const ACTIVITY_SYNC_OFFLINE_STATUSES = [
   "offline",
+  "offline_permanent",
   "retrying",
   "websocket_retrying",
 ];
@@ -1327,10 +1328,11 @@ function normalizeActivitySyncBadge(status) {
     "connecting",
     "local",
     "offline",
+    "offline_permanent",
     "provisioning",
     "syncing",
   ].includes(rawConnection)
-    ? rawConnection
+    ? rawConnection === "offline_permanent" ? "offline" : rawConnection
     : "";
   const connection = explicitConnection || (connected
     ? "connected"

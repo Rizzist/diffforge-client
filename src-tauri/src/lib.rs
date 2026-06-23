@@ -1830,6 +1830,8 @@ struct TerminalOpenRequest {
     provider: Option<String>,
     provider_session_id: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
     plain_shell: Option<bool>,
     fresh_session: Option<bool>,
     preserve_coordination_session: Option<bool>,
@@ -1859,6 +1861,8 @@ struct TerminalStartAgentRequest {
     provider: String,
     provider_session_id: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1903,6 +1907,8 @@ struct TerminalOpenResult {
     requested_provider_session_id: Option<String>,
     model: Option<String>,
     model_source: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
     activity_status: String,
     command_phase: String,
     input_ready: bool,

@@ -19680,6 +19680,7 @@ function TerminalView({
   terminalWorkspaceWorkingDirectory,
   terminalWorkspaceLogicalIndexes,
   terminalWorkspaceLogicalTerminalCount,
+  agentLaunchDefaults = null,
   agentStatusError,
   agentStatuses,
   agentStatusState,
@@ -20405,6 +20406,12 @@ function TerminalView({
         || getTodoQueueRemoteCommandDispatchId(item)
         || "",
     ).trim();
+    const loopRuntimeRunId = String(fields.loopRuntimeRunId || fields.loop_runtime_run_id || item?.remoteCommand?.loopRuntimeRunId || item?.remoteCommand?.loop_runtime_run_id || "").trim();
+    const loopRuntimeNodeId = String(fields.loopRuntimeNodeId || fields.loop_runtime_node_id || item?.remoteCommand?.loopRuntimeNodeId || item?.remoteCommand?.loop_runtime_node_id || "").trim();
+    const loopRuntimeEdgeId = String(fields.loopRuntimeEdgeId || fields.loop_runtime_edge_id || item?.remoteCommand?.loopRuntimeEdgeId || item?.remoteCommand?.loop_runtime_edge_id || "").trim();
+    const loopspaceId = String(fields.loopspaceId || fields.loopspace_id || item?.remoteCommand?.loopspaceId || item?.remoteCommand?.loopspace_id || "").trim();
+    const loopRuntimeTriggerId = String(fields.triggerId || fields.trigger_id || item?.remoteCommand?.triggerId || item?.remoteCommand?.trigger_id || "").trim();
+    const loopRuntimeTriggerRunId = String(fields.triggerRunId || fields.trigger_run_id || item?.remoteCommand?.triggerRunId || item?.remoteCommand?.trigger_run_id || "").trim();
     const receiptItem = commandId
       ? {
         ...(item || {}),
@@ -20511,6 +20518,12 @@ function TerminalView({
           ...(dispatchSource && typeof dispatchSource === "object" ? { dispatchSource } : {}),
           ...(dispatchTarget && typeof dispatchTarget === "object" ? { dispatchTarget } : {}),
           itemId: nextReceipt.itemId,
+          loopRuntimeEdgeId: fields.loopRuntimeEdgeId || fields.loop_runtime_edge_id || item?.remoteCommand?.loopRuntimeEdgeId || item?.remoteCommand?.loop_runtime_edge_id || "",
+          loopRuntimeNodeId: fields.loopRuntimeNodeId || fields.loop_runtime_node_id || item?.remoteCommand?.loopRuntimeNodeId || item?.remoteCommand?.loop_runtime_node_id || "",
+          loopRuntimeRunId: fields.loopRuntimeRunId || fields.loop_runtime_run_id || item?.remoteCommand?.loopRuntimeRunId || item?.remoteCommand?.loop_runtime_run_id || "",
+          loopRuntimeTriggerId: fields.triggerId || fields.trigger_id || item?.remoteCommand?.triggerId || item?.remoteCommand?.trigger_id || "",
+          loopRuntimeTriggerRunId: fields.triggerRunId || fields.trigger_run_id || item?.remoteCommand?.triggerRunId || item?.remoteCommand?.trigger_run_id || "",
+          loopspaceId: fields.loopspaceId || fields.loopspace_id || item?.remoteCommand?.loopspaceId || item?.remoteCommand?.loopspace_id || "",
           source: normalizeTodoQueueSource(item?.source),
           statusReason: String(fields.reason || fields.message || ""),
           targetAgentId: fields.targetAgentId || getTodoQueueTargetAgentId(item),
@@ -20525,6 +20538,55 @@ function TerminalView({
         dispatchId,
         status: nextReceipt.status,
         workspaceId,
+      }).catch(() => {});
+    }
+    if (loopRuntimeRunId && loopspaceId) {
+      const receiptStatus = nextReceipt.status;
+      const remoteStatus = receiptStatus === "sending"
+        ? "running"
+        : receiptStatus === "submitted"
+          ? "running"
+          : receiptStatus === "released"
+            ? "interrupted"
+            : receiptStatus;
+      void invoke("cloud_mcp_record_remote_command_status", {
+        event: {
+          command_id: commandId || loopRuntimeRunId,
+          commandId: commandId || loopRuntimeRunId,
+          command_kind: "terminal_orchestrator_send_message",
+          commandKind: "terminal_orchestrator_send_message",
+          loop_runtime_run_id: loopRuntimeRunId,
+          loopRuntimeRunId: loopRuntimeRunId,
+          loop_runtime_node_id: loopRuntimeNodeId,
+          loopRuntimeNodeId: loopRuntimeNodeId,
+          loop_runtime_edge_id: loopRuntimeEdgeId,
+          loopRuntimeEdgeId: loopRuntimeEdgeId,
+          loopspace_id: loopspaceId,
+          loopspaceId: loopspaceId,
+          trigger_id: loopRuntimeTriggerId,
+          triggerId: loopRuntimeTriggerId,
+          trigger_run_id: loopRuntimeTriggerRunId,
+          triggerRunId: loopRuntimeTriggerRunId,
+          target_terminal_id: fields.targetTerminalId || getTodoQueueTargetTerminalId(item),
+          targetTerminalId: fields.targetTerminalId || getTodoQueueTargetTerminalId(item),
+          target_terminal_index: fields.targetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
+          targetTerminalIndex: fields.targetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
+          target_terminal_name: fields.targetTerminalName || getTodoQueueTargetTerminalName(item),
+          targetTerminalName: fields.targetTerminalName || getTodoQueueTargetTerminalName(item),
+        },
+        message: String(fields.reason || fields.message || receiptStatus || ""),
+        status: remoteStatus,
+        details: {
+          itemId: nextReceipt.itemId,
+          source: normalizeTodoQueueSource(item?.source),
+          statusReason: String(fields.reason || fields.message || ""),
+          targetAgentId: fields.targetAgentId || getTodoQueueTargetAgentId(item),
+          targetTerminalId: fields.targetTerminalId || getTodoQueueTargetTerminalId(item),
+          targetTerminalIndex: fields.targetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
+          targetTerminalName: fields.targetTerminalName || getTodoQueueTargetTerminalName(item),
+          targetThreadId: fields.targetThreadId || getTodoQueueTargetThreadId(item),
+          textPreview: nextReceipt.text,
+        },
       }).catch(() => {});
     }
     return receiptKey;
@@ -26607,6 +26669,30 @@ function TerminalView({
       commandId,
       dispatchSource,
       dispatchTarget,
+      ...(item?.remoteCommand?.loopRuntimeRunId || item?.remoteCommand?.loop_runtime_run_id ? {
+        loopRuntimeRunId: item.remoteCommand.loopRuntimeRunId || item.remoteCommand.loop_runtime_run_id,
+        loop_runtime_run_id: item.remoteCommand.loopRuntimeRunId || item.remoteCommand.loop_runtime_run_id,
+      } : {}),
+      ...(item?.remoteCommand?.loopRuntimeNodeId || item?.remoteCommand?.loop_runtime_node_id ? {
+        loopRuntimeNodeId: item.remoteCommand.loopRuntimeNodeId || item.remoteCommand.loop_runtime_node_id,
+        loop_runtime_node_id: item.remoteCommand.loopRuntimeNodeId || item.remoteCommand.loop_runtime_node_id,
+      } : {}),
+      ...(item?.remoteCommand?.loopRuntimeEdgeId || item?.remoteCommand?.loop_runtime_edge_id ? {
+        loopRuntimeEdgeId: item.remoteCommand.loopRuntimeEdgeId || item.remoteCommand.loop_runtime_edge_id,
+        loop_runtime_edge_id: item.remoteCommand.loopRuntimeEdgeId || item.remoteCommand.loop_runtime_edge_id,
+      } : {}),
+      ...(item?.remoteCommand?.loopspaceId || item?.remoteCommand?.loopspace_id ? {
+        loopspaceId: item.remoteCommand.loopspaceId || item.remoteCommand.loopspace_id,
+        loopspace_id: item.remoteCommand.loopspaceId || item.remoteCommand.loopspace_id,
+      } : {}),
+      ...(item?.remoteCommand?.triggerId || item?.remoteCommand?.trigger_id ? {
+        triggerId: item.remoteCommand.triggerId || item.remoteCommand.trigger_id,
+        trigger_id: item.remoteCommand.triggerId || item.remoteCommand.trigger_id,
+      } : {}),
+      ...(item?.remoteCommand?.triggerRunId || item?.remoteCommand?.trigger_run_id ? {
+        triggerRunId: item.remoteCommand.triggerRunId || item.remoteCommand.trigger_run_id,
+        trigger_run_id: item.remoteCommand.triggerRunId || item.remoteCommand.trigger_run_id,
+      } : {}),
       source: queuedMode ? "cloud-diffforge-todo-dispatch" : "cloud-diffforge-listed-todo",
       todoDeviceId: sourceDeviceId,
       todoDispatchId: dispatchId,
@@ -34733,6 +34819,7 @@ function TerminalView({
                 key={`${terminalWorkspace.id}-${terminalIndex}`}
                 agent={getTerminalAgent(terminalIndex)}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
+                agentLaunchDefaults={agentLaunchDefaults}
                 agentLaunchReady={workspaceTerminalAgentLaunchReady}
                 agentStatuses={agentStatuses}
                 agentStatusError={agentStatusError}
@@ -34897,6 +34984,7 @@ function TerminalView({
       key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}`}
       agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
       agentLaunchEpoch={workspaceAgentLaunchEpoch}
+      agentLaunchDefaults={agentLaunchDefaults}
       agentLaunchReady={workspaceTerminalAgentLaunchReady}
       agentStatuses={agentStatuses}
       agentStatusError={agentStatusError}

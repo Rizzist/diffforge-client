@@ -31,6 +31,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styled, { keyframes } from "styled-components";
 
+import { AGENT_LAUNCH_MODEL_OPTIONS as MODEL_OPTIONS } from "../agents/agentLaunchDefaults.js";
 import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
 import {
   appendWorkspaceThreadComposerAttachments,
@@ -2383,26 +2384,6 @@ const PRISM_LANGUAGE_ALIASES = new Map([
   ["tsx", "tsx"],
   ["yml", "yaml"],
 ]);
-const MODEL_OPTIONS = {
-  claude: [
-    { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
-    { detail: "Higher capability", label: "Opus", value: "opus" },
-    { detail: "Fastest Claude option", label: "Haiku", speed: "fast", value: "haiku" },
-  ],
-  codex: [
-    { detail: "Latest Codex model", label: "5.5", thinkingPower: "xhigh", value: "gpt-5.5" },
-    { detail: "Balanced coding model", label: "5.4", thinkingPower: "high", value: "gpt-5.4" },
-    { detail: "Fast coding model", label: "5.3 Codex Spark", speed: "fast", thinkingPower: "high", value: "gpt-5.3-codex-spark" },
-    { detail: "Long-running work model", label: "5.2", thinkingPower: "high", value: "gpt-5.2" },
-    { detail: "Older Codex model", label: "5.1", thinkingPower: "medium", value: "gpt-5.1" },
-  ],
-  opencode: [
-    { detail: "Vision capable when configured in OpenCode", label: "GPT-5.5", value: "openai/gpt-5.5" },
-    { detail: "Vision capable when configured in OpenCode", label: "Claude Sonnet", value: "anthropic/claude-sonnet-4-5" },
-    { detail: "Vision capable when configured in OpenCode", label: "Gemini 2.5 Pro", value: "google/gemini-2.5-pro" },
-  ],
-};
-
 function normalizeAgentId(value) {
   const agentId = String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
 

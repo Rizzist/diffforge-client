@@ -139,6 +139,133 @@ fn terminal_provider_resume_args(
     }
 }
 
+#[derive(Clone, Default)]
+struct TerminalProviderLaunchOptions {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct TerminalProviderResolvedLaunchOptions {
+    model: Option<String>,
+    model_source: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
+}
+
+fn terminal_normalize_launch_keyword(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty() && value != "default")
+}
+
+fn terminal_provider_model_supports_codex_fast(model: Option<&str>) -> bool {
+    let model = model.unwrap_or_default().trim().to_ascii_lowercase();
+    model == "gpt-5.5" || model == "gpt-5.4"
+}
+
+fn terminal_provider_model_supports_claude_fast(model: Option<&str>) -> bool {
+    let model = model.unwrap_or_default().trim().to_ascii_lowercase();
+    model == "opus" || model.contains("opus")
+}
+
+fn terminal_normalize_launch_reasoning_effort(
+    provider: AgentProvider,
+    effort: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(effort) = terminal_normalize_launch_keyword(effort) else {
+        return Ok(None);
+    };
+
+    let valid = match provider {
+        AgentProvider::Codex => matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh"),
+        AgentProvider::Claude => {
+            matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
+        }
+        AgentProvider::OpenCode => false,
+    };
+
+    if valid {
+        Ok(Some(effort))
+    } else if matches!(provider, AgentProvider::OpenCode) {
+        Err(
+            "OpenCode launch effort is configured through OpenCode model variants, not a global CLI flag."
+                .to_string(),
+        )
+    } else {
+        Err("Launch effort is invalid for this provider.".to_string())
+    }
+}
+
+fn terminal_normalize_launch_speed(
+    provider: AgentProvider,
+    model: Option<&str>,
+    speed: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(speed) = speed.map(|value| value.trim().to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if speed.is_empty() || speed == "default" {
+        return Ok(None);
+    }
+    if speed == "standard" {
+        return Ok(Some("standard".to_string()));
+    }
+    if speed != "fast" {
+        return Err("Launch speed is invalid.".to_string());
+    }
+
+    let supported = match provider {
+        AgentProvider::Codex => terminal_provider_model_supports_codex_fast(model),
+        AgentProvider::Claude => terminal_provider_model_supports_claude_fast(model),
+        AgentProvider::OpenCode => false,
+    };
+
+    if supported {
+        Ok(Some("fast".to_string()))
+    } else {
+        Err("Fast launch speed is not supported for this provider/model.".to_string())
+    }
+}
+
+fn terminal_append_provider_launch_args(
+    provider: AgentProvider,
+    args: &mut Vec<String>,
+    launch: &TerminalProviderResolvedLaunchOptions,
+) {
+    if let Some(model) = launch.model.as_ref() {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+
+    match provider {
+        AgentProvider::Codex => {
+            if let Some(effort) = launch.reasoning_effort.as_ref() {
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort=\"{effort}\""));
+            }
+            if launch.speed.as_deref() == Some("fast") {
+                args.push("-c".to_string());
+                args.push("service_tier=\"fast\"".to_string());
+                args.push("--enable".to_string());
+                args.push("fast_mode".to_string());
+            }
+        }
+        AgentProvider::Claude => {
+            if let Some(effort) = launch.reasoning_effort.as_ref() {
+                args.push("--effort".to_string());
+                args.push(effort.clone());
+            }
+            if launch.speed.as_deref() == Some("fast") {
+                args.push("--settings".to_string());
+                args.push("{\"fastMode\":true}".to_string());
+            }
+        }
+        AgentProvider::OpenCode => {}
+    }
+}
+
 fn terminal_uuid_session_id_from_text(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     for window in bytes.windows(36) {
@@ -902,10 +1029,10 @@ fn spawn_terminal_codex_session_discovery(
 fn terminal_launch(
     kind: &str,
     provider: Option<String>,
-    model: Option<String>,
+    launch_options: TerminalProviderLaunchOptions,
     provider_session_id: Option<String>,
     working_directory: &str,
-) -> Result<(Vec<String>, Vec<String>, String, Option<String>, Option<String>, Option<String>), String> {
+) -> Result<(Vec<String>, Vec<String>, String, Option<String>, TerminalProviderResolvedLaunchOptions), String> {
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
     let requested_resume_session_id = provider_session_id
@@ -939,30 +1066,43 @@ fn terminal_launch(
         .as_deref()
         .and_then(|session_id| agent_session_last_model(provider, session_id))
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
-    let request_model = normalize_forge_model(model)?;
-    let (launch_model, launch_model_source) = match session_model {
-        Some(model) => (Some(model), Some("session-current".to_string())),
+    let request_model = normalize_forge_model(launch_options.model)?;
+    let mut resolved_launch = match session_model {
+        Some(model) => TerminalProviderResolvedLaunchOptions {
+            model: Some(model),
+            model_source: Some("session-current".to_string()),
+            ..Default::default()
+        },
         None => {
             let source = if request_model.is_some() {
                 Some("request".to_string())
             } else {
                 None
             };
-            (request_model, source)
+            TerminalProviderResolvedLaunchOptions {
+                model: request_model,
+                model_source: source,
+                ..Default::default()
+            }
         }
     };
-    if let Some(model) = launch_model.as_ref() {
-        args.push("--model".to_string());
-        args.push(model.clone());
-    }
+    resolved_launch.reasoning_effort = terminal_normalize_launch_reasoning_effort(
+        provider,
+        launch_options.reasoning_effort,
+    )?;
+    resolved_launch.speed = terminal_normalize_launch_speed(
+        provider,
+        resolved_launch.model.as_deref(),
+        launch_options.speed,
+    )?;
+    terminal_append_provider_launch_args(provider, &mut args, &resolved_launch);
 
     Ok((
         agent_command_candidates(definition),
         args,
         definition.label.to_string(),
         codex_resume_home,
-        launch_model,
-        launch_model_source,
+        resolved_launch,
     ))
 }
 
@@ -4877,7 +5017,11 @@ async fn terminal_open(
     let provider_session_id = request.provider_session_id;
     let requested_provider_session_id =
         terminal_clean_provider_session_id(provider_session_id.as_deref());
-    let model = request.model;
+    let launch_options = TerminalProviderLaunchOptions {
+        model: request.model,
+        reasoning_effort: request.reasoning_effort,
+        speed: request.speed,
+    };
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
     let fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
@@ -4995,13 +5139,19 @@ async fn terminal_open(
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
         None;
 
-    let (command_candidates, args, label, codex_resume_home, launch_model, launch_model_source) = if is_prewarm_pty || plain_shell {
-        (Vec::new(), Vec::new(), "Prepared PTY".to_string(), None, None, None)
+    let (command_candidates, args, label, codex_resume_home, resolved_launch) = if is_prewarm_pty || plain_shell {
+        (
+            Vec::new(),
+            Vec::new(),
+            "Prepared PTY".to_string(),
+            None,
+            TerminalProviderResolvedLaunchOptions::default(),
+        )
     } else {
         terminal_launch(
             &kind,
             provider,
-            model,
+            launch_options,
             requested_provider_session_id.clone(),
             &working_directory_text,
         )?
@@ -5484,8 +5634,10 @@ async fn terminal_open(
         provider_session_id: runtime_snapshot.provider_session_id.clone(),
         native_session_id: runtime_snapshot.native_session_id.clone(),
         requested_provider_session_id,
-        model: launch_model,
-        model_source: launch_model_source,
+        model: resolved_launch.model,
+        model_source: resolved_launch.model_source,
+        reasoning_effort: resolved_launch.reasoning_effort,
+        speed: resolved_launch.speed,
         activity_status: runtime_snapshot.activity_status,
         command_phase: runtime_snapshot.command_phase,
         input_ready: runtime_snapshot.input_ready,
@@ -6013,21 +6165,61 @@ async fn start_terminal_agent_in_prepared_pty(
             };
         }
     };
-    let (launch_model, launch_model_source) = match session_model {
-        Some(model) => (Some(model), Some("session-current".to_string())),
+    let mut resolved_launch = match session_model {
+        Some(model) => TerminalProviderResolvedLaunchOptions {
+            model: Some(model),
+            model_source: Some("session-current".to_string()),
+            ..Default::default()
+        },
         None => {
             let source = if request_model.is_some() {
                 Some("request".to_string())
             } else {
                 None
             };
-            (request_model, source)
+            TerminalProviderResolvedLaunchOptions {
+                model: request_model,
+                model_source: source,
+                ..Default::default()
+            }
         }
     };
-    if let Some(model) = launch_model.as_ref() {
-        args.push("--model".to_string());
-        args.push(model.clone());
-    }
+    resolved_launch.reasoning_effort = match terminal_normalize_launch_reasoning_effort(
+        provider,
+        request.reasoning_effort,
+    ) {
+        Ok(effort) => effort,
+        Err(error) => {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id,
+                model: None,
+                model_source: None,
+                started: false,
+                skipped: true,
+                message: error,
+            };
+        }
+    };
+    resolved_launch.speed = match terminal_normalize_launch_speed(
+        provider,
+        resolved_launch.model.as_deref(),
+        request.speed,
+    ) {
+        Ok(speed) => speed,
+        Err(error) => {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id,
+                model: None,
+                model_source: None,
+                started: false,
+                skipped: true,
+                message: error,
+            };
+        }
+    };
+    terminal_append_provider_launch_args(provider, &mut args, &resolved_launch);
 
     if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
         return TerminalStartAgentPaneResult {
@@ -6242,8 +6434,8 @@ async fn start_terminal_agent_in_prepared_pty(
                 return TerminalStartAgentPaneResult {
                     pane_id,
                     instance_id: Some(instance.id),
-                    model: launch_model,
-                    model_source: launch_model_source,
+                    model: resolved_launch.model,
+                    model_source: resolved_launch.model_source,
                     started: true,
                     skipped: false,
                     message: "Agent started.".to_string(),

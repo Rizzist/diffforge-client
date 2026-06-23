@@ -7,6 +7,10 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  getAgentLaunchDefault,
+  resolveAgentLaunchDefaultForModel,
+} from "../../agents/agentLaunchDefaults.js";
+import {
   collapseFunctionalRepoPathToCoreRepoPath,
   createCoreRepoNameDisplayMasker,
 } from "../coreRepoNameDisplay";
@@ -1462,10 +1466,6 @@ const TODO_DROP_OVERLAY_UNSUPPORTED_LABEL_STYLE = {
   textTransform: "none",
   whiteSpace: "normal",
 };
-const TERMINAL_STARTUP_DEFAULT_MODELS = {
-  claude: "sonnet",
-  codex: "gpt-5.5",
-};
 const TERMINAL_SESSION_MODE_GENERAL = "general";
 const TERMINAL_SESSION_MODE_MANAGED_PATCH = "managed_patch";
 const TERMINAL_SESSION_MODE_DIRECT_EDIT = "direct_edit";
@@ -1698,8 +1698,8 @@ function TerminalAccountStaleChip({ paneId, agentKind }) {
   );
 }
 
-function getTerminalStartupDefaultModel(agentKind) {
-  return TERMINAL_STARTUP_DEFAULT_MODELS[String(agentKind || "").trim().toLowerCase()] || "";
+function getTerminalStartupDefaultLaunch(agentKind, agentLaunchDefaults = null) {
+  return getAgentLaunchDefault(agentKind, agentLaunchDefaults);
 }
 
 function cleanTerminalUrlLink(value) {
@@ -2002,6 +2002,7 @@ function ButtonFontPlusIcon(props) {
 function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
+  agentLaunchDefaults = null,
   agentLaunchReady = true,
   agentStatuses,
   agentStatusError,
@@ -5593,17 +5594,32 @@ function WorkspaceTerminal({
     const startupThreadProviderSessionId = forceFreshSessionForThisStart
       ? ""
       : providerSessionOverrideForThisStart || threadProviderSessionId;
-    const startupDefaultModel = isGenericTerminal ? "" : getTerminalStartupDefaultModel(terminalAgentKind);
+    const startupDefaultLaunch = isGenericTerminal
+      ? { effort: "", model: "", speed: "" }
+      : getTerminalStartupDefaultLaunch(terminalAgentKind, agentLaunchDefaults);
+    const startupDefaultModel = startupDefaultLaunch.model || "";
+    const startupProviderSessionSuppressesDefaultModel = Boolean(
+      startupThreadProviderSessionId
+        && terminalAgentKind === "opencode"
+        && !threadProviderModel,
+    );
     const startupThreadProviderModel = isGenericTerminal
       ? ""
-      : startupThreadProviderSessionId
-        ? startupDefaultModel
-        : threadProviderModel || startupDefaultModel;
-    const startupThreadProviderModelSource = threadProviderModel && !startupThreadProviderSessionId
+      : threadProviderModel || (startupProviderSessionSuppressesDefaultModel ? "" : startupDefaultModel);
+    const startupThreadProviderModelSource = threadProviderModel
       ? "session-restore"
       : startupThreadProviderModel
-        ? "app-default"
+        ? "settings-default"
         : "";
+    const startupThreadProviderLaunch = startupThreadProviderModel
+      ? resolveAgentLaunchDefaultForModel(
+        terminalAgentKind,
+        agentLaunchDefaults,
+        startupThreadProviderModel,
+      )
+      : { effort: "", speed: "" };
+    const startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
+    const startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
     const startupThreadId = terminalThreadIdRef.current;
     const startupSlotKey = forceFreshSessionForThisStart
       ? String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1)
@@ -5652,9 +5668,11 @@ function WorkspaceTerminal({
         && previousStartupSnapshot.restartKey !== restartKey,
       startupSlotKey,
       startupDefaultModel: startupDefaultModel || "",
+      startupThreadProviderEffort: startupThreadProviderEffort || "",
       startupThreadId: startupThreadId || "",
       startupThreadProviderModelSource,
       startupThreadProviderModelPresent: Boolean(startupThreadProviderModel),
+      startupThreadProviderSpeed: startupThreadProviderSpeed || "",
       startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
       terminalClosed,
       terminalIndex,
@@ -5670,9 +5688,11 @@ function WorkspaceTerminal({
       providerSessionOverridePresent: Boolean(providerSessionOverrideForThisStart),
       restartKey,
       startupDefaultModel: startupDefaultModel || "",
+      startupThreadProviderEffort: startupThreadProviderEffort || "",
       startupThreadId: startupThreadId || "",
       startupThreadProviderModel: startupThreadProviderModel || "",
       startupThreadProviderModelSource,
+      startupThreadProviderSpeed: startupThreadProviderSpeed || "",
       startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
       terminalIndex,
       threadProviderModel: threadProviderModel || "",
@@ -13210,6 +13230,8 @@ function WorkspaceTerminal({
               freshSession: forceFreshSessionForThisStart,
               providerSessionId: startupThreadProviderSessionId,
               model: startupThreadProviderModel,
+              reasoningEffort: startupThreadProviderEffort,
+              speed: startupThreadProviderSpeed,
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
               sessionMode: sessionModeForThisStart,
@@ -13311,6 +13333,8 @@ function WorkspaceTerminal({
           openedProviderModelSource,
           startupThreadProviderModel: startupThreadProviderModel || "",
           startupThreadProviderModelSource,
+          startupThreadProviderEffort,
+          startupThreadProviderSpeed,
           startupThreadId: startupThreadId || "",
           startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
           backendProviderSessionPresent: Boolean(openedProviderSessionId),
@@ -13332,6 +13356,8 @@ function WorkspaceTerminal({
           instanceId: terminalInstanceId,
           model: openedProviderModel,
           modelSource: openedProviderModelSource,
+          reasoningEffort: startupThreadProviderEffort,
+          speed: startupThreadProviderSpeed,
           nativeSessionId: openedNativeSessionId,
           nativeSessionKind: openedNativeSessionId ? "session" : "",
           nativeSessionSource: openedNativeSessionId ? "session-restore" : "",
@@ -13394,6 +13420,8 @@ function WorkspaceTerminal({
           paneId,
           providerSessionId: openedProviderSessionId || openedNativeSessionId || startupThreadProviderSessionId,
           ready: true,
+          reasoningEffort: startupThreadProviderEffort,
+          speed: startupThreadProviderSpeed,
           terminalIndex,
           threadId: startupThreadId,
           workspaceId: workspace?.id || "",

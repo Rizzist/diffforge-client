@@ -17,7 +17,12 @@ export function sanitizeDfBlueprintId(value, fallback = "node") {
 }
 
 function quoteDfBlueprint(value) {
-  return `"${String(value ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return `"${String(value ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t")
+    .replace(/"/g, '\\"')}"`;
 }
 
 function unquoteDfBlueprint(value) {
@@ -26,6 +31,9 @@ function unquoteDfBlueprint(value) {
     return trimmed
       .slice(1, -1)
       .replace(/\\"/g, '"')
+      .replace(/\\t/g, "\t")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
       .replace(/\\\\/g, "\\");
   }
   return trimmed.replace(/^'|'$/g, "");
@@ -155,11 +163,11 @@ function parseNodeLine(line, lineIndex) {
 
 function parseEdgeEndpoint(raw) {
   const endpoint = String(raw || "").trim();
-  const match = endpoint.match(/^([a-zA-Z0-9_-]+)(?:\.([a-zA-Z0-9_-]+))?$/);
-  if (!match) return { nodeId: sanitizeDfBlueprintId(endpoint), portId: "" };
+  const match = endpoint.match(/^([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)$/);
+  if (!match) return null;
   return {
     nodeId: match[1],
-    portId: match[2] || "",
+    portId: match[2],
   };
 }
 
@@ -169,14 +177,15 @@ function parseEdgeLine(line, lineIndex) {
   if (!match) return null;
   const from = parseEdgeEndpoint(match[1]);
   const to = parseEdgeEndpoint(match[2]);
+  if (!from || !to) return null;
   const props = parseDfBlueprintProps(match[3] || "");
-  const id = safeText(props.id || props.edge_id, `edge-${from.nodeId}-${from.portId || "out"}-${to.nodeId}-${to.portId || "in"}-${lineIndex}`);
+  const id = safeText(props.id || props.edge_id, `edge-${from.nodeId}-${from.portId}-${to.nodeId}-${to.portId}-${lineIndex}`);
   return {
     id,
     from: from.nodeId,
-    fromPort: from.portId || safeText(props.from_port, "out"),
+    fromPort: from.portId,
     to: to.nodeId,
-    toPort: to.portId || safeText(props.to_port, "in"),
+    toPort: to.portId,
     label: safeText(props.label || props.name),
     role: safeText(props.role, "flow"),
     props,
@@ -269,8 +278,9 @@ export function serializeDfBlueprint(ast = emptyDfBlueprintAst()) {
   }
   if (next.nodes.length && next.edges.length) lines.push("");
   for (const edge of next.edges) {
-    const fromPort = edge.fromPort || "out";
-    const toPort = edge.toPort || "in";
+    const fromPort = safeText(edge.fromPort);
+    const toPort = safeText(edge.toPort);
+    if (!fromPort || !toPort) continue;
     const props = {
       id: edge.id,
       role: edge.role || "flow",
@@ -348,6 +358,32 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       },
     };
   }
+  if (templateId === "send_message") {
+    const deviceLabel = safeText(template?.device_label);
+    return {
+      id: `${templateId}-${suffix}`,
+      icon: safeText(template?.icon, "message"),
+      label: safeText(template?.label, "Send message"),
+      mode: "",
+      nodeKind: "send_message",
+      kind: "send_message",
+      role: safeText(template?.role, "action"),
+      triggerId: "",
+      hasPosition: Boolean(position),
+      x: position ? Math.round(Number(position.x) || 0) : 0,
+      y: position ? Math.round(Number(position.y) || 0) : 0,
+      props: {
+        device_id: deviceId,
+        device_label: deviceLabel,
+        display: "region",
+        h: "360",
+        prompt: "",
+        target_terminal_id: safeText(template?.target_terminal_id),
+        target_terminal_name: safeText(template?.target_terminal_name),
+        w: "620",
+      },
+    };
+  }
   return {
     id: `${templateId}-${suffix}`,
     icon: safeText(template?.icon, "node"),
@@ -407,23 +443,40 @@ export function removeDfBlueprintTrigger(source, triggerId) {
   return serializeDfBlueprint(ast);
 }
 
-export function connectDfBlueprintNodes(source, fromNode, toNode) {
+export function removeDfBlueprintEdge(source, edgeId) {
+  const id = safeText(edgeId);
+  if (!id) return source || "";
+  const ast = parseDfBlueprintSource(source);
+  ast.edges = ast.edges.filter((edge) => edge.id !== id);
+  return serializeDfBlueprint(ast);
+}
+
+export function connectDfBlueprintNodes(source, fromNode, toNode, options = {}) {
   const from = safeText(fromNode?.id || fromNode);
   const to = safeText(toNode?.id || toNode);
   if (!from || !to || from === to) return source || "";
   const ast = parseDfBlueprintSource(source);
-  if (ast.edges.some((edge) => edge.from === from && edge.to === to)) {
+  const fromPort = safeText(options.fromPort || options.from_port, "out");
+  const toPort = safeText(options.toPort || options.to_port, "in");
+  const branch = safeText(options.branch || fromPort);
+  const label = safeText(options.label, branch ? branch.toUpperCase() : "NEXT");
+  if (ast.edges.some((edge) => (
+    edge.from === from
+    && edge.to === to
+    && edge.fromPort === fromPort
+    && edge.toPort === toPort
+  ))) {
     return serializeDfBlueprint(ast);
   }
   ast.edges.push({
-    id: `edge-${from}-${to}-${Date.now().toString(36)}`,
+    id: `edge-${from}-${fromPort}-${to}-${toPort}-${Date.now().toString(36)}`,
     from,
-    fromPort: "out",
+    fromPort,
     to,
-    toPort: "in",
-    label: "next",
+    toPort,
+    label,
     role: "flow",
-    props: {},
+    props: branch ? { branch } : {},
   });
   return serializeDfBlueprint(ast);
 }
@@ -504,25 +557,40 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
     } else if (action === "connect") {
       const from = safeText(op.from || op.from_id);
       const to = safeText(op.to || op.to_id);
-      if (from && to && from !== to && !ast.edges.some((edge) => edge.from === from && edge.to === to)) {
+      const fromPort = safeText(op.from_port);
+      const toPort = safeText(op.to_port);
+      const branch = safeText(op.branch || fromPort);
+      if (from && to && from !== to && fromPort && toPort && !ast.edges.some((edge) => (
+        edge.from === from
+        && edge.to === to
+        && edge.fromPort === fromPort
+        && edge.toPort === toPort
+      ))) {
         ast.edges.push({
-          id: safeText(op.edge_id || op.id, `edge-${from}-${to}-${Date.now().toString(36)}`),
+          id: safeText(op.edge_id || op.id, `edge-${from}-${fromPort}-${to}-${toPort}-${Date.now().toString(36)}`),
           from,
-          fromPort: safeText(op.from_port, "out"),
+          fromPort,
           to,
-          toPort: safeText(op.to_port, "in"),
-          label: safeText(op.label, "next"),
+          toPort,
+          label: safeText(op.label, branch ? branch.toUpperCase() : "NEXT"),
           role: safeText(op.role, "flow"),
-          props: {},
+          props: branch ? { branch } : {},
         });
       }
     } else if (action === "disconnect") {
       const edgeId = safeText(op.edge_id || op.id);
       const from = safeText(op.from || op.from_id);
       const to = safeText(op.to || op.to_id);
+      const fromPort = safeText(op.from_port || op.fromPort);
+      const toPort = safeText(op.to_port || op.toPort);
+      const branch = safeText(op.branch);
       ast.edges = ast.edges.filter((edge) => {
         if (edgeId) return edge.id !== edgeId;
-        return !(edge.from === from && edge.to === to);
+        if (edge.from !== from || edge.to !== to) return true;
+        if (fromPort && edge.fromPort !== fromPort) return true;
+        if (toPort && edge.toPort !== toPort) return true;
+        if (branch && safeText(edge.props?.branch || edge.branch || edge.fromPort) !== branch) return true;
+        return false;
       });
     } else if (action === "updatenodeprops" || action === "update_node_props" || action === "updateprops") {
       const id = safeText(op.node_id || op.id);

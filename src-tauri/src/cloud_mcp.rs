@@ -4050,6 +4050,7 @@ fn cloud_mcp_sync_connection_for_runtime(connected: bool, status: &str) -> &'sta
         | "route_not_configured"
         | "route_not_browser_ready" => "provisioning",
         "desktop_registering" | "websocket_handshaking" | "handshaking" => "syncing",
+        "offline_permanent" => "offline_permanent",
         "websocket_retrying" | "retrying" => "offline",
         _ => "connecting",
     }
@@ -9518,6 +9519,10 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
 }
 
 async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
+    if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+        cloud_mcp_mark_global_ws_offline_permanent(state).await;
+        return Err(cloud_mcp_offline_mode_message().to_string());
+    }
     cloud_mcp_record_signin_diagnostic(
         state,
         "cloud_mcp.connect",
@@ -9583,6 +9588,10 @@ async fn cloud_mcp_set_global_ws_phase(
     status: &str,
     global_ws_status: &str,
 ) {
+    if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+        cloud_mcp_mark_global_ws_offline_permanent(state).await;
+        return;
+    }
     let mut runtime = state.inner.lock().await;
     let previous_status = runtime.status.clone();
     let preserve_connected = runtime.global_ws_connected;
@@ -9707,11 +9716,35 @@ fn cloud_mcp_reconnect_window_reset(state: &CloudMcpState) {
     }
 }
 
+fn cloud_mcp_offline_mode_message() -> &'static str {
+    "Cloud sync is in offline mode. Click Reconnect to resume live sync."
+}
+
+async fn cloud_mcp_mark_global_ws_offline_permanent(state: &CloudMcpState) {
+    CLOUD_MCP_GLOBAL_WS_LIVE.store(false, Ordering::Release);
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = false;
+        runtime.status = "offline_permanent".to_string();
+        runtime.last_error.clear();
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = "offline_permanent".to_string();
+        runtime.global_ws_last_error.clear();
+        runtime.global_ws_connection_id = None;
+        runtime.global_ws_message_token = None;
+    }
+    cloud_mcp_fail_pending_ws_requests(state, cloud_mcp_offline_mode_message()).await;
+    cloud_mcp_note_sync_connection(false, "offline_permanent");
+}
+
 /// Reconnect backoff after a failed attempt: 10s for the first minute, 30s
 /// until three minutes, then flips perma-offline so the loop parks until a
 /// manual retry. A pending reconnect notify (manual retry / event wake) cuts
 /// the wait short. Returns true once perma-offline is engaged.
 async fn cloud_mcp_reconnect_backoff_wait(state: &CloudMcpState) -> bool {
+    if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+        return true;
+    }
     let elapsed = cloud_mcp_reconnect_window_elapsed(state);
     if elapsed >= Duration::from_secs(CLOUD_MCP_RECONNECT_PERMA_OFFLINE_SECS) {
         state.global_ws_perma_offline.store(true, Ordering::SeqCst);
@@ -9765,20 +9798,15 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             // manual retry (or "continue offline" toggling back on). The wake
             // resets the reconnect window so the full 10s/30s/3min cycle runs
             // again from scratch.
-            {
-                let mut runtime = state.inner.lock().await;
-                runtime.connected = false;
-                runtime.status = "offline_permanent".to_string();
-                runtime.global_ws_connected = false;
-                runtime.global_ws_status = "offline_permanent".to_string();
-            }
-            cloud_mcp_note_sync_connection(false, "offline_permanent");
+            cloud_mcp_mark_global_ws_offline_permanent(&state).await;
             log_cloud_sync_event(
                 "ws.perma_offline_parked",
                 json!({ "iteration": loop_iteration }),
             );
             state.global_ws_reconnect.notified().await;
-            state.global_ws_perma_offline.store(false, Ordering::SeqCst);
+            if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+                continue;
+            }
             cloud_mcp_reconnect_window_reset(&state);
             continue;
         }
@@ -9819,6 +9847,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                         "error": clean_terminal_telemetry_text(&error),
                     }),
                 );
+                if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+                    cloud_mcp_mark_global_ws_offline_permanent(&state).await;
+                    continue;
+                }
                 if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
                     state.global_ws_started.store(false, Ordering::SeqCst);
                     return;
@@ -9848,6 +9880,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
         if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
             state.global_ws_started.store(false, Ordering::SeqCst);
             return;
+        }
+        if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+            cloud_mcp_mark_global_ws_offline_permanent(&state).await;
+            continue;
         }
         {
             let mut runtime = state.inner.lock().await;
@@ -9886,6 +9922,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                         "error": clean_terminal_telemetry_text(&error),
                     }),
                 );
+                if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+                    cloud_mcp_mark_global_ws_offline_permanent(&state).await;
+                    continue;
+                }
                 if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
                     state.global_ws_started.store(false, Ordering::SeqCst);
                     return;
@@ -9911,6 +9951,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             }
         }
 
+        if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+            cloud_mcp_mark_global_ws_offline_permanent(&state).await;
+            continue;
+        }
         cloud_mcp_reconnect_backoff_wait(&state).await;
     }
 }
@@ -10004,6 +10048,9 @@ async fn cloud_mcp_open_global_ws(
     _base_url: &str,
     target: &CloudMcpWsTarget,
 ) -> Result<(), String> {
+    if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+        return Err(cloud_mcp_offline_mode_message().to_string());
+    }
     cloud_mcp_record_signin_diagnostic(
         state,
         "websocket.open",
@@ -10359,6 +10406,17 @@ async fn cloud_mcp_open_global_ws(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if outgoing_kind == "cloud_app_ws_close" {
+                    if let Err(error) = write
+                        .send(Message::Text(outgoing.to_string().into()))
+                        .await
+                    {
+                        break Err(format!("Cloud MCP app websocket close request failed: {error}"));
+                    }
+                    let _ = write.send(Message::Close(None)).await;
+                    let _ = write.flush().await;
+                    break Ok(());
+                }
                 let voice_activity_key = if cloud_mcp_voice_ws_kind(&outgoing_kind) {
                     let bytes = cloud_mcp_sync_payload_bytes(&outgoing);
                     Some(cloud_mcp_record_sync_activity(
@@ -10466,6 +10524,11 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
         return;
     }
 
+    if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+        cloud_mcp_mark_global_ws_offline_permanent(state).await;
+        return;
+    }
+
     let message = error
         .map(|value| clean_terminal_telemetry_text(value))
         .unwrap_or_else(|| "Cloud MCP app websocket disconnected.".to_string());
@@ -10512,6 +10575,12 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
 ) {
     CLOUD_MCP_GLOBAL_WS_LIVE.store(false, Ordering::Release);
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+        return;
+    }
+    if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+        state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
+        let _ = state.global_ws_tx.lock().await.take();
+        cloud_mcp_mark_global_ws_offline_permanent(state).await;
         return;
     }
     let message = clean_terminal_telemetry_text(error);
@@ -15634,6 +15703,62 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["commandKind"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_kind"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandKind"])),
+        "loop_runtime_run_id": cloud_mcp_payload_text(event, &["loop_runtime_run_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeRunId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["runId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loop_runtime_run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopRuntimeRunId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "runId"])),
+        "loopRuntimeRunId": cloud_mcp_payload_text(event, &["loop_runtime_run_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeRunId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["runId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loop_runtime_run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopRuntimeRunId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "runId"])),
+        "loop_runtime_node_id": cloud_mcp_payload_text(event, &["loop_runtime_node_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeNodeId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loop_runtime_node_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopRuntimeNodeId"])),
+        "loopRuntimeNodeId": cloud_mcp_payload_text(event, &["loop_runtime_node_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeNodeId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loop_runtime_node_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopRuntimeNodeId"])),
+        "loop_runtime_edge_id": cloud_mcp_payload_text(event, &["loop_runtime_edge_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeEdgeId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loop_runtime_edge_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopRuntimeEdgeId"])),
+        "loopRuntimeEdgeId": cloud_mcp_payload_text(event, &["loop_runtime_edge_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeEdgeId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loop_runtime_edge_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopRuntimeEdgeId"])),
+        "loopspace_id": cloud_mcp_payload_text(event, &["loopspace_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopspaceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopspaceId"])),
+        "loopspaceId": cloud_mcp_payload_text(event, &["loopspace_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["loopspaceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "loopspaceId"])),
+        "trigger_id": cloud_mcp_payload_text(event, &["trigger_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["triggerId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "trigger_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "triggerId"])),
+        "triggerId": cloud_mcp_payload_text(event, &["trigger_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["triggerId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "trigger_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "triggerId"])),
+        "trigger_run_id": cloud_mcp_payload_text(event, &["trigger_run_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["triggerRunId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "trigger_run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "triggerRunId"])),
+        "triggerRunId": cloud_mcp_payload_text(event, &["trigger_run_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["triggerRunId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "trigger_run_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "triggerRunId"])),
         "target_agent_id": cloud_mcp_payload_text(event, &["target_agent_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["targetAgentId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_agent_id"]))
@@ -20874,6 +20999,9 @@ async fn cloud_mcp_wait_for_ws_sender(
 ) -> Result<mpsc::UnboundedSender<Value>, String> {
     let started = Instant::now();
     loop {
+        if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+            return Err(cloud_mcp_offline_mode_message().to_string());
+        }
         if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
             let runtime = state.inner.lock().await;
             let primary = runtime.global_ws_last_error.trim();
@@ -24644,15 +24772,17 @@ async fn cloud_mcp_enter_offline_mode(
 ) -> Result<CloudMcpStatus, String> {
     let state = state.inner();
     state.global_ws_perma_offline.store(true, Ordering::SeqCst);
-    {
-        let mut runtime = state.inner.lock().await;
-        runtime.connected = false;
-        runtime.status = "offline_permanent".to_string();
-        runtime.global_ws_connected = false;
-        runtime.global_ws_status = "offline_permanent".to_string();
-    }
-    cloud_mcp_note_sync_connection(false, "offline_permanent");
+    let close_result = cloud_mcp_send_app_ws_close_request(state, "user_offline_mode").await;
+    state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
+    let _ = state.global_ws_tx.lock().await.take();
+    cloud_mcp_mark_global_ws_offline_permanent(state).await;
     state.global_ws_reconnect.notify_waiters();
+    if let Err(error) = close_result {
+        log_cloud_sync_event(
+            "ws.offline_close_skipped",
+            json!({ "error": clean_terminal_telemetry_text(&error) }),
+        );
+    }
     Ok(cloud_mcp_status_snapshot(state).await)
 }
 
@@ -34642,6 +34772,30 @@ async fn cloud_mcp_record_todo_dispatch_status(
                 payload["dispatchTarget"] = dispatch_target;
             }
             for (target_key, source_keys) in [
+                (
+                    "loop_runtime_run_id",
+                    &["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"][..],
+                ),
+                (
+                    "loop_runtime_node_id",
+                    &["loop_runtime_node_id", "loopRuntimeNodeId"][..],
+                ),
+                (
+                    "loop_runtime_edge_id",
+                    &["loop_runtime_edge_id", "loopRuntimeEdgeId"][..],
+                ),
+                (
+                    "loopspace_id",
+                    &["loopspace_id", "loopspaceId"][..],
+                ),
+                (
+                    "trigger_id",
+                    &["trigger_id", "triggerId", "loopRuntimeTriggerId"][..],
+                ),
+                (
+                    "trigger_run_id",
+                    &["trigger_run_id", "triggerRunId", "loopRuntimeTriggerRunId"][..],
+                ),
                 ("repo_id", &["repo_id", "repoId"][..]),
                 (
                     "target_agent_id",

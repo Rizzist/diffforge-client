@@ -6184,16 +6184,18 @@ const SkillDocumentEditor = styled.div`
 `;
 
 const SkillDocumentToolbar = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(max-content, auto);
+  display: flex;
+  flex-wrap: wrap;
   position: relative;
   z-index: 5;
   box-sizing: border-box;
   flex: 0 0 auto;
   min-width: 0;
   min-height: 44px;
-  align-items: start;
+  align-items: flex-start;
+  align-content: flex-start;
   gap: 8px;
+  overflow: visible;
   padding: 7px 10px;
   border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   background: var(--tools-control-bg);
@@ -6208,10 +6210,6 @@ const SkillDocumentToolbar = styled.div`
       padding-top: 48px;
     }
   }
-
-  @media (max-width: 980px) {
-    grid-template-columns: minmax(0, 1fr);
-  }
 `;
 
 const SkillDocumentToolbarCopy = styled.div`
@@ -6223,21 +6221,26 @@ const SkillDocumentToolbarCopy = styled.div`
 
 const SkillDocumentToolbarControls = styled.div`
   display: flex;
+  flex: 1 1 260px;
   flex-wrap: wrap;
   align-items: center;
+  align-content: flex-start;
   justify-content: flex-start;
   gap: 8px;
   min-width: 0;
   max-width: 100%;
 
   &[data-side="right"] {
+    flex: 0 1 auto;
     justify-content: flex-end;
+    margin-left: auto;
     overflow: visible;
   }
 
   @media (max-width: 980px) {
     &[data-side="right"] {
       justify-content: flex-start;
+      margin-left: 0;
     }
   }
 `;

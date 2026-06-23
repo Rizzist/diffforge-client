@@ -13,6 +13,24 @@ window.addEventListener("unhandledrejection", (event) => {
 // AppShell bundle. Besides startup latency, this keeps AppShell's background
 // listeners/pollers out of small always-on surfaces.
 const hash = window.location.hash || "";
+const mainWindowBoot = !hash;
+
+if (mainWindowBoot) {
+  const platformText = [
+    navigator.userAgentData?.platform,
+    navigator.platform,
+    navigator.userAgent,
+  ].filter(Boolean).join(" ").toLowerCase();
+  const windowPlatform = /mac|darwin/.test(platformText)
+    ? "macos"
+    : /win/.test(platformText)
+      ? "windows"
+      : "linux";
+
+  document.documentElement.dataset.windowPlatform = windowPlatform;
+  document.body.dataset.windowPlatform = windowPlatform;
+}
+
 const loadRootComponent = hash === "#/snipping-overlay"
   ? import("./snipping/SnippingWorkspaceView.jsx").then((module) => module.SnippingOverlayWindow)
   : hash === "#/snipping-recording-controls"
